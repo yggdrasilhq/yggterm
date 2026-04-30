@@ -73,8 +73,8 @@ use tracing::warn;
 use uuid::Uuid;
 use yggterm_core::{
     PerfSpan, SessionNode, SessionStore, SessionTitleStore, TranscriptRole, WorkspaceDocument,
-    WorkspaceDocumentKind, append_trace_event, event_trace_path, follow_trace_lines,
-    generation_context_from_messages, looks_like_generated_fallback_title,
+    WorkspaceDocumentKind, YGGTERM_DESKTOP_APP_ID, append_trace_event, event_trace_path,
+    follow_trace_lines, generation_context_from_messages, looks_like_generated_fallback_title,
     looks_like_low_signal_generated_copy, read_codex_session_identity_fields,
     read_codex_transcript_messages, read_codex_transcript_messages_limited, read_trace_tail,
     resolve_yggterm_home,
@@ -10016,6 +10016,215 @@ pub fn run_app_control_list_clients() -> anyhow::Result<()> {
     write_stdout_payload(&serde_json::to_string_pretty(&json!({
         "count": records.len(),
         "clients": records,
+    }))?)?;
+    Ok(())
+}
+
+fn parse_desktop_entry_fields(text: &str) -> BTreeMap<String, String> {
+    text.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#') && !line.starts_with('['))
+        .filter_map(|line| line.split_once('='))
+        .map(|(key, value)| (key.trim().to_string(), value.trim().to_string()))
+        .collect()
+}
+
+fn desktop_entry_snapshot(path: &Path) -> Value {
+    let text = fs::read_to_string(path).unwrap_or_default();
+    let fields = parse_desktop_entry_fields(&text);
+    json!({
+        "path": path.display().to_string(),
+        "exists": path.is_file(),
+        "fields": fields,
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn process_environment_snapshot(pid: u32) -> BTreeMap<String, String> {
+    const KEYS: &[&str] = &[
+        "YGGTERM_ALLOW_MULTI_WINDOW",
+        "YGGTERM_REMOTE_SMOKE_TAG",
+        "YGGTERM_DESKTOP_APP_ID_SUFFIX",
+        "YGGTERM_SKIP_ACTIVE_EXEC_HANDOFF",
+        "YGGTERM_HOME",
+        "DISPLAY",
+        "WAYLAND_DISPLAY",
+        "XDG_SESSION_ID",
+        "XDG_RUNTIME_DIR",
+        "GDK_BACKEND",
+    ];
+    let payload = fs::read(format!("/proc/{pid}/environ")).unwrap_or_default();
+    payload
+        .split(|byte| *byte == 0)
+        .filter_map(|entry| std::str::from_utf8(entry).ok())
+        .filter_map(|entry| entry.split_once('='))
+        .filter(|(key, _)| KEYS.contains(key))
+        .map(|(key, value)| (key.to_string(), value.to_string()))
+        .collect()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn process_environment_snapshot(_pid: u32) -> BTreeMap<String, String> {
+    BTreeMap::new()
+}
+
+fn truthy_env_value(value: Option<&str>) -> bool {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .is_some_and(|value| {
+            !matches!(
+                value.to_ascii_lowercase().as_str(),
+                "0" | "false" | "no" | "off"
+            )
+        })
+}
+
+fn recent_linux_desktop_app_id_events(home: &Path, lines: usize) -> Vec<Value> {
+    tail_text_file_lines(&event_trace_path(home), lines)
+        .into_iter()
+        .filter_map(|line| serde_json::from_str::<Value>(&line).ok())
+        .filter(|event| event.get("name").and_then(Value::as_str) == Some("linux_desktop_app_id"))
+        .map(|event| {
+            let payload = event.get("payload").cloned().unwrap_or(Value::Null);
+            json!({
+                "ts_ms": event.get("ts_ms").cloned().unwrap_or(Value::Null),
+                "pid": event.get("pid").cloned().unwrap_or(Value::Null),
+                "app_id": payload.get("app_id").cloned().unwrap_or(Value::Null),
+                "payload": payload,
+            })
+        })
+        .collect()
+}
+
+#[cfg(target_os = "linux")]
+fn kde_pinned_yggterm_launchers() -> Vec<String> {
+    let Some(home) = dirs::home_dir() else {
+        return Vec::new();
+    };
+    let path = home.join(".config/plasma-org.kde.plasma.desktop-appletsrc");
+    let Ok(text) = fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    text.lines()
+        .filter_map(|line| line.trim().strip_prefix("launchers="))
+        .flat_map(|value| value.split(','))
+        .map(str::trim)
+        .filter(|value| value.contains("yggterm") || value.contains(YGGTERM_DESKTOP_APP_ID))
+        .map(str::to_string)
+        .collect()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn kde_pinned_yggterm_launchers() -> Vec<String> {
+    Vec::new()
+}
+
+fn desktop_field<'a>(entry: &'a Value, key: &str) -> Option<&'a str> {
+    entry
+        .get("fields")
+        .and_then(Value::as_object)
+        .and_then(|fields| fields.get(key))
+        .and_then(Value::as_str)
+}
+
+pub fn run_app_control_desktop_identity() -> anyhow::Result<()> {
+    let home = resolve_yggterm_home()?;
+    let endpoint = default_endpoint(&home);
+    let mut records = active_client_instance_records(&home, &endpoint)?;
+    records.sort_by_key(|record| std::cmp::Reverse(record.started_at_ms));
+    let data_dir = dirs::data_local_dir().unwrap_or_else(|| home.join(".local/share"));
+    let canonical_desktop_path = data_dir
+        .join("applications")
+        .join(format!("{YGGTERM_DESKTOP_APP_ID}.desktop"));
+    let legacy_desktop_path = data_dir.join("applications").join("yggterm.desktop");
+    let canonical_entry = desktop_entry_snapshot(&canonical_desktop_path);
+    let legacy_entry = desktop_entry_snapshot(&legacy_desktop_path);
+    let app_id_events = recent_linux_desktop_app_id_events(&home, 2_000);
+    let mut latest_app_id_by_pid = BTreeMap::<u32, String>::new();
+    for event in &app_id_events {
+        let pid = event
+            .get("pid")
+            .and_then(Value::as_u64)
+            .and_then(|value| u32::try_from(value).ok());
+        let app_id = event.get("app_id").and_then(Value::as_str);
+        if let (Some(pid), Some(app_id)) = (pid, app_id) {
+            latest_app_id_by_pid.insert(pid, app_id.to_string());
+        }
+    }
+
+    let pins = kde_pinned_yggterm_launchers();
+    let mut problems = Vec::<String>::new();
+    if desktop_field(&canonical_entry, "Icon") != Some(YGGTERM_DESKTOP_APP_ID) {
+        problems.push(format!(
+            "canonical desktop file Icon should be {YGGTERM_DESKTOP_APP_ID}"
+        ));
+    }
+    if desktop_field(&canonical_entry, "StartupWMClass") != Some(YGGTERM_DESKTOP_APP_ID) {
+        problems.push(format!(
+            "canonical desktop file StartupWMClass should be {YGGTERM_DESKTOP_APP_ID}"
+        ));
+    }
+
+    let clients = records
+        .iter()
+        .map(|record| {
+            let env = process_environment_snapshot(record.pid);
+            let latest_app_id = latest_app_id_by_pid.get(&record.pid).cloned();
+            let explicit_suffix = env.get("YGGTERM_DESKTOP_APP_ID_SUFFIX").is_some_and(|value| {
+                !value.trim().is_empty()
+            });
+            let remote_smoke = truthy_env_value(env.get("YGGTERM_REMOTE_SMOKE_TAG").map(String::as_str));
+            if let Some(app_id) = latest_app_id.as_deref()
+                && app_id != YGGTERM_DESKTOP_APP_ID
+                && !explicit_suffix
+                && !remote_smoke
+            {
+                problems.push(format!(
+                    "live client pid {} uses app id {app_id}; pinned KDE launchers expect {YGGTERM_DESKTOP_APP_ID}",
+                    record.pid
+                ));
+            }
+            if let Some(app_id) = latest_app_id.as_deref()
+                && app_id != YGGTERM_DESKTOP_APP_ID
+                && truthy_env_value(env.get("YGGTERM_ALLOW_MULTI_WINDOW").map(String::as_str))
+                && !remote_smoke
+                && !explicit_suffix
+            {
+                problems.push(format!(
+                    "pid {} appears to be an update-handoff launch where YGGTERM_ALLOW_MULTI_WINDOW changed the desktop app id",
+                    record.pid
+                ));
+            }
+            json!({
+                "record": record,
+                "env": env,
+                "latest_linux_desktop_app_id": latest_app_id,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let pinned_canonical = pins
+        .iter()
+        .any(|pin| pin.contains(&format!("{YGGTERM_DESKTOP_APP_ID}.desktop")));
+    if pinned_canonical && records.is_empty() {
+        problems.push(
+            "KDE pins the canonical Yggterm launcher, but no live app-control client is registered"
+                .to_string(),
+        );
+    }
+
+    write_stdout_payload(&serde_json::to_string_pretty(&json!({
+        "platform": std::env::consts::OS,
+        "canonical_app_id": YGGTERM_DESKTOP_APP_ID,
+        "desktop_files": {
+            "canonical": canonical_entry,
+            "legacy": legacy_entry,
+        },
+        "kde_pinned_launchers": pins,
+        "clients": clients,
+        "recent_linux_desktop_app_id_events": app_id_events,
+        "problems": problems,
     }))?)?;
     Ok(())
 }

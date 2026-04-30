@@ -4,6 +4,19 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+## 2.1.65
+
+### Added
+
+- add `yggterm-headless server app desktop-identity` as a read-only KDE/app-control incident report for pinned launcher ids, desktop file fields, live client app ids, and update-handoff environment flags
+
+### Fixed
+
+- keep direct-install KDE launches grouped under the pinned `dev.yggterm.Yggterm` launcher during update handoff instead of creating an isolated app id from `YGGTERM_ALLOW_MULTI_WINDOW`
+- allow a runtime-running prompt-ready remote terminal surface to complete resume, clear the attention toast, and re-enable input instead of timing out while visible content is already loaded
+- switch Linux desktop entries to the canonical theme icon name and refresh the icon edge pixels so the installed app icon no longer shows a pale jagged border
+- add focused CI regression tests for KDE desktop identity and the remote-resume prompt readiness path
+
 ## 2.1.64
 
 ### Fixed
