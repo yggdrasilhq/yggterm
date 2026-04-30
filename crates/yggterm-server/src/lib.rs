@@ -29,9 +29,10 @@ pub use daemon::{
     refresh_managed_cli, refresh_preview, refresh_remote_machine, remove_session,
     remove_ssh_target, request_terminal_launch, run_daemon, set_all_preview_blocks_folded,
     set_session_keep_alive, set_view_mode, shutdown, snapshot, start_command_session,
-    start_local_session, start_local_session_at, start_ssh_session_at, status,
-    switch_agent_session_mode, sync_external_window, sync_theme, terminal_ensure, terminal_read,
-    terminal_resize, terminal_snapshot, terminal_write, toggle_preview_block, update_session_copy,
+    start_local_session, start_local_session_at, start_remote_codex_session_at,
+    start_remote_runtime_codex_session, start_ssh_session_at, status, switch_agent_session_mode,
+    sync_external_window, sync_theme, terminal_ensure, terminal_read, terminal_resize,
+    terminal_snapshot, terminal_write, toggle_preview_block, update_session_copy,
 };
 pub use host::{GhosttyHostKind, GhosttyHostSupport, GhosttyTerminalHostMode, detect_ghostty_host};
 pub use protocol::{
@@ -290,6 +291,7 @@ fn managed_live_session_is_recoverable(key: &str, session: &ManagedSessionView) 
 const RUNTIME_PERSISTENCE_METADATA_LABEL: &str = "Runtime Persistence";
 const RUNTIME_PERSISTENCE_KEEP_ALIVE: &str = "keep-alive";
 const UPDATE_RESTART_RESTORE_REASON: &str = "update-restart";
+const REMOTE_LAUNCH_ACTION_METADATA_LABEL: &str = "Remote Launch Action";
 
 fn session_keep_alive(session: &ManagedSessionView) -> bool {
     session
@@ -335,6 +337,11 @@ fn persisted_live_session_from_managed(
                 .iter()
                 .find(|entry| entry.label == "Cwd")
                 .map(|entry| entry.value.clone()),
+            remote_launch_action: session
+                .metadata
+                .iter()
+                .find(|entry| entry.label == REMOTE_LAUNCH_ACTION_METADATA_LABEL)
+                .map(|entry| entry.value.clone()),
             restore_reason,
         })
 }
@@ -377,6 +384,11 @@ fn live_session_uses_remote_runtime(session: &ManagedSessionView) -> bool {
     session.source == SessionSource::LiveSsh
         && (is_remote_scanned_live_session_path(&session.session_path)
             || session.session_path.starts_with("ssh://"))
+}
+
+fn remote_live_session_starts_new_codex(session: &ManagedSessionView) -> bool {
+    session_metadata_value(session, REMOTE_LAUNCH_ACTION_METADATA_LABEL).as_deref()
+        == Some("start-codex")
 }
 
 fn remote_scanned_session_path_is_live(
@@ -745,6 +757,8 @@ pub struct PersistedLiveSession {
     pub ssh_target: String,
     pub prefix: Option<String>,
     pub cwd: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_launch_action: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub restore_reason: Option<String>,
 }
@@ -2164,6 +2178,101 @@ impl YggtermServer {
         Ok(key)
     }
 
+    pub fn start_remote_codex_session(
+        &mut self,
+        target: &str,
+        prefix: Option<&str>,
+        cwd: Option<&str>,
+        title_hint: Option<&str>,
+    ) -> anyhow::Result<String> {
+        let ssh_target = canonicalize_ssh_target_alias(target);
+        if ssh_target.is_empty() {
+            anyhow::bail!("enter an SSH target such as dev, pi@raspberry, or user@ip");
+        }
+        let prefix = prefix
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned);
+        let requested_cwd = cwd
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned);
+        let cwd =
+            normalize_remote_attach_cwd(&ssh_target, prefix.as_deref(), requested_cwd.as_deref());
+        let machine_key = machine_key_from_ssh_target(&ssh_target);
+        let target_label = self
+            .ssh_targets
+            .iter()
+            .find(|existing| existing.ssh_target == ssh_target && existing.prefix == prefix)
+            .map(|existing| existing.label.trim().to_string())
+            .filter(|label| !label.is_empty())
+            .unwrap_or_else(|| {
+                ssh_machine_label(&SshConnectTarget {
+                    label: String::new(),
+                    kind: SessionKind::SshShell,
+                    ssh_target: ssh_target.clone(),
+                    prefix: prefix.clone(),
+                    cwd: cwd.clone(),
+                })
+            });
+        let target = SshConnectTarget {
+            label: target_label,
+            kind: SessionKind::SshShell,
+            ssh_target: ssh_target.clone(),
+            prefix,
+            cwd,
+        };
+        self.upsert_ssh_target(&target);
+        self.ensure_remote_machine_stub(&target);
+        let uuid = Uuid::new_v4().to_string();
+        let key = remote_scanned_session_path(&machine_key, &uuid);
+        let title = title_hint
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| {
+                live_session_default_title(
+                    SessionKind::Codex,
+                    target.cwd.as_deref(),
+                    &ssh_machine_label(&target),
+                )
+            });
+        let (remote_binary, remote_deploy_state) = self
+            .cached_remote_launch_for_target(&target.ssh_target, target.prefix.as_deref())
+            .unwrap_or_else(|| {
+                (
+                    preferred_remote_binary_fallback(),
+                    RemoteDeployState::Planned,
+                )
+            });
+        let mut session = build_live_session(
+            &uuid,
+            SessionKind::Codex,
+            &target,
+            self.backend,
+            self.theme,
+            self.ghostty_host.bridge_enabled,
+        );
+        configure_remote_new_codex_live_session(
+            &mut session,
+            &key,
+            &uuid,
+            &title,
+            &target,
+            &remote_binary,
+            remote_deploy_state,
+            target.cwd.as_deref(),
+            self.theme,
+        );
+        self.sessions.insert(key.clone(), session);
+        self.live_session_order.retain(|existing| existing != &key);
+        self.live_session_order.insert(0, key.clone());
+        self.active_session_path = Some(key.clone());
+        self.active_view_mode = WorkspaceViewMode::Terminal;
+        self.request_terminal_launch_for_active();
+        Ok(key)
+    }
+
     pub fn refresh_remote_machine_for_ssh_target(
         &mut self,
         target: &SshConnectTarget,
@@ -2994,6 +3103,105 @@ impl YggtermServer {
         Ok(key)
     }
 
+    pub fn start_remote_runtime_codex_session(
+        &mut self,
+        session_id: &str,
+        cwd: Option<&str>,
+    ) -> anyhow::Result<String> {
+        let key = remote_runtime_codex_session_key(session_id);
+        let target = local_session_target(SessionKind::Codex, cwd);
+        let title = self
+            .sessions
+            .get(&key)
+            .map(|session| session.title.clone())
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| {
+                format!(
+                    "Remote Codex {}",
+                    session_id.chars().take(8).collect::<String>()
+                )
+            });
+        if !self.sessions.contains_key(&key) {
+            self.insert_live_session_with_launch(
+                &key,
+                session_id,
+                SessionKind::Codex,
+                &target,
+                Some(title.clone()),
+                false,
+            );
+        }
+        let launch_command = agent_launch_command(SessionKind::Codex, cwd, None);
+        let home = resolve_yggterm_home()?;
+        let registry = RemoteRuntimeRegistry::open(&home)?;
+        let _ = registry.register_session(RemoteRuntimeSessionInput {
+            session_id: Some(session_id.to_string()),
+            machine_key: "local".to_string(),
+            runtime_kind: RemoteRuntimeKind::Codex,
+            title: title.clone(),
+            cwd: target.cwd.clone(),
+            summary: Some("Daemon-owned remote Codex session".to_string()),
+            requires_terminal: true,
+        })?;
+        let _ = registry.transition_session(
+            session_id,
+            RemoteRuntimeSessionState::AttachingPty,
+            Some("starting daemon-owned remote codex runtime"),
+            &json!({
+                "cwd": target.cwd,
+            }),
+        )?;
+        if let Some(session) = self.sessions.get_mut(&key) {
+            session.id = session_id.to_string();
+            session.session_path = key.clone();
+            session.title = title;
+            session.kind = SessionKind::Codex;
+            session.launch_command = launch_command.clone();
+            session.launch_phase = TerminalLaunchPhase::Queued;
+            session.remote_deploy_state = RemoteDeployState::NotRequired;
+            session.status_line = describe_status_line(
+                session.backend,
+                self.theme,
+                session.source,
+                session.launch_phase,
+                session.remote_deploy_state,
+                session.bridge_available,
+            );
+            upsert_session_metadata(
+                &mut session.metadata,
+                "Source",
+                "daemon-owned-remote-runtime".to_string(),
+            );
+            upsert_session_metadata(
+                &mut session.metadata,
+                "Restore",
+                format!("yggterm server remote start-codex {session_id}"),
+            );
+            if let Some(cwd) = target.cwd.as_deref() {
+                upsert_session_metadata(&mut session.metadata, "Cwd", cwd.to_string());
+            }
+            upsert_session_metadata(&mut session.metadata, "Runtime Session", key.clone());
+            upsert_session_metadata(
+                &mut session.metadata,
+                "Runtime Ownership",
+                "yggterm daemon".to_string(),
+            );
+            session.terminal_lines = vec![
+                format!("$ {launch_command}"),
+                format!("Queue daemon-owned remote Codex session {session_id}"),
+                format!(
+                    "Workspace: {}",
+                    target.cwd.clone().unwrap_or_else(local_default_cwd)
+                ),
+                "Runtime owner: yggterm daemon".to_string(),
+                "Transport bridge: stdio attach to daemon PTY".to_string(),
+            ];
+        }
+        self.active_session_path = Some(key.clone());
+        self.active_view_mode = WorkspaceViewMode::Terminal;
+        Ok(key)
+    }
+
     pub fn restore_live_session(&mut self, live: PersistedLiveSession) {
         let PersistedLiveSession {
             key,
@@ -3004,6 +3212,7 @@ impl YggtermServer {
             ssh_target,
             prefix,
             cwd,
+            remote_launch_action,
             restore_reason,
         } = live;
         let temporary_update_restore =
@@ -3039,11 +3248,13 @@ impl YggtermServer {
         };
         self.upsert_ssh_target(&target);
         if let Some((machine_key, session_id, normalized_live_key)) = remote_scanned_key.as_ref() {
+            let starts_new_codex = remote_launch_action.as_deref() == Some("start-codex");
             let machine_ix = self
                 .remote_machines
                 .iter()
                 .position(|machine| machine.machine_key == *machine_key);
-            if let Some(machine_ix) = machine_ix
+            if !starts_new_codex
+                && let Some(machine_ix) = machine_ix
                 && let Some(session_ix) = self.remote_machines[machine_ix]
                     .sessions
                     .iter()
@@ -3125,17 +3336,31 @@ impl YggtermServer {
                 false,
             );
             if let Some(session) = self.sessions.get_mut(normalized_live_key) {
-                configure_remote_resume_live_session(
-                    session,
-                    normalized_live_key,
-                    session_id,
-                    &resolved_title,
-                    &target,
-                    &remote_binary,
-                    remote_deploy_state,
-                    target.cwd.as_deref(),
-                    self.theme,
-                );
+                if starts_new_codex {
+                    configure_remote_new_codex_live_session(
+                        session,
+                        normalized_live_key,
+                        session_id,
+                        &resolved_title,
+                        &target,
+                        &remote_binary,
+                        remote_deploy_state,
+                        target.cwd.as_deref(),
+                        self.theme,
+                    );
+                } else {
+                    configure_remote_resume_live_session(
+                        session,
+                        normalized_live_key,
+                        session_id,
+                        &resolved_title,
+                        &target,
+                        &remote_binary,
+                        remote_deploy_state,
+                        target.cwd.as_deref(),
+                        self.theme,
+                    );
+                }
                 if keep_alive {
                     set_session_keep_alive_metadata(session, true);
                 }
@@ -3288,6 +3513,7 @@ impl YggtermServer {
         let missing_remote_live_session = self.sessions.get(&path).and_then(|session| {
             if !live_session_uses_remote_runtime(session)
                 || !is_remote_scanned_live_session_path(&session.session_path)
+                || remote_live_session_starts_new_codex(session)
             {
                 return None;
             }
@@ -3548,19 +3774,28 @@ impl YggtermServer {
                     session.launch_command =
                         if is_remote_scanned_live_session_path(&session.session_path) {
                             let cwd = session_metadata_value(session, "Cwd").unwrap_or_default();
-                            remote_ssh_launch_command(
-                                &ssh_target,
-                                ssh_prefix.as_deref(),
-                                &remote_binary,
-                                &[
-                                    "server",
-                                    "remote",
-                                    "resume-codex",
-                                    &session.id,
-                                    &cwd,
-                                    "--require-existing",
-                                ],
-                            )
+                            if remote_live_session_starts_new_codex(session) {
+                                remote_ssh_launch_command(
+                                    &ssh_target,
+                                    ssh_prefix.as_deref(),
+                                    &remote_binary,
+                                    &["server", "remote", "start-codex", &session.id, &cwd],
+                                )
+                            } else {
+                                remote_ssh_launch_command(
+                                    &ssh_target,
+                                    ssh_prefix.as_deref(),
+                                    &remote_binary,
+                                    &[
+                                        "server",
+                                        "remote",
+                                        "resume-codex",
+                                        &session.id,
+                                        &cwd,
+                                        "--require-existing",
+                                    ],
+                                )
+                            }
                         } else {
                             let cwd = session_metadata_value(session, "Cwd").unwrap_or_default();
                             remote_ssh_launch_command(
@@ -6185,6 +6420,110 @@ fn configure_remote_resume_live_session(
     );
 }
 
+fn configure_remote_new_codex_live_session(
+    session: &mut ManagedSessionView,
+    session_path: &str,
+    session_id: &str,
+    resolved_title: &str,
+    target: &SshConnectTarget,
+    remote_binary: &str,
+    remote_deploy_state: RemoteDeployState,
+    cwd: Option<&str>,
+    theme: UiTheme,
+) {
+    let launch_cwd = cwd
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            target
+                .cwd
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+        });
+    session.id = session_id.to_string();
+    session.session_path = session_path.to_string();
+    session.title = resolved_title.to_string();
+    session.kind = SessionKind::Codex;
+    session.source = SessionSource::LiveSsh;
+    session.host_label = target.label.clone();
+    session.launch_phase = TerminalLaunchPhase::RemoteBootstrap;
+    session.remote_deploy_state = remote_deploy_state;
+    session.ssh_target = Some(target.ssh_target.clone());
+    session.ssh_prefix = target.prefix.clone();
+    session.launch_command = remote_ssh_launch_command(
+        &target.ssh_target,
+        target.prefix.as_deref(),
+        remote_binary,
+        &[
+            "server",
+            "remote",
+            "start-codex",
+            session_id,
+            launch_cwd.unwrap_or(""),
+        ],
+    );
+    session.terminal_lines = vec![
+        format!("$ {}", session.launch_command),
+        format!("Queue remote Yggterm Codex session {session_id}"),
+        format!("Target host: {}", target.ssh_target),
+        format!("Workspace: {}", launch_cwd.unwrap_or("<unknown>")),
+        "Daemon PTY: request main viewport terminal stream".to_string(),
+    ];
+    upsert_session_metadata(&mut session.metadata, "Source", "remote-codex".to_string());
+    upsert_session_metadata(&mut session.metadata, "Host", target.ssh_target.clone());
+    upsert_session_metadata(&mut session.metadata, "UUID", session_id.to_string());
+    upsert_session_metadata(
+        &mut session.metadata,
+        REMOTE_LAUNCH_ACTION_METADATA_LABEL,
+        "start-codex".to_string(),
+    );
+    upsert_session_metadata(
+        &mut session.metadata,
+        "Restore",
+        format!("yggterm server remote start-codex {session_id}"),
+    );
+    if let Some(cwd) = launch_cwd {
+        upsert_session_metadata(&mut session.metadata, "Cwd", cwd.to_string());
+    }
+    upsert_session_metadata(
+        &mut session.metadata,
+        "Status",
+        format!(
+            "remote codex queued · {}",
+            match remote_deploy_state {
+                RemoteDeployState::Ready => "remote yggterm ready",
+                RemoteDeployState::CopyingBinary => "copying yggterm binary",
+                RemoteDeployState::Planned => "remote bootstrap planned",
+                RemoteDeployState::NotRequired => "not required",
+            }
+        ),
+    );
+    upsert_session_metadata(
+        &mut session.metadata,
+        "Deploy",
+        match remote_deploy_state {
+            RemoteDeployState::Ready => "ready".to_string(),
+            RemoteDeployState::CopyingBinary => "copying".to_string(),
+            RemoteDeployState::Planned => "planned".to_string(),
+            RemoteDeployState::NotRequired => "not required".to_string(),
+        },
+    );
+    upsert_session_metadata(
+        &mut session.metadata,
+        "Launch",
+        session.launch_command.clone(),
+    );
+    session.status_line = describe_status_line(
+        session.backend,
+        theme,
+        session.source,
+        session.launch_phase,
+        session.remote_deploy_state,
+        session.bridge_available,
+    );
+}
+
 fn apply_remote_preview_head_payload(
     session: &mut ManagedSessionView,
     payload: RemotePreviewPayload,
@@ -8206,6 +8545,40 @@ pub fn run_remote_resume_codex(
         "path": key,
         "mode": "daemon_runtime_bridge",
         "require_existing": require_existing,
+    }));
+    bridge_remote_runtime_session_stdio(&endpoint, &key)
+}
+
+pub fn run_remote_start_codex(session_id: &str, cwd: Option<&str>) -> anyhow::Result<()> {
+    let perf_home = resolve_yggterm_home().ok();
+    let mut perf_span = perf_home
+        .as_ref()
+        .map(|home| PerfSpan::start(home.clone(), "remote", "start_codex"));
+    let mut finish_span = |meta: serde_json::Value| {
+        if let Some(span) = perf_span.take() {
+            span.finish(meta);
+        }
+    };
+    let _ = ensure_local_managed_cli(ManagedCliTool::Codex)?;
+    let home = resolve_yggterm_home()?;
+    let runtime_key = remote_runtime_codex_session_key(session_id);
+    if let Some(endpoint) = endpoint_with_live_remote_runtime(&home, &runtime_key) {
+        finish_span(serde_json::json!({
+            "session_id": session_id,
+            "cwd": cwd,
+            "path": runtime_key,
+            "mode": "existing_daemon_runtime_bridge",
+        }));
+        return bridge_remote_runtime_session_stdio(&endpoint, &runtime_key);
+    }
+    let endpoint = default_endpoint(&home);
+    ensure_local_daemon_running(&endpoint)?;
+    let key = daemon::start_remote_runtime_codex_session(&endpoint, session_id, cwd)?;
+    finish_span(serde_json::json!({
+        "session_id": session_id,
+        "cwd": cwd,
+        "path": key,
+        "mode": "daemon_runtime_bridge",
     }));
     bridge_remote_runtime_session_stdio(&endpoint, &key)
 }
@@ -13648,16 +14021,17 @@ mod tests {
     use super::{
         ClientInstanceRecord, GhosttyHostSupport, GhosttyTerminalHostMode, ManagedSessionView,
         PersistedDaemonState, PersistedLiveSession, PersistedStoredSession, PreviewTone,
-        REMOTE_OUTPUT_SENTINEL, RemoteCommandCacheEntry, RemoteDeployState, RemoteMachineHealth,
-        RemoteMachineSnapshot, RemotePreviewPayload, RemoteScannedSession, ServerEndpoint,
-        ServerRuntimeStatus, ServerUiSnapshot, SessionKind, SessionMetadataEntry, SessionNode,
-        SessionPreview, SessionPreviewBlock, SessionSource, SnapshotPreview, SnapshotPreviewBlock,
-        SnapshotRenderedSection, SnapshotSessionView, SshConnectTarget, StoredPreviewHydrationMode,
-        TerminalBackend, TerminalLaunchPhase, UPDATE_RESTART_RESTORE_REASON, UiTheme,
-        WorkspaceViewMode, YggtermServer, active_client_instance_records,
-        apply_remote_preview_payload, apply_remote_preview_payload_for_path,
-        apply_remote_scanned_session_preview, build_session, canonical_static_label,
-        choose_app_control_pid, clear_local_daemon_socket_link_escaping_home,
+        REMOTE_LAUNCH_ACTION_METADATA_LABEL, REMOTE_OUTPUT_SENTINEL, RemoteCommandCacheEntry,
+        RemoteDeployState, RemoteMachineHealth, RemoteMachineSnapshot, RemotePreviewPayload,
+        RemoteScannedSession, ServerEndpoint, ServerRuntimeStatus, ServerUiSnapshot, SessionKind,
+        SessionMetadataEntry, SessionNode, SessionPreview, SessionPreviewBlock, SessionSource,
+        SnapshotPreview, SnapshotPreviewBlock, SnapshotRenderedSection, SnapshotSessionView,
+        SshConnectTarget, StoredPreviewHydrationMode, TerminalBackend, TerminalLaunchPhase,
+        UPDATE_RESTART_RESTORE_REASON, UiTheme, WorkspaceViewMode, YggtermServer,
+        active_client_instance_records, apply_remote_preview_payload,
+        apply_remote_preview_payload_for_path, apply_remote_scanned_session_preview, build_session,
+        canonical_static_label, choose_app_control_pid,
+        clear_local_daemon_socket_link_escaping_home,
         clear_local_daemon_socket_link_for_version_mismatch, clear_session_preview_for_loading,
         clear_stale_local_daemon_socket_when_no_daemon, client_instances_dir, current_millis_u64,
         dedupe_remote_scanned_sessions, legacy_agent_launch_command,
@@ -17085,6 +17459,7 @@ terminal_window_id: None,
                     ssh_target: "dev".to_string(),
                     prefix: None,
                     cwd: Some("/home/pi".to_string()),
+                    remote_launch_action: None,
                     restore_reason: None,
                 }],
             },
@@ -17154,6 +17529,7 @@ terminal_window_id: None,
             ssh_target: "dev".to_string(),
             prefix: None,
             cwd: Some("/home/pi/gh/yggterm".to_string()),
+            remote_launch_action: None,
             restore_reason: None,
         });
         let local_shell = server.start_local_session(
@@ -17347,6 +17723,7 @@ terminal_window_id: None,
             ssh_target: "localhost".to_string(),
             prefix: None,
             cwd: Some("/home/pi".to_string()),
+            remote_launch_action: None,
             restore_reason: Some(UPDATE_RESTART_RESTORE_REASON.to_string()),
         });
 
@@ -17399,6 +17776,7 @@ terminal_window_id: None,
                     ssh_target: "localhost".to_string(),
                     prefix: None,
                     cwd: Some("/home/pi".to_string()),
+                    remote_launch_action: None,
                     restore_reason: None,
                 }],
             },
@@ -17447,6 +17825,7 @@ terminal_window_id: None,
                         ssh_target: "localhost".to_string(),
                         prefix: None,
                         cwd: Some("/home/pi/gh/yggterm".to_string()),
+                        remote_launch_action: None,
                         restore_reason: None,
                     },
                     PersistedLiveSession {
@@ -17458,6 +17837,7 @@ terminal_window_id: None,
                         ssh_target: "localhost".to_string(),
                         prefix: None,
                         cwd: Some("/home/pi/gh/codex-litellm".to_string()),
+                        remote_launch_action: None,
                         restore_reason: None,
                     },
                     PersistedLiveSession {
@@ -17469,6 +17849,7 @@ terminal_window_id: None,
                         ssh_target: "localhost".to_string(),
                         prefix: None,
                         cwd: Some("/home/pi".to_string()),
+                        remote_launch_action: None,
                         restore_reason: None,
                     },
                 ],
@@ -17535,6 +17916,7 @@ terminal_window_id: None,
                         ssh_target: "localhost".to_string(),
                         prefix: None,
                         cwd: Some("/tmp/one".to_string()),
+                        remote_launch_action: None,
                         restore_reason: None,
                     },
                     PersistedLiveSession {
@@ -17546,6 +17928,7 @@ terminal_window_id: None,
                         ssh_target: "localhost".to_string(),
                         prefix: None,
                         cwd: Some("/tmp/two".to_string()),
+                        remote_launch_action: None,
                         restore_reason: None,
                     },
                 ],
@@ -17658,6 +18041,7 @@ terminal_window_id: None,
                         ssh_target: "dev".to_string(),
                         prefix: None,
                         cwd: Some("/srv/dev/one".to_string()),
+                        remote_launch_action: None,
                         restore_reason: None,
                     },
                     PersistedLiveSession {
@@ -17669,6 +18053,7 @@ terminal_window_id: None,
                         ssh_target: "dev".to_string(),
                         prefix: None,
                         cwd: Some("/srv/dev/two".to_string()),
+                        remote_launch_action: None,
                         restore_reason: None,
                     },
                 ],
@@ -18057,6 +18442,7 @@ terminal_window_id: None,
             ssh_target: "jojo".to_string(),
             prefix: None,
             cwd: Some("/srv/app".to_string()),
+            remote_launch_action: None,
             restore_reason: None,
         });
 
@@ -18122,6 +18508,7 @@ terminal_window_id: None,
             ssh_target: "definitely-not-a-real-host.invalid".to_string(),
             prefix: None,
             cwd: Some("/srv/app".to_string()),
+            remote_launch_action: None,
             restore_reason: None,
         });
 
@@ -18137,6 +18524,154 @@ terminal_window_id: None,
                 .launch_command
                 .contains("definitely-not-a-real-host.invalid")
         );
+    }
+
+    #[test]
+    fn start_remote_codex_session_uses_remote_start_codex_launch_contract() {
+        let tree = SessionNode {
+            kind: SessionNodeKind::Group,
+            name: "sessions".to_string(),
+            title: None,
+            document_kind: None,
+            group_kind: None,
+            path: PathBuf::from("/"),
+            children: Vec::new(),
+            session_id: None,
+            cwd: None,
+        };
+        let mut server = YggtermServer::new(
+            &tree,
+            false,
+            GhosttyHostSupport::shadow("test".to_string(), false, false),
+            UiTheme::ZedLight,
+        );
+        server.remote_machines.push(RemoteMachineSnapshot {
+            machine_key: "dev".to_string(),
+            label: "dev".to_string(),
+            ssh_target: "dev".to_string(),
+            prefix: None,
+            remote_binary_expr: Some("$HOME/.yggterm/bin/yggterm".to_string()),
+            remote_deploy_state: RemoteDeployState::Ready,
+            health: RemoteMachineHealth::Healthy,
+            sessions: Vec::new(),
+        });
+
+        let key = server
+            .start_remote_codex_session("dev", None, Some("/home/pi/gh/yggterm"), Some("Yggterm"))
+            .expect("start remote codex");
+
+        let session = server.sessions.get(&key).expect("remote codex session");
+        assert!(key.starts_with("remote-session://dev/"));
+        assert_eq!(session.kind, SessionKind::Codex);
+        assert_eq!(session.source, SessionSource::LiveSsh);
+        assert_eq!(session.ssh_target.as_deref(), Some("dev"));
+        assert_eq!(
+            session_metadata_value(session, REMOTE_LAUNCH_ACTION_METADATA_LABEL).as_deref(),
+            Some("start-codex")
+        );
+        assert!(
+            session.launch_command.contains("'start-codex'"),
+            "{}",
+            session.launch_command
+        );
+        assert!(
+            session.launch_command.contains("'/home/pi/gh/yggterm'"),
+            "{}",
+            session.launch_command
+        );
+        assert!(!session.launch_command.contains("'resume-codex'"));
+        assert!(!session.launch_command.contains("'attach'"));
+
+        let persisted = server.persisted_state_for_update_restart();
+        let persisted_session = persisted
+            .live_sessions
+            .iter()
+            .find(|live| live.key == key)
+            .expect("persisted remote codex session");
+        assert_eq!(
+            persisted_session.remote_launch_action.as_deref(),
+            Some("start-codex")
+        );
+    }
+
+    #[test]
+    fn restore_remote_start_codex_session_keeps_start_contract_even_when_scan_has_same_id() {
+        let tree = SessionNode {
+            kind: SessionNodeKind::Group,
+            name: "sessions".to_string(),
+            title: None,
+            document_kind: None,
+            group_kind: None,
+            path: PathBuf::from("/"),
+            children: Vec::new(),
+            session_id: None,
+            cwd: None,
+        };
+        let mut server = YggtermServer::new(
+            &tree,
+            false,
+            GhosttyHostSupport::shadow("test".to_string(), false, false),
+            UiTheme::ZedLight,
+        );
+        server.remote_machines.push(RemoteMachineSnapshot {
+            machine_key: "dev".to_string(),
+            label: "dev".to_string(),
+            ssh_target: "dev".to_string(),
+            prefix: None,
+            remote_binary_expr: Some("$HOME/.yggterm/bin/yggterm".to_string()),
+            remote_deploy_state: RemoteDeployState::Ready,
+            health: RemoteMachineHealth::Healthy,
+            sessions: vec![RemoteScannedSession {
+                session_path: "remote-session://dev/fresh-codex".to_string(),
+                session_id: "fresh-codex".to_string(),
+                cwd: "/home/pi/gh/yggterm".to_string(),
+                started_at: "2026-04-28T10:00:00Z".to_string(),
+                modified_epoch: 1,
+                event_count: 0,
+                user_message_count: 0,
+                assistant_message_count: 0,
+                title_hint: "Yggterm".to_string(),
+                recent_context: String::new(),
+                cached_precis: None,
+                cached_summary: None,
+                live_runtime: true,
+                storage_path: "/home/pi/.codex/sessions/fresh-codex.jsonl".to_string(),
+            }],
+        });
+
+        server.restore_live_session(PersistedLiveSession {
+            key: "remote-session://dev/fresh-codex".to_string(),
+            id: "fresh-codex".to_string(),
+            title: "Yggterm".to_string(),
+            kind: SessionKind::Codex,
+            keep_alive: true,
+            ssh_target: "dev".to_string(),
+            prefix: None,
+            cwd: Some("/home/pi/gh/yggterm".to_string()),
+            remote_launch_action: Some("start-codex".to_string()),
+            restore_reason: None,
+        });
+        server.active_session_path = Some("remote-session://dev/fresh-codex".to_string());
+        server.active_view_mode = WorkspaceViewMode::Terminal;
+        server.request_terminal_launch_for_active();
+
+        let session = server
+            .sessions
+            .get("remote-session://dev/fresh-codex")
+            .expect("restored start-codex live session");
+        assert_eq!(session.kind, SessionKind::Codex);
+        assert_eq!(session.source, SessionSource::LiveSsh);
+        assert_eq!(
+            session_metadata_value(session, REMOTE_LAUNCH_ACTION_METADATA_LABEL).as_deref(),
+            Some("start-codex")
+        );
+        assert!(
+            session.launch_command.contains("'start-codex'"),
+            "{}",
+            session.launch_command
+        );
+        assert!(!session.launch_command.contains("'resume-codex'"));
+        assert!(!session.launch_command.contains("--require-existing"));
     }
 
     #[test]
@@ -18177,6 +18712,7 @@ terminal_window_id: None,
             ssh_target: "dev".to_string(),
             prefix: None,
             cwd: Some("/home/pi/gh".to_string()),
+            remote_launch_action: None,
             restore_reason: None,
         });
 
@@ -18257,6 +18793,7 @@ terminal_window_id: None,
             ssh_target: "jojo".to_string(),
             prefix: Some("sudo -u pi".to_string()),
             cwd: Some("/home/pi".to_string()),
+            remote_launch_action: None,
             restore_reason: None,
         });
         server.restore_live_session(PersistedLiveSession {
@@ -18268,6 +18805,7 @@ terminal_window_id: None,
             ssh_target: "jojo".to_string(),
             prefix: Some("sudo -u pi".to_string()),
             cwd: Some("/srv/app".to_string()),
+            remote_launch_action: None,
             restore_reason: None,
         });
 
@@ -18337,6 +18875,7 @@ terminal_window_id: None,
             ssh_target: "jojo".to_string(),
             prefix: Some("sudo -u pi".to_string()),
             cwd: Some("/srv/app".to_string()),
+            remote_launch_action: None,
             restore_reason: None,
         });
 
@@ -18390,6 +18929,7 @@ terminal_window_id: None,
             ssh_target: "dev".to_string(),
             prefix: None,
             cwd: Some("/home/pi/gh".to_string()),
+            remote_launch_action: None,
             restore_reason: None,
         });
 
@@ -18425,6 +18965,7 @@ terminal_window_id: None,
             ssh_target: String::new(),
             prefix: None,
             cwd: Some("/home/pi/gh".to_string()),
+            remote_launch_action: None,
             restore_reason: None,
         });
         server.restore_live_session(PersistedLiveSession {
@@ -18436,6 +18977,7 @@ terminal_window_id: None,
             ssh_target: String::new(),
             prefix: None,
             cwd: Some("/home/pi".to_string()),
+            remote_launch_action: None,
             restore_reason: None,
         });
 
@@ -18477,6 +19019,7 @@ terminal_window_id: None,
             ssh_target: "localhost".to_string(),
             prefix: None,
             cwd: Some("/home/pi".to_string()),
+            remote_launch_action: None,
             restore_reason: None,
         });
 

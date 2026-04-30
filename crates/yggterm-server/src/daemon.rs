@@ -441,6 +441,12 @@ pub enum ServerRequest {
         cwd: Option<String>,
         title_hint: Option<String>,
     },
+    StartRemoteCodexSession {
+        target: String,
+        prefix: Option<String>,
+        cwd: Option<String>,
+        title_hint: Option<String>,
+    },
     OpenRemoteSession {
         machine_key: String,
         session_id: String,
@@ -493,6 +499,10 @@ pub enum ServerRequest {
         session_id: String,
         cwd: Option<String>,
         require_existing: bool,
+    },
+    StartRemoteRuntimeCodexSession {
+        session_id: String,
+        cwd: Option<String>,
     },
     FocusLive {
         key: String,
@@ -1103,6 +1113,21 @@ impl DaemonRuntime {
                 self.persist()?;
                 self.snapshot_response(Some(format!("started {key}")))
             }
+            ServerRequest::StartRemoteCodexSession {
+                target,
+                prefix,
+                cwd,
+                title_hint,
+            } => {
+                let key = self.server.start_remote_codex_session(
+                    &target,
+                    prefix.as_deref(),
+                    cwd.as_deref(),
+                    title_hint.as_deref(),
+                )?;
+                self.persist()?;
+                self.snapshot_response(Some(format!("started {key}")))
+            }
             ServerRequest::OpenRemoteSession {
                 machine_key,
                 session_id,
@@ -1331,6 +1356,14 @@ impl DaemonRuntime {
                     cwd.as_deref(),
                     require_existing,
                 )?;
+                let _ = self.ensure_terminal_for_path(&key)?;
+                self.persist()?;
+                ServerResponse::Ack { message: Some(key) }
+            }
+            ServerRequest::StartRemoteRuntimeCodexSession { session_id, cwd } => {
+                let key = self
+                    .server
+                    .start_remote_runtime_codex_session(&session_id, cwd.as_deref())?;
                 let _ = self.ensure_terminal_for_path(&key)?;
                 self.persist()?;
                 ServerResponse::Ack { message: Some(key) }
@@ -1988,6 +2021,7 @@ fn server_request_name(request: &ServerRequest) -> &'static str {
         ServerRequest::ConnectSsh { .. } => "connect_ssh",
         ServerRequest::ConnectSshCustom { .. } => "connect_ssh_custom",
         ServerRequest::StartSshSession { .. } => "start_ssh_session",
+        ServerRequest::StartRemoteCodexSession { .. } => "start_remote_codex_session",
         ServerRequest::OpenRemoteSession { .. } => "open_remote_session",
         ServerRequest::RefreshRemoteMachine { .. } => "refresh_remote_machine",
         ServerRequest::RefreshManagedCli { .. } => "refresh_managed_cli",
@@ -2001,6 +2035,9 @@ fn server_request_name(request: &ServerRequest) -> &'static str {
         ServerRequest::StartCommandSession { .. } => "start_command_session",
         ServerRequest::EnsureRemoteRuntimeCodexSession { .. } => {
             "ensure_remote_runtime_codex_session"
+        }
+        ServerRequest::StartRemoteRuntimeCodexSession { .. } => {
+            "start_remote_runtime_codex_session"
         }
         ServerRequest::FocusLive { .. } => "focus_live",
         ServerRequest::SetViewMode { .. } => "set_view_mode",
@@ -2253,6 +2290,24 @@ pub fn start_ssh_session_at(
     )?)
 }
 
+pub fn start_remote_codex_session_at(
+    endpoint: &ServerEndpoint,
+    target: &str,
+    prefix: Option<&str>,
+    cwd: Option<&str>,
+    title_hint: Option<&str>,
+) -> Result<(ServerUiSnapshot, Option<String>)> {
+    expect_snapshot(send_request(
+        endpoint,
+        &ServerRequest::StartRemoteCodexSession {
+            target: target.to_string(),
+            prefix: prefix.map(ToOwned::to_owned),
+            cwd: cwd.map(ToOwned::to_owned),
+            title_hint: title_hint.map(ToOwned::to_owned),
+        },
+    )?)
+}
+
 pub fn refresh_remote_machine(
     endpoint: &ServerEndpoint,
     machine_key: &str,
@@ -2400,6 +2455,21 @@ pub fn ensure_remote_runtime_codex_session(
             session_id: session_id.to_string(),
             cwd: cwd.map(ToOwned::to_owned),
             require_existing,
+        },
+    )?)?
+    .with_context(|| format!("missing runtime session key for {session_id}"))
+}
+
+pub fn start_remote_runtime_codex_session(
+    endpoint: &ServerEndpoint,
+    session_id: &str,
+    cwd: Option<&str>,
+) -> Result<String> {
+    expect_ack(send_request(
+        endpoint,
+        &ServerRequest::StartRemoteRuntimeCodexSession {
+            session_id: session_id.to_string(),
+            cwd: cwd.map(ToOwned::to_owned),
         },
     )?)?
     .with_context(|| format!("missing runtime session key for {session_id}"))
@@ -3840,6 +3910,7 @@ mod tests {
                 ssh_target: "jojo".to_string(),
                 prefix: None,
                 cwd: Some("/home/pi".to_string()),
+                remote_launch_action: None,
                 restore_reason: None,
             }],
         };

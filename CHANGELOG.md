@@ -4,6 +4,16 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+## 2.1.51
+
+### Fixed
+
+- throttle high-volume full-screen terminal output through a low-power TUI render path, keeping jojo/KDE idle and active TUI WebKit CPU within budget instead of leaving `WebKitWebProcess` hot after `htop`-class output
+- restore xterm newline semantics with `convertEol: true` and add a sidebar-switch regression assertion for horizontal line drift, so spaces and table output keep their columns after switching sessions
+- wait for a real Codex prompt before marking local agent terminals ready, preventing banner-only Codex surfaces from leaving stale resume notifications or half-mounted prompt regions
+- keep remote Codex "New Session" actions on the daemon-owned `server remote start-codex` path and preserve that launch contract through restart/scan hydration instead of opening a plain SSH shell
+- refresh the app icon assets around a centered friendly terminal prompt mark while keeping the design rule face-free for packaged KDE, Windows, and macOS assets
+
 ## 2.1.50
 
 ### Fixed

@@ -1,122 +1,77 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
   <defs>
-    <linearGradient id="tile-bg" x1="16" y1="10" x2="112" y2="122" gradientUnits="userSpaceOnUse">
-      <stop offset="0" stop-color="#17333A" />
-      <stop offset="0.58" stop-color="#10262F" />
-      <stop offset="1" stop-color="#0B1820" />
+    <linearGradient id="tile-bg" x1="18" y1="10" x2="112" y2="122" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#152F37" />
+      <stop offset="0.58" stop-color="#10262E" />
+      <stop offset="1" stop-color="#0A161D" />
     </linearGradient>
-    <linearGradient id="tile-sheen" x1="24" y1="12" x2="98" y2="108" gradientUnits="userSpaceOnUse">
-      <stop offset="0" stop-color="#DFF7EA" stop-opacity="0.18" />
-      <stop offset="0.55" stop-color="#62CDA3" stop-opacity="0.05" />
+    <linearGradient id="tile-sheen" x1="22" y1="12" x2="98" y2="108" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#F4FFF8" stop-opacity="0.18" />
+      <stop offset="0.48" stop-color="#7BE3BA" stop-opacity="0.06" />
       <stop offset="1" stop-color="#000000" stop-opacity="0" />
     </linearGradient>
-    <linearGradient id="leaf" x1="30" y1="30" x2="102" y2="88" gradientUnits="userSpaceOnUse">
-      <stop offset="0" stop-color="#D5EA79" />
-      <stop offset="0.5" stop-color="#72D46F" />
-      <stop offset="1" stop-color="#22B8A4" />
+    <linearGradient id="prompt" x1="38" y1="54" x2="91" y2="91" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#F9FFE4" />
+      <stop offset="0.46" stop-color="#9AF0C9" />
+      <stop offset="1" stop-color="#62D6B5" />
     </linearGradient>
-    <linearGradient id="leaf-deep" x1="40" y1="38" x2="106" y2="91" gradientUnits="userSpaceOnUse">
-      <stop offset="0" stop-color="#7BB95F" />
-      <stop offset="1" stop-color="#168E93" />
+    <linearGradient id="leaf" x1="31" y1="25" x2="98" y2="92" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#D8EC73" />
+      <stop offset="0.55" stop-color="#73D36D" />
+      <stop offset="1" stop-color="#2ABAA7" />
     </linearGradient>
-    <linearGradient id="stem" x1="47" y1="36" x2="83" y2="88" gradientUnits="userSpaceOnUse">
-      <stop offset="0" stop-color="#E2C47C" />
-      <stop offset="0.55" stop-color="#B98D54" />
-      <stop offset="1" stop-color="#6C4E31" />
+    <linearGradient id="leaf-deep" x1="48" y1="38" x2="101" y2="97" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#84C65E" />
+      <stop offset="1" stop-color="#178C8E" />
     </linearGradient>
-    <linearGradient id="prompt" x1="37" y1="70" x2="91" y2="100" gradientUnits="userSpaceOnUse">
-      <stop offset="0" stop-color="#FFF4B6" />
-      <stop offset="1" stop-color="#FFBC42" />
+    <linearGradient id="wood" x1="46" y1="23" x2="82" y2="101" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#D7B879" />
+      <stop offset="0.54" stop-color="#9B7444" />
+      <stop offset="1" stop-color="#5B3B26" />
     </linearGradient>
-    <filter id="shadow" x="-24%" y="-24%" width="148%" height="152%">
-      <feDropShadow dx="0" dy="5" stdDeviation="4.5" flood-color="#031017" flood-opacity="0.38" />
+    <filter id="tile-shadow" x="-18%" y="-18%" width="136%" height="140%">
+      <feDropShadow dx="0" dy="5" stdDeviation="4.2" flood-color="#031017" flood-opacity="0.38" />
     </filter>
-    <filter id="prompt-glow" x="-35%" y="-35%" width="170%" height="170%">
-      <feDropShadow dx="0" dy="0" stdDeviation="4" flood-color="#FFC85F" flood-opacity="0.45" />
+    <filter id="mark-glow" x="-35%" y="-35%" width="170%" height="170%">
+      <feDropShadow dx="0" dy="0" stdDeviation="3.6" flood-color="#72E4BD" flood-opacity="0.44" />
     </filter>
   </defs>
 
-  <rect x="6" y="6" width="116" height="116" rx="27" fill="url(#tile-bg)" />
-  <rect x="8.5" y="8.5" width="111" height="111" rx="24" fill="url(#tile-sheen)" />
-  <rect x="7.5" y="7.5" width="113" height="113" rx="25" fill="none" stroke="#36515A" stroke-opacity="0.72" stroke-width="2" />
+  <rect x="7" y="7" width="114" height="114" rx="27" fill="url(#tile-bg)" />
+  <rect x="9.5" y="9.5" width="109" height="109" rx="24" fill="url(#tile-sheen)" />
+  <rect x="8.5" y="8.5" width="111" height="111" rx="25" fill="none" stroke="#354F58" stroke-opacity="0.7" stroke-width="2" />
 
-  <g filter="url(#shadow)">
-    <path
-      d="M30 95C40 83 52 78 64 81C76 78 88 83 98 95"
-      fill="none"
-      stroke="#28424B"
-      stroke-width="7"
-      stroke-linecap="round"
-      opacity="0.74"
-    />
-    <path
-      d="M39 101C49 90 57 86 64 87C71 86 79 90 89 101"
-      fill="none"
-      stroke="#79C996"
-      stroke-width="4"
-      stroke-linecap="round"
-      opacity="0.7"
-    />
+  <path d="M14 35H114" stroke="#334852" stroke-width="2.6" stroke-linecap="round" opacity="0.82" />
+  <circle cx="25" cy="23" r="4.4" fill="#66DEC1" />
+  <circle cx="39" cy="23" r="4.4" fill="#94D565" />
+  <circle cx="53" cy="23" r="4.4" fill="#FFC45D" />
 
-    <path
-      d="M64 54C64 47 65 40 68 31"
-      fill="none"
-      stroke="url(#stem)"
-      stroke-width="5.5"
-      stroke-linecap="round"
-      opacity="0.86"
-    />
-    <path
-      d="M64 45C57 39 51 34 45 25"
-      fill="none"
-      stroke="url(#stem)"
-      stroke-width="4"
-      stroke-linecap="round"
-      opacity="0.82"
-    />
-    <path
-      d="M66 43C75 36 83 29 91 19"
-      fill="none"
-      stroke="url(#stem)"
-      stroke-width="4"
-      stroke-linecap="round"
-      opacity="0.82"
-    />
+  <g filter="url(#tile-shadow)">
+    <rect x="21" y="42" width="86" height="58" rx="15" fill="#0A151B" opacity="0.78" />
 
-    <path
-      d="M31 30C43 26 55 31 61 44C47 47 36 42 31 30Z"
-      fill="url(#leaf)"
-    />
-    <path
-      d="M93 20C101 32 98 45 85 53C80 39 83 28 93 20Z"
-      fill="url(#leaf)"
-    />
-    <path
-      d="M73 38C86 36 97 43 101 57C87 60 77 53 73 38Z"
-      fill="url(#leaf-deep)"
-    />
-    <path
-      d="M48 41C55 54 53 66 42 75C36 61 38 50 48 41Z"
-      fill="url(#leaf-deep)"
-      opacity="0.9"
-    />
+    <path d="M64 43C64 36 65 29 68 20" fill="none" stroke="url(#wood)" stroke-width="5.6" stroke-linecap="round" />
+    <path d="M63 47C56 39 50 32 41 25" fill="none" stroke="url(#wood)" stroke-width="4.2" stroke-linecap="round" />
+    <path d="M66 47C74 39 82 31 93 24" fill="none" stroke="url(#wood)" stroke-width="4.2" stroke-linecap="round" />
+    <path d="M56 95C59 86 62 77 64 67" fill="none" stroke="url(#wood)" stroke-width="5.4" stroke-linecap="round" opacity="0.86" />
+    <path d="M72 95C69 86 66 77 64 67" fill="none" stroke="url(#wood)" stroke-width="5.4" stroke-linecap="round" opacity="0.86" />
 
-    <path
-      d="M35 52H93C99 52 103 56 103 62V82C103 88 99 92 93 92H35C29 92 25 88 25 82V62C25 56 29 52 35 52Z"
-      fill="#0B161D"
-      opacity="0.72"
-    />
+    <path d="M31 28C44 24 55 30 60 43C47 46 36 41 31 28Z" fill="url(#leaf)" />
+    <path d="M97 25C101 38 96 49 83 54C80 40 86 30 97 25Z" fill="url(#leaf)" />
+    <path d="M72 34C85 33 95 40 98 53C85 57 75 49 72 34Z" fill="url(#leaf-deep)" />
+    <path d="M46 41C53 53 51 65 40 73C35 60 38 49 46 41Z" fill="url(#leaf-deep)" opacity="0.96" />
+    <path d="M83 82C94 78 104 82 109 92C98 97 88 92 83 82Z" fill="url(#leaf)" opacity="0.92" />
+    <path d="M20 91C30 82 42 81 52 89C43 98 30 99 20 91Z" fill="url(#leaf-deep)" opacity="0.86" />
   </g>
 
-  <g filter="url(#prompt-glow)">
+  <g filter="url(#mark-glow)">
     <path
-      d="M42 57L56 71L42 85"
+      d="M42 56L57 71L42 86"
       fill="none"
       stroke="url(#prompt)"
-      stroke-width="9.5"
+      stroke-width="10"
       stroke-linecap="round"
       stroke-linejoin="round"
     />
-    <path d="M68 85H90" stroke="url(#prompt)" stroke-width="9.5" stroke-linecap="round" />
+    <path d="M69 86H90" stroke="url(#prompt)" stroke-width="10" stroke-linecap="round" />
   </g>
 </svg>
