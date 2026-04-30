@@ -1627,7 +1627,13 @@ impl ShellState {
                 maybe_append_cached_live_session(session_path);
             }
         }
-        let active_session = self
+        let active_live_session = active_session_path.as_deref().and_then(|path| {
+            live_sessions
+                .iter()
+                .find(|session| session.session_path == path)
+                .cloned()
+        });
+        let active_server_session = self
             .server
             .active_session()
             .filter(|session| Some(session.session_path.as_str()) == active_session_path.as_deref())
@@ -1635,25 +1641,29 @@ impl ShellState {
             .map(|mut session| {
                 self.overlay_live_terminal_sidebar_sample(&mut session);
                 session
-            })
-            .or_else(|| {
-                active_session_path.as_deref().and_then(|path| {
-                    live_sessions
-                        .iter()
-                        .find(|session| session.session_path == path)
-                        .cloned()
-                })
-            })
-            .or_else(|| {
-                (render_active_view_mode == WorkspaceViewMode::Terminal)
-                    .then(|| active_session_path.as_deref())
-                    .flatten()
-                    .and_then(|path| self.cached_hot_session_view(path))
-                    .map(|mut session| {
-                        self.overlay_live_terminal_sidebar_sample(&mut session);
-                        session
-                    })
             });
+        let active_cached_session = || {
+            (render_active_view_mode == WorkspaceViewMode::Terminal)
+                .then(|| active_session_path.as_deref())
+                .flatten()
+                .and_then(|path| self.cached_hot_session_view(path))
+                .map(|mut session| {
+                    self.overlay_live_terminal_sidebar_sample(&mut session);
+                    session
+                })
+        };
+        let active_server_is_stale_stored_terminal = active_server_session
+            .as_ref()
+            .is_some_and(|session| session.source == SessionSource::Stored)
+            && render_active_view_mode == WorkspaceViewMode::Terminal
+            && active_live_session.is_some();
+        let active_session = if active_server_is_stale_stored_terminal {
+            active_live_session
+        } else {
+            active_server_session
+                .or(active_live_session)
+                .or_else(active_cached_session)
+        };
         let mut retained_terminal_sessions = if detach_terminal_before_close {
             Vec::new()
         } else {
@@ -53987,6 +53997,45 @@ Waiting for the remote terminal to paint...\n";
                 .iter()
                 .any(|session| session.session_path == session_path)
         );
+    }
+
+    #[test]
+    fn shell_snapshot_prefers_live_remote_over_stored_session_with_same_path() {
+        let session_path = "remote-session://dev/019dbddf-0a07";
+        let mut shell = ShellState::new(test_shell_bootstrap_with_active_session(session_path));
+        let mut stored = test_live_shell_session(session_path);
+        stored.id = "stored-preview".to_string();
+        stored.title = "Stored Preview".to_string();
+        stored.source = SessionSource::Stored;
+        stored.launch_phase = yggterm_server::TerminalLaunchPhase::Queued;
+        stored.terminal_process_id = None;
+        stored.terminal_lines.clear();
+
+        let mut live = test_live_shell_session(session_path);
+        live.id = "live-remote".to_string();
+        live.title = "Live Remote".to_string();
+        live.source = SessionSource::LiveSsh;
+        live.host_label = "dev".to_string();
+        live.ssh_target = Some("dev".to_string());
+        live.ssh_prefix = Some("dev".to_string());
+
+        shell.server.apply_snapshot(ServerUiSnapshot {
+            active_session_path: Some(session_path.to_string()),
+            active_session: Some(snapshot_session_view_for_ui(stored)),
+            active_view_mode: WorkspaceViewMode::Terminal,
+            remote_machines: Vec::new(),
+            ssh_targets: Vec::new(),
+            live_sessions: vec![snapshot_session_view_for_ui(live)],
+        });
+
+        let snapshot = shell.snapshot();
+        let active = snapshot
+            .active_session
+            .as_ref()
+            .expect("live remote session should remain active");
+        assert_eq!(active.session_path, session_path);
+        assert_eq!(active.title, "Live Remote");
+        assert_eq!(active.source, SessionSource::LiveSsh);
     }
 
     #[test]

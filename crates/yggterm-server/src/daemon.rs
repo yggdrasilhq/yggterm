@@ -3501,7 +3501,32 @@ fn write_persisted_state(path: &Path, state: &PersistedDaemonState) -> Result<()
             .with_context(|| format!("creating daemon state dir {}", parent.display()))?;
     }
     let json = serde_json::to_string_pretty(state).context("serializing daemon state")?;
-    fs::write(path, json).with_context(|| format!("writing daemon state {}", path.display()))?;
+    if path.exists() {
+        let backup_path = path.with_file_name(format!(
+            "{}.previous.json",
+            path.file_stem()
+                .and_then(|stem| stem.to_str())
+                .unwrap_or("server-state")
+        ));
+        if let Err(error) = fs::copy(path, &backup_path) {
+            tracing::warn!(
+                path = %path.display(),
+                backup_path = %backup_path.display(),
+                error = %error,
+                "failed to back up daemon state before overwrite"
+            );
+        }
+    }
+    let temp_path = path.with_extension("json.tmp");
+    fs::write(&temp_path, json)
+        .with_context(|| format!("writing daemon state temp file {}", temp_path.display()))?;
+    fs::rename(&temp_path, path)
+        .or_else(|_| {
+            fs::copy(&temp_path, path)?;
+            fs::remove_file(&temp_path)?;
+            Ok::<(), std::io::Error>(())
+        })
+        .with_context(|| format!("writing daemon state {}", path.display()))?;
     Ok(())
 }
 
@@ -3921,6 +3946,46 @@ mod tests {
             .expect("persisted daemon state");
         assert_eq!(loaded.active_session_path, expected.active_session_path);
         assert_eq!(loaded.live_sessions, expected.live_sessions);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn write_persisted_state_keeps_previous_copy_before_overwrite() {
+        let root = std::env::temp_dir().join(format!(
+            "yggterm-daemon-state-backup-{}-{}",
+            std::process::id(),
+            super::current_millis()
+        ));
+        let state_path = root.join("server-state.json");
+        let first = PersistedDaemonState {
+            active_session_path: Some("remote-session://dev/first".to_string()),
+            active_view_mode: super::WorkspaceViewMode::Terminal,
+            ssh_targets: Vec::new(),
+            remote_machines: Vec::new(),
+            stored_sessions: Vec::new(),
+            live_sessions: Vec::new(),
+        };
+        let second = PersistedDaemonState {
+            active_session_path: Some("remote-session://dev/second".to_string()),
+            active_view_mode: super::WorkspaceViewMode::Rendered,
+            ssh_targets: Vec::new(),
+            remote_machines: Vec::new(),
+            stored_sessions: Vec::new(),
+            live_sessions: Vec::new(),
+        };
+
+        write_persisted_state(&state_path, &first).expect("write first daemon state");
+        write_persisted_state(&state_path, &second).expect("write second daemon state");
+
+        let backup_path = root.join("server-state.previous.json");
+        let backup = load_persisted_state(&backup_path)
+            .expect("load backup daemon state")
+            .expect("backup daemon state");
+        let current = load_persisted_state(&state_path)
+            .expect("load current daemon state")
+            .expect("current daemon state");
+        assert_eq!(backup.active_session_path, first.active_session_path);
+        assert_eq!(current.active_session_path, second.active_session_path);
         let _ = fs::remove_dir_all(&root);
     }
 
