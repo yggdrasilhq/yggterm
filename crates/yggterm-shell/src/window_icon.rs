@@ -7,7 +7,12 @@ pub fn load_window_icon_from_png(png_bytes: &[u8], asset_name: &str) -> Icon {
     let mut reader = decoder
         .read_info()
         .unwrap_or_else(|_| panic!("decode {asset_name} icon metadata"));
-    let mut buffer = vec![0; reader.output_buffer_size()];
+    let mut buffer = vec![
+        0;
+        reader
+            .output_buffer_size()
+            .expect("reading icon png output buffer size")
+    ];
     let info = reader
         .next_frame(&mut buffer)
         .unwrap_or_else(|_| panic!("decode {asset_name} icon pixels"));

@@ -26,9 +26,29 @@ checksum_file() {
   fi
 }
 
+maybe_refresh_release_codex_cli() {
+  if [[ "${YGGTERM_RELEASE_CODEX_REFRESH:-1}" == "0" ]]; then
+    echo "Skipping managed Codex CLI refresh because YGGTERM_RELEASE_CODEX_REFRESH=0."
+    return
+  fi
+  if [[ ! -x "$MOCK_CLI_BIN_PATH" ]]; then
+    echo "warning: cannot refresh managed Codex CLI; missing executable $MOCK_CLI_BIN_PATH" >&2
+    return
+  fi
+  local report_path="${DIST_DIR}/managed-codex-refresh-${TARGET_LABEL}.jsonl"
+  rm -f "$report_path"
+  echo "Checking managed Codex CLI tools..."
+  if "$MOCK_CLI_BIN_PATH" --scenario managed-cli-refresh --foreground --jsonl-out "$report_path"; then
+    echo "Managed Codex CLI refresh report: $report_path"
+  else
+    echo "warning: managed Codex CLI refresh/check failed; continuing release packaging" >&2
+  fi
+}
+
 pushd "$ROOT_DIR" >/dev/null
 "${CARGO_CMD[@]}" build --release -p yggterm --bin yggterm --bin yggterm-headless --bin yggterm-mock-cli --no-default-features
 popd >/dev/null
+maybe_refresh_release_codex_cli
 
 cp "$BIN_PATH" "$DIST_DIR/yggterm-${TARGET_LABEL}"
 cp "$HEADLESS_BIN_PATH" "$DIST_DIR/yggterm-headless-${TARGET_LABEL}"
