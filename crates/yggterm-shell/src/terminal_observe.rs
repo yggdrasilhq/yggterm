@@ -1006,6 +1006,24 @@ fn terminal_host_geometry_problem_for_app_control(host: &Value) -> Option<&'stat
         .unwrap_or("")
         .trim()
         .to_ascii_lowercase();
+    let scrollback_locked = host
+        .get("scrollback_locked")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let cursor_expected_top = host
+        .get("cursor_expected_rect")
+        .and_then(|value| value.get("top"))
+        .and_then(Value::as_f64);
+    let cursor_expected_height = host
+        .get("cursor_expected_rect")
+        .and_then(|value| value.get("height"))
+        .and_then(Value::as_f64)
+        .unwrap_or(0.0);
+    let host_bottom = host
+        .get("host_rect")
+        .and_then(|value| value.get("bottom"))
+        .and_then(Value::as_f64)
+        .unwrap_or(host_top + host_outer_height);
     let width_delta = (host_width - screen_width).abs();
     let viewport_spans_host = host_width >= 240.0
         && viewport_width >= 200.0
@@ -1053,6 +1071,15 @@ fn terminal_host_geometry_problem_for_app_control(host: &Value) -> Option<&'stat
         && (screen_height - viewport_height).abs() > 12.0
     {
         return Some("active terminal host geometry does not match the xterm viewport height");
+    }
+    if !scrollback_locked
+        && cursor_expected_height >= 8.0
+        && let Some(cursor_top) = cursor_expected_top
+    {
+        let cursor_bottom = cursor_top + cursor_expected_height;
+        if host_bottom >= 120.0 && cursor_bottom > host_bottom + 4.0 {
+            return Some("active terminal cursor row is clipped below the visible host");
+        }
     }
     if helpers_width >= 200.0
         && host_width >= 200.0
