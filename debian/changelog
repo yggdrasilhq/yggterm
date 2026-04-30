@@ -1,3 +1,11 @@
+yggterm (2.1.66-1) unstable; urgency=medium
+
+  * Clamp xterm canvas row fitting on WebKit/KDE so the restored prompt row stays inside the visible terminal host.
+  * Add bounded repaint repair for retained-session and bulk terminal writes.
+  * Expose row, viewport, cursor overflow, canvas, and fit-guard diagnostics through app-control terminal state/probes.
+
+ -- Yggdrasil HQ <avi@gour.top>  Fri, 01 May 2026 03:48:24 +0530
+
 yggterm (2.1.65-1) unstable; urgency=medium
 
   * Keep KDE direct-install launches grouped under the canonical dev.yggterm.Yggterm desktop id during update handoff.
