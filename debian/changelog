@@ -1,3 +1,14 @@
+yggterm (2.1.53-1) unstable; urgency=medium
+
+  * Stretch the approved Yggi mascot icon to fill the packaged icon canvas.
+  * Keep Settings text-field editing owned by the field and out of the terminal.
+  * Make zoom numbers directly editable and keep the terminal-theme menu inside the settings rail.
+  * Budget high-volume TUI frames before and after remote resume overlay dismissal to reduce WebKit CPU.
+  * Extend KDE/X11 smoke proof for settings typing, terminal reclaim, hidden-cursor TUI, render budget, and WebKit RSS.
+  * Document stale GUI binary execution as destructive in AGENTS.md.
+
+ -- Yggdrasil HQ <avi@gour.top>  Thu, 30 Apr 2026 18:58:15 +0530
+
 yggterm (2.1.52-1) unstable; urgency=medium
 
   * Prune stale direct-install version directories during install and integration.
