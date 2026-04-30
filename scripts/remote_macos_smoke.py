@@ -72,12 +72,9 @@ def discover_macos_companion_binaries(artifact: Path) -> list[Path]:
     lower = artifact.name.lower()
     for suffix in ("x86_64", "aarch64"):
         add_candidate(artifact.with_name(f"yggterm-headless-macos-{suffix}"))
-        add_candidate(artifact.with_name(f"yggterm-mock-cli-macos-{suffix}"))
     if lower.endswith(".app.zip"):
         add_candidate(artifact.with_name("yggterm-headless-macos-x86_64"))
-        add_candidate(artifact.with_name("yggterm-mock-cli-macos-x86_64"))
     add_candidate(artifact.with_name("yggterm-headless"))
-    add_candidate(artifact.with_name("yggterm-mock-cli"))
     return candidates
 
 
@@ -404,12 +401,12 @@ def stage_artifact(host: str, artifact: Path, remote_dir: str) -> tuple[str, str
             host,
             f"tar -xzf {quote(remote_rel)} -C {quote(remote_dir)} && "
             f"find {quote(remote_dir)} -maxdepth 1 -type f -name 'yggterm*' "
-            f"! -name '*headless*' ! -name '*mock-cli*' ! -name '*.sha256' -exec chmod +x {{}} +",
+            f"! -name '*headless*' ! -name '*.sha256' -exec chmod +x {{}} +",
         )
         remote_bin = ssh_shell(
             host,
             f"find {quote(remote_dir)} -maxdepth 1 -type f -name 'yggterm*' "
-            f"! -name '*headless*' ! -name '*mock-cli*' ! -name '*.sha256' | head -n1",
+            f"! -name '*headless*' ! -name '*.sha256' | head -n1",
         ).stdout.strip()
         if not remote_bin:
             raise RuntimeError(f"could not resolve staged macOS yggterm binary from archive {artifact}")
@@ -441,7 +438,7 @@ def stage_artifact(host: str, artifact: Path, remote_dir: str) -> tuple[str, str
         remote_bin = ssh_shell(
             host,
             f"find {quote(remote_dir)} -maxdepth 1 -type f -name 'yggterm*' "
-            f"! -name '*headless*' ! -name '*mock-cli*' | head -n1",
+            f"! -name '*headless*' | head -n1",
         ).stdout.strip()
         if not remote_bin:
             raise RuntimeError(f"could not resolve staged macOS payload from zip {artifact}")
@@ -479,18 +476,6 @@ do
   if [ -f "$candidate" ]; then
     cp "$candidate" "$macos/yggterm-headless"
     chmod +x "$macos/yggterm-headless"
-    break
-  fi
-done
-for candidate in \
-  "$bin_dir/yggterm-mock-cli" \
-  "$bin_dir/yggterm-mock-cli-macos-x86_64" \
-  {quote(remote_dir + '/yggterm-mock-cli')} \
-  {quote(remote_dir + '/yggterm-mock-cli-macos-x86_64')}
-do
-  if [ -f "$candidate" ]; then
-    cp "$candidate" "$macos/yggterm-mock-cli"
-    chmod +x "$macos/yggterm-mock-cli"
     break
   fi
 done
@@ -576,7 +561,6 @@ def install_staged_macos_app_bundle(host: str, remote_app: str) -> dict:
         "installed_app": installed_app,
         "installed_bin": installed_bin,
         "installed_headless": f"{installed_app}/Contents/MacOS/yggterm-headless",
-        "installed_mock_cli": f"{installed_app}/Contents/MacOS/yggterm-mock-cli",
     }
 
 
@@ -589,12 +573,12 @@ def normalize_staged_macos_payload(
             host,
             f"tar -xzf {quote(remote_bin)} -C {quote(remote_dir)} && "
             f"find {quote(remote_dir)} -maxdepth 1 -type f -name 'yggterm*' "
-            f"! -name '*headless*' ! -name '*mock-cli*' ! -name '*.sha256' -exec chmod +x {{}} +",
+            f"! -name '*headless*' ! -name '*.sha256' -exec chmod +x {{}} +",
         )
         resolved = ssh_shell(
             host,
             f"find {quote(remote_dir)} -maxdepth 1 -type f -name 'yggterm*' "
-            f"! -name '*headless*' ! -name '*mock-cli*' ! -name '*.tar.gz' ! -name '*.sha256' | head -n1",
+            f"! -name '*headless*' ! -name '*.tar.gz' ! -name '*.sha256' | head -n1",
         ).stdout.strip()
         if not resolved:
             raise RuntimeError(f"could not resolve staged macOS binary from remote archive {remote_bin}")
@@ -1022,7 +1006,6 @@ def main() -> int:
             bundle_binaries = {
                 "gui": f"{remote_app}/Contents/MacOS/Yggterm",
                 "headless": f"{remote_app}/Contents/MacOS/yggterm-headless",
-                "mock_cli": f"{remote_app}/Contents/MacOS/yggterm-mock-cli",
             }
             if ssh_shell(
                 args.host,

@@ -18,7 +18,7 @@ here exists to make slow work survivable.
   - search
 - Prefer cached/stale data quickly, then refresh in the background.
 - Explain long-running loading states to the user instead of silently hanging.
-- Make latency, retries, and stale-cache behavior measurable in a mock client.
+- Make latency, retries, and stale-cache behavior measurable in the headless monitor.
 
 ## Core Rule
 
@@ -107,7 +107,7 @@ If loading exceeds `3000ms`, notify the user with the concrete reason:
 - Interactive failures should back off, not pulse forever.
 - Cached data must remain visible when safe.
 - Duplicate background work should coalesce by semantic job key.
-- Retry policies should be visible in telemetry and reproducible in the mock client.
+- Retry policies should be visible in telemetry and reproducible in the headless monitor.
 
 ## Session Lifetime Semantics
 
@@ -165,13 +165,13 @@ Current direction:
 The current implementation may use tmux-backed persistence internally, but the protocol contract is
 more general than tmux itself.
 
-## Mock Client
+## Headless Monitor
 
-`yggterm-mock-cli` exists to profile the protocol behavior without the full desktop shell. It is
+`yggterm-headless server monitor` profiles protocol behavior without the full desktop shell. It is
 also the first-line panic-management tool for live incidents: when a remote desktop such as `jojo`
 has a hung terminal, a missing restored session, a slow daemon, or a suspect drawing/input path,
-start with the mock CLI to establish daemon reachability, session truth, latency, and version
-state before making fixes.
+start with the headless monitor to establish daemon reachability, session truth, latency, and
+version state before making fixes.
 
 It should be able to:
 
@@ -191,11 +191,11 @@ This makes distributed regressions easier to reproduce than relying on the full 
 Example:
 
 ```bash
-./target/debug/yggterm-mock-cli \
+./target/debug/yggterm-headless server monitor \
   --scenario startup \
   --delay-ms 4200 \
   --progress-step-ms 700 \
-  --jsonl-out /tmp/yggterm-mock-cli.jsonl
+  --jsonl-out /tmp/yggterm-headless-monitor.jsonl
 ```
 
 That should emit:
@@ -210,13 +210,13 @@ Incident examples:
 
 ```bash
 # First read-only picture during a hung terminal or missing session incident.
-./target/debug/yggterm-mock-cli \
+./target/debug/yggterm-headless server monitor \
   --scenario panic-report \
   --expect-path live::<session-id> \
   --jsonl-out /tmp/yggterm-incident.jsonl
 
 # Watch daemon latency and session truth once per second.
-./target/debug/yggterm-mock-cli \
+./target/debug/yggterm-headless server monitor \
   --scenario panic-report \
   --expect-path live::<session-id> \
   --iterations 30 \
@@ -224,10 +224,10 @@ Incident examples:
   --jsonl-out /tmp/yggterm-watch.jsonl
 
 # Survey reachable versioned daemons and aliases before a hot update.
-./target/debug/yggterm-mock-cli --scenario server-list
+./target/debug/yggterm-headless server monitor --scenario server-list
 
 # Probe control-plane latency across the daemon fleet.
-./target/debug/yggterm-mock-cli --scenario latency-check --all
+./target/debug/yggterm-headless server monitor --scenario latency-check --all
 ```
 
 Expected incident workflow:
@@ -245,19 +245,19 @@ Expected incident workflow:
 Session lifetime examples:
 
 ```bash
-# Start a live shell session, then let the mock client exit without shutdown.
-./target/debug/yggterm-mock-cli \
+# Start a live shell session, then let the headless monitor exit without shutdown.
+./target/debug/yggterm-headless server monitor \
   --scenario disconnect-safe \
   --cwd ~/gh/yggterm \
   --title-hint "mock reconnect probe"
 
 # Reconnect from a later client process and verify the same session is still present.
-./target/debug/yggterm-mock-cli \
+./target/debug/yggterm-headless server monitor \
   --scenario reconnect-check \
   --expect-path local://<session-uuid>
 
 # Explicit shutdown should tear the session graph down.
-./target/debug/yggterm-mock-cli \
+./target/debug/yggterm-headless server monitor \
   --scenario graceful-shutdown
 ```
 
@@ -271,7 +271,7 @@ Observability:
 
 - `status` should expose whether the daemon restored from persisted cached state
 - `status` should expose the restored stored/live/remote-machine counts
-- `yggterm-mock-cli` should emit those fields in startup and reconnect scenarios so cache-path
+- `yggterm-headless server monitor` should emit those fields in startup and reconnect scenarios so cache-path
   regressions can be profiled without the desktop shell
 - `server trace tail <lines>` should dump the last trace probes from `~/.yggterm/event-trace.jsonl`
 - `server trace follow <lines> [poll_ms]` should stay attached and stream new probes as they land

@@ -72,16 +72,20 @@ fi
   printf '%s\n' 'yggterm launcher: no runnable executable found' >&2
   exit 1
 }
+use_headless=0
 if [ "\${1:-}" = "server" ]; then
   use_headless=1
   if [ "\${2:-}" = "app" ] && [ "\${3:-}" = "launch" ]; then
     use_headless=0
   fi
-  if [ "\$use_headless" = "1" ]; then
-    target_dir="\$(dirname "\$target")"
-    if [ -x "\$target_dir/yggterm-headless" ]; then
-      target="\$target_dir/yggterm-headless"
-    fi
+fi
+if [ "\${1:-}" = "--version" ] || [ "\${1:-}" = "-V" ] || [ "\${1:-}" = "version" ]; then
+  use_headless=1
+fi
+if [ "\$use_headless" = "1" ]; then
+  target_dir="\$(dirname "\$target")"
+  if [ -x "\$target_dir/yggterm-headless" ]; then
+    target="\$target_dir/yggterm-headless"
   fi
 fi
 if [ "${YGGTERM_ENABLE_ACCESSIBILITY:-0}" != "1" ] && [ -z "${NO_AT_BRIDGE+x}" ]; then
@@ -96,9 +100,9 @@ EOF
   chmod 0755 "${launcher_path}" || true
 }
 
-write_mock_cli_wrapper() {
+write_headless_wrapper() {
   bin_dir="${HOME}/.local/bin"
-  launcher_path="${bin_dir}/yggterm-mock-cli"
+  launcher_path="${bin_dir}/yggterm-headless"
   mkdir -p "${bin_dir}"
   cat > "${launcher_path}" <<EOF
 #!/usr/bin/env sh
@@ -107,14 +111,14 @@ set -eu
 ROOT='${install_root}'
 target=""
 latest_dir="\$(ls -td "\$ROOT"/versions/* 2>/dev/null | head -n 1 || true)"
-if [ -n "\$latest_dir" ] && [ -x "\$latest_dir/yggterm-mock-cli" ]; then
-  target="\$latest_dir/yggterm-mock-cli"
+if [ -n "\$latest_dir" ] && [ -x "\$latest_dir/yggterm-headless" ]; then
+  target="\$latest_dir/yggterm-headless"
 fi
 if [ -z "\$target" ] || [ ! -x "\$target" ]; then
-  target='${installed_mock_cli}'
+  target='${installed_headless_binary}'
 fi
 [ -x "\$target" ] || {
-  printf '%s\n' 'yggterm-mock-cli launcher: no runnable executable found' >&2
+  printf '%s\n' 'yggterm-headless launcher: no runnable executable found' >&2
   exit 1
 }
 if [ "${YGGTERM_ENABLE_ACCESSIBILITY:-0}" != "1" ] && [ -z "${NO_AT_BRIDGE+x}" ]; then
@@ -187,9 +191,9 @@ if [ -n "${current_version}" ] && [ "${current_version}" = "${release_version}" 
   )"
   if [ -n "${current_binary}" ] && [ -x "${current_binary}" ]; then
     installed_binary="${current_binary}"
-    installed_mock_cli="$(dirname "${current_binary}")/yggterm-mock-cli"
+    installed_headless_binary="$(dirname "${current_binary}")/yggterm-headless"
     write_launcher_wrapper
-    write_mock_cli_wrapper
+    write_headless_wrapper
     log "refreshing desktop integration"
     "${current_binary}" install integrate >/dev/null 2>&1 || true
     prune_old_versions "${current_version}"
@@ -230,27 +234,21 @@ case "${target_label}" in
   windows-*)
   binary_name="yggterm-${target_label}.exe"
   headless_binary_name="yggterm-headless-${target_label}.exe"
-  mock_cli_binary_name="yggterm-mock-cli-${target_label}.exe"
   installed_binary="${version_dir}/yggterm.exe"
   installed_headless_binary="${version_dir}/yggterm-headless.exe"
-  installed_mock_cli="${version_dir}/yggterm-mock-cli.exe"
   ;;
   *)
   binary_name="yggterm-${target_label}"
   headless_binary_name="yggterm-headless-${target_label}"
-  mock_cli_binary_name="yggterm-mock-cli-${target_label}"
   installed_binary="${version_dir}/yggterm"
   installed_headless_binary="${version_dir}/yggterm-headless"
-  installed_mock_cli="${version_dir}/yggterm-mock-cli"
   ;;
 esac
 
 cp "${TMP_DIR}/${binary_name}" "${installed_binary}"
 cp "${TMP_DIR}/${headless_binary_name}" "${installed_headless_binary}"
-cp "${TMP_DIR}/${mock_cli_binary_name}" "${installed_mock_cli}"
 chmod 0755 "${installed_binary}" || true
 chmod 0755 "${installed_headless_binary}" || true
-chmod 0755 "${installed_mock_cli}" || true
 
 cat > "${install_root}/install-state.json" <<JSON
 {
@@ -264,7 +262,7 @@ cat > "${install_root}/install-state.json" <<JSON
 JSON
 
 write_launcher_wrapper
-write_mock_cli_wrapper
+write_headless_wrapper
 
 log "refreshing desktop integration"
 "${installed_binary}" install integrate >/dev/null 2>&1 || true

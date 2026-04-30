@@ -1,3 +1,11 @@
+yggterm (2.1.64-1) unstable; urgency=medium
+
+  * Keep active full-screen TUI terminals on the real xterm canvas instead of the low-power text overlay.
+  * Route direct-install version probes through yggterm-headless so version checks do not touch the GUI binary.
+  * Fold panic-management monitor scenarios into yggterm-headless and stop shipping a separate mock CLI binary.
+
+ -- Yggdrasil HQ <avi@gour.top>  Fri, 01 May 2026 01:50:27 +0530
+
 yggterm (2.1.63-1) unstable; urgency=medium
 
   * Update the direct SHA-2 dependency to sha2 0.11.0 alongside the refreshed Dioxus desktop runtime stack.

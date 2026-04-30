@@ -38747,15 +38747,15 @@ fn terminal_eval_script_with_canvas_renderer(
                 return value;
             }}
             if (activeRenderSurface && entersAltScreen) {{
-                lowPowerTuiActive = true;
-                lowPowerTuiTextBuffer = '';
-                syncLowPowerTuiHostEntry();
-                renderLowPowerTuiPayload(value);
-                return '';
+                hideLowPowerTuiOverlay();
+                return value;
             }}
             if (activeRenderSurface && lowPowerTuiActive) {{
-                renderLowPowerTuiPayload(value);
-                return '';
+                hideLowPowerTuiOverlay();
+                const replayPrefix = value.includes('\x1b[?1049h')
+                    ? ''
+                    : '\x1b[?1049h\x1b[?25l\x1b[2J\x1b[H';
+                return `${{replayPrefix}}${{value}}`;
             }}
             return value;
         }};
@@ -44335,14 +44335,15 @@ mod tests {
             "inactive/offscreen TUI sessions should not keep repainting hidden canvases"
         );
         assert!(
-            script.contains("renderLowPowerTuiPayload(value)"),
-            "active alternate-screen TUI output should have a low-power render path"
-        );
-        assert!(
             script.contains("let lowPowerTuiTextBuffer = '';")
                 && script.contains("if (activeRenderSurface && lowPowerTuiActive) {")
-                && script.contains("renderLowPowerTuiPayload(value);\n                return '';"),
-            "alternate-screen low-power mode should own every chunk until the TUI exits alternate screen"
+                && script.contains("return `${replayPrefix}${value}`;"),
+            "an offscreen low-power TUI should replay onto xterm when the host becomes visible"
+        );
+        assert!(
+            script.contains("if (activeRenderSurface && entersAltScreen) {")
+                && script.contains("hideLowPowerTuiOverlay();\n                return value;"),
+            "visible alternate-screen TUI output should stay on the real xterm canvas"
         );
         assert!(
             script.contains("data-yggterm-low-power-tui"),
