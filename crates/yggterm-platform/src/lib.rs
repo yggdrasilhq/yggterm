@@ -279,7 +279,13 @@ fn ensure_macos_png_not_blank(output_path: &Path, context_label: &str) -> Result
     let mut reader = decoder
         .read_info()
         .with_context(|| format!("reading PNG info for {}", output_path.display()))?;
-    let mut buffer = vec![0; reader.output_buffer_size()];
+    let mut buffer = vec![
+        0;
+        reader.output_buffer_size().with_context(|| format!(
+            "reading PNG buffer size for {}",
+            output_path.display()
+        ))?
+    ];
     let info = reader
         .next_frame(&mut buffer)
         .with_context(|| format!("decoding PNG pixels for {}", output_path.display()))?;

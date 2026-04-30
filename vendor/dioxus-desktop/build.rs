@@ -1,4 +1,8 @@
-use std::{fs, io::Write as _, path::{Path, PathBuf}};
+use std::{
+    fs,
+    io::Write as _,
+    path::{Path, PathBuf},
+};
 
 fn check_gnu() {
     // WARN about wry support on windows gnu targets. GNU windows targets don't work well in wry currently
