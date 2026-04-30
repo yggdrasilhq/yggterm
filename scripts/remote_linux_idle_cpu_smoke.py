@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -185,8 +186,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--settle-sec", type=float, default=10.0)
     parser.add_argument("--visible-max-cpu", type=float, default=2.5)
     parser.add_argument("--focused-max-cpu", type=float, default=2.5)
+    parser.add_argument("--tui-max-cpu", type=float, default=18.0)
     parser.add_argument("--background-max-cpu", type=float, default=1.2)
     parser.add_argument("--refocused-max-cpu", type=float, default=2.5)
+    parser.add_argument("--skip-tui", action="store_true")
     parser.add_argument("--keep-remote-dir", action="store_true")
     return parser.parse_args()
 
@@ -218,6 +221,14 @@ def launch_env_from_session(session_info: dict, backend: str, remote_home: str) 
         "YGGTERM_REMOTE_SMOKE_TAG": "1",
         "NO_AT_BRIDGE": "1",
     }
+    for passthrough_key in (
+        "YGGTERM_ENABLE_WEBKIT_COMPOSITING",
+        "YGGTERM_ENABLE_XTERM_CANVAS",
+        "YGGTERM_TERMINAL_WRITE_FRAME_MS",
+    ):
+        passthrough_value = os.environ.get(passthrough_key)
+        if passthrough_value:
+            env[passthrough_key] = passthrough_value
     picked_session_id = str(picked.get("session_id") or picked.get("Name") or "").strip()
     if picked_session_id:
         env["XDG_SESSION_ID"] = picked_session_id
@@ -270,7 +281,8 @@ def launch_env_from_session(session_info: dict, backend: str, remote_home: str) 
         env["DISPLAY"] = display
         env["XAUTHORITY"] = xauthority
         env["GDK_BACKEND"] = "x11"
-        env["WEBKIT_DISABLE_COMPOSITING_MODE"] = "1"
+        if not env.get("YGGTERM_ENABLE_WEBKIT_COMPOSITING"):
+            env["WEBKIT_DISABLE_COMPOSITING_MODE"] = "1"
     return env
 
 
@@ -279,11 +291,43 @@ def state_summary(state: dict) -> dict:
     terminal_hosts = dom.get("terminal_hosts") or []
     active_hosts = dom.get("active_terminal_hosts") or []
     shell = state.get("shell") or {}
+
+    def compact_host(host: dict) -> dict:
+        return {
+            "id": host.get("id"),
+            "session_path": host.get("session_path"),
+            "active": host.get("active"),
+            "input_enabled": host.get("input_enabled"),
+            "text_sample": str(host.get("text_sample") or "")[-240:],
+            "text_tail": str(host.get("text_tail") or "")[-240:],
+            "buffer_text_sample": str(host.get("buffer_text_sample") or "")[-240:],
+            "cursor_line_text": str(host.get("cursor_line_text") or "")[-240:],
+            "render_event_count": host.get("render_event_count"),
+            "write_command_count": host.get("write_command_count"),
+            "write_bridge_flush_count": host.get("write_bridge_flush_count"),
+            "write_bridge_in_flight": host.get("write_bridge_in_flight"),
+            "write_bridge_pending_chars": host.get("write_bridge_pending_chars"),
+            "last_write_sample": str(host.get("last_write_sample") or "")[-240:],
+            "last_write_applied_tail": str(host.get("last_write_applied_tail") or "")[-240:],
+            "low_power_tui_overlay_present": host.get("low_power_tui_overlay_present"),
+            "low_power_tui_overlay_active": host.get("low_power_tui_overlay_active"),
+            "low_power_tui_frame_count": host.get("low_power_tui_frame_count"),
+            "low_power_tui_text_sample": str(host.get("low_power_tui_text_sample") or "")[-240:],
+            "inactive_tui_frame_drop_count": host.get("inactive_tui_frame_drop_count"),
+            "inactive_tui_last_tail": str(host.get("inactive_tui_last_tail") or "")[-240:],
+            "rect": host.get("rect"),
+            "host_rect": host.get("host_rect"),
+            "screen_rect": host.get("screen_rect"),
+            "viewport_rect": host.get("viewport_rect"),
+        }
+
     return {
         "active_session_path": state.get("active_session_path"),
         "active_view_mode": state.get("active_view_mode"),
         "terminal_hosts": len(terminal_hosts),
         "active_terminal_hosts": len(active_hosts),
+        "terminal_host_details": [compact_host(host) for host in terminal_hosts[:6]],
+        "active_terminal_host_details": [compact_host(host) for host in active_hosts[:6]],
         "active_terminal_input_enabled": any(
             bool(host.get("input_enabled")) for host in active_hosts
         ),
@@ -301,6 +345,65 @@ def remote_cpu_sample(host: str, label: str, pid: int, home: str, duration_sec: 
         .replace("%LABEL%", repr(label))
     )
     return linux_smoke.ssh_python_json(host, snippet)
+
+
+def synthetic_tui_command(duration_sec: float) -> str:
+    duration = max(6.0, float(duration_sec))
+    return f"""python3 - <<'PY'
+import shutil
+import sys
+import time
+
+duration = {duration!r}
+size = shutil.get_terminal_size((100, 32))
+row_count = max(8, min(size.lines - 2, 42))
+bar_width = max(24, min(size.columns - 14, 96))
+start = time.time()
+frame = 0
+sys.stdout.write("\\x1b[?1049h\\x1b[?25l\\x1b[2J")
+try:
+    while time.time() - start < duration:
+        frame += 1
+        sys.stdout.write("\\x1b[H")
+        sys.stdout.write(f"Yggterm synthetic TUI CPU smoke frame {{frame}}\\x1b[K\\r\\n")
+        for row in range(1, row_count):
+            filled = (frame + row * 3) % bar_width
+            bar = ("#" * filled).ljust(bar_width, ".")
+            pct = round((filled / max(1, bar_width)) * 100)
+            sys.stdout.write(f"{{row:02d}} [{{bar}}] {{pct:02d}}%\\x1b[K\\r\\n")
+        sys.stdout.flush()
+        time.sleep(0.08)
+finally:
+    sys.stdout.write("\\x1b[?25h\\x1b[?1049l\\r\\n")
+    sys.stdout.flush()
+PY
+"""
+
+
+def remote_terminal_send(
+    host: str,
+    remote_bin: str,
+    env: dict[str, str],
+    pid: int,
+    session_path: str,
+    data: str,
+    timeout_ms: int,
+) -> dict:
+    proc = linux_smoke.ssh_shell(
+        host,
+        f"{linux_smoke.remote_env_exports(env)}; "
+        f"{linux_smoke.quote(remote_bin)} server app terminal send --pid {pid} "
+        f"{linux_smoke.quote(session_path)} --data {linux_smoke.quote(data)} "
+        f"--timeout-ms {timeout_ms}",
+        check=False,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(
+            proc.stderr.strip()
+            or proc.stdout.strip()
+            or f"terminal send failed for {session_path}"
+        )
+    return json.loads(proc.stdout.strip() or "{}")
 
 
 def remote_launch_visible_state_with_fallback(
@@ -379,6 +482,7 @@ def main() -> int:
         "thresholds": {
             "visible_max_cpu": args.visible_max_cpu,
             "focused_max_cpu": args.focused_max_cpu,
+            "tui_max_cpu": args.tui_max_cpu,
             "background_max_cpu": args.background_max_cpu,
             "refocused_max_cpu": args.refocused_max_cpu,
         },
@@ -432,6 +536,35 @@ def main() -> int:
         summary["cpu_terminal_focused_idle"] = remote_cpu_sample(
             args.host, "terminal_focused_idle", pid, remote_home, args.sample_sec
         )
+        if not args.skip_tui:
+            tui_duration = args.sample_sec + 3.0
+            summary["synthetic_tui_send"] = remote_terminal_send(
+                args.host,
+                remote_bin,
+                launch_env,
+                pid,
+                session_path,
+                synthetic_tui_command(tui_duration) + "\r",
+                args.timeout_ms,
+            )
+            time.sleep(1.0)
+            summary["state_during_synthetic_tui"] = state_summary(
+                linux_smoke.wait_for_remote_state(
+                    args.host, remote_bin, launch_env, pid, args.timeout_ms, timeout_seconds=20.0
+                )
+            )
+            summary["cpu_terminal_active_tui"] = remote_cpu_sample(
+                args.host, "terminal_active_tui", pid, remote_home, args.sample_sec
+            )
+            remote_terminal_send(
+                args.host,
+                remote_bin,
+                launch_env,
+                pid,
+                session_path,
+                "\u0003",
+                args.timeout_ms,
+            )
         summary["background_response"] = linux_smoke.remote_background_window(
             args.host, remote_bin, launch_env, pid, args.timeout_ms
         )
@@ -475,6 +608,7 @@ def main() -> int:
         budgets = {
             "cpu_after_launch_idle_visible": args.visible_max_cpu,
             "cpu_terminal_focused_idle": args.focused_max_cpu,
+            "cpu_terminal_active_tui": args.tui_max_cpu,
             "cpu_terminal_background_idle": args.background_max_cpu,
             "cpu_terminal_refocused_idle": args.refocused_max_cpu,
         }
