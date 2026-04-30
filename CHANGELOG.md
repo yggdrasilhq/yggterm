@@ -4,6 +4,12 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+## 2.1.63
+
+### Changed
+
+- update the direct SHA-2 dependency to sha2 0.11.0 so the release carries the latest available hashing stack alongside the Dioxus 0.7.6 desktop runtime refresh
+
 ## 2.1.62
 
 ### Changed
