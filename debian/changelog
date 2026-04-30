@@ -1,3 +1,41 @@
+yggterm (2.1.62-1) unstable; urgency=medium
+
+  * Update the desktop runtime stack to Dioxus 0.7.6, Wry 0.55.0, Tao 0.35.0, WebKitGTK 2.0.2, reqwest 0.13.3, rusqlite 0.39.0, png 0.18, and refreshed transitive dependencies.
+  * Preserve Yggterm's local Dioxus/Wry observability and WebKit stability patches on top of the newer vendored crates.
+
+ -- Yggdrasil HQ <avi@gour.top>  Fri, 01 May 2026 01:01:09 +0530
+
+yggterm (2.1.61-1) unstable; urgency=medium
+
+  * Add yggterm-mock-cli controls for listing reachable servers, hot-restarting daemons, waiting for sessions, probing latency, and refreshing managed Codex CLI tools.
+  * Add daemon hot restart handoff support that persists state and launches a requested replacement daemon after acknowledgement.
+  * Check or refresh managed Codex CLI tools during release packaging, with an opt-out environment flag.
+
+ -- Yggdrasil HQ <avi@gour.top>  Fri, 01 May 2026 00:12:54 +0530
+
+yggterm (2.1.60-1) unstable; urgency=medium
+
+  * Reject retained remote terminal tails as interactive until a prompt-ready surface is visible.
+  * Add a remote-side scan lock so repeated refreshes cannot pile up SSH scan processes.
+  * Preserve cache instead of falling back to Python when a remote yggterm scan is already active.
+  * Keep legacy daemon cleanup from treating bare socket files as live runtime ownership.
+  * Bound daemon request socket IO so stale daemons cannot block status/runtime probes forever.
+
+ -- Yggdrasil HQ <avi@gour.top>  Thu, 30 Apr 2026 23:13:06 +0530
+
+yggterm (2.1.59-1) unstable; urgency=medium
+
+  * Keep daemon status, snapshot, and terminal input responsive when a PTY write blocks.
+  * Add bounded terminal input backpressure so one stalled session cannot freeze all sessions.
+  * Queue remote machine refresh scans outside the daemon runtime lock.
+  * Coalesce queued remote machine refreshes, time out hung remote scans, and cool down shell retry loops.
+  * Let fresh local shell prompts settle interactive instead of leaving input disabled.
+  * Keep active terminals input-armed while passive side rails are open.
+  * Scope document-level paste handling to the active terminal host.
+  * Expose terminal focus/type/scroll/select app-control probes through yggterm-headless.
+
+ -- Yggdrasil HQ <avi@gour.top>  Thu, 30 Apr 2026 22:22:14 +0530
+
 yggterm (2.1.53-1) unstable; urgency=medium
 
   * Stretch the approved Yggi mascot icon to fill the packaged icon canvas.

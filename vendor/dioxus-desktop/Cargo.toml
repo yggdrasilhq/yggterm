@@ -13,7 +13,7 @@
 edition = "2021"
 rust-version = "1.76.0"
 name = "dioxus-desktop"
-version = "0.7.3"
+version = "0.7.6"
 authors = ["Jonathan Kelley"]
 build = "build.rs"
 autolib = false
@@ -92,6 +92,9 @@ name = "check_rendering"
 path = "headless_tests/rendering.rs"
 harness = false
 
+[dependencies.anyhow]
+version = "1.0.98"
+
 [dependencies.async-trait]
 version = "0.1.88"
 
@@ -99,62 +102,65 @@ version = "0.1.88"
 version = "0.22.1"
 
 [dependencies.bytes]
-version = "1.10"
+version = "1.10.1"
 
 [dependencies.dioxus-asset-resolver]
-version = "0.7.3"
+version = "0.7.6"
 features = ["native"]
 
 [dependencies.dioxus-cli-config]
-version = "0.7.3"
+version = "0.7.6"
 
 [dependencies.dioxus-core]
-version = "0.7.3"
+version = "0.7.6"
 features = ["serialize"]
 
 [dependencies.dioxus-devtools]
-version = "0.7.3"
+version = "0.7.6"
 optional = true
 
 [dependencies.dioxus-document]
-version = "0.7.3"
+version = "0.7.6"
 default-features = false
 
 [dependencies.dioxus-history]
-version = "0.7.3"
+version = "0.7.6"
 default-features = false
 
 [dependencies.dioxus-hooks]
-version = "0.7.3"
+version = "0.7.6"
 
 [dependencies.dioxus-html]
-version = "0.7.3"
+version = "0.7.6"
 features = ["serialize"]
 default-features = false
 
 [dependencies.dioxus-interpreter-js]
-version = "0.7.3"
+version = "0.7.6"
 features = [
     "binary-protocol",
     "serialize",
 ]
 
 [dependencies.dioxus-signals]
-version = "0.7.3"
+version = "0.7.6"
 optional = true
 
 [dependencies.dunce]
 version = "1.0.5"
 
 [dependencies.futures-channel]
-version = "0.3.31"
+version = "0.3.32"
 
 [dependencies.futures-util]
-version = "0.3"
+version = "0.3.32"
 default-features = false
 
 [dependencies.generational-box]
-version = "0.7.3"
+version = "0.7.6"
+
+[dependencies.image]
+version = "0.25.6"
 
 [dependencies.infer]
 version = "0.19.0"
@@ -173,7 +179,7 @@ features = ["std_rng"]
 version = "2.1.1"
 
 [dependencies.serde]
-version = "1.0.219"
+version = "1.0.225"
 
 [dependencies.serde_json]
 version = "1.0.140"
@@ -186,7 +192,7 @@ version = "2.6"
 features = ["const-generics"]
 
 [dependencies.tao]
-version = "0.34.0"
+version = "0.35.0"
 features = [
     "rwh_05",
     "rwh_05",
@@ -215,16 +221,15 @@ version = "0.1.41"
 version = "1.0"
 
 [dependencies.wry]
-version = "0.53.5"
+version = "0.55.0"
 features = [
     "os-webview",
     "protocol",
-    "drag-drop",
 ]
 default-features = false
 
 [build-dependencies.lazy-js-bundle]
-version = "0.7.3"
+version = "0.7.6"
 
 [target.'cfg(any(target_os = "windows",target_os = "macos",target_os = "linux"))'.dependencies.tray-icon]
 version = "0.21.0"
@@ -245,7 +250,7 @@ version = "0.17.2"
 default-features = false
 
 [target.'cfg(not(target_os = "android"))'.dependencies.tungstenite]
-version = "0.27.0"
+version = "0.28.0"
 features = ["native-tls"]
 
 [target.'cfg(target_os = "android")'.dependencies.jni]
@@ -261,7 +266,7 @@ version = "0.1.1"
 version = "0.6.0"
 
 [target.'cfg(target_os = "android")'.dependencies.tungstenite]
-version = "0.27.0"
+version = "0.28.0"
 features = ["rustls"]
 
 [target.'cfg(target_os = "ios")'.dependencies.objc]
@@ -271,11 +276,10 @@ version = "0.2.7"
 version = "0.1.1"
 
 [target.'cfg(target_os = "linux")'.dependencies.wry]
-version = "0.53.5"
+version = "0.55.0"
 features = [
     "os-webview",
     "protocol",
-    "drag-drop",
     "linux-body",
 ]
 default-features = false

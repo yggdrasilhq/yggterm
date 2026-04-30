@@ -68,15 +68,6 @@ pub(super) fn desktop_handler(
         return edit_state.handle_event(request, responder);
     }
 
-    // If the request is asking for a file dialog, handle that, returning the list of files selected
-    if trimmed_uri == "__file_dialog" {
-        if let Err(err) = file_dialog_responder_sync(request, responder) {
-            tracing::error!("Failed to handle file dialog request: {err:?}");
-        }
-
-        return;
-    }
-
     if let Some(stage) = trimmed_uri.strip_prefix("__probe/") {
         let full_stage = if let Some(query) = request.uri().query() {
             format!("{stage}?{query}")
@@ -90,6 +81,15 @@ pub(super) fn desktop_handler(
                 .body(Vec::new())
                 .unwrap(),
         );
+    }
+
+    // If the request is asking for a file dialog, handle that, returning the list of files selected
+    if trimmed_uri == "__file_dialog" {
+        if let Err(err) = file_dialog_responder_sync(request, responder) {
+            tracing::error!("Failed to handle file dialog request: {err:?}");
+        }
+
+        return;
     }
 
     // todo: we want to move the custom assets onto a different protocol or something

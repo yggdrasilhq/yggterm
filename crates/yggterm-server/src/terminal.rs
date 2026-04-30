@@ -4,6 +4,7 @@ use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system}
 use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::mpsc::{self, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -20,6 +21,7 @@ const INITIAL_ATTACH_MAX_CHUNKS: usize = 192;
 const INITIAL_ATTACH_MAX_BYTES: usize = 512 * 1024;
 const INITIAL_ATTACH_TRAILING_NOISE_CHUNKS: usize = 16;
 const ATTACH_READY_MARKER: &str = "__YGGTERM_ATTACH_READY__\n";
+const TERMINAL_WRITE_QUEUE_CAPACITY: usize = 64;
 
 #[derive(Debug, Clone)]
 pub struct TerminalChunk {
@@ -292,8 +294,9 @@ impl TerminalManager {
 }
 
 struct PtySessionRuntime {
+    key: String,
     master: Arc<Mutex<Box<dyn MasterPty + Send>>>,
-    writer: Arc<Mutex<Box<dyn Write + Send>>>,
+    writer_tx: SyncSender<Vec<u8>>,
     child: Arc<Mutex<Box<dyn Child + Send + Sync>>>,
     chunks: Arc<Mutex<VecDeque<TerminalChunk>>>,
     retained_bytes: Arc<AtomicUsize>,
@@ -332,6 +335,67 @@ impl TerminalScreenState {
 
     fn refresh_formatted(&mut self) {
         self.formatted = String::from_utf8_lossy(&self.parser.screen().state_formatted()).into();
+    }
+}
+
+fn spawn_terminal_writer_thread(
+    key: String,
+    writer: Box<dyn Write + Send>,
+    last_activity_ms: Arc<AtomicU64>,
+    capacity: usize,
+) -> Result<SyncSender<Vec<u8>>> {
+    let (tx, rx) = mpsc::sync_channel::<Vec<u8>>(capacity);
+    thread::Builder::new()
+        .name(format!("pty-writer-{key}"))
+        .spawn(move || {
+            let mut writer = writer;
+            while let Ok(data) = rx.recv() {
+                last_activity_ms.store(now_millis(), Ordering::SeqCst);
+                let byte_count = data.len();
+                if let Err(error) = writer.write_all(&data).and_then(|()| writer.flush()) {
+                    trace_terminal_event(
+                        "write_failed",
+                        serde_json::json!({
+                            "path": key,
+                            "bytes": byte_count,
+                            "error": error.to_string(),
+                        }),
+                    );
+                    break;
+                }
+            }
+        })
+        .context("spawning pty writer thread")?;
+    Ok(tx)
+}
+
+fn enqueue_terminal_write(
+    writer_tx: &SyncSender<Vec<u8>>,
+    key: &str,
+    data: &str,
+    capacity: usize,
+) -> Result<()> {
+    if data.is_empty() {
+        return Ok(());
+    }
+    let bytes = data.as_bytes().to_vec();
+    let byte_count = bytes.len();
+    match writer_tx.try_send(bytes) {
+        Ok(()) => Ok(()),
+        Err(TrySendError::Full(_)) => {
+            trace_terminal_event(
+                "write_backpressure",
+                serde_json::json!({
+                    "path": key,
+                    "bytes": byte_count,
+                    "queue_capacity": capacity,
+                }),
+            );
+            bail!("terminal input queue is full for {key}; child process is not accepting input")
+        }
+        Err(TrySendError::Disconnected(_)) => {
+            bail!("terminal writer is no longer available for {key}")
+        }
     }
 }
 
@@ -386,6 +450,13 @@ impl PtySessionRuntime {
         let reader_screen_state = Arc::clone(&screen_state);
         let key_label = key.to_string();
         let launch_command_label = launch_command.to_string();
+        let writer_tx = spawn_terminal_writer_thread(
+            key.to_string(),
+            writer,
+            Arc::clone(&last_activity_ms),
+            TERMINAL_WRITE_QUEUE_CAPACITY,
+        )
+        .context("spawning pty writer thread")?;
 
         thread::Builder::new()
             .name(format!("pty-reader-{key}"))
@@ -470,8 +541,9 @@ impl PtySessionRuntime {
             .context("spawning pty reader thread")?;
 
         Ok(Self {
+            key: key.to_string(),
             master: Arc::new(Mutex::new(pair.master)),
-            writer: Arc::new(Mutex::new(writer)),
+            writer_tx,
             child: Arc::new(Mutex::new(child)),
             chunks,
             retained_bytes,
@@ -639,13 +711,16 @@ impl PtySessionRuntime {
     }
 
     fn write(&self, data: &str) -> Result<()> {
-        let mut writer = self.writer.lock().expect("pty writer lock poisoned");
+        if data.is_empty() {
+            return Ok(());
+        }
         self.last_activity_ms.store(now_millis(), Ordering::SeqCst);
-        writer
-            .write_all(data.as_bytes())
-            .context("writing to pty")?;
-        writer.flush().context("flushing pty writer")?;
-        Ok(())
+        enqueue_terminal_write(
+            &self.writer_tx,
+            &self.key,
+            data,
+            TERMINAL_WRITE_QUEUE_CAPACITY,
+        )
     }
 
     fn seed_snapshot(&self, data: &str) {
@@ -1140,6 +1215,29 @@ fn strip_terminal_control_sequences(input: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io;
+    use std::sync::mpsc;
+    use std::time::Instant;
+
+    struct BlockingFirstWrite {
+        first_started: mpsc::Sender<()>,
+        release_first: mpsc::Receiver<()>,
+        writes: Arc<AtomicUsize>,
+    }
+
+    impl Write for BlockingFirstWrite {
+        fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+            if self.writes.fetch_add(1, Ordering::SeqCst) == 0 {
+                let _ = self.first_started.send(());
+                let _ = self.release_first.recv();
+            }
+            Ok(data.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
 
     #[test]
     fn trim_chunk_buffer_enforces_byte_budget() {
@@ -1504,5 +1602,41 @@ mod tests {
         assert!(combined.contains("Done. Added these in the ThinkBook x layer."));
         assert!(!combined.contains("^[[?1;2c"));
         assert!(!combined.contains("^[]10;rgb:cccc/cccc/cccc"));
+    }
+
+    #[test]
+    fn terminal_write_queue_reports_backpressure_without_blocking_request_thread() {
+        let (first_started_tx, first_started_rx) = mpsc::channel();
+        let (release_first_tx, release_first_rx) = mpsc::channel();
+        let writes = Arc::new(AtomicUsize::new(0));
+        let writer = BlockingFirstWrite {
+            first_started: first_started_tx,
+            release_first: release_first_rx,
+            writes: Arc::clone(&writes),
+        };
+        let writer_tx = spawn_terminal_writer_thread(
+            "local://blocked".to_string(),
+            Box::new(writer),
+            Arc::new(AtomicU64::new(0)),
+            1,
+        )
+        .expect("spawn writer");
+
+        enqueue_terminal_write(&writer_tx, "local://blocked", "first", 1)
+            .expect("enqueue first write");
+        first_started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("writer should start first write");
+        enqueue_terminal_write(&writer_tx, "local://blocked", "second", 1)
+            .expect("enqueue second write behind blocked writer");
+
+        let started = Instant::now();
+        let error = enqueue_terminal_write(&writer_tx, "local://blocked", "third", 1)
+            .expect_err("full queue should fail fast");
+
+        assert!(started.elapsed() < Duration::from_millis(100));
+        assert!(error.to_string().contains("terminal input queue is full"));
+        release_first_tx.send(()).expect("release blocked writer");
+        drop(writer_tx);
     }
 }
