@@ -1,6 +1,5 @@
 use anyhow::{Context, Result, bail};
 use serde_json::json;
-use std::env;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -123,8 +122,8 @@ struct Config {
     background: bool,
 }
 
-fn main() -> Result<()> {
-    let cfg = parse_args(env::args().skip(1).collect())?;
+pub fn run(args: Vec<String>) -> Result<()> {
+    let cfg = parse_args(args)?;
     let home_dir = resolve_yggterm_home()?;
     let endpoint = default_endpoint(&home_dir);
 
@@ -413,7 +412,8 @@ fn resolve_hot_restart_daemon_exe(cfg: &Config) -> Result<PathBuf> {
     let daemon_exe = if let Some(path) = cfg.daemon_exe.clone() {
         path
     } else {
-        let current_exe = env::current_exe().context("resolving yggterm-mock-cli path")?;
+        let current_exe =
+            std::env::current_exe().context("resolving yggterm-headless monitor path")?;
         local_headless_companion_executable_from_current(&current_exe).with_context(|| {
             format!(
                 "missing yggterm-headless companion next to {}",
@@ -514,7 +514,7 @@ fn run_scenario(
     iteration: usize,
 ) -> Result<()> {
     let request_id = format!(
-        "yggterm-mock-cli-{}-{iteration}",
+        "yggterm-headless-monitor-{}-{iteration}",
         cfg.scenario.operation_name()
     );
     let meta = YggRequestMeta::interactive(
@@ -544,246 +544,247 @@ fn run_scenario(
 
     maybe_emit_artificial_delay(cfg, &meta)?;
 
-    let result: Result<serde_json::Value> = match cfg.scenario {
-        Scenario::Startup => {
-            ping(endpoint)?;
-            let daemon_status = status(endpoint)?;
-            let (snap, _) = snapshot(endpoint)?;
-            Ok(json!({
-                "server_version": daemon_status.server_version,
-                "server_build_id": daemon_status.server_build_id,
-                "restored_from_persisted_state": daemon_status.restored_from_persisted_state,
-                "restored_stored_sessions": daemon_status.restored_stored_sessions,
-                "restored_live_sessions": daemon_status.restored_live_sessions,
-                "restored_remote_machines": daemon_status.restored_remote_machines,
-                "active_session_path": snap.active_session_path,
-                "active_view_mode": snap.active_view_mode,
-                "remote_machines": snap.remote_machines.len(),
-                "remote_machine_details": remote_machine_details_json(&snap),
-                "remote_machine_health_counts": remote_machine_health_counts_json(&snap),
-                "ssh_targets": snap.ssh_targets.len(),
-                "live_sessions": snap.live_sessions.len(),
-            }))
-        }
-        Scenario::Ping => {
-            ping(endpoint)?;
-            Ok(json!({"pong": true}))
-        }
-        Scenario::Status => {
-            let daemon_status = status(endpoint)?;
-            Ok(serde_json::to_value(daemon_status)?)
-        }
-        Scenario::ServerList => {
-            let home_dir = resolve_yggterm_home()?;
-            Ok(reachable_servers_json(&home_dir))
-        }
-        Scenario::Snapshot => {
-            let (snap, message) = snapshot(endpoint)?;
-            Ok(json!({
-                "message": message,
-                "active_session_path": snap.active_session_path,
-                "active_view_mode": snap.active_view_mode,
-                "remote_machines": snap.remote_machines.len(),
-                "remote_machine_details": remote_machine_details_json(&snap),
-                "remote_machine_health_counts": remote_machine_health_counts_json(&snap),
-                "ssh_targets": snap.ssh_targets.len(),
-                "live_sessions": snap.live_sessions.len(),
-            }))
-        }
-        Scenario::RefreshRemote => {
-            let machine_key = cfg
-                .machine_key
-                .as_deref()
-                .context("--machine-key is required for refresh-remote")?;
-            ping(endpoint)?;
-            let (snap, message) = refresh_remote_machine(endpoint, machine_key)?;
-            let machine = snap
-                .remote_machines
-                .iter()
-                .find(|machine| machine.machine_key == machine_key);
-            Ok(json!({
-                "message": message,
-                "machine_key": machine_key,
-                "health": machine.map(|machine| &machine.health),
-                "session_count": machine.map(|machine| machine.sessions.len()).unwrap_or_default(),
-            }))
-        }
-        Scenario::TerminalFootprint => {
-            ping(endpoint)?;
-            let mut session_paths = Vec::new();
-            for ix in 0..cfg.session_count {
+    let result: Result<serde_json::Value> = (|| -> Result<serde_json::Value> {
+        match cfg.scenario {
+            Scenario::Startup => {
+                ping(endpoint)?;
+                let daemon_status = status(endpoint)?;
+                let (snap, _) = snapshot(endpoint)?;
+                Ok(json!({
+                    "server_version": daemon_status.server_version,
+                    "server_build_id": daemon_status.server_build_id,
+                    "restored_from_persisted_state": daemon_status.restored_from_persisted_state,
+                    "restored_stored_sessions": daemon_status.restored_stored_sessions,
+                    "restored_live_sessions": daemon_status.restored_live_sessions,
+                    "restored_remote_machines": daemon_status.restored_remote_machines,
+                    "active_session_path": snap.active_session_path,
+                    "active_view_mode": snap.active_view_mode,
+                    "remote_machines": snap.remote_machines.len(),
+                    "remote_machine_details": remote_machine_details_json(&snap),
+                    "remote_machine_health_counts": remote_machine_health_counts_json(&snap),
+                    "ssh_targets": snap.ssh_targets.len(),
+                    "live_sessions": snap.live_sessions.len(),
+                }))
+            }
+            Scenario::Ping => {
+                ping(endpoint)?;
+                Ok(json!({"pong": true}))
+            }
+            Scenario::Status => {
+                let daemon_status = status(endpoint)?;
+                Ok(serde_json::to_value(daemon_status)?)
+            }
+            Scenario::ServerList => {
+                let home_dir = resolve_yggterm_home()?;
+                Ok(reachable_servers_json(&home_dir))
+            }
+            Scenario::Snapshot => {
+                let (snap, message) = snapshot(endpoint)?;
+                Ok(json!({
+                    "message": message,
+                    "active_session_path": snap.active_session_path,
+                    "active_view_mode": snap.active_view_mode,
+                    "remote_machines": snap.remote_machines.len(),
+                    "remote_machine_details": remote_machine_details_json(&snap),
+                    "remote_machine_health_counts": remote_machine_health_counts_json(&snap),
+                    "ssh_targets": snap.ssh_targets.len(),
+                    "live_sessions": snap.live_sessions.len(),
+                }))
+            }
+            Scenario::RefreshRemote => {
+                let machine_key = cfg
+                    .machine_key
+                    .as_deref()
+                    .context("--machine-key is required for refresh-remote")?;
+                ping(endpoint)?;
+                let (snap, message) = refresh_remote_machine(endpoint, machine_key)?;
+                let machine = snap
+                    .remote_machines
+                    .iter()
+                    .find(|machine| machine.machine_key == machine_key);
+                Ok(json!({
+                    "message": message,
+                    "machine_key": machine_key,
+                    "health": machine.map(|machine| &machine.health),
+                    "session_count": machine.map(|machine| machine.sessions.len()).unwrap_or_default(),
+                }))
+            }
+            Scenario::TerminalFootprint => {
+                ping(endpoint)?;
+                let mut session_paths = Vec::new();
+                for ix in 0..cfg.session_count {
+                    let (snap, _) = start_local_session_at(
+                        endpoint,
+                        SessionKind::Shell,
+                        cfg.cwd.as_deref(),
+                        Some(&format!("mock footprint {}", ix + 1)),
+                    )?;
+                    let session_path = snap
+                        .active_session_path
+                        .clone()
+                        .context("terminal-footprint scenario did not produce an active session")?;
+                    let _ = request_terminal_launch(endpoint)?;
+                    let _ = terminal_ensure(endpoint, &session_path)?;
+                    let command = format!(
+                        "head -c {bytes} /dev/zero | tr '\\\\000' x; printf '\\\\n'\n",
+                        bytes = cfg.burst_bytes
+                    );
+                    let _ = terminal_write(endpoint, &session_path, &command)?;
+                    std::thread::sleep(Duration::from_millis(80));
+                    let _ = terminal_read(endpoint, &session_path, 0)?;
+                    session_paths.push(session_path);
+                }
+                std::thread::sleep(Duration::from_millis(250));
+                let daemon_status = status(endpoint)?;
+                Ok(json!({
+                    "session_paths": session_paths,
+                    "requested_session_count": cfg.session_count,
+                    "burst_bytes": cfg.burst_bytes,
+                    "terminal_session_count": daemon_status.terminal_session_count,
+                    "terminal_retained_chunks": daemon_status.terminal_retained_chunks,
+                    "terminal_retained_bytes": daemon_status.terminal_retained_bytes,
+                    "terminal_session_buffer_limit_bytes": daemon_status.terminal_session_buffer_limit_bytes,
+                    "terminal_idle_buffer_limit_bytes": daemon_status.terminal_idle_buffer_limit_bytes,
+                }))
+            }
+            Scenario::DisconnectSafe => {
+                ping(endpoint)?;
                 let (snap, _) = start_local_session_at(
                     endpoint,
                     SessionKind::Shell,
                     cfg.cwd.as_deref(),
-                    Some(&format!("mock footprint {}", ix + 1)),
+                    cfg.title_hint.as_deref().or(Some("mock lifetime probe")),
                 )?;
                 let session_path = snap
                     .active_session_path
                     .clone()
-                    .context("terminal-footprint scenario did not produce an active session")?;
-                let _ = request_terminal_launch(endpoint)?;
-                let _ = terminal_ensure(endpoint, &session_path)?;
-                let command = format!(
-                    "head -c {bytes} /dev/zero | tr '\\\\000' x; printf '\\\\n'\n",
-                    bytes = cfg.burst_bytes
-                );
-                let _ = terminal_write(endpoint, &session_path, &command)?;
-                std::thread::sleep(Duration::from_millis(80));
-                let _ = terminal_read(endpoint, &session_path, 0)?;
-                session_paths.push(session_path);
+                    .context("disconnect-safe scenario did not produce an active session")?;
+                let _ = request_terminal_launch(endpoint);
+                let (snap, _) = snapshot(endpoint)?;
+                let retained_after_disconnect = snap
+                    .active_session_path
+                    .as_deref()
+                    .is_some_and(|path| path == session_path)
+                    || snap
+                        .live_sessions
+                        .iter()
+                        .any(|session| session.session_path == session_path);
+                Ok(json!({
+                    "session_path": session_path,
+                    "active_view_mode": snap.active_view_mode,
+                    "live_sessions": snap.live_sessions.len(),
+                    "retained_after_disconnect": retained_after_disconnect,
+                    "note": "client may now exit without shutdown; rerun reconnect-check with --expect-path"
+                }))
             }
-            std::thread::sleep(Duration::from_millis(250));
-            let daemon_status = status(endpoint)?;
-            Ok(json!({
-                "session_paths": session_paths,
-                "requested_session_count": cfg.session_count,
-                "burst_bytes": cfg.burst_bytes,
-                "terminal_session_count": daemon_status.terminal_session_count,
-                "terminal_retained_chunks": daemon_status.terminal_retained_chunks,
-                "terminal_retained_bytes": daemon_status.terminal_retained_bytes,
-                "terminal_session_buffer_limit_bytes": daemon_status.terminal_session_buffer_limit_bytes,
-                "terminal_idle_buffer_limit_bytes": daemon_status.terminal_idle_buffer_limit_bytes,
-            }))
-        }
-        Scenario::DisconnectSafe => {
-            ping(endpoint)?;
-            let (snap, _) = start_local_session_at(
-                endpoint,
-                SessionKind::Shell,
-                cfg.cwd.as_deref(),
-                cfg.title_hint.as_deref().or(Some("mock lifetime probe")),
-            )?;
-            let session_path = snap
-                .active_session_path
-                .clone()
-                .context("disconnect-safe scenario did not produce an active session")?;
-            let _ = request_terminal_launch(endpoint);
-            let (snap, _) = snapshot(endpoint)?;
-            let retained_after_disconnect = snap
-                .active_session_path
-                .as_deref()
-                .is_some_and(|path| path == session_path)
-                || snap
-                    .live_sessions
-                    .iter()
-                    .any(|session| session.session_path == session_path);
-            Ok(json!({
-                "session_path": session_path,
-                "active_view_mode": snap.active_view_mode,
-                "live_sessions": snap.live_sessions.len(),
-                "retained_after_disconnect": retained_after_disconnect,
-                "note": "client may now exit without shutdown; rerun reconnect-check with --expect-path"
-            }))
-        }
-        Scenario::ReconnectCheck => {
-            let expected_path = cfg
-                .expect_path
-                .as_deref()
-                .context("--expect-path is required for reconnect-check")?;
-            ping(endpoint)?;
-            let daemon_status = status(endpoint)?;
-            let (snap, message) = snapshot(endpoint)?;
-            let active_matches = snap
-                .active_session_path
-                .as_deref()
-                .is_some_and(|path| path == expected_path);
-            let listed = snap
-                .live_sessions
-                .iter()
-                .any(|session| session.session_path == expected_path);
-            if !active_matches && !listed {
-                bail!("expected session path not found after reconnect: {expected_path}");
-            }
-            Ok(json!({
-                "message": message,
-                "expected_path": expected_path,
-                "active_matches": active_matches,
-                "listed": listed,
-                "active_session_path": snap.active_session_path,
-                "live_sessions": snap.live_sessions.len(),
-                "restored_from_persisted_state": daemon_status.restored_from_persisted_state,
-                "restored_stored_sessions": daemon_status.restored_stored_sessions,
-                "restored_live_sessions": daemon_status.restored_live_sessions,
-                "restored_remote_machines": daemon_status.restored_remote_machines
-            }))
-        }
-        Scenario::WaitSession => {
-            let expected_path = cfg
-                .expect_path
-                .as_deref()
-                .context("--expect-path is required for wait-session")?;
-            let started = Instant::now();
-            loop {
+            Scenario::ReconnectCheck => {
+                let expected_path = cfg
+                    .expect_path
+                    .as_deref()
+                    .context("--expect-path is required for reconnect-check")?;
+                ping(endpoint)?;
                 let daemon_status = status(endpoint)?;
                 let (snap, message) = snapshot(endpoint)?;
-                let elapsed_ms = started.elapsed().as_millis() as u64;
-                let (active_matches, listed, terminal_keyed) =
-                    session_present(expected_path, &snap, &daemon_status);
-                if active_matches || listed || terminal_keyed {
-                    break Ok(json!({
-                        "message": message,
-                        "expected_path": expected_path,
-                        "active_matches": active_matches,
-                        "listed": listed,
-                        "terminal_keyed": terminal_keyed,
-                        "elapsed_ms": elapsed_ms,
-                        "active_session_path": snap.active_session_path,
-                        "live_sessions": snap.live_sessions.len(),
-                        "terminal_session_count": daemon_status.terminal_session_count,
-                    }));
+                let active_matches = snap
+                    .active_session_path
+                    .as_deref()
+                    .is_some_and(|path| path == expected_path);
+                let listed = snap
+                    .live_sessions
+                    .iter()
+                    .any(|session| session.session_path == expected_path);
+                if !active_matches && !listed {
+                    bail!("expected session path not found after reconnect: {expected_path}");
                 }
-                if elapsed_ms >= cfg.timeout_ms {
-                    bail!(
-                        "expected session path not found after {}ms: {}",
-                        cfg.timeout_ms,
-                        expected_path
-                    );
-                }
-                emit(
-                    cfg,
-                    YggEventEnvelope::new(meta.clone(), YggEventKind::Progress)
-                        .with_elapsed_ms(elapsed_ms)
-                        .with_message("session not loaded yet")
-                        .with_progress(YggProgress {
-                            step: "poll_session".to_string(),
-                            current: None,
-                            total: None,
-                            message: Some(format!("waiting for {expected_path}")),
-                        }),
-                )?;
-                sleep(Duration::from_millis(cfg.poll_ms.max(1)));
+                Ok(json!({
+                    "message": message,
+                    "expected_path": expected_path,
+                    "active_matches": active_matches,
+                    "listed": listed,
+                    "active_session_path": snap.active_session_path,
+                    "live_sessions": snap.live_sessions.len(),
+                    "restored_from_persisted_state": daemon_status.restored_from_persisted_state,
+                    "restored_stored_sessions": daemon_status.restored_stored_sessions,
+                    "restored_live_sessions": daemon_status.restored_live_sessions,
+                    "restored_remote_machines": daemon_status.restored_remote_machines
+                }))
             }
-        }
-        Scenario::LatencyCheck => {
-            let home_dir = resolve_yggterm_home()?;
-            let targets = if cfg.all_servers {
-                reachable_versioned_daemon_statuses(&home_dir)
-                    .into_iter()
-                    .map(|(endpoint, daemon_status)| (endpoint, Some(daemon_status)))
-                    .collect::<Vec<_>>()
-            } else {
-                vec![(endpoint.clone(), None)]
-            };
-            let mut checks = Vec::new();
-            for (target, cached_status) in targets {
-                let ping_start = Instant::now();
-                let ping_error = ping(&target).err().map(|error| error.to_string());
-                let ping_ms = ping_start.elapsed().as_millis() as u64;
+            Scenario::WaitSession => {
+                let expected_path = cfg
+                    .expect_path
+                    .as_deref()
+                    .context("--expect-path is required for wait-session")?;
+                let started = Instant::now();
+                loop {
+                    let daemon_status = status(endpoint)?;
+                    let (snap, message) = snapshot(endpoint)?;
+                    let elapsed_ms = started.elapsed().as_millis() as u64;
+                    let (active_matches, listed, terminal_keyed) =
+                        session_present(expected_path, &snap, &daemon_status);
+                    if active_matches || listed || terminal_keyed {
+                        break Ok(json!({
+                            "message": message,
+                            "expected_path": expected_path,
+                            "active_matches": active_matches,
+                            "listed": listed,
+                            "terminal_keyed": terminal_keyed,
+                            "elapsed_ms": elapsed_ms,
+                            "active_session_path": snap.active_session_path,
+                            "live_sessions": snap.live_sessions.len(),
+                            "terminal_session_count": daemon_status.terminal_session_count,
+                        }));
+                    }
+                    if elapsed_ms >= cfg.timeout_ms {
+                        bail!(
+                            "expected session path not found after {}ms: {}",
+                            cfg.timeout_ms,
+                            expected_path
+                        );
+                    }
+                    emit(
+                        cfg,
+                        YggEventEnvelope::new(meta.clone(), YggEventKind::Progress)
+                            .with_elapsed_ms(elapsed_ms)
+                            .with_message("session not loaded yet")
+                            .with_progress(YggProgress {
+                                step: "poll_session".to_string(),
+                                current: None,
+                                total: None,
+                                message: Some(format!("waiting for {expected_path}")),
+                            }),
+                    )?;
+                    sleep(Duration::from_millis(cfg.poll_ms.max(1)));
+                }
+            }
+            Scenario::LatencyCheck => {
+                let home_dir = resolve_yggterm_home()?;
+                let targets = if cfg.all_servers {
+                    reachable_versioned_daemon_statuses(&home_dir)
+                        .into_iter()
+                        .map(|(endpoint, daemon_status)| (endpoint, Some(daemon_status)))
+                        .collect::<Vec<_>>()
+                } else {
+                    vec![(endpoint.clone(), None)]
+                };
+                let mut checks = Vec::new();
+                for (target, cached_status) in targets {
+                    let ping_start = Instant::now();
+                    let ping_error = ping(&target).err().map(|error| error.to_string());
+                    let ping_ms = ping_start.elapsed().as_millis() as u64;
 
-                let status_start = Instant::now();
-                let status_result = status(&target);
-                let status_ms = status_start.elapsed().as_millis() as u64;
-                let daemon_status = status_result.ok().or(cached_status);
+                    let status_start = Instant::now();
+                    let status_result = status(&target);
+                    let status_ms = status_start.elapsed().as_millis() as u64;
+                    let daemon_status = status_result.ok().or(cached_status);
 
-                let snapshot_start = Instant::now();
-                let snapshot_result = snapshot(&target);
-                let snapshot_ms = snapshot_start.elapsed().as_millis() as u64;
-                let snapshot_error = snapshot_result.err().map(|error| error.to_string());
-                let slow = ping_ms >= cfg.slow_notice_ms
-                    || status_ms >= cfg.slow_notice_ms
-                    || snapshot_ms >= cfg.slow_notice_ms;
-                checks.push(json!({
+                    let snapshot_start = Instant::now();
+                    let snapshot_result = snapshot(&target);
+                    let snapshot_ms = snapshot_start.elapsed().as_millis() as u64;
+                    let snapshot_error = snapshot_result.err().map(|error| error.to_string());
+                    let slow = ping_ms >= cfg.slow_notice_ms
+                        || status_ms >= cfg.slow_notice_ms
+                        || snapshot_ms >= cfg.slow_notice_ms;
+                    checks.push(json!({
                     "endpoint": endpoint_json(&target),
                     "server": daemon_status.as_ref().map(|daemon_status| server_status_json(&target, daemon_status)),
                     "ping_ms": ping_ms,
@@ -793,38 +794,38 @@ fn run_scenario(
                     "snapshot_error": snapshot_error,
                     "slow": slow,
                 }));
+                }
+                Ok(json!({
+                    "server_count": checks.len(),
+                    "slow_notice_ms": cfg.slow_notice_ms,
+                    "checks": checks,
+                }))
             }
-            Ok(json!({
-                "server_count": checks.len(),
-                "slow_notice_ms": cfg.slow_notice_ms,
-                "checks": checks,
-            }))
-        }
-        Scenario::PanicReport => {
-            let home_dir = resolve_yggterm_home()?;
-            let targets = panic_report_targets(&home_dir, endpoint);
-            let mut checks = Vec::new();
-            let mut recommended_next_steps = Vec::new();
-            let expected_path = cfg.expect_path.as_deref();
-            for (target, cached_status) in targets {
-                let ping_start = Instant::now();
-                let ping_error = ping(&target).err().map(|error| error.to_string());
-                let ping_ms = ping_start.elapsed().as_millis() as u64;
+            Scenario::PanicReport => {
+                let home_dir = resolve_yggterm_home()?;
+                let targets = panic_report_targets(&home_dir, endpoint);
+                let mut checks = Vec::new();
+                let mut recommended_next_steps = Vec::new();
+                let expected_path = cfg.expect_path.as_deref();
+                for (target, cached_status) in targets {
+                    let ping_start = Instant::now();
+                    let ping_error = ping(&target).err().map(|error| error.to_string());
+                    let ping_ms = ping_start.elapsed().as_millis() as u64;
 
-                let status_start = Instant::now();
-                let status_result = status(&target);
-                let status_ms = status_start.elapsed().as_millis() as u64;
-                let status_error = status_result.as_ref().err().map(|error| error.to_string());
-                let daemon_status = status_result.ok().or(cached_status);
+                    let status_start = Instant::now();
+                    let status_result = status(&target);
+                    let status_ms = status_start.elapsed().as_millis() as u64;
+                    let status_error = status_result.as_ref().err().map(|error| error.to_string());
+                    let daemon_status = status_result.ok().or(cached_status);
 
-                let snapshot_start = Instant::now();
-                let snapshot_result = snapshot(&target);
-                let snapshot_ms = snapshot_start.elapsed().as_millis() as u64;
-                let snapshot_error = snapshot_result
-                    .as_ref()
-                    .err()
-                    .map(|error| error.to_string());
-                let snapshot_data = snapshot_result.ok().map(|(snap, message)| {
+                    let snapshot_start = Instant::now();
+                    let snapshot_result = snapshot(&target);
+                    let snapshot_ms = snapshot_start.elapsed().as_millis() as u64;
+                    let snapshot_error = snapshot_result
+                        .as_ref()
+                        .err()
+                        .map(|error| error.to_string());
+                    let snapshot_data = snapshot_result.ok().map(|(snap, message)| {
                     let expected_presence = expected_path
                         .zip(daemon_status.as_ref())
                         .map(|(expected_path, daemon_status)| {
@@ -855,31 +856,31 @@ fn run_scenario(
                     })
                 });
 
-                let slow = ping_ms >= cfg.slow_notice_ms
-                    || status_ms >= cfg.slow_notice_ms
-                    || snapshot_ms >= cfg.slow_notice_ms;
-                if ping_error.is_some() || status_error.is_some() {
-                    recommended_next_steps.push(
+                    let slow = ping_ms >= cfg.slow_notice_ms
+                        || status_ms >= cfg.slow_notice_ms
+                        || snapshot_ms >= cfg.slow_notice_ms;
+                    if ping_error.is_some() || status_error.is_some() {
+                        recommended_next_steps.push(
                         "daemon control plane is not reachable; check server-list, active sockets, and hot-restart if appropriate".to_string(),
                     );
-                }
-                if snapshot_error.is_some() {
-                    recommended_next_steps.push(
+                    }
+                    if snapshot_error.is_some() {
+                        recommended_next_steps.push(
                         "snapshot failed; inspect event trace and app-control state before assuming the GUI is at fault".to_string(),
                     );
-                }
-                if slow {
-                    recommended_next_steps.push(format!(
-                        "latency threshold exceeded on {}: ping={}ms status={}ms snapshot={}ms",
-                        serde_json::to_string(&endpoint_json(&target))
-                            .unwrap_or_else(|_| format!("{target:?}")),
-                        ping_ms,
-                        status_ms,
-                        snapshot_ms
-                    ));
-                }
+                    }
+                    if slow {
+                        recommended_next_steps.push(format!(
+                            "latency threshold exceeded on {}: ping={}ms status={}ms snapshot={}ms",
+                            serde_json::to_string(&endpoint_json(&target))
+                                .unwrap_or_else(|_| format!("{target:?}")),
+                            ping_ms,
+                            status_ms,
+                            snapshot_ms
+                        ));
+                    }
 
-                checks.push(json!({
+                    checks.push(json!({
                     "endpoint": endpoint_json(&target),
                     "server": daemon_status.as_ref().map(|daemon_status| server_status_json(&target, daemon_status)),
                     "ping_ms": ping_ms,
@@ -891,107 +892,108 @@ fn run_scenario(
                     "snapshot": snapshot_data,
                     "slow": slow,
                 }));
+                }
+                recommended_next_steps.sort();
+                recommended_next_steps.dedup();
+                Ok(json!({
+                    "home_dir": home_dir.display().to_string(),
+                    "server_count": checks.len(),
+                    "slow_notice_ms": cfg.slow_notice_ms,
+                    "expected_path": expected_path,
+                    "checks": checks,
+                    "recommended_next_steps": recommended_next_steps,
+                }))
             }
-            recommended_next_steps.sort();
-            recommended_next_steps.dedup();
-            Ok(json!({
-                "home_dir": home_dir.display().to_string(),
-                "server_count": checks.len(),
-                "slow_notice_ms": cfg.slow_notice_ms,
-                "expected_path": expected_path,
-                "checks": checks,
-                "recommended_next_steps": recommended_next_steps,
-            }))
-        }
-        Scenario::HotRestart => {
-            let home_dir = resolve_yggterm_home()?;
-            let daemon_exe = resolve_hot_restart_daemon_exe(cfg)?;
-            let targets = if cfg.all_servers {
-                reachable_versioned_daemon_statuses(&home_dir)
-                    .into_iter()
-                    .collect::<Vec<_>>()
-            } else {
-                vec![(endpoint.clone(), status(endpoint)?)]
-            };
-            let mut fallback_used = false;
-            let mut target_results = Vec::new();
-            for (target, daemon_status) in &targets {
-                let expected_version = cfg
-                    .expected_version
-                    .as_deref()
-                    .or(Some(env!("CARGO_PKG_VERSION")));
-                let hot_result = hot_restart(
-                    target,
-                    &daemon_exe,
-                    expected_version,
-                    cfg.expected_build_id,
-                    cfg.reason
+            Scenario::HotRestart => {
+                let home_dir = resolve_yggterm_home()?;
+                let daemon_exe = resolve_hot_restart_daemon_exe(cfg)?;
+                let targets = if cfg.all_servers {
+                    reachable_versioned_daemon_statuses(&home_dir)
+                        .into_iter()
+                        .collect::<Vec<_>>()
+                } else {
+                    vec![(endpoint.clone(), status(endpoint)?)]
+                };
+                let mut fallback_used = false;
+                let mut target_results = Vec::new();
+                for (target, daemon_status) in &targets {
+                    let expected_version = cfg
+                        .expected_version
                         .as_deref()
-                        .or(Some("yggterm-mock-cli hot restart")),
-                );
-                match hot_result {
-                    Ok(message) => target_results.push(json!({
-                        "endpoint": endpoint_json(target),
-                        "server": server_status_json(target, daemon_status),
-                        "native_hot_restart": true,
-                        "message": message,
-                    })),
-                    Err(error) => {
-                        fallback_used = true;
-                        let prepare = prepare_update_restart(target)
+                        .or(Some(env!("CARGO_PKG_VERSION")));
+                    let hot_result = hot_restart(
+                        target,
+                        &daemon_exe,
+                        expected_version,
+                        cfg.expected_build_id,
+                        cfg.reason
+                            .as_deref()
+                            .or(Some("yggterm-headless monitor hot restart")),
+                    );
+                    match hot_result {
+                        Ok(message) => target_results.push(json!({
+                            "endpoint": endpoint_json(target),
+                            "server": server_status_json(target, daemon_status),
+                            "native_hot_restart": true,
+                            "message": message,
+                        })),
+                        Err(error) => {
+                            fallback_used = true;
+                            let prepare = prepare_update_restart(target)
                             .map(|message| json!({"ok": true, "message": message}))
                             .unwrap_or_else(|prepare_error| {
                                 json!({"ok": false, "error": prepare_error.to_string()})
                             });
-                        let shutdown_result = shutdown(target)
+                            let shutdown_result = shutdown(target)
                             .map(|message| json!({"ok": true, "message": message}))
                             .unwrap_or_else(|shutdown_error| {
                                 json!({"ok": false, "error": shutdown_error.to_string()})
                             });
-                        target_results.push(json!({
-                            "endpoint": endpoint_json(target),
-                            "server": server_status_json(target, daemon_status),
-                            "native_hot_restart": false,
-                            "hot_restart_error": error.to_string(),
-                            "prepare_update_restart": prepare,
-                            "shutdown": shutdown_result,
-                        }));
+                            target_results.push(json!({
+                                "endpoint": endpoint_json(target),
+                                "server": server_status_json(target, daemon_status),
+                                "native_hot_restart": false,
+                                "hot_restart_error": error.to_string(),
+                                "prepare_update_restart": prepare,
+                                "shutdown": shutdown_result,
+                            }));
+                        }
                     }
                 }
+                if fallback_used || targets.is_empty() {
+                    ensure_local_daemon_running(endpoint)?;
+                }
+                let ready = wait_for_daemon_status(endpoint, cfg)?;
+                Ok(json!({
+                    "daemon_executable": daemon_exe.display().to_string(),
+                    "target_count": targets.len(),
+                    "fallback_used": fallback_used,
+                    "targets": target_results,
+                    "ready": ready,
+                }))
             }
-            if fallback_used || targets.is_empty() {
+            Scenario::ManagedCliRefresh => {
                 ensure_local_daemon_running(endpoint)?;
+                let message =
+                    refresh_managed_cli(endpoint, cfg.machine_key.as_deref(), cfg.background)?;
+                let daemon_status = status(endpoint).ok();
+                Ok(json!({
+                    "message": message,
+                    "machine_key": cfg.machine_key.clone(),
+                    "background": cfg.background,
+                    "server": daemon_status.as_ref().map(|daemon_status| server_status_json(endpoint, daemon_status)),
+                }))
             }
-            let ready = wait_for_daemon_status(endpoint, cfg)?;
-            Ok(json!({
-                "daemon_executable": daemon_exe.display().to_string(),
-                "target_count": targets.len(),
-                "fallback_used": fallback_used,
-                "targets": target_results,
-                "ready": ready,
-            }))
+            Scenario::GracefulShutdown => {
+                let message = shutdown(endpoint)?;
+                let ping_after = ping(endpoint).is_ok();
+                Ok(json!({
+                    "message": message,
+                    "daemon_reachable_after": ping_after
+                }))
+            }
         }
-        Scenario::ManagedCliRefresh => {
-            ensure_local_daemon_running(endpoint)?;
-            let message =
-                refresh_managed_cli(endpoint, cfg.machine_key.as_deref(), cfg.background)?;
-            let daemon_status = status(endpoint).ok();
-            Ok(json!({
-                "message": message,
-                "machine_key": cfg.machine_key.clone(),
-                "background": cfg.background,
-                "server": daemon_status.as_ref().map(|daemon_status| server_status_json(endpoint, daemon_status)),
-            }))
-        }
-        Scenario::GracefulShutdown => {
-            let message = shutdown(endpoint)?;
-            let ping_after = ping(endpoint).is_ok();
-            Ok(json!({
-                "message": message,
-                "daemon_reachable_after": ping_after
-            }))
-        }
-    };
+    })();
 
     let elapsed_ms = start.elapsed().as_millis() as u64;
     if elapsed_ms >= cfg.slow_notice_ms {

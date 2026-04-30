@@ -14,10 +14,6 @@ path = "src/main.rs"
 name = "yggterm-headless"
 path = "src/bin/yggterm-headless.rs"
 
-[[bin]]
-name = "yggterm-mock-cli"
-path = "src/bin/yggterm-mock-cli.rs"
-
 [features]
 default = []
 ghostty-ffi = ["yggterm-server/ghostty-ffi"]

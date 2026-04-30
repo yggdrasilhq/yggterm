@@ -15,7 +15,7 @@ def parse_args() -> argparse.Namespace:
         description="Spawn 23 orphan daemons and verify a fresh daemon reaps them."
     )
     parser.add_argument("--bin", default="./target/debug/yggterm")
-    parser.add_argument("--out-dir", default="/tmp/yggterm-mock-cli-daemon-reap-23")
+    parser.add_argument("--out-dir", default="/tmp/yggterm-headless-daemon-reap-23")
     parser.add_argument("--orphan-count", type=int, default=23)
     parser.add_argument("--reap-after-ms", type=int, default=1000)
     parser.add_argument("--age-wait-ms", type=int, default=1600)

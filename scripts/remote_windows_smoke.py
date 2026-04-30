@@ -88,7 +88,7 @@ function Resolve-YggtermBinary {
 
   $root = Join-Path $HOME $RemoteDirName
   $staged = Get-ChildItem -Path $root -Filter "yggterm*.exe" -File -ErrorAction SilentlyContinue |
-    Where-Object { $_.Name -notlike "yggterm-headless*" -and $_.Name -notlike "yggterm-mock-cli*" } |
+    Where-Object { $_.Name -notlike "yggterm-headless*" } |
     Sort-Object Name |
     Select-Object -Last 1
   if ($staged) {
@@ -304,10 +304,8 @@ def discover_windows_companion_binaries(artifact: Path) -> list[Path]:
     if name.startswith("yggterm-windows-") and name.endswith(".exe"):
         suffix = name[len("yggterm-windows-") :]
         add_candidate(artifact.with_name(f"yggterm-headless-windows-{suffix}"))
-        add_candidate(artifact.with_name(f"yggterm-mock-cli-windows-{suffix}"))
     elif name == "yggterm.exe":
         add_candidate(artifact.with_name("yggterm-headless.exe"))
-        add_candidate(artifact.with_name("yggterm-mock-cli.exe"))
 
     return companions
 
@@ -383,17 +381,14 @@ def install_staged_windows_artifact(
         "New-Item -ItemType Directory -Force -Path $installRoot, (Split-Path -Parent $versionDir), $versionDir | Out-Null",
         "$installedExe = Join-Path $versionDir 'yggterm.exe'",
         "$installedHeadless = Join-Path $versionDir 'yggterm-headless.exe'",
-        "$installedMock = Join-Path $versionDir 'yggterm-mock-cli.exe'",
         "$installedLoader = Join-Path $versionDir 'WebView2Loader.dll'",
         "$launcher = Join-Path $installRoot 'Yggterm.vbs'",
         "$stagedHeadless = Get-ChildItem -Path $RemoteRoot -Filter 'yggterm-headless*.exe' -File -ErrorAction SilentlyContinue | Sort-Object Name | Select-Object -Last 1",
-        "$stagedMock = Get-ChildItem -Path $RemoteRoot -Filter 'yggterm-mock-cli*.exe' -File -ErrorAction SilentlyContinue | Sort-Object Name | Select-Object -Last 1",
         "$stagedLoader = Get-ChildItem -Path $RemoteRoot -Filter 'WebView2Loader*.dll' -File -ErrorAction SilentlyContinue | Sort-Object Name | Select-Object -Last 1",
         "if (-not $stagedHeadless) { throw 'staged artifact is missing yggterm-headless.exe' }",
         "if (-not $stagedLoader) { throw 'staged artifact is missing WebView2Loader.dll' }",
         "Copy-Item $StagedBin $installedExe -Force",
         "Copy-Item $stagedHeadless.FullName $installedHeadless -Force",
-        "if ($stagedMock) { Copy-Item $stagedMock.FullName $installedMock -Force }",
         "Copy-Item $stagedLoader.FullName $installedLoader -Force",
         "$statePayload = @{ channel = 'direct'; repo = 'yggdrasilhq/yggterm'; asset_label = $AssetLabel; active_version = $version; active_executable = $installedExe; icon_revision = $version }",
         "$state = $statePayload | ConvertTo-Json -Depth 6",

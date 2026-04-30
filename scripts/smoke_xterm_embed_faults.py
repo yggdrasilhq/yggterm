@@ -14524,7 +14524,11 @@ def assert_hidden_cursor_tui(pid: int, session: str, out_dir: Path) -> dict:
             and bool(int(host.get("low_power_tui_frame_count") or 0))
             and ("hc" in text_sample or "hc" in cursor_line_text or "hc" in low_power_text)
         )
-        if observed_xterm_alt or observed_low_power_tui:
+        if observed_low_power_tui:
+            raise AssertionError(
+                f"active visible TUI was diverted into the low-power text overlay: {low_power_text!r}"
+            )
+        if observed_xterm_alt:
             break
         time.sleep(0.15)
     shot_path = out_dir / "hidden-cursor-tui.png"
@@ -14539,6 +14543,8 @@ def assert_hidden_cursor_tui(pid: int, session: str, out_dir: Path) -> dict:
         host.get("low_power_tui_overlay_active") is True
         and int(host.get("low_power_tui_frame_count") or 0) >= 1
     )
+    if observed_low_power_tui:
+        raise AssertionError(f"active hidden-cursor TUI used low-power overlay instead of xterm: {host!r}")
     if observed_live:
         if cursor_sample_is_visibly_active(host):
             raise AssertionError(
@@ -14555,10 +14561,9 @@ def assert_hidden_cursor_tui(pid: int, session: str, out_dir: Path) -> dict:
     if restored_host.get("xterm_buffer_kind") != "normal":
         raise AssertionError(f"hidden-cursor fixture did not restore the normal buffer: {restored_host!r}")
     restored_low_power_frame_count = int(restored_host.get("low_power_tui_frame_count") or 0)
-    low_power_tui_contract = observed_low_power_tui and restored_low_power_frame_count >= 1
-    if not low_power_tui_contract and int(restored_host.get("xterm_buffer_transition_count") or 0) < 2:
+    if int(restored_host.get("xterm_buffer_transition_count") or 0) < 2:
         raise AssertionError(f"expected alternate-buffer transitions, saw {restored_host!r}")
-    if not low_power_tui_contract and int(restored_host.get("xterm_cursor_hidden_toggle_count") or 0) < 2:
+    if int(restored_host.get("xterm_cursor_hidden_toggle_count") or 0) < 2:
         raise AssertionError(f"expected hidden-cursor toggles, saw {restored_host!r}")
     assert_cursor_alignment(restored_state)
     return {
