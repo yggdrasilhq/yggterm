@@ -19983,6 +19983,12 @@ async fn capture_dom_debug_snapshot_basic_for(active_session_path: Option<&str>)
                     const screenRect = screen ? screen.getBoundingClientRect() : null;
                     const viewportRect = viewport ? viewport.getBoundingClientRect() : null;
                     const hostRect = host.getBoundingClientRect();
+                    const hostPaddingLeft = Number.parseFloat(hostStyle.paddingLeft || '0') || 0;
+                    const hostPaddingRight = Number.parseFloat(hostStyle.paddingRight || '0') || 0;
+                    const hostPaddingTop = Number.parseFloat(hostStyle.paddingTop || '0') || 0;
+                    const hostPaddingBottom = Number.parseFloat(hostStyle.paddingBottom || '0') || 0;
+                    const hostContentWidth = Math.max(0, Number(hostRect.width || 0) - hostPaddingLeft - hostPaddingRight);
+                    const hostContentHeight = Math.max(0, Number(hostRect.height || 0) - hostPaddingTop - hostPaddingBottom);
                     const xtermDimensions = term && term._core && term._core._renderService && term._core._renderService.dimensions
                         ? term._core._renderService.dimensions
                         : null;
@@ -19993,6 +19999,42 @@ async fn capture_dom_debug_snapshot_basic_for(active_session_path: Option<&str>)
                     const xtermCellHeight = xtermCssDimensions && xtermCssDimensions.cell
                         ? Number(xtermCssDimensions.cell.height || 0)
                         : 0;
+                    const xtermCssCanvas = xtermCssDimensions && xtermCssDimensions.canvas
+                        ? xtermCssDimensions.canvas
+                        : null;
+                    const xtermDimensionSummary = xtermDimensions ? {
+                        css_cell_width: Number(xtermCellWidth.toFixed(3)),
+                        css_cell_height: Number(xtermCellHeight.toFixed(3)),
+                        css_canvas_width: Number(Number(xtermCssCanvas ? xtermCssCanvas.width || 0 : 0).toFixed(3)),
+                        css_canvas_height: Number(Number(xtermCssCanvas ? xtermCssCanvas.height || 0 : 0).toFixed(3)),
+                    } : null;
+                    const canvasLayers = Array.from(host.querySelectorAll('canvas')).slice(0, 8).map((canvas, index) => {
+                        const rect = canvas.getBoundingClientRect();
+                        return {
+                            index,
+                            width: Number(canvas.width || 0),
+                            height: Number(canvas.height || 0),
+                            rect: {
+                                left: Number(rect.left.toFixed(2)),
+                                top: Number(rect.top.toFixed(2)),
+                                width: Number(rect.width.toFixed(2)),
+                                height: Number(rect.height.toFixed(2)),
+                            },
+                        };
+                    });
+                    const fitCellHeight = Math.max(
+                        1,
+                        Math.ceil(
+                            xtermCellHeight
+                            || Number((cursorRowRect && cursorRowRect.height) || 0)
+                            || (Number(term && term.options ? term.options.fontSize || 0 : 0) * Number(term && term.options ? term.options.lineHeight || 1 : 1))
+                            || 18
+                        )
+                    );
+                    const fitRows = Math.max(0, Number(term && term.rows ? term.rows : 0));
+                    const fitRequiredHeight = fitRows * fitCellHeight;
+                    const fitAvailableHeight = Math.max(0, hostContentHeight - 2);
+                    const fitOverflowPx = Math.max(0, fitRequiredHeight - fitAvailableHeight);
                     const cursorBaseRect = rowsRect || screenRect || viewportRect || hostRect;
                     const expectedCursorRect = (
                         cursorBaseRect
@@ -20019,6 +20061,9 @@ async fn capture_dom_debug_snapshot_basic_for(active_session_path: Option<&str>)
                             height: Number(Math.max(8, computedCellHeight).toFixed(2)),
                         };
                     })() : null;
+                    const cursorBottomOverflowPx = expectedCursorRect && hostRect
+                        ? Math.max(0, (expectedCursorRect.top + expectedCursorRect.height) - hostRect.bottom)
+                        : 0;
                     const xtermBufferKind = (() => {
                         try {
                             if (!term || !term.buffer) {
@@ -20061,13 +20106,20 @@ async fn capture_dom_debug_snapshot_basic_for(active_session_path: Option<&str>)
                         viewport_present: Boolean(viewport),
                         rows_present: Boolean(rowsLayer),
                         canvas_count: canvasCount,
+                        canvas_layers: canvasLayers,
                         text_sample: terminalText.slice(0, 240),
                         text_tail: terminalText.slice(-8192),
                         dom_text_sample: hostText.slice(0, 240),
                         buffer_text_sample: bufferText.slice(0, 240),
                         host_rect: rectSummary(host),
-                        host_content_width: rectSummary(host)?.width || null,
-                        host_content_height: rectSummary(host)?.height || null,
+                        host_client_width: Number(host.clientWidth || 0),
+                        host_client_height: Number(host.clientHeight || 0),
+                        host_padding_left_px: Number(hostPaddingLeft.toFixed(2)),
+                        host_padding_right_px: Number(hostPaddingRight.toFixed(2)),
+                        host_padding_top_px: Number(hostPaddingTop.toFixed(2)),
+                        host_padding_bottom_px: Number(hostPaddingBottom.toFixed(2)),
+                        host_content_width: Number(hostContentWidth.toFixed(2)),
+                        host_content_height: Number(hostContentHeight.toFixed(2)),
                         background_color: String(hostStyle.backgroundColor || ''),
                         foreground_color: String(hostStyle.color || ''),
                         screen_rect: rectSummary(screen),
@@ -20089,6 +20141,7 @@ async fn capture_dom_debug_snapshot_basic_for(active_session_path: Option<&str>)
                         xterm_font_weight_bold: term ? String(term.options.fontWeightBold || '') : null,
                         xterm_line_height: term ? String(term.options.lineHeight || '') : null,
                         xterm_minimum_contrast_ratio: term ? String(term.options.minimumContrastRatio || '') : null,
+                        xterm_dimensions: xtermDimensionSummary,
                         xterm_theme_background: term && term.options.theme ? String(term.options.theme.background || '') : null,
                         xterm_theme_foreground: term && term.options.theme ? String(term.options.theme.foreground || '') : null,
                         low_contrast_span_count: 0,
@@ -20131,6 +20184,19 @@ async fn capture_dom_debug_snapshot_basic_for(active_session_path: Option<&str>)
                             height: Number(cursorRowRect.height.toFixed(2)),
                         } : null),
                         cursor_expected_rect: expectedCursorRect,
+                        cursor_bottom_overflow_px: Number(cursorBottomOverflowPx.toFixed(2)),
+                        cursor_x: Number.isFinite(cursorX) ? Number(cursorX) : null,
+                        cursor_y: Number.isFinite(cursorY) ? Number(cursorY) : null,
+                        viewport_y: activeBuffer ? Number(activeBuffer.viewportY || 0) : null,
+                        base_y: activeBuffer ? Number(activeBuffer.baseY || 0) : null,
+                        cols: term ? Number(term.cols || 0) : null,
+                        rows: term ? Number(term.rows || 0) : null,
+                        blank_rows_below_cursor: term && Number.isFinite(cursorY)
+                            ? Math.max(0, Number(term.rows || 0) - (Number(cursorY) + 1))
+                            : null,
+                        fit_required_height_px: Number(fitRequiredHeight.toFixed(2)),
+                        fit_available_height_px: Number(fitAvailableHeight.toFixed(2)),
+                        fit_overflow_px: Number(fitOverflowPx.toFixed(2)),
                         cursor_visible_row_index: Number.isFinite(visibleCursorRowIndex)
                             ? Number(visibleCursorRowIndex)
                             : null,
@@ -20146,6 +20212,22 @@ async fn capture_dom_debug_snapshot_basic_for(active_session_path: Option<&str>)
                         inactive_tui_frame_drop_count: mountedHost ? Number(mountedHost.inactiveTuiFrameDropCount || 0) : 0,
                         inactive_tui_last_tail: mountedHost ? String(mountedHost.inactiveTuiLastTail || '') : '',
                         input_enabled: mountedHost ? Boolean(mountedHost.inputEnabled) : false,
+                        mounted_entry_present: Boolean(mountedHost),
+                        mounted_entry_host_same: Boolean(mountedHost && mountedHost.host === host),
+                        mounted_entry_host_connected: Boolean(mountedHost && mountedHost.host && mountedHost.host.isConnected),
+                        scrollback_locked: mountedHost ? Boolean(mountedHost.scrollbackLocked) : false,
+                        scroll_event_count: mountedHost ? Number(mountedHost.scrollEventCount || 0) : 0,
+                        wheel_event_count: mountedHost ? Number(mountedHost.wheelEventCount || 0) : 0,
+                        data_event_count: mountedHost ? Number(mountedHost.dataEventCount || 0) : 0,
+                        write_command_count: mountedHost ? Number(mountedHost.writeCommandCount || 0) : 0,
+                        write_callback_count: mountedHost ? Number(mountedHost.writeCallbackCount || 0) : 0,
+                        write_parsed_count: mountedHost ? Number(mountedHost.writeParsedCount || 0) : 0,
+                        write_bridge_flush_count: mountedHost ? Number(mountedHost.writeBridgeFlushCount || 0) : 0,
+                        write_bridge_in_flight: mountedHost ? Boolean(mountedHost.writeBridgeInFlight) : false,
+                        write_bridge_pending_chars: mountedHost ? String(mountedHost.writeBridgePendingData || '').length : 0,
+                        retained_write_paint_repair_count: mountedHost ? Number(mountedHost.retainedWritePaintRepairCount || 0) : 0,
+                        last_retained_write_paint_repair_reason: mountedHost ? String(mountedHost.lastRetainedWritePaintRepairReason || '') : '',
+                        last_fit_guard: mountedHost && mountedHost.lastFitGuard ? mountedHost.lastFitGuard : null,
                         xterm_renderer_mode: canvasCount > 0 ? 'canvas' : 'dom',
                         helper_textarea_focused: Boolean(helperTextarea && helperTextarea === activeElement),
                         host_has_active_element: Boolean(activeElement && host.contains(activeElement)),
@@ -21112,15 +21194,96 @@ async fn probe_terminal_viewport_scroll_for(session_path: &str, lines: i32) -> V
                         await new Promise((resolve) => setTimeout(resolve, delayMs));
                     }}
                 }};
-                const snapshot = () => {{
-                    const active = entry.term && entry.term.buffer ? entry.term.buffer.active : null;
-                    const viewportElement = host.querySelector('.xterm-viewport');
-                    const modes = entry.term && entry.term.modes ? entry.term.modes : null;
-                    return {{
-                        viewport_y: active ? Number(active.viewportY || 0) : null,
-                        base_y: active ? Number(active.baseY || 0) : null,
-                        viewport_scroll_top: viewportElement ? Number(viewportElement.scrollTop || 0) : null,
-                        input_enabled: Boolean(entry.inputEnabled),
+	                const snapshot = () => {{
+	                    const active = entry.term && entry.term.buffer ? entry.term.buffer.active : null;
+	                    const viewportElement = host.querySelector('.xterm-viewport');
+	                    const screenElement = host.querySelector('.xterm-screen');
+	                    const modes = entry.term && entry.term.modes ? entry.term.modes : null;
+	                    const hostRect = host.getBoundingClientRect();
+	                    const viewportRect = viewportElement ? viewportElement.getBoundingClientRect() : null;
+	                    const screenRect = screenElement ? screenElement.getBoundingClientRect() : null;
+	                    const cursorX = active ? Number(active.cursorX || 0) : null;
+	                    const cursorY = active ? Number(active.cursorY || 0) : null;
+	                    const cursorLineIndex = active && Number.isFinite(cursorY)
+	                        ? Number(active.baseY || 0) + Number(cursorY || 0)
+	                        : null;
+	                    const visibleCursorRowIndex = (
+	                        Number.isFinite(cursorLineIndex)
+	                        && active
+	                        && Number.isFinite(Number(active.viewportY || 0))
+	                    ) ? Number(cursorLineIndex) - Number(active.viewportY || 0) : cursorY;
+	                    const dimensions = entry.term && entry.term._core && entry.term._core._renderService
+	                        ? entry.term._core._renderService.dimensions
+	                        : null;
+	                    const cssCell = dimensions && dimensions.css && dimensions.css.cell
+	                        ? dimensions.css.cell
+	                        : null;
+	                    const cellWidth = cssCell ? Number(cssCell.width || 0) : 0;
+	                    const cellHeight = cssCell ? Number(cssCell.height || 0) : 0;
+	                    const fallbackCellHeight = Math.max(
+	                        1,
+	                        Math.ceil(
+	                            cellHeight
+	                            || (Number(entry.term && entry.term.options ? entry.term.options.fontSize || 0 : 0)
+	                                * Number(entry.term && entry.term.options ? entry.term.options.lineHeight || 1 : 1))
+	                            || 18
+	                        )
+	                    );
+	                    const cursorBaseRect = screenRect || viewportRect || hostRect;
+	                    const cursorExpectedRect = (
+	                        cursorBaseRect
+	                        && Number.isFinite(cursorX)
+	                        && Number.isFinite(visibleCursorRowIndex)
+	                        && Number(visibleCursorRowIndex) >= 0
+	                    ) ? {{
+	                        left: Number((cursorBaseRect.left + (Number(cursorX) * (cellWidth || (cursorBaseRect.width / Math.max(1, Number(entry.term && entry.term.cols ? entry.term.cols : 1)))))).toFixed(2)),
+	                        top: Number((cursorBaseRect.top + (Number(visibleCursorRowIndex) * fallbackCellHeight)).toFixed(2)),
+	                        width: Number(Math.max(2, cellWidth || 8).toFixed(2)),
+	                        height: Number(Math.max(8, fallbackCellHeight).toFixed(2)),
+	                    }} : null;
+	                    const cursorBottomOverflowPx = cursorExpectedRect
+	                        ? Math.max(0, (cursorExpectedRect.top + cursorExpectedRect.height) - hostRect.bottom)
+	                        : 0;
+	                    const fitRequiredHeight = Number(entry.term && entry.term.rows ? entry.term.rows || 0 : 0) * fallbackCellHeight;
+	                    const fitAvailableHeight = Math.max(0, Number(hostRect.height || 0) - 2);
+	                    return {{
+	                        viewport_y: active ? Number(active.viewportY || 0) : null,
+	                        base_y: active ? Number(active.baseY || 0) : null,
+	                        cursor_x: Number.isFinite(cursorX) ? Number(cursorX) : null,
+	                        cursor_y: Number.isFinite(cursorY) ? Number(cursorY) : null,
+	                        cursor_visible_row_index: Number.isFinite(visibleCursorRowIndex) ? Number(visibleCursorRowIndex) : null,
+	                        cols: entry.term ? Number(entry.term.cols || 0) : null,
+	                        rows: entry.term ? Number(entry.term.rows || 0) : null,
+	                        cell_height_px: Number((cellHeight || fallbackCellHeight).toFixed(3)),
+	                        raster_cell_height_px: fallbackCellHeight,
+	                        host_rect: {{
+	                            left: Number(hostRect.left.toFixed(2)),
+	                            top: Number(hostRect.top.toFixed(2)),
+	                            width: Number(hostRect.width.toFixed(2)),
+	                            height: Number(hostRect.height.toFixed(2)),
+	                            bottom: Number(hostRect.bottom.toFixed(2)),
+	                        }},
+	                        screen_rect: screenRect ? {{
+	                            left: Number(screenRect.left.toFixed(2)),
+	                            top: Number(screenRect.top.toFixed(2)),
+	                            width: Number(screenRect.width.toFixed(2)),
+	                            height: Number(screenRect.height.toFixed(2)),
+	                            bottom: Number(screenRect.bottom.toFixed(2)),
+	                        }} : null,
+	                        viewport_rect: viewportRect ? {{
+	                            left: Number(viewportRect.left.toFixed(2)),
+	                            top: Number(viewportRect.top.toFixed(2)),
+	                            width: Number(viewportRect.width.toFixed(2)),
+	                            height: Number(viewportRect.height.toFixed(2)),
+	                            bottom: Number(viewportRect.bottom.toFixed(2)),
+	                        }} : null,
+	                        cursor_expected_rect: cursorExpectedRect,
+	                        cursor_bottom_overflow_px: Number(cursorBottomOverflowPx.toFixed(2)),
+	                        fit_required_height_px: Number(fitRequiredHeight.toFixed(2)),
+	                        fit_available_height_px: Number(fitAvailableHeight.toFixed(2)),
+	                        fit_overflow_px: Number(Math.max(0, fitRequiredHeight - fitAvailableHeight).toFixed(2)),
+	                        viewport_scroll_top: viewportElement ? Number(viewportElement.scrollTop || 0) : null,
+	                        input_enabled: Boolean(entry.inputEnabled),
                         helper_textarea_focused: Boolean(helperTextarea && document.activeElement === helperTextarea),
                         host_has_active_element: Boolean(host && host.contains(document.activeElement)),
                         xterm_buffer_kind: entry.term && entry.term.buffer
@@ -36868,6 +37031,114 @@ fn terminal_eval_script_with_canvas_renderer(
                 }}
             }} catch (_error) {{}}
         }};
+        const terminalHostContentMetrics = () => {{
+            try {{
+                const rect = host.getBoundingClientRect();
+                const style = window.getComputedStyle(host);
+                const paddingLeft = Number.parseFloat(style.paddingLeft || '0') || 0;
+                const paddingRight = Number.parseFloat(style.paddingRight || '0') || 0;
+                const paddingTop = Number.parseFloat(style.paddingTop || '0') || 0;
+                const paddingBottom = Number.parseFloat(style.paddingBottom || '0') || 0;
+                return {{
+                    width: Math.max(0, Number(rect.width || 0) - paddingLeft - paddingRight),
+                    height: Math.max(0, Number(rect.height || 0) - paddingTop - paddingBottom),
+                    padding_top: paddingTop,
+                    padding_bottom: paddingBottom,
+                }};
+            }} catch (_error) {{
+                const metrics = hostMetrics();
+                return {{ width: metrics.width, height: metrics.height, padding_top: 0, padding_bottom: 0 }};
+            }}
+        }};
+        const terminalCssCellHeight = () => {{
+            try {{
+                const core = term && term._core ? term._core : null;
+                const renderService = core
+                    ? (core._renderService || core.renderService || null)
+                    : null;
+                const dimensions = renderService && renderService.dimensions
+                    ? renderService.dimensions
+                    : null;
+                const cssCell = dimensions && dimensions.css && dimensions.css.cell
+                    ? dimensions.css.cell
+                    : null;
+                const measured = cssCell ? Number(cssCell.height || 0) : 0;
+                if (Number.isFinite(measured) && measured > 0) {{
+                    return measured;
+                }}
+            }} catch (_error) {{}}
+            try {{
+                const fontSize = term && term.options ? Number(term.options.fontSize || 0) : 0;
+                const lineHeight = term && term.options ? Number(term.options.lineHeight || 1) : 1;
+                const fallback = fontSize * lineHeight;
+                if (Number.isFinite(fallback) && fallback > 0) {{
+                    return fallback;
+                }}
+            }} catch (_error) {{}}
+            return 18;
+        }};
+        const terminalFitDiagnostics = () => {{
+            const content = terminalHostContentMetrics();
+            const rows = Math.max(0, Number(term && term.rows ? term.rows : 0));
+            const cols = Math.max(0, Number(term && term.cols ? term.cols : 0));
+            const cellHeight = terminalCssCellHeight();
+            const rasterCellHeight = Math.max(1, Math.ceil(cellHeight));
+            const bottomGuardPx = 2;
+            const availableHeight = Math.max(0, Number(content.height || 0) - bottomGuardPx);
+            const requiredHeight = rows * rasterCellHeight;
+            return {{
+                cols,
+                rows,
+                cell_height_px: Number(cellHeight.toFixed(3)),
+                raster_cell_height_px: rasterCellHeight,
+                available_height_px: Number(availableHeight.toFixed(2)),
+                required_height_px: Number(requiredHeight.toFixed(2)),
+                overflow_px: Number(Math.max(0, requiredHeight - availableHeight).toFixed(2)),
+                bottom_guard_px: bottomGuardPx,
+            }};
+        }};
+        const applyTerminalRowFitGuard = (reason) => {{
+            try {{
+                const diagnostics = terminalFitDiagnostics();
+                if (
+                    diagnostics.rows <= 1
+                    || diagnostics.cols <= 0
+                    || diagnostics.available_height_px < 120
+                    || diagnostics.overflow_px <= 0
+                ) {{
+                    return false;
+                }}
+                const safeRows = Math.max(
+                    1,
+                    Math.min(
+                        diagnostics.rows - 1,
+                        Math.floor(diagnostics.available_height_px / diagnostics.raster_cell_height_px)
+                    )
+                );
+                if (safeRows >= diagnostics.rows) {{
+                    return false;
+                }}
+                term.resize(diagnostics.cols, safeRows);
+                if (window.__yggtermXtermHosts && window.__yggtermXtermHosts[hostId]) {{
+                    window.__yggtermXtermHosts[hostId].lastFitGuard = {{
+                        reason,
+                        before_rows: diagnostics.rows,
+                        after_rows: safeRows,
+                        overflow_px: diagnostics.overflow_px,
+                        available_height_px: diagnostics.available_height_px,
+                        raster_cell_height_px: diagnostics.raster_cell_height_px,
+                        at_ms: Date.now(),
+                    }};
+                }}
+                dioxus.send({{
+                    kind: "debug",
+                    message: `row_fit_guard host=${{hostId}} reason=${{reason}} rows=${{diagnostics.rows}}->${{safeRows}} overflow=${{diagnostics.overflow_px}} cell=${{diagnostics.raster_cell_height_px}} avail=${{diagnostics.available_height_px}}`
+                }});
+                return true;
+            }} catch (_error) {{
+                return false;
+            }}
+        }};
         let resizeObserver = null;
         let attachHostInteractions = (_targetHost) => {{}};
         let detachHostInteractions = (_targetHost) => {{}};
@@ -37524,6 +37795,8 @@ fn terminal_eval_script_with_canvas_renderer(
         let renderEventCount = 0;
         let lastRenderProbeAtMs = 0;
         let renderProbeFramePending = false;
+        let retainedWritePaintRepairCount = 0;
+        let retainedWritePaintRepairPending = false;
         let lastResizeKey = '';
         let lastWriteAppliedSampleAtMs = 0;
         let lastWriteFlushStartedAtMs = 0;
@@ -37787,6 +38060,7 @@ fn terminal_eval_script_with_canvas_renderer(
                 try {{
                     stretchXtermRoot();
                     fitAddon.fit();
+                    applyTerminalRowFitGuard('visible_paint');
                 }} catch (_error) {{}}
                 const metrics = hostMetrics();
                 if (hostLooksUsable() && term.rows <= 1) {{
@@ -37809,6 +38083,24 @@ fn terminal_eval_script_with_canvas_renderer(
                     }}
                 }} catch (_error) {{}}
                 emitPaint();
+            }});
+        }};
+        const scheduleRetainedWritePaintRepair = (reason) => {{
+            if (retainedWritePaintRepairPending) {{
+                return;
+            }}
+            retainedWritePaintRepairPending = true;
+            retainedWritePaintRepairCount += 1;
+            requestAnimationFrame(() => {{
+                retainedWritePaintRepairPending = false;
+                requestVisiblePaint(true);
+                window.setTimeout(() => requestVisiblePaint(true), 48);
+                window.setTimeout(() => requestVisiblePaint(false), 160);
+                if (window.__yggtermXtermHosts && window.__yggtermXtermHosts[hostId]) {{
+                    window.__yggtermXtermHosts[hostId].retainedWritePaintRepairCount =
+                        retainedWritePaintRepairCount;
+                    window.__yggtermXtermHosts[hostId].lastRetainedWritePaintRepairReason = reason;
+                }}
             }});
         }};
         const requestRenderProbe = (reason) => {{
@@ -38441,11 +38733,15 @@ fn terminal_eval_script_with_canvas_renderer(
             rebindCurrentHost('emit_resize', true);
             try {{
                 fitAddon.fit();
+                const rowFitGuardApplied = applyTerminalRowFitGuard('resize');
                 const resizeKey = `${{term.cols}}x${{term.rows}}`;
-                if (resizeKey !== lastResizeKey) {{
+                if (resizeKey !== lastResizeKey || rowFitGuardApplied) {{
+                    const resizeChanged = resizeKey !== lastResizeKey;
                     lastResizeKey = resizeKey;
                     forceRendererResize();
-                    dioxus.send({{ kind: "resize", cols: term.cols, rows: term.rows }});
+                    if (resizeChanged) {{
+                        dioxus.send({{ kind: "resize", cols: term.cols, rows: term.rows }});
+                    }}
                 }}
             }} catch (_error) {{}}
         }};
@@ -38481,6 +38777,9 @@ fn terminal_eval_script_with_canvas_renderer(
             lastWriteSample: '',
             lastWriteAppliedTail: '',
             lastWriteError: '',
+            retainedWritePaintRepairCount,
+            lastRetainedWritePaintRepairReason: '',
+            lastFitGuard: null,
             lastWriteQueuedAtMs: 0,
             lastWriteCallbackAtMs: 0,
             terminalWriteFrameMs,
@@ -38772,7 +39071,7 @@ fn terminal_eval_script_with_canvas_renderer(
             }}
             return value;
         }};
-        const finalizeWriteFlush = (flushShouldFollow, callbackFired) => {{
+        const finalizeWriteFlush = (flushShouldFollow, callbackFired, paintRepairReason = '') => {{
             const currentEntry = window.__yggtermXtermHosts && window.__yggtermXtermHosts[hostId];
             if (currentEntry) {{
                 currentEntry.writeBridgeInFlight = false;
@@ -38793,7 +39092,11 @@ fn terminal_eval_script_with_canvas_renderer(
             }} else {{
                 syncScrollbackLock();
             }}
-            requestRenderProbe('write_flush');
+            if (paintRepairReason) {{
+                scheduleRetainedWritePaintRepair(paintRepairReason);
+            }} else {{
+                requestRenderProbe('write_flush');
+            }}
                 emitHostHealthThrottled();
                 schedulePendingWriteFlush(false);
             }};
@@ -38813,10 +39116,17 @@ fn terminal_eval_script_with_canvas_renderer(
             entry.writeBridgePendingData = '';
             payload = filterPayloadForRenderSurface(payload);
             if (!payload) {{
-                finalizeWriteFlush(false, false);
+                finalizeWriteFlush(false, false, '');
                 return;
             }}
+            const rawPayloadLength = payload.length;
+            const rawFrameLike = terminalPayloadLooksHighVolumeFrame(payload);
             payload = coalesceHighVolumeTerminalPayload(payload);
+            const paintRepairReason = (
+                retainedWritePaintRepairCount < 3
+                || rawPayloadLength >= 4096
+                || rawFrameLike
+            ) ? `write_flush_retained len=${{rawPayloadLength}} frame=${{rawFrameLike}}` : '';
             entry.writeBridgeInFlight = true;
                 entry.writeBridgeFlushCount = Number(entry.writeBridgeFlushCount || 0) + 1;
                 lastWriteFlushStartedAtMs = Date.now();
@@ -38829,11 +39139,11 @@ fn terminal_eval_script_with_canvas_renderer(
             try {{
                 if (syncWrite) {{
                     syncWrite(payload);
-                    finalizeWriteFlush(flushShouldFollow, false);
+                    finalizeWriteFlush(flushShouldFollow, false, paintRepairReason);
                     return;
                 }}
                 term.write(payload, () => {{
-                    finalizeWriteFlush(flushShouldFollow, true);
+                    finalizeWriteFlush(flushShouldFollow, true, paintRepairReason);
                 }});
             }} catch (error) {{
                 if (entry) {{
@@ -44318,7 +44628,19 @@ mod tests {
         );
         assert!(
             script.contains("requestRenderProbe('write_flush');"),
-            "write flushes should not force full terminal repaint after xterm has rendered"
+            "small write flushes should not force full terminal repaint after xterm has rendered"
+        );
+        assert!(
+            script.contains("const scheduleRetainedWritePaintRepair = (reason) => {")
+                && script.contains("retainedWritePaintRepairCount < 3")
+                && script.contains("rawPayloadLength >= 4096"),
+            "retained-session and bulk writes should schedule a bounded visible repaint repair for WebKit canvas"
+        );
+        assert!(
+            script.contains("const applyTerminalRowFitGuard = (reason) => {")
+                && script.contains("Math.ceil(cellHeight)")
+                && script.contains("term.resize(diagnostics.cols, safeRows);"),
+            "fit should clamp one-row WebKit raster overflow so the prompt row cannot fall below the host"
         );
         assert!(
             script.contains("const terminalWriteFrameMs = Math.max(0, Number("),
@@ -44364,6 +44686,10 @@ mod tests {
         assert!(
             script.contains("const resizeKey = `${term.cols}x${term.rows}`;"),
             "resize notifications should be deduped before calling back into Rust"
+        );
+        assert!(
+            script.contains("const rowFitGuardApplied = applyTerminalRowFitGuard('resize');"),
+            "resize should apply the row fit guard after fitAddon.fit"
         );
     }
 
@@ -49640,6 +49966,55 @@ Waiting for the remote terminal to paint...\n";
             surface.get("geometry_problem").and_then(Value::as_str),
             Some("active terminal host geometry does not match the xterm screen height")
         );
+    }
+    #[test]
+    fn app_control_terminal_surface_flags_cursor_row_clipped_below_host() {
+        let host = json!({
+            "child_count": 1,
+            "xterm_present": true,
+            "screen_present": true,
+            "viewport_present": true,
+            "rows_present": false,
+            "canvas_count": 1,
+            "text_sample": "normal terminal output",
+            "input_enabled": true,
+            "scrollback_locked": false,
+            "host_content_width": 883.0,
+            "host_content_height": 904.0,
+            "host_rect": { "left": 277.0, "top": 8.0, "width": 883.0, "height": 904.0, "bottom": 912.0 },
+            "screen_rect": { "left": 277.0, "top": 8.0, "width": 883.0, "height": 904.0 },
+            "viewport_rect": { "left": 277.0, "top": 8.0, "width": 883.0, "height": 904.0 },
+            "cursor_expected_rect": { "left": 293.0, "top": 908.0, "width": 8.0, "height": 18.0 },
+            "cursor_line_text": "› Use /skills to list available skills"
+        });
+        let surface = summarize_terminal_surface_for_app_control(&[host], false);
+        assert_eq!(
+            surface.get("geometry_problem").and_then(Value::as_str),
+            Some("active terminal cursor row is clipped below the visible host")
+        );
+    }
+    #[test]
+    fn app_control_terminal_surface_ignores_cursor_below_view_when_scrollback_locked() {
+        let host = json!({
+            "child_count": 1,
+            "xterm_present": true,
+            "screen_present": true,
+            "viewport_present": true,
+            "rows_present": false,
+            "canvas_count": 1,
+            "text_sample": "normal terminal output",
+            "input_enabled": true,
+            "scrollback_locked": true,
+            "host_content_width": 883.0,
+            "host_content_height": 904.0,
+            "host_rect": { "left": 277.0, "top": 8.0, "width": 883.0, "height": 904.0, "bottom": 912.0 },
+            "screen_rect": { "left": 277.0, "top": 8.0, "width": 883.0, "height": 904.0 },
+            "viewport_rect": { "left": 277.0, "top": 8.0, "width": 883.0, "height": 904.0 },
+            "cursor_expected_rect": { "left": 293.0, "top": 908.0, "width": 8.0, "height": 18.0 },
+            "cursor_line_text": "› Use /skills to list available skills"
+        });
+        let surface = summarize_terminal_surface_for_app_control(&[host], false);
+        assert_eq!(surface.get("geometry_problem"), Some(&Value::Null));
     }
     #[test]
     fn app_control_terminal_surface_flags_helper_textarea_drift() {
