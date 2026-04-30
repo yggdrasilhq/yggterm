@@ -7,19 +7,20 @@ use yggterm_server::{
     cleanup_legacy_daemons, default_endpoint, detect_ghostty_host, ensure_local_daemon_running,
     ping, run_app_control_background_window, run_app_control_close_window,
     run_app_control_create_terminal, run_app_control_describe_rows, run_app_control_describe_state,
-    run_app_control_drag, run_app_control_dump_state, run_app_control_focus_window,
-    run_app_control_list_clients, run_app_control_move_window_by, run_app_control_open_path,
-    run_app_control_paste_terminal_clipboard, run_app_control_paste_terminal_clipboard_image,
-    run_app_control_probe_terminal_viewport_input, run_app_control_probe_terminal_viewport_scroll,
-    run_app_control_probe_terminal_viewport_select, run_app_control_reclaim_terminal_focus,
-    run_app_control_remove_session, run_app_control_scroll_preview,
-    run_app_control_send_terminal_input, run_app_control_set_clipboard_png_base64,
-    run_app_control_set_clipboard_text, run_app_control_set_fullscreen,
-    run_app_control_set_main_zoom, run_app_control_set_right_panel_mode,
-    run_app_control_set_row_expanded, run_app_control_set_search,
-    run_app_control_set_session_keep_alive, run_app_control_set_window_chrome_hover, run_attach,
-    run_daemon, run_screenrecord_capture, run_screenshot_capture, run_trace_bundle,
-    run_trace_follow, run_trace_tail, shutdown, snapshot, status, try_run_remote_server_command,
+    run_app_control_desktop_identity, run_app_control_drag, run_app_control_dump_state,
+    run_app_control_focus_window, run_app_control_list_clients, run_app_control_move_window_by,
+    run_app_control_open_path, run_app_control_paste_terminal_clipboard,
+    run_app_control_paste_terminal_clipboard_image, run_app_control_probe_terminal_viewport_input,
+    run_app_control_probe_terminal_viewport_scroll, run_app_control_probe_terminal_viewport_select,
+    run_app_control_reclaim_terminal_focus, run_app_control_remove_session,
+    run_app_control_scroll_preview, run_app_control_send_terminal_input,
+    run_app_control_set_clipboard_png_base64, run_app_control_set_clipboard_text,
+    run_app_control_set_fullscreen, run_app_control_set_main_zoom,
+    run_app_control_set_right_panel_mode, run_app_control_set_row_expanded,
+    run_app_control_set_search, run_app_control_set_session_keep_alive,
+    run_app_control_set_window_chrome_hover, run_attach, run_daemon, run_screenrecord_capture,
+    run_screenshot_capture, run_trace_bundle, run_trace_follow, run_trace_tail, shutdown, snapshot,
+    status, try_run_remote_server_command,
 };
 
 #[path = "../headless_monitor.rs"]
@@ -90,6 +91,18 @@ fn print_server_help() {
   yggterm-headless server screenshot <target> [output]
   yggterm-headless server screenrecord <target> [output]
   yggterm-headless server app <subcommand>"
+    );
+}
+
+fn print_server_app_help() {
+    println!(
+        "usage:
+  yggterm-headless server app clients
+  yggterm-headless server app desktop-identity
+  yggterm-headless server app state [--pid <pid>]
+  yggterm-headless server app rows [--pid <pid>]
+  yggterm-headless server app screenshot [output] [--pid <pid>]
+  yggterm-headless server app terminal <new|send|focus|probe-type|probe-scroll|probe-select> ..."
     );
 }
 
@@ -413,6 +426,10 @@ fn main() -> Result<()> {
             })
             .unwrap_or(15_000);
         return match args[2].as_str() {
+            "--help" | "-h" | "help" => {
+                print_server_app_help();
+                Ok(())
+            }
             "screenshot" => {
                 let target = args
                     .windows(2)
@@ -444,6 +461,7 @@ fn main() -> Result<()> {
                 run_screenrecord_capture("app", output_path, timeout_ms, duration_secs)
             }
             "clients" => run_app_control_list_clients(),
+            "desktop-identity" => run_app_control_desktop_identity(),
             "state" => run_app_control_describe_state(timeout_ms),
             "dump" => {
                 let output_path = cli_positional_args(&args, 3)
