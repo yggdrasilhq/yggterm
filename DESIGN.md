@@ -422,10 +422,11 @@ The Yggterm app icon should not read as a generic black terminal square, but it 
 - Mascot name: `Yggi`.
 - Role: a small Yggdrasil sprout that keeps sessions alive, protects context, and guides work across machines.
 - Personality: alert, warm, capable, and calm. The mark should never feel childish, ominous, or creature-like.
-- Core icon shape: rounded desktop tile, centered warm `>_` prompt, soft Yggdrasil sprout, green/teal leaves, subtle root arc. The terminal mark is the primary read at taskbar size; the sprout wraps around it. Do not put eyes, faces, claws, teeth, or dark character silhouettes in the app icon.
+- Core icon shape: the supplied full-color Yggi mascot tile with the checkerboard background removed, using the same friendly sprout character and terminal window composition. The `>_` prompt should remain a strong read and the mascot should stay warm, cute, and professional rather than spooky.
 - The icon must still read at 16px and 32px in KDE panels, Windows taskbar, and macOS Dock. At those sizes the prompt and sprout silhouette are the primary signals.
+- Keep the app icon visually full-size against neighboring desktop icons: the visible tile should fill the 512px canvas with only a small transparent safety margin, not sit inside a padded thumbnail.
 - Keep the app icon full-color and characterful. Keep internal tree/workspace glyphs restrained and mostly grayscale unless a state needs color.
-- Maintain one canonical SVG source under `assets/brand/yggterm-icon.svg`; regenerate raster assets instead of hand-editing PNG, ICO, or ICNS outputs.
+- Maintain the exact transparent Yggi raster under `assets/brand/yggterm-icon-512.png`; `assets/brand/yggterm-icon.svg` may be a packaging wrapper around that raster so Linux scalable icon lookup cannot fall back to an older mark.
 
 ### Stability-first product rules
 
