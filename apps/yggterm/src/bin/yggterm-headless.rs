@@ -22,6 +22,9 @@ use yggterm_server::{
     run_trace_follow, run_trace_tail, shutdown, snapshot, status, try_run_remote_server_command,
 };
 
+#[path = "../headless_monitor.rs"]
+mod headless_monitor;
+
 const ENV_YGGTERM_DIRECT_INSTALL_ROOT: &str = "YGGTERM_DIRECT_INSTALL_ROOT";
 const ENV_YGGTERM_SKIP_ACTIVE_EXEC_HANDOFF: &str = "YGGTERM_SKIP_ACTIVE_EXEC_HANDOFF";
 
@@ -67,6 +70,8 @@ common server commands:
   yggterm-headless server daemon
   yggterm-headless server status
   yggterm-headless server snapshot
+  yggterm-headless server monitor --scenario panic-report
+  yggterm-headless server monitor --scenario latency-check --all
   yggterm-headless server app <subcommand>"
     );
 }
@@ -80,11 +85,51 @@ fn print_server_help() {
   yggterm-headless server status
   yggterm-headless server snapshot
   yggterm-headless server shutdown
+  yggterm-headless server monitor --scenario <panic-report|server-list|latency-check|wait-session|hot-restart|managed-cli-refresh>
   yggterm-headless server trace <tail|follow|bundle>
   yggterm-headless server screenshot <target> [output]
   yggterm-headless server screenrecord <target> [output]
   yggterm-headless server app <subcommand>"
     );
+}
+
+fn monitor_scenario_alias(command: &str) -> Option<&'static str> {
+    match command {
+        "diagnose" | "panic-report" | "incident-report" => Some("panic-report"),
+        "server-list" | "status-all" => Some("server-list"),
+        "hot-restart" | "hot-update" => Some("hot-restart"),
+        "wait-session" | "wait-loaded" => Some("wait-session"),
+        "latency-check" | "health-check" => Some("latency-check"),
+        "managed-cli-refresh" | "codex-refresh" => Some("managed-cli-refresh"),
+        _ => None,
+    }
+}
+
+fn normalize_monitor_args(args: &[String]) -> Option<Vec<String>> {
+    match args {
+        [first, rest @ ..] if first == "monitor" => Some(rest.to_vec()),
+        [first, rest @ ..] if first == "--scenario" => {
+            let mut monitor_args = vec![first.clone()];
+            monitor_args.extend(rest.iter().cloned());
+            Some(monitor_args)
+        }
+        [server, monitor, rest @ ..] if server == "server" && monitor == "monitor" => {
+            Some(rest.to_vec())
+        }
+        [server, command, rest @ ..] if server == "server" => {
+            monitor_scenario_alias(command).map(|scenario| {
+                let mut monitor_args = vec!["--scenario".to_string(), scenario.to_string()];
+                monitor_args.extend(rest.iter().cloned());
+                monitor_args
+            })
+        }
+        [command, rest @ ..] => monitor_scenario_alias(command).map(|scenario| {
+            let mut monitor_args = vec!["--scenario".to_string(), scenario.to_string()];
+            monitor_args.extend(rest.iter().cloned());
+            monitor_args
+        }),
+        [] => None,
+    }
 }
 
 fn cli_positional_args(args: &[String], start: usize) -> Vec<&str> {
@@ -238,6 +283,9 @@ fn main() -> Result<()> {
                 .map(String::as_str)
                 .filter(|value| !value.is_empty()),
         );
+    }
+    if let Some(monitor_args) = normalize_monitor_args(&args) {
+        return headless_monitor::run(monitor_args);
     }
     if try_run_remote_server_command(&args)? {
         return Ok(());
@@ -899,7 +947,7 @@ fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{cli_positional_args, preferred_headless_executable};
+    use super::{cli_positional_args, normalize_monitor_args, preferred_headless_executable};
     use std::path::PathBuf;
     use yggterm_core::{InstallChannel, InstallContext, UpdatePolicy};
 
@@ -943,6 +991,51 @@ mod tests {
         assert_eq!(
             preferred,
             PathBuf::from("/direct/versions/2.1.52").join(expected_name)
+        );
+    }
+
+    #[test]
+    fn normalize_monitor_args_accepts_server_monitor_and_incident_aliases() {
+        assert_eq!(
+            normalize_monitor_args(&[
+                "server".to_string(),
+                "monitor".to_string(),
+                "--scenario".to_string(),
+                "panic-report".to_string(),
+                "--jsonl-out".to_string(),
+                "/tmp/incident.jsonl".to_string(),
+            ]),
+            Some(vec![
+                "--scenario".to_string(),
+                "panic-report".to_string(),
+                "--jsonl-out".to_string(),
+                "/tmp/incident.jsonl".to_string(),
+            ])
+        );
+        assert_eq!(
+            normalize_monitor_args(&[
+                "server".to_string(),
+                "latency-check".to_string(),
+                "--all".to_string(),
+            ]),
+            Some(vec![
+                "--scenario".to_string(),
+                "latency-check".to_string(),
+                "--all".to_string(),
+            ])
+        );
+        assert_eq!(
+            normalize_monitor_args(&[
+                "panic-report".to_string(),
+                "--iterations".to_string(),
+                "3".to_string()
+            ]),
+            Some(vec![
+                "--scenario".to_string(),
+                "panic-report".to_string(),
+                "--iterations".to_string(),
+                "3".to_string(),
+            ])
         );
     }
 }
