@@ -18,6 +18,6 @@ rusqlite = { version = "0.39.0", features = ["bundled"] }
 uuid = { version = "1", features = ["v4"] }
 flate2 = "1"
 semver = "1"
-sha2 = "0.10"
+sha2 = "0.11.0"
 tar = "0.4"
 yggui-contract = { path = "../yggui-contract" }

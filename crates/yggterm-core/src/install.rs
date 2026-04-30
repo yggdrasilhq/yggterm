@@ -1093,11 +1093,21 @@ fn verify_archive_checksum(archive: &[u8], checksum_url: &str) -> Result<()> {
         .split_whitespace()
         .next()
         .context("missing checksum value")?;
-    let actual = format!("{:x}", Sha256::digest(archive));
+    let actual = hex_lower(&Sha256::digest(archive));
     if expected != actual {
         anyhow::bail!("release checksum mismatch");
     }
     Ok(())
+}
+
+fn hex_lower(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
 }
 
 fn extract_binary_from_archive(
