@@ -4,6 +4,17 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+## 2.1.53
+
+### Fixed
+
+- stretch the approved Yggi mascot icon to fill the packaged 512px canvas with only a small safety margin, so KDE, Windows, and macOS launchers no longer render it as a tiny padded tile
+- keep Settings text fields owned by the field being edited instead of re-focusing or leaking keystrokes into the active terminal, and expose right-rail field/menu geometry in app-control so this path is now smoke-tested
+- make Interface/Terminal zoom numbers directly editable and replace the native terminal-theme select with an in-rail menu that stays inside the settings panel
+- budget all high-volume full-screen/TUI terminal frames, including remote-resume frames before the overlay dismisses, so WebKit does not spin hot on jojo after `htop`/Codex-style output
+- refine the terminal/settings smoke so it proves settings typing, viewport reclaim, blank-Enter spinner behavior, hidden-cursor TUI recovery, render budgets, and WebKit child RSS on KDE/X11
+- document stale binary execution as destructive in `AGENTS.md`, requiring future version checks and live-install investigations to use canonical metadata or isolated homes instead of launching archived GUI artifacts
+
 ## 2.1.52
 
 ### Fixed
