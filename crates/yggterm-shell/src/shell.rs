@@ -3553,6 +3553,15 @@ impl ShellState {
             zoom_percent(self.settings.ui_font_size, 14.0)
         );
     }
+    fn set_ui_zoom_percent(&mut self, percent: i32) {
+        let normalized = (percent.clamp(50, 150) as f32 / 100.0) * 14.0;
+        self.settings.ui_font_size = clamp_zoom_value(normalized);
+        self.persist_settings();
+        self.last_action = format!(
+            "interface zoom {}%",
+            zoom_percent(self.settings.ui_font_size, 14.0)
+        );
+    }
     fn adjust_main_zoom(&mut self, delta_steps: i32) {
         let active_snapshot = self.snapshot();
         let active_view_mode = active_snapshot.active_view_mode;
@@ -3600,6 +3609,12 @@ impl ShellState {
             "{label} {}%",
             zoom_percent(after, main_zoom_base(view_mode))
         );
+    }
+    fn set_main_zoom_percent(&mut self, percent: i32) {
+        let active_snapshot = self.snapshot();
+        let view_mode = active_snapshot.active_view_mode;
+        let normalized = (percent.clamp(50, 250) as f32 / 100.0) * main_zoom_base(view_mode);
+        self.set_main_zoom(view_mode, normalized);
     }
     fn set_terminal_theme_name_for(&mut self, theme: UiTheme, value: String) {
         match theme {
@@ -19753,6 +19768,28 @@ async fn capture_dom_debug_snapshot_basic_for(active_session_path: Option<&str>)
             const titlebarMetadataButton = titlebar?.querySelector('[data-titlebar-metadata-button="1"]') || null;
             const titlebarOverflowButton = titlebar?.querySelector('[data-titlebar-overflow-button="1"]') || null;
             const titlebarOverflowMenu = titlebar?.querySelector('[data-titlebar-overflow-menu="1"]') || null;
+            const rightSideRails = rootNode
+                ? Array.from(rootNode.querySelectorAll('[data-yggui-side-rail="1"]'))
+                : Array.from(document.querySelectorAll('[data-yggui-side-rail="1"]'));
+            const rightSideRail =
+                pickLast(visibleNodes(rightSideRails))
+                || pickLast(rightSideRails)
+                || null;
+            const rightSideRailHeader = rightSideRail?.querySelector('[data-yggui-rail-header="1"]') || null;
+            const rightSideRailScroll = rightSideRail?.querySelector('[data-yggui-rail-scroll="1"]') || null;
+            const settingsEndpointInput = rootNode?.querySelector('[data-settings-field-key="litellm-endpoint"]') || null;
+            const settingsApiKeyInput = rootNode?.querySelector('[data-settings-field-key="litellm-api-key"]') || null;
+            const settingsInterfaceLlmInput = rootNode?.querySelector('[data-settings-field-key="interface-llm"]') || null;
+            const settingsCodexExtraArgsInput = rootNode?.querySelector('[data-settings-field-key="codex-extra-args"]') || null;
+            const settingsTitlebarAutoHideToggle = rootNode?.querySelector('[data-settings-toggle-key="auto-hide-titlebar"]')
+                || rootNode?.querySelector('[data-settings-field-key="auto-hide-titlebar"]')
+                || null;
+            const settingsTitlebarAutoHideToggleState = settingsTitlebarAutoHideToggle?.querySelector('[data-settings-toggle-state="1"]') || null;
+            const installUpdateRow = rootNode?.querySelector('[data-install-update-row="1"]') || null;
+            const installUpdateButton = rootNode?.querySelector('[data-install-update-button="1"]') || null;
+            const installUpdateDetail = rootNode?.querySelector('[data-install-update-detail="1"]') || null;
+            const terminalThemeMenu = rootNode?.querySelector('[data-terminal-theme-menu="1"]') || null;
+            const terminalThemeButton = rootNode?.querySelector('[data-terminal-theme-button="1"]') || null;
             const activeElement = document.activeElement;
             const terminalRegistry = window.__yggtermXtermHosts || {};
             const readTerminalBufferSample = (term) => {
@@ -20084,6 +20121,11 @@ async fn capture_dom_debug_snapshot_basic_for(active_session_path: Option<&str>)
                 shell_frame_backdrop_filter: shellFrame ? String(window.getComputedStyle(shellFrame).getPropertyValue('backdrop-filter') || window.getComputedStyle(shellFrame).getPropertyValue('-webkit-backdrop-filter') || '') : null,
                 shell_frame_box_shadow: shellFrame ? String(window.getComputedStyle(shellFrame).boxShadow || '') : null,
                 shell_frame_border_radius: shellFrame ? String(window.getComputedStyle(shellFrame).borderRadius || '') : null,
+                right_side_rail_rect: rectSummary(rightSideRail),
+                right_side_rail_header_text: String(rightSideRailHeader?.innerText || '').trim().slice(0, 120),
+                right_side_rail_scroll_rect: rectSummary(rightSideRailScroll),
+                right_side_rail_visible_attr: String(rightSideRail?.getAttribute('data-yggui-side-rail-visible') || ''),
+                right_side_rail_text_sample: String(rightSideRail?.innerText || '').trim().slice(0, 240),
                 terminal_host_count: terminalHosts.length,
                 terminal_hosts: terminalHosts,
                 preview_scroll_count: previewScrollers.length,
@@ -20119,6 +20161,9 @@ async fn capture_dom_debug_snapshot_basic_for(active_session_path: Option<&str>)
                     value: 'value' in activeElement ? String(activeElement.value || '') : '',
                     data_tree_rename_input: activeElement.getAttribute
                         ? String(activeElement.getAttribute('data-tree-rename-input') || '').trim()
+                        : '',
+                    data_settings_field_key: activeElement.getAttribute
+                        ? String(activeElement.getAttribute('data-settings-field-key') || '').trim()
                         : '',
                     within_terminal_host_id: activeTerminalHost
                         ? String(activeTerminalHost.id || '').trim()
@@ -20168,6 +20213,22 @@ async fn capture_dom_debug_snapshot_basic_for(active_session_path: Option<&str>)
                 titlebar_overflow_button_rect: rectSummary(titlebarOverflowButton),
                 titlebar_overflow_button_hit_target: elementSummaryAtPoint(rectSummary(titlebarOverflowButton)),
                 titlebar_overflow_menu_rect: rectSummary(titlebarOverflowMenu),
+                settings_endpoint_input_rect: rectSummary(settingsEndpointInput),
+                settings_api_key_input_rect: rectSummary(settingsApiKeyInput),
+                settings_interface_llm_input_rect: rectSummary(settingsInterfaceLlmInput),
+                settings_interface_llm_input_hit_target: elementSummaryAtPoint(rectSummary(settingsInterfaceLlmInput)),
+                settings_codex_extra_args_input_rect: rectSummary(settingsCodexExtraArgsInput),
+                settings_titlebar_auto_hide_toggle_rect: rectSummary(settingsTitlebarAutoHideToggle),
+                settings_titlebar_auto_hide_toggle_hit_target: elementSummaryAtPoint(rectSummary(settingsTitlebarAutoHideToggle)),
+                settings_titlebar_auto_hide_toggle_enabled: settingsTitlebarAutoHideToggle?.getAttribute('data-settings-toggle-enabled') === 'true',
+                settings_titlebar_auto_hide_toggle_text: String(settingsTitlebarAutoHideToggleState?.innerText || '').trim().slice(0, 32),
+                install_update_row_rect: rectSummary(installUpdateRow),
+                install_update_button_rect: rectSummary(installUpdateButton),
+                install_update_button_mode: String(installUpdateButton?.getAttribute('data-install-update-mode') || '').trim(),
+                install_update_button_text: String(installUpdateButton?.innerText || '').trim().slice(0, 120),
+                install_update_detail_text: String(installUpdateDetail?.innerText || '').trim().slice(0, 240),
+                terminal_theme_menu_rect: rectSummary(terminalThemeMenu),
+                terminal_theme_button_rect: rectSummary(terminalThemeButton),
             });
         })();
     "#;
@@ -25906,8 +25967,13 @@ fn app() -> Element {
                                 }
                             },
                             on_adjust_ui_zoom: move |delta: i32| state.with_mut(|shell| shell.adjust_ui_zoom(delta)),
+                            on_set_ui_zoom: move |percent: i32| state.with_mut(|shell| shell.set_ui_zoom_percent(percent)),
                             on_adjust_main_zoom: move |delta: i32| {
                                 state.with_mut(|shell| shell.adjust_main_zoom(delta));
+                                apply_active_terminal_zoom(state);
+                            },
+                            on_set_main_zoom: move |percent: i32| {
+                                state.with_mut(|shell| shell.set_main_zoom_percent(percent));
                                 apply_active_terminal_zoom(state);
                             },
                             on_set_terminal_theme_name: move |(theme, value): (UiTheme, String)| {
@@ -34287,13 +34353,11 @@ impl TerminalWriteBridge {
 
 fn terminal_write_should_frame_budget(
     data: &str,
-    is_remote_resume_session: bool,
-    remote_overlay_dismissed: bool,
+    _is_remote_resume_session: bool,
+    _remote_overlay_dismissed: bool,
     protocol_only_output: bool,
 ) -> bool {
-    !protocol_only_output
-        && (!is_remote_resume_session || remote_overlay_dismissed)
-        && terminal_output_is_high_volume_frame_like(data)
+    !protocol_only_output && terminal_output_is_high_volume_frame_like(data)
 }
 
 fn terminal_output_is_high_volume_frame_like(data: &str) -> bool {
@@ -36068,18 +36132,42 @@ fn focus_settings_field_by_key_script(field_key: &str) -> String {
     format!(
         r#"
         (() => {{
-          const claimUntil = Date.now() + 1400;
-          try {{
-            window.__yggtermUiFocusClaimUntilMs = Math.max(
-              Number(window.__yggtermUiFocusClaimUntilMs || 0),
-              claimUntil
-            );
-          }} catch (_error) {{}}
+          const claimFocus = () => {{
+            try {{
+              const claimUntil = Date.now() + 2200;
+              window.__yggtermUiFocusClaimUntilMs = Math.max(
+                Number(window.__yggtermUiFocusClaimUntilMs || 0),
+                claimUntil
+              );
+            }} catch (_error) {{}}
+          }};
+          const bindFocusClaim = (input) => {{
+            if (!input || input.__yggtermSettingsFocusClaimBound) {{
+              return;
+            }}
+            try {{
+              Object.defineProperty(input, '__yggtermSettingsFocusClaimBound', {{
+                value: true,
+                configurable: true,
+              }});
+            }} catch (_error) {{
+              input.__yggtermSettingsFocusClaimBound = true;
+            }}
+            for (const eventName of ['focus', 'input', 'keydown', 'mousedown', 'pointerdown', 'click']) {{
+              try {{
+                input.addEventListener(eventName, claimFocus, true);
+              }} catch (_error) {{}}
+            }}
+          }};
+          claimFocus();
           const focusInput = () => {{
             const input = document.querySelector('[data-settings-field-key={field_key:?}]');
             if (!input || typeof input.focus !== 'function') {{
               return false;
             }}
+            bindFocusClaim(input);
+            claimFocus();
+            const alreadyActive = document.activeElement === input;
             try {{
               const active = document.activeElement;
               const helperActive = Boolean(
@@ -36091,6 +36179,7 @@ fn focus_settings_field_by_key_script(field_key: &str) -> String {
                 active.blur();
               }}
             }} catch (_error) {{}}
+            if (!alreadyActive) {{
             try {{
               input.focus({{ preventScroll: true }});
             }} catch (_error) {{
@@ -36103,6 +36192,7 @@ fn focus_settings_field_by_key_script(field_key: &str) -> String {
               try {{
                 input.setSelectionRange(valueLength, valueLength);
               }} catch (_error) {{}}
+            }}
             }}
             return document.activeElement === input;
           }};
@@ -36283,7 +36373,8 @@ fn terminal_runtime_input_policy(
     (allow_input, focus_input)
 }
 fn terminal_input_override_for_right_panel_mode(right_panel_mode: RightPanelMode) -> bool {
-    matches!(right_panel_mode, RightPanelMode::Settings)
+    let _ = right_panel_mode;
+    false
 }
 fn terminal_eval_script(
     host_id: &str,
@@ -39639,7 +39730,9 @@ fn RightRail(
     on_set_notification_sound: EventHandler<bool>,
     on_set_titlebar_auto_hide: EventHandler<bool>,
     on_adjust_ui_zoom: EventHandler<i32>,
+    on_set_ui_zoom: EventHandler<i32>,
     on_adjust_main_zoom: EventHandler<i32>,
+    on_set_main_zoom: EventHandler<i32>,
     on_set_terminal_theme_name: EventHandler<(UiTheme, String)>,
     on_trigger_update: EventHandler<MouseEvent>,
     on_connect_ssh_custom: EventHandler<MouseEvent>,
@@ -39687,7 +39780,9 @@ fn RightRail(
                     on_set_notification_sound,
                     on_set_titlebar_auto_hide,
                     on_adjust_ui_zoom,
+                    on_set_ui_zoom,
                     on_adjust_main_zoom,
+                    on_set_main_zoom,
                     on_set_terminal_theme_name,
                     on_trigger_update,
                 }
@@ -39756,7 +39851,9 @@ fn SettingsRailBody(
     on_set_notification_sound: EventHandler<bool>,
     on_set_titlebar_auto_hide: EventHandler<bool>,
     on_adjust_ui_zoom: EventHandler<i32>,
+    on_set_ui_zoom: EventHandler<i32>,
     on_adjust_main_zoom: EventHandler<i32>,
+    on_set_main_zoom: EventHandler<i32>,
     on_set_terminal_theme_name: EventHandler<(UiTheme, String)>,
     on_trigger_update: EventHandler<MouseEvent>,
 ) -> Element {
@@ -39854,8 +39951,8 @@ fn SettingsRailBody(
                 secret: false,
                 autofocus: false,
                 palette: snapshot.palette,
-                on_focus_input: on_focus_input,
-                on_blur_input: on_blur_input,
+                on_focus_input: on_focus_input.clone(),
+                on_blur_input: on_blur_input.clone(),
                 on_change: on_codex_extra_args_change,
             }
             div {
@@ -39878,21 +39975,29 @@ fn SettingsRailBody(
                 on_change: on_set_notification_sound,
             }
             ZoomSettingRow {
+                field_key: "interface-zoom".to_string(),
                 label: "Interface Zoom".to_string(),
                 percent: zoom_percent(snapshot.settings.ui_font_size, 14.0),
                 palette: snapshot.palette,
+                on_focus_input: on_focus_input.clone(),
+                on_blur_input: on_blur_input.clone(),
                 on_decrease: move |_| on_adjust_ui_zoom.call(-1),
                 on_increase: move |_| on_adjust_ui_zoom.call(1),
+                on_set_percent: move |value: i32| on_set_ui_zoom.call(value),
             }
             ZoomSettingRow {
+                field_key: "main-zoom".to_string(),
                 label: main_zoom_label,
                 percent: zoom_percent(
                     active_viewport_zoom_value(&snapshot),
                     main_zoom_base(snapshot.active_view_mode),
                 ),
                 palette: snapshot.palette,
+                on_focus_input,
+                on_blur_input,
                 on_decrease: move |_| on_adjust_main_zoom.call(-1),
                 on_increase: move |_| on_adjust_main_zoom.call(1),
+                on_set_percent: move |value: i32| on_set_main_zoom.call(value),
             }
             if active_viewport_shows_terminal_theme(&snapshot) {
                 TerminalThemeSettingRow {
@@ -41128,7 +41233,6 @@ fn SettingsField(
     let focus_key_on_mousedown = field_key.clone();
     let focus_key_on_click = field_key.clone();
     let focus_key_on_focus = field_key.clone();
-    let focus_key_on_keydown = field_key.clone();
     rsx! {
         div {
             style: "display:flex; flex-direction:column; gap:4px;",
@@ -41159,7 +41263,6 @@ fn SettingsField(
                 onblur: move |_| on_blur_input.call(()),
                 onkeydown: move |evt| {
                     evt.stop_propagation();
-                    on_focus_input.call(focus_key_on_keydown.clone());
                 },
                 oninput: move |evt| on_change.call(evt.value()),
             }
@@ -41401,12 +41504,19 @@ fn NotificationSettingsSection(
 }
 #[component]
 fn ZoomSettingRow(
+    field_key: String,
     label: String,
     percent: i32,
     palette: Palette,
+    on_focus_input: EventHandler<String>,
+    on_blur_input: EventHandler<()>,
     on_decrease: EventHandler<MouseEvent>,
     on_increase: EventHandler<MouseEvent>,
+    on_set_percent: EventHandler<i32>,
 ) -> Element {
+    let focus_key_on_mousedown = field_key.clone();
+    let focus_key_on_click = field_key.clone();
+    let focus_key_on_focus = field_key.clone();
     rsx! {
         div {
             style: "display:flex; flex-direction:column; gap:4px;",
@@ -41434,9 +41544,37 @@ fn ZoomSettingRow(
                     onclick: move |evt| on_decrease.call(evt),
                     "−"
                 }
-                span {
-                    style: format!("font-size:12px; font-weight:600; color:{};", palette.text),
-                    "{percent}"
+                input {
+                    "data-settings-field-key": "{field_key}",
+                    r#type: "number",
+                    min: "50",
+                    max: "250",
+                    step: "5",
+                    value: "{percent}",
+                    style: format!(
+                        "min-width:0; width:54px; height:24px; border:none; border-radius:8px; \
+                         background:transparent; color:{}; outline:none; text-align:center; \
+                         font-size:12px; font-weight:700; appearance:textfield; -moz-appearance:textfield;",
+                        palette.text
+                    ),
+                    onmousedown: move |evt| {
+                        evt.stop_propagation();
+                        on_focus_input.call(focus_key_on_mousedown.clone());
+                    },
+                    onclick: move |evt| {
+                        evt.stop_propagation();
+                        on_focus_input.call(focus_key_on_click.clone());
+                    },
+                    onfocus: move |_| on_focus_input.call(focus_key_on_focus.clone()),
+                    onblur: move |_| on_blur_input.call(()),
+                    onkeydown: move |evt| {
+                        evt.stop_propagation();
+                    },
+                    oninput: move |evt| {
+                        if let Ok(value) = evt.value().trim().parse::<i32>() {
+                            on_set_percent.call(value);
+                        }
+                    },
                 }
                 button {
                     style: zoom_button_style(palette),
@@ -41497,35 +41635,31 @@ fn TerminalThemeSelectRow(
     mode: UiTheme,
     on_change: EventHandler<(UiTheme, String)>,
 ) -> Element {
-    let select_background = if palette_is_dark(palette) {
+    let mut menu_open = use_signal(|| false);
+    let control_background = if palette_is_dark(palette) {
         "rgba(10,14,20,0.98)"
     } else {
         "rgba(255,255,255,0.94)"
     };
-    let select_text = if palette_is_dark(palette) {
+    let control_text = if palette_is_dark(palette) {
         "#f6fbff"
     } else {
         "#1f2b35"
     };
-    let select_border = if palette_is_dark(palette) {
+    let control_border = if palette_is_dark(palette) {
         "rgba(214,229,242,0.38)"
     } else {
         "rgba(201,214,226,0.56)"
     };
-    let option_background = if palette_is_dark(palette) {
-        "#101720"
+    let menu_background = if palette_is_dark(palette) {
+        "rgba(13,19,27,0.99)"
     } else {
-        "#ffffff"
-    };
-    let option_text = if palette_is_dark(palette) {
-        "#f6fbff"
-    } else {
-        "#1f2b35"
+        "rgba(255,255,255,0.98)"
     };
     rsx! {
         div {
             style: format!(
-                "display:grid; grid-template-columns:auto minmax(0,1fr); align-items:center; gap:10px; \
+                "display:grid; grid-template-columns:auto minmax(0,1fr); align-items:start; gap:10px; \
                  min-width:0; min-height:34px; padding:0;",
             ),
             div {
@@ -41559,28 +41693,72 @@ fn TerminalThemeSelectRow(
                     "{label}"
                 }
             }
-            select {
-                value: "{value}",
-                style: format!(
-                    "width:100%; height:34px; border:none; border-radius:10px; padding:0 28px 0 12px; appearance:none; -webkit-appearance:none; -moz-appearance:none; \
-                     background:{}; color:{}; box-shadow: inset 0 0 0 1px {}; font-size:12px; font-weight:700; color-scheme:{};",
-                    select_background,
-                    select_text,
-                    select_border,
-                    if palette_is_dark(palette) { "dark" } else { "light" }
-                ),
-                oninput: move |evt| on_change.call((mode, evt.value())),
-                for option in options {
-                    option {
-                        key: "{label}:{option}",
-                        value: "{option}",
-                        selected: option == value,
+            div {
+                style: "display:flex; flex-direction:column; gap:4px; min-width:0;",
+                button {
+                    r#type: "button",
+                    "data-terminal-theme-button": "1",
+                    "data-terminal-theme-mode": format!("{:?}", mode),
+                    style: format!(
+                        "width:100%; height:34px; border:none; border-radius:10px; padding:0 9px 0 12px; \
+                         display:flex; align-items:center; justify-content:space-between; gap:8px; min-width:0; \
+                         background:{}; color:{}; box-shadow: inset 0 0 0 1px {}; \
+                         font-size:12px; font-weight:700; text-align:left;",
+                        control_background,
+                        control_text,
+                        control_border
+                    ),
+                    onclick: move |_| menu_open.set(!menu_open()),
+                    onkeydown: move |evt| evt.stop_propagation(),
+                    span {
+                        style: "min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;",
+                        "{value}"
+                    }
+                    span {
+                        style: format!("flex:0 0 auto; color:{};", palette.muted),
+                        "⌄"
+                    }
+                }
+                if menu_open() {
+                    div {
+                        "data-terminal-theme-menu": "1",
+                        "data-terminal-theme-mode": format!("{:?}", mode),
                         style: format!(
-                            "background:{}; color:{}; font-size:12px; font-weight:700;",
-                            option_background,
-                            option_text
+                            "display:flex; flex-direction:column; gap:2px; max-height:184px; overflow:auto; \
+                             border-radius:10px; padding:4px; background:{}; box-shadow: inset 0 0 0 1px {};",
+                            menu_background,
+                            control_border
                         ),
-                        "{option}"
+                        for option in options {
+                            {
+                                let selected = option == value;
+                                let option_for_click = option.clone();
+                                rsx! {
+                                    button {
+                                        key: "{label}:{option}",
+                                        r#type: "button",
+                                        style: format!(
+                                            "width:100%; min-height:28px; border:none; border-radius:7px; padding:0 8px; \
+                                             text-align:left; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; \
+                                             background:{}; color:{}; font-size:12px; font-weight:{};",
+                                            if selected {
+                                                palette.accent_soft
+                                            } else {
+                                                "transparent"
+                                            },
+                                            control_text,
+                                            if selected { 700 } else { 600 }
+                                        ),
+                                        onclick: move |_| {
+                                            on_change.call((mode, option_for_click.clone()));
+                                            menu_open.set(false);
+                                        },
+                                        onkeydown: move |evt| evt.stop_propagation(),
+                                        "{option}"
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -43569,8 +43747,8 @@ mod tests {
         );
     }
     #[test]
-    fn terminal_input_override_defaults_to_settings_panel_only() {
-        assert!(terminal_input_override_for_right_panel_mode(
+    fn terminal_input_override_defaults_to_no_right_panel() {
+        assert!(!terminal_input_override_for_right_panel_mode(
             RightPanelMode::Settings
         ));
         assert!(!terminal_input_override_for_right_panel_mode(
@@ -54433,6 +54611,16 @@ Waiting for the remote terminal to paint...\n";
             false,
             true,
             true,
+        ));
+    }
+    #[test]
+    fn remote_resume_frames_are_budgeted_before_overlay_dismissal() {
+        let full_screen_frame = format!("\u{1b}[?25l\u{1b}[H{}", "tui ".repeat(200));
+        assert!(terminal_write_should_frame_budget(
+            &full_screen_frame,
+            true,
+            false,
+            false,
         ));
     }
     #[test]
