@@ -1,5 +1,7 @@
 use anyhow::{Context, Result};
-use yggterm_core::{SessionStore, detect_install_context};
+use std::path::Path;
+use std::process::Command;
+use yggterm_core::{InstallContext, SessionStore, detect_install_context};
 use yggterm_server::{
     AppControlRightPanelMode, AppControlViewMode, cleanup_legacy_daemons, default_endpoint,
     detect_ghostty_host, ensure_local_daemon_running, ping, run_app_control_background_window,
@@ -17,6 +19,9 @@ use yggterm_server::{
     run_screenshot_capture, run_trace_bundle, run_trace_follow, run_trace_tail, shutdown, snapshot,
     status, try_run_remote_server_command,
 };
+
+const ENV_YGGTERM_DIRECT_INSTALL_ROOT: &str = "YGGTERM_DIRECT_INSTALL_ROOT";
+const ENV_YGGTERM_SKIP_ACTIVE_EXEC_HANDOFF: &str = "YGGTERM_SKIP_ACTIVE_EXEC_HANDOFF";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BuiltinCliCommand {
@@ -120,6 +125,91 @@ fn ensure_local_server_ready_for_cli(store: &SessionStore) -> Result<()> {
     ensure_local_daemon_running(&endpoint)
 }
 
+fn paths_same_executable(left: &Path, right: &Path) -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        return left
+            .to_string_lossy()
+            .replace('/', "\\")
+            .eq_ignore_ascii_case(&right.to_string_lossy().replace('/', "\\"));
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        left == right
+    }
+}
+
+fn preferred_headless_executable(install_context: &InstallContext) -> Option<std::path::PathBuf> {
+    let preferred_gui = install_context.preferred_executable.as_ref()?;
+    let binary_name = if cfg!(target_os = "windows") {
+        "yggterm-headless.exe"
+    } else {
+        "yggterm-headless"
+    };
+    Some(
+        preferred_gui
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join(binary_name),
+    )
+}
+
+fn maybe_handoff_to_preferred_headless_executable(
+    current_exe: &Path,
+    args: &[String],
+    install_context: &InstallContext,
+) -> Result<()> {
+    if std::env::var_os(ENV_YGGTERM_SKIP_ACTIVE_EXEC_HANDOFF).is_some() {
+        return Ok(());
+    }
+    let Some(preferred) = preferred_headless_executable(install_context) else {
+        return Ok(());
+    };
+    let current = current_exe
+        .canonicalize()
+        .unwrap_or_else(|_| current_exe.to_path_buf());
+    let preferred = preferred
+        .canonicalize()
+        .unwrap_or_else(|_| preferred.to_path_buf());
+    if paths_same_executable(&current, &preferred) || !preferred.is_file() {
+        return Ok(());
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+
+        let mut command = Command::new(&preferred);
+        command.args(args);
+        command.env(ENV_YGGTERM_SKIP_ACTIVE_EXEC_HANDOFF, "1");
+        if let Some(root) = install_context.managed_root.as_ref() {
+            command.env(ENV_YGGTERM_DIRECT_INSTALL_ROOT, root);
+        }
+        let error = command.exec();
+        return Err(error).with_context(|| {
+            format!("failed to exec headless command as {}", preferred.display())
+        });
+    }
+
+    #[cfg(not(unix))]
+    {
+        let mut command = Command::new(&preferred);
+        command.args(args);
+        command.env(ENV_YGGTERM_SKIP_ACTIVE_EXEC_HANDOFF, "1");
+        if let Some(root) = install_context.managed_root.as_ref() {
+            command.env(ENV_YGGTERM_DIRECT_INSTALL_ROOT, root);
+        }
+        let status = command.status().with_context(|| {
+            format!(
+                "failed to hand off headless command to {}",
+                preferred.display()
+            )
+        })?;
+        std::process::exit(status.code().unwrap_or(1));
+    }
+}
+
 fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter("info")
@@ -129,7 +219,8 @@ fn main() -> Result<()> {
 
     let args = std::env::args().skip(1).collect::<Vec<_>>();
     let current_exe = std::env::current_exe()?;
-    let _install_context = detect_install_context(&current_exe)?;
+    let install_context = detect_install_context(&current_exe)?;
+    maybe_handoff_to_preferred_headless_executable(&current_exe, &args, &install_context)?;
     let store = SessionStore::open_or_init()?;
 
     if args.as_slice() == ["server", "daemon"] {
@@ -703,7 +794,9 @@ fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::cli_positional_args;
+    use super::{cli_positional_args, preferred_headless_executable};
+    use std::path::PathBuf;
+    use yggterm_core::{InstallChannel, InstallContext, UpdatePolicy};
 
     #[test]
     fn cli_positional_args_skips_flag_values() {
@@ -720,6 +813,31 @@ mod tests {
         assert_eq!(
             cli_positional_args(&args, 3),
             vec!["C:\\Users\\Admin\\window.png"]
+        );
+    }
+
+    #[test]
+    fn preferred_headless_executable_uses_active_gui_sibling() {
+        let context = InstallContext {
+            channel: InstallChannel::Direct,
+            update_policy: UpdatePolicy::Auto,
+            repo: "test/repo".to_string(),
+            asset_label: "linux-x86_64".to_string(),
+            current_version: "2.1.52".to_string(),
+            executable_path: PathBuf::from("/direct/versions/2.1.50/yggterm-headless"),
+            preferred_executable: Some(PathBuf::from("/direct/versions/2.1.52/yggterm")),
+            managed_root: Some(PathBuf::from("/direct")),
+            manager_hint: Some("Direct install".to_string()),
+        };
+        let preferred = preferred_headless_executable(&context).expect("preferred headless");
+        let expected_name = if cfg!(target_os = "windows") {
+            "yggterm-headless.exe"
+        } else {
+            "yggterm-headless"
+        };
+        assert_eq!(
+            preferred,
+            PathBuf::from("/direct/versions/2.1.52").join(expected_name)
         );
     }
 }
