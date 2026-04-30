@@ -1,3 +1,9 @@
+yggterm (2.1.63-1) unstable; urgency=medium
+
+  * Update the direct SHA-2 dependency to sha2 0.11.0 alongside the refreshed Dioxus desktop runtime stack.
+
+ -- Yggdrasil HQ <avi@gour.top>  Fri, 01 May 2026 01:29:10 +0530
+
 yggterm (2.1.62-1) unstable; urgency=medium
 
   * Update the desktop runtime stack to Dioxus 0.7.6, Wry 0.55.0, Tao 0.35.0, WebKitGTK 2.0.2, reqwest 0.13.3, rusqlite 0.39.0, png 0.18, and refreshed transitive dependencies.
