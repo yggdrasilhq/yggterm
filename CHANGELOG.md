@@ -4,6 +4,16 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+## 2.1.52
+
+### Fixed
+
+- prune stale direct-install version directories during install and desktop integration, preventing archived old GUI binaries from being accidentally executed and rewriting modern session state
+- route `yggterm server ...` launcher invocations through the active `yggterm-headless` sibling, while keeping `server app launch` on the GUI path, so app-control/status probes cannot start an unintended desktop shell
+- make stale versioned `yggterm-headless` binaries hand off to the active installed headless binary before opening the session store or daemon state
+- write daemon state through a temporary file and preserve `server-state.previous.json` before overwrites, giving future live-session state regressions a recoverable last-good copy instead of a single point of failure
+- prefer a live remote session over a stale stored preview when both share the same `remote-session://...` path in Terminal view, avoiding blank surfaces and session/view contract violations after partial state recovery
+
 ## 2.1.51
 
 ### Fixed
