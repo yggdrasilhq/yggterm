@@ -1,3 +1,13 @@
+yggterm (2.1.52-1) unstable; urgency=medium
+
+  * Prune stale direct-install version directories during install and integration.
+  * Route yggterm server commands through the active yggterm-headless sibling except GUI app launch.
+  * Hand off stale versioned headless binaries before they can touch daemon/session state.
+  * Preserve server-state.previous.json before daemon state overwrites.
+  * Prefer live remote sessions over stale stored previews with the same remote-session path.
+
+ -- Yggdrasil HQ <avi@gour.top>  Thu, 30 Apr 2026 14:38:06 +0530
+
 yggterm (2.1.51-1) unstable; urgency=medium
 
   * Add a low-power TUI render path for high-volume full-screen terminal output so WebKit stays inside CPU budget.
