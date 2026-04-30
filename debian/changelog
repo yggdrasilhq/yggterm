@@ -1,3 +1,12 @@
+yggterm (2.1.65-1) unstable; urgency=medium
+
+  * Keep KDE direct-install launches grouped under the canonical dev.yggterm.Yggterm desktop id during update handoff.
+  * Accept runtime-running prompt-ready remote terminal surfaces so resume clears the attention toast and re-enables input.
+  * Add yggterm-headless server app desktop-identity for KDE launcher/app-id incident reports.
+  * Use the canonical theme icon in Linux desktop entries and refresh the icon edge pixels.
+
+ -- Yggdrasil HQ <avi@gour.top>  Fri, 01 May 2026 02:25:00 +0530
+
 yggterm (2.1.64-1) unstable; urgency=medium
 
   * Keep active full-screen TUI terminals on the real xterm canvas instead of the low-power text overlay.

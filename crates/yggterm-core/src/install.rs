@@ -455,7 +455,7 @@ fn should_repair_linux_launcher(context: &InstallContext) -> bool {
     launcher_file_looks_stale(&launcher_path, &launcher_text)
         || desktop_text.contains("/tmp/yggterm-")
         || !desktop_text.contains("Icon=")
-        || !desktop_text.contains("yggterm.svg")
+        || !desktop_text.contains(&format!("Icon={YGGTERM_DESKTOP_APP_ID}\n"))
         || desktop_text.contains("NoDisplay=true")
 }
 
@@ -467,6 +467,18 @@ fn should_repair_linux_launcher(_context: &InstallContext) -> bool {
 #[cfg(target_os = "linux")]
 fn non_direct_install_channel_may_repair_linux_launcher(channel: InstallChannel) -> bool {
     !matches!(channel, InstallChannel::Direct | InstallChannel::Unknown)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_desktop_entry_contents(desktop_exec_path: &Path, no_display: bool) -> String {
+    format!(
+        "[Desktop Entry]\nType=Application\nVersion=1.0\nName=Yggterm\nComment=Remote-first terminal workspace\nExec={}\nTryExec={}\nIcon={}\nTerminal=false\nNoDisplay={}\nCategories=System;TerminalEmulator;Development;\nStartupNotify=true\nStartupWMClass={}\nX-Desktop-File-Install-Version=0.27\n",
+        desktop_exec_escape(desktop_exec_path),
+        desktop_exec_escape(desktop_exec_path),
+        YGGTERM_DESKTOP_APP_ID,
+        if no_display { "true" } else { "false" },
+        YGGTERM_DESKTOP_APP_ID,
+    )
 }
 
 #[cfg(target_os = "linux")]
@@ -503,7 +515,7 @@ fn refresh_linux_integration(context: &InstallContext) -> Result<Vec<String>> {
         None
     };
 
-    let installed_icons = install_linux_icon_assets(
+    let _installed_icons = install_linux_icon_assets(
         &data_dir,
         &direct_assets_dir,
         &["yggterm", YGGTERM_DESKTOP_APP_ID],
@@ -512,22 +524,9 @@ fn refresh_linux_integration(context: &InstallContext) -> Result<Vec<String>> {
     let desktop_path = applications_dir.join(format!("{YGGTERM_DESKTOP_APP_ID}.desktop"));
     let legacy_desktop_path = applications_dir.join("yggterm.desktop");
     let desktop_exec_path = launcher_path.as_deref().unwrap_or(&context.executable_path);
-    let desktop_icon_path = desktop_exec_escape(&installed_icons.direct_svg_path);
-    let desktop_contents = format!(
-        "[Desktop Entry]\nType=Application\nVersion=1.0\nName=Yggterm\nComment=Remote-first terminal workspace\nExec={}\nTryExec={}\nIcon={}\nTerminal=false\nNoDisplay=false\nCategories=System;TerminalEmulator;Development;\nStartupNotify=true\nStartupWMClass={}\nX-Desktop-File-Install-Version=0.27\n",
-        desktop_exec_escape(desktop_exec_path),
-        desktop_exec_escape(desktop_exec_path),
-        desktop_icon_path,
-        YGGTERM_DESKTOP_APP_ID,
-    );
+    let desktop_contents = linux_desktop_entry_contents(desktop_exec_path, false);
     write_if_changed(&desktop_path, desktop_contents.as_bytes())?;
-    let legacy_desktop_contents = format!(
-        "[Desktop Entry]\nType=Application\nVersion=1.0\nName=Yggterm\nComment=Remote-first terminal workspace\nExec={}\nTryExec={}\nIcon={}\nTerminal=false\nNoDisplay=true\nCategories=System;TerminalEmulator;Development;\nStartupNotify=true\nStartupWMClass={}\nX-Desktop-File-Install-Version=0.27\n",
-        desktop_exec_escape(desktop_exec_path),
-        desktop_exec_escape(desktop_exec_path),
-        desktop_icon_path,
-        YGGTERM_DESKTOP_APP_ID,
-    );
+    let legacy_desktop_contents = linux_desktop_entry_contents(desktop_exec_path, true);
     write_if_changed(&legacy_desktop_path, legacy_desktop_contents.as_bytes())?;
     let _ = std::process::Command::new("update-desktop-database")
         .arg(&applications_dir)
@@ -1398,6 +1397,23 @@ mod tests {
         assert!(script.contains("[ \"${2:-}\" = 'app' ] && [ \"${3:-}\" = 'launch' ]"));
         assert!(script.contains("[ \"${1:-}\" = '--version' ]"));
         assert!(script.contains("target=\"$target_dir/yggterm-headless\""));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_desktop_entry_uses_theme_icon_and_canonical_wm_class() {
+        let desktop = linux_desktop_entry_contents(Path::new("/home/pi/.local/bin/yggterm"), false);
+        assert!(desktop.contains("Exec=/home/pi/.local/bin/yggterm\n"));
+        assert!(desktop.contains("TryExec=/home/pi/.local/bin/yggterm\n"));
+        assert!(desktop.contains(&format!("Icon={YGGTERM_DESKTOP_APP_ID}\n")));
+        assert!(desktop.contains(&format!("StartupWMClass={YGGTERM_DESKTOP_APP_ID}\n")));
+        assert!(desktop.contains("NoDisplay=false\n"));
+        assert!(!desktop.contains("yggterm.svg"));
+
+        let legacy = linux_desktop_entry_contents(Path::new("/home/pi/.local/bin/yggterm"), true);
+        assert!(legacy.contains("NoDisplay=true\n"));
+        assert!(legacy.contains(&format!("Icon={YGGTERM_DESKTOP_APP_ID}\n")));
+        assert!(legacy.contains(&format!("StartupWMClass={YGGTERM_DESKTOP_APP_ID}\n")));
     }
 
     #[test]
