@@ -17,7 +17,6 @@ pub const YGGTERM_DESKTOP_APP_ID: &str = "dev.yggterm.Yggterm";
 pub const ENV_YGGTERM_ENABLE_ACCESSIBILITY: &str = "YGGTERM_ENABLE_ACCESSIBILITY";
 pub const ENV_YGGTERM_ENABLE_WEBKIT_COMPOSITING: &str = "YGGTERM_ENABLE_WEBKIT_COMPOSITING";
 const LINUX_LAUNCHER_MARKER: &str = "yggterm-direct-launcher-v3";
-const MOCK_CLI_NAME: &str = "yggterm-mock-cli";
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum InstallChannel {
@@ -491,13 +490,13 @@ fn refresh_linux_integration(context: &InstallContext) -> Result<Vec<String>> {
             &preferred_executable_for(context, "yggterm"),
             "yggterm launcher",
         )?;
-        let mock_launcher = bin_dir.join(MOCK_CLI_NAME);
+        let headless_launcher = bin_dir.join("yggterm-headless");
         write_linux_launcher_script(
             context,
-            &mock_launcher,
-            MOCK_CLI_NAME,
-            &preferred_executable_for(context, MOCK_CLI_NAME),
-            "yggterm-mock-cli launcher",
+            &headless_launcher,
+            "yggterm-headless",
+            &preferred_executable_for(context, "yggterm-headless"),
+            "yggterm-headless launcher",
         )?;
         Some(launcher)
     } else {
@@ -887,11 +886,6 @@ where
     } else {
         format!("yggterm-headless-{}", context.asset_label)
     };
-    let mock_cli_name = if cfg!(target_os = "windows") {
-        format!("{MOCK_CLI_NAME}-{}.exe", context.asset_label)
-    } else {
-        format!("{MOCK_CLI_NAME}-{}", context.asset_label)
-    };
     let binary_path = version_dir.join(if cfg!(target_os = "windows") {
         "yggterm.exe"
     } else {
@@ -901,11 +895,6 @@ where
         "yggterm-headless.exe"
     } else {
         "yggterm-headless"
-    });
-    let mock_cli_path = version_dir.join(if cfg!(target_os = "windows") {
-        "yggterm-mock-cli.exe"
-    } else {
-        MOCK_CLI_NAME
     });
     on_progress(ReleaseUpdateInstallProgress {
         stage: ReleaseUpdateInstallStage::Extracting,
@@ -919,12 +908,6 @@ where
         detail: "Extracting headless helper".to_string(),
     });
     extract_binary_from_archive(&archive, &headless_name, &headless_path)?;
-    on_progress(ReleaseUpdateInstallProgress {
-        stage: ReleaseUpdateInstallStage::Extracting,
-        percent: 97,
-        detail: "Extracting mock CLI".to_string(),
-    });
-    extract_binary_from_archive(&archive, &mock_cli_name, &mock_cli_path)?;
     write_direct_install_state(
         root,
         &context.repo,
@@ -1211,7 +1194,7 @@ fn linux_launcher_script(
         String::new()
     };
     format!(
-        "#!/usr/bin/env sh\n# {marker}\nset -eu\nROOT={root}\nSTATE=\"$ROOT/{state_file}\"\nBINARY_NAME={binary_name}\ntarget=\"\"\nif [ \"$BINARY_NAME\" = 'yggterm' ] && [ -f \"$STATE\" ]; then\n  target=\"$(sed -n 's/.*\"active_executable\"[[:space:]]*:[[:space:]]*\"\\([^\"]*\\)\".*/\\1/p' \"$STATE\" | head -n1)\"\nfi\nif [ -z \"$target\" ] || [ ! -x \"$target\" ]; then\n  latest_version=\"$(find \"$ROOT/versions\" -mindepth 1 -maxdepth 1 -type d -printf '%f\\n' 2>/dev/null | sort -V | tail -n1)\"\n  if [ -n \"$latest_version\" ] && [ -x \"$ROOT/versions/$latest_version/$BINARY_NAME\" ]; then\n    target=\"$ROOT/versions/$latest_version/$BINARY_NAME\"\n  fi\nfi\nif [ -z \"$target\" ] || [ ! -x \"$target\" ]; then\n  target={fallback}\nfi\n[ -x \"$target\" ] || {{ printf '%s\\n' '{launcher_name}: no runnable executable found' >&2; exit 1; }}\nif [ \"$BINARY_NAME\" = 'yggterm' ] && [ \"${{1:-}}\" = 'server' ]; then\n  use_headless=1\n  if [ \"${{2:-}}\" = 'app' ] && [ \"${{3:-}}\" = 'launch' ]; then\n    use_headless=0\n  fi\n  if [ \"$use_headless\" = '1' ]; then\n    target_dir=\"$(dirname \"$target\")\"\n    if [ -x \"$target_dir/yggterm-headless\" ]; then\n      target=\"$target_dir/yggterm-headless\"\n    fi\n  fi\nfi\n{accessibility_guard}{webkit_guard}{export_root}exec \"$target\" \"$@\"\n",
+        "#!/usr/bin/env sh\n# {marker}\nset -eu\nROOT={root}\nSTATE=\"$ROOT/{state_file}\"\nBINARY_NAME={binary_name}\ntarget=\"\"\nif [ \"$BINARY_NAME\" = 'yggterm' ] && [ -f \"$STATE\" ]; then\n  target=\"$(sed -n 's/.*\"active_executable\"[[:space:]]*:[[:space:]]*\"\\([^\"]*\\)\".*/\\1/p' \"$STATE\" | head -n1)\"\nfi\nif [ -z \"$target\" ] || [ ! -x \"$target\" ]; then\n  latest_version=\"$(find \"$ROOT/versions\" -mindepth 1 -maxdepth 1 -type d -printf '%f\\n' 2>/dev/null | sort -V | tail -n1)\"\n  if [ -n \"$latest_version\" ] && [ -x \"$ROOT/versions/$latest_version/$BINARY_NAME\" ]; then\n    target=\"$ROOT/versions/$latest_version/$BINARY_NAME\"\n  fi\nfi\nif [ -z \"$target\" ] || [ ! -x \"$target\" ]; then\n  target={fallback}\nfi\n[ -x \"$target\" ] || {{ printf '%s\\n' '{launcher_name}: no runnable executable found' >&2; exit 1; }}\nif [ \"$BINARY_NAME\" = 'yggterm' ]; then\n  use_headless=0\n  if [ \"${{1:-}}\" = 'server' ]; then\n    use_headless=1\n    if [ \"${{2:-}}\" = 'app' ] && [ \"${{3:-}}\" = 'launch' ]; then\n      use_headless=0\n    fi\n  fi\n  if [ \"${{1:-}}\" = '--version' ] || [ \"${{1:-}}\" = '-V' ] || [ \"${{1:-}}\" = 'version' ]; then\n    use_headless=1\n  fi\n  if [ \"$use_headless\" = '1' ]; then\n    target_dir=\"$(dirname \"$target\")\"\n    if [ -x \"$target_dir/yggterm-headless\" ]; then\n      target=\"$target_dir/yggterm-headless\"\n    fi\n  fi\nfi\n{accessibility_guard}{webkit_guard}{export_root}exec \"$target\" \"$@\"\n",
         marker = LINUX_LAUNCHER_MARKER,
         root = root_quoted,
         state_file = INSTALL_STATE_FILENAME,
@@ -1234,10 +1217,25 @@ fn preferred_executable_for(context: &InstallContext, binary_name: &str) -> Path
     } else {
         binary_name.to_string()
     };
-    preferred
+    let candidate = preferred
         .parent()
         .unwrap_or_else(|| Path::new("."))
-        .join(sibling_name)
+        .join(sibling_name);
+    if binary_name == "yggterm-headless" && !candidate.exists() {
+        let packaged_name = if cfg!(target_os = "windows") {
+            "yggterm-headless-bin.exe"
+        } else {
+            "yggterm-headless-bin"
+        };
+        let packaged_candidate = preferred
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join(packaged_name);
+        if packaged_candidate.exists() {
+            return packaged_candidate;
+        }
+    }
+    candidate
 }
 
 #[cfg(unix)]
@@ -1396,8 +1394,9 @@ mod tests {
             "yggterm launcher",
         );
         assert!(script.contains("yggterm-direct-launcher-v3"));
-        assert!(script.contains("[ \"${1:-}\" = 'server' ]"));
+        assert!(script.contains("if [ \"${1:-}\" = 'server' ]; then"));
         assert!(script.contains("[ \"${2:-}\" = 'app' ] && [ \"${3:-}\" = 'launch' ]"));
+        assert!(script.contains("[ \"${1:-}\" = '--version' ]"));
         assert!(script.contains("target=\"$target_dir/yggterm-headless\""));
     }
 
