@@ -11350,7 +11350,13 @@ def assert_focus_and_visibility(pid: int, state: dict) -> dict:
 def assert_text_readability(state: dict) -> dict:
     host = active_host(state)
     bg = str(host.get("xterm_theme_background") or host.get("viewport_background_color") or "")
-    rows_color = str(host.get("rows_sample_color") or host.get("rows_color") or "")
+    rows_color = str(
+        host.get("rows_sample_color")
+        or host.get("rows_color")
+        or host.get("xterm_theme_foreground")
+        or host.get("foreground_color")
+        or ""
+    )
     dim_color = str(host.get("dim_sample_color") or "")
     low_contrast_count = int(host.get("low_contrast_span_count") or 0)
     low_contrast_row_count = int(host.get("low_contrast_row_count") or 0)
@@ -11359,14 +11365,25 @@ def assert_text_readability(state: dict) -> dict:
     min_row_contrast = float(host.get("xterm_minimum_contrast_ratio") or 0.0)
     if min_row_contrast <= 0.0:
         min_row_contrast = 8.5 if bg == "#fbfbfd" else 6.5
-    if "JetBrains Mono" not in str(host.get("rows_sample_font_family") or host.get("rows_font_family") or ""):
+    font_family = str(
+        host.get("rows_sample_font_family")
+        or host.get("rows_font_family")
+        or host.get("xterm_font_family")
+        or host.get("font_family")
+        or ""
+    )
+    font_weight = str(
+        host.get("rows_sample_font_weight")
+        or host.get("rows_font_weight")
+        or host.get("xterm_font_weight")
+        or ""
+    )
+    if "JetBrains Mono" not in font_family:
         raise AssertionError(
-            f"rows font family drifted from JetBrains Mono stack: {host.get('rows_sample_font_family')!r}"
+            f"terminal font family drifted from JetBrains Mono stack: {font_family!r}"
         )
-    if str(host.get("rows_sample_font_weight") or host.get("rows_font_weight")) != "400":
-        raise AssertionError(
-            f"rows font weight drifted: {host.get('rows_sample_font_weight') or host.get('rows_font_weight')!r}"
-        )
+    if font_weight != "400":
+        raise AssertionError(f"terminal font weight drifted: {font_weight!r}")
     line_height = float(host.get("xterm_line_height") or 0.0)
     if abs(line_height - 1.0) > 0.01:
         raise AssertionError(f"terminal line height drifted from VS Code parity: {line_height!r}")
@@ -11400,6 +11417,8 @@ def assert_text_readability(state: dict) -> dict:
         "low_contrast_span_count": low_contrast_count,
         "low_contrast_row_count": low_contrast_row_count,
         "xterm_line_height": line_height,
+        "font_family": font_family,
+        "font_weight": font_weight,
     }
 
 
@@ -12815,6 +12834,20 @@ def assert_sidebar_session_switch_focus_space_scroll(pid: int, session: str, out
         raise AssertionError(f"sidebar switch scroll probe left terminal input disabled: {scroll_probe!r}")
     if not scroll_moved:
         raise AssertionError(f"sidebar switch scroll probe did not reach or move terminal: {scroll_probe!r}")
+    scroll_text = "\n".join(
+        str(scroll_after.get(key) or "")
+        for key in ("text_head", "text_sample", "text_tail")
+    )
+    drifted_rows = [
+        line
+        for line in scroll_text.splitlines()
+        if (index := line.find("YGG_SWITCH_SCROLL_")) > 2
+    ]
+    if drifted_rows:
+        raise AssertionError(
+            "sidebar switch scroll output drifted horizontally; terminal linefeeds did not reset to column 0: "
+            f"rows={drifted_rows[:8]!r} scroll_probe={scroll_probe!r}"
+        )
 
     shot_path = out_dir / "sidebar-switch-focus-space-scroll.png"
     app_screenshot(pid, shot_path)
@@ -13664,17 +13697,37 @@ def assert_scroll(pid: int, session: str, before_state: dict) -> dict:
 def assert_cursor_prompt_visibility(state: dict, *, context: str) -> dict:
     host = active_host(state)
     cursor_rect = host.get("cursor_sample_rect") or {}
+    expected_rect = host.get("cursor_expected_rect") or {}
     cursor_row_rect = host.get("cursor_row_rect") or {}
     host_rect = host.get("host_rect") or {}
     cursor_line_text = str(host.get("cursor_line_text") or host.get("cursor_row_text") or "")
     active_cursor_rect = cursor_rect
     if not cursor_sample_is_visibly_active(host):
-        raise AssertionError(
-            f"{context}: native cursor rect missing: raw={cursor_rect!r} hidden={host.get('xterm_cursor_hidden')!r}"
+        canvas_expected_cursor_fallback = (
+            str(host.get("xterm_renderer_mode") or "").strip().lower() == "canvas"
+            and host.get("helper_textarea_focused") is True
+            and host.get("host_has_active_element") is True
+            and host.get("xterm_cursor_hidden") is not True
+            and rect_is_visible(expected_rect)
+            and (
+                cursor_line_text.strip() != ""
+                or int(host.get("cursor_visible_row_index") or -1) >= 0
+            )
         )
+        if not canvas_expected_cursor_fallback:
+            raise AssertionError(
+                f"{context}: native cursor rect missing: raw={cursor_rect!r} hidden={host.get('xterm_cursor_hidden')!r}"
+            )
+        active_cursor_rect = expected_rect
     if not cursor_line_text.strip():
         raise AssertionError(f"{context}: cursor line text is empty")
-    row_color = str(host.get("cursor_row_color") or host.get("rows_color") or "")
+    row_color = str(
+        host.get("cursor_row_color")
+        or host.get("rows_color")
+        or host.get("foreground_color")
+        or host.get("xterm_theme_foreground")
+        or ""
+    )
     row_background = str(
         host.get("cursor_row_background")
         or host.get("viewport_background_color")
@@ -14452,12 +14505,19 @@ def assert_hidden_cursor_tui(pid: int, session: str, out_dir: Path) -> dict:
         state = app_state(pid)
         host = active_host(state)
         text_sample = str(host.get("text_sample") or "")
+        low_power_text = str(host.get("low_power_tui_text_sample") or "")
         cursor_line_text = str(host.get("cursor_line_text") or host.get("cursor_row_text") or "")
-        if (
+        observed_xterm_alt = (
             host.get("xterm_buffer_kind") == "alternate"
             and host.get("xterm_cursor_hidden") is True
             and ("hc" in text_sample or "hc" in cursor_line_text)
-        ):
+        )
+        observed_low_power_tui = (
+            host.get("low_power_tui_overlay_active") is True
+            and bool(int(host.get("low_power_tui_frame_count") or 0))
+            and ("hc" in text_sample or "hc" in cursor_line_text or "hc" in low_power_text)
+        )
+        if observed_xterm_alt or observed_low_power_tui:
             break
         time.sleep(0.15)
     shot_path = out_dir / "hidden-cursor-tui.png"
@@ -14467,6 +14527,10 @@ def assert_hidden_cursor_tui(pid: int, session: str, out_dir: Path) -> dict:
     observed_live = (
         host.get("xterm_buffer_kind") == "alternate"
         and host.get("xterm_cursor_hidden") is True
+    )
+    observed_low_power_tui = (
+        host.get("low_power_tui_overlay_active") is True
+        and int(host.get("low_power_tui_frame_count") or 0) >= 1
     )
     if observed_live:
         if cursor_sample_is_visibly_active(host):
@@ -14483,9 +14547,11 @@ def assert_hidden_cursor_tui(pid: int, session: str, out_dir: Path) -> dict:
     restored_host = active_host(restored_state)
     if restored_host.get("xterm_buffer_kind") != "normal":
         raise AssertionError(f"hidden-cursor fixture did not restore the normal buffer: {restored_host!r}")
-    if int(restored_host.get("xterm_buffer_transition_count") or 0) < 2:
+    restored_low_power_frame_count = int(restored_host.get("low_power_tui_frame_count") or 0)
+    low_power_tui_contract = observed_low_power_tui and restored_low_power_frame_count >= 1
+    if not low_power_tui_contract and int(restored_host.get("xterm_buffer_transition_count") or 0) < 2:
         raise AssertionError(f"expected alternate-buffer transitions, saw {restored_host!r}")
-    if int(restored_host.get("xterm_cursor_hidden_toggle_count") or 0) < 2:
+    if not low_power_tui_contract and int(restored_host.get("xterm_cursor_hidden_toggle_count") or 0) < 2:
         raise AssertionError(f"expected hidden-cursor toggles, saw {restored_host!r}")
     assert_cursor_alignment(restored_state)
     return {
@@ -14493,12 +14559,16 @@ def assert_hidden_cursor_tui(pid: int, session: str, out_dir: Path) -> dict:
         "probe": probe,
         "screenshot": str(shot_path),
         "observed_live_alternate_buffer": observed_live,
+        "observed_live_low_power_tui": observed_low_power_tui,
         "buffer_kind": host.get("xterm_buffer_kind"),
         "cursor_hidden": host.get("xterm_cursor_hidden"),
         "renderer_mode": host.get("xterm_renderer_mode"),
+        "low_power_tui_frame_count": host.get("low_power_tui_frame_count"),
+        "low_power_tui_text_sample": host.get("low_power_tui_text_sample"),
         "restored_buffer_kind": restored_host.get("xterm_buffer_kind"),
         "buffer_transition_count": restored_host.get("xterm_buffer_transition_count"),
         "cursor_hidden_toggle_count": restored_host.get("xterm_cursor_hidden_toggle_count"),
+        "restored_low_power_tui_frame_count": restored_low_power_frame_count,
     }
 
 

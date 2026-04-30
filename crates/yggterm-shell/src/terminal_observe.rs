@@ -1145,10 +1145,17 @@ pub(crate) fn terminal_chunk_has_codex_prompt_output(data: &str) -> bool {
         .map(str::trim)
         .filter(|line| !line.is_empty())
         .collect::<Vec<_>>();
-    !normalized_lines.is_empty()
-        && normalized_lines.len() <= 2
-        && normalized_lines.iter().all(|line| line.len() <= 96)
-        && normalized_lines.iter().any(|line| {
+    if normalized_lines.is_empty() {
+        return false;
+    }
+    let tail = normalized_lines
+        .iter()
+        .rev()
+        .take(4)
+        .copied()
+        .collect::<Vec<_>>();
+    tail.iter().all(|line| line.chars().count() <= 160)
+        && tail.iter().any(|line| {
             let semantic =
                 line.trim_matches(|ch: char| matches!(ch, '╭' | '╮' | '╰' | '╯' | '─' | '│' | ' '));
             semantic.starts_with('›')
@@ -1517,6 +1524,29 @@ mod tests {
         ));
         assert!(terminal_chunk_has_codex_prompt_output(
             "› Write tests for @filename"
+        ));
+        assert!(terminal_chunk_has_codex_prompt_output(
+            "\
+╭────────────────────────────────────────────────────────╮
+│ >_ OpenAI Codex (v0.125.0)                             │
+│                                                        │
+│ model:     gpt-5.3-codex-spark high   /model to change │
+│ directory: ~                                           │
+╰────────────────────────────────────────────────────────╯
+
+
+› Summarize recent commits
+
+  gpt-5.3-codex-spark high · ~"
+        ));
+        assert!(!terminal_chunk_has_codex_prompt_output(
+            "\
+╭────────────────────────────────────────────────────────╮
+│ >_ OpenAI Codex (v0.125.0)                             │
+│                                                        │
+│ model:     gpt-5.3-codex-spark high   /model to change │
+│ directory: ~                                           │
+╰────────────────────────────────────────────────────────╯"
         ));
         assert!(!terminal_chunk_has_codex_prompt_output("$ echo hi"));
     }
