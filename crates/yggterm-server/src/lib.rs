@@ -24,15 +24,16 @@ pub use daemon::{
     ServerEndpoint, ServerRequest, ServerResponse, ServerRuntimeStatus, TerminalStreamChunk,
     cleanup_legacy_daemons, connect_ssh, connect_ssh_custom, default_endpoint,
     ensure_remote_runtime_codex_session as daemon_ensure_remote_runtime_codex_session, focus_live,
-    focus_live_with_view, open_remote_session, open_remote_session_with_view, open_stored_session,
-    open_stored_session_with_view, ping, prepare_update_restart, raise_external_window,
-    refresh_managed_cli, refresh_preview, refresh_remote_machine, remove_session,
-    remove_ssh_target, request_terminal_launch, run_daemon, set_all_preview_blocks_folded,
-    set_session_keep_alive, set_view_mode, shutdown, snapshot, start_command_session,
-    start_local_session, start_local_session_at, start_remote_codex_session_at,
-    start_remote_runtime_codex_session, start_ssh_session_at, status, switch_agent_session_mode,
-    sync_external_window, sync_theme, terminal_ensure, terminal_read, terminal_resize,
-    terminal_snapshot, terminal_write, toggle_preview_block, update_session_copy,
+    focus_live_with_view, hot_restart, open_remote_session, open_remote_session_with_view,
+    open_stored_session, open_stored_session_with_view, ping, prepare_update_restart,
+    raise_external_window, reachable_versioned_daemon_statuses, refresh_managed_cli,
+    refresh_preview, refresh_remote_machine, remove_session, remove_ssh_target,
+    request_terminal_launch, run_daemon, set_all_preview_blocks_folded, set_session_keep_alive,
+    set_view_mode, shutdown, snapshot, start_command_session, start_local_session,
+    start_local_session_at, start_remote_codex_session_at, start_remote_runtime_codex_session,
+    start_ssh_session_at, status, switch_agent_session_mode, sync_external_window, sync_theme,
+    terminal_ensure, terminal_read, terminal_resize, terminal_snapshot, terminal_write,
+    toggle_preview_block, update_session_copy,
 };
 pub use host::{GhosttyHostKind, GhosttyHostSupport, GhosttyTerminalHostMode, detect_ghostty_host};
 pub use protocol::{
@@ -61,6 +62,8 @@ use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashSet};
 use std::fs::{self, OpenOptions};
 use std::io::{ErrorKind, Read, Write};
+#[cfg(unix)]
+use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -86,6 +89,7 @@ pub enum WorkspaceViewMode {
 }
 
 const REMOTE_COMMAND_CACHE_VERIFY_TTL_MS: u64 = 10 * 60_000;
+const REMOTE_YGGTERM_COMMAND_TIMEOUT_MS: u64 = 45_000;
 
 pub fn refresh_local_managed_cli_now(background: bool) -> anyhow::Result<String> {
     Ok(summarize_managed_cli_report(
@@ -493,6 +497,12 @@ pub struct RemoteMachineSnapshot {
     pub remote_deploy_state: RemoteDeployState,
     pub health: RemoteMachineHealth,
     pub sessions: Vec<RemoteScannedSession>,
+}
+
+pub(crate) struct RemoteMachineRefreshScan {
+    pub remote_binary_expr: Option<String>,
+    pub remote_deploy_state: RemoteDeployState,
+    pub scan_result: anyhow::Result<Vec<RemoteScannedSession>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2273,13 +2283,13 @@ impl YggtermServer {
         Ok(key)
     }
 
-    pub fn refresh_remote_machine_for_ssh_target(
-        &mut self,
+    pub(crate) fn is_loopback_remote_target(target: &SshConnectTarget) -> bool {
+        is_loopback_ssh_target(&target.ssh_target)
+    }
+
+    pub(crate) fn scan_remote_machine_refresh(
         target: &SshConnectTarget,
-    ) -> anyhow::Result<()> {
-        if is_loopback_ssh_target(&target.ssh_target) {
-            return Ok(());
-        }
+    ) -> RemoteMachineRefreshScan {
         if let Ok(home) = resolve_yggterm_home() {
             append_trace_event(
                 &home,
@@ -2292,9 +2302,6 @@ impl YggtermServer {
                 }),
             );
         }
-        let machine_key = machine_key_from_ssh_target(&target.ssh_target);
-        let label = ssh_machine_label(target);
-        let entry_ix = self.ensure_remote_machine_stub(target);
         let resolved_remote_launch =
             resolve_remote_yggterm_binary(&target.ssh_target, target.prefix.as_deref()).ok();
         let remote_binary_expr = resolved_remote_launch
@@ -2303,7 +2310,22 @@ impl YggtermServer {
         let remote_deploy_state = resolved_remote_launch
             .map(|(_, deploy_state)| deploy_state)
             .unwrap_or(RemoteDeployState::Planned);
-        match scan_remote_machine_sessions(target) {
+        RemoteMachineRefreshScan {
+            remote_binary_expr,
+            remote_deploy_state,
+            scan_result: scan_remote_machine_sessions(target),
+        }
+    }
+
+    pub(crate) fn apply_remote_machine_refresh_scan(
+        &mut self,
+        target: &SshConnectTarget,
+        scan: RemoteMachineRefreshScan,
+    ) -> anyhow::Result<()> {
+        let machine_key = machine_key_from_ssh_target(&target.ssh_target);
+        let label = ssh_machine_label(target);
+        let entry_ix = self.ensure_remote_machine_stub(target);
+        match scan.scan_result {
             Ok(mut sessions) => {
                 sessions.sort_by(|left, right| {
                     right
@@ -2320,8 +2342,8 @@ impl YggtermServer {
                     label,
                     ssh_target: target.ssh_target.clone(),
                     prefix: target.prefix.clone(),
-                    remote_binary_expr,
-                    remote_deploy_state,
+                    remote_binary_expr: scan.remote_binary_expr,
+                    remote_deploy_state: scan.remote_deploy_state,
                     health: RemoteMachineHealth::Healthy,
                     sessions,
                 };
@@ -2355,8 +2377,8 @@ impl YggtermServer {
                     label,
                     ssh_target: target.ssh_target.clone(),
                     prefix: target.prefix.clone(),
-                    remote_binary_expr,
-                    remote_deploy_state,
+                    remote_binary_expr: scan.remote_binary_expr,
+                    remote_deploy_state: scan.remote_deploy_state,
                     health: if existing_sessions.is_empty() {
                         RemoteMachineHealth::Offline
                     } else {
@@ -2381,6 +2403,17 @@ impl YggtermServer {
                 Err(error)
             }
         }
+    }
+
+    pub fn refresh_remote_machine_for_ssh_target(
+        &mut self,
+        target: &SshConnectTarget,
+    ) -> anyhow::Result<()> {
+        if Self::is_loopback_remote_target(target) {
+            return Ok(());
+        }
+        let scan = Self::scan_remote_machine_refresh(target);
+        self.apply_remote_machine_refresh_scan(target, scan)
     }
 
     pub fn refresh_remote_machine_by_key(&mut self, machine_key: &str) -> anyhow::Result<()> {
@@ -2513,7 +2546,10 @@ impl YggtermServer {
         }
     }
 
-    fn remote_target_for_machine_key(&self, machine_key: &str) -> anyhow::Result<SshConnectTarget> {
+    pub(crate) fn remote_target_for_machine_key(
+        &self,
+        machine_key: &str,
+    ) -> anyhow::Result<SshConnectTarget> {
         let machine_key = normalize_machine_key(machine_key);
         self.ssh_targets
             .iter()
@@ -7752,6 +7788,39 @@ fn remote_command_resolve_lock(cache_key: &str) -> Arc<Mutex<()>> {
         .clone()
 }
 
+fn wait_remote_command_with_timeout(
+    mut child: std::process::Child,
+    timeout_ms: u64,
+    context: &str,
+) -> anyhow::Result<std::process::Output> {
+    let started = Instant::now();
+    let timeout = Duration::from_millis(timeout_ms);
+    loop {
+        if child
+            .try_wait()
+            .with_context(|| format!("failed polling remote command for {context}"))?
+            .is_some()
+        {
+            return child
+                .wait_with_output()
+                .with_context(|| format!("failed collecting remote command output for {context}"));
+        }
+        if started.elapsed() >= timeout {
+            let _ = child.kill();
+            let output = child.wait_with_output().with_context(|| {
+                format!("failed collecting timed-out remote command for {context}")
+            })?;
+            anyhow::bail!(
+                "remote yggterm command timed out after {}s for {}: {}",
+                timeout_ms / 1000,
+                context,
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
 fn run_remote_binary_command(
     ssh_target: &str,
     exec_prefix: Option<&str>,
@@ -7787,9 +7856,12 @@ fn run_remote_binary_command(
             .write_all(bytes)
             .with_context(|| format!("failed to send remote yggterm payload to {ssh_target}"))?;
     }
-    let output = child
-        .wait_with_output()
-        .with_context(|| format!("failed waiting for remote yggterm command on {ssh_target}"))?;
+    let output = wait_remote_command_with_timeout(
+        child,
+        REMOTE_YGGTERM_COMMAND_TIMEOUT_MS,
+        &format!("{ssh_target} {binary_invocation}"),
+    )
+    .with_context(|| format!("failed waiting for remote yggterm command on {ssh_target}"))?;
     if !output.status.success() {
         anyhow::bail!(
             "remote yggterm command failed for {}: {}",
@@ -7828,6 +7900,9 @@ fn run_remote_yggterm_command(
 
 fn should_fallback_to_python(error: &anyhow::Error) -> bool {
     let message = format!("{error:#}");
+    if message.contains("remote scan already in progress") {
+        return false;
+    }
     message.contains("command not found")
         || message.contains("not found")
         || message.contains("No such file")
@@ -9094,14 +9169,25 @@ fn reap_spawned_child_in_background(
     });
 }
 
-fn spawn_local_daemon_process(current_exe: &Path, endpoint: &ServerEndpoint) -> anyhow::Result<()> {
-    let daemon_exe = local_headless_companion_executable_from_current(current_exe).with_context(|| {
-        format!(
-            "missing yggterm-headless companion next to {}; build yggterm-headless or install a release bundle that includes it",
-            current_exe.display()
-        )
-    })?;
-    let mut command = Command::new(&daemon_exe);
+pub(crate) fn spawn_hot_restart_daemon_process(
+    daemon_exe: &Path,
+    endpoint: &ServerEndpoint,
+) -> anyhow::Result<()> {
+    spawn_daemon_process_from_executable(
+        daemon_exe,
+        endpoint,
+        "spawning hot restart yggterm daemon",
+        "spawned_hot_restart_daemon_child",
+    )
+}
+
+fn spawn_daemon_process_from_executable(
+    daemon_exe: &Path,
+    endpoint: &ServerEndpoint,
+    spawn_context: &'static str,
+    child_event: &'static str,
+) -> anyhow::Result<()> {
+    let mut command = Command::new(daemon_exe);
     command
         .arg("server")
         .arg("daemon")
@@ -9124,16 +9210,32 @@ fn spawn_local_daemon_process(current_exe: &Path, endpoint: &ServerEndpoint) -> 
             });
         }
     }
-    let child = command.spawn().context("spawning local yggterm daemon")?;
+    let child = command.spawn().context(spawn_context)?;
     trace_local_daemon_child_event(
         endpoint,
-        "spawned_daemon_child",
+        child_event,
         json!({
             "pid": child.id(),
             "daemon_exe": daemon_exe.display().to_string(),
         }),
     );
-    reap_spawned_child_in_background(child, endpoint.clone(), daemon_exe);
+    reap_spawned_child_in_background(child, endpoint.clone(), daemon_exe.to_path_buf());
+    Ok(())
+}
+
+fn spawn_local_daemon_process(current_exe: &Path, endpoint: &ServerEndpoint) -> anyhow::Result<()> {
+    let daemon_exe = local_headless_companion_executable_from_current(current_exe).with_context(|| {
+        format!(
+            "missing yggterm-headless companion next to {}; build yggterm-headless or install a release bundle that includes it",
+            current_exe.display()
+        )
+    })?;
+    spawn_daemon_process_from_executable(
+        &daemon_exe,
+        endpoint,
+        "spawning local yggterm daemon",
+        "spawned_daemon_child",
+    )?;
     Ok(())
 }
 
@@ -10713,14 +10815,16 @@ fn wait_for_app_control_open_path_ready(
 ) -> anyhow::Result<Value> {
     let deadline = Instant::now() + Duration::from_millis(timeout_ms.max(250));
     let mut last_state = None::<Value>;
-    let mut last_error = None::<String>;
     let mut last_failure = None::<String>;
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
         let describe_timeout_ms = remaining.as_millis().clamp(750, 4_000) as u64;
-        match request_app_control(home, AppControlCommand::DescribeState, describe_timeout_ms) {
+        let last_error = match request_app_control(
+            home,
+            AppControlCommand::DescribeState,
+            describe_timeout_ms,
+        ) {
             Ok(response) => {
-                last_error = None;
                 if let Some(data) = response.data {
                     if app_control_open_path_ready(&data, session_path, view_mode.as_ref()) {
                         return Ok(data);
@@ -10732,11 +10836,10 @@ fn wait_for_app_control_open_path_ready(
                     }
                     last_state = Some(data);
                 }
+                None
             }
-            Err(error) => {
-                last_error = Some(error.to_string());
-            }
-        }
+            Err(error) => Some(error.to_string()),
+        };
         if Instant::now() >= deadline {
             if let Some(detail) = last_failure {
                 anyhow::bail!(
@@ -11504,9 +11607,9 @@ fn x11_keyboard_probe_input(
     let before_context = active_terminal_probe_context(&home, session_path, snapshot_timeout_ms)?;
     let window_id = focus_terminal_viewport_via_x11(&home, &before_context)?;
     let mut keyboard_backend = "xdotool_window".to_string();
-    let mut send_keys = |target_window: Option<&str>,
-                         target_display: &str,
-                         target_xauthority: Option<&str>|
+    let send_keys = |target_window: Option<&str>,
+                     target_display: &str,
+                     target_xauthority: Option<&str>|
      -> anyhow::Result<()> {
         if press_ctrl_c {
             run_xdotool_checked_owned(
@@ -11833,6 +11936,118 @@ pub fn run_remote_ensure_managed_cli(tool: ManagedCliTool) -> anyhow::Result<()>
     Ok(())
 }
 
+struct RemoteScanLockGuard {
+    #[cfg(unix)]
+    file: std::fs::File,
+    #[cfg(unix)]
+    home: PathBuf,
+    #[cfg(unix)]
+    path: PathBuf,
+}
+
+impl Drop for RemoteScanLockGuard {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        {
+            unsafe {
+                let _ = libc::flock(self.file.as_raw_fd(), libc::LOCK_UN);
+            }
+            append_trace_event(
+                &self.home,
+                "remote",
+                "scan",
+                "lock_released",
+                json!({
+                    "path": self.path.display().to_string(),
+                    "pid": std::process::id(),
+                }),
+            );
+        }
+    }
+}
+
+#[cfg(unix)]
+fn remote_scan_lock_is_busy(error: &std::io::Error) -> bool {
+    error.kind() == ErrorKind::WouldBlock
+        || error
+            .raw_os_error()
+            .is_some_and(|code| code == libc::EWOULDBLOCK || code == libc::EAGAIN)
+}
+
+fn try_acquire_remote_scan_lock(
+    yggterm_home: &Path,
+    requested_home: &Path,
+) -> anyhow::Result<Option<RemoteScanLockGuard>> {
+    #[cfg(unix)]
+    {
+        fs::create_dir_all(yggterm_home)
+            .with_context(|| format!("creating yggterm home {}", yggterm_home.display()))?;
+        let lock_path = yggterm_home.join("remote-scan.lock");
+        let mut file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .with_context(|| format!("opening remote scan lock {}", lock_path.display()))?;
+        let flock_result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if flock_result != 0 {
+            let error = std::io::Error::last_os_error();
+            if remote_scan_lock_is_busy(&error) {
+                append_trace_event(
+                    yggterm_home,
+                    "remote",
+                    "scan",
+                    "lock_busy",
+                    json!({
+                        "path": lock_path.display().to_string(),
+                        "requested_home": requested_home.display().to_string(),
+                        "pid": std::process::id(),
+                    }),
+                );
+                return Ok(None);
+            }
+            return Err(error)
+                .with_context(|| format!("locking remote scan lock {}", lock_path.display()));
+        }
+        file.set_len(0)
+            .with_context(|| format!("truncating remote scan lock {}", lock_path.display()))?;
+        writeln!(
+            file,
+            "{}",
+            serde_json::to_string(&json!({
+                "pid": std::process::id(),
+                "created_at_ms": current_millis_u64(),
+                "requested_home": requested_home.display().to_string(),
+            }))?
+        )
+        .with_context(|| format!("writing remote scan lock {}", lock_path.display()))?;
+        file.flush()
+            .with_context(|| format!("flushing remote scan lock {}", lock_path.display()))?;
+        append_trace_event(
+            yggterm_home,
+            "remote",
+            "scan",
+            "lock_acquired",
+            json!({
+                "path": lock_path.display().to_string(),
+                "requested_home": requested_home.display().to_string(),
+                "pid": std::process::id(),
+            }),
+        );
+        Ok(Some(RemoteScanLockGuard {
+            file,
+            home: yggterm_home.to_path_buf(),
+            path: lock_path,
+        }))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = yggterm_home;
+        let _ = requested_home;
+        Ok(Some(RemoteScanLockGuard {}))
+    }
+}
+
 pub fn run_remote_scan(codex_home: Option<&str>) -> anyhow::Result<()> {
     let requested_home = codex_home
         .map(|value| value.trim())
@@ -11855,6 +12070,12 @@ pub fn run_remote_scan(codex_home: Option<&str>) -> anyhow::Result<()> {
         });
     let scan_roots = remote_scan_roots(&requested_home, codex_home);
     let yggterm_home = resolve_yggterm_home()?;
+    let Some(_scan_lock) = try_acquire_remote_scan_lock(&yggterm_home, &requested_home)? else {
+        anyhow::bail!(
+            "remote scan already in progress for {}",
+            requested_home.display()
+        );
+    };
     let live_runtime_ids = live_remote_runtime_codex_session_ids(&yggterm_home);
     let title_store = SessionTitleStore::open(&yggterm_home)?;
     let mut files = Vec::new();
@@ -14052,8 +14273,8 @@ mod tests {
         screen_resume_or_spawn_shell_command, session_metadata_value, should_fallback_to_python,
         should_remove_local_daemon_socket_for_spawn_state, stored_session_launch_command,
         strip_remote_payload_noise, synthesize_remote_scanned_session_view,
-        upsert_session_metadata, validate_server_ui_snapshot,
-        windows_local_interactive_shell_launch_command,
+        try_acquire_remote_scan_lock, upsert_session_metadata, validate_server_ui_snapshot,
+        wait_remote_command_with_timeout, windows_local_interactive_shell_launch_command,
     };
     use crate::SessionRenderedSection;
     #[cfg(unix)]
@@ -14062,10 +14283,30 @@ mod tests {
     use serde_json::json;
     use std::fs;
     use std::path::PathBuf;
+    use std::process::{Command, Stdio};
     use std::sync::Mutex;
+    use std::time::{Duration, Instant};
     use yggterm_core::{SessionNodeKind, TranscriptRole};
 
     static CODEX_HOME_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    #[cfg(unix)]
+    #[test]
+    fn remote_command_wait_times_out_hung_child() {
+        let child = Command::new("sh")
+            .arg("-c")
+            .arg("exec sleep 5")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn test child");
+        let started = Instant::now();
+        let error = wait_remote_command_with_timeout(child, 50, "timeout-test")
+            .expect_err("hung child should time out");
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(error.to_string().contains("timed out"));
+    }
 
     fn snapshot_session(path: &str, source: SessionSource) -> SnapshotSessionView {
         SnapshotSessionView {
@@ -14161,6 +14402,7 @@ mod tests {
         ServerRuntimeStatus {
             server_version: "2.1.46".to_string(),
             server_build_id: 0,
+            server_pid: 0,
             host_kind: "test".to_string(),
             host_detail: "test".to_string(),
             embedded_surface_supported: false,
@@ -19208,6 +19450,35 @@ terminal_window_id: None,
     }
 
     #[test]
+    fn remote_scan_busy_lock_does_not_fallback_to_python() {
+        let error = anyhow::anyhow!(
+            "remote yggterm command failed for dev: Error: remote scan already in progress for /home/pi/.codex"
+        );
+        assert!(!should_fallback_to_python(&error));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remote_scan_lock_rejects_second_concurrent_holder() -> Result<()> {
+        let root = std::env::temp_dir().join(format!(
+            "yggterm-remote-scan-lock-{}-{}",
+            std::process::id(),
+            current_millis_u64()
+        ));
+        fs::create_dir_all(&root)?;
+        let requested_home = root.join(".codex");
+        let first = try_acquire_remote_scan_lock(&root, &requested_home)?
+            .expect("first lock should be acquired");
+        assert!(try_acquire_remote_scan_lock(&root, &requested_home)?.is_none());
+        drop(first);
+        let third = try_acquire_remote_scan_lock(&root, &requested_home)?;
+        assert!(third.is_some());
+        drop(third);
+        fs::remove_dir_all(&root)?;
+        Ok(())
+    }
+
+    #[test]
     fn remote_cache_key_trims_prefix_noise() {
         assert_eq!(
             remote_cache_key(" jojo ", Some("  sudo -u pi  ")),
@@ -19409,6 +19680,7 @@ terminal_window_id: None,
         let status = ServerRuntimeStatus {
             server_version: "2.1.41".to_string(),
             server_build_id: 41,
+            server_pid: 0,
             host_kind: "xterm".to_string(),
             host_detail: String::new(),
             embedded_surface_supported: true,

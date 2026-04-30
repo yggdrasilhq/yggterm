@@ -9,16 +9,16 @@ license = "Apache-2.0"
 anyhow.workspace = true
 arboard = { version = "3.6.1", features = ["wayland-data-control"] }
 base64 = "0.22"
-dioxus = { version = "=0.7.3", features = ["desktop"] }
-dioxus-desktop = "=0.7.3"
+dioxus = { version = "=0.7.6", features = ["desktop"] }
+dioxus-desktop = "=0.7.6"
 include_dir = "0.7"
 keyboard-types = "0.7"
 libc = "0.2"
 once_cell = "1"
-png = "0.17"
+png = "0.18"
 serde.workspace = true
 serde_json.workspace = true
-tao = "0.34.6"
+tao = "0.35.0"
 tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }
 time = { version = "0.3", features = ["formatting", "parsing"] }
 tracing.workspace = true
@@ -33,13 +33,13 @@ cairo-rs = { version = "0.18.5", features = ["png"] }
 gdk = "0.18.2"
 gdk-pixbuf = "0.18.5"
 gtk = "0.18.2"
-webkit2gtk = { version = "=2.0.1", features = ["v2_38"] }
-wry = "0.53.5"
+webkit2gtk = { version = "=2.0.2", features = ["v2_38"] }
+wry = "0.55.0"
 
 [target.'cfg(target_os = "windows")'.dependencies]
-webview2-com = "0.38.2"
+webview2-com = "0.38"
 windows = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Com", "Win32_System_Com_StructuredStorage"] }
-wry = "0.53.5"
+wry = "0.55.0"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2-foundation = { version = "0.3.2", features = ["NSProcessInfo", "NSString"] }

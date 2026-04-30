@@ -18,7 +18,19 @@ Yggterm installs into a managed user-space location, wires up desktop integratio
 
 Rerun the same one-liner any time to force a manual update of a direct install.
 
-Direct installs also ship `yggterm-mock-cli`, a small diagnostic CLI for probing daemon state, startup behavior, and native integration problems from the same installed runtime.
+Direct installs also ship `yggterm-mock-cli`, a panic-management CLI for terminal incidents. Use it from SSH when a session is hung, slow, missing after restore, drawing incorrectly, or connected to a stale daemon; it gathers a structured picture of daemon reachability, session presence, latency, and restart/update state without depending on the full desktop shell.
+
+Useful daemon-control scenarios:
+
+```bash
+yggterm-mock-cli --scenario panic-report --expect-path "live::<session>" --jsonl-out /tmp/yggterm-incident.jsonl
+yggterm-mock-cli --scenario panic-report --iterations 30 --interval-ms 1000 --jsonl-out /tmp/yggterm-watch.jsonl
+yggterm-mock-cli --scenario server-list
+yggterm-mock-cli --scenario hot-restart --all --timeout-ms 30000
+yggterm-mock-cli --scenario wait-session --expect-path "live::<session>" --timeout-ms 30000
+yggterm-mock-cli --scenario latency-check --all
+yggterm-mock-cli --scenario managed-cli-refresh --foreground
+```
 
 Yggterm also ships an always-on event trace so sluggish sessions can be debugged after the fact or while the app is still running:
 

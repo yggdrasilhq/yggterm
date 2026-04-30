@@ -14,7 +14,12 @@ fn decode_png_rgba(path: &Path) -> (u32, u32, Vec<u8>) {
     let bytes = fs::read(path).expect("read app icon png");
     let decoder = png::Decoder::new(Cursor::new(bytes));
     let mut reader = decoder.read_info().expect("decode app icon metadata");
-    let mut buffer = vec![0; reader.output_buffer_size()];
+    let mut buffer = vec![
+        0;
+        reader
+            .output_buffer_size()
+            .expect("app icon png output buffer size")
+    ];
     let info = reader
         .next_frame(&mut buffer)
         .expect("decode app icon pixels");

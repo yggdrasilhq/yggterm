@@ -38,6 +38,6 @@ yggui = { path = "../../crates/yggui" }
 yggui-contract = { path = "../../crates/yggui-contract" }
 
 [build-dependencies]
-png = "0.17"
-ico = "0.4"
-winresource = "0.1"
+png = "0.18"
+ico = "0.5.0"
+winresource = "0.1.31"
