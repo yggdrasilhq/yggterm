@@ -5005,15 +5005,24 @@ fn terminal_surface_has_prompt_ready_text(text: &str) -> bool {
         && (terminal_chunk_has_prompt_output(trimmed)
             || terminal_chunk_has_codex_prompt_output(trimmed))
 }
+fn terminal_host_surface_text<'a>(
+    host_health_cursor_line_text: &'a str,
+    host_health_text_tail: &'a str,
+) -> &'a str {
+    if terminal_surface_has_prompt_ready_text(host_health_cursor_line_text) {
+        host_health_cursor_line_text
+    } else if !host_health_text_tail.trim().is_empty() {
+        host_health_text_tail
+    } else {
+        host_health_cursor_line_text
+    }
+}
 fn retained_remote_surface_has_non_prompt_text(
     host_health_cursor_line_text: &str,
     host_health_text_tail: &str,
 ) -> bool {
-    let host_surface_text = if !host_health_text_tail.trim().is_empty() {
-        host_health_text_tail
-    } else {
-        host_health_cursor_line_text
-    };
+    let host_surface_text =
+        terminal_host_surface_text(host_health_cursor_line_text, host_health_text_tail);
     let trimmed = host_surface_text.trim();
     !trimmed.is_empty()
         && !terminal_surface_has_prompt_ready_text(host_surface_text)
@@ -5036,11 +5045,8 @@ fn remote_resume_visual_reveal_output_is_acceptable(
             && !terminal_chunk_is_saved_transcript_prefill(deferred_resume_output)
             && !terminal_chunk_is_low_signal_terminal_noise(deferred_resume_output);
     }
-    let host_surface_text = if !host_health_text_tail.trim().is_empty() {
-        host_health_text_tail
-    } else {
-        host_health_cursor_line_text
-    };
+    let host_surface_text =
+        terminal_host_surface_text(host_health_cursor_line_text, host_health_text_tail);
     let host_surface_trimmed = host_surface_text.trim();
     !host_surface_trimmed.is_empty()
         && terminal_surface_has_prompt_ready_text(host_surface_text)
@@ -5198,11 +5204,8 @@ fn quiet_retained_remote_surface_ready(
     if !(runtime_running || cursor_has_text) || !(cursor_has_text || tail_has_text) {
         return false;
     }
-    let host_surface_text = if tail_has_text {
-        host_health_text_tail
-    } else {
-        host_health_cursor_line_text
-    };
+    let host_surface_text =
+        terminal_host_surface_text(host_health_cursor_line_text, host_health_text_tail);
     if !terminal_surface_has_prompt_ready_text(host_surface_text) {
         return false;
     }
@@ -33100,6 +33103,7 @@ fn TerminalCanvas(
                                         saw_generic_idle_footer_output
                                             || tail_generic_idle_footer_output,
                                         saw_prompt_only_surface,
+                                        runtime_running,
                                     )
                                 } else {
                                     saw_meaningful_output
@@ -33526,6 +33530,7 @@ fn TerminalCanvas(
                                         saw_generic_idle_footer_output
                                             || tail_generic_idle_footer_output,
                                         saw_prompt_only_surface,
+                                        runtime_running,
                                     )
                                 } else {
                                     saw_meaningful_output
@@ -33757,13 +33762,17 @@ fn TerminalCanvas(
                                 let remote_resume_eof_without_output = is_remote_resume_session
                                     && !traced_attach_ready
                                     && runtime_eof_without_output;
+                                let prompt_only_surface_is_live = saw_prompt_only_surface
+                                    && runtime_running
+                                    && visible_resume_surface;
                                 let invalid_remote_resume_surface = is_remote_resume_session
                                     && !traced_attach_ready
                                     && (saw_generic_idle_output
                                         || tail_generic_idle_output
                                         || saw_generic_idle_footer_output
                                         || tail_generic_idle_footer_output
-                                        || saw_prompt_only_surface
+                                        || (saw_prompt_only_surface
+                                            && !prompt_only_surface_is_live)
                                         || saw_transcript_browser_output);
                                 let should_nudge_remote_resume = is_remote_resume_session
                                     && !traced_attach_ready
@@ -34763,9 +34772,13 @@ fn remote_resume_surface_connected(
     saw_generic_idle_output: bool,
     saw_generic_idle_footer_output: bool,
     saw_prompt_only_surface: bool,
+    runtime_running: bool,
 ) -> bool {
-    if saw_transcript_browser_output || saw_generic_idle_output || saw_prompt_only_surface {
+    if saw_transcript_browser_output || saw_generic_idle_output {
         return false;
+    }
+    if saw_prompt_only_surface {
+        return runtime_running && saw_visible_output;
     }
     if saw_generic_idle_footer_output && !saw_meaningful_output {
         return false;
@@ -34802,6 +34815,7 @@ fn remote_resume_attach_confirmation_satisfied(
         saw_generic_idle_output,
         saw_generic_idle_footer_output,
         saw_prompt_only_surface,
+        runtime_running,
     ) && (remote_resume_meaningful_observations >= 2
         || now_ms.saturating_sub(mount_started_ms) >= REMOTE_TERMINAL_ATTACH_CONFIRMATION_MIN_MS)
     {
@@ -34812,7 +34826,6 @@ fn remote_resume_attach_confirmation_satisfied(
         && !saw_transcript_browser_output
         && !saw_generic_idle_output
         && !saw_generic_idle_footer_output
-        && !saw_prompt_only_surface
         && first_resume_connected_output_ms.is_some_and(|started_ms| {
             now_ms.saturating_sub(started_ms) >= REMOTE_TERMINAL_ATTACH_CONNECTED_GRACE_MS
         })
@@ -42335,8 +42348,7 @@ fn linux_desktop_app_id() -> String {
     });
     linux_desktop_app_id_for_context(
         explicit_suffix.as_deref(),
-        env_flag_truthy("YGGTERM_ALLOW_MULTI_WINDOW")
-            || env_flag_truthy("YGGTERM_REMOTE_SMOKE_TAG"),
+        env_flag_truthy("YGGTERM_REMOTE_SMOKE_TAG"),
         false,
         home_seed.as_deref(),
     )
@@ -44778,6 +44790,35 @@ mod tests {
             ),
             format!("{YGGTERM_DESKTOP_APP_ID}.ismoketest")
         );
+    }
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_desktop_app_id_ignores_update_handoff_multi_window_env() {
+        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = ENV_LOCK.lock().expect("linux desktop app id env lock");
+        let allow_multi_window = std::env::var("YGGTERM_ALLOW_MULTI_WINDOW").ok();
+        let smoke_tag = std::env::var("YGGTERM_REMOTE_SMOKE_TAG").ok();
+        let explicit_suffix = std::env::var("YGGTERM_DESKTOP_APP_ID_SUFFIX").ok();
+        unsafe {
+            std::env::set_var("YGGTERM_ALLOW_MULTI_WINDOW", "1");
+            std::env::remove_var("YGGTERM_REMOTE_SMOKE_TAG");
+            std::env::remove_var("YGGTERM_DESKTOP_APP_ID_SUFFIX");
+        }
+        assert_eq!(linux_desktop_app_id(), YGGTERM_DESKTOP_APP_ID);
+        unsafe {
+            match allow_multi_window {
+                Some(value) => std::env::set_var("YGGTERM_ALLOW_MULTI_WINDOW", value),
+                None => std::env::remove_var("YGGTERM_ALLOW_MULTI_WINDOW"),
+            }
+            match smoke_tag {
+                Some(value) => std::env::set_var("YGGTERM_REMOTE_SMOKE_TAG", value),
+                None => std::env::remove_var("YGGTERM_REMOTE_SMOKE_TAG"),
+            }
+            match explicit_suffix {
+                Some(value) => std::env::set_var("YGGTERM_DESKTOP_APP_ID_SUFFIX", value),
+                None => std::env::remove_var("YGGTERM_DESKTOP_APP_ID_SUFFIX"),
+            }
+        }
     }
     #[cfg(target_os = "linux")]
     #[test]
@@ -49317,6 +49358,45 @@ Waiting for the remote terminal to paint...\n";
         assert!(!retained_remote_surface_has_non_prompt_text(
             "› Explain this codebase",
             ""
+        ));
+        assert!(!retained_remote_surface_has_non_prompt_text(
+            "› Use /skills to list available skills",
+            stale_tail
+        ));
+    }
+    #[test]
+    fn remote_resume_visual_reveal_accepts_codex_prompt_ready_tail_after_transcript() {
+        let tail = "\
+• Published v2.1.53.
+
+■ Conversation interrupted - tell the model what to do differently. Something went wrong? Hit /feedback to report the issue.
+
+› Use /skills to list available skills
+  gpt-5.5 xhigh · ~/gh/yggterm
+";
+        assert!(!retained_remote_surface_has_non_prompt_text("", tail));
+        assert!(remote_resume_visual_reveal_output_is_acceptable(
+            "", "", tail
+        ));
+        assert!(quiet_retained_remote_surface_ready(
+            true,
+            false,
+            true,
+            true,
+            false,
+            false,
+            true,
+            "",
+            tail,
+            50,
+            2,
+            Some(0),
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
         ));
     }
     #[test]
@@ -55187,31 +55267,37 @@ Updated at   Branch  Conversation\n\
     #[test]
     fn remote_resume_surface_connected_rejects_generic_idle_surface() {
         assert!(!remote_resume_surface_connected(
-            false, true, false, false, true, false, false,
+            false, true, false, false, true, false, false, true,
         ));
     }
     #[test]
     fn remote_resume_surface_connected_accepts_meaningful_codex_surface_with_prompt() {
         assert!(remote_resume_surface_connected(
-            true, true, false, false, false, false, false,
+            true, true, false, false, false, false, false, true,
         ));
     }
     #[test]
     fn remote_resume_surface_connected_rejects_attach_ready_marker_without_visible_surface() {
         assert!(!remote_resume_surface_connected(
-            false, false, true, false, false, false, false,
+            false, false, true, false, false, false, false, true,
         ));
     }
     #[test]
     fn remote_resume_surface_connected_accepts_attach_ready_marker_with_visible_surface() {
         assert!(remote_resume_surface_connected(
-            false, true, true, false, false, false, false,
+            false, true, true, false, false, false, false, true,
         ));
     }
     #[test]
-    fn remote_resume_surface_connected_rejects_prompt_only_surface() {
+    fn remote_resume_surface_connected_accepts_runtime_prompt_only_surface() {
+        assert!(remote_resume_surface_connected(
+            false, true, false, false, false, false, true, true,
+        ));
+    }
+    #[test]
+    fn remote_resume_surface_connected_rejects_dead_prompt_only_surface() {
         assert!(!remote_resume_surface_connected(
-            false, true, false, false, false, false, true,
+            false, true, false, false, false, false, true, false,
         ));
     }
     #[test]
@@ -55312,6 +55398,25 @@ Updated at   Branch  Conversation\n\
             true,
             Some(1_000),
             true,
+        ));
+    }
+    #[test]
+    fn remote_resume_attach_confirmation_accepts_runtime_prompt_surface_after_deadline() {
+        assert!(remote_resume_attach_confirmation_satisfied(
+            false,
+            true,
+            false,
+            false,
+            false,
+            false,
+            true,
+            0,
+            1_000,
+            1_000 + REMOTE_TERMINAL_ATTACH_CONFIRMATION_MIN_MS,
+            false,
+            true,
+            None,
+            false,
         ));
     }
     #[test]

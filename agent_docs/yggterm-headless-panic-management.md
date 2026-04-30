@@ -46,6 +46,9 @@ yggterm-headless server monitor \
   for blocking daemon work.
 - Daemon state healthy but screen is blank or text/input is wrong: switch to `yggterm server app
   state`, `screenshot`, `probe-type`, `probe-scroll`, or `probe-select`.
+- KDE pinning or duplicate taskbar icon suspect: run `yggterm-headless server app
+  desktop-identity` and inspect the canonical desktop file, pinned launcher ids, live client app ids,
+  and update-handoff environment.
 - Remote Codex/tooling suspect: run `managed-cli-refresh --foreground` or target a machine with
   `--machine-key`.
 

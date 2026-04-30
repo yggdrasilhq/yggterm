@@ -66,6 +66,13 @@ jobs:
       - name: Build release binary
         run: cargo build --release -p yggterm --no-default-features
 
+      - name: Run focused regression tests
+        run: |
+          cargo test -p yggterm-core --no-default-features linux_desktop_entry_uses_theme_icon_and_canonical_wm_class
+          cargo test -p yggterm-shell --no-default-features linux_desktop_app_id_ignores_update_handoff_multi_window_env
+          cargo test -p yggterm-shell --no-default-features remote_resume_attach_confirmation_accepts_runtime_prompt_surface_after_deadline
+          cargo test -p yggterm-shell --no-default-features remote_resume_visual_reveal_accepts_codex_prompt_ready_tail_after_transcript
+
       - name: Check shell scripts
         run: |
           bash -n scripts/install.sh

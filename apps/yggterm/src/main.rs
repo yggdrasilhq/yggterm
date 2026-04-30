@@ -24,17 +24,17 @@ use yggterm_server::{
     ensure_local_daemon_running, local_headless_companion_executable_from_current, ping,
     request_app_control, run_app_control_background_window, run_app_control_close_window,
     run_app_control_create_terminal, run_app_control_describe_rows, run_app_control_describe_state,
-    run_app_control_drag, run_app_control_dump_state, run_app_control_focus_window,
-    run_app_control_key, run_app_control_list_clients, run_app_control_move_window_by,
-    run_app_control_open_path, run_app_control_paste_terminal_clipboard,
-    run_app_control_paste_terminal_clipboard_image, run_app_control_pointer,
-    run_app_control_probe_terminal_viewport_input, run_app_control_probe_terminal_viewport_scroll,
-    run_app_control_probe_terminal_viewport_select, run_app_control_reclaim_terminal_focus,
-    run_app_control_remove_session, run_app_control_reset_theme_editor,
-    run_app_control_restart_pending_update, run_app_control_scroll_preview,
-    run_app_control_send_terminal_input, run_app_control_set_clipboard_png_base64,
-    run_app_control_set_clipboard_text, run_app_control_set_fullscreen,
-    run_app_control_set_main_zoom, run_app_control_set_maximized,
+    run_app_control_desktop_identity, run_app_control_drag, run_app_control_dump_state,
+    run_app_control_focus_window, run_app_control_key, run_app_control_list_clients,
+    run_app_control_move_window_by, run_app_control_open_path,
+    run_app_control_paste_terminal_clipboard, run_app_control_paste_terminal_clipboard_image,
+    run_app_control_pointer, run_app_control_probe_terminal_viewport_input,
+    run_app_control_probe_terminal_viewport_scroll, run_app_control_probe_terminal_viewport_select,
+    run_app_control_reclaim_terminal_focus, run_app_control_remove_session,
+    run_app_control_reset_theme_editor, run_app_control_restart_pending_update,
+    run_app_control_scroll_preview, run_app_control_send_terminal_input,
+    run_app_control_set_clipboard_png_base64, run_app_control_set_clipboard_text,
+    run_app_control_set_fullscreen, run_app_control_set_main_zoom, run_app_control_set_maximized,
     run_app_control_set_preview_layout, run_app_control_set_right_panel_mode,
     run_app_control_set_row_expanded, run_app_control_set_search,
     run_app_control_set_session_keep_alive, run_app_control_set_theme_editor_open,
@@ -409,6 +409,18 @@ fn print_server_help() {
     );
 }
 
+fn print_server_app_help() {
+    println!(
+        "usage:
+  yggterm server app clients
+  yggterm server app desktop-identity
+  yggterm server app state [--pid <pid>]
+  yggterm server app rows [--pid <pid>]
+  yggterm server app screenshot [output] [--pid <pid>]
+  yggterm server app terminal <new|send|focus|probe-type|probe-scroll|probe-select> ..."
+    );
+}
+
 fn ensure_local_server_ready_for_cli(store: &SessionStore) -> Result<()> {
     let endpoint = default_endpoint(store.home_dir());
     ensure_local_daemon_running(&endpoint)
@@ -598,6 +610,10 @@ fn main() -> Result<()> {
             })
             .unwrap_or(15_000);
         return match args[2].as_str() {
+            "--help" | "-h" | "help" => {
+                print_server_app_help();
+                Ok(())
+            }
             "screenshot" => {
                 let target = args
                     .windows(2)
@@ -650,6 +666,7 @@ fn main() -> Result<()> {
                 )
             }
             "clients" => run_app_control_list_clients(),
+            "desktop-identity" => run_app_control_desktop_identity(),
             "state" => run_app_control_describe_state(timeout_ms),
             "dump" => {
                 let output_path = cli_positional_args(&args, 3)
