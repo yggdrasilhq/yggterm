@@ -33,13 +33,25 @@ need_cmd tar
 need_cmd uname
 need_cmd sed
 
+prune_old_versions() {
+  keep_version="$1"
+  [ -n "${keep_version}" ] || return 0
+  versions_dir="${install_root}/versions"
+  [ -d "${versions_dir}" ] || return 0
+  for candidate in "${versions_dir}"/*; do
+    [ -d "${candidate}" ] || continue
+    [ "$(basename "${candidate}")" = "${keep_version}" ] && continue
+    rm -rf "${candidate}" || true
+  done
+}
+
 write_launcher_wrapper() {
   bin_dir="${HOME}/.local/bin"
   launcher_path="${bin_dir}/yggterm"
   mkdir -p "${bin_dir}"
   cat > "${launcher_path}" <<EOF
 #!/usr/bin/env sh
-# yggterm-direct-launcher-v2
+# yggterm-direct-launcher-v3
 set -eu
 ROOT='${install_root}'
 STATE="\$ROOT/install-state.json"
@@ -60,6 +72,18 @@ fi
   printf '%s\n' 'yggterm launcher: no runnable executable found' >&2
   exit 1
 }
+if [ "\${1:-}" = "server" ]; then
+  use_headless=1
+  if [ "\${2:-}" = "app" ] && [ "\${3:-}" = "launch" ]; then
+    use_headless=0
+  fi
+  if [ "\$use_headless" = "1" ]; then
+    target_dir="\$(dirname "\$target")"
+    if [ -x "\$target_dir/yggterm-headless" ]; then
+      target="\$target_dir/yggterm-headless"
+    fi
+  fi
+fi
 if [ "${YGGTERM_ENABLE_ACCESSIBILITY:-0}" != "1" ] && [ -z "${NO_AT_BRIDGE+x}" ]; then
   export NO_AT_BRIDGE=1
 fi
@@ -78,7 +102,7 @@ write_mock_cli_wrapper() {
   mkdir -p "${bin_dir}"
   cat > "${launcher_path}" <<EOF
 #!/usr/bin/env sh
-# yggterm-direct-launcher-v2
+# yggterm-direct-launcher-v3
 set -eu
 ROOT='${install_root}'
 target=""
@@ -168,6 +192,7 @@ if [ -n "${current_version}" ] && [ "${current_version}" = "${release_version}" 
     write_mock_cli_wrapper
     log "refreshing desktop integration"
     "${current_binary}" install integrate >/dev/null 2>&1 || true
+    prune_old_versions "${current_version}"
     log "binary: ${current_binary}"
   fi
   exit 0
@@ -243,6 +268,7 @@ write_mock_cli_wrapper
 
 log "refreshing desktop integration"
 "${installed_binary}" install integrate >/dev/null 2>&1 || true
+prune_old_versions "${release_version}"
 
 log "installed yggterm ${release_version}"
 log "binary: ${installed_binary}"
