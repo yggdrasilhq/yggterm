@@ -15,8 +15,8 @@ def parse_args() -> argparse.Namespace:
         description="Run 23 strict daemon footprint checks against an isolated YGGTERM_HOME."
     )
     parser.add_argument("--bin", default="./target/debug/yggterm")
-    parser.add_argument("--mock-bin", default="./target/debug/yggterm-mock-cli")
-    parser.add_argument("--out-dir", default="/tmp/yggterm-mock-cli-footprint-23")
+    parser.add_argument("--headless-bin", default="./target/debug/yggterm-headless")
+    parser.add_argument("--out-dir", default="/tmp/yggterm-headless-footprint-23")
     parser.add_argument("--session-count", type=int, default=23)
     parser.add_argument("--burst-bytes", type=int, default=524288)
     parser.add_argument("--idle-trim-ms", type=int, default=1500)
@@ -51,15 +51,15 @@ def scenario_result_data(events: list[dict]) -> dict:
     return {}
 
 
-def mock_cli(
-    mock_bin: str,
+def headless_monitor(
+    headless_bin: str,
     env: dict[str, str],
     out_dir: Path,
     name: str,
     *extra_args: str,
 ) -> tuple[subprocess.CompletedProcess, list[dict]]:
     jsonl_path = out_dir / f"{name}.jsonl"
-    cmd = [str(Path(mock_bin).resolve()), *extra_args, "--jsonl-out", str(jsonl_path)]
+    cmd = [str(Path(headless_bin).resolve()), *extra_args, "--jsonl-out", str(jsonl_path)]
     result = run(cmd, env=env, check=False)
     return result, parse_jsonl(jsonl_path)
 
@@ -138,7 +138,7 @@ def cpu_time_ms_for_pid(pid: int) -> int:
 
 
 def wait_for_trim_status(
-    mock_bin: str,
+    headless_bin: str,
     env: dict[str, str],
     out_dir: Path,
     name: str,
@@ -151,7 +151,7 @@ def wait_for_trim_status(
     last_result: subprocess.CompletedProcess | None = None
     last_status: dict = {}
     while time.monotonic() < deadline:
-        last_result, status_events = mock_cli(mock_bin, env, out_dir, name, "--scenario", "status")
+        last_result, status_events = headless_monitor(headless_bin, env, out_dir, name, "--scenario", "status")
         last_status = scenario_result_data(status_events)
         session_count = int(last_status.get("terminal_session_count") or 0)
         retained_bytes = int(last_status.get("terminal_retained_bytes") or 0)
@@ -169,7 +169,7 @@ def main() -> int:
         shutil.rmtree(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    home = Path(tempfile.mkdtemp(prefix="yggterm-mock-cli-footprint-home-"))
+    home = Path(tempfile.mkdtemp(prefix="yggterm-headless-footprint-home-"))
     env = os.environ.copy()
     env["YGGTERM_HOME"] = str(home)
     env["YGGTERM_DAEMON_TERMINAL_IDLE_TRIM_MS"] = str(args.idle_trim_ms)
@@ -198,11 +198,11 @@ def main() -> int:
             {"startup_ms": startup_ms, "startup_budget_ms": 1500},
         )
 
-        startup_result, startup_events = mock_cli(args.mock_bin, env, out_dir, "01-startup", "--scenario", "startup")
+        startup_result, startup_events = headless_monitor(args.headless_bin, env, out_dir, "01-startup", "--scenario", "startup")
         startup = scenario_result_data(startup_events)
         record("startup_ok", startup_result.returncode == 0 and bool(startup.get("server_version")), startup)
 
-        status_result, status_events = mock_cli(args.mock_bin, env, out_dir, "02-status-initial", "--scenario", "status")
+        status_result, status_events = headless_monitor(args.headless_bin, env, out_dir, "02-status-initial", "--scenario", "status")
         status0 = scenario_result_data(status_events)
         record("initial_status_ok", status_result.returncode == 0, status0)
         record(
@@ -221,8 +221,8 @@ def main() -> int:
         session_count = 0
         for iteration in range(args.iterations):
             name_prefix = f"{iteration + 1:02d}"
-            footprint_result, footprint_events = mock_cli(
-                args.mock_bin,
+            footprint_result, footprint_events = headless_monitor(
+                args.headless_bin,
                 env,
                 out_dir,
                 f"{name_prefix}-terminal-footprint",
@@ -274,8 +274,8 @@ def main() -> int:
                 {"pids": pids},
             )
 
-            status_after_result, status_after_events = mock_cli(
-                args.mock_bin,
+            status_after_result, status_after_events = headless_monitor(
+                args.headless_bin,
                 env,
                 out_dir,
                 f"{name_prefix}-status-after-load",
@@ -298,8 +298,8 @@ def main() -> int:
             ping_after = run([str(Path(args.bin).resolve()), "server", "ping"], env=env, check=False)
             record(f"ping_after_load_ok_{name_prefix}", ping_after.returncode == 0, {"returncode": ping_after.returncode})
 
-            snapshot_result, snapshot_events = mock_cli(
-                args.mock_bin,
+            snapshot_result, snapshot_events = headless_monitor(
+                args.headless_bin,
                 env,
                 out_dir,
                 f"{name_prefix}-snapshot-after-load",
@@ -310,7 +310,7 @@ def main() -> int:
             record(f"snapshot_after_load_ok_{name_prefix}", snapshot_result.returncode == 0, snapshot_data)
 
             status_trim_result, status2 = wait_for_trim_status(
-                args.mock_bin,
+                args.headless_bin,
                 env,
                 out_dir,
                 f"{name_prefix}-status-after-trim",
@@ -406,7 +406,7 @@ def main() -> int:
             {"samples": iteration_samples, "growth_tolerance_bytes": growth_tolerance_bytes},
         )
 
-        shutdown_result, shutdown_events = mock_cli(args.mock_bin, env, out_dir, "08-graceful-shutdown", "--scenario", "graceful-shutdown")
+        shutdown_result, shutdown_events = headless_monitor(args.headless_bin, env, out_dir, "08-graceful-shutdown", "--scenario", "graceful-shutdown")
         shutdown_data = scenario_result_data(shutdown_events)
         record("graceful_shutdown_ok", shutdown_result.returncode == 0, shutdown_data)
         time.sleep(0.5)

@@ -12,12 +12,10 @@ mkdir -p "$DIST_DIR"
 
 BIN_NAME="yggterm"
 HEADLESS_BIN_NAME="yggterm-headless"
-MOCK_CLI_BIN_NAME="yggterm-mock-cli"
 case "$TARGET_LABEL" in
   windows-*)
     BIN_NAME="yggterm.exe"
     HEADLESS_BIN_NAME="yggterm-headless.exe"
-    MOCK_CLI_BIN_NAME="yggterm-mock-cli.exe"
     ;;
 esac
 
@@ -45,16 +43,14 @@ elif [[ -n "$TARGET_TRIPLE" && "$TARGET_TRIPLE" != "$HOST_TRIPLE" ]] && command 
 else
   BUILD_CMD+=("build")
 fi
-BUILD_CMD+=(--release -p yggterm --bin yggterm --bin yggterm-headless --bin yggterm-mock-cli --no-default-features)
+BUILD_CMD+=(--release -p yggterm --bin yggterm --bin yggterm-headless --no-default-features)
 BIN_PATH="${ROOT_DIR}/target/release/${BIN_NAME}"
 HEADLESS_BIN_PATH="${ROOT_DIR}/target/release/${HEADLESS_BIN_NAME}"
-MOCK_CLI_BIN_PATH="${ROOT_DIR}/target/release/${MOCK_CLI_BIN_NAME}"
 WEBVIEW2_LOADER_PATH=""
 if [[ -n "$TARGET_TRIPLE" ]]; then
   BUILD_CMD+=(--target "$TARGET_TRIPLE")
   BIN_PATH="${ROOT_DIR}/target/${TARGET_TRIPLE}/release/${BIN_NAME}"
   HEADLESS_BIN_PATH="${ROOT_DIR}/target/${TARGET_TRIPLE}/release/${HEADLESS_BIN_NAME}"
-  MOCK_CLI_BIN_PATH="${ROOT_DIR}/target/${TARGET_TRIPLE}/release/${MOCK_CLI_BIN_NAME}"
 fi
 
 find_webview2_loader() {
@@ -112,15 +108,19 @@ maybe_refresh_release_codex_cli() {
     echo "Skipping managed Codex CLI refresh for cross target ${TARGET_TRIPLE}; host is ${HOST_TRIPLE}."
     return
   fi
-  if [[ ! -x "$MOCK_CLI_BIN_PATH" ]]; then
-    echo "warning: cannot refresh managed Codex CLI; missing executable $MOCK_CLI_BIN_PATH" >&2
+  if [[ ! -x "$HEADLESS_BIN_PATH" ]]; then
+    echo "warning: cannot refresh managed Codex CLI; missing executable $HEADLESS_BIN_PATH" >&2
     return
   fi
   local report_path="${DIST_DIR}/managed-codex-refresh-${TARGET_LABEL}.jsonl"
   rm -f "$report_path"
-  echo "Checking managed Codex CLI tools..."
-  if "$MOCK_CLI_BIN_PATH" --scenario managed-cli-refresh --foreground --jsonl-out "$report_path"; then
-    echo "Managed Codex CLI refresh report: $report_path"
+  echo "Queueing managed Codex CLI refresh/check..."
+  if "$HEADLESS_BIN_PATH" server monitor --scenario managed-cli-refresh --background --jsonl-out "$report_path"; then
+    if grep -q '"kind":"error"' "$report_path"; then
+      echo "warning: managed Codex CLI refresh/check reported an error; continuing release packaging: $report_path" >&2
+    else
+      echo "Managed Codex CLI refresh report: $report_path"
+    fi
   else
     echo "warning: managed Codex CLI refresh/check failed; continuing release packaging" >&2
   fi
@@ -129,7 +129,6 @@ maybe_refresh_release_codex_cli() {
 build_macos_release_bundle() {
   local gui_binary_path="$1"
   local headless_binary_path="$2"
-  local mock_cli_binary_path="$3"
   local app_path="${DIST_DIR}/Yggterm.app"
   local contents_path="${app_path}/Contents"
   local macos_path="${contents_path}/MacOS"
@@ -146,10 +145,6 @@ build_macos_release_bundle() {
   if [[ -f "$headless_binary_path" ]]; then
     cp "$headless_binary_path" "${macos_path}/yggterm-headless"
     chmod 0755 "${macos_path}/yggterm-headless" || true
-  fi
-  if [[ -f "$mock_cli_binary_path" ]]; then
-    cp "$mock_cli_binary_path" "${macos_path}/yggterm-mock-cli"
-    chmod 0755 "${macos_path}/yggterm-mock-cli" || true
   fi
 
   if [[ -f "$icon_png" ]]; then
@@ -233,13 +228,6 @@ case "$HEADLESS_BIN_NAME" in
     ;;
 esac
 cp "$HEADLESS_BIN_PATH" "${DIST_DIR}/${HEADLESS_OUT_BASENAME}"
-MOCK_CLI_OUT_BASENAME="yggterm-mock-cli-${TARGET_LABEL}"
-case "$MOCK_CLI_BIN_NAME" in
-  *.exe)
-    MOCK_CLI_OUT_BASENAME="${MOCK_CLI_OUT_BASENAME}.exe"
-    ;;
-esac
-cp "$MOCK_CLI_BIN_PATH" "${DIST_DIR}/${MOCK_CLI_OUT_BASENAME}"
 
 WEBVIEW2_OUT_BASENAME=""
 if [[ "$TARGET_LABEL" == windows-* ]]; then
@@ -268,7 +256,6 @@ checksum_file() {
 
 checksum_file "${DIST_DIR}/${OUT_BASENAME}" "${DIST_DIR}/${OUT_BASENAME}.sha256"
 checksum_file "${DIST_DIR}/${HEADLESS_OUT_BASENAME}" "${DIST_DIR}/${HEADLESS_OUT_BASENAME}.sha256"
-checksum_file "${DIST_DIR}/${MOCK_CLI_OUT_BASENAME}" "${DIST_DIR}/${MOCK_CLI_OUT_BASENAME}.sha256"
 if [[ -n "$WEBVIEW2_OUT_BASENAME" ]]; then
   checksum_file "${DIST_DIR}/${WEBVIEW2_OUT_BASENAME}" "${DIST_DIR}/${WEBVIEW2_OUT_BASENAME}.sha256"
 fi
@@ -278,8 +265,6 @@ TAR_CONTENTS=(
   "${OUT_BASENAME}.sha256"
   "${HEADLESS_OUT_BASENAME}"
   "${HEADLESS_OUT_BASENAME}.sha256"
-  "${MOCK_CLI_OUT_BASENAME}"
-  "${MOCK_CLI_OUT_BASENAME}.sha256"
 )
 if [[ -n "$WEBVIEW2_OUT_BASENAME" ]]; then
   TAR_CONTENTS+=(
@@ -295,8 +280,7 @@ checksum_file "${DIST_DIR}/yggterm-${TARGET_LABEL}.tar.gz" "${DIST_DIR}/yggterm-
 if [[ "$TARGET_LABEL" == macos-* ]]; then
   build_macos_release_bundle \
     "${DIST_DIR}/${OUT_BASENAME}" \
-    "${DIST_DIR}/${HEADLESS_OUT_BASENAME}" \
-    "${DIST_DIR}/${MOCK_CLI_OUT_BASENAME}"
+    "${DIST_DIR}/${HEADLESS_OUT_BASENAME}"
 fi
 
 if [[ "$TARGET_LABEL" == windows-* ]]; then
@@ -306,7 +290,6 @@ if [[ "$TARGET_LABEL" == windows-* ]]; then
     "$WINDOWS_ZIP_PATH" \
     "${DIST_DIR}/${OUT_BASENAME}" \
     "${DIST_DIR}/${HEADLESS_OUT_BASENAME}" \
-    "${DIST_DIR}/${MOCK_CLI_OUT_BASENAME}" \
     "${DIST_DIR}/${WEBVIEW2_OUT_BASENAME}"
   checksum_file "$WINDOWS_ZIP_PATH" "${WINDOWS_ZIP_PATH}.sha256"
   echo "Release zip: ${WINDOWS_ZIP_PATH}"
@@ -314,7 +297,6 @@ fi
 
 echo "Release binary: ${DIST_DIR}/${OUT_BASENAME}"
 echo "Release headless binary: ${DIST_DIR}/${HEADLESS_OUT_BASENAME}"
-echo "Release mock cli: ${DIST_DIR}/${MOCK_CLI_OUT_BASENAME}"
 if [[ -n "$WEBVIEW2_OUT_BASENAME" ]]; then
   echo "Release WebView2 loader: ${DIST_DIR}/${WEBVIEW2_OUT_BASENAME}"
 fi

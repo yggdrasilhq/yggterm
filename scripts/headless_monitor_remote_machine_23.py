@@ -13,13 +13,13 @@ from pathlib import Path
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Run 23 strict mock-cli checks for restored remote-machine health state "
+            "Run 23 strict headless monitor checks for restored remote-machine health state "
             "against an isolated YGGTERM_HOME."
         )
     )
     parser.add_argument("--bin", default="./target/debug/yggterm")
-    parser.add_argument("--mock-bin", default="./target/debug/yggterm-mock-cli")
-    parser.add_argument("--out-dir", default="/tmp/yggterm-mock-cli-remote-machine-23")
+    parser.add_argument("--headless-bin", default="./target/debug/yggterm-headless")
+    parser.add_argument("--out-dir", default="/tmp/yggterm-headless-remote-machine-23")
     return parser.parse_args()
 
 
@@ -27,8 +27,8 @@ def run(argv: list[str], *, env: dict[str, str], check: bool = True) -> subproce
     return subprocess.run(argv, text=True, capture_output=True, env=env, check=check)
 
 
-def mock_cli(
-    mock_bin: str,
+def headless_monitor(
+    headless_bin: str,
     env: dict[str, str],
     out_dir: Path,
     name: str,
@@ -36,7 +36,7 @@ def mock_cli(
 ) -> tuple[subprocess.CompletedProcess, dict]:
     jsonl_path = out_dir / f"{name}.jsonl"
     result = run(
-        [str(Path(mock_bin).resolve()), *extra_args, "--jsonl-out", str(jsonl_path)],
+        [str(Path(headless_bin).resolve()), *extra_args, "--jsonl-out", str(jsonl_path)],
         env=env,
         check=False,
     )
@@ -211,7 +211,7 @@ def main() -> int:
         shutil.rmtree(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    home = Path(tempfile.mkdtemp(prefix="yggterm-mock-cli-remote-machine-home-"))
+    home = Path(tempfile.mkdtemp(prefix="yggterm-headless-remote-machine-home-"))
     env = os.environ.copy()
     env["YGGTERM_HOME"] = str(home)
     write_seed_state(home)
@@ -226,7 +226,7 @@ def main() -> int:
         daemon_proc = start_daemon(args.bin, env)
         record("daemon_started", True, {"pid": daemon_proc.pid})
 
-        startup_result, startup_payload = mock_cli(args.mock_bin, env, out_dir, "01-startup", "--scenario", "startup")
+        startup_result, startup_payload = headless_monitor(args.headless_bin, env, out_dir, "01-startup", "--scenario", "startup")
         startup = scenario_result_data(startup_payload)
         startup_details = startup.get("remote_machine_details") or []
         startup_counts = startup.get("remote_machine_health_counts") or {}
@@ -242,15 +242,15 @@ def main() -> int:
         record("startup_has_cached_machine_detail", machine_by_key(startup_details, "cached-dev").get("health") == "cached", {"details": startup_details})
         record("startup_has_offline_machine_detail", machine_by_key(startup_details, "offline-dev").get("health") == "offline", {"details": startup_details})
 
-        ping_result, ping_payload = mock_cli(args.mock_bin, env, out_dir, "02-ping", "--scenario", "ping")
+        ping_result, ping_payload = headless_monitor(args.headless_bin, env, out_dir, "02-ping", "--scenario", "ping")
         record("ping_returns_pong", ping_result.returncode == 0 and scenario_result_data(ping_payload).get("pong") is True, scenario_result_data(ping_payload))
 
-        status_result, status_payload = mock_cli(args.mock_bin, env, out_dir, "03-status", "--scenario", "status")
+        status_result, status_payload = headless_monitor(args.headless_bin, env, out_dir, "03-status", "--scenario", "status")
         status = scenario_result_data(status_payload)
         record("status_restored_from_persisted_state", status_result.returncode == 0 and status.get("restored_from_persisted_state") is True, status)
         record("status_restored_remote_machines", status.get("restored_remote_machines") == 3, status)
 
-        snapshot_result, snapshot_payload = mock_cli(args.mock_bin, env, out_dir, "04-snapshot", "--scenario", "snapshot")
+        snapshot_result, snapshot_payload = headless_monitor(args.headless_bin, env, out_dir, "04-snapshot", "--scenario", "snapshot")
         snapshot_data = scenario_result_data(snapshot_payload)
         snapshot_details = snapshot_data.get("remote_machine_details") or []
         snapshot_counts = snapshot_data.get("remote_machine_health_counts") or {}
@@ -276,8 +276,8 @@ def main() -> int:
             {"details": snapshot_details},
         )
 
-        snapshot3_result, snapshot3_payload = mock_cli(
-            args.mock_bin, env, out_dir, "05-snapshot-iter3", "--scenario", "snapshot", "--iterations", "3"
+        snapshot3_result, snapshot3_payload = headless_monitor(
+            args.headless_bin, env, out_dir, "05-snapshot-iter3", "--scenario", "snapshot", "--iterations", "3"
         )
         record(
             "snapshot_iterations_all_result",
@@ -285,8 +285,8 @@ def main() -> int:
             {"sequence": event_sequence(snapshot3_payload)},
         )
 
-        invalid_refresh_result, invalid_refresh_payload = mock_cli(
-            args.mock_bin,
+        invalid_refresh_result, invalid_refresh_payload = headless_monitor(
+            args.headless_bin,
             env,
             out_dir,
             "06-invalid-refresh",
@@ -311,8 +311,8 @@ def main() -> int:
             {"sequence": event_sequence(invalid_refresh_payload)},
         )
 
-        shutdown_result, shutdown_payload = mock_cli(
-            args.mock_bin, env, out_dir, "07-graceful-shutdown", "--scenario", "graceful-shutdown"
+        shutdown_result, shutdown_payload = headless_monitor(
+            args.headless_bin, env, out_dir, "07-graceful-shutdown", "--scenario", "graceful-shutdown"
         )
         shutdown_data = scenario_result_data(shutdown_payload)
         daemon_proc = None
@@ -327,8 +327,8 @@ def main() -> int:
         record("no_daemon_after_shutdown", len(live_daemon_pids_for_home(home)) == 0, {"pids": live_daemon_pids_for_home(home)})
 
         daemon_proc = start_daemon(args.bin, env)
-        restart_startup_result, restart_startup_payload = mock_cli(
-            args.mock_bin, env, out_dir, "08-startup-after-restart", "--scenario", "startup"
+        restart_startup_result, restart_startup_payload = headless_monitor(
+            args.headless_bin, env, out_dir, "08-startup-after-restart", "--scenario", "startup"
         )
         restart_startup = scenario_result_data(restart_startup_payload)
         record(
@@ -337,8 +337,8 @@ def main() -> int:
             restart_startup,
         )
 
-        restart_snapshot_result, restart_snapshot_payload = mock_cli(
-            args.mock_bin, env, out_dir, "09-snapshot-after-restart", "--scenario", "snapshot"
+        restart_snapshot_result, restart_snapshot_payload = headless_monitor(
+            args.headless_bin, env, out_dir, "09-snapshot-after-restart", "--scenario", "snapshot"
         )
         restart_snapshot = scenario_result_data(restart_snapshot_payload)
         record(

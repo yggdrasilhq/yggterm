@@ -4,6 +4,14 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+## 2.1.64
+
+### Fixed
+
+- keep active full-screen TUI terminals such as `htop` on the real xterm canvas instead of replacing them with the low-power text overlay, preventing garbled rows and needless redraw churn while the user is watching the terminal
+- route direct-install `yggterm --version` through the active headless sibling so version probes do not touch the GUI binary or live desktop state
+- fold the panic-management monitor scenarios into `yggterm-headless server monitor`, stop shipping the separate mock CLI binary, and expose `yggterm-headless` directly from direct installs and `.deb` packages
+
 ## 2.1.63
 
 ### Changed

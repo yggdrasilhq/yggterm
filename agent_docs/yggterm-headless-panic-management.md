@@ -1,7 +1,9 @@
-# yggterm-mock-cli Panic Management
+# yggterm-headless Panic Management
 
-`yggterm-mock-cli` is the SSH-safe incident tool for Yggterm terminal failures. Use it before
-guessing from screenshots or editing restore/rendering code.
+`yggterm-headless server monitor` is the SSH-safe incident tool for Yggterm terminal failures. Use
+it before guessing from screenshots or editing restore/rendering code. The old standalone incident CLI
+surface has been folded into this headless command so operators have one binary for daemon control,
+app-control, tracing, and panic management.
 
 ## When To Use It
 
@@ -17,7 +19,7 @@ guessing from screenshots or editing restore/rendering code.
 Run a read-only incident report and save JSONL evidence:
 
 ```bash
-yggterm-mock-cli \
+yggterm-headless server monitor \
   --scenario panic-report \
   --expect-path "<session-path>" \
   --jsonl-out /tmp/yggterm-incident.jsonl
@@ -26,7 +28,7 @@ yggterm-mock-cli \
 For intermittent failures, watch over time:
 
 ```bash
-yggterm-mock-cli \
+yggterm-headless server monitor \
   --scenario panic-report \
   --expect-path "<session-path>" \
   --iterations 30 \
@@ -49,6 +51,6 @@ yggterm-mock-cli \
 
 ## Principle
 
-The mock CLI should establish facts, not hide symptoms. Keep incident commands read-only until the
-report clearly points at daemon lifecycle recovery, session restore, or managed CLI refresh as the
-right next step.
+The headless monitor should establish facts, not hide symptoms. Keep incident commands read-only
+until the report clearly points at daemon lifecycle recovery, session restore, or managed CLI
+refresh as the right next step.
