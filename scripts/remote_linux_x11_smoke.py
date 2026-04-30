@@ -443,13 +443,7 @@ def maybe_stage_linux_companion_binaries(host: str, artifact: Path, remote_dir: 
             artifact_name.replace("yggterm-", "yggterm-headless-", 1)
             if artifact_name.startswith("yggterm-")
             else "yggterm-headless",
-        ),
-        (
-            "yggterm-mock-cli",
-            artifact_name.replace("yggterm-", "yggterm-mock-cli-", 1)
-            if artifact_name.startswith("yggterm-")
-            else "yggterm-mock-cli",
-        ),
+        )
     ]
     for remote_name, sibling_name in companion_specs:
         sibling = artifact.with_name(sibling_name)

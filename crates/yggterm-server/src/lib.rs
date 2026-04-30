@@ -8102,17 +8102,12 @@ fn bootstrap_remote_yggterm(ssh_target: &str, exec_prefix: Option<&str>) -> anyh
             "resolving local yggterm headless remote executable near {current}; build yggterm-headless or install a release bundle that includes it"
         )
     })?;
-    let mock_cli_exe = local_mock_cli_companion_executable();
     let remote_path = "$HOME/.yggterm/bin/yggterm";
     let headless_path = "$HOME/.yggterm/bin/yggterm-headless";
-    let mock_cli_path = "$HOME/.yggterm/bin/yggterm-mock-cli";
 
     let installed_remote_path =
         upload_remote_bootstrap_payload(ssh_target, exec_prefix, &headless_exe, remote_path)?;
     upload_remote_bootstrap_payload(ssh_target, exec_prefix, &headless_exe, headless_path)?;
-    if let Some(mock_cli_exe) = mock_cli_exe {
-        upload_remote_bootstrap_payload(ssh_target, exec_prefix, &mock_cli_exe, mock_cli_path)?;
-    }
     Ok(installed_remote_path)
 }
 
@@ -8121,14 +8116,6 @@ fn headless_bootstrap_file_names(current_ext: &str) -> Vec<&'static str> {
         vec!["yggterm-headless.exe", "yggterm-headless-bin.exe"]
     } else {
         vec!["yggterm-headless", "yggterm-headless-bin"]
-    }
-}
-
-fn mock_cli_bootstrap_file_names(current_ext: &str) -> Vec<&'static str> {
-    if current_ext.eq_ignore_ascii_case("exe") {
-        vec!["yggterm-mock-cli.exe"]
-    } else {
-        vec!["yggterm-mock-cli"]
     }
 }
 
@@ -8143,13 +8130,6 @@ fn is_headless_bootstrap_path(path: &Path) -> bool {
             | "yggterm-headless.exe"
             | "yggterm-headless-bin.exe"
     )
-}
-
-fn is_mock_cli_bootstrap_path(path: &Path) -> bool {
-    let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
-        return false;
-    };
-    matches!(name, "yggterm-mock-cli" | "yggterm-mock-cli.exe")
 }
 
 fn local_bootstrap_executable_from_current(current: &Path, names: &[&str]) -> Option<PathBuf> {
@@ -8210,22 +8190,6 @@ pub fn local_headless_companion_executable_from_current(current: &Path) -> Optio
 pub fn local_headless_companion_executable() -> Option<PathBuf> {
     let current = std::env::current_exe().ok()?;
     local_headless_companion_executable_from_current(&current)
-}
-
-fn local_mock_cli_companion_executable_from_current(current: &Path) -> Option<PathBuf> {
-    if current.is_file() && is_mock_cli_bootstrap_path(current) {
-        return Some(current.to_path_buf());
-    }
-    let current_ext = current
-        .extension()
-        .and_then(|ext| ext.to_str())
-        .unwrap_or_default();
-    local_bootstrap_executable_from_current(current, &mock_cli_bootstrap_file_names(current_ext))
-}
-
-fn local_mock_cli_companion_executable() -> Option<PathBuf> {
-    let current = std::env::current_exe().ok()?;
-    local_mock_cli_companion_executable_from_current(&current)
 }
 
 fn resolve_remote_yggterm_binary(
@@ -14257,11 +14221,11 @@ mod tests {
         clear_stale_local_daemon_socket_when_no_daemon, client_instances_dir, current_millis_u64,
         dedupe_remote_scanned_sessions, legacy_agent_launch_command,
         legacy_remote_tmux_session_name, load_remote_machine_sessions_from_mirror,
-        local_daemon_connect_error_is_transient, local_mock_cli_companion_executable_from_current,
-        local_remote_bootstrap_executable_from_current, managed_session_from_snapshot,
-        mirror_remote_machine_sessions, parse_recent_context_sections, parse_screen_session_ref,
-        parse_stored_transcript, push_preview_block, remote_bootstrap_install_command,
-        remote_cache_key, remote_command_cache, remote_direct_attach_launch_command,
+        local_daemon_connect_error_is_transient, local_remote_bootstrap_executable_from_current,
+        managed_session_from_snapshot, mirror_remote_machine_sessions,
+        parse_recent_context_sections, parse_screen_session_ref, parse_stored_transcript,
+        push_preview_block, remote_bootstrap_install_command, remote_cache_key,
+        remote_command_cache, remote_direct_attach_launch_command,
         remote_resume_requires_missing_saved_session_failure,
         remote_resume_runtime_output_mismatches_managed_session,
         remote_resume_runtime_output_requires_restart, remote_resume_shell_command,
@@ -16158,29 +16122,6 @@ terminal_window_id: None,
         assert_eq!(
             local_remote_bootstrap_executable_from_current(&current),
             Some(headless.clone())
-        );
-
-        let _ = fs::remove_dir_all(&root);
-        Ok(())
-    }
-
-    #[test]
-    fn local_mock_cli_companion_executable_uses_adjacent_mock_cli_binary() -> Result<()> {
-        let root = std::env::temp_dir().join(format!(
-            "yggterm-bootstrap-mock-{}-{}",
-            std::process::id(),
-            current_millis_u64()
-        ));
-        let profile = root.join("target/debug");
-        fs::create_dir_all(&profile)?;
-        let current = profile.join("yggterm");
-        let mock_cli = profile.join("yggterm-mock-cli");
-        fs::write(&current, b"gui")?;
-        fs::write(&mock_cli, b"mock")?;
-
-        assert_eq!(
-            local_mock_cli_companion_executable_from_current(&current),
-            Some(mock_cli.clone())
         );
 
         let _ = fs::remove_dir_all(&root);
