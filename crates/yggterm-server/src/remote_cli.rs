@@ -2,8 +2,8 @@ use crate::{
     ManagedCliTool, run_remote_ensure_managed_cli, run_remote_generation_context,
     run_remote_preview, run_remote_preview_head, run_remote_protocol_version,
     run_remote_refresh_managed_cli, run_remote_resume_codex, run_remote_saved_codex_session_exists,
-    run_remote_scan, run_remote_stage_clipboard_png, run_remote_terminate_codex,
-    run_remote_upsert_generated_copy,
+    run_remote_scan, run_remote_stage_clipboard_png, run_remote_start_codex,
+    run_remote_terminate_codex, run_remote_upsert_generated_copy,
 };
 use anyhow::{Result, bail};
 
@@ -18,6 +18,10 @@ pub enum RemoteServerCommand {
         session_id: String,
         cwd: Option<String>,
         require_existing: bool,
+    },
+    StartCodex {
+        session_id: String,
+        cwd: Option<String>,
     },
     RefreshManagedCli {
         background: bool,
@@ -74,6 +78,15 @@ fn parse_remote_server_command(args: &[String]) -> Result<Option<RemoteServerCom
                 .filter(|value| !value.is_empty()),
             require_existing: args.iter().any(|value| value == "--require-existing"),
         },
+        "start-codex" if args.len() >= 4 => RemoteServerCommand::StartCodex {
+            session_id: args[3].clone(),
+            cwd: args
+                .iter()
+                .skip(4)
+                .find(|value| !value.starts_with("--"))
+                .cloned()
+                .filter(|value| !value.is_empty()),
+        },
         "refresh-managed-cli" if args.len() >= 4 => RemoteServerCommand::RefreshManagedCli {
             background: args[3] == "background",
         },
@@ -119,6 +132,9 @@ fn run_remote_server_command(command: RemoteServerCommand) -> Result<()> {
             cwd,
             require_existing,
         } => run_remote_resume_codex(&session_id, cwd.as_deref(), require_existing),
+        RemoteServerCommand::StartCodex { session_id, cwd } => {
+            run_remote_start_codex(&session_id, cwd.as_deref())
+        }
         RemoteServerCommand::RefreshManagedCli { background } => {
             run_remote_refresh_managed_cli(background)
         }

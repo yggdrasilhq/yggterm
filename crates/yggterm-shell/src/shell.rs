@@ -108,9 +108,10 @@ use yggterm_server::{
     remove_session, remove_ssh_target, request_terminal_launch, set_all_preview_blocks_folded,
     set_session_keep_alive, set_view_mode as daemon_set_view_mode, shutdown as daemon_shutdown,
     snapshot as daemon_snapshot, snapshot_session_view_for_ui, stage_remote_clipboard_png,
-    start_command_session, start_local_session_at, start_ssh_session_at, status,
-    take_next_app_control_request, terminal_ensure, terminal_read, terminal_resize,
-    terminal_snapshot, terminal_write, toggle_preview_block as daemon_toggle_preview_block,
+    start_command_session, start_local_session_at, start_remote_codex_session_at,
+    start_ssh_session_at, status, take_next_app_control_request, terminal_ensure, terminal_read,
+    terminal_resize, terminal_snapshot, terminal_write,
+    toggle_preview_block as daemon_toggle_preview_block,
     update_session_copy as daemon_update_session_copy, validate_server_ui_snapshot,
 };
 use yggui::{
@@ -190,6 +191,10 @@ const XTERM_JS: &str = include_str!("../../../assets/xterm/xterm.js");
 const XTERM_FIT_JS: &str = include_str!("../../../assets/xterm/addon-fit.js");
 const XTERM_CANVAS_JS: &str = include_str!("../../../assets/xterm/addon-canvas.js");
 const XTERM_CANVAS_RENDERER_ENV: &str = "YGGTERM_ENABLE_XTERM_CANVAS";
+const TERMINAL_WRITE_FRAME_MS_ENV: &str = "YGGTERM_TERMINAL_WRITE_FRAME_MS";
+const TERMINAL_FRAME_BRIDGE_MIN_BYTES: usize = 256;
+const TERMINAL_FRAME_BRIDGE_PENDING_MAX_BYTES: usize = 256 * 1024;
+const TERMINAL_FRAME_BRIDGE_CSI_MIN_COUNT: usize = 24;
 const PREVIEW_BLOCK_WINDOW: usize = 24;
 const PREVIEW_SAFE_FULL_RENDER_BLOCK_LIMIT: usize = 600;
 const PREVIEW_VIRTUAL_OVERSCAN_FACTOR: f64 = 0.85;
@@ -239,6 +244,7 @@ const LIVE_SESSION_SNAPSHOT_NUDGE_POLLS: usize = 3;
 // interactions. Treat Enter as the commit action so transient WebView focus
 // churn during controlled input updates cannot commit a half-typed label.
 const TERMINAL_BUSY_HINT_MS: u64 = 120;
+const CODEX_COMPLETION_NOTIFICATION_MIN_BUSY_MS: u64 = 10_000;
 const TITLEBAR_HEIGHT_PX: f64 = 32.0;
 const TITLEBAR_RESPONSIVE_CSS: &str = r#"
 [data-yggterm-titlebar-right] .yggterm-titlebar-overflow-trigger {
@@ -5096,6 +5102,56 @@ fn stale_remote_resume_retry_blank_surface_should_recover(
             host_health_blank_rows_below_cursor,
         )
 }
+fn quiet_retained_remote_surface_ready(
+    is_remote_resume_session: bool,
+    terminal_live_host_connected: bool,
+    terminal_paint_seen: bool,
+    geometry_ready: bool,
+    host_has_transport_error: bool,
+    placeholder_rendered: bool,
+    runtime_running: bool,
+    host_health_cursor_line_text: &str,
+    host_health_text_tail: &str,
+    host_health_rows: u16,
+    host_health_blank_rows_below_cursor: u16,
+    resume_visual_reveal_deadline_ms: Option<u64>,
+    saw_transcript_browser_output: bool,
+    saw_generic_idle_output: bool,
+    tail_generic_idle_output: bool,
+    saw_generic_idle_footer_output: bool,
+    tail_generic_idle_footer_output: bool,
+    saw_prompt_only_surface: bool,
+) -> bool {
+    if !is_remote_resume_session
+        || terminal_live_host_connected
+        || !terminal_paint_seen
+        || !geometry_ready
+        || host_has_transport_error
+        || !remote_resume_host_surface_may_prove_live_terminal(placeholder_rendered)
+        || !resume_visual_reveal_deadline_ms
+            .is_some_and(|deadline_ms| current_millis() >= deadline_ms)
+        || saw_transcript_browser_output
+        || saw_generic_idle_output
+        || tail_generic_idle_output
+        || saw_generic_idle_footer_output
+        || tail_generic_idle_footer_output
+        || !terminal_host_prompt_layout_is_acceptable(
+            host_health_rows,
+            host_health_blank_rows_below_cursor,
+        )
+    {
+        return false;
+    }
+    let cursor_has_text = !host_health_cursor_line_text.trim().is_empty();
+    let tail_has_text = !host_health_text_tail.trim().is_empty();
+    if !(runtime_running || cursor_has_text) || !(cursor_has_text || tail_has_text) {
+        return false;
+    }
+    if saw_prompt_only_surface && !runtime_running {
+        return false;
+    }
+    true
+}
 fn upsert_terminal_resume_notification(
     state: Signal<ShellState>,
     session_path: &str,
@@ -9929,6 +9985,7 @@ fn spawn_start_group_session(mut state: Signal<ShellState>, row: BrowserRow, kin
         row.label
     );
     let launch_context = state.with(|shell| group_session_launch_context(shell, &row, kind));
+    clear_sidebar_keyboard_owner();
     state.with_mut(|shell| shell.close_context_menu());
     match launch_context {
         TerminalLaunchContext::Local { cwd, title_hint } => {
@@ -9946,53 +10003,93 @@ fn spawn_start_group_session(mut state: Signal<ShellState>, row: BrowserRow, kin
             title_hint,
         } => {
             spawn_server_snapshot_action(state, pending, move |endpoint| {
-                start_ssh_session_at(
-                    &endpoint,
-                    &ssh_target,
-                    prefix.as_deref(),
-                    cwd.as_deref(),
-                    title_hint.as_deref(),
-                )
+                if matches!(kind, SessionKind::Codex | SessionKind::CodexLiteLlm) {
+                    start_remote_codex_session_at(
+                        &endpoint,
+                        &ssh_target,
+                        prefix.as_deref(),
+                        cwd.as_deref(),
+                        title_hint.as_deref(),
+                    )
+                } else {
+                    start_ssh_session_at(
+                        &endpoint,
+                        &ssh_target,
+                        prefix.as_deref(),
+                        cwd.as_deref(),
+                        title_hint.as_deref(),
+                    )
+                }
             });
         }
     }
 }
-fn current_new_session_context(
+fn current_agent_session_launch_context(
     shell: &ShellState,
     kind: SessionKind,
-) -> (Option<String>, Option<String>) {
-    let selected_row = current_selected_sidebar_row(shell);
-    if let Some(row) = selected_row.as_ref() {
-        return match row.kind {
-            BrowserRowKind::Session => (
-                row.session_cwd.clone(),
-                Some(format!("{} {}", row.label, session_kind_action_label(kind))),
-            ),
-            _ => {
-                let snapshot = shell.snapshot();
-                let context_row = resolve_creation_context_row(&snapshot.rows, row);
-                (
-                    group_session_cwd(&context_row),
-                    Some(group_session_title_hint(&context_row, kind)),
-                )
-            }
-        };
+) -> TerminalLaunchContext {
+    if let Some(row) = current_selected_sidebar_row(shell) {
+        if let Some(machine) = remote_machine_for_sidebar_row(shell, &row) {
+            let cwd = row
+                .session_cwd
+                .clone()
+                .filter(|value| !value.trim().is_empty())
+                .or_else(|| remote_folder_cwd(&row));
+            return TerminalLaunchContext::Remote {
+                ssh_target: machine.ssh_target.clone(),
+                prefix: machine.prefix.clone(),
+                cwd,
+                title_hint: Some(format!("{} {}", row.label, session_kind_action_label(kind))),
+            };
+        }
+        if row.kind == BrowserRowKind::Session {
+            return TerminalLaunchContext::Local {
+                cwd: row.session_cwd.clone(),
+                title_hint: Some(format!("{} {}", row.label, session_kind_action_label(kind))),
+            };
+        }
+        let snapshot = shell.snapshot();
+        let context_row = resolve_creation_context_row(&snapshot.rows, &row);
+        return group_session_launch_context(shell, &context_row, kind);
     }
     if let Some(active) = shell.server.active_session() {
         let cwd = metadata_value(active, "Cwd");
         let cwd = (!cwd.trim().is_empty()).then_some(cwd);
-        let title = if active.title.trim().is_empty() {
-            None
-        } else {
-            Some(format!(
-                "{} {}",
-                active.title,
-                session_kind_action_label(kind)
-            ))
+        if active.source == SessionSource::LiveSsh {
+            if let Some(ssh_target) = active.ssh_target.clone() {
+                return TerminalLaunchContext::Remote {
+                    ssh_target,
+                    prefix: active.ssh_prefix.clone(),
+                    cwd,
+                    title_hint: if active.title.trim().is_empty() {
+                        None
+                    } else {
+                        Some(format!(
+                            "{} {}",
+                            active.title,
+                            session_kind_action_label(kind)
+                        ))
+                    },
+                };
+            }
+        }
+        return TerminalLaunchContext::Local {
+            cwd,
+            title_hint: if active.title.trim().is_empty() {
+                None
+            } else {
+                Some(format!(
+                    "{} {}",
+                    active.title,
+                    session_kind_action_label(kind)
+                ))
+            },
         };
-        return (cwd, title);
     }
-    (None, None)
+    TerminalLaunchContext::Local {
+        cwd: None,
+        title_hint: None,
+    }
 }
 fn preferred_agent_session_kind(settings: &AppSettings) -> SessionKind {
     match settings.default_agent_profile {
@@ -12442,19 +12539,47 @@ fn execute_alt_overlay_action(mut state: Signal<ShellState>, action: AltOverlayA
         }),
         AltOverlayAction::StartSession => {
             let preferred_agent_kind = preferred_agent_session_kind(&state.read().settings);
-            let (cwd, title_hint) = state.with_mut(|shell| {
+            let launch_context = state.with_mut(|shell| {
                 shell.clear_alt_overlay();
                 shell.close_titlebar_new_menu();
-                current_new_session_context(shell, preferred_agent_kind)
+                current_agent_session_launch_context(shell, preferred_agent_kind)
             });
-            spawn_server_snapshot_action(state, "starting session".to_string(), move |endpoint| {
-                start_local_session_at(
-                    &endpoint,
-                    preferred_agent_kind,
-                    cwd.as_deref(),
-                    title_hint.as_deref(),
-                )
-            });
+            match launch_context {
+                TerminalLaunchContext::Local { cwd, title_hint } => {
+                    spawn_server_snapshot_action(
+                        state,
+                        "starting session".to_string(),
+                        move |endpoint| {
+                            start_local_session_at(
+                                &endpoint,
+                                preferred_agent_kind,
+                                cwd.as_deref(),
+                                title_hint.as_deref(),
+                            )
+                        },
+                    );
+                }
+                TerminalLaunchContext::Remote {
+                    ssh_target,
+                    prefix,
+                    cwd,
+                    title_hint,
+                } => {
+                    spawn_server_snapshot_action(
+                        state,
+                        "starting remote session".to_string(),
+                        move |endpoint| {
+                            start_remote_codex_session_at(
+                                &endpoint,
+                                &ssh_target,
+                                prefix.as_deref(),
+                                cwd.as_deref(),
+                                title_hint.as_deref(),
+                            )
+                        },
+                    );
+                }
+            }
         }
         AltOverlayAction::StartTerminal => {
             let launch_context = state.with_mut(|shell| {
@@ -13612,6 +13737,7 @@ fn schedule_terminal_focus_after_activation(mut state: Signal<ShellState>, sessi
               if (active && active.closest && active.closest('#yggterm-sidebar') && active.blur) {{
                 active.blur();
               }}
+              window.__yggtermSidebarFocusGeneration = Number(window.__yggtermSidebarFocusGeneration || 0) + 1;
               window.__yggtermSidebarKeyboardOwner = false;
               window.__yggtermFocusedSidebarRowPath = '';
               window.__yggtermUiFocusClaimUntilMs = 0;
@@ -18566,9 +18692,14 @@ async fn capture_dom_debug_snapshot_for(active_session_path: Option<&str>) -> Va
                         })
                         .filter((entry) => entry.text || entry.class_name || entry.style_attr)
                     : [];
+                const lowPowerTuiOverlayNode = host.querySelector('[data-yggterm-low-power-tui="1"]');
+                const lowPowerTuiOverlayText =
+                    lowPowerTuiOverlayNode && window.getComputedStyle(lowPowerTuiOverlayNode).display !== 'none'
+                        ? String(lowPowerTuiOverlayNode.textContent || '').trim()
+                        : '';
                 const bufferTextSample = readTerminalBufferSample(term);
                 const hostText = String(host.innerText || "");
-                const terminalText = bufferTextSample || hostText;
+                const terminalText = lowPowerTuiOverlayText || bufferTextSample || hostText;
                 const terminalTextTail = hostText.trim()
                     ? hostText.trim().slice(-8192)
                     : terminalText.trim().slice(-8192);
@@ -18623,26 +18754,31 @@ async fn capture_dom_debug_snapshot_for(active_session_path: Option<&str>) -> Va
                     }
                     return cursorSample.getBoundingClientRect();
                 })() : null;
+                const cursorBaseRect = rowsRect || screenRect || viewportRect || hostRect;
                 const expectedCursorRect = (
-                    rowsLayer
+                    cursorBaseRect
                     && hostRect
-                    && rowsRect
                     && cursorX != null
                     && visibleCursorRowIndex != null
+                    && Number.isFinite(cursorX)
                     && Number.isFinite(visibleCursorRowIndex)
                     && Number(visibleCursorRowIndex) >= 0
-                    && (xtermCellWidth > 0 || rowsRect.width > 0)
-                    && (xtermCellHeight > 0 || rowSampleRect)
+                    && (xtermCellWidth > 0 || cursorBaseRect.width > 0)
+                    && (xtermCellHeight > 0 || rowSampleRect || Number(term && term.rows ? term.rows : 0) > 0)
                 ) ? (() => {
                     const computedCellWidth = xtermCellWidth > 0
                         ? xtermCellWidth
-                        : rowsRect.width / Math.max(1, Number(term && term.cols ? term.cols : 1));
+                        : cursorBaseRect.width / Math.max(1, Number(term && term.cols ? term.cols : 1));
                     const computedCellHeight = xtermCellHeight > 0
                         ? xtermCellHeight
-                        : Math.max(10, Number((rowSampleRect && rowSampleRect.height) || 0));
+                        : Math.max(
+                            10,
+                            Number((rowSampleRect && rowSampleRect.height) || 0)
+                                || (cursorBaseRect.height / Math.max(1, Number(term && term.rows ? term.rows : 1)))
+                        );
                     return {
-                        left: Number((rowsRect.left + (cursorX * computedCellWidth)).toFixed(2)),
-                        top: Number((rowsRect.top + (Number(visibleCursorRowIndex) * computedCellHeight)).toFixed(2)),
+                        left: Number((cursorBaseRect.left + (cursorX * computedCellWidth)).toFixed(2)),
+                        top: Number((cursorBaseRect.top + (Number(visibleCursorRowIndex) * computedCellHeight)).toFixed(2)),
                         width: Number(Math.max(2, computedCellWidth).toFixed(2)),
                         height: Number(Math.max(8, computedCellHeight).toFixed(2)),
                     };
@@ -18849,6 +18985,12 @@ async fn capture_dom_debug_snapshot_for(active_session_path: Option<&str>) -> Va
                     xterm_write_buffer_tail: xtermWriteBufferTail,
                     xterm_core_write_sync_available: Boolean(term && term._core && typeof term._core.writeSync === 'function'),
                     xterm_write_buffer_write_sync_available: Boolean(xtermWriteBuffer && typeof xtermWriteBuffer.writeSync === 'function'),
+                    low_power_tui_overlay_present: Boolean(lowPowerTuiOverlayNode),
+                    low_power_tui_overlay_active: mountedHost ? Boolean(mountedHost.lowPowerTuiActive) : Boolean(lowPowerTuiOverlayText),
+                    low_power_tui_frame_count: mountedHost ? Number(mountedHost.lowPowerTuiFrameCount || 0) : 0,
+                    low_power_tui_text_sample: lowPowerTuiOverlayText.slice(0, 240),
+                    inactive_tui_frame_drop_count: mountedHost ? Number(mountedHost.inactiveTuiFrameDropCount || 0) : 0,
+                    inactive_tui_last_tail: mountedHost ? String(mountedHost.inactiveTuiLastTail || '') : '',
                     xterm_element_present: Boolean(termElement),
                     xterm_element_connected: Boolean(termElement && termElement.isConnected),
                     xterm_element_host_id: termElementHost ? String(termElementHost.id || '') : null,
@@ -19735,6 +19877,9 @@ async fn capture_dom_debug_snapshot_basic_for(active_session_path: Option<&str>)
                     const helpers = host.querySelector('.xterm-helpers');
                     const helpersStyle = helpers ? window.getComputedStyle(helpers) : null;
                     const helperTextareaStyle = helperTextarea ? window.getComputedStyle(helperTextarea) : null;
+                    const screenRect = screen ? screen.getBoundingClientRect() : null;
+                    const viewportRect = viewport ? viewport.getBoundingClientRect() : null;
+                    const hostRect = host.getBoundingClientRect();
                     const xtermDimensions = term && term._core && term._core._renderService && term._core._renderService.dimensions
                         ? term._core._renderService.dimensions
                         : null;
@@ -19745,23 +19890,28 @@ async fn capture_dom_debug_snapshot_basic_for(active_session_path: Option<&str>)
                     const xtermCellHeight = xtermCssDimensions && xtermCssDimensions.cell
                         ? Number(xtermCssDimensions.cell.height || 0)
                         : 0;
+                    const cursorBaseRect = rowsRect || screenRect || viewportRect || hostRect;
                     const expectedCursorRect = (
-                        rowsRect
+                        cursorBaseRect
                         && cursorX != null
                         && Number.isFinite(cursorX)
                         && Number.isFinite(visibleCursorRowIndex)
                         && Number(visibleCursorRowIndex) >= 0
-                        && (xtermCellWidth > 0 || rowsRect.width > 0)
+                        && (xtermCellWidth > 0 || cursorBaseRect.width > 0)
                     ) ? (() => {
                         const computedCellWidth = xtermCellWidth > 0
                             ? xtermCellWidth
-                            : rowsRect.width / Math.max(1, Number(term && term.cols ? term.cols : 1));
+                            : cursorBaseRect.width / Math.max(1, Number(term && term.cols ? term.cols : 1));
                         const computedCellHeight = xtermCellHeight > 0
                             ? xtermCellHeight
-                            : Math.max(10, Number((cursorRowRect && cursorRowRect.height) || 0));
+                            : Math.max(
+                                10,
+                                Number((cursorRowRect && cursorRowRect.height) || 0)
+                                    || (cursorBaseRect.height / Math.max(1, Number(term && term.rows ? term.rows : 1)))
+                            );
                         return {
-                            left: Number((rowsRect.left + (Number(cursorX) * computedCellWidth)).toFixed(2)),
-                            top: Number((rowsRect.top + (Number(visibleCursorRowIndex) * computedCellHeight)).toFixed(2)),
+                            left: Number((cursorBaseRect.left + (Number(cursorX) * computedCellWidth)).toFixed(2)),
+                            top: Number((cursorBaseRect.top + (Number(visibleCursorRowIndex) * computedCellHeight)).toFixed(2)),
                             width: Number(Math.max(2, computedCellWidth).toFixed(2)),
                             height: Number(Math.max(8, computedCellHeight).toFixed(2)),
                         };
@@ -19791,9 +19941,14 @@ async fn capture_dom_debug_snapshot_basic_for(active_session_path: Option<&str>)
                         }
                     })();
                     const canvasCount = host.querySelectorAll('canvas').length;
+                    const lowPowerTuiOverlayNode = host.querySelector('[data-yggterm-low-power-tui="1"]');
+                    const lowPowerTuiOverlayText =
+                        lowPowerTuiOverlayNode && window.getComputedStyle(lowPowerTuiOverlayNode).display !== 'none'
+                            ? String(lowPowerTuiOverlayNode.textContent || '').trim()
+                            : '';
                     const hostText = String(host.innerText || '').trim();
                     const bufferText = readTerminalBufferSample(term).trim();
-                    const terminalText = bufferText || hostText;
+                    const terminalText = lowPowerTuiOverlayText || bufferText || hostText;
                     return {
                         host_id: hostId,
                         session_path: String(host.getAttribute('data-terminal-session-path') || '').trim(),
@@ -19826,7 +19981,9 @@ async fn capture_dom_debug_snapshot_basic_for(active_session_path: Option<&str>)
                         rows_sample_white_space: rowSampleStyle ? String(rowSampleStyle.whiteSpace || '') : null,
                         rows_sample_color: rowSampleStyle ? String(rowSampleStyle.color || '') : null,
                         xterm_root_user_select: resolvedUserSelect(xtermRootStyle),
+                        xterm_font_family: term ? String(term.options.fontFamily || '') : null,
                         xterm_font_weight: term ? String(term.options.fontWeight || '') : null,
+                        xterm_font_weight_bold: term ? String(term.options.fontWeightBold || '') : null,
                         xterm_line_height: term ? String(term.options.lineHeight || '') : null,
                         xterm_minimum_contrast_ratio: term ? String(term.options.minimumContrastRatio || '') : null,
                         xterm_theme_background: term && term.options.theme ? String(term.options.theme.background || '') : null,
@@ -19879,6 +20036,12 @@ async fn capture_dom_debug_snapshot_basic_for(active_session_path: Option<&str>)
                         xterm_cursor_hidden: xtermCursorHidden,
                         xterm_cursor_hidden_toggle_count: mountedHost ? Number(mountedHost.cursorHiddenToggleCount || 0) : 0,
                         xterm_last_visual_transition_reason: mountedHost ? String(mountedHost.lastVisualTransitionReason || '') : '',
+                        low_power_tui_overlay_present: Boolean(lowPowerTuiOverlayNode),
+                        low_power_tui_overlay_active: mountedHost ? Boolean(mountedHost.lowPowerTuiActive) : Boolean(lowPowerTuiOverlayText),
+                        low_power_tui_frame_count: mountedHost ? Number(mountedHost.lowPowerTuiFrameCount || 0) : 0,
+                        low_power_tui_text_sample: lowPowerTuiOverlayText.slice(0, 240),
+                        inactive_tui_frame_drop_count: mountedHost ? Number(mountedHost.inactiveTuiFrameDropCount || 0) : 0,
+                        inactive_tui_last_tail: mountedHost ? String(mountedHost.inactiveTuiLastTail || '') : '',
                         input_enabled: mountedHost ? Boolean(mountedHost.inputEnabled) : false,
                         xterm_renderer_mode: canvasCount > 0 ? 'canvas' : 'dom',
                         helper_textarea_focused: Boolean(helperTextarea && helperTextarea === activeElement),
@@ -25323,18 +25486,38 @@ fn app() -> Element {
                             on_toggle_overflow_menu: move |_| state.with_mut(|shell| shell.toggle_titlebar_overflow_menu()),
                             on_close_overflow_menu: move |_| state.with_mut(|shell| shell.close_titlebar_overflow_menu()),
                             on_start_session: move |_| {
-                            let (cwd, title_hint) = state.with_mut(|shell| {
+                            let launch_context = state.with_mut(|shell| {
                                 shell.close_titlebar_new_menu();
-                                current_new_session_context(shell, preferred_agent_kind)
+                                current_agent_session_launch_context(shell, preferred_agent_kind)
                             });
-                            spawn_server_snapshot_action(state, "starting session".to_string(), move |endpoint| {
-                                start_local_session_at(
-                                    &endpoint,
-                                    preferred_agent_kind,
-                                    cwd.as_deref(),
-                                    title_hint.as_deref(),
-                                )
-                            })
+                            match launch_context {
+                                TerminalLaunchContext::Local { cwd, title_hint } => {
+                                    spawn_server_snapshot_action(state, "starting session".to_string(), move |endpoint| {
+                                        start_local_session_at(
+                                            &endpoint,
+                                            preferred_agent_kind,
+                                            cwd.as_deref(),
+                                            title_hint.as_deref(),
+                                        )
+                                    })
+                                }
+                                TerminalLaunchContext::Remote {
+                                    ssh_target,
+                                    prefix,
+                                    cwd,
+                                    title_hint,
+                                } => {
+                                    spawn_server_snapshot_action(state, "starting remote session".to_string(), move |endpoint| {
+                                        start_remote_codex_session_at(
+                                            &endpoint,
+                                            &ssh_target,
+                                            prefix.as_deref(),
+                                            cwd.as_deref(),
+                                            title_hint.as_deref(),
+                                        )
+                                    })
+                                }
+                            }
                             },
                             on_start_terminal: move |_| {
                             let launch_context = state.with_mut(|shell| {
@@ -25748,7 +25931,18 @@ fn app() -> Element {
                         selected_tree_paths: snapshot.selected_tree_paths.clone(),
                         can_remove_saved_ssh_target: saved_ssh_target_machine_key(&row, &snapshot.ssh_targets).is_some(),
                         palette: snapshot.palette,
-                        on_close: move |_| state.with_mut(|shell| shell.close_context_menu()),
+                        on_close: move |_| {
+                            let active_terminal_session = state.with_mut(|shell| {
+                                shell.close_context_menu();
+                                (shell.server.active_view_mode() == WorkspaceViewMode::Terminal)
+                                    .then(|| shell.server.active_session_path().map(str::to_string))
+                                    .flatten()
+                            });
+                            clear_sidebar_keyboard_owner();
+                            if let Some(session_path) = active_terminal_session {
+                                schedule_terminal_focus_after_activation(state, session_path);
+                            }
+                        },
                         on_create_group_codex: {
                             let row = context_row.clone();
                             let preferred_agent_kind = preferred_agent_kind;
@@ -27110,18 +27304,6 @@ fn Sidebar(
                       sidebar.addEventListener('mousedown', (event) => {{
                         claimOwner(event.target);
                       }}, true);
-                      sidebar.addEventListener('mouseup', (event) => {{
-                        if (Number(event.button) !== 0) {{
-                          return;
-                        }}
-                        claimOwner(event.target);
-                      }}, true);
-                      sidebar.addEventListener('click', (event) => {{
-                        if (Number(event.button) !== 0) {{
-                          return;
-                        }}
-                        claimOwner(event.target);
-                      }}, true);
                       sidebar.addEventListener('contextmenu', (event) => {{
                         claimOwner(event.target);
                       }}, true);
@@ -27155,6 +27337,7 @@ fn Sidebar(
                             || editableOwnsKey(active)
                             || editableOwnsKey(target)
                           ) {{
+                            window.__yggtermSidebarFocusGeneration = Number(window.__yggtermSidebarFocusGeneration || 0) + 1;
                             window.__yggtermSidebarKeyboardOwner = false;
                             return;
                           }}
@@ -27526,6 +27709,7 @@ fn terminal_input_should_show_stateless_busy_hint(data: &str) -> bool {
 fn codex_completion_notification_should_fire(
     enabled: bool,
     busy_since_input: bool,
+    busy_duration_ms: Option<u64>,
     already_notified: bool,
     runtime_running: bool,
     saw_generic_idle_output: bool,
@@ -27537,6 +27721,8 @@ fn codex_completion_notification_should_fire(
 ) -> bool {
     enabled
         && busy_since_input
+        && busy_duration_ms
+            .is_some_and(|duration_ms| duration_ms >= CODEX_COMPLETION_NOTIFICATION_MIN_BUSY_MS)
         && !already_notified
         && !runtime_running
         && (saw_generic_idle_output
@@ -27571,15 +27757,17 @@ fn sidebar_row_shows_busy_icon(snapshot: &RenderSnapshot, row: &BrowserRow) -> b
     let is_idle = terminal_chunk_looks_idle_for_sidebar_icon(&sidebar_sample);
     let has_codex_working_status =
         terminal_chunk_has_codex_working_status_for_sidebar_icon(&sidebar_sample);
+    if matches!(session.kind, SessionKind::Codex | SessionKind::CodexLiteLlm)
+        && has_codex_working_status
+    {
+        return true;
+    }
     let is_active_live_session = snapshot.active_session_path.as_deref()
         == Some(session.session_path.as_str())
         && matches!(
             session.source,
             SessionSource::LiveLocal | SessionSource::LiveSsh
         );
-    if is_active_live_session && has_codex_working_status {
-        return true;
-    }
     if matches!(
         session.launch_phase,
         yggterm_server::TerminalLaunchPhase::Queued
@@ -31404,6 +31592,7 @@ fn TerminalCanvas(
             let mut traced_first_output = false;
             let mut traced_first_meaningful_output = false;
             let mut traced_attach_ready = false;
+            let mut traced_terminal_control_output = false;
             let mut remote_resume_meaningful_observations = 0_u64;
             let mount_started_ms = current_millis();
             let mut resume_recovery_attempts = 0_u64;
@@ -31429,8 +31618,10 @@ fn TerminalCanvas(
             let codex_completion_notifications_enabled =
                 matches!(session_kind, SessionKind::Codex | SessionKind::CodexLiteLlm);
             let mut codex_busy_since_input = false;
+            let mut codex_busy_started_at_ms = None::<u64>;
             let mut codex_completion_notified = false;
             let mut last_window_focused_for_read = state.with(|shell| shell.window_focused);
+            let mut terminal_write_bridge = TerminalWriteBridge::new(terminal_write_frame_ms());
             loop {
                 let window_focused_for_read = state.with(|shell| shell.window_focused);
                 if window_focused_for_read != last_window_focused_for_read {
@@ -31441,6 +31632,9 @@ fn TerminalCanvas(
                         next_read_deadline =
                             tokio::time::Instant::now() + Duration::from_millis(read_poll_ms);
                     }
+                }
+                if js_ready && let Some(data) = terminal_write_bridge.flush_due(current_millis()) {
+                    let _ = eval.send(TerminalJsCommand::Write { data });
                 }
                 if !bootstrap_owner_still_current(state) {
                     release_bootstrap_lease(
@@ -31829,6 +32023,7 @@ fn TerminalCanvas(
                                     pending_terminal_input_has_text = next_pending_input_has_text;
                                     if codex_completion_notifications_enabled && show_busy_hint {
                                         codex_busy_since_input = true;
+                                        codex_busy_started_at_ms.get_or_insert_with(current_millis);
                                         codex_completion_notified = false;
                                     }
                                     if show_busy_hint
@@ -32201,6 +32396,12 @@ fn TerminalCanvas(
                                 }
                             }
                             Ok(TerminalJsEvent::Resize { cols, rows }) => {
+                                if current_terminal_cols == cols
+                                    && current_terminal_rows == rows
+                                    && terminal_geometry_ready
+                                {
+                                    continue;
+                                }
                                 current_terminal_cols = cols;
                                 current_terminal_rows = rows;
                                 let geometry_usable = terminal_geometry_is_usable(cols, rows);
@@ -32507,11 +32708,14 @@ fn TerminalCanvas(
                                     && !saw_prompt_only_surface
                                 {
                                     codex_busy_since_input = true;
+                                    codex_busy_started_at_ms.get_or_insert_with(current_millis);
                                     codex_completion_notified = false;
                                 }
                                 if codex_completion_notification_should_fire(
                                     codex_completion_notifications_enabled,
                                     codex_busy_since_input,
+                                    codex_busy_started_at_ms
+                                        .map(|started_ms| current_millis().saturating_sub(started_ms)),
                                     codex_completion_notified,
                                     runtime_running,
                                     saw_generic_idle_output,
@@ -32529,6 +32733,19 @@ fn TerminalCanvas(
                                     );
                                     codex_completion_notified = true;
                                     codex_busy_since_input = false;
+                                    codex_busy_started_at_ms = None;
+                                } else if codex_completion_notifications_enabled
+                                    && codex_busy_since_input
+                                    && !runtime_running
+                                    && (saw_generic_idle_output
+                                        || tail_generic_idle_output
+                                        || saw_generic_idle_footer_output
+                                        || tail_generic_idle_footer_output
+                                        || saw_prompt_output
+                                        || tail_prompt_only_output)
+                                {
+                                    codex_busy_since_input = false;
+                                    codex_busy_started_at_ms = None;
                                 }
                                 let has_transport_error = batched_output
                                     .as_deref()
@@ -32546,11 +32763,10 @@ fn TerminalCanvas(
                                         saw_prompt_only_surface,
                                         saw_transcript_browser_output,
                                     );
-                                let forward_terminal_protocol_only_output = is_remote_resume_session
-                                    && !terminal_overlay_dismissed()
-                                    && batched_output
-                                        .as_deref()
-                                        .is_some_and(terminal_chunk_requires_terminal_emulator_forward);
+                                let forward_terminal_protocol_only_output = batched_output
+                                    .as_deref()
+                                    .is_some_and(terminal_chunk_requires_terminal_emulator_forward);
+                                let mut frame_budgeted_terminal_output = false;
                                 if saw_visible_output && !suppress_resume_control_only_output {
                                     terminal_has_visible_output = true;
                                     set_signal_if_changed(terminal_resume_surface_staged, true);
@@ -32720,6 +32936,29 @@ fn TerminalCanvas(
                                     placeholder_rendered = false;
                                 }
                                 if let Some(data) = batched_output.as_ref() {
+                                    let terminal_control_output =
+                                        data.contains("\x1b[?1049h")
+                                            || data.contains("\x1b[?1049l")
+                                            || data.contains("\x1b[?25l")
+                                            || terminal_output_is_high_volume_frame_like(data);
+                                    if terminal_control_output && !traced_terminal_control_output {
+                                        traced_terminal_control_output = true;
+                                        append_trace_event(
+                                            &trace_home,
+                                            "ui",
+                                            "terminal_mount",
+                                            "terminal_control_output",
+                                            json!({
+                                                "session_path": session_path.clone(),
+                                                "cursor": cursor,
+                                                "bytes": data.len(),
+                                                "contains_alt_enter": data.contains("\x1b[?1049h"),
+                                                "contains_alt_exit": data.contains("\x1b[?1049l"),
+                                                "contains_hidden_cursor": data.contains("\x1b[?25l"),
+                                                "frame_like": terminal_output_is_high_volume_frame_like(data),
+                                            }),
+                                        );
+                                    }
                                     if !traced_first_output {
                                         append_trace_event(
                                             &trace_home,
@@ -32777,9 +33016,14 @@ fn TerminalCanvas(
                                                 let _ = eval.send(terminal_reset_command(&title, &theme));
                                                 placeholder_rendered = false;
                                             }
-                                            let _ = eval.send(TerminalJsCommand::Write {
-                                                data: data.clone(),
-                                            });
+                                            for write in terminal_write_bridge.stage_or_immediate(
+                                                data.clone(),
+                                                current_millis(),
+                                                false,
+                                            ) {
+                                                let _ =
+                                                    eval.send(TerminalJsCommand::Write { data: write });
+                                            }
                                             set_signal_if_changed(
                                                 terminal_resume_surface_staged,
                                                 true,
@@ -32794,9 +33038,23 @@ fn TerminalCanvas(
                                                 let _ = eval.send(terminal_reset_command(&title, &theme));
                                                 placeholder_rendered = false;
                                             }
-                                            let _ = eval.send(TerminalJsCommand::Write {
-                                                data: data.clone(),
-                                            });
+                                            let throttle_bridge_output =
+                                                terminal_write_should_frame_budget(
+                                                    data,
+                                                    is_remote_resume_session,
+                                                    terminal_overlay_dismissed(),
+                                                    forward_terminal_protocol_only_output,
+                                                );
+                                            frame_budgeted_terminal_output =
+                                                throttle_bridge_output;
+                                            for write in terminal_write_bridge.stage_or_immediate(
+                                                data.clone(),
+                                                current_millis(),
+                                                throttle_bridge_output,
+                                            ) {
+                                                let _ =
+                                                    eval.send(TerminalJsCommand::Write { data: write });
+                                            }
                                             if !forward_terminal_protocol_only_output {
                                                 set_signal_if_changed(
                                                     terminal_resume_surface_staged,
@@ -32880,6 +33138,18 @@ fn TerminalCanvas(
                                         &last_host_health_cursor_line_text,
                                         &last_host_health_text_tail,
                                     );
+                                let local_attach_ready_output =
+                                    local_terminal_attach_ready_output(
+                                        session_kind,
+                                        saw_meaningful_output,
+                                        saw_prompt_output,
+                                        tail_prompt_only_output,
+                                        saw_visible_output,
+                                        local_retained_surface_ready,
+                                        batched_output.as_deref(),
+                                        &last_host_health_cursor_line_text,
+                                        &last_host_health_text_tail,
+                                    );
                                 let attach_ready = if is_remote_resume_session {
                                     let now_ms = current_millis();
                                     terminal_paint_seen
@@ -32907,11 +33177,7 @@ fn TerminalCanvas(
                                 } else {
                                     terminal_paint_seen
                                         && terminal_geometry_ready
-                                        && (saw_meaningful_output
-                                        || saw_prompt_output
-                                        || tail_prompt_only_output
-                                        || saw_visible_output
-                                        || local_retained_surface_ready)
+                                        && local_attach_ready_output
                                 };
                                 let first_attach_ready = attach_ready && !traced_attach_ready;
                                 if attach_ready {
@@ -33082,30 +33348,26 @@ fn TerminalCanvas(
                                         || tail_prompt_only_output
                                         || saw_attach_ready_marker
                                 };
-                                let quiet_retained_surface_ready = is_remote_resume_session
-                                    && !terminal_live_host_connected()
-                                    && terminal_paint_seen
-                                    && terminal_geometry_ready
-                                    && !last_host_health_has_transport_error
-                                    && remote_resume_host_surface_may_prove_live_terminal(
-                                        placeholder_rendered,
-                                    )
-                                    && (runtime_running
-                                        || !last_host_health_cursor_line_text.trim().is_empty())
-                                    && resume_visual_reveal_after_ms
-                                        .is_some_and(|deadline_ms| current_millis() >= deadline_ms)
-                                    && !saw_transcript_browser_output
-                                    && !saw_generic_idle_output
-                                    && !tail_generic_idle_output
-                                    && !saw_generic_idle_footer_output
-                                    && !tail_generic_idle_footer_output
-                                    && !saw_prompt_only_surface
-                                    && terminal_host_prompt_layout_is_acceptable(
-                                        last_host_health_rows,
-                                        last_host_health_blank_rows_below_cursor,
-                                    )
-                                    && (!last_host_health_cursor_line_text.trim().is_empty()
-                                        || !last_host_health_text_tail.trim().is_empty());
+                                let quiet_retained_surface_ready = quiet_retained_remote_surface_ready(
+                                    is_remote_resume_session,
+                                    terminal_live_host_connected(),
+                                    terminal_paint_seen,
+                                    terminal_geometry_ready,
+                                    last_host_health_has_transport_error,
+                                    placeholder_rendered,
+                                    runtime_running,
+                                    &last_host_health_cursor_line_text,
+                                    &last_host_health_text_tail,
+                                    last_host_health_rows,
+                                    last_host_health_blank_rows_below_cursor,
+                                    resume_visual_reveal_after_ms,
+                                    saw_transcript_browser_output,
+                                    saw_generic_idle_output,
+                                    tail_generic_idle_output,
+                                    saw_generic_idle_footer_output,
+                                    tail_generic_idle_footer_output,
+                                    saw_prompt_only_surface,
+                                );
                                 if quiet_retained_surface_ready {
                                     set_signal_if_changed(terminal_live_host_connected, true);
                                     set_signal_if_changed(terminal_has_meaningful_output, true);
@@ -33555,6 +33817,12 @@ fn TerminalCanvas(
                                     maybe_spawn_missing_managed_cli_refreshes(state);
                                     break;
                                 }
+                                if frame_budgeted_terminal_output {
+                                    read_poll_ms = terminal_write_bridge
+                                        .frame_ms
+                                        .max(TERMINAL_ACTIVE_OUTPUT_READ_POLL_MS)
+                                        .min(TERMINAL_LOCAL_IDLE_READ_POLL_MAX_MS);
+                                }
                                 next_read_deadline = tokio::time::Instant::now()
                                     + Duration::from_millis(read_poll_ms);
                                 if saw_meaningful_output
@@ -33929,6 +34197,206 @@ fn terminal_frame_style(fullscreen: bool) -> TerminalFrameStyle {
         }
     }
 }
+
+#[derive(Debug)]
+struct TerminalWriteBridge {
+    frame_ms: u64,
+    pending: String,
+    last_frame_flush_ms: u64,
+    active_frame_control_prefix: String,
+}
+
+impl TerminalWriteBridge {
+    fn new(frame_ms: u64) -> Self {
+        Self {
+            frame_ms,
+            pending: String::new(),
+            last_frame_flush_ms: 0,
+            active_frame_control_prefix: String::new(),
+        }
+    }
+
+    fn stage_or_immediate(&mut self, data: String, now_ms: u64, frame_budget: bool) -> Vec<String> {
+        let exits_alt_screen = data.contains("\x1b[?1049l");
+        let control_prefix = terminal_frame_control_prefix(&data);
+        if !control_prefix.is_empty() {
+            self.active_frame_control_prefix = control_prefix.to_string();
+        }
+
+        if !frame_budget || self.frame_ms == 0 {
+            let mut writes = Vec::new();
+            if let Some(pending) = self.flush_all(now_ms) {
+                writes.push(pending);
+            }
+            writes.push(data);
+            if exits_alt_screen {
+                self.active_frame_control_prefix.clear();
+            }
+            return writes;
+        }
+
+        self.pending.push_str(&data);
+        self.pending = coalesce_high_volume_terminal_frames_with_prefix(
+            &self.pending,
+            &self.active_frame_control_prefix,
+        );
+        if self.pending.len() > TERMINAL_FRAME_BRIDGE_PENDING_MAX_BYTES {
+            self.pending = trim_high_volume_terminal_frame_buffer_with_prefix(
+                &self.pending,
+                &self.active_frame_control_prefix,
+            );
+        }
+
+        let writes: Vec<String> = self.flush_due(now_ms).into_iter().collect();
+        if exits_alt_screen {
+            self.active_frame_control_prefix.clear();
+        }
+        writes
+    }
+
+    fn flush_due(&mut self, now_ms: u64) -> Option<String> {
+        if self.pending.is_empty() {
+            return None;
+        }
+        if self.last_frame_flush_ms == 0
+            || now_ms.saturating_sub(self.last_frame_flush_ms) >= self.frame_ms
+        {
+            return self.flush_all(now_ms);
+        }
+        None
+    }
+
+    fn flush_all(&mut self, now_ms: u64) -> Option<String> {
+        if self.pending.is_empty() {
+            return None;
+        }
+        self.last_frame_flush_ms = now_ms;
+        Some(std::mem::take(&mut self.pending))
+    }
+}
+
+fn terminal_write_should_frame_budget(
+    data: &str,
+    is_remote_resume_session: bool,
+    remote_overlay_dismissed: bool,
+    protocol_only_output: bool,
+) -> bool {
+    !protocol_only_output
+        && (!is_remote_resume_session || remote_overlay_dismissed)
+        && terminal_output_is_high_volume_frame_like(data)
+}
+
+fn terminal_output_is_high_volume_frame_like(data: &str) -> bool {
+    data.len() >= TERMINAL_FRAME_BRIDGE_MIN_BYTES
+        && (terminal_last_frame_anchor_index(data).is_some()
+            || data.contains("\x1b[?25l")
+            || terminal_csi_count_at_least(data, TERMINAL_FRAME_BRIDGE_CSI_MIN_COUNT))
+}
+
+fn coalesce_high_volume_terminal_frames(data: &str) -> String {
+    if data.len() < TERMINAL_FRAME_BRIDGE_MIN_BYTES {
+        return data.to_string();
+    }
+    if !terminal_has_repeated_frame_anchor(data) {
+        return data.to_string();
+    }
+    terminal_last_frame_anchor_index(data)
+        .map(|index| {
+            let prefix = terminal_frame_control_prefix(data);
+            if prefix.is_empty() {
+                data[index..].to_string()
+            } else {
+                format!("{prefix}{}", &data[index..])
+            }
+        })
+        .unwrap_or_else(|| data.to_string())
+}
+
+fn coalesce_high_volume_terminal_frames_with_prefix(data: &str, active_prefix: &str) -> String {
+    let coalesced = coalesce_high_volume_terminal_frames(data);
+    if active_prefix.is_empty()
+        || coalesced.starts_with(active_prefix)
+        || terminal_first_frame_anchor_index(&coalesced) != Some(0)
+    {
+        return coalesced;
+    }
+    format!("{active_prefix}{coalesced}")
+}
+
+fn trim_high_volume_terminal_frame_buffer(data: &str) -> String {
+    if let Some(index) = terminal_last_frame_anchor_index(data) {
+        return data[index..].to_string();
+    }
+    let start = data
+        .char_indices()
+        .rev()
+        .find(|(index, _)| {
+            data.len().saturating_sub(*index) <= TERMINAL_FRAME_BRIDGE_PENDING_MAX_BYTES
+        })
+        .map(|(index, _)| index)
+        .unwrap_or(0);
+    data[start..].to_string()
+}
+
+fn trim_high_volume_terminal_frame_buffer_with_prefix(data: &str, active_prefix: &str) -> String {
+    let trimmed = trim_high_volume_terminal_frame_buffer(data);
+    if active_prefix.is_empty()
+        || trimmed.starts_with(active_prefix)
+        || terminal_first_frame_anchor_index(&trimmed) != Some(0)
+    {
+        return trimmed;
+    }
+    format!("{active_prefix}{trimmed}")
+}
+
+fn terminal_frame_control_prefix(data: &str) -> &str {
+    if !(data.contains("\x1b[?1049h") || data.contains("\x1b[?25l")) {
+        return "";
+    }
+    terminal_first_frame_anchor_index(data)
+        .and_then(|index| data.get(..index))
+        .unwrap_or("")
+}
+
+fn terminal_has_repeated_frame_anchor(data: &str) -> bool {
+    terminal_frame_anchor_count(data, 2) >= 2
+}
+
+fn terminal_frame_anchor_count(data: &str, stop_at: usize) -> usize {
+    let mut count = 0usize;
+    for anchor in terminal_frame_anchors() {
+        for _ in data.match_indices(anchor) {
+            count += 1;
+            if count >= stop_at {
+                return count;
+            }
+        }
+    }
+    count
+}
+
+fn terminal_last_frame_anchor_index(data: &str) -> Option<usize> {
+    terminal_frame_anchors()
+        .iter()
+        .filter_map(|anchor| data.rfind(anchor))
+        .max()
+}
+
+fn terminal_first_frame_anchor_index(data: &str) -> Option<usize> {
+    terminal_frame_anchors()
+        .iter()
+        .filter_map(|anchor| data.find(anchor))
+        .min()
+}
+
+fn terminal_frame_anchors() -> [&'static str; 5] {
+    ["\x1b[H", "\x1b[1;1H", "\x1b[1;1f", "\x1b[;H", "\x1b[0;0H"]
+}
+
+fn terminal_csi_count_at_least(data: &str, threshold: usize) -> bool {
+    data.match_indices("\x1b[").take(threshold).count() >= threshold
+}
+
 fn batch_terminal_chunks(
     chunks: Vec<yggterm_server::TerminalStreamChunk>,
 ) -> (Option<String>, bool, bool, bool, bool, bool, bool) {
@@ -33942,13 +34410,25 @@ fn batch_terminal_chunks(
     let (combined, saw_attach_ready_marker) = strip_terminal_attach_ready_marker(&combined);
     let observation =
         strip_low_signal_terminal_noise_lines(&sanitize_terminal_resume_runtime_output(&combined));
+    let should_forward_control_only =
+        observation.is_empty() && terminal_chunk_requires_terminal_emulator_forward(&combined);
+    let should_forward_terminal_control = combined.contains("\x1b[?1049h")
+        || combined.contains("\x1b[?1049l")
+        || combined.contains("\x1b[?25l")
+        || terminal_output_is_high_volume_frame_like(&combined);
     let saw_visible_output = terminal_chunk_has_visible_output(&observation);
     let saw_meaningful_output = terminal_chunk_has_meaningful_output(&observation);
     let saw_prompt_output = terminal_chunk_has_prompt_output(&observation);
     let tail_prompt_only_output = terminal_chunk_tail_is_idle(&observation);
     let saw_transcript_browser_output = terminal_chunk_is_transcript_browser(&observation);
     (
-        (!observation.is_empty()).then_some(observation),
+        if observation.is_empty() {
+            should_forward_control_only.then_some(combined)
+        } else if should_forward_terminal_control {
+            Some(combined)
+        } else {
+            Some(observation)
+        },
         saw_visible_output,
         saw_meaningful_output,
         saw_prompt_output,
@@ -34474,6 +34954,13 @@ fn terminal_xterm_canvas_renderer_enabled() -> bool {
         .ok()
         .map_or(true, |value| env_value_truthy(&value))
 }
+fn terminal_write_frame_ms() -> u64 {
+    std::env::var(TERMINAL_WRITE_FRAME_MS_ENV)
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .map(|value| value.min(3000))
+        .unwrap_or(400)
+}
 fn env_value_truthy(value: &str) -> bool {
     matches!(
         value.trim().to_ascii_lowercase().as_str(),
@@ -34877,6 +35364,30 @@ fn local_retained_terminal_surface_ready(
             || !host_health_cursor_line_text.trim().is_empty()
             || !host_health_text_tail.trim().is_empty())
 }
+fn local_terminal_attach_ready_output(
+    session_kind: SessionKind,
+    saw_meaningful_output: bool,
+    saw_prompt_output: bool,
+    tail_prompt_only_output: bool,
+    saw_visible_output: bool,
+    local_retained_surface_ready: bool,
+    batched_output: Option<&str>,
+    host_health_cursor_line_text: &str,
+    host_health_text_tail: &str,
+) -> bool {
+    if !session_kind.is_agent() {
+        return saw_meaningful_output
+            || saw_prompt_output
+            || tail_prompt_only_output
+            || saw_visible_output
+            || local_retained_surface_ready;
+    }
+    saw_meaningful_output
+        || saw_prompt_output
+        || batched_output.is_some_and(terminal_chunk_has_codex_prompt_output)
+        || terminal_chunk_has_codex_prompt_output(host_health_cursor_line_text)
+        || terminal_chunk_has_codex_prompt_output(host_health_text_tail)
+}
 const TERMINAL_FONT_FAMILY: &str = "'Iosevka Term', 'JetBrains Mono', 'Fira Code', monospace";
 fn terminal_hex_channel(value: &str) -> Option<u8> {
     u8::from_str_radix(value, 16).ok()
@@ -35104,9 +35615,9 @@ fn sidebar_row_dom_id(path: &str) -> String {
     }
     id
 }
-fn claim_sidebar_focus_by_path(path: Option<&str>) {
+fn claim_sidebar_focus_script(path: Option<&str>) -> String {
     let row_id = path.map(sidebar_row_dom_id);
-    let _ = document::eval(&format!(
+    format!(
         r#"
         (() => {{
           if (!window.__yggtermSidebarDeleteListenerInstalled) {{
@@ -35139,6 +35650,7 @@ fn claim_sidebar_focus_by_path(path: Option<&str>) {
                 || editableOwnsKey(active)
                 || editableOwnsKey(target)
               ) {{
+                window.__yggtermSidebarFocusGeneration = Number(window.__yggtermSidebarFocusGeneration || 0) + 1;
                 window.__yggtermSidebarKeyboardOwner = false;
                 return;
               }}
@@ -35157,8 +35669,16 @@ fn claim_sidebar_focus_by_path(path: Option<&str>) {
             window.__yggtermSidebarDeleteListenerInstalled = true;
           }}
           const rowId = {row_id:?};
+          const focusGeneration = Number(window.__yggtermSidebarFocusGeneration || 0) + 1;
+          window.__yggtermSidebarFocusGeneration = focusGeneration;
           const claimUntil = Date.now() + 1400;
           const focusSidebar = () => {{
+            if (Number(window.__yggtermSidebarFocusGeneration || 0) !== focusGeneration) {{
+              return false;
+            }}
+            if (Date.now() > claimUntil) {{
+              return false;
+            }}
             const row = rowId ? document.getElementById(rowId) : null;
             const rowPath = row
               ? String(row.getAttribute('data-sidebar-row-path') || '')
@@ -35205,20 +35725,25 @@ fn claim_sidebar_focus_by_path(path: Option<&str>) {
           window.setTimeout(focusSidebar, 420);
         }})();
         "#,
-    ));
+    )
 }
-fn clear_sidebar_keyboard_owner() {
-    let _ = document::eval(
-        r#"
+fn claim_sidebar_focus_by_path(path: Option<&str>) {
+    let _ = document::eval(&claim_sidebar_focus_script(path));
+}
+fn clear_sidebar_keyboard_owner_script() -> &'static str {
+    r#"
         (() => {
           try {
+            window.__yggtermSidebarFocusGeneration = Number(window.__yggtermSidebarFocusGeneration || 0) + 1;
             window.__yggtermSidebarKeyboardOwner = false;
             window.__yggtermFocusedSidebarRowPath = '';
             window.__yggtermUiFocusClaimUntilMs = 0;
           } catch (_error) {}
         })();
-        "#,
-    );
+        "#
+}
+fn clear_sidebar_keyboard_owner() {
+    let _ = document::eval(clear_sidebar_keyboard_owner_script());
 }
 fn terminal_instance_key(session_path: &str) -> String {
     session_path.to_string()
@@ -35807,6 +36332,7 @@ fn terminal_eval_script_with_canvas_renderer(
         serde_json::to_string(&initial_input_enabled).expect("serialize initial input enabled");
     let canvas_renderer_enabled =
         serde_json::to_string(&canvas_renderer_enabled).expect("serialize canvas renderer flag");
+    let terminal_write_frame_ms = terminal_write_frame_ms();
     let font_family =
         serde_json::to_string(TERMINAL_FONT_FAMILY).expect("serialize terminal font family");
     let font_weight = serde_json::to_string(&terminal_font_weight(theme))
@@ -35839,6 +36365,7 @@ fn terminal_eval_script_with_canvas_renderer(
         r#"
         const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
         const hostId = {host_id:?};
+        const terminalWriteFrameMs = Math.max(0, Number({terminal_write_frame_ms} || 0));
         let host = document.getElementById(hostId);
         dioxus.send({{ kind: "debug", message: `bootstrap host=${{hostId}} present=${{!!host}}` }});
         if (!host) {{
@@ -36003,7 +36530,7 @@ fn terminal_eval_script_with_canvas_renderer(
             lineHeight: {line_height},
             letterSpacing: 0,
             minimumContrastRatio: {minimum_contrast_ratio},
-            scrollback: 5000,
+            scrollback: 1000,
             theme: {{
                 background: {background},
                 foreground: {foreground},
@@ -36049,6 +36576,7 @@ fn terminal_eval_script_with_canvas_renderer(
                     && target.closest('[id^="yggterm-terminal-"]')
                 );
                 if (terminalOwnsDelete) {{
+                    window.__yggtermSidebarFocusGeneration = Number(window.__yggtermSidebarFocusGeneration || 0) + 1;
                     window.__yggtermSidebarKeyboardOwner = false;
                     return true;
                 }}
@@ -36756,7 +37284,25 @@ fn terminal_eval_script_with_canvas_renderer(
         let scrollEventCount = 0;
         let dataEventCount = 0;
         let renderEventCount = 0;
+        let lastRenderProbeAtMs = 0;
+        let renderProbeFramePending = false;
+        let lastResizeKey = '';
+        let lastWriteAppliedSampleAtMs = 0;
+        let lastWriteFlushStartedAtMs = 0;
+        let writeBridgeFlushTimer = null;
+        let hostHealthFramePending = false;
+        let lastHostHealthAtMs = 0;
         let scrollbackLocked = false;
+        let lowPowerTuiOverlay = null;
+        let lowPowerTuiActive = false;
+        let lowPowerTuiFrameCount = 0;
+        let lowPowerTuiLastText = '';
+        let lowPowerTuiTextBuffer = '';
+        let tracedLowPowerTuiActive = false;
+        let tracedInactiveTuiDrop = false;
+        let tracedTuiFilterProbe = false;
+        let inactiveTuiFrameDropCount = 0;
+        let inactiveTuiLastTail = '';
         let bufferTransitionCount = 0;
         let cursorHiddenToggleCount = 0;
         let lastObservedBufferKind = null;
@@ -36997,7 +37543,7 @@ fn terminal_eval_script_with_canvas_renderer(
             }}
             forceTerminalRepaint(lastVisualTransitionReason);
         }};
-        const requestVisiblePaint = () => {{
+        const requestVisiblePaint = (forceFullRefresh = true) => {{
             requestAnimationFrame(() => {{
                 rebindCurrentHost('request_visible_paint', true);
                 try {{
@@ -37020,10 +37566,25 @@ fn terminal_eval_script_with_canvas_renderer(
                     }});
                 }}
                 try {{
-                    if (term.refresh) {{
+                    if (forceFullRefresh && term.refresh) {{
                         term.refresh(0, Math.max(0, term.rows - 1));
                     }}
                 }} catch (_error) {{}}
+                emitPaint();
+            }});
+        }};
+        const requestRenderProbe = (reason) => {{
+            const now = Date.now();
+            if (renderProbeFramePending || (now - lastRenderProbeAtMs < 220)) {{
+                return;
+            }}
+            renderProbeFramePending = true;
+            requestAnimationFrame(() => {{
+                renderProbeFramePending = false;
+                lastRenderProbeAtMs = Date.now();
+                enforceHelperTextareaContract();
+                refreshCursorContrastContract();
+                trackTerminalVisualState(reason);
                 emitPaint();
             }});
         }};
@@ -37217,8 +37778,27 @@ fn terminal_eval_script_with_canvas_renderer(
                 return;
             }}
             ensureVisibleHost('set_input_enabled');
+            emitResize();
             scrollLiveCursorIntoView();
             requestVisiblePaint();
+            window.requestAnimationFrame(() => {{
+                stretchXtermRoot();
+                emitResize();
+                requestVisiblePaint();
+                emitHostHealth();
+            }});
+            window.setTimeout(() => {{
+                stretchXtermRoot();
+                emitResize();
+                requestVisiblePaint();
+                emitHostHealth();
+            }}, 32);
+            window.setTimeout(() => {{
+                stretchXtermRoot();
+                emitResize();
+                requestVisiblePaint();
+                emitHostHealth();
+            }}, 140);
             if (focus) {{
                 focusTerminal();
             }} else {{
@@ -37601,8 +38181,12 @@ fn terminal_eval_script_with_canvas_renderer(
             rebindCurrentHost('emit_resize', true);
             try {{
                 fitAddon.fit();
-                forceRendererResize();
-                dioxus.send({{ kind: "resize", cols: term.cols, rows: term.rows }});
+                const resizeKey = `${{term.cols}}x${{term.rows}}`;
+                if (resizeKey !== lastResizeKey) {{
+                    lastResizeKey = resizeKey;
+                    forceRendererResize();
+                    dioxus.send({{ kind: "resize", cols: term.cols, rows: term.rows }});
+                }}
             }} catch (_error) {{}}
         }};
         window.__yggtermXtermHosts = window.__yggtermXtermHosts || {{}};
@@ -37639,6 +38223,12 @@ fn terminal_eval_script_with_canvas_renderer(
             lastWriteError: '',
             lastWriteQueuedAtMs: 0,
             lastWriteCallbackAtMs: 0,
+            terminalWriteFrameMs,
+            lowPowerTuiActive: false,
+            lowPowerTuiFrameCount: 0,
+            lastLowPowerTuiText: '',
+            inactiveTuiFrameDropCount: 0,
+            inactiveTuiLastTail: '',
             lastWheelDeltaY: 0,
             scrollbackLocked,
         }};
@@ -37696,6 +38286,232 @@ fn terminal_eval_script_with_canvas_renderer(
                 return String(host.innerText || '').slice(0, 4096);
             }}
         }};
+        const syncLowPowerTuiHostEntry = () => {{
+            try {{
+                const currentEntry = window.__yggtermXtermHosts && window.__yggtermXtermHosts[hostId];
+                if (!currentEntry) {{
+                    return;
+                }}
+                currentEntry.lowPowerTuiActive = Boolean(lowPowerTuiActive);
+                currentEntry.lowPowerTuiFrameCount = Number(lowPowerTuiFrameCount || 0);
+                currentEntry.lastLowPowerTuiText = String(lowPowerTuiLastText || '').slice(-4096);
+                currentEntry.inactiveTuiFrameDropCount = Number(inactiveTuiFrameDropCount || 0);
+                currentEntry.inactiveTuiLastTail = String(inactiveTuiLastTail || '').slice(-240);
+            }} catch (_error) {{}}
+        }};
+        const hideLowPowerTuiOverlay = () => {{
+            try {{
+                if (lowPowerTuiOverlay) {{
+                    lowPowerTuiOverlay.style.display = 'none';
+                    lowPowerTuiOverlay.textContent = '';
+                }}
+            }} catch (_error) {{}}
+            lowPowerTuiActive = false;
+            lowPowerTuiLastText = '';
+            lowPowerTuiTextBuffer = '';
+            syncLowPowerTuiHostEntry();
+        }};
+        const ensureLowPowerTuiOverlay = () => {{
+            try {{
+                if (lowPowerTuiOverlay && lowPowerTuiOverlay.isConnected) {{
+                    return lowPowerTuiOverlay;
+                }}
+                const overlay = document.createElement('pre');
+                overlay.setAttribute('data-yggterm-low-power-tui', '1');
+                overlay.setAttribute('aria-hidden', 'true');
+                overlay.style.position = 'absolute';
+                overlay.style.inset = '0';
+                overlay.style.zIndex = '2';
+                overlay.style.margin = '0';
+                overlay.style.padding = '0';
+                overlay.style.border = '0';
+                overlay.style.overflow = 'hidden';
+                overlay.style.pointerEvents = 'none';
+                overlay.style.userSelect = 'none';
+                overlay.style.webkitUserSelect = 'none';
+                overlay.style.whiteSpace = 'pre';
+                overlay.style.tabSize = '4';
+                overlay.style.fontFamily = {font_family};
+                overlay.style.fontWeight = String({font_weight});
+                overlay.style.fontFeatureSettings = '"calt" 0, "liga" 0';
+                overlay.style.fontVariantLigatures = 'none';
+                overlay.style.letterSpacing = '0px';
+                overlay.style.webkitFontSmoothing = {font_smoothing};
+                overlay.style.MozOsxFontSmoothing = {moz_font_smoothing};
+                overlay.style.color = {foreground};
+                overlay.style.background = {background};
+                overlay.style.fontSize = `${{Number(term && term.options ? term.options.fontSize || {font_size} : {font_size})}}px`;
+                overlay.style.lineHeight = `${{Number(term && term.options ? term.options.fontSize || {font_size} : {font_size}) * Number(term && term.options ? term.options.lineHeight || {line_height} : {line_height})}}px`;
+                host.appendChild(overlay);
+                lowPowerTuiOverlay = overlay;
+                return overlay;
+            }} catch (_error) {{
+                return null;
+            }}
+        }};
+        const terminalPayloadLooksHighVolumeFrame = (payload) => {{
+            const value = String(payload || '');
+            if (
+                value.includes('\x1b[?1049h')
+                || value.includes('\x1b[?25l')
+                || value.includes('\x1b[2J')
+            ) {{
+                return true;
+            }}
+            if (value.length < 256) {{
+                return false;
+            }}
+            const anchors = ['\x1b[H', '\x1b[1;1H', '\x1b[1;1f', '\x1b[;H', '\x1b[0;0H'];
+            for (const anchor of anchors) {{
+                if (value.indexOf(anchor) >= 0) {{
+                    return true;
+                }}
+            }}
+            let csiCount = 0;
+            let index = value.indexOf('\x1b[');
+            while (index >= 0 && csiCount < 24) {{
+                csiCount += 1;
+                index = value.indexOf('\x1b[', index + 2);
+            }}
+            return csiCount >= 24;
+        }};
+        const hostIsActiveRenderSurface = () => {{
+            try {{
+                const rect = host.getBoundingClientRect();
+                const style = window.getComputedStyle(host);
+                const visiblyMounted =
+                    style.display !== 'none'
+                    && style.visibility !== 'hidden'
+                    && Number(rect.width || 0) > 0
+                    && Number(rect.height || 0) > 0
+                    && Number(rect.right || 0) > 0
+                    && Number(rect.bottom || 0) > 0
+                    && Number(rect.left || 0) < Number(window.innerWidth || 0)
+                    && Number(rect.top || 0) < Number(window.innerHeight || 0);
+                return visiblyMounted;
+            }} catch (_error) {{
+                return false;
+            }}
+        }};
+        const stripAnsiForLowPowerTui = (payload) => {{
+            return String(payload || '')
+                .replace(/\x1b\][^\x07]*(?:\x07|\x1b\\)/g, '')
+                .replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, '')
+                .replace(/\x1b[()][A-Za-z0-9]/g, '')
+                .replace(/[\x00\x0e\x0f]/g, '');
+        }};
+        const lowPowerTuiTextFromPayload = (payload) => {{
+            const frame = coalesceHighVolumeTerminalPayload(String(payload || ''))
+                .replace(/\x1b\[\?1049[hl]/g, '');
+            const normalized = stripAnsiForLowPowerTui(frame)
+                .replace(/\r\n/g, '\n')
+                .replace(/\r/g, '\n')
+                .replace(/\t/g, '    ');
+            const rows = Math.max(1, Number(term && term.rows ? term.rows : 24));
+            const cols = Math.max(1, Number(term && term.cols ? term.cols : 80));
+            const lines = normalized.split('\n');
+            return lines
+                .slice(Math.max(0, lines.length - rows))
+                .map((line) => String(line || '').slice(0, cols))
+                .join('\n')
+                .slice(-8192);
+        }};
+        const renderLowPowerTuiPayload = (payload) => {{
+            const overlay = ensureLowPowerTuiOverlay();
+            if (!overlay) {{
+                return false;
+            }}
+            const value = String(payload || '');
+            const text = lowPowerTuiTextFromPayload(value);
+            const startsFreshFrame =
+                value.includes('\x1b[?1049h')
+                || value.includes('\x1b[2J')
+                || value.includes('\x1b[H')
+                || value.includes('\x1b[1;1H')
+                || value.includes('\x1b[1;1f')
+                || value.includes('\x1b[;H')
+                || value.includes('\x1b[0;0H');
+            if (startsFreshFrame) {{
+                lowPowerTuiTextBuffer = text;
+            }} else if (text) {{
+                const rows = Math.max(1, Number(term && term.rows ? term.rows : 24));
+                lowPowerTuiTextBuffer = `${{lowPowerTuiTextBuffer}}${{text}}`
+                    .split('\n')
+                    .slice(-rows)
+                    .join('\n')
+                    .slice(-8192);
+            }}
+            const renderedText = lowPowerTuiTextBuffer || text;
+            if (!renderedText.trim()) {{
+                return false;
+            }}
+            overlay.style.display = 'block';
+            overlay.textContent = renderedText;
+            lowPowerTuiActive = true;
+            lowPowerTuiFrameCount += 1;
+            lowPowerTuiLastText = renderedText;
+            if (!tracedLowPowerTuiActive) {{
+                tracedLowPowerTuiActive = true;
+                dioxus.send({{
+                    kind: "debug",
+                    message: `low_power_tui_active host=${{hostId}} frames=${{lowPowerTuiFrameCount}} chars=${{renderedText.length}}`
+                }});
+            }}
+            syncLowPowerTuiHostEntry();
+            requestRenderProbe('low_power_tui');
+            emitHostHealthThrottled();
+            return true;
+        }};
+        const filterPayloadForRenderSurface = (payload) => {{
+            const value = String(payload || '');
+            if (!value) {{
+                return '';
+            }}
+            const exitsAltScreen = value.includes('\x1b[?1049l');
+            const entersAltScreen = value.includes('\x1b[?1049h');
+            const frameLike = terminalPayloadLooksHighVolumeFrame(value);
+            const activeRenderSurface = hostIsActiveRenderSurface();
+            if (!tracedTuiFilterProbe && (value.includes('?1049') || value.includes('\x1b[?25l') || frameLike)) {{
+                tracedTuiFilterProbe = true;
+                dioxus.send({{
+                    kind: "debug",
+                    message: `tui_filter_probe host=${{hostId}} enters=${{entersAltScreen}} exits=${{exitsAltScreen}} activeSurface=${{activeRenderSurface}} frameLike=${{frameLike}} chars=${{value.length}}`
+                }});
+            }}
+            if (!activeRenderSurface && !exitsAltScreen && (lowPowerTuiActive || entersAltScreen || frameLike)) {{
+                if (entersAltScreen) {{
+                    lowPowerTuiActive = true;
+                    lowPowerTuiTextBuffer = '';
+                }}
+                inactiveTuiFrameDropCount += 1;
+                inactiveTuiLastTail = value.slice(-240);
+                if (!tracedInactiveTuiDrop) {{
+                    tracedInactiveTuiDrop = true;
+                    dioxus.send({{
+                        kind: "debug",
+                        message: `inactive_tui_drop host=${{hostId}} frameLike=${{frameLike}} chars=${{value.length}}`
+                    }});
+                }}
+                syncLowPowerTuiHostEntry();
+                return '';
+            }}
+            if (exitsAltScreen) {{
+                hideLowPowerTuiOverlay();
+                return value;
+            }}
+            if (activeRenderSurface && entersAltScreen) {{
+                lowPowerTuiActive = true;
+                lowPowerTuiTextBuffer = '';
+                syncLowPowerTuiHostEntry();
+                renderLowPowerTuiPayload(value);
+                return '';
+            }}
+            if (activeRenderSurface && lowPowerTuiActive) {{
+                renderLowPowerTuiPayload(value);
+                return '';
+            }}
+            return value;
+        }};
         const finalizeWriteFlush = (flushShouldFollow, callbackFired) => {{
             const currentEntry = window.__yggtermXtermHosts && window.__yggtermXtermHosts[hostId];
             if (currentEntry) {{
@@ -37705,31 +38521,46 @@ fn terminal_eval_script_with_canvas_renderer(
                         Number(currentEntry.writeCallbackCount || 0) + 1;
                     currentEntry.lastWriteCallbackAtMs = Date.now();
                 }}
-                currentEntry.lastWriteAppliedTail =
-                    readTerminalBufferSample().slice(-240);
+                const now = Date.now();
+                if (now - lastWriteAppliedSampleAtMs >= 250) {{
+                    lastWriteAppliedSampleAtMs = now;
+                    currentEntry.lastWriteAppliedTail =
+                        readTerminalBufferSample().slice(-240);
+                }}
             }}
             if (flushShouldFollow) {{
                 scrollLiveCursorIntoView();
             }} else {{
                 syncScrollbackLock();
             }}
-            requestVisiblePaint();
-            emitHostHealth();
-            queueMicrotask(flushPendingWrite);
-        }};
-        const flushPendingWrite = () => {{
-            const entry = window.__yggtermXtermHosts && window.__yggtermXtermHosts[hostId];
-            if (!entry || entry.writeBridgeInFlight) {{
-                return;
+            requestRenderProbe('write_flush');
+                emitHostHealthThrottled();
+                schedulePendingWriteFlush(false);
+            }};
+            const flushPendingWrite = () => {{
+                if (writeBridgeFlushTimer !== null) {{
+                    clearTimeout(writeBridgeFlushTimer);
+                    writeBridgeFlushTimer = null;
+                }}
+                const entry = window.__yggtermXtermHosts && window.__yggtermXtermHosts[hostId];
+                if (!entry || entry.writeBridgeInFlight) {{
+                    return;
             }}
-            const payload = String(entry.writeBridgePendingData || '');
+            let payload = String(entry.writeBridgePendingData || '');
             if (!payload) {{
                 return;
             }}
             entry.writeBridgePendingData = '';
+            payload = filterPayloadForRenderSurface(payload);
+            if (!payload) {{
+                finalizeWriteFlush(false, false);
+                return;
+            }}
+            payload = coalesceHighVolumeTerminalPayload(payload);
             entry.writeBridgeInFlight = true;
-            entry.writeBridgeFlushCount = Number(entry.writeBridgeFlushCount || 0) + 1;
-            const flushShouldFollow = !syncScrollbackLock() && liveCursorNearBottom();
+                entry.writeBridgeFlushCount = Number(entry.writeBridgeFlushCount || 0) + 1;
+                lastWriteFlushStartedAtMs = Date.now();
+                const flushShouldFollow = !syncScrollbackLock() && liveCursorNearBottom();
             const syncWrite = term && term._core && typeof term._core.writeSync === 'function'
                 ? term._core.writeSync.bind(term._core)
                 : entry && entry.term && entry.term._core && entry.term._core._writeBuffer && typeof entry.term._core._writeBuffer.writeSync === 'function'
@@ -37751,8 +38582,57 @@ fn terminal_eval_script_with_canvas_renderer(
                         error && error.message ? String(error.message) : String(error);
                 }}
                 emitHostHealth();
-                queueMicrotask(flushPendingWrite);
+                schedulePendingWriteFlush(false);
             }}
+        }};
+        const schedulePendingWriteFlush = (force = false) => {{
+            const entry = window.__yggtermXtermHosts && window.__yggtermXtermHosts[hostId];
+            if (!entry || entry.writeBridgeInFlight) {{
+                return;
+            }}
+            const pendingLength = String(entry.writeBridgePendingData || '').length;
+            if (pendingLength <= 0) {{
+                return;
+            }}
+            const now = Date.now();
+            const elapsedSinceFlush = lastWriteFlushStartedAtMs > 0
+                ? now - lastWriteFlushStartedAtMs
+                : Number.POSITIVE_INFINITY;
+            const highVolumePayload = pendingLength >= 256;
+            if (
+                !force
+                && terminalWriteFrameMs > 0
+                && highVolumePayload
+                && elapsedSinceFlush < terminalWriteFrameMs
+            ) {{
+                if (writeBridgeFlushTimer === null) {{
+                    writeBridgeFlushTimer = window.setTimeout(() => {{
+                        writeBridgeFlushTimer = null;
+                        flushPendingWrite();
+                    }}, Math.max(8, terminalWriteFrameMs - elapsedSinceFlush));
+                }}
+                return;
+            }}
+            queueMicrotask(flushPendingWrite);
+        }};
+        const coalesceHighVolumeTerminalPayload = (payload) => {{
+            const value = String(payload || '');
+            if (value.length < 4096) {{
+                return value;
+            }}
+            const anchors = ['\x1b[H', '\x1b[1;1H'];
+            let bestAnchor = -1;
+            for (const anchor of anchors) {{
+                const first = value.indexOf(anchor);
+                const last = value.lastIndexOf(anchor);
+                if (first >= 0 && last > first && last > bestAnchor) {{
+                    bestAnchor = last;
+                }}
+            }}
+            if (bestAnchor <= 0) {{
+                return value;
+            }}
+            return value.slice(bestAnchor);
         }};
         const writeParsedDisposable = typeof term.onWriteParsed === 'function'
             ? term.onWriteParsed(() => {{
@@ -37761,8 +38641,8 @@ fn terminal_eval_script_with_canvas_renderer(
                     currentEntry.writeParsedCount = Number(currentEntry.writeParsedCount || 0) + 1;
                     currentEntry.lastWriteParsedAtMs = Date.now();
                 }}
-                trackTerminalVisualState('write_parsed');
-                emitHostHealth();
+                requestRenderProbe('write_parsed');
+                emitHostHealthThrottled();
             }})
             : null;
         const renderDisposable = term.onRender(() => {{
@@ -37770,10 +38650,7 @@ fn terminal_eval_script_with_canvas_renderer(
             if (window.__yggtermXtermHosts && window.__yggtermXtermHosts[hostId]) {{
                 window.__yggtermXtermHosts[hostId].renderEventCount = renderEventCount;
             }}
-            enforceHelperTextareaContract();
-            refreshCursorContrastContract();
-            trackTerminalVisualState('render');
-            emitPaint();
+            requestRenderProbe('render');
         }});
         const scrollDisposable = typeof term.onScroll === 'function'
             ? term.onScroll(() => {{
@@ -37842,6 +38719,23 @@ fn terminal_eval_script_with_canvas_renderer(
                     blank_rows_below_cursor: Math.max(0, Math.min(65535, Math.round(blankRowsBelowCursor))),
                 }});
             }} catch (_error) {{}}
+        }};
+        const emitHostHealthThrottled = () => {{
+            const now = Date.now();
+            if (now - lastHostHealthAtMs >= 250) {{
+                lastHostHealthAtMs = now;
+                emitHostHealth();
+                return;
+            }}
+            if (hostHealthFramePending) {{
+                return;
+            }}
+            hostHealthFramePending = true;
+            window.setTimeout(() => {{
+                hostHealthFramePending = false;
+                lastHostHealthAtMs = Date.now();
+                emitHostHealth();
+            }}, 250);
         }};
         term.onData((data) => {{
             if (!inputEnabled) {{
@@ -37921,6 +38815,7 @@ fn terminal_eval_script_with_canvas_renderer(
                 continue;
             }}
             if (message.kind === "reset") {{
+                hideLowPowerTuiOverlay();
                 if (typeof term.reset === 'function') {{
                     term.reset();
                 }} else {{
@@ -38009,7 +38904,7 @@ fn terminal_eval_script_with_canvas_renderer(
                         String(window.__yggtermXtermHosts[hostId].writeBridgePendingData || '')
                         + String(message.data || '');
                 }}
-                queueMicrotask(flushPendingWrite);
+                schedulePendingWriteFlush(false);
             }} else if (message.kind === "set_input_enabled") {{
                 setInputEnabled(Boolean(message.enabled), Boolean(message.focus));
                 emitHostHealth();
@@ -42097,6 +42992,30 @@ mod tests {
         assert!(text.copy.contains("selected session rows"));
         assert!(!text.copy.contains("server-owned terminal runtime"));
     }
+
+    #[test]
+    fn sidebar_focus_claim_is_cancelable_before_terminal_reclaim() {
+        let script = claim_sidebar_focus_script(Some("ssh://dev/session-1"));
+
+        assert!(script.contains("window.__yggtermSidebarFocusGeneration = focusGeneration;"));
+        assert!(
+            script.contains(
+                "Number(window.__yggtermSidebarFocusGeneration || 0) !== focusGeneration"
+            )
+        );
+        assert!(script.contains("Date.now() > claimUntil"));
+    }
+
+    #[test]
+    fn clearing_sidebar_keyboard_owner_cancels_pending_sidebar_focus_claims() {
+        let script = clear_sidebar_keyboard_owner_script();
+
+        assert!(script.contains(
+            "window.__yggtermSidebarFocusGeneration = Number(window.__yggtermSidebarFocusGeneration || 0) + 1;"
+        ));
+        assert!(script.contains("window.__yggtermSidebarKeyboardOwner = false;"));
+        assert!(script.contains("window.__yggtermUiFocusClaimUntilMs = 0;"));
+    }
     #[test]
     fn interface_zoom_clamps_to_fifty_percent_floor() {
         assert_eq!(clamp_zoom_value(0.0), 7.0);
@@ -42116,6 +43035,7 @@ mod tests {
         let script = terminal_eval_script("yggterm-terminal-test", &theme, true);
         assert!(script.contains("fontSize: 13"));
         assert!(script.contains("lineHeight: 1"));
+        assert!(script.contains("convertEol: true"));
         assert!(script.contains("brightWhite"));
         assert!(script.contains("cursorInactiveStyle: 'outline'"));
     }
@@ -42931,10 +43851,19 @@ mod tests {
         let rebuild_ix = script[set_input_ix..]
             .find("ensureVisibleHost('set_input_enabled');")
             .expect("blank-host rebuild is triggered when reenabling input");
+        let refit_ix = script[set_input_ix..]
+            .find("emitResize();")
+            .expect("retained host reenabling refits xterm before focus returns");
         let request_paint_ix = script[set_input_ix..]
             .find("requestVisiblePaint();")
             .expect("input reenabling still requests a visible paint");
         assert!(rebuild_ix < request_paint_ix);
+        assert!(rebuild_ix < refit_ix);
+        assert!(refit_ix < request_paint_ix);
+        assert!(
+            script[set_input_ix..].contains("window.setTimeout(() => {\n                stretchXtermRoot();\n                emitResize();"),
+            "retained host reenabling should reflow again after WebKit restores a hidden xterm subtree"
+        );
     }
 
     #[test]
@@ -42992,7 +43921,7 @@ mod tests {
             "rebind helper should trace when the mounted host changes"
         );
         let request_visible_ix = script
-            .find("const requestVisiblePaint = () => {")
+            .find("const requestVisiblePaint = (forceFullRefresh = true) => {")
             .expect("requestVisiblePaint declaration present");
         let rebind_ix = script[request_visible_ix..]
             .find("rebindCurrentHost('request_visible_paint', true);")
@@ -43011,6 +43940,68 @@ mod tests {
         assert!(
             script.contains("if (nextPaintKey !== lastPaintKey) {"),
             "paint events should only notify dioxus when the visible paint shape changes"
+        );
+    }
+
+    #[test]
+    fn terminal_eval_script_throttles_hot_render_bridge_work() {
+        let theme = terminal_theme(UiTheme::ZedLight, palette(UiTheme::ZedLight), 13.0, "");
+        let script = terminal_eval_script("yggterm-terminal-test", &theme, true);
+        assert!(
+            script.contains("const requestRenderProbe = (reason) => {"),
+            "hot xterm render callbacks should use a throttled probe helper"
+        );
+        assert!(
+            script.contains("if (renderProbeFramePending || (now - lastRenderProbeAtMs < 220))"),
+            "render bridge probes should be rate-limited so TUI output does not churn WebKit"
+        );
+        assert!(
+            script.contains("requestRenderProbe('write_flush');"),
+            "write flushes should not force full terminal repaint after xterm has rendered"
+        );
+        assert!(
+            script.contains("const terminalWriteFrameMs = Math.max(0, Number("),
+            "terminal write coalescing should have a runtime frame budget"
+        );
+        assert!(
+            script.contains("const highVolumePayload = pendingLength >= 256;"),
+            "large repeated TUI frames should be coalesced before xterm parses them"
+        );
+        assert!(
+            script.contains("const coalesceHighVolumeTerminalPayload = (payload) => {"),
+            "obsolete repeated TUI frames should be collapsed before xterm rendering"
+        );
+        assert!(
+            script.contains("const filterPayloadForRenderSurface = (payload) => {"),
+            "the write bridge should decide whether high-volume TUI output should render on xterm"
+        );
+        assert!(
+            script.contains("return visiblyMounted;"),
+            "render-surface detection should trust real visibility instead of a stale active-session marker"
+        );
+        assert!(
+            script.contains(
+                "!activeRenderSurface && !exitsAltScreen && (lowPowerTuiActive || entersAltScreen || frameLike)"
+            ),
+            "inactive/offscreen TUI sessions should not keep repainting hidden canvases"
+        );
+        assert!(
+            script.contains("renderLowPowerTuiPayload(value)"),
+            "active alternate-screen TUI output should have a low-power render path"
+        );
+        assert!(
+            script.contains("let lowPowerTuiTextBuffer = '';")
+                && script.contains("if (activeRenderSurface && lowPowerTuiActive) {")
+                && script.contains("renderLowPowerTuiPayload(value);\n                return '';"),
+            "alternate-screen low-power mode should own every chunk until the TUI exits alternate screen"
+        );
+        assert!(
+            script.contains("data-yggterm-low-power-tui"),
+            "the low-power TUI surface should be app-control observable"
+        );
+        assert!(
+            script.contains("const resizeKey = `${term.cols}x${term.rows}`;"),
+            "resize notifications should be deduped before calling back into Rust"
         );
     }
 
@@ -43499,16 +44490,69 @@ mod tests {
     #[test]
     fn codex_completion_notification_only_fires_after_busy_session_becomes_idle() {
         assert!(!codex_completion_notification_should_fire(
-            true, false, false, false, true, false, false, false, false, false,
+            true,
+            false,
+            Some(CODEX_COMPLETION_NOTIFICATION_MIN_BUSY_MS),
+            false,
+            false,
+            true,
+            false,
+            false,
+            false,
+            false,
+            false,
         ));
         assert!(!codex_completion_notification_should_fire(
-            true, true, false, true, true, false, false, false, false, false,
+            true,
+            true,
+            Some(CODEX_COMPLETION_NOTIFICATION_MIN_BUSY_MS),
+            false,
+            true,
+            true,
+            false,
+            false,
+            false,
+            false,
+            false,
         ));
         assert!(codex_completion_notification_should_fire(
-            true, true, false, false, true, false, false, false, false, false,
+            true,
+            true,
+            Some(CODEX_COMPLETION_NOTIFICATION_MIN_BUSY_MS),
+            false,
+            false,
+            true,
+            false,
+            false,
+            false,
+            false,
+            false,
         ));
         assert!(!codex_completion_notification_should_fire(
-            true, true, true, false, true, false, false, false, false, false,
+            true,
+            true,
+            Some(CODEX_COMPLETION_NOTIFICATION_MIN_BUSY_MS),
+            true,
+            false,
+            true,
+            false,
+            false,
+            false,
+            false,
+            false,
+        ));
+        assert!(!codex_completion_notification_should_fire(
+            true,
+            true,
+            Some(CODEX_COMPLETION_NOTIFICATION_MIN_BUSY_MS - 1),
+            false,
+            false,
+            true,
+            false,
+            false,
+            false,
+            false,
+            false,
         ));
     }
     #[test]
@@ -46545,6 +47589,57 @@ mod tests {
                 assert_eq!(title_hint.as_deref(), Some("yggterm shell"));
             }
             other => panic!("expected remote launch context, got {other:?}"),
+        }
+    }
+    #[test]
+    fn active_remote_new_session_context_starts_remote_codex_not_local_shell() {
+        let session_path = "remote-session://dev/abc123";
+        let mut shell = ShellState::new(test_shell_bootstrap_with_active_session(session_path));
+        let mut live_session = test_live_shell_session(session_path);
+        live_session.id = "abc123".to_string();
+        live_session.title = "Jyas Shell".to_string();
+        live_session.kind = SessionKind::Codex;
+        live_session.host_label = "dev".to_string();
+        live_session.source = SessionSource::LiveSsh;
+        live_session.ssh_target = Some("pi@dev".to_string());
+        live_session.ssh_prefix = Some("cd /srv".to_string());
+        live_session.metadata = vec![SessionMetadataEntry {
+            label: "Cwd",
+            value: "/home/pi/git/jyas".to_string(),
+        }];
+        shell.server.apply_snapshot(ServerUiSnapshot {
+            active_session_path: Some(session_path.to_string()),
+            active_session: Some(snapshot_session_view_for_ui(live_session.clone())),
+            active_view_mode: WorkspaceViewMode::Terminal,
+            remote_machines: vec![RemoteMachineSnapshot {
+                machine_key: "dev".to_string(),
+                label: "dev".to_string(),
+                ssh_target: "pi@dev".to_string(),
+                prefix: Some("cd /srv".to_string()),
+                remote_binary_expr: Some("$HOME/.yggterm/bin/yggterm".to_string()),
+                remote_deploy_state: RemoteDeployState::Ready,
+                health: RemoteMachineHealth::Healthy,
+                sessions: Vec::new(),
+            }],
+            ssh_targets: Vec::new(),
+            live_sessions: vec![snapshot_session_view_for_ui(live_session)],
+        });
+        shell.needs_initial_server_sync = false;
+        shell.browser.select_path(session_path.to_string());
+
+        match current_agent_session_launch_context(&shell, SessionKind::Codex) {
+            TerminalLaunchContext::Remote {
+                ssh_target,
+                prefix,
+                cwd,
+                title_hint,
+            } => {
+                assert_eq!(ssh_target, "pi@dev");
+                assert_eq!(prefix.as_deref(), Some("cd /srv"));
+                assert_eq!(cwd.as_deref(), Some("/home/pi/git/jyas"));
+                assert_eq!(title_hint.as_deref(), Some("Jyas Shell session"));
+            }
+            other => panic!("expected remote Codex launch context, got {other:?}"),
         }
     }
     #[test]
@@ -50496,6 +51591,51 @@ Waiting for the remote terminal to paint...\n";
         assert!(sidebar_row_shows_busy_icon(&snapshot, row));
     }
     #[test]
+    fn sidebar_busy_icon_marks_inactive_codex_working_status() {
+        let active_path = "remote-session://dev/idle";
+        let working_path = "remote-session://dev/working";
+        let mut shell = ShellState::new(test_shell_bootstrap_with_active_session(active_path));
+        let mut active_session = test_live_shell_session(active_path);
+        active_session.id = "idle".to_string();
+        active_session.kind = SessionKind::Codex;
+        active_session.source = SessionSource::LiveSsh;
+        active_session.terminal_foreground_active = Some(false);
+        active_session.terminal_lines = vec!["gpt-5.5 xhigh · ~/gh/yggterm".to_string()];
+        let mut working_session = test_live_shell_session(working_path);
+        working_session.id = "working".to_string();
+        working_session.kind = SessionKind::Codex;
+        working_session.source = SessionSource::LiveSsh;
+        working_session.terminal_foreground_active = Some(false);
+        working_session.terminal_lines = vec![
+            "› Use /skills to list available skills".to_string(),
+            "• Working (23m 04s • esc to interrupt) · 1 background terminal running · /ps to view · /stop to close".to_string(),
+        ];
+        shell.server.apply_snapshot(ServerUiSnapshot {
+            active_session_path: Some(active_path.to_string()),
+            active_session: Some(snapshot_session_view_for_ui(active_session.clone())),
+            active_view_mode: WorkspaceViewMode::Terminal,
+            remote_machines: Vec::new(),
+            ssh_targets: Vec::new(),
+            live_sessions: vec![
+                snapshot_session_view_for_ui(active_session),
+                snapshot_session_view_for_ui(working_session),
+            ],
+        });
+        shell.needs_initial_server_sync = false;
+        shell.browser.select_path(active_path.to_string());
+
+        let snapshot = shell.snapshot();
+        let row = snapshot
+            .rows
+            .iter()
+            .find(|row| {
+                normalize_live_session_path(&row.full_path)
+                    == normalize_live_session_path(working_path)
+            })
+            .expect("inactive working live session row");
+        assert!(sidebar_row_shows_busy_icon(&snapshot, row));
+    }
+    #[test]
     fn sidebar_busy_icon_ignores_stale_inactive_live_sample_without_foreground_activity() {
         let stale_session = ManagedSessionView {
             id: "stale".to_string(),
@@ -53157,6 +54297,96 @@ Waiting for the remote terminal to paint...\n";
         assert!(!saw_meaningful_output);
     }
     #[test]
+    fn batch_terminal_chunks_preserves_control_only_handshake_for_xterm() {
+        let (combined, saw_visible_output, saw_meaningful_output, _, _, _, _) =
+            batch_terminal_chunks(vec![yggterm_server::TerminalStreamChunk {
+                seq: 1,
+                data: "\u{1b}[?2004h\u{1b}[>7u\u{1b}[?1004h\u{1b}[6n".to_string(),
+            }]);
+        assert_eq!(
+            combined.as_deref(),
+            Some("\u{1b}[?2004h\u{1b}[>7u\u{1b}[?1004h\u{1b}[6n")
+        );
+        assert!(!saw_visible_output);
+        assert!(!saw_meaningful_output);
+    }
+    #[test]
+    fn batch_terminal_chunks_preserves_alt_screen_tui_control_for_xterm() {
+        let raw_frame =
+            "\u{1b}[?1049h\u{1b}[?25l\u{1b}[2J\u{1b}[HYggterm synthetic TUI frame\u{1b}[K\r\n";
+        let (combined, saw_visible_output, saw_meaningful_output, _, _, _, _) =
+            batch_terminal_chunks(vec![yggterm_server::TerminalStreamChunk {
+                seq: 1,
+                data: raw_frame.to_string(),
+            }]);
+        assert_eq!(combined.as_deref(), Some(raw_frame));
+        assert!(saw_visible_output);
+        assert!(!saw_meaningful_output);
+    }
+    #[test]
+    fn batch_terminal_chunks_preserves_alt_screen_exit_for_xterm() {
+        let raw_exit = "\u{1b}[?25h\u{1b}[?1049l\r\npi@jojo:~$ ";
+        let (combined, saw_visible_output, _, saw_prompt_output, _, _, _) =
+            batch_terminal_chunks(vec![yggterm_server::TerminalStreamChunk {
+                seq: 1,
+                data: raw_exit.to_string(),
+            }]);
+        assert_eq!(combined.as_deref(), Some(raw_exit));
+        assert!(saw_visible_output);
+        assert!(saw_prompt_output);
+    }
+    #[test]
+    fn terminal_write_bridge_keeps_prompt_output_immediate() {
+        let mut bridge = TerminalWriteBridge::new(400);
+        assert_eq!(
+            bridge.stage_or_immediate("pi@dev:~$ ssh main".to_string(), 10, false),
+            vec!["pi@dev:~$ ssh main".to_string()]
+        );
+        assert_eq!(bridge.flush_due(500), None);
+    }
+    #[test]
+    fn terminal_write_bridge_frame_budgets_full_screen_redraws() {
+        let mut bridge = TerminalWriteBridge::new(400);
+        let frame_one = format!("\x1b[H{}\n", "one ".repeat(400));
+        let frame_two = format!("\x1b[H{}\n", "two ".repeat(400));
+        let first = bridge.stage_or_immediate(frame_one.clone(), 1_000, true);
+        assert_eq!(first, vec![frame_one]);
+        let second = bridge.stage_or_immediate(frame_two.clone(), 1_060, true);
+        assert!(second.is_empty());
+        assert_eq!(bridge.flush_due(1_200), None);
+        assert_eq!(bridge.flush_due(1_401), Some(frame_two));
+    }
+    #[test]
+    fn terminal_write_bridge_collapses_pending_tui_frames_to_latest_anchor() {
+        let mut bridge = TerminalWriteBridge::new(400);
+        let frame_one = format!("\x1b[H{}\n", "old ".repeat(400));
+        let frame_two = format!("\x1b[H{}\n", "new ".repeat(400));
+        let _ = bridge.stage_or_immediate(frame_one, 1_000, true);
+        let _ = bridge.stage_or_immediate(frame_two.clone(), 1_060, true);
+        assert_eq!(bridge.pending, frame_two);
+    }
+    #[test]
+    fn terminal_write_bridge_keeps_alt_screen_prefix_when_collapsing_tui_frames() {
+        let mut bridge = TerminalWriteBridge::new(400);
+        let frame_one = format!("\x1b[?1049h\x1b[?25l\x1b[2J\x1b[H{}\n", "old ".repeat(400));
+        let frame_two = format!("\x1b[H{}\n", "new ".repeat(400));
+        let _ = bridge.stage_or_immediate(frame_one, 1_000, true);
+        let _ = bridge.stage_or_immediate(frame_two.clone(), 1_060, true);
+        assert_eq!(
+            bridge.pending,
+            format!("\x1b[?1049h\x1b[?25l\x1b[2J{frame_two}")
+        );
+    }
+    #[test]
+    fn terminal_write_frame_budget_skips_protocol_only_handshake() {
+        assert!(!terminal_write_should_frame_budget(
+            "\u{1b}[?2004h\u{1b}[>7u\u{1b}[?1004h\u{1b}[6n",
+            false,
+            true,
+            true,
+        ));
+    }
+    #[test]
     fn remote_resume_agent_session_excludes_plain_remote_shells() {
         let mut session = ManagedSessionView {
             id: "abc".to_string(),
@@ -53412,6 +54642,49 @@ Waiting for the remote terminal to paint...\n";
         ));
     }
     #[test]
+    fn local_agent_attach_waits_for_codex_prompt_not_banner_only() {
+        let banner = "\
+╭────────────────────────────────────────────────────────╮
+│ >_ OpenAI Codex (v0.125.0)                             │
+│                                                        │
+│ model:     gpt-5.3-codex-spark high   /model to change │
+│ directory: ~                                           │
+╰────────────────────────────────────────────────────────╯";
+        assert!(!local_terminal_attach_ready_output(
+            SessionKind::Codex,
+            false,
+            false,
+            false,
+            true,
+            true,
+            Some(banner),
+            "",
+            banner,
+        ));
+        let prompt = "\
+╭────────────────────────────────────────────────────────╮
+│ >_ OpenAI Codex (v0.125.0)                             │
+│                                                        │
+│ model:     gpt-5.3-codex-spark high   /model to change │
+│ directory: ~                                           │
+╰────────────────────────────────────────────────────────╯
+
+› Summarize recent commits
+
+  gpt-5.3-codex-spark high · ~";
+        assert!(local_terminal_attach_ready_output(
+            SessionKind::Codex,
+            false,
+            false,
+            false,
+            true,
+            true,
+            Some(prompt),
+            "",
+            prompt,
+        ));
+    }
+    #[test]
     fn terminal_resume_output_excerpt_strips_saved_transcript_boilerplate() {
         let data = "\
 Saved transcript · jojo · typing takes over the live terminal\r\n\
@@ -53489,6 +54762,52 @@ Updated at   Branch  Conversation\n\
     fn stale_remote_resume_retry_blank_surface_ignores_initial_blank_attach() {
         assert!(!stale_remote_resume_retry_blank_surface_should_recover(
             true, false, true, true, false, "", "", 43, 42, true,
+        ));
+    }
+    #[test]
+    fn quiet_retained_remote_prompt_can_clear_resume_overlay_when_runtime_is_running() {
+        assert!(quiet_retained_remote_surface_ready(
+            true,
+            false,
+            true,
+            true,
+            false,
+            false,
+            true,
+            "pi@dev:~$",
+            "",
+            43,
+            1,
+            Some(0),
+            false,
+            false,
+            false,
+            false,
+            false,
+            true,
+        ));
+    }
+    #[test]
+    fn quiet_retained_remote_prompt_does_not_clear_without_running_runtime() {
+        assert!(!quiet_retained_remote_surface_ready(
+            true,
+            false,
+            true,
+            true,
+            false,
+            false,
+            false,
+            "pi@dev:~$",
+            "",
+            43,
+            1,
+            Some(0),
+            false,
+            false,
+            false,
+            false,
+            false,
+            true,
         ));
     }
     #[test]
