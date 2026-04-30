@@ -16,7 +16,7 @@ pub const ENV_YGGTERM_DIRECT_INSTALL_ROOT: &str = "YGGTERM_DIRECT_INSTALL_ROOT";
 pub const YGGTERM_DESKTOP_APP_ID: &str = "dev.yggterm.Yggterm";
 pub const ENV_YGGTERM_ENABLE_ACCESSIBILITY: &str = "YGGTERM_ENABLE_ACCESSIBILITY";
 pub const ENV_YGGTERM_ENABLE_WEBKIT_COMPOSITING: &str = "YGGTERM_ENABLE_WEBKIT_COMPOSITING";
-const LINUX_LAUNCHER_MARKER: &str = "yggterm-direct-launcher-v2";
+const LINUX_LAUNCHER_MARKER: &str = "yggterm-direct-launcher-v3";
 const MOCK_CLI_NAME: &str = "yggterm-mock-cli";
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -358,6 +358,45 @@ pub fn write_direct_install_state(
     Ok(())
 }
 
+pub fn prune_direct_install_versions(root: &Path, keep_version: &str) -> Result<Vec<PathBuf>> {
+    if keep_version.trim().is_empty() {
+        anyhow::bail!("refusing to prune direct install versions without an active version");
+    }
+    let versions_dir = root.join("versions");
+    if !versions_dir.is_dir() {
+        return Ok(Vec::new());
+    }
+
+    let mut pruned = Vec::new();
+    for entry in fs::read_dir(&versions_dir)
+        .with_context(|| format!("failed to read versions dir {}", versions_dir.display()))?
+    {
+        let entry = entry?;
+        let path = entry.path();
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if !file_type.is_dir() {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if name == keep_version {
+            continue;
+        }
+        match fs::remove_dir_all(&path) {
+            Ok(()) => pruned.push(path),
+            Err(error) => tracing::warn!(
+                path = %path.display(),
+                error = %error,
+                "failed to prune stale yggterm direct install version"
+            ),
+        }
+    }
+    Ok(pruned)
+}
+
 pub fn refresh_desktop_integration(context: &InstallContext) -> Result<Vec<String>> {
     let mut notes = Vec::new();
     if context.channel != InstallChannel::Direct && !should_repair_linux_launcher(context) {
@@ -375,6 +414,16 @@ pub fn refresh_desktop_integration(context: &InstallContext) -> Result<Vec<Strin
     #[cfg(target_os = "windows")]
     {
         notes.extend(refresh_windows_integration(context)?);
+    }
+
+    if context.channel == InstallChannel::Direct
+        && let Some(root) = context.managed_root.as_ref()
+    {
+        for path in prune_direct_install_versions(root, &context.current_version)? {
+            if let Some(version) = path.file_name().and_then(|name| name.to_str()) {
+                notes.push(format!("pruned stale direct install version {version}"));
+            }
+        }
     }
 
     Ok(notes)
@@ -1152,7 +1201,7 @@ fn linux_launcher_script(
         String::new()
     };
     format!(
-        "#!/usr/bin/env sh\n# {marker}\nset -eu\nROOT={root}\nSTATE=\"$ROOT/{state_file}\"\nBINARY_NAME={binary_name}\ntarget=\"\"\nif [ \"$BINARY_NAME\" = 'yggterm' ] && [ -f \"$STATE\" ]; then\n  target=\"$(sed -n 's/.*\"active_executable\"[[:space:]]*:[[:space:]]*\"\\([^\"]*\\)\".*/\\1/p' \"$STATE\" | head -n1)\"\nfi\nif [ -z \"$target\" ] || [ ! -x \"$target\" ]; then\n  latest_version=\"$(find \"$ROOT/versions\" -mindepth 1 -maxdepth 1 -type d -printf '%f\\n' 2>/dev/null | sort -V | tail -n1)\"\n  if [ -n \"$latest_version\" ] && [ -x \"$ROOT/versions/$latest_version/$BINARY_NAME\" ]; then\n    target=\"$ROOT/versions/$latest_version/$BINARY_NAME\"\n  fi\nfi\nif [ -z \"$target\" ] || [ ! -x \"$target\" ]; then\n  target={fallback}\nfi\n[ -x \"$target\" ] || {{ printf '%s\\n' '{launcher_name}: no runnable executable found' >&2; exit 1; }}\n{accessibility_guard}{webkit_guard}{export_root}exec \"$target\" \"$@\"\n",
+        "#!/usr/bin/env sh\n# {marker}\nset -eu\nROOT={root}\nSTATE=\"$ROOT/{state_file}\"\nBINARY_NAME={binary_name}\ntarget=\"\"\nif [ \"$BINARY_NAME\" = 'yggterm' ] && [ -f \"$STATE\" ]; then\n  target=\"$(sed -n 's/.*\"active_executable\"[[:space:]]*:[[:space:]]*\"\\([^\"]*\\)\".*/\\1/p' \"$STATE\" | head -n1)\"\nfi\nif [ -z \"$target\" ] || [ ! -x \"$target\" ]; then\n  latest_version=\"$(find \"$ROOT/versions\" -mindepth 1 -maxdepth 1 -type d -printf '%f\\n' 2>/dev/null | sort -V | tail -n1)\"\n  if [ -n \"$latest_version\" ] && [ -x \"$ROOT/versions/$latest_version/$BINARY_NAME\" ]; then\n    target=\"$ROOT/versions/$latest_version/$BINARY_NAME\"\n  fi\nfi\nif [ -z \"$target\" ] || [ ! -x \"$target\" ]; then\n  target={fallback}\nfi\n[ -x \"$target\" ] || {{ printf '%s\\n' '{launcher_name}: no runnable executable found' >&2; exit 1; }}\nif [ \"$BINARY_NAME\" = 'yggterm' ] && [ \"${{1:-}}\" = 'server' ]; then\n  use_headless=1\n  if [ \"${{2:-}}\" = 'app' ] && [ \"${{3:-}}\" = 'launch' ]; then\n    use_headless=0\n  fi\n  if [ \"$use_headless\" = '1' ]; then\n    target_dir=\"$(dirname \"$target\")\"\n    if [ -x \"$target_dir/yggterm-headless\" ]; then\n      target=\"$target_dir/yggterm-headless\"\n    fi\n  fi\nfi\n{accessibility_guard}{webkit_guard}{export_root}exec \"$target\" \"$@\"\n",
         marker = LINUX_LAUNCHER_MARKER,
         root = root_quoted,
         state_file = INSTALL_STATE_FILENAME,
@@ -1308,7 +1357,55 @@ mod tests {
     fn launcher_file_detects_dev_build_fallback_as_stale() {
         let path = Path::new("/tmp/yggterm-launcher");
         let contents =
-            "# yggterm-direct-launcher-v2\nexec '/home/pi/gh/yggterm/target/debug/yggterm'\n";
+            "# yggterm-direct-launcher-v3\nexec '/home/pi/gh/yggterm/target/debug/yggterm'\n";
         assert!(launcher_file_looks_stale(path, contents));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_launcher_routes_server_commands_to_headless_except_app_launch() {
+        let context = InstallContext {
+            channel: InstallChannel::Direct,
+            update_policy: UpdatePolicy::Auto,
+            repo: DEFAULT_RELEASE_REPO.to_string(),
+            asset_label: "linux-x86_64".to_string(),
+            current_version: "2.1.52".to_string(),
+            executable_path: PathBuf::from(
+                "/home/pi/.local/share/yggterm/direct/versions/2.1.52/yggterm",
+            ),
+            preferred_executable: Some(PathBuf::from(
+                "/home/pi/.local/share/yggterm/direct/versions/2.1.52/yggterm",
+            )),
+            managed_root: Some(PathBuf::from("/home/pi/.local/share/yggterm/direct")),
+            manager_hint: Some("Direct install".to_string()),
+        };
+        let script = linux_launcher_script(
+            &context,
+            "yggterm",
+            Path::new("/home/pi/.local/share/yggterm/direct/versions/2.1.52/yggterm"),
+            "yggterm launcher",
+        );
+        assert!(script.contains("yggterm-direct-launcher-v3"));
+        assert!(script.contains("[ \"${1:-}\" = 'server' ]"));
+        assert!(script.contains("[ \"${2:-}\" = 'app' ] && [ \"${3:-}\" = 'launch' ]"));
+        assert!(script.contains("target=\"$target_dir/yggterm-headless\""));
+    }
+
+    #[test]
+    fn prune_direct_install_versions_keeps_only_active_version() {
+        let root =
+            std::env::temp_dir().join(format!("yggterm-prune-test-{}", uuid::Uuid::new_v4()));
+        let versions = root.join("versions");
+        fs::create_dir_all(versions.join("2.1.50")).expect("create old version");
+        fs::create_dir_all(versions.join("2.1.52")).expect("create active version");
+        fs::write(versions.join("note.txt"), "not a version").expect("write file");
+
+        let pruned = prune_direct_install_versions(&root, "2.1.52").expect("prune versions");
+        assert_eq!(pruned.len(), 1);
+        assert!(!versions.join("2.1.50").exists());
+        assert!(versions.join("2.1.52").exists());
+        assert!(versions.join("note.txt").exists());
+
+        let _ = fs::remove_dir_all(root);
     }
 }
