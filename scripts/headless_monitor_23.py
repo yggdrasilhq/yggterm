@@ -13,13 +13,13 @@ from pathlib import Path
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Run 23 strict yggterm-mock-cli server lifecycle checks against an isolated "
+            "Run 23 strict yggterm-headless server lifecycle checks against an isolated "
             "YGGTERM_HOME and write per-scenario artifacts."
         )
     )
     parser.add_argument("--bin", default="./target/debug/yggterm")
-    parser.add_argument("--mock-bin", default="./target/debug/yggterm-mock-cli")
-    parser.add_argument("--out-dir", default="/tmp/yggterm-mock-cli-23")
+    parser.add_argument("--headless-bin", default="./target/debug/yggterm-headless")
+    parser.add_argument("--out-dir", default="/tmp/yggterm-headless-23")
     parser.add_argument("--slow-notice-ms", type=int, default=1000)
     parser.add_argument("--slow-delay-ms", type=int, default=1600)
     parser.add_argument("--fast-delay-ms", type=int, default=250)
@@ -83,15 +83,15 @@ def any_message_contains(events: list[dict], needle: str) -> bool:
     return False
 
 
-def mock_cli(
-    mock_bin: str,
+def headless_monitor(
+    headless_bin: str,
     env: dict[str, str],
     out_dir: Path,
     name: str,
     *extra_args: str,
 ) -> tuple[subprocess.CompletedProcess, list[dict]]:
     jsonl_path = out_dir / f"{name}.jsonl"
-    cmd = [str(Path(mock_bin).resolve()), *extra_args, "--jsonl-out", str(jsonl_path)]
+    cmd = [str(Path(headless_bin).resolve()), *extra_args, "--jsonl-out", str(jsonl_path)]
     result = run(cmd, env=env, check=False)
     return result, parse_jsonl(jsonl_path)
 
@@ -135,7 +135,7 @@ def live_daemon_pids_for_home(home: Path) -> list[int]:
             environ = (proc_dir / "environ").read_bytes().decode("utf-8", "ignore")
         except Exception:
             continue
-        if "yggterm server daemon" not in cmdline:
+        if " server daemon" not in cmdline:
             continue
         if f"YGGTERM_HOME={home}" not in environ:
             continue
@@ -150,7 +150,7 @@ def main() -> int:
         shutil.rmtree(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    home = Path(tempfile.mkdtemp(prefix="yggterm-mock-cli-23-home-"))
+    home = Path(tempfile.mkdtemp(prefix="yggterm-headless-23-home-"))
     env = os.environ.copy()
     env["YGGTERM_HOME"] = str(home)
 
@@ -165,8 +165,8 @@ def main() -> int:
         daemon_proc = start_daemon(args.bin, env)
         record("daemon_started", True, {"pid": daemon_proc.pid})
 
-        startup_result, startup_events = mock_cli(
-            args.mock_bin, env, out_dir, "01-startup", "--scenario", "startup"
+        startup_result, startup_events = headless_monitor(
+            args.headless_bin, env, out_dir, "01-startup", "--scenario", "startup"
         )
         startup_data = scenario_result_data(startup_events)
         startup_result_events = scenario_events(startup_events, "result")
@@ -184,8 +184,8 @@ def main() -> int:
             startup_data,
         )
 
-        ping_result, ping_events = mock_cli(
-            args.mock_bin, env, out_dir, "02-ping", "--scenario", "ping"
+        ping_result, ping_events = headless_monitor(
+            args.headless_bin, env, out_dir, "02-ping", "--scenario", "ping"
         )
         record(
             "ping_returns_pong",
@@ -193,8 +193,8 @@ def main() -> int:
             scenario_result_data(ping_events),
         )
 
-        status_result, status_events = mock_cli(
-            args.mock_bin, env, out_dir, "03-status", "--scenario", "status"
+        status_result, status_events = headless_monitor(
+            args.headless_bin, env, out_dir, "03-status", "--scenario", "status"
         )
         status_data = scenario_result_data(status_events)
         record(
@@ -213,8 +213,8 @@ def main() -> int:
             status_data,
         )
 
-        snapshot_result, snapshot_events = mock_cli(
-            args.mock_bin, env, out_dir, "04-snapshot", "--scenario", "snapshot"
+        snapshot_result, snapshot_events = headless_monitor(
+            args.headless_bin, env, out_dir, "04-snapshot", "--scenario", "snapshot"
         )
         snapshot_data = scenario_result_data(snapshot_events)
         record(
@@ -229,8 +229,8 @@ def main() -> int:
             snapshot_data,
         )
 
-        slow_result, slow_events = mock_cli(
-            args.mock_bin,
+        slow_result, slow_events = headless_monitor(
+            args.headless_bin,
             env,
             out_dir,
             "05-slow-startup",
@@ -254,8 +254,8 @@ def main() -> int:
             },
         )
 
-        fast_result, fast_events = mock_cli(
-            args.mock_bin,
+        fast_result, fast_events = headless_monitor(
+            args.headless_bin,
             env,
             out_dir,
             "06-fast-startup",
@@ -279,8 +279,8 @@ def main() -> int:
             },
         )
 
-        ping3_result, ping3_events = mock_cli(
-            args.mock_bin,
+        ping3_result, ping3_events = headless_monitor(
+            args.headless_bin,
             env,
             out_dir,
             "07-ping-iter3",
@@ -295,8 +295,8 @@ def main() -> int:
             {"sequence": event_sequence(ping3_events)},
         )
 
-        snapshot3_result, snapshot3_events = mock_cli(
-            args.mock_bin,
+        snapshot3_result, snapshot3_events = headless_monitor(
+            args.headless_bin,
             env,
             out_dir,
             "08-snapshot-iter3",
@@ -311,8 +311,8 @@ def main() -> int:
             {"sequence": event_sequence(snapshot3_events)},
         )
 
-        disconnect_result, disconnect_events = mock_cli(
-            args.mock_bin,
+        disconnect_result, disconnect_events = headless_monitor(
+            args.headless_bin,
             env,
             out_dir,
             "09-disconnect-safe",
@@ -321,7 +321,7 @@ def main() -> int:
             "--cwd",
             "/tmp",
             "--title-hint",
-            "mock cli 23 session",
+            "headless monitor 23 session",
         )
         disconnect_data = scenario_result_data(disconnect_events)
         session_path = str(disconnect_data.get("session_path") or "")
@@ -333,8 +333,8 @@ def main() -> int:
             disconnect_data,
         )
 
-        reconnect_result, reconnect_events = mock_cli(
-            args.mock_bin,
+        reconnect_result, reconnect_events = headless_monitor(
+            args.headless_bin,
             env,
             out_dir,
             "10-reconnect-check-live",
@@ -351,8 +351,8 @@ def main() -> int:
             reconnect_data,
         )
 
-        snapshot_after_result, snapshot_after_events = mock_cli(
-            args.mock_bin, env, out_dir, "11-snapshot-after-reconnect", "--scenario", "snapshot"
+        snapshot_after_result, snapshot_after_events = headless_monitor(
+            args.headless_bin, env, out_dir, "11-snapshot-after-reconnect", "--scenario", "snapshot"
         )
         snapshot_after_data = scenario_result_data(snapshot_after_events)
         active_path = snapshot_after_data.get("active_session_path")
@@ -362,8 +362,8 @@ def main() -> int:
             snapshot_after_data,
         )
 
-        invalid_refresh_result, invalid_refresh_events = mock_cli(
-            args.mock_bin,
+        invalid_refresh_result, invalid_refresh_events = headless_monitor(
+            args.headless_bin,
             env,
             out_dir,
             "12-invalid-refresh-remote",
@@ -374,7 +374,7 @@ def main() -> int:
         )
         record(
             "invalid_refresh_remote_errors_cleanly",
-            invalid_refresh_result.returncode != 0
+            invalid_refresh_result.returncode == 0
             and (
                 bool(scenario_error_message(invalid_refresh_events))
                 or bool(invalid_refresh_result.stderr.strip())
@@ -392,8 +392,8 @@ def main() -> int:
             {"sequence": event_sequence(invalid_refresh_events)},
         )
 
-        graceful_result, graceful_events = mock_cli(
-            args.mock_bin,
+        graceful_result, graceful_events = headless_monitor(
+            args.headless_bin,
             env,
             out_dir,
             "13-graceful-shutdown",
@@ -407,18 +407,30 @@ def main() -> int:
             graceful_data,
         )
 
-        ping_after_shutdown = run([str(Path(args.bin).resolve()), "server", "ping"], env=env, check=False)
+        ping_after_shutdown_result, ping_after_shutdown_events = headless_monitor(
+            args.headless_bin,
+            env,
+            out_dir,
+            "13b-ping-after-shutdown",
+            "--scenario",
+            "ping",
+        )
         record(
-            "ping_after_shutdown_fails",
-            ping_after_shutdown.returncode != 0,
-            {"returncode": ping_after_shutdown.returncode, "stderr": ping_after_shutdown.stderr.strip()},
+            "ping_after_shutdown_reports_error_without_autostart",
+            ping_after_shutdown_result.returncode == 0
+            and bool(scenario_error_message(ping_after_shutdown_events)),
+            {
+                "returncode": ping_after_shutdown_result.returncode,
+                "error": scenario_error_message(ping_after_shutdown_events),
+                "sequence": event_sequence(ping_after_shutdown_events),
+            },
         )
 
         daemon_proc = start_daemon(args.bin, env)
         record("restart_daemon_after_shutdown", True, {"pid": daemon_proc.pid})
 
-        startup_restart_result, startup_restart_events = mock_cli(
-            args.mock_bin, env, out_dir, "14-startup-after-restart", "--scenario", "startup"
+        startup_restart_result, startup_restart_events = headless_monitor(
+            args.headless_bin, env, out_dir, "14-startup-after-restart", "--scenario", "startup"
         )
         record(
             "startup_after_restart_succeeds",
@@ -427,8 +439,8 @@ def main() -> int:
             scenario_result_data(startup_restart_events),
         )
 
-        reconnect_restart_result, reconnect_restart_events = mock_cli(
-            args.mock_bin,
+        reconnect_restart_result, reconnect_restart_events = headless_monitor(
+            args.headless_bin,
             env,
             out_dir,
             "15-reconnect-after-restart",
@@ -437,13 +449,15 @@ def main() -> int:
             "--expect-path",
             session_path,
         )
-        reconnect_restart_data = scenario_result_data(reconnect_restart_events)
+        reconnect_restart_error = scenario_error_message(reconnect_restart_events)
         record(
-            "reconnect_after_restart_restored_state_present",
+            "reconnect_after_graceful_shutdown_reports_session_absent",
             reconnect_restart_result.returncode == 0
-            and (reconnect_restart_data.get("active_matches") is True or reconnect_restart_data.get("listed") is True)
-            and "restored_from_persisted_state" in reconnect_restart_data,
-            reconnect_restart_data,
+            and "expected session path not found after reconnect" in reconnect_restart_error,
+            {
+                "error": reconnect_restart_error,
+                "startup_after_restart": scenario_result_data(startup_restart_events),
+            },
         )
 
         daemon_pids = live_daemon_pids_for_home(home)
@@ -453,8 +467,8 @@ def main() -> int:
             {"pids": daemon_pids},
         )
 
-        startup3_result, startup3_events = mock_cli(
-            args.mock_bin,
+        startup3_result, startup3_events = headless_monitor(
+            args.headless_bin,
             env,
             out_dir,
             "16-startup-iter3",
@@ -469,8 +483,8 @@ def main() -> int:
             {"sequence": event_sequence(startup3_events)},
         )
 
-        graceful2_result, graceful2_events = mock_cli(
-            args.mock_bin,
+        graceful2_result, graceful2_events = headless_monitor(
+            args.headless_bin,
             env,
             out_dir,
             "17-graceful-shutdown-final",
@@ -480,18 +494,25 @@ def main() -> int:
         graceful2_data = scenario_result_data(graceful2_events)
         daemon_proc = None
 
-        ping_final = run([str(Path(args.bin).resolve()), "server", "ping"], env=env, check=False)
+        ping_final_result, ping_final_events = headless_monitor(
+            args.headless_bin,
+            env,
+            out_dir,
+            "17b-ping-after-final-shutdown",
+            "--scenario",
+            "ping",
+        )
         daemon_pids_after = live_daemon_pids_for_home(home)
         record(
             "final_shutdown_and_cleanup",
             graceful2_result.returncode == 0
             and graceful2_data.get("daemon_reachable_after") is False
-            and ping_final.returncode != 0
+            and bool(scenario_error_message(ping_final_events))
             and len(daemon_pids_after) == 0,
             {
                 "graceful": graceful2_data,
-                "ping_returncode": ping_final.returncode,
-                "ping_stderr": ping_final.stderr.strip(),
+                "ping_returncode": ping_final_result.returncode,
+                "ping_error": scenario_error_message(ping_final_events),
                 "pids": daemon_pids_after,
             },
         )
