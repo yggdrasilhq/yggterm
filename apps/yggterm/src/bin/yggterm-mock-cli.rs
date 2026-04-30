@@ -3,16 +3,18 @@ use serde_json::json;
 use std::env;
 use std::fs::OpenOptions;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::thread::sleep;
 use std::time::Duration;
 use std::time::Instant;
 use yggterm_core::resolve_yggterm_home;
 use yggterm_server::{
-    SessionKind, YGG_LOADING_NOTIFICATION_AFTER_MS, YggEventEnvelope, YggEventKind, YggProgress,
-    YggRequestMeta, YggSurface, YggTarget, default_endpoint, ping, refresh_remote_machine,
-    request_terminal_launch, shutdown, snapshot, start_local_session_at, status, terminal_ensure,
-    terminal_read, terminal_write,
+    ServerEndpoint, SessionKind, YGG_LOADING_NOTIFICATION_AFTER_MS, YggEventEnvelope, YggEventKind,
+    YggProgress, YggRequestMeta, YggSurface, YggTarget, default_endpoint,
+    ensure_local_daemon_running, hot_restart, local_headless_companion_executable_from_current,
+    ping, prepare_update_restart, reachable_versioned_daemon_statuses, refresh_managed_cli,
+    refresh_remote_machine, request_terminal_launch, shutdown, snapshot, start_local_session_at,
+    status, terminal_ensure, terminal_read, terminal_write,
 };
 
 fn remote_machine_details_json(snap: &yggterm_server::ServerUiSnapshot) -> serde_json::Value {
@@ -66,6 +68,12 @@ enum Scenario {
     DisconnectSafe,
     ReconnectCheck,
     GracefulShutdown,
+    ServerList,
+    HotRestart,
+    WaitSession,
+    LatencyCheck,
+    PanicReport,
+    ManagedCliRefresh,
 }
 
 impl Scenario {
@@ -80,6 +88,12 @@ impl Scenario {
             Self::DisconnectSafe => "disconnect_safe",
             Self::ReconnectCheck => "reconnect_check",
             Self::GracefulShutdown => "graceful_shutdown",
+            Self::ServerList => "server_list",
+            Self::HotRestart => "hot_restart",
+            Self::WaitSession => "wait_session",
+            Self::LatencyCheck => "latency_check",
+            Self::PanicReport => "panic_report",
+            Self::ManagedCliRefresh => "managed_cli_refresh",
         }
     }
 }
@@ -98,6 +112,15 @@ struct Config {
     machine_key: Option<String>,
     session_count: usize,
     burst_bytes: usize,
+    all_servers: bool,
+    timeout_ms: u64,
+    poll_ms: u64,
+    interval_ms: u64,
+    daemon_exe: Option<PathBuf>,
+    expected_version: Option<String>,
+    expected_build_id: Option<u64>,
+    reason: Option<String>,
+    background: bool,
 }
 
 fn main() -> Result<()> {
@@ -107,6 +130,9 @@ fn main() -> Result<()> {
 
     for iteration in 0..cfg.iterations {
         run_scenario(&cfg, &endpoint, iteration)?;
+        if iteration + 1 < cfg.iterations && cfg.interval_ms > 0 {
+            sleep(Duration::from_millis(cfg.interval_ms));
+        }
     }
     Ok(())
 }
@@ -124,6 +150,15 @@ fn parse_args(args: Vec<String>) -> Result<Config> {
     let mut machine_key = None::<String>;
     let mut session_count = 23usize;
     let mut burst_bytes = 512 * 1024usize;
+    let mut all_servers = false;
+    let mut timeout_ms = 30_000_u64;
+    let mut poll_ms = 500_u64;
+    let mut interval_ms = 0_u64;
+    let mut daemon_exe = None::<PathBuf>;
+    let mut expected_version = None::<String>;
+    let mut expected_build_id = None::<u64>;
+    let mut reason = None::<String>;
+    let mut background = false;
 
     let mut ix = 0usize;
     while ix < args.len() {
@@ -141,8 +176,17 @@ fn parse_args(args: Vec<String>) -> Result<Config> {
                     "disconnect-safe" => Scenario::DisconnectSafe,
                     "reconnect-check" => Scenario::ReconnectCheck,
                     "graceful-shutdown" => Scenario::GracefulShutdown,
+                    "server-list" | "status-all" => Scenario::ServerList,
+                    "hot-restart" | "hot-update" => Scenario::HotRestart,
+                    "wait-session" | "wait-loaded" => Scenario::WaitSession,
+                    "latency-check" | "health-check" => Scenario::LatencyCheck,
+                    "panic-report" | "incident-report" | "diagnose" => Scenario::PanicReport,
+                    "managed-cli-refresh" | "codex-refresh" => Scenario::ManagedCliRefresh,
                     other => bail!("unknown scenario: {other}"),
                 };
+            }
+            "--all" => {
+                all_servers = true;
             }
             "--iterations" => {
                 ix += 1;
@@ -230,6 +274,67 @@ fn parse_args(args: Vec<String>) -> Result<Config> {
                     .parse()
                     .context("invalid --burst-bytes value")?;
             }
+            "--timeout-ms" => {
+                ix += 1;
+                timeout_ms = args
+                    .get(ix)
+                    .context("missing value after --timeout-ms")?
+                    .parse()
+                    .context("invalid --timeout-ms value")?;
+            }
+            "--poll-ms" => {
+                ix += 1;
+                poll_ms = args
+                    .get(ix)
+                    .context("missing value after --poll-ms")?
+                    .parse()
+                    .context("invalid --poll-ms value")?;
+            }
+            "--interval-ms" => {
+                ix += 1;
+                interval_ms = args
+                    .get(ix)
+                    .context("missing value after --interval-ms")?
+                    .parse()
+                    .context("invalid --interval-ms value")?;
+            }
+            "--daemon-exe" => {
+                ix += 1;
+                daemon_exe = Some(PathBuf::from(
+                    args.get(ix).context("missing value after --daemon-exe")?,
+                ));
+            }
+            "--expected-version" => {
+                ix += 1;
+                expected_version = Some(
+                    args.get(ix)
+                        .context("missing value after --expected-version")?
+                        .to_string(),
+                );
+            }
+            "--expected-build-id" => {
+                ix += 1;
+                expected_build_id = Some(
+                    args.get(ix)
+                        .context("missing value after --expected-build-id")?
+                        .parse()
+                        .context("invalid --expected-build-id value")?,
+                );
+            }
+            "--reason" => {
+                ix += 1;
+                reason = Some(
+                    args.get(ix)
+                        .context("missing value after --reason")?
+                        .to_string(),
+                );
+            }
+            "--background" => {
+                background = true;
+            }
+            "--foreground" => {
+                background = false;
+            }
             other => bail!("unknown argument: {other}"),
         }
         ix += 1;
@@ -248,7 +353,159 @@ fn parse_args(args: Vec<String>) -> Result<Config> {
         machine_key,
         session_count,
         burst_bytes,
+        all_servers,
+        timeout_ms,
+        poll_ms,
+        interval_ms,
+        daemon_exe,
+        expected_version,
+        expected_build_id,
+        reason,
+        background,
     })
+}
+
+fn endpoint_json(endpoint: &ServerEndpoint) -> serde_json::Value {
+    match endpoint {
+        #[cfg(unix)]
+        ServerEndpoint::UnixSocket(path) => json!({
+            "transport": "unix",
+            "path": path.display().to_string(),
+        }),
+        ServerEndpoint::Tcp { host, port } => json!({
+            "transport": "tcp",
+            "host": host,
+            "port": port,
+        }),
+    }
+}
+
+fn server_status_json(
+    endpoint: &ServerEndpoint,
+    daemon_status: &yggterm_server::ServerRuntimeStatus,
+) -> serde_json::Value {
+    json!({
+        "endpoint": endpoint_json(endpoint),
+        "server_version": daemon_status.server_version,
+        "server_build_id": daemon_status.server_build_id,
+        "server_pid": daemon_status.server_pid,
+        "host_kind": daemon_status.host_kind,
+        "host_detail": daemon_status.host_detail,
+        "terminal_session_count": daemon_status.terminal_session_count,
+        "terminal_session_keys": daemon_status.terminal_session_keys,
+        "managed_session_count": daemon_status.managed_session_count,
+        "restored_from_persisted_state": daemon_status.restored_from_persisted_state,
+    })
+}
+
+fn reachable_servers_json(home_dir: &Path) -> serde_json::Value {
+    let servers = reachable_versioned_daemon_statuses(home_dir)
+        .into_iter()
+        .map(|(endpoint, daemon_status)| server_status_json(&endpoint, &daemon_status))
+        .collect::<Vec<_>>();
+    json!({
+        "server_count": servers.len(),
+        "servers": servers,
+    })
+}
+
+fn resolve_hot_restart_daemon_exe(cfg: &Config) -> Result<PathBuf> {
+    let daemon_exe = if let Some(path) = cfg.daemon_exe.clone() {
+        path
+    } else {
+        let current_exe = env::current_exe().context("resolving yggterm-mock-cli path")?;
+        local_headless_companion_executable_from_current(&current_exe).with_context(|| {
+            format!(
+                "missing yggterm-headless companion next to {}",
+                current_exe.display()
+            )
+        })?
+    };
+    let metadata = std::fs::metadata(&daemon_exe)
+        .with_context(|| format!("reading daemon executable {}", daemon_exe.display()))?;
+    if !metadata.is_file() {
+        bail!("daemon executable is not a file: {}", daemon_exe.display());
+    }
+    Ok(daemon_exe)
+}
+
+fn status_matches_expected(
+    daemon_status: &yggterm_server::ServerRuntimeStatus,
+    cfg: &Config,
+) -> bool {
+    let expected_version = cfg
+        .expected_version
+        .as_deref()
+        .or_else(|| (cfg.scenario == Scenario::HotRestart).then_some(env!("CARGO_PKG_VERSION")));
+    expected_version.is_none_or(|version| daemon_status.server_version == version)
+        && cfg
+            .expected_build_id
+            .is_none_or(|build_id| daemon_status.server_build_id == build_id)
+}
+
+fn wait_for_daemon_status(endpoint: &ServerEndpoint, cfg: &Config) -> Result<serde_json::Value> {
+    let started = Instant::now();
+    loop {
+        match status(endpoint) {
+            Ok(daemon_status) if status_matches_expected(&daemon_status, cfg) => {
+                return Ok(json!({
+                    "ready": true,
+                    "elapsed_ms": started.elapsed().as_millis() as u64,
+                    "server": server_status_json(endpoint, &daemon_status),
+                }));
+            }
+            Ok(daemon_status) if started.elapsed() >= Duration::from_millis(cfg.timeout_ms) => {
+                bail!(
+                    "daemon reachable but expected version/build did not match after {}ms: version={} build_id={}",
+                    cfg.timeout_ms,
+                    daemon_status.server_version,
+                    daemon_status.server_build_id
+                );
+            }
+            Err(error) if started.elapsed() >= Duration::from_millis(cfg.timeout_ms) => {
+                bail!(
+                    "daemon did not become reachable after {}ms: {}",
+                    cfg.timeout_ms,
+                    error
+                );
+            }
+            _ => sleep(Duration::from_millis(cfg.poll_ms.max(1))),
+        }
+    }
+}
+
+fn session_present(
+    expected_path: &str,
+    snap: &yggterm_server::ServerUiSnapshot,
+    daemon_status: &yggterm_server::ServerRuntimeStatus,
+) -> (bool, bool, bool) {
+    let active_matches = snap
+        .active_session_path
+        .as_deref()
+        .is_some_and(|path| path == expected_path);
+    let listed = snap
+        .live_sessions
+        .iter()
+        .any(|session| session.session_path == expected_path);
+    let terminal_keyed = daemon_status
+        .terminal_session_keys
+        .iter()
+        .any(|path| path == expected_path);
+    (active_matches, listed, terminal_keyed)
+}
+
+fn panic_report_targets(
+    home_dir: &Path,
+    endpoint: &ServerEndpoint,
+) -> Vec<(ServerEndpoint, Option<yggterm_server::ServerRuntimeStatus>)> {
+    let mut targets = reachable_versioned_daemon_statuses(home_dir)
+        .into_iter()
+        .map(|(endpoint, status)| (endpoint, Some(status)))
+        .collect::<Vec<_>>();
+    if targets.is_empty() {
+        targets.push((endpoint.clone(), None));
+    }
+    targets
 }
 
 fn run_scenario(
@@ -315,6 +572,10 @@ fn run_scenario(
         Scenario::Status => {
             let daemon_status = status(endpoint)?;
             Ok(serde_json::to_value(daemon_status)?)
+        }
+        Scenario::ServerList => {
+            let home_dir = resolve_yggterm_home()?;
+            Ok(reachable_servers_json(&home_dir))
         }
         Scenario::Snapshot => {
             let (snap, message) = snapshot(endpoint)?;
@@ -447,6 +708,281 @@ fn run_scenario(
                 "restored_remote_machines": daemon_status.restored_remote_machines
             }))
         }
+        Scenario::WaitSession => {
+            let expected_path = cfg
+                .expect_path
+                .as_deref()
+                .context("--expect-path is required for wait-session")?;
+            let started = Instant::now();
+            loop {
+                let daemon_status = status(endpoint)?;
+                let (snap, message) = snapshot(endpoint)?;
+                let elapsed_ms = started.elapsed().as_millis() as u64;
+                let (active_matches, listed, terminal_keyed) =
+                    session_present(expected_path, &snap, &daemon_status);
+                if active_matches || listed || terminal_keyed {
+                    break Ok(json!({
+                        "message": message,
+                        "expected_path": expected_path,
+                        "active_matches": active_matches,
+                        "listed": listed,
+                        "terminal_keyed": terminal_keyed,
+                        "elapsed_ms": elapsed_ms,
+                        "active_session_path": snap.active_session_path,
+                        "live_sessions": snap.live_sessions.len(),
+                        "terminal_session_count": daemon_status.terminal_session_count,
+                    }));
+                }
+                if elapsed_ms >= cfg.timeout_ms {
+                    bail!(
+                        "expected session path not found after {}ms: {}",
+                        cfg.timeout_ms,
+                        expected_path
+                    );
+                }
+                emit(
+                    cfg,
+                    YggEventEnvelope::new(meta.clone(), YggEventKind::Progress)
+                        .with_elapsed_ms(elapsed_ms)
+                        .with_message("session not loaded yet")
+                        .with_progress(YggProgress {
+                            step: "poll_session".to_string(),
+                            current: None,
+                            total: None,
+                            message: Some(format!("waiting for {expected_path}")),
+                        }),
+                )?;
+                sleep(Duration::from_millis(cfg.poll_ms.max(1)));
+            }
+        }
+        Scenario::LatencyCheck => {
+            let home_dir = resolve_yggterm_home()?;
+            let targets = if cfg.all_servers {
+                reachable_versioned_daemon_statuses(&home_dir)
+                    .into_iter()
+                    .map(|(endpoint, daemon_status)| (endpoint, Some(daemon_status)))
+                    .collect::<Vec<_>>()
+            } else {
+                vec![(endpoint.clone(), None)]
+            };
+            let mut checks = Vec::new();
+            for (target, cached_status) in targets {
+                let ping_start = Instant::now();
+                let ping_error = ping(&target).err().map(|error| error.to_string());
+                let ping_ms = ping_start.elapsed().as_millis() as u64;
+
+                let status_start = Instant::now();
+                let status_result = status(&target);
+                let status_ms = status_start.elapsed().as_millis() as u64;
+                let daemon_status = status_result.ok().or(cached_status);
+
+                let snapshot_start = Instant::now();
+                let snapshot_result = snapshot(&target);
+                let snapshot_ms = snapshot_start.elapsed().as_millis() as u64;
+                let snapshot_error = snapshot_result.err().map(|error| error.to_string());
+                let slow = ping_ms >= cfg.slow_notice_ms
+                    || status_ms >= cfg.slow_notice_ms
+                    || snapshot_ms >= cfg.slow_notice_ms;
+                checks.push(json!({
+                    "endpoint": endpoint_json(&target),
+                    "server": daemon_status.as_ref().map(|daemon_status| server_status_json(&target, daemon_status)),
+                    "ping_ms": ping_ms,
+                    "ping_error": ping_error,
+                    "status_ms": status_ms,
+                    "snapshot_ms": snapshot_ms,
+                    "snapshot_error": snapshot_error,
+                    "slow": slow,
+                }));
+            }
+            Ok(json!({
+                "server_count": checks.len(),
+                "slow_notice_ms": cfg.slow_notice_ms,
+                "checks": checks,
+            }))
+        }
+        Scenario::PanicReport => {
+            let home_dir = resolve_yggterm_home()?;
+            let targets = panic_report_targets(&home_dir, endpoint);
+            let mut checks = Vec::new();
+            let mut recommended_next_steps = Vec::new();
+            let expected_path = cfg.expect_path.as_deref();
+            for (target, cached_status) in targets {
+                let ping_start = Instant::now();
+                let ping_error = ping(&target).err().map(|error| error.to_string());
+                let ping_ms = ping_start.elapsed().as_millis() as u64;
+
+                let status_start = Instant::now();
+                let status_result = status(&target);
+                let status_ms = status_start.elapsed().as_millis() as u64;
+                let status_error = status_result.as_ref().err().map(|error| error.to_string());
+                let daemon_status = status_result.ok().or(cached_status);
+
+                let snapshot_start = Instant::now();
+                let snapshot_result = snapshot(&target);
+                let snapshot_ms = snapshot_start.elapsed().as_millis() as u64;
+                let snapshot_error = snapshot_result
+                    .as_ref()
+                    .err()
+                    .map(|error| error.to_string());
+                let snapshot_data = snapshot_result.ok().map(|(snap, message)| {
+                    let expected_presence = expected_path
+                        .zip(daemon_status.as_ref())
+                        .map(|(expected_path, daemon_status)| {
+                            let (active_matches, listed, terminal_keyed) =
+                                session_present(expected_path, &snap, daemon_status);
+                            if !active_matches && !listed && !terminal_keyed {
+                                recommended_next_steps.push(format!(
+                                    "expected session not present on {}: run wait-session or inspect restore path",
+                                    serde_json::to_string(&endpoint_json(&target))
+                                        .unwrap_or_else(|_| format!("{target:?}"))
+                                ));
+                            }
+                            json!({
+                                "expected_path": expected_path,
+                                "active_matches": active_matches,
+                                "listed": listed,
+                                "terminal_keyed": terminal_keyed,
+                            })
+                        });
+                    json!({
+                        "message": message,
+                        "active_session_path": snap.active_session_path,
+                        "active_view_mode": snap.active_view_mode,
+                        "live_sessions": snap.live_sessions.len(),
+                        "remote_machines": snap.remote_machines.len(),
+                        "remote_machine_health_counts": remote_machine_health_counts_json(&snap),
+                        "expected_presence": expected_presence,
+                    })
+                });
+
+                let slow = ping_ms >= cfg.slow_notice_ms
+                    || status_ms >= cfg.slow_notice_ms
+                    || snapshot_ms >= cfg.slow_notice_ms;
+                if ping_error.is_some() || status_error.is_some() {
+                    recommended_next_steps.push(
+                        "daemon control plane is not reachable; check server-list, active sockets, and hot-restart if appropriate".to_string(),
+                    );
+                }
+                if snapshot_error.is_some() {
+                    recommended_next_steps.push(
+                        "snapshot failed; inspect event trace and app-control state before assuming the GUI is at fault".to_string(),
+                    );
+                }
+                if slow {
+                    recommended_next_steps.push(format!(
+                        "latency threshold exceeded on {}: ping={}ms status={}ms snapshot={}ms",
+                        serde_json::to_string(&endpoint_json(&target))
+                            .unwrap_or_else(|_| format!("{target:?}")),
+                        ping_ms,
+                        status_ms,
+                        snapshot_ms
+                    ));
+                }
+
+                checks.push(json!({
+                    "endpoint": endpoint_json(&target),
+                    "server": daemon_status.as_ref().map(|daemon_status| server_status_json(&target, daemon_status)),
+                    "ping_ms": ping_ms,
+                    "ping_error": ping_error,
+                    "status_ms": status_ms,
+                    "status_error": status_error,
+                    "snapshot_ms": snapshot_ms,
+                    "snapshot_error": snapshot_error,
+                    "snapshot": snapshot_data,
+                    "slow": slow,
+                }));
+            }
+            recommended_next_steps.sort();
+            recommended_next_steps.dedup();
+            Ok(json!({
+                "home_dir": home_dir.display().to_string(),
+                "server_count": checks.len(),
+                "slow_notice_ms": cfg.slow_notice_ms,
+                "expected_path": expected_path,
+                "checks": checks,
+                "recommended_next_steps": recommended_next_steps,
+            }))
+        }
+        Scenario::HotRestart => {
+            let home_dir = resolve_yggterm_home()?;
+            let daemon_exe = resolve_hot_restart_daemon_exe(cfg)?;
+            let targets = if cfg.all_servers {
+                reachable_versioned_daemon_statuses(&home_dir)
+                    .into_iter()
+                    .collect::<Vec<_>>()
+            } else {
+                vec![(endpoint.clone(), status(endpoint)?)]
+            };
+            let mut fallback_used = false;
+            let mut target_results = Vec::new();
+            for (target, daemon_status) in &targets {
+                let expected_version = cfg
+                    .expected_version
+                    .as_deref()
+                    .or(Some(env!("CARGO_PKG_VERSION")));
+                let hot_result = hot_restart(
+                    target,
+                    &daemon_exe,
+                    expected_version,
+                    cfg.expected_build_id,
+                    cfg.reason
+                        .as_deref()
+                        .or(Some("yggterm-mock-cli hot restart")),
+                );
+                match hot_result {
+                    Ok(message) => target_results.push(json!({
+                        "endpoint": endpoint_json(target),
+                        "server": server_status_json(target, daemon_status),
+                        "native_hot_restart": true,
+                        "message": message,
+                    })),
+                    Err(error) => {
+                        fallback_used = true;
+                        let prepare = prepare_update_restart(target)
+                            .map(|message| json!({"ok": true, "message": message}))
+                            .unwrap_or_else(|prepare_error| {
+                                json!({"ok": false, "error": prepare_error.to_string()})
+                            });
+                        let shutdown_result = shutdown(target)
+                            .map(|message| json!({"ok": true, "message": message}))
+                            .unwrap_or_else(|shutdown_error| {
+                                json!({"ok": false, "error": shutdown_error.to_string()})
+                            });
+                        target_results.push(json!({
+                            "endpoint": endpoint_json(target),
+                            "server": server_status_json(target, daemon_status),
+                            "native_hot_restart": false,
+                            "hot_restart_error": error.to_string(),
+                            "prepare_update_restart": prepare,
+                            "shutdown": shutdown_result,
+                        }));
+                    }
+                }
+            }
+            if fallback_used || targets.is_empty() {
+                ensure_local_daemon_running(endpoint)?;
+            }
+            let ready = wait_for_daemon_status(endpoint, cfg)?;
+            Ok(json!({
+                "daemon_executable": daemon_exe.display().to_string(),
+                "target_count": targets.len(),
+                "fallback_used": fallback_used,
+                "targets": target_results,
+                "ready": ready,
+            }))
+        }
+        Scenario::ManagedCliRefresh => {
+            ensure_local_daemon_running(endpoint)?;
+            let message =
+                refresh_managed_cli(endpoint, cfg.machine_key.as_deref(), cfg.background)?;
+            let daemon_status = status(endpoint).ok();
+            Ok(json!({
+                "message": message,
+                "machine_key": cfg.machine_key.clone(),
+                "background": cfg.background,
+                "server": daemon_status.as_ref().map(|daemon_status| server_status_json(endpoint, daemon_status)),
+            }))
+        }
         Scenario::GracefulShutdown => {
             let message = shutdown(endpoint)?;
             let ping_after = ping(endpoint).is_ok();
@@ -537,4 +1073,91 @@ fn emit(cfg: &Config, event: YggEventEnvelope) -> Result<()> {
         writeln!(file, "{line}")?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_hot_restart_control_options() {
+        let cfg = parse_args(vec![
+            "--scenario".to_string(),
+            "hot-restart".to_string(),
+            "--all".to_string(),
+            "--daemon-exe".to_string(),
+            "/tmp/yggterm-headless".to_string(),
+            "--expected-version".to_string(),
+            "2.1.61".to_string(),
+            "--expected-build-id".to_string(),
+            "123".to_string(),
+            "--reason".to_string(),
+            "release".to_string(),
+        ])
+        .expect("parse hot restart args");
+
+        assert_eq!(cfg.scenario, Scenario::HotRestart);
+        assert!(cfg.all_servers);
+        assert_eq!(
+            cfg.daemon_exe.as_deref(),
+            Some(Path::new("/tmp/yggterm-headless"))
+        );
+        assert_eq!(cfg.expected_version.as_deref(), Some("2.1.61"));
+        assert_eq!(cfg.expected_build_id, Some(123));
+        assert_eq!(cfg.reason.as_deref(), Some("release"));
+    }
+
+    #[test]
+    fn parse_wait_session_and_managed_cli_options() {
+        let wait_cfg = parse_args(vec![
+            "--scenario".to_string(),
+            "wait-session".to_string(),
+            "--expect-path".to_string(),
+            "live::codex".to_string(),
+            "--timeout-ms".to_string(),
+            "30000".to_string(),
+            "--poll-ms".to_string(),
+            "250".to_string(),
+        ])
+        .expect("parse wait session args");
+        assert_eq!(wait_cfg.scenario, Scenario::WaitSession);
+        assert_eq!(wait_cfg.expect_path.as_deref(), Some("live::codex"));
+        assert_eq!(wait_cfg.timeout_ms, 30_000);
+        assert_eq!(wait_cfg.poll_ms, 250);
+
+        let refresh_cfg = parse_args(vec![
+            "--scenario".to_string(),
+            "managed-cli-refresh".to_string(),
+            "--background".to_string(),
+            "--machine-key".to_string(),
+            "jojo".to_string(),
+        ])
+        .expect("parse refresh args");
+        assert_eq!(refresh_cfg.scenario, Scenario::ManagedCliRefresh);
+        assert!(refresh_cfg.background);
+        assert_eq!(refresh_cfg.machine_key.as_deref(), Some("jojo"));
+    }
+
+    #[test]
+    fn parse_panic_report_monitoring_options() {
+        let cfg = parse_args(vec![
+            "--scenario".to_string(),
+            "panic-report".to_string(),
+            "--expect-path".to_string(),
+            "live::hung-codex".to_string(),
+            "--iterations".to_string(),
+            "3".to_string(),
+            "--interval-ms".to_string(),
+            "1000".to_string(),
+            "--slow-notice-ms".to_string(),
+            "750".to_string(),
+        ])
+        .expect("parse panic report args");
+
+        assert_eq!(cfg.scenario, Scenario::PanicReport);
+        assert_eq!(cfg.expect_path.as_deref(), Some("live::hung-codex"));
+        assert_eq!(cfg.iterations, 3);
+        assert_eq!(cfg.interval_ms, 1000);
+        assert_eq!(cfg.slow_notice_ms, 750);
+    }
 }

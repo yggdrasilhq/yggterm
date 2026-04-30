@@ -12,7 +12,7 @@
 [package]
 edition = "2021"
 name = "dioxus-interpreter-js"
-version = "0.7.3"
+version = "0.7.6"
 authors = ["Jonathan Kelley"]
 build = "build.rs"
 autolib = false
@@ -71,20 +71,20 @@ name = "serialize"
 path = "tests/serialize.rs"
 
 [dependencies.dioxus-core]
-version = "0.7.3"
+version = "0.7.6"
 optional = true
 
 [dependencies.dioxus-core-types]
-version = "0.7.3"
+version = "0.7.6"
 optional = true
 
 [dependencies.dioxus-html]
-version = "0.7.3"
+version = "0.7.6"
 optional = true
 default-features = false
 
 [dependencies.js-sys]
-version = "0.3"
+version = "0.3.77"
 optional = true
 
 [dependencies.rustc-hash]
@@ -92,7 +92,7 @@ version = "2.1.1"
 optional = true
 
 [dependencies.serde]
-version = "1.0.219"
+version = "1.0.225"
 features = ["derive"]
 optional = true
 
@@ -106,7 +106,7 @@ version = "0.3.1"
 optional = true
 
 [dependencies.wasm-bindgen]
-version = "0.2.105"
+version = "0.2.100"
 optional = true
 
 [dependencies.wasm-bindgen-futures]
@@ -123,4 +123,4 @@ optional = true
 default-features = false
 
 [build-dependencies.lazy-js-bundle]
-version = "0.7.3"
+version = "0.7.6"

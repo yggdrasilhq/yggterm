@@ -723,6 +723,11 @@ fn terminal_host_problem_for_app_control(host: &Value) -> Option<&'static str> {
         .and_then(Value::as_str)
         .map(str::trim)
         .unwrap_or("");
+    let session_path = host
+        .get("session_path")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or("");
     let cursor_line_text = host
         .get("cursor_line_text")
         .or_else(|| host.get("cursor_row_text"))
@@ -788,8 +793,12 @@ fn terminal_host_problem_for_app_control(host: &Value) -> Option<&'static str> {
         || (!cursor_line_text.is_empty()
             && (terminal_chunk_has_prompt_output(cursor_line_text)
                 || terminal_chunk_has_codex_prompt_output(cursor_line_text)));
-    let prompt_ready_surface =
-        prompt_visible && (input_enabled || helper_textarea_focused || cursor_sample_visible);
+    let local_prompt_surface = session_path.starts_with("local://") && prompt_visible;
+    let prompt_ready_surface = prompt_visible
+        && (input_enabled
+            || helper_textarea_focused
+            || cursor_sample_visible
+            || local_prompt_surface);
     if !cursor_line_text.is_empty() && terminal_chunk_is_transport_error(cursor_line_text) {
         return Some("active terminal host is showing transport/error output");
     }
@@ -844,6 +853,9 @@ fn terminal_host_problem_for_app_control(host: &Value) -> Option<&'static str> {
     }
     if terminal_chunk_is_low_signal_terminal_noise(text_sample) {
         return Some("active terminal host is still showing low-signal terminal noise");
+    }
+    if session_path.starts_with("remote-session://") && input_enabled && !prompt_ready_surface {
+        return Some("active remote terminal is input-enabled without a prompt-ready surface");
     }
     None
 }
@@ -1571,6 +1583,94 @@ mod tests {
             "helper_textarea_rect": {"left": 0.0, "top": 0.0, "width": 1.0, "height": 1.0}
         });
         assert_eq!(terminal_host_problem_for_app_control(&host), None);
+    }
+
+    #[test]
+    fn terminal_host_problem_accepts_fresh_local_shell_prompt_before_input_is_enabled() {
+        let host = json!({
+            "session_path": "local://fresh-shell",
+            "text_sample": "pi@jojo:~$",
+            "cursor_line_text": "pi@jojo:~$",
+            "input_enabled": false,
+            "helper_textarea_focused": false,
+            "cursor_node_count": 0,
+            "xterm_present": true,
+            "screen_present": true,
+            "rows_present": false,
+            "canvas_count": 4,
+            "render_event_count": 12,
+            "data_event_count": 1,
+            "xterm_buffer_kind": "normal",
+            "host_rect": {"left": 0.0, "top": 0.0, "width": 840.0, "height": 830.0},
+            "host_content_width": 840.0,
+            "host_content_height": 830.0,
+            "screen_rect": {"width": 840.0, "height": 830.0},
+            "viewport_rect": {"width": 840.0, "height": 830.0},
+            "helpers_rect": {"width": 840.0, "height": 830.0},
+            "helper_textarea_rect": {"left": -10000.0, "top": 68.0, "width": 1.0, "height": 1.0}
+        });
+        assert_eq!(terminal_host_problem_for_app_control(&host), None);
+    }
+
+    #[test]
+    fn terminal_host_problem_keeps_remote_prompt_only_surface_recovering_until_ready() {
+        let host = json!({
+            "session_path": "remote-session://dev/fresh-shell",
+            "text_sample": "pi@dev:~$",
+            "cursor_line_text": "pi@dev:~$",
+            "input_enabled": false,
+            "helper_textarea_focused": false,
+            "cursor_node_count": 0,
+            "xterm_present": true,
+            "screen_present": true,
+            "rows_present": false,
+            "canvas_count": 4,
+            "render_event_count": 12,
+            "data_event_count": 1,
+            "xterm_buffer_kind": "normal",
+            "host_rect": {"left": 0.0, "top": 0.0, "width": 840.0, "height": 830.0},
+            "host_content_width": 840.0,
+            "host_content_height": 830.0,
+            "screen_rect": {"width": 840.0, "height": 830.0},
+            "viewport_rect": {"width": 840.0, "height": 830.0},
+            "helpers_rect": {"width": 840.0, "height": 830.0},
+            "helper_textarea_rect": {"left": -10000.0, "top": 68.0, "width": 1.0, "height": 1.0}
+        });
+        assert_eq!(
+            terminal_host_problem_for_app_control(&host),
+            Some("active terminal host is only showing a plain shell prompt")
+        );
+    }
+
+    #[test]
+    fn terminal_host_problem_rejects_input_enabled_remote_tail_without_prompt() {
+        let host = json!({
+            "session_path": "remote-session://dev/stale-codex",
+            "text_sample": "The final 2.1.59 artifacts are built. Before replacing the live jojo install, I’m taking one more runtime/install snapshot.",
+            "text_tail": "The final 2.1.59 artifacts are built. Before replacing the live jojo install, I’m taking one more runtime/install snapshot.",
+            "cursor_line_text": "stale scan processes.",
+            "input_enabled": true,
+            "helper_textarea_focused": true,
+            "cursor_node_count": 1,
+            "xterm_present": true,
+            "screen_present": true,
+            "rows_present": false,
+            "canvas_count": 4,
+            "render_event_count": 12,
+            "data_event_count": 1,
+            "xterm_buffer_kind": "normal",
+            "host_rect": {"left": 0.0, "top": 0.0, "width": 840.0, "height": 830.0},
+            "host_content_width": 840.0,
+            "host_content_height": 830.0,
+            "screen_rect": {"width": 840.0, "height": 830.0},
+            "viewport_rect": {"width": 840.0, "height": 830.0},
+            "helpers_rect": {"width": 840.0, "height": 830.0},
+            "helper_textarea_rect": {"left": -10000.0, "top": 68.0, "width": 1.0, "height": 1.0}
+        });
+        assert_eq!(
+            terminal_host_problem_for_app_control(&host),
+            Some("active remote terminal is input-enabled without a prompt-ready surface")
+        );
     }
 
     #[test]

@@ -167,7 +167,11 @@ more general than tmux itself.
 
 ## Mock Client
 
-`yggterm-mock-cli` exists to profile the protocol behavior without the full desktop shell.
+`yggterm-mock-cli` exists to profile the protocol behavior without the full desktop shell. It is
+also the first-line panic-management tool for live incidents: when a remote desktop such as `jojo`
+has a hung terminal, a missing restored session, a slow daemon, or a suspect drawing/input path,
+start with the mock CLI to establish daemon reachability, session truth, latency, and version
+state before making fixes.
 
 It should be able to:
 
@@ -177,6 +181,10 @@ It should be able to:
 - simulate client-side timeout thresholds and delayed-loading notifications
 - inject artificial latency with progress ticks so loading-state UX can be tested deliberately
 - prove session lifetime semantics across disconnect/reconnect/shutdown paths
+- produce a read-only `panic-report` that combines server discovery, latency checks, snapshot
+  health, optional `--expect-path` session presence, and recommended next probes
+- repeat any scenario with `--iterations` plus `--interval-ms` so a remote agent can monitor a
+  flaky session without relying on the GUI render loop
 
 This makes distributed regressions easier to reproduce than relying on the full GUI alone.
 
@@ -197,6 +205,42 @@ That should emit:
 - several `progress` envelopes during the injected delay
 - a `progress` envelope once the `3000ms` loading threshold is exceeded
 - final `result` or `error`
+
+Incident examples:
+
+```bash
+# First read-only picture during a hung terminal or missing session incident.
+./target/debug/yggterm-mock-cli \
+  --scenario panic-report \
+  --expect-path live::<session-id> \
+  --jsonl-out /tmp/yggterm-incident.jsonl
+
+# Watch daemon latency and session truth once per second.
+./target/debug/yggterm-mock-cli \
+  --scenario panic-report \
+  --expect-path live::<session-id> \
+  --iterations 30 \
+  --interval-ms 1000 \
+  --jsonl-out /tmp/yggterm-watch.jsonl
+
+# Survey reachable versioned daemons and aliases before a hot update.
+./target/debug/yggterm-mock-cli --scenario server-list
+
+# Probe control-plane latency across the daemon fleet.
+./target/debug/yggterm-mock-cli --scenario latency-check --all
+```
+
+Expected incident workflow:
+
+- `panic-report` is read-only and should be safe to run first on a live user machine.
+- If `server-list` shows no current daemon or a version mismatch, diagnose daemon lifecycle before
+  treating the terminal viewport as the root cause.
+- If `panic-report` finds the expected session missing, use `wait-session` with the same
+  `--expect-path` before editing restore logic.
+- If `latency-check` or `panic-report` marks status/snapshot as slow, inspect trace/perf telemetry
+  and look for blocking daemon work before changing the UI.
+- If daemon state is healthy but the user sees blank or unreadable content, switch to
+  `server app state`, `server app screenshot`, and the viewport probes to debug drawing/input.
 
 Session lifetime examples:
 

@@ -3,21 +3,23 @@ use std::path::Path;
 use std::process::Command;
 use yggterm_core::{InstallContext, SessionStore, detect_install_context};
 use yggterm_server::{
-    AppControlRightPanelMode, AppControlViewMode, cleanup_legacy_daemons, default_endpoint,
-    detect_ghostty_host, ensure_local_daemon_running, ping, run_app_control_background_window,
-    run_app_control_close_window, run_app_control_create_terminal, run_app_control_describe_rows,
-    run_app_control_describe_state, run_app_control_drag, run_app_control_dump_state,
-    run_app_control_focus_window, run_app_control_list_clients, run_app_control_move_window_by,
-    run_app_control_open_path, run_app_control_paste_terminal_clipboard,
-    run_app_control_paste_terminal_clipboard_image, run_app_control_remove_session,
-    run_app_control_scroll_preview, run_app_control_send_terminal_input,
-    run_app_control_set_clipboard_png_base64, run_app_control_set_clipboard_text,
-    run_app_control_set_fullscreen, run_app_control_set_main_zoom,
-    run_app_control_set_right_panel_mode, run_app_control_set_row_expanded,
-    run_app_control_set_search, run_app_control_set_session_keep_alive,
-    run_app_control_set_window_chrome_hover, run_attach, run_daemon, run_screenrecord_capture,
-    run_screenshot_capture, run_trace_bundle, run_trace_follow, run_trace_tail, shutdown, snapshot,
-    status, try_run_remote_server_command,
+    AppControlRightPanelMode, AppControlViewMode, ProbeTerminalViewportInputMode,
+    cleanup_legacy_daemons, default_endpoint, detect_ghostty_host, ensure_local_daemon_running,
+    ping, run_app_control_background_window, run_app_control_close_window,
+    run_app_control_create_terminal, run_app_control_describe_rows, run_app_control_describe_state,
+    run_app_control_drag, run_app_control_dump_state, run_app_control_focus_window,
+    run_app_control_list_clients, run_app_control_move_window_by, run_app_control_open_path,
+    run_app_control_paste_terminal_clipboard, run_app_control_paste_terminal_clipboard_image,
+    run_app_control_probe_terminal_viewport_input, run_app_control_probe_terminal_viewport_scroll,
+    run_app_control_probe_terminal_viewport_select, run_app_control_reclaim_terminal_focus,
+    run_app_control_remove_session, run_app_control_scroll_preview,
+    run_app_control_send_terminal_input, run_app_control_set_clipboard_png_base64,
+    run_app_control_set_clipboard_text, run_app_control_set_fullscreen,
+    run_app_control_set_main_zoom, run_app_control_set_right_panel_mode,
+    run_app_control_set_row_expanded, run_app_control_set_search,
+    run_app_control_set_session_keep_alive, run_app_control_set_window_chrome_hover, run_attach,
+    run_daemon, run_screenrecord_capture, run_screenshot_capture, run_trace_bundle,
+    run_trace_follow, run_trace_tail, shutdown, snapshot, status, try_run_remote_server_command,
 };
 
 const ENV_YGGTERM_DIRECT_INSTALL_ROOT: &str = "YGGTERM_DIRECT_INSTALL_ROOT";
@@ -686,6 +688,17 @@ fn main() -> Result<()> {
                             })?;
                         run_app_control_send_terminal_input(session_path, data, timeout_ms)
                     }
+                    "focus" => {
+                        let session_path = cli_positional_args(&args, 4)
+                            .into_iter()
+                            .next()
+                            .ok_or_else(|| {
+                                anyhow::anyhow!(
+                                    "missing session path for server app terminal focus"
+                                )
+                            })?;
+                        run_app_control_reclaim_terminal_focus(session_path, timeout_ms)
+                    }
                     "paste" => {
                         let session_path = cli_positional_args(&args, 4)
                             .into_iter()
@@ -727,6 +740,98 @@ fn main() -> Result<()> {
                                 )
                             })?;
                         run_app_control_set_session_keep_alive(session_path, false, timeout_ms)
+                    }
+                    "probe-type" => {
+                        let session_path = cli_positional_args(&args, 4)
+                            .into_iter()
+                            .next()
+                            .ok_or_else(|| {
+                                anyhow::anyhow!(
+                                    "missing session path for server app terminal probe-type"
+                                )
+                            })?;
+                        let data = args
+                            .windows(2)
+                            .find_map(|window| {
+                                if window[0] == "--data" {
+                                    Some(window[1].as_str())
+                                } else {
+                                    None
+                                }
+                            })
+                            .ok_or_else(|| {
+                                anyhow::anyhow!("missing --data for server app terminal probe-type")
+                            })?;
+                        let press_enter = args.iter().any(|arg| arg == "--enter");
+                        let press_tab = args.iter().any(|arg| arg == "--tab");
+                        let press_ctrl_c = args.iter().any(|arg| arg == "--ctrl-c");
+                        let press_ctrl_e = args.iter().any(|arg| arg == "--ctrl-e");
+                        let press_ctrl_u = args.iter().any(|arg| arg == "--ctrl-u");
+                        let mode = args
+                            .windows(2)
+                            .find_map(|window| {
+                                if window[0] != "--mode" {
+                                    return None;
+                                }
+                                match window[1].as_str() {
+                                    "auto" => Some(ProbeTerminalViewportInputMode::Auto),
+                                    "keyboard" => Some(ProbeTerminalViewportInputMode::Keyboard),
+                                    "xterm" => Some(ProbeTerminalViewportInputMode::Xterm),
+                                    _ => None,
+                                }
+                            })
+                            .unwrap_or(ProbeTerminalViewportInputMode::Auto);
+                        run_app_control_probe_terminal_viewport_input(
+                            session_path,
+                            data,
+                            mode,
+                            press_enter,
+                            press_tab,
+                            press_ctrl_c,
+                            press_ctrl_e,
+                            press_ctrl_u,
+                            timeout_ms,
+                        )
+                    }
+                    "probe-scroll" => {
+                        let session_path = cli_positional_args(&args, 4)
+                            .into_iter()
+                            .next()
+                            .ok_or_else(|| {
+                                anyhow::anyhow!(
+                                    "missing session path for server app terminal probe-scroll"
+                                )
+                            })?;
+                        let lines = args
+                            .windows(2)
+                            .find_map(|window| {
+                                if window[0] == "--lines" {
+                                    window[1].parse::<i32>().ok()
+                                } else {
+                                    None
+                                }
+                            })
+                            .ok_or_else(|| {
+                                anyhow::anyhow!(
+                                    "missing --lines for server app terminal probe-scroll"
+                                )
+                            })?;
+                        run_app_control_probe_terminal_viewport_scroll(
+                            session_path,
+                            lines,
+                            timeout_ms,
+                        )
+                    }
+                    "probe-select" => {
+                        let session_path = cli_positional_args(&args, 4)
+                            .into_iter()
+                            .next()
+                            .ok_or_else(|| {
+                                anyhow::anyhow!(
+                                    "missing session path for server app terminal probe-select"
+                                )
+                            })?;
+                        run_app_control_probe_terminal_viewport_select(session_path, timeout_ms)
                     }
                     other => anyhow::bail!("unsupported app terminal action: {other}"),
                 }

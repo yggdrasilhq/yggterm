@@ -103,6 +103,29 @@ with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED) as handle:
 PY
 }
 
+maybe_refresh_release_codex_cli() {
+  if [[ "${YGGTERM_RELEASE_CODEX_REFRESH:-1}" == "0" ]]; then
+    echo "Skipping managed Codex CLI refresh because YGGTERM_RELEASE_CODEX_REFRESH=0."
+    return
+  fi
+  if [[ -n "$TARGET_TRIPLE" && "$TARGET_TRIPLE" != "$HOST_TRIPLE" ]]; then
+    echo "Skipping managed Codex CLI refresh for cross target ${TARGET_TRIPLE}; host is ${HOST_TRIPLE}."
+    return
+  fi
+  if [[ ! -x "$MOCK_CLI_BIN_PATH" ]]; then
+    echo "warning: cannot refresh managed Codex CLI; missing executable $MOCK_CLI_BIN_PATH" >&2
+    return
+  fi
+  local report_path="${DIST_DIR}/managed-codex-refresh-${TARGET_LABEL}.jsonl"
+  rm -f "$report_path"
+  echo "Checking managed Codex CLI tools..."
+  if "$MOCK_CLI_BIN_PATH" --scenario managed-cli-refresh --foreground --jsonl-out "$report_path"; then
+    echo "Managed Codex CLI refresh report: $report_path"
+  else
+    echo "warning: managed Codex CLI refresh/check failed; continuing release packaging" >&2
+  fi
+}
+
 build_macos_release_bundle() {
   local gui_binary_path="$1"
   local headless_binary_path="$2"
@@ -193,6 +216,7 @@ PLIST
 pushd "$ROOT_DIR" >/dev/null
 "${BUILD_CMD[@]}"
 popd >/dev/null
+maybe_refresh_release_codex_cli
 
 OUT_BASENAME="yggterm-${TARGET_LABEL}"
 case "$BIN_NAME" in

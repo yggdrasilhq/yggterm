@@ -5,7 +5,8 @@ use crate::{
     TerminalManager, WorkspaceViewMode, YggtermServer, active_client_instance_records,
     current_millis, fetch_remote_generation_context,
     local_headless_companion_executable_from_current, persist_remote_generated_copy,
-    remote_resume_runtime_output_requires_restart, terminate_remote_codex_session,
+    remote_resume_runtime_output_requires_restart, spawn_hot_restart_daemon_process,
+    terminate_remote_codex_session,
 };
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -44,6 +45,7 @@ const DEFAULT_TERMINAL_IDLE_TRIM_AFTER_MS: u64 = 45_000;
 const DEFAULT_ORPHAN_DAEMON_REAP_AFTER_MS: u64 = 180_000;
 #[cfg(target_os = "linux")]
 const DUPLICATE_SAME_HOME_GRACE_MS: u64 = 2_000;
+const DAEMON_REQUEST_IO_TIMEOUT_MS: u64 = 10_000;
 const REMOTE_ATTACH_STARTUP_GRACE_MS: u64 = 900;
 const ENV_YGGTERM_ENABLE_BACKGROUND_COPY_CHORE: &str = "YGGTERM_ENABLE_BACKGROUND_COPY_CHORE";
 
@@ -357,6 +359,8 @@ pub struct ServerRuntimeStatus {
     pub server_version: String,
     #[serde(default)]
     pub server_build_id: u64,
+    #[serde(default)]
+    pub server_pid: u32,
     pub host_kind: String,
     pub host_detail: String,
     pub embedded_surface_supported: bool,
@@ -420,6 +424,12 @@ pub enum ServerRequest {
     Status,
     Snapshot,
     PrepareUpdateRestart,
+    HotRestart {
+        daemon_executable: String,
+        expected_version: Option<String>,
+        expected_build_id: Option<u64>,
+        reason: Option<String>,
+    },
     OpenStoredSession {
         session_kind: SessionKind,
         path: String,
@@ -580,10 +590,18 @@ struct DaemonRuntime {
     store: SessionStore,
     server: YggtermServer,
     terminals: TerminalManager,
+    remote_machine_refreshes_in_flight: HashSet<String>,
     restored_from_persisted_state: bool,
     restored_stored_sessions: usize,
     restored_live_sessions: usize,
     restored_remote_machines: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RemoteMachineRefreshQueueStatus {
+    Spawn,
+    AlreadyInFlight,
+    Loopback,
 }
 
 #[derive(Debug, Clone)]
@@ -640,6 +658,7 @@ impl DaemonRuntime {
             store,
             server,
             terminals: TerminalManager::new(),
+            remote_machine_refreshes_in_flight: HashSet::new(),
             restored_from_persisted_state,
             restored_stored_sessions,
             restored_live_sessions,
@@ -658,6 +677,7 @@ impl DaemonRuntime {
         ServerRuntimeStatus {
             server_version: SERVER_PROTOCOL_VERSION.to_string(),
             server_build_id: current_build_id(),
+            server_pid: std::process::id(),
             host_kind: self.support.kind.as_str().to_string(),
             host_detail: self.support.detail.clone(),
             embedded_surface_supported: self.support.embedded_surface_supported,
@@ -1029,6 +1049,39 @@ impl DaemonRuntime {
                 )?;
                 ServerResponse::Ack {
                     message: Some("update restart prepared".to_string()),
+                }
+            }
+            ServerRequest::HotRestart {
+                daemon_executable,
+                expected_version,
+                expected_build_id,
+                reason,
+            } => {
+                let daemon_executable = canonical_hot_restart_executable(&daemon_executable)?;
+                write_persisted_state(
+                    &self.state_path,
+                    &self.server.persisted_state_for_update_restart(),
+                )?;
+                append_trace_event(
+                    self.store.home_dir(),
+                    "daemon",
+                    "lifecycle",
+                    "hot_restart_prepared",
+                    serde_json::json!({
+                        "daemon_executable": daemon_executable.display().to_string(),
+                        "expected_version": expected_version,
+                        "expected_build_id": expected_build_id,
+                        "reason": reason,
+                        "server_version": SERVER_PROTOCOL_VERSION,
+                        "server_build_id": current_build_id(),
+                        "pid": std::process::id(),
+                    }),
+                );
+                ServerResponse::Ack {
+                    message: Some(format!(
+                        "hot restart prepared: {}",
+                        daemon_executable.display()
+                    )),
                 }
             }
             ServerRequest::OpenStoredSession {
@@ -2017,6 +2070,7 @@ fn server_request_name(request: &ServerRequest) -> &'static str {
         ServerRequest::Status => "status",
         ServerRequest::Snapshot => "snapshot",
         ServerRequest::PrepareUpdateRestart => "prepare_update_restart",
+        ServerRequest::HotRestart { .. } => "hot_restart",
         ServerRequest::OpenStoredSession { .. } => "open_stored_session",
         ServerRequest::ConnectSsh { .. } => "connect_ssh",
         ServerRequest::ConnectSshCustom { .. } => "connect_ssh_custom",
@@ -2161,11 +2215,20 @@ pub fn reachable_versioned_daemon_statuses(
         }
     }
 
+    let mut reached_socket_identities = HashSet::<PathBuf>::new();
     paths
         .into_iter()
         .filter_map(|path| {
             let endpoint = ServerEndpoint::UnixSocket(path);
-            status(&endpoint).ok().map(|runtime| (endpoint, runtime))
+            let runtime = status(&endpoint).ok()?;
+            let ServerEndpoint::UnixSocket(path) = &endpoint else {
+                return None;
+            };
+            let socket_identity = fs::canonicalize(path).unwrap_or_else(|_| path.clone());
+            if !reached_socket_identities.insert(socket_identity) {
+                return None;
+            }
+            Some((endpoint, runtime))
         })
         .collect()
 }
@@ -2657,6 +2720,27 @@ pub fn prepare_update_restart(endpoint: &ServerEndpoint) -> Result<Option<String
     )?)
 }
 
+pub fn hot_restart(
+    endpoint: &ServerEndpoint,
+    daemon_executable: &Path,
+    expected_version: Option<&str>,
+    expected_build_id: Option<u64>,
+    reason: Option<&str>,
+) -> Result<Option<String>> {
+    let daemon_executable = daemon_executable
+        .canonicalize()
+        .unwrap_or_else(|_| daemon_executable.to_path_buf());
+    expect_ack(send_request(
+        endpoint,
+        &ServerRequest::HotRestart {
+            daemon_executable: daemon_executable.display().to_string(),
+            expected_version: expected_version.map(ToOwned::to_owned),
+            expected_build_id,
+            reason: reason.map(ToOwned::to_owned),
+        },
+    )?)
+}
+
 pub fn shutdown(endpoint: &ServerEndpoint) -> Result<Option<String>> {
     expect_ack(send_request(endpoint, &ServerRequest::Shutdown)?)
 }
@@ -2874,14 +2958,21 @@ pub fn run_daemon(endpoint: &ServerEndpoint, runtime: GhosttyHostSupport) -> Res
         };
         info!(path=%path.display(), host=%host, "yggterm server daemon listening");
         spawn_active_terminal_prewarm(runtime.clone(), last_activity_ms.clone(), home_dir.clone());
+        let mut restart_after_exit = None::<PathBuf>;
         loop {
             match listener.accept() {
                 Ok((stream, _)) => {
                     let runtime = runtime.clone();
                     let last_activity_ms = last_activity_ms.clone();
                     match handle_unix_stream(stream, runtime, last_activity_ms) {
-                        Ok(true) => break,
-                        Ok(false) => {}
+                        Ok(outcome) => {
+                            if let Some(executable) = outcome.restart_executable {
+                                restart_after_exit = Some(executable);
+                            }
+                            if outcome.should_shutdown {
+                                break;
+                            }
+                        }
                         Err(error) => warn!(error=%error, "daemon request failed"),
                     }
                 }
@@ -2907,6 +2998,7 @@ pub fn run_daemon(endpoint: &ServerEndpoint, runtime: GhosttyHostSupport) -> Res
                 Err(error) => return Err(error).context("accepting daemon client"),
             }
         }
+        let restart_executable = restart_after_exit.take();
         append_trace_event(
             &home_dir,
             "daemon",
@@ -2915,8 +3007,38 @@ pub fn run_daemon(endpoint: &ServerEndpoint, runtime: GhosttyHostSupport) -> Res
             serde_json::json!({
                 "endpoint": format!("{endpoint:?}"),
                 "transport": "unix",
+                "hot_restart": restart_executable.is_some(),
             }),
         );
+        drop(listener);
+        if let Some(executable) = restart_executable {
+            if let Err(error) = fs::remove_file(path)
+                && error.kind() != ErrorKind::NotFound
+            {
+                warn!(
+                    path = %path.display(),
+                    error = %error,
+                    "failed to remove unix socket before hot restart"
+                );
+            }
+            if let Err(error) = spawn_hot_restart_daemon_process(&executable, endpoint) {
+                append_trace_event(
+                    &home_dir,
+                    "daemon",
+                    "lifecycle",
+                    "hot_restart_spawn_failed",
+                    serde_json::json!({
+                        "daemon_executable": executable.display().to_string(),
+                        "error": error.to_string(),
+                    }),
+                );
+                warn!(
+                    daemon_executable = %executable.display(),
+                    error = %error,
+                    "failed to spawn hot restart daemon"
+                );
+            }
+        }
         return Ok(());
     }
 
@@ -2944,14 +3066,21 @@ pub fn run_daemon(endpoint: &ServerEndpoint, runtime: GhosttyHostSupport) -> Res
                 last_activity_ms.clone(),
                 home_dir.clone(),
             );
+            let mut restart_after_exit = None::<PathBuf>;
             loop {
                 match listener.accept() {
                     Ok((stream, _)) => {
                         let runtime = runtime.clone();
                         let last_activity_ms = last_activity_ms.clone();
                         match handle_tcp_stream(stream, runtime, last_activity_ms) {
-                            Ok(true) => break,
-                            Ok(false) => {}
+                            Ok(outcome) => {
+                                if let Some(executable) = outcome.restart_executable {
+                                    restart_after_exit = Some(executable);
+                                }
+                                if outcome.should_shutdown {
+                                    break;
+                                }
+                            }
                             Err(error) => warn!(error=%error, "daemon request failed"),
                         }
                     }
@@ -2989,6 +3118,7 @@ pub fn run_daemon(endpoint: &ServerEndpoint, runtime: GhosttyHostSupport) -> Res
                     Err(error) => return Err(error).context("accepting daemon client"),
                 }
             }
+            let restart_executable = restart_after_exit.take();
             append_trace_event(
                 &home_dir,
                 "daemon",
@@ -2997,8 +3127,29 @@ pub fn run_daemon(endpoint: &ServerEndpoint, runtime: GhosttyHostSupport) -> Res
                 serde_json::json!({
                     "endpoint": format!("{endpoint:?}"),
                     "transport": "tcp",
+                    "hot_restart": restart_executable.is_some(),
                 }),
             );
+            drop(listener);
+            if let Some(executable) = restart_executable {
+                if let Err(error) = spawn_hot_restart_daemon_process(&executable, endpoint) {
+                    append_trace_event(
+                        &home_dir,
+                        "daemon",
+                        "lifecycle",
+                        "hot_restart_spawn_failed",
+                        serde_json::json!({
+                            "daemon_executable": executable.display().to_string(),
+                            "error": error.to_string(),
+                        }),
+                    );
+                    warn!(
+                        daemon_executable = %executable.display(),
+                        error = %error,
+                        "failed to spawn hot restart daemon"
+                    );
+                }
+            }
             Ok(())
         }
     }
@@ -3027,11 +3178,174 @@ fn lock_daemon_runtime<'a>(
     }
 }
 
+fn mark_remote_machine_refresh_queued(
+    in_flight: &mut HashSet<String>,
+    machine_key: &str,
+    should_spawn: bool,
+) -> RemoteMachineRefreshQueueStatus {
+    if !should_spawn {
+        return RemoteMachineRefreshQueueStatus::Loopback;
+    }
+    if in_flight.insert(machine_key.to_string()) {
+        RemoteMachineRefreshQueueStatus::Spawn
+    } else {
+        RemoteMachineRefreshQueueStatus::AlreadyInFlight
+    }
+}
+
+fn daemon_queue_remote_machine_refresh(
+    runtime: &Arc<Mutex<DaemonRuntime>>,
+    machine_key: String,
+    request_name: &'static str,
+) -> ServerResponse {
+    let normalized_machine_key = machine_key.trim().to_string();
+    let (target, home_dir, response, should_spawn) = {
+        let mut runtime = lock_daemon_runtime(runtime, "queue_remote_machine_refresh");
+        if daemon_request_trace_enabled(request_name) {
+            append_trace_event(
+                runtime.store.home_dir(),
+                "daemon",
+                "request",
+                "begin",
+                serde_json::json!({ "request": request_name, "mode": "queued" }),
+            );
+        }
+        let target = match runtime
+            .server
+            .remote_target_for_machine_key(&normalized_machine_key)
+        {
+            Ok(target) => target,
+            Err(error) => {
+                if daemon_request_trace_enabled(request_name) {
+                    append_trace_event(
+                        runtime.store.home_dir(),
+                        "daemon",
+                        "request",
+                        "end",
+                        serde_json::json!({
+                            "request": request_name,
+                            "mode": "queued",
+                            "ok": false,
+                            "error": error.to_string(),
+                        }),
+                    );
+                }
+                return ServerResponse::Error {
+                    message: error.to_string(),
+                };
+            }
+        };
+        let should_spawn = !YggtermServer::is_loopback_remote_target(&target);
+        let queue_status = mark_remote_machine_refresh_queued(
+            &mut runtime.remote_machine_refreshes_in_flight,
+            &normalized_machine_key,
+            should_spawn,
+        );
+        let response = runtime.snapshot_response(Some(match queue_status {
+            RemoteMachineRefreshQueueStatus::Spawn => {
+                format!("queued refresh {normalized_machine_key}")
+            }
+            RemoteMachineRefreshQueueStatus::AlreadyInFlight => {
+                format!("refresh already in progress {normalized_machine_key}")
+            }
+            RemoteMachineRefreshQueueStatus::Loopback => {
+                format!("skipped loopback refresh {normalized_machine_key}")
+            }
+        }));
+        if daemon_request_trace_enabled(request_name) {
+            append_trace_event(
+                runtime.store.home_dir(),
+                "daemon",
+                "request",
+                "end",
+                serde_json::json!({
+                    "request": request_name,
+                    "mode": "queued",
+                    "ok": true,
+                    "queue_status": format!("{queue_status:?}"),
+                }),
+            );
+        }
+        (
+            target,
+            runtime.store.home_dir().to_path_buf(),
+            response,
+            queue_status == RemoteMachineRefreshQueueStatus::Spawn,
+        )
+    };
+    if should_spawn {
+        let runtime = Arc::clone(runtime);
+        let queued_machine_key = normalized_machine_key.clone();
+        std::thread::spawn(move || {
+            append_trace_event(
+                &home_dir,
+                "daemon",
+                "remote_machine",
+                "background_refresh_begin",
+                serde_json::json!({
+                    "machine_key": queued_machine_key.clone(),
+                    "ssh_target": target.ssh_target.clone(),
+                    "prefix": target.prefix.clone(),
+                }),
+            );
+            let scan = YggtermServer::scan_remote_machine_refresh(&target);
+            let mut runtime = lock_daemon_runtime(&runtime, "background_remote_machine_refresh");
+            let outcome = runtime
+                .server
+                .apply_remote_machine_refresh_scan(&target, scan);
+            if let Err(persist_error) = runtime.persist() {
+                warn!(
+                    machine_key = %queued_machine_key,
+                    error = %persist_error,
+                    "failed to persist background remote machine refresh"
+                );
+            }
+            runtime
+                .remote_machine_refreshes_in_flight
+                .remove(&queued_machine_key);
+            match outcome {
+                Ok(()) => append_trace_event(
+                    runtime.store.home_dir(),
+                    "daemon",
+                    "remote_machine",
+                    "background_refresh_end",
+                    serde_json::json!({
+                        "machine_key": queued_machine_key.clone(),
+                        "ok": true,
+                    }),
+                ),
+                Err(error) => {
+                    append_trace_event(
+                        runtime.store.home_dir(),
+                        "daemon",
+                        "remote_machine",
+                        "background_refresh_end",
+                        serde_json::json!({
+                            "machine_key": queued_machine_key.clone(),
+                            "ok": false,
+                            "error": error.to_string(),
+                        }),
+                    );
+                    warn!(
+                        machine_key = %queued_machine_key,
+                        error = %error,
+                        "background remote machine refresh failed"
+                    );
+                }
+            }
+        });
+    }
+    response
+}
+
 fn daemon_request_response(
     runtime: &Arc<Mutex<DaemonRuntime>>,
     request: ServerRequest,
 ) -> ServerResponse {
     let request_name = server_request_name(&request);
+    if let ServerRequest::RefreshRemoteMachine { machine_key } = request {
+        return daemon_queue_remote_machine_refresh(runtime, machine_key, request_name);
+    }
     let mut runtime = lock_daemon_runtime(runtime, "handle_request");
     let home_dir = runtime.store.home_dir().to_path_buf();
     match panic::catch_unwind(AssertUnwindSafe(|| runtime.handle_request(request))) {
@@ -3227,38 +3541,7 @@ fn linux_home_has_reachable_terminal_runtime(home: &Path) -> bool {
 
 #[cfg(target_os = "linux")]
 fn linux_home_has_recoverable_runtime_activity(home: &Path) -> bool {
-    linux_home_has_live_bridge_process(home)
-        || linux_home_has_versioned_daemon_socket_file(home)
-        || linux_home_has_reachable_daemon_socket(home)
-        || linux_home_has_reachable_terminal_runtime(home)
-}
-
-#[cfg(target_os = "linux")]
-fn linux_home_has_versioned_daemon_socket_file(home: &Path) -> bool {
-    let Ok(entries) = fs::read_dir(home) else {
-        return false;
-    };
-    entries
-        .flatten()
-        .map(|entry| entry.path())
-        .any(|path| parse_versioned_server_socket_name(&path).is_some())
-}
-
-#[cfg(target_os = "linux")]
-fn linux_home_has_reachable_daemon_socket(home: &Path) -> bool {
-    let Ok(entries) = fs::read_dir(home) else {
-        return false;
-    };
-    for entry in entries.flatten() {
-        let socket_path = entry.path();
-        if parse_versioned_server_socket_name(&socket_path).is_none() {
-            continue;
-        }
-        if std::os::unix::net::UnixStream::connect(&socket_path).is_ok() {
-            return true;
-        }
-    }
-    false
+    linux_home_has_live_bridge_process(home) || linux_home_has_reachable_terminal_runtime(home)
 }
 
 #[cfg(target_os = "linux")]
@@ -3530,6 +3813,73 @@ fn write_persisted_state(path: &Path, state: &PersistedDaemonState) -> Result<()
     Ok(())
 }
 
+fn canonical_hot_restart_executable(raw_path: &str) -> Result<PathBuf> {
+    if raw_path.trim().is_empty() {
+        bail!("hot restart daemon executable path is empty");
+    }
+    let path = PathBuf::from(raw_path);
+    let canonical = path
+        .canonicalize()
+        .with_context(|| format!("resolving hot restart executable {}", path.display()))?;
+    let metadata = fs::metadata(&canonical)
+        .with_context(|| format!("reading hot restart executable {}", canonical.display()))?;
+    if !metadata.is_file() {
+        bail!(
+            "hot restart executable is not a regular file: {}",
+            canonical.display()
+        );
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if metadata.permissions().mode() & 0o111 == 0 {
+            bail!(
+                "hot restart executable is not marked executable: {}",
+                canonical.display()
+            );
+        }
+    }
+    Ok(canonical)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DaemonRequestOutcome {
+    should_shutdown: bool,
+    restart_executable: Option<PathBuf>,
+}
+
+fn daemon_request_outcome_for_response(
+    request: &ServerRequest,
+    response: &ServerResponse,
+) -> DaemonRequestOutcome {
+    if matches!(response, ServerResponse::Error { .. }) {
+        return DaemonRequestOutcome {
+            should_shutdown: false,
+            restart_executable: None,
+        };
+    }
+
+    match request {
+        ServerRequest::Shutdown => DaemonRequestOutcome {
+            should_shutdown: true,
+            restart_executable: None,
+        },
+        ServerRequest::HotRestart {
+            daemon_executable, ..
+        } => DaemonRequestOutcome {
+            should_shutdown: true,
+            restart_executable: Some(
+                canonical_hot_restart_executable(daemon_executable)
+                    .unwrap_or_else(|_| PathBuf::from(daemon_executable)),
+            ),
+        },
+        _ => DaemonRequestOutcome {
+            should_shutdown: false,
+            restart_executable: None,
+        },
+    }
+}
+
 fn write_response<W: Write>(writer: &mut W, response: &ServerResponse) -> Result<()> {
     serde_json::to_writer(&mut *writer, response).context("serializing daemon response")?;
     writer
@@ -3556,28 +3906,28 @@ fn handle_unix_stream(
     mut stream: std::os::unix::net::UnixStream,
     runtime: Arc<Mutex<DaemonRuntime>>,
     last_activity_ms: Arc<AtomicU64>,
-) -> Result<bool> {
+) -> Result<DaemonRequestOutcome> {
     let request = read_request(stream.try_clone().context("cloning unix stream")?)?;
     mark_daemon_activity(last_activity_ms.as_ref());
-    let should_shutdown = matches!(request, ServerRequest::Shutdown);
-    let response = daemon_request_response(&runtime, request);
+    let response = daemon_request_response(&runtime, request.clone());
+    let outcome = daemon_request_outcome_for_response(&request, &response);
     write_response(&mut stream, &response)?;
     trim_process_heap_if_supported();
-    Ok(should_shutdown)
+    Ok(outcome)
 }
 
 fn handle_tcp_stream(
     mut stream: std::net::TcpStream,
     runtime: Arc<Mutex<DaemonRuntime>>,
     last_activity_ms: Arc<AtomicU64>,
-) -> Result<bool> {
+) -> Result<DaemonRequestOutcome> {
     let request = read_request(stream.try_clone().context("cloning tcp stream")?)?;
     mark_daemon_activity(last_activity_ms.as_ref());
-    let should_shutdown = matches!(request, ServerRequest::Shutdown);
-    let response = daemon_request_response(&runtime, request);
+    let response = daemon_request_response(&runtime, request.clone());
+    let outcome = daemon_request_outcome_for_response(&request, &response);
     write_response(&mut stream, &response)?;
     trim_process_heap_if_supported();
-    Ok(should_shutdown)
+    Ok(outcome)
 }
 
 #[cfg(target_os = "linux")]
@@ -3599,6 +3949,15 @@ fn send_request(endpoint: &ServerEndpoint, request: &ServerRequest) -> Result<Se
         ServerEndpoint::UnixSocket(path) => {
             let mut stream = std::os::unix::net::UnixStream::connect(path)
                 .with_context(|| format!("connecting to {}", path.display()))?;
+            let io_timeout = Some(std::time::Duration::from_millis(
+                DAEMON_REQUEST_IO_TIMEOUT_MS,
+            ));
+            stream
+                .set_read_timeout(io_timeout)
+                .context("setting daemon request read timeout")?;
+            stream
+                .set_write_timeout(io_timeout)
+                .context("setting daemon request write timeout")?;
             stream
                 .write_all(&request_bytes)
                 .context("writing daemon request")?;
@@ -3621,6 +3980,15 @@ fn send_request(endpoint: &ServerEndpoint, request: &ServerRequest) -> Result<Se
         ServerEndpoint::Tcp { host, port } => {
             let mut stream = std::net::TcpStream::connect((host.as_str(), *port))
                 .with_context(|| format!("connecting to {}:{}", host, port))?;
+            let io_timeout = Some(std::time::Duration::from_millis(
+                DAEMON_REQUEST_IO_TIMEOUT_MS,
+            ));
+            stream
+                .set_read_timeout(io_timeout)
+                .context("setting daemon request read timeout")?;
+            stream
+                .set_write_timeout(io_timeout)
+                .context("setting daemon request write timeout")?;
             stream
                 .write_all(&request_bytes)
                 .context("writing daemon request")?;
@@ -3646,10 +4014,12 @@ fn send_request(endpoint: &ServerEndpoint, request: &ServerRequest) -> Result<Se
 #[cfg(test)]
 mod tests {
     use super::{
-        daemon_background_copy_chore_enabled_from_env, terminal_sidebar_snapshot_from_screen,
+        RemoteMachineRefreshQueueStatus, daemon_background_copy_chore_enabled_from_env,
+        mark_remote_machine_refresh_queued, terminal_sidebar_snapshot_from_screen,
     };
+    use std::collections::HashSet;
     use std::fs;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
 
     use super::collect_remote_copy_candidates;
     #[cfg(target_os = "linux")]
@@ -3683,6 +4053,99 @@ mod tests {
         assert!(daemon_background_copy_chore_enabled_from_env(Some("1")));
         assert!(daemon_background_copy_chore_enabled_from_env(Some("true")));
         assert!(daemon_background_copy_chore_enabled_from_env(Some(" YES ")));
+    }
+
+    #[test]
+    fn remote_machine_refresh_queue_coalesces_in_flight_targets() {
+        let mut in_flight = HashSet::new();
+        assert_eq!(
+            mark_remote_machine_refresh_queued(&mut in_flight, "dev", true),
+            RemoteMachineRefreshQueueStatus::Spawn
+        );
+        assert_eq!(
+            mark_remote_machine_refresh_queued(&mut in_flight, "dev", true),
+            RemoteMachineRefreshQueueStatus::AlreadyInFlight
+        );
+        assert_eq!(
+            mark_remote_machine_refresh_queued(&mut in_flight, "local", false),
+            RemoteMachineRefreshQueueStatus::Loopback
+        );
+    }
+
+    #[test]
+    fn daemon_request_outcome_restarts_only_after_successful_hot_restart() {
+        let request = super::ServerRequest::HotRestart {
+            daemon_executable: "/tmp/yggterm-headless-next".to_string(),
+            expected_version: Some("2.1.61".to_string()),
+            expected_build_id: None,
+            reason: Some("test".to_string()),
+        };
+
+        let outcome = super::daemon_request_outcome_for_response(
+            &request,
+            &super::ServerResponse::Ack {
+                message: Some("ok".to_string()),
+            },
+        );
+        assert!(outcome.should_shutdown);
+        assert_eq!(
+            outcome.restart_executable,
+            Some(PathBuf::from("/tmp/yggterm-headless-next"))
+        );
+
+        let error_outcome = super::daemon_request_outcome_for_response(
+            &request,
+            &super::ServerResponse::Error {
+                message: "no".to_string(),
+            },
+        );
+        assert!(!error_outcome.should_shutdown);
+        assert_eq!(error_outcome.restart_executable, None);
+
+        let shutdown_outcome = super::daemon_request_outcome_for_response(
+            &super::ServerRequest::Shutdown,
+            &super::ServerResponse::Ack {
+                message: Some("bye".to_string()),
+            },
+        );
+        assert!(shutdown_outcome.should_shutdown);
+        assert_eq!(shutdown_outcome.restart_executable, None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn canonical_hot_restart_executable_requires_executable_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join(format!(
+            "yggterm-hot-restart-exe-{}-{}",
+            std::process::id(),
+            super::current_millis()
+        ));
+        fs::create_dir_all(&root).expect("create temp dir");
+        let executable = root.join("yggterm-headless");
+        fs::write(&executable, b"#!/bin/sh\n").expect("write executable");
+        let mut permissions = fs::metadata(&executable).expect("metadata").permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&executable, permissions).expect("chmod executable");
+
+        let canonical =
+            super::canonical_hot_restart_executable(executable.to_str().expect("utf8 temp path"))
+                .expect("executable should validate");
+        assert_eq!(
+            canonical,
+            executable.canonicalize().expect("canonical path")
+        );
+
+        let non_executable = root.join("not-executable");
+        fs::write(&non_executable, b"").expect("write non executable");
+        assert!(
+            super::canonical_hot_restart_executable(
+                non_executable.to_str().expect("utf8 temp path"),
+            )
+            .is_err()
+        );
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[cfg(unix)]
