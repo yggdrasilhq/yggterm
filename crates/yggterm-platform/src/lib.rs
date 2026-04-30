@@ -1,4 +1,6 @@
 use anyhow::{Context, Result, bail};
+#[cfg(target_os = "macos")]
+use std::io::BufReader;
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -274,7 +276,7 @@ pub fn capture_macos_window_view_cache_screenshot(
 fn ensure_macos_png_not_blank(output_path: &Path, context_label: &str) -> Result<()> {
     let file = std::fs::File::open(output_path)
         .with_context(|| format!("opening macOS screenshot {}", output_path.display()))?;
-    let mut decoder = png::Decoder::new(file);
+    let mut decoder = png::Decoder::new(BufReader::new(file));
     decoder.set_transformations(Transformations::EXPAND | Transformations::STRIP_16);
     let mut reader = decoder
         .read_info()
