@@ -4,6 +4,17 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+## 2.1.67
+
+### Added
+
+- replace the misleading stored-session preview on empty startup with a start page that offers recent sessions, a new Codex session, a local terminal, and SSH connect actions
+
+### Fixed
+
+- clear stored-only active-session snapshots during startup/background sync so launching with no live sessions does not show `xterm.js backend reserved` or a stale remote transcript as the active workspace
+- expose start-page visibility and recent-session rows through app-control DOM state for deterministic smoke coverage
+
 ## 2.1.66
 
 ### Fixed

@@ -1,3 +1,11 @@
+yggterm (2.1.67-1) unstable; urgency=medium
+
+  * Replace the misleading stored-session preview on empty startup with a start page.
+  * Keep stored-only daemon snapshots from reselecting stale remote transcripts while no live sessions are open.
+  * Expose start-page visibility and recent-session rows through app-control DOM state.
+
+ -- Yggdrasil HQ <avi@gour.top>  Fri, 01 May 2026 04:43:14 +0530
+
 yggterm (2.1.66-1) unstable; urgency=medium
 
   * Clamp xterm canvas row fitting on WebKit/KDE so the restored prompt row stays inside the visible terminal host.
