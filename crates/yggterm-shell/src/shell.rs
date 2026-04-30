@@ -507,6 +507,7 @@ struct ShellState {
     recent_ui_telemetry: HashMap<String, (String, u64)>,
     had_cached_startup_snapshot: bool,
     latest_open_request_id: u64,
+    show_start_page_when_no_live_sessions: bool,
     closing_app: bool,
 }
 #[derive(Clone, PartialEq, Eq)]
@@ -730,6 +731,21 @@ fn render_active_view_mode_for_snapshot(
     } else {
         active_view_mode
     }
+}
+
+fn snapshot_has_only_stored_active_session(snapshot: &ServerUiSnapshot) -> bool {
+    snapshot.live_sessions.is_empty()
+        && snapshot.active_session_path.is_some()
+        && snapshot
+            .active_session
+            .as_ref()
+            .is_some_and(|session| session.source == SessionSource::Stored)
+}
+
+fn clear_stored_only_active_session(snapshot: &mut ServerUiSnapshot) {
+    snapshot.active_session_path = None;
+    snapshot.active_session = None;
+    snapshot.active_view_mode = WorkspaceViewMode::Rendered;
 }
 
 fn limit_live_terminal_retention_for_platform(
@@ -1272,10 +1288,17 @@ impl ShellState {
             ),
             bootstrap.theme,
         );
-        if let Some(initial_server_snapshot) = bootstrap.initial_server_snapshot.clone() {
+        let mut initial_snapshot_cleared_to_start_page = false;
+        if let Some(mut initial_server_snapshot) = bootstrap.initial_server_snapshot.clone() {
+            if snapshot_has_only_stored_active_session(&initial_server_snapshot) {
+                clear_stored_only_active_session(&mut initial_server_snapshot);
+                initial_snapshot_cleared_to_start_page = true;
+            }
             server.apply_snapshot(initial_server_snapshot);
         }
         let has_initial_server_snapshot = bootstrap.initial_server_snapshot.is_some();
+        let initial_snapshot_points_to_start_page =
+            server.active_session_path().is_none() && server.live_sessions().is_empty();
         let needs_initial_server_sync =
             bootstrap.refresh_server_after_launch || !has_initial_server_snapshot;
         let passive_copy_suspended = !implicit_copy_generation_enabled();
@@ -1401,6 +1424,9 @@ impl ShellState {
             recent_ui_telemetry: HashMap::new(),
             had_cached_startup_snapshot: has_initial_server_snapshot,
             latest_open_request_id: 0,
+            show_start_page_when_no_live_sessions: !has_initial_server_snapshot
+                || initial_snapshot_cleared_to_start_page
+                || initial_snapshot_points_to_start_page,
             closing_app: false,
         };
         if let Some(path) = state.browser.selected_path().map(ToOwned::to_owned) {
@@ -2625,9 +2651,18 @@ impl ShellState {
         let previous_active_session = self.server.active_session().cloned();
         match result {
             Ok((mut snapshot, message)) => {
-                if preserve_focus {
+                let explicit_stored_open = snapshot_has_only_stored_active_session(&snapshot)
+                    && !self.show_start_page_when_no_live_sessions;
+                if preserve_focus && !explicit_stored_open {
                     preserve_client_focus_for_background_snapshot(self, &mut snapshot);
                 }
+                if snapshot_has_only_stored_active_session(&snapshot)
+                    && self.show_start_page_when_no_live_sessions
+                {
+                    clear_stored_only_active_session(&mut snapshot);
+                }
+                self.show_start_page_when_no_live_sessions =
+                    snapshot.active_session_path.is_none() && snapshot.live_sessions.is_empty();
                 self.server.apply_snapshot(snapshot);
                 self.refresh_cached_hot_session_views();
                 self.restore_active_preview_if_snapshot_regressed(previous_active_session);
@@ -2717,6 +2752,8 @@ impl ShellState {
         match result {
             Ok((snapshot, message)) => {
                 let snapshot = self.reconcile_snapshot_for_request(request_id, snapshot);
+                self.show_start_page_when_no_live_sessions =
+                    snapshot.active_session_path.is_none() && snapshot.live_sessions.is_empty();
                 self.server.apply_snapshot(snapshot);
                 self.refresh_cached_hot_session_views();
                 self.restore_active_preview_if_snapshot_regressed(previous_active_session);
@@ -2769,7 +2806,14 @@ impl ShellState {
         let previous_active_session = self.server.active_session().cloned();
         match result {
             Ok((snapshot, message)) => {
-                let snapshot = self.reconcile_snapshot_for_request(request_id, snapshot);
+                let mut snapshot = self.reconcile_snapshot_for_request(request_id, snapshot);
+                if snapshot_has_only_stored_active_session(&snapshot)
+                    && self.show_start_page_when_no_live_sessions
+                {
+                    clear_stored_only_active_session(&mut snapshot);
+                }
+                self.show_start_page_when_no_live_sessions =
+                    snapshot.active_session_path.is_none() && snapshot.live_sessions.is_empty();
                 self.server.apply_snapshot(snapshot);
                 self.refresh_cached_hot_session_views();
                 self.restore_active_preview_if_snapshot_regressed(previous_active_session);
@@ -3472,6 +3516,7 @@ impl ShellState {
             }
             BrowserRowKind::Session | BrowserRowKind::Document => {
                 self.context_menu_row = None;
+                self.show_start_page_when_no_live_sessions = false;
                 self.clear_user_collapsed_synthetic_ancestors_for_path(&row.full_path);
                 self.apply_daemon_snapshot_result(open_stored_session(
                     &self.bootstrap.server_endpoint,
@@ -8745,6 +8790,7 @@ fn spawn_focus_live_session_row_retry(
         },
     );
     state.with_mut(|shell| {
+        shell.show_start_page_when_no_live_sessions = false;
         shell.latest_open_request_id = shell.latest_open_request_id.saturating_add(1);
         open_request_id = shell.latest_open_request_id;
         retained_live_terminal = mode == WorkspaceViewMode::Terminal
@@ -8912,6 +8958,7 @@ fn spawn_open_session_row_with_mode_retry_inner(
         .flatten();
     if prefer_terminal && state.with(|shell| session_is_hot_terminal_row(shell, &row)) {
         state.with_mut(|shell| {
+            shell.show_start_page_when_no_live_sessions = false;
             shell.latest_open_request_id = shell.latest_open_request_id.saturating_add(1);
             shell.selected_tree_paths.clear();
             shell.selected_tree_paths.insert(row.full_path.clone());
@@ -8956,6 +9003,7 @@ fn spawn_open_session_row_with_mode_retry_inner(
         },
     );
     state.with_mut(|shell| {
+        shell.show_start_page_when_no_live_sessions = false;
         shell.latest_open_request_id = shell.latest_open_request_id.saturating_add(1);
         open_request_id = shell.latest_open_request_id;
         shell.selected_tree_paths.clear();
@@ -10171,6 +10219,89 @@ fn preferred_agent_session_kind(settings: &AppSettings) -> SessionKind {
     match settings.default_agent_profile {
         AgentSessionProfile::CodexLiteLlm => SessionKind::CodexLiteLlm,
         AgentSessionProfile::Codex => SessionKind::Codex,
+    }
+}
+
+fn spawn_start_preferred_agent_session(mut state: Signal<ShellState>) {
+    let preferred_agent_kind = preferred_agent_session_kind(&state.read().settings);
+    let launch_context = state.with_mut(|shell| {
+        shell.show_start_page_when_no_live_sessions = false;
+        shell.clear_alt_overlay();
+        shell.close_titlebar_new_menu();
+        current_agent_session_launch_context(shell, preferred_agent_kind)
+    });
+    match launch_context {
+        TerminalLaunchContext::Local { cwd, title_hint } => {
+            spawn_server_snapshot_action(state, "starting session".to_string(), move |endpoint| {
+                start_local_session_at(
+                    &endpoint,
+                    preferred_agent_kind,
+                    cwd.as_deref(),
+                    title_hint.as_deref(),
+                )
+            });
+        }
+        TerminalLaunchContext::Remote {
+            ssh_target,
+            prefix,
+            cwd,
+            title_hint,
+        } => {
+            spawn_server_snapshot_action(
+                state,
+                "starting remote session".to_string(),
+                move |endpoint| {
+                    start_remote_codex_session_at(
+                        &endpoint,
+                        &ssh_target,
+                        prefix.as_deref(),
+                        cwd.as_deref(),
+                        title_hint.as_deref(),
+                    )
+                },
+            );
+        }
+    }
+}
+
+fn spawn_start_terminal_session(mut state: Signal<ShellState>) {
+    let launch_context = state.with_mut(|shell| {
+        shell.show_start_page_when_no_live_sessions = false;
+        shell.clear_alt_overlay();
+        shell.close_titlebar_new_menu();
+        terminal_launch_context(shell)
+    });
+    match launch_context {
+        TerminalLaunchContext::Local { cwd, title_hint } => {
+            spawn_server_snapshot_action(state, "starting terminal".to_string(), move |endpoint| {
+                start_local_session_at(
+                    &endpoint,
+                    SessionKind::Shell,
+                    cwd.as_deref(),
+                    title_hint.as_deref(),
+                )
+            });
+        }
+        TerminalLaunchContext::Remote {
+            ssh_target,
+            prefix,
+            cwd,
+            title_hint,
+        } => {
+            spawn_server_snapshot_action(
+                state,
+                "starting ssh terminal".to_string(),
+                move |endpoint| {
+                    start_ssh_session_at(
+                        &endpoint,
+                        &ssh_target,
+                        prefix.as_deref(),
+                        cwd.as_deref(),
+                        title_hint.as_deref(),
+                    )
+                },
+            );
+        }
     }
 }
 
@@ -12614,91 +12745,10 @@ fn execute_alt_overlay_action(mut state: Signal<ShellState>, action: AltOverlayA
             shell.titlebar_new_menu_open = true;
         }),
         AltOverlayAction::StartSession => {
-            let preferred_agent_kind = preferred_agent_session_kind(&state.read().settings);
-            let launch_context = state.with_mut(|shell| {
-                shell.clear_alt_overlay();
-                shell.close_titlebar_new_menu();
-                current_agent_session_launch_context(shell, preferred_agent_kind)
-            });
-            match launch_context {
-                TerminalLaunchContext::Local { cwd, title_hint } => {
-                    spawn_server_snapshot_action(
-                        state,
-                        "starting session".to_string(),
-                        move |endpoint| {
-                            start_local_session_at(
-                                &endpoint,
-                                preferred_agent_kind,
-                                cwd.as_deref(),
-                                title_hint.as_deref(),
-                            )
-                        },
-                    );
-                }
-                TerminalLaunchContext::Remote {
-                    ssh_target,
-                    prefix,
-                    cwd,
-                    title_hint,
-                } => {
-                    spawn_server_snapshot_action(
-                        state,
-                        "starting remote session".to_string(),
-                        move |endpoint| {
-                            start_remote_codex_session_at(
-                                &endpoint,
-                                &ssh_target,
-                                prefix.as_deref(),
-                                cwd.as_deref(),
-                                title_hint.as_deref(),
-                            )
-                        },
-                    );
-                }
-            }
+            spawn_start_preferred_agent_session(state);
         }
         AltOverlayAction::StartTerminal => {
-            let launch_context = state.with_mut(|shell| {
-                shell.clear_alt_overlay();
-                shell.close_titlebar_new_menu();
-                terminal_launch_context(shell)
-            });
-            match launch_context {
-                TerminalLaunchContext::Local { cwd, title_hint } => {
-                    spawn_server_snapshot_action(
-                        state,
-                        "starting terminal".to_string(),
-                        move |endpoint| {
-                            start_local_session_at(
-                                &endpoint,
-                                SessionKind::Shell,
-                                cwd.as_deref(),
-                                title_hint.as_deref(),
-                            )
-                        },
-                    );
-                }
-                TerminalLaunchContext::Remote {
-                    ssh_target,
-                    prefix,
-                    cwd,
-                    title_hint,
-                } => {
-                    spawn_server_snapshot_action(
-                        state,
-                        "starting ssh terminal".to_string(),
-                        move |endpoint| {
-                            start_ssh_session_at(
-                                &endpoint,
-                                &ssh_target,
-                                prefix.as_deref(),
-                                cwd.as_deref(),
-                                title_hint.as_deref(),
-                            )
-                        },
-                    );
-                }
-            }
+            spawn_start_terminal_session(state);
         }
         AltOverlayAction::CreatePaper => {
             state.with_mut(|shell| {
@@ -19250,6 +19300,14 @@ async fn capture_dom_debug_snapshot_for(active_session_path: Option<&str>) -> Va
                 .filter((section) => section.height > 0 && section.top < previewViewportBottom && section.top + section.height > previewViewportTop);
             const previewAssistantEntries = previewEntries.filter((entry) => entry.getAttribute('data-preview-tone') === 'assistant');
             const previewFallbackContext = (previewScroller || document).querySelector('[data-preview-fallback-context="1"]');
+            const startPage = document.querySelector('[data-yggterm-start-page="1"]');
+            const startPageRecentSessions = Array.from(document.querySelectorAll('[data-yggterm-start-page-recent-session="1"]'))
+                .map((node) => ({
+                    session_path: String(node.getAttribute('data-session-path') || ''),
+                    text: String(node.innerText || '').trim().slice(0, 240),
+                    rect: rectSummary(node),
+                }))
+                .filter((entry) => entry.session_path.length > 0);
             const previewRawTimestamps = previewEntries
                 .map((entry) => String(entry.getAttribute('data-preview-raw-timestamp') || '').trim())
                 .filter(Boolean)
@@ -19311,6 +19369,10 @@ async fn capture_dom_debug_snapshot_for(active_session_path: Option<&str>) -> Va
                 preview_rendered_sections: previewRenderedSections.slice(0, 12),
                 preview_fallback_context_visible: Boolean(previewFallbackContext),
                 preview_fallback_context_text: String(previewFallbackContext?.innerText || "").trim().slice(0, 480),
+                start_page_visible: Boolean(startPage),
+                start_page_text_sample: String(startPage?.innerText || "").trim().slice(0, 480),
+                start_page_recent_count: Number(startPage?.getAttribute('data-yggterm-start-page-recent-count') || '0'),
+                start_page_recent_sessions: startPageRecentSessions.slice(0, 12),
                 preview_assistant_entry_count: previewAssistantEntries.length,
                 preview_font_family: previewFontFamily,
                 preview_raw_timestamps: previewRawTimestamps,
@@ -19778,6 +19840,14 @@ async fn capture_dom_debug_snapshot_basic_for(active_session_path: Option<&str>)
                 })
                 .filter((section) => section.height > 0 && section.top < previewViewportBottom && section.top + section.height > previewViewportTop);
             const previewFallbackContext = (previewScroller || document).querySelector('[data-preview-fallback-context="1"]');
+            const startPage = document.querySelector('[data-yggterm-start-page="1"]');
+            const startPageRecentSessions = Array.from(document.querySelectorAll('[data-yggterm-start-page-recent-session="1"]'))
+                .map((node) => ({
+                    session_path: String(node.getAttribute('data-session-path') || ''),
+                    text: String(node.innerText || '').trim().slice(0, 240),
+                    rect: rectSummary(node),
+                }))
+                .filter((entry) => entry.session_path.length > 0);
             const previewTimestampLabels = Array.from((previewScroller || document).querySelectorAll('[data-preview-timestamp="1"] div:first-child'))
                 .map((node) => String(node.textContent || '').trim())
                 .filter(Boolean)
@@ -20275,6 +20345,10 @@ async fn capture_dom_debug_snapshot_basic_for(active_session_path: Option<&str>)
                 preview_rendered_sections: previewRenderedSections.slice(0, 12),
                 preview_fallback_context_visible: Boolean(previewFallbackContext),
                 preview_fallback_context_text: String(previewFallbackContext?.innerText || "").trim().slice(0, 480),
+                start_page_visible: Boolean(startPage),
+                start_page_text_sample: String(startPage?.innerText || "").trim().slice(0, 480),
+                start_page_recent_count: Number(startPage?.getAttribute('data-yggterm-start-page-recent-count') || '0'),
+                start_page_recent_sessions: startPageRecentSessions.slice(0, 12),
                 preview_timestamp_labels: previewTimestampLabels,
                 sidebar_rect: sidebarRect,
                 sidebar_scroll_top: sidebarScroller ? Math.round(sidebarScroller.scrollTop) : null,
@@ -29234,7 +29308,10 @@ fn MainSurface(
         }
     } else {
         rsx! {
-            EmptyState { palette: snapshot.palette }
+            StartPage {
+                snapshot: snapshot.clone(),
+                state,
+            }
         }
     };
     rsx! {
@@ -40161,24 +40238,187 @@ fn TerminalCard(title: String, subtitle: String, lines: Vec<String>, palette: Pa
         }
     }
 }
+fn start_page_recent_rows(snapshot: &RenderSnapshot) -> Vec<BrowserRow> {
+    let mut seen = HashSet::<String>::new();
+    snapshot
+        .rows
+        .iter()
+        .filter(|row| matches!(row.kind, BrowserRowKind::Session | BrowserRowKind::Document))
+        .filter(|row| {
+            row.kind == BrowserRowKind::Session
+                || row.document_kind == Some(WorkspaceDocumentKind::TerminalRecipe)
+        })
+        .filter(|row| {
+            snapshot
+                .active_session_path
+                .as_deref()
+                .is_none_or(|active| active != row.full_path)
+        })
+        .filter(|row| seen.insert(row.full_path.clone()))
+        .take(6)
+        .cloned()
+        .collect()
+}
+
+fn start_page_row_context(row: &BrowserRow) -> String {
+    if !row.detail_label.trim().is_empty() {
+        return row.detail_label.clone();
+    }
+    if let Some(cwd) = row
+        .session_cwd
+        .as_ref()
+        .filter(|cwd| !cwd.trim().is_empty())
+    {
+        return cwd.clone();
+    }
+    if !row.host_label.trim().is_empty() {
+        return row.host_label.clone();
+    }
+    match row.kind {
+        BrowserRowKind::Document => "Saved workspace item".to_string(),
+        _ => "Saved terminal session".to_string(),
+    }
+}
+
 #[component]
-fn EmptyState(palette: Palette) -> Element {
+fn StartPage(snapshot: SharedSnapshot, state: Signal<ShellState>) -> Element {
+    let palette = snapshot.palette;
+    let recent_rows = start_page_recent_rows(snapshot.as_ref());
+    let recent_count = recent_rows.len();
+    let quick_button_style = format!(
+        "display:inline-flex; align-items:center; justify-content:center; gap:8px; min-height:34px; \
+         padding:0 13px; border:none; border-radius:8px; background:{}; color:{}; \
+         font-size:12px; font-weight:700; box-shadow:inset 0 0 0 1px rgba(120,142,166,0.16);",
+        palette.panel_alt, palette.text
+    );
+    let primary_button_style = format!(
+        "display:inline-flex; align-items:center; justify-content:center; gap:8px; min-height:34px; \
+         padding:0 13px; border:none; border-radius:8px; background:{}; color:white; \
+         font-size:12px; font-weight:800; box-shadow:0 8px 20px rgba(37,99,235,0.14);",
+        palette.accent
+    );
     rsx! {
         div {
-            style: "display:flex; align-items:center; justify-content:center; height:100%;",
+            "data-yggterm-start-page": "1",
+            "data-yggterm-start-page-recent-count": "{recent_count}",
+            style: "display:flex; align-items:stretch; justify-content:center; width:100%; height:100%; overflow:auto;",
             div {
-                style: format!(
-                    "display:flex; flex-direction:column; align-items:center; gap:8px; background:{}; \
-                     border:none; border-radius:16px; padding:22px 26px; box-shadow: inset 0 0 0 1px rgba(255,255,255,0.42);",
-                    palette.panel_alt
-                ),
+                style: "display:flex; flex-direction:column; gap:24px; width:min(880px, 100%); margin:auto; padding:44px 42px;",
                 div {
-                    style: format!("font-size:14px; font-weight:700; color:{};", palette.text),
-                    "No Session Selected"
+                    style: "display:flex; flex-direction:column; gap:10px;",
+                    div {
+                        style: format!("font-size:13px; line-height:1.2; font-weight:800; color:{};", palette.accent),
+                        "Yggterm"
+                    }
+                    div {
+                        style: format!("font-size:28px; line-height:1.16; font-weight:800; color:{}; letter-spacing:0;", palette.text),
+                        "Start a session"
+                    }
+                    div {
+                        style: format!("font-size:13px; line-height:1.65; color:{}; max-width:620px;", palette.muted),
+                        "Open recent work, start a local terminal, or connect to a remote machine."
+                    }
                 }
                 div {
-                    style: format!("font-size:12px; color:{};", palette.muted),
-                    "Choose a stored Codex session or connect over SSH from the sidebar."
+                    style: "display:flex; flex-wrap:wrap; gap:10px;",
+                    button {
+                        "data-yggterm-start-action": "agent",
+                        style: "{primary_button_style}",
+                        onclick: move |_| spawn_start_preferred_agent_session(state),
+                        "New Codex Session"
+                    }
+                    button {
+                        "data-yggterm-start-action": "terminal",
+                        style: "{quick_button_style}",
+                        onclick: move |_| spawn_start_terminal_session(state),
+                        "Local Terminal"
+                    }
+                    button {
+                        "data-yggterm-start-action": "ssh",
+                        style: "{quick_button_style}",
+                        onclick: move |_| {
+                            state.with_mut(|shell| shell.toggle_connect_panel());
+                        },
+                        "Connect SSH"
+                    }
+                }
+                div {
+                    style: "display:flex; flex-direction:column; gap:10px; min-width:0;",
+                    div {
+                        style: "display:flex; align-items:center; justify-content:space-between; gap:16px;",
+                        div {
+                            style: format!("font-size:12px; font-weight:800; color:{}; text-transform:uppercase; letter-spacing:0;", palette.muted),
+                            "Recent work"
+                        }
+                        div {
+                            style: format!("font-size:12px; color:{};", palette.muted),
+                            "{recent_count} shown"
+                        }
+                    }
+                    if recent_rows.is_empty() {
+                        div {
+                            "data-yggterm-start-page-empty-recent": "1",
+                            style: format!(
+                                "display:flex; align-items:center; min-height:72px; padding:18px; border-radius:8px; \
+                                 background:{}; color:{}; box-shadow:inset 0 0 0 1px rgba(120,142,166,0.14); font-size:13px;",
+                                palette.panel_alt, palette.muted
+                            ),
+                            "No saved sessions yet. Start a terminal or connect SSH."
+                        }
+                    }
+                    for row in recent_rows.into_iter() {
+                        {
+                            let row_for_click = row.clone();
+                            let context = start_page_row_context(&row);
+                            let host = if row.host_label.trim().is_empty() {
+                                "local".to_string()
+                            } else {
+                                row.host_label.clone()
+                            };
+                            rsx! {
+                                button {
+                                    "data-yggterm-start-page-recent-session": "1",
+                                    "data-session-path": "{row.full_path}",
+                                    style: format!(
+                                        "display:grid; grid-template-columns:minmax(0,1fr) auto; gap:14px; align-items:center; width:100%; text-align:left; \
+                                         border:none; border-radius:8px; padding:14px 15px; background:{}; color:{}; \
+                                         box-shadow:inset 0 0 0 1px rgba(120,142,166,0.14);",
+                                        palette.panel_alt, palette.text
+                                    ),
+                                    onclick: move |_| spawn_open_session_row(state, row_for_click.clone()),
+                                    div {
+                                        style: "display:flex; flex-direction:column; gap:5px; min-width:0;",
+                                        div {
+                                            style: "display:flex; align-items:center; gap:8px; min-width:0;",
+                                            span {
+                                                style: format!("font-size:13px; line-height:1.3; font-weight:800; color:{}; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;", palette.text),
+                                                "{row.label}"
+                                            }
+                                            span {
+                                                style: format!("font-size:11px; line-height:1.3; color:{}; flex:0 0 auto;", palette.muted),
+                                                "{host}"
+                                            }
+                                        }
+                                        div {
+                                            style: format!(
+                                                "font-size:12px; line-height:1.45; color:{}; overflow:hidden; display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical;",
+                                                palette.muted
+                                            ),
+                                            "{context}"
+                                        }
+                                    }
+                                    div {
+                                        style: format!(
+                                            "display:inline-flex; align-items:center; justify-content:center; min-height:28px; padding:0 10px; \
+                                             border-radius:7px; background:{}; color:{}; font-size:12px; font-weight:800;",
+                                            palette.panel, palette.accent
+                                        ),
+                                        "Open"
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -51384,6 +51624,21 @@ Waiting for the remote terminal to paint...\n";
         }
     }
 
+    fn test_stored_only_snapshot_for_active_session(active_session_path: &str) -> ServerUiSnapshot {
+        let mut session = test_snapshot_session_view(active_session_path);
+        session.source = SessionSource::Stored;
+        session.terminal_process_id = None;
+        session.terminal_lines.clear();
+        ServerUiSnapshot {
+            active_session_path: Some(active_session_path.to_string()),
+            active_session: Some(session),
+            active_view_mode: WorkspaceViewMode::Rendered,
+            remote_machines: Vec::new(),
+            ssh_targets: Vec::new(),
+            live_sessions: Vec::new(),
+        }
+    }
+
     fn test_shell_bootstrap_with_active_session(active_session_path: &str) -> ShellBootstrap {
         let active_tree = SessionNode {
             kind: SessionNodeKind::CodexSession,
@@ -54255,6 +54510,92 @@ Waiting for the remote terminal to paint...\n";
         let snapshot = shell.snapshot();
         assert!(snapshot.retained_terminal_sessions.is_empty());
         assert_eq!(snapshot.active_session_path.as_deref(), Some(session_path));
+    }
+
+    #[test]
+    fn initial_stored_only_active_session_shows_start_page() {
+        let session_path = "remote-session://dev/startup-stored";
+        let mut bootstrap = test_shell_bootstrap_with_active_session(session_path);
+        bootstrap.initial_server_snapshot =
+            Some(test_stored_only_snapshot_for_active_session(session_path));
+        bootstrap.refresh_server_after_launch = false;
+
+        let shell = ShellState::new(bootstrap);
+        let snapshot = shell.snapshot();
+
+        assert_eq!(shell.server.active_session_path(), None);
+        assert!(snapshot.active_session.is_none());
+        assert_eq!(snapshot.active_view_mode, WorkspaceViewMode::Rendered);
+        assert!(
+            start_page_recent_rows(&snapshot)
+                .iter()
+                .any(|row| row.full_path == session_path)
+        );
+    }
+
+    #[test]
+    fn background_stored_only_snapshot_does_not_replace_start_page() {
+        let session_path = "remote-session://dev/background-stored";
+        let mut bootstrap = test_shell_bootstrap_with_active_session(session_path);
+        bootstrap.initial_server_snapshot = None;
+        bootstrap.refresh_server_after_launch = true;
+        let mut shell = ShellState::new(bootstrap);
+
+        shell.apply_daemon_snapshot_result(Ok((
+            test_stored_only_snapshot_for_active_session(session_path),
+            Some("snapshot applied".to_string()),
+        )));
+
+        assert_eq!(shell.server.active_session_path(), None);
+        assert!(shell.snapshot().active_session.is_none());
+    }
+
+    #[test]
+    fn initial_empty_server_snapshot_keeps_start_page_guard() {
+        let session_path = "remote-session://dev/initial-empty";
+        let mut bootstrap = test_shell_bootstrap_with_active_session(session_path);
+        bootstrap.initial_server_snapshot = Some(ServerUiSnapshot {
+            active_session_path: None,
+            active_session: None,
+            active_view_mode: WorkspaceViewMode::Rendered,
+            remote_machines: Vec::new(),
+            ssh_targets: Vec::new(),
+            live_sessions: Vec::new(),
+        });
+        bootstrap.refresh_server_after_launch = true;
+        let mut shell = ShellState::new(bootstrap);
+
+        assert!(shell.show_start_page_when_no_live_sessions);
+
+        shell.apply_daemon_snapshot_result(Ok((
+            test_stored_only_snapshot_for_active_session(session_path),
+            Some("background snapshot applied".to_string()),
+        )));
+
+        assert_eq!(shell.server.active_session_path(), None);
+        assert!(shell.snapshot().active_session.is_none());
+    }
+
+    #[test]
+    fn explicitly_opened_stored_session_can_render_preview_without_live_sessions() {
+        let session_path = "remote-session://dev/opened-stored";
+        let mut bootstrap = test_shell_bootstrap_with_active_session(session_path);
+        bootstrap.initial_server_snapshot = None;
+        bootstrap.refresh_server_after_launch = true;
+        let mut shell = ShellState::new(bootstrap);
+        shell.show_start_page_when_no_live_sessions = false;
+
+        shell.apply_daemon_snapshot_result(Ok((
+            test_stored_only_snapshot_for_active_session(session_path),
+            Some("opened stored session".to_string()),
+        )));
+
+        assert_eq!(shell.server.active_session_path(), Some(session_path));
+        assert!(shell.snapshot().active_session.is_some());
+        assert_eq!(
+            shell.snapshot().active_view_mode,
+            WorkspaceViewMode::Rendered
+        );
     }
 
     #[test]
