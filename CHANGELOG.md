@@ -4,6 +4,44 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+## 2.1.62
+
+### Changed
+
+- update the desktop runtime stack to Dioxus 0.7.6, Wry 0.55.0, Tao 0.35.0, WebKitGTK 2.0.2, reqwest 0.13.3, rusqlite 0.39.0, png 0.18, and refreshed transitive dependencies while preserving Yggterm's local Dioxus/Wry observability patches
+
+## 2.1.61
+
+### Added
+
+- add daemon-backed `yggterm-mock-cli` control scenarios for panic reports, listing reachable versioned servers, hot-restarting daemons with a replacement headless binary, waiting for a session to load, probing daemon latency, repeated interval monitoring, and refreshing managed Codex CLI tools
+- add a daemon `hot_restart` request that persists restart-safe state, acknowledges the client, exits the current listener, and spawns the requested replacement daemon
+
+### Changed
+
+- run a best-effort managed Codex CLI refresh/check during release packaging, with `YGGTERM_RELEASE_CODEX_REFRESH=0` as the opt-out
+
+## 2.1.60
+
+### Fixed
+
+- prevent retained remote terminal text from being treated as an interactive prompt, so stale Codex output cannot clear the resume toast or re-enable input before a prompt-ready surface is visible
+- add a remote-side non-blocking scan lock and keep “scan already in progress” out of the Python fallback path, preventing repeated remote refreshes from piling up SSH scan processes
+- stop Linux legacy-daemon cleanup from treating a bare versioned socket as live runtime ownership while still preserving daemons with active bridges or terminal runtimes
+- bound daemon request socket IO so status/runtime probes against stale daemons fail instead of blocking scan and cleanup paths indefinitely
+
+## 2.1.59
+
+### Fixed
+
+- keep terminal input responsive when a child PTY stops accepting writes by moving blocking PTY writes off the daemon request thread and failing fast under sustained input backpressure
+- keep daemon `ping`, `status`, and terminal writes responsive while remote machine refreshes run by queueing slow SSH scans outside the daemon runtime lock
+- coalesce queued remote machine refreshes, time out hung remote scans, and cool down the shell retry loop so one offline or slow SSH target cannot spawn repeated background scans
+- let fresh local shell terminals become interactive as soon as the real prompt is visible, instead of holding input disabled behind a prompt-only readiness loop
+- keep the active terminal input-armed when passive side rails are open or the window-focus observer lags, while still avoiding forced autofocus unless the terminal actually owns focus
+- scope document-level clipboard paste handling to the active terminal host so settings/sidebar paste events cannot leak large payloads into a running terminal
+- keep the direct-install launcher path compatible with terminal focus/type/scroll/select app-control probes by exposing those actions through `yggterm-headless`
+
 ## 2.1.53
 
 ### Fixed

@@ -235,6 +235,7 @@ const BACKGROUND_REFRESH_NOTICE_MS: u64 = 12_000;
 const BACKGROUND_REFRESH_STARTUP_DEFER_MS: u64 = 120_000;
 const BACKGROUND_REFRESH_INTERACTIVE_DEFER_MS: u64 = 15_000;
 const BACKGROUND_REFRESH_POLL_MS: u64 = 15_000;
+const REMOTE_MACHINE_REFRESH_QUEUED_RETRY_MS: u64 = 60_000;
 const LIVE_SESSION_SNAPSHOT_TRIGGER_DEBOUNCE_MS: u64 = 360;
 const LIVE_SESSION_SNAPSHOT_BUSY_POLL_MS: u64 = 2_500;
 const LIVE_SESSION_SNAPSHOT_IDLE_POLL_MS: u64 = 60_000;
@@ -4998,6 +4999,30 @@ fn remote_resume_visual_reveal_has_post_attach_content(deferred_resume_output: &
         && !terminal_chunk_has_generic_codex_idle_footer(deferred_resume_output)
         && !terminal_chunk_tail_has_generic_codex_idle_footer(deferred_resume_output)
 }
+fn terminal_surface_has_prompt_ready_text(text: &str) -> bool {
+    let trimmed = text.trim();
+    !trimmed.is_empty()
+        && (terminal_chunk_has_prompt_output(trimmed)
+            || terminal_chunk_has_codex_prompt_output(trimmed))
+}
+fn retained_remote_surface_has_non_prompt_text(
+    host_health_cursor_line_text: &str,
+    host_health_text_tail: &str,
+) -> bool {
+    let host_surface_text = if !host_health_text_tail.trim().is_empty() {
+        host_health_text_tail
+    } else {
+        host_health_cursor_line_text
+    };
+    let trimmed = host_surface_text.trim();
+    !trimmed.is_empty()
+        && !terminal_surface_has_prompt_ready_text(host_surface_text)
+        && !terminal_chunk_is_transport_error(host_surface_text)
+        && !terminal_chunk_is_loading_placeholder(host_surface_text)
+        && !terminal_chunk_is_transcript_browser(host_surface_text)
+        && !terminal_chunk_is_saved_transcript_prefill(host_surface_text)
+        && !terminal_chunk_is_low_signal_terminal_noise(host_surface_text)
+}
 fn remote_resume_visual_reveal_output_is_acceptable(
     deferred_resume_output: &str,
     host_health_cursor_line_text: &str,
@@ -5018,6 +5043,7 @@ fn remote_resume_visual_reveal_output_is_acceptable(
     };
     let host_surface_trimmed = host_surface_text.trim();
     !host_surface_trimmed.is_empty()
+        && terminal_surface_has_prompt_ready_text(host_surface_text)
         && !terminal_chunk_is_transport_error(host_surface_text)
         && !terminal_chunk_is_loading_placeholder(host_surface_text)
         && !terminal_chunk_is_transcript_browser(host_surface_text)
@@ -5170,6 +5196,14 @@ fn quiet_retained_remote_surface_ready(
     let cursor_has_text = !host_health_cursor_line_text.trim().is_empty();
     let tail_has_text = !host_health_text_tail.trim().is_empty();
     if !(runtime_running || cursor_has_text) || !(cursor_has_text || tail_has_text) {
+        return false;
+    }
+    let host_surface_text = if tail_has_text {
+        host_health_text_tail
+    } else {
+        host_health_cursor_line_text
+    };
+    if !terminal_surface_has_prompt_ready_text(host_surface_text) {
         return false;
     }
     if saw_prompt_only_surface && !runtime_running {
@@ -8345,9 +8379,18 @@ fn spawn_background_remote_machine_refresh(state: Signal<ShellState>, machine_ke
                         );
                         return;
                     }
-                    shell
-                        .remote_machine_refresh_retry_after_ms
-                        .remove(&machine_key);
+                    let queued_or_running =
+                        remote_machine_refresh_message_keeps_client_cooldown(message.as_deref());
+                    if queued_or_running {
+                        shell.remote_machine_refresh_retry_after_ms.insert(
+                            machine_key.clone(),
+                            current_millis().saturating_add(REMOTE_MACHINE_REFRESH_QUEUED_RETRY_MS),
+                        );
+                    } else {
+                        shell
+                            .remote_machine_refresh_retry_after_ms
+                            .remove(&machine_key);
+                    }
                     preserve_client_focus_for_background_snapshot(shell, &mut snapshot);
                     shell.server.apply_snapshot(snapshot);
                     shell.refresh_search_state("remote_machine_refresh_complete");
@@ -8374,6 +8417,11 @@ fn spawn_background_remote_machine_refresh(state: Signal<ShellState>, machine_ke
         maybe_spawn_missing_remote_machine_refreshes(state);
         maybe_spawn_missing_managed_cli_refreshes(state);
     });
+}
+fn remote_machine_refresh_message_keeps_client_cooldown(message: Option<&str>) -> bool {
+    message.is_some_and(|value| {
+        value.starts_with("queued refresh ") || value.starts_with("refresh already in progress ")
+    })
 }
 fn pending_remote_machine_refreshes(
     remote_machines: &[RemoteMachineSnapshot],
@@ -13300,7 +13348,12 @@ fn decode_png_rgba(png_bytes: &[u8]) -> Result<(Vec<u8>, usize, usize)> {
     let mut reader = decoder
         .read_info()
         .map_err(|error| anyhow!("failed to decode clipboard PNG metadata: {error}"))?;
-    let mut buffer = vec![0; reader.output_buffer_size()];
+    let mut buffer = vec![
+        0;
+        reader
+            .output_buffer_size()
+            .context("reading clipboard PNG output buffer size")?
+    ];
     let info = reader
         .next_frame(&mut buffer)
         .map_err(|error| anyhow!("failed to decode clipboard PNG pixels: {error}"))?;
@@ -31408,12 +31461,12 @@ fn TerminalCanvas(
             let placeholder = placeholder;
             let trace_home = trace_home;
             let mut state = state;
-            let mut terminal_has_meaningful_output = terminal_has_meaningful_output;
-            let mut terminal_prompt_only = terminal_prompt_only;
-            let mut terminal_overlay_dismissed = terminal_overlay_dismissed;
-            let mut terminal_live_host_connected = terminal_live_host_connected;
-            let mut terminal_resume_surface_staged = terminal_resume_surface_staged;
-            let mut terminal_resume_overlay_excerpt = terminal_resume_overlay_excerpt;
+            let terminal_has_meaningful_output = terminal_has_meaningful_output;
+            let terminal_prompt_only = terminal_prompt_only;
+            let terminal_overlay_dismissed = terminal_overlay_dismissed;
+            let terminal_live_host_connected = terminal_live_host_connected;
+            let terminal_resume_surface_staged = terminal_resume_surface_staged;
+            let terminal_resume_overlay_excerpt = terminal_resume_overlay_excerpt;
             let mut resume_overlay_failed = resume_overlay_failed;
             let mut resume_overlay_timed_out = resume_overlay_timed_out;
             let session_host_label = session_host_label;
@@ -32297,6 +32350,62 @@ fn TerminalCanvas(
                                     );
                                     maybe_spawn_missing_remote_machine_refreshes(state);
                                     maybe_spawn_missing_managed_cli_refreshes(state);
+                                    continue;
+                                }
+                                if is_remote_resume_session
+                                    && (poisoned_by_retry || !ready_attempt_from_shell)
+                                    && terminal_paint_seen
+                                    && terminal_geometry_ready
+                                    && !has_transport_error
+                                    && retained_remote_surface_has_non_prompt_text(
+                                        &cursor_line_text,
+                                        &text_tail,
+                                    )
+                                {
+                                    append_trace_event(
+                                        &trace_home,
+                                        "ui",
+                                        "terminal_mount",
+                                        "retained_non_prompt_surface_wait",
+                                        json!({
+                                            "session_path": session_path.clone(),
+                                            "cursor_line_text": cursor_line_text,
+                                            "text_tail": text_tail,
+                                            "rows": rows,
+                                            "blank_rows_below_cursor": blank_rows_below_cursor,
+                                        }),
+                                    );
+                                    let _ = safe_shell_mut(
+                                        state,
+                                        "terminal_attach_wait_for_prompt_ready_surface",
+                                        |shell| {
+                                            shell
+                                                .terminal_attach_in_flight
+                                                .insert(session_path.clone());
+                                            shell.terminal_resume_ready_paths.remove(&session_path);
+                                        },
+                                    );
+                                    set_signal_if_changed(terminal_overlay_dismissed, false);
+                                    set_signal_if_changed(terminal_live_host_connected, false);
+                                    set_signal_if_changed(resume_overlay_failed, false);
+                                    set_signal_if_changed(resume_overlay_timed_out, false);
+                                    let _ = eval.send(TerminalJsCommand::SetInputEnabled {
+                                        enabled: false,
+                                        focus: false,
+                                    });
+                                    upsert_terminal_resume_notification(
+                                        state,
+                                        &session_path,
+                                        NotificationTone::Warning,
+                                        "Restoring Remote Terminal",
+                                        format!(
+                                            "Yggterm is waiting for a prompt-ready live terminal on {} before accepting input.",
+                                            session_host_label
+                                        ),
+                                    );
+                                    read_poll_ms = 120;
+                                    next_read_deadline = tokio::time::Instant::now()
+                                        + Duration::from_millis(read_poll_ms);
                                     continue;
                                 }
                                 if stale_remote_resume_retry_blank_surface_should_recover(
@@ -35913,12 +36022,21 @@ fn apply_active_terminal_zoom(state: Signal<ShellState>) {
     ));
 }
 fn sync_active_terminal_input_policy(state: Signal<ShellState>) {
-    let (terminal_input_override_active, window_focused, snapshot) = {
+    let (terminal_input_override_active, window_focused, snapshot, remote_resume_input_ready) = {
         let shell = state.read();
+        let snapshot = shell.snapshot();
+        let remote_resume_input_ready = snapshot.active_session.as_ref().is_none_or(|session| {
+            !is_remote_resume_agent_session(session)
+                || shell
+                    .terminal_resume_ready_paths
+                    .contains(&session.session_path)
+                || shell.terminal_session_has_ready_attempt(&session.session_path)
+        });
         (
             shell.terminal_input_override_active,
             shell.window_focused,
-            shell.snapshot(),
+            snapshot,
+            remote_resume_input_ready,
         )
     };
     if snapshot.active_view_mode != WorkspaceViewMode::Terminal {
@@ -35929,7 +36047,7 @@ fn sync_active_terminal_input_policy(state: Signal<ShellState>) {
         let _ = document::eval(&terminal_clear_input_policy_script());
         return;
     };
-    let (allow_input, focus_input) = terminal_runtime_input_policy(
+    let (mut allow_input, mut focus_input) = terminal_runtime_input_policy(
         snapshot.active_view_mode,
         snapshot.active_session_path.as_deref(),
         &session.session_path,
@@ -35945,6 +36063,10 @@ fn sync_active_terminal_input_policy(state: Signal<ShellState>) {
         window_focused,
         terminal_input_override_active,
     );
+    if !remote_resume_input_ready {
+        allow_input = false;
+        focus_input = false;
+    }
     let _ = document::eval(&terminal_set_input_policy_script_for_active_session(
         &session.session_path,
         allow_input,
@@ -36357,7 +36479,7 @@ fn terminal_runtime_input_policy(
     terminal_input_override_active: bool,
 ) -> (bool, bool) {
     let right_panel_allows_input =
-        terminal_input_override_active || right_panel_allows_terminal_autofocus(right_panel_mode);
+        terminal_input_override_active || right_panel_allows_terminal_input(right_panel_mode);
     let terminal_selected = terminal_should_accept_input(
         active_view_mode,
         active_session_path,
@@ -36367,10 +36489,12 @@ fn terminal_runtime_input_policy(
         titlebar_transient_open,
         tree_rename_active,
     );
-    let focus_context_allows_input = window_focused || terminal_input_override_active;
-    let allow_input = focus_context_allows_input && terminal_selected && right_panel_allows_input;
-    let focus_input = allow_input;
+    let allow_input = terminal_selected && right_panel_allows_input;
+    let focus_input = allow_input && (window_focused || terminal_input_override_active);
     (allow_input, focus_input)
+}
+fn right_panel_allows_terminal_input(right_panel_mode: RightPanelMode) -> bool {
+    !matches!(right_panel_mode, RightPanelMode::Connect)
 }
 fn terminal_input_override_for_right_panel_mode(right_panel_mode: RightPanelMode) -> bool {
     let _ = right_panel_mode;
@@ -38143,8 +38267,30 @@ fn terminal_eval_script_with_canvas_renderer(
         attachHostInteractions(host);
         let pendingClipboardPasteToken = 0;
         const terminalNativePasteDedupeMs = 2500;
+        const pasteEventBelongsToTerminal = (event) => {{
+            try {{
+                if (!event || !inputEnabled || !hostOwnsActiveTerminalInput()) {{
+                    return false;
+                }}
+                const target = event.target || null;
+                const active = document.activeElement;
+                const helperTextarea = host.querySelector('.xterm-helper-textarea');
+                if (target && host.contains(target)) {{
+                    return true;
+                }}
+                if (helperTextarea && active === helperTextarea) {{
+                    return true;
+                }}
+                if (active === host || (term && term.textarea && active === term.textarea)) {{
+                    return true;
+                }}
+                return false;
+            }} catch (_error) {{
+                return false;
+            }}
+        }};
         const handleClipboardPaste = (event) => {{
-            if (!inputEnabled || !event) {{
+            if (!pasteEventBelongsToTerminal(event)) {{
                 return;
             }}
             try {{
@@ -43618,7 +43764,7 @@ mod tests {
         );
     }
     #[test]
-    fn terminal_runtime_input_policy_only_requires_viewport_override_for_focusable_side_rails() {
+    fn terminal_runtime_input_policy_keeps_passive_settings_rail_live() {
         assert_eq!(
             terminal_runtime_input_policy(
                 WorkspaceViewMode::Terminal,
@@ -43632,7 +43778,7 @@ mod tests {
                 true,
                 false,
             ),
-            (false, false)
+            (true, true)
         );
         assert_eq!(
             terminal_runtime_input_policy(
@@ -43669,6 +43815,21 @@ mod tests {
                 WorkspaceViewMode::Terminal,
                 Some("local://shell"),
                 "local://shell",
+                RightPanelMode::Connect,
+                false,
+                false,
+                false,
+                false,
+                true,
+                true,
+            ),
+            (true, true)
+        );
+        assert_eq!(
+            terminal_runtime_input_policy(
+                WorkspaceViewMode::Terminal,
+                Some("local://shell"),
+                "local://shell",
                 RightPanelMode::Settings,
                 true,
                 false,
@@ -43696,7 +43857,7 @@ mod tests {
         );
     }
     #[test]
-    fn terminal_runtime_input_policy_releases_input_while_window_unfocused() {
+    fn terminal_runtime_input_policy_arms_input_without_focusing_unfocused_window() {
         assert_eq!(
             terminal_runtime_input_policy(
                 WorkspaceViewMode::Terminal,
@@ -43710,7 +43871,7 @@ mod tests {
                 false,
                 false,
             ),
-            (false, false)
+            (true, false)
         );
     }
     #[test]
@@ -44300,6 +44461,12 @@ mod tests {
         assert!(script.contains("event.__yggtermHandledPaste = true;"));
         assert!(script.contains("let pendingClipboardPasteToken = 0;"));
         assert!(script.contains("const terminalNativePasteDedupeMs = 2500;"));
+        assert!(script.contains("const pasteEventBelongsToTerminal = (event) => {"));
+        assert!(
+            script.contains("if (!event || !inputEnabled || !hostOwnsActiveTerminalInput()) {")
+        );
+        assert!(script.contains("if (target && host.contains(target)) {"));
+        assert!(script.contains("if (!pasteEventBelongsToTerminal(event)) {"));
         assert!(script.contains("const pasteToken = pendingClipboardPasteToken + 1;"));
         assert!(script.contains("if (pasteToken !== pendingClipboardPasteToken) {"));
         assert!(script.contains("window.__yggtermLastPasteEventAtMs = Date.now();"));
@@ -48610,6 +48777,19 @@ mod tests {
         assert!(pending.is_empty());
     }
     #[test]
+    fn remote_machine_refresh_queued_messages_keep_client_cooldown() {
+        assert!(remote_machine_refresh_message_keeps_client_cooldown(Some(
+            "queued refresh dev"
+        )));
+        assert!(remote_machine_refresh_message_keeps_client_cooldown(Some(
+            "refresh already in progress dev"
+        )));
+        assert!(!remote_machine_refresh_message_keeps_client_cooldown(Some(
+            "refreshed dev"
+        )));
+        assert!(!remote_machine_refresh_message_keeps_client_cooldown(None));
+    }
+    #[test]
     fn pending_managed_cli_refreshes_include_local_and_new_machine() {
         let remote_machines = vec![RemoteMachineSnapshot {
             machine_key: "dev".to_string(),
@@ -49026,6 +49206,18 @@ Waiting for the remote terminal to paint...\n";
             false,
             "   \n",
             "",
+            "› Explain this codebase",
+            43,
+            1,
+        ));
+        assert!(!remote_resume_visual_reveal_can_complete(
+            true,
+            true,
+            true,
+            true,
+            false,
+            "   \n",
+            "",
             "Committed and pushed successfully.",
             43,
             1,
@@ -49112,6 +49304,21 @@ Waiting for the remote terminal to paint...\n";
         ));
     }
     #[test]
+    fn remote_resume_visual_reveal_rejects_stale_retained_handoff_tail() {
+        let stale_tail = "The final 2.1.59 artifacts are built. Before replacing the live jojo install, I’m taking one more runtime/install snapshot and recording the exact active GUI/daemon paths, then I’ll install only the new direct version and clean the queued stale scan processes.";
+        assert!(retained_remote_surface_has_non_prompt_text("", stale_tail));
+        assert!(!remote_resume_visual_reveal_output_is_acceptable(
+            "", "", stale_tail
+        ));
+        assert!(!remote_resume_visual_reveal_can_complete(
+            true, true, true, true, false, "", "", stale_tail, 43, 1,
+        ));
+        assert!(!retained_remote_surface_has_non_prompt_text(
+            "› Explain this codebase",
+            ""
+        ));
+    }
+    #[test]
     fn stale_remote_resume_retry_clear_rejects_placeholder_backed_host_surface() {
         assert!(!stale_remote_resume_retry_should_clear(
             true,
@@ -49123,6 +49330,23 @@ Waiting for the remote terminal to paint...\n";
             false,
             "Tell me which one you want `sta`",
             "",
+            43,
+            1,
+            true,
+        ));
+    }
+    #[test]
+    fn stale_remote_resume_retry_clear_rejects_non_prompt_retained_surface() {
+        assert!(!stale_remote_resume_retry_should_clear(
+            true,
+            true,
+            true,
+            true,
+            true,
+            false,
+            false,
+            "",
+            "Committed and pushed successfully.",
             43,
             1,
             true,
@@ -55045,6 +55269,29 @@ Updated at   Branch  Conversation\n\
             false,
             false,
             true,
+        ));
+    }
+    #[test]
+    fn quiet_retained_remote_surface_rejects_non_prompt_text_even_when_runtime_is_running() {
+        assert!(!quiet_retained_remote_surface_ready(
+            true,
+            false,
+            true,
+            true,
+            false,
+            false,
+            true,
+            "",
+            "The final 2.1.59 artifacts are built.",
+            43,
+            1,
+            Some(0),
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
         ));
     }
     #[test]

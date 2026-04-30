@@ -13,7 +13,6 @@ use std::{
     cell::{Cell, RefCell},
     collections::HashMap,
     rc::Rc,
-    time::Duration,
 };
 use tao::{
     dpi::PhysicalSize,
@@ -21,6 +20,9 @@ use tao::{
     event_loop::{ControlFlow, EventLoop, EventLoopBuilder, EventLoopProxy, EventLoopWindowTarget},
     window::WindowId,
 };
+
+#[cfg(all(feature = "devtools", debug_assertions))]
+use std::time::Duration;
 
 /// The single top-level object that manages all the running windows, assets, shortcuts, etc
 pub(crate) struct App {
@@ -37,6 +39,7 @@ pub(crate) struct App {
     pub(crate) webviews: HashMap<WindowId, WebviewInstance>,
     pub(crate) float_all: bool,
     pub(crate) show_devtools: bool,
+    pub(crate) tray_icon_show_window_on_click: bool,
 
     /// This single blob of state is shared between all the windows so they have access to the runtime state
     ///
@@ -61,6 +64,8 @@ impl App {
             .take()
             .unwrap_or_else(|| EventLoopBuilder::<UserWindowEvent>::with_user_event().build());
 
+        let tray_icon_show_window_on_click = cfg.tray_icon_show_window_on_click;
+
         let app = Self {
             exit_on_last_window_close: cfg.exit_on_last_window_close,
             disable_dma_buf_on_wayland: cfg.disable_dma_buf_on_wayland,
@@ -70,6 +75,7 @@ impl App {
             unmounted_dom: Cell::new(Some(virtual_dom)),
             float_all: false,
             show_devtools: false,
+            tray_icon_show_window_on_click,
             cfg: Cell::new(Some(cfg)),
             shared: Rc::new(SharedContext {
                 event_handlers: WindowEventHandlers::default(),
@@ -163,7 +169,7 @@ impl App {
             button_state: _,
         } = event
         {
-            if button == tray_icon::MouseButton::Left {
+            if button == tray_icon::MouseButton::Left && self.tray_icon_show_window_on_click {
                 for webview in self.webviews.values() {
                     webview.desktop_context.window.set_visible(true);
                     webview.desktop_context.window.set_focus();
@@ -349,9 +355,9 @@ impl App {
                     {
                         // This is a place where wry says it's threadsafe but it's actually not.
                         // If we're patching the app, we want to make sure it's not going to progress in the interim.
-                        let lock = crate::android_sync_lock::android_runtime_lock();
+                        #[cfg(target_os = "android")]
+                        let _lock = crate::android_sync_lock::android_runtime_lock();
                         dioxus_devtools::apply_changes(&webview.dom, &hr_msg);
-                        drop(lock);
                     }
 
                     webview.poll_vdom();

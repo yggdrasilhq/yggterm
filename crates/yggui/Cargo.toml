@@ -9,19 +9,19 @@ license = "Apache-2.0"
 yggui-contract = { path = "../yggui-contract" }
 anyhow.workspace = true
 base64 = "0.22"
-dioxus = { version = "=0.7.3", features = ["desktop"] }
-dioxus-desktop = "=0.7.3"
+dioxus = { version = "=0.7.6", features = ["desktop"] }
+dioxus-desktop = "=0.7.6"
 include_dir = "0.7"
 once_cell = "1"
-png = "0.17"
+png = "0.18"
 libc = "0.2"
 serde.workspace = true
 serde_json.workspace = true
 tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }
-tao = "0.34.6"
+tao = "0.35.0"
 time = { version = "0.3", features = ["formatting", "parsing"] }
 tracing.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
-webkit2gtk = { version = "=2.0.1", features = ["v2_38"] }
-wry = "0.53.5"
+webkit2gtk = { version = "=2.0.2", features = ["v2_38"] }
+wry = "0.55.0"
