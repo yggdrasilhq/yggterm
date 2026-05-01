@@ -1,3 +1,10 @@
+yggterm (2.1.77-1) unstable; urgency=medium
+
+  * Accept permission selector tails that start inside the auto-reviewer line.
+  * Use stable Full Access and enter/escape markers for remote resume readiness.
+
+ -- Yggdrasil HQ <avi@gour.top>  Fri, 01 May 2026 14:31:40 +0530
+
 yggterm (2.1.76-1) unstable; urgency=medium
 
   * Accept truncated Codex permission selector tails during remote resume.

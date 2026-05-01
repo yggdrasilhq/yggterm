@@ -50183,7 +50183,7 @@ Waiting for the remote terminal to paint...\n";
   Press enter to confirm or esc to go back
 ";
         let truncated_tail = "\
-to the auto-reviewer subagent.
+uto-reviewer subagent.
   3. Full Access        Codex can edit files outside this workspace and access the internet without asking
                         for approval. Exercise caution when using.
 
