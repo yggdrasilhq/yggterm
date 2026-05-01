@@ -211,6 +211,9 @@ const REMOTE_TERMINAL_RESUME_VISUAL_REVEAL_MS: u64 = 180;
 const REMOTE_TERMINAL_ATTACH_CONFIRMATION_MIN_MS: u64 = 1_500;
 const REMOTE_TERMINAL_ATTACH_CONNECTED_GRACE_MS: u64 = 280;
 const STARTUP_TERMINAL_RESTORE_RECOVERY_MS: u64 = 5_000;
+const TERMINAL_LOCAL_ENSURE_ATTEMPT_TIMEOUT_MS: u64 = 5_000;
+const TERMINAL_REMOTE_ENSURE_ATTEMPT_TIMEOUT_MS: u64 = 30_000;
+const TERMINAL_LOCAL_ENSURE_MAX_ATTEMPTS: u64 = 3;
 const RECENT_DAEMON_START_GRACE_MS: u64 = 3_000;
 const TERMINAL_REMOTE_RESUME_READ_POLL_MS: u64 = 45;
 const TERMINAL_LOCAL_INITIAL_READ_POLL_MS: u64 = 120;
@@ -3167,13 +3170,30 @@ impl ShellState {
         active_session_path: &str,
         now_ms: u64,
     ) -> bool {
+        let stale_startup_attempt = self
+            .latest_terminal_open_attempt_for_path(active_session_path)
+            .is_some_and(|attempt| {
+                matches!(
+                    attempt.state,
+                    TerminalOpenAttemptState::Pending | TerminalOpenAttemptState::Recovering
+                ) && attempt.source == "startup_restore"
+                    && now_ms.saturating_sub(attempt.started_at_ms)
+                        >= STARTUP_TERMINAL_RESTORE_RECOVERY_MS
+            });
+        if !stale_startup_attempt {
+            return false;
+        }
         let has_stable_retained_host = self.terminal_session_host_id(active_session_path).is_some()
             && !self.terminal_attach_in_flight.contains(active_session_path);
+        let has_terminal_request = self
+            .active_surface_requests
+            .contains_key(&YggSurface::Terminal);
+        let active_terminal_request_for_session =
+            self.terminal_session_has_active_terminal_request(active_session_path);
         if self.server.active_view_mode() != WorkspaceViewMode::Terminal
-            || self.server_busy
+            || (self.server_busy && !active_terminal_request_for_session)
             || self.server.active_session_path() != Some(active_session_path)
-            || self.latest_open_request_id != 0
-            || self.terminal_session_has_active_terminal_request(active_session_path)
+            || (has_terminal_request && !active_terminal_request_for_session)
             || has_stable_retained_host
             || self.terminal_session_has_visual_resume_reveal(active_session_path)
             || self.terminal_session_has_ready_attempt(active_session_path)
@@ -3182,15 +3202,7 @@ impl ShellState {
         {
             return false;
         }
-        self.latest_terminal_open_attempt_for_path(active_session_path)
-            .is_some_and(|attempt| {
-                matches!(
-                    attempt.state,
-                    TerminalOpenAttemptState::Pending | TerminalOpenAttemptState::Recovering
-                ) && attempt.source == "startup_restore"
-                    && now_ms.saturating_sub(attempt.started_at_ms)
-                        >= STARTUP_TERMINAL_RESTORE_RECOVERY_MS
-            })
+        true
     }
     fn recover_startup_terminal_restore(&mut self, active_session_path: &str, now_ms: u64) -> bool {
         if !self.startup_terminal_restore_should_recover(active_session_path, now_ms) {
@@ -35692,6 +35704,20 @@ fn should_retry_terminal_ensure(error: &anyhow::Error) -> bool {
         || text.contains("parsing daemon response: \"\"")
         || text.contains("timed out")
 }
+fn terminal_ensure_attempt_timeout_ms(session_path: &str) -> u64 {
+    if session_path.starts_with("remote-session://") || session_path.starts_with("ssh://") {
+        TERMINAL_REMOTE_ENSURE_ATTEMPT_TIMEOUT_MS
+    } else {
+        TERMINAL_LOCAL_ENSURE_ATTEMPT_TIMEOUT_MS
+    }
+}
+fn terminal_ensure_max_attempts(session_path: &str) -> u64 {
+    if session_path.starts_with("remote-session://") || session_path.starts_with("ssh://") {
+        8
+    } else {
+        TERMINAL_LOCAL_ENSURE_MAX_ATTEMPTS
+    }
+}
 
 fn should_retry_terminal_read_error_after_attach(
     is_remote_resume_session: bool,
@@ -35729,9 +35755,22 @@ async fn terminal_ensure_with_retry_async(
     let mut delay_ms = 40_u64;
     let mut attempts = 0_u64;
     let mut daemon_checked = false;
+    let attempt_timeout_ms = terminal_ensure_attempt_timeout_ms(&session_path);
+    let max_attempts = terminal_ensure_max_attempts(&session_path);
     loop {
         attempts += 1;
-        match terminal_ensure_async(endpoint.clone(), session_path.clone(), trace_home).await {
+        let ensure_result = match tokio::time::timeout(
+            Duration::from_millis(attempt_timeout_ms),
+            terminal_ensure_async(endpoint.clone(), session_path.clone(), trace_home),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => Err(anyhow!(
+                "terminal ensure timed out after {attempt_timeout_ms}ms for {session_path}"
+            )),
+        };
+        match ensure_result {
             Ok(result) => {
                 if attempts > 1 {
                     append_trace_event(
@@ -35747,7 +35786,7 @@ async fn terminal_ensure_with_retry_async(
                 }
                 return Ok(result);
             }
-            Err(error) if attempts < 8 && should_retry_terminal_ensure(&error) => {
+            Err(error) if attempts < max_attempts && should_retry_terminal_ensure(&error) => {
                 if !daemon_checked {
                     daemon_checked = true;
                     append_trace_event(
@@ -51849,6 +51888,54 @@ q to quit   pgup/pgdn to page   enter to edit message
         }
         assert!(
             shell.startup_terminal_restore_should_recover(active_session_path, current_millis())
+        );
+    }
+    #[test]
+    fn startup_terminal_restore_recovers_with_same_session_surface_request() {
+        let active_session_path = "local://test";
+        let bootstrap = test_shell_bootstrap_with_active_session(active_session_path);
+        let mut shell = ShellState::new(bootstrap);
+        shell.server_busy = true;
+        shell.latest_open_request_id = 1;
+        shell.server.set_view_mode(WorkspaceViewMode::Terminal);
+        shell
+            .terminal_attach_in_flight
+            .insert(active_session_path.to_string());
+        shell.active_surface_requests.insert(
+            YggSurface::Terminal,
+            ActiveSurfaceRequest {
+                request_id: "focus-live-test".to_string(),
+                operation: "focus_live".to_string(),
+                target: YggTarget::Terminal {
+                    session_path: active_session_path.to_string(),
+                },
+            },
+        );
+        let attempt_id = shell.begin_terminal_open_attempt(
+            active_session_path,
+            "startup-terminal-test",
+            2,
+            "startup_restore",
+        );
+        if let Some(attempt) = shell.terminal_open_attempts.get_mut(&attempt_id) {
+            attempt.state = TerminalOpenAttemptState::Recovering;
+            attempt.started_at_ms =
+                current_millis().saturating_sub(STARTUP_TERMINAL_RESTORE_RECOVERY_MS + 1);
+        }
+
+        assert!(
+            shell.startup_terminal_restore_should_recover(active_session_path, current_millis())
+        );
+        assert!(shell.recover_startup_terminal_restore(active_session_path, current_millis()));
+        assert!(
+            !shell
+                .terminal_attach_in_flight
+                .contains(active_session_path)
+        );
+        assert!(
+            !shell
+                .terminal_bootstrap_lease_by_session
+                .contains_key(active_session_path)
         );
     }
     #[test]
