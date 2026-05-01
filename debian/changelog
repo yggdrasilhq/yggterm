@@ -1,3 +1,10 @@
+yggterm (2.1.69-1) unstable; urgency=medium
+
+  * Keep accepted live Codex transcript-browser resumes interactive after the initial ready signal.
+  * Prevent stale remote-resume timeout notifications from re-disabling input once a resume-ready path is recorded.
+
+ -- Yggdrasil HQ <avi@gour.top>  Fri, 01 May 2026 05:54:12 +0530
+
 yggterm (2.1.68-1) unstable; urgency=medium
 
   * Treat live Codex transcript-browser surfaces as interactive when the PTY runtime is still running.
