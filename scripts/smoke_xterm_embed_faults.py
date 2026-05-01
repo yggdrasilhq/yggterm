@@ -5197,6 +5197,26 @@ def remote_attention_notifications_for_session(state: dict, session: str) -> lis
     return matching
 
 
+LOCAL_CODEX_SCAFFOLD_MARKERS = (
+    "this codex session stays attached to the daemon",
+    "codex is launched locally and will receive /quit",
+    "local codex terminal.",
+)
+
+
+def terminal_text_has_local_codex_scaffold(text: str) -> bool:
+    normalized = str(text or "").lower()
+    return any(marker in normalized for marker in LOCAL_CODEX_SCAFFOLD_MARKERS)
+
+
+def codex_spawn_surface_has_local_scaffold(state: dict, host: dict | None) -> bool:
+    viewport = viewport_state(state)
+    surface_problem = str((viewport.get("active_terminal_surface") or {}).get("problem") or "")
+    if "local codex scaffold" in surface_problem.lower():
+        return True
+    return terminal_text_has_local_codex_scaffold(terminal_host_text(host or {}))
+
+
 def codex_spawn_host_excerpt(host: dict | None) -> dict:
     if not isinstance(host, dict):
         return {}
@@ -5215,6 +5235,7 @@ def codex_spawn_host_excerpt(host: dict | None) -> dict:
         "cursor_bottom_overflow_px": host.get("cursor_bottom_overflow_px"),
         "text_tail": host_text[-700:],
         "has_live_codex_prompt": host_has_live_codex_prompt(host),
+        "has_local_codex_scaffold": terminal_text_has_local_codex_scaffold(host_text),
     }
 
 
@@ -5264,6 +5285,11 @@ def wait_for_codex_spawn_ready(
         if host is None:
             time.sleep(0.2)
             continue
+        if codex_spawn_surface_has_local_scaffold(last_state, host):
+            raise AssertionError(
+                "spawned remote Codex session showed local scaffold text instead of waiting "
+                f"for the real remote runtime: {codex_spawn_state_excerpt(last_state, session, 0.0)!r}"
+            )
         if (
             last_state.get("active_view_mode") == "Terminal"
             and viewport.get("ready") is True
@@ -14234,6 +14260,13 @@ def assert_codex_spawn_timeline(pid: int, out_dir: Path) -> dict:
             raise AssertionError(
                 f"spawned remote Codex session raised remote-attention notification at {label}: "
                 f"{attention!r}"
+            )
+        if excerpt.get("host", {}).get("has_local_codex_scaffold") or (
+            "local codex scaffold"
+            in str((excerpt.get("active_terminal_surface") or {}).get("problem") or "").lower()
+        ):
+            raise AssertionError(
+                f"spawned remote Codex session showed local scaffold text at {label}: {excerpt!r}"
             )
         return excerpt
 
