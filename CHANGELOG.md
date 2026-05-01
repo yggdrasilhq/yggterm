@@ -4,6 +4,12 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+## 2.1.72
+
+### Fixed
+
+- classify split canvas transcript-browser surfaces as interactive when the header and footer land in different app-control text samples, so responsive remote Codex sessions are no longer reported as not prompt-ready
+
 ## 2.1.71
 
 ### Fixed
