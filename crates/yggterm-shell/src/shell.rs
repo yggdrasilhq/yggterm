@@ -19289,6 +19289,9 @@ async fn capture_dom_debug_snapshot_for(active_session_path: Option<&str>) -> Va
                     write_callback_count: mountedHost ? Number(mountedHost.writeCallbackCount || 0) : 0,
                     write_parsed_count: mountedHost ? Number(mountedHost.writeParsedCount || 0) : 0,
                     last_write_parsed_at_ms: mountedHost ? Number(mountedHost.lastWriteParsedAtMs || 0) : 0,
+                    last_data_event_at_ms: mountedHost ? Number(mountedHost.lastDataEventAtMs || 0) : 0,
+                    last_render_event_at_ms: mountedHost ? Number(mountedHost.lastRenderEventAtMs || 0) : 0,
+                    last_write_flush_started_at_ms: mountedHost ? Number(mountedHost.lastWriteFlushStartedAtMs || 0) : 0,
                     xterm_present: Boolean(xtermRoot),
                     helpers_present: Boolean(helpers),
                     helper_textarea_present: Boolean(helperTextarea),
@@ -20450,6 +20453,11 @@ async fn capture_dom_debug_snapshot_basic_for(active_session_path: Option<&str>)
                         write_command_count: mountedHost ? Number(mountedHost.writeCommandCount || 0) : 0,
                         write_callback_count: mountedHost ? Number(mountedHost.writeCallbackCount || 0) : 0,
                         write_parsed_count: mountedHost ? Number(mountedHost.writeParsedCount || 0) : 0,
+                        last_data_event_at_ms: mountedHost ? Number(mountedHost.lastDataEventAtMs || 0) : 0,
+                        last_render_event_at_ms: mountedHost ? Number(mountedHost.lastRenderEventAtMs || 0) : 0,
+                        last_write_queued_at_ms: mountedHost ? Number(mountedHost.lastWriteQueuedAtMs || 0) : 0,
+                        last_write_flush_started_at_ms: mountedHost ? Number(mountedHost.lastWriteFlushStartedAtMs || 0) : 0,
+                        last_write_callback_at_ms: mountedHost ? Number(mountedHost.lastWriteCallbackAtMs || 0) : 0,
                         write_bridge_flush_count: mountedHost ? Number(mountedHost.writeBridgeFlushCount || 0) : 0,
                         write_bridge_in_flight: mountedHost ? Boolean(mountedHost.writeBridgeInFlight) : false,
                         write_bridge_pending_chars: mountedHost ? String(mountedHost.writeBridgePendingData || '').length : 0,
@@ -20989,6 +20997,7 @@ async fn probe_terminal_viewport_input_for(
     session_path: &str,
     data: &str,
     mode: ProbeTerminalViewportInputMode,
+    per_char: bool,
     press_enter: bool,
     press_tab: bool,
     press_ctrl_c: bool,
@@ -20999,6 +21008,7 @@ async fn probe_terminal_viewport_input_for(
         session_path,
         data,
         mode,
+        per_char,
         press_enter,
         press_tab,
         press_ctrl_c,
@@ -21019,6 +21029,7 @@ fn terminal_probe_input_script(
     session_path: &str,
     data: &str,
     mode: ProbeTerminalViewportInputMode,
+    per_char: bool,
     press_enter: bool,
     press_tab: bool,
     press_ctrl_c: bool,
@@ -21035,6 +21046,7 @@ fn terminal_probe_input_script(
                 const sessionPath = {session_path_literal};
                 const text = {data_literal};
                 const inputMode = {mode_literal};
+                const perChar = {per_char};
                 const pressEnter = {press_enter};
                 const pressTab = {press_tab};
                 const pressCtrlC = {press_ctrl_c};
@@ -21085,8 +21097,45 @@ fn terminal_probe_input_script(
                         await new Promise((resolve) => setTimeout(resolve, delayMs));
                     }}
                 }};
+                const terminalBufferSnapshot = () => {{
+                    const active = entry.term && entry.term.buffer ? entry.term.buffer.active : null;
+                    if (!active || !active.getLine) {{
+                        return {{
+                            text_tail: '',
+                            cursor_line_text: '',
+                            buffer_line_count: 0,
+                        }};
+                    }}
+                    const rows = Math.max(1, Number(entry.term && entry.term.rows ? entry.term.rows || 0 : 24));
+                    const baseY = Number(active.baseY || 0);
+                    const cursorY = Number(active.cursorY || 0);
+                    const cursorLineIndex = Math.max(0, baseY + cursorY);
+                    const length = Math.max(0, Number(active.length || 0));
+                    const end = Math.min(
+                        length,
+                        Math.max(cursorLineIndex + 1, baseY + rows, length)
+                    );
+                    const start = Math.max(0, end - Math.max(rows * 2, 80));
+                    const lines = [];
+                    for (let ix = start; ix < end; ix += 1) {{
+                        const line = active.getLine(ix);
+                        lines.push(line && line.translateToString
+                            ? String(line.translateToString(true) || '')
+                            : '');
+                    }}
+                    const cursorLine = active.getLine(cursorLineIndex);
+                    const cursorLineText = cursorLine && cursorLine.translateToString
+                        ? String(cursorLine.translateToString(true) || '')
+                        : '';
+                    return {{
+                        text_tail: lines.join('\n').slice(-8192),
+                        cursor_line_text: cursorLineText,
+                        buffer_line_count: length,
+                    }};
+                }};
                 const snapshot = () => {{
                     const active = entry.term && entry.term.buffer ? entry.term.buffer.active : null;
+                    const buffer = terminalBufferSnapshot();
                     return {{
                         viewport_y: active ? Number(active.viewportY || 0) : null,
                         base_y: active ? Number(active.baseY || 0) : null,
@@ -21095,7 +21144,19 @@ fn terminal_probe_input_script(
                         helper_textarea_focused: Boolean(helperTextarea && document.activeElement === helperTextarea),
                         host_has_active_element: Boolean(host && document.activeElement && host.contains(document.activeElement)),
                         input_enabled: Boolean(entry.inputEnabled),
-                        text_tail: String(host.innerText || "").trim().slice(-8192),
+                        text_tail: buffer.text_tail,
+                        cursor_line_text: buffer.cursor_line_text,
+                        buffer_line_count: buffer.buffer_line_count,
+                        data_event_count: Number(entry.dataEventCount || 0),
+                        render_event_count: Number(entry.renderEventCount || 0),
+                        write_command_count: Number(entry.writeCommandCount || 0),
+                        write_bridge_flush_count: Number(entry.writeBridgeFlushCount || 0),
+                        last_data_event_at_ms: Number(entry.lastDataEventAtMs || 0),
+                        last_render_event_at_ms: Number(entry.lastRenderEventAtMs || 0),
+                        last_write_queued_at_ms: Number(entry.lastWriteQueuedAtMs || 0),
+                        last_write_flush_started_at_ms: Number(entry.lastWriteFlushStartedAtMs || 0),
+                        last_write_callback_at_ms: Number(entry.lastWriteCallbackAtMs || 0),
+                        monotonic_ms: Number(performance.now().toFixed(3)),
                     }};
                 }};
                 const focusTarget = () => {{
@@ -21247,6 +21308,13 @@ fn terminal_probe_input_script(
                     if (!textChunk) {{
                         return;
                     }}
+                    if (perChar && Array.from(textChunk).length > 1) {{
+                        for (const char of Array.from(textChunk)) {{
+                            await dispatchTextInput(char);
+                            await settle(4);
+                        }}
+                        return;
+                    }}
                     if (!domKeyboardOnly && ((await sendViaCoreTrigger(textChunk, true))
                         || (await sendViaTermInput(textChunk, true)))) {{
                         return;
@@ -21267,6 +21335,7 @@ fn terminal_probe_input_script(
                 }};
                 focusTarget();
                 await settle(35);
+                const startedAtMs = performance.now();
                 const before = snapshot();
                 if (pressCtrlC) {{
                     if (domKeyboardOnly
@@ -21311,14 +21380,52 @@ fn terminal_probe_input_script(
                         await dispatchKey({{ key: 'Enter', code: 'Enter', keyCode: 13 }});
                     }}
                 }}
-                await settle(140);
+                const dispatchedAtMs = performance.now();
+                let after = snapshot();
+                let visibleEchoAtMs = null;
+                let counterChangeAtMs = null;
+                let waitIterations = 0;
+                const textVisible = (sample) => {{
+                    if (!text) {{
+                        return false;
+                    }}
+                    return String(sample.cursor_line_text || '').includes(text)
+                        || String(sample.text_tail || '').includes(text);
+                }};
+                const countersChanged = (sample) => {{
+                    return Number(sample.data_event_count || 0) > Number(before.data_event_count || 0)
+                        || Number(sample.write_command_count || 0) > Number(before.write_command_count || 0)
+                        || Number(sample.last_data_event_at_ms || 0) > Number(before.last_data_event_at_ms || 0)
+                        || Number(sample.last_write_queued_at_ms || 0) > Number(before.last_write_queued_at_ms || 0);
+                }};
+                const deadlineAtMs = performance.now() + 2500;
+                while (performance.now() < deadlineAtMs) {{
+                    after = snapshot();
+                    if (counterChangeAtMs === null && countersChanged(after)) {{
+                        counterChangeAtMs = performance.now();
+                    }}
+                    if (visibleEchoAtMs === null && textVisible(after)) {{
+                        visibleEchoAtMs = performance.now();
+                        break;
+                    }}
+                    if (!text && counterChangeAtMs !== null) {{
+                        break;
+                    }}
+                    waitIterations += 1;
+                    await settle(8);
+                }}
+                await settle(30);
+                after = snapshot();
+                const completedAtMs = performance.now();
+                const visibleEchoObserved = text ? textVisible(after) : counterChangeAtMs !== null;
                 dioxus.send({{
                     accepted: true,
                     session_path: sessionPath,
                     host_id: entry.hostId,
                     before,
-                    after: snapshot(),
+                    after,
                     typed_text: text,
+                    per_char: perChar,
                     press_enter: pressEnter,
                     press_tab: pressTab,
                     press_ctrl_c: pressCtrlC,
@@ -21328,7 +21435,16 @@ fn terminal_probe_input_script(
                     used_core_trigger: usedCoreTrigger,
                     used_term_input: usedTermInput,
                     keyboard_backend: keyboardBackend(),
-                    has_transport_error: terminalChunkIsTransportError(String(host.innerText || '')),
+                    has_transport_error: terminalChunkIsTransportError(String(after.text_tail || '')),
+                    visible_echo_observed: visibleEchoObserved,
+                    timings: {{
+                        focus_to_before_ms: Number((before.monotonic_ms - startedAtMs).toFixed(3)),
+                        dispatch_ms: Number((dispatchedAtMs - startedAtMs).toFixed(3)),
+                        counter_change_ms: counterChangeAtMs === null ? null : Number((counterChangeAtMs - startedAtMs).toFixed(3)),
+                        visible_echo_ms: visibleEchoAtMs === null ? null : Number((visibleEchoAtMs - startedAtMs).toFixed(3)),
+                        total_ms: Number((completedAtMs - startedAtMs).toFixed(3)),
+                        wait_iterations: waitIterations,
+                    }},
                 }});
             }} catch (error) {{
                 dioxus.send({{
@@ -21342,6 +21458,7 @@ fn terminal_probe_input_script(
         session_path_literal = session_path_literal,
         data_literal = data_literal,
         mode_literal = serde_json::to_string(&mode).unwrap_or_else(|_| "\"auto\"".to_string()),
+        per_char = if per_char { "true" } else { "false" },
         press_enter = if press_enter { "true" } else { "false" },
         press_tab = if press_tab { "true" } else { "false" },
         press_ctrl_c = if press_ctrl_c { "true" } else { "false" },
@@ -23007,6 +23124,7 @@ async fn process_pending_app_control_requests(
             session_path,
             data,
             mode,
+            per_char,
             press_enter,
             press_tab,
             press_ctrl_c,
@@ -23017,6 +23135,7 @@ async fn process_pending_app_control_requests(
                 &session_path,
                 &data,
                 mode,
+                per_char,
                 press_enter,
                 press_tab,
                 press_ctrl_c,
@@ -39216,6 +39335,8 @@ fn terminal_eval_script_with_canvas_renderer(
             writeCallbackCount: 0,
             writeParsedCount: 0,
             lastWriteParsedAtMs: 0,
+            lastDataEventAtMs: 0,
+            lastRenderEventAtMs: 0,
             writeBridgeFlushCount: 0,
             writeBridgeInFlight: false,
             writeBridgePendingData: '',
@@ -39226,6 +39347,7 @@ fn terminal_eval_script_with_canvas_renderer(
             lastRetainedWritePaintRepairReason: '',
             lastFitGuard: null,
             lastWriteQueuedAtMs: 0,
+            lastWriteFlushStartedAtMs: 0,
             lastWriteCallbackAtMs: 0,
             terminalWriteFrameMs,
             lowPowerTuiActive: false,
@@ -39575,6 +39697,7 @@ fn terminal_eval_script_with_canvas_renderer(
             entry.writeBridgeInFlight = true;
                 entry.writeBridgeFlushCount = Number(entry.writeBridgeFlushCount || 0) + 1;
                 lastWriteFlushStartedAtMs = Date.now();
+                entry.lastWriteFlushStartedAtMs = lastWriteFlushStartedAtMs;
                 const flushShouldFollow = !syncScrollbackLock() && liveCursorNearBottom();
             const syncWrite = term && term._core && typeof term._core.writeSync === 'function'
                 ? term._core.writeSync.bind(term._core)
@@ -39664,6 +39787,7 @@ fn terminal_eval_script_with_canvas_renderer(
             renderEventCount += 1;
             if (window.__yggtermXtermHosts && window.__yggtermXtermHosts[hostId]) {{
                 window.__yggtermXtermHosts[hostId].renderEventCount = renderEventCount;
+                window.__yggtermXtermHosts[hostId].lastRenderEventAtMs = Date.now();
             }}
             requestRenderProbe('render');
         }});
@@ -39759,6 +39883,7 @@ fn terminal_eval_script_with_canvas_renderer(
             dataEventCount += 1;
             if (window.__yggtermXtermHosts && window.__yggtermXtermHosts[hostId]) {{
                 window.__yggtermXtermHosts[hostId].dataEventCount = dataEventCount;
+                window.__yggtermXtermHosts[hostId].lastDataEventAtMs = Date.now();
             }}
             scrollbackLocked = false;
             if (window.__yggtermXtermHosts && window.__yggtermXtermHosts[hostId]) {{

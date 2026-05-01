@@ -4,6 +4,13 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+## 2.1.83
+
+### Added
+
+- add a UI latency smoke that measures app-control state, sidebar rows, search, panel switching, and visible terminal typing latency
+- extend `probe-type --per-char` so terminal typing proof reports xterm-buffer visible echo timing instead of trusting canvas-empty DOM text
+
 ## 2.1.82
 
 ### Fixed

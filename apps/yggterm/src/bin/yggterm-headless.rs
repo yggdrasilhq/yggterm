@@ -833,6 +833,7 @@ fn main() -> Result<()> {
                         let press_ctrl_c = args.iter().any(|arg| arg == "--ctrl-c");
                         let press_ctrl_e = args.iter().any(|arg| arg == "--ctrl-e");
                         let press_ctrl_u = args.iter().any(|arg| arg == "--ctrl-u");
+                        let per_char = args.iter().any(|arg| arg == "--per-char");
                         let mode = args
                             .windows(2)
                             .find_map(|window| {
@@ -851,6 +852,7 @@ fn main() -> Result<()> {
                             session_path,
                             data,
                             mode,
+                            per_char,
                             press_enter,
                             press_tab,
                             press_ctrl_c,
