@@ -33182,6 +33182,7 @@ fn TerminalCanvas(
                                     should_suppress_remote_resume_surface_output(
                                         is_remote_resume_session,
                                         terminal_overlay_dismissed(),
+                                        runtime_running,
                                         has_transport_error,
                                         saw_meaningful_output,
                                         saw_generic_idle_output,
@@ -33622,6 +33623,8 @@ fn TerminalCanvas(
                                                 "meaningful": saw_meaningful_output,
                                                 "visible": saw_visible_output,
                                                 "marker": saw_attach_ready_marker,
+                                                "transcript_browser": saw_transcript_browser_output,
+                                                "runtime_running": runtime_running,
                                             }),
                                         );
                                         traced_attach_ready = true;
@@ -33698,6 +33701,50 @@ fn TerminalCanvas(
                                             focus: should_focus_now,
                                         });
                                     }
+                                }
+                                if is_remote_resume_session
+                                    && attach_ready
+                                    && saw_transcript_browser_output
+                                    && runtime_running
+                                    && visible_resume_surface
+                                {
+                                    append_trace_event(
+                                        &trace_home,
+                                        "ui",
+                                        "terminal_mount",
+                                        "live_transcript_browser_accepted",
+                                        json!({
+                                            "session_path": session_path.clone(),
+                                            "cursor": cursor,
+                                        }),
+                                    );
+                                    let _ = eval.send(TerminalJsCommand::SetInputEnabled {
+                                        enabled: true,
+                                        focus: true,
+                                    });
+                                    clear_terminal_resume_notification(state, &session_path);
+                                    let _ = safe_shell_mut(
+                                        state,
+                                        "terminal_attach_live_transcript_browser_ready",
+                                        |shell| {
+                                            shell.retain_terminal_session_path(&session_path);
+                                            shell
+                                                .terminal_resume_ready_paths
+                                                .insert(session_path.clone());
+                                            shell.terminal_attach_in_flight.remove(&session_path);
+                                            shell.maybe_finish_terminal_surface_request_for_session(
+                                                &session_path,
+                                            );
+                                        },
+                                    );
+                                    maybe_spawn_missing_remote_machine_refreshes(state);
+                                    maybe_spawn_missing_managed_cli_refreshes(state);
+                                    set_signal_if_changed(terminal_overlay_dismissed, true);
+                                    set_signal_if_changed(terminal_live_host_connected, true);
+                                    set_signal_if_changed(resume_overlay_failed, false);
+                                    set_signal_if_changed(resume_overlay_timed_out, false);
+                                    resume_visual_reveal_after_ms = None;
+                                    post_attach_read_recovery_attempts = 0;
                                 }
                                 if is_remote_resume_session
                                     && traced_attach_ready
@@ -34013,7 +34060,7 @@ fn TerminalCanvas(
                                         || tail_generic_idle_footer_output
                                         || (saw_prompt_only_surface
                                             && !prompt_only_surface_is_live)
-                                        || saw_transcript_browser_output);
+                                        || (saw_transcript_browser_output && !runtime_running));
                                 let should_nudge_remote_resume = is_remote_resume_session
                                     && !traced_attach_ready
                                     && !resume_resize_nudged
@@ -34960,6 +35007,7 @@ fn terminal_chunk_tail_has_generic_codex_idle_footer(data: &str) -> bool {
 fn should_suppress_remote_resume_surface_output(
     is_remote_resume_session: bool,
     overlay_dismissed: bool,
+    runtime_running: bool,
     has_transport_error: bool,
     saw_meaningful_output: bool,
     saw_generic_idle_output: bool,
@@ -34972,7 +35020,7 @@ fn should_suppress_remote_resume_surface_output(
     is_remote_resume_session
         && !overlay_dismissed
         && (has_transport_error
-            || saw_transcript_browser_output
+            || (saw_transcript_browser_output && !runtime_running)
             || saw_prompt_only_surface
             || (!saw_meaningful_output
                 && (saw_generic_idle_output
@@ -35014,7 +35062,10 @@ fn remote_resume_surface_connected(
     saw_prompt_only_surface: bool,
     runtime_running: bool,
 ) -> bool {
-    if saw_transcript_browser_output || saw_generic_idle_output {
+    if saw_transcript_browser_output {
+        return runtime_running && saw_visible_output;
+    }
+    if saw_generic_idle_output {
         return false;
     }
     if saw_prompt_only_surface {
@@ -56011,6 +56062,18 @@ Updated at   Branch  Conversation\n\
         ));
     }
     #[test]
+    fn remote_resume_surface_connected_accepts_live_transcript_browser_surface() {
+        assert!(remote_resume_surface_connected(
+            false, true, false, true, false, false, false, true,
+        ));
+    }
+    #[test]
+    fn remote_resume_surface_connected_rejects_dead_transcript_browser_surface() {
+        assert!(!remote_resume_surface_connected(
+            false, true, false, true, false, false, false, false,
+        ));
+    }
+    #[test]
     fn remote_resume_surface_connected_rejects_dead_prompt_only_surface() {
         assert!(!remote_resume_surface_connected(
             false, true, false, false, false, false, true, false,
@@ -56136,6 +56199,25 @@ Updated at   Branch  Conversation\n\
         ));
     }
     #[test]
+    fn remote_resume_attach_confirmation_accepts_live_transcript_browser_after_deadline() {
+        assert!(remote_resume_attach_confirmation_satisfied(
+            false,
+            true,
+            false,
+            true,
+            false,
+            false,
+            false,
+            0,
+            1_000,
+            1_000 + REMOTE_TERMINAL_ATTACH_CONFIRMATION_MIN_MS,
+            false,
+            true,
+            None,
+            false,
+        ));
+    }
+    #[test]
     fn remote_resume_attach_confirmation_rejects_attach_ready_without_post_attach_content() {
         assert!(!remote_resume_attach_confirmation_satisfied(
             false, false, true, false, false, false, false, 0, 1_000, 1_100, false, true, None,
@@ -56172,22 +56254,31 @@ Updated at   Branch  Conversation\n\
     #[test]
     fn suppress_resume_output_rejects_prompt_only_or_idle_without_meaningful_context() {
         assert!(should_suppress_remote_resume_surface_output(
-            true, false, false, false, false, true, false, false, false, false,
+            true, false, false, false, false, true, false, false, false, false, false,
         ));
         assert!(should_suppress_remote_resume_surface_output(
-            true, false, true, false, false, false, false, false, false, false,
+            true, false, false, true, false, false, false, false, false, false, false,
         ));
         assert!(should_suppress_remote_resume_surface_output(
-            true, false, false, false, false, false, false, false, true, false,
+            true, false, false, false, false, false, false, false, false, true, false,
         ));
         assert!(should_suppress_remote_resume_surface_output(
-            true, false, false, false, false, false, false, false, false, true,
+            true, false, false, false, false, false, false, false, false, false, true,
         ));
     }
     #[test]
     fn suppress_resume_output_allows_meaningful_transcript_with_idle_tail() {
         assert!(!should_suppress_remote_resume_surface_output(
-            true, false, false, true, false, false, true, false, false, false,
+            true, false, false, false, true, false, false, true, false, false, false,
+        ));
+    }
+    #[test]
+    fn suppress_resume_output_allows_live_transcript_browser_surface() {
+        assert!(!should_suppress_remote_resume_surface_output(
+            true, false, true, false, false, false, false, false, false, false, true,
+        ));
+        assert!(should_suppress_remote_resume_surface_output(
+            true, false, false, false, false, false, false, false, false, false, true,
         ));
     }
     #[test]
