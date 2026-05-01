@@ -18,6 +18,7 @@ The fix is not a larger feature. The fix is to make invalid state impossible or 
 - Fresh live terminals are runtime-only by default. They are restored across app/daemon restart only after the user explicitly marks them `Keep Alive`; clearing keep-alive must remove them from persisted live-session state without killing the currently running terminal.
 - Update restart is different from Keep Alive. Before a direct-install restart, the daemon must persist every recoverable live runtime with a temporary update-restore marker. That marker allows the next daemon to restore the session once, but it must not silently convert unkept terminals into durable Keep Alive sessions.
 - Daemon cleanup is home-scoped. An app may reap same-home duplicate, legacy, or orphan daemons, but it must not signal a daemon from another `YGGTERM_HOME`, and it must not reap a legacy daemon that still has registered GUI clients.
+- Multi-version daemon discovery is read-only observability, not an attach target. A current remote client may list stale versioned daemons for incident reports, but it must not bridge a live terminal through a daemon whose `server_version` differs from the current protocol version.
 - Stored sessions and remote scanned sessions open as preview unless an explicit terminal launch/resume action promotes them to a live runtime.
 - Remote scanned sessions may appear in Terminal mode only when the remote scan says the runtime is live and the active session source is `LiveSsh`.
 - A retained terminal host may stay mounted only if its session identity still matches a live session or a deliberate recovery state.
@@ -53,6 +54,8 @@ Update restart protection is observable through persisted daemon state. A normal
 Native paste is observable through terminal events and app-control paste commands. A browser `Ctrl+V`/`Cmd+V` must emit the native paste request instead of relying on xterm.js to guess clipboard contents.
 
 Terminal typing proof is a viewport contract. Smokes that claim user-facing typing behavior should use `probe-type --mode keyboard`; app-control direct PTY sends may prepare state, but interrupt bytes are split from following command bytes so prompt recovery cannot hide a dropped first character.
+
+Remote terminal recovery must make terminal-open truth converge. When a remote resume times out, the matching `terminal_attach_in_flight` entry, bootstrap lease, and terminal surface request must clear, and the open-attempt ledger must latch a failure. A stuck notification may explain a failure, but it must not keep the UI in a permanent loading state or drive an infinite render loop.
 
 ## Stability Gates
 
