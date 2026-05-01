@@ -1,3 +1,10 @@
+yggterm (2.1.73-1) unstable; urgency=medium
+
+  * Recognize Codex model-permission setup menus as interactive terminal surfaces.
+  * Keep input enabled for new remote Codex sessions while the permissions selector is visible.
+
+ -- Yggdrasil HQ <avi@gour.top>  Fri, 01 May 2026 13:05:56 +0530
+
 yggterm (2.1.72-1) unstable; urgency=medium
 
   * Accept split canvas transcript-browser surfaces in app-control readiness checks.
