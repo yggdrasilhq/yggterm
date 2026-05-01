@@ -4,6 +4,12 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+## 2.1.74
+
+### Fixed
+
+- let Codex model-permission setup menus complete remote terminal resume even when the selector sits mid-screen with many blank rows below the hidden cursor, keeping input enabled without weakening stale transcript detection
+
 ## 2.1.73
 
 ### Fixed
