@@ -314,6 +314,47 @@ def app_move_window_by(pid: int, delta_x: float, delta_y: float) -> dict:
     return (payload.get("data") or payload) if isinstance(payload, dict) else {}
 
 
+def app_resize_window(pid: int, width: float, height: float) -> dict:
+    payload = run(
+        "server",
+        "app",
+        "resize-window",
+        "--pid",
+        str(pid),
+        "--width",
+        str(width),
+        "--height",
+        str(height),
+        "--timeout-ms",
+        "8000",
+    )
+    return (payload.get("data") or payload) if isinstance(payload, dict) else {}
+
+
+def app_scroll_right_panel(
+    pid: int,
+    *,
+    top_px: float | None = None,
+    ratio: float | None = None,
+) -> dict:
+    args = [
+        "server",
+        "app",
+        "panel",
+        "scroll",
+        "--pid",
+        str(pid),
+        "--timeout-ms",
+        "12000",
+    ]
+    if top_px is not None:
+        args.extend(["--top", str(top_px)])
+    if ratio is not None:
+        args.extend(["--ratio", str(ratio)])
+    payload = run(*args)
+    return (payload.get("data") or payload) if isinstance(payload, dict) else {}
+
+
 def app_pointer_button_name(button: int) -> str:
     return {
         1: "primary",
@@ -9855,6 +9896,274 @@ def assert_titlebar_always_on_top_contract(pid: int) -> dict:
     }
 
 
+def assert_small_window_chrome_contract(pid: int, out_dir: Path) -> dict:
+    baseline = app_state(pid)
+    baseline_window = baseline.get("window") or {}
+    baseline_inner = baseline_window.get("inner_size") or {}
+    baseline_width = float(baseline_inner.get("width") or 0.0)
+    baseline_height = float(baseline_inner.get("height") or 0.0)
+    baseline_maximized = bool(baseline_window.get("maximized"))
+    if baseline_maximized:
+        app_set_maximized(pid, False)
+        baseline = wait_for_window_maximized(pid, False) or app_state(pid)
+    try:
+        settings_open = app_set_right_panel_mode(pid, "settings")
+        resize = app_resize_window(pid, 520, 380)
+        compact = wait_for_probe(
+            lambda: app_state(pid),
+            lambda state: (
+                float(((state.get("window") or {}).get("inner_size") or {}).get("width") or 9999.0)
+                <= 620.0
+                and float(((state.get("window") or {}).get("inner_size") or {}).get("height") or 9999.0)
+                <= 480.0
+                and rect_is_visible(dom_rect(state, "right_side_rail_rect"))
+            ),
+            timeout_seconds=6.0,
+            description="compact window resize",
+        )
+
+        def compact_theme_selectors_fit(state: dict) -> bool:
+            scroll_rect = dom_rect(state, "right_side_rail_scroll_rect")
+            shell = dom_rect(state, "shell_root_rect")
+            rects = [
+                rect
+                for rect in (dom_value(state, "terminal_theme_button_rects") or [])
+                if isinstance(rect, dict) and rect_is_visible(rect)
+            ]
+            return len(rects) >= 2 and all(
+                rect_contains_rect(shell, rect, tolerance=2.5)
+                and rect_contains_rect(scroll_rect, rect, tolerance=2.5)
+                for rect in rects
+            )
+
+        panel_scroll_samples = []
+        for ratio in (0.0, 0.18, 0.32, 0.46, 0.60, 0.74, 0.88, 1.0):
+            scroll_result = app_scroll_right_panel(pid, ratio=ratio)
+            compact = wait_for_probe(
+                lambda: app_state(pid),
+                lambda state: rect_is_visible(dom_rect(state, "right_side_rail_scroll_rect")),
+                timeout_seconds=2.0,
+                description=f"compact settings rail scroll sample {ratio:.2f}",
+            )
+            panel_scroll_samples.append(
+                {
+                    "ratio": ratio,
+                    "scroll": scroll_result,
+                    "scroll_top": dom_value(compact, "right_side_rail_scroll_top"),
+                    "theme_button_rects": dom_value(compact, "terminal_theme_button_rects") or [],
+                }
+            )
+            if compact_theme_selectors_fit(compact):
+                break
+        shell_rect = dom_rect(compact, "shell_root_rect")
+        titlebar_rect = dom_rect(compact, "titlebar_rect")
+        left_rect = dom_rect(compact, "titlebar_left_rect")
+        search_rect = dom_rect(compact, "titlebar_search_outer_shell_rect") or dom_rect(
+            compact, "titlebar_search_shell_rect"
+        )
+        right_rect = dom_rect(compact, "titlebar_right_rect")
+        overflow_rect = dom_rect(compact, "titlebar_overflow_button_rect")
+        main_rect = dom_rect(compact, "main_surface_rect")
+        search_placeholder = str(dom_value(compact, "titlebar_search_input_placeholder") or "")
+        rail_rect = dom_rect(compact, "right_side_rail_rect")
+        rail_scroll_rect = dom_rect(compact, "right_side_rail_scroll_rect")
+        rail_background = str(dom_value(compact, "right_side_rail_background") or "")
+        rail_background_alpha = parse_css_alpha(rail_background)
+        terminal_theme_button_rects = [
+            rect
+            for rect in (dom_value(compact, "terminal_theme_button_rects") or [])
+            if isinstance(rect, dict) and rect_is_visible(rect)
+        ]
+        terminal_theme_button_modes = dom_value(compact, "terminal_theme_button_modes") or []
+        failures = []
+        if not rect_is_visible(shell_rect):
+            failures.append("shell root rect missing")
+        if not rect_is_visible(titlebar_rect):
+            failures.append("titlebar rect missing")
+        if not rect_is_visible(left_rect):
+            failures.append("titlebar left group missing")
+        if not rect_is_visible(search_rect):
+            failures.append("titlebar search shell missing")
+        if len(search_placeholder) > 20:
+            failures.append(f"compact search placeholder is too long: {search_placeholder!r}")
+        if not rect_is_visible(right_rect):
+            failures.append("titlebar right group missing")
+        if not rect_is_visible(overflow_rect):
+            failures.append("overflow trigger missing in compact titlebar")
+        if not rect_is_visible(main_rect):
+            failures.append("main surface missing")
+        if not rect_is_visible(rail_rect):
+            failures.append("settings rail missing in compact window")
+        if not rect_is_visible(rail_scroll_rect):
+            failures.append("settings rail scroll body missing in compact window")
+        if rect_is_visible(shell_rect) and rect_is_visible(right_rect) and not rect_contains_rect(
+            shell_rect, right_rect, tolerance=2.5
+        ):
+            failures.append(f"titlebar right group overflows shell: shell={shell_rect!r} right={right_rect!r}")
+        if rect_is_visible(shell_rect) and rect_is_visible(search_rect) and not rect_contains_rect(
+            shell_rect, search_rect, tolerance=2.5
+        ):
+            failures.append(f"titlebar search overflows shell: shell={shell_rect!r} search={search_rect!r}")
+        if rect_is_visible(titlebar_rect) and rect_is_visible(main_rect):
+            if rect_bottom(titlebar_rect) > float(main_rect.get("top") or 0.0) + 6.0:
+                failures.append(
+                    f"titlebar overlaps main surface: titlebar={titlebar_rect!r} main={main_rect!r}"
+                )
+        if rect_is_visible(titlebar_rect) and rect_is_visible(rail_rect):
+            if float(rail_rect.get("top") or 0.0) < rect_bottom(titlebar_rect) - 2.5:
+                failures.append(
+                    f"compact settings rail overlaps titlebar: titlebar={titlebar_rect!r} rail={rail_rect!r}"
+                )
+        if rect_is_visible(shell_rect) and rect_is_visible(rail_rect) and not rect_contains_rect(
+            shell_rect, rail_rect, tolerance=2.5
+        ):
+            failures.append(f"compact settings rail overflows shell: shell={shell_rect!r} rail={rail_rect!r}")
+        if rect_is_visible(rail_rect) and rect_is_visible(rail_scroll_rect) and not rect_contains_rect(
+            rail_rect, rail_scroll_rect, tolerance=2.5
+        ):
+            failures.append(
+                f"compact settings rail scroll body overflows rail: rail={rail_rect!r} scroll={rail_scroll_rect!r}"
+            )
+        if rail_background_alpha is None or rail_background_alpha < 0.92:
+            failures.append(f"compact settings rail is not opaque enough: background={rail_background!r}")
+        if len(terminal_theme_button_rects) < 2:
+            failures.append(
+                f"compact settings rail did not expose both terminal theme selectors: modes={terminal_theme_button_modes!r} rects={terminal_theme_button_rects!r}"
+            )
+        for rect in terminal_theme_button_rects:
+            if rect_is_visible(shell_rect) and not rect_contains_rect(shell_rect, rect, tolerance=2.5):
+                failures.append(f"terminal theme selector overflows compact shell: shell={shell_rect!r} rect={rect!r}")
+            if rect_is_visible(rail_scroll_rect) and not rect_contains_rect(
+                rail_scroll_rect, rect, tolerance=2.5
+            ):
+                failures.append(
+                    f"terminal theme selector is clipped outside compact rail scroll body: scroll={rail_scroll_rect!r} rect={rect!r}"
+                )
+        if failures:
+            raise AssertionError("; ".join(failures))
+        shot_path = out_dir / "small-window-chrome.png"
+        shot = app_screenshot(pid, shot_path, crop_state=compact, check_corners=True)
+        return {
+            "settings_open": settings_open,
+            "resize": resize,
+            "panel_scroll_samples": panel_scroll_samples,
+            "window": compact.get("window") or {},
+            "shell_rect": shell_rect,
+            "titlebar_rect": titlebar_rect,
+            "left_rect": left_rect,
+            "search_rect": search_rect,
+            "search_placeholder": search_placeholder,
+            "right_rect": right_rect,
+            "overflow_rect": overflow_rect,
+            "main_rect": main_rect,
+            "right_side_rail_rect": rail_rect,
+            "right_side_rail_scroll_rect": rail_scroll_rect,
+            "right_side_rail_background": rail_background,
+            "terminal_theme_button_rects": terminal_theme_button_rects,
+            "terminal_theme_button_modes": terminal_theme_button_modes,
+            "screenshot": str(shot_path),
+            "screenshot_result": (shot.get("data") or shot) if isinstance(shot, dict) else shot,
+        }
+    finally:
+        if baseline_width > 0 and baseline_height > 0:
+            app_resize_window(pid, baseline_width, baseline_height)
+            time.sleep(0.25)
+        if baseline_maximized:
+            app_set_maximized(pid, True)
+
+
+def assert_settings_zoom_input_contract(pid: int) -> dict:
+    app_set_right_panel_mode(pid, "settings")
+    state = wait_for_probe(
+        lambda: app_state(pid),
+        lambda state: right_panel_mode(state) == "settings"
+        and len(((state.get("dom") or {}).get("settings_zoom_input_types") or [])) >= 2,
+        timeout_seconds=6.0,
+        description="settings zoom inputs",
+    )
+    dom = state.get("dom") or {}
+    types = [str(value).lower() for value in (dom.get("settings_zoom_input_types") or [])]
+    input_modes = [str(value).lower() for value in (dom.get("settings_zoom_input_input_modes") or [])]
+    rects = dom.get("settings_zoom_input_rects") or []
+    values = dom.get("settings_zoom_input_values") or []
+    if not types or any(value != "text" for value in types):
+        raise AssertionError(f"settings zoom controls still expose native input types: {types!r}")
+    if len(input_modes) != len(types) or any(value != "numeric" for value in input_modes):
+        raise AssertionError(f"settings zoom controls missing numeric input modes: {input_modes!r}")
+    if len(rects) < 2 or any(not rect_is_visible(rect) for rect in rects[:2]):
+        raise AssertionError(f"settings zoom input rects missing: {rects!r}")
+    return {
+        "types": types,
+        "input_modes": input_modes,
+        "values": values,
+        "rects": rects,
+    }
+
+
+def assert_settings_terminal_theme_dropdown_contract(pid: int) -> dict:
+    app_set_right_panel_mode(pid, "settings")
+    scroll = app_scroll_right_panel(pid, ratio=1.0)
+    state = wait_for_probe(
+        lambda: app_state(pid),
+        lambda state: rect_is_visible(dom_rect(state, "terminal_theme_button_rect")),
+        timeout_seconds=6.0,
+        description="terminal theme dropdown button visible",
+    )
+    button_rect = dom_rect(state, "terminal_theme_button_rect")
+    click = app_pointer_command(
+        pid,
+        "click",
+        x=rect_center_x(button_rect),
+        y=rect_center_y(button_rect),
+        button="primary",
+    )
+    opened = wait_for_probe(
+        lambda: app_state(pid),
+        lambda state: rect_is_visible(dom_rect(state, "terminal_theme_menu_rect"))
+        and bool((state.get("dom") or {}).get("terminal_theme_filter_input_focused")),
+        timeout_seconds=6.0,
+        description="terminal theme dropdown opened and filter focused",
+    )
+    dom = opened.get("dom") or {}
+    menu_rect = dom_rect(opened, "terminal_theme_menu_rect")
+    input_rect = dom_rect(opened, "terminal_theme_filter_input_rect")
+    window_height = float(opened.get("window_inner_height") or dom.get("window_inner_height") or 0.0)
+    if window_height > 0 and rect_bottom(menu_rect) > window_height + 2.0:
+        raise AssertionError(
+            f"terminal theme dropdown opened outside visible window: menu={menu_rect!r} height={window_height}"
+        )
+    type_filter = app_key_command(pid, "type", text="gov")
+    filtered = wait_for_probe(
+        lambda: app_state(pid),
+        lambda state: (state.get("dom") or {}).get("terminal_theme_menu_filter") == "gov"
+        and int((state.get("dom") or {}).get("terminal_theme_menu_option_count") or 0) >= 1,
+        timeout_seconds=6.0,
+        description="terminal theme dropdown keyboard filter",
+    )
+    filtered_dom = filtered.get("dom") or {}
+    commit = app_key_command(pid, "press", "Enter")
+    committed = wait_for_probe(
+        lambda: app_state(pid),
+        lambda state: not rect_is_visible(dom_rect(state, "terminal_theme_menu_rect"))
+        and str((state.get("settings") or {}).get("terminal_light_theme_name") or "")
+        == "Dot Gov",
+        timeout_seconds=6.0,
+        description="terminal theme dropdown keyboard commit",
+    )
+    return {
+        "scroll": scroll,
+        "button_rect": button_rect,
+        "click": click,
+        "menu_rect": menu_rect,
+        "filter_input_rect": input_rect,
+        "filter_type": type_filter,
+        "filtered_option_count": filtered_dom.get("terminal_theme_menu_option_count"),
+        "filter_value": filtered_dom.get("terminal_theme_menu_filter"),
+        "commit": commit,
+        "terminal_light_theme_name": (committed.get("settings") or {}).get("terminal_light_theme_name"),
+    }
+
+
 def assert_theme_editor_contract(pid: int, out_dir: Path) -> dict:
     default_grain = 0.12
     baseline = app_state(pid)
@@ -15034,6 +15343,8 @@ def main() -> int:
         "search_focus_overlay",
         "selection_copy_generation_budget",
         "settings_terminal_reclaim",
+        "settings_zoom_input",
+        "small_window_chrome",
         "theme_editor_contract",
         "active_session_copy_quality",
         "titlebar_autohide_hover",
@@ -15178,6 +15489,11 @@ def main() -> int:
         run_check("selection_copy_generation_budget", lambda: assert_selection_copy_generation_budget(args.pid))
         run_check("titlebar_overflow_menu", lambda: assert_titlebar_overflow_menu_contract(args.pid))
         run_check("settings_terminal_reclaim", lambda: assert_settings_terminal_reclaim_contract(args.pid))
+        run_check("settings_zoom_input", lambda: assert_settings_zoom_input_contract(args.pid))
+        run_check(
+            "settings_terminal_theme_dropdown",
+            lambda: assert_settings_terminal_theme_dropdown_contract(args.pid),
+        )
         run_check("right_panel_animation", lambda: assert_right_panel_animation_contract(args.pid))
         run_check("sidebar_cursor_contract", lambda: assert_sidebar_cursor_contract(args.pid))
         if "stored_codex_session_open" in selected_checks:
@@ -15209,6 +15525,7 @@ def main() -> int:
             lambda: assert_titlebar_empty_lane_window_controls_contract(args.pid, out_dir),
         )
         run_check("titlebar_always_on_top", lambda: assert_titlebar_always_on_top_contract(args.pid))
+        run_check("small_window_chrome", lambda: assert_small_window_chrome_contract(args.pid, out_dir))
         run_check("titlebar_autohide_hover", lambda: assert_titlebar_autohide_hover_contract(args.pid, out_dir))
         run_check("theme_editor_contract", lambda: assert_theme_editor_contract(args.pid, out_dir))
         run_check("terminal_zoom_live_apply", lambda: assert_terminal_zoom_live_apply(
