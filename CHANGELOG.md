@@ -4,6 +4,12 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+## 2.1.73
+
+### Fixed
+
+- recognize Codex model-permission setup menus as interactive terminal surfaces, so new remote Codex sessions do not disable input or show a false "Remote Terminal Needs Attention" timeout while the permissions selector is visible
+
 ## 2.1.72
 
 ### Fixed
