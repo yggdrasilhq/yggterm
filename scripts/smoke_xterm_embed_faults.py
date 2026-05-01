@@ -11978,7 +11978,6 @@ def assert_live_sessions_tree_contract(pid: int) -> dict:
         if index not in live_group_child_indexes
         and normalize_live_path(str(row.get("path") or "")) in live_group_paths
         and str(row.get("kind") or "").strip() == "Session"
-        and bool(row.get("live_member"))
     ]
     if duplicate_tree_live_rows:
         raise AssertionError(
@@ -12135,7 +12134,6 @@ def assert_sidebar_contract(pid: int, session: str) -> dict:
         if index not in live_group_child_indexes
         and normalize_live_path(str(row.get("path") or "")) in live_group_paths
         and str(row.get("kind") or "").strip() == "Session"
-        and bool(row.get("live_member"))
     ]
     if duplicate_tree_live_rows:
         raise AssertionError(
@@ -12379,6 +12377,7 @@ def assert_stored_codex_session_open_contract(pid: int) -> dict:
         for row in app_rows(pid)
         if str(row.get("kind") or "") == "Session"
         and "/.codex/sessions/" in str(row.get("path") or row.get("full_path") or "")
+        and not bool(row.get("live_member"))
     ]
     if not stored_rows:
         raise AssertionError("no stored Codex session row is available for open-contract proof")
@@ -12424,9 +12423,9 @@ def assert_stored_codex_session_open_contract(pid: int) -> dict:
             f"target={target!r} last_action={last_action!r}"
         )
     placement = assert_local_tree_placement(pid, target)
-    if placement.get("placement") != "stored_tree":
+    if placement.get("placement") != "live_sessions_only":
         raise AssertionError(
-            "stored Codex row was promoted into Live Sessions instead of staying in its tree: "
+            "stored Codex row opened a live terminal but did not move into Live Sessions only: "
             f"target={target!r} placement={placement!r}"
         )
     cursor_contract = assert_sidebar_cursor_contract(pid, state=opened_state)
