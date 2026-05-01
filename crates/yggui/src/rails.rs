@@ -101,7 +101,7 @@ pub fn RailScrollBody(content: Element) -> Element {
         div {
             "data-yggui-rail-scroll": "1",
             class: "yggui-rail-scroll",
-            style: "flex:1; overflow:auto; padding:10px 16px 14px 16px; display:flex; flex-direction:column; gap:14px; \
+            style: "flex:1; overflow:auto; padding:10px 16px 32px 16px; display:flex; flex-direction:column; gap:14px; scroll-padding-block:16px 32px; \
              text-rendering:optimizeLegibility; -webkit-font-smoothing:antialiased; -moz-osx-font-smoothing:grayscale;",
             {content}
         }

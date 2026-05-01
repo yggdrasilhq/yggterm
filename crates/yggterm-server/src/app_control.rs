@@ -180,6 +180,12 @@ pub enum AppControlCommand {
         #[serde(default)]
         ratio: Option<f64>,
     },
+    ScrollRightPanel {
+        #[serde(default)]
+        top_px: Option<f64>,
+        #[serde(default)]
+        ratio: Option<f64>,
+    },
     SetPreviewLayout {
         layout: AppControlPreviewLayout,
     },
@@ -203,6 +209,10 @@ pub enum AppControlCommand {
     MoveWindowBy {
         delta_x: f64,
         delta_y: f64,
+    },
+    ResizeWindow {
+        width: f64,
+        height: f64,
     },
     CloseWindow,
     Pointer {
@@ -296,6 +306,7 @@ impl AppControlCommand {
             Self::RestartPendingUpdate => "restart_pending_update",
             Self::CaptureScreenshot { .. } => "capture_screenshot",
             Self::ScrollPreview { .. } => "scroll_preview",
+            Self::ScrollRightPanel { .. } => "scroll_right_panel",
             Self::SetPreviewLayout { .. } => "set_preview_layout",
             Self::CaptureScreenRecording { .. } => "capture_screen_recording",
             Self::SetMaximized { .. } => "set_maximized",
@@ -304,6 +315,7 @@ impl AppControlCommand {
             Self::SetClipboardContents { .. } => "set_clipboard_contents",
             Self::BackgroundWindow => "background_window",
             Self::MoveWindowBy { .. } => "move_window_by",
+            Self::ResizeWindow { .. } => "resize_window",
             Self::CloseWindow => "close_window",
             Self::Pointer { .. } => "pointer",
             Self::Key { .. } => "key",
