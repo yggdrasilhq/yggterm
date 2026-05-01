@@ -1,3 +1,10 @@
+yggterm (2.1.70-1) unstable; urgency=medium
+
+  * Accept focused, input-enabled Codex transcript-browser surfaces in app-control readiness checks.
+  * Stop reporting responsive transcript-browser resumes as a false prompt-ready surface problem.
+
+ -- Yggdrasil HQ <avi@gour.top>  Fri, 01 May 2026 06:04:06 +0530
+
 yggterm (2.1.69-1) unstable; urgency=medium
 
   * Keep accepted live Codex transcript-browser resumes interactive after the initial ready signal.
