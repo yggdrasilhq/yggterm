@@ -1214,6 +1214,11 @@ impl YggtermServer {
         let Some((raw_machine_key, session_id)) = parse_remote_scanned_session_path(path) else {
             return Ok(None);
         };
+        if let Some(session) = self.sessions.get(path)
+            && remote_live_session_starts_new_codex(session)
+        {
+            return Ok(None);
+        }
         let machine_key = normalize_machine_key(raw_machine_key);
         let target = self.remote_target_for_machine_key(&machine_key)?;
         fetch_remote_resume_snapshot_over_ssh(
@@ -4462,6 +4467,9 @@ fn remote_resume_requires_missing_saved_session_failure(
 }
 
 fn remote_resume_seed_fallback_text(session: &ManagedSessionView) -> Option<String> {
+    if remote_live_session_starts_new_codex(session) {
+        return None;
+    }
     let mut lines = Vec::new();
     for block in session.preview.blocks.iter().take(4) {
         let mut emitted = false;
@@ -4612,6 +4620,9 @@ fn remote_resume_fallback_line_is_boilerplate(line: &str) -> bool {
         || normalized.starts_with("launch command prepared:")
         || normalized.starts_with("daemon pty:")
         || normalized.starts_with("queue remote yggterm resume ")
+        || normalized.contains("this codex session stays attached to the daemon")
+        || normalized.contains("codex is launched locally and will receive /quit")
+        || normalized == "local codex terminal."
         || normalized.contains("__yggterm_requested=")
         || normalized.contains("__yggterm_cwd_ok=")
 }
@@ -18983,6 +18994,44 @@ terminal_window_id: None,
         assert_eq!(
             persisted_session.remote_launch_action.as_deref(),
             Some("start-codex")
+        );
+    }
+
+    #[test]
+    fn start_remote_codex_session_does_not_seed_preview_scaffold() {
+        let tree = SessionNode {
+            kind: SessionNodeKind::Group,
+            name: "sessions".to_string(),
+            title: None,
+            document_kind: None,
+            group_kind: None,
+            path: PathBuf::from("/"),
+            children: Vec::new(),
+            session_id: None,
+            cwd: None,
+        };
+        let mut server = YggtermServer::new(
+            &tree,
+            false,
+            GhosttyHostSupport::shadow("test".to_string(), false, false),
+            UiTheme::ZedLight,
+        );
+
+        let key = server
+            .start_remote_codex_session(
+                "definitely-not-a-real-host.invalid",
+                None,
+                Some("/home/pi"),
+                Some("Fresh Codex"),
+            )
+            .expect("start remote codex");
+
+        assert_eq!(server.remote_resume_seed_fallback_for_path(&key), None);
+        assert_eq!(
+            server
+                .remote_resume_seed_snapshot_for_path(&key)
+                .expect("fresh start-codex should not SSH-fetch a seed"),
+            None
         );
     }
 
