@@ -1,3 +1,10 @@
+yggterm (2.1.84-1) unstable; urgency=medium
+
+  * Remove artificial per-character sleeps from terminal latency probes.
+  * Add app update check/restart commands to yggterm-headless.
+
+ -- Yggdrasil HQ <avi@gour.top>  Fri, 01 May 2026 19:46:53 +0530
+
 yggterm (2.1.83-1) unstable; urgency=medium
 
   * Add a UI latency smoke for app-control, sidebar, search, panel, and
