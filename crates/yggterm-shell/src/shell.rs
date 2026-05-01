@@ -5153,6 +5153,14 @@ fn terminal_max_blank_rows_below_live_cursor(rows: u16) -> u16 {
 fn terminal_host_prompt_layout_is_acceptable(rows: u16, blank_rows_below_cursor: u16) -> bool {
     rows == 0 || blank_rows_below_cursor <= terminal_max_blank_rows_below_live_cursor(rows)
 }
+fn terminal_host_surface_layout_is_acceptable(
+    rows: u16,
+    blank_rows_below_cursor: u16,
+    host_surface_text: &str,
+) -> bool {
+    terminal_host_prompt_layout_is_acceptable(rows, blank_rows_below_cursor)
+        || terminal_chunk_is_codex_interactive_setup_prompt(host_surface_text)
+}
 fn remote_resume_visual_reveal_can_complete(
     attach_ready: bool,
     geometry_ready: bool,
@@ -5171,11 +5179,14 @@ fn remote_resume_visual_reveal_can_complete(
         host_health_text_tail,
     );
     let deferred_output_ready = !deferred_resume_output.trim().is_empty() && output_is_acceptable;
+    let host_surface_text =
+        terminal_host_surface_text(host_health_cursor_line_text, host_health_text_tail);
     let host_surface_ready =
         remote_resume_host_surface_may_prove_live_terminal(placeholder_rendered)
-            && terminal_host_prompt_layout_is_acceptable(
+            && terminal_host_surface_layout_is_acceptable(
                 host_health_rows,
                 host_health_blank_rows_below_cursor,
+                host_surface_text,
             )
             && output_is_acceptable;
     attach_ready
@@ -5198,6 +5209,8 @@ fn stale_remote_resume_retry_should_clear(
     host_health_blank_rows_below_cursor: u16,
     poisoned_by_retry: bool,
 ) -> bool {
+    let host_surface_text =
+        terminal_host_surface_text(host_health_cursor_line_text, host_health_text_tail);
     is_remote_resume_session
         && (attach_ready || ready_attempt)
         && terminal_paint_seen
@@ -5205,9 +5218,10 @@ fn stale_remote_resume_retry_should_clear(
         && remote_resume_host_surface_may_prove_live_terminal(placeholder_rendered)
         && !host_has_transport_error
         && poisoned_by_retry
-        && terminal_host_prompt_layout_is_acceptable(
+        && terminal_host_surface_layout_is_acceptable(
             host_health_rows,
             host_health_blank_rows_below_cursor,
+            host_surface_text,
         )
         && remote_resume_visual_reveal_output_is_acceptable(
             "",
@@ -5274,10 +5288,6 @@ fn quiet_retained_remote_surface_ready(
         || tail_generic_idle_output
         || saw_generic_idle_footer_output
         || tail_generic_idle_footer_output
-        || !terminal_host_prompt_layout_is_acceptable(
-            host_health_rows,
-            host_health_blank_rows_below_cursor,
-        )
     {
         return false;
     }
@@ -5288,6 +5298,13 @@ fn quiet_retained_remote_surface_ready(
     }
     let host_surface_text =
         terminal_host_surface_text(host_health_cursor_line_text, host_health_text_tail);
+    if !terminal_host_surface_layout_is_acceptable(
+        host_health_rows,
+        host_health_blank_rows_below_cursor,
+        host_surface_text,
+    ) {
+        return false;
+    }
     if !terminal_surface_has_prompt_ready_text(host_surface_text) {
         return false;
     }
@@ -50159,12 +50176,13 @@ Waiting for the remote terminal to paint...\n";
 ";
         assert!(terminal_chunk_is_codex_interactive_setup_prompt(tail));
         assert!(terminal_surface_has_prompt_ready_text(tail));
+        assert!(!terminal_host_prompt_layout_is_acceptable(50, 31));
         assert!(!retained_remote_surface_has_non_prompt_text("", tail));
         assert!(remote_resume_visual_reveal_output_is_acceptable(
             "", "", tail
         ));
         assert!(remote_resume_visual_reveal_can_complete(
-            true, true, true, true, false, "", "", tail, 50, 0,
+            true, true, true, true, false, "", "", tail, 50, 31,
         ));
         assert!(quiet_retained_remote_surface_ready(
             true,
@@ -50177,7 +50195,7 @@ Waiting for the remote terminal to paint...\n";
             "",
             tail,
             50,
-            0,
+            31,
             Some(0),
             false,
             false,
