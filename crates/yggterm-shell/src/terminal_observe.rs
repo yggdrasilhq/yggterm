@@ -723,6 +723,16 @@ fn terminal_host_problem_for_app_control(host: &Value) -> Option<&'static str> {
         .and_then(Value::as_str)
         .map(str::trim)
         .unwrap_or("");
+    let text_tail = host
+        .get("text_tail")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or("");
+    let buffer_text_sample = host
+        .get("buffer_text_sample")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or("");
     let session_path = host
         .get("session_path")
         .and_then(Value::as_str)
@@ -799,7 +809,15 @@ fn terminal_host_problem_for_app_control(host: &Value) -> Option<&'static str> {
             || helper_textarea_focused
             || cursor_sample_visible
             || local_prompt_surface);
-    let transcript_browser_surface = terminal_chunk_is_transcript_browser(text_sample);
+    let mut visible_text_parts = Vec::new();
+    for part in [text_sample, text_tail, buffer_text_sample, cursor_line_text] {
+        if !part.is_empty() && !visible_text_parts.contains(&part) {
+            visible_text_parts.push(part);
+        }
+    }
+    let visible_text = visible_text_parts.join("\n");
+    let visible_text = visible_text.as_str();
+    let transcript_browser_surface = terminal_chunk_is_transcript_browser(visible_text);
     let transcript_browser_ready_surface = session_path.starts_with("remote-session://")
         && transcript_browser_surface
         && input_enabled
@@ -817,7 +835,7 @@ fn terminal_host_problem_for_app_control(host: &Value) -> Option<&'static str> {
             || input_enabled
             || helper_textarea_focused
             || xterm_cursor_hidden);
-    if text_sample.is_empty() {
+    if visible_text.is_empty() {
         if prompt_ready_surface {
             return None;
         }
@@ -826,23 +844,23 @@ fn terminal_host_problem_for_app_control(host: &Value) -> Option<&'static str> {
         }
         return None;
     }
-    if terminal_chunk_is_transport_error(text_sample) {
+    if terminal_chunk_is_transport_error(visible_text) {
         return Some("active terminal host is showing transport/error output");
     }
-    if terminal_chunk_is_loading_placeholder(text_sample) {
+    if terminal_chunk_is_loading_placeholder(visible_text) {
         return Some("active terminal host is still showing resume placeholder content");
     }
-    if terminal_chunk_is_generic_codex_idle(text_sample) && !prompt_ready_surface {
+    if terminal_chunk_is_generic_codex_idle(visible_text) && !prompt_ready_surface {
         return Some("active terminal host is still showing generic Codex idle chrome");
     }
-    if terminal_chunk_has_generic_codex_idle_footer(text_sample)
-        && !terminal_chunk_has_meaningful_output(text_sample)
+    if terminal_chunk_has_generic_codex_idle_footer(visible_text)
+        && !terminal_chunk_has_meaningful_output(visible_text)
         && !prompt_ready_surface
     {
         return Some("active terminal host is still showing generic Codex idle footer");
     }
-    if (terminal_chunk_has_prompt_output(text_sample)
-        || terminal_chunk_has_codex_prompt_output(text_sample))
+    if (terminal_chunk_has_prompt_output(visible_text)
+        || terminal_chunk_has_codex_prompt_output(visible_text))
         && !prompt_ready_surface
     {
         return Some("active terminal host is only showing a plain shell prompt");
@@ -853,13 +871,13 @@ fn terminal_host_problem_for_app_control(host: &Value) -> Option<&'static str> {
         }
         return Some("active terminal host is still showing the transcript browser");
     }
-    if terminal_chunk_is_saved_transcript_prefill(text_sample) {
+    if terminal_chunk_is_saved_transcript_prefill(visible_text) {
         return Some("active terminal host is still showing saved transcript prefill");
     }
-    if terminal_chunk_is_launcher_boilerplate(text_sample) {
+    if terminal_chunk_is_launcher_boilerplate(visible_text) {
         return Some("active terminal host is still showing launcher boilerplate");
     }
-    if terminal_chunk_is_low_signal_terminal_noise(text_sample) {
+    if terminal_chunk_is_low_signal_terminal_noise(visible_text) {
         return Some("active terminal host is still showing low-signal terminal noise");
     }
     if session_path.starts_with("remote-session://")
@@ -1741,6 +1759,36 @@ mod tests {
     }
 
     #[test]
+    fn terminal_host_problem_accepts_split_canvas_transcript_browser_surface() {
+        let host = json!({
+            "session_path": "remote-session://dev/live-codex",
+            "text_sample": "/ T R A N S C R I P T / / / / / / / / / / /\n  x86_64/arm64, and Debian artifacts. I’m checking the final release asset list.",
+            "text_tail": "• Published v2.1.50: https://github.com/yggdrasilhq/yggterm/releases/tag/v2.1.50\n\n──────────────────────────────────── 87% ─\n ↑/↓ to scroll   pgup/pgdn to page   home/end to jump\n q to quit   esc/← to edit prev   → to edit next   enter to edit message",
+            "buffer_text_sample": "/ T R A N S C R I P T / / / / / / / / / / /\n  x86_64/arm64, and Debian artifacts. I’m checking the final release asset list.",
+            "cursor_line_text": "",
+            "input_enabled": true,
+            "helper_textarea_focused": true,
+            "cursor_node_count": 0,
+            "xterm_present": true,
+            "screen_present": true,
+            "rows_present": false,
+            "canvas_count": 4,
+            "render_event_count": 91,
+            "data_event_count": 1,
+            "xterm_buffer_kind": "alternate",
+            "xterm_cursor_hidden": true,
+            "host_rect": {"left": 277.0, "top": 40.0, "width": 883.0, "height": 872.0},
+            "host_content_width": 883.0,
+            "host_content_height": 872.0,
+            "screen_rect": {"width": 883.0, "height": 872.0},
+            "viewport_rect": {"width": 883.0, "height": 872.0},
+            "helpers_rect": {"width": 883.0, "height": 872.0},
+            "helper_textarea_rect": {"left": -9723.0, "top": 40.0, "width": 1.0, "height": 1.0}
+        });
+        assert_eq!(terminal_host_problem_for_app_control(&host), None);
+    }
+
+    #[test]
     fn describe_viewport_snapshot_accepts_input_enabled_transcript_browser_surface() {
         let snapshot = json!({
             "active_session_path": "remote-session://dev/live-codex",
@@ -1780,8 +1828,9 @@ mod tests {
                 "input_enabled": true,
                 "helper_textarea_focused": true,
                 "xterm_cursor_hidden": true,
-                "text_sample": "/ T R A N S C R I P T /\n• Published v2.1.50\n\n──────────────────── 87% ─\n ↑/↓ to scroll   pgup/pgdn to page   home/end to jump\n q to quit   esc/← to edit prev   → to edit next   enter to edit message",
-                "cursor_line_text": " q to quit   esc/← to edit prev   → to edit next   enter to edit message",
+                "text_sample": "/ T R A N S C R I P T /\n• Published v2.1.50",
+                "text_tail": "──────────────────── 87% ─\n ↑/↓ to scroll   pgup/pgdn to page   home/end to jump\n q to quit   esc/← to edit prev   → to edit next   enter to edit message",
+                "cursor_line_text": "",
                 "resume_overlay_visible": false,
                 "resume_overlay_text": "",
                 "resume_overlay_excerpt": "",
