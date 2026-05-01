@@ -1,3 +1,12 @@
+yggterm (2.1.79-1) unstable; urgency=medium
+
+  * Stop fresh SSH-backed Codex sessions from seeding the terminal viewport
+    with local Codex scaffold text before the remote runtime produces output.
+  * Treat local Codex scaffold text as stale/non-meaningful terminal output.
+  * Make the remote Codex spawn timeline smoke reject visible scaffold text.
+
+ -- Yggdrasil HQ <avi@gour.top>  Fri, 01 May 2026 16:22:55 +0530
+
 yggterm (2.1.78-1) unstable; urgency=medium
 
   * Accept fresh remote Codex welcome/prompt surfaces as live terminals.

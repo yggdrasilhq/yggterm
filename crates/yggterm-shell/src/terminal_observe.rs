@@ -864,6 +864,9 @@ fn terminal_host_problem_for_app_control(host: &Value) -> Option<&'static str> {
     if terminal_chunk_is_loading_placeholder(visible_text) {
         return Some("active terminal host is still showing resume placeholder content");
     }
+    if terminal_chunk_is_local_codex_scaffold(visible_text) {
+        return Some("active terminal host is still showing local Codex scaffold content");
+    }
     if terminal_chunk_is_generic_codex_idle(visible_text) && !prompt_ready_surface {
         return Some("active terminal host is still showing generic Codex idle chrome");
     }
@@ -1175,6 +1178,7 @@ pub(crate) fn terminal_chunk_has_meaningful_output(data: &str) -> bool {
     if terminal_chunk_is_generic_codex_idle(data)
         || terminal_chunk_is_transcript_browser(data)
         || terminal_chunk_is_loading_placeholder(data)
+        || terminal_chunk_is_local_codex_scaffold(data)
     {
         return false;
     }
@@ -1204,6 +1208,34 @@ pub(crate) fn terminal_chunk_has_meaningful_output(data: &str) -> bool {
         .filter(|ch| *ch == '\n' || *ch == '\r')
         .count();
     printable >= 80 || newline_count >= 6 || normalized_lines.len() >= 4
+}
+
+pub(crate) fn terminal_chunk_is_local_codex_scaffold(data: &str) -> bool {
+    let stripped = strip_terminal_control_sequences(data);
+    let lines = stripped
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>();
+    if lines.is_empty() {
+        return false;
+    }
+    let mut saw_scaffold = false;
+    for line in lines {
+        let normalized = line.to_ascii_lowercase();
+        let is_scaffold = normalized == "local codex terminal."
+            || normalized.starts_with("> this codex session stays attached to the daemon")
+            || normalized.contains("this codex session stays attached to the daemon")
+            || normalized.contains("codex is launched locally and will receive /quit")
+            || normalized.starts_with("open live terminal ")
+            || normalized.starts_with("launch command prepared:");
+        if is_scaffold {
+            saw_scaffold = true;
+            continue;
+        }
+        return false;
+    }
+    saw_scaffold
 }
 
 pub(crate) fn terminal_chunk_is_codex_interactive_setup_prompt(data: &str) -> bool {
@@ -1589,8 +1621,9 @@ pub(crate) fn strip_terminal_control_sequences(data: &str) -> String {
 mod tests {
     use super::{
         WorkspaceViewMode, describe_viewport_snapshot, terminal_bootstrap_activation_epoch,
-        terminal_chunk_has_codex_prompt_output, terminal_chunk_is_codex_interactive_setup_prompt,
-        terminal_chunk_is_codex_prompt_surface, terminal_chunk_is_transport_error,
+        terminal_chunk_has_codex_prompt_output, terminal_chunk_has_meaningful_output,
+        terminal_chunk_is_codex_interactive_setup_prompt, terminal_chunk_is_codex_prompt_surface,
+        terminal_chunk_is_local_codex_scaffold, terminal_chunk_is_transport_error,
         terminal_host_problem_for_app_control,
     };
     use serde_json::{Value, json};
@@ -2192,6 +2225,36 @@ The prompt stayed usable after the restore.
     fn transport_error_detector_keeps_line_shaped_shared_connection_failure() {
         let data = "Shared connection to 192.0.2.10 closed.\r\n";
         assert!(terminal_chunk_is_transport_error(data));
+    }
+
+    #[test]
+    fn local_codex_scaffold_is_not_meaningful_terminal_output() {
+        let data = "> This Codex session stays attached to the daemon and opens inline in the main terminal viewport.\r\n\r\nCodex is launched locally and will receive /quit when the daemon shuts down.\r\n";
+        assert!(terminal_chunk_is_local_codex_scaffold(data));
+        assert!(!terminal_chunk_has_meaningful_output(data));
+
+        let host = json!({
+            "session_path": "remote-session://dev/fresh",
+            "text_sample": data,
+            "text_tail": data,
+            "xterm_present": true,
+            "screen_present": true,
+            "canvas_count": 1,
+            "host_content_width": 800.0,
+            "host_content_height": 600.0,
+            "host_rect": {"left": 0.0, "top": 0.0, "width": 800.0, "height": 600.0}
+        });
+        assert_eq!(
+            terminal_host_problem_for_app_control(&host),
+            Some("active terminal host is still showing local Codex scaffold content")
+        );
+    }
+
+    #[test]
+    fn local_codex_scaffold_detector_allows_real_boot_output() {
+        let data = "> This Codex session stays attached to the daemon and opens inline in the main terminal viewport.\r\n\r\nCodex is launched locally and will receive /quit when the daemon shuts down.\r\n\r\n• Booting MCP server\r\n";
+        assert!(!terminal_chunk_is_local_codex_scaffold(data));
+        assert!(terminal_chunk_has_meaningful_output(data));
     }
 
     #[test]
