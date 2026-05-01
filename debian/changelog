@@ -1,3 +1,13 @@
+yggterm (2.1.80-1) unstable; urgency=medium
+
+  * Show live local Codex/LiteLLM transcript-backed runtimes under Live
+    Sessions.
+  * Keep idle stored Codex transcript rows historical until explicitly opened,
+    then move the live runtime into Live Sessions without a duplicate row.
+  * Improve light-theme live-session close affordance contrast.
+
+ -- Yggdrasil HQ <avi@gour.top>  Fri, 01 May 2026 16:53:41 +0530
+
 yggterm (2.1.79-1) unstable; urgency=medium
 
   * Stop fresh SSH-backed Codex sessions from seeding the terminal viewport
