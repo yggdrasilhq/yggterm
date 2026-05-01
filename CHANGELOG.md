@@ -4,6 +4,14 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+## 2.1.85
+
+### Fixed
+
+- recover local startup-restore terminal mounts that get stuck behind a stale same-session surface request, preventing blank selected terminals and high render churn after restart/handoff races
+- make terminal ensure attempts bounded for local sessions so daemon IPC stalls clear attach state instead of leaving input disabled indefinitely
+- strengthen the UI latency smoke with a readiness gate that rejects blank xterm hosts before measuring typing latency
+
 ## 2.1.84
 
 ### Fixed
