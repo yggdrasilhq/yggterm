@@ -50,7 +50,7 @@ pub fn TitlebarChrome(
     rsx! {
         div {
             style: format!(
-                "position:relative; display:grid; grid-template-columns:minmax(0,1fr) minmax(260px, 560px) minmax(0,1fr); align-items:center; \
+                "position:relative; display:grid; grid-template-columns:minmax(42px, 1fr) minmax(84px, 560px) max-content; align-items:center; \
                  gap:6px; height:32px; padding:0 8px 0 8px; box-sizing:border-box; background:{}; zoom:{}%; user-select:none; overflow:visible; \
                  -webkit-user-select:none;",
                 background, zoom_percent

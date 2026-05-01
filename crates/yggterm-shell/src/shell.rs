@@ -1,6 +1,6 @@
 use crate::app_capture::{
     background_app_window, capture_visible_app_surface, describe_window, focus_app_window,
-    move_app_window_by, record_visible_app_surface,
+    move_app_window_by, record_visible_app_surface, resize_app_window,
 };
 use crate::terminal_observe::{
     TerminalOpenAttempt, TerminalOpenAttemptState, describe_terminal_open_attempt,
@@ -266,6 +266,51 @@ const TITLEBAR_RESPONSIVE_CSS: &str = r#"
 }
 @media (max-width: 1020px) {
     [data-yggterm-titlebar-right] .yggterm-titlebar-connect-primary {
+        display: none !important;
+    }
+}
+@media (max-width: 900px) {
+    [data-yggterm-titlebar-left] .yggterm-titlebar-session-shell {
+        display: none !important;
+    }
+}
+@media (max-width: 760px) {
+    [data-yggterm-titlebar-left] .yggterm-titlebar-view-toggle {
+        display: none !important;
+    }
+    [data-yggterm-titlebar-search="1"] {
+        min-width: 180px !important;
+    }
+    [data-yggterm-workspace-row="1"] > [data-yggui-side-rail="1"] {
+        position: absolute !important;
+        top: 0 !important;
+        right: 0 !important;
+        bottom: 0 !important;
+        height: auto !important;
+        z-index: 170 !important;
+        background: var(--yggterm-panel-color, rgba(255,255,255,0.98)) !important;
+        box-shadow: -12px 0 28px rgba(30, 42, 55, 0.12), inset 1px 0 0 var(--yggterm-border-color, rgba(201,214,226,0.70)) !important;
+    }
+}
+@media (max-width: 620px) {
+    [data-yggterm-titlebar-left] .yggterm-titlebar-new-shell {
+        display: none !important;
+    }
+    [data-yggterm-titlebar-search="1"] {
+        min-width: 120px !important;
+    }
+    [data-yggterm-window-control="fullscreen"] {
+        display: none !important;
+    }
+    [data-yggterm-titlebar-right] {
+        gap: 4px !important;
+    }
+}
+@media (max-width: 520px) {
+    [data-yggterm-titlebar-search="1"] {
+        min-width: 84px !important;
+    }
+    [data-yggterm-window-control="always-on-top"] {
         display: none !important;
     }
 }
@@ -936,13 +981,13 @@ fn adjust_main_zoom_settings_for_view(
         WorkspaceViewMode::Terminal => {
             let before = settings.terminal_font_size;
             settings.terminal_font_size =
-                clamp_zoom_value_main(settings.terminal_font_size + delta_steps as f32);
+                clamp_zoom_value_main(settings.terminal_font_size + delta_steps as f32, view_mode);
             (before, settings.terminal_font_size)
         }
         WorkspaceViewMode::Rendered => {
             let before = settings.rendered_font_size;
             settings.rendered_font_size =
-                clamp_zoom_value_main(settings.rendered_font_size + delta_steps as f32);
+                clamp_zoom_value_main(settings.rendered_font_size + delta_steps as f32, view_mode);
             (before, settings.rendered_font_size)
         }
     }
@@ -952,7 +997,7 @@ fn set_main_zoom_settings_for_view(
     view_mode: WorkspaceViewMode,
     value: f32,
 ) -> (f32, f32) {
-    let clamped = clamp_zoom_value_main(value);
+    let clamped = clamp_zoom_value_main(value, view_mode);
     match view_mode {
         WorkspaceViewMode::Terminal => {
             let before = settings.terminal_font_size;
@@ -3689,7 +3734,7 @@ impl ShellState {
         );
     }
     fn set_ui_zoom_percent(&mut self, percent: i32) {
-        let normalized = (percent.clamp(50, 150) as f32 / 100.0) * 14.0;
+        let normalized = (percent.clamp(50, 250) as f32 / 100.0) * 14.0;
         self.settings.ui_font_size = clamp_zoom_value(normalized);
         self.persist_settings();
         self.last_action = format!(
@@ -12061,7 +12106,7 @@ fn titlebar_autohide_content_offset_style(auto_hide_enabled: bool, revealed: boo
         emphasized_exit_transition(&["padding-top"])
     };
     format!(
-        "display:flex; flex:1; min-height:0; overflow:hidden; box-sizing:border-box; padding-top:{}px; \
+        "position:relative; display:flex; flex:1; min-height:0; overflow:hidden; box-sizing:border-box; padding-top:{}px; \
          will-change:padding-top; transition:{};",
         top_padding, transition
     )
@@ -18289,9 +18334,15 @@ async fn capture_dom_debug_snapshot_for(active_session_path: Option<&str>) -> Va
                 || rootNode?.querySelector('[data-settings-field-key="auto-hide-titlebar"]')
                 || null;
             const settingsTitlebarAutoHideToggleState = settingsTitlebarAutoHideToggle?.querySelector('[data-settings-toggle-state="1"]') || null;
+            const settingsZoomInputs = Array.from(rootNode?.querySelectorAll('[data-settings-zoom-input="1"]') || []);
+            const terminalThemeButtons = Array.from(rootNode?.querySelectorAll('[data-terminal-theme-button="1"]') || []);
             const installUpdateRow = rootNode?.querySelector('[data-install-update-row="1"]') || null;
             const installUpdateButton = rootNode?.querySelector('[data-install-update-button="1"]') || null;
             const installUpdateDetail = rootNode?.querySelector('[data-install-update-detail="1"]') || null;
+            const terminalThemeMenu = rootNode?.querySelector('[data-terminal-theme-menu="1"]') || null;
+            const terminalThemeButton = rootNode?.querySelector('[data-terminal-theme-button="1"]') || null;
+            const terminalThemeFilterInput = rootNode?.querySelector('[data-terminal-theme-filter-input="1"]') || null;
+            const terminalThemeSelectedOption = rootNode?.querySelector('[data-terminal-theme-selected-option="1"]') || null;
             const themeEditorOverlay = rootNode?.querySelector('[data-theme-editor-overlay="1"]') || null;
             const themeEditorShell = rootNode?.querySelector('[data-theme-editor-shell="1"]') || null;
             const themeEditorOpenButton = rootNode?.querySelector('[data-theme-editor-open-button="1"]') || null;
@@ -19571,11 +19622,15 @@ async fn capture_dom_debug_snapshot_for(active_session_path: Option<&str>) -> Va
                 shell_frame_border_radius: shellFrame ? String(window.getComputedStyle(shellFrame).borderRadius || '') : null,
                 right_side_rail_rect: rectSummary(rightSideRail),
                 right_side_rail_opacity: rightSideRail ? String(window.getComputedStyle(rightSideRail).opacity || '') : null,
+                right_side_rail_background: rightSideRail ? String(window.getComputedStyle(rightSideRail).backgroundColor || '') : null,
                 right_side_rail_transform: rightSideRail ? String(window.getComputedStyle(rightSideRail).transform || '') : null,
                 right_side_rail_pointer_events: rightSideRail ? String(window.getComputedStyle(rightSideRail).pointerEvents || '') : null,
                 right_side_rail_transition: rightSideRail ? String(window.getComputedStyle(rightSideRail).transition || '') : null,
                 right_side_rail_header_text: String(rightSideRailHeader?.innerText || '').trim().slice(0, 120),
                 right_side_rail_scroll_rect: rectSummary(rightSideRailScroll),
+                right_side_rail_scroll_top: rightSideRailScroll ? Math.round(rightSideRailScroll.scrollTop) : null,
+                right_side_rail_scroll_height: rightSideRailScroll ? Math.round(rightSideRailScroll.scrollHeight) : null,
+                right_side_rail_scroll_client_height: rightSideRailScroll ? Math.round(rightSideRailScroll.clientHeight) : null,
                 right_side_rail_scroll_child_count: rightSideRailScroll ? rightSideRailScroll.children.length : 0,
                 right_side_rail_visible_attr: String(rightSideRail?.getAttribute('data-yggui-side-rail-visible') || ''),
                 right_side_rail_text_sample: String(rightSideRail?.innerText || '').trim().slice(0, 240),
@@ -19597,6 +19652,7 @@ async fn capture_dom_debug_snapshot_for(active_session_path: Option<&str>) -> Va
                 titlebar_search_shell_box_shadow: titlebarSearchShell ? String(window.getComputedStyle(titlebarSearchShell).boxShadow || '') : null,
                 titlebar_search_shell_border_radius: titlebarSearchShell ? String(window.getComputedStyle(titlebarSearchShell).borderRadius || '') : null,
                 titlebar_search_outer_shell_rect: rectSummary(titlebarSearchOuterShell),
+                titlebar_search_input_placeholder: String(titlebarSearchInput?.getAttribute('placeholder') || '').trim(),
                 titlebar_search_outer_shell_background: titlebarSearchOuterShell ? String(window.getComputedStyle(titlebarSearchOuterShell).backgroundColor || '') : null,
                 titlebar_search_outer_shell_box_shadow: titlebarSearchOuterShell ? String(window.getComputedStyle(titlebarSearchOuterShell).boxShadow || '') : null,
                 titlebar_search_outer_shell_border_radius: titlebarSearchOuterShell ? String(window.getComputedStyle(titlebarSearchOuterShell).borderRadius || '') : null,
@@ -19710,11 +19766,26 @@ async fn capture_dom_debug_snapshot_for(active_session_path: Option<&str>) -> Va
                 settings_titlebar_auto_hide_toggle_hit_target: elementSummaryAtPoint(rectSummary(settingsTitlebarAutoHideToggle)),
                 settings_titlebar_auto_hide_toggle_enabled: settingsTitlebarAutoHideToggle?.getAttribute('data-settings-toggle-enabled') === 'true',
                 settings_titlebar_auto_hide_toggle_text: String(settingsTitlebarAutoHideToggleState?.innerText || '').trim().slice(0, 32),
+                settings_zoom_input_rects: settingsZoomInputs.map((node) => rectSummary(node)).filter(Boolean),
+                settings_zoom_input_types: settingsZoomInputs.map((node) => String(node.getAttribute('type') || '').trim()),
+                settings_zoom_input_input_modes: settingsZoomInputs.map((node) => String(node.getAttribute('inputmode') || '').trim()),
+                settings_zoom_input_values: settingsZoomInputs.map((node) => String(node.value || '').trim()),
                 install_update_row_rect: rectSummary(installUpdateRow),
                 install_update_button_rect: rectSummary(installUpdateButton),
                 install_update_button_mode: String(installUpdateButton?.getAttribute('data-install-update-mode') || '').trim(),
                 install_update_button_text: String(installUpdateButton?.innerText || '').trim().slice(0, 120),
                 install_update_detail_text: String(installUpdateDetail?.innerText || '').trim().slice(0, 240),
+                terminal_theme_menu_rect: rectSummary(terminalThemeMenu),
+                terminal_theme_button_rect: rectSummary(terminalThemeButton),
+                terminal_theme_button_rects: terminalThemeButtons.map((node) => rectSummary(node)).filter(Boolean),
+                terminal_theme_button_modes: terminalThemeButtons.map((node) => String(node.getAttribute('data-terminal-theme-mode') || '').trim()),
+                terminal_theme_menu_filter: String(terminalThemeMenu?.getAttribute('data-terminal-theme-filter') || ''),
+                terminal_theme_menu_option_count: Number(terminalThemeMenu?.getAttribute('data-terminal-theme-option-count') || '0'),
+                terminal_theme_filter_input_rect: rectSummary(terminalThemeFilterInput),
+                terminal_theme_filter_input_value: terminalThemeFilterInput ? String(terminalThemeFilterInput.value || '') : '',
+                terminal_theme_filter_input_focused: terminalThemeFilterInput ? terminalThemeFilterInput === document.activeElement : false,
+                terminal_theme_selected_option_rect: rectSummary(terminalThemeSelectedOption),
+                terminal_theme_selected_option_text: String(terminalThemeSelectedOption?.innerText || '').trim().slice(0, 120),
                 theme_editor_overlay_rect: rectSummary(themeEditorOverlay),
                 theme_editor_shell_rect: rectSummary(themeEditorShell),
                 theme_editor_shell_background: themeEditorShell ? String(window.getComputedStyle(themeEditorShell).backgroundColor || '') : null,
@@ -20044,6 +20115,7 @@ async fn capture_dom_debug_snapshot_basic_for(active_session_path: Option<&str>)
             const titlebarSearchDropdownHeader = titlebarSearchDropdown?.querySelector('[data-titlebar-search-dropdown-header="1"]') || null;
             const titlebarSearchDropdownEntries = Array.from(titlebarSearchDropdown?.querySelectorAll('[data-titlebar-search-dropdown-entry="1"]') || []);
             const titlebarSearchCounter = titlebar?.querySelector('[data-titlebar-search-counter="1"]') || null;
+            const titlebarLeftGroup = titlebar?.querySelector('[data-yggterm-titlebar-left="1"]') || null;
             const titlebarNewMenuShell = titlebar?.querySelector('[data-titlebar-new-menu-shell="1"]') || null;
             const titlebarSessionShell = titlebar?.querySelector('[data-titlebar-session-path]')
                 || titlebar?.querySelector('[data-titlebar-session-shell="1"]')
@@ -20084,11 +20156,15 @@ async fn capture_dom_debug_snapshot_basic_for(active_session_path: Option<&str>)
                 || rootNode?.querySelector('[data-settings-field-key="auto-hide-titlebar"]')
                 || null;
             const settingsTitlebarAutoHideToggleState = settingsTitlebarAutoHideToggle?.querySelector('[data-settings-toggle-state="1"]') || null;
+            const settingsZoomInputs = Array.from(rootNode?.querySelectorAll('[data-settings-zoom-input="1"]') || []);
+            const terminalThemeButtons = Array.from(rootNode?.querySelectorAll('[data-terminal-theme-button="1"]') || []);
             const installUpdateRow = rootNode?.querySelector('[data-install-update-row="1"]') || null;
             const installUpdateButton = rootNode?.querySelector('[data-install-update-button="1"]') || null;
             const installUpdateDetail = rootNode?.querySelector('[data-install-update-detail="1"]') || null;
             const terminalThemeMenu = rootNode?.querySelector('[data-terminal-theme-menu="1"]') || null;
             const terminalThemeButton = rootNode?.querySelector('[data-terminal-theme-button="1"]') || null;
+            const terminalThemeFilterInput = rootNode?.querySelector('[data-terminal-theme-filter-input="1"]') || null;
+            const terminalThemeSelectedOption = rootNode?.querySelector('[data-terminal-theme-selected-option="1"]') || null;
             const activeElement = document.activeElement;
             const terminalRegistry = window.__yggtermXtermHosts || {};
             const readTerminalBufferSample = (term) => {
@@ -20508,8 +20584,12 @@ async fn capture_dom_debug_snapshot_basic_for(active_session_path: Option<&str>)
                 shell_frame_box_shadow: shellFrame ? String(window.getComputedStyle(shellFrame).boxShadow || '') : null,
                 shell_frame_border_radius: shellFrame ? String(window.getComputedStyle(shellFrame).borderRadius || '') : null,
                 right_side_rail_rect: rectSummary(rightSideRail),
+                right_side_rail_background: rightSideRail ? String(window.getComputedStyle(rightSideRail).backgroundColor || '') : null,
                 right_side_rail_header_text: String(rightSideRailHeader?.innerText || '').trim().slice(0, 120),
                 right_side_rail_scroll_rect: rectSummary(rightSideRailScroll),
+                right_side_rail_scroll_top: rightSideRailScroll ? Math.round(rightSideRailScroll.scrollTop) : null,
+                right_side_rail_scroll_height: rightSideRailScroll ? Math.round(rightSideRailScroll.scrollHeight) : null,
+                right_side_rail_scroll_client_height: rightSideRailScroll ? Math.round(rightSideRailScroll.clientHeight) : null,
                 right_side_rail_visible_attr: String(rightSideRail?.getAttribute('data-yggui-side-rail-visible') || ''),
                 right_side_rail_text_sample: String(rightSideRail?.innerText || '').trim().slice(0, 240),
                 terminal_host_count: terminalHosts.length,
@@ -20555,6 +20635,12 @@ async fn capture_dom_debug_snapshot_basic_for(active_session_path: Option<&str>)
                     data_settings_field_key: activeElement.getAttribute
                         ? String(activeElement.getAttribute('data-settings-field-key') || '').trim()
                         : '',
+                    data_terminal_theme_filter_input: activeElement.getAttribute
+                        ? String(activeElement.getAttribute('data-terminal-theme-filter-input') || '').trim()
+                        : '',
+                    data_terminal_theme_mode: activeElement.getAttribute
+                        ? String(activeElement.getAttribute('data-terminal-theme-mode') || '').trim()
+                        : '',
                     within_terminal_host_id: activeTerminalHost
                         ? String(activeTerminalHost.id || '').trim()
                         : '',
@@ -20570,10 +20656,12 @@ async fn capture_dom_debug_snapshot_basic_for(active_session_path: Option<&str>)
                 main_surface_body_rect: rectSummary(mainSurfaceBody),
                 titlebar_count: titlebars.length,
                 titlebar_rect: rectSummary(titlebar),
+                titlebar_left_rect: rectSummary(titlebarLeftGroup),
                 titlebar_search_shell_rect: rectSummary(titlebarSearchShell),
                 titlebar_search_outer_shell_rect: rectSummary(titlebarSearchOuterShell),
                 titlebar_search_field_shell_rect: rectSummary(titlebarSearchFieldShell),
                 titlebar_search_input_rect: rectSummary(titlebarSearchInput),
+                titlebar_search_input_placeholder: String(titlebarSearchInput?.getAttribute('placeholder') || '').trim(),
                 titlebar_search_dropdown_rect: rectSummary(titlebarSearchDropdown),
                 titlebar_search_dropdown_header_rect: rectSummary(titlebarSearchDropdownHeader),
                 titlebar_search_dropdown_entry_rects: titlebarSearchDropdownEntries.slice(0, 8).map((node) => rectSummary(node)).filter(Boolean),
@@ -20612,6 +20700,10 @@ async fn capture_dom_debug_snapshot_basic_for(active_session_path: Option<&str>)
                 settings_titlebar_auto_hide_toggle_hit_target: elementSummaryAtPoint(rectSummary(settingsTitlebarAutoHideToggle)),
                 settings_titlebar_auto_hide_toggle_enabled: settingsTitlebarAutoHideToggle?.getAttribute('data-settings-toggle-enabled') === 'true',
                 settings_titlebar_auto_hide_toggle_text: String(settingsTitlebarAutoHideToggleState?.innerText || '').trim().slice(0, 32),
+                settings_zoom_input_rects: settingsZoomInputs.map((node) => rectSummary(node)).filter(Boolean),
+                settings_zoom_input_types: settingsZoomInputs.map((node) => String(node.getAttribute('type') || '').trim()),
+                settings_zoom_input_input_modes: settingsZoomInputs.map((node) => String(node.getAttribute('inputmode') || '').trim()),
+                settings_zoom_input_values: settingsZoomInputs.map((node) => String(node.value || '').trim()),
                 install_update_row_rect: rectSummary(installUpdateRow),
                 install_update_button_rect: rectSummary(installUpdateButton),
                 install_update_button_mode: String(installUpdateButton?.getAttribute('data-install-update-mode') || '').trim(),
@@ -20619,6 +20711,15 @@ async fn capture_dom_debug_snapshot_basic_for(active_session_path: Option<&str>)
                 install_update_detail_text: String(installUpdateDetail?.innerText || '').trim().slice(0, 240),
                 terminal_theme_menu_rect: rectSummary(terminalThemeMenu),
                 terminal_theme_button_rect: rectSummary(terminalThemeButton),
+                terminal_theme_button_rects: terminalThemeButtons.map((node) => rectSummary(node)).filter(Boolean),
+                terminal_theme_button_modes: terminalThemeButtons.map((node) => String(node.getAttribute('data-terminal-theme-mode') || '').trim()),
+                terminal_theme_menu_filter: String(terminalThemeMenu?.getAttribute('data-terminal-theme-filter') || ''),
+                terminal_theme_menu_option_count: Number(terminalThemeMenu?.getAttribute('data-terminal-theme-option-count') || '0'),
+                terminal_theme_filter_input_rect: rectSummary(terminalThemeFilterInput),
+                terminal_theme_filter_input_value: terminalThemeFilterInput ? String(terminalThemeFilterInput.value || '') : '',
+                terminal_theme_filter_input_focused: terminalThemeFilterInput ? terminalThemeFilterInput === document.activeElement : false,
+                terminal_theme_selected_option_rect: rectSummary(terminalThemeSelectedOption),
+                terminal_theme_selected_option_text: String(terminalThemeSelectedOption?.innerText || '').trim().slice(0, 120),
             });
         })();
     "#;
@@ -20767,6 +20868,7 @@ async fn capture_dom_debug_snapshot_action_fallback_for(
                 titlebar_search_outer_shell_rect: rectSummary(titlebarSearchOuterShell),
                 titlebar_search_field_shell_rect: rectSummary(titlebarSearchFieldShell),
                 titlebar_search_input_rect: rectSummary(titlebarSearchInput),
+                titlebar_search_input_placeholder: String(titlebarSearchInput?.getAttribute('placeholder') || '').trim(),
                 titlebar_search_dropdown_rect: rectSummary(titlebarSearchDropdown),
                 titlebar_search_counter_text: String(titlebarSearchCounter?.textContent || '').trim(),
                 active_element: activeElement ? {
@@ -20969,6 +21071,86 @@ async fn scroll_preview_viewport_for(
                 }};
                 const initialMaxTop = Math.max(0, scroller.scrollHeight - scroller.clientHeight);
                 let targetTop = computeTargetTop(initialMaxTop);
+                scroller.scrollTo({{ top: targetTop, behavior: 'auto' }});
+                await settle();
+                const settledMaxTop = Math.max(0, scroller.scrollHeight - scroller.clientHeight);
+                const settledTargetTop = computeTargetTop(settledMaxTop);
+                if (Math.abs(settledTargetTop - scroller.scrollTop) > 12) {{
+                    scroller.scrollTo({{ top: settledTargetTop, behavior: 'auto' }});
+                    await settle();
+                }}
+                dioxus.send({{
+                    accepted: true,
+                    requested_top_px: requestedTop,
+                    requested_ratio: requestedRatio,
+                    applied_top_px: Math.round(scroller.scrollTop),
+                    max_top_px: Math.round(initialMaxTop),
+                    settled_max_top_px: Math.round(settledMaxTop),
+                    client_height_px: Math.round(scroller.clientHeight),
+                    scroll_height_px: Math.round(scroller.scrollHeight),
+                }});
+            }} catch (error) {{
+                dioxus.send({{
+                    accepted: false,
+                    reason: error && error.message ? error.message : String(error),
+                }});
+            }}
+        }})();
+    "#
+    );
+    let mut eval = document::eval(&script);
+    match eval.recv::<Value>().await {
+        Ok(value) => value,
+        Err(error) => json!({
+            "accepted": false,
+            "reason": error.to_string(),
+        }),
+    }
+}
+async fn scroll_right_panel_for(top_px: Option<f64>, ratio: Option<f64>) -> Value {
+    let requested_top_px = top_px.filter(|value| value.is_finite());
+    let requested_ratio = ratio
+        .filter(|value| value.is_finite())
+        .map(|value| value.clamp(0.0, 1.0));
+    let top_literal = requested_top_px
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "null".to_string());
+    let ratio_literal = requested_ratio
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "null".to_string());
+    let script = format!(
+        r#"
+        (async () => {{
+            try {{
+                const requestedTop = {top_literal};
+                const requestedRatio = {ratio_literal};
+                const visibleNodes = (nodes) => nodes.filter((node) => node && node.getClientRects().length > 0);
+                const pickLast = (nodes) => nodes.length ? nodes[nodes.length - 1] : null;
+                const scrollers = Array.from(document.querySelectorAll('[data-yggui-rail-scroll="1"]'))
+                  .filter((node) => node.isConnected);
+                const scroller = pickLast(visibleNodes(scrollers)) || pickLast(scrollers) || null;
+                if (!scroller) {{
+                    dioxus.send({{
+                        accepted: false,
+                        reason: "right_panel_scroller_missing",
+                    }});
+                    return;
+                }}
+                const settle = async () => {{
+                    await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+                    await new Promise((resolve) => setTimeout(resolve, 70));
+                }};
+                const computeTargetTop = (maxTop) => {{
+                    let nextTop = 0;
+                    if (typeof requestedTop === 'number' && Number.isFinite(requestedTop)) {{
+                        nextTop = requestedTop;
+                    }} else if (typeof requestedRatio === 'number' && Number.isFinite(requestedRatio)) {{
+                        nextTop = maxTop * requestedRatio;
+                    }}
+                    return Math.max(0, Math.min(maxTop, nextTop));
+                }};
+                const initialMaxTop = Math.max(0, scroller.scrollHeight - scroller.clientHeight);
+                const targetTop = computeTargetTop(initialMaxTop);
                 scroller.scrollTo({{ top: targetTop, behavior: 'auto' }});
                 await settle();
                 const settledMaxTop = Math.max(0, scroller.scrollHeight - scroller.clientHeight);
@@ -21330,10 +21512,10 @@ fn terminal_probe_input_script(
                     }}
                     if (perChar && Array.from(textChunk).length > 1) {{
                         for (const char of Array.from(textChunk)) {{
-                            await dispatchTextInput(char, false);
+                            await dispatchTextInput(char, true);
                         }}
                         if (settleAfter) {{
-                            await settle(24);
+                            await settle(12);
                         }}
                         return;
                     }}
@@ -22304,6 +22486,26 @@ async fn process_pending_app_control_requests(
                 error: None,
             }
         }
+        AppControlCommand::ScrollRightPanel { top_px, ratio } => {
+            let scroll_result = scroll_right_panel_for(top_px, ratio).await;
+            sleep(Duration::from_millis(40)).await;
+            let dom_snapshot =
+                capture_dom_debug_snapshot_for_or_empty(active_session_path.as_deref()).await;
+            AppControlResponse {
+                request_id: request.request_id.clone(),
+                handled_by_pid: std::process::id(),
+                completed_at_ms: current_millis() as u128,
+                output_path: None,
+                data: Some(json!({
+                    "command": "scroll_right_panel",
+                    "window": describe_window(&desktop),
+                    "right_panel_mode": right_panel_mode_label(state.read().right_panel_mode),
+                    "scroll": scroll_result,
+                    "dom": dom_snapshot,
+                })),
+                error: None,
+            }
+        }
         AppControlCommand::SetPreviewLayout { layout } => {
             let layout_mode = match layout {
                 AppControlPreviewLayout::Chat => PreviewLayoutMode::Chat,
@@ -22491,6 +22693,29 @@ async fn process_pending_app_control_requests(
                     data: Some(data),
                     error: None,
                 },
+                Err(error) => AppControlResponse {
+                    request_id: request.request_id.clone(),
+                    handled_by_pid: std::process::id(),
+                    completed_at_ms: current_millis() as u128,
+                    output_path: None,
+                    data: None,
+                    error: Some(error.to_string()),
+                },
+            }
+        }
+        AppControlCommand::ResizeWindow { width, height } => {
+            match resize_app_window(&desktop, width, height) {
+                Ok(data) => {
+                    state.with_mut(sync_window_frame_state);
+                    AppControlResponse {
+                        request_id: request.request_id.clone(),
+                        handled_by_pid: std::process::id(),
+                        completed_at_ms: current_millis() as u128,
+                        output_path: None,
+                        data: Some(data),
+                        error: None,
+                    }
+                }
                 Err(error) => AppControlResponse {
                     request_id: request.request_id.clone(),
                     handled_by_pid: std::process::id(),
@@ -24281,7 +24506,7 @@ pub fn launch_shell(bootstrap: ShellBootstrap) -> Result<()> {
         .with_traffic_light_inset(tao::dpi::LogicalPosition::new(16.0, 14.0))
         .with_resizable(true)
         .with_inner_size(LogicalSize::new(1460.0, 920.0))
-        .with_min_inner_size(LogicalSize::new(1024.0, 720.0));
+        .with_min_inner_size(LogicalSize::new(480.0, 360.0));
     #[cfg(not(target_os = "macos"))]
     let linux_transparent_window = linux_window_transparent;
     #[cfg(not(target_os = "macos"))]
@@ -24293,7 +24518,7 @@ pub fn launch_shell(bootstrap: ShellBootstrap) -> Result<()> {
             .with_decorations(linux_native_decorations)
             .with_resizable(true)
             .with_inner_size(LogicalSize::new(1460.0, 920.0))
-            .with_min_inner_size(LogicalSize::new(1024.0, 720.0));
+            .with_min_inner_size(LogicalSize::new(480.0, 360.0));
         #[cfg(target_os = "windows")]
         let window = window.with_taskbar_icon(Some(window_icon::load_yggterm_window_icon()));
         window
@@ -26338,6 +26563,7 @@ fn app() -> Element {
                     }
                 }
                 div {
+                    "data-yggterm-workspace-row": "1",
                     style: titlebar_autohide_content_offset_style(
                         titlebar_auto_hide_enabled,
                         titlebar_revealed,
@@ -26872,9 +27098,9 @@ fn Titlebar(
     let titlebar_session_menu_open = snapshot.titlebar_session_menu_open;
     let search_dropdown_open = titlebar_search_dropdown_open(&snapshot);
     let search_placeholder = if snapshot.command_mode_active {
-        "/ Run a yggterm command"
+        "/ Run command"
     } else {
-        "Search live sessions or type '/' for commands"
+        "Search or type /"
     };
     let search_content_controls_enabled = !snapshot.search_content_hits.is_empty();
     let search_counter_label = if search_content_controls_enabled {
@@ -27015,6 +27241,7 @@ fn Titlebar(
                         "☰"
                     }
                     div {
+                        class: "yggterm-titlebar-view-toggle",
                         style: toggle_slider_style(snapshot.palette),
                         onmousedown: |evt| evt.stop_propagation(),
                         button {
@@ -27054,6 +27281,7 @@ fn Titlebar(
                             6
                         ),
                         div {
+                            class: "yggterm-titlebar-new-shell",
                             style: "position:relative; display:flex; align-items:flex-start; height:100%; overflow:visible;",
                             onmousedown: |evt| {
                                 evt.prevent_default();
@@ -27184,6 +27412,7 @@ fn Titlebar(
                             div {
                             key: "{titlebar_session_key}",
                             "data-titlebar-session-path": "{active_session_path_value}",
+                            class: "yggterm-titlebar-session-shell",
                             style: format!(
                                 "position:relative; display:flex; align-items:flex-start; align-self:center; flex:1 1 220px; min-width:0; max-width:360px; height:{}px; overflow:visible; margin-left:0;",
                                 titlebar_modal_tab_height
@@ -32303,6 +32532,8 @@ fn TerminalCanvas(
             let mut terminal_geometry_ready = false;
             let mut current_terminal_cols = 0_u16;
             let mut current_terminal_rows = 0_u16;
+            let mut last_sent_terminal_resize_cols = 0_u16;
+            let mut last_sent_terminal_resize_rows = 0_u16;
             let mut terminal_paint_seen = !is_remote_resume_session;
             let mut cursor = 0u64;
             let mut read_poll_ms = if is_remote_resume_session {
@@ -33239,25 +33470,44 @@ fn TerminalCanvas(
                                 }
                             }
                             Ok(TerminalJsEvent::Resize { cols, rows }) => {
-                                if current_terminal_cols == cols
-                                    && current_terminal_rows == rows
-                                    && terminal_geometry_ready
-                                {
-                                    continue;
-                                }
                                 current_terminal_cols = cols;
                                 current_terminal_rows = rows;
                                 let geometry_usable = terminal_geometry_is_usable(cols, rows);
                                 resize_seen = resize_seen || geometry_usable;
                                 terminal_geometry_ready =
                                     terminal_geometry_ready || geometry_usable;
-                                let _ = terminal_resize_async(
+                                if last_sent_terminal_resize_cols == cols
+                                    && last_sent_terminal_resize_rows == rows
+                                {
+                                    continue;
+                                }
+                                match terminal_resize_async(
                                     endpoint.clone(),
                                     runtime_session_path.clone(),
                                     cols,
                                     rows,
                                 )
-                                .await;
+                                .await
+                                {
+                                    Ok(()) => {
+                                        last_sent_terminal_resize_cols = cols;
+                                        last_sent_terminal_resize_rows = rows;
+                                    }
+                                    Err(error) => {
+                                        append_trace_event(
+                                            &trace_home,
+                                            "ui",
+                                            "terminal_mount",
+                                            "terminal_resize_error",
+                                            json!({
+                                                "session_path": session_path.clone(),
+                                                "cols": cols,
+                                                "rows": rows,
+                                                "error": error.to_string(),
+                                            }),
+                                        );
+                                    }
+                                }
                             }
                             Ok(TerminalJsEvent::Clipboard { action, chars }) => {
                                 let (title, message) = if action == "cut" {
@@ -42768,6 +43018,17 @@ fn ZoomSettingRow(
     let focus_key_on_mousedown = field_key.clone();
     let focus_key_on_click = field_key.clone();
     let focus_key_on_focus = field_key.clone();
+    let mut draft_percent = use_signal(|| percent.to_string());
+    let mut focused = use_signal(|| false);
+    let display_percent = draft_percent();
+    use_effect(move || {
+        if !focused() {
+            let canonical = percent.to_string();
+            if draft_percent() != canonical {
+                draft_percent.set(canonical);
+            }
+        }
+    });
     rsx! {
         div {
             style: "display:flex; flex-direction:column; gap:4px;",
@@ -42797,16 +43058,27 @@ fn ZoomSettingRow(
                 }
                 input {
                     "data-settings-field-key": "{field_key}",
-                    r#type: "number",
-                    min: "50",
-                    max: "250",
-                    step: "5",
-                    value: "{percent}",
+                    "data-settings-zoom-input": "1",
+                    r#type: "text",
+                    inputmode: "numeric",
+                    pattern: "[0-9]*",
+                    value: "{display_percent}",
                     style: format!(
                         "min-width:0; width:54px; height:24px; border:none; border-radius:8px; \
-                         background:transparent; color:{}; outline:none; text-align:center; \
-                         font-size:12px; font-weight:700; appearance:textfield; -moz-appearance:textfield;",
-                        palette.text
+                         background:{}; color:{}; outline:none; text-align:center; \
+                         font-size:12px; font-weight:750; box-shadow: inset 0 0 0 1px {}; \
+                         appearance:textfield; -moz-appearance:textfield;",
+                        if palette_is_dark(palette) {
+                            "rgba(10,14,20,0.60)"
+                        } else {
+                            "rgba(255,255,255,0.66)"
+                        },
+                        palette.text,
+                        if palette_is_dark(palette) {
+                            "rgba(93,116,134,0.44)"
+                        } else {
+                            "rgba(198,212,224,0.48)"
+                        }
                     ),
                     onmousedown: move |evt| {
                         evt.stop_propagation();
@@ -42816,15 +43088,34 @@ fn ZoomSettingRow(
                         evt.stop_propagation();
                         on_focus_input.call(focus_key_on_click.clone());
                     },
-                    onfocus: move |_| on_focus_input.call(focus_key_on_focus.clone()),
-                    onblur: move |_| on_blur_input.call(()),
+                    onfocus: move |_| {
+                        focused.set(true);
+                        on_focus_input.call(focus_key_on_focus.clone());
+                    },
+                    onblur: move |_| {
+                        focused.set(false);
+                        let next = normalize_zoom_percent_text(&draft_percent(), percent);
+                        draft_percent.set(next.to_string());
+                        on_set_percent.call(next);
+                        on_blur_input.call(());
+                    },
                     onkeydown: move |evt| {
                         evt.stop_propagation();
+                        match evt.key() {
+                            Key::Enter => {
+                                evt.prevent_default();
+                                let next = normalize_zoom_percent_text(&draft_percent(), percent);
+                                draft_percent.set(next.to_string());
+                                on_set_percent.call(next);
+                            }
+                            Key::Character(ref chars) if !chars.chars().all(|ch| ch.is_ascii_digit()) => {
+                                evt.prevent_default();
+                            }
+                            _ => {}
+                        }
                     },
                     oninput: move |evt| {
-                        if let Ok(value) = evt.value().trim().parse::<i32>() {
-                            on_set_percent.call(value);
-                        }
+                        draft_percent.set(sanitize_zoom_percent_text(&evt.value()));
                     },
                 }
                 button {
@@ -42887,6 +43178,7 @@ fn TerminalThemeSelectRow(
     on_change: EventHandler<(UiTheme, String)>,
 ) -> Element {
     let mut menu_open = use_signal(|| false);
+    let mut filter_query = use_signal(String::new);
     let control_background = if palette_is_dark(palette) {
         "rgba(10,14,20,0.98)"
     } else {
@@ -42907,6 +43199,14 @@ fn TerminalThemeSelectRow(
     } else {
         "rgba(255,255,255,0.98)"
     };
+    let mode_key = format!("{:?}", mode);
+    let filter_value = filter_query();
+    let filtered_options = filter_terminal_theme_options(&options, &filter_value);
+    let empty_filter = filter_value.trim().is_empty();
+    let option_count = filtered_options.len();
+    let mut open_button_filter = filter_query;
+    let mut open_button_menu = menu_open;
+    let options_for_enter = options.clone();
     rsx! {
         div {
             style: format!(
@@ -42949,7 +43249,7 @@ fn TerminalThemeSelectRow(
                 button {
                     r#type: "button",
                     "data-terminal-theme-button": "1",
-                    "data-terminal-theme-mode": format!("{:?}", mode),
+                    "data-terminal-theme-mode": "{mode_key}",
                     style: format!(
                         "width:100%; height:34px; border:none; border-radius:10px; padding:0 9px 0 12px; \
                          display:flex; align-items:center; justify-content:space-between; gap:8px; min-width:0; \
@@ -42959,8 +43259,34 @@ fn TerminalThemeSelectRow(
                         control_text,
                         control_border
                     ),
-                    onclick: move |_| menu_open.set(!menu_open()),
-                    onkeydown: move |evt| evt.stop_propagation(),
+                    onclick: move |_| {
+                        let next = !open_button_menu();
+                        open_button_menu.set(next);
+                        if next {
+                            open_button_filter.set(String::new());
+                        }
+                    },
+                    onkeydown: move |evt| {
+                        evt.stop_propagation();
+                        match evt.key() {
+                            Key::Enter => {
+                                evt.prevent_default();
+                                menu_open.set(true);
+                                filter_query.set(String::new());
+                            }
+                            Key::Character(ref chars) if chars == " " => {
+                                evt.prevent_default();
+                                menu_open.set(true);
+                                filter_query.set(String::new());
+                            }
+                            Key::Character(ref chars) if chars.chars().all(|ch| !ch.is_control()) => {
+                                evt.prevent_default();
+                                menu_open.set(true);
+                                filter_query.set(chars.to_string());
+                            }
+                            _ => {}
+                        }
+                    },
                     span {
                         style: "min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;",
                         "{value}"
@@ -42973,14 +43299,78 @@ fn TerminalThemeSelectRow(
                 if menu_open() {
                     div {
                         "data-terminal-theme-menu": "1",
-                        "data-terminal-theme-mode": format!("{:?}", mode),
+                        "data-terminal-theme-mode": "{mode_key}",
+                        "data-terminal-theme-filter": "{filter_value}",
+                        "data-terminal-theme-option-count": "{option_count}",
                         style: format!(
-                            "display:flex; flex-direction:column; gap:2px; max-height:184px; overflow:auto; \
-                             border-radius:10px; padding:4px; background:{}; box-shadow: inset 0 0 0 1px {};",
+                            "display:flex; flex-direction:column; gap:4px; max-height:min(236px, 54vh); overflow:auto; \
+                             border-radius:10px; padding:5px; background:{}; box-shadow: inset 0 0 0 1px {}; scroll-margin-block:16px;",
                             menu_background,
                             control_border
                         ),
-                        for option in options {
+                        onmounted: {
+                            let mode_key = mode_key.clone();
+                            move |evt| {
+                                let mode_key = mode_key.clone();
+                                async move {
+                                    let _ = evt.set_focus(true).await;
+                                    let _ = document::eval(&format!(
+                                        r#"
+                                    setTimeout(() => {{
+                                        const menu = document.querySelector('[data-terminal-theme-menu="1"][data-terminal-theme-mode="{mode_key}"]');
+                                        if (!menu) return;
+                                        menu.scrollIntoView({{ block: 'nearest', inline: 'nearest', behavior: 'smooth' }});
+                                        const input = menu.querySelector('[data-terminal-theme-filter-input="1"]');
+                                        if (input && typeof input.focus === 'function') {{
+                                            input.focus({{ preventScroll: true }});
+                                            if (typeof input.select === 'function') {{
+                                                input.select();
+                                            }}
+                                        }}
+                                    }}, 0);
+                                    "#
+                                    ));
+                                }
+                            }
+                        },
+                        input {
+                            "data-terminal-theme-filter-input": "1",
+                            "data-terminal-theme-mode": "{mode_key}",
+                            r#type: "text",
+                            value: "{filter_value}",
+                            placeholder: "Filter themes",
+                            style: format!(
+                                "height:28px; padding:0 9px; border:none; border-radius:8px; background:{}; color:{}; \
+                                 outline:none; box-shadow: inset 0 0 0 1px {}; font-size:12px; font-weight:650;",
+                                control_background,
+                                control_text,
+                                control_border
+                            ),
+                            onmousedown: |evt| evt.stop_propagation(),
+                            onclick: |evt| evt.stop_propagation(),
+                            onkeydown: move |evt| {
+                                evt.stop_propagation();
+                                if evt.key() == Key::Escape {
+                                    evt.prevent_default();
+                                    menu_open.set(false);
+                                } else if evt.key() == Key::Enter {
+                                    evt.prevent_default();
+                                    if let Some(first) = filter_terminal_theme_options(&options_for_enter, &filter_query()).into_iter().next() {
+                                        on_change.call((mode, first));
+                                        menu_open.set(false);
+                                    }
+                                }
+                            },
+                            oninput: move |evt| filter_query.set(evt.value()),
+                        }
+                        if option_count == 0 {
+                            div {
+                                "data-terminal-theme-empty": "1",
+                                style: format!("padding:7px 8px; color:{}; font-size:12px; font-weight:600;", palette.muted),
+                                "No matching themes"
+                            }
+                        }
+                        for option in filtered_options {
                             {
                                 let selected = option == value;
                                 let option_for_click = option.clone();
@@ -43003,9 +43393,17 @@ fn TerminalThemeSelectRow(
                                         onclick: move |_| {
                                             on_change.call((mode, option_for_click.clone()));
                                             menu_open.set(false);
+                                            filter_query.set(String::new());
                                         },
                                         onkeydown: move |evt| evt.stop_propagation(),
-                                        "{option}"
+                                        if selected && empty_filter {
+                                            span {
+                                                "data-terminal-theme-selected-option": "1",
+                                                "{option}"
+                                            }
+                                        } else {
+                                            "{option}"
+                                        }
                                     }
                                 }
                             }
@@ -43023,6 +43421,17 @@ fn terminal_theme_value_for_settings(value: &str, theme: UiTheme) -> String {
     } else {
         value.to_string()
     }
+}
+fn filter_terminal_theme_options(options: &[String], query: &str) -> Vec<String> {
+    let query = query.trim().to_ascii_lowercase();
+    if query.is_empty() {
+        return options.to_vec();
+    }
+    options
+        .iter()
+        .filter(|option| option.to_ascii_lowercase().contains(&query))
+        .cloned()
+        .collect()
 }
 #[component]
 fn MetadataGroup(title: String, entries: Vec<SessionMetadataEntry>, palette: Palette) -> Element {
@@ -43299,7 +43708,8 @@ fn shell_style(
     format!(
         "position:absolute; inset:{}px; display:flex; flex-direction:column; overflow:hidden; \
          border-radius:{}px; background-color:{}; background-image:{}; box-shadow:{}; background-clip:padding-box; backdrop-filter:{}; \
-         -webkit-backdrop-filter:{}; clip-path:{}; -webkit-clip-path:{}; font-family:{};",
+         -webkit-backdrop-filter:{}; clip-path:{}; -webkit-clip-path:{}; font-family:{}; \
+         --yggterm-panel-color:{}; --yggterm-border-color:{}; --yggterm-shell-fill:{};",
         frame_inset,
         effective_radius,
         effective_shell_fill,
@@ -43309,7 +43719,10 @@ fn shell_style(
         backdrop,
         frame_clip,
         frame_clip,
-        interface_font_family()
+        interface_font_family(),
+        palette.panel,
+        palette.border,
+        effective_shell_fill
     )
 }
 #[cfg(target_os = "linux")]
@@ -43669,9 +44082,12 @@ fn apply_linux_window_shape_reapply_sequence(
 fn apply_linux_always_on_top_state(desktop: &dioxus::desktop::DesktopContext, always_on_top: bool) {
     use gtk::prelude::*;
 
+    desktop.set_always_on_bottom(false);
     let gtk_window = desktop.gtk_window();
+    gtk_window.set_keep_below(false);
     gtk_window.set_keep_above(always_on_top);
     if let Some(gdk_window) = gtk_window.window() {
+        gdk_window.set_keep_below(false);
         gdk_window.set_keep_above(always_on_top);
     }
 }
@@ -44209,11 +44625,23 @@ fn inline_toggle_thumb_style(enabled: bool) -> String {
         transition
     )
 }
-fn clamp_zoom_value(value: f32) -> f32 {
-    value.clamp(7.0, 20.0)
+fn sanitize_zoom_percent_text(value: &str) -> String {
+    value.chars().filter(|ch| ch.is_ascii_digit()).collect()
 }
-fn clamp_zoom_value_main(value: f32) -> f32 {
-    value.clamp(5.0, 20.0)
+fn normalize_zoom_percent_text(value: &str, fallback: i32) -> i32 {
+    sanitize_zoom_percent_text(value)
+        .parse::<i32>()
+        .unwrap_or(fallback)
+        .clamp(50, 250)
+}
+fn clamp_zoom_value_for_base(value: f32, base: f32) -> f32 {
+    value.clamp(base * 0.5, base * 2.5)
+}
+fn clamp_zoom_value(value: f32) -> f32 {
+    clamp_zoom_value_for_base(value, 14.0)
+}
+fn clamp_zoom_value_main(value: f32, view_mode: WorkspaceViewMode) -> f32 {
+    clamp_zoom_value_for_base(value, main_zoom_base(view_mode))
 }
 fn zoom_percent(value: f32, base: f32) -> i32 {
     ((value / base) * 100.0).round() as i32
@@ -44244,12 +44672,40 @@ mod tests {
     use yggterm_server::SessionPreview;
     #[test]
     fn terminal_zoom_clamps_to_fifty_percent_floor() {
-        assert_eq!(clamp_zoom_value_main(0.0), 5.0);
-        assert_eq!(clamp_zoom_value_main(4.0), 5.0);
+        assert_eq!(clamp_zoom_value_main(0.0, WorkspaceViewMode::Terminal), 7.0);
+        assert_eq!(clamp_zoom_value_main(4.0, WorkspaceViewMode::Terminal), 7.0);
         assert_eq!(
-            zoom_percent(clamp_zoom_value_main(4.0), TERMINAL_ZOOM_BASE),
-            36
+            zoom_percent(
+                clamp_zoom_value_main(4.0, WorkspaceViewMode::Terminal),
+                TERMINAL_ZOOM_BASE
+            ),
+            50
         );
+        assert_eq!(clamp_zoom_value_main(4.0, WorkspaceViewMode::Rendered), 5.0);
+    }
+    #[test]
+    fn zoom_percent_text_input_sanitizes_and_clamps() {
+        assert_eq!(sanitize_zoom_percent_text("2e5-abc"), "25");
+        assert_eq!(normalize_zoom_percent_text("2e5-abc", 100), 50);
+        assert_eq!(normalize_zoom_percent_text("999", 100), 250);
+        assert_eq!(normalize_zoom_percent_text("", 125), 125);
+    }
+    #[test]
+    fn terminal_theme_filter_matches_case_insensitive_substrings() {
+        let options = vec![
+            "Andromeda".to_string(),
+            "Dot Gov".to_string(),
+            "Solarized Light".to_string(),
+        ];
+        assert_eq!(
+            filter_terminal_theme_options(&options, "gov"),
+            vec!["Dot Gov".to_string()]
+        );
+        assert_eq!(
+            filter_terminal_theme_options(&options, "LIGHT"),
+            vec!["Solarized Light".to_string()]
+        );
+        assert_eq!(filter_terminal_theme_options(&options, ""), options);
     }
     #[test]
     fn rendered_zoom_updates_only_rendered_font_size() {
@@ -45666,7 +46122,7 @@ mod tests {
         );
         assert!(script.contains("const target = helperTextarea || host;"));
         assert!(script.contains("target.dispatchEvent(new KeyboardEvent('keydown', keyInit));"));
-        assert!(script.contains("await dispatchTextInput(char, false);"));
+        assert!(script.contains("await dispatchTextInput(char, true);"));
         assert!(script.contains("await settle(24);"));
     }
 

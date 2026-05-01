@@ -4,6 +4,20 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+## 2.1.86
+
+### Fixed
+
+- keep the compact titlebar usable in very small windows by moving crowded controls into the overflow menu and preserving the search field width
+- keep the compact Settings rail opaque and inside the content area, with a shorter search placeholder that fits narrow titlebars
+- restore the Linux always-on-top toggle by clearing keep-below before applying keep-above
+- keep Settings terminal-theme dropdowns keyboard-filterable and scrolled into view when opened near the bottom of the rail
+- replace Settings zoom steppers with numeric text inputs that reject non-digits and clamp values to supported zoom bounds
+- synchronize daemon PTY resize requests with xterm fit geometry after compact window resizes, preventing stale row/column sizes from corrupting prompt rendering
+- repaint resumed remote Codex sessions from the daemon current-screen snapshot before replaying retained bridge chunks, preventing sparse or scrollback-shaped TUI restores
+- fill the thin edge fringe in the 512px app icon so the panel icon renders with a cleaner border
+- extend the jojo/KDE smoke coverage for compact chrome and Settings controls
+
 ## 2.1.85
 
 ### Fixed

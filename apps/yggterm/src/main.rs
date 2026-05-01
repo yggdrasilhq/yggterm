@@ -31,8 +31,9 @@ use yggterm_server::{
     run_app_control_pointer, run_app_control_probe_terminal_viewport_input,
     run_app_control_probe_terminal_viewport_scroll, run_app_control_probe_terminal_viewport_select,
     run_app_control_reclaim_terminal_focus, run_app_control_remove_session,
-    run_app_control_reset_theme_editor, run_app_control_restart_pending_update,
-    run_app_control_scroll_preview, run_app_control_send_terminal_input,
+    run_app_control_reset_theme_editor, run_app_control_resize_window,
+    run_app_control_restart_pending_update, run_app_control_scroll_preview,
+    run_app_control_scroll_right_panel, run_app_control_send_terminal_input,
     run_app_control_set_clipboard_png_base64, run_app_control_set_clipboard_text,
     run_app_control_set_fullscreen, run_app_control_set_main_zoom, run_app_control_set_maximized,
     run_app_control_set_preview_layout, run_app_control_set_right_panel_mode,
@@ -761,6 +762,27 @@ fn main() -> Result<()> {
                     timeout_ms,
                 )
             }
+            "resize-window" | "set-window-size" | "size" => {
+                let width = args.windows(2).find_map(|window| {
+                    if window[0] == "--width" || window[0] == "--w" {
+                        window[1].parse::<f64>().ok()
+                    } else {
+                        None
+                    }
+                });
+                let height = args.windows(2).find_map(|window| {
+                    if window[0] == "--height" || window[0] == "--h" {
+                        window[1].parse::<f64>().ok()
+                    } else {
+                        None
+                    }
+                });
+                run_app_control_resize_window(
+                    width.context("missing --width/--w for server app resize-window")?,
+                    height.context("missing --height/--h for server app resize-window")?,
+                    timeout_ms,
+                )
+            }
             "close" | "quit" | "exit" => run_app_control_close_window(timeout_ms),
             "chrome-hover" | "titlebar-hover" => {
                 let active = cli_positional_args(&args, 3)
@@ -824,6 +846,23 @@ fn main() -> Result<()> {
                     .into_iter()
                     .next()
                     .unwrap_or("hidden");
+                if mode == "scroll" {
+                    let top_px = args.windows(2).find_map(|window| {
+                        if window[0] == "--top" {
+                            window[1].parse::<f64>().ok()
+                        } else {
+                            None
+                        }
+                    });
+                    let ratio = args.windows(2).find_map(|window| {
+                        if window[0] == "--ratio" {
+                            window[1].parse::<f64>().ok()
+                        } else {
+                            None
+                        }
+                    });
+                    return run_app_control_scroll_right_panel(top_px, ratio, timeout_ms);
+                }
                 let mode = match mode {
                     "hidden" | "hide" | "close" | "none" => AppControlRightPanelMode::Hidden,
                     "connect" => AppControlRightPanelMode::Connect,
