@@ -1,3 +1,10 @@
+yggterm (2.1.74-1) unstable; urgency=medium
+
+  * Let Codex model-permission setup menus pass the remote resume layout gate.
+  * Keep stale transcript detection strict while accepting the mid-screen setup selector.
+
+ -- Yggdrasil HQ <avi@gour.top>  Fri, 01 May 2026 13:29:13 +0530
+
 yggterm (2.1.73-1) unstable; urgency=medium
 
   * Recognize Codex model-permission setup menus as interactive terminal surfaces.
