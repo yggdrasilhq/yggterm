@@ -1,3 +1,11 @@
+yggterm (2.1.83-1) unstable; urgency=medium
+
+  * Add a UI latency smoke for app-control, sidebar, search, panel, and
+    terminal visible-echo budgets.
+  * Make terminal probe-type prove canvas-buffer echo timing with --per-char.
+
+ -- Yggdrasil HQ <avi@gour.top>  Fri, 01 May 2026 19:19:22 +0530
+
 yggterm (2.1.82-1) unstable; urgency=medium
 
   * Remove unkept update-restored remote sessions from Live Sessions after a
