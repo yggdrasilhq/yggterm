@@ -4,6 +4,14 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+## 2.1.80
+
+### Fixed
+
+- show live local Codex/LiteLLM sessions under `Live Sessions` even when their active runtime is backed by a stored `.codex` or `.codex-litellm` transcript path
+- keep idle stored Codex transcript rows historical until explicitly opened, then move the resulting live runtime into `Live Sessions` without duplicating the row in the stored tree
+- improve light-theme live-session close affordance contrast and extend the live-session tree smoke to reject duplicate live rows outside the live group
+
 ## 2.1.79
 
 ### Fixed

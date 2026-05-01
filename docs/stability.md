@@ -37,7 +37,7 @@ The fix is not a larger feature. The fix is to make invalid state impossible or 
 - Terminal mode is active without an active session.
 - Terminal mode is active for a stored/non-live session, except document terminal recipes.
 - A remote scanned terminal session is not backed by a `LiveSsh` session and a remote scan `live_runtime == true`.
-- `live_sessions` contains a stored session, document node, duplicate path, or remote scanned row that the scan does not mark live.
+- `live_sessions` contains a historical `Stored` session, document node, duplicate path, or remote scanned row that the scan does not mark live. A `LiveLocal` Codex/LiteLLM runtime may still use a stored transcript path; in that case it belongs in `Live Sessions`.
 - An active live session is missing from `live_sessions`.
 
 These checks should move closer to the reducer/state transitions over the next passes. For now they are intentionally snapshot-level so both unit tests and GUI smoke tests can catch cross-layer disagreement.
