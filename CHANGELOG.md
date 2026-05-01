@@ -4,6 +4,12 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+## 2.1.75
+
+### Fixed
+
+- let retained, runtime-running Codex model-permission setup screens finish remote terminal resume without waiting for an attach-ready visual deadline, so the false "Remote Terminal Needs Attention" toast clears and input re-enables while the permissions selector is visible
+
 ## 2.1.74
 
 ### Fixed
