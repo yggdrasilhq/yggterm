@@ -4,6 +4,13 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+## 2.1.82
+
+### Fixed
+
+- remove unkept update-restored remote sessions from `Live Sessions` after a fresh remote scan proves their runtime is no longer live
+- trace stale temporary remote live-session pruning so panic reports can distinguish recoverable keep-alive rows from stale loading rows
+
 ## 2.1.81
 
 ### Fixed
