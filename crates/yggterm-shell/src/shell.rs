@@ -21217,7 +21217,7 @@ fn terminal_probe_input_script(
                     }}
                     return 'dom_input';
                 }};
-                const dispatchKey = async (spec) => {{
+                const dispatchKey = async (spec, settleAfter = true) => {{
                     const keyInit = {{
                         key: spec.key,
                         code: spec.code || '',
@@ -21237,16 +21237,18 @@ fn terminal_probe_input_script(
                         target.dispatchEvent(new KeyboardEvent('keypress', keyInit));
                     }}
                     target.dispatchEvent(new KeyboardEvent('keyup', keyInit));
-                    await settle(18);
+                    if (settleAfter) {{
+                        await settle(18);
+                    }}
                 }};
-                const dispatchPrintableText = async (textChunk) => {{
+                const dispatchPrintableText = async (textChunk, settleAfter = true) => {{
                     if (!textChunk) {{
                         return;
                     }}
                     if (!helperTextarea) {{
                         for (const char of Array.from(textChunk)) {{
                             const spec = keySpecForChar(char);
-                            await dispatchKey(spec);
+                            await dispatchKey(spec, settleAfter);
                         }}
                         return;
                     }}
@@ -21269,9 +21271,11 @@ fn terminal_probe_input_script(
                         inputType: 'insertText',
                     }}));
                     helperTextarea.value = '';
-                    await settle(24);
+                    if (settleAfter) {{
+                        await settle(24);
+                    }}
                 }};
-                const sendViaCoreTrigger = async (payload, wasUserInput = true) => {{
+                const sendViaCoreTrigger = async (payload, wasUserInput = true, settleAfter = true) => {{
                     const trigger = entry.term
                         && entry.term._core
                         && entry.term._core.coreService
@@ -21284,42 +21288,48 @@ fn terminal_probe_input_script(
                     try {{
                         trigger(String(payload || ''), Boolean(wasUserInput));
                         usedCoreTrigger = true;
-                        await settle(28);
+                        if (settleAfter) {{
+                            await settle(28);
+                        }}
                         return true;
                     }} catch (_error) {{
                         return false;
                     }}
                 }};
-                const sendViaTermInput = async (payload, wasUserInput = true) => {{
+                const sendViaTermInput = async (payload, wasUserInput = true, settleAfter = true) => {{
                     if (!entry.term || typeof entry.term.input !== 'function') {{
                         return false;
                     }}
                     try {{
                         entry.term.input(String(payload || ''), Boolean(wasUserInput));
                         usedTermInput = true;
-                        await settle(28);
+                        if (settleAfter) {{
+                            await settle(28);
+                        }}
                         return true;
                     }} catch (_error) {{
                         return false;
                     }}
                 }};
-                const dispatchTextInput = async (chunk) => {{
+                const dispatchTextInput = async (chunk, settleAfter = true) => {{
                     const textChunk = String(chunk || '');
                     if (!textChunk) {{
                         return;
                     }}
                     if (perChar && Array.from(textChunk).length > 1) {{
                         for (const char of Array.from(textChunk)) {{
-                            await dispatchTextInput(char);
-                            await settle(4);
+                            await dispatchTextInput(char, false);
+                        }}
+                        if (settleAfter) {{
+                            await settle(24);
                         }}
                         return;
                     }}
-                    if (!domKeyboardOnly && ((await sendViaCoreTrigger(textChunk, true))
-                        || (await sendViaTermInput(textChunk, true)))) {{
+                    if (!domKeyboardOnly && ((await sendViaCoreTrigger(textChunk, true, settleAfter))
+                        || (await sendViaTermInput(textChunk, true, settleAfter)))) {{
                         return;
                     }}
-                    await dispatchPrintableText(textChunk);
+                    await dispatchPrintableText(textChunk, settleAfter);
                 }};
                 const terminalChunkIsTransportError = (textValue) => {{
                     const normalized = String(textValue || '').toLowerCase();
@@ -45613,9 +45623,12 @@ mod tests {
             false,
             false,
             false,
+            false,
         );
         assert!(script.contains("const target = helperTextarea || host;"));
         assert!(script.contains("target.dispatchEvent(new KeyboardEvent('keydown', keyInit));"));
+        assert!(script.contains("await dispatchTextInput(char, false);"));
+        assert!(script.contains("await settle(24);"));
     }
 
     #[test]

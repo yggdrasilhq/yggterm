@@ -4,6 +4,13 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+## 2.1.84
+
+### Fixed
+
+- make `probe-type --per-char` dispatch character-level keyboard events without artificial per-character sleeps, so latency smoke reports the app/input path instead of its own pacing
+- expose `server app update <check|restart>` through `yggterm-headless`, matching the direct launcher path used for server/app-control commands
+
 ## 2.1.83
 
 ### Added
