@@ -1,3 +1,12 @@
+yggterm (2.1.85-1) unstable; urgency=medium
+
+  * Recover stale local startup-restore terminal mounts instead of leaving a
+    blank selected terminal in attach-in-flight state.
+  * Bound local terminal ensure attempts so IPC stalls clear attach state.
+  * Add a readiness gate to the UI latency smoke before typing probes.
+
+ -- Yggdrasil HQ <avi@gour.top>  Fri, 01 May 2026 20:34:40 +0530
+
 yggterm (2.1.84-1) unstable; urgency=medium
 
   * Remove artificial per-character sleeps from terminal latency probes.
