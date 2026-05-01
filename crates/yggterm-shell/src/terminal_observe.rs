@@ -793,6 +793,10 @@ fn terminal_host_problem_for_app_control(host: &Value) -> Option<&'static str> {
         .get("xterm_cursor_hidden")
         .and_then(Value::as_bool)
         .unwrap_or(false);
+    let mounted_entry_host_connected = host
+        .get("mounted_entry_host_connected")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     let cursor_sample_visible = host
         .get("cursor_sample_rect")
         .and_then(Value::as_object)
@@ -808,9 +812,15 @@ fn terminal_host_problem_for_app_control(host: &Value) -> Option<&'static str> {
     let visible_text = visible_text.as_str();
     let codex_interactive_setup_prompt =
         terminal_chunk_is_codex_interactive_setup_prompt(visible_text);
+    let codex_prompt_surface = terminal_chunk_is_codex_prompt_surface(visible_text);
+    let live_remote_codex_prompt_surface = session_path.starts_with("remote-session://")
+        && codex_prompt_surface
+        && mounted_entry_host_connected
+        && (xterm_present || screen_present || rows_present || canvas_count > 0);
     let prompt_visible = terminal_chunk_has_prompt_output(text_sample)
         || terminal_chunk_has_codex_prompt_output(text_sample)
         || codex_interactive_setup_prompt
+        || codex_prompt_surface
         || (!cursor_line_text.is_empty()
             && (terminal_chunk_has_prompt_output(cursor_line_text)
                 || terminal_chunk_has_codex_prompt_output(cursor_line_text)));
@@ -819,7 +829,8 @@ fn terminal_host_problem_for_app_control(host: &Value) -> Option<&'static str> {
         && (input_enabled
             || helper_textarea_focused
             || cursor_sample_visible
-            || local_prompt_surface);
+            || local_prompt_surface
+            || live_remote_codex_prompt_surface);
     let transcript_browser_surface = terminal_chunk_is_transcript_browser(visible_text);
     let transcript_browser_ready_surface = session_path.starts_with("remote-session://")
         && transcript_browser_surface
@@ -1221,6 +1232,31 @@ pub(crate) fn terminal_chunk_is_codex_interactive_setup_prompt(data: &str) -> bo
     codex_context && permissions_menu && explicit_input
 }
 
+pub(crate) fn terminal_chunk_is_codex_prompt_surface(data: &str) -> bool {
+    let stripped = strip_terminal_control_sequences(data);
+    let normalized = stripped
+        .to_ascii_lowercase()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if normalized.is_empty()
+        || terminal_chunk_is_transport_error(&stripped)
+        || terminal_chunk_is_loading_placeholder(&stripped)
+        || terminal_chunk_is_transcript_browser(&stripped)
+        || terminal_chunk_has_generic_codex_idle_footer(&stripped)
+    {
+        return false;
+    }
+    let has_codex_header =
+        stripped.contains("OpenAI Codex") && stripped.contains("/model to change");
+    has_codex_header
+        && terminal_chunk_has_codex_prompt_output(&stripped)
+        && (normalized.contains("model:")
+            || normalized.contains("directory:")
+            || normalized.contains("gpt-")
+            || normalized.contains("claude"))
+}
+
 pub(crate) fn terminal_chunk_has_prompt_output(data: &str) -> bool {
     let stripped = strip_terminal_control_sequences(data);
     let normalized_lines = stripped
@@ -1554,7 +1590,8 @@ mod tests {
     use super::{
         WorkspaceViewMode, describe_viewport_snapshot, terminal_bootstrap_activation_epoch,
         terminal_chunk_has_codex_prompt_output, terminal_chunk_is_codex_interactive_setup_prompt,
-        terminal_chunk_is_transport_error, terminal_host_problem_for_app_control,
+        terminal_chunk_is_codex_prompt_surface, terminal_chunk_is_transport_error,
+        terminal_host_problem_for_app_control,
     };
     use serde_json::{Value, json};
 
@@ -1646,6 +1683,40 @@ mod tests {
             "helpers_rect": {"width": 840.0, "height": 830.0},
             "helper_textarea_rect": {"left": 0.0, "top": 0.0, "width": 1.0, "height": 1.0}
         });
+        assert_eq!(terminal_host_problem_for_app_control(&host), None);
+    }
+
+    #[test]
+    fn terminal_host_problem_accepts_live_remote_codex_prompt_before_input_gate() {
+        let text_tail = "╭──────────────────────────────────────────────╮\n│ >_ OpenAI Codex (v0.128.0)                   │\n│                                              │\n│ model:     gpt-5.5 medium   /model to change │\n│ directory: ~/gh/yggterm                      │\n╰──────────────────────────────────────────────╯\n\n  Tip: New Use /fast to enable our fastest inference with increased plan usage.\n\n\n› Explain this codebase\n\n  gpt-5.5 medium · ~/gh/yggterm";
+        let host = json!({
+            "session_path": "remote-session://dev/new-codex",
+            "text_sample": text_tail,
+            "text_tail": text_tail,
+            "buffer_text_sample": text_tail,
+            "cursor_line_text": "› Explain this codebase",
+            "input_enabled": false,
+            "helper_textarea_focused": false,
+            "xterm_present": true,
+            "screen_present": true,
+            "rows_present": false,
+            "canvas_count": 4,
+            "render_event_count": 42,
+            "data_event_count": 0,
+            "xterm_buffer_kind": "normal",
+            "xterm_cursor_hidden": false,
+            "mounted_entry_host_connected": true,
+            "blank_rows_below_cursor": 39,
+            "rows": 50,
+            "host_rect": {"left": 0.0, "top": 0.0, "width": 840.0, "height": 830.0},
+            "host_content_width": 840.0,
+            "host_content_height": 830.0,
+            "screen_rect": {"width": 840.0, "height": 830.0},
+            "viewport_rect": {"width": 840.0, "height": 830.0},
+            "helpers_rect": {"width": 840.0, "height": 830.0},
+            "helper_textarea_rect": {"left": -10000.0, "top": 68.0, "width": 1.0, "height": 1.0}
+        });
+        assert!(terminal_chunk_is_codex_prompt_surface(text_tail));
         assert_eq!(terminal_host_problem_for_app_control(&host), None);
     }
 
