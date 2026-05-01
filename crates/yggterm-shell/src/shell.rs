@@ -5295,6 +5295,33 @@ fn quiet_retained_remote_surface_ready(
     }
     true
 }
+fn retained_remote_transcript_browser_surface_ready(
+    is_remote_resume_session: bool,
+    terminal_paint_seen: bool,
+    geometry_ready: bool,
+    host_has_transport_error: bool,
+    runtime_running: bool,
+    host_health_cursor_line_text: &str,
+    host_health_text_tail: &str,
+    host_health_rows: u16,
+    host_health_blank_rows_below_cursor: u16,
+) -> bool {
+    if !is_remote_resume_session
+        || !terminal_paint_seen
+        || !geometry_ready
+        || host_has_transport_error
+        || !runtime_running
+        || !terminal_host_prompt_layout_is_acceptable(
+            host_health_rows,
+            host_health_blank_rows_below_cursor,
+        )
+    {
+        return false;
+    }
+    let host_surface_text =
+        terminal_host_surface_text(host_health_cursor_line_text, host_health_text_tail);
+    terminal_chunk_is_transcript_browser(host_surface_text)
+}
 fn upsert_terminal_resume_notification(
     state: Signal<ShellState>,
     session_path: &str,
@@ -31272,6 +31299,10 @@ fn TerminalCanvas(
     let terminal_resume_prefill = terminal_placeholder.clone();
     let host_is_active_session = snapshot.active_view_mode == WorkspaceViewMode::Terminal
         && snapshot.active_session_path.as_deref() == Some(host_session_path.as_str());
+    let session_launch_phase_running = matches!(
+        session.launch_phase,
+        yggterm_server::TerminalLaunchPhase::Running
+    );
     let _resume_ready_from_shell = {
         let shell = state.read();
         !is_remote_resume_session
@@ -31678,6 +31709,7 @@ fn TerminalCanvas(
         let theme = future_theme.clone();
         let placeholder = terminal_resume_prefill.clone();
         let session_kind = session_kind;
+        let session_launch_phase_running = session_launch_phase_running;
         let trace_home = trace_home.clone();
         let delayed_recovery_trace_home = trace_home.clone();
         let state = state;
@@ -32036,6 +32068,7 @@ fn TerminalCanvas(
             let mut last_host_health_text_tail = String::new();
             let mut last_host_health_rows = 0_u16;
             let mut last_host_health_blank_rows_below_cursor = 0_u16;
+            let mut last_runtime_running = session_launch_phase_running;
             let mut pending_terminal_input_has_text = false;
             let codex_completion_notifications_enabled =
                 matches!(session_kind, SessionKind::Codex | SessionKind::CodexLiteLlm);
@@ -32645,6 +32678,67 @@ fn TerminalCanvas(
                                     maybe_spawn_missing_managed_cli_refreshes(state);
                                     continue;
                                 }
+                                if retained_remote_transcript_browser_surface_ready(
+                                    is_remote_resume_session,
+                                    terminal_paint_seen,
+                                    terminal_geometry_ready,
+                                    has_transport_error,
+                                    last_runtime_running || session_launch_phase_running,
+                                    &cursor_line_text,
+                                    &text_tail,
+                                    rows,
+                                    blank_rows_below_cursor,
+                                ) {
+                                    append_trace_event(
+                                        &trace_home,
+                                        "ui",
+                                        "terminal_mount",
+                                        "retained_transcript_browser_surface_accepted",
+                                        json!({
+                                            "session_path": session_path.clone(),
+                                            "cursor_line_text": cursor_line_text.clone(),
+                                            "text_tail": text_tail.clone(),
+                                            "rows": rows,
+                                            "blank_rows_below_cursor": blank_rows_below_cursor,
+                                        }),
+                                    );
+                                    set_signal_if_changed(terminal_resume_surface_staged, true);
+                                    set_signal_if_changed(terminal_live_host_connected, true);
+                                    set_signal_if_changed(terminal_overlay_dismissed, true);
+                                    set_signal_if_changed(terminal_has_meaningful_output, true);
+                                    set_signal_if_changed(terminal_prompt_only, false);
+                                    set_signal_if_changed(resume_overlay_failed, false);
+                                    set_signal_if_changed(resume_overlay_timed_out, false);
+                                    resume_visual_reveal_after_ms = None;
+                                    post_attach_read_recovery_attempts = 0;
+                                    let _ = eval.send(TerminalJsCommand::SetInputEnabled {
+                                        enabled: true,
+                                        focus: true,
+                                    });
+                                    clear_terminal_resume_notification(state, &session_path);
+                                    let _ = safe_shell_mut(
+                                        state,
+                                        "terminal_attach_retained_transcript_browser_ready",
+                                        |shell| {
+                                            shell.retain_terminal_session_path(&session_path);
+                                            shell
+                                                .terminal_resume_ready_paths
+                                                .insert(session_path.clone());
+                                            shell.terminal_attach_in_flight
+                                                .remove(&session_path);
+                                            shell.mark_terminal_open_attempt_ready_for_session(
+                                                &session_path,
+                                                "retained_transcript_browser",
+                                            );
+                                            shell.maybe_finish_terminal_surface_request_for_session(
+                                                &session_path,
+                                            );
+                                        },
+                                    );
+                                    maybe_spawn_missing_remote_machine_refreshes(state);
+                                    maybe_spawn_missing_managed_cli_refreshes(state);
+                                    continue;
+                                }
                                 if is_remote_resume_session
                                     && (poisoned_by_retry || !ready_attempt_from_shell)
                                     && terminal_paint_seen
@@ -33114,6 +33208,7 @@ fn TerminalCanvas(
                         {
                             Ok((next_cursor, chunks, runtime_running, runtime_output_seen, runtime_eof_without_output)) => {
                                 cursor = next_cursor;
+                                last_runtime_running = runtime_running;
                                 read_poll_ms = if chunks.is_empty() {
                                     if is_remote_resume_session && !traced_attach_ready {
                                         TERMINAL_REMOTE_RESUME_READ_POLL_MS
@@ -50070,6 +50165,39 @@ Waiting for the remote terminal to paint...\n";
             false,
             false,
             false,
+        ));
+    }
+    #[test]
+    fn retained_transcript_browser_surface_is_ready_when_runtime_is_running() {
+        let tail = "\
+/ T R A N S C R I P T /
+
+Published v2.1.50
+
+q to quit   pgup/pgdn to page   enter to edit message
+";
+        assert!(!retained_remote_surface_has_non_prompt_text("", tail));
+        assert!(retained_remote_transcript_browser_surface_ready(
+            true,
+            true,
+            true,
+            false,
+            true,
+            "q to quit   pgup/pgdn to page   enter to edit message",
+            tail,
+            50,
+            1,
+        ));
+        assert!(!retained_remote_transcript_browser_surface_ready(
+            true,
+            true,
+            true,
+            false,
+            false,
+            "q to quit   pgup/pgdn to page   enter to edit message",
+            tail,
+            50,
+            1,
         ));
     }
     #[test]

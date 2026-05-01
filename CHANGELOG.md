@@ -4,6 +4,12 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+## 2.1.71
+
+### Fixed
+
+- accept retained Codex transcript-browser terminal surfaces as interactive when the remote runtime is running, so hot-restarted/restored sessions do not stay stuck behind a stale resume notification while the visible transcript UI is usable
+
 ## 2.1.70
 
 ### Fixed
