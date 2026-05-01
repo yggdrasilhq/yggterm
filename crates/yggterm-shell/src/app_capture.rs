@@ -7,7 +7,7 @@ use std::fs;
 #[cfg(target_os = "linux")]
 use std::fs::File;
 use std::path::{Path, PathBuf};
-use tao::dpi::PhysicalPosition;
+use tao::dpi::{LogicalSize, PhysicalPosition};
 use yggterm_server::ScreenshotTarget;
 
 #[cfg(target_os = "macos")]
@@ -157,6 +157,24 @@ pub fn move_app_window_by(desktop: &DesktopContext, delta_x: f64, delta_y: f64) 
         "before_position": {
             "x": before_position.x,
             "y": before_position.y,
+        },
+        "window": describe_window(desktop),
+    }))
+}
+
+pub fn resize_app_window(desktop: &DesktopContext, width: f64, height: f64) -> Result<Value> {
+    let before_size = desktop.inner_size();
+    let width = width.round().clamp(320.0, 4096.0);
+    let height = height.round().clamp(240.0, 4096.0);
+    desktop.set_inner_size(LogicalSize::new(width, height));
+    desktop.request_redraw();
+    Ok(json!({
+        "resize_requested": true,
+        "width": width,
+        "height": height,
+        "before_inner_size": {
+            "width": before_size.width,
+            "height": before_size.height,
         },
         "window": describe_window(desktop),
     }))
