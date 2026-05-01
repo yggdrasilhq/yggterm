@@ -5181,6 +5181,10 @@ fn remote_resume_visual_reveal_can_complete(
     let deferred_output_ready = !deferred_resume_output.trim().is_empty() && output_is_acceptable;
     let host_surface_text =
         terminal_host_surface_text(host_health_cursor_line_text, host_health_text_tail);
+    let codex_interactive_setup_prompt =
+        terminal_chunk_is_codex_interactive_setup_prompt(host_surface_text)
+            || terminal_chunk_is_codex_interactive_setup_prompt(deferred_resume_output);
+    let reveal_ready = reveal_deadline_reached || codex_interactive_setup_prompt;
     let host_surface_ready =
         remote_resume_host_surface_may_prove_live_terminal(placeholder_rendered)
             && terminal_host_surface_layout_is_acceptable(
@@ -5192,7 +5196,7 @@ fn remote_resume_visual_reveal_can_complete(
     attach_ready
         && geometry_ready
         && replay_may_complete
-        && reveal_deadline_reached
+        && reveal_ready
         && (deferred_output_ready || host_surface_ready)
 }
 fn stale_remote_resume_retry_should_clear(
@@ -5275,14 +5279,20 @@ fn quiet_retained_remote_surface_ready(
     tail_generic_idle_footer_output: bool,
     saw_prompt_only_surface: bool,
 ) -> bool {
+    let host_surface_text =
+        terminal_host_surface_text(host_health_cursor_line_text, host_health_text_tail);
+    let codex_interactive_setup_prompt =
+        terminal_chunk_is_codex_interactive_setup_prompt(host_surface_text);
+    let visual_reveal_ready = resume_visual_reveal_deadline_ms
+        .is_some_and(|deadline_ms| current_millis() >= deadline_ms)
+        || (codex_interactive_setup_prompt && runtime_running);
     if !is_remote_resume_session
         || terminal_live_host_connected
         || !terminal_paint_seen
         || !geometry_ready
         || host_has_transport_error
         || !remote_resume_host_surface_may_prove_live_terminal(placeholder_rendered)
-        || !resume_visual_reveal_deadline_ms
-            .is_some_and(|deadline_ms| current_millis() >= deadline_ms)
+        || !visual_reveal_ready
         || saw_transcript_browser_output
         || saw_generic_idle_output
         || tail_generic_idle_output
@@ -5296,8 +5306,6 @@ fn quiet_retained_remote_surface_ready(
     if !(runtime_running || cursor_has_text) || !(cursor_has_text || tail_has_text) {
         return false;
     }
-    let host_surface_text =
-        terminal_host_surface_text(host_health_cursor_line_text, host_health_text_tail);
     if !terminal_host_surface_layout_is_acceptable(
         host_health_rows,
         host_health_blank_rows_below_cursor,
@@ -50182,27 +50190,11 @@ Waiting for the remote terminal to paint...\n";
             "", "", tail
         ));
         assert!(remote_resume_visual_reveal_can_complete(
-            true, true, true, true, false, "", "", tail, 50, 31,
+            true, true, true, false, false, "", "", tail, 50, 31,
         ));
         assert!(quiet_retained_remote_surface_ready(
-            true,
-            false,
-            true,
-            true,
-            false,
-            false,
-            true,
-            "",
-            tail,
-            50,
-            31,
-            Some(0),
-            false,
-            false,
-            false,
-            false,
-            false,
-            false,
+            true, false, true, true, false, false, true, "", tail, 50, 31, None, false, false,
+            false, false, false, false,
         ));
     }
     #[test]
