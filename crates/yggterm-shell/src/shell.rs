@@ -9,11 +9,11 @@ use crate::terminal_observe::{
     terminal_bootstrap_should_wait_for_mount_epoch_sync, terminal_chunk_has_codex_prompt_output,
     terminal_chunk_has_generic_codex_idle_footer, terminal_chunk_has_meaningful_output,
     terminal_chunk_has_prompt_output, terminal_chunk_has_visible_output,
-    terminal_chunk_is_generic_codex_idle, terminal_chunk_is_loading_placeholder,
-    terminal_chunk_is_low_signal_terminal_noise, terminal_chunk_is_saved_transcript_prefill,
-    terminal_chunk_is_transcript_browser, terminal_chunk_is_transport_error,
-    terminal_open_attempt_failure_reason_from_viewport, terminal_open_attempt_state_label,
-    terminal_tail_excerpt,
+    terminal_chunk_is_codex_interactive_setup_prompt, terminal_chunk_is_generic_codex_idle,
+    terminal_chunk_is_loading_placeholder, terminal_chunk_is_low_signal_terminal_noise,
+    terminal_chunk_is_saved_transcript_prefill, terminal_chunk_is_transcript_browser,
+    terminal_chunk_is_transport_error, terminal_open_attempt_failure_reason_from_viewport,
+    terminal_open_attempt_state_label, terminal_tail_excerpt,
 };
 #[cfg(test)]
 use crate::terminal_observe::{
@@ -5084,7 +5084,8 @@ fn terminal_surface_has_prompt_ready_text(text: &str) -> bool {
     let trimmed = text.trim();
     !trimmed.is_empty()
         && (terminal_chunk_has_prompt_output(trimmed)
-            || terminal_chunk_has_codex_prompt_output(trimmed))
+            || terminal_chunk_has_codex_prompt_output(trimmed)
+            || terminal_chunk_is_codex_interactive_setup_prompt(trimmed))
 }
 fn terminal_host_surface_text<'a>(
     host_health_cursor_line_text: &'a str,
@@ -50130,6 +50131,60 @@ Waiting for the remote terminal to paint...\n";
         assert!(!retained_remote_surface_has_non_prompt_text(
             "› Use /skills to list available skills",
             stale_tail
+        ));
+    }
+    #[test]
+    fn remote_resume_visual_reveal_accepts_codex_permission_menu() {
+        let tail = "\
+╭─────────────────────────────────────────────╮
+│ >_ OpenAI Codex (v0.128.0)                  │
+│                                             │
+│ model:     gpt-5.5 xhigh   /model to change │
+│ directory: ~/gh/yggterm                     │
+╰─────────────────────────────────────────────╯
+
+  Tip: You can run any shell command from Codex using ! (e.g. !ls)
+
+
+  Update Model Permissions
+
+› 1. Default (current)  Codex can read and edit files in the current workspace, and run commands. Approval
+                        is required to access the internet or edit other files.
+  2. Auto-review        Same workspace-write permissions as Default, but eligible `on-request` approvals
+                        are routed through the auto-reviewer subagent.
+  3. Full Access        Codex can edit files outside this workspace and access the internet without asking
+                        for approval. Exercise caution when using.
+
+  Press enter to confirm or esc to go back
+";
+        assert!(terminal_chunk_is_codex_interactive_setup_prompt(tail));
+        assert!(terminal_surface_has_prompt_ready_text(tail));
+        assert!(!retained_remote_surface_has_non_prompt_text("", tail));
+        assert!(remote_resume_visual_reveal_output_is_acceptable(
+            "", "", tail
+        ));
+        assert!(remote_resume_visual_reveal_can_complete(
+            true, true, true, true, false, "", "", tail, 50, 0,
+        ));
+        assert!(quiet_retained_remote_surface_ready(
+            true,
+            false,
+            true,
+            true,
+            false,
+            false,
+            true,
+            "",
+            tail,
+            50,
+            0,
+            Some(0),
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
         ));
     }
     #[test]
