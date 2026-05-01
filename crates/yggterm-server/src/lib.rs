@@ -9512,6 +9512,10 @@ fn bridge_remote_runtime_session_stdio(
     let start = Instant::now();
     let mut last_size = None::<(u16, u16)>;
     let mut marked_interactive = false;
+    let mut initial_snapshot_pending = true;
+    let mut initial_snapshot_probe_count = 0_u32;
+    let mut next_initial_snapshot_probe_at = Instant::now();
+    let mut wrote_initial_visible_chunks = false;
     let registry_home = resolve_yggterm_home().ok();
     loop {
         if let Some((cols, rows)) = current_tty_size()
@@ -9537,10 +9541,34 @@ fn bridge_remote_runtime_session_stdio(
             }
             marked_interactive = true;
         }
-        let initial_snapshot = if initial_read && runtime_output_seen {
+        let should_probe_initial_snapshot = bridge_should_probe_initial_snapshot(
+            initial_snapshot_pending,
+            initial_read,
+            runtime_output_seen,
+            !chunks.is_empty(),
+        ) && Instant::now() >= next_initial_snapshot_probe_at;
+        let initial_snapshot = if should_probe_initial_snapshot {
+            initial_snapshot_probe_count = initial_snapshot_probe_count.saturating_add(1);
+            next_initial_snapshot_probe_at = Instant::now() + Duration::from_millis(120);
             match terminal_snapshot(endpoint, path) {
-                Ok((snapshot, _running, _runtime_output_seen)) => {
-                    bridge_initial_snapshot_text(Some(snapshot.as_str())).map(str::to_string)
+                Ok((snapshot, _running, snapshot_runtime_output_seen)) => {
+                    let snapshot_text =
+                        bridge_initial_snapshot_text(Some(snapshot.as_str())).map(str::to_string);
+                    if snapshot_text.is_none() && initial_snapshot_probe_count <= 3 {
+                        trace_remote_bridge_event(
+                            "initial_screen_snapshot_not_ready",
+                            json!({
+                                "path": path,
+                                "session_id": session_id,
+                                "probe_count": initial_snapshot_probe_count,
+                                "snapshot_bytes": snapshot.len(),
+                                "runtime_output_seen": runtime_output_seen,
+                                "snapshot_runtime_output_seen": snapshot_runtime_output_seen,
+                                "retained_chunks": chunks.len(),
+                            }),
+                        );
+                    }
+                    snapshot_text
                 }
                 Err(error) => {
                     trace_remote_bridge_event(
@@ -9558,19 +9586,41 @@ fn bridge_remote_runtime_session_stdio(
             None
         };
         if let Some(snapshot) = initial_snapshot {
+            initial_snapshot_pending = false;
             trace_remote_bridge_event(
                 "initial_screen_snapshot",
                 json!({
                     "path": path,
                     "session_id": session_id,
                     "bytes": snapshot.len(),
+                    "probe_count": initial_snapshot_probe_count,
                     "discarded_retained_chunks": chunks.len(),
                 }),
             );
             stdout.write_all(snapshot.as_bytes())?;
         } else {
+            let chunks_have_visible_text = chunks
+                .iter()
+                .any(|chunk| terminal_bridge_snapshot_has_visible_text(&chunk.data));
             for chunk in chunks {
                 stdout.write_all(chunk.data.as_bytes())?;
+            }
+            if chunks_have_visible_text {
+                wrote_initial_visible_chunks = true;
+            }
+            if initial_snapshot_pending
+                && wrote_initial_visible_chunks
+                && start.elapsed() >= Duration::from_secs(15)
+            {
+                initial_snapshot_pending = false;
+                trace_remote_bridge_event(
+                    "initial_screen_snapshot_give_up",
+                    json!({
+                        "path": path,
+                        "session_id": session_id,
+                        "probe_count": initial_snapshot_probe_count,
+                    }),
+                );
             }
         }
         stdout.flush()?;
@@ -9618,6 +9668,15 @@ fn bridge_initial_snapshot_text(snapshot: Option<&str>) -> Option<&str> {
     snapshot
         .map(str::trim)
         .filter(|text| terminal_bridge_snapshot_has_visible_text(text))
+}
+
+fn bridge_should_probe_initial_snapshot(
+    pending: bool,
+    initial_read: bool,
+    runtime_output_seen: bool,
+    chunks_available: bool,
+) -> bool {
+    pending && (initial_read || runtime_output_seen || chunks_available)
 }
 
 fn terminal_bridge_snapshot_has_visible_text(text: &str) -> bool {
@@ -14757,6 +14816,25 @@ mod tests {
         let snapshot = "\x1b[?25h\x1b[m\x1b[H\x1b[J\r\n\t  ";
 
         assert_eq!(super::bridge_initial_snapshot_text(Some(snapshot)), None);
+    }
+
+    #[test]
+    fn remote_runtime_bridge_retries_initial_snapshot_after_cursor_advances() {
+        assert!(super::bridge_should_probe_initial_snapshot(
+            true, true, false, false
+        ));
+        assert!(super::bridge_should_probe_initial_snapshot(
+            true, false, true, false
+        ));
+        assert!(super::bridge_should_probe_initial_snapshot(
+            true, false, false, true
+        ));
+        assert!(!super::bridge_should_probe_initial_snapshot(
+            false, false, true, true
+        ));
+        assert!(!super::bridge_should_probe_initial_snapshot(
+            true, false, false, false
+        ));
     }
 
     fn snapshot_session(path: &str, source: SessionSource) -> SnapshotSessionView {
