@@ -1,3 +1,12 @@
+yggterm (2.1.75-1) unstable; urgency=medium
+
+  * Let retained Codex permission selectors finish remote resume without an
+    attach-ready visual deadline.
+  * Clear the false remote-attention notification and re-enable input while the
+    visible permissions selector is waiting for a choice.
+
+ -- Yggdrasil HQ <avi@gour.top>  Fri, 01 May 2026 13:56:03 +0530
+
 yggterm (2.1.74-1) unstable; urgency=medium
 
   * Let Codex model-permission setup menus pass the remote resume layout gate.
