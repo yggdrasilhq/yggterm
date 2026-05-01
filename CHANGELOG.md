@@ -4,6 +4,12 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+## 2.1.77
+
+### Fixed
+
+- accept even more aggressively truncated Codex permission-selector tails that start inside the `auto-reviewer` line, using the stable `Full Access`/confirm/escape markers to clear remote startup resume without waiting for a timeout
+
 ## 2.1.76
 
 ### Fixed
