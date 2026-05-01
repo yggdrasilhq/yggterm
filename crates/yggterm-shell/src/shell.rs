@@ -9,11 +9,12 @@ use crate::terminal_observe::{
     terminal_bootstrap_should_wait_for_mount_epoch_sync, terminal_chunk_has_codex_prompt_output,
     terminal_chunk_has_generic_codex_idle_footer, terminal_chunk_has_meaningful_output,
     terminal_chunk_has_prompt_output, terminal_chunk_has_visible_output,
-    terminal_chunk_is_codex_interactive_setup_prompt, terminal_chunk_is_generic_codex_idle,
-    terminal_chunk_is_loading_placeholder, terminal_chunk_is_low_signal_terminal_noise,
-    terminal_chunk_is_saved_transcript_prefill, terminal_chunk_is_transcript_browser,
-    terminal_chunk_is_transport_error, terminal_open_attempt_failure_reason_from_viewport,
-    terminal_open_attempt_state_label, terminal_tail_excerpt,
+    terminal_chunk_is_codex_interactive_setup_prompt, terminal_chunk_is_codex_prompt_surface,
+    terminal_chunk_is_generic_codex_idle, terminal_chunk_is_loading_placeholder,
+    terminal_chunk_is_low_signal_terminal_noise, terminal_chunk_is_saved_transcript_prefill,
+    terminal_chunk_is_transcript_browser, terminal_chunk_is_transport_error,
+    terminal_open_attempt_failure_reason_from_viewport, terminal_open_attempt_state_label,
+    terminal_tail_excerpt,
 };
 #[cfg(test)]
 use crate::terminal_observe::{
@@ -5092,7 +5093,13 @@ fn terminal_host_surface_text<'a>(
     host_health_text_tail: &'a str,
 ) -> &'a str {
     if terminal_surface_has_prompt_ready_text(host_health_cursor_line_text) {
-        host_health_cursor_line_text
+        if terminal_chunk_has_codex_prompt_output(host_health_cursor_line_text)
+            && terminal_chunk_is_codex_prompt_surface(host_health_text_tail)
+        {
+            host_health_text_tail
+        } else {
+            host_health_cursor_line_text
+        }
     } else if !host_health_text_tail.trim().is_empty() {
         host_health_text_tail
     } else {
@@ -5160,6 +5167,7 @@ fn terminal_host_surface_layout_is_acceptable(
 ) -> bool {
     terminal_host_prompt_layout_is_acceptable(rows, blank_rows_below_cursor)
         || terminal_chunk_is_codex_interactive_setup_prompt(host_surface_text)
+        || terminal_chunk_is_codex_prompt_surface(host_surface_text)
 }
 fn remote_resume_visual_reveal_can_complete(
     attach_ready: bool,
@@ -22521,7 +22529,9 @@ async fn process_pending_app_control_requests(
                         machine_key.unwrap_or_default()
                     )),
                 },
-                Some(Some((_machine_key, _machine))) if requested_kind != SessionKind::Shell => {
+                Some(Some((_machine_key, _machine)))
+                    if requested_kind == SessionKind::CodexLiteLlm =>
+                {
                     AppControlResponse {
                         request_id: request.request_id.clone(),
                         handled_by_pid: std::process::id(),
@@ -22529,25 +22539,37 @@ async fn process_pending_app_control_requests(
                         output_path: None,
                         data: None,
                         error: Some(
-                            "app-control remote terminal creation only supports shell".to_string(),
+                            "app-control remote terminal creation supports shell or codex"
+                                .to_string(),
                         ),
                     }
                 }
                 Some(Some((machine_key, machine))) => {
                     let cwd_for_task = cwd.clone();
                     let title_hint_for_task = title_hint.clone();
+                    let requested_kind_for_task = requested_kind;
                     let outcome = run_dedicated_interactive_request_io(
                         "app_control_create_terminal_remote",
                         &home,
                         move || {
                             ensure_daemon_running(&endpoint)?;
-                            start_ssh_session_at(
-                                &endpoint,
-                                &machine.ssh_target,
-                                machine.prefix.as_deref(),
-                                cwd_for_task.as_deref(),
-                                title_hint_for_task.as_deref(),
-                            )
+                            if requested_kind_for_task == SessionKind::Codex {
+                                start_remote_codex_session_at(
+                                    &endpoint,
+                                    &machine.ssh_target,
+                                    machine.prefix.as_deref(),
+                                    cwd_for_task.as_deref(),
+                                    title_hint_for_task.as_deref(),
+                                )
+                            } else {
+                                start_ssh_session_at(
+                                    &endpoint,
+                                    &machine.ssh_target,
+                                    machine.prefix.as_deref(),
+                                    cwd_for_task.as_deref(),
+                                    title_hint_for_task.as_deref(),
+                                )
+                            }
                         },
                     )
                     .await;
@@ -33280,6 +33302,9 @@ fn TerminalCanvas(
                                 let saw_generic_idle_output = batched_output
                                     .as_deref()
                                     .is_some_and(terminal_chunk_is_generic_codex_idle);
+                                let saw_codex_prompt_surface = batched_output
+                                    .as_deref()
+                                    .is_some_and(terminal_chunk_is_codex_prompt_surface);
                                 let tail_generic_idle_output = batched_output
                                     .as_deref()
                                     .is_some_and(terminal_chunk_tail_is_generic_codex_idle);
@@ -33356,6 +33381,7 @@ fn TerminalCanvas(
                                         runtime_running,
                                         has_transport_error,
                                         saw_meaningful_output,
+                                        saw_codex_prompt_surface,
                                         saw_generic_idle_output,
                                         tail_generic_idle_output,
                                         saw_generic_idle_footer_output,
@@ -33510,6 +33536,7 @@ fn TerminalCanvas(
                                         visible_resume_surface,
                                         saw_attach_ready_marker,
                                         saw_transcript_browser_output,
+                                        saw_codex_prompt_surface,
                                         saw_generic_idle_output
                                             || tail_generic_idle_output,
                                         saw_generic_idle_footer_output
@@ -33760,6 +33787,7 @@ fn TerminalCanvas(
                                             visible_resume_surface,
                                             saw_attach_ready_marker,
                                             saw_transcript_browser_output,
+                                            saw_codex_prompt_surface,
                                             saw_generic_idle_output
                                                 || tail_generic_idle_output,
                                             saw_generic_idle_footer_output
@@ -33989,6 +34017,7 @@ fn TerminalCanvas(
                                         visible_resume_surface,
                                         saw_attach_ready_marker,
                                         saw_transcript_browser_output,
+                                        saw_codex_prompt_surface,
                                         saw_generic_idle_output
                                             || tail_generic_idle_output,
                                         saw_generic_idle_footer_output
@@ -34229,12 +34258,16 @@ fn TerminalCanvas(
                                 let prompt_only_surface_is_live = saw_prompt_only_surface
                                     && runtime_running
                                     && visible_resume_surface;
+                                let codex_prompt_surface_is_live = saw_codex_prompt_surface
+                                    && runtime_running
+                                    && visible_resume_surface;
                                 let invalid_remote_resume_surface = is_remote_resume_session
                                     && !traced_attach_ready
-                                    && (saw_generic_idle_output
+                                    && (((saw_generic_idle_output
                                         || tail_generic_idle_output
                                         || saw_generic_idle_footer_output
-                                        || tail_generic_idle_footer_output
+                                        || tail_generic_idle_footer_output)
+                                        && !codex_prompt_surface_is_live)
                                         || (saw_prompt_only_surface
                                             && !prompt_only_surface_is_live)
                                         || (saw_transcript_browser_output && !runtime_running));
@@ -35187,6 +35220,7 @@ fn should_suppress_remote_resume_surface_output(
     runtime_running: bool,
     has_transport_error: bool,
     saw_meaningful_output: bool,
+    saw_codex_prompt_surface: bool,
     saw_generic_idle_output: bool,
     tail_generic_idle_output: bool,
     saw_generic_idle_footer_output: bool,
@@ -35194,12 +35228,14 @@ fn should_suppress_remote_resume_surface_output(
     saw_prompt_only_surface: bool,
     saw_transcript_browser_output: bool,
 ) -> bool {
+    let live_codex_prompt_surface = runtime_running && saw_codex_prompt_surface;
     is_remote_resume_session
         && !overlay_dismissed
         && (has_transport_error
             || (saw_transcript_browser_output && !runtime_running)
             || saw_prompt_only_surface
-            || (!saw_meaningful_output
+            || (!live_codex_prompt_surface
+                && !saw_meaningful_output
                 && (saw_generic_idle_output
                     || tail_generic_idle_output
                     || saw_generic_idle_footer_output
@@ -35234,12 +35270,16 @@ fn remote_resume_surface_connected(
     saw_visible_output: bool,
     saw_attach_ready_marker: bool,
     saw_transcript_browser_output: bool,
+    saw_codex_prompt_surface: bool,
     saw_generic_idle_output: bool,
     saw_generic_idle_footer_output: bool,
     saw_prompt_only_surface: bool,
     runtime_running: bool,
 ) -> bool {
     if saw_transcript_browser_output {
+        return runtime_running && saw_visible_output;
+    }
+    if saw_codex_prompt_surface {
         return runtime_running && saw_visible_output;
     }
     if saw_generic_idle_output {
@@ -35261,6 +35301,7 @@ fn remote_resume_attach_confirmation_satisfied(
     saw_visible_output: bool,
     saw_attach_ready_marker: bool,
     saw_transcript_browser_output: bool,
+    saw_codex_prompt_surface: bool,
     saw_generic_idle_output: bool,
     saw_generic_idle_footer_output: bool,
     saw_prompt_only_surface: bool,
@@ -35280,6 +35321,7 @@ fn remote_resume_attach_confirmation_satisfied(
         saw_visible_output,
         saw_attach_ready_marker,
         saw_transcript_browser_output,
+        saw_codex_prompt_surface,
         saw_generic_idle_output,
         saw_generic_idle_footer_output,
         saw_prompt_only_surface,
@@ -35292,8 +35334,8 @@ fn remote_resume_attach_confirmation_satisfied(
     if terminal_live_host_connected
         && runtime_running
         && !saw_transcript_browser_output
-        && !saw_generic_idle_output
-        && !saw_generic_idle_footer_output
+        && (!saw_generic_idle_output || saw_codex_prompt_surface)
+        && (!saw_generic_idle_footer_output || saw_codex_prompt_surface)
         && first_resume_connected_output_ms.is_some_and(|started_ms| {
             now_ms.saturating_sub(started_ms) >= REMOTE_TERMINAL_ATTACH_CONNECTED_GRACE_MS
         })
@@ -50250,6 +50292,55 @@ uto-reviewer subagent.
         ));
     }
     #[test]
+    fn remote_resume_visual_reveal_accepts_live_codex_prompt_with_mid_screen_cursor() {
+        let tail = "\
+╭──────────────────────────────────────────────╮
+│ >_ OpenAI Codex (v0.128.0)                   │
+│                                              │
+│ model:     gpt-5.5 medium   /model to change │
+│ directory: ~/gh/yggterm                      │
+╰──────────────────────────────────────────────╯
+
+  Tip: New Use /fast to enable our fastest inference with increased plan usage.
+
+
+› Explain this codebase
+
+  gpt-5.5 medium · ~/gh/yggterm";
+        assert!(terminal_chunk_is_codex_prompt_surface(tail));
+        assert!(!terminal_host_prompt_layout_is_acceptable(50, 39));
+        assert!(remote_resume_visual_reveal_can_complete(
+            true,
+            true,
+            true,
+            true,
+            false,
+            "",
+            "› Explain this codebase",
+            tail,
+            50,
+            39,
+        ));
+        assert!(!retained_remote_surface_has_non_prompt_text(
+            "› Explain this codebase",
+            tail,
+        ));
+        assert!(stale_remote_resume_retry_should_clear(
+            true,
+            true,
+            false,
+            true,
+            true,
+            false,
+            false,
+            "› Explain this codebase",
+            tail,
+            50,
+            39,
+            true,
+        ));
+    }
+    #[test]
     fn remote_resume_visual_reveal_accepts_codex_prompt_ready_tail_after_transcript() {
         let tail = "\
 • Published v2.1.53.
@@ -56373,49 +56464,55 @@ Updated at   Branch  Conversation\n\
     #[test]
     fn remote_resume_surface_connected_rejects_generic_idle_surface() {
         assert!(!remote_resume_surface_connected(
-            false, true, false, false, true, false, false, true,
+            false, true, false, false, false, true, false, false, true,
         ));
     }
     #[test]
     fn remote_resume_surface_connected_accepts_meaningful_codex_surface_with_prompt() {
         assert!(remote_resume_surface_connected(
-            true, true, false, false, false, false, false, true,
+            true, true, false, false, false, false, false, false, true,
         ));
     }
     #[test]
     fn remote_resume_surface_connected_rejects_attach_ready_marker_without_visible_surface() {
         assert!(!remote_resume_surface_connected(
-            false, false, true, false, false, false, false, true,
+            false, false, true, false, false, false, false, false, true,
         ));
     }
     #[test]
     fn remote_resume_surface_connected_accepts_attach_ready_marker_with_visible_surface() {
         assert!(remote_resume_surface_connected(
-            false, true, true, false, false, false, false, true,
+            false, true, true, false, false, false, false, false, true,
         ));
     }
     #[test]
     fn remote_resume_surface_connected_accepts_runtime_prompt_only_surface() {
         assert!(remote_resume_surface_connected(
-            false, true, false, false, false, false, true, true,
+            false, true, false, false, false, false, false, true, true,
+        ));
+    }
+    #[test]
+    fn remote_resume_surface_connected_accepts_live_codex_prompt_surface() {
+        assert!(remote_resume_surface_connected(
+            false, true, false, false, true, true, false, false, true,
         ));
     }
     #[test]
     fn remote_resume_surface_connected_accepts_live_transcript_browser_surface() {
         assert!(remote_resume_surface_connected(
-            false, true, false, true, false, false, false, true,
+            false, true, false, true, false, false, false, false, true,
         ));
     }
     #[test]
     fn remote_resume_surface_connected_rejects_dead_transcript_browser_surface() {
         assert!(!remote_resume_surface_connected(
-            false, true, false, true, false, false, false, false,
+            false, true, false, true, false, false, false, false, false,
         ));
     }
     #[test]
     fn remote_resume_surface_connected_rejects_dead_prompt_only_surface() {
         assert!(!remote_resume_surface_connected(
-            false, true, false, false, false, false, true, false,
+            false, true, false, false, false, false, false, true, false,
         ));
     }
     #[test]
@@ -56509,6 +56606,7 @@ Updated at   Branch  Conversation\n\
             false,
             false,
             false,
+            false,
             1,
             1_000,
             1_320,
@@ -56527,7 +56625,28 @@ Updated at   Branch  Conversation\n\
             false,
             false,
             false,
+            false,
             true,
+            0,
+            1_000,
+            1_000 + REMOTE_TERMINAL_ATTACH_CONFIRMATION_MIN_MS,
+            false,
+            true,
+            None,
+            false,
+        ));
+    }
+    #[test]
+    fn remote_resume_attach_confirmation_accepts_live_codex_prompt_after_deadline() {
+        assert!(remote_resume_attach_confirmation_satisfied(
+            false,
+            true,
+            false,
+            false,
+            true,
+            true,
+            false,
+            false,
             0,
             1_000,
             1_000 + REMOTE_TERMINAL_ATTACH_CONFIRMATION_MIN_MS,
@@ -56547,6 +56666,7 @@ Updated at   Branch  Conversation\n\
             false,
             false,
             false,
+            false,
             0,
             1_000,
             1_000 + REMOTE_TERMINAL_ATTACH_CONFIRMATION_MIN_MS,
@@ -56559,13 +56679,14 @@ Updated at   Branch  Conversation\n\
     #[test]
     fn remote_resume_attach_confirmation_rejects_attach_ready_without_post_attach_content() {
         assert!(!remote_resume_attach_confirmation_satisfied(
-            false, false, true, false, false, false, false, 0, 1_000, 1_100, false, true, None,
-            false,
+            false, false, true, false, false, false, false, false, 0, 1_000, 1_100, false, true,
+            None, false,
         ));
     }
     #[test]
     fn remote_resume_attach_confirmation_rejects_connected_grace_without_runtime() {
         assert!(!remote_resume_attach_confirmation_satisfied(
+            false,
             false,
             false,
             false,
@@ -56593,31 +56714,37 @@ Updated at   Branch  Conversation\n\
     #[test]
     fn suppress_resume_output_rejects_prompt_only_or_idle_without_meaningful_context() {
         assert!(should_suppress_remote_resume_surface_output(
-            true, false, false, false, false, true, false, false, false, false, false,
+            true, false, false, false, false, false, true, false, false, false, false, false,
         ));
         assert!(should_suppress_remote_resume_surface_output(
-            true, false, false, true, false, false, false, false, false, false, false,
+            true, false, false, true, false, false, false, false, false, false, false, false,
         ));
         assert!(should_suppress_remote_resume_surface_output(
-            true, false, false, false, false, false, false, false, false, true, false,
+            true, false, false, false, false, false, false, false, false, false, true, false,
         ));
         assert!(should_suppress_remote_resume_surface_output(
-            true, false, false, false, false, false, false, false, false, false, true,
+            true, false, false, false, false, false, false, false, false, false, false, true,
         ));
     }
     #[test]
     fn suppress_resume_output_allows_meaningful_transcript_with_idle_tail() {
         assert!(!should_suppress_remote_resume_surface_output(
-            true, false, false, false, true, false, false, true, false, false, false,
+            true, false, false, false, true, false, false, false, true, false, false, false,
+        ));
+    }
+    #[test]
+    fn suppress_resume_output_allows_live_codex_prompt_surface() {
+        assert!(!should_suppress_remote_resume_surface_output(
+            true, false, true, false, false, true, true, false, false, false, false, false,
         ));
     }
     #[test]
     fn suppress_resume_output_allows_live_transcript_browser_surface() {
         assert!(!should_suppress_remote_resume_surface_output(
-            true, false, true, false, false, false, false, false, false, false, true,
+            true, false, true, false, false, false, false, false, false, false, false, true,
         ));
         assert!(should_suppress_remote_resume_surface_output(
-            true, false, false, false, false, false, false, false, false, false, true,
+            true, false, false, false, false, false, false, false, false, false, false, true,
         ));
     }
     #[test]
