@@ -4,6 +4,14 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+## 2.1.81
+
+### Fixed
+
+- refuse to bridge remote Codex runtime stdio through stale-version daemons, preventing 2.1.80 clients from hanging on live sessions still owned by older 2.1.78 daemons
+- make remote terminal resume timeouts clear attach/request state and latch the terminal-open failure instead of leaving sessions in an indefinite loading state
+- stop persistent no-progress loading and attention toasts from running an infinite progress animation while a session is already stuck
+
 ## 2.1.80
 
 ### Fixed

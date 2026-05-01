@@ -8635,15 +8635,31 @@ pub fn run_remote_start_codex(session_id: &str, cwd: Option<&str>) -> anyhow::Re
 }
 
 fn endpoint_with_live_remote_runtime(home: &Path, runtime_key: &str) -> Option<ServerEndpoint> {
-    daemon::reachable_versioned_daemon_statuses(home)
-        .into_iter()
-        .find(|(_, runtime)| {
-            runtime
-                .terminal_session_keys
-                .iter()
-                .any(|key| key == runtime_key)
-        })
-        .map(|(endpoint, _)| endpoint)
+    for (endpoint, runtime) in daemon::reachable_versioned_daemon_statuses(home) {
+        if !runtime
+            .terminal_session_keys
+            .iter()
+            .any(|key| key == runtime_key)
+        {
+            continue;
+        }
+        if runtime.server_version == daemon::SERVER_PROTOCOL_VERSION {
+            return Some(endpoint);
+        }
+        append_trace_event(
+            home,
+            "server",
+            "remote_runtime",
+            "skip_stale_runtime_daemon",
+            json!({
+                "runtime_key": runtime_key,
+                "endpoint": format!("{endpoint:?}"),
+                "server_version": runtime.server_version,
+                "current_version": daemon::SERVER_PROTOCOL_VERSION,
+            }),
+        );
+    }
+    None
 }
 
 pub fn ensure_local_daemon_running(endpoint: &ServerEndpoint) -> anyhow::Result<()> {
@@ -14583,9 +14599,12 @@ mod tests {
         }
     }
 
-    fn minimal_runtime_status(terminal_session_keys: Vec<String>) -> ServerRuntimeStatus {
+    fn minimal_runtime_status_with_version(
+        server_version: &str,
+        terminal_session_keys: Vec<String>,
+    ) -> ServerRuntimeStatus {
         ServerRuntimeStatus {
-            server_version: "2.1.46".to_string(),
+            server_version: server_version.to_string(),
             server_build_id: 0,
             server_pid: 0,
             host_kind: "test".to_string(),
@@ -14620,6 +14639,7 @@ mod tests {
     #[cfg(unix)]
     fn spawn_one_status_socket(
         path: PathBuf,
+        server_version: &'static str,
         terminal_session_keys: Vec<String>,
     ) -> std::thread::JoinHandle<()> {
         std::thread::spawn(move || {
@@ -14634,8 +14654,10 @@ mod tests {
             let request: super::ServerRequest =
                 serde_json::from_str(line.trim_end()).expect("parse status request");
             assert!(matches!(request, super::ServerRequest::Status));
-            let response =
-                super::ServerResponse::Status(minimal_runtime_status(terminal_session_keys));
+            let response = super::ServerResponse::Status(minimal_runtime_status_with_version(
+                server_version,
+                terminal_session_keys,
+            ));
             serde_json::to_writer(&mut stream, &response).expect("write status response");
             stream.write_all(b"\n").expect("write response terminator");
             stream.flush().expect("flush status response");
@@ -14644,7 +14666,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn remote_resume_endpoint_finds_live_runtime_on_reachable_old_daemon_socket() {
+    fn remote_resume_endpoint_ignores_stale_runtime_on_reachable_old_daemon_socket() {
         let root = std::env::temp_dir().join(format!(
             "yggterm-remote-runtime-old-daemon-{}-{}",
             std::process::id(),
@@ -14654,7 +14676,11 @@ mod tests {
         fs::create_dir_all(&home).expect("create temp yggterm home");
         let legacy_socket = home.join("server-2-1-46.sock");
         let runtime_key = "codex-runtime://old-live-session";
-        let handle = spawn_one_status_socket(legacy_socket.clone(), vec![runtime_key.to_string()]);
+        let handle = spawn_one_status_socket(
+            legacy_socket.clone(),
+            "2.1.46",
+            vec![runtime_key.to_string()],
+        );
         for _ in 0..100 {
             if legacy_socket.exists() {
                 break;
@@ -14666,10 +14692,44 @@ mod tests {
         let endpoint = super::endpoint_with_live_remote_runtime(&home, runtime_key);
 
         assert_eq!(
-            endpoint,
-            Some(ServerEndpoint::UnixSocket(legacy_socket)),
-            "remote resume must bridge to the reachable old daemon that still owns the live runtime"
+            endpoint, None,
+            "remote resume must not bridge through a stale-version daemon"
         );
+        handle.join().expect("status socket thread");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remote_resume_endpoint_accepts_current_runtime_on_reachable_versioned_socket() {
+        let root = std::env::temp_dir().join(format!(
+            "yggterm-remote-runtime-current-daemon-{}-{}",
+            std::process::id(),
+            current_millis_u64()
+        ));
+        let home = root.join(".yggterm");
+        fs::create_dir_all(&home).expect("create temp yggterm home");
+        let socket = home.join(format!(
+            "server-{}.sock",
+            super::daemon::SERVER_PROTOCOL_VERSION.replace('.', "-")
+        ));
+        let runtime_key = "codex-runtime://current-live-session";
+        let handle = spawn_one_status_socket(
+            socket.clone(),
+            super::daemon::SERVER_PROTOCOL_VERSION,
+            vec![runtime_key.to_string()],
+        );
+        for _ in 0..100 {
+            if socket.exists() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(socket.exists(), "current socket did not become ready");
+
+        let endpoint = super::endpoint_with_live_remote_runtime(&home, runtime_key);
+
+        assert_eq!(endpoint, Some(ServerEndpoint::UnixSocket(socket)));
         handle.join().expect("status socket thread");
         let _ = fs::remove_dir_all(&root);
     }
