@@ -4,6 +4,12 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+## 2.1.70
+
+### Fixed
+
+- accept focused, input-enabled Codex transcript-browser surfaces in app-control readiness checks so Yggterm reports responsive remote resumes as interactive instead of flagging a false prompt-ready problem
+
 ## 2.1.69
 
 ### Fixed
