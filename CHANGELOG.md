@@ -4,6 +4,12 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+## 2.1.76
+
+### Fixed
+
+- accept truncated lower-half Codex model-permission setup tails during remote resume, so retained startup surfaces that only expose `Full Access` plus the confirm/escape hint still clear the remote-attention gate and keep input enabled
+
 ## 2.1.75
 
 ### Fixed
