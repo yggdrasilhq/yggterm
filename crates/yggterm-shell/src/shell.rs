@@ -2408,6 +2408,42 @@ impl ShellState {
         self.latest_terminal_open_attempt_for_path(session_path)
             .map(describe_terminal_open_attempt)
     }
+    fn mark_terminal_open_attempt_ready_for_session(
+        &mut self,
+        session_path: &str,
+        reason: &'static str,
+    ) {
+        let Some(attempt_id) = self
+            .terminal_open_attempt_by_session
+            .get(session_path)
+            .cloned()
+        else {
+            return;
+        };
+        let now_ms = current_millis();
+        let mut ready_snapshot = None;
+        if let Some(attempt) = self.terminal_open_attempts.get_mut(&attempt_id) {
+            let first_ready = attempt.ready_at_ms.is_none();
+            if first_ready {
+                attempt.ready_at_ms = Some(now_ms);
+            }
+            if attempt.latched_failure_reason.is_none() {
+                attempt.state = TerminalOpenAttemptState::Ready;
+            }
+            if first_ready {
+                ready_snapshot = Some(attempt.clone());
+            }
+        }
+        if let Some(attempt) = ready_snapshot {
+            self.record_terminal_open_attempt_event(
+                "ready",
+                &attempt,
+                Some(json!({
+                    "reason": reason,
+                })),
+            );
+        }
+    }
     fn observe_terminal_open_attempt_from_viewport(&mut self, viewport: &Value) {
         let active_session_path = viewport
             .get("active_session_path")
@@ -31352,8 +31388,15 @@ fn TerminalCanvas(
             let session_host_label = session_host_label.clone();
             spawn(async move {
                 sleep(Duration::from_millis(REMOTE_TERMINAL_RESUME_SLOW_MS)).await;
+                let still_waiting_for_resume =
+                    safe_shell_read(state, "terminal_resume_slow_timer_still_waiting", |shell| {
+                        shell
+                            .terminal_session_resume_notification_should_stay_visible(&session_path)
+                    })
+                    .unwrap_or(true);
                 if *timer_last_bootstrap_identity.borrow() == timer_mount_identity
                     && !timer_terminal_live_host_connected()
+                    && still_waiting_for_resume
                 {
                     timer_resume_overlay_slow.set(true);
                     upsert_terminal_resume_notification(
@@ -31381,8 +31424,18 @@ fn TerminalCanvas(
             let session_host_label = session_host_label.clone();
             spawn(async move {
                 sleep(Duration::from_millis(REMOTE_TERMINAL_RESUME_FAIL_MS)).await;
+                let still_waiting_for_resume = safe_shell_read(
+                    state,
+                    "terminal_resume_timeout_timer_still_waiting",
+                    |shell| {
+                        shell
+                            .terminal_session_resume_notification_should_stay_visible(&session_path)
+                    },
+                )
+                .unwrap_or(true);
                 if *timer_last_bootstrap_identity.borrow() == timer_mount_identity
                     && !timer_terminal_live_host_connected()
+                    && still_waiting_for_resume
                 {
                     timer_resume_overlay_timed_out.set(true);
                     upsert_terminal_resume_notification(
@@ -31444,7 +31497,6 @@ fn TerminalCanvas(
             && poisoned_by_retry
             && terminal_resume_surface_staged()
             && terminal_live_host_connected()
-            && (terminal_has_meaningful_output() || terminal_prompt_only())
             && !resume_overlay_failed()
             && !resume_overlay_timed_out()
     };
@@ -31475,13 +31527,11 @@ fn TerminalCanvas(
         let retained_ready_surface = shell.terminal_resume_ready_paths.contains(&session_path)
             && terminal_resume_surface_staged()
             && terminal_live_host_connected()
-            && (terminal_has_meaningful_output() || terminal_prompt_only())
             && !resume_overlay_failed()
             && !resume_overlay_timed_out();
         let render_ready_surface = ready_attempt
             && terminal_resume_surface_staged()
             && terminal_live_host_connected()
-            && (terminal_has_meaningful_output() || terminal_prompt_only())
             && !resume_overlay_failed()
             && !resume_overlay_timed_out();
         let remote_resume_ready =
@@ -33722,6 +33772,8 @@ fn TerminalCanvas(
                                         enabled: true,
                                         focus: true,
                                     });
+                                    set_signal_if_changed(terminal_has_meaningful_output, true);
+                                    set_signal_if_changed(terminal_prompt_only, false);
                                     clear_terminal_resume_notification(state, &session_path);
                                     let _ = safe_shell_mut(
                                         state,
@@ -33732,6 +33784,10 @@ fn TerminalCanvas(
                                                 .terminal_resume_ready_paths
                                                 .insert(session_path.clone());
                                             shell.terminal_attach_in_flight.remove(&session_path);
+                                            shell.mark_terminal_open_attempt_ready_for_session(
+                                                &session_path,
+                                                "live_transcript_browser",
+                                            );
                                             shell.maybe_finish_terminal_surface_request_for_session(
                                                 &session_path,
                                             );
@@ -51203,6 +51259,44 @@ Waiting for the remote terminal to paint...\n";
         assert!(
             !shell.startup_terminal_restore_should_recover(active_session_path, current_millis(),)
         );
+    }
+    #[test]
+    fn remote_resume_ready_path_clears_resume_notification_gate() {
+        let active_session_path = "remote-session://oc/test";
+        let bootstrap = test_shell_bootstrap_with_active_session(active_session_path);
+        let mut shell = ShellState::new(bootstrap);
+        shell.server_busy = false;
+        shell.server.set_view_mode(WorkspaceViewMode::Terminal);
+        shell.retain_terminal_session_path(active_session_path);
+        shell
+            .terminal_attach_in_flight
+            .insert(active_session_path.to_string());
+        assert!(
+            shell.terminal_session_resume_notification_should_stay_visible(active_session_path)
+        );
+        shell
+            .terminal_resume_ready_paths
+            .insert(active_session_path.to_string());
+        shell.terminal_attach_in_flight.remove(active_session_path);
+        assert!(
+            !shell.terminal_session_resume_notification_should_stay_visible(active_session_path)
+        );
+    }
+    #[test]
+    fn mark_terminal_open_attempt_ready_for_session_records_ready_attempt() {
+        let active_session_path = "remote-session://oc/test";
+        let bootstrap = test_shell_bootstrap_with_active_session(active_session_path);
+        let mut shell = ShellState::new(bootstrap);
+        let attempt_id =
+            shell.begin_terminal_open_attempt(active_session_path, "req-test", 1, "open_row");
+        shell.mark_terminal_open_attempt_ready_for_session(active_session_path, "test_ready");
+        let attempt = shell
+            .terminal_open_attempts
+            .get(&attempt_id)
+            .expect("attempt should exist");
+        assert!(matches!(attempt.state, TerminalOpenAttemptState::Ready));
+        assert!(attempt.ready_at_ms.is_some());
+        assert!(shell.terminal_session_has_ready_attempt(active_session_path));
     }
     #[test]
     fn recover_startup_terminal_restore_rearms_attempt_deadline() {
