@@ -799,6 +799,11 @@ fn terminal_host_problem_for_app_control(host: &Value) -> Option<&'static str> {
             || helper_textarea_focused
             || cursor_sample_visible
             || local_prompt_surface);
+    let transcript_browser_surface = terminal_chunk_is_transcript_browser(text_sample);
+    let transcript_browser_ready_surface = session_path.starts_with("remote-session://")
+        && transcript_browser_surface
+        && input_enabled
+        && (helper_textarea_focused || xterm_present || screen_present || canvas_count > 0);
     if !cursor_line_text.is_empty() && terminal_chunk_is_transport_error(cursor_line_text) {
         return Some("active terminal host is showing transport/error output");
     }
@@ -842,7 +847,10 @@ fn terminal_host_problem_for_app_control(host: &Value) -> Option<&'static str> {
     {
         return Some("active terminal host is only showing a plain shell prompt");
     }
-    if terminal_chunk_is_transcript_browser(text_sample) {
+    if transcript_browser_surface {
+        if transcript_browser_ready_surface {
+            return None;
+        }
         return Some("active terminal host is still showing the transcript browser");
     }
     if terminal_chunk_is_saved_transcript_prefill(text_sample) {
@@ -854,7 +862,11 @@ fn terminal_host_problem_for_app_control(host: &Value) -> Option<&'static str> {
     if terminal_chunk_is_low_signal_terminal_noise(text_sample) {
         return Some("active terminal host is still showing low-signal terminal noise");
     }
-    if session_path.starts_with("remote-session://") && input_enabled && !prompt_ready_surface {
+    if session_path.starts_with("remote-session://")
+        && input_enabled
+        && !prompt_ready_surface
+        && !transcript_browser_ready_surface
+    {
         return Some("active remote terminal is input-enabled without a prompt-ready surface");
     }
     None
@@ -1493,11 +1505,11 @@ pub(crate) fn strip_terminal_control_sequences(data: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        WorkspaceViewMode, terminal_bootstrap_activation_epoch,
+        WorkspaceViewMode, describe_viewport_snapshot, terminal_bootstrap_activation_epoch,
         terminal_chunk_has_codex_prompt_output, terminal_chunk_is_transport_error,
         terminal_host_problem_for_app_control,
     };
-    use serde_json::json;
+    use serde_json::{Value, json};
 
     #[test]
     fn terminal_host_problem_accepts_prompt_ready_codex_footer_surface() {
@@ -1697,6 +1709,114 @@ mod tests {
         assert_eq!(
             terminal_host_problem_for_app_control(&host),
             Some("active remote terminal is input-enabled without a prompt-ready surface")
+        );
+    }
+
+    #[test]
+    fn terminal_host_problem_accepts_input_enabled_transcript_browser_surface() {
+        let host = json!({
+            "session_path": "remote-session://dev/live-codex",
+            "text_sample": "/ T R A N S C R I P T /\n• Published v2.1.50: https://github.com/yggdrasilhq/yggterm/releases/tag/v2.1.50\n\n──────────────────── 87% ─\n ↑/↓ to scroll   pgup/pgdn to page   home/end to jump\n q to quit   esc/← to edit prev   → to edit next   enter to edit message",
+            "cursor_line_text": " q to quit   esc/← to edit prev   → to edit next   enter to edit message",
+            "input_enabled": true,
+            "helper_textarea_focused": true,
+            "cursor_node_count": 0,
+            "xterm_present": true,
+            "screen_present": true,
+            "rows_present": false,
+            "canvas_count": 4,
+            "render_event_count": 12,
+            "data_event_count": 1,
+            "xterm_buffer_kind": "normal",
+            "xterm_cursor_hidden": true,
+            "host_rect": {"left": 0.0, "top": 0.0, "width": 840.0, "height": 830.0},
+            "host_content_width": 840.0,
+            "host_content_height": 830.0,
+            "screen_rect": {"width": 840.0, "height": 830.0},
+            "viewport_rect": {"width": 840.0, "height": 830.0},
+            "helpers_rect": {"width": 840.0, "height": 830.0},
+            "helper_textarea_rect": {"left": -10000.0, "top": 68.0, "width": 1.0, "height": 1.0}
+        });
+        assert_eq!(terminal_host_problem_for_app_control(&host), None);
+    }
+
+    #[test]
+    fn describe_viewport_snapshot_accepts_input_enabled_transcript_browser_surface() {
+        let snapshot = json!({
+            "active_session_path": "remote-session://dev/live-codex",
+            "active_view_mode": "Terminal",
+            "shell": {
+                "terminal_attach_in_flight": [],
+                "notifications": []
+            },
+            "active_surface_requests": []
+        });
+        let dom = json!({
+            "titlebar_title_text": "yggterm",
+            "titlebar_summary_text": "",
+            "titlebar_button_tooltip": "",
+            "titlebar_menu_open": false,
+            "preview_text_sample": "",
+            "preview_viewport_rect": null,
+            "preview_visible_block_ids": [],
+            "preview_font_family": "Inter",
+            "preview_visible_entries": [],
+            "preview_rendered_sections": [],
+            "preview_fallback_context_visible": false,
+            "preview_fallback_context_text": "",
+            "preview_timestamp_labels": [],
+            "preview_window": null,
+            "shell_text_sample": "",
+            "document_editor_count": 0,
+            "document_body_sample": "",
+            "terminal_hosts": [{
+                "session_path": "remote-session://dev/live-codex",
+                "child_count": 1,
+                "xterm_present": true,
+                "screen_present": true,
+                "viewport_present": true,
+                "rows_present": false,
+                "canvas_count": 4,
+                "input_enabled": true,
+                "helper_textarea_focused": true,
+                "xterm_cursor_hidden": true,
+                "text_sample": "/ T R A N S C R I P T /\n• Published v2.1.50\n\n──────────────────── 87% ─\n ↑/↓ to scroll   pgup/pgdn to page   home/end to jump\n q to quit   esc/← to edit prev   → to edit next   enter to edit message",
+                "cursor_line_text": " q to quit   esc/← to edit prev   → to edit next   enter to edit message",
+                "resume_overlay_visible": false,
+                "resume_overlay_text": "",
+                "resume_overlay_excerpt": "",
+                "resume_overlay_kind": "hidden",
+                "resume_overlay_phase": "hidden",
+                "resume_overlay_effective_failed": false
+            }],
+            "terminal_resume_overlay": {
+                "visible": false,
+                "text_sample": "",
+                "excerpt": "",
+                "kind": "",
+                "phase": "hidden",
+                "effective_failed": false
+            },
+            "preview_visible_block_count": 0,
+            "preview_scroll_count": 1
+        });
+        let viewport = describe_viewport_snapshot(&snapshot, &dom);
+        assert_eq!(viewport.get("ready").and_then(Value::as_bool), Some(true));
+        assert_eq!(
+            viewport.get("interactive").and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            viewport
+                .get("terminal_settled_kind")
+                .and_then(Value::as_str),
+            Some("interactive")
+        );
+        assert_eq!(
+            viewport
+                .get("active_terminal_surface")
+                .and_then(|surface| surface.get("problem")),
+            Some(&Value::Null)
         );
     }
 
