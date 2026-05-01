@@ -3479,7 +3479,9 @@ fn linux_proc_yggterm_home(proc_path: &Path) -> Option<PathBuf> {
 fn linux_yggterm_server_process_is_live_bridge(parts: &[String]) -> bool {
     parts.first().is_some_and(|argv0| argv0.contains("yggterm"))
         && parts.windows(3).any(|window| {
-            window[0] == "server" && window[1] == "remote" && window[2] == "resume-codex"
+            window[0] == "server"
+                && window[1] == "remote"
+                && (window[2] == "resume-codex" || window[2] == "start-codex")
         })
 }
 
@@ -3644,6 +3646,7 @@ fn cleanup_legacy_linux_daemon_processes(
     let mut killed_orphan = 0usize;
     let mut killed_duplicate_same_home = 0usize;
     let mut skipped_active_client_legacy = 0usize;
+    let mut skipped_runtime_activity_legacy = 0usize;
     let mut skipped_cross_home_orphan = 0usize;
     let proc_entries = fs::read_dir("/proc").context("reading /proc for stale daemon cleanup")?;
     for entry in proc_entries {
@@ -3688,20 +3691,24 @@ fn cleanup_legacy_linux_daemon_processes(
         }
         daemon_candidates += 1;
         let daemon_home = linux_proc_yggterm_home(&proc_path);
-        let has_clients = daemon_home
+        let has_gui_clients = daemon_home
             .as_deref()
             .and_then(|home| active_client_instance_records(home, &default_endpoint(home)).ok())
-            .is_some_and(|records| !records.is_empty())
-            || daemon_home
-                .as_deref()
-                .is_some_and(linux_home_has_recoverable_runtime_activity);
+            .is_some_and(|records| !records.is_empty());
+        let has_recoverable_runtime_activity = daemon_home
+            .as_deref()
+            .is_some_and(linux_home_has_recoverable_runtime_activity);
+        let has_clients = has_gui_clients || has_recoverable_runtime_activity;
         let age_ms = linux_proc_pid_age_ms(pid).unwrap_or_default();
         let is_legacy_binary =
             legacy_daemon_reap_applies_to_home(current_home.as_deref(), daemon_home.as_deref())
                 && daemon_binary_is_legacy(current_exe, argv0, proc_exe_target.as_deref());
         let is_legacy_reapable = is_legacy_binary && !has_clients;
-        if is_legacy_binary && has_clients {
+        if is_legacy_binary && has_gui_clients {
             skipped_active_client_legacy += 1;
+        }
+        if is_legacy_binary && !has_gui_clients && has_recoverable_runtime_activity {
+            skipped_runtime_activity_legacy += 1;
         }
         let is_cross_home_orphan_candidate = !has_clients
             && age_ms >= reap_after_ms
@@ -3740,6 +3747,7 @@ fn cleanup_legacy_linux_daemon_processes(
                 "killed_orphan": killed_orphan,
                 "killed_duplicate_same_home": killed_duplicate_same_home,
                 "skipped_active_client_legacy": skipped_active_client_legacy,
+                "skipped_runtime_activity_legacy": skipped_runtime_activity_legacy,
                 "skipped_cross_home_orphan": skipped_cross_home_orphan,
                 "same_home_daemon_count": same_home_daemon_count,
                 "oldest_same_home_pid": oldest_same_home_pid,
@@ -4307,7 +4315,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn live_bridge_process_detection_matches_remote_resume_stdio_bridges() {
-        let parts = vec![
+        let resume_parts = vec![
             "/home/pi/.yggterm/bin/yggterm".to_string(),
             "server".to_string(),
             "remote".to_string(),
@@ -4316,7 +4324,20 @@ mod tests {
             "/home/pi/gh/yggterm".to_string(),
             "--require-existing".to_string(),
         ];
-        assert!(super::linux_yggterm_server_process_is_live_bridge(&parts));
+        assert!(super::linux_yggterm_server_process_is_live_bridge(
+            &resume_parts
+        ));
+        let start_parts = vec![
+            "/home/pi/.yggterm/bin/yggterm".to_string(),
+            "server".to_string(),
+            "remote".to_string(),
+            "start-codex".to_string(),
+            "019dbddf".to_string(),
+            "/home/pi/gh/yggterm".to_string(),
+        ];
+        assert!(super::linux_yggterm_server_process_is_live_bridge(
+            &start_parts
+        ));
         let short_lived_probe = vec![
             "/home/pi/.yggterm/bin/yggterm".to_string(),
             "server".to_string(),
