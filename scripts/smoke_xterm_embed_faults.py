@@ -400,6 +400,7 @@ def app_create_terminal(
     title: str | None = None,
     cwd: str | None = None,
     kind: str | None = None,
+    machine_key: str | None = None,
 ) -> dict:
     args = [
         "server",
@@ -417,6 +418,8 @@ def app_create_terminal(
         args.extend(["--cwd", cwd])
     if kind:
         args.extend(["--kind", kind])
+    if machine_key:
+        args.extend(["--machine-key", machine_key])
     payload = unwrap_data(run(*args))
     session_path = str(payload.get("session_path") or payload.get("active_session_path") or "").strip()
     if session_path and not payload.get("session_path"):
@@ -5167,6 +5170,120 @@ def assert_no_problem_notifications(state: dict, *, context: str) -> dict:
     if bad:
         raise AssertionError(f"{context}: bad daemon/socket notifications observed: {bad!r}")
     return {"context": context, "bad_notification_count": 0}
+
+
+def remote_attention_notifications_for_session(state: dict, session: str) -> list[dict]:
+    session = str(session or "").strip()
+    if not session:
+        return []
+    matching = []
+    seen = set()
+    for notification in visible_notifications(state):
+        if not isinstance(notification, dict):
+            continue
+        identifier = notification.get("id") or json.dumps(notification, sort_keys=True, default=str)
+        if identifier in seen:
+            continue
+        seen.add(identifier)
+        title = str(notification.get("title") or "")
+        job_key = str(notification.get("job_key") or notification.get("jobKey") or "")
+        haystack = json.dumps(notification, sort_keys=True, default=str)
+        if title == "Remote Terminal Needs Attention" and (
+            f"terminal-resume:{session}" in job_key
+            or f"terminal-resume:{session}" in haystack
+            or session in job_key
+        ):
+            matching.append(notification)
+    return matching
+
+
+def codex_spawn_host_excerpt(host: dict | None) -> dict:
+    if not isinstance(host, dict):
+        return {}
+    host_text = terminal_host_text(host)
+    return {
+        "session_path": host.get("session_path"),
+        "input_enabled": host.get("input_enabled"),
+        "helper_textarea_focused": host.get("helper_textarea_focused"),
+        "host_has_active_element": host.get("host_has_active_element"),
+        "mounted_entry_host_connected": host.get("mounted_entry_host_connected"),
+        "xterm_cursor_hidden": host.get("xterm_cursor_hidden"),
+        "cursor_line_text": host.get("cursor_line_text") or host.get("cursor_row_text"),
+        "blank_rows_below_cursor": host.get("blank_rows_below_cursor"),
+        "rows": host.get("rows"),
+        "fit_overflow_px": host.get("fit_overflow_px"),
+        "cursor_bottom_overflow_px": host.get("cursor_bottom_overflow_px"),
+        "text_tail": host_text[-700:],
+        "has_live_codex_prompt": host_has_live_codex_prompt(host),
+    }
+
+
+def codex_spawn_state_excerpt(state: dict, session: str, elapsed_ms: float) -> dict:
+    viewport = viewport_state(state)
+    host = host_for_session_or_none(state, session) or active_host_or_none(state)
+    visible = visible_notifications(state)
+    return {
+        "elapsed_ms": round(elapsed_ms, 1),
+        "active_session_path": state.get("active_session_path"),
+        "active_view_mode": state.get("active_view_mode"),
+        "ready": viewport.get("ready"),
+        "interactive": viewport.get("interactive"),
+        "reason": viewport.get("reason"),
+        "terminal_settled_kind": viewport.get("terminal_settled_kind"),
+        "terminal_open_attempt": viewport.get("terminal_open_attempt"),
+        "active_terminal_surface": viewport.get("active_terminal_surface"),
+        "active_surface_requests": viewport.get("active_surface_requests"),
+        "visible_notification_count": len(visible),
+        "visible_notifications": visible,
+        "matching_remote_attention": remote_attention_notifications_for_session(state, session),
+        "host": codex_spawn_host_excerpt(host),
+    }
+
+
+def wait_for_codex_spawn_ready(
+    pid: int,
+    session: str,
+    *,
+    timeout_seconds: float = 45.0,
+) -> dict:
+    normalized_session = normalize_live_path(session)
+    deadline = time.time() + timeout_seconds
+    last_state = {}
+    last_open_attempt = 0.0
+    last_focus_attempt = 0.0
+    while time.time() < deadline:
+        last_state = app_state(pid)
+        if normalize_live_path(str(last_state.get("active_session_path") or "")) != normalized_session:
+            if time.time() - last_open_attempt >= 0.75:
+                app_open(pid, session, view="terminal")
+                last_open_attempt = time.time()
+            time.sleep(0.18)
+            continue
+        viewport = viewport_state(last_state)
+        host = host_for_session_or_none(last_state, session)
+        if host is None:
+            time.sleep(0.2)
+            continue
+        if (
+            last_state.get("active_view_mode") == "Terminal"
+            and viewport.get("ready") is True
+            and viewport.get("interactive") is True
+            and viewport.get("terminal_settled_kind") == "interactive"
+            and host.get("input_enabled") is True
+            and host_has_live_codex_prompt(host)
+            and not ((viewport.get("active_terminal_surface") or {}).get("problem"))
+        ):
+            return last_state
+        if time.time() - last_focus_attempt >= 0.9:
+            focus_rect = host.get("host_rect") or dom_rect(last_state, "main_surface_body_rect")
+            if rect_is_visible(focus_rect):
+                try:
+                    xdotool_click_window(pid, rect_center_x(focus_rect), rect_center_y(focus_rect))
+                    last_focus_attempt = time.time()
+                except Exception:
+                    pass
+        time.sleep(0.2)
+    raise AssertionError(f"spawned Codex session did not become ready: {last_state!r}")
 
 
 def session_view_contract_violations(state: dict) -> list[str]:
@@ -14067,6 +14184,127 @@ def wait_for_live_codex_prompt(pid: int, session: str, timeout_seconds: float = 
     raise AssertionError(f"live Codex prompt did not become visible in time: {last_state!r}")
 
 
+def assert_codex_spawn_timeline(pid: int, out_dir: Path) -> dict:
+    machine_key = (
+        os.environ.get("YGGTERM_SMOKE_REMOTE_MACHINE")
+        or os.environ.get("YGGTERM_SMOKE_CODEX_MACHINE")
+        or "dev"
+    ).strip()
+    if not machine_key:
+        raise AssertionError("codex_spawn_timeline requires a remote machine key")
+
+    created = app_create_terminal(
+        pid,
+        title="Smoke Remote Codex Timeline",
+        kind="codex",
+        machine_key=machine_key,
+    )
+    session = str(created.get("session_path") or created.get("active_session_path") or "").strip()
+    if not session:
+        raise AssertionError(f"remote Codex timeline create did not return a session path: {created!r}")
+    if not session.startswith("remote-session://"):
+        raise AssertionError(
+            "codex_spawn_timeline must exercise an SSH-backed remote session, "
+            f"got {session!r}: {created!r}"
+        )
+
+    started = time.perf_counter()
+    samples = []
+    sample_offsets = [
+        ("sub1s", 0.5),
+        ("1s", 1.0),
+        ("2s", 2.0),
+        ("5s", 5.0),
+    ]
+
+    def capture_sample(label: str) -> dict:
+        elapsed_ms = (time.perf_counter() - started) * 1000.0
+        state = app_state(pid, timeout_ms=12000, retries=1)
+        state_path = out_dir / f"codex-spawn-{label}-state.json"
+        with state_path.open("w") as fh:
+            json.dump(state, fh, indent=2)
+        screenshot_path = out_dir / f"codex-spawn-{label}.png"
+        screenshot = app_screenshot(pid, screenshot_path, crop_state=state)
+        excerpt = codex_spawn_state_excerpt(state, session, elapsed_ms)
+        excerpt["state_path"] = str(state_path)
+        excerpt["screenshot_path"] = str(screenshot_path)
+        excerpt["screenshot"] = screenshot
+        attention = excerpt.get("matching_remote_attention") or []
+        if attention:
+            raise AssertionError(
+                f"spawned remote Codex session raised remote-attention notification at {label}: "
+                f"{attention!r}"
+            )
+        return excerpt
+
+    cleanup = None
+    try:
+        for label, offset in sample_offsets:
+            remaining = started + offset - time.perf_counter()
+            if remaining > 0:
+                time.sleep(remaining)
+            samples.append(capture_sample(label))
+
+        ready_state = wait_for_codex_spawn_ready(pid, session, timeout_seconds=50.0)
+        ready_elapsed_ms = (time.perf_counter() - started) * 1000.0
+        ready_state_path = out_dir / "codex-spawn-ready-state.json"
+        with ready_state_path.open("w") as fh:
+            json.dump(ready_state, fh, indent=2)
+        ready_screenshot_path = out_dir / "codex-spawn-ready.png"
+        ready_screenshot = app_screenshot(pid, ready_screenshot_path, crop_state=ready_state)
+        ready = codex_spawn_state_excerpt(ready_state, session, ready_elapsed_ms)
+        ready["state_path"] = str(ready_state_path)
+        ready["screenshot_path"] = str(ready_screenshot_path)
+        ready["screenshot"] = ready_screenshot
+
+        post_timeout_offset = 38.0
+        remaining = started + post_timeout_offset - time.perf_counter()
+        if remaining > 0:
+            time.sleep(remaining)
+        after_timeout = capture_sample("after38s")
+        after_state = app_state(pid, timeout_ms=12000, retries=1)
+        after_host = host_for_session_or_none(after_state, session)
+        after_viewport = viewport_state(after_state)
+        if after_host is None:
+            raise AssertionError(f"spawned Codex host disappeared after timeout window: {after_state!r}")
+        if not host_has_live_codex_prompt(after_host):
+            raise AssertionError(
+                "spawned remote Codex session did not hold a live Codex prompt after "
+                f"the old attention timeout: {codex_spawn_host_excerpt(after_host)!r}"
+            )
+        if after_host.get("input_enabled") is not True:
+            raise AssertionError(
+                f"spawned remote Codex input was not enabled after timeout window: {after_host!r}"
+            )
+        if (after_viewport.get("active_terminal_surface") or {}).get("problem"):
+            raise AssertionError(
+                f"spawned remote Codex still has active surface problem: "
+                f"{after_viewport.get('active_terminal_surface')!r}"
+            )
+        if remote_attention_notifications_for_session(after_state, session):
+            raise AssertionError(
+                "spawned remote Codex raised Remote Terminal Needs Attention after timeout: "
+                f"{remote_attention_notifications_for_session(after_state, session)!r}"
+            )
+
+        return {
+            "machine_key": machine_key,
+            "created": created,
+            "session": session,
+            "samples": samples,
+            "ready": ready,
+            "after_timeout": after_timeout,
+        }
+    finally:
+        try:
+            cleanup = app_remove_session(pid, session)
+        except Exception as exc:
+            cleanup = {"error": str(exc)}
+        cleanup_path = out_dir / "codex-spawn-cleanup.json"
+        with cleanup_path.open("w") as fh:
+            json.dump(cleanup, fh, indent=2)
+
+
 def ensure_live_codex_runtime(pid: int, session: str) -> dict:
     current = wait_for_interactive_session(pid, session, timeout_seconds=20.0)
     host = host_for_session(current, session)
@@ -14751,6 +14989,7 @@ def main() -> int:
     no_session_setup_checks = {
         "background_blur",
         "client_memory_budget",
+        "codex_spawn_timeline",
         "focus",
         "geometry",
         "managed_cli_refresh_ttl",
@@ -14869,6 +15108,14 @@ def main() -> int:
     disposable_codex_deleted = False
     try:
         run_check("initial_prompt_pixels", lambda: initial_prompt_pixels)
+        if "codex_spawn_timeline" in selected_checks or (
+            not selected_checks
+            and (
+                os.environ.get("YGGTERM_SMOKE_REMOTE_MACHINE")
+                or os.environ.get("YGGTERM_SMOKE_CODEX_MACHINE")
+            )
+        ):
+            run_check("codex_spawn_timeline", lambda: assert_codex_spawn_timeline(args.pid, out_dir))
         if args.session_kind == "codex":
             run_check("codex_startup_health", lambda: assert_codex_startup_health(args.pid, args.session, out_dir))
         run_check("startup_bootstrap_dedupe", lambda: assert_no_duplicate_startup_terminal_bootstrap(args.pid))

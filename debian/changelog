@@ -1,3 +1,11 @@
+yggterm (2.1.78-1) unstable; urgency=medium
+
+  * Accept fresh remote Codex welcome/prompt surfaces as live terminals.
+  * Add remote Codex spawn timeline smoke coverage for the old attention
+    timeout window.
+
+ -- Yggdrasil HQ <avi@gour.top>  Fri, 01 May 2026 15:39:19 +0530
+
 yggterm (2.1.77-1) unstable; urgency=medium
 
   * Accept permission selector tails that start inside the auto-reviewer line.
