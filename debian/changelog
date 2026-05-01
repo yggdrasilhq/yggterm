@@ -1,3 +1,11 @@
+yggterm (2.1.81-1) unstable; urgency=medium
+
+  * Refuse to bridge remote Codex runtimes through stale-version daemons.
+  * Clear remote terminal attach/request state when resume times out.
+  * Remove infinite progress animation from persistent no-progress toasts.
+
+ -- Yggdrasil HQ <avi@gour.top>  Fri, 01 May 2026 18:00:29 +0530
+
 yggterm (2.1.80-1) unstable; urgency=medium
 
   * Show live local Codex/LiteLLM transcript-backed runtimes under Live
