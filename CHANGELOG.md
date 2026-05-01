@@ -4,6 +4,15 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+## 2.1.87
+
+### Fixed
+
+- retry the remote Codex bridge current-screen repaint after early control-only output, so fresh or resumed Codex TUIs do not get stranded in a sparse prompt-only redraw while the daemon already has the full screen
+- stop fresh SSH-backed Codex terminals from writing the local Codex scaffold into the xterm host while the real remote bridge is still loading
+- add bridge trace points for initial-screen snapshot readiness, success, and give-up paths to make future jojo redraw incidents diagnosable from telemetry
+- seed requested SSH targets into temp-home Linux smoke runs so remote Codex timeline checks exercise the intended machine instead of depending on the user's live profile
+
 ## 2.1.86
 
 ### Fixed
