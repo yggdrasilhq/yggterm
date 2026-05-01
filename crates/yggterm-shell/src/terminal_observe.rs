@@ -1207,11 +1207,15 @@ pub(crate) fn terminal_chunk_is_codex_interactive_setup_prompt(data: &str) -> bo
     }
     let codex_context = normalized.contains("openai codex")
         || normalized.contains("codex can read and edit files")
+        || normalized.contains("codex can edit files outside this workspace")
         || normalized.contains("update model permissions");
     let permissions_menu = normalized.contains("update model permissions")
         || (normalized.contains("default (current)")
             && normalized.contains("auto-review")
-            && normalized.contains("full access"));
+            && normalized.contains("full access"))
+        || (normalized.contains("auto-reviewer subagent")
+            && normalized.contains("full access")
+            && normalized.contains("exercise caution when using"));
     let explicit_input = normalized.contains("press enter to confirm")
         || normalized.contains("enter to confirm")
         || normalized.contains("esc to go back");
@@ -1620,6 +1624,9 @@ mod tests {
         });
         assert!(terminal_chunk_is_codex_interactive_setup_prompt(
             host.get("text_tail").and_then(Value::as_str).unwrap()
+        ));
+        assert!(terminal_chunk_is_codex_interactive_setup_prompt(
+            "to the auto-reviewer subagent.\n  3. Full Access        Codex can edit files outside this workspace and access the internet without asking\n                        for approval. Exercise caution when using.\n\n  Press enter to confirm or esc to go back"
         ));
         assert_eq!(terminal_host_problem_for_app_control(&host), None);
     }

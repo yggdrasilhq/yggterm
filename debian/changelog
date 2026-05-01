@@ -1,3 +1,11 @@
+yggterm (2.1.76-1) unstable; urgency=medium
+
+  * Accept truncated Codex permission selector tails during remote resume.
+  * Keep retained permissions selectors interactive when only the lower half of
+    the menu is visible to the live health loop.
+
+ -- Yggdrasil HQ <avi@gour.top>  Fri, 01 May 2026 14:14:50 +0530
+
 yggterm (2.1.75-1) unstable; urgency=medium
 
   * Let retained Codex permission selectors finish remote resume without an
