@@ -50182,19 +50182,71 @@ Waiting for the remote terminal to paint...\n";
 
   Press enter to confirm or esc to go back
 ";
+        let truncated_tail = "\
+to the auto-reviewer subagent.
+  3. Full Access        Codex can edit files outside this workspace and access the internet without asking
+                        for approval. Exercise caution when using.
+
+  Press enter to confirm or esc to go back
+";
         assert!(terminal_chunk_is_codex_interactive_setup_prompt(tail));
+        assert!(terminal_chunk_is_codex_interactive_setup_prompt(
+            truncated_tail
+        ));
         assert!(terminal_surface_has_prompt_ready_text(tail));
+        assert!(terminal_surface_has_prompt_ready_text(truncated_tail));
         assert!(!terminal_host_prompt_layout_is_acceptable(50, 31));
         assert!(!retained_remote_surface_has_non_prompt_text("", tail));
+        assert!(!retained_remote_surface_has_non_prompt_text(
+            "",
+            truncated_tail
+        ));
         assert!(remote_resume_visual_reveal_output_is_acceptable(
             "", "", tail
+        ));
+        assert!(remote_resume_visual_reveal_output_is_acceptable(
+            "",
+            "",
+            truncated_tail
         ));
         assert!(remote_resume_visual_reveal_can_complete(
             true, true, true, false, false, "", "", tail, 50, 31,
         ));
+        assert!(remote_resume_visual_reveal_can_complete(
+            true,
+            true,
+            true,
+            false,
+            false,
+            "",
+            "",
+            truncated_tail,
+            50,
+            31,
+        ));
         assert!(quiet_retained_remote_surface_ready(
             true, false, true, true, false, false, true, "", tail, 50, 31, None, false, false,
             false, false, false, false,
+        ));
+        assert!(quiet_retained_remote_surface_ready(
+            true,
+            false,
+            true,
+            true,
+            false,
+            false,
+            true,
+            "",
+            truncated_tail,
+            50,
+            31,
+            None,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
         ));
     }
     #[test]
