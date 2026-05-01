@@ -31732,14 +31732,7 @@ fn TerminalCanvas(
     let initial_resume_overlay_excerpt = remote_resume_overlay_excerpt(&session)
         .or_else(|| remote_resume_overlay_seed_excerpt(&session));
     let terminal_placeholder = if is_remote_resume_session {
-        remote_terminal_prefill_text(&session).or_else(|| {
-            snapshot
-                .active_summary
-                .as_deref()
-                .map(str::trim)
-                .filter(|text| !text.is_empty())
-                .map(format_terminal_prefill_text)
-        })
+        remote_terminal_placeholder_text(&session, snapshot.active_summary.as_deref())
     } else {
         local_terminal_prefill_text(&session)
     };
@@ -35929,6 +35922,17 @@ fn remote_terminal_prefill_text(session: &ManagedSessionView) -> Option<String> 
                 format!("{trimmed}\r\n")
             }
         })
+}
+fn remote_terminal_placeholder_text(
+    session: &ManagedSessionView,
+    active_summary: Option<&str>,
+) -> Option<String> {
+    remote_terminal_prefill_text(session).or_else(|| {
+        active_summary
+            .map(str::trim)
+            .filter(|text| terminal_resume_excerpt_is_meaningful(text))
+            .map(format_terminal_prefill_text)
+    })
 }
 fn remote_session_starts_new_codex(session: &ManagedSessionView) -> bool {
     session.session_path.starts_with("remote-session://")
@@ -57269,6 +57273,14 @@ q to quit   pgup/pgdn to page   enter to edit message
             stored_preview_hydrated: false,
         };
         assert_eq!(remote_terminal_prefill_text(&session), None);
+        assert_eq!(
+            remote_terminal_placeholder_text(&session, Some("Local Codex terminal.")),
+            None
+        );
+        assert_eq!(
+            remote_terminal_placeholder_text(&session, Some("Waiting on real remote output")),
+            Some("Waiting on real remote output\r\n".to_string())
+        );
     }
 
     #[test]
