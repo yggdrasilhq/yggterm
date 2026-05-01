@@ -1213,8 +1213,7 @@ pub(crate) fn terminal_chunk_is_codex_interactive_setup_prompt(data: &str) -> bo
         || (normalized.contains("default (current)")
             && normalized.contains("auto-review")
             && normalized.contains("full access"))
-        || (normalized.contains("auto-reviewer subagent")
-            && normalized.contains("full access")
+        || (normalized.contains("full access")
             && normalized.contains("exercise caution when using"));
     let explicit_input = normalized.contains("press enter to confirm")
         || normalized.contains("enter to confirm")
@@ -1626,7 +1625,7 @@ mod tests {
             host.get("text_tail").and_then(Value::as_str).unwrap()
         ));
         assert!(terminal_chunk_is_codex_interactive_setup_prompt(
-            "to the auto-reviewer subagent.\n  3. Full Access        Codex can edit files outside this workspace and access the internet without asking\n                        for approval. Exercise caution when using.\n\n  Press enter to confirm or esc to go back"
+            "uto-reviewer subagent.\n  3. Full Access        Codex can edit files outside this workspace and access the internet without asking\n                        for approval. Exercise caution when using.\n\n  Press enter to confirm or esc to go back"
         ));
         assert_eq!(terminal_host_problem_for_app_control(&host), None);
     }
