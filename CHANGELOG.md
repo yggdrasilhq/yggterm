@@ -4,6 +4,12 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+## 2.1.69
+
+### Fixed
+
+- keep live Codex transcript-browser resumes interactive after acceptance by trusting explicit resume-ready paths, marking the terminal open attempt ready, and blocking stale slow/timeout notifications from re-poisoning input
+
 ## 2.1.68
 
 ### Fixed
