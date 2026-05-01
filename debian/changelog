@@ -1,3 +1,10 @@
+yggterm (2.1.71-1) unstable; urgency=medium
+
+  * Accept retained Codex transcript-browser surfaces when the remote runtime is running.
+  * Clear stale resume notifications for hot-restarted transcript-browser sessions without fresh PTY bytes.
+
+ -- Yggdrasil HQ <avi@gour.top>  Fri, 01 May 2026 06:17:38 +0530
+
 yggterm (2.1.70-1) unstable; urgency=medium
 
   * Accept focused, input-enabled Codex transcript-browser surfaces in app-control readiness checks.
