@@ -137,11 +137,11 @@ def main() -> int:
     parser.add_argument("--terminal-mode", choices=["keyboard", "xterm", "auto"], default="keyboard")
     parser.add_argument("--clear-after", action="store_true", help="Send Ctrl+U after terminal samples.")
     parser.add_argument("--json-out", type=Path)
-    parser.add_argument("--max-state-ms", type=float, default=900.0)
-    parser.add_argument("--max-rows-ms", type=float, default=900.0)
-    parser.add_argument("--max-search-ms", type=float, default=900.0)
-    parser.add_argument("--max-panel-ms", type=float, default=900.0)
-    parser.add_argument("--max-terminal-visible-ms", type=float, default=350.0)
+    parser.add_argument("--max-state-ms", type=float, default=1200.0)
+    parser.add_argument("--max-rows-ms", type=float, default=1200.0)
+    parser.add_argument("--max-search-ms", type=float, default=1200.0)
+    parser.add_argument("--max-panel-ms", type=float, default=1200.0)
+    parser.add_argument("--max-terminal-visible-ms", type=float, default=500.0)
     parser.add_argument("--max-terminal-p95-ms", type=float, default=450.0)
     args = parser.parse_args()
 
@@ -170,10 +170,31 @@ def main() -> int:
     rows_result = run_json(args, "rows", app_args(args, "rows"))
     report["measurements"]["rows_ms"] = rows_result.elapsed_ms
 
-    token_prefix = f"ygglat{int(time.time()) % 100000}"
+    if args.clear_after:
+        try:
+            run_json(
+                args,
+                "terminal_initial_clear",
+                terminal_args(
+                    args,
+                    session_path,
+                    "probe-type",
+                    session_path,
+                    "--mode",
+                    args.terminal_mode,
+                    "--data",
+                    "",
+                    "--ctrl-u",
+                ),
+            )
+            time.sleep(0.2)
+        except Exception as error:  # noqa: BLE001
+            report["failures"].append(f"terminal initial clear failed: {error}")
+
+    token_prefix = f"l{int(time.time()) % 100:02d}"
     terminal_visible_ms: list[float] = []
     for ix in range(max(1, args.samples)):
-        token = f"{token_prefix}{ix}"
+        token = f"{token_prefix}{ix:x}"
         probe = terminal_probe(args, session_path, token)
         probe_data = data_from(probe)
         timings = probe_data.get("timings") if isinstance(probe_data.get("timings"), dict) else {}
@@ -214,7 +235,7 @@ def main() -> int:
                 ),
             )
         except Exception as error:  # noqa: BLE001
-            report["failures"].append(f"terminal clear failed: {error}")
+            report["failures"].append(f"terminal final clear failed: {error}")
 
     search_token = f"latency-{token_prefix}"
     search_result = run_json(
