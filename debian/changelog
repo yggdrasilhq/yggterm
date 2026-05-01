@@ -1,3 +1,11 @@
+yggterm (2.1.82-1) unstable; urgency=medium
+
+  * Remove unkept update-restored remote sessions from Live Sessions after a
+    fresh remote scan proves their runtime is no longer live.
+  * Trace stale temporary remote live-session pruning for panic-report proof.
+
+ -- Yggdrasil HQ <avi@gour.top>  Fri, 01 May 2026 18:34:23 +0530
+
 yggterm (2.1.81-1) unstable; urgency=medium
 
   * Refuse to bridge remote Codex runtimes through stale-version daemons.
