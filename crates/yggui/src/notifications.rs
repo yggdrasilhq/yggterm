@@ -12,10 +12,6 @@ pub const TOAST_CSS: &str = r#"
   78% { opacity: 1; transform: translateY(0); }
   100% { opacity: 0; transform: translateY(-6px); }
 }
-@keyframes yggterm-toast-progress-indeterminate {
-  0% { transform: translateX(-65%); }
-  100% { transform: translateX(165%); }
-}
 "#;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -295,8 +291,7 @@ fn ToastProgressBar(progress: Option<f32>, tone: ToastTone) -> Element {
             } else {
                 div {
                     style: format!(
-                        "position:absolute; inset:0 auto 0 0; width:44%; border-radius:999px; background:{}; \
-                         animation:yggterm-toast-progress-indeterminate 1.1s ease-in-out infinite;",
+                        "position:absolute; inset:0 auto 0 0; width:44%; border-radius:999px; background:{};",
                         accent
                     )
                 }
