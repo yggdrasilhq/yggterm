@@ -4,6 +4,13 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+## 2.1.78
+
+### Fixed
+
+- accept freshly spawned remote Codex welcome/prompt surfaces as live interactive terminals, so new SSH-backed Codex sessions stop falling into a false "Remote Terminal Needs Attention" timeout after the prompt appears
+- add app-control and smoke coverage for `server app terminal new --machine-key <machine> --kind codex`, including sub-1s/1s/2s/5s/ready/post-timeout screenshots and state captures
+
 ## 2.1.77
 
 ### Fixed
