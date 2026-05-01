@@ -11479,10 +11479,24 @@ fn terminal_host_probe_snapshot(host: &Value) -> Value {
         "base_y": host.get("base_y").and_then(Value::as_i64),
         "cols": host.get("cols").and_then(Value::as_u64),
         "rows": host.get("rows").and_then(Value::as_u64),
-        "text_tail": host.get("text_sample").and_then(Value::as_str).unwrap_or_default(),
+        "text_tail": host.get("text_tail")
+            .or_else(|| host.get("buffer_text_sample"))
+            .or_else(|| host.get("text_sample"))
+            .and_then(Value::as_str)
+            .unwrap_or_default(),
+        "cursor_line_text": host.get("cursor_line_text")
+            .or_else(|| host.get("cursor_row_text"))
+            .and_then(Value::as_str)
+            .unwrap_or_default(),
         "data_event_count": host.get("data_event_count").and_then(Value::as_u64),
+        "render_event_count": host.get("render_event_count").and_then(Value::as_u64),
+        "write_bridge_flush_count": host.get("write_bridge_flush_count").and_then(Value::as_u64),
         "write_command_count": host.get("write_command_count").and_then(Value::as_u64),
+        "last_data_event_at_ms": host.get("last_data_event_at_ms").and_then(Value::as_u64),
+        "last_render_event_at_ms": host.get("last_render_event_at_ms").and_then(Value::as_u64),
         "last_write_queued_at_ms": host.get("last_write_queued_at_ms").and_then(Value::as_u64),
+        "last_write_flush_started_at_ms": host.get("last_write_flush_started_at_ms").and_then(Value::as_u64),
+        "last_write_callback_at_ms": host.get("last_write_callback_at_ms").and_then(Value::as_u64),
     })
 }
 
@@ -11515,7 +11529,18 @@ fn terminal_probe_snapshot_changed(before: &Value, after: &Value, data: &str) ->
         .get("text_tail")
         .and_then(Value::as_str)
         .unwrap_or_default();
-    if !data.is_empty() && after_text.contains(data) && after_text != before_text {
+    let before_cursor = before
+        .get("cursor_line_text")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let after_cursor = after
+        .get("cursor_line_text")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if !data.is_empty()
+        && (after_text.contains(data) || after_cursor.contains(data))
+        && (after_text != before_text || after_cursor != before_cursor)
+    {
         return true;
     }
     let before_data_events = before
@@ -11551,7 +11576,7 @@ fn terminal_probe_snapshot_changed(before: &Value, after: &Value, data: &str) ->
     if after_last_write > before_last_write {
         return true;
     }
-    after_text != before_text
+    after_text != before_text || after_cursor != before_cursor
 }
 
 fn x11_keyboard_probe_requires_focused_retry(
@@ -12126,6 +12151,7 @@ pub fn run_app_control_probe_terminal_viewport_input(
     session_path: &str,
     data: &str,
     mode: ProbeTerminalViewportInputMode,
+    per_char: bool,
     press_enter: bool,
     press_tab: bool,
     press_ctrl_c: bool,
@@ -12133,7 +12159,8 @@ pub fn run_app_control_probe_terminal_viewport_input(
     press_ctrl_u: bool,
     timeout_ms: u64,
 ) -> anyhow::Result<()> {
-    if !app_control_skip_x11_synthetic_input()
+    if !per_char
+        && !app_control_skip_x11_synthetic_input()
         && matches!(
             mode,
             ProbeTerminalViewportInputMode::Auto | ProbeTerminalViewportInputMode::Keyboard
@@ -12160,6 +12187,7 @@ pub fn run_app_control_probe_terminal_viewport_input(
             session_path: session_path.to_string(),
             data: data.to_string(),
             mode,
+            per_char,
             press_enter,
             press_tab,
             press_ctrl_c,
