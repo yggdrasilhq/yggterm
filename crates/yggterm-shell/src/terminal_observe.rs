@@ -798,8 +798,19 @@ fn terminal_host_problem_for_app_control(host: &Value) -> Option<&'static str> {
         .and_then(Value::as_object)
         .is_some()
         || cursor_node_count > 0;
+    let mut visible_text_parts = Vec::new();
+    for part in [text_sample, text_tail, buffer_text_sample, cursor_line_text] {
+        if !part.is_empty() && !visible_text_parts.contains(&part) {
+            visible_text_parts.push(part);
+        }
+    }
+    let visible_text = visible_text_parts.join("\n");
+    let visible_text = visible_text.as_str();
+    let codex_interactive_setup_prompt =
+        terminal_chunk_is_codex_interactive_setup_prompt(visible_text);
     let prompt_visible = terminal_chunk_has_prompt_output(text_sample)
         || terminal_chunk_has_codex_prompt_output(text_sample)
+        || codex_interactive_setup_prompt
         || (!cursor_line_text.is_empty()
             && (terminal_chunk_has_prompt_output(cursor_line_text)
                 || terminal_chunk_has_codex_prompt_output(cursor_line_text)));
@@ -809,14 +820,6 @@ fn terminal_host_problem_for_app_control(host: &Value) -> Option<&'static str> {
             || helper_textarea_focused
             || cursor_sample_visible
             || local_prompt_surface);
-    let mut visible_text_parts = Vec::new();
-    for part in [text_sample, text_tail, buffer_text_sample, cursor_line_text] {
-        if !part.is_empty() && !visible_text_parts.contains(&part) {
-            visible_text_parts.push(part);
-        }
-    }
-    let visible_text = visible_text_parts.join("\n");
-    let visible_text = visible_text.as_str();
     let transcript_browser_surface = terminal_chunk_is_transcript_browser(visible_text);
     let transcript_browser_ready_surface = session_path.starts_with("remote-session://")
         && transcript_browser_surface
@@ -1192,6 +1195,29 @@ pub(crate) fn terminal_chunk_has_meaningful_output(data: &str) -> bool {
     printable >= 80 || newline_count >= 6 || normalized_lines.len() >= 4
 }
 
+pub(crate) fn terminal_chunk_is_codex_interactive_setup_prompt(data: &str) -> bool {
+    let stripped = strip_terminal_control_sequences(data);
+    let normalized = stripped
+        .to_ascii_lowercase()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if normalized.is_empty() {
+        return false;
+    }
+    let codex_context = normalized.contains("openai codex")
+        || normalized.contains("codex can read and edit files")
+        || normalized.contains("update model permissions");
+    let permissions_menu = normalized.contains("update model permissions")
+        || (normalized.contains("default (current)")
+            && normalized.contains("auto-review")
+            && normalized.contains("full access"));
+    let explicit_input = normalized.contains("press enter to confirm")
+        || normalized.contains("enter to confirm")
+        || normalized.contains("esc to go back");
+    codex_context && permissions_menu && explicit_input
+}
+
 pub(crate) fn terminal_chunk_has_prompt_output(data: &str) -> bool {
     let stripped = strip_terminal_control_sequences(data);
     let normalized_lines = stripped
@@ -1524,8 +1550,8 @@ pub(crate) fn strip_terminal_control_sequences(data: &str) -> String {
 mod tests {
     use super::{
         WorkspaceViewMode, describe_viewport_snapshot, terminal_bootstrap_activation_epoch,
-        terminal_chunk_has_codex_prompt_output, terminal_chunk_is_transport_error,
-        terminal_host_problem_for_app_control,
+        terminal_chunk_has_codex_prompt_output, terminal_chunk_is_codex_interactive_setup_prompt,
+        terminal_chunk_is_transport_error, terminal_host_problem_for_app_control,
     };
     use serde_json::{Value, json};
 
@@ -1564,6 +1590,37 @@ mod tests {
             "helpers_rect": {"width": 840.0, "height": 830.0},
             "helper_textarea_rect": {"left": 0.0, "top": 0.0, "width": 1.0, "height": 1.0}
         });
+        assert_eq!(terminal_host_problem_for_app_control(&host), None);
+    }
+
+    #[test]
+    fn terminal_host_problem_accepts_codex_permission_menu_surface() {
+        let host = json!({
+            "session_path": "remote-session://dev/codex-permissions",
+            "text_sample": "╭─────────────────────────────────────────────╮\n│ >_ OpenAI Codex (v0.128.0)                  │\n│                                             │\n│ model:     gpt-5.5 xhigh   /model to change │\n│ directory: ~/gh/yggterm                     │",
+            "text_tail": "╭─────────────────────────────────────────────╮\n│ >_ OpenAI Codex (v0.128.0)                  │\n│                                             │\n│ model:     gpt-5.5 xhigh   /model to change │\n│ directory: ~/gh/yggterm                     │\n╰─────────────────────────────────────────────╯\n\n  Tip: You can run any shell command from Codex using ! (e.g. !ls)\n\n\n  Update Model Permissions\n\n› 1. Default (current)  Codex can read and edit files in the current workspace, and run commands. Approval\n                        is required to access the internet or edit other files.\n  2. Auto-review        Same workspace-write permissions as Default, but eligible `on-request` approvals\n                        are routed through the auto-reviewer subagent.\n  3. Full Access        Codex can edit files outside this workspace and access the internet without asking\n                        for approval. Exercise caution when using.\n\n  Press enter to confirm or esc to go back",
+            "cursor_line_text": "",
+            "input_enabled": true,
+            "helper_textarea_focused": true,
+            "xterm_present": true,
+            "screen_present": true,
+            "rows_present": false,
+            "canvas_count": 4,
+            "render_event_count": 22,
+            "data_event_count": 5,
+            "xterm_buffer_kind": "normal",
+            "xterm_cursor_hidden": true,
+            "host_rect": {"left": 0.0, "top": 0.0, "width": 840.0, "height": 830.0},
+            "host_content_width": 840.0,
+            "host_content_height": 830.0,
+            "screen_rect": {"width": 840.0, "height": 830.0},
+            "viewport_rect": {"width": 840.0, "height": 830.0},
+            "helpers_rect": {"width": 840.0, "height": 830.0},
+            "helper_textarea_rect": {"left": -10000.0, "top": 68.0, "width": 1.0, "height": 1.0}
+        });
+        assert!(terminal_chunk_is_codex_interactive_setup_prompt(
+            host.get("text_tail").and_then(Value::as_str).unwrap()
+        ));
         assert_eq!(terminal_host_problem_for_app_control(&host), None);
     }
 
