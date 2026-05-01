@@ -4,6 +4,12 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+## 2.1.68
+
+### Fixed
+
+- treat a live, runtime-running Codex transcript browser as an interactive terminal surface instead of a stale retained transcript, so remote resume clears the restoring notification and re-enables input
+
 ## 2.1.67
 
 ### Added
