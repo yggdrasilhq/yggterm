@@ -2959,7 +2959,11 @@ impl ShellState {
         self.sync_browser_settings();
     }
     fn ensure_session_path_visible(&mut self, session_path: &str) {
-        if is_hot_terminal_sidebar_path(session_path) {
+        if is_hot_terminal_sidebar_path(session_path)
+            || self.server.live_sessions().iter().any(|session| {
+                session.session_path == session_path && is_promoted_live_session(session)
+            })
+        {
             self.browser
                 .ensure_expanded_paths(vec!["__live_sessions__".to_string()]);
         }
@@ -3010,7 +3014,7 @@ impl ShellState {
                 .live_sessions()
                 .iter()
                 .filter(|session| {
-                    is_hot_terminal_sidebar_path(&session.session_path)
+                    is_promoted_live_session(session)
                         && self.server.session_supports_terminal(&session.session_path)
                 })
                 .map(|session| session.session_path.clone())
@@ -10438,6 +10442,9 @@ fn is_hot_terminal_sidebar_path(path: &str) -> bool {
         || path.starts_with("codex://")
         || path.starts_with("codex-litellm://")
 }
+fn is_local_codex_history_session_path(path: &str) -> bool {
+    is_codex_storage_session_path(path) || is_codex_litellm_storage_session_path(path)
+}
 
 fn merge_hot_sidebar_sessions(
     live_sessions: &[ManagedSessionView],
@@ -12051,7 +12058,11 @@ fn live_session_close_button_style(palette: Palette, selected: bool) -> String {
             "inset 0 0 0 1px rgba(16,24,40,0.10)",
         )
     } else {
-        ("rgba(44,53,70,0.08)", palette.muted, "none")
+        (
+            "rgba(255,255,255,0.86)",
+            "#344052",
+            "inset 0 0 0 1px rgba(16,24,40,0.08)",
+        )
     };
     format!(
         "display:inline-flex; align-items:center; justify-content:center; width:18px; min-width:18px; height:18px; \
@@ -14279,7 +14290,18 @@ fn merged_sidebar_rows_uncached(
     }
     let push_remote_ms = push_remote_started_at.elapsed().as_secs_f64() * 1000.0;
     let extend_stored_started_at = Instant::now();
-    rows.extend(stored_rows.iter().cloned());
+    let promoted_live_paths = promoted_live_sessions
+        .iter()
+        .map(|session| normalize_live_session_path(&session.session_path))
+        .collect::<HashSet<_>>();
+    rows.extend(stored_rows.iter().filter_map(|row| {
+        let row_path = normalize_live_session_path(&row.full_path);
+        if row.kind == BrowserRowKind::Session && promoted_live_paths.contains(&row_path) {
+            None
+        } else {
+            Some(row.clone())
+        }
+    }));
     let extend_stored_ms = extend_stored_started_at.elapsed().as_secs_f64() * 1000.0;
     if breakdown_enabled {
         maybe_record_sidebar_merge_breakdown(
@@ -14641,7 +14663,10 @@ fn is_promoted_live_session(session: &ManagedSessionView) -> bool {
         session.source,
         SessionSource::LiveLocal | SessionSource::LiveSsh
     ) && session.kind != SessionKind::Document
-        && is_hot_terminal_sidebar_path(&session.session_path)
+        && (is_hot_terminal_sidebar_path(&session.session_path)
+            || (session.source == SessionSource::LiveLocal
+                && is_local_codex_history_session_path(&session.session_path)
+                && matches!(session.kind, SessionKind::Codex | SessionKind::CodexLiteLlm)))
 }
 fn enrich_sidebar_rows_with_live_titles(
     rows: &mut [BrowserRow],
@@ -45733,6 +45758,11 @@ mod tests {
         assert!(close_style.contains("rgba(221,232,243,0.10)"));
         assert!(!close_style.contains("rgba(255,255,255,0.94)"));
 
+        let light = palette(UiTheme::ZedLight);
+        let light_close_style = live_session_close_button_style(light, false);
+        assert!(light_close_style.contains("rgba(255,255,255,0.86)"));
+        assert!(light_close_style.contains("#344052"));
+
         let keep_alive_style = live_session_keep_alive_dot_style(dark);
         assert!(keep_alive_style.contains("rgba(22,28,34,0.88)"));
     }
@@ -47403,6 +47433,68 @@ mod tests {
                 .any(|row| row.full_path == stored_path && row.depth == 1)
         );
     }
+
+    #[test]
+    fn merged_sidebar_rows_promote_live_stored_codex_session_without_tree_duplicate() {
+        let stored_path =
+            "/home/pi/.codex-litellm/sessions/2026/02/23/litellm-session.jsonl".to_string();
+        let mut live = test_live_shell_session(&stored_path);
+        live.id = "litellm-session".to_string();
+        live.title = "litellm".to_string();
+        live.kind = SessionKind::CodexLiteLlm;
+        live.host_label = "localhost".to_string();
+        live.source = SessionSource::LiveLocal;
+        live.metadata = vec![
+            SessionMetadataEntry {
+                label: "Cwd",
+                value: "/home/pi".to_string(),
+            },
+            SessionMetadataEntry {
+                label: "Storage",
+                value: stored_path.clone(),
+            },
+        ];
+
+        let rows = merged_sidebar_rows(
+            &[BrowserRow {
+                kind: BrowserRowKind::Session,
+                full_path: stored_path.clone(),
+                label: "litellm".to_string(),
+                detail_label: String::new(),
+                document_kind: None,
+                group_kind: None,
+                session_title: Some("litellm".to_string()),
+                depth: 1,
+                host_label: "local".to_string(),
+                descendant_sessions: 1,
+                expanded: true,
+                session_id: Some("litellm-session".to_string()),
+                session_cwd: Some("/home/pi".to_string()),
+            }],
+            &[],
+            &[],
+            &[live],
+            &HashSet::from(["__live_sessions__".to_string()]),
+        );
+
+        assert_eq!(
+            rows.first().map(|row| row.full_path.as_str()),
+            Some("__live_sessions__")
+        );
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row.full_path == stored_path)
+                .count(),
+            1,
+            "live stored Codex/LiteLLM sessions should not duplicate under the stored tree: {rows:?}"
+        );
+        assert!(rows.iter().any(|row| {
+            row.full_path == stored_path
+                && row.depth == 1
+                && row.session_id.as_deref() == Some("litellm-session")
+        }));
+    }
+
     #[test]
     fn merged_sidebar_rows_synthesize_local_tree_for_live_sessions_when_stored_tree_is_empty() {
         let rows = merged_sidebar_rows(
@@ -55456,7 +55548,7 @@ q to quit   pgup/pgdn to page   enter to edit message
         ));
     }
     #[test]
-    fn shell_snapshot_keeps_retained_stored_codex_sessions_out_of_live_retention() {
+    fn shell_snapshot_retains_live_local_stored_codex_sessions() {
         let active_path = "local://fresh-shell";
         let codex_path = "/home/pi/.codex/sessions/example.jsonl";
         let mut shell = ShellState::new(test_shell_bootstrap_with_active_session(active_path));
@@ -55552,8 +55644,8 @@ q to quit   pgup/pgdn to page   enter to edit message
             .collect::<HashSet<_>>();
         assert!(retained_paths.contains(active_path));
         assert!(
-            !retained_paths.contains(codex_path),
-            "stored Codex transcript paths are not promoted live-retention rows"
+            retained_paths.contains(codex_path),
+            "LiveLocal Codex transcript paths must stay retained so they render under Live Sessions"
         );
     }
     #[test]
