@@ -2640,6 +2640,42 @@ impl ShellState {
             Some(json!({ "reason": reason })),
         );
     }
+    fn fail_terminal_open_attempt_for_session(&mut self, session_path: &str, reason: String) {
+        let Some(attempt_id) = self
+            .terminal_open_attempt_by_session
+            .get(session_path)
+            .cloned()
+        else {
+            return;
+        };
+        let Some(attempt) = self.terminal_open_attempts.get_mut(&attempt_id) else {
+            return;
+        };
+        if attempt.latched_failure_reason.is_some() {
+            return;
+        }
+        attempt.latched_failure_at_ms = Some(current_millis());
+        attempt.latched_failure_reason = Some(reason.clone());
+        attempt.state = TerminalOpenAttemptState::Failed;
+        let attempt_snapshot = attempt.clone();
+        self.record_terminal_open_attempt_event(
+            "session_failed",
+            &attempt_snapshot,
+            Some(json!({ "reason": reason })),
+        );
+    }
+    fn fail_remote_terminal_resume_timeout(
+        &mut self,
+        session_path: &str,
+        bootstrap_lease_identity: &str,
+        reason: String,
+    ) {
+        release_terminal_bootstrap_lease_if_current(self, session_path, bootstrap_lease_identity);
+        self.terminal_attach_in_flight.remove(session_path);
+        self.terminal_resume_ready_paths.remove(session_path);
+        self.fail_terminal_open_attempt_for_session(session_path, reason);
+        self.maybe_finish_terminal_surface_request_for_session(session_path);
+    }
     fn record_terminal_open_attempt_event(
         &mut self,
         name: &str,
@@ -31523,6 +31559,8 @@ fn TerminalCanvas(
             let timer_last_bootstrap_identity = last_bootstrap_identity.clone();
             let timer_terminal_live_host_connected = terminal_live_host_connected;
             let mut timer_resume_overlay_timed_out = resume_overlay_timed_out;
+            let timer_bootstrap_lease_identity = bootstrap_identity.clone();
+            let timer_trace_home = trace_home.clone();
             let state = state;
             let session_path = session_path.clone();
             let session_host_label = session_host_label.clone();
@@ -31541,16 +31579,35 @@ fn TerminalCanvas(
                     && !timer_terminal_live_host_connected()
                     && still_waiting_for_resume
                 {
+                    let failure_reason = format!(
+                        "The live terminal on {} did not become interactive in time.",
+                        session_host_label
+                    );
                     timer_resume_overlay_timed_out.set(true);
                     upsert_terminal_resume_notification(
                         state,
                         &session_path,
                         NotificationTone::Error,
                         "Remote Terminal Needs Attention",
-                        format!(
-                            "The live terminal on {} did not become interactive in time.",
-                            session_host_label
-                        ),
+                        failure_reason.clone(),
+                    );
+                    let _ =
+                        safe_shell_mut(state, "terminal_resume_timeout_clear_inflight", |shell| {
+                            shell.fail_remote_terminal_resume_timeout(
+                                &session_path,
+                                &timer_bootstrap_lease_identity,
+                                failure_reason,
+                            );
+                        });
+                    append_trace_event(
+                        &timer_trace_home,
+                        "ui",
+                        "terminal_mount",
+                        "resume_timeout_cleared_inflight",
+                        json!({
+                            "session_path": session_path,
+                            "bootstrap_identity": timer_bootstrap_lease_identity,
+                        }),
                     );
                 }
             });
@@ -51725,6 +51782,69 @@ q to quit   pgup/pgdn to page   enter to edit message
         assert!(
             !shell.terminal_session_resume_notification_should_stay_visible(active_session_path)
         );
+    }
+    #[test]
+    fn remote_resume_timeout_clears_inflight_request_and_latches_failure() {
+        let active_session_path = "remote-session://oc/test";
+        let bootstrap = test_shell_bootstrap_with_active_session(active_session_path);
+        let mut shell = ShellState::new(bootstrap);
+        shell.server_busy = true;
+        shell.server.set_view_mode(WorkspaceViewMode::Terminal);
+        shell.active_surface_requests.insert(
+            YggSurface::Terminal,
+            ActiveSurfaceRequest {
+                request_id: "req-test".to_string(),
+                operation: "open_row".to_string(),
+                target: YggTarget::Terminal {
+                    session_path: active_session_path.to_string(),
+                },
+            },
+        );
+        shell
+            .terminal_attach_in_flight
+            .insert(active_session_path.to_string());
+        shell
+            .terminal_resume_ready_paths
+            .insert(active_session_path.to_string());
+        shell
+            .terminal_bootstrap_lease_by_session
+            .insert(active_session_path.to_string(), "lease-test".to_string());
+        let attempt_id =
+            shell.begin_terminal_open_attempt(active_session_path, "req-test", 1, "open_row");
+
+        shell.fail_remote_terminal_resume_timeout(
+            active_session_path,
+            "lease-test",
+            "timed out".to_string(),
+        );
+
+        assert!(
+            !shell
+                .terminal_attach_in_flight
+                .contains(active_session_path)
+        );
+        assert!(
+            !shell
+                .terminal_resume_ready_paths
+                .contains(active_session_path)
+        );
+        assert!(
+            !shell
+                .terminal_bootstrap_lease_by_session
+                .contains_key(active_session_path)
+        );
+        assert!(
+            !shell
+                .active_surface_requests
+                .contains_key(&YggSurface::Terminal)
+        );
+        assert!(!shell.server_busy);
+        let attempt = shell
+            .terminal_open_attempts
+            .get(&attempt_id)
+            .expect("attempt should exist");
+        assert!(matches!(attempt.state, TerminalOpenAttemptState::Failed));
+        assert_eq!(attempt.latched_failure_reason.as_deref(), Some("timed out"));
     }
     #[test]
     fn mark_terminal_open_attempt_ready_for_session_records_ready_attempt() {
