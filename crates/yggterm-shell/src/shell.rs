@@ -11,10 +11,10 @@ use crate::terminal_observe::{
     terminal_chunk_has_prompt_output, terminal_chunk_has_visible_output,
     terminal_chunk_is_codex_interactive_setup_prompt, terminal_chunk_is_codex_prompt_surface,
     terminal_chunk_is_generic_codex_idle, terminal_chunk_is_loading_placeholder,
-    terminal_chunk_is_low_signal_terminal_noise, terminal_chunk_is_saved_transcript_prefill,
-    terminal_chunk_is_transcript_browser, terminal_chunk_is_transport_error,
-    terminal_open_attempt_failure_reason_from_viewport, terminal_open_attempt_state_label,
-    terminal_tail_excerpt,
+    terminal_chunk_is_local_codex_scaffold, terminal_chunk_is_low_signal_terminal_noise,
+    terminal_chunk_is_saved_transcript_prefill, terminal_chunk_is_transcript_browser,
+    terminal_chunk_is_transport_error, terminal_open_attempt_failure_reason_from_viewport,
+    terminal_open_attempt_state_label, terminal_tail_excerpt,
 };
 #[cfg(test)]
 use crate::terminal_observe::{
@@ -33305,6 +33305,9 @@ fn TerminalCanvas(
                                 let saw_codex_prompt_surface = batched_output
                                     .as_deref()
                                     .is_some_and(terminal_chunk_is_codex_prompt_surface);
+                                let saw_local_codex_scaffold = batched_output
+                                    .as_deref()
+                                    .is_some_and(terminal_chunk_is_local_codex_scaffold);
                                 let tail_generic_idle_output = batched_output
                                     .as_deref()
                                     .is_some_and(terminal_chunk_tail_is_generic_codex_idle);
@@ -33388,7 +33391,7 @@ fn TerminalCanvas(
                                         tail_generic_idle_footer_output,
                                         saw_prompt_only_surface,
                                         saw_transcript_browser_output,
-                                    );
+                                    ) || saw_local_codex_scaffold;
                                 let forward_terminal_protocol_only_output = batched_output
                                     .as_deref()
                                     .is_some_and(terminal_chunk_requires_terminal_emulator_forward);
@@ -34268,6 +34271,7 @@ fn TerminalCanvas(
                                         || saw_generic_idle_footer_output
                                         || tail_generic_idle_footer_output)
                                         && !codex_prompt_surface_is_live)
+                                        || saw_local_codex_scaffold
                                         || (saw_prompt_only_surface
                                             && !prompt_only_surface_is_live)
                                         || (saw_transcript_browser_output && !runtime_running));
@@ -34359,6 +34363,8 @@ fn TerminalCanvas(
                                     let reason = if invalid_remote_resume_surface {
                                         if saw_transcript_browser_output {
                                             "transcript_browser_surface"
+                                        } else if saw_local_codex_scaffold {
+                                            "local_codex_scaffold"
                                         } else if saw_generic_idle_footer_output
                                             || tail_generic_idle_footer_output
                                         {
@@ -35358,8 +35364,11 @@ fn terminal_resume_excerpt_is_meaningful(text: &str) -> bool {
         && !normalized.starts_with("launch command prepared:")
         && !normalized.contains("stays attached to the daemon")
         && !normalized.contains("opens inline in the main terminal viewport")
+        && !normalized.contains("codex is launched locally and will receive /quit")
+        && normalized != "local codex terminal."
         && !normalized.contains("daemon pty: request main viewport terminal stream")
         && !terminal_chunk_is_loading_placeholder(trimmed)
+        && !terminal_chunk_is_local_codex_scaffold(trimmed)
         && !terminal_chunk_is_generic_codex_idle(trimmed)
         && !terminal_chunk_is_transcript_browser(trimmed)
         && !terminal_chunk_has_prompt_output(trimmed)
@@ -35433,6 +35442,9 @@ fn format_terminal_prefill_text(text: &str) -> String {
     }
 }
 fn remote_terminal_prefill_text(session: &ManagedSessionView) -> Option<String> {
+    if remote_session_starts_new_codex(session) {
+        return None;
+    }
     remote_resume_overlay_excerpt(session)
         .or_else(|| remote_resume_overlay_seed_excerpt(session))
         .or_else(|| terminal_loading_notice_text(session))
@@ -35444,6 +35456,10 @@ fn remote_terminal_prefill_text(session: &ManagedSessionView) -> Option<String> 
                 format!("{trimmed}\r\n")
             }
         })
+}
+fn remote_session_starts_new_codex(session: &ManagedSessionView) -> bool {
+    session.session_path.starts_with("remote-session://")
+        && metadata_value(session, "Remote Launch Action") == "start-codex"
 }
 async fn terminal_ensure_async(
     endpoint: ServerEndpoint,
@@ -56309,6 +56325,59 @@ q to quit   pgup/pgdn to page   enter to edit message
             )
         );
     }
+
+    #[test]
+    fn remote_terminal_prefill_text_skips_fresh_start_codex_scaffold() {
+        let session = ManagedSessionView {
+            id: "fresh".to_string(),
+            session_path: "remote-session://dev/fresh".to_string(),
+            title: "Fresh Codex".to_string(),
+            kind: SessionKind::Codex,
+            host_label: "dev".to_string(),
+            source: yggterm_server::SessionSource::LiveSsh,
+            backend: TerminalBackend::Xterm,
+            bridge_available: false,
+            launch_phase: yggterm_server::TerminalLaunchPhase::Running,
+            remote_deploy_state: yggterm_server::RemoteDeployState::Ready,
+            launch_command: "yggterm server remote start-codex fresh".to_string(),
+            status_line: "ready".to_string(),
+            terminal_lines: Vec::new(),
+            rendered_sections: Vec::new(),
+            preview: yggterm_server::SessionPreview {
+                summary: vec![yggterm_server::SessionMetadataEntry {
+                    label: "Summary",
+                    value: "Local Codex terminal.".to_string(),
+                }],
+                blocks: vec![yggterm_server::SessionPreviewBlock {
+                    role: "USER",
+                    timestamp: "server:launch".to_string(),
+                    tone: PreviewTone::User,
+                    folded: false,
+                    lines: vec![
+                        "This Codex session stays attached to the daemon and opens inline in the main terminal viewport.".to_string(),
+                    ],
+                }],
+            },
+            metadata: vec![yggterm_server::SessionMetadataEntry {
+                label: "Remote Launch Action",
+                value: "start-codex".to_string(),
+            }],
+            terminal_process_id: None,
+            terminal_foreground_active: None,
+            terminal_window_id: None,
+            terminal_host_token: None,
+            terminal_host_mode: GhosttyTerminalHostMode::Unsupported,
+            embedded_surface_id: None,
+            embedded_surface_detail: None,
+            last_launch_error: None,
+            last_window_error: None,
+            ssh_target: Some("dev".to_string()),
+            ssh_prefix: None,
+            stored_preview_hydrated: false,
+        };
+        assert_eq!(remote_terminal_prefill_text(&session), None);
+    }
+
     #[test]
     fn local_terminal_prefill_text_uses_hot_session_terminal_lines_and_status() {
         let session = ManagedSessionView {

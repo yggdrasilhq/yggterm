@@ -4,6 +4,14 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+## 2.1.79
+
+### Fixed
+
+- stop fresh SSH-backed Codex sessions from seeding the terminal viewport with the local Codex scaffold before the real remote runtime produces output
+- classify local Codex scaffold text as stale/non-meaningful terminal output, so app-control and the shell no longer treat it as a loaded or interactive session
+- extend the remote Codex spawn timeline smoke to fail if scaffold text appears in any sampled host surface
+
 ## 2.1.78
 
 ### Fixed
