@@ -309,6 +309,69 @@ def remote_panic_log(host: str, home: str) -> dict | None:
     }
 
 
+def remote_machine_key_from_ssh_target(ssh_target: str) -> str:
+    host = ssh_target.rsplit("@", 1)[-1].strip()
+    if "." in host:
+        host = host.split(".", 1)[0]
+    return host.strip().lower().replace(" ", "-").replace("_", "-")
+
+
+def remote_seed_smoke_ssh_target(host: str, remote_home: str, ssh_target: str) -> dict | None:
+    ssh_target = ssh_target.strip()
+    if not ssh_target:
+        return None
+    machine_key = remote_machine_key_from_ssh_target(ssh_target)
+    if not machine_key:
+        return None
+    state = {
+        "active_session_path": None,
+        "active_view_mode": "Rendered",
+        "ssh_targets": [
+            {
+                "label": machine_key,
+                "kind": "ssh_shell",
+                "ssh_target": ssh_target,
+                "prefix": None,
+                "cwd": None,
+            }
+        ],
+        "remote_machines": [
+            {
+                "machine_key": machine_key,
+                "label": machine_key,
+                "ssh_target": ssh_target,
+                "prefix": None,
+                "remote_binary_expr": None,
+                "remote_deploy_state": "Planned",
+                "health": "cached",
+                "sessions": [],
+            }
+        ],
+        "stored_sessions": [],
+        "live_sessions": [],
+    }
+    remote_state = f"{remote_home.rstrip('/')}/server-state.json"
+    writer = (
+        "import json,pathlib,sys; "
+        "path=pathlib.Path(sys.argv[1]); "
+        "path.parent.mkdir(parents=True, exist_ok=True); "
+        "path.write_text(json.dumps(json.load(sys.stdin), indent=2), encoding='utf-8'); "
+        "print(path)"
+    )
+    proc = ssh_shell(
+        host,
+        f"mkdir -p {quote(remote_home)} && python3 -c {quote(writer)} {quote(remote_state)}",
+        input_text=json.dumps(state),
+    )
+    return {
+        "machine_key": machine_key,
+        "ssh_target": ssh_target,
+        "state_path": remote_state,
+        "stdout": (proc.stdout or "").strip(),
+        "stderr": (proc.stderr or "").strip(),
+    }
+
+
 def configure_remote_transport(proxy_jump: str | None, ssh_port: int | None) -> None:
     if proxy_jump:
         os.environ["YGGTERM_REMOTE_PROXY_JUMP"] = proxy_jump
@@ -395,9 +458,11 @@ def ssh_shell(
     *,
     check: bool = True,
     timeout_seconds: float | None = None,
+    input_text: str | None = None,
 ) -> subprocess.CompletedProcess:
     return local_run(
         [*ssh_base(), host, f"bash -lc {quote(command)}"],
+        input_text=input_text,
         check=check,
         timeout_seconds=timeout_seconds,
     )
@@ -1330,6 +1395,20 @@ def main() -> int:
         metadata["kde_desktop"] = kde_desktop
 
         ssh_shell(args.host, f"mkdir -p {quote(remote_home)} {quote(remote_out)}")
+        smoke_remote_machine = (
+            os.environ.get("YGGTERM_SMOKE_REMOTE_MACHINE")
+            or os.environ.get("YGGTERM_SMOKE_CODEX_MACHINE")
+            or ""
+        ).strip()
+        if smoke_remote_machine:
+            launch_env["YGGTERM_SMOKE_REMOTE_MACHINE"] = remote_machine_key_from_ssh_target(
+                smoke_remote_machine
+            )
+            metadata["seeded_smoke_remote_target"] = remote_seed_smoke_ssh_target(
+                args.host,
+                remote_home,
+                smoke_remote_machine,
+            )
         exports = remote_env_exports(launch_env)
         metadata["daemon_prewarm"] = remote_ensure_local_daemon_ready(
             args.host,
