@@ -9520,6 +9520,7 @@ fn bridge_remote_runtime_session_stdio(
             let _ = terminal_resize(endpoint, path, cols, rows);
             last_size = Some((cols, rows));
         }
+        let initial_read = cursor == 0;
         let (next_cursor, chunks, running, runtime_output_seen, eof_without_output) =
             terminal_read_with_local_daemon_recovery(endpoint, path, cursor)?;
         cursor = next_cursor;
@@ -9536,8 +9537,41 @@ fn bridge_remote_runtime_session_stdio(
             }
             marked_interactive = true;
         }
-        for chunk in chunks {
-            stdout.write_all(chunk.data.as_bytes())?;
+        let initial_snapshot = if initial_read && runtime_output_seen {
+            match terminal_snapshot(endpoint, path) {
+                Ok((snapshot, _running, _runtime_output_seen)) => {
+                    bridge_initial_snapshot_text(Some(snapshot.as_str())).map(str::to_string)
+                }
+                Err(error) => {
+                    trace_remote_bridge_event(
+                        "initial_screen_snapshot_error",
+                        json!({
+                            "path": path,
+                            "session_id": session_id,
+                            "error": error.to_string(),
+                        }),
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        if let Some(snapshot) = initial_snapshot {
+            trace_remote_bridge_event(
+                "initial_screen_snapshot",
+                json!({
+                    "path": path,
+                    "session_id": session_id,
+                    "bytes": snapshot.len(),
+                    "discarded_retained_chunks": chunks.len(),
+                }),
+            );
+            stdout.write_all(snapshot.as_bytes())?;
+        } else {
+            for chunk in chunks {
+                stdout.write_all(chunk.data.as_bytes())?;
+            }
         }
         stdout.flush()?;
         if !running && (!runtime_output_seen || eof_without_output) {
@@ -9578,6 +9612,47 @@ fn bridge_remote_runtime_session_stdio(
     }
     stop.store(true, std::sync::atomic::Ordering::Relaxed);
     Ok(())
+}
+
+fn bridge_initial_snapshot_text(snapshot: Option<&str>) -> Option<&str> {
+    snapshot
+        .map(str::trim)
+        .filter(|text| terminal_bridge_snapshot_has_visible_text(text))
+}
+
+fn terminal_bridge_snapshot_has_visible_text(text: &str) -> bool {
+    enum EscapeState {
+        Text,
+        Escape,
+        Csi,
+    }
+    let mut state = EscapeState::Text;
+    for ch in text.chars() {
+        match state {
+            EscapeState::Text => {
+                if ch == '\x1b' {
+                    state = EscapeState::Escape;
+                    continue;
+                }
+                if !ch.is_control() && !ch.is_whitespace() {
+                    return true;
+                }
+            }
+            EscapeState::Escape => {
+                if ch == '[' {
+                    state = EscapeState::Csi;
+                } else if ('@'..='~').contains(&ch) {
+                    state = EscapeState::Text;
+                }
+            }
+            EscapeState::Csi => {
+                if ('@'..='~').contains(&ch) {
+                    state = EscapeState::Text;
+                }
+            }
+        }
+    }
+    false
 }
 
 fn trace_remote_bridge_event(name: &str, payload: serde_json::Value) {
@@ -10535,6 +10610,21 @@ pub fn run_app_control_scroll_preview(
     Ok(())
 }
 
+pub fn run_app_control_scroll_right_panel(
+    top_px: Option<f64>,
+    ratio: Option<f64>,
+    timeout_ms: u64,
+) -> anyhow::Result<()> {
+    let home = resolve_yggterm_home()?;
+    let response = request_app_control(
+        &home,
+        AppControlCommand::ScrollRightPanel { top_px, ratio },
+        timeout_ms,
+    )?;
+    write_stdout_payload(&serde_json::to_string_pretty(&response)?)?;
+    Ok(())
+}
+
 pub fn run_app_control_set_main_zoom(
     value: f32,
     view_mode: Option<AppControlViewMode>,
@@ -10688,6 +10778,21 @@ pub fn run_app_control_move_window_by(
     let response = request_app_control(
         &home,
         AppControlCommand::MoveWindowBy { delta_x, delta_y },
+        timeout_ms,
+    )?;
+    write_stdout_payload(&serde_json::to_string_pretty(&response)?)?;
+    Ok(())
+}
+
+pub fn run_app_control_resize_window(
+    width: f64,
+    height: f64,
+    timeout_ms: u64,
+) -> anyhow::Result<()> {
+    let home = resolve_yggterm_home()?;
+    let response = request_app_control(
+        &home,
+        AppControlCommand::ResizeWindow { width, height },
         timeout_ms,
     )?;
     write_stdout_payload(&serde_json::to_string_pretty(&response)?)?;
@@ -14635,6 +14740,23 @@ mod tests {
             .expect_err("hung child should time out");
         assert!(started.elapsed() < Duration::from_secs(2));
         assert!(error.to_string().contains("timed out"));
+    }
+
+    #[test]
+    fn remote_runtime_bridge_initial_snapshot_accepts_vt_screen_state() {
+        let snapshot = "\x1b[H\x1b[J\x1b[2m╭──╮\r\n│ >_ OpenAI Codex │\r\n╰──╯\x1b[49;1H› prompt";
+
+        assert_eq!(
+            super::bridge_initial_snapshot_text(Some(snapshot)),
+            Some(snapshot)
+        );
+    }
+
+    #[test]
+    fn remote_runtime_bridge_initial_snapshot_rejects_control_only_state() {
+        let snapshot = "\x1b[?25h\x1b[m\x1b[H\x1b[J\r\n\t  ";
+
+        assert_eq!(super::bridge_initial_snapshot_text(Some(snapshot)), None);
     }
 
     fn snapshot_session(path: &str, source: SessionSource) -> SnapshotSessionView {
