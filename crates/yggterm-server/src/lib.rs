@@ -370,12 +370,20 @@ fn is_local_codex_storage_session_path(path: &str) -> bool {
 }
 
 fn managed_session_is_promoted_live_session(key: &str, session: &ManagedSessionView) -> bool {
-    matches!(
+    if !matches!(
         session.source,
         SessionSource::LiveLocal | SessionSource::LiveSsh
-    ) && session.kind != SessionKind::Document
-        && !is_local_codex_storage_session_path(key)
-        && !is_local_codex_storage_session_path(&session.session_path)
+    ) || session.kind == SessionKind::Document
+    {
+        return false;
+    }
+    if is_local_codex_storage_session_path(key)
+        || is_local_codex_storage_session_path(&session.session_path)
+    {
+        return session.source == SessionSource::LiveLocal
+            && local_live_session_kind_is_recoverable(session.kind);
+    }
+    true
 }
 
 fn active_session_snapshot_gap_is_recoverable(path: &str) -> bool {
@@ -608,12 +616,6 @@ pub fn validate_server_ui_snapshot(snapshot: &ServerUiSnapshot) -> Vec<String> {
                 live.source, live.session_path
             ));
         }
-        if is_local_codex_storage_session_path(&live.session_path) {
-            violations.push(format!(
-                "live_sessions contains a stored Codex transcript path: {}",
-                live.session_path
-            ));
-        }
         if live.kind == SessionKind::Document {
             violations.push(format!(
                 "live_sessions contains a document node: {}",
@@ -645,7 +647,6 @@ pub fn validate_server_ui_snapshot(snapshot: &ServerUiSnapshot) -> Vec<String> {
                 active.source,
                 SessionSource::LiveLocal | SessionSource::LiveSsh
             ) && !live_paths.contains(active.session_path.as_str())
-                && !is_local_codex_storage_session_path(&active.session_path)
             {
                 violations.push(format!(
                     "active live session is missing from live_sessions: {}",
@@ -14763,7 +14764,7 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_contract_rejects_stored_codex_paths_in_live_sessions() {
+    fn snapshot_contract_accepts_live_local_stored_codex_paths_in_live_sessions() {
         let path = "/home/pi/.codex/sessions/stored.jsonl";
         let live = snapshot_session(path, SessionSource::LiveLocal);
         let snapshot = snapshot_with_active(
@@ -14776,16 +14777,11 @@ mod tests {
 
         let violations = validate_server_ui_snapshot(&snapshot);
 
-        assert!(
-            violations
-                .iter()
-                .any(|violation| violation.contains("stored Codex transcript path")),
-            "{violations:#?}"
-        );
+        assert!(violations.is_empty(), "{violations:#?}");
     }
 
     #[test]
-    fn snapshot_contract_accepts_active_stored_codex_terminal_outside_live_sessions() {
+    fn snapshot_contract_rejects_active_live_stored_codex_terminal_outside_live_sessions() {
         let path = "/home/pi/.codex/sessions/stored.jsonl";
         let live = snapshot_session(path, SessionSource::LiveLocal);
         let snapshot = snapshot_with_active(
@@ -14798,7 +14794,12 @@ mod tests {
 
         let violations = validate_server_ui_snapshot(&snapshot);
 
-        assert!(violations.is_empty(), "{violations:#?}");
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.contains("active live session is missing")),
+            "{violations:#?}"
+        );
     }
 
     #[test]
@@ -18500,7 +18501,7 @@ terminal_window_id: None,
     }
 
     #[test]
-    fn request_terminal_launch_keeps_stored_codex_transcript_out_of_live_sessions() {
+    fn request_terminal_launch_promotes_stored_codex_transcript_into_live_sessions() {
         let tree = SessionNode {
             kind: SessionNodeKind::Group,
             name: "sessions".to_string(),
@@ -18538,7 +18539,9 @@ terminal_window_id: None,
         server.request_terminal_launch_for_path(path);
 
         let live_sessions = server.live_sessions();
-        assert!(live_sessions.is_empty());
+        assert_eq!(live_sessions.len(), 1);
+        assert_eq!(live_sessions[0].session_path, path);
+        assert_eq!(live_sessions[0].source, SessionSource::LiveLocal);
         assert_eq!(server.active_session_path(), Some(path));
         assert_eq!(
             server.active_session().map(|session| session.source),
