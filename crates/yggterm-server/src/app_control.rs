@@ -243,6 +243,8 @@ pub enum AppControlCommand {
         #[serde(default)]
         mode: ProbeTerminalViewportInputMode,
         #[serde(default)]
+        per_char: bool,
+        #[serde(default)]
         press_enter: bool,
         #[serde(default)]
         press_tab: bool,
