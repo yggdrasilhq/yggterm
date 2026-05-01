@@ -295,6 +295,7 @@ fn managed_live_session_is_recoverable(key: &str, session: &ManagedSessionView) 
 const RUNTIME_PERSISTENCE_METADATA_LABEL: &str = "Runtime Persistence";
 const RUNTIME_PERSISTENCE_KEEP_ALIVE: &str = "keep-alive";
 const UPDATE_RESTART_RESTORE_REASON: &str = "update-restart";
+const RUNTIME_RESTORE_REASON_METADATA_LABEL: &str = "Runtime Restore Reason";
 const REMOTE_LAUNCH_ACTION_METADATA_LABEL: &str = "Remote Launch Action";
 
 fn session_keep_alive(session: &ManagedSessionView) -> bool {
@@ -401,6 +402,11 @@ fn live_session_uses_remote_runtime(session: &ManagedSessionView) -> bool {
 fn remote_live_session_starts_new_codex(session: &ManagedSessionView) -> bool {
     session_metadata_value(session, REMOTE_LAUNCH_ACTION_METADATA_LABEL).as_deref()
         == Some("start-codex")
+}
+
+fn session_is_temporary_update_restore(session: &ManagedSessionView) -> bool {
+    session_metadata_value(session, RUNTIME_RESTORE_REASON_METADATA_LABEL).as_deref()
+        == Some(UPDATE_RESTART_RESTORE_REASON)
 }
 
 fn remote_scanned_session_path_is_live(
@@ -2353,6 +2359,9 @@ impl YggtermServer {
                     health: RemoteMachineHealth::Healthy,
                     sessions,
                 };
+                let refreshed_machine_key = self.remote_machines[entry_ix].machine_key.clone();
+                let pruned_live_sessions = self
+                    .prune_stale_temporary_remote_live_sessions_after_scan(&refreshed_machine_key);
                 if let Ok(home) = resolve_yggterm_home() {
                     append_trace_event(
                         &home,
@@ -2364,6 +2373,7 @@ impl YggtermServer {
                             "machine_key": self.remote_machines[entry_ix].machine_key,
                             "health": "healthy",
                             "session_count": self.remote_machines[entry_ix].sessions.len(),
+                            "pruned_temporary_live_sessions": pruned_live_sessions,
                         }),
                     );
                 }
@@ -2426,6 +2436,75 @@ impl YggtermServer {
         let machine_key = normalize_machine_key(machine_key);
         let target = self.remote_target_for_machine_key(&machine_key)?;
         self.refresh_remote_machine_for_ssh_target(&target)
+    }
+
+    fn prune_stale_temporary_remote_live_sessions_after_scan(
+        &mut self,
+        machine_key: &str,
+    ) -> usize {
+        let normalized_machine_key = normalize_machine_key(machine_key);
+        let stale_paths = self
+            .live_session_order
+            .iter()
+            .filter_map(|key| {
+                let session = self.sessions.get(key)?;
+                let (raw_session_machine_key, _) =
+                    parse_remote_scanned_session_path(&session.session_path)?;
+                if normalize_machine_key(raw_session_machine_key) != normalized_machine_key {
+                    return None;
+                }
+                if session.source != SessionSource::LiveSsh
+                    || !session_is_temporary_update_restore(session)
+                    || session_keep_alive(session)
+                    || remote_live_session_starts_new_codex(session)
+                    || remote_scanned_session_path_is_live(
+                        &self.remote_machines,
+                        &session.session_path,
+                    )
+                {
+                    return None;
+                }
+                Some((key.clone(), session.session_path.clone()))
+            })
+            .collect::<Vec<_>>();
+        if stale_paths.is_empty() {
+            return 0;
+        }
+        let stale_keys = stale_paths
+            .iter()
+            .map(|(key, _)| key.clone())
+            .collect::<HashSet<_>>();
+        self.live_session_order
+            .retain(|existing| !stale_keys.contains(existing));
+        for (key, session_path) in &stale_paths {
+            self.sessions.remove(key);
+            if self
+                .active_session_path
+                .as_deref()
+                .is_some_and(|active| active == key || active == session_path)
+            {
+                self.active_session_path = None;
+                self.active_view_mode = WorkspaceViewMode::Rendered;
+            }
+        }
+        if let Ok(home) = resolve_yggterm_home() {
+            append_trace_event(
+                &home,
+                "server",
+                "remote_machine",
+                "prune_temporary_stale_live_sessions",
+                serde_json::json!({
+                    "machine_key": normalized_machine_key,
+                    "session_count": stale_paths.len(),
+                    "session_paths": stale_paths
+                        .iter()
+                        .map(|(_, session_path)| session_path)
+                        .collect::<Vec<_>>(),
+                }),
+            );
+        }
+        self.normalize_active_view_mode();
+        stale_paths.len()
     }
 
     fn promote_remote_machine_health(
@@ -3328,6 +3407,13 @@ impl YggtermServer {
                 if keep_alive {
                     set_session_keep_alive_metadata(&mut session, true);
                 }
+                if temporary_update_restore {
+                    upsert_session_metadata(
+                        &mut session.metadata,
+                        RUNTIME_RESTORE_REASON_METADATA_LABEL,
+                        UPDATE_RESTART_RESTORE_REASON.to_string(),
+                    );
+                }
                 self.sessions.insert(normalized_live_key.clone(), session);
                 self.live_session_order
                     .retain(|existing| existing != normalized_live_key);
@@ -3406,6 +3492,13 @@ impl YggtermServer {
                 if keep_alive {
                     set_session_keep_alive_metadata(session, true);
                 }
+                if temporary_update_restore {
+                    upsert_session_metadata(
+                        &mut session.metadata,
+                        RUNTIME_RESTORE_REASON_METADATA_LABEL,
+                        UPDATE_RESTART_RESTORE_REASON.to_string(),
+                    );
+                }
             }
             return;
         }
@@ -3420,6 +3513,13 @@ impl YggtermServer {
         if let Some(session) = self.sessions.get_mut(&key) {
             if keep_alive {
                 set_session_keep_alive_metadata(session, true);
+            }
+            if temporary_update_restore {
+                upsert_session_metadata(
+                    &mut session.metadata,
+                    RUNTIME_RESTORE_REASON_METADATA_LABEL,
+                    UPDATE_RESTART_RESTORE_REASON.to_string(),
+                );
             }
         }
     }
@@ -14444,16 +14544,16 @@ mod tests {
         ClientInstanceRecord, GhosttyHostSupport, GhosttyTerminalHostMode, ManagedSessionView,
         PersistedDaemonState, PersistedLiveSession, PersistedStoredSession, PreviewTone,
         REMOTE_LAUNCH_ACTION_METADATA_LABEL, REMOTE_OUTPUT_SENTINEL, RemoteCommandCacheEntry,
-        RemoteDeployState, RemoteMachineHealth, RemoteMachineSnapshot, RemotePreviewPayload,
-        RemoteScannedSession, ServerEndpoint, ServerRuntimeStatus, ServerUiSnapshot, SessionKind,
-        SessionMetadataEntry, SessionNode, SessionPreview, SessionPreviewBlock, SessionSource,
-        SnapshotPreview, SnapshotPreviewBlock, SnapshotRenderedSection, SnapshotSessionView,
-        SshConnectTarget, StoredPreviewHydrationMode, TerminalBackend, TerminalLaunchPhase,
-        UPDATE_RESTART_RESTORE_REASON, UiTheme, WorkspaceViewMode, YggtermServer,
-        active_client_instance_records, apply_remote_preview_payload,
-        apply_remote_preview_payload_for_path, apply_remote_scanned_session_preview, build_session,
-        canonical_static_label, choose_app_control_pid,
-        clear_local_daemon_socket_link_escaping_home,
+        RemoteDeployState, RemoteMachineHealth, RemoteMachineRefreshScan, RemoteMachineSnapshot,
+        RemotePreviewPayload, RemoteScannedSession, ServerEndpoint, ServerRuntimeStatus,
+        ServerUiSnapshot, SessionKind, SessionMetadataEntry, SessionNode, SessionPreview,
+        SessionPreviewBlock, SessionSource, SnapshotPreview, SnapshotPreviewBlock,
+        SnapshotRenderedSection, SnapshotSessionView, SshConnectTarget, StoredPreviewHydrationMode,
+        TerminalBackend, TerminalLaunchPhase, UPDATE_RESTART_RESTORE_REASON, UiTheme,
+        WorkspaceViewMode, YggtermServer, active_client_instance_records,
+        apply_remote_preview_payload, apply_remote_preview_payload_for_path,
+        apply_remote_scanned_session_preview, build_session, canonical_static_label,
+        choose_app_control_pid, clear_local_daemon_socket_link_escaping_home,
         clear_local_daemon_socket_link_for_version_mismatch, clear_session_preview_for_loading,
         clear_stale_local_daemon_socket_when_no_daemon, client_instances_dir, current_millis_u64,
         dedupe_remote_scanned_sessions, legacy_agent_launch_command,
@@ -17937,6 +18037,161 @@ terminal_window_id: None,
         assert!(server.sessions.contains_key(&stale_path));
         assert_eq!(server.ssh_targets().len(), 1);
         assert_eq!(server.ssh_targets()[0].ssh_target, "dev");
+    }
+
+    #[test]
+    fn remote_refresh_prunes_unkept_update_restored_remote_live_without_runtime() {
+        let tree = SessionNode {
+            kind: SessionNodeKind::Group,
+            name: "sessions".to_string(),
+            title: None,
+            document_kind: None,
+            group_kind: None,
+            path: PathBuf::from("/"),
+            children: Vec::new(),
+            session_id: None,
+            cwd: None,
+        };
+        let mut server = YggtermServer::new(
+            &tree,
+            false,
+            GhosttyHostSupport::shadow("test".to_string(), false, false),
+            UiTheme::ZedLight,
+        );
+        let stale_path = remote_scanned_session_path("dev", "missing-runtime");
+        server.restore_persisted_state(
+            PersistedDaemonState {
+                active_session_path: Some(stale_path.clone()),
+                active_view_mode: WorkspaceViewMode::Terminal,
+                ssh_targets: Vec::new(),
+                remote_machines: vec![remote_machine_with_scanned_session(
+                    "dev",
+                    "missing-runtime",
+                    false,
+                )],
+                stored_sessions: Vec::new(),
+                live_sessions: vec![PersistedLiveSession {
+                    key: stale_path.clone(),
+                    id: "missing-runtime".to_string(),
+                    title: "Temporary Update Restore".to_string(),
+                    kind: SessionKind::Codex,
+                    keep_alive: false,
+                    ssh_target: "dev".to_string(),
+                    prefix: None,
+                    cwd: Some("/home/pi".to_string()),
+                    remote_launch_action: None,
+                    restore_reason: Some(UPDATE_RESTART_RESTORE_REASON.to_string()),
+                }],
+            },
+            None,
+        );
+
+        assert_eq!(server.active_session_path(), Some(stale_path.as_str()));
+        assert_eq!(server.live_sessions().len(), 1);
+        assert!(server.sessions.contains_key(&stale_path));
+
+        let mut scanned_machine =
+            remote_machine_with_scanned_session("dev", "missing-runtime", false);
+        let target = SshConnectTarget {
+            label: "dev".to_string(),
+            kind: SessionKind::SshShell,
+            ssh_target: "dev".to_string(),
+            prefix: None,
+            cwd: None,
+        };
+        server
+            .apply_remote_machine_refresh_scan(
+                &target,
+                RemoteMachineRefreshScan {
+                    remote_binary_expr: Some("$HOME/.yggterm/bin/yggterm".to_string()),
+                    remote_deploy_state: RemoteDeployState::Ready,
+                    scan_result: Ok(std::mem::take(&mut scanned_machine.sessions)),
+                },
+            )
+            .expect("remote scan should apply");
+
+        assert!(server.live_sessions().is_empty());
+        assert!(!server.sessions.contains_key(&stale_path));
+        assert_eq!(server.active_session_path(), None);
+        assert_eq!(server.active_view_mode(), WorkspaceViewMode::Rendered);
+        assert!(
+            server.remote_machines()[0]
+                .sessions
+                .iter()
+                .all(|session| !session.live_runtime)
+        );
+    }
+
+    #[test]
+    fn remote_refresh_keeps_explicit_keep_alive_remote_live_without_runtime() {
+        let tree = SessionNode {
+            kind: SessionNodeKind::Group,
+            name: "sessions".to_string(),
+            title: None,
+            document_kind: None,
+            group_kind: None,
+            path: PathBuf::from("/"),
+            children: Vec::new(),
+            session_id: None,
+            cwd: None,
+        };
+        let mut server = YggtermServer::new(
+            &tree,
+            false,
+            GhosttyHostSupport::shadow("test".to_string(), false, false),
+            UiTheme::ZedLight,
+        );
+        let kept_path = remote_scanned_session_path("dev", "kept-runtime");
+        server.restore_persisted_state(
+            PersistedDaemonState {
+                active_session_path: Some(kept_path.clone()),
+                active_view_mode: WorkspaceViewMode::Terminal,
+                ssh_targets: Vec::new(),
+                remote_machines: vec![remote_machine_with_scanned_session(
+                    "dev",
+                    "kept-runtime",
+                    false,
+                )],
+                stored_sessions: Vec::new(),
+                live_sessions: vec![PersistedLiveSession {
+                    key: kept_path.clone(),
+                    id: "kept-runtime".to_string(),
+                    title: "Kept Restore".to_string(),
+                    kind: SessionKind::Codex,
+                    keep_alive: true,
+                    ssh_target: "dev".to_string(),
+                    prefix: None,
+                    cwd: Some("/home/pi".to_string()),
+                    remote_launch_action: None,
+                    restore_reason: None,
+                }],
+            },
+            None,
+        );
+
+        let mut scanned_machine = remote_machine_with_scanned_session("dev", "kept-runtime", false);
+        let target = SshConnectTarget {
+            label: "dev".to_string(),
+            kind: SessionKind::SshShell,
+            ssh_target: "dev".to_string(),
+            prefix: None,
+            cwd: None,
+        };
+        server
+            .apply_remote_machine_refresh_scan(
+                &target,
+                RemoteMachineRefreshScan {
+                    remote_binary_expr: Some("$HOME/.yggterm/bin/yggterm".to_string()),
+                    remote_deploy_state: RemoteDeployState::Ready,
+                    scan_result: Ok(std::mem::take(&mut scanned_machine.sessions)),
+                },
+            )
+            .expect("remote scan should apply");
+
+        let live_sessions = server.live_sessions();
+        assert_eq!(live_sessions.len(), 1);
+        assert_eq!(live_sessions[0].session_path, kept_path);
+        assert!(server.sessions.contains_key(&kept_path));
     }
 
     #[test]
