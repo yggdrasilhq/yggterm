@@ -894,7 +894,7 @@ fn shell_command(launch_command: &str, cwd: Option<&str>) -> CommandBuilder {
     let mut command = CommandBuilder::new(shell);
     command.arg("-c");
     let wrapped_launch_command = if launch_command_looks_like_remote_resume_attach(launch_command) {
-        format!("stty raw -echo </dev/tty >/dev/tty 2>/dev/null || true; exec {launch_command}")
+        remote_resume_attach_shell_command(launch_command)
     } else {
         launch_command.to_string()
     };
@@ -920,6 +920,17 @@ fn shell_command(launch_command: &str, cwd: Option<&str>) -> CommandBuilder {
 
 fn launch_command_looks_like_remote_resume_attach(launch_command: &str) -> bool {
     launch_command.contains("server'\\'' '\\''remote'\\'' '\\''resume-codex")
+}
+
+fn remote_resume_attach_shell_command(launch_command: &str) -> String {
+    let trimmed = launch_command.trim_start();
+    let launch =
+        if trimmed.starts_with("exec ") || trimmed.starts_with("__yggterm_initial_tty_size=") {
+            launch_command.to_string()
+        } else {
+            format!("exec {launch_command}")
+        };
+    format!("stty raw -echo </dev/tty >/dev/tty 2>/dev/null || true; {launch}")
 }
 
 fn terminal_key_prefers_initial_screen_snapshot(key: &str, launch_command: &str) -> bool {
@@ -1522,6 +1533,31 @@ mod tests {
         ));
         assert!(!launch_command_looks_like_remote_resume_attach(
             "bash -lc 'ls'"
+        ));
+    }
+
+    #[test]
+    fn remote_resume_attach_shell_command_preserves_tty_settle_prefix() {
+        let launch_command = "__yggterm_initial_tty_size=$(stty size 2>/dev/null || true); unset __yggterm_initial_tty_size; exec ssh -tt jojo 'exec $HOME/.yggterm/bin/yggterm '\\''server'\\'' '\\''remote'\\'' '\\''resume-codex'\\'' '\\''test-session'\\'' '\\''/home/pi'\\'''";
+
+        let wrapped = remote_resume_attach_shell_command(launch_command);
+
+        assert!(wrapped.starts_with(
+            "stty raw -echo </dev/tty >/dev/tty 2>/dev/null || true; __yggterm_initial_tty_size="
+        ));
+        assert!(!wrapped.contains("; exec __yggterm_initial_tty_size="));
+        assert!(wrapped.contains("; exec ssh -tt jojo"));
+        assert!(wrapped.contains("'resume-codex'"));
+    }
+
+    #[test]
+    fn remote_resume_attach_shell_command_execs_plain_ssh_command() {
+        let launch_command = "ssh -tt jojo 'exec $HOME/.yggterm/bin/yggterm '\\''server'\\'' '\\''remote'\\'' '\\''resume-codex'\\'' '\\''test-session'\\'' '\\''/home/pi'\\'''";
+
+        let wrapped = remote_resume_attach_shell_command(launch_command);
+
+        assert!(wrapped.starts_with(
+            "stty raw -echo </dev/tty >/dev/tty 2>/dev/null || true; exec ssh -tt jojo"
         ));
     }
 
