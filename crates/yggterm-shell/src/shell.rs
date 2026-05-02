@@ -24979,6 +24979,7 @@ fn app() -> Element {
                     maximized,
                 );
                 desktop_for_root_effect.request_redraw();
+                let _ = desktop_for_root_effect.webview.set_visible(true);
                 desktop_for_root_effect.set_visible(true);
                 if reveal_after_shape {
                     reveal_linux_window_after_corner_shape(
@@ -46499,6 +46500,23 @@ mod tests {
     }
 
     #[test]
+    fn xterm_fit_asset_uses_precise_host_height_guard() {
+        assert!(
+            XTERM_FIT_JS.contains("getBoundingClientRect"),
+            "the fit addon must use fractional host geometry instead of parseInt-only CSS height"
+        );
+        assert!(
+            XTERM_FIT_JS.contains("__yggtermXtermFitBottomGuardPx || 2")
+                && XTERM_FIT_JS.contains("parentHeight - verticalPadding - bottomGuardPx"),
+            "the fit addon should reserve a bottom guard before proposing xterm rows"
+        );
+        assert!(
+            !XTERM_FIT_JS.contains("parseInt(r.getPropertyValue(\"height\"))"),
+            "xterm fit must not round the host height upward into a clipped bottom row"
+        );
+    }
+
+    #[test]
     fn terminal_eval_script_runtime_gates_canvas_renderer() {
         let theme = terminal_theme(UiTheme::ZedLight, palette(UiTheme::ZedLight), 13.0, "");
         let disabled =
@@ -52036,6 +52054,59 @@ q to quit   pgup/pgdn to page   enter to edit message
         assert_eq!(
             surface.get("geometry_problem").and_then(Value::as_str),
             Some("active terminal cursor row is clipped below the visible host")
+        );
+    }
+    #[test]
+    fn app_control_terminal_surface_flags_xterm_row_fit_overflow() {
+        let host = json!({
+            "child_count": 1,
+            "xterm_present": true,
+            "screen_present": true,
+            "viewport_present": true,
+            "rows_present": false,
+            "canvas_count": 1,
+            "text_sample": "normal terminal output",
+            "input_enabled": true,
+            "scrollback_locked": false,
+            "host_content_width": 883.0,
+            "host_content_height": 899.96,
+            "host_rect": { "left": 277.0, "top": 8.0, "width": 883.0, "height": 899.96, "bottom": 907.96 },
+            "screen_rect": { "left": 277.0, "top": 8.0, "width": 883.0, "height": 899.96 },
+            "viewport_rect": { "left": 277.0, "top": 8.0, "width": 883.0, "height": 899.96 },
+            "cursor_expected_rect": { "left": 293.0, "top": 854.0, "width": 8.0, "height": 18.0 },
+            "fit_required_height_px": 900.0,
+            "fit_available_height_px": 899.96,
+            "fit_overflow_px": 0.04,
+            "cursor_line_text": "› prompt"
+        });
+        let surface = summarize_terminal_surface_for_app_control(&[host], false);
+        assert_eq!(surface.get("geometry_problem"), Some(&Value::Null));
+
+        let host = json!({
+            "child_count": 1,
+            "xterm_present": true,
+            "screen_present": true,
+            "viewport_present": true,
+            "rows_present": false,
+            "canvas_count": 1,
+            "text_sample": "normal terminal output",
+            "input_enabled": true,
+            "scrollback_locked": false,
+            "host_content_width": 883.0,
+            "host_content_height": 899.75,
+            "host_rect": { "left": 277.0, "top": 8.0, "width": 883.0, "height": 899.75, "bottom": 907.75 },
+            "screen_rect": { "left": 277.0, "top": 8.0, "width": 883.0, "height": 899.75 },
+            "viewport_rect": { "left": 277.0, "top": 8.0, "width": 883.0, "height": 899.75 },
+            "cursor_expected_rect": { "left": 293.0, "top": 854.0, "width": 8.0, "height": 18.0 },
+            "fit_required_height_px": 900.0,
+            "fit_available_height_px": 899.75,
+            "fit_overflow_px": 0.25,
+            "cursor_line_text": "› prompt"
+        });
+        let surface = summarize_terminal_surface_for_app_control(&[host], false);
+        assert_eq!(
+            surface.get("geometry_problem").and_then(Value::as_str),
+            Some("active terminal xterm rows exceed the visible host height")
         );
     }
     #[test]
