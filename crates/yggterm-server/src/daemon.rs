@@ -1,4 +1,4 @@
-use crate::terminal::TerminalBufferStats;
+use crate::terminal::{TerminalBufferStats, terminal_data_has_scrollback_text};
 use crate::{
     GhosttyHostSupport, ManagedSessionView, PersistedDaemonState, RemoteMachineSnapshot,
     RemoteRuntimeRegistry, ServerUiSnapshot, SessionKind, SnapshotSessionView, SshConnectTarget,
@@ -959,7 +959,18 @@ impl DaemonRuntime {
                 );
             }
             if !needs_restart {
-                if !has_runtime_output && let Some(prefill) = seed_prefill.as_deref() {
+                let remote_reuse_missing_retained_scrollback = path
+                    .starts_with("remote-session://")
+                    && has_runtime_output
+                    && seed_prefill
+                        .as_deref()
+                        .is_some_and(terminal_data_has_scrollback_text)
+                    && !self
+                        .terminals
+                        .session_initial_read_has_scrollback(&runtime_path);
+                if (!has_runtime_output || remote_reuse_missing_retained_scrollback)
+                    && let Some(prefill) = seed_prefill.as_deref()
+                {
                     if let Ok(home) = crate::resolve_yggterm_home() {
                         append_trace_event(
                             &home,
@@ -969,6 +980,11 @@ impl DaemonRuntime {
                             serde_json::json!({
                                 "path": path,
                                 "bytes": prefill.len(),
+                                "reason": if remote_reuse_missing_retained_scrollback {
+                                    "remote_reuse_missing_retained_scrollback"
+                                } else {
+                                    "no_runtime_output"
+                                },
                             }),
                         );
                     }
@@ -1609,6 +1625,9 @@ impl DaemonRuntime {
                 }
             }
             ServerRequest::TerminalWrite { path, data } => {
+                if self.server.remote_terminal_write_for_path(&path, &data)? {
+                    return Ok(ServerResponse::Ack { message: None });
+                }
                 let runtime_path = self.terminal_runtime_key_for_path(&path);
                 self.terminals.write(&runtime_path, &data)?;
                 ServerResponse::Ack { message: None }

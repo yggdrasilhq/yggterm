@@ -5303,6 +5303,34 @@ fn terminal_host_surface_layout_is_acceptable(
         || terminal_chunk_is_codex_interactive_setup_prompt(host_surface_text)
         || terminal_chunk_is_codex_prompt_surface(host_surface_text)
 }
+fn remote_resume_stable_bootstrap_epoch(
+    is_remote_resume_session: bool,
+    resume_overlay_failed: bool,
+    resume_overlay_timed_out: bool,
+) -> bool {
+    is_remote_resume_session && !resume_overlay_failed && !resume_overlay_timed_out
+}
+fn remote_prompt_gap_resize_nudge_allowed(
+    is_remote_resume_session: bool,
+    remote_starting_codex_session: bool,
+    traced_attach_ready: bool,
+    terminal_overlay_dismissed: bool,
+    terminal_geometry_ready: bool,
+    has_transport_error: bool,
+    rows: u16,
+    cursor_line_text: &str,
+    blank_rows_below_cursor: u16,
+) -> bool {
+    is_remote_resume_session
+        && !remote_starting_codex_session
+        && !traced_attach_ready
+        && terminal_overlay_dismissed
+        && terminal_geometry_ready
+        && !has_transport_error
+        && rows >= 20
+        && !cursor_line_text.trim().is_empty()
+        && !terminal_host_prompt_layout_is_acceptable(rows, blank_rows_below_cursor)
+}
 fn remote_resume_visual_reveal_can_complete(
     attach_ready: bool,
     geometry_ready: bool,
@@ -19483,6 +19511,9 @@ async fn capture_dom_debug_snapshot_for(active_session_path: Option<&str>) -> Va
                     last_write_queued_at_ms: mountedHost ? Number(mountedHost.lastWriteQueuedAtMs || 0) : 0,
                     last_write_callback_at_ms: mountedHost ? Number(mountedHost.lastWriteCallbackAtMs || 0) : 0,
                     last_wheel_delta_y: mountedHost ? Number(mountedHost.lastWheelDeltaY || 0) : 0,
+                    last_raw_payload_length: mountedHost ? Number(mountedHost.lastRawPayloadLength || 0) : 0,
+                    last_raw_payload_line_count: mountedHost ? Number(mountedHost.lastRawPayloadLineCount || 0) : 0,
+                    scrollback_expected: mountedHost ? Boolean(mountedHost.scrollbackExpected) : false,
                     scrollback_locked: mountedHost ? Boolean(mountedHost.scrollbackLocked) : false,
                     screen_present: Boolean(screen),
                     viewport_present: Boolean(viewport),
@@ -20659,6 +20690,9 @@ async fn capture_dom_debug_snapshot_basic_for(active_session_path: Option<&str>)
                         write_bridge_pending_chars: mountedHost ? String(mountedHost.writeBridgePendingData || '').length : 0,
                         retained_write_paint_repair_count: mountedHost ? Number(mountedHost.retainedWritePaintRepairCount || 0) : 0,
                         last_retained_write_paint_repair_reason: mountedHost ? String(mountedHost.lastRetainedWritePaintRepairReason || '') : '',
+                        last_raw_payload_length: mountedHost ? Number(mountedHost.lastRawPayloadLength || 0) : 0,
+                        last_raw_payload_line_count: mountedHost ? Number(mountedHost.lastRawPayloadLineCount || 0) : 0,
+                        scrollback_expected: mountedHost ? Boolean(mountedHost.scrollbackExpected) : false,
                         last_fit_guard: mountedHost && mountedHost.lastFitGuard ? mountedHost.lastFitGuard : null,
                         xterm_renderer_mode: canvasCount > 0 ? 'canvas' : 'dom',
                         helper_textarea_focused: Boolean(helperTextarea && helperTextarea === activeElement),
@@ -21769,8 +21803,11 @@ fn terminal_probe_input_script(
                 after = snapshot();
                 const completedAtMs = performance.now();
                 const visibleEchoObserved = text ? textVisible(after) : counterChangeAtMs !== null;
+                const hasTransportError = terminalChunkIsTransportError(String(after.text_tail || ''));
+                const accepted = !hasTransportError && (!text || visibleEchoObserved);
                 dioxus.send({{
-                    accepted: true,
+                    accepted,
+                    reason: accepted ? null : (hasTransportError ? "terminal_transport_error_visible" : "visible_echo_missing"),
                     session_path: sessionPath,
                     host_id: entry.hostId,
                     before,
@@ -21786,7 +21823,7 @@ fn terminal_probe_input_script(
                     used_core_trigger: usedCoreTrigger,
                     used_term_input: usedTermInput,
                     keyboard_backend: keyboardBackend(),
-                    has_transport_error: terminalChunkIsTransportError(String(after.text_tail || '')),
+                    has_transport_error: hasTransportError,
                     visible_echo_observed: visibleEchoObserved,
                     timings: {{
                         focus_to_before_ms: Number((before.monotonic_ms - startedAtMs).toFixed(3)),
@@ -21999,6 +22036,46 @@ async fn probe_terminal_viewport_scroll_for(session_path: &str, lines: i32) -> V
                     }};
                 }};
                 const before = snapshot();
+                const canMove = (sample) => {{
+                    const viewportY = Number(sample && sample.viewport_y);
+                    const baseY = Number(sample && sample.base_y);
+                    const scrollTop = Number(sample && sample.viewport_scroll_top);
+                    const rows = Number(sample && sample.rows);
+                    const rawLines = Number(sample && sample.last_raw_payload_line_count);
+                    const expectsScrollback = Boolean(sample && sample.scrollback_expected)
+                        || (Number.isFinite(rows) && Number.isFinite(rawLines) && rows > 0 && rawLines > rows + 4)
+                        || (Number.isFinite(baseY) && baseY > 0);
+                    if (lines < 0) {{
+                        return (Number.isFinite(viewportY) && viewportY > 0)
+                            || (Number.isFinite(scrollTop) && scrollTop > 0.5)
+                            || expectsScrollback;
+                    }}
+                    if (lines > 0) {{
+                        return Number.isFinite(viewportY) && Number.isFinite(baseY) && viewportY < baseY;
+                    }}
+                    return false;
+                }};
+                const moved = (previous, next) => {{
+                    if (!previous || !next) {{
+                        return false;
+                    }}
+                    if (Number(previous.viewport_y) !== Number(next.viewport_y)) {{
+                        return true;
+                    }}
+                    const previousTop = Number(previous.viewport_scroll_top);
+                    const nextTop = Number(next.viewport_scroll_top);
+                    if (Number.isFinite(previousTop) && Number.isFinite(nextTop) && Math.abs(previousTop - nextTop) > 0.5) {{
+                        return true;
+                    }}
+                    if (String(previous.text_head || '') !== String(next.text_head || '')) {{
+                        return true;
+                    }}
+                    if (String(previous.text_tail || '') !== String(next.text_tail || '')) {{
+                        return true;
+                    }}
+                    return Number(next.wheel_event_count || 0) > Number(previous.wheel_event_count || 0)
+                        || Number(next.scroll_event_count || 0) > Number(previous.scroll_event_count || 0);
+                }};
                 const deltaY = Number(lines || 0) * 40;
                 try {{
                     if (helperTextarea && helperTextarea.focus) {{
@@ -22022,13 +22099,16 @@ async fn probe_terminal_viewport_scroll_for(session_path: &str, lines: i32) -> V
                     screenY: clientY,
                 }}));
                 await settle(120);
+                const after = snapshot();
                 dioxus.send({{
                     accepted: true,
                     session_path: sessionPath,
                     host_id: entry.hostId,
                     lines,
+                    movement_expected: canMove(before),
+                    scroll_probe_moved: moved(before, after),
                     before,
-                    after: snapshot(),
+                    after,
                 }});
             }} catch (error) {{
                 dioxus.send({{
@@ -31088,12 +31168,23 @@ fn terminal_session_still_active(shell: &ShellState, session_path: &str, host_id
             || shell.terminal_attach_in_flight.contains(session_path))
 }
 fn terminal_session_should_bootstrap_host(
-    _shell: &ShellState,
+    shell: &ShellState,
     active_session_path: Option<&str>,
     session_path: &str,
 ) -> bool {
     active_session_path == Some(session_path)
+        && !shell.terminal_session_is_retained_live(session_path)
 }
+
+fn retained_ready_remote_host_should_reuse_bootstrap(
+    is_remote_resume_session: bool,
+    retained: bool,
+    resume_ready: bool,
+    host_id_present: bool,
+) -> bool {
+    is_remote_resume_session && retained && resume_ready && host_id_present
+}
+
 fn next_terminal_bootstrap_owner_id() -> u64 {
     NEXT_TERMINAL_BOOTSTRAP_OWNER_ID.fetch_add(1, Ordering::Relaxed)
 }
@@ -32066,6 +32157,8 @@ fn TerminalCanvas(
         use_hook(|| std::rc::Rc::new(std::cell::RefCell::new(String::new()))).clone();
     let input_enable_identity =
         use_hook(|| std::rc::Rc::new(std::cell::RefCell::new(String::new()))).clone();
+    let retained_rehydrate_identity =
+        use_hook(|| std::rc::Rc::new(std::cell::RefCell::new(String::new()))).clone();
     let wait_trace_identity =
         use_hook(|| std::rc::Rc::new(std::cell::RefCell::new(String::new()))).clone();
     let inactive_bootstrap_skip_identity =
@@ -32145,12 +32238,32 @@ fn TerminalCanvas(
     } else {
         mount_bootstrap_generation.get()
     };
-    let bootstrap_activation_epoch = terminal_bootstrap_activation_epoch(
-        snapshot.active_view_mode,
-        snapshot.active_session_path.as_deref(),
-        &session_path,
-        latest_open_request_id,
+    let retained_ready_remote_host = state.with(|shell| {
+        retained_ready_remote_host_should_reuse_bootstrap(
+            is_remote_resume_session,
+            shell
+                .retained_terminal_session_paths
+                .contains(&session_path),
+            shell.terminal_resume_ready_paths.contains(&session_path),
+            shell.terminal_session_host_id(&session_path).is_some(),
+        )
+    });
+    let stable_remote_bootstrap_epoch = remote_resume_stable_bootstrap_epoch(
+        is_remote_resume_session,
+        resume_overlay_failed(),
+        resume_overlay_timed_out(),
     );
+    let bootstrap_activation_epoch = if retained_ready_remote_host || stable_remote_bootstrap_epoch
+    {
+        0
+    } else {
+        terminal_bootstrap_activation_epoch(
+            snapshot.active_view_mode,
+            snapshot.active_session_path.as_deref(),
+            &session_path,
+            latest_open_request_id,
+        )
+    };
     let bootstrap_identity =
         format!("{mount_identity}:{current_bootstrap_generation}:{bootstrap_activation_epoch}");
     if *last_bootstrap_identity.borrow() != mount_identity {
@@ -32283,7 +32396,10 @@ fn TerminalCanvas(
             });
         }
     }
-    let active_host_key = format!("active-host:{bootstrap_identity}");
+    let active_host_selected = snapshot.active_view_mode == WorkspaceViewMode::Terminal
+        && snapshot.active_session_path.as_deref() == Some(session_path.as_str());
+    let active_host_key =
+        format!("active-host:{bootstrap_identity}:{active_host_selected}:{latest_open_request_id}");
     if *active_terminal_host_identity.borrow() != active_host_key {
         *active_terminal_host_identity.borrow_mut() = active_host_key.clone();
         state.with_mut(|shell| {
@@ -32390,6 +32506,97 @@ fn TerminalCanvas(
                 host_should_accept_input,
                 host_should_accept_input,
             ));
+        });
+    }
+    let retained_rehydrate_key = format!(
+        "retained-rehydrate:{session_path}:{latest_open_request_id}:{retained_ready_remote_host}:{active_host_selected}"
+    );
+    if retained_ready_remote_host
+        && active_host_selected
+        && *retained_rehydrate_identity.borrow() != retained_rehydrate_key
+    {
+        *retained_rehydrate_identity.borrow_mut() = retained_rehydrate_key;
+        let endpoint = endpoint.clone();
+        let runtime_session_path =
+            state.with(|shell| terminal_runtime_session_path(&shell, &session_path));
+        let session_path_for_task = session_path.clone();
+        let trace_home = trace_home.clone();
+        spawn(async move {
+            sleep(Duration::from_millis(80)).await;
+            let still_active = state.with(|shell| {
+                shell.server.active_view_mode() == WorkspaceViewMode::Terminal
+                    && shell.server.active_session_path() == Some(session_path_for_task.as_str())
+            });
+            if !still_active {
+                append_trace_event(
+                    &trace_home,
+                    "ui",
+                    "terminal_mount",
+                    "retained_rehydrate_skipped_inactive",
+                    json!({
+                        "session_path": session_path_for_task,
+                    }),
+                );
+                return;
+            }
+            append_trace_event(
+                &trace_home,
+                "ui",
+                "terminal_mount",
+                "retained_rehydrate_begin",
+                json!({
+                    "session_path": session_path_for_task.clone(),
+                }),
+            );
+            match terminal_read_async(endpoint, runtime_session_path, 0, &trace_home).await {
+                Ok((_next_cursor, chunks, _runtime_running, _runtime_output_seen, _eof)) => {
+                    let data = chunks
+                        .into_iter()
+                        .map(|chunk| chunk.data)
+                        .collect::<String>();
+                    let (data, saw_attach_ready_marker) = strip_terminal_attach_ready_marker(&data);
+                    if data.trim().is_empty() {
+                        append_trace_event(
+                            &trace_home,
+                            "ui",
+                            "terminal_mount",
+                            "retained_rehydrate_empty",
+                            json!({
+                                "session_path": session_path_for_task,
+                                "attach_ready_marker": saw_attach_ready_marker,
+                            }),
+                        );
+                        return;
+                    }
+                    let bytes = data.len();
+                    let _ = document::eval(&terminal_replay_retained_data_script_for_session(
+                        &session_path_for_task,
+                        &data,
+                    ));
+                    append_trace_event(
+                        &trace_home,
+                        "ui",
+                        "terminal_mount",
+                        "retained_rehydrate_end",
+                        json!({
+                            "session_path": session_path_for_task,
+                            "bytes": bytes,
+                        }),
+                    );
+                }
+                Err(error) => {
+                    append_trace_event(
+                        &trace_home,
+                        "ui",
+                        "terminal_mount",
+                        "retained_rehydrate_error",
+                        json!({
+                            "session_path": session_path_for_task,
+                            "error": error.to_string(),
+                        }),
+                    );
+                }
+            }
         });
     }
     let should_bootstrap_host = {
@@ -33345,15 +33552,16 @@ fn TerminalCanvas(
                                         },
                                     );
                                 }
-                                let prompt_gap_looks_stale = is_remote_resume_session
-                                    && !remote_starting_codex_session
-                                    && terminal_overlay_dismissed()
-                                    && terminal_geometry_ready
-                                    && !has_transport_error
-                                    && rows >= 20
-                                    && !cursor_line_text.trim().is_empty()
-                                    && !terminal_host_prompt_layout_is_acceptable(
+                                let prompt_gap_looks_stale =
+                                    remote_prompt_gap_resize_nudge_allowed(
+                                        is_remote_resume_session,
+                                        remote_starting_codex_session,
+                                        traced_attach_ready,
+                                        terminal_overlay_dismissed(),
+                                        terminal_geometry_ready,
+                                        has_transport_error,
                                         rows,
+                                        &cursor_line_text,
                                         blank_rows_below_cursor,
                                     );
                                 if prompt_gap_looks_stale && prompt_gap_resize_nudges < 4 {
@@ -34764,37 +34972,19 @@ fn TerminalCanvas(
                                             "rows": current_terminal_rows,
                                         }),
                                     );
-                                    if let Err(error) = terminal_resize_nudge_async(
-                                        endpoint.clone(),
-                                        runtime_session_path.clone(),
-                                        current_terminal_cols,
-                                        current_terminal_rows,
-                                    )
-                                    .await
-                                    {
-                                        append_trace_event(
-                                            &trace_home,
-                                            "ui",
-                                            "terminal_mount",
-                                            "post_attach_redraw_nudge_error",
-                                            json!({
-                                                "session_path": session_path.clone(),
-                                                "error": error.to_string(),
-                                            }),
-                                        );
-                                    } else {
-                                        append_trace_event(
-                                            &trace_home,
-                                            "ui",
-                                            "terminal_mount",
-                                            "post_attach_redraw_nudge_end",
-                                            json!({
-                                                "session_path": session_path.clone(),
-                                                "cols": current_terminal_cols,
-                                                "rows": current_terminal_rows,
-                                            }),
-                                        );
-                                    }
+                                    let _ = eval.send(TerminalJsCommand::Refit);
+                                    append_trace_event(
+                                        &trace_home,
+                                        "ui",
+                                        "terminal_mount",
+                                        "post_attach_redraw_nudge_end",
+                                        json!({
+                                            "session_path": session_path.clone(),
+                                            "cols": current_terminal_cols,
+                                            "rows": current_terminal_rows,
+                                            "server_resize": false,
+                                        }),
+                                    );
                                     read_poll_ms = 45;
                                     next_read_deadline = tokio::time::Instant::now()
                                         + Duration::from_millis(read_poll_ms);
@@ -39408,8 +39598,7 @@ fn terminal_eval_script_with_canvas_renderer(
             requestAnimationFrame(() => {{
                 retainedWritePaintRepairPending = false;
                 requestVisiblePaint(true);
-                window.setTimeout(() => requestVisiblePaint(true), 48);
-                window.setTimeout(() => requestVisiblePaint(false), 160);
+                window.setTimeout(() => requestVisiblePaint(false), 96);
                 if (window.__yggtermXtermHosts && window.__yggtermXtermHosts[hostId]) {{
                     window.__yggtermXtermHosts[hostId].retainedWritePaintRepairCount =
                         retainedWritePaintRepairCount;
@@ -39432,10 +39621,39 @@ fn terminal_eval_script_with_canvas_renderer(
                 emitPaint();
             }});
         }};
+        const termHasBufferedContent = () => {{
+            try {{
+                const buffer = term && term.buffer && term.buffer.active;
+                if (!buffer) {{
+                    return false;
+                }}
+                const baseY = Number(buffer.baseY || 0);
+                if (baseY > 0) {{
+                    return true;
+                }}
+                const length = Number(buffer.length || 0);
+                const rows = Number(term && term.rows ? term.rows : 0);
+                if (rows > 0 && length > rows) {{
+                    return true;
+                }}
+                const sampleLimit = Math.min(length, 5);
+                for (let offset = 0; offset < sampleLimit; offset += 1) {{
+                    const line = buffer.getLine(Math.max(0, length - 1 - offset));
+                    if (line && String(line.translateToString(true) || '').trim()) {{
+                        return true;
+                    }}
+                }}
+            }} catch (_error) {{}}
+            return false;
+        }};
         const ensureVisibleHost = (reason) => {{
             rebindCurrentHost(reason, true);
             const hadPriorPaintProbe = paintCount > 0;
             if (emitPaint()) {{
+                return;
+            }}
+            if (termHasBufferedContent()) {{
+                requestVisiblePaint();
                 return;
             }}
             if (!hadPriorPaintProbe && reason === 'set_input_enabled') {{
@@ -40117,6 +40335,9 @@ fn terminal_eval_script_with_canvas_renderer(
             inactiveTuiFrameDropCount: 0,
             inactiveTuiLastTail: '',
             lastWheelDeltaY: 0,
+            lastRawPayloadLength: 0,
+            lastRawPayloadLineCount: 0,
+            scrollbackExpected: false,
             scrollbackLocked,
         }};
         dioxus.send({{
@@ -40129,7 +40350,7 @@ fn terminal_eval_script_with_canvas_renderer(
             [140, 420, 900, 1600].forEach((delayMs) => {{
                 window.setTimeout(() => {{
                     emitResize();
-                    requestVisiblePaint();
+                    requestVisiblePaint(delayMs <= 140);
                     if (inputEnabled && programmaticFocusEnabled) {{
                         focusTerminal();
                     }}
@@ -40473,10 +40694,28 @@ fn terminal_eval_script_with_canvas_renderer(
             }}
             const rawPayloadLength = payload.length;
             const rawFrameLike = terminalPayloadLooksHighVolumeFrame(payload);
-            payload = coalesceHighVolumeTerminalPayload(payload);
+            const rawPayloadLineCount = (payload.match(/\n/g) || []).length;
+            const retainedScrollbackReplay =
+                rawPayloadLineCount > Math.max(4, Number(term && term.rows ? term.rows : 0) + 4)
+                && (payload.includes('\x1b[2J') || payload.includes('YGG_REMOTE_RETAINED_SCROLLBACK_'));
+            const expectedScrollbackPayload =
+                (!rawFrameLike || retainedScrollbackReplay)
+                && !payload.includes('\x1b[?1049h')
+                && currentBufferKind() === 'normal'
+                && rawPayloadLineCount > Math.max(4, Number(term && term.rows ? term.rows : 0) + 4);
+            if (entry) {{
+                entry.lastRawPayloadLength = rawPayloadLength;
+                entry.lastRawPayloadLineCount = rawPayloadLineCount;
+                if (expectedScrollbackPayload) {{
+                    entry.scrollbackExpected = true;
+                }}
+            }}
+            if (!retainedScrollbackReplay) {{
+                payload = coalesceHighVolumeTerminalPayload(payload);
+            }}
             const paintRepairReason = (
-                retainedWritePaintRepairCount < 3
-                || (rawPayloadLength >= 4096 && !rawFrameLike)
+                retainedWritePaintRepairCount < 2
+                || (retainedWritePaintRepairCount < 4 && rawPayloadLength >= 4096 && !rawFrameLike)
             ) ? `write_flush_retained len=${{rawPayloadLength}} frame=${{rawFrameLike}}` : '';
             entry.writeBridgeInFlight = true;
                 entry.writeBridgeFlushCount = Number(entry.writeBridgeFlushCount || 0) + 1;
@@ -41109,6 +41348,85 @@ fn terminal_set_input_enabled_script_for_session(
         session_path = session_path,
         enabled = if enabled { "true" } else { "false" },
         focus = if focus { "true" } else { "false" },
+    )
+}
+fn terminal_replay_retained_data_script_for_session(session_path: &str, data: &str) -> String {
+    let session_path = serde_json::to_string(session_path).unwrap_or_else(|_| "null".to_string());
+    let data = serde_json::to_string(data).unwrap_or_else(|_| "\"\"".to_string());
+    format!(
+        r#"
+        (() => {{
+          const sessionPath = {session_path};
+          const data = {data};
+          const registry = window.__yggtermXtermHosts || {{}};
+          const entries = Object.values(registry)
+            .filter((entry) => entry && entry.term && entry.sessionPath === sessionPath)
+            .sort((a, b) => (b.mountedAt || 0) - (a.mountedAt || 0));
+          const visibleEntries = entries.filter((entry) => {{
+            try {{
+              const host = document.getElementById(entry.hostId);
+              if (!host) {{
+                return false;
+              }}
+              const rect = host.getBoundingClientRect();
+              const style = window.getComputedStyle(host);
+              return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
+            }} catch (_error) {{
+              return false;
+            }}
+          }});
+          const entry = visibleEntries[0] || entries[0] || null;
+          if (!entry || !entry.term || !data) {{
+            return;
+          }}
+          const buffer = entry.term.buffer && entry.term.buffer.active;
+          const baseY = buffer ? Number(buffer.baseY || 0) : 0;
+          if (baseY > 0) {{
+            return;
+          }}
+          try {{
+            if (typeof entry.term.reset === "function") {{
+              entry.term.reset();
+            }}
+          }} catch (_error) {{}}
+          const writeSync = entry.term && entry.term._core && typeof entry.term._core.writeSync === "function"
+            ? entry.term._core.writeSync.bind(entry.term._core)
+            : entry.term && entry.term._core && entry.term._core._writeBuffer && typeof entry.term._core._writeBuffer.writeSync === "function"
+              ? entry.term._core._writeBuffer.writeSync.bind(entry.term._core._writeBuffer)
+              : null;
+          try {{
+            if (writeSync) {{
+              writeSync(data);
+            }} else if (typeof entry.term.write === "function") {{
+              entry.term.write(data);
+            }}
+          }} catch (_error) {{}}
+          try {{
+            entry.lastRawPayloadLength = data.length;
+            entry.lastRawPayloadLineCount = (data.match(/\n/g) || []).length;
+            if (entry.lastRawPayloadLineCount > Math.max(4, Number(entry.term.rows || 0) + 4)) {{
+              entry.scrollbackExpected = true;
+            }}
+          }} catch (_error) {{}}
+          try {{
+            if (typeof entry.term.scrollToBottom === "function") {{
+              entry.term.scrollToBottom();
+            }}
+          }} catch (_error) {{}}
+          try {{
+            if (typeof entry.term.refresh === "function") {{
+              entry.term.refresh(0, Math.max(0, Number(entry.term.rows || 1) - 1));
+            }}
+          }} catch (_error) {{}}
+          try {{
+            if (typeof entry.setInputEnabled === "function") {{
+              entry.setInputEnabled(true, true);
+            }}
+          }} catch (_error) {{}}
+        }})();
+        "#,
+        session_path = session_path,
+        data = data,
     )
 }
 fn terminal_set_input_policy_script_for_active_session(
@@ -46493,18 +46811,71 @@ mod tests {
     }
 
     #[test]
+    fn retained_ready_remote_host_reuses_bootstrap_on_focus_return() {
+        assert!(retained_ready_remote_host_should_reuse_bootstrap(
+            true, true, true, true
+        ));
+        assert!(!retained_ready_remote_host_should_reuse_bootstrap(
+            false, true, true, true
+        ));
+        assert!(!retained_ready_remote_host_should_reuse_bootstrap(
+            true, false, true, true
+        ));
+        assert!(!retained_ready_remote_host_should_reuse_bootstrap(
+            true, true, false, true
+        ));
+        assert!(!retained_ready_remote_host_should_reuse_bootstrap(
+            true, true, true, false
+        ));
+    }
+
+    #[test]
+    fn remote_resume_bootstrap_epoch_stays_stable_until_failure() {
+        assert!(remote_resume_stable_bootstrap_epoch(true, false, false));
+        assert!(!remote_resume_stable_bootstrap_epoch(true, true, false));
+        assert!(!remote_resume_stable_bootstrap_epoch(true, false, true));
+        assert!(!remote_resume_stable_bootstrap_epoch(false, false, false));
+    }
+
+    #[test]
+    fn retained_rehydrate_script_replays_only_collapsed_xterm_buffers() {
+        let script = terminal_replay_retained_data_script_for_session(
+            "remote-session://dev/test",
+            "\x1b[2J\x1b[Hline 1\r\nline 2\r\n",
+        );
+        assert!(script.contains("if (baseY > 0)"));
+        assert!(script.contains("entry.term.reset();"));
+        assert!(script.contains("writeSync(data);"));
+        assert!(script.contains("entry.scrollbackExpected = true;"));
+    }
+
+    #[test]
+    fn retained_rehydrate_strips_attach_ready_protocol_markers() {
+        let (cleaned, saw_marker) = strip_terminal_attach_ready_marker(
+            "__YGGTERM_ATTACH_READY__\nreal output\n__YGGTERM_ATTACH_READY__\n",
+        );
+
+        assert!(saw_marker);
+        assert_eq!(cleaned, "real output");
+    }
+
+    #[test]
     fn terminal_eval_script_defers_initial_blank_host_rebuild_until_after_first_paint_probe() {
         let theme = terminal_theme(UiTheme::ZedLight, palette(UiTheme::ZedLight), 13.0, "");
         let script = terminal_eval_script("yggterm-terminal-test", &theme, true);
         let ensure_ix = script
             .find("const ensureVisibleHost = (reason) => {")
             .expect("ensureVisibleHost declaration present");
+        let buffered_ix = script[ensure_ix..]
+            .find("if (termHasBufferedContent()) {")
+            .expect("retained buffered xterm content should block blank-host rebuild");
         let defer_ix = script[ensure_ix..]
             .find("if (!hadPriorPaintProbe && reason === 'set_input_enabled') {")
             .expect("initial set_input_enabled should defer rebuild until after a paint probe");
         let rebuild_ix = script[ensure_ix..]
             .find("rebuildAttempts += 1;")
             .expect("blank-host rebuild counter should still exist");
+        assert!(buffered_ix < defer_ix);
         assert!(defer_ix < rebuild_ix);
     }
 
@@ -46587,9 +46958,22 @@ mod tests {
         );
         assert!(
             script.contains("const scheduleRetainedWritePaintRepair = (reason) => {")
-                && script.contains("retainedWritePaintRepairCount < 3")
-                && script.contains("(rawPayloadLength >= 4096 && !rawFrameLike)"),
+                && script.contains("retainedWritePaintRepairCount < 2")
+                && script.contains(
+                    "retainedWritePaintRepairCount < 4 && rawPayloadLength >= 4096 && !rawFrameLike"
+                ),
             "retained-session and non-frame bulk writes should schedule a bounded visible repaint repair for WebKit canvas"
+        );
+        assert!(
+            script.contains("scrollbackExpected: false")
+                && script.contains("const retainedScrollbackReplay =")
+                && script.contains("entry.scrollbackExpected = true;")
+                && script.contains("lastRawPayloadLineCount"),
+            "bulk retained replays should be observable as expected xterm scrollback"
+        );
+        assert!(
+            script.contains("requestVisiblePaint(delayMs <= 140);"),
+            "startup resize nudges should not force repeated full-canvas refreshes"
         );
         assert!(
             !script.contains("|| rawFrameLike"),
@@ -51913,6 +52297,28 @@ uto-reviewer subagent.
   gpt-5.5 medium · ~/gh/yggterm";
         assert!(terminal_chunk_is_codex_prompt_surface(tail));
         assert!(!terminal_host_prompt_layout_is_acceptable(50, 39));
+        assert!(remote_prompt_gap_resize_nudge_allowed(
+            true,
+            false,
+            false,
+            true,
+            true,
+            false,
+            50,
+            "› Explain this codebase",
+            39,
+        ));
+        assert!(!remote_prompt_gap_resize_nudge_allowed(
+            true,
+            false,
+            true,
+            true,
+            true,
+            false,
+            50,
+            "› Explain this codebase",
+            39,
+        ));
         assert!(remote_resume_visual_reveal_can_complete(
             true,
             true,
@@ -53790,6 +54196,26 @@ q to quit   pgup/pgdn to page   enter to edit message
             "host-active"
         ));
     }
+
+    #[test]
+    fn active_retained_remote_session_does_not_bootstrap_again_on_focus_return() {
+        let session_path = "remote-session://dev/019dbdc7-7e63-7211-a7f8-51eb4d6e80b2";
+        let bootstrap = test_shell_bootstrap_with_active_session(session_path);
+        let mut shell = ShellState::new(bootstrap);
+        shell.server.set_view_mode(WorkspaceViewMode::Terminal);
+        shell.bump_terminal_mount_epoch_for_session(session_path);
+        shell.retain_terminal_session_path(session_path);
+        shell
+            .terminal_resume_ready_paths
+            .insert(session_path.to_string());
+
+        assert!(!terminal_session_should_bootstrap_host(
+            &shell,
+            Some(session_path),
+            session_path
+        ));
+    }
+
     #[test]
     fn schedule_background_copy_scan_now_preserves_existing_cooldown() {
         let bootstrap = test_shell_bootstrap_with_active_session("local://test");

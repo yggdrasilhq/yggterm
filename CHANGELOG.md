@@ -4,6 +4,15 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+## 2.1.99
+
+- Fixed remote retained-session switching so xterm replays daemon-retained scrollback instead of remounting from a visible-only vt100 snapshot.
+- Added app-control scrollback expectation fields and smoke assertions that fail when `probe-scroll` is merely accepted but the viewport does not move.
+- Reduced repeated full-canvas repaint nudges during terminal resize/replay paths to keep viewport drag and session switching latency bounded.
+- Seed remote retained Codex sessions from saved JSONL transcript prefill when the live multiplexer snapshot is empty, avoiding shallow prompt-only restores after clean daemon starts.
+- Strip remote attach protocol markers such as `__YGGTERM_ATTACH_READY__` before vt100 parsing, retained replay, app-control text samples, and smoke assertions.
+- Added `server terminal write <session>` as the app-owned terminal input path and disabled desktop-wide synthetic typing unless explicitly opted in, preventing jojo/KDE input from leaking into other apps.
+
 ## 2.1.98
 
 - Restored native Codex TUI color richness by disabling xterm.js minimum-contrast palette rewriting for terminal surfaces.
