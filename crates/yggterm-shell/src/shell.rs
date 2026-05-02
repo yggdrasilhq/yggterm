@@ -83,10 +83,11 @@ use yggterm_core::{
     SessionStore, WorkspaceDocumentInput, WorkspaceDocumentKind, WorkspaceGroupKind,
     YGGTERM_DESKTOP_APP_ID, append_bounded_jsonl_record, append_perf_event, append_trace_event,
     best_effort_precis_from_context, best_effort_summary_from_context,
-    best_effort_title_from_context, check_for_update, current_version, install_mode_summary,
-    install_release_update_with_progress, looks_like_generated_fallback_title,
-    looks_like_low_signal_generated_copy, read_codex_session_identity_fields, resolve_yggterm_home,
-    save_settings_file, unique_session_short_ids_for_pairs, update_command_hint,
+    best_effort_title_from_context, check_for_update, current_version, detect_install_context,
+    install_mode_summary, install_release_update_with_progress,
+    looks_like_generated_fallback_title, looks_like_low_signal_generated_copy,
+    read_codex_session_identity_fields, resolve_yggterm_home, save_settings_file,
+    unique_session_short_ids_for_pairs, update_command_hint,
 };
 use yggterm_platform::{DockRect, configure_background_service_command, send_user_notification};
 #[cfg(unix)]
@@ -6665,11 +6666,16 @@ fn spawn_initial_browser_tree_load(
     });
 }
 fn restart_into_pending_update(mut state: Signal<ShellState>) {
-    let pending = state.read().pending_update_restart.clone();
+    let pending = state
+        .read()
+        .pending_update_restart
+        .clone()
+        .or_else(pending_restart_from_active_install_state_for_current_exe);
     let Some(update) = pending else {
         return;
     };
     state.with_mut(|shell| {
+        shell.pending_update_restart = Some(update.clone());
         shell.last_action = format!("restarting into {}", update.version);
     });
     spawn(async move {
@@ -6848,6 +6854,32 @@ fn update_available_suffix_for_context(context: &InstallContext) -> String {
     }
 }
 
+fn pending_restart_from_active_install_state(current_exe: &Path) -> Option<PendingUpdateRestart> {
+    let context = detect_install_context(current_exe).ok()?;
+    let preferred = context.preferred_executable?;
+    if !preferred.is_file() {
+        return None;
+    }
+    let current = current_exe
+        .canonicalize()
+        .unwrap_or_else(|_| current_exe.to_path_buf());
+    let preferred_canonical = preferred
+        .canonicalize()
+        .unwrap_or_else(|_| preferred.clone());
+    if current == preferred_canonical {
+        return None;
+    }
+    Some(PendingUpdateRestart {
+        version: context.current_version,
+        executable: preferred,
+    })
+}
+
+fn pending_restart_from_active_install_state_for_current_exe() -> Option<PendingUpdateRestart> {
+    let current_exe = std::env::current_exe().ok()?;
+    pending_restart_from_active_install_state(&current_exe)
+}
+
 fn apply_update_install_progress(
     shell: &mut ShellState,
     version: &str,
@@ -6901,6 +6933,9 @@ fn spawn_update_workflow(mut state: Signal<ShellState>, trigger: UpdateWorkflowT
         let (event_tx, mut event_rx) = mpsc::unbounded_channel::<UpdateWorkflowEvent>();
         let mut worker = Box::pin(task::spawn_blocking(
             move || -> Result<UpdateWorkflowOutcome> {
+                if let Some(update) = pending_restart_from_active_install_state_for_current_exe() {
+                    return Ok(UpdateWorkflowOutcome::Installed(update));
+                }
                 let Some(update) = check_for_update(&install_context)? else {
                     return Ok(UpdateWorkflowOutcome::NoUpdate);
                 };
@@ -56771,6 +56806,60 @@ q to quit   pgup/pgdn to page   enter to edit message
             context.preferred_executable.as_deref(),
             Some(Path::new("/tmp/yggterm-2.1.9"))
         );
+    }
+
+    #[test]
+    fn pending_restart_from_active_install_state_detects_external_direct_update() {
+        let root = std::env::temp_dir().join(format!(
+            "yggterm-active-install-restart-{}",
+            current_millis()
+        ));
+        let old_dir = root.join("versions").join("2.1.93");
+        let next_dir = root.join("versions").join("2.1.94");
+        let old_exe = old_dir.join("yggterm");
+        let next_exe = next_dir.join("yggterm");
+        fs::create_dir_all(&old_dir).expect("create old version dir");
+        fs::create_dir_all(&next_dir).expect("create next version dir");
+        fs::write(&old_exe, b"old").expect("write old executable marker");
+        fs::write(&next_exe, b"next").expect("write next executable marker");
+        yggterm_core::write_direct_install_state(
+            &root,
+            "yggdrasilhq/yggterm",
+            "linux-x86_64",
+            "2.1.94",
+            &next_exe,
+        )
+        .expect("write direct install state");
+
+        let pending = pending_restart_from_active_install_state(&old_exe)
+            .expect("active direct install should be restartable");
+
+        assert_eq!(pending.version, "2.1.94");
+        assert_eq!(pending.executable, next_exe);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn pending_restart_from_active_install_state_ignores_current_active_executable() {
+        let root = std::env::temp_dir().join(format!(
+            "yggterm-active-install-current-{}",
+            current_millis()
+        ));
+        let version_dir = root.join("versions").join("2.1.94");
+        let current_exe = version_dir.join("yggterm");
+        fs::create_dir_all(&version_dir).expect("create version dir");
+        fs::write(&current_exe, b"current").expect("write current executable marker");
+        yggterm_core::write_direct_install_state(
+            &root,
+            "yggdrasilhq/yggterm",
+            "linux-x86_64",
+            "2.1.94",
+            &current_exe,
+        )
+        .expect("write direct install state");
+
+        assert!(pending_restart_from_active_install_state(&current_exe).is_none());
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
