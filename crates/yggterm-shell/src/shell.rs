@@ -36971,7 +36971,7 @@ fn local_terminal_attach_ready_output(
         || terminal_chunk_has_codex_prompt_output(host_health_cursor_line_text)
         || terminal_chunk_has_codex_prompt_output(host_health_text_tail)
 }
-const TERMINAL_FONT_FAMILY: &str = "'Iosevka Term', 'JetBrains Mono', 'Fira Code', monospace";
+const TERMINAL_FONT_FAMILY: &str = "'JetBrains Mono', 'DejaVu Sans Mono', 'Fira Code', monospace";
 fn terminal_hex_channel(value: &str) -> Option<u8> {
     u8::from_str_radix(value, 16).ok()
 }
@@ -37075,8 +37075,10 @@ fn terminal_cursor_muted(theme: &TerminalTheme) -> String {
 }
 fn terminal_minimum_contrast_ratio(theme: &TerminalTheme) -> f32 {
     let _ = theme;
-    // Match VS Code's integrated terminal default. Higher values wash out ANSI palettes.
-    4.5
+    // Preserve the terminal application's ANSI palette exactly. xterm.js'
+    // contrast rewrite path makes Codex TUI colors look washed out compared
+    // with native terminals such as Ghostty.
+    1.0
 }
 fn relative_terminal_luminance_from_hex(color: &str) -> Option<f32> {
     let (red, green, blue) = parse_terminal_hex_rgb(color)?;
@@ -46773,11 +46775,11 @@ mod tests {
     }
 
     #[test]
-    fn terminal_minimum_contrast_ratio_matches_vscode_default() {
+    fn terminal_minimum_contrast_ratio_preserves_native_ansi_palette() {
         let light = terminal_theme(UiTheme::ZedLight, palette(UiTheme::ZedLight), 13.0, "");
         let dark = terminal_theme(UiTheme::ZedDark, palette(UiTheme::ZedDark), 13.0, "");
-        assert_eq!(terminal_minimum_contrast_ratio(&light), 4.5);
-        assert_eq!(terminal_minimum_contrast_ratio(&dark), 4.5);
+        assert_eq!(terminal_minimum_contrast_ratio(&light), 1.0);
+        assert_eq!(terminal_minimum_contrast_ratio(&dark), 1.0);
     }
 
     #[test]
