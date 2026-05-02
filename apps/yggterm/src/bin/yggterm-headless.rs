@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use std::io::Read;
 use std::path::Path;
 use std::process::Command;
 use yggterm_core::{InstallContext, SessionStore, detect_install_context};
@@ -21,7 +22,7 @@ use yggterm_server::{
     run_app_control_set_session_keep_alive, run_app_control_set_window_chrome_hover,
     run_app_control_trigger_update_check, run_attach, run_daemon, run_screenrecord_capture,
     run_screenshot_capture, run_trace_bundle, run_trace_follow, run_trace_tail, shutdown, snapshot,
-    status, try_run_remote_server_command,
+    status, terminal_write, try_run_remote_server_command,
 };
 
 #[path = "../headless_monitor.rs"]
@@ -87,6 +88,7 @@ fn print_server_help() {
   yggterm-headless server status
   yggterm-headless server snapshot
   yggterm-headless server shutdown
+  yggterm-headless server terminal write <session> (--data <data>|--stdin)
   yggterm-headless server monitor --scenario <panic-report|server-list|latency-check|wait-session|hot-restart|managed-cli-refresh>
   yggterm-headless server trace <tail|follow|bundle>
   yggterm-headless server screenshot <target> [output]
@@ -298,6 +300,31 @@ fn main() -> Result<()> {
                 .map(String::as_str)
                 .filter(|value| !value.is_empty()),
         );
+    }
+    if args.len() >= 5 && args[0] == "server" && args[1] == "terminal" && args[2] == "write" {
+        ensure_local_server_ready_for_cli(&store)?;
+        let endpoint = default_endpoint(store.home_dir());
+        let data = if args.iter().any(|arg| arg == "--stdin") {
+            let mut value = String::new();
+            std::io::stdin()
+                .read_to_string(&mut value)
+                .context("reading terminal write stdin")?;
+            value
+        } else {
+            cli_flag_value(&args, "--data")
+                .context("missing --data or --stdin for server terminal write")?
+                .to_string()
+        };
+        terminal_write(&endpoint, &args[3], &data)?;
+        println!(
+            "{}",
+            serde_json::to_string(&serde_json::json!({
+                "accepted": true,
+                "session_path": args[3],
+                "bytes": data.len(),
+            }))?
+        );
+        return Ok(());
     }
     if let Some(monitor_args) = normalize_monitor_args(&args) {
         return headless_monitor::run(monitor_args);
