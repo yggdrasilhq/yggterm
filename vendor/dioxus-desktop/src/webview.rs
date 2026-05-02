@@ -355,6 +355,7 @@ impl WebviewInstance {
 
         let page_loaded = AtomicBool::new(false);
 
+        let requested_webview_visible = cfg.window.window.visible;
         let mut webview = WebViewBuilder::new_with_web_context(&mut web_context)
             .with_bounds(wry::Rect {
                 position: wry::dpi::Position::Logical(wry::dpi::LogicalPosition::new(0.0, 0.0)),
@@ -364,6 +365,7 @@ impl WebviewInstance {
                 )),
             })
             .with_transparent(cfg.window.window.transparent)
+            .with_visible(requested_webview_visible)
             .with_url("dioxus://index.html/")
             .with_ipc_handler(ipc_handler)
             .with_navigation_handler(move |var| {

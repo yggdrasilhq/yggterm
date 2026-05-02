@@ -171,9 +171,13 @@ impl InnerWebView {
       // with alternating value.
       // calling gtk_window.show_all() then hiding it again
       // seems to fix the issue.
+      if !visible {
+        gtk_window.set_opacity(0.0);
+      }
       gtk_window.show_all();
       if !visible {
         let _ = w.set_visible(false);
+        gtk_window.set_opacity(1.0);
       }
 
       w.x11.replace(X11Data {
@@ -892,6 +896,7 @@ impl InnerWebView {
     if let Some(x11_data) = &self.x11 {
       if x11_data.is_child {
         if visible {
+          x11_data.gtk_window.set_opacity(1.0);
           x11_data.gtk_window.show_all();
         } else {
           x11_data.gtk_window.hide();

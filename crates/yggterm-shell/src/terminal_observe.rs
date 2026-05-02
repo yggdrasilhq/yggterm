@@ -1067,6 +1067,10 @@ fn terminal_host_geometry_problem_for_app_control(host: &Value) -> Option<&'stat
         .get("scrollback_locked")
         .and_then(Value::as_bool)
         .unwrap_or(false);
+    let fit_overflow_px = host
+        .get("fit_overflow_px")
+        .and_then(Value::as_f64)
+        .unwrap_or(0.0);
     let cursor_expected_top = host
         .get("cursor_expected_rect")
         .and_then(|value| value.get("top"))
@@ -1134,9 +1138,12 @@ fn terminal_host_geometry_problem_for_app_control(host: &Value) -> Option<&'stat
         && let Some(cursor_top) = cursor_expected_top
     {
         let cursor_bottom = cursor_top + cursor_expected_height;
-        if host_bottom >= 120.0 && cursor_bottom > host_bottom + 4.0 {
+        if host_bottom >= 120.0 && cursor_bottom > host_bottom + 0.5 {
             return Some("active terminal cursor row is clipped below the visible host");
         }
+    }
+    if !scrollback_locked && fit_overflow_px > 0.05 {
+        return Some("active terminal xterm rows exceed the visible host height");
     }
     if helpers_width >= 200.0
         && host_width >= 200.0
