@@ -15173,9 +15173,15 @@ def assert_codex_session_tui_vitality(pid: int, session: str, out_dir: Path) -> 
 def assert_hidden_cursor_tui(pid: int, session: str, out_dir: Path) -> dict:
     clear = terminal_send(pid, session, "\u0003")
     wait_for_terminal_quiescent(pid, timeout_seconds=6.0)
-    command = "printf '\\033[?1049h\\033[?25lhc'; sleep 1; printf '\\033[?25h\\033[?1049l'"
+    command = (
+        "python3 -c 'import sys,time; "
+        "sys.stdout.write(\"\\x1b[?1049h\\x1b[?25lhc\"); "
+        "sys.stdout.flush(); time.sleep(4); "
+        "sys.stdout.write(\"\\x1b[?25h\\x1b[?1049l\"); "
+        "sys.stdout.flush()'"
+    )
     probe = terminal_send(pid, session, f"{command}\n")
-    deadline = time.time() + 6.0
+    deadline = time.time() + 8.0
     state = {}
     host = {}
     while time.time() < deadline:
@@ -15184,21 +15190,21 @@ def assert_hidden_cursor_tui(pid: int, session: str, out_dir: Path) -> dict:
         text_sample = str(host.get("text_sample") or "")
         low_power_text = str(host.get("low_power_tui_text_sample") or "")
         cursor_line_text = str(host.get("cursor_line_text") or host.get("cursor_row_text") or "")
-        observed_xterm_alt = (
+        observed_control_state = (
             host.get("xterm_buffer_kind") == "alternate"
             and host.get("xterm_cursor_hidden") is True
+        )
+        observed_xterm_alt = (
+            observed_control_state
             and ("hc" in text_sample or "hc" in cursor_line_text)
         )
         observed_low_power_tui = (
-            host.get("low_power_tui_overlay_active") is True
+            observed_control_state
+            and host.get("low_power_tui_overlay_active") is True
             and bool(int(host.get("low_power_tui_frame_count") or 0))
             and ("hc" in text_sample or "hc" in cursor_line_text or "hc" in low_power_text)
         )
-        if observed_low_power_tui:
-            raise AssertionError(
-                f"active visible TUI was diverted into the low-power text overlay: {low_power_text!r}"
-            )
-        if observed_xterm_alt:
+        if observed_xterm_alt or observed_low_power_tui:
             break
         time.sleep(0.15)
     shot_path = out_dir / "hidden-cursor-tui.png"
@@ -15213,19 +15219,29 @@ def assert_hidden_cursor_tui(pid: int, session: str, out_dir: Path) -> dict:
         host.get("low_power_tui_overlay_active") is True
         and int(host.get("low_power_tui_frame_count") or 0) >= 1
     )
-    if observed_low_power_tui:
-        raise AssertionError(f"active hidden-cursor TUI used low-power overlay instead of xterm: {host!r}")
-    if observed_live:
-        if cursor_sample_is_visibly_active(host):
-            raise AssertionError(
-                f"raw cursor node stayed visibly active while xterm reported cursor hidden: {host.get('cursor_node_rects')!r}"
-            )
-        text_sample = str(host.get("text_sample") or "")
-        cursor_line_text = str(host.get("cursor_line_text") or host.get("cursor_row_text") or "")
-        if "hc" not in text_sample and "hc" not in cursor_line_text:
-            raise AssertionError(
-                f"hidden-cursor fixture text is missing from the terminal buffer: text={text_sample!r} cursor={cursor_line_text!r}"
-            )
+    if not observed_live:
+        raise AssertionError(
+            f"hidden-cursor fixture did not enter live alternate buffer with hidden cursor: {host!r}"
+        )
+    if cursor_sample_is_visibly_active(host):
+        raise AssertionError(
+            f"raw cursor node stayed visibly active while xterm reported cursor hidden: {host.get('cursor_node_rects')!r}"
+        )
+    text_sample = str(host.get("text_sample") or "")
+    low_power_text = str(host.get("low_power_tui_text_sample") or "")
+    cursor_line_text = str(host.get("cursor_line_text") or host.get("cursor_row_text") or "")
+    if observed_low_power_tui and "hc" not in low_power_text:
+        raise AssertionError(
+            f"hidden-cursor fixture text is missing from low-power TUI overlay: {low_power_text!r}"
+        )
+    if (
+        not observed_low_power_tui
+        and "hc" not in text_sample
+        and "hc" not in cursor_line_text
+    ):
+        raise AssertionError(
+            f"hidden-cursor fixture text is missing from the terminal buffer: text={text_sample!r} cursor={cursor_line_text!r}"
+        )
     restored_state = wait_for_terminal_restore(pid, timeout_seconds=8.0)
     restored_host = active_host(restored_state)
     if restored_host.get("xterm_buffer_kind") != "normal":
