@@ -337,6 +337,79 @@ def state_summary(state: dict) -> dict:
     }
 
 
+def terminal_quiescent_key(summary: dict) -> tuple:
+    hosts = summary.get("terminal_host_details") or []
+    if not hosts:
+        return tuple()
+    host = hosts[0]
+    return (
+        host.get("render_event_count"),
+        host.get("write_command_count"),
+        host.get("write_bridge_flush_count"),
+        host.get("write_bridge_in_flight"),
+        host.get("write_bridge_pending_chars"),
+        host.get("low_power_tui_overlay_active"),
+        host.get("low_power_tui_frame_count"),
+        host.get("inactive_tui_frame_drop_count"),
+        host.get("cursor_line_text"),
+        host.get("text_tail"),
+    )
+
+
+def wait_for_terminal_quiescent_state(
+    host: str,
+    remote_bin: str,
+    launch_env: dict[str, str],
+    pid: int,
+    timeout_ms: int,
+    *,
+    timeout_seconds: float = 20.0,
+    require_visible: bool = False,
+) -> tuple[dict, dict]:
+    deadline = time.time() + max(1.0, timeout_seconds)
+    last_key: tuple | None = None
+    stable_polls = 0
+    last_summary: dict = {}
+    while time.time() < deadline:
+        state = linux_smoke.wait_for_remote_state(
+            host,
+            remote_bin,
+            launch_env,
+            pid,
+            timeout_ms,
+            timeout_seconds=5.0,
+            require_visible=require_visible,
+        )
+        summary = state_summary(state)
+        key = terminal_quiescent_key(summary)
+        hosts = summary.get("terminal_host_details") or []
+        host_summary = hosts[0] if hosts else {}
+        idle_bridge = (
+            host_summary.get("write_bridge_in_flight") is not True
+            and int(host_summary.get("write_bridge_pending_chars") or 0) == 0
+            and host_summary.get("low_power_tui_overlay_active") is not True
+        )
+        if key and key == last_key and idle_bridge:
+            stable_polls += 1
+            if stable_polls >= 2:
+                return state, {
+                    "quiescent": True,
+                    "stable_polls": stable_polls,
+                    "key": key,
+                }
+        else:
+            stable_polls = 0
+            last_key = key
+        last_summary = summary
+        time.sleep(1.0)
+    return state, {
+        "quiescent": False,
+        "stable_polls": stable_polls,
+        "last_key": last_key,
+        "last_summary": last_summary,
+    }
+
+
 def remote_cpu_sample(host: str, label: str, pid: int, home: str, duration_sec: float) -> dict:
     snippet = (
         CPU_SAMPLE_SNIPPET.replace("%ROOT_PID%", str(pid))
@@ -586,6 +659,17 @@ def main() -> int:
             or background_shell_focused is False
         )
         summary["background_effective"] = background_effective
+        quiescent_state, quiescence = wait_for_terminal_quiescent_state(
+            args.host,
+            remote_bin,
+            launch_env,
+            pid,
+            args.timeout_ms,
+            timeout_seconds=max(6.0, args.settle_sec + 10.0),
+            require_visible=False,
+        )
+        summary["background_quiescence"] = quiescence
+        summary["state_after_background_quiescent"] = state_summary(quiescent_state)
         summary["cpu_terminal_background_idle"] = remote_cpu_sample(
             args.host, "terminal_background_idle", pid, remote_home, args.sample_sec
         )
@@ -602,6 +686,17 @@ def main() -> int:
             args.host, remote_bin, launch_env, pid, args.timeout_ms, timeout_seconds=30.0
         )
         summary["state_after_refocus"] = state_summary(state)
+        refocus_quiescent_state, refocus_quiescence = wait_for_terminal_quiescent_state(
+            args.host,
+            remote_bin,
+            launch_env,
+            pid,
+            args.timeout_ms,
+            timeout_seconds=max(6.0, args.settle_sec + 10.0),
+            require_visible=False,
+        )
+        summary["refocus_quiescence"] = refocus_quiescence
+        summary["state_after_refocus_quiescent"] = state_summary(refocus_quiescent_state)
         summary["cpu_terminal_refocused_idle"] = remote_cpu_sample(
             args.host, "terminal_refocused_idle", pid, remote_home, args.sample_sec
         )

@@ -243,6 +243,7 @@ const BACKGROUND_REFRESH_POLL_MS: u64 = 15_000;
 const REMOTE_MACHINE_REFRESH_QUEUED_RETRY_MS: u64 = 60_000;
 const LIVE_SESSION_SNAPSHOT_TRIGGER_DEBOUNCE_MS: u64 = 360;
 const LIVE_SESSION_SNAPSHOT_BUSY_POLL_MS: u64 = 2_500;
+const LIVE_SESSION_SNAPSHOT_BACKGROUND_BUSY_POLL_MS: u64 = 15_000;
 const LIVE_SESSION_SNAPSHOT_IDLE_POLL_MS: u64 = 60_000;
 const LIVE_SESSION_SNAPSHOT_NUDGE_INTERVAL_MS: u64 = 250;
 const LIVE_SESSION_SNAPSHOT_NUDGE_POLLS: usize = 3;
@@ -8272,13 +8273,15 @@ fn shell_has_live_session_snapshot_refresh_target(shell: &ShellState) -> bool {
     !shell.server.live_sessions().is_empty()
 }
 fn shell_live_session_snapshot_refresh_interval_ms(shell: &ShellState) -> u64 {
-    if shell
+    let busy = shell
         .server
         .live_sessions()
         .iter()
-        .any(|session| session.terminal_foreground_active == Some(true))
-    {
+        .any(|session| session.terminal_foreground_active == Some(true));
+    if busy && shell.window_focused {
         LIVE_SESSION_SNAPSHOT_BUSY_POLL_MS
+    } else if busy {
+        LIVE_SESSION_SNAPSHOT_BACKGROUND_BUSY_POLL_MS
     } else {
         LIVE_SESSION_SNAPSHOT_IDLE_POLL_MS
     }
@@ -39888,6 +39891,10 @@ fn terminal_eval_script_with_canvas_renderer(
                 if (lowPowerTuiOverlay) {{
                     lowPowerTuiOverlay.style.display = 'none';
                     lowPowerTuiOverlay.textContent = '';
+                    if (typeof lowPowerTuiOverlay.remove === 'function') {{
+                        lowPowerTuiOverlay.remove();
+                    }}
+                    lowPowerTuiOverlay = null;
                 }}
             }} catch (_error) {{}}
             lowPowerTuiActive = false;
@@ -39988,6 +39995,24 @@ fn terminal_eval_script_with_canvas_renderer(
             const value = String(payload || '');
             return value.includes('\x1b') && !stripAnsiForLowPowerTui(value).trim();
         }};
+        const terminalPayloadContainsCodexWelcomeSurface = (payload) => {{
+            const value = String(payload || '');
+            return value.includes('OpenAI Codex') && value.includes('/model to change');
+        }};
+        const lowPowerTuiXtermControlPrefix = (payload) => {{
+            const value = String(payload || '');
+            let prefix = '';
+            if (value.includes('\x1b[?1049h')) {{
+                prefix += '\x1b[?1049h';
+            }}
+            if (value.includes('\x1b[?25l')) {{
+                prefix += '\x1b[?25l';
+            }}
+            if (!prefix && value.includes('\x1b[2J')) {{
+                prefix = '\x1b[?25l';
+            }}
+            return prefix;
+        }};
         const lowPowerTuiTextFromPayload = (payload) => {{
             const frame = coalesceHighVolumeTerminalPayload(String(payload || ''))
                 .replace(/\x1b\[\?1049[hl]/g, '');
@@ -40059,6 +40084,7 @@ fn terminal_eval_script_with_canvas_renderer(
             const entersAltScreen = value.includes('\x1b[?1049h');
             const frameLike = terminalPayloadLooksHighVolumeFrame(value);
             const protocolOnly = terminalPayloadLooksProtocolOnly(value);
+            const codexWelcome = terminalPayloadContainsCodexWelcomeSurface(value);
             const activeRenderSurface = hostIsActiveRenderSurface();
             if (!tracedTuiFilterProbe && (value.includes('?1049') || value.includes('\x1b[?25l') || frameLike || protocolOnly)) {{
                 tracedTuiFilterProbe = true;
@@ -40088,9 +40114,13 @@ fn terminal_eval_script_with_canvas_renderer(
                 hideLowPowerTuiOverlay();
                 return value;
             }}
-            if (activeRenderSurface && entersAltScreen) {{
-                hideLowPowerTuiOverlay();
-                return value;
+            if (activeRenderSurface && !codexWelcome && (lowPowerTuiActive || entersAltScreen || frameLike)) {{
+                if (renderLowPowerTuiPayload(value)) {{
+                    return lowPowerTuiXtermControlPrefix(value);
+                }}
+                if (lowPowerTuiActive || protocolOnly) {{
+                    return '';
+                }}
             }}
             if (activeRenderSurface && lowPowerTuiActive) {{
                 hideLowPowerTuiOverlay();
@@ -40155,8 +40185,7 @@ fn terminal_eval_script_with_canvas_renderer(
             payload = coalesceHighVolumeTerminalPayload(payload);
             const paintRepairReason = (
                 retainedWritePaintRepairCount < 3
-                || rawPayloadLength >= 4096
-                || rawFrameLike
+                || (rawPayloadLength >= 4096 && !rawFrameLike)
             ) ? `write_flush_retained len=${{rawPayloadLength}} frame=${{rawFrameLike}}` : '';
             entry.writeBridgeInFlight = true;
                 entry.writeBridgeFlushCount = Number(entry.writeBridgeFlushCount || 0) + 1;
@@ -46039,8 +46068,12 @@ mod tests {
         assert!(
             script.contains("const scheduleRetainedWritePaintRepair = (reason) => {")
                 && script.contains("retainedWritePaintRepairCount < 3")
-                && script.contains("rawPayloadLength >= 4096"),
-            "retained-session and bulk writes should schedule a bounded visible repaint repair for WebKit canvas"
+                && script.contains("(rawPayloadLength >= 4096 && !rawFrameLike)"),
+            "retained-session and non-frame bulk writes should schedule a bounded visible repaint repair for WebKit canvas"
+        );
+        assert!(
+            !script.contains("|| rawFrameLike"),
+            "visible high-volume TUI frames must not force repeated full-canvas paint repairs"
         );
         assert!(
             script.contains("const applyTerminalRowFitGuard = (reason) => {")
@@ -46086,13 +46119,21 @@ mod tests {
             "an offscreen low-power TUI should replay onto xterm when the host becomes visible"
         );
         assert!(
-            script.contains("if (activeRenderSurface && entersAltScreen) {")
-                && script.contains("hideLowPowerTuiOverlay();\n                return value;"),
-            "visible alternate-screen TUI output should stay on the real xterm canvas"
+            script.contains("const terminalPayloadContainsCodexWelcomeSurface = (payload) => {")
+                && script.contains(
+                    "if (activeRenderSurface && !codexWelcome && (lowPowerTuiActive || entersAltScreen || frameLike)) {"
+                )
+                && script.contains("return lowPowerTuiXtermControlPrefix(value);"),
+            "visible high-volume TUI output should use the low-power surface instead of repainting the xterm canvas on every frame"
         );
         assert!(
             script.contains("data-yggterm-low-power-tui"),
             "the low-power TUI surface should be app-control observable"
+        );
+        assert!(
+            script.contains("lowPowerTuiOverlay.remove();")
+                && script.contains("lowPowerTuiOverlay = null;"),
+            "exiting a low-power TUI should remove the overlay node instead of leaving hidden paint state mounted"
         );
         assert!(
             script.contains("const resizeKey = `${term.cols}x${term.rows}`;"),
@@ -53364,6 +53405,33 @@ q to quit   pgup/pgdn to page   enter to edit message
             ssh_prefix: None,
             stored_preview_hydrated: false,
         }
+    }
+    #[test]
+    fn live_session_snapshot_refresh_slows_busy_poll_when_window_unfocused() {
+        let session_path = "local://busy-shell";
+        let mut shell = ShellState::new(test_shell_bootstrap_with_active_session(session_path));
+        let mut busy_session = test_snapshot_session_view(session_path);
+        busy_session.terminal_foreground_active = Some(true);
+        shell.server.apply_snapshot(ServerUiSnapshot {
+            active_session_path: Some(session_path.to_string()),
+            active_session: Some(busy_session.clone()),
+            active_view_mode: WorkspaceViewMode::Terminal,
+            remote_machines: Vec::new(),
+            ssh_targets: Vec::new(),
+            live_sessions: vec![busy_session],
+        });
+
+        shell.set_window_focused(true);
+        assert_eq!(
+            shell_live_session_snapshot_refresh_interval_ms(&shell),
+            LIVE_SESSION_SNAPSHOT_BUSY_POLL_MS
+        );
+
+        shell.set_window_focused(false);
+        assert_eq!(
+            shell_live_session_snapshot_refresh_interval_ms(&shell),
+            LIVE_SESSION_SNAPSHOT_BACKGROUND_BUSY_POLL_MS
+        );
     }
     fn test_browser_tree_with_local_group_sessions() -> SessionNode {
         SessionNode {
