@@ -1,3 +1,11 @@
+yggterm (2.1.97-1) unstable; urgency=medium
+
+  * Fit xterm.js directly from live terminal host geometry.
+  * Coalesce terminal viewport resize events and rate-limit PTY resizes.
+  * Add terminal viewport resize smoke coverage for stale xterm canvases.
+
+ -- Yggdrasil HQ <avi@gour.top>  Sat, 02 May 2026 22:38:47 +0530
+
 yggterm (2.1.85-1) unstable; urgency=medium
 
   * Recover stale local startup-restore terminal mounts instead of leaving a
