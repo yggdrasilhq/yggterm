@@ -11058,6 +11058,81 @@ def wait_for_terminal_zoom_contract(
     )
 
 
+def assert_terminal_viewport_resize_refits_xterm(pid: int, session: str, out_dir: Path) -> dict:
+    app_set_search(pid, "", focused=False)
+    state = wait_for_session_focus(pid, session, timeout_seconds=10.0)
+    if titlebar_transient_open(state):
+        state = dismiss_titlebar_transients(pid, state, timeout_seconds=1.5)
+    if right_panel_mode(state) not in ("", "hidden", "none", "null"):
+        state = close_right_panel(pid, state, timeout_seconds=1.5)
+    if bool(((state.get("window") or {}).get("maximized"))):
+        app_set_maximized(pid, False)
+        state = wait_for_window_maximized(pid, False) or app_state(pid)
+    wait_for_notifications_clear(pid, timeout_seconds=6.0)
+
+    def fit_summary(sample_state: dict) -> dict:
+        host = host_for_session(sample_state, session)
+        host_rect = host.get("host_rect") or {}
+        dims = host.get("xterm_dimensions") or {}
+        cell_height = float(dims.get("css_cell_height") or host.get("cell_height_px") or 18.0)
+        cell_width = float(dims.get("css_cell_width") or 8.0)
+        return {
+            "cols": int(host.get("cols") or 0),
+            "rows": int(host.get("rows") or 0),
+            "host_width": float(host_rect.get("width") or 0.0),
+            "host_height": float(host_rect.get("height") or 0.0),
+            "canvas_width": float(dims.get("css_canvas_width") or 0.0),
+            "canvas_height": float(dims.get("css_canvas_height") or 0.0),
+            "cell_width": cell_width,
+            "cell_height": cell_height,
+            "fit_overflow_px": float(host.get("fit_overflow_px") or 0.0),
+            "cursor_bottom_overflow_px": float(host.get("cursor_bottom_overflow_px") or 0.0),
+            "geometry_problem": ((sample_state.get("viewport") or {}).get("active_terminal_surface") or {}).get("geometry_problem"),
+            "surface_problem": ((sample_state.get("viewport") or {}).get("active_terminal_surface") or {}).get("problem"),
+        }
+
+    def fit_is_healthy(sample_state: dict) -> bool:
+        summary = fit_summary(sample_state)
+        if summary["host_width"] < 640 or summary["host_height"] < 460:
+            return False
+        expected_cols = int(summary["host_width"] / max(1.0, summary["cell_width"]))
+        expected_rows = int((summary["host_height"] - 2.0) / max(1.0, summary["cell_height"]))
+        if summary["cols"] < max(40, expected_cols - 1):
+            return False
+        if summary["rows"] < max(12, expected_rows - 1):
+            return False
+        if summary["canvas_width"] < summary["host_width"] - max(4.0, summary["cell_width"]):
+            return False
+        if summary["canvas_height"] < summary["host_height"] - max(24.0, summary["cell_height"] + 8.0):
+            return False
+        if summary["fit_overflow_px"] > 0.05 or summary["cursor_bottom_overflow_px"] > 0.5:
+            return False
+        if summary["geometry_problem"]:
+            return False
+        return True
+
+    samples = {}
+    for label, width, height in (
+        ("compact", 980, 660),
+        ("wide", 1460, 920),
+    ):
+        resize = app_resize_window(pid, width, height)
+        settled = wait_for_probe(
+            lambda: app_state(pid),
+            fit_is_healthy,
+            timeout_seconds=8.0,
+            description=f"terminal viewport {label} resize refit",
+        )
+        shot_path = out_dir / f"terminal-viewport-resize-{label}.png"
+        app_screenshot(pid, shot_path)
+        samples[label] = {
+            "resize": resize,
+            "summary": fit_summary(settled),
+            "screenshot": str(shot_path),
+        }
+    return samples
+
+
 def assert_terminal_zoom_live_apply(pid: int, session: str, out_dir: Path) -> dict:
     app_set_search(pid, "", focused=False)
     state = wait_for_session_focus(pid, session, timeout_seconds=10.0)
@@ -15462,6 +15537,7 @@ def main() -> int:
         "cursor_mouse_hold",
         "live_sessions_restore",
         "selection",
+        "terminal_viewport_resize",
         "terminal_interaction_latency",
         "terminal_interactive_lifecycle",
         "terminal_delete_key",
@@ -15733,6 +15809,10 @@ def main() -> int:
         run_check(
             "terminal_interaction_latency",
             lambda: assert_terminal_interaction_latency(args.pid, late_phase_session),
+        )
+        run_check(
+            "terminal_viewport_resize",
+            lambda: assert_terminal_viewport_resize_refits_xterm(args.pid, late_phase_session, out_dir),
         )
         if args.session_kind == "plain":
             run_check("clipboard_image", lambda: assert_clipboard_image_contract(
