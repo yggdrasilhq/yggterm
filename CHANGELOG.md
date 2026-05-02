@@ -4,6 +4,13 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+## 2.1.91
+
+### Fixed
+
+- render active high-volume alternate-screen TUI frames through the low-power terminal surface instead of repainting the xterm canvas on every frame, cutting jojo active-TUI CPU below the smoke budget while keeping input routed through the live terminal
+- bound retained paint-repair refreshes for frame-like terminal output so TUI redraws do not multiply into repeated full-canvas refresh work
+
 ## 2.1.90
 
 ### Fixed
