@@ -4,6 +4,13 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+## 2.1.95
+
+### Fixed
+
+- keep KDE/X11 startup windows hidden through the WebKitGTK child-window bootstrap, preventing the transient square-corner flash before Yggterm applies its rounded native shape
+- size xterm.js rows from fractional viewport geometry with a bottom guard, and report sub-pixel row-fit overflow through app-control so clipped prompt/footer rows fail smoke coverage
+
 ## 2.1.94
 
 ### Fixed
