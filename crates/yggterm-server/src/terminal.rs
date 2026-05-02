@@ -128,6 +128,12 @@ impl TerminalManager {
             .is_some_and(|session| session.hit_eof_without_output())
     }
 
+    pub fn session_initial_read_has_scrollback(&self, key: &str) -> bool {
+        self.sessions
+            .get(key)
+            .is_some_and(|session| session.initial_read_has_scrollback())
+    }
+
     pub fn session_runtime_age_ms(&self, key: &str) -> Option<u64> {
         self.sessions.get(key).map(|session| session.age_ms())
     }
@@ -502,12 +508,23 @@ impl PtySessionRuntime {
                     match reader.read(&mut buffer) {
                         Ok(0) => break,
                         Ok(bytes) => {
-                            let data = String::from_utf8_lossy(&buffer[..bytes]).to_string();
+                            let raw_data = String::from_utf8_lossy(&buffer[..bytes]).to_string();
+                            let (data, stripped_attach_ready_marker) =
+                                if launch_command_looks_like_remote_resume_attach(
+                                    &launch_command_label,
+                                ) {
+                                    terminal_data_without_attach_ready_markers(&raw_data)
+                                } else {
+                                    (raw_data, false)
+                                };
                             if data.is_empty() {
+                                if stripped_attach_ready_marker {
+                                    reader_activity.store(now_millis(), Ordering::SeqCst);
+                                }
                                 continue;
                             }
                             if let Ok(mut screen_state) = reader_screen_state.lock() {
-                                screen_state.process(&buffer[..bytes]);
+                                screen_state.process(data.as_bytes());
                             }
                             if !saw_any_output {
                                 saw_any_output = true;
@@ -699,11 +716,28 @@ impl PtySessionRuntime {
             terminal_key_prefers_initial_screen_snapshot(&self.key, &self.launch_command);
         let mut chunks = if cursor == 0 {
             if prefer_initial_screen_snapshot {
-                self.screen_snapshot_chunk(next_cursor)
-                    .into_iter()
-                    .collect::<Vec<_>>()
+                let retained_initial = select_remote_retained_initial_chunks(
+                    &self.key,
+                    &self.launch_command,
+                    &retained_chunks,
+                );
+                if initial_remote_attach_should_preserve_retained_chunks(
+                    &self.key,
+                    &self.launch_command,
+                    &retained_initial,
+                ) {
+                    retained_initial
+                } else {
+                    self.screen_snapshot_chunk(next_cursor)
+                        .into_iter()
+                        .collect::<Vec<_>>()
+                }
             } else {
-                select_initial_attach_chunks_for_launch(&retained_chunks, &self.launch_command)
+                select_remote_retained_initial_chunks(
+                    &self.key,
+                    &self.launch_command,
+                    &retained_chunks,
+                )
             }
         } else {
             retained_chunks
@@ -737,6 +771,13 @@ impl PtySessionRuntime {
             runtime_output_seen: self.has_runtime_output(),
             eof_without_output: self.eof_without_output.load(Ordering::SeqCst),
         }
+    }
+
+    fn initial_read_has_scrollback(&self) -> bool {
+        self.read(0)
+            .chunks
+            .iter()
+            .any(|chunk| terminal_chunk_has_scrollback_text(&chunk.data))
     }
 
     fn buffer_usage(&self) -> (usize, usize) {
@@ -939,6 +980,49 @@ fn terminal_key_prefers_initial_screen_snapshot(key: &str, launch_command: &str)
         || launch_command_looks_like_remote_resume_attach(launch_command)
 }
 
+fn initial_remote_attach_should_preserve_retained_chunks(
+    key: &str,
+    launch_command: &str,
+    chunks: &[TerminalChunk],
+) -> bool {
+    if !(key.starts_with("remote-session://")
+        || launch_command_looks_like_remote_resume_attach(launch_command))
+    {
+        return false;
+    }
+    chunks
+        .iter()
+        .any(|chunk| terminal_chunk_has_meaningful_attach_text(&chunk.data))
+}
+
+fn select_remote_retained_initial_chunks(
+    key: &str,
+    launch_command: &str,
+    chunks: &VecDeque<TerminalChunk>,
+) -> Vec<TerminalChunk> {
+    let mut selected = select_initial_attach_chunks_for_launch(chunks, launch_command);
+    if !(key.starts_with("remote-session://")
+        || launch_command_looks_like_remote_resume_attach(launch_command))
+        || selected
+            .iter()
+            .any(|chunk| terminal_chunk_has_scrollback_text(&chunk.data))
+    {
+        return selected;
+    }
+    let Some(seed) = chunks
+        .iter()
+        .find(|chunk| terminal_chunk_has_scrollback_text(&chunk.data))
+        .cloned()
+    else {
+        return selected;
+    };
+    selected.retain(|chunk| chunk.seq != seed.seq);
+    let mut merged = Vec::with_capacity(selected.len().saturating_add(1));
+    merged.push(seed);
+    merged.extend(selected);
+    merged
+}
+
 fn shell_uses_bash_prompt_cwd() -> bool {
     std::env::var("SHELL")
         .ok()
@@ -1070,12 +1154,28 @@ fn select_initial_attach_tail(
 }
 
 fn terminal_chunk_has_visible_text(data: &str) -> bool {
-    let stripped = strip_terminal_control_sequences(data);
+    let (data, _) = terminal_data_without_attach_ready_markers(data);
+    let stripped = strip_terminal_control_sequences(&data);
     stripped.chars().any(|ch| !ch.is_whitespace())
 }
 
+pub fn terminal_data_has_scrollback_text(data: &str) -> bool {
+    terminal_chunk_has_scrollback_text(data)
+}
+
+fn terminal_chunk_has_scrollback_text(data: &str) -> bool {
+    let (data, _) = terminal_data_without_attach_ready_markers(data);
+    let stripped = strip_terminal_control_sequences(&data);
+    let non_empty_lines = stripped
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .count();
+    non_empty_lines >= usize::from(DEFAULT_ROWS).saturating_add(4)
+}
+
 fn terminal_chunk_has_meaningful_attach_text(data: &str) -> bool {
-    let stripped = strip_terminal_control_sequences(data);
+    let (data, _) = terminal_data_without_attach_ready_markers(data);
+    let stripped = strip_terminal_control_sequences(&data);
     let lines = stripped
         .lines()
         .map(str::trim)
@@ -1108,10 +1208,11 @@ fn terminal_chunk_has_meaningful_attach_text(data: &str) -> bool {
 }
 
 fn terminal_chunk_is_disposable_initial_attach_suffix(data: &str) -> bool {
-    if data.contains("__YGGTERM_ATTACH_READY__") {
-        return false;
+    let (data, saw_attach_ready_marker) = terminal_data_without_attach_ready_markers(data);
+    if saw_attach_ready_marker && data.trim().is_empty() {
+        return true;
     }
-    let stripped = strip_terminal_control_sequences(data);
+    let stripped = strip_terminal_control_sequences(&data);
     let trimmed = stripped.trim();
     if trimmed.is_empty() {
         return true;
@@ -1129,6 +1230,21 @@ fn terminal_chunk_is_disposable_initial_attach_suffix(data: &str) -> bool {
         return false;
     }
     terminal_chunk_is_low_signal_attach_fragment(&stripped)
+}
+
+fn terminal_data_without_attach_ready_markers(data: &str) -> (String, bool) {
+    if !data.contains("__YGGTERM_ATTACH_READY__") {
+        return (data.to_string(), false);
+    }
+    let mut cleaned = data
+        .lines()
+        .filter(|line| !line.contains("__YGGTERM_ATTACH_READY__"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    if !cleaned.is_empty() && data.ends_with('\n') {
+        cleaned.push('\n');
+    }
+    (cleaned, true)
 }
 
 fn terminal_chunk_is_low_signal_attach_fragment(data: &str) -> bool {
@@ -1599,6 +1715,110 @@ mod tests {
         assert!(selected.len() < chunks.len());
         assert_eq!(selected.first().map(|chunk| chunk.seq), Some(69));
         assert_eq!(selected.last().map(|chunk| chunk.seq), Some(260));
+    }
+
+    #[test]
+    fn initial_remote_resume_attach_preserves_retained_scrollback() {
+        let runtime = PtySessionRuntime::spawn(
+            "remote-session://dev/retained-scrollback",
+            "sh -lc 'sleep 30'",
+            None,
+            None,
+        )
+        .expect("spawn test runtime");
+        let seeded_scrollback = (1..=80)
+            .map(|line| format!("YGG_REMOTE_RETAINED_SCROLLBACK_{line:03}\n"))
+            .collect::<String>();
+        runtime.seed_snapshot(&seeded_scrollback);
+
+        let result = runtime.read(0);
+        let combined = result
+            .chunks
+            .iter()
+            .map(|chunk| chunk.data.as_str())
+            .collect::<String>();
+
+        assert!(combined.contains("YGG_REMOTE_RETAINED_SCROLLBACK_001"));
+        assert!(combined.contains("YGG_REMOTE_RETAINED_SCROLLBACK_080"));
+        assert!(combined.contains("__YGGTERM_ATTACH_READY__"));
+        assert!(
+            combined.matches("YGG_REMOTE_RETAINED_SCROLLBACK_").count() >= 80,
+            "{combined:?}"
+        );
+        runtime.shutdown(None).expect("shutdown test runtime");
+    }
+
+    #[test]
+    fn initial_remote_resume_attach_recovers_older_seed_scrollback_after_tail_noise() {
+        let mut chunks = VecDeque::new();
+        let seed = (1..=80)
+            .map(|line| format!("YGG_REMOTE_SEED_SCROLLBACK_{line:03}\n"))
+            .collect::<String>();
+        chunks.push_back(TerminalChunk { seq: 1, data: seed });
+        for seq in 2..260 {
+            chunks.push_back(TerminalChunk {
+                seq,
+                data: format!("\u{1b}[Htail-frame-{seq}\n"),
+            });
+        }
+
+        let selected = select_remote_retained_initial_chunks(
+            "remote-session://dev/retained-scrollback",
+            "sh -lc 'sleep 30'",
+            &chunks,
+        );
+        let combined = selected
+            .iter()
+            .map(|chunk| chunk.data.as_str())
+            .collect::<String>();
+
+        assert!(combined.contains("YGG_REMOTE_SEED_SCROLLBACK_001"));
+        assert!(combined.contains("YGG_REMOTE_SEED_SCROLLBACK_080"));
+        assert!(combined.contains("tail-frame-259"));
+    }
+
+    #[test]
+    fn terminal_manager_reports_missing_remote_scrollback_after_tail_only() {
+        let mut manager = TerminalManager::new();
+        let key = "remote-session://dev/retained-switch-tail-only";
+        manager
+            .ensure_session(key, "sh -lc 'sleep 30'", None)
+            .expect("spawn test runtime");
+
+        manager
+            .seed_session(key, "› Use /skills to list available skills\n")
+            .expect("seed tail-only runtime");
+        assert!(!manager.session_initial_read_has_scrollback(key));
+
+        let seeded_scrollback = (1..=80)
+            .map(|line| format!("YGG_REMOTE_SWITCH_SCROLLBACK_{line:03}\n"))
+            .collect::<String>();
+        manager
+            .seed_session(key, &seeded_scrollback)
+            .expect("seed retained scrollback");
+        assert!(manager.session_initial_read_has_scrollback(key));
+
+        let summary = manager.shutdown_all(|_| None);
+        assert_eq!(summary.errors, Vec::<String>::new());
+    }
+
+    #[test]
+    fn attach_ready_markers_do_not_count_as_visible_scrollback() {
+        let marker_only = "__YGGTERM_ATTACH_READY__\n".repeat(80);
+
+        assert!(!terminal_chunk_has_visible_text(&marker_only));
+        assert!(!terminal_chunk_has_scrollback_text(&marker_only));
+        assert!(!terminal_chunk_has_meaningful_attach_text(&marker_only));
+        assert!(terminal_chunk_is_disposable_initial_attach_suffix(
+            &marker_only
+        ));
+
+        let (cleaned, saw_marker) = terminal_data_without_attach_ready_markers(&format!(
+            "real output\n{}next output\n",
+            marker_only
+        ));
+        assert!(saw_marker);
+        assert_eq!(cleaned, "real output\nnext output\n");
     }
 
     #[test]

@@ -44,7 +44,7 @@ use yggterm_server::{
     run_app_control_set_ui_theme, run_app_control_set_window_chrome_hover,
     run_app_control_trigger_update_check, run_attach, run_daemon, run_screenrecord_capture,
     run_screenshot_capture, run_trace_bundle, run_trace_follow, run_trace_tail, shutdown, snapshot,
-    start_local_session, status, try_run_remote_server_command,
+    start_local_session, status, terminal_write, try_run_remote_server_command,
 };
 use yggterm_shell::{ShellBootstrap, launch_shell, start_daemon_watchdog, warm_daemon_start};
 use yggui_contract::UiTheme;
@@ -404,6 +404,7 @@ fn print_server_help() {
   yggterm server status
   yggterm server snapshot
   yggterm server shutdown
+  yggterm server terminal write <session> (--data <data>|--stdin)
   yggterm server smoke
   yggterm server trace <tail|follow|bundle>
   yggterm server screenshot <target> [output]
@@ -494,6 +495,31 @@ fn main() -> Result<()> {
                 .map(String::as_str)
                 .filter(|value| !value.is_empty()),
         );
+    }
+    if args.len() >= 5 && args[0] == "server" && args[1] == "terminal" && args[2] == "write" {
+        ensure_local_server_ready_for_cli(&store)?;
+        let endpoint = default_endpoint(store.home_dir());
+        let data = if args.iter().any(|arg| arg == "--stdin") {
+            let mut value = String::new();
+            std::io::stdin()
+                .read_to_string(&mut value)
+                .context("reading terminal write stdin")?;
+            value
+        } else {
+            cli_flag_value(&args, "--data")
+                .context("missing --data or --stdin for server terminal write")?
+                .to_string()
+        };
+        terminal_write(&endpoint, &args[3], &data)?;
+        println!(
+            "{}",
+            serde_json::to_string(&serde_json::json!({
+                "accepted": true,
+                "session_path": args[3],
+                "bytes": data.len(),
+            }))?
+        );
+        return Ok(());
     }
     if try_run_remote_server_command(&args)? {
         return Ok(());

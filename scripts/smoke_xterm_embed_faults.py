@@ -2861,6 +2861,26 @@ def probe_scroll(pid: int, session: str, lines: int, *, timeout_ms: int = 12000,
     raise last_error
 
 
+def scroll_probe_moved(probe: dict) -> bool:
+    before = probe.get("before") or {}
+    after = probe.get("after") or {}
+    return (
+        before.get("viewport_y") != after.get("viewport_y")
+        or before.get("viewport_scroll_top") != after.get("viewport_scroll_top")
+        or before.get("text_head") != after.get("text_head")
+        or before.get("text_tail") != after.get("text_tail")
+        or int(after.get("wheel_event_count") or 0) > int(before.get("wheel_event_count") or 0)
+        or int(after.get("scroll_event_count") or 0) > int(before.get("scroll_event_count") or 0)
+    )
+
+
+def host_expects_scrollback(host: dict) -> bool:
+    return bool(host.get("scrollback_expected")) or (
+        int(host.get("last_raw_payload_line_count") or 0)
+        > int(host.get("rows") or 0) + 4
+    )
+
+
 def probe_type(
     pid: int,
     session: str,
@@ -4112,6 +4132,15 @@ def terminal_host_text(host: dict) -> str:
         if value:
             samples.append(value)
     return "\n".join(samples)
+
+
+def assert_no_attach_ready_protocol_markers(host: dict, context: str) -> None:
+    text = terminal_host_text(host)
+    if "__YGGTERM_ATTACH_READY__" in text:
+        raise AssertionError(
+            f"{context} exposed Yggterm attach-ready protocol markers in the terminal viewport: "
+            f"text_tail={text[-1000:]!r} host={host!r}"
+        )
 
 
 def detect_codex_startup_failure(host: dict) -> dict | None:
@@ -13369,6 +13398,88 @@ def assert_hot_session_switch(pid: int, session: str, session_kind: str, out_dir
     }
 
 
+def assert_remote_session_switch_scrollback(pid: int, session: str, out_dir: Path) -> dict:
+    target_path = normalize_live_path(str(session or "").strip())
+    if not target_path.startswith("remote-session://"):
+        return {"skipped": True, "reason": "target is not a remote retained session"}
+
+    snapshot = server_snapshot()
+    partner = find_hot_switch_partner(snapshot, target_path, "codex")
+    created_partner = None
+    if partner is None:
+        created_partner = app_create_terminal(pid, title="Smoke Remote Switch Partner")
+        partner_path = normalize_live_path(str(created_partner.get("session_path") or "").strip())
+        if not partner_path:
+            raise AssertionError(
+                f"remote switch fallback could not create a disposable partner: {created_partner!r}"
+            )
+        wait_for_interactive_session(pid, partner_path, timeout_seconds=20.0)
+        terminal_send(pid, partner_path, "printf 'remote switch partner ready'\r")
+        wait_for_terminal_quiescent(pid, timeout_seconds=10.0)
+        snapshot = server_snapshot()
+        partner = find_hot_switch_partner(snapshot, target_path, "codex")
+    if partner is None:
+        return {"skipped": True, "reason": "no local hot-switch partner available"}
+
+    partner_path = normalize_live_path(str(partner.get("session_path") or ""))
+    app_open(pid, target_path, view="terminal")
+    initial_state = wait_for_session_focus(pid, target_path, timeout_seconds=15.0)
+    initial_host = host_for_session(initial_state, target_path)
+    assert_no_attach_ready_protocol_markers(initial_host, "remote switch initial")
+    initial_base_y = int(initial_host.get("base_y") or 0)
+    initial_expected = host_expects_scrollback(initial_host)
+    if not initial_expected and initial_base_y <= 0:
+        return {
+            "skipped": True,
+            "reason": "remote session has no observed retained scrollback payload",
+            "base_y": initial_base_y,
+            "last_raw_payload_line_count": int(initial_host.get("last_raw_payload_line_count") or 0),
+            "scrollback_expected": bool(initial_host.get("scrollback_expected")),
+        }
+    initial_scroll = assert_scroll(pid, target_path, initial_state)
+
+    ok, _, detail = app_open_raw(pid, partner_path, view="terminal")
+    if not ok:
+        raise AssertionError(
+            f"remote switch could not open partner: partner={partner_path!r} detail={detail!r}"
+        )
+    partner_state = wait_for_session_focus(pid, partner_path, timeout_seconds=12.0)
+    if normalize_live_path(str(partner_state.get("active_session_path") or "")) != partner_path:
+        raise AssertionError(
+            f"remote switch landed on wrong partner: expected={partner_path!r} state={partner_state!r}"
+        )
+
+    ok, _, detail = app_open_raw(pid, target_path, view="terminal")
+    if not ok:
+        raise AssertionError(
+            f"remote switch could not return to target: target={target_path!r} detail={detail!r}"
+        )
+    final_state = wait_for_session_focus(pid, target_path, timeout_seconds=15.0)
+    if normalize_live_path(str(final_state.get("active_session_path") or "")) != target_path:
+        raise AssertionError(
+            f"remote switch return landed on wrong session: expected={target_path!r} state={final_state!r}"
+        )
+    final_host = host_for_session(final_state, target_path)
+    assert_no_attach_ready_protocol_markers(final_host, "remote switch return")
+    if not host_expects_scrollback(final_host) and int(final_host.get("base_y") or 0) <= 0:
+        raise AssertionError(
+            "remote switch return lost retained scrollback expectation and xterm scrollback: "
+            f"initial_host={initial_host!r} final_host={final_host!r}"
+        )
+    final_scroll = assert_scroll(pid, target_path, final_state)
+    shot_path = out_dir / "remote-switch-scrollback-return.png"
+    app_screenshot(pid, shot_path)
+    return {
+        "partner_path": partner_path,
+        "created_partner": created_partner,
+        "initial_base_y": initial_base_y,
+        "initial_scroll": initial_scroll,
+        "final_base_y": int(final_host.get("base_y") or 0),
+        "final_scroll": final_scroll,
+        "screenshot": str(shot_path),
+    }
+
+
 def assert_sidebar_session_switch_focus_space_scroll(pid: int, session: str, out_dir: Path) -> dict:
     target_path = normalize_live_path(str(session or "").strip())
     if not target_path:
@@ -13482,14 +13593,7 @@ def assert_sidebar_session_switch_focus_space_scroll(pid: int, session: str, out
     scroll_probe = probe_scroll(pid, target_path, -5, retries=1)
     scroll_before = scroll_probe.get("before") or {}
     scroll_after = scroll_probe.get("after") or {}
-    scroll_moved = (
-        scroll_before.get("viewport_y") != scroll_after.get("viewport_y")
-        or scroll_before.get("viewport_scroll_top") != scroll_after.get("viewport_scroll_top")
-        or scroll_before.get("text_head") != scroll_after.get("text_head")
-        or scroll_before.get("text_tail") != scroll_after.get("text_tail")
-        or int(scroll_after.get("wheel_event_count") or 0) > int(scroll_before.get("wheel_event_count") or 0)
-        or int(scroll_after.get("scroll_event_count") or 0) > int(scroll_before.get("scroll_event_count") or 0)
-    )
+    scroll_moved = scroll_probe_moved(scroll_probe)
     if scroll_after.get("input_enabled") is not True:
         raise AssertionError(f"sidebar switch scroll probe left terminal input disabled: {scroll_probe!r}")
     if not scroll_moved:
@@ -14194,6 +14298,12 @@ def assert_terminal_interaction_latency(pid: int, session: str) -> dict:
         )
     if not bool(scroll_data.get("accepted")):
         raise AssertionError(f"terminal scroll probe was not accepted: {scroll_response!r}")
+    scroll_before = scroll_data.get("before") or {}
+    if host_expects_scrollback(scroll_before) and not scroll_probe_moved(scroll_data):
+        raise AssertionError(
+            "terminal scroll probe was accepted but expected scrollback did not move: "
+            f"scroll_data={scroll_data!r}"
+        )
 
     return {
         "focus_elapsed_ms": round(focus_elapsed_ms, 1),
@@ -14206,8 +14316,9 @@ def assert_terminal_interaction_latency(pid: int, session: str) -> dict:
         "type_keyboard_backend": type_data.get("keyboard_backend"),
         "type_used_core_trigger": type_data.get("used_core_trigger"),
         "type_used_term_input": type_data.get("used_term_input"),
-        "scroll_before": scroll_data.get("before"),
+        "scroll_before": scroll_before,
         "scroll_after": scroll_data.get("after"),
+        "scroll_moved": scroll_probe_moved(scroll_data),
         "selected_text_length": int(select_data.get("selected_text_length") or 0),
     }
 
@@ -14246,6 +14357,11 @@ def assert_scroll(pid: int, session: str, before_state: dict) -> dict:
     alternate_mouse_owned = buffer_kind == "alternate" and mouse_tracking_mode not in ("", "none", "None")
     if base_y <= before_viewport_y <= 0:
         if not alternate_mouse_owned:
+            if host_expects_scrollback(host):
+                raise AssertionError(
+                    "scrollback was expected from retained terminal replay, but xterm has no scrollback: "
+                    f"host={host!r}"
+                )
             return {
                 "lines": 0,
                 "before": {
@@ -15830,6 +15946,10 @@ def main() -> int:
                 ))
         if args.session_kind == "codex":
             run_check("status_command", lambda: assert_status_command(args.pid, late_phase_session, out_dir))
+        if late_phase_session.startswith("remote-session://"):
+            run_check("remote_session_switch_scrollback", lambda: assert_remote_session_switch_scrollback(
+                args.pid, late_phase_session, out_dir
+            ))
         if late_phase_session.startswith("local://"):
             run_check("local_tree", lambda: assert_local_tree_placement(args.pid, late_phase_session))
             run_check("sidebar_contract", lambda: assert_sidebar_contract(args.pid, late_phase_session))

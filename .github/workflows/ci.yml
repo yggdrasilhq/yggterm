@@ -69,9 +69,21 @@ jobs:
       - name: Run focused regression tests
         run: |
           cargo test -p yggterm-core --no-default-features linux_desktop_entry_uses_theme_icon_and_canonical_wm_class
+          cargo test -p yggterm-server --no-default-features initial_remote_resume_attach
+          cargo test -p yggterm-server --no-default-features terminal_manager_reports_missing_remote_scrollback_after_tail_only
+          cargo test -p yggterm-server --no-default-features saved_session_reuses_recovered_interrupted_runtime_snapshot
+          cargo test -p yggterm-server --no-default-features remote_resume_seed_snapshot_prefill_keeps_recovered_transcript_after_breakage
+          cargo test -p yggterm-server --no-default-features remote_preview_payload_terminal_prefill_provides_scrollback
           cargo test -p yggterm-shell --no-default-features linux_desktop_app_id_ignores_update_handoff_multi_window_env
+          cargo test -p yggterm-shell --no-default-features retained_ready_remote_host_reuses_bootstrap_on_focus_return
+          cargo test -p yggterm-shell --no-default-features remote_resume_bootstrap_epoch_stays_stable_until_failure
+          cargo test -p yggterm-shell --no-default-features active_retained_remote_session_does_not_bootstrap_again_on_focus_return
+          cargo test -p yggterm-shell --no-default-features retained_rehydrate_script_replays_only_collapsed_xterm_buffers
+          cargo test -p yggterm-shell --no-default-features terminal_eval_script_defers_initial_blank_host_rebuild_until_after_first_paint_probe
+          cargo test -p yggterm-shell --no-default-features terminal_eval_script_throttles_hot_render_bridge_work
           cargo test -p yggterm-shell --no-default-features remote_resume_attach_confirmation_accepts_runtime_prompt_surface_after_deadline
           cargo test -p yggterm-shell --no-default-features remote_resume_visual_reveal_accepts_codex_prompt_ready_tail_after_transcript
+          python3 -m py_compile scripts/smoke_xterm_embed_faults.py
 
       - name: Check shell scripts
         run: |
