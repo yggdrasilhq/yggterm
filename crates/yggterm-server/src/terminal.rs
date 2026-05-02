@@ -74,10 +74,20 @@ impl TerminalManager {
         launch_command: &str,
         cwd: Option<&str>,
     ) -> Result<()> {
+        self.ensure_session_with_size(key, launch_command, cwd, None)
+    }
+
+    pub fn ensure_session_with_size(
+        &mut self,
+        key: &str,
+        launch_command: &str,
+        cwd: Option<&str>,
+        initial_size: Option<(u16, u16)>,
+    ) -> Result<()> {
         if self.sessions.contains_key(key) {
             return Ok(());
         }
-        let runtime = PtySessionRuntime::spawn(key, launch_command, cwd)?;
+        let runtime = PtySessionRuntime::spawn(key, launch_command, cwd, initial_size)?;
         self.sessions.insert(key.to_string(), runtime);
         Ok(())
     }
@@ -225,6 +235,18 @@ impl TerminalManager {
         cwd: Option<&str>,
         stop_command: Option<&str>,
     ) -> Result<()> {
+        self.restart_session_with_size(key, launch_command, cwd, stop_command, None)
+    }
+
+    pub fn restart_session_with_size(
+        &mut self,
+        key: &str,
+        launch_command: &str,
+        cwd: Option<&str>,
+        stop_command: Option<&str>,
+        initial_size: Option<(u16, u16)>,
+    ) -> Result<()> {
+        let (initial_cols, initial_rows) = initial_size.unwrap_or((DEFAULT_COLS, DEFAULT_ROWS));
         trace_terminal_event(
             "restart",
             serde_json::json!({
@@ -232,12 +254,14 @@ impl TerminalManager {
                 "cwd": cwd,
                 "launch_command": launch_command,
                 "stop_command": stop_command,
+                "initial_cols": initial_cols,
+                "initial_rows": initial_rows,
             }),
         );
         if let Some(runtime) = self.sessions.remove(key) {
             runtime.shutdown(stop_command)?;
         }
-        let runtime = PtySessionRuntime::spawn(key, launch_command, cwd)?;
+        let runtime = PtySessionRuntime::spawn(key, launch_command, cwd, initial_size)?;
         self.sessions.insert(key.to_string(), runtime);
         Ok(())
     }
@@ -400,20 +424,31 @@ fn enqueue_terminal_write(
 }
 
 impl PtySessionRuntime {
-    fn spawn(key: &str, launch_command: &str, cwd: Option<&str>) -> Result<Self> {
+    fn spawn(
+        key: &str,
+        launch_command: &str,
+        cwd: Option<&str>,
+        initial_size: Option<(u16, u16)>,
+    ) -> Result<Self> {
+        let (initial_cols, initial_rows) = initial_size.unwrap_or((DEFAULT_COLS, DEFAULT_ROWS));
+        if initial_cols == 0 || initial_rows == 0 {
+            bail!("terminal size must be greater than zero");
+        }
         trace_terminal_event(
             "spawn",
             serde_json::json!({
                 "path": key,
                 "cwd": cwd,
                 "launch_command": launch_command,
+                "initial_cols": initial_cols,
+                "initial_rows": initial_rows,
             }),
         );
         let pty_system = native_pty_system();
         let pair = pty_system
             .openpty(PtySize {
-                rows: DEFAULT_ROWS,
-                cols: DEFAULT_COLS,
+                rows: initial_rows,
+                cols: initial_cols,
                 pixel_width: 0,
                 pixel_height: 0,
             })
@@ -438,8 +473,8 @@ impl PtySessionRuntime {
         let runtime_output_seen = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let eof_without_output = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let screen_state = Arc::new(Mutex::new(TerminalScreenState::new(
-            DEFAULT_ROWS,
-            DEFAULT_COLS,
+            initial_rows,
+            initial_cols,
         )));
         let reader_chunks = Arc::clone(&chunks);
         let reader_retained_bytes = Arc::clone(&retained_bytes);
@@ -1289,6 +1324,7 @@ mod tests {
             "remote-session://oc/test",
             "ssh -tt oc 'exec $HOME/.yggterm/bin/yggterm '\\''server'\\'' '\\''remote'\\'' '\\''resume-codex'\\'' '\\''test-session'\\'' '\\''/home/pi'\\'''",
             None,
+            None,
         )
         .expect("spawn test runtime");
         for seq in 0..96 {
@@ -1308,6 +1344,7 @@ mod tests {
             "local://test-shell",
             "printf 'pi@dev:~/gh/yggterm$ echo ready\n'",
             None,
+            None,
         )
         .expect("spawn test runtime");
         runtime.seed_snapshot("pi@dev:~/gh/yggterm$ echo ready\n");
@@ -1326,6 +1363,27 @@ mod tests {
             .collect::<String>();
 
         assert!(combined.contains("pi@dev:~/gh/yggterm$ echo ready"));
+        runtime.shutdown(None).expect("shutdown test runtime");
+    }
+
+    #[test]
+    fn spawned_terminal_uses_requested_initial_size() {
+        let runtime = PtySessionRuntime::spawn(
+            "local://sized-test",
+            "bash -lc 'printf sized'",
+            None,
+            Some((104, 48)),
+        )
+        .expect("spawn sized test runtime");
+        let size = runtime
+            .screen_state
+            .lock()
+            .expect("pty screen state lock poisoned")
+            .parser
+            .screen()
+            .size();
+
+        assert_eq!(size, (48, 104));
         runtime.shutdown(None).expect("shutdown test runtime");
     }
 
@@ -1488,6 +1546,7 @@ mod tests {
             "remote-session://oc/test",
             "ssh -tt oc 'exec $HOME/.yggterm/bin/yggterm '\\''server'\\'' '\\''remote'\\'' '\\''resume-codex'\\'' '\\''test-session'\\'' '\\''/home/pi'\\'''",
             None,
+            None,
         )
         .expect("spawn test runtime");
         runtime.seed_snapshot(
@@ -1511,6 +1570,7 @@ mod tests {
             "remote-session://oc/test",
             "ssh -tt oc 'exec $HOME/.yggterm/bin/yggterm '\\''server'\\'' '\\''remote'\\'' '\\''resume-codex'\\'' '\\''test-session'\\'' '\\''/home/pi'\\'''",
             None,
+            None,
         )
         .expect("spawn test runtime");
         runtime.seed_snapshot("abcdef\rXYZ");
@@ -1529,8 +1589,9 @@ mod tests {
 
     #[test]
     fn initial_local_attach_does_not_append_attach_ready_marker() {
-        let runtime = PtySessionRuntime::spawn("local://test", "bash -lc 'printf hello'", None)
-            .expect("spawn local test runtime");
+        let runtime =
+            PtySessionRuntime::spawn("local://test", "bash -lc 'printf hello'", None, None)
+                .expect("spawn local test runtime");
         runtime.seed_snapshot("hello\n");
 
         let result = runtime.read(0);
@@ -1553,6 +1614,7 @@ mod tests {
         let runtime = PtySessionRuntime::spawn(
             "local://env-test",
             "python3 -c 'import os,sys; sys.stdout.write(os.getenv(\"NO_COLOR\", \"<unset>\"))'",
+            None,
             None,
         )
         .expect("spawn env test runtime");

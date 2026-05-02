@@ -784,6 +784,7 @@ fn terminal_host_problem_for_app_control(host: &Value) -> Option<&'static str> {
         .get("blank_rows_below_cursor")
         .and_then(Value::as_u64)
         .unwrap_or(0);
+    let rows = host.get("rows").and_then(Value::as_u64).unwrap_or(0);
     let xterm_buffer_kind = host
         .get("xterm_buffer_kind")
         .and_then(Value::as_str)
@@ -881,6 +882,15 @@ fn terminal_host_problem_for_app_control(host: &Value) -> Option<&'static str> {
         && !prompt_ready_surface
     {
         return Some("active terminal host is only showing a plain shell prompt");
+    }
+    if session_path.starts_with("remote-session://")
+        && terminal_chunk_has_codex_prompt_output(visible_text)
+        && !codex_prompt_surface
+        && !codex_interactive_setup_prompt
+        && rows >= 24
+        && blank_rows_below_cursor > rows / 2
+    {
+        return Some("active remote Codex prompt surface is missing the welcome frame");
     }
     if transcript_browser_surface {
         if transcript_browser_ready_surface {
@@ -1751,6 +1761,42 @@ mod tests {
         });
         assert!(terminal_chunk_is_codex_prompt_surface(text_tail));
         assert_eq!(terminal_host_problem_for_app_control(&host), None);
+    }
+
+    #[test]
+    fn terminal_host_problem_rejects_collapsed_remote_codex_prompt_surface() {
+        let text_tail = "• Booting MCP server: codex_apps (0s • esc to interrupt)\n\n\n› Summarize recent commits\n\n  gpt-5.5 medium · ~";
+        let host = json!({
+            "session_path": "remote-session://dev/collapsed-codex",
+            "text_sample": text_tail,
+            "text_tail": text_tail,
+            "buffer_text_sample": text_tail,
+            "cursor_line_text": "› Summarize recent commits",
+            "input_enabled": true,
+            "helper_textarea_focused": true,
+            "xterm_present": true,
+            "screen_present": true,
+            "rows_present": false,
+            "canvas_count": 4,
+            "render_event_count": 154,
+            "data_event_count": 0,
+            "xterm_buffer_kind": "normal",
+            "xterm_cursor_hidden": false,
+            "mounted_entry_host_connected": true,
+            "blank_rows_below_cursor": 35,
+            "rows": 48,
+            "host_rect": {"left": 0.0, "top": 0.0, "width": 840.0, "height": 830.0},
+            "host_content_width": 840.0,
+            "host_content_height": 830.0,
+            "screen_rect": {"width": 840.0, "height": 830.0},
+            "viewport_rect": {"width": 840.0, "height": 830.0},
+            "helpers_rect": {"width": 840.0, "height": 830.0},
+            "helper_textarea_rect": {"left": -10000.0, "top": 68.0, "width": 1.0, "height": 1.0}
+        });
+        assert_eq!(
+            terminal_host_problem_for_app_control(&host),
+            Some("active remote Codex prompt surface is missing the welcome frame")
+        );
     }
 
     #[test]

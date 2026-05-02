@@ -1129,6 +1129,12 @@ impl YggtermServer {
         self.request_terminal_launch_for_active();
     }
 
+    pub(crate) fn session_starts_new_remote_codex(&self, path: &str) -> bool {
+        self.resolve_session_storage_key(path)
+            .and_then(|key| self.sessions.get(key))
+            .is_some_and(remote_live_session_starts_new_codex)
+    }
+
     fn resolve_session_storage_key<'a>(&'a self, path: &'a str) -> Option<&'a str> {
         if self.sessions.contains_key(path) {
             return Some(path);
@@ -3093,7 +3099,11 @@ impl YggtermServer {
                 "Source",
                 source_label.unwrap_or("recipe-session").to_string(),
             );
-            upsert_session_metadata(&mut session.metadata, "Launch", launch_command.to_string());
+            upsert_session_metadata(
+                &mut session.metadata,
+                "Launch",
+                user_visible_launch_command(launch_command),
+            );
             upsert_session_metadata(&mut session.metadata, "Status", "planned".to_string());
             session.terminal_lines = vec![
                 format!("$ {launch_command}"),
@@ -3960,7 +3970,7 @@ impl YggtermServer {
                     upsert_session_metadata(
                         &mut session.metadata,
                         "Launch",
-                        session.launch_command.clone(),
+                        user_visible_launch_command(&session.launch_command),
                     );
                 }
                 session.backend = TerminalBackend::Xterm;
@@ -5837,11 +5847,11 @@ fn remote_ssh_launch_command(
         Some(prefix) => format!("{prefix} && {inner}"),
         None => inner,
     };
-    format!(
+    remote_terminal_ssh_command(format!(
         "ssh -tt -o ControlMaster=auto -o ControlPersist=45 -o ControlPath=/tmp/yggterm-ssh-%C {} {}",
         ssh_target,
         shell_single_quote(&remote)
-    )
+    ))
 }
 
 fn remote_ssh_shell_command(ssh_target: &str, prefix: Option<&str>, inner: &str) -> String {
@@ -5855,11 +5865,11 @@ fn remote_ssh_shell_command(ssh_target: &str, prefix: Option<&str>, inner: &str)
         Some(prefix) => format!("{prefix} && {inner}"),
         None => inner,
     };
-    format!(
+    remote_terminal_ssh_command(format!(
         "ssh -tt -o ControlMaster=auto -o ControlPersist=45 -o ControlPath=/tmp/yggterm-ssh-%C {} {}",
         ssh_target,
         shell_single_quote(&remote)
-    )
+    ))
 }
 
 fn remote_direct_attach_launch_command(
@@ -5892,11 +5902,38 @@ fn remote_direct_attach_launch_command(
         Some(prefix) => format!("{prefix} && {inner}"),
         None => inner,
     };
-    format!(
+    remote_terminal_ssh_command(format!(
         "ssh -tt -o ControlMaster=auto -o ControlPersist=45 -o ControlPath=/tmp/yggterm-ssh-%C {} {}",
         ssh_target,
         shell_single_quote(&remote)
-    )
+    ))
+}
+
+fn remote_terminal_ssh_command(ssh_command: String) -> String {
+    format!("{} exec {ssh_command}", remote_terminal_tty_settle_prefix())
+}
+
+fn user_visible_launch_command(launch_command: &str) -> String {
+    launch_command
+        .strip_prefix(remote_terminal_tty_settle_prefix())
+        .and_then(|rest| rest.strip_prefix(" exec "))
+        .unwrap_or(launch_command)
+        .to_string()
+}
+
+fn remote_terminal_tty_settle_prefix() -> &'static str {
+    "__yggterm_initial_tty_size=$(stty size 2>/dev/null || true); \
+     case \"$__yggterm_initial_tty_size\" in \"36 120\"|\"24 80\") \
+     __yggterm_tty_wait=0; \
+     while [ \"$__yggterm_tty_wait\" -lt 24 ]; do \
+     __yggterm_current_tty_size=$(stty size 2>/dev/null || true); \
+     [ -n \"$__yggterm_current_tty_size\" ] && \
+     [ \"$__yggterm_current_tty_size\" != \"$__yggterm_initial_tty_size\" ] && break; \
+     __yggterm_tty_wait=$((__yggterm_tty_wait + 1)); \
+     sleep 0.05; \
+     done;; \
+     esac; \
+     unset __yggterm_initial_tty_size __yggterm_current_tty_size __yggterm_tty_wait;"
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -6556,7 +6593,7 @@ fn configure_remote_resume_live_session(
     upsert_session_metadata(
         &mut session.metadata,
         "Launch",
-        session.launch_command.clone(),
+        user_visible_launch_command(&session.launch_command),
     );
     session.status_line = describe_status_line(
         session.backend,
@@ -6660,7 +6697,7 @@ fn configure_remote_new_codex_live_session(
     upsert_session_metadata(
         &mut session.metadata,
         "Launch",
-        session.launch_command.clone(),
+        user_visible_launch_command(&session.launch_command),
     );
     session.status_line = describe_status_line(
         session.backend,
@@ -8674,6 +8711,7 @@ pub fn run_remote_resume_codex(
     let _ = ensure_local_managed_cli(ManagedCliTool::Codex)?;
     let home = resolve_yggterm_home()?;
     let runtime_key = remote_runtime_codex_session_key(session_id);
+    let initial_size = current_tty_size();
     if require_existing
         && let Some(endpoint) = endpoint_with_live_remote_runtime(&home, &runtime_key)
     {
@@ -8683,19 +8721,28 @@ pub fn run_remote_resume_codex(
             "path": runtime_key,
             "mode": "existing_daemon_runtime_bridge",
             "require_existing": require_existing,
+            "initial_cols": initial_size.map(|(cols, _)| cols),
+            "initial_rows": initial_size.map(|(_, rows)| rows),
         }));
         return bridge_remote_runtime_session_stdio(&endpoint, &runtime_key);
     }
     let endpoint = default_endpoint(&home);
     ensure_local_daemon_running(&endpoint)?;
-    let key =
-        daemon_ensure_remote_runtime_codex_session(&endpoint, session_id, cwd, require_existing)?;
+    let key = daemon_ensure_remote_runtime_codex_session(
+        &endpoint,
+        session_id,
+        cwd,
+        require_existing,
+        initial_size,
+    )?;
     finish_span(serde_json::json!({
         "session_id": session_id,
         "cwd": cwd,
         "path": key,
         "mode": "daemon_runtime_bridge",
         "require_existing": require_existing,
+        "initial_cols": initial_size.map(|(cols, _)| cols),
+        "initial_rows": initial_size.map(|(_, rows)| rows),
     }));
     bridge_remote_runtime_session_stdio(&endpoint, &key)
 }
@@ -8713,23 +8760,28 @@ pub fn run_remote_start_codex(session_id: &str, cwd: Option<&str>) -> anyhow::Re
     let _ = ensure_local_managed_cli(ManagedCliTool::Codex)?;
     let home = resolve_yggterm_home()?;
     let runtime_key = remote_runtime_codex_session_key(session_id);
+    let initial_size = current_tty_size();
     if let Some(endpoint) = endpoint_with_live_remote_runtime(&home, &runtime_key) {
         finish_span(serde_json::json!({
             "session_id": session_id,
             "cwd": cwd,
             "path": runtime_key,
             "mode": "existing_daemon_runtime_bridge",
+            "initial_cols": initial_size.map(|(cols, _)| cols),
+            "initial_rows": initial_size.map(|(_, rows)| rows),
         }));
         return bridge_remote_runtime_session_stdio(&endpoint, &runtime_key);
     }
     let endpoint = default_endpoint(&home);
     ensure_local_daemon_running(&endpoint)?;
-    let key = daemon::start_remote_runtime_codex_session(&endpoint, session_id, cwd)?;
+    let key = daemon::start_remote_runtime_codex_session(&endpoint, session_id, cwd, initial_size)?;
     finish_span(serde_json::json!({
         "session_id": session_id,
         "cwd": cwd,
         "path": key,
         "mode": "daemon_runtime_bridge",
+        "initial_cols": initial_size.map(|(cols, _)| cols),
+        "initial_rows": initial_size.map(|(_, rows)| rows),
     }));
     bridge_remote_runtime_session_stdio(&endpoint, &key)
 }
@@ -9527,7 +9579,12 @@ fn bridge_remote_runtime_session_stdio(
         let initial_read = cursor == 0;
         let (next_cursor, chunks, running, runtime_output_seen, eof_without_output) =
             terminal_read_with_local_daemon_recovery(endpoint, path, cursor)?;
-        cursor = next_cursor;
+        let chunks_have_visible_text = chunks
+            .iter()
+            .any(|chunk| terminal_bridge_snapshot_has_visible_text(&chunk.data));
+        let delay_initial_raw_stream = initial_snapshot_pending
+            && bridge_initial_snapshot_should_use_raw_stream(path)
+            && !chunks_have_visible_text;
         if runtime_output_seen && !marked_interactive {
             if let Some(home) = registry_home.as_deref() {
                 let _ = RemoteRuntimeRegistry::open(home).and_then(|registry| {
@@ -9546,6 +9603,8 @@ fn bridge_remote_runtime_session_stdio(
             initial_read,
             runtime_output_seen,
             !chunks.is_empty(),
+        ) && !bridge_initial_snapshot_should_use_raw_stream(
+            path,
         ) && Instant::now() >= next_initial_snapshot_probe_at;
         let initial_snapshot = if should_probe_initial_snapshot {
             initial_snapshot_probe_count = initial_snapshot_probe_count.saturating_add(1);
@@ -9553,7 +9612,8 @@ fn bridge_remote_runtime_session_stdio(
             match terminal_snapshot(endpoint, path) {
                 Ok((snapshot, _running, snapshot_runtime_output_seen)) => {
                     let snapshot_text =
-                        bridge_initial_snapshot_text(Some(snapshot.as_str())).map(str::to_string);
+                        bridge_initial_snapshot_text_for_path(path, Some(snapshot.as_str()))
+                            .map(str::to_string);
                     if snapshot_text.is_none() && initial_snapshot_probe_count <= 3 {
                         trace_remote_bridge_event(
                             "initial_screen_snapshot_not_ready",
@@ -9586,6 +9646,7 @@ fn bridge_remote_runtime_session_stdio(
             None
         };
         if let Some(snapshot) = initial_snapshot {
+            cursor = next_cursor;
             initial_snapshot_pending = false;
             trace_remote_bridge_event(
                 "initial_screen_snapshot",
@@ -9598,15 +9659,36 @@ fn bridge_remote_runtime_session_stdio(
                 }),
             );
             stdout.write_all(snapshot.as_bytes())?;
+        } else if delay_initial_raw_stream {
+            if initial_read && start.elapsed() >= Duration::from_secs(15) {
+                cursor = next_cursor;
+                initial_snapshot_pending = false;
+                trace_remote_bridge_event(
+                    "initial_raw_stream_give_up",
+                    json!({
+                        "path": path,
+                        "session_id": session_id,
+                    }),
+                );
+            }
         } else {
-            let chunks_have_visible_text = chunks
-                .iter()
-                .any(|chunk| terminal_bridge_snapshot_has_visible_text(&chunk.data));
+            cursor = next_cursor;
             for chunk in chunks {
                 stdout.write_all(chunk.data.as_bytes())?;
             }
             if chunks_have_visible_text {
                 wrote_initial_visible_chunks = true;
+                if initial_snapshot_pending && bridge_initial_snapshot_should_use_raw_stream(path) {
+                    initial_snapshot_pending = false;
+                    trace_remote_bridge_event(
+                        "initial_raw_stream_first_paint",
+                        json!({
+                            "path": path,
+                            "session_id": session_id,
+                            "cursor": next_cursor,
+                        }),
+                    );
+                }
             }
             if initial_snapshot_pending
                 && wrote_initial_visible_chunks
@@ -9666,8 +9748,107 @@ fn bridge_remote_runtime_session_stdio(
 
 fn bridge_initial_snapshot_text(snapshot: Option<&str>) -> Option<&str> {
     snapshot
-        .map(str::trim)
+        .map(|text| text.trim_matches('\0'))
         .filter(|text| terminal_bridge_snapshot_has_visible_text(text))
+}
+
+fn bridge_initial_snapshot_should_use_raw_stream(path: &str) -> bool {
+    path.starts_with("codex-runtime://")
+}
+
+fn bridge_initial_snapshot_text_for_path<'a>(
+    path: &str,
+    snapshot: Option<&'a str>,
+) -> Option<&'a str> {
+    let text = bridge_initial_snapshot_text(snapshot)?;
+    if path.starts_with("codex-runtime://")
+        && remote_snapshot_looks_like_codex_prompt_only(text.as_bytes())
+    {
+        return None;
+    }
+    Some(text)
+}
+
+fn remote_snapshot_looks_like_codex_prompt_only(bytes: &[u8]) -> bool {
+    let text = strip_snapshot_terminal_controls(&String::from_utf8_lossy(bytes));
+    if text.contains("OpenAI Codex") || text.contains("/model to change") {
+        return false;
+    }
+    let lines = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+    if lines.is_empty() || lines.len() > 8 {
+        return false;
+    }
+    let normalized = lines.join("\n").to_ascii_lowercase();
+    let has_codex_prompt = lines.iter().any(|line| {
+        let semantic = line
+            .trim()
+            .trim_matches(|ch: char| matches!(ch, '╭' | '╮' | '╰' | '╯' | '─' | '│' | ' '));
+        semantic.starts_with('›')
+    });
+    let has_model_footer = normalized.contains("gpt-")
+        || normalized.contains("claude")
+        || normalized.contains("% left");
+    has_codex_prompt && has_model_footer
+}
+
+fn strip_snapshot_terminal_controls(input: &str) -> String {
+    #[derive(Clone, Copy)]
+    enum State {
+        Normal,
+        Escape,
+        Csi,
+        Osc,
+        OscEscape,
+        StringTerminator,
+    }
+
+    let mut state = State::Normal;
+    let mut out = String::with_capacity(input.len());
+    for ch in input.chars() {
+        match state {
+            State::Normal => {
+                if ch == '\u{1b}' {
+                    state = State::Escape;
+                } else if !ch.is_control() || matches!(ch, '\n' | '\r' | '\t') {
+                    out.push(ch);
+                }
+            }
+            State::Escape => match ch {
+                '[' => state = State::Csi,
+                ']' => state = State::Osc,
+                'P' | 'X' | '^' | '_' => state = State::StringTerminator,
+                _ => state = State::Normal,
+            },
+            State::Csi => {
+                if ('@'..='~').contains(&ch) {
+                    state = State::Normal;
+                }
+            }
+            State::Osc => match ch {
+                '\u{7}' => state = State::Normal,
+                '\u{1b}' => state = State::OscEscape,
+                _ => {}
+            },
+            State::OscEscape => {
+                state = if ch == '\\' {
+                    State::Normal
+                } else {
+                    State::Osc
+                };
+            }
+            State::StringTerminator => {
+                if ch == '\u{1b}' {
+                    state = State::OscEscape;
+                }
+            }
+        }
+    }
+    out
 }
 
 fn bridge_should_probe_initial_snapshot(
@@ -13752,7 +13933,7 @@ fn build_live_session(
             },
             SessionMetadataEntry {
                 label: "Launch",
-                value: launch_command,
+                value: user_visible_launch_command(&launch_command),
             },
         ],
         terminal_process_id: None,
@@ -14809,6 +14990,30 @@ mod tests {
             super::bridge_initial_snapshot_text(Some(snapshot)),
             Some(snapshot)
         );
+        assert_eq!(
+            super::bridge_initial_snapshot_text_for_path("codex-runtime://session", Some(snapshot)),
+            Some(snapshot)
+        );
+    }
+
+    #[test]
+    fn remote_runtime_bridge_initial_snapshot_preserves_tui_positioning_rows() {
+        let snapshot = "\n\n\n\n\n\n› Write tests for @filename\n\n  gpt-5.5 medium · ~/gh/yggterm";
+
+        assert_eq!(
+            super::bridge_initial_snapshot_text(Some(snapshot)),
+            Some(snapshot)
+        );
+    }
+
+    #[test]
+    fn remote_runtime_bridge_uses_raw_stream_for_codex_first_paint() {
+        assert!(super::bridge_initial_snapshot_should_use_raw_stream(
+            "codex-runtime://session"
+        ));
+        assert!(!super::bridge_initial_snapshot_should_use_raw_stream(
+            "local://session"
+        ));
     }
 
     #[test]
@@ -14816,6 +15021,29 @@ mod tests {
         let snapshot = "\x1b[?25h\x1b[m\x1b[H\x1b[J\r\n\t  ";
 
         assert_eq!(super::bridge_initial_snapshot_text(Some(snapshot)), None);
+    }
+
+    #[test]
+    fn remote_runtime_bridge_initial_snapshot_rejects_codex_prompt_only_state() {
+        let snapshot = "› Write tests for @filename\n\n  gpt-5.5 medium · ~/gh/yggterm";
+        let positioned_snapshot =
+            "\x1b[39;1H› Write tests for @filename\n\n  gpt-5.5 medium · ~/gh/yggterm";
+
+        assert_eq!(
+            super::bridge_initial_snapshot_text_for_path("codex-runtime://session", Some(snapshot)),
+            None
+        );
+        assert_eq!(
+            super::bridge_initial_snapshot_text_for_path(
+                "codex-runtime://session",
+                Some(positioned_snapshot)
+            ),
+            None
+        );
+        assert_eq!(
+            super::bridge_initial_snapshot_text_for_path("local://session", Some(snapshot)),
+            Some(snapshot)
+        );
     }
 
     #[test]
@@ -16156,7 +16384,10 @@ mod tests {
             "$HOME/.yggterm/bin/yggterm",
             &["server", "remote", "resume-codex", "abc123", "/srv/app"],
         );
-        assert!(command.starts_with("ssh -tt -o ControlMaster=auto "));
+        assert!(command.starts_with("__yggterm_initial_tty_size="));
+        assert!(command.contains("exec ssh -tt -o ControlMaster=auto "));
+        assert!(command.contains("stty size"));
+        assert!(command.contains("\"36 120\"|\"24 80\""));
         assert!(command.contains("-tt -o ControlMaster=auto -o ControlPersist=45 -o ControlPath=/tmp/yggterm-ssh-%C jojo "));
         assert!(command.contains("tmux new-session -A -s yggterm &&"));
         assert!(command.contains("$HOME/.yggterm/bin/yggterm"));
@@ -16165,6 +16396,20 @@ mod tests {
         assert!(!command.contains("YGGTERM_HOME"));
         assert!(command.contains("ControlMaster"));
         assert!(command.contains("ControlPath"));
+    }
+
+    #[test]
+    fn user_visible_launch_command_hides_internal_tty_settle_wrapper() {
+        let command = remote_ssh_launch_command(
+            "jojo",
+            None,
+            "$HOME/.yggterm/bin/yggterm",
+            &["server", "remote", "start-codex", "abc123", "/srv/app"],
+        );
+        let visible = super::user_visible_launch_command(&command);
+        assert!(visible.starts_with("ssh -tt -o ControlMaster=auto "));
+        assert!(!visible.contains("__yggterm_initial_tty_size"));
+        assert!(visible.contains("'start-codex'"));
     }
 
     #[test]
@@ -16177,9 +16422,11 @@ mod tests {
             "/srv/app",
             &["recent meaningful transcript fragment".to_string()],
         );
-        assert!(command.starts_with(
-            "ssh -tt -o ControlMaster=auto -o ControlPersist=45 -o ControlPath=/tmp/yggterm-ssh-%C "
+        assert!(command.starts_with("__yggterm_initial_tty_size="));
+        assert!(command.contains(
+            "exec ssh -tt -o ControlMaster=auto -o ControlPersist=45 -o ControlPath=/tmp/yggterm-ssh-%C "
         ));
+        assert!(command.contains("stty size"));
         assert!(command.contains("tmux new-session -A -s yggterm &&"));
         assert!(!command.contains("attach_screen()"));
         assert!(!command.contains("screen -ls \"$name\""));
@@ -16704,8 +16951,9 @@ terminal_window_id: None,
         assert!(
             session
                 .launch_command
-                .starts_with("ssh -tt -o ControlMaster=auto ")
+                .contains("exec ssh -tt -o ControlMaster=auto ")
         );
+        assert!(session.launch_command.contains("stty size"));
         assert!(session.launch_command.contains("server"));
         assert!(session.launch_command.contains("resume-codex"));
         if let Ok(mut cache) = remote_command_cache().lock() {
@@ -19530,6 +19778,7 @@ terminal_window_id: None,
         );
         assert!(!session.launch_command.contains("'resume-codex'"));
         assert!(!session.launch_command.contains("'attach'"));
+        assert!(server.session_starts_new_remote_codex(&key));
 
         let persisted = server.persisted_state_for_update_restart();
         let persisted_session = persisted
@@ -19659,6 +19908,7 @@ terminal_window_id: None,
         );
         assert!(!session.launch_command.contains("'resume-codex'"));
         assert!(!session.launch_command.contains("--require-existing"));
+        assert!(server.session_starts_new_remote_codex("remote-session://dev/fresh-codex"));
     }
 
     #[test]
