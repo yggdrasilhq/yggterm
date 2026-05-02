@@ -4,6 +4,11 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+## 2.1.98
+
+- Restored native Codex TUI color richness by disabling xterm.js minimum-contrast palette rewriting for terminal surfaces.
+- Switched the xterm font stack to installed monospace faces first so WebKit does not resolve a missing Iosevka family to a proportional fallback on jojo.
+
 ## 2.1.97
 
 ### Fixed
