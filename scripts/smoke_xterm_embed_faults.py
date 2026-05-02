@@ -5346,6 +5346,22 @@ def assert_codex_spawn_layout_sane(host: dict, *, context: str) -> dict:
     }
 
 
+def assert_codex_prompt_layout_for_state(state: dict, session: str, *, context: str) -> dict:
+    host = host_for_session_or_none(state, session) or active_host_or_none(state)
+    if host is None:
+        raise AssertionError(f"{context}: no terminal host available for Codex prompt layout check")
+    if not host_has_live_codex_prompt(host):
+        return {
+            "checked": False,
+            "reason": "active terminal does not currently expose a live Codex prompt",
+            "session_path": host.get("session_path"),
+        }
+    result = assert_codex_spawn_layout_sane(host, context=context)
+    result["checked"] = True
+    result["session_path"] = host.get("session_path")
+    return result
+
+
 def codex_spawn_state_excerpt(state: dict, session: str, elapsed_ms: float) -> dict:
     viewport = viewport_state(state)
     host = host_for_session_or_none(state, session) or active_host_or_none(state)
@@ -15536,6 +15552,10 @@ def main() -> int:
             run_check("codex_spawn_timeline", lambda: assert_codex_spawn_timeline(args.pid, out_dir))
         if args.session_kind == "codex":
             run_check("codex_startup_health", lambda: assert_codex_startup_health(args.pid, args.session, out_dir))
+        run_check(
+            "codex_prompt_layout",
+            lambda: assert_codex_prompt_layout_for_state(state, args.session, context="initial active terminal"),
+        )
         run_check("startup_bootstrap_dedupe", lambda: assert_no_duplicate_startup_terminal_bootstrap(args.pid))
         run_check("focus", lambda: assert_focus_and_visibility(args.pid, state))
         run_check("geometry", lambda: assert_geometry(state))
