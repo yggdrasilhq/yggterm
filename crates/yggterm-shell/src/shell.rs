@@ -2474,13 +2474,16 @@ impl ShellState {
         let mut ready_snapshot = None;
         if let Some(attempt) = self.terminal_open_attempts.get_mut(&attempt_id) {
             let first_ready = attempt.ready_at_ms.is_none();
+            let recovered_failure = attempt.latched_failure_reason.is_some();
             if first_ready {
                 attempt.ready_at_ms = Some(now_ms);
             }
-            if attempt.latched_failure_reason.is_none() {
-                attempt.state = TerminalOpenAttemptState::Ready;
+            if recovered_failure {
+                attempt.latched_failure_at_ms = None;
+                attempt.latched_failure_reason = None;
             }
-            if first_ready {
+            attempt.state = TerminalOpenAttemptState::Ready;
+            if first_ready || recovered_failure {
                 ready_snapshot = Some(attempt.clone());
             }
         }
@@ -2569,13 +2572,16 @@ impl ShellState {
             attempt.last_overlay_text = overlay_text.clone();
             if ready && interactive && settled_kind == "interactive" && surface_problem.is_none() {
                 let first_ready = attempt.ready_at_ms.is_none();
+                let recovered_failure = attempt.latched_failure_reason.is_some();
                 if first_ready {
                     attempt.ready_at_ms = Some(now_ms);
                 }
-                if attempt.latched_failure_reason.is_none() {
-                    attempt.state = TerminalOpenAttemptState::Ready;
+                if recovered_failure {
+                    attempt.latched_failure_at_ms = None;
+                    attempt.latched_failure_reason = None;
                 }
-                if first_ready {
+                attempt.state = TerminalOpenAttemptState::Ready;
+                if first_ready || recovered_failure {
                     deferred_event = Some((
                         "ready",
                         attempt.clone(),
@@ -2637,10 +2643,13 @@ impl ShellState {
                     }
                     should_return_early = true;
                 } else if ready && attempt.ready_at_ms.is_none() {
+                    let recovered_failure = attempt.latched_failure_reason.is_some();
                     attempt.ready_at_ms = Some(now_ms);
-                    if attempt.latched_failure_reason.is_none() {
-                        attempt.state = TerminalOpenAttemptState::Ready;
+                    if recovered_failure {
+                        attempt.latched_failure_at_ms = None;
+                        attempt.latched_failure_reason = None;
                     }
+                    attempt.state = TerminalOpenAttemptState::Ready;
                     deferred_event = Some((
                         "ready",
                         attempt.clone(),
@@ -5218,6 +5227,30 @@ fn retained_remote_surface_has_non_prompt_text(
         && !terminal_chunk_is_transcript_browser(host_surface_text)
         && !terminal_chunk_is_saved_transcript_prefill(host_surface_text)
         && !terminal_chunk_is_low_signal_terminal_noise(host_surface_text)
+}
+fn retained_remote_surface_should_wait_for_prompt_ready(
+    is_remote_resume_session: bool,
+    poisoned_by_retry: bool,
+    ready_attempt_from_shell: bool,
+    attach_ready_seen: bool,
+    terminal_live_host_connected: bool,
+    terminal_paint_seen: bool,
+    terminal_geometry_ready: bool,
+    has_transport_error: bool,
+    host_health_cursor_line_text: &str,
+    host_health_text_tail: &str,
+) -> bool {
+    is_remote_resume_session
+        && !attach_ready_seen
+        && !terminal_live_host_connected
+        && (poisoned_by_retry || !ready_attempt_from_shell)
+        && terminal_paint_seen
+        && terminal_geometry_ready
+        && !has_transport_error
+        && retained_remote_surface_has_non_prompt_text(
+            host_health_cursor_line_text,
+            host_health_text_tail,
+        )
 }
 fn remote_resume_visual_reveal_output_is_acceptable(
     deferred_resume_output: &str,
@@ -21930,7 +21963,76 @@ async fn probe_terminal_viewport_select_for(session_path: &str) -> Value {
                 }}
                 const host = document.getElementById(entry.hostId);
                 const rowsLayer = host ? host.querySelector('.xterm-rows') : null;
-                if (!host || !rowsLayer) {{
+                if (!host) {{
+                    dioxus.send({{
+                        accepted: false,
+                        reason: "terminal_host_missing",
+                        session_path: sessionPath,
+                    }});
+                    return;
+                }}
+                if (!rowsLayer) {{
+                    const viewport = host.querySelector('.xterm-viewport');
+                    const screen = host.querySelector('.xterm-screen');
+                    const backgroundColor = String(
+                        (viewport && window.getComputedStyle(viewport).backgroundColor)
+                        || (screen && window.getComputedStyle(screen).backgroundColor)
+                        || window.getComputedStyle(host).backgroundColor
+                        || ''
+                    );
+                    const activeBuffer = entry.term && entry.term.buffer && entry.term.buffer.active
+                        ? entry.term.buffer.active
+                        : null;
+                    const visibleLines = [];
+                    if (activeBuffer && typeof activeBuffer.getLine === 'function') {{
+                        const totalLines = Math.max(0, Number(activeBuffer.length || 0));
+                        const termRows = Math.max(1, Number(entry.term.rows || 0) || 24);
+                        const viewportY = Math.max(0, Number(activeBuffer.viewportY || 0));
+                        const startRow = Math.min(totalLines, viewportY);
+                        const endRow = Math.min(totalLines, startRow + termRows);
+                        for (let row = startRow; row < endRow; row += 1) {{
+                            const line = activeBuffer.getLine(row);
+                            if (!line || typeof line.translateToString !== 'function') {{
+                                continue;
+                            }}
+                            const text = String(line.translateToString(true) || '').replace(/\s+$/g, '');
+                            if (text.trim()) {{
+                                visibleLines.push(text);
+                            }}
+                        }}
+                        if (!visibleLines.length) {{
+                            const cursorRow = Math.max(
+                                0,
+                                Math.min(
+                                    Math.max(0, totalLines - 1),
+                                    Number(activeBuffer.baseY || 0) + Number(activeBuffer.cursorY || 0)
+                                )
+                            );
+                            const cursorLine = activeBuffer.getLine(cursorRow);
+                            if (cursorLine && typeof cursorLine.translateToString === 'function') {{
+                                const cursorText = String(cursorLine.translateToString(true) || '').replace(/\s+$/g, '');
+                                if (cursorText.trim()) {{
+                                    visibleLines.push(cursorText);
+                                }}
+                            }}
+                        }}
+                    }}
+                    const meaningful = visibleLines.filter((line) => /[A-Za-z0-9]/.test(line) && line.trim().length >= 3);
+                    const effectiveSelectedText = String(meaningful[0] || visibleLines[0] || '').trim();
+                    if (effectiveSelectedText) {{
+                        dioxus.send({{
+                            accepted: true,
+                            session_path: sessionPath,
+                            host_id: entry.hostId,
+                            selection_method: "buffer_fallback",
+                            selected_text: effectiveSelectedText.slice(0, 480),
+                            selected_text_length: effectiveSelectedText.length,
+                            selected_contrast: null,
+                            selected_excerpt: effectiveSelectedText.slice(0, 240),
+                            background_color: backgroundColor,
+                        }});
+                        return;
+                    }}
                     dioxus.send({{
                         accepted: false,
                         reason: "terminal_rows_missing",
@@ -33170,6 +33272,10 @@ fn TerminalCanvas(
                                                 .insert(session_path.clone());
                                             shell.terminal_attach_in_flight
                                                 .remove(&session_path);
+                                            shell.mark_terminal_open_attempt_ready_for_session(
+                                                &session_path,
+                                                "stale_retry_host_health",
+                                            );
                                             shell.maybe_finish_terminal_surface_request_for_session(
                                                 &session_path,
                                             );
@@ -33240,16 +33346,18 @@ fn TerminalCanvas(
                                     maybe_spawn_missing_managed_cli_refreshes(state);
                                     continue;
                                 }
-                                if is_remote_resume_session
-                                    && (poisoned_by_retry || !ready_attempt_from_shell)
-                                    && terminal_paint_seen
-                                    && terminal_geometry_ready
-                                    && !has_transport_error
-                                    && retained_remote_surface_has_non_prompt_text(
-                                        &cursor_line_text,
-                                        &text_tail,
-                                    )
-                                {
+                                if retained_remote_surface_should_wait_for_prompt_ready(
+                                    is_remote_resume_session,
+                                    poisoned_by_retry,
+                                    ready_attempt_from_shell,
+                                    traced_attach_ready,
+                                    terminal_live_host_connected(),
+                                    terminal_paint_seen,
+                                    terminal_geometry_ready,
+                                    has_transport_error,
+                                    &cursor_line_text,
+                                    &text_tail,
+                                ) {
                                     append_trace_event(
                                         &trace_home,
                                         "ui",
@@ -34641,6 +34749,10 @@ fn TerminalCanvas(
                                                 .insert(session_path.clone());
                                             shell.terminal_attach_in_flight
                                                 .remove(&session_path);
+                                            shell.mark_terminal_open_attempt_ready_for_session(
+                                                &session_path,
+                                                "stale_retry_host_health",
+                                            );
                                             shell.maybe_finish_terminal_surface_request_for_session(
                                                 &session_path,
                                             );
@@ -34713,6 +34825,10 @@ fn TerminalCanvas(
                                                 .insert(session_path.clone());
                                             shell.terminal_attach_in_flight
                                                 .remove(&session_path);
+                                            shell.mark_terminal_open_attempt_ready_for_session(
+                                                &session_path,
+                                                "visual_reveal",
+                                            );
                                             shell.maybe_finish_terminal_surface_request_for_session(
                                                 &session_path,
                                             );
@@ -39868,6 +39984,10 @@ fn terminal_eval_script_with_canvas_renderer(
                 .replace(/\x1b[()][A-Za-z0-9]/g, '')
                 .replace(/[\x00\x0e\x0f]/g, '');
         }};
+        const terminalPayloadLooksProtocolOnly = (payload) => {{
+            const value = String(payload || '');
+            return value.includes('\x1b') && !stripAnsiForLowPowerTui(value).trim();
+        }};
         const lowPowerTuiTextFromPayload = (payload) => {{
             const frame = coalesceHighVolumeTerminalPayload(String(payload || ''))
                 .replace(/\x1b\[\?1049[hl]/g, '');
@@ -39938,15 +40058,16 @@ fn terminal_eval_script_with_canvas_renderer(
             const exitsAltScreen = value.includes('\x1b[?1049l');
             const entersAltScreen = value.includes('\x1b[?1049h');
             const frameLike = terminalPayloadLooksHighVolumeFrame(value);
+            const protocolOnly = terminalPayloadLooksProtocolOnly(value);
             const activeRenderSurface = hostIsActiveRenderSurface();
-            if (!tracedTuiFilterProbe && (value.includes('?1049') || value.includes('\x1b[?25l') || frameLike)) {{
+            if (!tracedTuiFilterProbe && (value.includes('?1049') || value.includes('\x1b[?25l') || frameLike || protocolOnly)) {{
                 tracedTuiFilterProbe = true;
                 dioxus.send({{
                     kind: "debug",
-                    message: `tui_filter_probe host=${{hostId}} enters=${{entersAltScreen}} exits=${{exitsAltScreen}} activeSurface=${{activeRenderSurface}} frameLike=${{frameLike}} chars=${{value.length}}`
+                    message: `tui_filter_probe host=${{hostId}} enters=${{entersAltScreen}} exits=${{exitsAltScreen}} activeSurface=${{activeRenderSurface}} frameLike=${{frameLike}} protocolOnly=${{protocolOnly}} chars=${{value.length}}`
                 }});
             }}
-            if (!activeRenderSurface && !exitsAltScreen && (lowPowerTuiActive || entersAltScreen || frameLike)) {{
+            if (!activeRenderSurface && !exitsAltScreen && (lowPowerTuiActive || entersAltScreen || frameLike || protocolOnly)) {{
                 if (entersAltScreen) {{
                     lowPowerTuiActive = true;
                     lowPowerTuiTextBuffer = '';
@@ -39957,7 +40078,7 @@ fn terminal_eval_script_with_canvas_renderer(
                     tracedInactiveTuiDrop = true;
                     dioxus.send({{
                         kind: "debug",
-                        message: `inactive_tui_drop host=${{hostId}} frameLike=${{frameLike}} chars=${{value.length}}`
+                        message: `inactive_tui_drop host=${{hostId}} frameLike=${{frameLike}} protocolOnly=${{protocolOnly}} chars=${{value.length}}`
                     }});
                 }}
                 syncLowPowerTuiHostEntry();
@@ -40025,7 +40146,8 @@ fn terminal_eval_script_with_canvas_renderer(
             entry.writeBridgePendingData = '';
             payload = filterPayloadForRenderSurface(payload);
             if (!payload) {{
-                finalizeWriteFlush(false, false, '');
+                syncLowPowerTuiHostEntry();
+                emitHostHealthThrottled();
                 return;
             }}
             const rawPayloadLength = payload.length;
@@ -45948,9 +46070,14 @@ mod tests {
         );
         assert!(
             script.contains(
-                "!activeRenderSurface && !exitsAltScreen && (lowPowerTuiActive || entersAltScreen || frameLike)"
+                "!activeRenderSurface && !exitsAltScreen && (lowPowerTuiActive || entersAltScreen || frameLike || protocolOnly)"
             ),
             "inactive/offscreen TUI sessions should not keep repainting hidden canvases"
+        );
+        assert!(
+            script.contains("const terminalPayloadLooksProtocolOnly = (payload) => {")
+                && script.contains("syncLowPowerTuiHostEntry();\n                emitHostHealthThrottled();\n                return;"),
+            "inactive protocol-only terminal chatter should update observability without forcing an xterm render probe"
         );
         assert!(
             script.contains("let lowPowerTuiTextBuffer = '';")
@@ -51029,6 +51156,12 @@ Waiting for the remote terminal to paint...\n";
     fn remote_resume_visual_reveal_rejects_stale_retained_handoff_tail() {
         let stale_tail = "The final 2.1.59 artifacts are built. Before replacing the live jojo install, I’m taking one more runtime/install snapshot and recording the exact active GUI/daemon paths, then I’ll install only the new direct version and clean the queued stale scan processes.";
         assert!(retained_remote_surface_has_non_prompt_text("", stale_tail));
+        assert!(retained_remote_surface_should_wait_for_prompt_ready(
+            true, true, false, false, false, true, true, false, "", stale_tail,
+        ));
+        assert!(!retained_remote_surface_should_wait_for_prompt_ready(
+            true, true, false, true, true, true, true, false, "", stale_tail,
+        ));
         assert!(!remote_resume_visual_reveal_output_is_acceptable(
             "", "", stale_tail
         ));
@@ -52587,6 +52720,26 @@ q to quit   pgup/pgdn to page   enter to edit message
             .expect("attempt should exist");
         assert!(matches!(attempt.state, TerminalOpenAttemptState::Ready));
         assert!(attempt.ready_at_ms.is_some());
+        assert!(shell.terminal_session_has_ready_attempt(active_session_path));
+    }
+    #[test]
+    fn mark_terminal_open_attempt_ready_recovers_latched_failure() {
+        let active_session_path = "remote-session://oc/test";
+        let bootstrap = test_shell_bootstrap_with_active_session(active_session_path);
+        let mut shell = ShellState::new(bootstrap);
+        let attempt_id =
+            shell.begin_terminal_open_attempt(active_session_path, "req-test", 1, "open_row");
+        shell.fail_remote_terminal_resume_timeout(active_session_path, "", "timed out".to_string());
+
+        shell.mark_terminal_open_attempt_ready_for_session(active_session_path, "late_ready");
+
+        let attempt = shell
+            .terminal_open_attempts
+            .get(&attempt_id)
+            .expect("attempt should exist");
+        assert!(matches!(attempt.state, TerminalOpenAttemptState::Ready));
+        assert!(attempt.ready_at_ms.is_some());
+        assert_eq!(attempt.latched_failure_reason, None);
         assert!(shell.terminal_session_has_ready_attempt(active_session_path));
     }
     #[test]
@@ -56110,6 +56263,60 @@ q to quit   pgup/pgdn to page   enter to edit message
                     != Some(notification_key.as_str()))
         );
         assert!(shell.terminal_session_has_ready_attempt(session_path));
+    }
+    #[test]
+    fn viewport_ready_observation_recovers_latched_terminal_failure() {
+        let session_path = "remote-session://dev/example";
+        let notification_key = terminal_resume_notification_job_key(session_path);
+        let mut shell = ShellState::new(test_shell_bootstrap_with_active_session(session_path));
+        shell.server.set_view_mode(WorkspaceViewMode::Terminal);
+        let attempt_id = shell.begin_terminal_open_attempt(session_path, "req-test", 1, "open_row");
+        shell.fail_remote_terminal_resume_timeout(
+            session_path,
+            "",
+            "The live terminal on dev did not become interactive in time.".to_string(),
+        );
+        shell.upsert_job_notification(
+            notification_key.clone(),
+            NotificationTone::Error,
+            "Remote Terminal Needs Attention",
+            "The live terminal on dev did not become interactive in time.",
+            None,
+            false,
+        );
+
+        shell.observe_terminal_open_attempt_from_viewport(&json!({
+            "active_session_path": session_path,
+            "active_view_mode": "Terminal",
+            "ready": true,
+            "interactive": true,
+            "terminal_settled_kind": "interactive",
+            "reason": null,
+            "terminal_resume_overlay": {
+                "visible": false,
+                "kind": "",
+                "phase": "",
+                "text_sample": ""
+            },
+            "active_terminal_surface": {
+                "problem": null
+            }
+        }));
+
+        let attempt = shell
+            .terminal_open_attempts
+            .get(&attempt_id)
+            .expect("attempt should exist");
+        assert!(matches!(attempt.state, TerminalOpenAttemptState::Ready));
+        assert_eq!(attempt.latched_failure_reason, None);
+        assert!(shell.terminal_session_has_ready_attempt(session_path));
+        assert!(
+            shell
+                .notifications
+                .iter()
+                .all(|notification| notification.job_key.as_deref()
+                    != Some(notification_key.as_str()))
+        );
     }
 
     #[test]
