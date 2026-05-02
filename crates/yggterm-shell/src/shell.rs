@@ -24911,6 +24911,8 @@ fn app() -> Element {
     let desktop_for_root_effect = desktop.clone();
     let trace_home_for_root_effect = trace_home.clone();
     let linux_transparent_window_for_root_effect = linux_transparent_window;
+    let transparent_window_reconfigure_started_for_root_effect =
+        transparent_window_reconfigure_started.clone();
     let trace_home_for_mount_epoch = trace_home.clone();
     use_effect(move || {
         if !APP_ROOT_EFFECT_TRACED.swap(true, Ordering::SeqCst) {
@@ -24963,6 +24965,19 @@ fn app() -> Element {
                 if reveal_after_shape {
                     prepare_linux_window_reveal_after_corner_shape(&desktop_for_root_effect);
                 }
+                let reveal_delay_ms =
+                    if reveal_after_shape && linux_transparent_window_for_root_effect {
+                        transparent_window_reconfigure_started_for_root_effect
+                            .store(true, Ordering::SeqCst);
+                        schedule_linux_transparent_window_pre_reveal_reconfigure(
+                            &desktop_for_root_effect,
+                            effective_radius,
+                            maximized,
+                            trace_home_for_root_effect.clone(),
+                        )
+                    } else {
+                        0
+                    };
                 apply_linux_transparent_window_surface_style(
                     &desktop_for_root_effect,
                     linux_transparent_window_for_root_effect,
@@ -24987,6 +25002,7 @@ fn app() -> Element {
                         effective_radius,
                         maximized,
                         trace_home_for_root_effect.clone(),
+                        reveal_delay_ms,
                     );
                 }
                 append_trace_event(
@@ -44217,21 +44233,94 @@ fn prepare_linux_window_reveal_after_corner_shape(desktop: &dioxus::desktop::Des
     desktop.gtk_window().set_opacity(0.0);
 }
 #[cfg(target_os = "linux")]
+const LINUX_TRANSPARENT_WINDOW_PRE_REVEAL_RECONFIGURE_MS: u64 = 190;
+#[cfg(target_os = "linux")]
+fn schedule_linux_transparent_window_pre_reveal_reconfigure(
+    desktop: &dioxus::desktop::DesktopContext,
+    radius: u8,
+    maximized: bool,
+    trace_home: PathBuf,
+) -> u64 {
+    let desktop = desktop.clone();
+    gtk::glib::timeout_add_local_once(Duration::from_millis(16), move || {
+        let size = desktop.inner_size();
+        append_trace_event(
+            &trace_home,
+            "ui",
+            "startup",
+            "transparent_window_pre_reveal_reconfigure_begin",
+            json!({
+                "pid": std::process::id(),
+                "width": size.width,
+                "height": size.height,
+                "radius": radius,
+            }),
+        );
+        if size.width <= 2 || size.height <= 2 {
+            append_trace_event(
+                &trace_home,
+                "ui",
+                "startup",
+                "transparent_window_pre_reveal_reconfigure_skipped",
+                json!({
+                    "pid": std::process::id(),
+                    "width": size.width,
+                    "height": size.height,
+                }),
+            );
+            return;
+        }
+        apply_linux_transparent_window_surface_style(&desktop, true, radius);
+        apply_linux_window_corner_shape(&desktop, radius, maximized);
+        desktop.request_redraw();
+        desktop.set_inner_size(LogicalSize::new(
+            f64::from(size.width + 1),
+            f64::from(size.height),
+        ));
+        let restore_desktop = desktop.clone();
+        let restore_trace_home = trace_home.clone();
+        gtk::glib::timeout_add_local_once(Duration::from_millis(72), move || {
+            restore_desktop.set_inner_size(LogicalSize::new(
+                f64::from(size.width),
+                f64::from(size.height),
+            ));
+            apply_linux_transparent_window_surface_style(&restore_desktop, true, radius);
+            apply_linux_window_corner_shape(&restore_desktop, radius, maximized);
+            restore_desktop.request_redraw();
+            append_trace_event(
+                &restore_trace_home,
+                "ui",
+                "startup",
+                "transparent_window_pre_reveal_reconfigure_end",
+                json!({
+                    "pid": std::process::id(),
+                    "width": size.width,
+                    "height": size.height,
+                    "radius": radius,
+                }),
+            );
+        });
+    });
+    LINUX_TRANSPARENT_WINDOW_PRE_REVEAL_RECONFIGURE_MS
+}
+#[cfg(target_os = "linux")]
 fn reveal_linux_window_after_corner_shape(
     desktop: &dioxus::desktop::DesktopContext,
     radius: u8,
     maximized: bool,
     trace_home: PathBuf,
+    initial_delay_ms: u64,
 ) {
     use gtk::prelude::*;
 
     let revealed = std::rc::Rc::new(std::cell::Cell::new(false));
     for delay_ms in [0_u64, 8, 16, 32, 64, 120, 240, 480] {
+        let effective_delay_ms = delay_ms.saturating_add(initial_delay_ms);
         let desktop = desktop.clone();
         let gtk_window = desktop.gtk_window().clone();
         let revealed = revealed.clone();
         let trace_home = trace_home.clone();
-        gtk::glib::timeout_add_local_once(Duration::from_millis(delay_ms), move || {
+        gtk::glib::timeout_add_local_once(Duration::from_millis(effective_delay_ms), move || {
             if revealed.get() {
                 return;
             }
@@ -44250,7 +44339,8 @@ fn reveal_linux_window_after_corner_shape(
                     "linux_window_revealed_after_corner_shape",
                     json!({
                         "pid": std::process::id(),
-                        "delay_ms": delay_ms,
+                        "delay_ms": effective_delay_ms,
+                        "initial_delay_ms": initial_delay_ms,
                         "width": allocation.width(),
                         "height": allocation.height(),
                         "radius": radius,
@@ -44268,7 +44358,8 @@ fn reveal_linux_window_after_corner_shape(
                     "linux_window_revealed_after_corner_shape_fallback",
                     json!({
                         "pid": std::process::id(),
-                        "delay_ms": delay_ms,
+                        "delay_ms": effective_delay_ms,
+                        "initial_delay_ms": initial_delay_ms,
                         "width": allocation.width(),
                         "height": allocation.height(),
                         "has_window": has_window,
