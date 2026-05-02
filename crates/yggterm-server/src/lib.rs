@@ -1342,6 +1342,67 @@ impl YggtermServer {
         Some((remote_shutdown_machine_ref(machine), session_id.to_string()))
     }
 
+    pub fn remote_terminal_write_for_path(&self, path: &str, data: &str) -> anyhow::Result<bool> {
+        if data.is_empty() {
+            return Ok(false);
+        }
+        let Some((raw_machine_key, session_id)) = parse_remote_scanned_session_path(path) else {
+            return Ok(false);
+        };
+        let machine_key = normalize_machine_key(raw_machine_key);
+        let target = self.remote_target_for_machine_key(&machine_key)?;
+        let runtime_key = remote_runtime_codex_session_key(session_id);
+        let debug_binary_override = std::env::var("YGGTERM_REMOTE_YGGTERM_BINARY_EXPR")
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+        let remote_binary_expr = debug_binary_override.or_else(|| {
+            self.remote_machines
+                .iter()
+                .find(|machine| machine.machine_key == machine_key)
+                .and_then(|machine| machine.remote_binary_expr.clone())
+        });
+        let write_args = ["server", "terminal", "write", &runtime_key, "--stdin"];
+        let write_result = if let Some(binary_expr) = remote_binary_expr.as_deref() {
+            run_remote_binary_command(
+                &target.ssh_target,
+                target.prefix.as_deref(),
+                binary_expr,
+                &write_args,
+                Some(data.as_bytes()),
+            )
+        } else {
+            run_remote_yggterm_command(
+                &target.ssh_target,
+                target.prefix.as_deref(),
+                &write_args,
+                Some(data.as_bytes()),
+            )
+        };
+        write_result.with_context(|| {
+            format!(
+                "remote terminal write failed for {path} through {}",
+                target.ssh_target
+            )
+        })?;
+        if let Ok(home) = resolve_yggterm_home() {
+            append_trace_event(
+                &home,
+                "server",
+                "terminal_io",
+                "remote_terminal_write_direct",
+                serde_json::json!({
+                    "path": path,
+                    "machine_key": machine_key,
+                    "ssh_target": target.ssh_target,
+                    "runtime_key": runtime_key,
+                    "bytes": data.len(),
+                }),
+            );
+        }
+        Ok(true)
+    }
+
     pub fn ssh_targets(&self) -> &[SshConnectTarget] {
         &self.ssh_targets
     }
@@ -5395,12 +5456,38 @@ pub(crate) fn remote_snapshot_is_transcript_browser(bytes: &[u8]) -> bool {
 }
 
 fn remote_snapshot_has_resume_breakage(bytes: &[u8]) -> bool {
-    let normalized = String::from_utf8_lossy(bytes)
+    let text = String::from_utf8_lossy(bytes);
+    let normalized = text
         .to_ascii_lowercase()
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ");
-    normalized.contains("conversation interrupted") || normalized.contains("something went wrong")
+    if !(normalized.contains("conversation interrupted")
+        || normalized.contains("something went wrong"))
+    {
+        return false;
+    }
+    !remote_snapshot_recovered_after_resume_breakage(&text)
+}
+
+fn remote_snapshot_recovered_after_resume_breakage(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    let interrupted_ix = lower.rfind("conversation interrupted");
+    let went_wrong_ix = lower.rfind("something went wrong");
+    let Some(breakage_ix) = interrupted_ix.into_iter().chain(went_wrong_ix).max() else {
+        return false;
+    };
+    let tail = &lower[breakage_ix..];
+    let has_prompt = tail.contains("\n› ")
+        || tail.contains("\n> ")
+        || tail.contains("\n$ ")
+        || tail.contains("\n# ");
+    let has_codex_footer = tail.contains("gpt-")
+        || tail.contains("tokens")
+        || tail.contains("/status")
+        || tail.contains("/skills")
+        || tail.contains("use /");
+    has_prompt && has_codex_footer
 }
 
 fn remote_snapshot_requires_trust_continue(bytes: &[u8]) -> bool {
@@ -5440,6 +5527,7 @@ fn remote_resume_seed_snapshot_prefill(bytes: &[u8]) -> Option<String> {
         return None;
     }
     let text = String::from_utf8_lossy(bytes).replace('\0', "");
+    let recovered_after_breakage = remote_snapshot_recovered_after_resume_breakage(&text);
     let mut lines = Vec::new();
     let mut saw_meaningful = false;
     for raw_line in text.lines() {
@@ -5462,7 +5550,17 @@ fn remote_resume_seed_snapshot_prefill(bytes: &[u8]) -> Option<String> {
         {
             continue;
         }
-        if lower.contains("conversation interrupted") || lower.contains("something went wrong") {
+        if lower.contains("conversation interrupted")
+            || lower.contains("something went wrong")
+            || lower.contains("/feedback")
+            || lower.contains("report the issue")
+        {
+            if recovered_after_breakage {
+                if saw_meaningful && !lines.last().is_some_and(|line: &String| line.is_empty()) {
+                    lines.push(String::new());
+                }
+                continue;
+            }
             break;
         }
         if remote_snapshot_is_generic_codex_idle(trimmed.as_bytes())
@@ -5482,6 +5580,110 @@ fn remote_resume_seed_snapshot_prefill(bytes: &[u8]) -> Option<String> {
     } else {
         Some(format!("{}\r\n", lines.join("\r\n")))
     }
+}
+
+fn remote_resume_prefill_has_scrollback(prefill: &str) -> bool {
+    prefill
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .count()
+        >= 40
+}
+
+fn remote_preview_payload_terminal_prefill(payload: &RemotePreviewPayload) -> Option<String> {
+    let mut lines = Vec::new();
+    for block in &payload.preview.blocks {
+        let content = block
+            .lines
+            .iter()
+            .map(|line| line.trim_end())
+            .filter(|line| !line.trim().is_empty())
+            .collect::<Vec<_>>();
+        if content.is_empty() {
+            continue;
+        }
+        if !lines.is_empty() {
+            lines.push(String::new());
+        }
+        lines.push(match block.role.as_str() {
+            "user" => "›".to_string(),
+            "assistant" => "•".to_string(),
+            other => format!("{other}:"),
+        });
+        lines.extend(content.into_iter().map(ToOwned::to_owned));
+    }
+    while lines.last().is_some_and(|line| line.trim().is_empty()) {
+        lines.pop();
+    }
+    if lines.is_empty() {
+        return None;
+    }
+    Some(format!("{}\r\n", lines.join("\r\n")))
+}
+
+fn fetch_remote_saved_codex_session_path_over_ssh(
+    ssh_target: &str,
+    exec_prefix: Option<&str>,
+    session_id: &str,
+) -> anyhow::Result<Option<String>> {
+    let inner = format!(
+        r#"root="${{CODEX_HOME:-$HOME/.codex}}/sessions"
+[ -d "$root" ] || exit 0
+target={session_id}
+exact=$(find "$root" -type f -name "*$target*.jsonl" -print -quit 2>/dev/null || true)
+if [ -n "$exact" ]; then
+  printf '%s' "$exact"
+  exit 0
+fi
+find "$root" -type f -name '*.jsonl' -print 2>/dev/null | while IFS= read -r path; do
+  if grep -Fq -- "$target" "$path" 2>/dev/null; then
+    printf '%s' "$path"
+    exit 0
+  fi
+done"#,
+        session_id = shell_single_quote(session_id),
+    );
+    let mut cmd = Command::new("ssh");
+    cmd.arg("-o").arg("ConnectTimeout=5");
+    cmd.arg("-o").arg("BatchMode=yes");
+    cmd.arg(ssh_target)
+        .arg(remote_shell_command(exec_prefix, &inner))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let output = cmd
+        .output()
+        .with_context(|| format!("finding remote saved Codex session on {ssh_target}"))?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "remote saved-session lookup failed for {}: {}",
+            ssh_target,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    Ok((!path.is_empty()).then_some(path))
+}
+
+fn fetch_remote_saved_codex_prefill_over_ssh(
+    ssh_target: &str,
+    exec_prefix: Option<&str>,
+    session_id: &str,
+) -> anyhow::Result<Option<String>> {
+    let Some(path) =
+        fetch_remote_saved_codex_session_path_over_ssh(ssh_target, exec_prefix, session_id)?
+    else {
+        return Ok(None);
+    };
+    let output = run_remote_yggterm_command(
+        ssh_target,
+        exec_prefix,
+        &["server", "remote", "preview", &path],
+        None,
+    )?;
+    let payload: RemotePreviewPayload =
+        serde_json::from_str(&output).context("invalid remote preview payload")?;
+    Ok(remote_preview_payload_terminal_prefill(&payload)
+        .map(|prefill| format!("\x1b[2J\x1b[H{prefill}")))
 }
 
 fn remote_saved_session_match_fragments(session_id: &str) -> anyhow::Result<Vec<String>> {
@@ -7854,12 +8056,82 @@ exit 0"#,
     let text = String::from_utf8_lossy(&output.stdout).replace('\0', "");
     let trimmed = text.trim();
     if trimmed.is_empty() {
+        if let Ok(Some(saved_prefill)) =
+            fetch_remote_saved_codex_prefill_over_ssh(ssh_target, exec_prefix, session_id)
+            && remote_resume_prefill_has_scrollback(&saved_prefill)
+        {
+            if let Ok(home) = resolve_yggterm_home() {
+                append_trace_event(
+                    &home,
+                    "server",
+                    "remote_resume_seed",
+                    "saved_codex_prefill_used",
+                    serde_json::json!({
+                        "ssh_target": ssh_target,
+                        "session_id": session_id,
+                        "bytes": saved_prefill.len(),
+                        "reason": "empty_multiplexer_snapshot",
+                    }),
+                );
+            }
+            return Ok(Some(saved_prefill));
+        }
         return Ok(None);
     }
-    let Some(prefill) = remote_resume_seed_snapshot_prefill(trimmed.as_bytes()) else {
-        return Ok(None);
-    };
-    Ok(Some(format!("\x1b[2J\x1b[H{}", prefill)))
+    let snapshot_prefill = remote_resume_seed_snapshot_prefill(trimmed.as_bytes());
+    if let Some(prefill) = snapshot_prefill.as_deref()
+        && remote_resume_prefill_has_scrollback(prefill)
+    {
+        if let Ok(home) = resolve_yggterm_home() {
+            append_trace_event(
+                &home,
+                "server",
+                "remote_resume_seed",
+                "multiplexer_snapshot_prefill_used",
+                serde_json::json!({
+                    "ssh_target": ssh_target,
+                    "session_id": session_id,
+                    "bytes": prefill.len(),
+                }),
+            );
+        }
+        return Ok(Some(format!("\x1b[2J\x1b[H{}", prefill)));
+    }
+    if let Ok(Some(saved_prefill)) =
+        fetch_remote_saved_codex_prefill_over_ssh(ssh_target, exec_prefix, session_id)
+        && remote_resume_prefill_has_scrollback(&saved_prefill)
+    {
+        if let Ok(home) = resolve_yggterm_home() {
+            append_trace_event(
+                &home,
+                "server",
+                "remote_resume_seed",
+                "saved_codex_prefill_used",
+                serde_json::json!({
+                    "ssh_target": ssh_target,
+                    "session_id": session_id,
+                    "bytes": saved_prefill.len(),
+                }),
+            );
+        }
+        return Ok(Some(saved_prefill));
+    }
+    if let Some(prefill) = snapshot_prefill.as_deref()
+        && let Ok(home) = resolve_yggterm_home()
+    {
+        append_trace_event(
+            &home,
+            "server",
+            "remote_resume_seed",
+            "shallow_snapshot_prefill_used",
+            serde_json::json!({
+                "ssh_target": ssh_target,
+                "session_id": session_id,
+                "bytes": prefill.len(),
+            }),
+        );
+    }
+    Ok(snapshot_prefill.map(|prefill| format!("\x1b[2J\x1b[H{}", prefill)))
 }
 
 fn normalize_remote_attach_cwd(
@@ -7998,7 +8270,7 @@ fn run_remote_binary_command(
     let mut child = cmd
         .spawn()
         .with_context(|| format!("failed to start remote yggterm command for {ssh_target}"))?;
-    if let Some(stdin) = child.stdin.as_mut()
+    if let Some(mut stdin) = child.stdin.take()
         && let Some(bytes) = stdin_bytes
     {
         stdin
@@ -11828,8 +12100,15 @@ fn terminal_host_probe_snapshot(host: &Value) -> Value {
         "host_has_active_element": host.get("host_has_active_element").and_then(Value::as_bool),
         "viewport_y": host.get("viewport_y").and_then(Value::as_i64),
         "base_y": host.get("base_y").and_then(Value::as_i64),
+        "viewport_scroll_top": host.get("viewport_scroll_top").and_then(Value::as_f64),
+        "scrollback_expected": host.get("scrollback_expected").and_then(Value::as_bool),
+        "last_raw_payload_line_count": host.get("last_raw_payload_line_count").and_then(Value::as_u64),
         "cols": host.get("cols").and_then(Value::as_u64),
         "rows": host.get("rows").and_then(Value::as_u64),
+        "text_head": host.get("text_head")
+            .or_else(|| host.get("text_sample"))
+            .and_then(Value::as_str)
+            .unwrap_or_default(),
         "text_tail": host.get("text_tail")
             .or_else(|| host.get("buffer_text_sample"))
             .or_else(|| host.get("text_sample"))
@@ -11843,6 +12122,8 @@ fn terminal_host_probe_snapshot(host: &Value) -> Value {
         "render_event_count": host.get("render_event_count").and_then(Value::as_u64),
         "write_bridge_flush_count": host.get("write_bridge_flush_count").and_then(Value::as_u64),
         "write_command_count": host.get("write_command_count").and_then(Value::as_u64),
+        "wheel_event_count": host.get("wheel_event_count").and_then(Value::as_u64),
+        "scroll_event_count": host.get("scroll_event_count").and_then(Value::as_u64),
         "last_data_event_at_ms": host.get("last_data_event_at_ms").and_then(Value::as_u64),
         "last_render_event_at_ms": host.get("last_render_event_at_ms").and_then(Value::as_u64),
         "last_write_queued_at_ms": host.get("last_write_queued_at_ms").and_then(Value::as_u64),
@@ -11928,6 +12209,104 @@ fn terminal_probe_snapshot_changed(before: &Value, after: &Value, data: &str) ->
         return true;
     }
     after_text != before_text || after_cursor != before_cursor
+}
+
+fn terminal_probe_i64_field(snapshot: &Value, key: &str) -> Option<i64> {
+    snapshot.get(key).and_then(|value| {
+        value
+            .as_i64()
+            .or_else(|| value.as_u64().and_then(|number| i64::try_from(number).ok()))
+    })
+}
+
+fn terminal_probe_u64_field(snapshot: &Value, key: &str) -> u64 {
+    snapshot.get(key).and_then(Value::as_u64).unwrap_or(0)
+}
+
+fn terminal_probe_f64_field(snapshot: &Value, key: &str) -> Option<f64> {
+    snapshot.get(key).and_then(|value| {
+        value
+            .as_f64()
+            .or_else(|| value.as_i64().map(|number| number as f64))
+            .or_else(|| value.as_u64().map(|number| number as f64))
+    })
+}
+
+fn terminal_probe_snapshot_expects_scrollback(snapshot: &Value) -> bool {
+    if snapshot
+        .get("scrollback_expected")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        return true;
+    }
+    let rows = terminal_probe_u64_field(snapshot, "rows");
+    let raw_lines = terminal_probe_u64_field(snapshot, "last_raw_payload_line_count");
+    if rows > 0 && raw_lines > rows.saturating_add(4) {
+        return true;
+    }
+    terminal_probe_i64_field(snapshot, "base_y")
+        .map(|base_y| base_y > 0)
+        .unwrap_or(false)
+}
+
+fn terminal_scroll_probe_snapshot_can_move(snapshot: &Value, lines: i32) -> bool {
+    if lines == 0 {
+        return false;
+    }
+    let viewport_y = terminal_probe_i64_field(snapshot, "viewport_y");
+    let base_y = terminal_probe_i64_field(snapshot, "base_y");
+    let scroll_top = terminal_probe_f64_field(snapshot, "viewport_scroll_top").unwrap_or(0.0);
+    if lines < 0 {
+        return viewport_y.map(|value| value > 0).unwrap_or(false)
+            || scroll_top > 0.5
+            || terminal_probe_snapshot_expects_scrollback(snapshot);
+    }
+    if let (Some(viewport_y), Some(base_y)) = (viewport_y, base_y) {
+        return viewport_y < base_y;
+    }
+    false
+}
+
+fn terminal_scroll_probe_snapshot_moved(before: &Value, after: &Value) -> bool {
+    if terminal_probe_i64_field(before, "viewport_y")
+        != terminal_probe_i64_field(after, "viewport_y")
+    {
+        return true;
+    }
+    let before_scroll = terminal_probe_f64_field(before, "viewport_scroll_top");
+    let after_scroll = terminal_probe_f64_field(after, "viewport_scroll_top");
+    if let (Some(before_scroll), Some(after_scroll)) = (before_scroll, after_scroll)
+        && (before_scroll - after_scroll).abs() > 0.5
+    {
+        return true;
+    }
+    let before_head = before
+        .get("text_head")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let after_head = after
+        .get("text_head")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if before_head != after_head {
+        return true;
+    }
+    let before_tail = before
+        .get("text_tail")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let after_tail = after
+        .get("text_tail")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if before_tail != after_tail {
+        return true;
+    }
+    terminal_probe_u64_field(after, "wheel_event_count")
+        > terminal_probe_u64_field(before, "wheel_event_count")
+        || terminal_probe_u64_field(after, "scroll_event_count")
+            > terminal_probe_u64_field(before, "scroll_event_count")
 }
 
 fn x11_keyboard_probe_requires_focused_retry(
@@ -12470,12 +12849,17 @@ fn x11_scroll_probe_input(
         std::thread::sleep(Duration::from_millis(120));
     }
     let after_context = active_terminal_probe_context(&home, session_path, snapshot_timeout_ms)?;
+    let movement_expected = terminal_scroll_probe_snapshot_can_move(&before_context.before, lines);
+    let scroll_probe_moved =
+        terminal_scroll_probe_snapshot_moved(&before_context.before, &after_context.before);
     Ok(json!({
         "accepted": true,
         "session_path": session_path,
         "before": before_context.before,
         "after": after_context.before,
         "lines": lines,
+        "movement_expected": movement_expected,
+        "scroll_probe_moved": scroll_probe_moved,
         "mode": "keyboard",
         "keyboard_backend": "xdotool",
         "window_id": window_id,
@@ -12487,6 +12871,18 @@ fn x11_scroll_probe_input(
 }
 
 fn app_control_skip_x11_synthetic_input() -> bool {
+    if !std::env::var("YGGTERM_APP_CONTROL_ENABLE_DESKTOP_SYNTHETIC_INPUT")
+        .ok()
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+    {
+        return true;
+    }
     std::env::var("YGGTERM_APP_CONTROL_SKIP_X11_SYNTHETIC_INPUT")
         .ok()
         .map(|value| {
@@ -12559,8 +12955,18 @@ pub fn run_app_control_probe_terminal_viewport_scroll(
     if !app_control_skip_x11_synthetic_input()
         && let Ok(response) = x11_scroll_probe_input(session_path, lines, timeout_ms)
     {
-        write_stdout_payload(&serde_json::to_string_pretty(&response)?)?;
-        return Ok(());
+        let movement_expected = response
+            .get("movement_expected")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let scroll_probe_moved = response
+            .get("scroll_probe_moved")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if !movement_expected || scroll_probe_moved {
+            write_stdout_payload(&serde_json::to_string_pretty(&response)?)?;
+            return Ok(());
+        }
     }
     let home = resolve_yggterm_home()?;
     let response = request_app_control(
@@ -16579,6 +16985,15 @@ mod tests {
     }
 
     #[test]
+    fn saved_session_reuses_recovered_interrupted_runtime_snapshot() {
+        let recovered = b">_ OpenAI Codex (v0.118.0)\nmodel: gpt-5.5 xhigh /model to change\ndirectory: ~/gh/yggterm\n\n: Make a passwordless user pi.\n\n\" Working on it.\n\nConversation interrupted - tell the model what to do differently. Something went wrong? Hit /feedback to report the issue.\n\n> Also, we are testing on ssh winvm and macos.\n\n\" Got it: Windows proof should use ssh winvm and macOS proof should use ssh macos.\n\n\xE2\x80\xBA Summarize recent commits\n\n  gpt-5.5 xhigh \xC2\xB7 ~/gh/yggterm\n";
+        assert!(remote_saved_session_can_reuse_existing_multiplexer(
+            true, recovered
+        ));
+        assert!(!remote_resume_runtime_output_requires_restart(recovered));
+    }
+
+    #[test]
     fn remote_resume_seed_snapshot_prefill_salvages_transcript_before_breakage() {
         let interrupted = b">_ OpenAI Codex (v0.118.0)\nmodel: gpt-5.4 high /model to change\ndirectory: ~\n\n: Make a passwordless user pi.\n\n\" Working on it.\n\nConversation interrupted - tell the model what to do differently. Something went wrong? Hit /feedback to report the issue.\n\n: Explain this codebase\n";
         let prefill = super::remote_resume_seed_snapshot_prefill(interrupted)
@@ -16587,6 +17002,98 @@ mod tests {
         assert!(prefill.contains("Working on it."));
         assert!(!prefill.contains("Conversation interrupted"));
         assert!(!prefill.contains("Explain this codebase"));
+    }
+
+    #[test]
+    fn remote_resume_seed_snapshot_prefill_keeps_recovered_transcript_after_breakage() {
+        let recovered = b">_ OpenAI Codex (v0.118.0)\nmodel: gpt-5.5 xhigh /model to change\ndirectory: ~/gh/yggterm\n\n: Make a passwordless user pi.\n\n\" Working on it.\n\nConversation interrupted - tell the model what to do differently. Something went wrong? Hit /feedback to report the issue.\n\n> Also, we are testing on ssh winvm and macos.\n\n\" Got it: Windows proof should use ssh winvm and macOS proof should use ssh macos.\n\n\xE2\x80\xBA Summarize recent commits\n\n  gpt-5.5 xhigh \xC2\xB7 ~/gh/yggterm\n";
+        let prefill = super::remote_resume_seed_snapshot_prefill(recovered)
+            .expect("prefill should keep recovered transcript");
+        assert!(prefill.contains("Make a passwordless user pi."));
+        assert!(prefill.contains("Also, we are testing on ssh winvm"));
+        assert!(prefill.contains("Summarize recent commits"));
+        assert!(!prefill.contains("Conversation interrupted"));
+        assert!(!prefill.contains("/feedback"));
+    }
+
+    #[test]
+    fn remote_preview_payload_terminal_prefill_provides_scrollback() {
+        let payload = RemotePreviewPayload {
+            title_hint: None,
+            cached_precis: None,
+            cached_summary: None,
+            preview: SnapshotPreview {
+                summary: Vec::new(),
+                blocks: vec![
+                    SnapshotPreviewBlock {
+                        role: "user".to_string(),
+                        timestamp: "now".to_string(),
+                        tone: PreviewTone::User,
+                        folded: false,
+                        lines: vec!["Investigate the remote terminal.".to_string()],
+                    },
+                    SnapshotPreviewBlock {
+                        role: "assistant".to_string(),
+                        timestamp: "now".to_string(),
+                        tone: PreviewTone::Assistant,
+                        folded: false,
+                        lines: (1..=45)
+                            .map(|line| format!("Recovered transcript line {line:03}"))
+                            .collect(),
+                    },
+                ],
+            },
+            rendered_sections: Vec::new(),
+        };
+        let prefill = super::remote_preview_payload_terminal_prefill(&payload)
+            .expect("preview payload should become terminal prefill");
+        assert!(prefill.contains("Investigate the remote terminal."));
+        assert!(prefill.contains("Recovered transcript line 045"));
+        assert!(super::remote_resume_prefill_has_scrollback(&prefill));
+    }
+
+    #[test]
+    fn terminal_scroll_probe_requires_actual_movement_when_scrollback_can_move() {
+        let before = json!({
+            "viewport_y": 124,
+            "base_y": 124,
+            "viewport_scroll_top": 2232.0,
+            "rows": 50,
+            "last_raw_payload_line_count": 197,
+            "text_head": "top",
+            "text_tail": "bottom",
+            "wheel_event_count": 0,
+            "scroll_event_count": 0,
+        });
+        let unchanged = json!({
+            "viewport_y": 124,
+            "base_y": 124,
+            "viewport_scroll_top": 2232.0,
+            "rows": 50,
+            "last_raw_payload_line_count": 197,
+            "text_head": "top",
+            "text_tail": "bottom",
+            "wheel_event_count": 0,
+            "scroll_event_count": 0,
+        });
+        let moved = json!({
+            "viewport_y": 104,
+            "base_y": 124,
+            "viewport_scroll_top": 1872.0,
+            "rows": 50,
+            "last_raw_payload_line_count": 197,
+            "text_head": "older",
+            "text_tail": "bottom",
+            "wheel_event_count": 1,
+            "scroll_event_count": 1,
+        });
+
+        assert!(super::terminal_scroll_probe_snapshot_can_move(&before, -20));
+        assert!(!super::terminal_scroll_probe_snapshot_can_move(&before, 20));
+        assert!(!super::terminal_scroll_probe_snapshot_moved(
+            &before, &unchanged
+        ));
+        assert!(super::terminal_scroll_probe_snapshot_moved(&before, &moved));
     }
 
     #[test]
