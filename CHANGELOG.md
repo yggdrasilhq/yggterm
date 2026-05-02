@@ -4,6 +4,13 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+## 2.1.88
+
+### Fixed
+
+- keep remote Codex resume bridges waiting when the daemon snapshot is only the bare Codex prompt/footer, so restored sessions repaint with the full Codex frame instead of getting stranded in a prompt-only failed state
+- preserve fresh Codex welcome frames through xterm write coalescing while MCP/status lines stream in, and flag tall prompt-only Codex surfaces as app-control failures instead of treating them as ready
+
 ## 2.1.87
 
 ### Fixed
