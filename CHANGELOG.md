@@ -4,6 +4,14 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+## 2.1.96
+
+### Fixed
+
+- hydrate GUI relaunches from the active Linux desktop environment when they are started from SSH/app-control, so KDE Wayland restart handoffs pick the transparent Xwayland window profile instead of falling back to square opaque corners
+- hide the transparent KDE/Xwayland window until its first configure/shape pass completes, preventing the launch-time square-corner flash before KWin settles the rounded frame
+- expose hydrated desktop environment fields in app-control desktop identity output to make future KDE launch/corner regressions easier to diagnose
+
 ## 2.1.95
 
 ### Fixed

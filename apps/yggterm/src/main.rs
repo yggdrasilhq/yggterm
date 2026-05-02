@@ -1,6 +1,8 @@
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
 use anyhow::{Context, Result};
+#[cfg(target_os = "linux")]
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::Read;
 use std::io::Write;
@@ -429,6 +431,11 @@ fn ensure_local_server_ready_for_cli(store: &SessionStore) -> Result<()> {
 
 fn main() -> Result<()> {
     maybe_wait_for_update_relaunch_parent_exit();
+    let args = std::env::args().skip(1).collect::<Vec<_>>();
+    #[cfg(target_os = "linux")]
+    if args.is_empty() {
+        hydrate_linux_gui_entry_environment_from_desktop();
+    }
     configure_linux_allocator_limits()?;
     configure_linux_desktop_backend();
     configure_linux_accessibility_bridge();
@@ -440,7 +447,6 @@ fn main() -> Result<()> {
         .without_time()
         .init();
 
-    let args = std::env::args().skip(1).collect::<Vec<_>>();
     if args.is_empty() {
         configure_gui_entry_process("Yggterm", "dev.yggterm.Yggterm")?;
     }
@@ -1576,6 +1582,131 @@ fn linux_session_env_looks_like_kde_plasma() -> bool {
 }
 
 #[cfg(target_os = "linux")]
+const LINUX_GUI_ENTRY_ENV_KEYS: &[&str] = &[
+    "DISPLAY",
+    "WAYLAND_DISPLAY",
+    "XAUTHORITY",
+    "XDG_RUNTIME_DIR",
+    "XDG_CURRENT_DESKTOP",
+    "XDG_SESSION_DESKTOP",
+    "DESKTOP_SESSION",
+    "KDE_FULL_SESSION",
+    "DBUS_SESSION_BUS_ADDRESS",
+];
+
+#[cfg(target_os = "linux")]
+fn linux_environ_bytes_to_map(environ: &[u8]) -> BTreeMap<String, String> {
+    environ
+        .split(|byte| *byte == 0)
+        .filter_map(|entry| std::str::from_utf8(entry).ok())
+        .filter_map(|entry| entry.split_once('='))
+        .map(|(key, value)| (key.trim(), value.trim()))
+        .filter(|(key, value)| !key.is_empty() && !value.is_empty())
+        .map(|(key, value)| (key.to_string(), value.to_string()))
+        .collect()
+}
+
+#[cfg(target_os = "linux")]
+fn linux_desktop_env_score(command_name: &str, env: &BTreeMap<String, String>) -> Option<i32> {
+    let has_display = env.contains_key("DISPLAY") || env.contains_key("WAYLAND_DISPLAY");
+    let has_runtime = env.contains_key("XDG_RUNTIME_DIR");
+    if !has_display || !has_runtime {
+        return None;
+    }
+    let desktop_text = [
+        env.get("XDG_CURRENT_DESKTOP"),
+        env.get("XDG_SESSION_DESKTOP"),
+        env.get("DESKTOP_SESSION"),
+        env.get("KDE_FULL_SESSION"),
+    ]
+    .into_iter()
+    .flatten()
+    .map(|value| value.to_ascii_lowercase())
+    .collect::<Vec<_>>()
+    .join(" ");
+    let kde = desktop_text.contains("kde")
+        || desktop_text.contains("plasma")
+        || matches!(
+            env.get("KDE_FULL_SESSION").map(String::as_str),
+            Some("true" | "1")
+        );
+    let command_score = match command_name {
+        "plasmashell" => 100,
+        "kwin_wayland" | "kwin_x11" => 95,
+        "startplasma-wayland" | "startplasma-x11" => 90,
+        "gnome-shell" => 70,
+        "cinnamon" | "mate-session" | "xfce4-session" => 60,
+        _ => 20,
+    };
+    let display_score = match (
+        env.contains_key("WAYLAND_DISPLAY"),
+        env.contains_key("DISPLAY"),
+    ) {
+        (true, true) => 25,
+        (true, false) => 15,
+        (false, true) => 10,
+        (false, false) => 0,
+    };
+    let desktop_score = if kde { 40 } else { 0 };
+    Some(command_score + display_score + desktop_score)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_choose_desktop_environment<I>(candidates: I) -> Option<(String, BTreeMap<String, String>)>
+where
+    I: IntoIterator<Item = (String, BTreeMap<String, String>)>,
+{
+    candidates
+        .into_iter()
+        .filter_map(|(command_name, env)| {
+            linux_desktop_env_score(&command_name, &env).map(|score| (score, command_name, env))
+        })
+        .max_by_key(|(score, _, _)| *score)
+        .map(|(_, command_name, env)| (command_name, env))
+}
+
+#[cfg(target_os = "linux")]
+fn discover_linux_desktop_environment() -> Option<(String, BTreeMap<String, String>)> {
+    let entries = fs::read_dir("/proc").ok()?;
+    let candidates = entries.filter_map(|entry| {
+        let entry = entry.ok()?;
+        let file_name = entry.file_name();
+        let pid = file_name.to_string_lossy();
+        if !pid.chars().all(|ch| ch.is_ascii_digit()) {
+            return None;
+        }
+        let proc_dir = entry.path();
+        let command_name = fs::read_to_string(proc_dir.join("comm"))
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())?;
+        let environ = fs::read(proc_dir.join("environ")).ok()?;
+        let env = linux_environ_bytes_to_map(&environ);
+        Some((command_name, env))
+    });
+    linux_choose_desktop_environment(candidates)
+}
+
+#[cfg(target_os = "linux")]
+fn hydrate_linux_gui_entry_environment_from_desktop() {
+    if std::env::var_os("DISPLAY").is_some() || std::env::var_os("WAYLAND_DISPLAY").is_some() {
+        return;
+    }
+    let Some((source, env)) = discover_linux_desktop_environment() else {
+        return;
+    };
+    for key in LINUX_GUI_ENTRY_ENV_KEYS {
+        if std::env::var_os(key).is_none()
+            && let Some(value) = env.get(*key)
+            && !value.trim().is_empty()
+        {
+            unsafe { std::env::set_var(key, value) };
+        }
+    }
+    unsafe { std::env::set_var("YGGTERM_DESKTOP_ENV_HYDRATED_FROM", source) };
+}
+
+#[cfg(target_os = "linux")]
 fn configure_linux_desktop_backend() {
     let policy = linux_desktop_backend_policy_from_input(LinuxDesktopBackendPolicyInput {
         allow_wayland_backend: linux_env_flag_truthy(ENV_YGGTERM_ALLOW_WAYLAND_BACKEND),
@@ -2628,6 +2759,10 @@ mod tests {
         should_retire_superseded_client, signal_client_instances_dir, signal_client_scope_matches,
         signal_parse_process_start_ticks_from_stat, signal_process_start_ticks,
     };
+    #[cfg(target_os = "linux")]
+    use super::{linux_choose_desktop_environment, linux_environ_bytes_to_map};
+    #[cfg(target_os = "linux")]
+    use std::collections::BTreeMap;
     use std::fs;
     use yggterm_server::{ClientInstanceRecord, ServerEndpoint};
 
@@ -2767,6 +2902,58 @@ mod tests {
         });
         assert!(!opt_in.force_x11_backend);
         assert_eq!(opt_in.reason, "wayland_backend_explicitly_allowed");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_desktop_env_parser_reads_null_separated_environment() {
+        let env = linux_environ_bytes_to_map(
+            b"DISPLAY=:1\0WAYLAND_DISPLAY=wayland-0\0XDG_RUNTIME_DIR=/run/user/1000\0",
+        );
+        assert_eq!(env.get("DISPLAY").map(String::as_str), Some(":1"));
+        assert_eq!(
+            env.get("WAYLAND_DISPLAY").map(String::as_str),
+            Some("wayland-0")
+        );
+        assert_eq!(
+            env.get("XDG_RUNTIME_DIR").map(String::as_str),
+            Some("/run/user/1000")
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_desktop_env_picker_prefers_plasma_display_scope() {
+        let mut ssh_env = BTreeMap::new();
+        ssh_env.insert("XDG_RUNTIME_DIR".to_string(), "/run/user/1000".to_string());
+        ssh_env.insert(
+            "SSH_CONNECTION".to_string(),
+            "192.0.2.1 1 192.0.2.2 2".to_string(),
+        );
+
+        let mut plasma_env = BTreeMap::new();
+        plasma_env.insert("XDG_RUNTIME_DIR".to_string(), "/run/user/1000".to_string());
+        plasma_env.insert("WAYLAND_DISPLAY".to_string(), "wayland-0".to_string());
+        plasma_env.insert("DISPLAY".to_string(), ":1".to_string());
+        plasma_env.insert(
+            "XAUTHORITY".to_string(),
+            "/run/user/1000/xauth_example".to_string(),
+        );
+        plasma_env.insert("XDG_CURRENT_DESKTOP".to_string(), "KDE".to_string());
+        plasma_env.insert("KDE_FULL_SESSION".to_string(), "true".to_string());
+
+        let picked = linux_choose_desktop_environment(vec![
+            ("sshd".to_string(), ssh_env),
+            ("plasmashell".to_string(), plasma_env),
+        ])
+        .expect("plasma desktop environment selected");
+
+        assert_eq!(picked.0, "plasmashell");
+        assert_eq!(picked.1.get("DISPLAY").map(String::as_str), Some(":1"));
+        assert_eq!(
+            picked.1.get("WAYLAND_DISPLAY").map(String::as_str),
+            Some("wayland-0")
+        );
     }
 
     #[cfg(unix)]
