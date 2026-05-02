@@ -47,6 +47,7 @@ const DEFAULT_ORPHAN_DAEMON_REAP_AFTER_MS: u64 = 180_000;
 const DUPLICATE_SAME_HOME_GRACE_MS: u64 = 2_000;
 const DAEMON_REQUEST_IO_TIMEOUT_MS: u64 = 10_000;
 const REMOTE_ATTACH_STARTUP_GRACE_MS: u64 = 900;
+const REMOTE_START_CODEX_ATTACH_STARTUP_GRACE_MS: u64 = 18_000;
 const ENV_YGGTERM_ENABLE_BACKGROUND_COPY_CHORE: &str = "YGGTERM_ENABLE_BACKGROUND_COPY_CHORE";
 
 fn daemon_env_flag_truthy(name: &str) -> bool {
@@ -339,9 +340,16 @@ fn remote_resume_stale_attach(
     has_runtime_output: bool,
     runtime_age_ms: u64,
     runtime_output_requires_restart: bool,
+    startup_grace_ms: u64,
 ) -> bool {
-    runtime_output_requires_restart
-        || (!has_runtime_output && runtime_age_ms >= REMOTE_ATTACH_STARTUP_GRACE_MS)
+    runtime_output_requires_restart || (!has_runtime_output && runtime_age_ms >= startup_grace_ms)
+}
+
+fn valid_initial_terminal_size(cols: Option<u16>, rows: Option<u16>) -> Option<(u16, u16)> {
+    match (cols, rows) {
+        (Some(cols), Some(rows)) if cols > 0 && rows > 0 => Some((cols, rows)),
+        _ => None,
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -509,10 +517,18 @@ pub enum ServerRequest {
         session_id: String,
         cwd: Option<String>,
         require_existing: bool,
+        #[serde(default)]
+        initial_cols: Option<u16>,
+        #[serde(default)]
+        initial_rows: Option<u16>,
     },
     StartRemoteRuntimeCodexSession {
         session_id: String,
         cwd: Option<String>,
+        #[serde(default)]
+        initial_cols: Option<u16>,
+        #[serde(default)]
+        initial_rows: Option<u16>,
     },
     FocusLive {
         key: String,
@@ -741,6 +757,14 @@ impl DaemonRuntime {
     }
 
     fn ensure_terminal_for_path(&mut self, path: &str) -> Result<Option<String>> {
+        self.ensure_terminal_for_path_with_initial_size(path, None)
+    }
+
+    fn ensure_terminal_for_path_with_initial_size(
+        &mut self,
+        path: &str,
+        initial_size: Option<(u16, u16)>,
+    ) -> Result<Option<String>> {
         let runtime_path = self.terminal_runtime_key_for_path(path);
         let prepare_message = self.server.ensure_managed_cli_for_session_path(path)?;
         if path.starts_with("remote-session://")
@@ -856,6 +880,12 @@ impl DaemonRuntime {
         } else {
             None
         };
+        let fresh_remote_codex_start = self.server.session_starts_new_remote_codex(path);
+        let remote_attach_startup_grace_ms = if fresh_remote_codex_start {
+            REMOTE_START_CODEX_ATTACH_STARTUP_GRACE_MS
+        } else {
+            REMOTE_ATTACH_STARTUP_GRACE_MS
+        };
         if self.terminals.has_session(&runtime_path) {
             let still_running = self.terminals.session_is_running(&runtime_path);
             let has_runtime_output = self.terminals.session_has_runtime_output(&runtime_path);
@@ -895,10 +925,11 @@ impl DaemonRuntime {
                     has_runtime_output,
                     runtime_age_ms,
                     remote_runtime_output_requires_restart,
+                    remote_attach_startup_grace_ms,
                 );
             let blank_remote_attach = path.starts_with("remote-session://")
                 && !has_runtime_output
-                && runtime_age_ms >= 1_500;
+                && runtime_age_ms >= remote_attach_startup_grace_ms;
             let spec_matches =
                 self.terminals
                     .session_matches_spec(&runtime_path, &launch_command, cwd.as_deref());
@@ -918,6 +949,8 @@ impl DaemonRuntime {
                         "remote_runtime_output_requires_restart": remote_runtime_output_requires_restart,
                         "stale_remote_attach": stale_remote_attach,
                         "blank_remote_attach": blank_remote_attach,
+                        "fresh_remote_codex_start": fresh_remote_codex_start,
+                        "remote_attach_startup_grace_ms": remote_attach_startup_grace_ms,
                         "runtime_saved_session_mismatch": runtime_saved_session_mismatch,
                         "spec_matches": spec_matches,
                         "remote_resume_path": path.starts_with("remote-session://"),
@@ -956,14 +989,17 @@ impl DaemonRuntime {
                             "cwd": cwd,
                             "launch_command": launch_command,
                             "stop_command": stop_command,
+                            "initial_cols": initial_size.map(|(cols, _)| cols),
+                            "initial_rows": initial_size.map(|(_, rows)| rows),
                         }),
                     );
                 }
-                self.terminals.restart_session(
+                self.terminals.restart_session_with_size(
                     &runtime_path,
                     &launch_command,
                     cwd.as_deref(),
                     stop_command.as_deref(),
+                    initial_size,
                 )?;
                 if let Ok(home) = crate::resolve_yggterm_home() {
                     append_trace_event(
@@ -992,11 +1028,17 @@ impl DaemonRuntime {
                     "path": path,
                     "cwd": cwd,
                     "launch_command": launch_command,
+                    "initial_cols": initial_size.map(|(cols, _)| cols),
+                    "initial_rows": initial_size.map(|(_, rows)| rows),
                 }),
             );
         }
-        self.terminals
-            .ensure_session(&runtime_path, &launch_command, cwd.as_deref())?;
+        self.terminals.ensure_session_with_size(
+            &runtime_path,
+            &launch_command,
+            cwd.as_deref(),
+            initial_size,
+        )?;
         if let Ok(home) = crate::resolve_yggterm_home() {
             append_trace_event(
                 &home,
@@ -1403,21 +1445,34 @@ impl DaemonRuntime {
                 session_id,
                 cwd,
                 require_existing,
+                initial_cols,
+                initial_rows,
             } => {
                 let key = self.server.ensure_remote_runtime_codex_session(
                     &session_id,
                     cwd.as_deref(),
                     require_existing,
                 )?;
-                let _ = self.ensure_terminal_for_path(&key)?;
+                let _ = self.ensure_terminal_for_path_with_initial_size(
+                    &key,
+                    valid_initial_terminal_size(initial_cols, initial_rows),
+                )?;
                 self.persist()?;
                 ServerResponse::Ack { message: Some(key) }
             }
-            ServerRequest::StartRemoteRuntimeCodexSession { session_id, cwd } => {
+            ServerRequest::StartRemoteRuntimeCodexSession {
+                session_id,
+                cwd,
+                initial_cols,
+                initial_rows,
+            } => {
                 let key = self
                     .server
                     .start_remote_runtime_codex_session(&session_id, cwd.as_deref())?;
-                let _ = self.ensure_terminal_for_path(&key)?;
+                let _ = self.ensure_terminal_for_path_with_initial_size(
+                    &key,
+                    valid_initial_terminal_size(initial_cols, initial_rows),
+                )?;
                 self.persist()?;
                 ServerResponse::Ack { message: Some(key) }
             }
@@ -2511,6 +2566,7 @@ pub fn ensure_remote_runtime_codex_session(
     session_id: &str,
     cwd: Option<&str>,
     require_existing: bool,
+    initial_size: Option<(u16, u16)>,
 ) -> Result<String> {
     expect_ack(send_request(
         endpoint,
@@ -2518,6 +2574,8 @@ pub fn ensure_remote_runtime_codex_session(
             session_id: session_id.to_string(),
             cwd: cwd.map(ToOwned::to_owned),
             require_existing,
+            initial_cols: initial_size.map(|(cols, _)| cols),
+            initial_rows: initial_size.map(|(_, rows)| rows),
         },
     )?)?
     .with_context(|| format!("missing runtime session key for {session_id}"))
@@ -2527,12 +2585,15 @@ pub fn start_remote_runtime_codex_session(
     endpoint: &ServerEndpoint,
     session_id: &str,
     cwd: Option<&str>,
+    initial_size: Option<(u16, u16)>,
 ) -> Result<String> {
     expect_ack(send_request(
         endpoint,
         &ServerRequest::StartRemoteRuntimeCodexSession {
             session_id: session_id.to_string(),
             cwd: cwd.map(ToOwned::to_owned),
+            initial_cols: initial_size.map(|(cols, _)| cols),
+            initial_rows: initial_size.map(|(_, rows)| rows),
         },
     )?)?
     .with_context(|| format!("missing runtime session key for {session_id}"))
@@ -4037,9 +4098,12 @@ mod tests {
     use super::load_persisted_state;
     #[cfg(target_os = "linux")]
     use super::orphan_daemon_reap_applies_to_home;
-    use super::remote_resume_stale_attach;
     use super::terminal_launch_command_for_path;
     use super::write_persisted_state;
+    use super::{
+        REMOTE_ATTACH_STARTUP_GRACE_MS, REMOTE_START_CODEX_ATTACH_STARTUP_GRACE_MS,
+        remote_resume_stale_attach,
+    };
     #[cfg(unix)]
     use super::{
         cleanup_legacy_unix_daemons, daemon_binary_is_legacy, default_endpoint,
@@ -4684,9 +4748,30 @@ mod tests {
 
     #[test]
     fn remote_resume_stale_attach_ignores_semantic_mismatch_without_breakage() {
-        assert!(!remote_resume_stale_attach(true, 3_500, false));
-        assert!(remote_resume_stale_attach(false, 901, false));
-        assert!(remote_resume_stale_attach(true, 3_500, true));
+        assert!(!remote_resume_stale_attach(
+            true,
+            3_500,
+            false,
+            REMOTE_ATTACH_STARTUP_GRACE_MS
+        ));
+        assert!(remote_resume_stale_attach(
+            false,
+            901,
+            false,
+            REMOTE_ATTACH_STARTUP_GRACE_MS
+        ));
+        assert!(!remote_resume_stale_attach(
+            false,
+            3_500,
+            false,
+            REMOTE_START_CODEX_ATTACH_STARTUP_GRACE_MS
+        ));
+        assert!(remote_resume_stale_attach(
+            true,
+            3_500,
+            true,
+            REMOTE_START_CODEX_ATTACH_STARTUP_GRACE_MS
+        ));
     }
 
     #[cfg(target_os = "linux")]

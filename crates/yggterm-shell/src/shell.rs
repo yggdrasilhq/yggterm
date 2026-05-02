@@ -206,6 +206,7 @@ const REMOTE_PREVIEW_SYNC_DEBOUNCE_MS: u64 = 2_500;
 const REMOTE_TERMINAL_RESUME_SLOW_MS: u64 = 1_200;
 const REMOTE_TERMINAL_RESUME_FAIL_MS: u64 = 30_000;
 const REMOTE_TERMINAL_RESUME_RECOVERY_STALL_MS: u64 = 3_000;
+const REMOTE_TERMINAL_START_CODEX_RECOVERY_STALL_MS: u64 = 18_000;
 const REMOTE_TERMINAL_RESUME_HARD_FAIL_MS: u64 = 24_000;
 const REMOTE_TERMINAL_RESUME_VISUAL_REVEAL_MS: u64 = 180;
 const REMOTE_TERMINAL_ATTACH_CONFIRMATION_MIN_MS: u64 = 1_500;
@@ -30810,7 +30811,8 @@ fn acquire_terminal_bootstrap_lease(
     owner_id: &str,
 ) -> bool {
     match shell.terminal_bootstrap_lease_by_session.get(session_path) {
-        Some(current_lease) if current_lease == lease_id => {
+        Some(current_lease) => {
+            let same_lease = current_lease == lease_id;
             let owner_matches = shell
                 .terminal_bootstrap_owner_by_session
                 .get(session_path)
@@ -30827,10 +30829,10 @@ fn acquire_terminal_bootstrap_lease(
                 shell
                     .terminal_bootstrap_owner_by_session
                     .insert(session_path.to_string(), owner_id.to_string());
-                true
+                !same_lease || !owner_matches
             }
         }
-        _ => {
+        None => {
             shell
                 .terminal_bootstrap_lease_by_session
                 .insert(session_path.to_string(), lease_id.to_string());
@@ -31711,6 +31713,7 @@ fn TerminalCanvas(
         ),
     );
     let is_remote_resume_session = is_remote_resume_agent_session(&session);
+    let remote_starting_codex_session = remote_session_starts_new_codex(&session);
     let terminal_shell_background = theme.background.clone();
     let terminal_shell_shadow = "none".to_string();
     let terminal_frame = terminal_frame_style(snapshot.fullscreen);
@@ -32202,6 +32205,7 @@ fn TerminalCanvas(
         let theme = future_theme.clone();
         let placeholder = terminal_resume_prefill.clone();
         let session_kind = session_kind;
+        let remote_starting_codex_session = remote_starting_codex_session;
         let session_launch_phase_running = session_launch_phase_running;
         let trace_home = trace_home.clone();
         let delayed_recovery_trace_home = trace_home.clone();
@@ -32277,6 +32281,7 @@ fn TerminalCanvas(
             let title = title;
             let theme = theme;
             let placeholder = placeholder;
+            let remote_starting_codex_session = remote_starting_codex_session;
             let trace_home = trace_home;
             let mut state = state;
             let terminal_has_meaningful_output = terminal_has_meaningful_output;
@@ -33037,6 +33042,7 @@ fn TerminalCanvas(
                                     );
                                 }
                                 let prompt_gap_looks_stale = is_remote_resume_session
+                                    && !remote_starting_codex_session
                                     && terminal_overlay_dismissed()
                                     && terminal_geometry_ready
                                     && !has_transport_error
@@ -33846,6 +33852,7 @@ fn TerminalCanvas(
                                 let suppress_resume_control_only_output =
                                     should_suppress_remote_resume_surface_output(
                                         is_remote_resume_session,
+                                        remote_starting_codex_session,
                                         terminal_overlay_dismissed(),
                                         runtime_running,
                                         has_transport_error,
@@ -34006,6 +34013,7 @@ fn TerminalCanvas(
                                         saw_attach_ready_marker,
                                         saw_transcript_browser_output,
                                         saw_codex_prompt_surface,
+                                        remote_starting_codex_session,
                                         saw_generic_idle_output
                                             || tail_generic_idle_output,
                                         saw_generic_idle_footer_output
@@ -34257,6 +34265,7 @@ fn TerminalCanvas(
                                             saw_attach_ready_marker,
                                             saw_transcript_browser_output,
                                             saw_codex_prompt_surface,
+                                            remote_starting_codex_session,
                                             saw_generic_idle_output
                                                 || tail_generic_idle_output,
                                             saw_generic_idle_footer_output
@@ -34422,6 +34431,7 @@ fn TerminalCanvas(
                                 }
                                 if is_remote_resume_session
                                     && traced_attach_ready
+                                    && !remote_starting_codex_session
                                     && !resume_post_attach_redraw_nudged
                                     && terminal_geometry_ready
                                 {
@@ -34487,6 +34497,7 @@ fn TerminalCanvas(
                                         saw_attach_ready_marker,
                                         saw_transcript_browser_output,
                                         saw_codex_prompt_surface,
+                                        remote_starting_codex_session,
                                         saw_generic_idle_output
                                             || tail_generic_idle_output,
                                         saw_generic_idle_footer_output
@@ -34716,7 +34727,11 @@ fn TerminalCanvas(
                                     && !traced_attach_ready
                                     && (!terminal_has_visible_output || !terminal_geometry_ready)
                                     && current_millis().saturating_sub(mount_started_ms)
-                                        >= REMOTE_TERMINAL_RESUME_RECOVERY_STALL_MS;
+                                        >= if remote_starting_codex_session {
+                                            REMOTE_TERMINAL_START_CODEX_RECOVERY_STALL_MS
+                                        } else {
+                                            REMOTE_TERMINAL_RESUME_RECOVERY_STALL_MS
+                                        };
                                 let dead_remote_resume_without_output = is_remote_resume_session
                                     && !traced_attach_ready
                                     && !runtime_running
@@ -34730,13 +34745,18 @@ fn TerminalCanvas(
                                 let codex_prompt_surface_is_live = saw_codex_prompt_surface
                                     && runtime_running
                                     && visible_resume_surface;
+                                let fresh_codex_idle_surface_is_live =
+                                    remote_starting_codex_session
+                                        && runtime_running
+                                        && visible_resume_surface;
                                 let invalid_remote_resume_surface = is_remote_resume_session
                                     && !traced_attach_ready
                                     && (((saw_generic_idle_output
                                         || tail_generic_idle_output
                                         || saw_generic_idle_footer_output
                                         || tail_generic_idle_footer_output)
-                                        && !codex_prompt_surface_is_live)
+                                        && !codex_prompt_surface_is_live
+                                        && !fresh_codex_idle_surface_is_live)
                                         || saw_local_codex_scaffold
                                         || (saw_prompt_only_surface
                                             && !prompt_only_surface_is_live)
@@ -35444,7 +35464,9 @@ fn terminal_write_should_frame_budget(
     _remote_overlay_dismissed: bool,
     protocol_only_output: bool,
 ) -> bool {
-    !protocol_only_output && terminal_output_is_high_volume_frame_like(data)
+    !protocol_only_output
+        && !terminal_output_contains_codex_welcome_surface(data)
+        && terminal_output_is_high_volume_frame_like(data)
 }
 
 fn terminal_output_is_high_volume_frame_like(data: &str) -> bool {
@@ -35454,8 +35476,15 @@ fn terminal_output_is_high_volume_frame_like(data: &str) -> bool {
             || terminal_csi_count_at_least(data, TERMINAL_FRAME_BRIDGE_CSI_MIN_COUNT))
 }
 
+fn terminal_output_contains_codex_welcome_surface(data: &str) -> bool {
+    data.contains("OpenAI Codex") && data.contains("/model to change")
+}
+
 fn coalesce_high_volume_terminal_frames(data: &str) -> String {
     if data.len() < TERMINAL_FRAME_BRIDGE_MIN_BYTES {
+        return data.to_string();
+    }
+    if terminal_output_contains_codex_welcome_surface(data) {
         return data.to_string();
     }
     if !terminal_has_repeated_frame_anchor(data) {
@@ -35485,6 +35514,9 @@ fn coalesce_high_volume_terminal_frames_with_prefix(data: &str, active_prefix: &
 }
 
 fn trim_high_volume_terminal_frame_buffer(data: &str) -> String {
+    if terminal_output_contains_codex_welcome_surface(data) {
+        return data.to_string();
+    }
     if let Some(index) = terminal_last_frame_anchor_index(data) {
         return data[index..].to_string();
     }
@@ -35688,6 +35720,7 @@ fn terminal_chunk_tail_has_generic_codex_idle_footer(data: &str) -> bool {
 }
 fn should_suppress_remote_resume_surface_output(
     is_remote_resume_session: bool,
+    allow_generic_idle_surface: bool,
     overlay_dismissed: bool,
     runtime_running: bool,
     has_transport_error: bool,
@@ -35701,12 +35734,15 @@ fn should_suppress_remote_resume_surface_output(
     saw_transcript_browser_output: bool,
 ) -> bool {
     let live_codex_prompt_surface = runtime_running && saw_codex_prompt_surface;
+    let live_allowed_generic_idle_surface =
+        allow_generic_idle_surface && runtime_running && !has_transport_error;
     is_remote_resume_session
         && !overlay_dismissed
         && (has_transport_error
             || (saw_transcript_browser_output && !runtime_running)
             || saw_prompt_only_surface
             || (!live_codex_prompt_surface
+                && !live_allowed_generic_idle_surface
                 && !saw_meaningful_output
                 && (saw_generic_idle_output
                     || tail_generic_idle_output
@@ -35743,6 +35779,7 @@ fn remote_resume_surface_connected(
     saw_attach_ready_marker: bool,
     saw_transcript_browser_output: bool,
     saw_codex_prompt_surface: bool,
+    allow_generic_idle_surface: bool,
     saw_generic_idle_output: bool,
     saw_generic_idle_footer_output: bool,
     saw_prompt_only_surface: bool,
@@ -35755,7 +35792,7 @@ fn remote_resume_surface_connected(
         return runtime_running && saw_visible_output;
     }
     if saw_generic_idle_output {
-        return false;
+        return allow_generic_idle_surface && runtime_running && saw_visible_output;
     }
     if saw_prompt_only_surface {
         return runtime_running && saw_visible_output;
@@ -35774,6 +35811,7 @@ fn remote_resume_attach_confirmation_satisfied(
     saw_attach_ready_marker: bool,
     saw_transcript_browser_output: bool,
     saw_codex_prompt_surface: bool,
+    allow_generic_idle_surface: bool,
     saw_generic_idle_output: bool,
     saw_generic_idle_footer_output: bool,
     saw_prompt_only_surface: bool,
@@ -35794,6 +35832,7 @@ fn remote_resume_attach_confirmation_satisfied(
         saw_attach_ready_marker,
         saw_transcript_browser_output,
         saw_codex_prompt_surface,
+        allow_generic_idle_surface,
         saw_generic_idle_output,
         saw_generic_idle_footer_output,
         saw_prompt_only_surface,
@@ -40059,6 +40098,9 @@ fn terminal_eval_script_with_canvas_renderer(
         const coalesceHighVolumeTerminalPayload = (payload) => {{
             const value = String(payload || '');
             if (value.length < 4096) {{
+                return value;
+            }}
+            if (value.includes('OpenAI Codex') && value.includes('/model to change')) {{
                 return value;
             }}
             const anchors = ['\x1b[H', '\x1b[1;1H'];
@@ -52769,6 +52811,42 @@ q to quit   pgup/pgdn to page   enter to edit message
         ));
     }
     #[test]
+    fn terminal_bootstrap_lease_blocks_new_mount_while_attach_is_in_flight() {
+        let active_session_path = "local://test";
+        let bootstrap = test_shell_bootstrap_with_active_session(active_session_path);
+        let mut shell = ShellState::new(bootstrap);
+        assert!(acquire_terminal_bootstrap_lease(
+            &mut shell,
+            active_session_path,
+            "lease-a",
+            "owner-a"
+        ));
+        shell
+            .terminal_attach_in_flight
+            .insert(active_session_path.to_string());
+        assert!(!acquire_terminal_bootstrap_lease(
+            &mut shell,
+            active_session_path,
+            "lease-b",
+            "owner-b"
+        ));
+        assert!(terminal_bootstrap_lease_is_current(
+            &shell,
+            active_session_path,
+            "lease-a"
+        ));
+        assert!(terminal_bootstrap_owner_is_current(
+            &shell,
+            active_session_path,
+            "owner-a"
+        ));
+        assert!(!terminal_bootstrap_owner_is_current(
+            &shell,
+            active_session_path,
+            "owner-b"
+        ));
+    }
+    #[test]
     fn inactive_retained_session_does_not_bootstrap_hidden_runtime() {
         let active_session_path = "codex://active";
         let inactive_session_path = "local://inactive";
@@ -57020,6 +57098,24 @@ q to quit   pgup/pgdn to page   enter to edit message
         );
     }
     #[test]
+    fn terminal_write_bridge_keeps_codex_welcome_frames_uncollapsed() {
+        let codex_welcome = format!(
+            "\x1b[1;1H\x1b[J╭──────────────────────────────────────────────╮\n│ >_ OpenAI Codex (v0.128.0)                   │\n│ model:     gpt-5.5 medium   /model to change │\n╰──────────────────────────────────────────────╯\n{}\n",
+            "tip ".repeat(1_100)
+        );
+        let mcp_update = "\x1b[9;2H\x1b[K• Booting MCP server: codex_apps (0s • esc to interrupt)";
+        let combined = format!("{codex_welcome}{mcp_update}");
+
+        assert!(!terminal_write_should_frame_budget(
+            &codex_welcome,
+            true,
+            false,
+            false,
+        ));
+        assert_eq!(coalesce_high_volume_terminal_frames(&combined), combined);
+        assert_eq!(trim_high_volume_terminal_frame_buffer(&combined), combined);
+    }
+    #[test]
     fn terminal_write_frame_budget_skips_protocol_only_handshake() {
         assert!(!terminal_write_should_frame_budget(
             "\u{1b}[?2004h\u{1b}[>7u\u{1b}[?1004h\u{1b}[6n",
@@ -57438,55 +57534,61 @@ Updated at   Branch  Conversation\n\
     #[test]
     fn remote_resume_surface_connected_rejects_generic_idle_surface() {
         assert!(!remote_resume_surface_connected(
-            false, true, false, false, false, true, false, false, true,
+            false, true, false, false, false, false, true, false, false, true,
+        ));
+    }
+    #[test]
+    fn remote_resume_surface_connected_accepts_fresh_codex_idle_surface() {
+        assert!(remote_resume_surface_connected(
+            false, true, false, false, false, true, true, false, false, true,
         ));
     }
     #[test]
     fn remote_resume_surface_connected_accepts_meaningful_codex_surface_with_prompt() {
         assert!(remote_resume_surface_connected(
-            true, true, false, false, false, false, false, false, true,
+            true, true, false, false, false, false, false, false, false, true,
         ));
     }
     #[test]
     fn remote_resume_surface_connected_rejects_attach_ready_marker_without_visible_surface() {
         assert!(!remote_resume_surface_connected(
-            false, false, true, false, false, false, false, false, true,
+            false, false, true, false, false, false, false, false, false, true,
         ));
     }
     #[test]
     fn remote_resume_surface_connected_accepts_attach_ready_marker_with_visible_surface() {
         assert!(remote_resume_surface_connected(
-            false, true, true, false, false, false, false, false, true,
+            false, true, true, false, false, false, false, false, false, true,
         ));
     }
     #[test]
     fn remote_resume_surface_connected_accepts_runtime_prompt_only_surface() {
         assert!(remote_resume_surface_connected(
-            false, true, false, false, false, false, false, true, true,
+            false, true, false, false, false, false, false, false, true, true,
         ));
     }
     #[test]
     fn remote_resume_surface_connected_accepts_live_codex_prompt_surface() {
         assert!(remote_resume_surface_connected(
-            false, true, false, false, true, true, false, false, true,
+            false, true, false, false, true, false, true, false, false, true,
         ));
     }
     #[test]
     fn remote_resume_surface_connected_accepts_live_transcript_browser_surface() {
         assert!(remote_resume_surface_connected(
-            false, true, false, true, false, false, false, false, true,
+            false, true, false, true, false, false, false, false, false, true,
         ));
     }
     #[test]
     fn remote_resume_surface_connected_rejects_dead_transcript_browser_surface() {
         assert!(!remote_resume_surface_connected(
-            false, true, false, true, false, false, false, false, false,
+            false, true, false, true, false, false, false, false, false, false,
         ));
     }
     #[test]
     fn remote_resume_surface_connected_rejects_dead_prompt_only_surface() {
         assert!(!remote_resume_surface_connected(
-            false, true, false, false, false, false, false, true, false,
+            false, true, false, false, false, false, false, false, true, false,
         ));
     }
     #[test]
@@ -57581,6 +57683,7 @@ Updated at   Branch  Conversation\n\
             false,
             false,
             false,
+            false,
             1,
             1_000,
             1_320,
@@ -57595,6 +57698,7 @@ Updated at   Branch  Conversation\n\
         assert!(remote_resume_attach_confirmation_satisfied(
             false,
             true,
+            false,
             false,
             false,
             false,
@@ -57615,6 +57719,28 @@ Updated at   Branch  Conversation\n\
         assert!(remote_resume_attach_confirmation_satisfied(
             false,
             true,
+            false,
+            false,
+            true,
+            false,
+            true,
+            false,
+            false,
+            0,
+            1_000,
+            1_000 + REMOTE_TERMINAL_ATTACH_CONFIRMATION_MIN_MS,
+            false,
+            true,
+            None,
+            false,
+        ));
+    }
+    #[test]
+    fn remote_resume_attach_confirmation_accepts_fresh_codex_idle_after_deadline() {
+        assert!(remote_resume_attach_confirmation_satisfied(
+            false,
+            true,
+            false,
             false,
             false,
             true,
@@ -57641,6 +57767,7 @@ Updated at   Branch  Conversation\n\
             false,
             false,
             false,
+            false,
             0,
             1_000,
             1_000 + REMOTE_TERMINAL_ATTACH_CONFIRMATION_MIN_MS,
@@ -57653,13 +57780,14 @@ Updated at   Branch  Conversation\n\
     #[test]
     fn remote_resume_attach_confirmation_rejects_attach_ready_without_post_attach_content() {
         assert!(!remote_resume_attach_confirmation_satisfied(
-            false, false, true, false, false, false, false, false, 0, 1_000, 1_100, false, true,
-            None, false,
+            false, false, true, false, false, false, false, false, false, 0, 1_000, 1_100, false,
+            true, None, false,
         ));
     }
     #[test]
     fn remote_resume_attach_confirmation_rejects_connected_grace_without_runtime() {
         assert!(!remote_resume_attach_confirmation_satisfied(
+            false,
             false,
             false,
             false,
@@ -57688,37 +57816,48 @@ Updated at   Branch  Conversation\n\
     #[test]
     fn suppress_resume_output_rejects_prompt_only_or_idle_without_meaningful_context() {
         assert!(should_suppress_remote_resume_surface_output(
-            true, false, false, false, false, false, true, false, false, false, false, false,
+            true, false, false, false, false, false, false, true, false, false, false, false,
+            false,
         ));
         assert!(should_suppress_remote_resume_surface_output(
-            true, false, false, true, false, false, false, false, false, false, false, false,
-        ));
-        assert!(should_suppress_remote_resume_surface_output(
-            true, false, false, false, false, false, false, false, false, false, true, false,
+            true, false, false, false, true, false, false, false, false, false, false, false,
+            false,
         ));
         assert!(should_suppress_remote_resume_surface_output(
             true, false, false, false, false, false, false, false, false, false, false, true,
+            false,
+        ));
+        assert!(should_suppress_remote_resume_surface_output(
+            true, false, false, false, false, false, false, false, false, false, false, false,
+            true,
+        ));
+    }
+    #[test]
+    fn suppress_resume_output_allows_fresh_codex_idle_surface() {
+        assert!(!should_suppress_remote_resume_surface_output(
+            true, true, false, true, false, false, false, true, false, false, false, false, false,
         ));
     }
     #[test]
     fn suppress_resume_output_allows_meaningful_transcript_with_idle_tail() {
         assert!(!should_suppress_remote_resume_surface_output(
-            true, false, false, false, true, false, false, false, true, false, false, false,
+            true, false, false, false, false, true, false, false, false, true, false, false, false,
         ));
     }
     #[test]
     fn suppress_resume_output_allows_live_codex_prompt_surface() {
         assert!(!should_suppress_remote_resume_surface_output(
-            true, false, true, false, false, true, true, false, false, false, false, false,
+            true, false, false, true, false, false, true, true, false, false, false, false, false,
         ));
     }
     #[test]
     fn suppress_resume_output_allows_live_transcript_browser_surface() {
         assert!(!should_suppress_remote_resume_surface_output(
-            true, false, true, false, false, false, false, false, false, false, false, true,
+            true, false, false, true, false, false, false, false, false, false, false, false, true,
         ));
         assert!(should_suppress_remote_resume_surface_output(
-            true, false, false, false, false, false, false, false, false, false, false, true,
+            true, false, false, false, false, false, false, false, false, false, false, false,
+            true,
         ));
     }
     #[test]
