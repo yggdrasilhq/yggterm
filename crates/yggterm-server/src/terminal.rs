@@ -695,8 +695,10 @@ impl PtySessionRuntime {
     fn read(&self, cursor: u64) -> TerminalReadResult {
         let retained_chunks = self.chunks.lock().expect("pty chunk lock poisoned");
         let next_cursor = self.seq.load(Ordering::SeqCst);
+        let prefer_initial_screen_snapshot =
+            terminal_key_prefers_initial_screen_snapshot(&self.key, &self.launch_command);
         let mut chunks = if cursor == 0 {
-            if launch_command_looks_like_remote_resume_attach(&self.launch_command) {
+            if prefer_initial_screen_snapshot {
                 self.screen_snapshot_chunk(next_cursor)
                     .into_iter()
                     .collect::<Vec<_>>()
@@ -722,10 +724,7 @@ impl PtySessionRuntime {
         {
             chunks = vec![snapshot_chunk];
         }
-        if cursor == 0
-            && self.is_running()
-            && launch_command_looks_like_remote_resume_attach(&self.launch_command)
-        {
+        if cursor == 0 && self.is_running() && prefer_initial_screen_snapshot {
             chunks.push(TerminalChunk {
                 seq: next_cursor.saturating_add(1),
                 data: ATTACH_READY_MARKER.to_string(),
@@ -921,6 +920,12 @@ fn shell_command(launch_command: &str, cwd: Option<&str>) -> CommandBuilder {
 
 fn launch_command_looks_like_remote_resume_attach(launch_command: &str) -> bool {
     launch_command.contains("server'\\'' '\\''remote'\\'' '\\''resume-codex")
+}
+
+fn terminal_key_prefers_initial_screen_snapshot(key: &str, launch_command: &str) -> bool {
+    key.starts_with("remote-session://")
+        || key.starts_with("codex-runtime://")
+        || launch_command_looks_like_remote_resume_attach(launch_command)
 }
 
 fn shell_uses_bash_prompt_cwd() -> bool {
@@ -1521,6 +1526,26 @@ mod tests {
     }
 
     #[test]
+    fn runtime_owned_terminal_keys_prefer_initial_screen_snapshot() {
+        assert!(terminal_key_prefers_initial_screen_snapshot(
+            "remote-session://jojo/test",
+            "bash -lc 'sleep 30'",
+        ));
+        assert!(terminal_key_prefers_initial_screen_snapshot(
+            "codex-runtime://test",
+            "bash -lc 'sleep 30'",
+        ));
+        assert!(terminal_key_prefers_initial_screen_snapshot(
+            "local://legacy-resume",
+            "ssh -tt jojo 'exec $HOME/.yggterm/bin/yggterm '\\''server'\\'' '\\''remote'\\'' '\\''resume-codex'\\'' '\\''test-session'\\'' '\\''/home/pi'\\'''",
+        ));
+        assert!(!terminal_key_prefers_initial_screen_snapshot(
+            "local://plain",
+            "bash -lc 'sleep 30'",
+        ));
+    }
+
+    #[test]
     fn initial_remote_resume_attach_trims_to_tail_budget() {
         let mut chunks = VecDeque::new();
         for seq in 1..=260 {
@@ -1584,6 +1609,46 @@ mod tests {
 
         assert!(combined.contains("XYZdef"));
         assert!(!combined.contains("abcdef\rXYZ"));
+        runtime.shutdown(None).expect("shutdown test runtime");
+    }
+
+    #[test]
+    fn initial_runtime_owned_attach_ignores_partial_retained_prompt_tail() {
+        let runtime = PtySessionRuntime::spawn(
+            "remote-session://oc/test",
+            "bash -lc 'sleep 30'",
+            None,
+            Some((100, 64)),
+        )
+        .expect("spawn test runtime");
+        runtime.seed_snapshot(
+            "\u{1b}[2J\u{1b}[H\u{1b}[61;1H› Run /review on my current changes\n  gpt-5.5 medium · ~/gh/yggterm",
+        );
+        {
+            let mut chunks = runtime.chunks.lock().expect("pty chunk lock poisoned");
+            chunks.clear();
+            let stale_tail = "\u{1b}[60;1H›\u{1b}[61;1H› Run /review on my current changes\n";
+            chunks.push_back(TerminalChunk {
+                seq: 1,
+                data: stale_tail.to_string(),
+            });
+            runtime
+                .retained_bytes
+                .store(stale_tail.len(), Ordering::SeqCst);
+            runtime.seq.store(1, Ordering::SeqCst);
+        }
+
+        let result = runtime.read(0);
+        let combined = result
+            .chunks
+            .iter()
+            .map(|chunk| chunk.data.as_str())
+            .collect::<String>();
+        let visible = strip_terminal_control_sequences(&combined);
+
+        assert!(combined.contains("__YGGTERM_ATTACH_READY__"));
+        assert!(!combined.contains("\u{1b}[60;1H›"));
+        assert_eq!(visible.matches('›').count(), 1, "{visible:?}");
         runtime.shutdown(None).expect("shutdown test runtime");
     }
 
