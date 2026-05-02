@@ -785,6 +785,15 @@ fn terminal_host_problem_for_app_control(host: &Value) -> Option<&'static str> {
         .and_then(Value::as_u64)
         .unwrap_or(0);
     let rows = host.get("rows").and_then(Value::as_u64).unwrap_or(0);
+    let base_y = host.get("base_y").and_then(Value::as_u64).unwrap_or(0);
+    let scrollback_expected = host
+        .get("scrollback_expected")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let last_raw_payload_line_count = host
+        .get("last_raw_payload_line_count")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
     let xterm_buffer_kind = host
         .get("xterm_buffer_kind")
         .and_then(Value::as_str)
@@ -906,6 +915,22 @@ fn terminal_host_problem_for_app_control(host: &Value) -> Option<&'static str> {
     }
     if terminal_chunk_is_low_signal_terminal_noise(visible_text) {
         return Some("active terminal host is still showing low-signal terminal noise");
+    }
+    if session_path.starts_with("remote-session://")
+        && input_enabled
+        && scrollback_expected
+        && base_y == 0
+        && xterm_buffer_kind != "alternate"
+    {
+        return Some("active remote terminal lost expected scrollback after retained replay");
+    }
+    if session_path.starts_with("remote-session://")
+        && input_enabled
+        && last_raw_payload_line_count > rows.saturating_add(4)
+        && base_y == 0
+        && xterm_buffer_kind != "alternate"
+    {
+        return Some("active remote terminal accepted multi-row replay without scrollback");
     }
     if session_path.starts_with("remote-session://")
         && input_enabled
