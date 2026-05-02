@@ -4,6 +4,12 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+## 2.1.94
+
+### Fixed
+
+- treat an externally installed direct-update version as a pending GUI restart, so a running app can restart into the active `install-state.json` executable instead of trying to overwrite a running headless helper
+
 ## 2.1.93
 
 ### Fixed
