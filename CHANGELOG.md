@@ -4,6 +4,13 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+## 2.1.89
+
+### Fixed
+
+- restore runtime-owned remote/Codex terminal attaches from the daemon current-screen snapshot instead of a partial retained xterm replay tail, preventing duplicate bare Codex prompt markers and stale prompt fragments when reopening live sessions
+- extend the xterm embed smoke with an active-host Codex prompt layout check so restored/live sessions fail the gate when a retained prompt artifact reappears
+
 ## 2.1.88
 
 ### Fixed
