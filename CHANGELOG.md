@@ -4,6 +4,15 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+## 2.1.90
+
+### Fixed
+
+- recover remote terminal open attempts when the xterm surface becomes interactive after an earlier timeout, clearing stale “Remote Terminal Needs Attention” toasts instead of leaving input disabled
+- stop a retained non-prompt host snapshot from re-poisoning a remote attach after an attach-ready marker has already been observed, preventing Codex sessions from getting stuck after delayed welcome-frame redraws
+- drop offscreen protocol-only/TUI control chatter without forcing xterm render probes, reducing WebKit CPU and typing latency while inactive TUI sessions continue running
+- let `probe-select` use xterm buffer text in the default canvas renderer, so xterm smoke latency/readability checks no longer misclassify canvas terminals as missing rows
+
 ## 2.1.89
 
 ### Fixed
