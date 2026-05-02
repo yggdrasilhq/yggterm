@@ -4,6 +4,14 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+## 2.1.97
+
+### Fixed
+
+- fit xterm.js directly from the live terminal host geometry so Codex/TUI surfaces expand from the old 80x24 bootstrap canvas to the full viewport, restoring rich status panels and prompt layout on large Yggterm windows
+- coalesce terminal resize observer events and rate-limit PTY resize notifications so dragging the terminal viewport no longer forces a daemon/TUI redraw for every intermediate DOM resize
+- add a focused terminal viewport resize smoke that fails if the wrapper grows while the xterm canvas stays stale, covering compact and wide window sizes with app-control screenshots
+
 ## 2.1.96
 
 ### Fixed

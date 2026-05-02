@@ -38239,22 +38239,6 @@ fn terminal_eval_script_with_canvas_renderer(
                 message: `canvas_addon_failed host=${{hostId}} error=${{error && error.message ? error.message : String(error)}}`
             }});
         }}
-        const forceRendererResize = () => {{
-            try {{
-                const core = term && term._core ? term._core : null;
-                const renderService = core
-                    ? (core._renderService || core.renderService || null)
-                    : null;
-                if (renderService && typeof renderService.handleResize === 'function') {{
-                    renderService.handleResize(term.cols, term.rows);
-                }}
-            }} catch (_error) {{}}
-            try {{
-                if (typeof term.refresh === 'function') {{
-                    term.refresh(0, Math.max(0, Number(term.rows || 1) - 1));
-                }}
-            }} catch (_error) {{}}
-        }};
         const terminalHostContentMetrics = () => {{
             try {{
                 const rect = host.getBoundingClientRect();
@@ -38300,6 +38284,71 @@ fn terminal_eval_script_with_canvas_renderer(
                 }}
             }} catch (_error) {{}}
             return 18;
+        }};
+        const terminalCssCellWidth = () => {{
+            try {{
+                const core = term && term._core ? term._core : null;
+                const renderService = core
+                    ? (core._renderService || core.renderService || null)
+                    : null;
+                const dimensions = renderService && renderService.dimensions
+                    ? renderService.dimensions
+                    : null;
+                const cssCell = dimensions && dimensions.css && dimensions.css.cell
+                    ? dimensions.css.cell
+                    : null;
+                const measured = cssCell ? Number(cssCell.width || 0) : 0;
+                if (Number.isFinite(measured) && measured > 0) {{
+                    return measured;
+                }}
+            }} catch (_error) {{}}
+            return 8;
+        }};
+        const proposedTerminalFitDimensions = () => {{
+            const content = terminalHostContentMetrics();
+            const cellWidth = Math.max(1, terminalCssCellWidth());
+            const cellHeight = Math.max(1, terminalCssCellHeight());
+            const bottomGuardPx = Math.max(0, Number(window.__yggtermXtermFitBottomGuardPx || 2));
+            const availableWidth = Math.max(0, Number(content.width || 0));
+            const availableHeight = Math.max(0, Number(content.height || 0) - bottomGuardPx);
+            return {{
+                cols: Math.max(2, Math.floor(availableWidth / cellWidth)),
+                rows: Math.max(1, Math.floor(availableHeight / cellHeight)),
+                available_width_px: Number(availableWidth.toFixed(2)),
+                available_height_px: Number(availableHeight.toFixed(2)),
+                cell_width_px: Number(cellWidth.toFixed(3)),
+                cell_height_px: Number(cellHeight.toFixed(3)),
+            }};
+        }};
+        const fitTerminalToHost = (reason) => {{
+            try {{
+                const proposed = proposedTerminalFitDimensions();
+                if (!proposed || proposed.cols <= 0 || proposed.rows <= 0) {{
+                    return false;
+                }}
+                if (term.cols === proposed.cols && term.rows === proposed.rows) {{
+                    return false;
+                }}
+                term.resize(proposed.cols, proposed.rows);
+                if (window.__yggtermXtermHosts && window.__yggtermXtermHosts[hostId]) {{
+                    window.__yggtermXtermHosts[hostId].lastExplicitFit = {{
+                        reason,
+                        cols: proposed.cols,
+                        rows: proposed.rows,
+                        available_width_px: proposed.available_width_px,
+                        available_height_px: proposed.available_height_px,
+                        cell_width_px: proposed.cell_width_px,
+                        cell_height_px: proposed.cell_height_px,
+                        at_ms: Date.now(),
+                    }};
+                }}
+                return true;
+            }} catch (_error) {{
+                try {{
+                    fitAddon.fit();
+                }} catch (_error2) {{}}
+                return false;
+            }}
         }};
         const terminalFitDiagnostics = () => {{
             const content = terminalHostContentMetrics();
@@ -39022,6 +39071,11 @@ fn terminal_eval_script_with_canvas_renderer(
         let retainedWritePaintRepairCount = 0;
         let retainedWritePaintRepairPending = false;
         let lastResizeKey = '';
+        let resizeFramePending = false;
+        let pendingResizeNotify = null;
+        let resizeNotifyTimer = null;
+        let lastResizeNotifyAtMs = 0;
+        let settledResizePaintTimer = null;
         let lastWriteAppliedSampleAtMs = 0;
         let lastWriteFlushStartedAtMs = 0;
         let writeBridgeFlushTimer = null;
@@ -39283,7 +39337,7 @@ fn terminal_eval_script_with_canvas_renderer(
                 rebindCurrentHost('request_visible_paint', true);
                 try {{
                     stretchXtermRoot();
-                    fitAddon.fit();
+                    fitTerminalToHost('visible_paint');
                     applyTerminalRowFitGuard('visible_paint');
                 }} catch (_error) {{}}
                 const metrics = hostMetrics();
@@ -39308,6 +39362,40 @@ fn terminal_eval_script_with_canvas_renderer(
                 }} catch (_error) {{}}
                 emitPaint();
             }});
+        }};
+        const flushResizeNotification = () => {{
+            if (resizeNotifyTimer !== null) {{
+                window.clearTimeout(resizeNotifyTimer);
+                resizeNotifyTimer = null;
+            }}
+            const pending = pendingResizeNotify;
+            pendingResizeNotify = null;
+            if (!pending) {{
+                return;
+            }}
+            lastResizeNotifyAtMs = Date.now();
+            dioxus.send({{ kind: "resize", cols: pending.cols, rows: pending.rows }});
+        }};
+        const scheduleResizeNotification = () => {{
+            pendingResizeNotify = {{ cols: term.cols, rows: term.rows }};
+            if (resizeNotifyTimer !== null) {{
+                return;
+            }}
+            const now = Date.now();
+            const elapsed = lastResizeNotifyAtMs > 0
+                ? now - lastResizeNotifyAtMs
+                : Number.POSITIVE_INFINITY;
+            const delayMs = elapsed >= 120 ? 0 : Math.max(24, 120 - elapsed);
+            resizeNotifyTimer = window.setTimeout(flushResizeNotification, delayMs);
+        }};
+        const scheduleSettledResizePaint = () => {{
+            if (settledResizePaintTimer !== null) {{
+                window.clearTimeout(settledResizePaintTimer);
+            }}
+            settledResizePaintTimer = window.setTimeout(() => {{
+                settledResizePaintTimer = null;
+                requestVisiblePaint(false);
+            }}, 140);
         }};
         const scheduleRetainedWritePaintRepair = (reason) => {{
             if (retainedWritePaintRepairPending) {{
@@ -39956,18 +40044,29 @@ fn terminal_eval_script_with_canvas_renderer(
         const emitResize = () => {{
             rebindCurrentHost('emit_resize', true);
             try {{
-                fitAddon.fit();
+                fitTerminalToHost('resize');
                 const rowFitGuardApplied = applyTerminalRowFitGuard('resize');
                 const resizeKey = `${{term.cols}}x${{term.rows}}`;
                 if (resizeKey !== lastResizeKey || rowFitGuardApplied) {{
                     const resizeChanged = resizeKey !== lastResizeKey;
                     lastResizeKey = resizeKey;
-                    forceRendererResize();
+                    requestRenderProbe('resize');
+                    scheduleSettledResizePaint();
                     if (resizeChanged) {{
-                        dioxus.send({{ kind: "resize", cols: term.cols, rows: term.rows }});
+                        scheduleResizeNotification();
                     }}
                 }}
             }} catch (_error) {{}}
+        }};
+        const scheduleEmitResize = () => {{
+            if (resizeFramePending) {{
+                return;
+            }}
+            resizeFramePending = true;
+            requestAnimationFrame(() => {{
+                resizeFramePending = false;
+                emitResize();
+            }});
         }};
         window.__yggtermXtermHosts = window.__yggtermXtermHosts || {{}};
         window.__yggtermXtermHosts[hostId] = {{
@@ -40038,7 +40137,7 @@ fn terminal_eval_script_with_canvas_renderer(
                 }}, delayMs);
             }});
         }};
-        resizeObserver = new ResizeObserver(() => emitResize());
+        resizeObserver = new ResizeObserver(() => scheduleEmitResize());
         resizeObserver.observe(host);
         const readTerminalBufferSample = () => {{
             try {{
@@ -40600,6 +40699,18 @@ fn terminal_eval_script_with_canvas_renderer(
             }} catch (_error) {{}}
             try {{
                 window.clearInterval(inputDriftWatchdog);
+            }} catch (_error) {{}}
+            try {{
+                if (resizeNotifyTimer !== null) {{
+                    window.clearTimeout(resizeNotifyTimer);
+                    resizeNotifyTimer = null;
+                }}
+            }} catch (_error) {{}}
+            try {{
+                if (settledResizePaintTimer !== null) {{
+                    window.clearTimeout(settledResizePaintTimer);
+                    settledResizePaintTimer = null;
+                }}
             }} catch (_error) {{}}
             try {{
                 const helperTextarea = host.querySelector('.xterm-helper-textarea');
@@ -46549,6 +46660,28 @@ mod tests {
             script.contains("const rowFitGuardApplied = applyTerminalRowFitGuard('resize');"),
             "resize should apply the row fit guard after fitAddon.fit"
         );
+        assert!(
+            script.contains("const fitTerminalToHost = (reason) => {")
+                && script.contains("term.resize(proposed.cols, proposed.rows);")
+                && script.contains("fitTerminalToHost('resize');"),
+            "the shell bridge should explicitly fit xterm to the live host instead of leaving the canvas at the bootstrap 80x24 size"
+        );
+        assert!(
+            script.contains("const scheduleEmitResize = () => {")
+                && script
+                    .contains("resizeObserver = new ResizeObserver(() => scheduleEmitResize());"),
+            "resize observer bursts should be collapsed to one fit per animation frame"
+        );
+        assert!(
+            script.contains("const scheduleResizeNotification = () => {")
+                && script.contains("pendingResizeNotify = { cols: term.cols, rows: term.rows };")
+                && script.contains("Math.max(24, 120 - elapsed)"),
+            "PTY resize notifications should be rate-limited so resize drags do not force a TUI redraw for every DOM event"
+        );
+        assert!(
+            !script.contains("forceRendererResize"),
+            "the resize path should not force full-canvas refreshes on every viewport size change"
+        );
     }
 
     #[test]
@@ -46604,6 +46737,10 @@ mod tests {
         assert!(
             !XTERM_FIT_JS.contains("parseInt(r.getPropertyValue(\"height\"))"),
             "xterm fit must not round the host height upward into a clipped bottom row"
+        );
+        assert!(
+            XTERM_FIT_JS.contains("typeof renderService.clear === \"function\""),
+            "the fit addon must not throw before terminal.resize when xterm changes private render-service shape"
         );
     }
 
