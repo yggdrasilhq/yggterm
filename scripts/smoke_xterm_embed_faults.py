@@ -12148,6 +12148,32 @@ def state_allows_codex_working_busy_row(state: dict, row_path: str) -> bool:
 
 
 def assert_busy_icon_lifecycle(pid: int, session: str, *, sleep_seconds: int = 8) -> dict:
+    def wait_for_command_echo(command_text: str, timeout_seconds: float = 3.0) -> dict | None:
+        deadline = time.time() + timeout_seconds
+        last_sample = ""
+        while time.time() < deadline:
+            state = app_state(pid)
+            try:
+                host = active_host(state)
+            except AssertionError:
+                time.sleep(0.08)
+                continue
+            sample = terminal_host_text(host)
+            last_sample = sample[-800:]
+            if command_text in sample:
+                return {
+                    "observed": True,
+                    "text_tail": last_sample,
+                    "data_event_count": host.get("data_event_count"),
+                    "write_command_count": host.get("write_command_count"),
+                    "render_event_count": host.get("render_event_count"),
+                }
+            time.sleep(0.08)
+        return {
+            "observed": False,
+            "text_tail": last_sample,
+        }
+
     def row_from_app_rows() -> dict | None:
         normalized = normalize_live_path(session)
         for candidate in app_rows(pid):
@@ -12174,9 +12200,28 @@ def assert_busy_icon_lifecycle(pid: int, session: str, *, sleep_seconds: int = 8
             pass
         time.sleep(0.12)
 
-    launch = unwrap_data(terminal_send(pid, session, f"sleep {sleep_seconds}\r"))
+    command = f"sleep {sleep_seconds}"
+    launch = probe_type(
+        pid,
+        session,
+        command,
+        mode="xterm",
+        press_ctrl_u=True,
+        press_enter=True,
+    )
     if not bool(launch.get("accepted")):
-        raise AssertionError(f"terminal send rejected busy lifecycle probe: {launch}")
+        raise AssertionError(f"terminal app-control input probe rejected busy lifecycle command: {launch}")
+    if not bool(launch.get("visible_echo_observed")):
+        fallback = terminal_send(pid, session, f"\x15{command}\r")
+        launch["daemon_write_fallback"] = fallback.get("data") or fallback
+        echo = wait_for_command_echo(command, timeout_seconds=3.0)
+        launch["daemon_write_fallback_echo"] = echo
+        if not echo or not bool(echo.get("observed")):
+            raise AssertionError(
+                "terminal app-control input probe accepted the busy lifecycle command without visible echo: "
+                f"{launch!r}"
+            )
+        launch["visible_echo_observed"] = True
 
     busy_row = None
     observed_rows: list[dict] = []
