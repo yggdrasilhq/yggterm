@@ -52,8 +52,8 @@ pub use terminal::{TerminalChunk, TerminalManager, TerminalReadResult};
 use anyhow::Context;
 use codex_cli::{
     ManagedCliAction, ManagedCliRefreshReport, best_effort_cwd_shell_prefix,
-    ensure_local_managed_cli, managed_cli_shell_command, refresh_local_managed_cli,
-    summarize_managed_cli_report, sync_terminal_identity_env,
+    ensure_local_managed_cli, inspect_local_managed_cli_for_launch, managed_cli_shell_command,
+    refresh_local_managed_cli, summarize_managed_cli_report, sync_terminal_identity_env,
     terminal_identity_shell_exports_for_remote,
 };
 use rusqlite::{Connection, params};
@@ -2565,12 +2565,12 @@ impl YggtermServer {
         let Some(tool) = ManagedCliTool::from_session_kind(session.kind) else {
             return Ok(None);
         };
-        let status = ensure_local_managed_cli(tool)?;
+        let status = inspect_local_managed_cli_for_launch(tool)?;
         Ok(Some(summarize_managed_cli_report(
             "local",
             &ManagedCliRefreshReport {
                 scope: "local".to_string(),
-                background: false,
+                background: true,
                 statuses: vec![status],
                 skipped_recently: false,
                 ttl_remaining_ms: None,

@@ -4,6 +4,15 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+## 2.1.93
+
+### Fixed
+
+- keep active Codex/TUI terminal output on the real xterm.js canvas instead of switching visible sessions to the lossy low-power text overlay, fixing corrupted repeated text such as incremental `Booting` fragments and false “input-enabled without a prompt-ready surface” readiness failures
+- return a stable `session_path` from app-control terminal creation even while the server snapshot is still catching up, so Codex interaction and latency smokes can deterministically probe the newly created terminal
+- keep managed Codex CLI refresh/check work out of the foreground terminal-launch path, so creating a Codex session uses the available binary immediately while release/update refreshes continue in the background
+- hide transparent KDE/X11 windows until the first native rounded-corner shape pass succeeds, preventing the visible square-window startup flash before the retry shape timer settles
+
 ## 2.1.92
 
 ### Fixed
