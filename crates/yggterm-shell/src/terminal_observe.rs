@@ -1534,6 +1534,7 @@ pub(crate) fn terminal_chunk_is_transport_error(data: &str) -> bool {
         "session open refused by peer",
         "controlsocket",
         "exec: export: not found",
+        "exec: __yggterm_initial_tty_size",
         "terminal session not found",
         "[screen is terminating]",
         "saved codex session",
