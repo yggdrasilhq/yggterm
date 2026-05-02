@@ -151,6 +151,7 @@ static INTENTIONAL_CLIENT_SHUTDOWN: AtomicBool = AtomicBool::new(false);
 static APP_ROOT_RENDER_TRACED: AtomicBool = AtomicBool::new(false);
 static APP_ROOT_EFFECT_TRACED: AtomicBool = AtomicBool::new(false);
 static APP_ROOT_MAC_WINDOW_FORCED: AtomicBool = AtomicBool::new(false);
+static APP_ROOT_LINUX_WINDOW_SHOWN: AtomicBool = AtomicBool::new(false);
 static APP_ROOT_WINDOW_FOCUS_REQUESTED: AtomicBool = AtomicBool::new(false);
 static APP_ROOT_RENDER_COUNT: AtomicU64 = AtomicU64::new(0);
 static NEXT_TERMINAL_BOOTSTRAP_OWNER_ID: AtomicU64 = AtomicU64::new(1);
@@ -250,7 +251,7 @@ const LIVE_SESSION_SNAPSHOT_NUDGE_POLLS: usize = 3;
 // Inline tree rename focuses asynchronously after context-menu and sidebar
 // interactions. Treat Enter as the commit action so transient WebView focus
 // churn during controlled input updates cannot commit a half-typed label.
-const TERMINAL_BUSY_HINT_MS: u64 = 120;
+const TERMINAL_BUSY_HINT_MS: u64 = 650;
 const CODEX_COMPLETION_NOTIFICATION_MIN_BUSY_MS: u64 = 10_000;
 const TITLEBAR_HEIGHT_PX: f64 = 32.0;
 const TITLEBAR_RESPONSIVE_CSS: &str = r#"
@@ -21412,27 +21413,27 @@ fn terminal_probe_input_script(
                     if (/^[a-z]$/i.test(char)) {{
                         const upper = char.toUpperCase();
                         const shift = char === upper && char !== char.toLowerCase();
-                        return {{ key: char, code: `Key${{upper}}`, keyCode: upper.charCodeAt(0), shiftKey: shift }};
+                        return {{ key: char, code: `Key${{upper}}`, keyCode: upper.charCodeAt(0), charCode: char.codePointAt(0), shiftKey: shift }};
                     }}
                     if (/^[0-9]$/.test(char)) {{
-                        return {{ key: char, code: `Digit${{char}}`, keyCode: char.charCodeAt(0), shiftKey: false }};
+                        return {{ key: char, code: `Digit${{char}}`, keyCode: char.charCodeAt(0), charCode: char.codePointAt(0), shiftKey: false }};
                     }}
                     if (char === ' ') {{
-                        return {{ key: ' ', code: 'Space', keyCode: 32, shiftKey: false }};
+                        return {{ key: ' ', code: 'Space', keyCode: 32, charCode: 32, shiftKey: false }};
                     }}
                     if (char === '/') {{
-                        return {{ key: '/', code: 'Slash', keyCode: 191, shiftKey: false }};
+                        return {{ key: '/', code: 'Slash', keyCode: 191, charCode: 47, shiftKey: false }};
                     }}
                     if (char === '-') {{
-                        return {{ key: '-', code: 'Minus', keyCode: 189, shiftKey: false }};
+                        return {{ key: '-', code: 'Minus', keyCode: 189, charCode: 45, shiftKey: false }};
                     }}
                     if (char === '_') {{
-                        return {{ key: '_', code: 'Minus', keyCode: 189, shiftKey: true }};
+                        return {{ key: '_', code: 'Minus', keyCode: 189, charCode: 95, shiftKey: true }};
                     }}
                     if (char === '.') {{
-                        return {{ key: '.', code: 'Period', keyCode: 190, shiftKey: false }};
+                        return {{ key: '.', code: 'Period', keyCode: 190, charCode: 46, shiftKey: false }};
                     }}
-                    return {{ key: char, code: '', keyCode: char.length === 1 ? char.charCodeAt(0) : 0, shiftKey: false }};
+                    return {{ key: char, code: '', keyCode: char.length === 1 ? char.charCodeAt(0) : 0, charCode: char.length === 1 ? char.codePointAt(0) : 0, shiftKey: false }};
                 }};
                 let usedCoreTrigger = false;
                 let usedTermInput = false;
@@ -21472,8 +21473,47 @@ fn terminal_probe_input_script(
                         await settle(18);
                     }}
                 }};
+                const dispatchPrintableKey = async (spec, settleAfter = true) => {{
+                    const keyInit = {{
+                        key: spec.key,
+                        code: spec.code || '',
+                        keyCode: spec.keyCode || 0,
+                        which: spec.keyCode || 0,
+                        charCode: 0,
+                        bubbles: true,
+                        cancelable: true,
+                        composed: true,
+                        shiftKey: Boolean(spec.shiftKey),
+                        altKey: Boolean(spec.altKey),
+                        ctrlKey: Boolean(spec.ctrlKey),
+                        metaKey: Boolean(spec.metaKey),
+                    }};
+                    target.dispatchEvent(new KeyboardEvent('keydown', keyInit));
+                    if (spec.key === ' ') {{
+                        target.dispatchEvent(new KeyboardEvent('keypress', {{
+                            ...keyInit,
+                            keyCode: 32,
+                            which: 32,
+                            charCode: 32,
+                        }}));
+                    }}
+                    target.dispatchEvent(new KeyboardEvent('keyup', keyInit));
+                    if (settleAfter) {{
+                        await settle(18);
+                    }}
+                }};
                 const dispatchPrintableText = async (textChunk, settleAfter = true) => {{
                     if (!textChunk) {{
+                        return;
+                    }}
+                    if (domKeyboardOnly) {{
+                        for (const char of Array.from(textChunk)) {{
+                            const spec = keySpecForChar(char);
+                            await dispatchPrintableKey(spec, false);
+                        }}
+                        if (settleAfter) {{
+                            await settle(24);
+                        }}
                         return;
                     }}
                     if (!helperTextarea) {{
@@ -24625,6 +24665,8 @@ pub fn launch_shell(bootstrap: ShellBootstrap) -> Result<()> {
             .with_resizable(true)
             .with_inner_size(LogicalSize::new(1460.0, 920.0))
             .with_min_inner_size(LogicalSize::new(480.0, 360.0));
+        #[cfg(target_os = "linux")]
+        let window = window.with_visible(false);
         #[cfg(target_os = "windows")]
         let window = window.with_taskbar_icon(Some(window_icon::load_yggterm_window_icon()));
         window
@@ -24794,6 +24836,7 @@ fn app() -> Element {
     let schedule_ui_update = schedule_update();
     let desktop_for_root_effect = desktop.clone();
     let trace_home_for_root_effect = trace_home.clone();
+    let linux_transparent_window_for_root_effect = linux_transparent_window;
     let trace_home_for_mount_epoch = trace_home.clone();
     use_effect(move || {
         if !APP_ROOT_EFFECT_TRACED.swap(true, Ordering::SeqCst) {
@@ -24820,6 +24863,50 @@ fn app() -> Element {
                     "mac_window_forced_visible",
                     json!({
                         "pid": std::process::id(),
+                    }),
+                );
+            }
+        }
+        #[cfg(target_os = "linux")]
+        {
+            if !APP_ROOT_LINUX_WINDOW_SHOWN.swap(true, Ordering::SeqCst) {
+                let maximized = desktop_for_root_effect.is_maximized();
+                let radius = if maximized {
+                    0
+                } else {
+                    UNMAXIMIZED_SHELL_RADIUS_PX
+                };
+                let effective_radius = shell_effective_radius(
+                    radius,
+                    maximized,
+                    linux_transparent_window_for_root_effect,
+                );
+                apply_linux_transparent_window_surface_style(
+                    &desktop_for_root_effect,
+                    linux_transparent_window_for_root_effect,
+                    effective_radius,
+                );
+                apply_linux_window_corner_shape(
+                    &desktop_for_root_effect,
+                    effective_radius,
+                    maximized,
+                );
+                apply_linux_window_shape_reapply_sequence(
+                    &desktop_for_root_effect,
+                    effective_radius,
+                    maximized,
+                );
+                desktop_for_root_effect.request_redraw();
+                desktop_for_root_effect.set_visible(true);
+                append_trace_event(
+                    &trace_home_for_root_effect,
+                    "ui",
+                    "startup",
+                    "linux_window_shown_after_shape_prepare",
+                    json!({
+                        "pid": std::process::id(),
+                        "radius": effective_radius,
+                        "transparent": linux_transparent_window_for_root_effect,
                     }),
                 );
             }
@@ -28750,7 +28837,12 @@ fn codex_completion_notification_should_fire(
             || tail_prompt_only_output)
 }
 fn terminal_input_uses_optimistic_busy_hint(session_path: &str) -> bool {
-    !normalize_live_session_path(session_path).starts_with("local://")
+    let session_path = normalize_live_session_path(session_path);
+    session_path.starts_with("local://")
+        || session_path.starts_with("ssh://")
+        || session_path.starts_with("remote-session://")
+        || session_path.starts_with("codex://")
+        || session_path.starts_with("codex-litellm://")
 }
 fn sidebar_row_shows_busy_icon(snapshot: &RenderSnapshot, row: &BrowserRow) -> bool {
     if matches!(row.kind, BrowserRowKind::Group | BrowserRowKind::Separator) {
@@ -39944,7 +40036,6 @@ fn terminal_eval_script_with_canvas_renderer(
             const value = String(payload || '');
             if (
                 value.includes('\x1b[?1049h')
-                || value.includes('\x1b[?25l')
                 || value.includes('\x1b[2J')
             ) {{
                 return true;
@@ -44233,7 +44324,7 @@ fn apply_linux_window_shape_reapply_sequence(
 
     let gtk_window = desktop.gtk_window();
     for delay_ms in [
-        0_u64, 24, 72, 180, 400, 900, 1_600, 2_800, 4_500, 7_000, 10_000, 14_000,
+        0_u64, 1, 8, 16, 24, 72, 180, 400, 900, 1_600, 2_800, 4_500, 7_000, 10_000, 14_000,
     ] {
         let gtk_window = gtk_window.clone();
         gtk::glib::timeout_add_local_once(Duration::from_millis(delay_ms), move || {
@@ -46336,6 +46427,8 @@ mod tests {
         );
         assert!(script.contains("const target = helperTextarea || host;"));
         assert!(script.contains("target.dispatchEvent(new KeyboardEvent('keydown', keyInit));"));
+        assert!(script.contains("target.dispatchEvent(new KeyboardEvent('keypress', keyInit));"));
+        assert!(script.contains("await dispatchPrintableKey(spec, false);"));
         assert!(script.contains("await dispatchTextInput(char, true);"));
         assert!(script.contains("await settle(24);"));
     }
@@ -50230,8 +50323,8 @@ mod tests {
         assert!(!pending);
     }
     #[test]
-    fn terminal_busy_hint_stays_stateless_for_plain_local_shells() {
-        assert!(!terminal_input_uses_optimistic_busy_hint("local://shell"));
+    fn terminal_busy_hint_applies_to_live_terminal_sessions() {
+        assert!(terminal_input_uses_optimistic_busy_hint("local://shell"));
         assert!(terminal_input_uses_optimistic_busy_hint(
             "ssh://dev/session"
         ));
@@ -51474,6 +51567,12 @@ q to quit   pgup/pgdn to page   enter to edit message
     #[test]
     fn terminal_chunk_marks_exec_export_not_found_as_transport_error() {
         let data = "bash: line 1: exec: export: not found\r\n";
+        assert!(terminal_chunk_is_transport_error(data));
+        assert!(!terminal_chunk_has_meaningful_output(data));
+    }
+    #[test]
+    fn terminal_chunk_marks_exec_tty_settle_assignment_as_transport_error() {
+        let data = "/bin/bash: line 1: exec: __yggterm_initial_tty_size=36: not found\r\n";
         assert!(terminal_chunk_is_transport_error(data));
         assert!(!terminal_chunk_has_meaningful_output(data));
     }
