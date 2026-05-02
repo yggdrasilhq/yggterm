@@ -4041,6 +4041,13 @@ def strip_terminal_border(line: str) -> str:
     return line.strip().strip("╭╮╰╯─│ ").strip()
 
 
+def int_or_none(value) -> int | None:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def terminal_chunk_has_prompt_output(data: str) -> bool:
     normalized_lines = [line.strip() for line in str(data or "").splitlines() if line.strip()]
     if not normalized_lines or len(normalized_lines) > 2:
@@ -5250,6 +5257,11 @@ def terminal_text_has_local_codex_scaffold(text: str) -> bool:
     return any(marker in normalized for marker in LOCAL_CODEX_SCAFFOLD_MARKERS)
 
 
+def terminal_text_has_codex_welcome_frame(text: str) -> bool:
+    text = str(text or "")
+    return "OpenAI Codex" in text and "/model to change" in text
+
+
 def codex_spawn_surface_has_local_scaffold(state: dict, host: dict | None) -> bool:
     viewport = viewport_state(state)
     surface_problem = str((viewport.get("active_terminal_surface") or {}).get("problem") or "")
@@ -5269,6 +5281,8 @@ def codex_spawn_host_excerpt(host: dict | None) -> dict:
         "host_has_active_element": host.get("host_has_active_element"),
         "mounted_entry_host_connected": host.get("mounted_entry_host_connected"),
         "xterm_cursor_hidden": host.get("xterm_cursor_hidden"),
+        "cursor_y": host.get("cursor_y"),
+        "cursor_visible_row_index": host.get("cursor_visible_row_index"),
         "cursor_line_text": host.get("cursor_line_text") or host.get("cursor_row_text"),
         "blank_rows_below_cursor": host.get("blank_rows_below_cursor"),
         "rows": host.get("rows"),
@@ -5276,7 +5290,59 @@ def codex_spawn_host_excerpt(host: dict | None) -> dict:
         "cursor_bottom_overflow_px": host.get("cursor_bottom_overflow_px"),
         "text_tail": host_text[-700:],
         "has_live_codex_prompt": host_has_live_codex_prompt(host),
+        "has_codex_welcome_frame": terminal_text_has_codex_welcome_frame(host_text),
         "has_local_codex_scaffold": terminal_text_has_local_codex_scaffold(host_text),
+    }
+
+
+def assert_codex_spawn_layout_sane(host: dict, *, context: str) -> dict:
+    host_text = terminal_host_text(host)
+    has_codex_welcome_frame = terminal_text_has_codex_welcome_frame(host_text)
+    prompt_counts = []
+    for chunk in (str(host.get("text_tail") or ""), str(host.get("text_sample") or "")):
+        prompt_counts.append(
+            sum(
+                1
+                for line in chunk.splitlines()
+                if strip_terminal_border(line).startswith("›")
+            )
+        )
+    rows = int_or_none(host.get("rows"))
+    cursor_row = int_or_none(host.get("cursor_visible_row_index"))
+    blank_rows_below = int_or_none(host.get("blank_rows_below_cursor"))
+    if any(count > 1 for count in prompt_counts) and not has_codex_welcome_frame:
+        raise AssertionError(
+            f"{context}: Codex prompt is duplicated in the terminal viewport: "
+            f"{codex_spawn_host_excerpt(host)!r}"
+        )
+    if (
+        rows is not None
+        and rows >= 24
+        and cursor_row is not None
+        and cursor_row < rows // 2
+        and not has_codex_welcome_frame
+    ):
+        raise AssertionError(
+            f"{context}: Codex prompt collapsed into the top half of a tall viewport: "
+            f"{codex_spawn_host_excerpt(host)!r}"
+        )
+    if (
+        rows is not None
+        and rows >= 24
+        and blank_rows_below is not None
+        and blank_rows_below > rows // 2
+        and not has_codex_welcome_frame
+    ):
+        raise AssertionError(
+            f"{context}: Codex prompt left most of the viewport blank below the cursor: "
+            f"{codex_spawn_host_excerpt(host)!r}"
+        )
+    return {
+        "prompt_line_counts": prompt_counts,
+        "has_codex_welcome_frame": has_codex_welcome_frame,
+        "rows": rows,
+        "cursor_visible_row_index": cursor_row,
+        "blank_rows_below_cursor": blank_rows_below,
     }
 
 
@@ -14597,6 +14663,10 @@ def assert_codex_spawn_timeline(pid: int, out_dir: Path) -> dict:
         ready["state_path"] = str(ready_state_path)
         ready["screenshot_path"] = str(ready_screenshot_path)
         ready["screenshot"] = ready_screenshot
+        ready["layout"] = assert_codex_spawn_layout_sane(
+            host_for_session(ready_state, session),
+            context="ready remote Codex spawn",
+        )
 
         post_timeout_offset = 38.0
         remaining = started + post_timeout_offset - time.perf_counter()
@@ -14627,6 +14697,10 @@ def assert_codex_spawn_timeline(pid: int, out_dir: Path) -> dict:
                 "spawned remote Codex raised Remote Terminal Needs Attention after timeout: "
                 f"{remote_attention_notifications_for_session(after_state, session)!r}"
             )
+        after_layout = assert_codex_spawn_layout_sane(
+            after_host,
+            context="remote Codex spawn after timeout",
+        )
 
         return {
             "machine_key": machine_key,
@@ -14635,6 +14709,7 @@ def assert_codex_spawn_timeline(pid: int, out_dir: Path) -> dict:
             "samples": samples,
             "ready": ready,
             "after_timeout": after_timeout,
+            "after_timeout_layout": after_layout,
         }
     finally:
         try:
