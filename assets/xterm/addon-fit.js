@@ -45,7 +45,12 @@
       }
       const core = this._terminal._core;
       if (this._terminal.rows !== proposed.rows || this._terminal.cols !== proposed.cols) {
-        core._renderService.clear();
+        const renderService = core
+          ? core._renderService || core.renderService || null
+          : null;
+        if (renderService && typeof renderService.clear === "function") {
+          renderService.clear();
+        }
         this._terminal.resize(proposed.cols, proposed.rows);
       }
     }
