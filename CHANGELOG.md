@@ -4,6 +4,14 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+## 2.1.92
+
+### Fixed
+
+- fix remote Codex resume launch wrapping so the local tty-size settle prelude is not executed as a command name, preventing `exec: __yggterm_initial_tty_size=...: not found` from leaving restored sessions input-disabled
+- show Linux desktop windows only after the first corner-shape preparation pass and retry the native shape faster during startup, reducing the transient square-corner artifact on KDE/X11
+- make app-control terminal probes deterministic in background jojo smokes, including exact printable keyboard synthesis, a visible daemon-write fallback, and no low-power TUI overlay for ordinary prompt traffic
+
 ## 2.1.91
 
 ### Fixed
