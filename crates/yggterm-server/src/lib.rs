@@ -10494,7 +10494,13 @@ fn process_environment_snapshot(pid: u32) -> BTreeMap<String, String> {
         "WAYLAND_DISPLAY",
         "XDG_SESSION_ID",
         "XDG_RUNTIME_DIR",
+        "XDG_CURRENT_DESKTOP",
+        "XDG_SESSION_DESKTOP",
+        "DESKTOP_SESSION",
+        "KDE_FULL_SESSION",
         "GDK_BACKEND",
+        "WINIT_UNIX_BACKEND",
+        "YGGTERM_DESKTOP_ENV_HYDRATED_FROM",
     ];
     let payload = fs::read(format!("/proc/{pid}/environ")).unwrap_or_default();
     payload

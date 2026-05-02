@@ -1536,7 +1536,12 @@ def main() -> int:
             only_check_args = "".join(
                 f" --only-check {quote(check_name)}" for check_name in args.only_check
             )
-            avoid_foreground = "0" if "keyboard_clipboard_paste" in args.only_check else "1"
+            foreground_required_checks = {"keyboard_clipboard_paste", "window_corner_artifact"}
+            avoid_foreground = (
+                "0"
+                if foreground_required_checks.intersection(args.only_check)
+                else "1"
+            )
             metadata["smoke_avoid_foreground"] = avoid_foreground == "1"
             smoke_proc = ssh_shell(
                 args.host,
