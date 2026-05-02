@@ -725,6 +725,37 @@ mod tests {
     }
 
     #[test]
+    fn managed_cli_launch_probe_uses_system_binary_without_refresh_action() {
+        let status = managed_cli_launch_status_from_probe(
+            ManagedCliTool::Codex,
+            ToolProbe {
+                version: Some("1.2.3".to_string()),
+                source: Some(ManagedCliBinarySource::System),
+                available: true,
+            },
+        );
+
+        assert_eq!(status.action, "system_fallback");
+        assert!(!status.changed);
+        assert!(status.available);
+        assert_eq!(
+            summarize_managed_cli_report(
+                "local",
+                &ManagedCliRefreshReport {
+                    scope: "local".to_string(),
+                    background: true,
+                    statuses: vec![status],
+                    skipped_recently: false,
+                    ttl_remaining_ms: None,
+                    install_attempted: false,
+                    install_deferred: false,
+                },
+            ),
+            "local: using existing PATH Codex binaries until npm is available"
+        );
+    }
+
+    #[test]
     fn managed_cli_shell_exports_prefer_managed_bin_and_suppress_npm_noise() {
         let paths = ManagedCliPaths {
             home: PathBuf::from("/tmp/yggterm-home"),
@@ -927,6 +958,60 @@ fn tool_status(
         action: action.to_string(),
         detail,
     }
+}
+
+fn managed_cli_launch_status_from_probe(
+    tool: ManagedCliTool,
+    probe: ToolProbe,
+) -> ManagedCliToolStatus {
+    let (action, detail) = match (probe.available, probe.source) {
+        (true, Some(ManagedCliBinarySource::Managed)) => (
+            "ready",
+            format!("{} is already managed by Yggterm.", tool.display_name()),
+        ),
+        (true, Some(ManagedCliBinarySource::System)) => (
+            "system_fallback",
+            format!(
+                "{} is available from the system PATH; Yggterm will refresh the managed copy in the background.",
+                tool.display_name()
+            ),
+        ),
+        (true, None) => ("ready", format!("{} is available.", tool.display_name())),
+        (false, _) => (
+            "unavailable",
+            format!(
+                "{} is not available yet; Yggterm will not block terminal launch on npm install.",
+                tool.display_name()
+            ),
+        ),
+    };
+    tool_status(tool, probe.clone(), probe, action, detail)
+}
+
+pub(crate) fn inspect_local_managed_cli_for_launch(
+    tool: ManagedCliTool,
+) -> Result<ManagedCliToolStatus> {
+    let paths = ManagedCliPaths::resolve()?;
+    append_trace_event(
+        &paths.home,
+        "server",
+        "managed_cli",
+        "launch_probe_begin",
+        serde_json::json!({ "tool": tool.binary_name() }),
+    );
+    let status = managed_cli_launch_status_from_probe(tool, probe_tool(&paths, tool));
+    append_trace_event(
+        &paths.home,
+        "server",
+        "managed_cli",
+        "launch_probe_end",
+        serde_json::json!({
+            "tool": tool.binary_name(),
+            "action": status.action.clone(),
+            "available": status.available,
+        }),
+    );
+    Ok(status)
 }
 
 pub(crate) fn managed_cli_shell_command(

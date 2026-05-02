@@ -17681,6 +17681,41 @@ fn resolve_app_control_remote_machine(
         .find(|machine| machine.machine_key == normalized)
         .cloned()
 }
+fn public_live_session_path_from_started_key(key: &str) -> Option<String> {
+    let trimmed = key.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    for scheme in ["local", "codex", "codex-litellm", "document"] {
+        if let Some(uuid) = trimmed.strip_prefix(&format!("{scheme}::")) {
+            return (!uuid.trim().is_empty()).then(|| format!("{scheme}://{}", uuid.trim()));
+        }
+    }
+    Some(trimmed.to_string())
+}
+fn app_control_created_session_path(
+    snapshot: &ServerUiSnapshot,
+    message: Option<&str>,
+) -> Option<String> {
+    snapshot
+        .active_session_path
+        .as_deref()
+        .filter(|path| !path.trim().is_empty())
+        .map(ToOwned::to_owned)
+        .or_else(|| {
+            snapshot
+                .active_session
+                .as_ref()
+                .map(|session| session.session_path.trim())
+                .filter(|path| !path.is_empty())
+                .map(ToOwned::to_owned)
+        })
+        .or_else(|| {
+            message
+                .and_then(|value| value.trim().strip_prefix("started "))
+                .and_then(public_live_session_path_from_started_key)
+        })
+}
 fn render_snapshot_session_view_contract_violations(
     shell: &ShellState,
     snapshot: &RenderSnapshot,
@@ -23146,7 +23181,8 @@ async fn process_pending_app_control_requests(
                     .await;
                     match outcome {
                         Ok((snapshot, message)) => {
-                            let created_path = snapshot.active_session_path.clone();
+                            let created_path =
+                                app_control_created_session_path(&snapshot, message.as_deref());
                             state.with_mut(|shell| {
                                 shell.apply_interactive_snapshot_result(Ok((
                                     snapshot,
@@ -23165,6 +23201,7 @@ async fn process_pending_app_control_requests(
                                     "title_hint": title_hint,
                                     "session_kind": requested_kind,
                                     "active_session_path": created_path,
+                                    "session_path": created_path,
                                     "message": message,
                                 })),
                                 error: None,
@@ -23199,7 +23236,8 @@ async fn process_pending_app_control_requests(
                     .await;
                     match outcome {
                         Ok((snapshot, message)) => {
-                            let created_path = snapshot.active_session_path.clone();
+                            let created_path =
+                                app_control_created_session_path(&snapshot, message.as_deref());
                             state.with_mut(|shell| {
                                 shell.apply_interactive_snapshot_result(Ok((
                                     snapshot,
@@ -23218,6 +23256,7 @@ async fn process_pending_app_control_requests(
                                     "title_hint": title_hint,
                                     "session_kind": requested_kind,
                                     "active_session_path": created_path,
+                                    "session_path": created_path,
                                     "message": message,
                                 })),
                                 error: None,
@@ -24881,6 +24920,14 @@ fn app() -> Element {
                     maximized,
                     linux_transparent_window_for_root_effect,
                 );
+                let reveal_after_shape = linux_startup_reveal_should_wait_for_shape(
+                    linux_transparent_window_for_root_effect,
+                    effective_radius,
+                    maximized,
+                );
+                if reveal_after_shape {
+                    prepare_linux_window_reveal_after_corner_shape(&desktop_for_root_effect);
+                }
                 apply_linux_transparent_window_surface_style(
                     &desktop_for_root_effect,
                     linux_transparent_window_for_root_effect,
@@ -24898,6 +24945,14 @@ fn app() -> Element {
                 );
                 desktop_for_root_effect.request_redraw();
                 desktop_for_root_effect.set_visible(true);
+                if reveal_after_shape {
+                    reveal_linux_window_after_corner_shape(
+                        &desktop_for_root_effect,
+                        effective_radius,
+                        maximized,
+                        trace_home_for_root_effect.clone(),
+                    );
+                }
                 append_trace_event(
                     &trace_home_for_root_effect,
                     "ui",
@@ -40205,14 +40260,6 @@ fn terminal_eval_script_with_canvas_renderer(
                 hideLowPowerTuiOverlay();
                 return value;
             }}
-            if (activeRenderSurface && !codexWelcome && (lowPowerTuiActive || entersAltScreen || frameLike)) {{
-                if (renderLowPowerTuiPayload(value)) {{
-                    return lowPowerTuiXtermControlPrefix(value);
-                }}
-                if (lowPowerTuiActive || protocolOnly) {{
-                    return '';
-                }}
-            }}
             if (activeRenderSurface && lowPowerTuiActive) {{
                 hideLowPowerTuiOverlay();
                 const replayPrefix = value.includes('\x1b[?1049h')
@@ -43925,6 +43972,34 @@ fn shell_effective_radius(radius: u8, maximized: bool, transparent_window: bool)
         linux_native_window_shape_supported(),
     )
 }
+#[cfg(target_os = "linux")]
+fn linux_startup_reveal_should_wait_for_shape_for_platform(
+    transparent_window: bool,
+    radius: u8,
+    maximized: bool,
+    native_decorations_forced: bool,
+    native_shape_supported: bool,
+) -> bool {
+    transparent_window
+        && radius > 0
+        && !maximized
+        && !native_decorations_forced
+        && native_shape_supported
+}
+#[cfg(target_os = "linux")]
+fn linux_startup_reveal_should_wait_for_shape(
+    transparent_window: bool,
+    radius: u8,
+    maximized: bool,
+) -> bool {
+    linux_startup_reveal_should_wait_for_shape_for_platform(
+        transparent_window,
+        radius,
+        maximized,
+        linux_force_native_decorations(),
+        linux_native_window_shape_supported(),
+    )
+}
 fn shell_root_background(palette: Palette, transparent_window: bool) -> &'static str {
     if transparent_window {
         "transparent"
@@ -44098,6 +44173,75 @@ fn apply_linux_transparent_window_surface_style(
     _transparent_window: bool,
     _radius: u8,
 ) {
+}
+#[cfg(target_os = "linux")]
+fn prepare_linux_window_reveal_after_corner_shape(desktop: &dioxus::desktop::DesktopContext) {
+    use gtk::prelude::*;
+
+    desktop.gtk_window().set_opacity(0.0);
+}
+#[cfg(target_os = "linux")]
+fn reveal_linux_window_after_corner_shape(
+    desktop: &dioxus::desktop::DesktopContext,
+    radius: u8,
+    maximized: bool,
+    trace_home: PathBuf,
+) {
+    use gtk::prelude::*;
+
+    let revealed = std::rc::Rc::new(std::cell::Cell::new(false));
+    for delay_ms in [0_u64, 8, 16, 32, 64, 120, 240, 480] {
+        let desktop = desktop.clone();
+        let gtk_window = desktop.gtk_window().clone();
+        let revealed = revealed.clone();
+        let trace_home = trace_home.clone();
+        gtk::glib::timeout_add_local_once(Duration::from_millis(delay_ms), move || {
+            if revealed.get() {
+                return;
+            }
+            let allocation = gtk_window.allocation();
+            let has_window = gtk_window.window().is_some();
+            let can_shape = allocation.width() > 0 && allocation.height() > 0 && has_window;
+            if can_shape {
+                apply_linux_window_corner_shape(&desktop, radius, maximized);
+                gtk_window.queue_draw();
+                gtk_window.set_opacity(1.0);
+                revealed.set(true);
+                append_trace_event(
+                    &trace_home,
+                    "ui",
+                    "startup",
+                    "linux_window_revealed_after_corner_shape",
+                    json!({
+                        "pid": std::process::id(),
+                        "delay_ms": delay_ms,
+                        "width": allocation.width(),
+                        "height": allocation.height(),
+                        "radius": radius,
+                    }),
+                );
+                return;
+            }
+            if delay_ms >= 480 {
+                gtk_window.set_opacity(1.0);
+                revealed.set(true);
+                append_trace_event(
+                    &trace_home,
+                    "ui",
+                    "startup",
+                    "linux_window_revealed_after_corner_shape_fallback",
+                    json!({
+                        "pid": std::process::id(),
+                        "delay_ms": delay_ms,
+                        "width": allocation.width(),
+                        "height": allocation.height(),
+                        "has_window": has_window,
+                        "radius": radius,
+                    }),
+                );
+            }
+        });
+    }
 }
 #[cfg(target_os = "linux")]
 fn env_flag_truthy(name: &str) -> bool {
@@ -45130,6 +45274,51 @@ mod tests {
         assert_eq!(
             normalize_app_control_main_zoom_value(20.0, WorkspaceViewMode::Terminal),
             20.0
+        );
+    }
+    #[test]
+    fn app_control_created_session_path_recovers_public_live_paths_from_start_message() {
+        let snapshot = ServerUiSnapshot {
+            active_session_path: None,
+            active_session: None,
+            active_view_mode: WorkspaceViewMode::Terminal,
+            remote_machines: Vec::new(),
+            ssh_targets: Vec::new(),
+            live_sessions: Vec::new(),
+        };
+
+        assert_eq!(
+            app_control_created_session_path(&snapshot, Some("started codex::abc123")).as_deref(),
+            Some("codex://abc123")
+        );
+        assert_eq!(
+            app_control_created_session_path(&snapshot, Some("started local::def456")).as_deref(),
+            Some("local://def456")
+        );
+        assert_eq!(
+            app_control_created_session_path(
+                &snapshot,
+                Some("started remote-session://jojo/ghi789")
+            )
+            .as_deref(),
+            Some("remote-session://jojo/ghi789")
+        );
+    }
+    #[test]
+    fn app_control_created_session_path_prefers_snapshot_path() {
+        let snapshot = ServerUiSnapshot {
+            active_session_path: Some("codex://from-snapshot".to_string()),
+            active_session: None,
+            active_view_mode: WorkspaceViewMode::Terminal,
+            remote_machines: Vec::new(),
+            ssh_targets: Vec::new(),
+            live_sessions: Vec::new(),
+        };
+
+        assert_eq!(
+            app_control_created_session_path(&snapshot, Some("started codex::from-message"))
+                .as_deref(),
+            Some("codex://from-snapshot")
         );
     }
     #[test]
@@ -46211,11 +46400,10 @@ mod tests {
         );
         assert!(
             script.contains("const terminalPayloadContainsCodexWelcomeSurface = (payload) => {")
-                && script.contains(
+                && !script.contains(
                     "if (activeRenderSurface && !codexWelcome && (lowPowerTuiActive || entersAltScreen || frameLike)) {"
-                )
-                && script.contains("return lowPowerTuiXtermControlPrefix(value);"),
-            "visible high-volume TUI output should use the low-power surface instead of repainting the xterm canvas on every frame"
+                ),
+            "visible TUI/Codex output should render through xterm instead of the lossy low-power text overlay"
         );
         assert!(
             script.contains("data-yggterm-low-power-tui"),
@@ -46638,6 +46826,28 @@ mod tests {
             false,
             Some("wayland"),
             true
+        ));
+    }
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_transparent_startup_reveal_waits_for_initial_shape() {
+        assert!(linux_startup_reveal_should_wait_for_shape_for_platform(
+            true, 10, false, false, true
+        ));
+        assert!(!linux_startup_reveal_should_wait_for_shape_for_platform(
+            false, 10, false, false, true
+        ));
+        assert!(!linux_startup_reveal_should_wait_for_shape_for_platform(
+            true, 0, false, false, true
+        ));
+        assert!(!linux_startup_reveal_should_wait_for_shape_for_platform(
+            true, 10, true, false, true
+        ));
+        assert!(!linux_startup_reveal_should_wait_for_shape_for_platform(
+            true, 10, false, true, true
+        ));
+        assert!(!linux_startup_reveal_should_wait_for_shape_for_platform(
+            true, 10, false, false, false
         ));
     }
     #[cfg(target_os = "linux")]
