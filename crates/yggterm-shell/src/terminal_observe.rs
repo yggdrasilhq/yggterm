@@ -40,6 +40,11 @@ pub(crate) fn describe_viewport_snapshot(snapshot: &Value, dom: &Value) -> Value
         .and_then(Value::as_str)
         .unwrap_or("Unknown")
         .to_string();
+    let active_session_source = snapshot
+        .get("active_session_source")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
     let active_title = snapshot
         .get("active_title")
         .and_then(Value::as_str)
@@ -310,7 +315,21 @@ pub(crate) fn describe_viewport_snapshot(snapshot: &Value, dom: &Value) -> Value
         let preview_has_content = preview_scroll_count > 0
             && ((preview_visible_block_count > 0 || !preview_rendered_sections.is_empty())
                 || (!preview_text_sample.is_empty() && !preview_placeholder));
-        if preview_loading && !preview_has_content {
+        let active_remote_live_preview = active_session_path.as_deref().is_some_and(|path| {
+            (path.starts_with("remote-session://") || path.starts_with("ssh://"))
+                && active_session_source.starts_with("Live")
+        });
+        if active_remote_live_preview {
+            (
+                false,
+                false,
+                Some("problem".to_string()),
+                Some(
+                    "active remote live session is showing Preview instead of the terminal surface"
+                        .to_string(),
+                ),
+            )
+        } else if preview_loading && !preview_has_content {
             (
                 false,
                 false,
@@ -856,7 +875,6 @@ fn terminal_host_problem_for_app_control(host: &Value) -> Option<&'static str> {
         && mounted_entry_host_connected
         && (xterm_present || screen_present || rows_present || canvas_count > 0);
     let transcript_browser_surface = terminal_chunk_is_transcript_browser(visible_text);
-    let codex_status_surface = terminal_chunk_is_codex_status_surface(visible_text);
     let visible_text_prompt = terminal_chunk_has_prompt_output(visible_text)
         || terminal_chunk_has_codex_prompt_output(visible_text);
     let prompt_visible = terminal_chunk_has_prompt_output(text_sample)
@@ -864,22 +882,16 @@ fn terminal_host_problem_for_app_control(host: &Value) -> Option<&'static str> {
         || visible_text_prompt
         || codex_interactive_setup_prompt
         || codex_prompt_surface
-        || codex_status_surface
         || (!cursor_line_text.is_empty()
             && (terminal_chunk_has_prompt_output(cursor_line_text)
                 || terminal_chunk_has_codex_prompt_output(cursor_line_text)));
     let local_prompt_surface = session_path.starts_with("local://") && prompt_visible;
-    let codex_status_ready_surface = session_path.starts_with("remote-session://")
-        && codex_status_surface
-        && input_enabled
-        && (helper_textarea_focused || xterm_present || screen_present || canvas_count > 0);
     let prompt_ready_surface = prompt_visible
         && (input_enabled
             || helper_textarea_focused
             || cursor_sample_visible
             || local_prompt_surface
-            || live_remote_codex_prompt_surface
-            || codex_status_ready_surface);
+            || live_remote_codex_prompt_surface);
     let transcript_browser_ready_surface = false;
     if !cursor_line_text.is_empty() && terminal_chunk_is_transport_error(cursor_line_text) {
         return Some("active terminal host is showing transport/error output");
@@ -950,6 +962,16 @@ fn terminal_host_problem_for_app_control(host: &Value) -> Option<&'static str> {
         return Some("active terminal host is still showing low-signal terminal noise");
     }
     if session_path.starts_with("remote-session://")
+        && !input_enabled
+        && mounted_entry_host_connected
+        && (xterm_present || screen_present || rows_present || canvas_count > 0)
+        && (last_raw_payload_length > 0 || write_command_count > 0)
+        && !prompt_ready_surface
+        && !transcript_browser_ready_surface
+    {
+        return Some("active remote terminal is showing stale retained text before prompt-ready surface");
+    }
+    if session_path.starts_with("remote-session://")
         && input_enabled
         && scrollback_expected
         && rows >= 8
@@ -973,7 +995,6 @@ fn terminal_host_problem_for_app_control(host: &Value) -> Option<&'static str> {
         && input_enabled
         && !prompt_ready_surface
         && !transcript_browser_ready_surface
-        && !codex_status_surface
     {
         return Some("active remote terminal is input-enabled without a prompt-ready surface");
     }
@@ -991,6 +1012,9 @@ fn terminal_host_geometry_problem_for_app_control(host: &Value) -> Option<&'stat
         .and_then(|value| value.get("top"))
         .and_then(Value::as_f64)
         .unwrap_or(0.0);
+    if host_left < -1.0 || host_top < -1.0 {
+        return Some("active terminal host is mounted offscreen");
+    }
     let host_width = host
         .get("host_content_width")
         .and_then(Value::as_f64)
@@ -1369,21 +1393,6 @@ pub(crate) fn terminal_chunk_is_codex_prompt_surface(data: &str) -> bool {
             || normalized.contains("claude"))
 }
 
-fn terminal_chunk_is_codex_status_surface(data: &str) -> bool {
-    let stripped = strip_terminal_control_sequences(data);
-    let normalized = stripped
-        .to_ascii_lowercase()
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ");
-    normalized.contains("openai codex")
-        && normalized.contains("context window:")
-        && (normalized.contains("5h limit:") || normalized.contains("weekly limit:"))
-        && !terminal_chunk_is_transport_error(&stripped)
-        && !terminal_chunk_is_loading_placeholder(&stripped)
-        && !terminal_chunk_is_transcript_browser(&stripped)
-}
-
 pub(crate) fn terminal_chunk_has_prompt_output(data: &str) -> bool {
     let stripped = strip_terminal_control_sequences(data);
     let normalized_lines = stripped
@@ -1415,12 +1424,34 @@ pub(crate) fn terminal_chunk_has_codex_prompt_output(data: &str) -> bool {
         .take(4)
         .copied()
         .collect::<Vec<_>>();
-    tail.iter().all(|line| line.chars().count() <= 160)
+    if tail.iter().all(|line| line.chars().count() <= 160)
         && tail.iter().any(|line| {
             let semantic =
                 line.trim_matches(|ch: char| matches!(ch, '╭' | '╮' | '╰' | '╯' | '─' | '│' | ' '));
             semantic.starts_with('›')
-        })
+        }) {
+        return true;
+    }
+    if terminal_chunk_is_transport_error(&stripped)
+        || terminal_chunk_is_loading_placeholder(&stripped)
+        || terminal_chunk_is_transcript_browser(&stripped)
+        || terminal_chunk_is_saved_transcript_prefill(&stripped)
+    {
+        return false;
+    }
+    let compact = stripped.split_whitespace().collect::<Vec<_>>().join(" ");
+    let Some(prompt_ix) = compact.rfind('›') else {
+        return false;
+    };
+    let prompt_suffix = compact[prompt_ix..].trim_matches(|ch: char| {
+        matches!(ch, '╭' | '╮' | '╰' | '╯' | '─' | '│' | ' ')
+    });
+    prompt_suffix.starts_with('›')
+        && prompt_suffix.chars().count() <= 260
+        && (prompt_suffix.contains("gpt-")
+            || prompt_suffix.contains("claude")
+            || prompt_suffix.contains("~/")
+            || prompt_suffix.chars().count() <= 140)
 }
 
 pub(crate) fn terminal_chunk_is_generic_codex_idle(data: &str) -> bool {
@@ -1784,6 +1815,36 @@ mod tests {
     }
 
     #[test]
+    fn terminal_host_problem_rejects_remote_codex_title_card_without_prompt() {
+        let host = json!({
+            "session_path": "remote-session://dev/title-card-only",
+            "text_sample": "╭─────────────────────────────────────────────╮\n│ >_ OpenAI Codex (v0.128.0)                  │\n│                                             │\n│ model:     gpt-5.5 xhigh   /model to change │\n│ directory: ~/gh/yggterm                     │",
+            "text_tail": "╭─────────────────────────────────────────────╮\n│ >_ OpenAI Codex (v0.128.0)                  │\n│                                             │\n│ model:     gpt-5.5 xhigh   /model to change │\n│ directory: ~/gh/yggterm                     │",
+            "cursor_line_text": "│ directory: ~/gh/yggterm                     │",
+            "input_enabled": true,
+            "helper_textarea_focused": true,
+            "xterm_present": true,
+            "screen_present": true,
+            "rows_present": true,
+            "canvas_count": 4,
+            "render_event_count": 8,
+            "write_command_count": 1,
+            "last_raw_payload_line_count": 4,
+            "host_rect": {"left": 0.0, "top": 0.0, "width": 840.0, "height": 830.0},
+            "host_content_width": 840.0,
+            "host_content_height": 830.0,
+            "screen_rect": {"width": 840.0, "height": 830.0},
+            "viewport_rect": {"width": 840.0, "height": 830.0},
+            "helpers_rect": {"width": 840.0, "height": 830.0},
+            "helper_textarea_rect": {"left": 0.0, "top": 0.0, "width": 1.0, "height": 1.0}
+        });
+        assert_eq!(
+            terminal_host_problem_for_app_control(&host),
+            Some("active terminal host is still showing generic Codex idle chrome")
+        );
+    }
+
+    #[test]
     fn terminal_host_problem_accepts_codex_permission_menu_surface() {
         let host = json!({
             "session_path": "remote-session://dev/codex-permissions",
@@ -1964,6 +2025,10 @@ mod tests {
 
   gpt-5.3-codex-spark high · ~"
         ));
+        assert!(terminal_chunk_has_codex_prompt_output(
+            "\
+╰─────────────────────────────────────────────╯\x1b[8;1H  Tip: New Use /fast to enable our fastest inference with increased plan usage.\x1b[10;1H⚠ Heads up, you have less than 10% of your weekly limit left. Run /status for a breakdown.\x1b[13;1H›\x1b[CSummarize recent commits\x1b[15;1H  gpt-5.5 xhigh · ~/gh/yggterm\x1b[13;3H\x1b>\x1b[?1l\x1b[?2004h"
+        ));
         assert!(!terminal_chunk_has_codex_prompt_output(
             "\
 ╭────────────────────────────────────────────────────────╮
@@ -2118,7 +2183,43 @@ mod tests {
     }
 
     #[test]
-    fn terminal_host_problem_accepts_input_enabled_codex_status_surface() {
+    fn terminal_host_problem_rejects_input_disabled_stale_retained_remote_prose() {
+        let stale_tail = "The commit and signed tag are pushed. I’m creating the GitHub release directly with the Linux installer archive, companion binaries, `.deb`, and checksums so the curl installer can resolve `v2.1.44` immediately; the tag workflow can still add any matrix artifacts afterward.";
+        let host = json!({
+            "session_path": "remote-session://dev/stale-codex",
+            "text_sample": stale_tail,
+            "text_tail": stale_tail,
+            "buffer_text_sample": stale_tail,
+            "cursor_line_text": "workflow can still add any matrix artifacts afterward.",
+            "input_enabled": false,
+            "helper_textarea_focused": false,
+            "cursor_node_count": 0,
+            "xterm_present": true,
+            "screen_present": true,
+            "rows_present": false,
+            "canvas_count": 4,
+            "render_event_count": 12,
+            "data_event_count": 0,
+            "last_raw_payload_length": 886,
+            "write_command_count": 1,
+            "mounted_entry_host_connected": true,
+            "xterm_buffer_kind": "normal",
+            "host_rect": {"left": 0.0, "top": 0.0, "width": 840.0, "height": 830.0},
+            "host_content_width": 840.0,
+            "host_content_height": 830.0,
+            "screen_rect": {"width": 840.0, "height": 830.0},
+            "viewport_rect": {"width": 840.0, "height": 830.0},
+            "helpers_rect": {"width": 840.0, "height": 830.0},
+            "helper_textarea_rect": {"left": -10000.0, "top": 68.0, "width": 1.0, "height": 1.0}
+        });
+        assert_eq!(
+            terminal_host_problem_for_app_control(&host),
+            Some("active remote terminal is showing stale retained text before prompt-ready surface")
+        );
+    }
+
+    #[test]
+    fn terminal_host_problem_rejects_input_enabled_codex_status_surface_without_prompt() {
         let status = "\
 >_ OpenAI Codex (v0.128.0)
 
@@ -2153,7 +2254,10 @@ Weekly limit:                97% left
             "helpers_rect": {"width": 840.0, "height": 830.0},
             "helper_textarea_rect": {"left": -10000.0, "top": 68.0, "width": 1.0, "height": 1.0}
         });
-        assert_eq!(terminal_host_problem_for_app_control(&host), None);
+        assert_eq!(
+            terminal_host_problem_for_app_control(&host),
+            Some("active remote terminal is input-enabled without a prompt-ready surface")
+        );
     }
 
     #[test]
@@ -2452,6 +2556,93 @@ Weekly limit:                21% left
             Some(&Value::String(
                 "active terminal host is still showing the transcript browser".to_string()
             ))
+        );
+    }
+
+    #[test]
+    fn viewport_rejects_remote_live_preview_fallback() {
+        let snapshot = json!({
+            "active_session_path": "remote-session://dev/live-codex",
+            "active_session_source": "LiveSsh",
+            "active_view_mode": "Rendered",
+            "active_title": "Debug Live",
+            "shell": {
+                "terminal_attach_in_flight": [],
+                "notifications": []
+            },
+            "active_surface_requests": []
+        });
+        let dom = json!({
+            "titlebar_title_text": "Debug Live",
+            "titlebar_summary_text": "",
+            "titlebar_button_tooltip": "",
+            "titlebar_menu_open": false,
+            "preview_text_sample": "May 03, 2026 11:15PM UTC+0530\nThis Codex session stays attached to the daemon and opens inline in the main terminal viewport.",
+            "preview_viewport_rect": {"left": 297.0, "top": 70.0, "width": 843.0, "height": 202.0},
+            "preview_visible_block_ids": ["preview-block-live-0"],
+            "preview_font_family": "Inter",
+            "preview_visible_entries": [],
+            "preview_rendered_sections": [],
+            "preview_fallback_context_visible": false,
+            "preview_fallback_context_text": "",
+            "preview_timestamp_labels": ["May 03, 2026 11:15PM UTC+0530"],
+            "preview_window": null,
+            "shell_text_sample": "",
+            "document_editor_count": 0,
+            "document_body_sample": "",
+            "terminal_hosts": [],
+            "terminal_resume_overlay": {
+                "visible": false,
+                "text_sample": "",
+                "excerpt": "",
+                "kind": "",
+                "phase": "hidden",
+                "effective_failed": false
+            },
+            "preview_visible_block_count": 1,
+            "preview_scroll_count": 1
+        });
+        let viewport = describe_viewport_snapshot(&snapshot, &dom);
+        assert_eq!(viewport.get("ready").and_then(Value::as_bool), Some(false));
+        assert_eq!(
+            viewport
+                .get("terminal_settled_kind")
+                .and_then(Value::as_str),
+            Some("problem")
+        );
+        assert_eq!(
+            viewport.get("reason").and_then(Value::as_str),
+            Some("active remote live session is showing Preview instead of the terminal surface")
+        );
+    }
+
+    #[test]
+    fn terminal_host_problem_rejects_offscreen_active_host() {
+        let host = json!({
+            "text_sample": "",
+            "cursor_line_text": "",
+            "input_enabled": false,
+            "helper_textarea_focused": false,
+            "xterm_present": true,
+            "screen_present": true,
+            "viewport_present": true,
+            "rows_present": false,
+            "canvas_count": 4,
+            "render_event_count": 6,
+            "data_event_count": 0,
+            "xterm_buffer_kind": "normal",
+            "xterm_cursor_hidden": false,
+            "host_rect": {"left": -2643.0, "top": 16.0, "width": 883.0, "height": 904.0},
+            "host_content_width": 883.0,
+            "host_content_height": 904.0,
+            "screen_rect": {"width": 883.0, "height": 904.0},
+            "viewport_rect": {"width": 883.0, "height": 904.0},
+            "helpers_rect": {"width": 883.0, "height": 904.0},
+            "helper_textarea_rect": {"left": -12643.0, "top": 16.0, "width": 1.0, "height": 1.0}
+        });
+        assert_eq!(
+            terminal_host_problem_for_app_control(&host),
+            Some("active terminal host is mounted offscreen")
         );
     }
 
