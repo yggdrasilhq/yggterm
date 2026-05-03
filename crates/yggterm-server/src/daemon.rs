@@ -2289,21 +2289,26 @@ pub fn status(endpoint: &ServerEndpoint) -> Result<ServerRuntimeStatus> {
 }
 
 #[cfg(unix)]
-pub fn reachable_versioned_daemon_statuses(
-    home_dir: &Path,
-) -> Vec<(ServerEndpoint, ServerRuntimeStatus)> {
+fn versioned_server_status_probe_paths(home_dir: &Path) -> Vec<PathBuf> {
     let mut seen = HashSet::<PathBuf>::new();
+    let mut seen_socket_identities = HashSet::<PathBuf>::new();
     let mut paths = Vec::<PathBuf>::new();
+    let mut push_path = |path: PathBuf| {
+        if !seen.insert(path.clone()) {
+            return;
+        }
+        let socket_identity = fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+        if !seen_socket_identities.insert(socket_identity) {
+            return;
+        }
+        paths.push(path);
+    };
 
     let current_endpoint = default_endpoint(home_dir);
     if let ServerEndpoint::UnixSocket(current_path) = current_endpoint {
-        if seen.insert(current_path.clone()) {
-            paths.push(current_path.clone());
-        }
+        push_path(current_path.clone());
         for candidate in versioned_server_socket_alias_candidates(&current_path) {
-            if seen.insert(candidate.clone()) {
-                paths.push(candidate);
-            }
+            push_path(candidate);
         }
     }
 
@@ -2319,25 +2324,24 @@ pub fn reachable_versioned_daemon_statuses(
                 .then_with(|| a.cmp(b))
         });
         for path in home_paths {
-            if seen.insert(path.clone()) {
-                paths.push(path);
-            }
+            push_path(path);
         }
     }
 
-    let mut reached_socket_identities = HashSet::<PathBuf>::new();
+    paths
+}
+
+#[cfg(unix)]
+pub fn reachable_versioned_daemon_statuses(
+    home_dir: &Path,
+) -> Vec<(ServerEndpoint, ServerRuntimeStatus)> {
+    let paths = versioned_server_status_probe_paths(home_dir);
+
     paths
         .into_iter()
         .filter_map(|path| {
             let endpoint = ServerEndpoint::UnixSocket(path);
             let runtime = status(&endpoint).ok()?;
-            let ServerEndpoint::UnixSocket(path) = &endpoint else {
-                return None;
-            };
-            let socket_identity = fs::canonicalize(path).unwrap_or_else(|_| path.clone());
-            if !reached_socket_identities.insert(socket_identity) {
-                return None;
-            }
             Some((endpoint, runtime))
         })
         .collect()
@@ -4415,6 +4419,32 @@ mod tests {
         let candidates = versioned_server_socket_alias_candidates(&current);
 
         assert!(candidates.contains(&sockets_dir.join("server-2-1-4.sock")));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn versioned_server_status_probe_paths_dedupe_symlink_aliases_before_status() {
+        let root = std::env::temp_dir().join(format!(
+            "yggterm-daemon-status-dedupe-test-{}-{}",
+            std::process::id(),
+            super::current_millis()
+        ));
+        let sockets_dir = root.join("home").join(".yggterm");
+        fs::create_dir_all(&sockets_dir).expect("create sockets dir");
+        let super::ServerEndpoint::UnixSocket(current) = super::default_endpoint(&sockets_dir)
+        else {
+            panic!("unix test requires unix socket endpoint");
+        };
+        fs::write(&current, b"").expect("write current socket placeholder");
+        std::os::unix::fs::symlink(&current, sockets_dir.join("server-2-1-102.sock"))
+            .expect("create 2.1.102 alias");
+        std::os::unix::fs::symlink(&current, sockets_dir.join("server-2-1-101.sock"))
+            .expect("create 2.1.101 alias");
+
+        let paths = super::versioned_server_status_probe_paths(&sockets_dir);
+
+        assert_eq!(paths, vec![current]);
         let _ = fs::remove_dir_all(&root);
     }
 
