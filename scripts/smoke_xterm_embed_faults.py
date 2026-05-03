@@ -4164,6 +4164,8 @@ def host_has_live_codex_prompt(host: dict) -> bool:
     )
     if any(marker in host_text for marker in transcript_only_markers):
         return False
+    if terminal_text_has_transcript_artifacts(host_text):
+        return False
     if "Update available!" in host_text and "Press enter to continue" in host_text:
         return False
     return any(
@@ -4246,6 +4248,32 @@ def assert_no_attach_ready_protocol_markers(host: dict, context: str) -> None:
         raise AssertionError(
             f"{context} exposed Yggterm attach-ready protocol markers in the terminal viewport: "
             f"text_tail={text[-1000:]!r} host={host!r}"
+        )
+
+
+def terminal_text_has_transcript_artifacts(text: str) -> bool:
+    lines = [line.strip().lower() for line in str(text or "").splitlines() if line.strip()]
+    role_lines = [
+        line
+        for line in lines
+        if line in ("user:", "assistant:")
+        or line.startswith("user: ")
+        or line.startswith("assistant: ")
+    ]
+    joined = " ".join(lines)
+    transcript_browser = (
+        "t r a n s c r i p t" in joined
+        or ("transcript" in joined and ("q to quit" in joined or "pgup/pgdn" in joined))
+    )
+    return (len(role_lines) >= 2 and len(lines) >= 4) or transcript_browser
+
+
+def assert_no_transcript_artifacts(host: dict, context: str) -> None:
+    text = terminal_host_text(host)
+    if terminal_text_has_transcript_artifacts(text):
+        raise AssertionError(
+            f"{context} exposed saved Codex transcript artifacts in the live terminal viewport: "
+            f"text_tail={text[-1600:]!r} host={host!r}"
         )
 
 
@@ -13532,6 +13560,7 @@ def assert_remote_session_switch_scrollback(pid: int, session: str, out_dir: Pat
     initial_state = wait_for_session_focus(pid, target_path, timeout_seconds=15.0)
     initial_host = host_for_session(initial_state, target_path)
     assert_no_attach_ready_protocol_markers(initial_host, "remote switch initial")
+    assert_no_transcript_artifacts(initial_host, "remote switch initial")
     initial_base_y = int(initial_host.get("base_y") or 0)
     initial_expected = host_expects_scrollback(initial_host)
     compact_resize = None
@@ -13551,6 +13580,7 @@ def assert_remote_session_switch_scrollback(pid: int, session: str, out_dir: Pat
                 initial_state = wait_for_interactive(pid, timeout_seconds=6.0)
             initial_host = host_for_session(initial_state, target_path)
             assert_no_attach_ready_protocol_markers(initial_host, "remote switch compact resize")
+            assert_no_transcript_artifacts(initial_host, "remote switch compact resize")
             initial_base_y = int(initial_host.get("base_y") or 0)
             initial_expected = host_expects_scrollback(initial_host)
     if not initial_expected and initial_base_y <= 0:
@@ -13620,6 +13650,7 @@ def assert_remote_session_switch_scrollback(pid: int, session: str, out_dir: Pat
         )
     final_host = host_for_session(final_state, target_path)
     assert_no_attach_ready_protocol_markers(final_host, "remote switch return")
+    assert_no_transcript_artifacts(final_host, "remote switch return")
     final_status_surface = None
     if "Session:" in codex_status_viewport_text(final_host):
         final_status_surface = assert_single_clean_codex_status_surface(
@@ -15739,6 +15770,7 @@ def assert_status_command(pid: int, session: str, out_dir: Path) -> dict:
     cursor_line_text = str(host.get("cursor_line_text") or "")
     if host_has_shell_status_failure(host):
         raise AssertionError("Codex status probe typed /status into the shell instead of the live Codex runtime")
+    assert_no_transcript_artifacts(host, "after /status")
     if "OpenAI Codex" not in host_text and "Session:" not in host_text:
         raise AssertionError("Codex status panel is not visible after /status<Enter>")
     status_surface = assert_single_clean_codex_status_surface(
