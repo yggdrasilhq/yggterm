@@ -105,14 +105,14 @@ use yggterm_server::{
     complete_app_control_request, connect_ssh_custom, fetch_remote_generation_context,
     focus_live_with_view, local_headless_companion_executable_from_current,
     managed_cli_refresh_ttl_ms, open_remote_session_with_view, open_stored_session,
-    open_stored_session_with_view, persist_remote_generated_copy, ping, prepare_update_restart,
-    refresh_local_managed_cli_now, refresh_managed_cli, refresh_preview, refresh_remote_machine,
-    remove_session, remove_ssh_target, request_terminal_launch, set_all_preview_blocks_folded,
-    set_session_keep_alive, set_view_mode as daemon_set_view_mode, shutdown as daemon_shutdown,
-    snapshot as daemon_snapshot, snapshot_session_view_for_ui, stage_remote_clipboard_png,
-    start_command_session, start_local_session_at, start_remote_codex_session_at,
-    start_ssh_session_at, status, take_next_app_control_request, terminal_ensure, terminal_read,
-    terminal_resize, terminal_snapshot, terminal_write,
+    open_stored_session_with_view, persist_remote_generated_copy, ping, prepare_client_close,
+    prepare_update_restart, refresh_local_managed_cli_now, refresh_managed_cli, refresh_preview,
+    refresh_remote_machine, remove_session, remove_ssh_target, request_terminal_launch,
+    set_all_preview_blocks_folded, set_session_keep_alive, set_view_mode as daemon_set_view_mode,
+    shutdown as daemon_shutdown, snapshot as daemon_snapshot, snapshot_session_view_for_ui,
+    stage_remote_clipboard_png, start_command_session, start_local_session_at,
+    start_remote_codex_session_at, start_ssh_session_at, status, take_next_app_control_request,
+    terminal_ensure, terminal_read, terminal_resize, terminal_snapshot, terminal_write,
     toggle_preview_block as daemon_toggle_preview_block,
     update_session_copy as daemon_update_session_copy, validate_server_ui_snapshot,
 };
@@ -5300,8 +5300,7 @@ fn terminal_surface_has_prompt_ready_text(text: &str) -> bool {
     !trimmed.is_empty()
         && (terminal_chunk_has_prompt_output(trimmed)
             || terminal_chunk_has_codex_prompt_output(trimmed)
-            || terminal_chunk_is_codex_interactive_setup_prompt(trimmed)
-            || terminal_chunk_is_codex_interrupted_input_surface(trimmed))
+            || terminal_chunk_is_codex_interactive_setup_prompt(trimmed))
 }
 fn terminal_chunk_is_codex_interrupted_input_surface(text: &str) -> bool {
     let mut tail_lines = text
@@ -6934,7 +6933,16 @@ fn spawn_graceful_shutdown_and_close(mut state: Signal<ShellState>) {
     state.with_mut(|shell| {
         shell.closing_app = true;
         shell.last_action = "closing yggterm".to_string();
+        shell.push_notification(
+            NotificationTone::Info,
+            "Closing Live Sessions",
+            "Non-keep-alive live sessions will close gracefully. Keep Alive sessions stay available; update restarts preserve all live sessions.".to_string(),
+        );
     });
+    let _ = send_user_notification(
+        "Yggterm closing live sessions",
+        "Non-keep-alive sessions will close gracefully; force cleanup runs after 1 hour.",
+    );
     spawn_close_force_exit_watchdog();
     spawn(async move {
         if detach_terminal_before_close {
@@ -19457,12 +19465,16 @@ async fn capture_dom_debug_snapshot_for(active_session_path: Option<&str>) -> Va
                     font_family: style.fontFamily,
                     host_css_font_family: String(style.getPropertyValue('--yggterm-term-font-family') || '').trim(),
                     host_css_foreground: String(style.getPropertyValue('--yggterm-term-foreground') || '').trim(),
+                    host_css_cursor: String(style.getPropertyValue('--yggterm-term-cursor') || '').trim(),
+                    host_css_cursor_text: String(style.getPropertyValue('--yggterm-term-cursor-text') || '').trim(),
                     host_css_cursor_block_text: String(style.getPropertyValue('--yggterm-term-cursor-block-text') || '').trim(),
                     xterm_font_family: term ? String(term.options.fontFamily || '') : null,
                     xterm_font_weight: term ? String(term.options.fontWeight || '') : null,
                     xterm_font_weight_bold: term ? String(term.options.fontWeightBold || '') : null,
                     xterm_line_height: term ? String(term.options.lineHeight || '') : null,
                     xterm_minimum_contrast_ratio: term ? String(term.options.minimumContrastRatio || '') : null,
+                    xterm_cursor_style: term ? String(term.options.cursorStyle || '') : null,
+                    xterm_cursor_width: term ? Number(term.options.cursorWidth || 0) : null,
                     rows_font_family: rowsStyle ? rowsStyle.fontFamily : null,
                     rows_font_weight: rowsStyle ? String(rowsStyle.fontWeight || '') : null,
                     rows_font_feature_settings: rowsStyle ? String(rowsStyle.fontFeatureSettings || '') : null,
@@ -19569,6 +19581,8 @@ async fn capture_dom_debug_snapshot_for(active_session_path: Option<&str>) -> Va
                     } : null,
                     xterm_theme_background: term && term.options.theme ? String(term.options.theme.background || '') : null,
                     xterm_theme_foreground: term && term.options.theme ? String(term.options.theme.foreground || '') : null,
+                    xterm_theme_cursor: term && term.options.theme ? String(term.options.theme.cursor || '') : null,
+                    xterm_theme_cursor_accent: term && term.options.theme ? String(term.options.theme.cursorAccent || '') : null,
                     xterm_buffer_kind: xtermBufferKind,
                     xterm_buffer_transition_count: mountedHost ? Number(mountedHost.bufferTransitionCount || 0) : 0,
                     xterm_cursor_hidden: (() => {
@@ -20728,9 +20742,13 @@ async fn capture_dom_debug_snapshot_basic_for(active_session_path: Option<&str>)
                         xterm_font_weight_bold: term ? String(term.options.fontWeightBold || '') : null,
                         xterm_line_height: term ? String(term.options.lineHeight || '') : null,
                         xterm_minimum_contrast_ratio: term ? String(term.options.minimumContrastRatio || '') : null,
+                        xterm_cursor_style: term ? String(term.options.cursorStyle || '') : null,
+                        xterm_cursor_width: term ? Number(term.options.cursorWidth || 0) : null,
                         xterm_dimensions: xtermDimensionSummary,
                         xterm_theme_background: term && term.options.theme ? String(term.options.theme.background || '') : null,
                         xterm_theme_foreground: term && term.options.theme ? String(term.options.theme.foreground || '') : null,
+                        xterm_theme_cursor: term && term.options.theme ? String(term.options.theme.cursor || '') : null,
+                        xterm_theme_cursor_accent: term && term.options.theme ? String(term.options.theme.cursorAccent || '') : null,
                         low_contrast_span_count: 0,
                         low_contrast_span_samples: [],
                         low_contrast_row_count: 0,
@@ -24512,6 +24530,33 @@ fn maybe_shutdown_daemon_for_last_client(
         }),
     );
     if active.is_empty() && KEEP_DAEMON_RUNNING_AFTER_LAST_CLIENT {
+        match prepare_client_close(endpoint) {
+            Ok(message) => {
+                if let Some(message) = message.as_deref() {
+                    let _ = send_user_notification("Yggterm live sessions", message);
+                }
+                append_trace_event(
+                    &perf_home_dir(settings_path),
+                    "client",
+                    "gui",
+                    "prepare_client_close",
+                    json!({
+                        "message": message,
+                    }),
+                );
+            }
+            Err(error) => {
+                append_trace_event(
+                    &perf_home_dir(settings_path),
+                    "client",
+                    "gui",
+                    "prepare_client_close_failed",
+                    json!({
+                        "error": error.to_string(),
+                    }),
+                );
+            }
+        }
         append_trace_event(
             &perf_home_dir(settings_path),
             "client",
@@ -37156,6 +37201,7 @@ struct TerminalTheme {
     background: String,
     foreground: String,
     cursor: String,
+    cursor_text: String,
     font_size: f32,
     selection: String,
     black: String,
@@ -37194,6 +37240,7 @@ fn terminal_theme(
             background: theme.palette.background.clone(),
             foreground: theme.palette.foreground.clone(),
             cursor: theme.palette.cursor.clone(),
+            cursor_text: theme.palette.cursor_text.clone(),
             font_size: font_size.max(5.0),
             selection: theme.palette.selection.clone(),
             black: theme.palette.black.clone(),
@@ -37218,6 +37265,7 @@ fn terminal_theme(
         background: "#f7f8fa".to_string(),
         foreground: "#1f2328".to_string(),
         cursor: "#0451a5".to_string(),
+        cursor_text: "#f7f8fa".to_string(),
         font_size: font_size.max(5.0),
         selection: "rgba(9, 105, 218, 0.20)".to_string(),
         black: "#24292f".to_string(),
@@ -37240,8 +37288,13 @@ fn terminal_theme(
 }
 fn terminal_theme_signature(theme: &TerminalTheme) -> String {
     format!(
-        "{}|{}|{}|{}|{}",
-        theme.background, theme.foreground, theme.cursor, theme.selection, theme.font_size
+        "{}|{}|{}|{}|{}|{}",
+        theme.background,
+        theme.foreground,
+        theme.cursor,
+        theme.cursor_text,
+        theme.selection,
+        theme.font_size
     )
 }
 fn terminal_reset_command(title: &str, theme: &TerminalTheme) -> TerminalJsCommand {
@@ -37447,15 +37500,7 @@ fn terminal_font_weight_bold(theme: &TerminalTheme) -> u16 {
     700
 }
 fn terminal_cursor_text(theme: &TerminalTheme) -> String {
-    let Some((red, green, blue)) = parse_terminal_hex_rgb(&theme.cursor) else {
-        return theme.background.clone();
-    };
-    let luminance = relative_terminal_luminance(red, green, blue);
-    if luminance > 0.46 {
-        "#0f172a".to_string()
-    } else {
-        "#fbfbfd".to_string()
-    }
+    theme.cursor_text.clone()
 }
 fn terminal_cursor_muted(theme: &TerminalTheme) -> String {
     let alpha = if relative_terminal_luminance_from_hex(&theme.background).unwrap_or(0.0) > 0.72 {
@@ -41400,6 +41445,7 @@ fn terminal_eval_script_with_canvas_renderer(
                     background: message.background,
                     foreground: message.foreground,
                     cursor: message.cursor,
+                    cursorAccent: message.cursor_text,
                     selectionBackground: message.selection,
                     black: message.black,
                     red: message.red,
@@ -41434,6 +41480,7 @@ fn terminal_eval_script_with_canvas_renderer(
                 try {{
                     term.options = {{
                         ...term.options,
+                        cursorStyle: 'block',
                         fontFamily: message.font_family,
                         fontSize: message.font_size,
                         fontWeight: message.font_weight,
@@ -41445,6 +41492,7 @@ fn terminal_eval_script_with_canvas_renderer(
                     }};
                 }} catch (_error) {{
                     term.options.fontFamily = message.font_family;
+                    term.options.cursorStyle = 'block';
                     term.options.fontSize = message.font_size;
                     term.options.fontWeight = message.font_weight;
                     term.options.fontWeightBold = message.font_weight_bold;
@@ -41582,6 +41630,7 @@ fn terminal_apply_script(host_id: &str, theme: &TerminalTheme) -> String {
             background: {background},
             foreground: {foreground},
             cursor: {cursor},
+            cursorAccent: {cursor_text},
             selectionBackground: {selection},
             black: {black},
             red: {red},
@@ -41603,6 +41652,7 @@ fn terminal_apply_script(host_id: &str, theme: &TerminalTheme) -> String {
           try {{
             entry.term.options = {{
               ...entry.term.options,
+              cursorStyle: 'block',
               fontFamily: {font_family},
               fontSize: {font_size},
               fontWeight: {font_weight},
@@ -41614,6 +41664,7 @@ fn terminal_apply_script(host_id: &str, theme: &TerminalTheme) -> String {
             }};
           }} catch (_error) {{
             entry.term.options.fontFamily = {font_family};
+            entry.term.options.cursorStyle = 'block';
             entry.term.options.fontSize = {font_size};
             entry.term.options.fontWeight = {font_weight};
             entry.term.options.fontWeightBold = {font_weight_bold};
@@ -42049,6 +42100,7 @@ fn terminal_apply_script_for_session(session_path: &str, theme: &TerminalTheme) 
             background: {background},
             foreground: {foreground},
             cursor: {cursor},
+            cursorAccent: {cursor_text},
             selectionBackground: {selection},
             black: {black},
             red: {red},
@@ -42070,6 +42122,7 @@ fn terminal_apply_script_for_session(session_path: &str, theme: &TerminalTheme) 
           try {{
             entry.term.options = {{
               ...entry.term.options,
+              cursorStyle: 'block',
               fontFamily: {font_family},
               fontSize: {font_size},
               fontWeight: {font_weight},
@@ -42081,6 +42134,7 @@ fn terminal_apply_script_for_session(session_path: &str, theme: &TerminalTheme) 
             }};
           }} catch (_error) {{
             entry.term.options.fontFamily = {font_family};
+            entry.term.options.cursorStyle = 'block';
             entry.term.options.fontSize = {font_size};
             entry.term.options.fontWeight = {font_weight};
             entry.term.options.fontWeightBold = {font_weight_bold};
@@ -47626,10 +47680,31 @@ mod tests {
     }
 
     #[test]
+    fn terminal_cursor_colors_follow_ghostty_theme_contract_across_themes() {
+        let light = terminal_theme(UiTheme::ZedLight, palette(UiTheme::ZedLight), 13.0, "");
+        let dark = terminal_theme(UiTheme::ZedDark, palette(UiTheme::ZedDark), 13.0, "");
+        let andromeda = terminal_theme(
+            UiTheme::ZedDark,
+            palette(UiTheme::ZedDark),
+            13.0,
+            "Andromeda",
+        );
+
+        assert_eq!(light.cursor, "#0451a5");
+        assert_eq!(terminal_cursor_text(&light), "#fbfbfd");
+        assert_eq!(dark.cursor, "#ffffff");
+        assert_eq!(terminal_cursor_text(&dark), "#000000");
+        assert_eq!(andromeda.cursor, "#f8f8f0");
+        assert_eq!(terminal_cursor_text(&andromeda), "#b5b5a8");
+    }
+
+    #[test]
     fn terminal_eval_script_preserves_native_xterm_cursor_contract() {
         let theme = terminal_theme(UiTheme::ZedLight, palette(UiTheme::ZedLight), 13.0, "");
         let script = terminal_eval_script("yggterm-terminal-test", &theme, true);
         assert!(script.contains("cursorStyle: 'block'"));
+        assert!(!script.contains("cursorStyle: 'bar'"));
+        assert!(!script.contains("cursorWidth: 2"));
         assert!(script.contains("cursorAccent:"));
         assert!(script.contains("host.style.setProperty('--yggterm-term-cursor-block-text'"));
         assert!(script.contains("function computeFocusedBlockCursorTextColor() {"));
@@ -47643,7 +47718,6 @@ mod tests {
         assert!(script.contains(".xterm-rows .xterm-cursor.xterm-cursor-outline {"));
         assert!(script.contains(".xterm-cursor.xterm-cursor-block.xterm-dim,"));
         assert!(script.contains(".xterm-cursor.xterm-cursor-outline.xterm-dim {"));
-        assert!(!script.contains("cursorWidth: 2"));
         assert!(!script.contains("yggterm-hidden-raw-cursor"));
         assert!(!script.contains("const scheduleCursorOverlaySync = () => {"));
         assert!(script.contains("host.style.position = 'relative';"));
@@ -52845,16 +52919,19 @@ uto-reviewer subagent.
         ));
     }
     #[test]
-    fn codex_interrupted_input_surface_is_prompt_ready() {
+    fn codex_interrupted_input_surface_without_prompt_is_not_prompt_ready() {
         let tail = "\
 • I found a concrete rename root cause.
 
 ■ Conversation interrupted - tell the model what to do differently. Something went wrong? Hit /feedback to report the issue.
 ";
         assert!(terminal_chunk_is_codex_interrupted_input_surface(tail));
-        assert!(terminal_surface_has_prompt_ready_text(tail));
-        assert!(!retained_remote_surface_has_non_prompt_text("", tail));
-        assert!(quiet_retained_remote_surface_ready(
+        assert!(!terminal_surface_has_prompt_ready_text(tail));
+        assert!(retained_remote_surface_has_non_prompt_text("", tail));
+        assert!(retained_remote_surface_should_wait_for_prompt_ready(
+            true, true, false, false, false, true, true, false, "", tail,
+        ));
+        assert!(!quiet_retained_remote_surface_ready(
             true,
             false,
             true,
