@@ -1,3 +1,13 @@
+yggterm (2.1.108-1) unstable; urgency=medium
+
+  * Restore normal close semantics for non-Keep-Alive live sessions.
+  * Keep update restart as the only path that temporarily protects unkept
+    live sessions.
+  * Reject interrupted Codex banners without prompts as ready terminal
+    surfaces.
+
+ -- Yggdrasil HQ <avi@gour.top>  Sun, 03 May 2026 19:42:00 +0530
+
 yggterm (2.1.107-1) unstable; urgency=medium
 
   * Persist recoverable live sessions across normal app restarts by default.
