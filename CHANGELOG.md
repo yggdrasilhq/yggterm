@@ -4,6 +4,10 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+## 2.1.104
+
+- Fixed post-update daemon observability when legacy socket aliases point at the same current daemon socket: `server-list` and latency checks now dedupe symlink aliases before probing, preventing a hot-restart/install check from blocking on repeated aliases.
+
 ## 2.1.103
 
 - Removed saved Codex JSONL transcript prefill from live remote terminal restore, so retained/live Codex sessions wait for or restart the real PTY instead of painting `USER:` / `ASSISTANT:` transcript artifacts into xterm.
