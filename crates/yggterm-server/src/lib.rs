@@ -1865,9 +1865,6 @@ impl YggtermServer {
             .filter(|(key, session)| managed_live_session_is_recoverable(key, session))
             .filter_map(|(key, session)| {
                 let keep_alive = session_keep_alive(session);
-                if !keep_alive && !protect_all_live {
-                    return None;
-                }
                 let restore_reason = (!keep_alive && protect_all_live)
                     .then(|| UPDATE_RESTART_RESTORE_REASON.to_string());
                 persisted_live_session_from_managed(key, session, keep_alive, restore_reason)
@@ -3409,7 +3406,7 @@ impl YggtermServer {
         } = live;
         let temporary_update_restore =
             restore_reason.as_deref() == Some(UPDATE_RESTART_RESTORE_REASON);
-        if !keep_alive && !temporary_update_restore {
+        if kind == SessionKind::Document {
             return;
         }
         let remote_scanned_key =
@@ -19294,7 +19291,7 @@ terminal_window_id: None,
     }
 
     #[test]
-    fn persisted_state_only_keeps_explicitly_kept_live_sessions() {
+    fn persisted_state_persists_recoverable_live_sessions_by_default() {
         let tree = SessionNode {
             kind: SessionNodeKind::Group,
             name: "sessions".to_string(),
@@ -19318,9 +19315,12 @@ terminal_window_id: None,
             Some("Ephemeral Local Shell"),
         );
 
+        let persisted = server.persisted_state();
+        assert_eq!(persisted.live_sessions.len(), 1);
+        assert_eq!(persisted.live_sessions[0].key, local_shell);
         assert!(
-            server.persisted_state().live_sessions.is_empty(),
-            "fresh live terminals are ephemeral until the user marks them kept alive"
+            !persisted.live_sessions[0].keep_alive,
+            "fresh recoverable live terminals persist by default but do not become keep-alive sessions"
         );
 
         assert!(
@@ -19338,10 +19338,10 @@ terminal_window_id: None,
                 .set_live_session_keep_alive(&local_shell, false)
                 .expect("clear shell keep-alive")
         );
-        assert!(
-            server.persisted_state().live_sessions.is_empty(),
-            "clearing keep-alive returns the terminal to runtime-only state"
-        );
+        let persisted = server.persisted_state();
+        assert_eq!(persisted.live_sessions.len(), 1);
+        assert_eq!(persisted.live_sessions[0].key, local_shell);
+        assert!(!persisted.live_sessions[0].keep_alive);
     }
 
     #[test]
@@ -19378,9 +19378,21 @@ terminal_window_id: None,
             .expect("mark codex keep-alive");
 
         let normal = server.persisted_state();
-        assert_eq!(normal.live_sessions.len(), 1);
-        assert_eq!(normal.live_sessions[0].key, local_codex);
-        assert_eq!(normal.live_sessions[0].restore_reason, None);
+        assert_eq!(normal.live_sessions.len(), 2);
+        let normal_shell = normal
+            .live_sessions
+            .iter()
+            .find(|live| live.key == local_shell)
+            .expect("unkept local shell included in normal persistence");
+        assert!(!normal_shell.keep_alive);
+        assert_eq!(normal_shell.restore_reason, None);
+        let normal_codex = normal
+            .live_sessions
+            .iter()
+            .find(|live| live.key == local_codex)
+            .expect("kept codex included in normal persistence");
+        assert!(normal_codex.keep_alive);
+        assert_eq!(normal_codex.restore_reason, None);
 
         let update = server.persisted_state_for_update_restart();
         assert_eq!(update.live_sessions.len(), 2);
@@ -19443,14 +19455,15 @@ terminal_window_id: None,
             session_metadata_value(session, "Runtime Persistence"),
             Some("keep-alive".to_string())
         );
-        assert!(
-            server.persisted_state().live_sessions.is_empty(),
-            "normal persistence drops temporary update-restored sessions unless the user keeps them alive"
-        );
+        let persisted = server.persisted_state();
+        assert_eq!(persisted.live_sessions.len(), 1);
+        assert_eq!(persisted.live_sessions[0].key, "local://update-shell");
+        assert!(!persisted.live_sessions[0].keep_alive);
+        assert_eq!(persisted.live_sessions[0].restore_reason, None);
     }
 
     #[test]
-    fn restore_persisted_state_skips_unkept_live_sessions() {
+    fn restore_persisted_state_restores_unkept_recoverable_live_sessions() {
         let tree = SessionNode {
             kind: SessionNodeKind::Group,
             name: "sessions".to_string(),
@@ -19491,10 +19504,14 @@ terminal_window_id: None,
             None,
         );
 
-        assert!(server.live_sessions().is_empty());
-        assert!(server.active_session_path().is_none());
-        assert_eq!(server.active_view_mode(), WorkspaceViewMode::Rendered);
-        assert!(!server.sessions.contains_key("local::old-shell"));
+        assert_eq!(server.live_sessions().len(), 1);
+        assert!(
+            server
+                .active_session_path()
+                .is_some_and(|path| path == "local::old-shell")
+        );
+        assert_eq!(server.active_view_mode(), WorkspaceViewMode::Terminal);
+        assert!(server.sessions.contains_key("local::old-shell"));
     }
 
     #[test]
