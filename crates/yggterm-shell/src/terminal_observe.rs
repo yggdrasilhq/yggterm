@@ -785,6 +785,7 @@ fn terminal_host_problem_for_app_control(host: &Value) -> Option<&'static str> {
         .and_then(Value::as_u64)
         .unwrap_or(0);
     let rows = host.get("rows").and_then(Value::as_u64).unwrap_or(0);
+    let cols = host.get("cols").and_then(Value::as_u64).unwrap_or(0);
     let base_y = host.get("base_y").and_then(Value::as_u64).unwrap_or(0);
     let scrollback_expected = host
         .get("scrollback_expected")
@@ -827,21 +828,31 @@ fn terminal_host_problem_for_app_control(host: &Value) -> Option<&'static str> {
         && codex_prompt_surface
         && mounted_entry_host_connected
         && (xterm_present || screen_present || rows_present || canvas_count > 0);
+    let transcript_browser_surface = terminal_chunk_is_transcript_browser(visible_text);
+    let codex_status_surface = terminal_chunk_is_codex_status_surface(visible_text);
+    let visible_text_prompt = terminal_chunk_has_prompt_output(visible_text)
+        || terminal_chunk_has_codex_prompt_output(visible_text);
     let prompt_visible = terminal_chunk_has_prompt_output(text_sample)
         || terminal_chunk_has_codex_prompt_output(text_sample)
+        || visible_text_prompt
         || codex_interactive_setup_prompt
         || codex_prompt_surface
+        || codex_status_surface
         || (!cursor_line_text.is_empty()
             && (terminal_chunk_has_prompt_output(cursor_line_text)
                 || terminal_chunk_has_codex_prompt_output(cursor_line_text)));
     let local_prompt_surface = session_path.starts_with("local://") && prompt_visible;
+    let codex_status_ready_surface = session_path.starts_with("remote-session://")
+        && codex_status_surface
+        && input_enabled
+        && (helper_textarea_focused || xterm_present || screen_present || canvas_count > 0);
     let prompt_ready_surface = prompt_visible
         && (input_enabled
             || helper_textarea_focused
             || cursor_sample_visible
             || local_prompt_surface
-            || live_remote_codex_prompt_surface);
-    let transcript_browser_surface = terminal_chunk_is_transcript_browser(visible_text);
+            || live_remote_codex_prompt_surface
+            || codex_status_ready_surface);
     let transcript_browser_ready_surface = session_path.starts_with("remote-session://")
         && transcript_browser_surface
         && input_enabled
@@ -919,6 +930,8 @@ fn terminal_host_problem_for_app_control(host: &Value) -> Option<&'static str> {
     if session_path.starts_with("remote-session://")
         && input_enabled
         && scrollback_expected
+        && rows >= 8
+        && cols >= 20
         && base_y == 0
         && xterm_buffer_kind != "alternate"
     {
@@ -927,6 +940,8 @@ fn terminal_host_problem_for_app_control(host: &Value) -> Option<&'static str> {
     if session_path.starts_with("remote-session://")
         && input_enabled
         && last_raw_payload_line_count > rows.saturating_add(4)
+        && rows >= 8
+        && cols >= 20
         && base_y == 0
         && xterm_buffer_kind != "alternate"
     {
@@ -936,6 +951,7 @@ fn terminal_host_problem_for_app_control(host: &Value) -> Option<&'static str> {
         && input_enabled
         && !prompt_ready_surface
         && !transcript_browser_ready_surface
+        && !codex_status_surface
     {
         return Some("active remote terminal is input-enabled without a prompt-ready surface");
     }
@@ -1331,6 +1347,21 @@ pub(crate) fn terminal_chunk_is_codex_prompt_surface(data: &str) -> bool {
             || normalized.contains("claude"))
 }
 
+fn terminal_chunk_is_codex_status_surface(data: &str) -> bool {
+    let stripped = strip_terminal_control_sequences(data);
+    let normalized = stripped
+        .to_ascii_lowercase()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    normalized.contains("openai codex")
+        && normalized.contains("context window:")
+        && (normalized.contains("5h limit:") || normalized.contains("weekly limit:"))
+        && !terminal_chunk_is_transport_error(&stripped)
+        && !terminal_chunk_is_loading_placeholder(&stripped)
+        && !terminal_chunk_is_transcript_browser(&stripped)
+}
+
 pub(crate) fn terminal_chunk_has_prompt_output(data: &str) -> bool {
     let stripped = strip_terminal_control_sequences(data);
     let normalized_lines = stripped
@@ -1543,12 +1574,6 @@ pub(crate) fn terminal_chunk_is_low_signal_terminal_noise(data: &str) -> bool {
 
 pub(crate) fn terminal_chunk_is_transport_error(data: &str) -> bool {
     let stripped = strip_terminal_control_sequences(data);
-    let normalized = stripped.to_ascii_lowercase();
-    if normalized.contains("[yggterm] terminal reader stopped")
-        || normalized.contains("terminal session not found")
-    {
-        return true;
-    }
     let lines = stripped
         .lines()
         .map(str::trim)
@@ -1561,6 +1586,7 @@ pub(crate) fn terminal_chunk_is_transport_error(data: &str) -> bool {
     }
     let head = lines.join(" ");
     if [
+        "[yggterm] terminal reader stopped",
         "error: reading /tmp/yggterm-screen",
         "mux_client_request_session",
         "session open refused by peer",
@@ -1589,11 +1615,9 @@ pub(crate) fn terminal_chunk_is_transport_error(data: &str) -> bool {
             || line == "no route to host"
             || line == "broken pipe"
             || line == "connection reset by peer"
-            || line.ends_with(": permission denied")
-            || line.ends_with(": no route to host")
-            || line.ends_with(": broken pipe")
-            || line.ends_with(": connection reset by peer")
             || ((line.starts_with("ssh:")
+                || line.starts_with("scp:")
+                || line.starts_with("sftp:")
                 || line.starts_with("error:")
                 || line.starts_with("fatal:")
                 || line.starts_with("rsync:"))
@@ -1977,6 +2001,164 @@ mod tests {
     }
 
     #[test]
+    fn terminal_host_problem_accepts_input_enabled_codex_status_surface() {
+        let status = "\
+>_ OpenAI Codex (v0.128.0)
+
+Model:                       gpt-5.5
+Directory:                   ~/gh/yggterm
+Session:                     019dbdc7-7e63-7211-a7f8-51eb4d6e80b2
+
+Context window:              22% left (205K used / 258K)
+5h limit:                    55% left
+Weekly limit:                97% left
+";
+        let host = json!({
+            "session_path": "remote-session://dev/live-codex",
+            "text_sample": status,
+            "text_tail": status,
+            "cursor_line_text": "Weekly limit:                97% left",
+            "input_enabled": true,
+            "helper_textarea_focused": true,
+            "cursor_node_count": 1,
+            "xterm_present": true,
+            "screen_present": true,
+            "rows_present": false,
+            "canvas_count": 4,
+            "render_event_count": 12,
+            "data_event_count": 3,
+            "xterm_buffer_kind": "normal",
+            "host_rect": {"left": 0.0, "top": 0.0, "width": 840.0, "height": 830.0},
+            "host_content_width": 840.0,
+            "host_content_height": 830.0,
+            "screen_rect": {"width": 840.0, "height": 830.0},
+            "viewport_rect": {"width": 840.0, "height": 830.0},
+            "helpers_rect": {"width": 840.0, "height": 830.0},
+            "helper_textarea_rect": {"left": -10000.0, "top": 68.0, "width": 1.0, "height": 1.0}
+        });
+        assert_eq!(terminal_host_problem_for_app_control(&host), None);
+    }
+
+    #[test]
+    fn terminal_host_problem_accepts_status_prompt_in_text_tail_when_cursor_line_is_empty() {
+        let tail = "\
+• I found a concrete rename root cause.
+
+/status
+
+>_ OpenAI Codex (v0.128.0)
+
+Model:                       gpt-5.5
+Directory:                   ~/gh/yggterm
+Session:                     019dbdc7-7e63-7211-a7f8-51eb4d6e80b2
+
+Context window:              22% left (205K used / 258K)
+5h limit:                    94% left
+Weekly limit:                21% left
+
+› Explain this codebase
+";
+        let host = json!({
+            "session_path": "remote-session://dev/live-codex",
+            "text_sample": "• I found a concrete rename root cause.",
+            "text_tail": tail,
+            "buffer_text_sample": "• I found a concrete rename root cause.",
+            "cursor_line_text": "",
+            "input_enabled": true,
+            "helper_textarea_focused": true,
+            "cursor_node_count": 0,
+            "xterm_present": true,
+            "screen_present": true,
+            "rows_present": false,
+            "canvas_count": 4,
+            "render_event_count": 20,
+            "data_event_count": 0,
+            "base_y": 541,
+            "rows": 50,
+            "blank_rows_below_cursor": 0,
+            "scrollback_expected": true,
+            "xterm_buffer_kind": "normal",
+            "mounted_entry_host_connected": true,
+            "host_rect": {"left": 0.0, "top": 0.0, "width": 840.0, "height": 830.0},
+            "host_content_width": 840.0,
+            "host_content_height": 830.0,
+            "screen_rect": {"width": 840.0, "height": 830.0},
+            "viewport_rect": {"width": 840.0, "height": 830.0},
+            "helpers_rect": {"width": 840.0, "height": 830.0},
+            "helper_textarea_rect": {"left": -10000.0, "top": 68.0, "width": 1.0, "height": 1.0}
+        });
+        assert_eq!(terminal_host_problem_for_app_control(&host), None);
+    }
+
+    #[test]
+    fn terminal_host_problem_defers_scrollback_loss_on_collapsed_retained_grid() {
+        let host = json!({
+            "session_path": "remote-session://dev/live-codex",
+            "text_sample": "›",
+            "text_tail": "›",
+            "cursor_line_text": "›",
+            "input_enabled": true,
+            "helper_textarea_focused": true,
+            "cursor_node_count": 0,
+            "xterm_present": true,
+            "screen_present": true,
+            "rows_present": false,
+            "canvas_count": 4,
+            "render_event_count": 20,
+            "data_event_count": 5,
+            "base_y": 0,
+            "rows": 1,
+            "cols": 2,
+            "scrollback_expected": true,
+            "xterm_buffer_kind": "normal",
+            "host_rect": {"left": 0.0, "top": 0.0, "width": 16.0, "height": 18.0},
+            "host_content_width": 16.0,
+            "host_content_height": 18.0,
+            "screen_rect": {"width": 16.0, "height": 18.0},
+            "viewport_rect": {"width": 16.0, "height": 18.0},
+            "helpers_rect": {"width": 16.0, "height": 18.0},
+            "helper_textarea_rect": {"left": -10000.0, "top": 68.0, "width": 1.0, "height": 1.0}
+        });
+        assert_eq!(terminal_host_problem_for_app_control(&host), None);
+    }
+
+    #[test]
+    fn terminal_host_problem_flags_full_size_retained_scrollback_loss() {
+        let host = json!({
+            "session_path": "remote-session://dev/live-codex",
+            "text_sample": "› Write tests for @filename",
+            "text_tail": "› Write tests for @filename",
+            "cursor_line_text": "› Write tests for @filename",
+            "input_enabled": true,
+            "helper_textarea_focused": true,
+            "cursor_node_count": 0,
+            "xterm_present": true,
+            "screen_present": true,
+            "rows_present": false,
+            "canvas_count": 4,
+            "render_event_count": 20,
+            "data_event_count": 5,
+            "base_y": 0,
+            "rows": 50,
+            "cols": 110,
+            "blank_rows_below_cursor": 0,
+            "scrollback_expected": true,
+            "xterm_buffer_kind": "normal",
+            "host_rect": {"left": 0.0, "top": 0.0, "width": 840.0, "height": 830.0},
+            "host_content_width": 840.0,
+            "host_content_height": 830.0,
+            "screen_rect": {"width": 840.0, "height": 830.0},
+            "viewport_rect": {"width": 840.0, "height": 830.0},
+            "helpers_rect": {"width": 840.0, "height": 830.0},
+            "helper_textarea_rect": {"left": -10000.0, "top": 68.0, "width": 1.0, "height": 1.0}
+        });
+        assert_eq!(
+            terminal_host_problem_for_app_control(&host),
+            Some("active remote terminal lost expected scrollback after retained replay")
+        );
+    }
+
+    #[test]
     fn terminal_host_problem_accepts_input_enabled_transcript_browser_surface() {
         let host = json!({
             "session_path": "remote-session://dev/live-codex",
@@ -2301,8 +2483,26 @@ The prompt stayed usable after the restore.
     }
 
     #[test]
+    fn transport_error_detector_ignores_bulleted_saved_transcript_ssh_failure() {
+        let data = "\
+I did not cut a release.
+The final rerun of the rebuilt Linux smoke wrapper was interrupted by an external network failure, not by Yggterm or Plasma:
+- ssh: connect to host 192.168.0.133 port 22: No route to host
+So the current state is:
+";
+        assert!(!terminal_chunk_is_transport_error(data));
+        assert!(terminal_chunk_has_meaningful_output(data));
+    }
+
+    #[test]
     fn transport_error_detector_keeps_line_shaped_shared_connection_failure() {
         let data = "Shared connection to 192.168.0.133 closed.\r\n";
+        assert!(terminal_chunk_is_transport_error(data));
+    }
+
+    #[test]
+    fn transport_error_detector_keeps_line_shaped_ssh_failure() {
+        let data = "ssh: connect to host 192.168.0.133 port 22: No route to host\r\n";
         assert!(terminal_chunk_is_transport_error(data));
     }
 

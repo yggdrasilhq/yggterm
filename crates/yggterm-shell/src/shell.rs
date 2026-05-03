@@ -1784,7 +1784,9 @@ impl ShellState {
                 {
                     continue;
                 }
-                if !self.server.session_supports_terminal(&session_path) {
+                if !self.server.session_supports_terminal(&session_path)
+                    && !self.cached_hot_session_views.contains_key(&session_path)
+                {
                     continue;
                 }
                 let Some(session) = self.cached_hot_session_view(&session_path) else {
@@ -2562,6 +2564,21 @@ impl ShellState {
             .and_then(Value::as_str)
             .map(str::to_string);
         let failure_reason = terminal_open_attempt_failure_reason_from_viewport(viewport);
+        let retained_fault_should_invalidate =
+            remote_retained_surface_fault_should_invalidate(reason.as_deref());
+        let retained_fault_waiting_for_second_observation = retained_fault_should_invalidate
+            && self
+                .retained_terminal_session_paths
+                .contains(active_session_path)
+            && self
+                .latest_terminal_open_attempt_for_path(active_session_path)
+                .is_some_and(|attempt| {
+                    attempt.ready_at_ms.is_some()
+                        && attempt.last_observed_reason.as_deref() != reason.as_deref()
+                });
+        let invalidated_retained_faulty_surface = retained_fault_should_invalidate
+            && !retained_fault_waiting_for_second_observation
+            && self.invalidate_retained_remote_non_prompt_surface(active_session_path);
         {
             let Some(attempt) = self.terminal_open_attempts.get_mut(&attempt_id) else {
                 return;
@@ -2623,9 +2640,12 @@ impl ShellState {
                 }
                 should_return_early = true;
             } else {
-                let recovering = !ready && matches!(overlay_phase, "recovering" | "chip")
+                let recovering = invalidated_retained_faulty_surface
+                    || !ready && matches!(overlay_phase, "recovering" | "chip")
                     || reason.as_deref()
-                        == Some("active terminal host exists but attach is still in flight");
+                        == Some("active terminal host exists but attach is still in flight")
+                    || (surface_problem.is_some()
+                        && !retained_fault_waiting_for_second_observation);
                 if recovering && attempt.latched_failure_reason.is_none() {
                     if !matches!(attempt.state, TerminalOpenAttemptState::Recovering) {
                         attempt.state = TerminalOpenAttemptState::Recovering;
@@ -3117,6 +3137,9 @@ impl ShellState {
                 .map(|session| session.session_path.clone())
                 .collect::<HashSet<_>>()
         };
+        if !limit_to_active_session {
+            keep_paths.extend(self.retained_terminal_session_paths.iter().cloned());
+        }
         if let Some(active_path) = self.server.active_session_path()
             && self.server.session_supports_terminal(active_path)
             && (self.server.active_view_mode() == WorkspaceViewMode::Terminal
@@ -3158,6 +3181,17 @@ impl ShellState {
     }
     fn terminal_session_is_retained_live(&self, session_path: &str) -> bool {
         let retained = self.retained_terminal_session_paths.contains(session_path);
+        let non_prompt_recovering_attempt = self
+            .latest_terminal_open_attempt_for_path(session_path)
+            .is_some_and(|attempt| {
+                matches!(attempt.state, TerminalOpenAttemptState::Recovering)
+                    && remote_retained_surface_fault_should_invalidate(
+                        attempt.last_observed_reason.as_deref(),
+                    )
+            });
+        if non_prompt_recovering_attempt {
+            return false;
+        }
         let bootstrap_in_progress = self
             .terminal_bootstrap_lease_by_session
             .contains_key(session_path)
@@ -3173,14 +3207,84 @@ impl ShellState {
     }
     fn terminal_session_should_render_retained(&self, session_path: &str) -> bool {
         self.retained_terminal_session_paths.contains(session_path)
-            && self.server.session_supports_terminal(session_path)
+            && (self.server.session_supports_terminal(session_path)
+                || self.cached_hot_session_views.contains_key(session_path))
     }
     fn terminal_session_has_ready_attempt(&self, session_path: &str) -> bool {
         self.latest_terminal_open_attempt_for_path(session_path)
             .is_some_and(|attempt| {
                 matches!(attempt.state, TerminalOpenAttemptState::Ready)
                     && attempt.latched_failure_reason.is_none()
+                    && (attempt.observations == 0
+                        || (attempt.last_observed_ready && attempt.last_surface_problem.is_none()))
             })
+    }
+    fn terminal_session_has_ready_history(&self, session_path: &str) -> bool {
+        self.latest_terminal_open_attempt_for_path(session_path)
+            .is_some_and(|attempt| {
+                attempt.ready_at_ms.is_some() && attempt.latched_failure_reason.is_none()
+            })
+    }
+    fn invalidate_retained_remote_non_prompt_surface(&mut self, session_path: &str) -> bool {
+        if !session_path.starts_with("remote-session://") {
+            return false;
+        }
+        let recovery_already_in_flight = self.terminal_attach_in_flight.contains(session_path)
+            && self
+                .latest_terminal_open_attempt_for_path(session_path)
+                .is_some_and(|attempt| {
+                    attempt.source == "retained_fault_recovery"
+                        && attempt.latched_failure_reason.is_none()
+                        && matches!(
+                            attempt.state,
+                            TerminalOpenAttemptState::Pending
+                                | TerminalOpenAttemptState::Recovering
+                        )
+                });
+        if recovery_already_in_flight {
+            return false;
+        }
+        let retained_before_fault = self.retained_terminal_session_paths.contains(session_path);
+        let active_terminal_session = self.server.active_view_mode() == WorkspaceViewMode::Terminal
+            && self.server.active_session_path() == Some(session_path);
+        if !retained_before_fault && !active_terminal_session {
+            return false;
+        }
+        self.retained_terminal_session_paths
+            .insert(session_path.to_string());
+        self.terminal_resume_ready_paths.remove(session_path);
+        self.terminal_bootstrap_owner_by_session
+            .remove(session_path);
+        self.terminal_bootstrap_lease_by_session
+            .remove(session_path);
+        let _ = self.bump_terminal_mount_epoch_for_session(session_path);
+        self.active_terminal_host_id = if self.server.active_view_mode()
+            == WorkspaceViewMode::Terminal
+            && self.server.active_session_path() == Some(session_path)
+        {
+            self.terminal_session_host_id(session_path)
+        } else {
+            None
+        };
+        self.terminal_attach_in_flight
+            .insert(session_path.to_string());
+        let previous_open_request_id = self
+            .latest_terminal_open_attempt_for_path(session_path)
+            .map(|attempt| attempt.open_request_id)
+            .unwrap_or(self.latest_open_request_id);
+        self.latest_open_request_id = self
+            .latest_open_request_id
+            .max(previous_open_request_id)
+            .saturating_add(1);
+        let request_id = format!("retained-fault-recovery-{}", current_millis());
+        let open_request_id = self.latest_open_request_id;
+        self.begin_terminal_open_attempt(
+            session_path,
+            &request_id,
+            open_request_id,
+            "retained_fault_recovery",
+        );
+        true
     }
     fn terminal_session_has_visual_resume_reveal(&self, session_path: &str) -> bool {
         self.terminal_resume_ready_paths.contains(session_path)
@@ -5196,7 +5300,20 @@ fn terminal_surface_has_prompt_ready_text(text: &str) -> bool {
     !trimmed.is_empty()
         && (terminal_chunk_has_prompt_output(trimmed)
             || terminal_chunk_has_codex_prompt_output(trimmed)
-            || terminal_chunk_is_codex_interactive_setup_prompt(trimmed))
+            || terminal_chunk_is_codex_interactive_setup_prompt(trimmed)
+            || terminal_chunk_is_codex_interrupted_input_surface(trimmed))
+}
+fn terminal_chunk_is_codex_interrupted_input_surface(text: &str) -> bool {
+    let mut tail_lines = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .rev()
+        .take(6)
+        .collect::<Vec<_>>();
+    tail_lines.reverse();
+    let tail = tail_lines.join(" ").to_ascii_lowercase();
+    tail.contains("conversation interrupted - tell the model what to do differently")
 }
 fn terminal_host_surface_text<'a>(
     host_health_cursor_line_text: &'a str,
@@ -5302,6 +5419,7 @@ fn terminal_host_surface_layout_is_acceptable(
     terminal_host_prompt_layout_is_acceptable(rows, blank_rows_below_cursor)
         || terminal_chunk_is_codex_interactive_setup_prompt(host_surface_text)
         || terminal_chunk_is_codex_prompt_surface(host_surface_text)
+        || terminal_chunk_is_codex_interrupted_input_surface(host_surface_text)
 }
 fn remote_resume_stable_bootstrap_epoch(
     is_remote_resume_session: bool,
@@ -5309,6 +5427,31 @@ fn remote_resume_stable_bootstrap_epoch(
     resume_overlay_timed_out: bool,
 ) -> bool {
     is_remote_resume_session && !resume_overlay_failed && !resume_overlay_timed_out
+}
+fn retained_rehydrate_identity_key(
+    session_path: &str,
+    mount_identity: &str,
+    retained_ready_remote_host: bool,
+    active_host_selected: bool,
+) -> String {
+    format!(
+        "retained-rehydrate:{session_path}:{mount_identity}:{retained_ready_remote_host}:{active_host_selected}"
+    )
+}
+fn retained_ready_remote_host_should_rehydrate(
+    retained_ready_remote_host: bool,
+    active_host_selected: bool,
+    ready_attempt: bool,
+    ready_history: bool,
+) -> bool {
+    retained_ready_remote_host && active_host_selected && !ready_attempt && !ready_history
+}
+fn remote_retained_surface_fault_should_invalidate(reason: Option<&str>) -> bool {
+    matches!(
+        reason,
+        Some("active remote terminal is input-enabled without a prompt-ready surface")
+            | Some("active remote terminal lost expected scrollback after retained replay")
+    )
 }
 fn remote_prompt_gap_resize_nudge_allowed(
     is_remote_resume_session: bool,
@@ -20694,6 +20837,7 @@ async fn capture_dom_debug_snapshot_basic_for(active_session_path: Option<&str>)
                         last_raw_payload_line_count: mountedHost ? Number(mountedHost.lastRawPayloadLineCount || 0) : 0,
                         scrollback_expected: mountedHost ? Boolean(mountedHost.scrollbackExpected) : false,
                         last_fit_guard: mountedHost && mountedHost.lastFitGuard ? mountedHost.lastFitGuard : null,
+                        last_skipped_fit: mountedHost && mountedHost.lastSkippedFit ? mountedHost.lastSkippedFit : null,
                         xterm_renderer_mode: canvasCount > 0 ? 'canvas' : 'dom',
                         helper_textarea_focused: Boolean(helperTextarea && helperTextarea === activeElement),
                         host_has_active_element: Boolean(activeElement && host.contains(activeElement)),
@@ -21707,16 +21851,60 @@ fn terminal_probe_input_script(
                     await dispatchPrintableText(textChunk, settleAfter);
                 }};
                 const terminalChunkIsTransportError = (textValue) => {{
-                    const normalized = String(textValue || '').toLowerCase();
-                    return (
-                        (normalized.includes('shared connection to ') && (normalized.includes(' closed') || normalized.includes('refused') || normalized.includes('timed out')))
-                        || (normalized.includes('connection to ') && (normalized.includes(' closed') || normalized.includes('refused') || normalized.includes('timed out')))
-                        || normalized.includes('terminal session not found')
-                        || normalized.includes('permission denied')
-                        || normalized.includes('no route to host')
-                        || normalized.includes('broken pipe')
-                        || normalized.includes('connection reset by peer')
-                    );
+                    const lines = String(textValue || '')
+                        .split(/\r?\n/)
+                        .map((line) => line.trim().toLowerCase())
+                        .filter((line) => line.length > 0);
+                    if (!lines.length) {{
+                        return false;
+                    }}
+                    const headLines = lines.slice(0, 4);
+                    const head = headLines.join(' ');
+                    const headFragments = [
+                        '[yggterm] terminal reader stopped',
+                        'error: reading /tmp/yggterm-screen',
+                        'mux_client_request_session',
+                        'session open refused by peer',
+                        'controlsocket',
+                        'exec: export: not found',
+                        'exec: __yggterm_initial_tty_size',
+                        'terminal session not found',
+                        '[screen is terminating]',
+                        'saved codex session',
+                        'cannot be restored as a live terminal',
+                    ];
+                    if (headFragments.some((fragment) => head.includes(fragment))) {{
+                        return true;
+                    }}
+                    return headLines.some((line) => {{
+                        const directDiagnosticLine = !(line.startsWith('- ')
+                            || line.startsWith('* ')
+                            || line.startsWith('> '));
+                        if (!directDiagnosticLine) {{
+                            return false;
+                        }}
+                        return (
+                            (line.startsWith('shared connection to ')
+                                && (line.includes(' closed') || line.includes('refused') || line.includes('timed out')))
+                            || (line.startsWith('connection to ')
+                                && (line.includes(' closed') || line.includes('refused') || line.includes('timed out')))
+                            || line === 'permission denied'
+                            || line === 'no route to host'
+                            || line === 'broken pipe'
+                            || line === 'connection reset by peer'
+                            || ((line.startsWith('ssh:')
+                                || line.startsWith('scp:')
+                                || line.startsWith('sftp:')
+                                || line.startsWith('error:')
+                                || line.startsWith('fatal:')
+                                || line.startsWith('rsync:'))
+                                && (line.includes('permission denied')
+                                    || line.includes('connection refused')
+                                    || line.includes('no route to host')
+                                    || line.includes('connection timed out')
+                                    || line.includes('broken pipe')))
+                        );
+                    }});
                 }};
                 focusTarget();
                 await settle(35);
@@ -31172,7 +31360,13 @@ fn terminal_session_should_bootstrap_host(
     active_session_path: Option<&str>,
     session_path: &str,
 ) -> bool {
-    active_session_path == Some(session_path)
+    let live_active_session_path = if shell.server.active_view_mode() == WorkspaceViewMode::Terminal
+    {
+        shell.server.active_session_path().or(active_session_path)
+    } else {
+        None
+    };
+    live_active_session_path == Some(session_path)
         && !shell.terminal_session_is_retained_live(session_path)
 }
 
@@ -32508,12 +32702,22 @@ fn TerminalCanvas(
             ));
         });
     }
-    let retained_rehydrate_key = format!(
-        "retained-rehydrate:{session_path}:{latest_open_request_id}:{retained_ready_remote_host}:{active_host_selected}"
+    let retained_rehydrate_key = retained_rehydrate_identity_key(
+        &session_path,
+        &mount_identity,
+        retained_ready_remote_host,
+        active_host_selected,
     );
-    if retained_ready_remote_host
-        && active_host_selected
-        && *retained_rehydrate_identity.borrow() != retained_rehydrate_key
+    let retained_rehydrate_allowed = {
+        let shell = state.read();
+        retained_ready_remote_host_should_rehydrate(
+            retained_ready_remote_host,
+            active_host_selected,
+            shell.terminal_session_has_ready_attempt(&session_path),
+            shell.terminal_session_has_ready_history(&session_path),
+        )
+    };
+    if retained_rehydrate_allowed && *retained_rehydrate_identity.borrow() != retained_rehydrate_key
     {
         *retained_rehydrate_identity.borrow_mut() = retained_rehydrate_key;
         let endpoint = endpoint.clone();
@@ -37613,17 +37817,25 @@ fn apply_active_terminal_zoom(state: Signal<ShellState>) {
         &theme,
     ));
 }
-fn sync_active_terminal_input_policy(state: Signal<ShellState>) {
-    let (terminal_input_override_active, window_focused, snapshot, remote_resume_input_ready) = {
-        let shell = state.read();
-        let snapshot = shell.snapshot();
-        let remote_resume_input_ready = snapshot.active_session.as_ref().is_none_or(|session| {
+fn remote_resume_input_ready_for_snapshot(shell: &ShellState, snapshot: &RenderSnapshot) -> bool {
+    match snapshot.active_session.as_ref() {
+        Some(session) => {
             !is_remote_resume_agent_session(session)
                 || shell
                     .terminal_resume_ready_paths
                     .contains(&session.session_path)
                 || shell.terminal_session_has_ready_attempt(&session.session_path)
-        });
+        }
+        None => snapshot.active_session_path.as_deref().is_none_or(|path| {
+            !path.starts_with("remote-session://") && !path.starts_with("ssh://")
+        }),
+    }
+}
+fn sync_active_terminal_input_policy(state: Signal<ShellState>) {
+    let (terminal_input_override_active, window_focused, snapshot, remote_resume_input_ready) = {
+        let shell = state.read();
+        let snapshot = shell.snapshot();
+        let remote_resume_input_ready = remote_resume_input_ready_for_snapshot(&shell, &snapshot);
         (
             shell.terminal_input_override_active,
             shell.window_focused,
@@ -38280,10 +38492,30 @@ fn terminal_eval_script_with_canvas_renderer(
         const hostMetrics = () => {{
             const rect = host.getBoundingClientRect();
             const computed = window.getComputedStyle(host);
+            const viewportWidth = Math.max(
+                0,
+                Number(window.innerWidth || document.documentElement.clientWidth || 0)
+            );
+            const viewportHeight = Math.max(
+                0,
+                Number(window.innerHeight || document.documentElement.clientHeight || 0)
+            );
+            const visible = computed.visibility !== "hidden" && computed.display !== "none";
             return {{
                 width: Math.round(rect.width || 0),
                 height: Math.round(rect.height || 0),
-                visible: computed.visibility !== "hidden" && computed.display !== "none",
+                left: Math.round(rect.left || 0),
+                top: Math.round(rect.top || 0),
+                right: Math.round(rect.right || 0),
+                bottom: Math.round(rect.bottom || 0),
+                visible,
+                onscreen: visible
+                    && rect.width > 0
+                    && rect.height > 0
+                    && rect.right > 0
+                    && rect.bottom > 0
+                    && rect.left < viewportWidth
+                    && rect.top < viewportHeight,
             }};
         }};
         const elementChainMetrics = (start) => {{
@@ -38310,7 +38542,7 @@ fn terminal_eval_script_with_canvas_renderer(
         }};
         const hostLooksUsable = () => {{
             const metrics = hostMetrics();
-            return metrics.visible && metrics.width >= 280 && metrics.height >= 140;
+            return metrics.visible && metrics.onscreen && metrics.width >= 280 && metrics.height >= 140;
         }};
         if (document.fonts && document.fonts.ready) {{
             try {{
@@ -38512,10 +38744,51 @@ fn terminal_eval_script_with_canvas_renderer(
                 cell_height_px: Number(cellHeight.toFixed(3)),
             }};
         }};
+        const terminalGridIsUsable = (cols, rows) => {{
+            const safeCols = Number(cols || 0);
+            const safeRows = Number(rows || 0);
+            return Number.isFinite(safeCols)
+                && Number.isFinite(safeRows)
+                && safeCols >= 20
+                && safeRows >= 4;
+        }};
+        const recordSkippedFit = (reason, proposed, cause) => {{
+            try {{
+                const entry = window.__yggtermXtermHosts && window.__yggtermXtermHosts[hostId]
+                    ? window.__yggtermXtermHosts[hostId]
+                    : null;
+                if (!entry) {{
+                    return;
+                }}
+                const previous = entry.lastSkippedFit || {{}};
+                const count = Number(previous.count || 0) + 1;
+                entry.lastSkippedFit = {{
+                    reason,
+                    cause,
+                    count,
+                    cols: proposed ? proposed.cols : null,
+                    rows: proposed ? proposed.rows : null,
+                    current_cols: term ? term.cols : null,
+                    current_rows: term ? term.rows : null,
+                    available_width_px: proposed ? proposed.available_width_px : null,
+                    available_height_px: proposed ? proposed.available_height_px : null,
+                    at_ms: Date.now(),
+                }};
+            }} catch (_error) {{}}
+        }};
         const fitTerminalToHost = (reason) => {{
             try {{
                 const proposed = proposedTerminalFitDimensions();
                 if (!proposed || proposed.cols <= 0 || proposed.rows <= 0) {{
+                    return false;
+                }}
+                const currentGridUsable = terminalGridIsUsable(term.cols, term.rows);
+                if (!terminalGridIsUsable(proposed.cols, proposed.rows) && currentGridUsable) {{
+                    recordSkippedFit(reason, proposed, 'proposed_grid_unusable');
+                    return false;
+                }}
+                if (!hostLooksUsable() && currentGridUsable) {{
+                    recordSkippedFit(reason, proposed, 'host_not_usable');
                     return false;
                 }}
                 if (term.cols === proposed.cols && term.rows === proposed.rows) {{
@@ -38537,7 +38810,11 @@ fn terminal_eval_script_with_canvas_renderer(
                 return true;
             }} catch (_error) {{
                 try {{
-                    fitAddon.fit();
+                    if (!terminalGridIsUsable(term.cols, term.rows)) {{
+                        fitAddon.fit();
+                    }} else {{
+                        recordSkippedFit(reason, null, 'fit_exception_current_grid_usable');
+                    }}
                 }} catch (_error2) {{}}
                 return false;
             }}
@@ -39538,8 +39815,10 @@ fn terminal_eval_script_with_canvas_renderer(
                         const proposed = typeof fitAddon.proposeDimensions === 'function'
                             ? fitAddon.proposeDimensions()
                             : null;
-                        if (proposed && proposed.cols > 0 && proposed.rows > 1) {{
+                        if (proposed && terminalGridIsUsable(proposed.cols, proposed.rows)) {{
                             term.resize(proposed.cols, proposed.rows);
+                        }} else {{
+                            recordSkippedFit('visible_paint_degenerate', proposed, 'proposed_grid_unusable');
                         }}
                     }} catch (_error) {{}}
                     dioxus.send({{
@@ -40325,6 +40604,7 @@ fn terminal_eval_script_with_canvas_renderer(
             retainedWritePaintRepairCount,
             lastRetainedWritePaintRepairReason: '',
             lastFitGuard: null,
+            lastSkippedFit: null,
             lastWriteQueuedAtMs: 0,
             lastWriteFlushStartedAtMs: 0,
             lastWriteCallbackAtMs: 0,
@@ -40829,16 +41109,60 @@ fn terminal_eval_script_with_canvas_renderer(
             : null;
         let lastHostHealthKey = '';
         const terminalChunkIsTransportError = (textValue) => {{
-            const normalized = String(textValue || '').toLowerCase();
-            return (
-                (normalized.includes('shared connection to ') && (normalized.includes(' closed') || normalized.includes('refused') || normalized.includes('timed out')))
-                || (normalized.includes('connection to ') && (normalized.includes(' closed') || normalized.includes('refused') || normalized.includes('timed out')))
-                || normalized.includes('terminal session not found')
-                || normalized.includes('permission denied')
-                || normalized.includes('no route to host')
-                || normalized.includes('broken pipe')
-                || normalized.includes('connection reset by peer')
-            );
+            const lines = String(textValue || '')
+                .split(/\r?\n/)
+                .map((line) => line.trim().toLowerCase())
+                .filter((line) => line.length > 0);
+            if (!lines.length) {{
+                return false;
+            }}
+            const headLines = lines.slice(0, 4);
+            const head = headLines.join(' ');
+            const headFragments = [
+                '[yggterm] terminal reader stopped',
+                'error: reading /tmp/yggterm-screen',
+                'mux_client_request_session',
+                'session open refused by peer',
+                'controlsocket',
+                'exec: export: not found',
+                'exec: __yggterm_initial_tty_size',
+                'terminal session not found',
+                '[screen is terminating]',
+                'saved codex session',
+                'cannot be restored as a live terminal',
+            ];
+            if (headFragments.some((fragment) => head.includes(fragment))) {{
+                return true;
+            }}
+            return headLines.some((line) => {{
+                const directDiagnosticLine = !(line.startsWith('- ')
+                    || line.startsWith('* ')
+                    || line.startsWith('> '));
+                if (!directDiagnosticLine) {{
+                    return false;
+                }}
+                return (
+                    (line.startsWith('shared connection to ')
+                        && (line.includes(' closed') || line.includes('refused') || line.includes('timed out')))
+                    || (line.startsWith('connection to ')
+                        && (line.includes(' closed') || line.includes('refused') || line.includes('timed out')))
+                    || line === 'permission denied'
+                    || line === 'no route to host'
+                    || line === 'broken pipe'
+                    || line === 'connection reset by peer'
+                    || ((line.startsWith('ssh:')
+                        || line.startsWith('scp:')
+                        || line.startsWith('sftp:')
+                        || line.startsWith('error:')
+                        || line.startsWith('fatal:')
+                        || line.startsWith('rsync:'))
+                        && (line.includes('permission denied')
+                            || line.includes('connection refused')
+                            || line.includes('no route to host')
+                            || line.includes('connection timed out')
+                            || line.includes('broken pipe')))
+                );
+            }});
         }};
         const emitHostHealth = () => {{
             try {{
@@ -47047,6 +47371,15 @@ mod tests {
             "resize should apply the row fit guard after fitAddon.fit"
         );
         assert!(
+            script.contains("const terminalGridIsUsable = (cols, rows) => {")
+                && script.contains("recordSkippedFit(reason, proposed, 'proposed_grid_unusable');")
+                && script.contains("if (!hostLooksUsable() && currentGridUsable) {")
+                && script.contains(
+                    "last_skipped_fit: mountedHost && mountedHost.lastSkippedFit ? mountedHost.lastSkippedFit : null"
+                ),
+            "retained xterm hosts should skip destructive hidden/collapsed fits and expose that decision to app-control"
+        );
+        assert!(
             script.contains("const fitTerminalToHost = (reason) => {")
                 && script.contains("term.resize(proposed.cols, proposed.rows);")
                 && script.contains("fitTerminalToHost('resize');"),
@@ -52386,6 +52719,80 @@ uto-reviewer subagent.
         ));
     }
     #[test]
+    fn codex_interrupted_input_surface_is_prompt_ready() {
+        let tail = "\
+• I found a concrete rename root cause.
+
+■ Conversation interrupted - tell the model what to do differently. Something went wrong? Hit /feedback to report the issue.
+";
+        assert!(terminal_chunk_is_codex_interrupted_input_surface(tail));
+        assert!(terminal_surface_has_prompt_ready_text(tail));
+        assert!(!retained_remote_surface_has_non_prompt_text("", tail));
+        assert!(quiet_retained_remote_surface_ready(
+            true,
+            false,
+            true,
+            true,
+            false,
+            false,
+            true,
+            "",
+            tail,
+            50,
+            20,
+            Some(0),
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+        ));
+    }
+    #[test]
+    fn retained_rehydrate_identity_is_mount_scoped_not_open_scoped() {
+        let session_path = "remote-session://dev/019dbdc7";
+        let key = retained_rehydrate_identity_key(
+            session_path,
+            "remote-session://dev/019dbdc7:7",
+            true,
+            true,
+        );
+        let same_mount = retained_rehydrate_identity_key(
+            session_path,
+            "remote-session://dev/019dbdc7:7",
+            true,
+            true,
+        );
+        let next_mount = retained_rehydrate_identity_key(
+            session_path,
+            "remote-session://dev/019dbdc7:8",
+            true,
+            true,
+        );
+        assert_eq!(key, same_mount);
+        assert_ne!(key, next_mount);
+        assert!(!key.contains(":open-row-"));
+    }
+    #[test]
+    fn retained_ready_remote_rehydrate_skips_ready_attempt() {
+        assert!(!retained_ready_remote_host_should_rehydrate(
+            true, true, true, false
+        ));
+        assert!(!retained_ready_remote_host_should_rehydrate(
+            true, true, false, true
+        ));
+        assert!(retained_ready_remote_host_should_rehydrate(
+            true, true, false, false
+        ));
+        assert!(!retained_ready_remote_host_should_rehydrate(
+            true, false, false, false
+        ));
+        assert!(!retained_ready_remote_host_should_rehydrate(
+            false, true, false, false
+        ));
+    }
+    #[test]
     fn retained_transcript_browser_surface_is_ready_when_runtime_is_running() {
         let tail = "\
 / T R A N S C R I P T /
@@ -53803,6 +54210,7 @@ q to quit   pgup/pgdn to page   enter to edit message
         let active_session_path = "remote-session://oc/test";
         let bootstrap = test_shell_bootstrap_with_active_session(active_session_path);
         let mut shell = ShellState::new(bootstrap);
+        shell.server.set_view_mode(WorkspaceViewMode::Terminal);
         let attempt_id =
             shell.begin_terminal_open_attempt(active_session_path, "req-test", 1, "open_row");
         shell.mark_terminal_open_attempt_ready_for_session(active_session_path, "test_ready");
@@ -53833,6 +54241,160 @@ q to quit   pgup/pgdn to page   enter to edit message
         assert!(attempt.ready_at_ms.is_some());
         assert_eq!(attempt.latched_failure_reason, None);
         assert!(shell.terminal_session_has_ready_attempt(active_session_path));
+    }
+    #[test]
+    fn viewport_surface_problem_demotes_latched_ready_attempt() {
+        let active_session_path = "remote-session://oc/test";
+        let bootstrap = test_shell_bootstrap_with_active_session(active_session_path);
+        let mut shell = ShellState::new(bootstrap);
+        let attempt_id =
+            shell.begin_terminal_open_attempt(active_session_path, "req-test", 1, "open_row");
+        shell.mark_terminal_open_attempt_ready_for_session(active_session_path, "visual_reveal");
+        assert!(shell.terminal_session_has_ready_attempt(active_session_path));
+
+        shell.observe_terminal_open_attempt_from_viewport(&json!({
+            "active_session_path": active_session_path,
+            "active_view_mode": "Terminal",
+            "ready": false,
+            "interactive": false,
+            "terminal_settled_kind": null,
+            "reason": "active remote terminal is input-enabled without a prompt-ready surface",
+            "terminal_resume_overlay": {
+                "visible": false,
+                "kind": "",
+                "phase": "",
+                "text_sample": ""
+            },
+            "active_terminal_surface": {
+                "problem": "active remote terminal is input-enabled without a prompt-ready surface"
+            }
+        }));
+
+        let attempt = shell
+            .terminal_open_attempts
+            .get(&attempt_id)
+            .expect("attempt should exist");
+        assert!(matches!(
+            attempt.state,
+            TerminalOpenAttemptState::Recovering
+        ));
+        assert_eq!(attempt.latched_failure_reason, None);
+        assert!(!attempt.last_observed_ready);
+        assert_eq!(
+            attempt.last_surface_problem.as_deref(),
+            Some("active remote terminal is input-enabled without a prompt-ready surface")
+        );
+        assert!(!shell.terminal_session_has_ready_attempt(active_session_path));
+    }
+    #[test]
+    fn retained_remote_lost_scrollback_invalidates_live_host() {
+        let active_session_path = "remote-session://oc/test";
+        let bootstrap = test_shell_bootstrap_with_active_session(active_session_path);
+        let mut shell = ShellState::new(bootstrap);
+        let attempt_id =
+            shell.begin_terminal_open_attempt(active_session_path, "req-test", 1, "open_row");
+        shell
+            .retained_terminal_session_paths
+            .insert(active_session_path.to_string());
+        shell
+            .terminal_resume_ready_paths
+            .insert(active_session_path.to_string());
+        shell.active_terminal_host_id = Some("stale-remote-host".to_string());
+        shell.mark_terminal_open_attempt_ready_for_session(active_session_path, "visual_reveal");
+        assert!(shell.terminal_session_is_retained_live(active_session_path));
+
+        let fault_viewport = json!({
+            "active_session_path": active_session_path,
+            "active_view_mode": "Terminal",
+            "ready": false,
+            "interactive": false,
+            "terminal_settled_kind": null,
+            "reason": "active remote terminal lost expected scrollback after retained replay",
+            "terminal_resume_overlay": {
+                "visible": false,
+                "kind": "",
+                "phase": "",
+                "text_sample": ""
+            },
+            "active_terminal_surface": {
+                "problem": "active remote terminal lost expected scrollback after retained replay"
+            }
+        });
+
+        shell.observe_terminal_open_attempt_from_viewport(&fault_viewport);
+        let first_attempt = shell
+            .terminal_open_attempts
+            .get(&attempt_id)
+            .expect("original attempt should still exist");
+        assert!(matches!(
+            first_attempt.state,
+            TerminalOpenAttemptState::Ready
+        ));
+        assert_eq!(
+            first_attempt.last_observed_reason.as_deref(),
+            Some("active remote terminal lost expected scrollback after retained replay")
+        );
+        assert!(
+            !shell
+                .terminal_attach_in_flight
+                .contains(active_session_path)
+        );
+        assert!(shell.terminal_session_is_retained_live(active_session_path));
+
+        shell.observe_terminal_open_attempt_from_viewport(&fault_viewport);
+
+        let attempt = shell
+            .terminal_open_attempts
+            .get(&attempt_id)
+            .expect("attempt should exist");
+        assert!(matches!(
+            attempt.state,
+            TerminalOpenAttemptState::Recovering
+        ));
+        assert_eq!(
+            attempt.last_observed_reason.as_deref(),
+            Some("active remote terminal lost expected scrollback after retained replay")
+        );
+        assert_eq!(
+            attempt.last_surface_problem.as_deref(),
+            Some("active remote terminal lost expected scrollback after retained replay")
+        );
+        assert!(
+            shell
+                .retained_terminal_session_paths
+                .contains(active_session_path)
+        );
+        assert!(shell.terminal_session_should_render_retained(active_session_path));
+        assert!(
+            !shell
+                .terminal_resume_ready_paths
+                .contains(active_session_path)
+        );
+        assert!(
+            shell
+                .terminal_attach_in_flight
+                .contains(active_session_path)
+        );
+        assert_eq!(
+            shell.active_terminal_host_id.as_deref(),
+            shell
+                .terminal_session_host_id(active_session_path)
+                .as_deref()
+        );
+        assert!(!shell.terminal_session_is_retained_live(active_session_path));
+        let recovery_attempt = shell
+            .latest_terminal_open_attempt_for_path(active_session_path)
+            .expect("recovery attempt should be current");
+        assert_eq!(recovery_attempt.source, "retained_fault_recovery");
+        assert!(matches!(
+            recovery_attempt.state,
+            TerminalOpenAttemptState::Pending
+        ));
+        assert!(recovery_attempt.open_request_id > attempt.open_request_id);
+        assert_eq!(
+            shell.latest_open_request_id,
+            recovery_attempt.open_request_id
+        );
     }
     #[test]
     fn recover_startup_terminal_restore_rearms_attempt_deadline() {
@@ -54214,6 +54776,35 @@ q to quit   pgup/pgdn to page   enter to edit message
             Some(session_path),
             session_path
         ));
+    }
+
+    #[test]
+    fn retained_fault_bootstrap_uses_live_active_session_when_snapshot_is_stale() {
+        let session_path = "remote-session://dev/019dbdc7-7e63-7211-a7f8-51eb4d6e80b2";
+        let bootstrap = test_shell_bootstrap_with_active_session(session_path);
+        let mut shell = ShellState::new(bootstrap);
+        shell.server.set_view_mode(WorkspaceViewMode::Terminal);
+        shell
+            .terminal_attach_in_flight
+            .insert(session_path.to_string());
+
+        assert!(terminal_session_should_bootstrap_host(
+            &shell,
+            Some("local://stale-render-snapshot"),
+            session_path
+        ));
+    }
+
+    #[test]
+    fn remote_resume_input_policy_blocks_missing_active_session_snapshot() {
+        let session_path = "remote-session://dev/019dbdc7-7e63-7211-a7f8-51eb4d6e80b2";
+        let bootstrap = test_shell_bootstrap_with_active_session(session_path);
+        let shell = ShellState::new(bootstrap);
+        let mut snapshot = shell.snapshot();
+        snapshot.active_session_path = Some(session_path.to_string());
+        snapshot.active_session = None;
+
+        assert!(!remote_resume_input_ready_for_snapshot(&shell, &snapshot));
     }
 
     #[test]
@@ -57931,6 +58522,74 @@ q to quit   pgup/pgdn to page   enter to edit message
             "LiveLocal Codex transcript paths must stay retained so they render under Live Sessions"
         );
     }
+
+    #[test]
+    fn sync_live_terminal_retention_keeps_cached_retained_remote_on_focus_switch() {
+        let remote_path = "remote-session://dev/019dbdc7-7e63-7211-a7f8-51eb4d6e80b2";
+        let local_path = "local://active-shell";
+        let mut shell = ShellState::new(test_shell_bootstrap_with_active_session(remote_path));
+        let mut remote_session = test_live_shell_session(remote_path);
+        remote_session.id = "remote-codex".to_string();
+        remote_session.title = "Remote Codex".to_string();
+        remote_session.kind = SessionKind::Codex;
+        remote_session.host_label = "dev".to_string();
+        remote_session.source = SessionSource::LiveSsh;
+        remote_session.bridge_available = true;
+        remote_session.ssh_target = Some("dev".to_string());
+        remote_session.status_line = "› Improve documentation in @filename".to_string();
+        remote_session.terminal_lines = vec![remote_session.status_line.clone()];
+        let mut local_session = test_live_shell_session(local_path);
+        local_session.id = "local-shell".to_string();
+        shell.server.apply_snapshot(ServerUiSnapshot {
+            active_session_path: Some(remote_path.to_string()),
+            active_session: Some(snapshot_session_view_for_ui(remote_session.clone())),
+            active_view_mode: WorkspaceViewMode::Terminal,
+            remote_machines: Vec::new(),
+            ssh_targets: Vec::new(),
+            live_sessions: vec![snapshot_session_view_for_ui(remote_session.clone())],
+        });
+        shell.refresh_cached_hot_session_views();
+        let attempt_id =
+            shell.begin_terminal_open_attempt(remote_path, "remote-open", 1, "startup_restore");
+        shell.retain_terminal_session_path(remote_path);
+        shell
+            .terminal_resume_ready_paths
+            .insert(remote_path.to_string());
+        shell.mark_terminal_open_attempt_ready_for_session(remote_path, "visual_reveal");
+        assert!(matches!(
+            shell
+                .terminal_open_attempts
+                .get(&attempt_id)
+                .map(|attempt| &attempt.state),
+            Some(TerminalOpenAttemptState::Ready)
+        ));
+
+        shell.server.apply_snapshot(ServerUiSnapshot {
+            active_session_path: Some(local_path.to_string()),
+            active_session: Some(snapshot_session_view_for_ui(local_session.clone())),
+            active_view_mode: WorkspaceViewMode::Terminal,
+            remote_machines: Vec::new(),
+            ssh_targets: Vec::new(),
+            live_sessions: vec![snapshot_session_view_for_ui(local_session)],
+        });
+        shell.refresh_cached_hot_session_views();
+        shell.sync_live_terminal_retention();
+
+        assert!(
+            shell.retained_terminal_session_paths.contains(remote_path),
+            "focus switch must not drop a ready retained remote host just because the latest daemon snapshot omits it from live_sessions"
+        );
+        assert!(shell.terminal_session_is_retained_live(remote_path));
+        let snapshot = shell.snapshot();
+        assert!(
+            snapshot
+                .retained_terminal_sessions
+                .iter()
+                .any(|session| session.session_path == remote_path),
+            "cached retained remote must remain renderable for focus return"
+        );
+    }
+
     #[test]
     fn shell_snapshot_retains_active_stored_terminal_session_in_terminal_view() {
         let session_path = "/home/pi/.codex/sessions/example.jsonl";

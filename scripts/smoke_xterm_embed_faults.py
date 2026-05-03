@@ -62,6 +62,9 @@ AVOID_FOREGROUND = (ENV.get("YGGTERM_SMOKE_AVOID_FOREGROUND") or "").strip().low
     "yes",
     "on",
 )
+ALLOW_DESKTOP_SYNTHETIC_INPUT = (
+    ENV.get("YGGTERM_SMOKE_ALLOW_DESKTOP_SYNTHETIC_INPUT") or ""
+).strip().lower() in ("1", "true", "yes", "on")
 PROBLEM_NOTIFICATION_MARKERS = (
     "connection refused",
     "no such file or directory",
@@ -363,11 +366,33 @@ def app_pointer_button_name(button: int) -> str:
     }.get(int(button), "primary")
 
 
+def assert_terminal_open_attempt_consistent(state: dict) -> None:
+    viewport = state.get("viewport") if isinstance(state.get("viewport"), dict) else state
+    attempt = viewport.get("terminal_open_attempt") or {}
+    if not isinstance(attempt, dict) or attempt.get("state") != "ready":
+        return
+    if int(attempt.get("observations") or 0) <= 0:
+        return
+    stale_reasons = []
+    if attempt.get("last_observed_ready") is not True:
+        stale_reasons.append("last_observed_ready is not true")
+    if attempt.get("last_surface_problem"):
+        stale_reasons.append(f"last_surface_problem={attempt.get('last_surface_problem')!r}")
+    if attempt.get("latched_failure_reason"):
+        stale_reasons.append(f"latched_failure_reason={attempt.get('latched_failure_reason')!r}")
+    if stale_reasons:
+        raise AssertionError(
+            "terminal open attempt is latched ready but the latest viewport observation is unhealthy: "
+            f"{', '.join(stale_reasons)}; attempt={attempt!r}; "
+            f"active_surface={viewport.get('active_terminal_surface')!r}"
+        )
+
+
 def app_state(pid: int, timeout_ms: int = 20000, retries: int = 2) -> dict:
     last_error = None
     for attempt in range(retries + 1):
         try:
-            return run(
+            state = run(
                 "server",
                 "app",
                 "state",
@@ -376,6 +401,8 @@ def app_state(pid: int, timeout_ms: int = 20000, retries: int = 2) -> dict:
                 "--timeout-ms",
                 str(timeout_ms),
             )["data"]
+            assert_terminal_open_attempt_consistent(state)
+            return state
         except AssertionError as exc:
             last_error = exc
             if "timed out waiting for app control response" not in str(exc) or attempt >= retries:
@@ -671,7 +698,7 @@ def focus_terminal_helper_textarea(
             return last_state
         focus_rect = (host or {}).get("host_rect") or dom_rect(last_state, "main_surface_body_rect")
         if rect_is_visible(focus_rect):
-            xdotool_click_window(pid, rect_center_x(focus_rect), rect_center_y(focus_rect))
+            terminal_reclaim_focus(pid, session)
         time.sleep(0.12)
     raise AssertionError(f"failed to focus terminal helper textarea: {last_state!r}")
 
@@ -692,9 +719,7 @@ def prime_terminal_surface_for_shortcut(pid: int, session: str) -> dict:
     focus_rect = host.get("host_rect") or dom_rect(state, "main_surface_body_rect")
     if not rect_is_visible(focus_rect):
         raise AssertionError(f"terminal host rect is not visible for shortcut priming: {state!r}")
-    window_id = visible_window_id_for_pid(pid)
-    xdotool_activate_window_if_supported(pid, window_id)
-    click = xdotool_click_window(pid, rect_center_x(focus_rect), rect_center_y(focus_rect))
+    click = terminal_reclaim_focus(pid, session)
     time.sleep(0.18)
     return {
         "click": click,
@@ -2426,6 +2451,11 @@ def xdotool_key_window(pid: int, *keys: str) -> dict:
             "keys": list(keys),
             "driver": "app",
         }
+    if not ALLOW_DESKTOP_SYNTHETIC_INPUT:
+        raise AssertionError(
+            "desktop-wide synthetic keyboard input is disabled; use app-control key or terminal probe APIs, "
+            "or set YGGTERM_SMOKE_ALLOW_DESKTOP_SYNTHETIC_INPUT=1 for an explicit unsafe local run"
+        )
     env = xdotool_env_for_pid(pid)
     window_id = visible_window_id_for_pid(pid)
     if not xdotool_focus_belongs_to_pid(pid):
@@ -2447,6 +2477,11 @@ def xdotool_key_window(pid: int, *keys: str) -> dict:
 
 
 def xdotool_key_window_physical(pid: int, *keys: str) -> dict:
+    if not ALLOW_DESKTOP_SYNTHETIC_INPUT:
+        raise AssertionError(
+            "desktop-wide synthetic keyboard input is disabled; use app-control key or terminal probe APIs, "
+            "or set YGGTERM_SMOKE_ALLOW_DESKTOP_SYNTHETIC_INPUT=1 for an explicit unsafe local run"
+        )
     env = xdotool_env_for_pid(pid)
     window_id = visible_window_id_for_pid(pid)
     xdotool_activate_window_if_supported(pid, window_id)
@@ -2476,6 +2511,11 @@ def xdotool_ctrl_v_window_physical(pid: int) -> dict:
             "keys": ["ctrl+v"],
             "driver": "app",
         }
+    if not ALLOW_DESKTOP_SYNTHETIC_INPUT:
+        raise AssertionError(
+            "desktop-wide synthetic keyboard input is disabled; use app-control paste APIs, "
+            "or set YGGTERM_SMOKE_ALLOW_DESKTOP_SYNTHETIC_INPUT=1 for an explicit unsafe local run"
+        )
     env = xdotool_env_for_pid(pid)
     window_id = visible_window_id_for_pid(pid)
     xdotool_activate_window_if_supported(pid, window_id)
@@ -2515,6 +2555,11 @@ def xdotool_key_focused(pid: int, *keys: str) -> dict:
             "keys": list(keys),
             "driver": "app",
         }
+    if not ALLOW_DESKTOP_SYNTHETIC_INPUT:
+        raise AssertionError(
+            "desktop-wide synthetic keyboard input is disabled; use app-control key or terminal probe APIs, "
+            "or set YGGTERM_SMOKE_ALLOW_DESKTOP_SYNTHETIC_INPUT=1 for an explicit unsafe local run"
+        )
     env = xdotool_env_for_pid(pid)
     window_id = visible_window_id_for_pid(pid)
     if not xdotool_focus_belongs_to_pid(pid):
@@ -2544,6 +2589,11 @@ def xdotool_type_window(pid: int, text: str) -> dict:
             "text": text,
             "driver": "app",
         }
+    if not ALLOW_DESKTOP_SYNTHETIC_INPUT:
+        raise AssertionError(
+            "desktop-wide synthetic text input is disabled; use app-control key/search/terminal APIs, "
+            "or set YGGTERM_SMOKE_ALLOW_DESKTOP_SYNTHETIC_INPUT=1 for an explicit unsafe local run"
+        )
     env = xdotool_env_for_pid(pid)
     window_id = visible_window_id_for_pid(pid)
     if not xdotool_focus_belongs_to_pid(pid):
@@ -2573,6 +2623,11 @@ def xdotool_type_focused(pid: int, text: str) -> dict:
             "text": text,
             "driver": "app",
         }
+    if not ALLOW_DESKTOP_SYNTHETIC_INPUT:
+        raise AssertionError(
+            "desktop-wide synthetic text input is disabled; use app-control key/search/terminal APIs, "
+            "or set YGGTERM_SMOKE_ALLOW_DESKTOP_SYNTHETIC_INPUT=1 for an explicit unsafe local run"
+        )
     env = xdotool_env_for_pid(pid)
     window_id = visible_window_id_for_pid(pid)
     if not xdotool_focus_belongs_to_pid(pid):
@@ -5779,7 +5834,7 @@ def wait_for_session_focus(pid: int, session: str, timeout_seconds: float = 12.0
             focus_rect = host.get("host_rect") or dom_rect(last_state, "main_surface_body_rect")
             if rect_is_visible(focus_rect):
                 try:
-                    xdotool_click_window(pid, rect_center_x(focus_rect), rect_center_y(focus_rect))
+                    terminal_reclaim_focus(pid, session)
                     last_focus_attempt = time.time()
                     time.sleep(0.12)
                     last_state = app_state(pid)
@@ -5864,7 +5919,7 @@ def wait_for_visible_cursor_session(pid: int, session: str, timeout_seconds: flo
             focus_rect = host.get("host_rect") or dom_rect(last_state, "main_surface_body_rect")
             if rect_is_visible(focus_rect):
                 try:
-                    xdotool_click_window(pid, rect_center_x(focus_rect), rect_center_y(focus_rect))
+                    terminal_reclaim_focus(pid, session)
                 except Exception:
                     pass
             last_focus_attempt = time.time()
