@@ -4,6 +4,10 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+## 2.1.107
+
+- Fixed live-session persistence so recoverable live terminals survive normal app restarts and are eligible for startup background prewarm even when the user has not explicitly toggled keep-alive. This closes the gap where restored sidebar sessions existed but no terminal runtimes loaded until the user selected them.
+
 ## 2.1.106
 
 - Restored remote live-session startup prewarm as a background load path instead of skipping it entirely. Remote live sessions are eligible to attach before they are selected, while the startup path still refuses saved-transcript prefill so Codex TUI surfaces do not repaint `USER:`/`ASSISTANT:` artifacts.

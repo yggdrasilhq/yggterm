@@ -1,8 +1,8 @@
-yggterm (2.1.106-1) unstable; urgency=medium
+yggterm (2.1.107-1) unstable; urgency=medium
 
-  * Restore remote live-session background startup prewarm without saved transcript prefill.
-  * Keep Codex transcript artifact rejection in the terminal smoke and CI gates.
-  * Keep server-list and latency observability responsive during post-update checks.
+  * Persist recoverable live sessions across normal app restarts by default.
+  * Keep restored live sessions eligible for startup background terminal prewarm.
+  * Add CI gates for default live-session persistence and unkept live-session restore.
 
  -- Yggdrasil HQ <avi@gour.top>  Sun, 03 May 2026 15:41:10 +0530
 
