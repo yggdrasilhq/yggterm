@@ -2087,6 +2087,37 @@ mod tests {
     }
 
     #[test]
+    fn terminal_host_problem_rejects_input_enabled_interrupted_codex_banner_without_prompt() {
+        let host = json!({
+            "session_path": "remote-session://dev/interrupted-codex",
+            "text_sample": "• I found a concrete rename root cause.\n\n■ Conversation interrupted - tell the model what to do differently. Something went wrong? Hit /feedback to report the issue.",
+            "text_tail": "• I found a concrete rename root cause.\n\n■ Conversation interrupted - tell the model what to do differently. Something went wrong? Hit /feedback to report the issue.",
+            "cursor_line_text": "",
+            "input_enabled": true,
+            "helper_textarea_focused": true,
+            "cursor_node_count": 1,
+            "xterm_present": true,
+            "screen_present": true,
+            "rows_present": false,
+            "canvas_count": 4,
+            "render_event_count": 12,
+            "data_event_count": 1,
+            "xterm_buffer_kind": "normal",
+            "host_rect": {"left": 0.0, "top": 0.0, "width": 840.0, "height": 830.0},
+            "host_content_width": 840.0,
+            "host_content_height": 830.0,
+            "screen_rect": {"width": 840.0, "height": 830.0},
+            "viewport_rect": {"width": 840.0, "height": 830.0},
+            "helpers_rect": {"width": 840.0, "height": 830.0},
+            "helper_textarea_rect": {"left": -10000.0, "top": 68.0, "width": 1.0, "height": 1.0}
+        });
+        assert_eq!(
+            terminal_host_problem_for_app_control(&host),
+            Some("active remote terminal is input-enabled without a prompt-ready surface")
+        );
+    }
+
+    #[test]
     fn terminal_host_problem_accepts_input_enabled_codex_status_surface() {
         let status = "\
 >_ OpenAI Codex (v0.128.0)

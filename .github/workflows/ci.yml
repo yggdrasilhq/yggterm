@@ -76,8 +76,9 @@ jobs:
           cargo test -p yggterm-server --no-default-features remote_resume_runtime_output_requires_restart_for_shell_prompt
           cargo test -p yggterm-server --no-default-features remote_resume_seed_snapshot_prefill_rejects_codex_role_transcript
           cargo test -p yggterm-server --no-default-features remote_preview_payload_terminal_prefill_is_disabled_for_live_terminal
-          cargo test -p yggterm-server --no-default-features persisted_state_persists_recoverable_live_sessions_by_default
-          cargo test -p yggterm-server --no-default-features restore_persisted_state_restores_unkept_recoverable_live_sessions
+          cargo test -p yggterm-server --no-default-features persisted_state_only_keeps_explicitly_kept_live_sessions
+          cargo test -p yggterm-server --no-default-features restore_persisted_state_skips_unkept_recoverable_live_sessions_without_update_reason
+          cargo test -p yggterm-server --no-default-features restore_persisted_state_restores_unkept_update_restart_live_sessions_once
           cargo test -p yggterm-server --no-default-features startup_prewarm_keeps_remote_live_sessions_eligible_for_background_load
           cargo test -p yggterm-server --no-default-features startup_prewarm_skips_remote_snapshot_seed_for_latency_budget
           cargo test -p yggterm-server --no-default-features versioned_server_status_probe_paths_dedupe_symlink_aliases_before_status
@@ -90,10 +91,15 @@ jobs:
           cargo test -p yggterm-shell --no-default-features terminal_eval_script_throttles_hot_render_bridge_work
           cargo test -p yggterm-shell --no-default-features terminal_eval_script_focuses_host_and_scopes_wheel_capture
           cargo test -p yggterm-shell --no-default-features terminal_eval_script_locks_even_one_line_scrollback
+          cargo test -p yggterm-shell --no-default-features terminal_cursor_colors_follow_ghostty_theme_contract_across_themes
+          cargo test -p yggterm-shell --no-default-features terminal_eval_script_preserves_native_xterm_cursor_contract
+          cargo test -p yggterm-shell --no-default-features parses_ghostty_cursor_text_when_present
           cargo test -p yggterm-shell --no-default-features remote_resume_attach_confirmation_accepts_runtime_prompt_surface_after_deadline
           cargo test -p yggterm-shell --no-default-features remote_resume_visual_reveal_accepts_codex_prompt_ready_tail_after_transcript
+          cargo test -p yggterm-shell --no-default-features codex_interrupted_input_surface_without_prompt_is_not_prompt_ready
           cargo test -p yggterm-shell --no-default-features terminal_host_problem_accepts_input_enabled_codex_status_surface
           cargo test -p yggterm-shell --no-default-features terminal_host_problem_accepts_remote_codex_prompt_only_surface_with_real_output
+          cargo test -p yggterm-shell --no-default-features terminal_host_problem_rejects_input_enabled_interrupted_codex_banner_without_prompt
           cargo test -p yggterm-shell --no-default-features terminal_host_problem_rejects_input_enabled_transcript_browser_surface
           cargo test -p yggterm-shell --no-default-features terminal_host_problem_rejects_codex_role_transcript_surface
           cargo test -p yggterm-shell --no-default-features remote_resume_surface_connected_rejects_live_transcript_browser_surface
