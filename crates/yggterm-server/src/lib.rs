@@ -5430,6 +5430,9 @@ fn normalize_remote_semantic_match_text(text: &str) -> String {
 }
 
 pub(crate) fn remote_snapshot_is_transcript_browser(bytes: &[u8]) -> bool {
+    if remote_snapshot_is_codex_role_transcript(bytes) {
+        return true;
+    }
     let normalized = String::from_utf8_lossy(bytes)
         .to_ascii_lowercase()
         .split_whitespace()
@@ -5453,6 +5456,24 @@ pub(crate) fn remote_snapshot_is_transcript_browser(bytes: &[u8]) -> bool {
         || normalized.contains("home end to jump")
         || normalized.contains("esc to edit prev")
         || normalized.contains("edit prev")
+}
+
+fn remote_snapshot_is_codex_role_transcript(bytes: &[u8]) -> bool {
+    let text = String::from_utf8_lossy(bytes).replace('\0', "");
+    let mut non_empty = 0usize;
+    let mut role_markers = 0usize;
+    for line in text.lines().map(str::trim).filter(|line| !line.is_empty()) {
+        non_empty += 1;
+        let lower = line.to_ascii_lowercase();
+        if lower == "user:"
+            || lower == "assistant:"
+            || lower.starts_with("user: ")
+            || lower.starts_with("assistant: ")
+        {
+            role_markers += 1;
+        }
+    }
+    role_markers >= 2 && non_empty >= 4
 }
 
 fn remote_snapshot_has_resume_breakage(bytes: &[u8]) -> bool {
@@ -5591,6 +5612,13 @@ fn remote_resume_prefill_has_scrollback(prefill: &str) -> bool {
 }
 
 fn remote_preview_payload_terminal_prefill(payload: &RemotePreviewPayload) -> Option<String> {
+    let _ = payload;
+    return None;
+}
+
+fn remote_preview_payload_terminal_prefill_before_2_1_103(
+    payload: &RemotePreviewPayload,
+) -> Option<String> {
     let mut lines = Vec::new();
     for block in &payload.preview.blocks {
         let content = block
@@ -8056,25 +8084,17 @@ exit 0"#,
     let text = String::from_utf8_lossy(&output.stdout).replace('\0', "");
     let trimmed = text.trim();
     if trimmed.is_empty() {
-        if let Ok(Some(saved_prefill)) =
-            fetch_remote_saved_codex_prefill_over_ssh(ssh_target, exec_prefix, session_id)
-            && remote_resume_prefill_has_scrollback(&saved_prefill)
-        {
-            if let Ok(home) = resolve_yggterm_home() {
-                append_trace_event(
-                    &home,
-                    "server",
-                    "remote_resume_seed",
-                    "saved_codex_prefill_used",
-                    serde_json::json!({
-                        "ssh_target": ssh_target,
-                        "session_id": session_id,
-                        "bytes": saved_prefill.len(),
-                        "reason": "empty_multiplexer_snapshot",
-                    }),
-                );
-            }
-            return Ok(Some(saved_prefill));
+        if let Ok(home) = resolve_yggterm_home() {
+            append_trace_event(
+                &home,
+                "server",
+                "remote_resume_seed",
+                "empty_multiplexer_snapshot_no_prefill",
+                serde_json::json!({
+                    "ssh_target": ssh_target,
+                    "session_id": session_id,
+                }),
+            );
         }
         return Ok(None);
     }
@@ -8096,25 +8116,6 @@ exit 0"#,
             );
         }
         return Ok(Some(format!("\x1b[2J\x1b[H{}", prefill)));
-    }
-    if let Ok(Some(saved_prefill)) =
-        fetch_remote_saved_codex_prefill_over_ssh(ssh_target, exec_prefix, session_id)
-        && remote_resume_prefill_has_scrollback(&saved_prefill)
-    {
-        if let Ok(home) = resolve_yggterm_home() {
-            append_trace_event(
-                &home,
-                "server",
-                "remote_resume_seed",
-                "saved_codex_prefill_used",
-                serde_json::json!({
-                    "ssh_target": ssh_target,
-                    "session_id": session_id,
-                    "bytes": saved_prefill.len(),
-                }),
-            );
-        }
-        return Ok(Some(saved_prefill));
     }
     if let Some(prefill) = snapshot_prefill.as_deref()
         && let Ok(home) = resolve_yggterm_home()
@@ -16951,6 +16952,21 @@ mod tests {
     }
 
     #[test]
+    fn remote_resume_seed_snapshot_prefill_rejects_codex_role_transcript() {
+        let role_transcript = b"USER:\nPlease fix Yggterm.\n\nASSISTANT:\nI am checking the terminal restore path.\n\nASSISTANT:\nThe daemon snapshot is stale.\n";
+        assert!(super::remote_snapshot_is_transcript_browser(
+            role_transcript
+        ));
+        assert!(remote_resume_runtime_output_requires_restart(
+            role_transcript
+        ));
+        assert_eq!(
+            super::remote_resume_seed_snapshot_prefill(role_transcript),
+            None
+        );
+    }
+
+    #[test]
     fn saved_session_rejects_resume_picker_existing_multiplexer_snapshot() {
         let resume_picker = b"Resume a previous session  Sort: Updated at\nUpdated at   Branch  Conversation\n1 day ago feature-x Investigate remote preview hydration\n";
         assert!(!remote_saved_session_can_reuse_existing_multiplexer(
@@ -17002,7 +17018,7 @@ mod tests {
     }
 
     #[test]
-    fn remote_preview_payload_terminal_prefill_provides_scrollback() {
+    fn remote_preview_payload_terminal_prefill_is_disabled_for_live_terminal() {
         let payload = RemotePreviewPayload {
             title_hint: None,
             cached_precis: None,
@@ -17030,11 +17046,10 @@ mod tests {
             },
             rendered_sections: Vec::new(),
         };
-        let prefill = super::remote_preview_payload_terminal_prefill(&payload)
-            .expect("preview payload should become terminal prefill");
-        assert!(prefill.contains("Investigate the remote terminal."));
-        assert!(prefill.contains("Recovered transcript line 045"));
-        assert!(super::remote_resume_prefill_has_scrollback(&prefill));
+        assert_eq!(
+            super::remote_preview_payload_terminal_prefill(&payload),
+            None
+        );
     }
 
     #[test]

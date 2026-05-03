@@ -391,7 +391,7 @@ pub(crate) fn describe_viewport_snapshot(snapshot: &Value, dom: &Value) -> Value
                 Some("terminal resume notification is still visible".to_string()),
             )
         } else if let Some(problem) = terminal_surface_problem.clone() {
-            (false, false, None::<String>, Some(problem))
+            (false, false, Some("problem".to_string()), Some(problem))
         } else if terminal_rendered && terminal_input_enabled {
             (true, true, Some("interactive".to_string()), None)
         } else if terminal_rendered && !terminal_input_enabled {
@@ -880,10 +880,7 @@ fn terminal_host_problem_for_app_control(host: &Value) -> Option<&'static str> {
             || local_prompt_surface
             || live_remote_codex_prompt_surface
             || codex_status_ready_surface);
-    let transcript_browser_ready_surface = session_path.starts_with("remote-session://")
-        && transcript_browser_surface
-        && input_enabled
-        && (helper_textarea_focused || xterm_present || screen_present || canvas_count > 0);
+    let transcript_browser_ready_surface = false;
     if !cursor_line_text.is_empty() && terminal_chunk_is_transport_error(cursor_line_text) {
         return Some("active terminal host is showing transport/error output");
     }
@@ -941,9 +938,6 @@ fn terminal_host_problem_for_app_control(host: &Value) -> Option<&'static str> {
         return Some("active remote Codex prompt surface is missing the welcome frame");
     }
     if transcript_browser_surface {
-        if transcript_browser_ready_surface {
-            return None;
-        }
         return Some("active terminal host is still showing the transcript browser");
     }
     if terminal_chunk_is_saved_transcript_prefill(visible_text) {
@@ -1509,6 +1503,9 @@ pub(crate) fn terminal_chunk_has_generic_codex_idle_footer(data: &str) -> bool {
 }
 
 pub(crate) fn terminal_chunk_is_transcript_browser(data: &str) -> bool {
+    if terminal_chunk_is_codex_role_transcript(data) {
+        return true;
+    }
     let stripped = strip_terminal_control_sequences(data);
     let normalized = stripped
         .to_ascii_lowercase()
@@ -1535,6 +1532,28 @@ pub(crate) fn terminal_chunk_is_transcript_browser(data: &str) -> bool {
         || normalized.contains("edit prev")
 }
 
+pub(crate) fn terminal_chunk_is_codex_role_transcript(data: &str) -> bool {
+    let stripped = strip_terminal_control_sequences(data);
+    let mut non_empty = 0usize;
+    let mut role_markers = 0usize;
+    for line in stripped
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+    {
+        non_empty += 1;
+        let lower = line.to_ascii_lowercase();
+        if lower == "user:"
+            || lower == "assistant:"
+            || lower.starts_with("user: ")
+            || lower.starts_with("assistant: ")
+        {
+            role_markers += 1;
+        }
+    }
+    role_markers >= 2 && non_empty >= 4
+}
+
 pub(crate) fn terminal_chunk_is_loading_placeholder(data: &str) -> bool {
     let stripped = strip_terminal_control_sequences(data);
     let normalized = stripped
@@ -1556,6 +1575,9 @@ pub(crate) fn terminal_chunk_has_visible_output(data: &str) -> bool {
 }
 
 pub(crate) fn terminal_chunk_is_saved_transcript_prefill(data: &str) -> bool {
+    if terminal_chunk_is_codex_role_transcript(data) {
+        return true;
+    }
     let normalized = strip_terminal_control_sequences(data)
         .to_ascii_lowercase()
         .split_whitespace()
@@ -2223,7 +2245,7 @@ Weekly limit:                21% left
     }
 
     #[test]
-    fn terminal_host_problem_accepts_input_enabled_transcript_browser_surface() {
+    fn terminal_host_problem_rejects_input_enabled_transcript_browser_surface() {
         let host = json!({
             "session_path": "remote-session://dev/live-codex",
             "text_sample": "/ T R A N S C R I P T /\n• Published v2.1.50: https://github.com/yggdrasilhq/yggterm/releases/tag/v2.1.50\n\n──────────────────── 87% ─\n ↑/↓ to scroll   pgup/pgdn to page   home/end to jump\n q to quit   esc/← to edit prev   → to edit next   enter to edit message",
@@ -2247,11 +2269,14 @@ Weekly limit:                21% left
             "helpers_rect": {"width": 840.0, "height": 830.0},
             "helper_textarea_rect": {"left": -10000.0, "top": 68.0, "width": 1.0, "height": 1.0}
         });
-        assert_eq!(terminal_host_problem_for_app_control(&host), None);
+        assert_eq!(
+            terminal_host_problem_for_app_control(&host),
+            Some("active terminal host is still showing the transcript browser")
+        );
     }
 
     #[test]
-    fn terminal_host_problem_accepts_split_canvas_transcript_browser_surface() {
+    fn terminal_host_problem_rejects_split_canvas_transcript_browser_surface() {
         let host = json!({
             "session_path": "remote-session://dev/live-codex",
             "text_sample": "/ T R A N S C R I P T / / / / / / / / / / /\n  x86_64/arm64, and Debian artifacts. I’m checking the final release asset list.",
@@ -2277,11 +2302,47 @@ Weekly limit:                21% left
             "helpers_rect": {"width": 883.0, "height": 872.0},
             "helper_textarea_rect": {"left": -9723.0, "top": 40.0, "width": 1.0, "height": 1.0}
         });
-        assert_eq!(terminal_host_problem_for_app_control(&host), None);
+        assert_eq!(
+            terminal_host_problem_for_app_control(&host),
+            Some("active terminal host is still showing the transcript browser")
+        );
     }
 
     #[test]
-    fn describe_viewport_snapshot_accepts_input_enabled_transcript_browser_surface() {
+    fn terminal_host_problem_rejects_codex_role_transcript_surface() {
+        let host = json!({
+            "session_path": "remote-session://dev/live-codex",
+            "text_sample": "USER:\nPlease fix yggterm.\n\nASSISTANT:\nI am checking the daemon state.",
+            "text_tail": "USER:\nPlease fix yggterm.\n\nASSISTANT:\nI am checking the daemon state.",
+            "buffer_text_sample": "USER:\nPlease fix yggterm.",
+            "cursor_line_text": "",
+            "input_enabled": true,
+            "helper_textarea_focused": true,
+            "cursor_node_count": 0,
+            "xterm_present": true,
+            "screen_present": true,
+            "rows_present": false,
+            "canvas_count": 4,
+            "render_event_count": 91,
+            "data_event_count": 1,
+            "xterm_buffer_kind": "normal",
+            "xterm_cursor_hidden": false,
+            "host_rect": {"left": 277.0, "top": 40.0, "width": 883.0, "height": 872.0},
+            "host_content_width": 883.0,
+            "host_content_height": 872.0,
+            "screen_rect": {"width": 883.0, "height": 872.0},
+            "viewport_rect": {"width": 883.0, "height": 872.0},
+            "helpers_rect": {"width": 883.0, "height": 872.0},
+            "helper_textarea_rect": {"left": -9723.0, "top": 40.0, "width": 1.0, "height": 1.0}
+        });
+        assert_eq!(
+            terminal_host_problem_for_app_control(&host),
+            Some("active terminal host is still showing the transcript browser")
+        );
+    }
+
+    #[test]
+    fn describe_viewport_snapshot_rejects_input_enabled_transcript_browser_surface() {
         let snapshot = json!({
             "active_session_path": "remote-session://dev/live-codex",
             "active_view_mode": "Terminal",
@@ -2342,22 +2403,24 @@ Weekly limit:                21% left
             "preview_scroll_count": 1
         });
         let viewport = describe_viewport_snapshot(&snapshot, &dom);
-        assert_eq!(viewport.get("ready").and_then(Value::as_bool), Some(true));
+        assert_eq!(viewport.get("ready").and_then(Value::as_bool), Some(false));
         assert_eq!(
             viewport.get("interactive").and_then(Value::as_bool),
-            Some(true)
+            Some(false)
         );
         assert_eq!(
             viewport
                 .get("terminal_settled_kind")
                 .and_then(Value::as_str),
-            Some("interactive")
+            Some("problem")
         );
         assert_eq!(
             viewport
                 .get("active_terminal_surface")
                 .and_then(|surface| surface.get("problem")),
-            Some(&Value::Null)
+            Some(&Value::String(
+                "active terminal host is still showing the transcript browser".to_string()
+            ))
         );
     }
 

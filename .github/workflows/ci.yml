@@ -74,8 +74,9 @@ jobs:
           cargo test -p yggterm-server --no-default-features saved_session_reuses_recovered_interrupted_runtime_snapshot
           cargo test -p yggterm-server --no-default-features terminal_utf8_decoder_preserves_box_drawing_across_read_boundaries
           cargo test -p yggterm-server --no-default-features remote_resume_runtime_output_requires_restart_for_shell_prompt
-          cargo test -p yggterm-server --no-default-features remote_resume_seed_snapshot_prefill_keeps_recovered_transcript_after_breakage
-          cargo test -p yggterm-server --no-default-features remote_preview_payload_terminal_prefill_provides_scrollback
+          cargo test -p yggterm-server --no-default-features remote_resume_seed_snapshot_prefill_rejects_codex_role_transcript
+          cargo test -p yggterm-server --no-default-features remote_preview_payload_terminal_prefill_is_disabled_for_live_terminal
+          cargo test -p yggterm-server --no-default-features startup_prewarm_is_enabled_by_default_and_still_filters_runtime_owned_paths
           cargo test -p yggterm-shell --no-default-features linux_desktop_app_id_ignores_update_handoff_multi_window_env
           cargo test -p yggterm-shell --no-default-features retained_ready_remote_host_reuses_bootstrap_on_focus_return
           cargo test -p yggterm-shell --no-default-features remote_resume_bootstrap_epoch_stays_stable_until_failure
@@ -89,6 +90,9 @@ jobs:
           cargo test -p yggterm-shell --no-default-features remote_resume_visual_reveal_accepts_codex_prompt_ready_tail_after_transcript
           cargo test -p yggterm-shell --no-default-features terminal_host_problem_accepts_input_enabled_codex_status_surface
           cargo test -p yggterm-shell --no-default-features terminal_host_problem_accepts_remote_codex_prompt_only_surface_with_real_output
+          cargo test -p yggterm-shell --no-default-features terminal_host_problem_rejects_input_enabled_transcript_browser_surface
+          cargo test -p yggterm-shell --no-default-features terminal_host_problem_rejects_codex_role_transcript_surface
+          cargo test -p yggterm-shell --no-default-features remote_resume_surface_connected_rejects_live_transcript_browser_surface
           cargo test -p yggterm-shell --no-default-features viewport_surface_problem_demotes_latched_ready_attempt
           cargo test -p yggterm-shell --no-default-features retained_remote_lost_scrollback_invalidates_live_host
           cargo test -p yggterm-shell --no-default-features retained_fault_bootstrap_uses_live_active_session_when_snapshot_is_stale

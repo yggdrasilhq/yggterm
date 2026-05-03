@@ -5635,31 +5635,17 @@ fn quiet_retained_remote_surface_ready(
     true
 }
 fn retained_remote_transcript_browser_surface_ready(
-    is_remote_resume_session: bool,
-    terminal_paint_seen: bool,
-    geometry_ready: bool,
-    host_has_transport_error: bool,
-    runtime_running: bool,
-    host_health_cursor_line_text: &str,
-    host_health_text_tail: &str,
-    host_health_rows: u16,
-    host_health_blank_rows_below_cursor: u16,
+    _is_remote_resume_session: bool,
+    _terminal_paint_seen: bool,
+    _geometry_ready: bool,
+    _host_has_transport_error: bool,
+    _runtime_running: bool,
+    _host_health_cursor_line_text: &str,
+    _host_health_text_tail: &str,
+    _host_health_rows: u16,
+    _host_health_blank_rows_below_cursor: u16,
 ) -> bool {
-    if !is_remote_resume_session
-        || !terminal_paint_seen
-        || !geometry_ready
-        || host_has_transport_error
-        || !runtime_running
-        || !terminal_host_prompt_layout_is_acceptable(
-            host_health_rows,
-            host_health_blank_rows_below_cursor,
-        )
-    {
-        return false;
-    }
-    let host_surface_text =
-        terminal_host_surface_text(host_health_cursor_line_text, host_health_text_tail);
-    terminal_chunk_is_transcript_browser(host_surface_text)
+    false
 }
 fn upsert_terminal_resume_notification(
     state: Signal<ShellState>,
@@ -36499,7 +36485,7 @@ fn remote_resume_surface_connected(
     runtime_running: bool,
 ) -> bool {
     if saw_transcript_browser_output {
-        return runtime_running && saw_visible_output;
+        return false;
     }
     if saw_codex_prompt_surface {
         return runtime_running && saw_visible_output;
@@ -36660,6 +36646,17 @@ fn format_terminal_prefill_text(text: &str) -> String {
     }
 }
 fn remote_terminal_prefill_text(session: &ManagedSessionView) -> Option<String> {
+    let _ = session;
+    None
+}
+fn remote_terminal_placeholder_text(
+    session: &ManagedSessionView,
+    active_summary: Option<&str>,
+) -> Option<String> {
+    let _ = (session, active_summary);
+    None
+}
+fn remote_terminal_prefill_text_before_2_1_103(session: &ManagedSessionView) -> Option<String> {
     if remote_session_starts_new_codex(session) {
         return None;
     }
@@ -36675,11 +36672,11 @@ fn remote_terminal_prefill_text(session: &ManagedSessionView) -> Option<String> 
             }
         })
 }
-fn remote_terminal_placeholder_text(
+fn remote_terminal_placeholder_text_before_2_1_103(
     session: &ManagedSessionView,
     active_summary: Option<&str>,
 ) -> Option<String> {
-    remote_terminal_prefill_text(session).or_else(|| {
+    remote_terminal_prefill_text_before_2_1_103(session).or_else(|| {
         active_summary
             .map(str::trim)
             .filter(|text| terminal_resume_excerpt_is_meaningful(text))
@@ -52922,7 +52919,7 @@ uto-reviewer subagent.
         ));
     }
     #[test]
-    fn retained_transcript_browser_surface_is_ready_when_runtime_is_running() {
+    fn retained_transcript_browser_surface_is_not_ready_even_when_runtime_is_running() {
         let tail = "\
 / T R A N S C R I P T /
 
@@ -52931,7 +52928,7 @@ Published v2.1.50
 q to quit   pgup/pgdn to page   enter to edit message
 ";
         assert!(!retained_remote_surface_has_non_prompt_text("", tail));
-        assert!(retained_remote_transcript_browser_surface_ready(
+        assert!(!retained_remote_transcript_browser_surface_ready(
             true,
             true,
             true,
@@ -59499,12 +59496,7 @@ q to quit   pgup/pgdn to page   enter to edit message
                 "This machine has ip 192.0.2.12. But I can ssh from 192.0.2.11 and the internet works."
             )
         );
-        assert_eq!(
-            remote_terminal_prefill_text(&session).as_deref(),
-            Some(
-                "This machine has ip 192.0.2.12. But I can ssh from 192.0.2.11 and the internet works.\r\n"
-            )
-        );
+        assert_eq!(remote_terminal_prefill_text(&session), None);
     }
 
     #[test]
@@ -59563,7 +59555,7 @@ q to quit   pgup/pgdn to page   enter to edit message
         );
         assert_eq!(
             remote_terminal_placeholder_text(&session, Some("Waiting on real remote output")),
-            Some("Waiting on real remote output\r\n".to_string())
+            None
         );
     }
 
@@ -59762,8 +59754,8 @@ Updated at   Branch  Conversation\n\
         ));
     }
     #[test]
-    fn remote_resume_surface_connected_accepts_live_transcript_browser_surface() {
-        assert!(remote_resume_surface_connected(
+    fn remote_resume_surface_connected_rejects_live_transcript_browser_surface() {
+        assert!(!remote_resume_surface_connected(
             false, true, false, true, false, false, false, false, false, true,
         ));
     }
@@ -59945,8 +59937,8 @@ Updated at   Branch  Conversation\n\
         ));
     }
     #[test]
-    fn remote_resume_attach_confirmation_accepts_live_transcript_browser_after_deadline() {
-        assert!(remote_resume_attach_confirmation_satisfied(
+    fn remote_resume_attach_confirmation_rejects_live_transcript_browser_after_deadline() {
+        assert!(!remote_resume_attach_confirmation_satisfied(
             false,
             true,
             false,
@@ -60039,7 +60031,7 @@ Updated at   Branch  Conversation\n\
         ));
     }
     #[test]
-    fn suppress_resume_output_allows_live_transcript_browser_surface() {
+    fn suppress_resume_output_rejects_live_transcript_browser_surface() {
         assert!(!should_suppress_remote_resume_surface_output(
             true, false, false, true, false, false, false, false, false, false, false, false, true,
         ));
