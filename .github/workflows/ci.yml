@@ -77,6 +77,7 @@ jobs:
           cargo test -p yggterm-server --no-default-features remote_resume_seed_snapshot_prefill_rejects_codex_role_transcript
           cargo test -p yggterm-server --no-default-features remote_preview_payload_terminal_prefill_is_disabled_for_live_terminal
           cargo test -p yggterm-server --no-default-features startup_prewarm_is_enabled_by_default_and_still_filters_runtime_owned_paths
+          cargo test -p yggterm-server --no-default-features startup_prewarm_skips_remote_snapshot_seed_for_latency_budget
           cargo test -p yggterm-server --no-default-features versioned_server_status_probe_paths_dedupe_symlink_aliases_before_status
           cargo test -p yggterm-shell --no-default-features linux_desktop_app_id_ignores_update_handoff_multi_window_env
           cargo test -p yggterm-shell --no-default-features retained_ready_remote_host_reuses_bootstrap_on_focus_return
