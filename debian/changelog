@@ -1,3 +1,12 @@
+yggterm (2.1.100-1) unstable; urgency=medium
+
+  * Preserve retained remote Codex scrollback when switching sessions.
+  * Keep app-owned terminal input and resize proof paths out of desktop-wide
+    keyboard or pointer synthesis.
+  * Expose skipped xterm fit decisions through app-control diagnostics.
+
+ -- Yggdrasil HQ <avi@gour.top>  Sun, 03 May 2026 13:59:11 +0530
+
 yggterm (2.1.98-1) unstable; urgency=medium
 
   * Restore terminal TUI visual richness by preserving native ANSI colors.

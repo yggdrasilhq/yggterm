@@ -4,6 +4,14 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+## 2.1.100
+
+- Fixed retained remote Codex restore/input after stale runtime reuse: `resume-codex --require-existing` now goes through the daemon ensure/restart checks before bridging, so shell-prompt or interrupted runtimes are restarted instead of being exposed as an input-enabled xterm.
+- Tightened terminal readiness observability so a previously ready terminal open attempt is demoted when later app-control state reports a non-ready surface, and the smoke harness now fails that contradictory state.
+- Kept terminal input proof on app-owned paths by default. The xterm probe uses `--ctrl-u`/`--enter`, saved transcript transport errors no longer mask visible-echo failures, and desktop-wide keyboard synthesis is blocked unless explicitly opted in for a local unsafe run.
+- Prevented inactive retained xterm hosts from accepting hidden/collapsed fit geometry, preserving remote scrollback and avoiding remount-style recovery when switching away to a local session and back.
+- Exposed skipped terminal fit decisions through app-control as `last_skipped_fit` and added `resize-window` to `yggterm-headless` so resize/viewport hang proofs can use the same app-owned control path as other terminal smokes.
+
 ## 2.1.99
 
 - Fixed remote retained-session switching so xterm replays daemon-retained scrollback instead of remounting from a visible-only vt100 snapshot.
