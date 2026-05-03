@@ -1135,7 +1135,7 @@ fn initial_remote_attach_should_preserve_retained_chunks(
     }
     chunks
         .iter()
-        .any(|chunk| terminal_chunk_has_meaningful_attach_text(&chunk.data))
+        .any(|chunk| terminal_chunk_has_scrollback_text(&chunk.data))
 }
 
 fn select_remote_retained_initial_chunks(
@@ -2035,6 +2035,46 @@ mod tests {
 
         assert!(combined.contains("XYZdef"));
         assert!(!combined.contains("abcdef\rXYZ"));
+        runtime.shutdown(None).expect("shutdown test runtime");
+    }
+
+    #[test]
+    fn initial_remote_resume_attach_prefers_screen_snapshot_over_stale_prose_tail() {
+        let runtime = PtySessionRuntime::spawn(
+            "remote-session://oc/stale-prose",
+            "ssh -tt oc 'exec $HOME/.yggterm/bin/yggterm '\\''server'\\'' '\\''remote'\\'' '\\''resume-codex'\\'' '\\''stale-prose'\\'' '\\''/home/pi'\\'''",
+            None,
+            Some((100, 50)),
+        )
+        .expect("spawn test runtime");
+        runtime.seed_snapshot(
+            "\u{1b}[2J\u{1b}[H\u{1b}[48;1H› Write tests for @filename\n  gpt-5.5 xhigh · ~/gh/yggterm",
+        );
+        {
+            let stale_tail = "The commit and signed tag are pushed. I’m creating the GitHub release directly with the Linux installer archive, companion binaries, `.deb`, and checksums so the curl installer can resolve `v2.1.44` immediately; the tag workflow can still add any matrix artifacts afterward.\n";
+            let mut chunks = runtime.chunks.lock().expect("pty chunk lock poisoned");
+            chunks.clear();
+            chunks.push_back(TerminalChunk {
+                seq: 1,
+                data: stale_tail.to_string(),
+            });
+            runtime
+                .retained_bytes
+                .store(stale_tail.len(), Ordering::SeqCst);
+            runtime.seq.store(1, Ordering::SeqCst);
+        }
+
+        let result = runtime.read(0);
+        let combined = result
+            .chunks
+            .iter()
+            .map(|chunk| chunk.data.as_str())
+            .collect::<String>();
+        let visible = strip_terminal_control_sequences(&combined);
+
+        assert!(combined.contains("__YGGTERM_ATTACH_READY__"));
+        assert!(visible.contains("› Write tests for @filename"));
+        assert!(!visible.contains("GitHub release directly"));
         runtime.shutdown(None).expect("shutdown test runtime");
     }
 
