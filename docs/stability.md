@@ -8,6 +8,24 @@ The repeated bugs come from ownership ambiguity. The same visible session is cur
 
 The fix is not a larger feature. The fix is to make invalid state impossible or at least immediately visible to tests and app-control.
 
+## Single-Source Surface Contract
+
+Yggterm has two major session surfaces, and they intentionally have different truth sources.
+
+Terminal mode is a runtime attachment. It is analogous to opening Ghostty, SSHing to a machine, and attaching to a durable `screen`/`tmux` session. The user-visible xterm viewport must be fed by exactly one source: daemon-owned PTY bytes for the selected runtime, plus daemon-owned retained scrollback derived from those same bytes. If the runtime is unavailable, Terminal mode may show a runtime error. It may not fall back to preview text.
+
+Preview mode is session presentation. It is read-only inspection, shaped like a chat transcript or document view. It may render stored Codex JSONL, generated summaries, `USER`/`ASSISTANT` message blocks, timestamps, and other display copy. That data is useful for inspection, but it is not terminal output.
+
+The forbidden bridge is the important part:
+
+- Preview/transcript blocks must never seed, repair, or replace a Terminal-mode xterm buffer.
+- Codex cards, `/status` panels, model banners, prompt examples, or weekly-limit strings are not correctness contracts.
+- The active shell's display copy must never outrank the daemon's current runtime stream for Terminal mode.
+- A retained xterm host is a cache keyed by runtime identity and stream epoch. When it is stale or blank, rebuild from daemon runtime bytes, not from presentation data.
+- App-control must expose enough source metadata to prove which surface is being rendered, for example `terminal_source=runtime_stream` or `preview_source=presentation`.
+
+This is the core determinism rule: Terminal tests should use fake PTY streams, sequence numbers, and visible byte markers. Preview tests should use stored transcript/presentation fixtures. They should not assert on live Codex wording.
+
 ## Feature Freeze Rules
 
 - No new user-facing terminal/session feature work until the stability gates below pass on Linux/KDE, Windows, and macOS.
@@ -24,6 +42,7 @@ The fix is not a larger feature. The fix is to make invalid state impossible or 
 - Remote scanned sessions may appear in Terminal mode only when the remote scan says the runtime is live and the active session source is `LiveSsh`.
 - A retained terminal host may stay mounted only if its session identity still matches a live session or a deliberate recovery state.
 - Preview mode is read-only by default. Switching preview/terminal may not rewrite the session title, summary, identity, or runtime target.
+- Terminal mode and Preview mode must not repair each other. Preview can inspect the transcript of a runtime; Terminal can attach to a runtime. Neither surface is a fallback renderer for the other.
 - Clipboard paste is an owned runtime operation. `Ctrl+V`/`Cmd+V` must route through the native clipboard reader so images can be staged locally or through the remote Yggterm helper, and text can still paste normally.
 - Terminal input, scroll, focus, and retained-host recovery are one controller. A terminal that only scrolls, only types, or loses scrollback while composing input is an invalid user-visible state.
 - Context menus and destructive runtime affordances must use theme primitives. Hard-coded light-mode menus or live-session close buttons are regressions.
@@ -46,6 +65,10 @@ These checks should move closer to the reducer/state transitions over the next p
 
 The shell also exposes a copy-generation budget contract through `server app state`: `generation.implicit_copy_generation_enabled`, `generation.copy_generation_start_count`, and the title/precis/summary in-flight path arrays. Opening or selecting a row without an explicit regenerate action must leave the start counter unchanged.
 
+Terminal source ownership is an app-control contract. A Terminal-mode active host must report a runtime-backed source, a matching active session path, input routing to that same runtime, and a visible stream sequence or fingerprint that agrees with the daemon's current runtime snapshot. A Terminal-mode host that contains `USER:`/`ASSISTANT:` transcript labels, saved JSONL preview text, generated summaries, or other presentation-only blocks is invalid even if `input_enabled=true`.
+
+Preview source ownership is the mirror contract. Preview mode should expose presentation metadata and chat/document blocks, and it should not mount an input-enabled xterm host for the same surface unless the user explicitly switches to Terminal mode.
+
 Inline rename is also part of the observability contract. While rename mode is active, `server app state` must expose the controlled `shell.tree_rename_value`; when DOM snapshots degrade under KDE load, the action fallback should still expose `dom.tree_rename_input_value` for the visible input or leave the shell value available for smoke assertions.
 
 Titlebar search has the same proof requirement. When `shell.search_query` is non-empty or `shell.search_focused` is true, a degraded DOM snapshot must still expose the active search input rect and focused input value so the slow-typing regression cannot hide behind app-control timeouts.
@@ -54,7 +77,7 @@ Update restart protection is observable through persisted daemon state. A normal
 
 Native paste is observable through terminal events and app-control paste commands. A browser `Ctrl+V`/`Cmd+V` must emit the native paste request instead of relying on xterm.js to guess clipboard contents.
 
-Terminal typing proof is a viewport contract. Smokes that claim user-facing typing behavior should use `probe-type --mode keyboard --per-char` and require `visible_echo_observed=true` plus bounded `timings.visible_echo_ms`. In canvas renderer mode the proof must come from the xterm buffer/cursor sample, not `host.innerText`, because DOM rows are absent by design. `--per-char` dispatches character-level keyboard events without artificial per-character sleeps; if it reports slow echo, treat that as app/input-path latency rather than probe pacing. App-control direct PTY sends may prepare state, but interrupt bytes are split from following command bytes so prompt recovery cannot hide a dropped first character.
+Terminal typing proof is a viewport contract. Smokes that claim user-facing typing behavior should use `probe-type --mode keyboard --per-char` and require `visible_echo_observed=true` plus bounded `timings.visible_echo_ms`. In canvas renderer mode the proof must come from the xterm buffer/cursor sample, not `host.innerText`, because DOM rows are absent by design. `--per-char` dispatches character-level keyboard events without artificial per-character sleeps; if it reports slow echo, treat that as app/input-path latency rather than probe pacing. App-control direct PTY sends may prepare state, but interrupt bytes are split from following command bytes so prompt recovery cannot hide a dropped first character. For Codex-class live smoke tests, prefer a non-submitted marker echo plus clear-line proof over `/status` output; `/status` text is Codex UI and is not deterministic enough for CI.
 
 Latency is also a smoke-test contract. `scripts/smoke_ui_latency.py` measures state, rows, search, right-panel, and active terminal input latency against app-control budgets. Before typing, it rejects the blank-host failure class by requiring the active terminal to be rendered, interactive, out of `terminal_attach_in_flight`, backed by a mounted xterm viewport, and input-enabled. Use `--clear-after` for live terminal probes so the smoke clears the prompt before and after short marker samples, preventing line wrapping from hiding an otherwise visible echo. Use it for live incident reports and CI-style regressions instead of relying on subjective typing feel alone.
 The default budgets are tuned for live SSH-driven app-control proof: 1200 ms for state/rows/search/panel command round trips, 500 ms for any individual terminal visible echo, and 450 ms for terminal visible-echo p95. Tighten those flags for local CI runs that do not include SSH/process-start overhead.

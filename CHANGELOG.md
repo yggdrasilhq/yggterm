@@ -4,6 +4,13 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+## 2.1.109
+
+- Enforced the terminal single-source contract: Terminal mode is backed by the daemon-owned PTY/runtime stream and no longer accepts generated Codex card/status-copy surfaces as prompt-ready terminal truth.
+- Kept retained live remote terminal hosts attached while inactive, so switching away and back does not leave a visually cached xterm with a stopped read loop that accepts input but never receives stream output.
+- Replaced brittle Codex `/status` card regression gates with deterministic daemon-stream marker proof and retained-session hot-switch coverage.
+- Updated the YggUI app-control and changelog proof workflows so generic terminal input regressions are verified with deterministic marker echo/clear probes instead of Codex-specific output.
+
 ## 2.1.108
 
 - Restored the intended live-session lifecycle split: normal final app close prunes and gracefully closes non-Keep-Alive live sessions with one-hour force cleanup, while update restart still temporarily protects every recoverable live session.
