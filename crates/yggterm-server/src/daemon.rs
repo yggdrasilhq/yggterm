@@ -83,6 +83,9 @@ fn startup_prewarm_skip_reason_with_flag(active_path: &str, enabled: bool) -> Op
     if active_path.starts_with("live::") {
         return Some("runtime_owned_live_session");
     }
+    if active_path.starts_with("remote-session://") {
+        return Some("remote_startup_prewarm_deferred_for_latency");
+    }
     None
 }
 
@@ -778,6 +781,22 @@ impl DaemonRuntime {
         path: &str,
         initial_size: Option<(u16, u16)>,
     ) -> Result<Option<String>> {
+        self.ensure_terminal_for_path_with_initial_size_and_seed(path, initial_size, true)
+    }
+
+    fn ensure_terminal_for_path_for_startup_prewarm(
+        &mut self,
+        path: &str,
+    ) -> Result<Option<String>> {
+        self.ensure_terminal_for_path_with_initial_size_and_seed(path, None, false)
+    }
+
+    fn ensure_terminal_for_path_with_initial_size_and_seed(
+        &mut self,
+        path: &str,
+        initial_size: Option<(u16, u16)>,
+        seed_remote_snapshot: bool,
+    ) -> Result<Option<String>> {
         let runtime_path = self.terminal_runtime_key_for_path(path);
         let prepare_message = self.server.ensure_managed_cli_for_session_path(path)?;
         if path.starts_with("remote-session://")
@@ -856,43 +875,58 @@ impl DaemonRuntime {
                 }),
             );
         }
-        let seed_prefill = if path.starts_with("remote-session://") {
-            match self.server.remote_resume_seed_snapshot_for_path(path) {
-                Ok(Some(prefill)) => {
-                    if let Ok(home) = crate::resolve_yggterm_home() {
-                        append_trace_event(
-                            &home,
-                            "daemon",
-                            "terminal_ensure",
-                            "remote_resume_seed_snapshot",
-                            serde_json::json!({
-                                "path": path,
-                                "bytes": prefill.len(),
-                            }),
-                        );
+        let seed_prefill =
+            if terminal_ensure_should_seed_remote_snapshot(path, seed_remote_snapshot) {
+                match self.server.remote_resume_seed_snapshot_for_path(path) {
+                    Ok(Some(prefill)) => {
+                        if let Ok(home) = crate::resolve_yggterm_home() {
+                            append_trace_event(
+                                &home,
+                                "daemon",
+                                "terminal_ensure",
+                                "remote_resume_seed_snapshot",
+                                serde_json::json!({
+                                    "path": path,
+                                    "bytes": prefill.len(),
+                                }),
+                            );
+                        }
+                        Some(prefill)
                     }
-                    Some(prefill)
-                }
-                Ok(None) => self.server.remote_resume_seed_fallback_for_path(path),
-                Err(error) => {
-                    if let Ok(home) = crate::resolve_yggterm_home() {
-                        append_trace_event(
-                            &home,
-                            "daemon",
-                            "terminal_ensure",
-                            "remote_resume_seed_snapshot_error",
-                            serde_json::json!({
-                                "path": path,
-                                "error": error.to_string(),
-                            }),
-                        );
+                    Ok(None) => self.server.remote_resume_seed_fallback_for_path(path),
+                    Err(error) => {
+                        if let Ok(home) = crate::resolve_yggterm_home() {
+                            append_trace_event(
+                                &home,
+                                "daemon",
+                                "terminal_ensure",
+                                "remote_resume_seed_snapshot_error",
+                                serde_json::json!({
+                                    "path": path,
+                                    "error": error.to_string(),
+                                }),
+                            );
+                        }
+                        self.server.remote_resume_seed_fallback_for_path(path)
                     }
-                    self.server.remote_resume_seed_fallback_for_path(path)
                 }
-            }
-        } else {
-            None
-        };
+            } else {
+                if path.starts_with("remote-session://")
+                    && let Ok(home) = crate::resolve_yggterm_home()
+                {
+                    append_trace_event(
+                        &home,
+                        "daemon",
+                        "terminal_ensure",
+                        "remote_resume_seed_snapshot_skipped",
+                        serde_json::json!({
+                            "path": path,
+                            "reason": "startup_prewarm_latency_budget",
+                        }),
+                    );
+                }
+                None
+            };
         let fresh_remote_codex_start = self.server.session_starts_new_remote_codex(path);
         let remote_attach_startup_grace_ms = if fresh_remote_codex_start {
             REMOTE_START_CODEX_ATTACH_STARTUP_GRACE_MS
@@ -2126,6 +2160,10 @@ fn current_millis_u64() -> u64 {
     u64::try_from(current_millis()).unwrap_or(u64::MAX)
 }
 
+fn terminal_ensure_should_seed_remote_snapshot(path: &str, seed_remote_snapshot: bool) -> bool {
+    path.starts_with("remote-session://") && seed_remote_snapshot
+}
+
 fn mark_daemon_activity(last_activity_ms: &AtomicU64) {
     last_activity_ms.store(current_millis_u64(), Ordering::Relaxed);
 }
@@ -2935,7 +2973,7 @@ fn spawn_active_terminal_prewarm(
             );
             let outcome = {
                 let mut runtime = lock_daemon_runtime(&runtime, "startup_prewarm_ensure");
-                runtime.ensure_terminal_for_path(&path)
+                runtime.ensure_terminal_for_path_for_startup_prewarm(&path)
             };
             match outcome {
                 Ok(_) => {
@@ -4669,6 +4707,26 @@ mod tests {
             super::startup_prewarm_skip_reason_with_flag("codex://session", true),
             None
         );
+        assert_eq!(
+            super::startup_prewarm_skip_reason_with_flag("remote-session://dev/session", true),
+            Some("remote_startup_prewarm_deferred_for_latency")
+        );
+    }
+
+    #[test]
+    fn startup_prewarm_skips_remote_snapshot_seed_for_latency_budget() {
+        assert!(!super::terminal_ensure_should_seed_remote_snapshot(
+            "remote-session://dev/session",
+            false
+        ));
+        assert!(super::terminal_ensure_should_seed_remote_snapshot(
+            "remote-session://dev/session",
+            true
+        ));
+        assert!(!super::terminal_ensure_should_seed_remote_snapshot(
+            "local://shell",
+            true
+        ));
     }
 
     #[test]
