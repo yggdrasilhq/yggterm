@@ -59,13 +59,26 @@ fn daemon_env_flag_truthy(name: &str) -> bool {
     })
 }
 
+fn daemon_env_flag_falsey_value(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "0" | "false" | "no" | "off"
+    )
+}
+
 fn startup_prewarm_enabled() -> bool {
-    daemon_env_flag_truthy("YGGTERM_ENABLE_STARTUP_TERMINAL_PREWARM")
+    if daemon_env_flag_truthy("YGGTERM_DISABLE_STARTUP_TERMINAL_PREWARM") {
+        return false;
+    }
+    std::env::var("YGGTERM_ENABLE_STARTUP_TERMINAL_PREWARM")
+        .ok()
+        .map(|value| !daemon_env_flag_falsey_value(&value))
+        .unwrap_or(true)
 }
 
 fn startup_prewarm_skip_reason_with_flag(active_path: &str, enabled: bool) -> Option<&'static str> {
     if !enabled {
-        return Some("disabled_default");
+        return Some("disabled_by_env");
     }
     if active_path.starts_with("live::") {
         return Some("runtime_owned_live_session");
@@ -2862,66 +2875,88 @@ fn spawn_active_terminal_prewarm(
     home_dir: PathBuf,
 ) {
     std::thread::spawn(move || {
-        let active_path = {
+        let paths = {
             let runtime = lock_daemon_runtime(&runtime, "startup_prewarm_active_path");
+            let mut paths = Vec::<String>::new();
             if runtime.server.active_view_mode() == WorkspaceViewMode::Terminal
                 && runtime.server.active_session_supports_terminal()
             {
-                runtime.server.active_session_path().map(ToOwned::to_owned)
-            } else {
-                None
+                if let Some(path) = runtime.server.active_session_path().map(ToOwned::to_owned) {
+                    paths.push(path);
+                }
             }
+            for session in runtime.server.live_sessions() {
+                if runtime
+                    .server
+                    .session_supports_terminal(&session.session_path)
+                    && !paths.iter().any(|path| path == &session.session_path)
+                {
+                    paths.push(session.session_path);
+                }
+            }
+            paths
         };
-        let Some(active_path) = active_path else {
-            return;
-        };
-        if let Some(reason) = startup_prewarm_skip_reason(&active_path) {
-            append_trace_event(
-                &home_dir,
-                "daemon",
-                "startup_prewarm",
-                "skip",
-                serde_json::json!({
-                    "path": active_path,
-                    "reason": reason,
-                }),
-            );
+        if paths.is_empty() {
             return;
         }
         append_trace_event(
             &home_dir,
             "daemon",
             "startup_prewarm",
-            "begin",
-            serde_json::json!({ "path": active_path }),
+            "plan",
+            serde_json::json!({
+                "paths": paths.clone(),
+            }),
         );
-        let outcome = {
-            let mut runtime = lock_daemon_runtime(&runtime, "startup_prewarm_ensure");
-            runtime.ensure_terminal_for_active()
-        };
-        match outcome {
-            Ok(()) => {
-                mark_daemon_activity(last_activity_ms.as_ref());
+        for path in paths {
+            if let Some(reason) = startup_prewarm_skip_reason(&path) {
                 append_trace_event(
                     &home_dir,
                     "daemon",
                     "startup_prewarm",
-                    "end",
-                    serde_json::json!({ "path": active_path }),
-                );
-            }
-            Err(error) => {
-                append_trace_event(
-                    &home_dir,
-                    "daemon",
-                    "startup_prewarm",
-                    "error",
+                    "skip",
                     serde_json::json!({
-                        "path": active_path,
-                        "error": error.to_string(),
+                        "path": path,
+                        "reason": reason,
                     }),
                 );
-                warn!(path=%active_path, error=%error, "daemon startup terminal prewarm failed");
+                continue;
+            }
+            append_trace_event(
+                &home_dir,
+                "daemon",
+                "startup_prewarm",
+                "begin",
+                serde_json::json!({ "path": path }),
+            );
+            let outcome = {
+                let mut runtime = lock_daemon_runtime(&runtime, "startup_prewarm_ensure");
+                runtime.ensure_terminal_for_path(&path)
+            };
+            match outcome {
+                Ok(_) => {
+                    mark_daemon_activity(last_activity_ms.as_ref());
+                    append_trace_event(
+                        &home_dir,
+                        "daemon",
+                        "startup_prewarm",
+                        "end",
+                        serde_json::json!({ "path": path }),
+                    );
+                }
+                Err(error) => {
+                    append_trace_event(
+                        &home_dir,
+                        "daemon",
+                        "startup_prewarm",
+                        "error",
+                        serde_json::json!({
+                            "path": path,
+                            "error": error.to_string(),
+                        }),
+                    );
+                    warn!(path=%path, error=%error, "daemon startup terminal prewarm failed");
+                }
             }
         }
     });
@@ -4580,14 +4615,14 @@ mod tests {
     }
 
     #[test]
-    fn startup_prewarm_is_disabled_by_default_and_still_filters_runtime_owned_paths() {
+    fn startup_prewarm_is_enabled_by_default_and_still_filters_runtime_owned_paths() {
         assert_eq!(
             super::startup_prewarm_skip_reason_with_flag("local://shell", false),
-            Some("disabled_default")
+            Some("disabled_by_env")
         );
         assert_eq!(
             super::startup_prewarm_skip_reason_with_flag("codex://session", false),
-            Some("disabled_default")
+            Some("disabled_by_env")
         );
         assert_eq!(
             super::startup_prewarm_skip_reason_with_flag(

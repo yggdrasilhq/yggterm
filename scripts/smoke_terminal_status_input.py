@@ -137,6 +137,8 @@ def host_has_live_codex_prompt(host: dict) -> bool:
     input_ready = host.get("input_enabled") is True or host.get("helper_textarea_focused") is True
     if not input_ready:
         return False
+    if terminal_text_has_transcript_artifacts(terminal_host_text(host)):
+        return False
     return any(
         terminal_chunk_has_codex_prompt_output(chunk)
         for chunk in terminal_host_text_chunks(host)
@@ -174,6 +176,11 @@ def codex_status_command_echo_count(text: str) -> int:
 
 def assert_single_clean_codex_status_surface(host: dict, *, context: str) -> dict:
     text = codex_status_viewport_text(host)
+    if terminal_text_has_transcript_artifacts(text):
+        raise AssertionError(
+            f"{context}: terminal viewport contains saved Codex transcript artifacts: "
+            f"text_tail={text[-1600:]!r}"
+        )
     replacement_count = text.count("\ufffd")
     if replacement_count:
         raise AssertionError(
@@ -195,6 +202,23 @@ def assert_single_clean_codex_status_surface(host: dict, *, context: str) -> dic
 
 def terminal_host_text(host: dict) -> str:
     return "\n".join(terminal_host_text_chunks(host))
+
+
+def terminal_text_has_transcript_artifacts(text: str) -> bool:
+    lines = [line.strip().lower() for line in str(text or "").splitlines() if line.strip()]
+    role_lines = [
+        line
+        for line in lines
+        if line in ("user:", "assistant:")
+        or line.startswith("user: ")
+        or line.startswith("assistant: ")
+    ]
+    joined = " ".join(lines)
+    transcript_browser = (
+        "t r a n s c r i p t" in joined
+        or ("transcript" in joined and ("q to quit" in joined or "pgup/pgdn" in joined))
+    )
+    return (len(role_lines) >= 2 and len(lines) >= 4) or transcript_browser
 
 
 def terminal_host_text_chunks(host: dict) -> list[str]:
