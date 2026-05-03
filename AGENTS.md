@@ -61,6 +61,7 @@ Build **Yggdrasil Terminal**: a Rust-first, cross-platform, remote-first termina
 - Treat this as an integration-heavy systems project.
 - When adding code, include clear ownership boundaries between Rust app logic, PTY runtime, and any optional Ghostty FFI.
 - Prefer incremental, testable changes.
+- For every reported regression, update the harness, smoke test, unit test, or CI gate to fail on the exact defect class before applying the runtime fix. Do not accept a fix based only on manual observation when a deterministic regression can be captured.
 - Document integration assumptions in `README.md` or module-level docs.
 - Treat stale binary execution as destructive. Do not execute archived/versioned GUI binaries, old `dist/` artifacts, backup copies, or direct-install store entries just to inspect their version. In particular, never run globbed commands like `~/.local/share/yggterm/direct/versions/*/yggterm --version`; old GUI binaries may ignore CLI-only intent, launch against the live `~/.yggterm` state, and overwrite session metadata.
 - Prove versions from canonical metadata before installing, publishing, or replacing a running app: `Cargo.toml`/lockfile, changelog section, git commit/tag, release asset checksum, `install-state.json`, and the active launcher/headless path. If an executable must be probed, use the active launcher on 2.1.52+ or the exact active `yggterm-headless` sibling from `install-state.json`; otherwise isolate it with a temporary `HOME`/`YGGTERM_HOME` and no access to user state.
