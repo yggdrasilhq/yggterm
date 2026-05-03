@@ -1,4 +1,4 @@
-yggterm (2.1.102-1) unstable; urgency=medium
+yggterm (2.1.103-1) unstable; urgency=medium
 
   * Fix app-owned xterm wheel scrolling for retained remote Codex sessions.
   * Tighten remote Codex switch/scrollback smoke coverage and CI gates.
