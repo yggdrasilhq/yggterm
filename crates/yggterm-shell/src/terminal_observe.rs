@@ -795,6 +795,18 @@ fn terminal_host_problem_for_app_control(host: &Value) -> Option<&'static str> {
         .get("last_raw_payload_line_count")
         .and_then(Value::as_u64)
         .unwrap_or(0);
+    let last_raw_payload_length = host
+        .get("last_raw_payload_length")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let last_data_event_at_ms = host
+        .get("last_data_event_at_ms")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let write_command_count = host
+        .get("write_command_count")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
     let xterm_buffer_kind = host
         .get("xterm_buffer_kind")
         .and_then(Value::as_str)
@@ -824,8 +836,23 @@ fn terminal_host_problem_for_app_control(host: &Value) -> Option<&'static str> {
     let codex_interactive_setup_prompt =
         terminal_chunk_is_codex_interactive_setup_prompt(visible_text);
     let codex_prompt_surface = terminal_chunk_is_codex_prompt_surface(visible_text);
+    let remote_codex_prompt_has_real_output = data_event_count > 0
+        || last_data_event_at_ms > 0
+        || last_raw_payload_length > 0
+        || write_command_count > 0;
+    let live_remote_codex_prompt_only_surface = session_path.starts_with("remote-session://")
+        && !codex_prompt_surface
+        && terminal_chunk_has_codex_prompt_output(visible_text)
+        && mounted_entry_host_connected
+        && remote_codex_prompt_has_real_output
+        && (input_enabled || helper_textarea_focused || cursor_sample_visible)
+        && (xterm_present || screen_present || rows_present || canvas_count > 0)
+        && !terminal_chunk_is_transport_error(visible_text)
+        && !terminal_chunk_is_loading_placeholder(visible_text)
+        && !terminal_chunk_is_transcript_browser(visible_text)
+        && !terminal_chunk_is_generic_codex_idle(visible_text);
     let live_remote_codex_prompt_surface = session_path.starts_with("remote-session://")
-        && codex_prompt_surface
+        && (codex_prompt_surface || live_remote_codex_prompt_only_surface)
         && mounted_entry_host_connected
         && (xterm_present || screen_present || rows_present || canvas_count > 0);
     let transcript_browser_surface = terminal_chunk_is_transcript_browser(visible_text);
@@ -906,6 +933,7 @@ fn terminal_host_problem_for_app_control(host: &Value) -> Option<&'static str> {
     if session_path.starts_with("remote-session://")
         && terminal_chunk_has_codex_prompt_output(visible_text)
         && !codex_prompt_surface
+        && !live_remote_codex_prompt_only_surface
         && !codex_interactive_setup_prompt
         && rows >= 24
         && blank_rows_below_cursor > rows / 2
@@ -1854,6 +1882,42 @@ mod tests {
             terminal_host_problem_for_app_control(&host),
             Some("active remote Codex prompt surface is missing the welcome frame")
         );
+    }
+
+    #[test]
+    fn terminal_host_problem_accepts_remote_codex_prompt_only_surface_with_real_output() {
+        let text_tail = "⚠ Heads up, you have less than 25% of your weekly limit left. Run /status for a breakdown.\n\n\n› Write tests for @filename\n\n  gpt-5.5 xhigh · ~";
+        let host = json!({
+            "session_path": "remote-session://dev/prompt-only-codex",
+            "text_sample": text_tail,
+            "text_tail": text_tail,
+            "buffer_text_sample": text_tail,
+            "cursor_line_text": "› Write tests for @filename",
+            "input_enabled": true,
+            "helper_textarea_focused": true,
+            "xterm_present": true,
+            "screen_present": true,
+            "rows_present": false,
+            "canvas_count": 4,
+            "render_event_count": 980,
+            "data_event_count": 7,
+            "last_data_event_at_ms": 1777800290482_u64,
+            "last_raw_payload_length": 140,
+            "write_command_count": 7,
+            "xterm_buffer_kind": "normal",
+            "xterm_cursor_hidden": false,
+            "mounted_entry_host_connected": true,
+            "blank_rows_below_cursor": 43,
+            "rows": 48,
+            "host_rect": {"left": 0.0, "top": 0.0, "width": 840.0, "height": 830.0},
+            "host_content_width": 840.0,
+            "host_content_height": 830.0,
+            "screen_rect": {"width": 840.0, "height": 830.0},
+            "viewport_rect": {"width": 840.0, "height": 830.0},
+            "helpers_rect": {"width": 840.0, "height": 830.0},
+            "helper_textarea_rect": {"left": -10000.0, "top": 68.0, "width": 1.0, "height": 1.0}
+        });
+        assert_eq!(terminal_host_problem_for_app_control(&host), None);
     }
 
     #[test]

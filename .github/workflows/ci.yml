@@ -83,9 +83,12 @@ jobs:
           cargo test -p yggterm-shell --no-default-features retained_rehydrate_script_replays_only_collapsed_xterm_buffers
           cargo test -p yggterm-shell --no-default-features terminal_eval_script_defers_initial_blank_host_rebuild_until_after_first_paint_probe
           cargo test -p yggterm-shell --no-default-features terminal_eval_script_throttles_hot_render_bridge_work
+          cargo test -p yggterm-shell --no-default-features terminal_eval_script_focuses_host_and_scopes_wheel_capture
+          cargo test -p yggterm-shell --no-default-features terminal_eval_script_locks_even_one_line_scrollback
           cargo test -p yggterm-shell --no-default-features remote_resume_attach_confirmation_accepts_runtime_prompt_surface_after_deadline
           cargo test -p yggterm-shell --no-default-features remote_resume_visual_reveal_accepts_codex_prompt_ready_tail_after_transcript
           cargo test -p yggterm-shell --no-default-features terminal_host_problem_accepts_input_enabled_codex_status_surface
+          cargo test -p yggterm-shell --no-default-features terminal_host_problem_accepts_remote_codex_prompt_only_surface_with_real_output
           cargo test -p yggterm-shell --no-default-features viewport_surface_problem_demotes_latched_ready_attempt
           cargo test -p yggterm-shell --no-default-features retained_remote_lost_scrollback_invalidates_live_host
           cargo test -p yggterm-shell --no-default-features retained_fault_bootstrap_uses_live_active_session_when_snapshot_is_stale
