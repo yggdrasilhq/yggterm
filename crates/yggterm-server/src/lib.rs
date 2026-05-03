@@ -8982,22 +8982,7 @@ pub fn run_remote_resume_codex(
     };
     let _ = ensure_local_managed_cli(ManagedCliTool::Codex)?;
     let home = resolve_yggterm_home()?;
-    let runtime_key = remote_runtime_codex_session_key(session_id);
     let initial_size = current_tty_size();
-    if require_existing
-        && let Some(endpoint) = endpoint_with_live_remote_runtime(&home, &runtime_key)
-    {
-        finish_span(serde_json::json!({
-            "session_id": session_id,
-            "cwd": cwd,
-            "path": runtime_key,
-            "mode": "existing_daemon_runtime_bridge",
-            "require_existing": require_existing,
-            "initial_cols": initial_size.map(|(cols, _)| cols),
-            "initial_rows": initial_size.map(|(_, rows)| rows),
-        }));
-        return bridge_remote_runtime_session_stdio(&endpoint, &runtime_key);
-    }
     let endpoint = default_endpoint(&home);
     ensure_local_daemon_running(&endpoint)?;
     let key = daemon_ensure_remote_runtime_codex_session(
