@@ -151,6 +151,48 @@ def host_has_shell_status_failure(host: dict) -> bool:
     )
 
 
+def codex_status_viewport_text(host: dict) -> str:
+    for key in ("text_tail", "text_sample"):
+        value = str(host.get(key) or "")
+        if "Session:" in value or "Weekly limit:" in value or "/status" in value:
+            return value
+    return terminal_host_text(host)
+
+
+def codex_status_panel_count(text: str) -> int:
+    return str(text or "").count("Session:")
+
+
+def codex_status_command_echo_count(text: str) -> int:
+    count = 0
+    for line in str(text or "").splitlines():
+        stripped = strip_terminal_border(line)
+        if stripped == "/status":
+            count += 1
+    return count
+
+
+def assert_single_clean_codex_status_surface(host: dict, *, context: str) -> dict:
+    text = codex_status_viewport_text(host)
+    replacement_count = text.count("\ufffd")
+    if replacement_count:
+        raise AssertionError(
+            f"{context}: terminal viewport contains replacement characters in Codex status output: "
+            f"replacement_count={replacement_count} text_tail={text[-1200:]!r}"
+        )
+    panel_count = codex_status_panel_count(text)
+    if panel_count != 1:
+        raise AssertionError(
+            f"{context}: expected exactly one visible Codex status panel, saw {panel_count}: "
+            f"text_tail={text[-1600:]!r}"
+        )
+    return {
+        "status_panel_count": panel_count,
+        "replacement_char_count": replacement_count,
+        "text_tail": text[-500:],
+    }
+
+
 def terminal_host_text(host: dict) -> str:
     return "\n".join(terminal_host_text_chunks(host))
 
@@ -273,6 +315,15 @@ def main() -> int:
     with (out_dir / "ensure-live-codex.json").open("w") as fh:
         json.dump(ensure, fh, indent=2)
     before = ensure["state"]
+    before_status_text = codex_status_viewport_text(active_host(before))
+    if (
+        codex_status_command_echo_count(before_status_text) > 0
+        or codex_status_panel_count(before_status_text) > 0
+    ):
+        raise AssertionError(
+            "status smoke must start from a clean disposable Codex viewport, not a user session "
+            f"with prior /status output: text_tail={before_status_text[-1200:]!r}"
+        )
     with (out_dir / "before.json").open("w") as fh:
         json.dump(before, fh, indent=2)
     run(
@@ -365,6 +416,7 @@ def main() -> int:
         raise AssertionError("typed /status did not appear in terminal text sample")
     if "OpenAI Codex" not in terminal_text and "Session:" not in terminal_text:
         raise AssertionError("Codex status panel did not appear after /status")
+    status_surface = assert_single_clean_codex_status_surface(host, context="after /status")
     if selected_text_length <= 0:
         raise AssertionError(f"selection probe did not capture visible text: {select!r}")
 
@@ -381,6 +433,7 @@ def main() -> int:
         "rows_sample_color": host.get("rows_sample_color"),
         "dim_sample_color": host.get("dim_sample_color"),
         "low_contrast_span_count": host.get("low_contrast_span_count"),
+        "status_surface": status_surface,
         "text_tail": str(text_tail)[-400:],
     }
     with (out_dir / "summary.json").open("w") as fh:
