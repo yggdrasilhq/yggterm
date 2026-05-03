@@ -22217,6 +22217,7 @@ async fn probe_terminal_viewport_scroll_for(session_path: &str, lines: i32) -> V
                         xterm_mouse_tracking_mode: modes ? String(modes.mouseTrackingMode || '') : '',
                         wheel_event_count: Number(entry.wheelEventCount || 0),
                         scroll_event_count: Number(entry.scrollEventCount || 0),
+                        last_wheel_scroll_debug: entry.lastWheelScrollDebug || null,
                         data_event_count: Number(entry.dataEventCount || 0),
                         render_event_count: Number(entry.renderEventCount || 0),
                         text_head: String(host.innerText || "").trim().slice(0, 240),
@@ -39599,7 +39600,7 @@ fn terminal_eval_script_with_canvas_renderer(
                     const active = term.buffer.active;
                     const viewportY = Math.max(0, Number(active.viewportY || 0));
                     const baseY = Math.max(0, Number(active.baseY || 0));
-                    scrollbackLocked = viewportY + 1 < baseY;
+                    scrollbackLocked = viewportY < baseY;
                 }}
             }} catch (_error) {{
                 scrollbackLocked = false;
@@ -40170,7 +40171,82 @@ fn terminal_eval_script_with_canvas_renderer(
                 window.__yggtermXtermHosts[hostId].lastWheelDeltaY = Number(event.deltaY || 0);
             }}
             const deltaLines = Math.max(1, Math.round(Math.abs(event.deltaY) / 40));
-            term.scrollLines(event.deltaY > 0 ? deltaLines : -deltaLines);
+            const activeBuffer = term && term.buffer ? term.buffer.active : null;
+            const wheelDebug = {{
+                delta_y: Number(event.deltaY || 0),
+                delta_lines: deltaLines,
+                had_active_buffer: Boolean(activeBuffer),
+                before_viewport_y: activeBuffer ? Number(activeBuffer.viewportY || 0) : null,
+                before_base_y: activeBuffer ? Number(activeBuffer.baseY || 0) : null,
+            }};
+            if (activeBuffer) {{
+                const currentViewportY = Number(activeBuffer.viewportY || 0);
+                const baseY = Number(activeBuffer.baseY || 0);
+                const targetViewportY = Math.max(
+                    0,
+                    Math.min(baseY, currentViewportY + (event.deltaY > 0 ? deltaLines : -deltaLines)),
+                );
+                wheelDebug.target_viewport_y = targetViewportY;
+                if (typeof term.scrollToLine === "function") {{
+                    term.scrollToLine(targetViewportY);
+                    wheelDebug.used_scroll_to_line = true;
+                }}
+                wheelDebug.after_scroll_to_line_viewport_y = Number(activeBuffer.viewportY || 0);
+                const core = term && term._core ? term._core : null;
+                const bufferService = core
+                    ? (core._bufferService || core.bufferService || null)
+                    : null;
+                const internalBuffer = bufferService && bufferService.buffer
+                    ? bufferService.buffer
+                    : null;
+                wheelDebug.internal_ydisp_before = internalBuffer
+                    && Number.isFinite(Number(internalBuffer.ydisp))
+                    ? Number(internalBuffer.ydisp)
+                    : null;
+                if (
+                    internalBuffer
+                    && Number.isFinite(Number(internalBuffer.ydisp))
+                    && Number(activeBuffer.viewportY || 0) !== targetViewportY
+                ) {{
+                    internalBuffer.ydisp = targetViewportY;
+                    wheelDebug.used_internal_ydisp_repair = true;
+                    const renderService = core && core._renderService ? core._renderService : null;
+                    if (renderService && typeof renderService.refreshRows === "function") {{
+                        renderService.refreshRows(0, Math.max(0, Number(term.rows || 1) - 1));
+                        wheelDebug.used_refresh_rows = true;
+                    }}
+                    if (core && core._onScroll && typeof core._onScroll.fire === "function") {{
+                        core._onScroll.fire(targetViewportY);
+                        wheelDebug.used_on_scroll_fire = true;
+                    }}
+                }}
+                wheelDebug.after_internal_viewport_y = Number(activeBuffer.viewportY || 0);
+                wheelDebug.internal_ydisp_after = internalBuffer
+                    && Number.isFinite(Number(internalBuffer.ydisp))
+                    ? Number(internalBuffer.ydisp)
+                    : null;
+                const viewportElement = host.querySelector(".xterm-viewport");
+                if (viewportElement) {{
+                    wheelDebug.viewport_scroll_top_before = Number(viewportElement.scrollTop || 0);
+                    const dimensions = term && term._core && term._core._renderService
+                        ? term._core._renderService.dimensions
+                        : null;
+                    const cssCell = dimensions && dimensions.css && dimensions.css.cell
+                        ? dimensions.css.cell
+                        : null;
+                    const rowHeightPx = Math.max(1, Number(cssCell && cssCell.height ? cssCell.height : 0) || Number(term.options.fontSize || 18) || 18);
+                    viewportElement.scrollTop = targetViewportY * rowHeightPx;
+                    viewportElement.dispatchEvent(new Event("scroll", {{ bubbles: true }}));
+                    wheelDebug.viewport_scroll_top_after = Number(viewportElement.scrollTop || 0);
+                }}
+            }} else {{
+                const scrollLinesDelta = event.deltaY > 0 ? deltaLines : -deltaLines;
+                wheelDebug.scroll_lines_delta = scrollLinesDelta;
+                term.scrollLines(scrollLinesDelta);
+            }}
+            if (window.__yggtermXtermHosts && window.__yggtermXtermHosts[hostId]) {{
+                window.__yggtermXtermHosts[hostId].lastWheelScrollDebug = wheelDebug;
+            }}
             syncScrollbackLock();
             event.preventDefault();
             if (event.stopImmediatePropagation) {{
@@ -46306,6 +46382,30 @@ mod tests {
         assert!(script.contains("const setInputEnabled = (enabled, focus) => {"));
         assert!(script.contains("targetHost.addEventListener(\"wheel\", handleWheel"));
         assert!(
+            script.contains("currentViewportY + (event.deltaY > 0 ? deltaLines : -deltaLines)")
+        );
+        assert!(script.contains("term.scrollToLine(targetViewportY);"));
+        assert!(script.contains("internalBuffer.ydisp = targetViewportY;"));
+        assert!(
+            script
+                .contains("renderService.refreshRows(0, Math.max(0, Number(term.rows || 1) - 1));")
+        );
+        assert!(
+            script.contains("const viewportElement = host.querySelector(\".xterm-viewport\");")
+        );
+        assert!(
+            !script
+                .contains("const viewportElement = targetHost.querySelector(\".xterm-viewport\");"),
+            "wheel handler must not reference the attach callback parameter outside its scope"
+        );
+        assert!(script.contains("viewportElement.scrollTop = targetViewportY * rowHeightPx;"));
+        assert!(script.contains("lastWheelScrollDebug = wheelDebug;"));
+        assert!(
+            script
+                .contains("const scrollLinesDelta = event.deltaY > 0 ? deltaLines : -deltaLines;")
+        );
+        assert!(script.contains("term.scrollLines(scrollLinesDelta);"));
+        assert!(
             script.contains("targetHost.addEventListener(\"pointerdown\", handleHostPointerFocus")
         );
         assert!(
@@ -47261,6 +47361,20 @@ mod tests {
         assert!(
             script.contains("if (nextPaintKey !== lastPaintKey) {"),
             "paint events should only notify dioxus when the visible paint shape changes"
+        );
+    }
+
+    #[test]
+    fn terminal_eval_script_locks_even_one_line_scrollback() {
+        let theme = terminal_theme(UiTheme::ZedLight, palette(UiTheme::ZedLight), 13.0, "");
+        let script = terminal_eval_script("yggterm-terminal-test", &theme, true);
+        assert!(
+            script.contains("scrollbackLocked = viewportY < baseY;"),
+            "any viewport above xterm's bottom, including one retained scrollback line, must block follow-to-bottom"
+        );
+        assert!(
+            !script.contains("scrollbackLocked = viewportY + 1 < baseY;"),
+            "one-line scrollback must not be treated as near-bottom or remote panes snap back while scrolling"
         );
     }
 

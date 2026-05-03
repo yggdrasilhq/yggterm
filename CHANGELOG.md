@@ -4,6 +4,13 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+## 2.1.102
+
+- Fixed remote Codex session switching and scrollback probes so app-owned wheel input moves the xterm viewport instead of only incrementing wheel counters.
+- Accepted real remote Codex prompt-only startup surfaces when runtime output and input evidence prove the session is live, preventing false loading/recovery UX when switching back to remote sessions.
+- Tightened the remote Codex smoke harness to seed and require scrollback movement, keep cleanup on app-control APIs, and fail the exact one-line scrollback snap-back regression that was missed before.
+- Added CI coverage for remote prompt-only readiness, xterm wheel bridge scoping, and one-line scrollback locking.
+
 ## 2.1.101
 
 - Preserved rich TUI glyph rendering by decoding PTY output as a continuous UTF-8 stream instead of lossy-decoding each read chunk, preventing split box-drawing and progress glyphs from turning into replacement characters.
