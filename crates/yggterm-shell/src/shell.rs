@@ -10,11 +10,12 @@ use crate::terminal_observe::{
     terminal_chunk_has_generic_codex_idle_footer, terminal_chunk_has_meaningful_output,
     terminal_chunk_has_prompt_output, terminal_chunk_has_visible_output,
     terminal_chunk_is_codex_interactive_setup_prompt, terminal_chunk_is_codex_prompt_surface,
-    terminal_chunk_is_generic_codex_idle, terminal_chunk_is_loading_placeholder,
-    terminal_chunk_is_local_codex_scaffold, terminal_chunk_is_low_signal_terminal_noise,
-    terminal_chunk_is_saved_transcript_prefill, terminal_chunk_is_transcript_browser,
-    terminal_chunk_is_transport_error, terminal_open_attempt_failure_reason_from_viewport,
-    terminal_open_attempt_state_label, terminal_tail_excerpt,
+    terminal_chunk_is_generic_codex_idle,
+    terminal_chunk_is_loading_placeholder, terminal_chunk_is_local_codex_scaffold,
+    terminal_chunk_is_low_signal_terminal_noise, terminal_chunk_is_saved_transcript_prefill,
+    terminal_chunk_is_transcript_browser, terminal_chunk_is_transport_error,
+    terminal_open_attempt_failure_reason_from_viewport, terminal_open_attempt_state_label,
+    terminal_tail_excerpt,
 };
 #[cfg(test)]
 use crate::terminal_observe::{
@@ -98,7 +99,7 @@ use yggterm_server::{
     AppControlRightPanelMode, AppControlViewMode, GhosttyTerminalHostMode, ManagedSessionView,
     PreviewTone, ProbeTerminalViewportInputMode, RemoteDeployState, RemoteMachineHealth,
     RemoteMachineSnapshot, RemoteScannedSession, ServerEndpoint, ServerRuntimeStatus,
-    ServerUiSnapshot, SessionKind, SessionMetadataEntry, SessionPreviewBlock,
+    ServerUiSnapshot, SessionKind, SessionMetadataEntry, SessionPreviewBlock, SnapshotSessionView,
     SessionRenderedSection, SessionSource, SshConnectTarget, TerminalBackend, WorkspaceViewMode,
     YGG_LOADING_NOTIFICATION_AFTER_MS, YggOperationPriority, YggRequestMeta, YggSurface, YggTarget,
     YggtermServer, app_control_requests_pending, cleanup_legacy_daemons,
@@ -142,6 +143,7 @@ const UI_TELEMETRY_ROTATED_FILENAME: &str = "ui-telemetry.previous.jsonl";
 const UI_TELEMETRY_MAX_BYTES: u64 = 8 * 1024 * 1024;
 const UNMAXIMIZED_SHELL_RADIUS_PX: u8 = 10;
 const APP_CONTROL_TERMINAL_INTERRUPT_SETTLE_MS: u64 = 140;
+const APP_CONTROL_TERMINAL_ENTER_SETTLE_MS: u64 = 90;
 const UPDATE_RELAUNCH_AFTER_PID_ENV: &str = "YGGTERM_RELAUNCH_AFTER_PID";
 const TERMINAL_IMAGE_PASTE_DEDUPE_MS: u64 = 3_000;
 static SIDEBAR_MERGE_CACHE: OnceCell<Mutex<SidebarMergeCache>> = OnceCell::new();
@@ -211,6 +213,8 @@ const REMOTE_TERMINAL_RESUME_RECOVERY_STALL_MS: u64 = 3_000;
 const REMOTE_TERMINAL_START_CODEX_RECOVERY_STALL_MS: u64 = 18_000;
 const REMOTE_TERMINAL_RESUME_HARD_FAIL_MS: u64 = 24_000;
 const REMOTE_TERMINAL_RESUME_VISUAL_REVEAL_MS: u64 = 180;
+const REMOTE_LIVE_PREWARM_COLS: u16 = 110;
+const REMOTE_LIVE_PREWARM_ROWS: u16 = 50;
 const REMOTE_TERMINAL_ATTACH_CONFIRMATION_MIN_MS: u64 = 1_500;
 const REMOTE_TERMINAL_ATTACH_CONNECTED_GRACE_MS: u64 = 280;
 const STARTUP_TERMINAL_RESTORE_RECOVERY_MS: u64 = 5_000;
@@ -1024,6 +1028,55 @@ fn normalize_app_control_main_zoom_value(value: f32, view_mode: WorkspaceViewMod
 }
 fn terminal_geometry_is_usable(cols: u16, rows: u16) -> bool {
     cols >= 20 && rows >= 4
+}
+fn terminal_geometry_resize_should_send(
+    last_cols: u16,
+    last_rows: u16,
+    cols: u16,
+    rows: u16,
+) -> bool {
+    terminal_geometry_is_usable(cols, rows) && (last_cols != cols || last_rows != rows)
+}
+fn created_remote_terminal_should_prewarm(session_path: &str) -> bool {
+    session_path.starts_with("remote-session://") || session_path.starts_with("ssh://")
+}
+fn active_remote_recovery_snapshot_probe_should_start(
+    is_remote_resume_session: bool,
+    host_is_active_session: bool,
+    _retained_live: bool,
+    has_unready_open_attempt: bool,
+) -> bool {
+    is_remote_resume_session && host_is_active_session && has_unready_open_attempt
+}
+fn server_prompt_snapshot_replay_should_start(
+    is_remote_resume_session: bool,
+    host_is_active_session: bool,
+    attach_in_flight: bool,
+    has_unready_open_attempt: bool,
+) -> bool {
+    is_remote_resume_session
+        && host_is_active_session
+        && (attach_in_flight || has_unready_open_attempt)
+}
+fn server_prompt_snapshot_replay_identity(
+    mount_identity: &str,
+    replay_len: usize,
+    status_line_len: usize,
+    latest_unready_attempt_id: Option<&str>,
+) -> String {
+    format!(
+        "server-snapshot-replay:{mount_identity}:{replay_len}:{status_line_len}:{}",
+        latest_unready_attempt_id.unwrap_or("no-unready-attempt")
+    )
+}
+fn active_recovery_snapshot_probe_key(
+    mount_identity: &str,
+    latest_unready_attempt_id: Option<&str>,
+) -> String {
+    format!(
+        "active-recovery-snapshot:{mount_identity}:{}",
+        latest_unready_attempt_id.unwrap_or("no-unready-attempt")
+    )
 }
 fn row_supports_terminal(shell: &ShellState, row: &BrowserRow) -> bool {
     match row.kind {
@@ -3181,6 +3234,9 @@ impl ShellState {
     }
     fn terminal_session_is_retained_live(&self, session_path: &str) -> bool {
         let retained = self.retained_terminal_session_paths.contains(session_path);
+        let active_remote_terminal_session = self.server.active_view_mode() == WorkspaceViewMode::Terminal
+            && self.server.active_session_path() == Some(session_path)
+            && (session_path.starts_with("remote-session://") || session_path.starts_with("ssh://"));
         let non_prompt_recovering_attempt = self
             .latest_terminal_open_attempt_for_path(session_path)
             .is_some_and(|attempt| {
@@ -3203,7 +3259,38 @@ impl ShellState {
             && (((self.terminal_resume_ready_paths.contains(session_path)
                 || self.terminal_session_has_ready_attempt(session_path))
                 && !self.terminal_attach_in_flight.contains(session_path))
-                || (bootstrap_in_progress && has_host_epoch))
+                || (!active_remote_terminal_session && bootstrap_in_progress && has_host_epoch))
+    }
+    fn rearm_unready_remote_terminal_bootstrap_for_open(&mut self, session_path: &str) -> bool {
+        if !(session_path.starts_with("remote-session://") || session_path.starts_with("ssh://")) {
+            return false;
+        }
+        if self.terminal_session_is_retained_live(session_path)
+            || self.terminal_session_has_ready_attempt(session_path)
+        {
+            return false;
+        }
+        let had_inflight = self.terminal_attach_in_flight.remove(session_path);
+        let had_owner = self
+            .terminal_bootstrap_owner_by_session
+            .remove(session_path)
+            .is_some();
+        let had_lease = self
+            .terminal_bootstrap_lease_by_session
+            .remove(session_path)
+            .is_some();
+        let had_ready = self.terminal_resume_ready_paths.remove(session_path);
+        let had_host = self.terminal_session_host_id(session_path).is_some();
+        if !(had_inflight || had_owner || had_lease || had_ready || had_host) {
+            return false;
+        }
+        let _ = self.bump_terminal_mount_epoch_for_session(session_path);
+        if self.server.active_view_mode() == WorkspaceViewMode::Terminal
+            && self.server.active_session_path() == Some(session_path)
+        {
+            self.active_terminal_host_id = self.terminal_session_host_id(session_path);
+        }
+        true
     }
     fn terminal_session_should_render_retained(&self, session_path: &str) -> bool {
         self.retained_terminal_session_paths.contains(session_path)
@@ -5398,6 +5485,49 @@ fn remote_resume_visual_reveal_output_is_acceptable(
 fn remote_resume_host_surface_may_prove_live_terminal(placeholder_rendered: bool) -> bool {
     !placeholder_rendered
 }
+fn remote_resume_blank_host_snapshot_is_replayable(snapshot: &str) -> bool {
+    let trimmed = snapshot.trim();
+    let prompt_ready_snapshot = terminal_chunk_is_codex_prompt_surface(trimmed)
+        || terminal_chunk_is_codex_interactive_setup_prompt(trimmed)
+        || terminal_chunk_has_codex_prompt_output(trimmed)
+        || (terminal_chunk_has_prompt_output(trimmed)
+            && !terminal_chunk_is_generic_codex_idle(trimmed)
+            && !terminal_chunk_tail_is_generic_codex_idle(trimmed));
+    !trimmed.is_empty()
+        && terminal_chunk_has_visible_output(trimmed)
+        && prompt_ready_snapshot
+        && !trimmed.contains("__YGGTERM_ATTACH_READY__")
+        && !terminal_chunk_is_transport_error(trimmed)
+        && !terminal_chunk_is_loading_placeholder(trimmed)
+        && !terminal_chunk_is_transcript_browser(trimmed)
+        && !terminal_chunk_is_saved_transcript_prefill(trimmed)
+        && !terminal_chunk_is_low_signal_terminal_noise(trimmed)
+}
+fn remote_resume_snapshot_is_replayable_for_session(
+    snapshot: &str,
+    remote_starting_codex_session: bool,
+) -> bool {
+    if !remote_resume_blank_host_snapshot_is_replayable(snapshot) {
+        return false;
+    }
+    if !remote_starting_codex_session {
+        return true;
+    }
+    let trimmed = snapshot.trim();
+    terminal_chunk_is_codex_prompt_surface(trimmed)
+        || terminal_chunk_is_codex_interactive_setup_prompt(trimmed)
+        || terminal_chunk_has_codex_prompt_output(trimmed)
+}
+fn remote_resume_non_prompt_snapshot_is_replayable(
+    snapshot: &str,
+    host_health_cursor_line_text: &str,
+    host_health_text_tail: &str,
+) -> bool {
+    retained_remote_surface_has_non_prompt_text(
+        host_health_cursor_line_text,
+        host_health_text_tail,
+    ) && remote_resume_blank_host_snapshot_is_replayable(snapshot)
+}
 fn terminal_max_blank_rows_below_live_cursor(rows: u16) -> u16 {
     if rows >= 36 {
         3
@@ -5449,6 +5579,11 @@ fn remote_retained_surface_fault_should_invalidate(reason: Option<&str>) -> bool
     matches!(
         reason,
         Some("active remote terminal is input-enabled without a prompt-ready surface")
+            | Some(
+                "active remote terminal is showing stale retained text before prompt-ready surface"
+            )
+            | Some("active terminal host exists but xterm surface is empty")
+            | Some("active terminal host is still showing generic Codex idle chrome")
             | Some("active remote terminal lost expected scrollback after retained replay")
     )
 }
@@ -5510,6 +5645,31 @@ fn remote_resume_visual_reveal_can_complete(
         && replay_may_complete
         && reveal_ready
         && (deferred_output_ready || host_surface_ready)
+}
+fn fresh_remote_codex_start_surface_ready(
+    is_remote_resume_session: bool,
+    remote_starting_codex_session: bool,
+    attach_ready: bool,
+    visible_resume_surface: bool,
+    saw_prompt_ready_surface: bool,
+    saw_transcript_browser_output: bool,
+    saw_generic_idle_output: bool,
+    tail_generic_idle_output: bool,
+    saw_generic_idle_footer_output: bool,
+    tail_generic_idle_footer_output: bool,
+    saw_prompt_only_surface: bool,
+) -> bool {
+    is_remote_resume_session
+        && remote_starting_codex_session
+        && attach_ready
+        && visible_resume_surface
+        && saw_prompt_ready_surface
+        && !saw_transcript_browser_output
+        && !saw_generic_idle_output
+        && !tail_generic_idle_output
+        && !saw_generic_idle_footer_output
+        && !tail_generic_idle_footer_output
+        && !saw_prompt_only_surface
 }
 fn stale_remote_resume_retry_should_clear(
     is_remote_resume_session: bool,
@@ -9392,17 +9552,30 @@ fn spawn_open_session_row_with_mode_retry_inner(
         state.with_mut(|shell| {
             shell.show_start_page_when_no_live_sessions = false;
             shell.latest_open_request_id = shell.latest_open_request_id.saturating_add(1);
+            let open_request_id = shell.latest_open_request_id;
             shell.selected_tree_paths.clear();
             shell.selected_tree_paths.insert(row.full_path.clone());
             shell.selection_anchor = Some(row.full_path.clone());
             shell.browser.select_path(row.full_path.clone());
             shell.ensure_session_path_visible(&row.full_path);
             shell.server.set_view_mode(WorkspaceViewMode::Terminal);
+            shell.rearm_unready_remote_terminal_bootstrap_for_open(&row.full_path);
             shell
                 .server
                 .request_terminal_launch_for_path(&row.full_path);
             arm_terminal_activation(shell, &row.full_path);
             shell.retain_terminal_session_path(&row.full_path);
+            if !shell.terminal_session_is_retained_live(&row.full_path) {
+                shell.terminal_resume_ready_paths.remove(&row.full_path);
+                let request_id =
+                    format!("hot-terminal-open-{}-{open_request_id}", current_millis());
+                shell.begin_terminal_open_attempt(
+                    &row.full_path,
+                    &request_id,
+                    open_request_id,
+                    "hot_open_row",
+                );
+            }
             shell.context_menu_row = None;
             shell.clear_terminal_resume_notifications_except(Some(row.full_path.as_str()));
             shell.sync_browser_settings();
@@ -9479,6 +9652,7 @@ fn spawn_open_session_row_with_mode_retry_inner(
         shell.sync_browser_settings();
         if prefer_terminal {
             arm_terminal_activation(shell, &row.full_path);
+            shell.rearm_unready_remote_terminal_bootstrap_for_open(&row.full_path);
             retained_live_terminal = shell.terminal_session_is_retained_live(&row.full_path);
             shell.terminal_attach_in_flight.retain(|session_path| {
                 shell.retained_terminal_session_paths.contains(session_path)
@@ -10818,6 +10992,9 @@ fn is_live_sidebar_row(row: &BrowserRow) -> bool {
 
 fn session_is_hot_terminal_row(shell: &ShellState, row: &BrowserRow) -> bool {
     shell.terminal_session_is_retained_live(&row.full_path)
+        || shell.server.live_sessions().iter().any(|session| {
+            session.session_path == row.full_path && is_promoted_live_session(session)
+        })
         || shell.server.active_session().is_some_and(|session| {
             session.session_path == row.full_path && is_promoted_live_session(session)
         })
@@ -21969,6 +22146,21 @@ fn terminal_probe_input_script(
                     return String(sample.cursor_line_text || '').includes(text)
                         || String(sample.text_tail || '').includes(text);
                 }};
+                const textNewlyVisible = (sample) => {{
+                    if (!textVisible(sample)) {{
+                        return false;
+                    }}
+                    if (!textVisible(before)) {{
+                        return true;
+                    }}
+                    return (
+                        String(sample.cursor_line_text || '').includes(text)
+                            && !String(before.cursor_line_text || '').includes(text)
+                    ) || (
+                        String(sample.text_tail || '').includes(text)
+                            && String(sample.text_tail || '') !== String(before.text_tail || '')
+                    );
+                }};
                 const countersChanged = (sample) => {{
                     return Number(sample.data_event_count || 0) > Number(before.data_event_count || 0)
                         || Number(sample.write_command_count || 0) > Number(before.write_command_count || 0)
@@ -21981,7 +22173,7 @@ fn terminal_probe_input_script(
                     if (counterChangeAtMs === null && countersChanged(after)) {{
                         counterChangeAtMs = performance.now();
                     }}
-                    if (visibleEchoAtMs === null && textVisible(after)) {{
+                    if (visibleEchoAtMs === null && textNewlyVisible(after)) {{
                         visibleEchoAtMs = performance.now();
                         break;
                     }}
@@ -21994,9 +22186,10 @@ fn terminal_probe_input_script(
                 await settle(30);
                 after = snapshot();
                 const completedAtMs = performance.now();
-                const visibleEchoObserved = text ? textVisible(after) : counterChangeAtMs !== null;
+                const visibleEchoObserved = text ? textNewlyVisible(after) : counterChangeAtMs !== null;
                 const hasTransportError = terminalChunkIsTransportError(String(after.text_tail || ''));
-                const accepted = !hasTransportError && (!text || visibleEchoObserved);
+                const accepted = !hasTransportError
+                    && (!text || visibleEchoObserved || (pressEnter && counterChangeAtMs !== null));
                 dioxus.send({{
                     accepted,
                     reason: accepted ? null : (hasTransportError ? "terminal_transport_error_visible" : "visible_echo_missing"),
@@ -23462,6 +23655,7 @@ async fn process_pending_app_control_requests(
                     let cwd_for_task = cwd.clone();
                     let title_hint_for_task = title_hint.clone();
                     let requested_kind_for_task = requested_kind;
+                    let prewarm_endpoint = endpoint.clone();
                     let outcome = run_dedicated_interactive_request_io(
                         "app_control_create_terminal_remote",
                         &home,
@@ -23497,6 +23691,15 @@ async fn process_pending_app_control_requests(
                                     message.clone(),
                                 )));
                             });
+                            if let Some(created_path) = created_path.clone()
+                                && created_remote_terminal_should_prewarm(&created_path)
+                            {
+                                spawn_created_remote_terminal_prewarm(
+                                    prewarm_endpoint,
+                                    created_path,
+                                    home.clone(),
+                                );
+                            }
                             AppControlResponse {
                                 request_id: request.request_id.clone(),
                                 handled_by_pid: std::process::id(),
@@ -23586,7 +23789,7 @@ async fn process_pending_app_control_requests(
             let (endpoint, runtime_session_path, trace_home) = state.with(|shell| {
                 (
                     shell.bootstrap.server_endpoint.clone(),
-                    terminal_runtime_session_path(shell, &session_path),
+                    app_control_terminal_input_write_path(shell, &session_path),
                     perf_home_dir(&shell.bootstrap.settings_path),
                 )
             });
@@ -31382,10 +31585,13 @@ fn terminal_resume_context_fallback(
     Some((title, summary))
 }
 fn terminal_session_still_active(shell: &ShellState, session_path: &str, host_id: &str) -> bool {
-    shell.server.active_view_mode() == WorkspaceViewMode::Terminal
+    let active_terminal_session = shell.server.active_view_mode() == WorkspaceViewMode::Terminal
         && shell.server.active_session_path() == Some(session_path)
         && (shell.active_terminal_host_id.as_deref() == Some(host_id)
-            || shell.terminal_attach_in_flight.contains(session_path))
+            || shell.terminal_attach_in_flight.contains(session_path));
+    active_terminal_session
+        || (shell.terminal_session_is_retained_live(session_path)
+            && shell.terminal_session_host_id(session_path).as_deref() == Some(host_id))
 }
 fn terminal_session_should_bootstrap_host(
     shell: &ShellState,
@@ -31441,7 +31647,7 @@ fn acquire_terminal_bootstrap_lease(
                 == Some(owner_id);
             if owner_matches {
                 false
-            } else if shell.terminal_attach_in_flight.contains(session_path) {
+            } else if same_lease && shell.terminal_attach_in_flight.contains(session_path) {
                 false
             } else {
                 shell
@@ -32385,6 +32591,10 @@ fn TerminalCanvas(
         use_hook(|| std::rc::Rc::new(std::cell::RefCell::new(String::new()))).clone();
     let retained_rehydrate_identity =
         use_hook(|| std::rc::Rc::new(std::cell::RefCell::new(String::new()))).clone();
+    let server_snapshot_replay_identity =
+        use_hook(|| std::rc::Rc::new(std::cell::RefCell::new(String::new()))).clone();
+    let recovery_snapshot_probe_identity =
+        use_hook(|| std::rc::Rc::new(std::cell::RefCell::new(String::new()))).clone();
     let wait_trace_identity =
         use_hook(|| std::rc::Rc::new(std::cell::RefCell::new(String::new()))).clone();
     let inactive_bootstrap_skip_identity =
@@ -32734,6 +32944,357 @@ fn TerminalCanvas(
             ));
         });
     }
+    let server_prompt_replay = state.with(|shell| {
+        remote_live_session_prompt_ready_replay_text_for_active_session(
+            &session,
+            shell.server.live_sessions().iter(),
+            &session_path,
+        )
+    });
+    let (should_replay_server_prompt, latest_unready_attempt_id) = state.with(|shell| {
+        let latest_unready_attempt_id = shell
+            .latest_terminal_open_attempt_for_path(&session_path)
+            .filter(|attempt| !matches!(attempt.state, TerminalOpenAttemptState::Ready))
+            .map(|attempt| attempt.attempt_id.clone());
+        (
+            server_prompt_snapshot_replay_should_start(
+                is_remote_resume_session,
+                host_is_active_session,
+                shell.terminal_attach_in_flight.contains(&session_path),
+                latest_unready_attempt_id.is_some(),
+            ),
+            latest_unready_attempt_id,
+        )
+    });
+    if host_is_active_session && is_remote_resume_session && should_replay_server_prompt {
+        if let Some(replay) = server_prompt_replay.as_ref() {
+        let replay_identity = server_prompt_snapshot_replay_identity(
+            &mount_identity,
+            replay.len(),
+            session.status_line.len(),
+            latest_unready_attempt_id.as_deref(),
+        );
+        if should_replay_server_prompt
+            && *server_snapshot_replay_identity.borrow() != replay_identity
+        {
+            *server_snapshot_replay_identity.borrow_mut() = replay_identity;
+            let session_path_for_task = session_path.clone();
+            let replay_for_task = replay.clone();
+            let trace_home_for_task = trace_home.clone();
+            spawn(async move {
+                let _ = document::eval(&terminal_replay_retained_data_script_for_session(
+                    &session_path_for_task,
+                    &replay_for_task,
+                ));
+                append_trace_event(
+                    &trace_home_for_task,
+                    "ui",
+                    "terminal_mount",
+                    "server_prompt_snapshot_replay",
+                    json!({
+                        "session_path": session_path_for_task.clone(),
+                        "bytes": replay_for_task.len(),
+                    }),
+                );
+                set_signal_if_changed(terminal_resume_surface_staged, true);
+                set_signal_if_changed(terminal_has_meaningful_output, true);
+                set_signal_if_changed(terminal_prompt_only, false);
+                set_signal_if_changed(terminal_live_host_connected, true);
+                set_signal_if_changed(terminal_overlay_dismissed, true);
+                set_signal_if_changed(resume_overlay_failed, false);
+                set_signal_if_changed(resume_overlay_timed_out, false);
+                clear_terminal_resume_notification(state, &session_path_for_task);
+                let _ = safe_shell_mut(
+                    state,
+                    "terminal_attach_server_prompt_snapshot_replay",
+                    |shell| {
+                        shell.retain_terminal_session_path(&session_path_for_task);
+                        shell
+                            .terminal_resume_ready_paths
+                            .insert(session_path_for_task.clone());
+                        shell
+                            .terminal_attach_in_flight
+                            .remove(&session_path_for_task);
+                        shell.mark_terminal_open_attempt_ready_for_session(
+                            &session_path_for_task,
+                            "server_prompt_snapshot_replay",
+                        );
+                        shell.maybe_finish_terminal_surface_request_for_session(
+                            &session_path_for_task,
+                        );
+                    },
+                );
+                maybe_spawn_missing_remote_machine_refreshes(state);
+                maybe_spawn_missing_managed_cli_refreshes(state);
+            });
+        }
+        } else {
+            let replay_identity = format!(
+                "server-snapshot-replay-daemon:{mount_identity}:{}",
+                latest_unready_attempt_id.as_deref().unwrap_or("no-unready-attempt")
+            );
+            if *server_snapshot_replay_identity.borrow() != replay_identity {
+                *server_snapshot_replay_identity.borrow_mut() = replay_identity;
+                let endpoint_for_task = endpoint.clone();
+                let session_path_for_task = session_path.clone();
+                let trace_home_for_task = trace_home.clone();
+                spawn(async move {
+                    for attempt in 1_u64..=60 {
+                        let still_recovering = state.with(|shell| {
+                            shell.server.active_view_mode() == WorkspaceViewMode::Terminal
+                                && shell.server.active_session_path()
+                                    == Some(session_path_for_task.as_str())
+                                && shell
+                                    .latest_terminal_open_attempt_for_path(&session_path_for_task)
+                                    .is_some_and(|attempt| {
+                                        !matches!(attempt.state, TerminalOpenAttemptState::Ready)
+                                    })
+                        });
+                        if !still_recovering {
+                            break;
+                        }
+                        match daemon_snapshot_async(endpoint_for_task.clone(), &trace_home_for_task).await {
+                            Ok(snapshot) => {
+                                if let Some(snapshot_text) =
+                                    snapshot_session_prompt_ready_replay_text_for_session_path(
+                                        snapshot.live_sessions.iter(),
+                                        &session_path_for_task,
+                                    )
+                                {
+                                    let _ = document::eval(
+                                        &terminal_replay_retained_data_script_for_session(
+                                            &session_path_for_task,
+                                            &snapshot_text,
+                                        ),
+                                    );
+                                    append_trace_event(
+                                        &trace_home_for_task,
+                                        "ui",
+                                        "terminal_mount",
+                                        "daemon_server_prompt_snapshot_replay",
+                                        json!({
+                                            "session_path": session_path_for_task.clone(),
+                                            "attempt": attempt,
+                                            "bytes": snapshot_text.len(),
+                                        }),
+                                    );
+                                    set_signal_if_changed(terminal_resume_surface_staged, true);
+                                    set_signal_if_changed(terminal_has_meaningful_output, true);
+                                    set_signal_if_changed(terminal_prompt_only, false);
+                                    set_signal_if_changed(terminal_live_host_connected, true);
+                                    set_signal_if_changed(terminal_overlay_dismissed, true);
+                                    set_signal_if_changed(resume_overlay_failed, false);
+                                    set_signal_if_changed(resume_overlay_timed_out, false);
+                                    clear_terminal_resume_notification(state, &session_path_for_task);
+                                    let _ = safe_shell_mut(
+                                        state,
+                                        "terminal_attach_daemon_server_prompt_snapshot_replay",
+                                        |shell| {
+                                            shell.retain_terminal_session_path(&session_path_for_task);
+                                            shell
+                                                .terminal_resume_ready_paths
+                                                .insert(session_path_for_task.clone());
+                                            shell
+                                                .terminal_attach_in_flight
+                                                .remove(&session_path_for_task);
+                                            shell.mark_terminal_open_attempt_ready_for_session(
+                                                &session_path_for_task,
+                                                "daemon_server_prompt_snapshot_replay",
+                                            );
+                                            shell.maybe_finish_terminal_surface_request_for_session(
+                                                &session_path_for_task,
+                                            );
+                                        },
+                                    );
+                                    maybe_spawn_missing_remote_machine_refreshes(state);
+                                    maybe_spawn_missing_managed_cli_refreshes(state);
+                                    break;
+                                }
+                            }
+                            Err(error) => {
+                                append_trace_event(
+                                    &trace_home_for_task,
+                                    "ui",
+                                    "terminal_mount",
+                                    "daemon_server_prompt_snapshot_replay_error",
+                                    json!({
+                                        "session_path": session_path_for_task.clone(),
+                                        "attempt": attempt,
+                                        "error": error.to_string(),
+                                    }),
+                                );
+                            }
+                        }
+                        sleep(Duration::from_millis(if attempt < 8 { 750 } else { 1_500 })).await;
+                    }
+                });
+            }
+        }
+    }
+    let (should_start_recovery_snapshot_probe, latest_unready_attempt_id) = state.with(|shell| {
+        let latest_unready_attempt_id = shell
+            .latest_terminal_open_attempt_for_path(&session_path)
+            .filter(|attempt| !matches!(attempt.state, TerminalOpenAttemptState::Ready))
+            .map(|attempt| attempt.attempt_id.clone());
+        (
+            active_remote_recovery_snapshot_probe_should_start(
+            is_remote_resume_session,
+            host_is_active_session,
+            shell.terminal_session_is_retained_live(&session_path),
+                latest_unready_attempt_id.is_some(),
+            ),
+            latest_unready_attempt_id,
+        )
+    });
+    let recovery_snapshot_probe_key =
+        active_recovery_snapshot_probe_key(&mount_identity, latest_unready_attempt_id.as_deref());
+    if should_start_recovery_snapshot_probe
+        && *recovery_snapshot_probe_identity.borrow() != recovery_snapshot_probe_key
+    {
+        *recovery_snapshot_probe_identity.borrow_mut() = recovery_snapshot_probe_key;
+        let endpoint_for_task = endpoint.clone();
+        let runtime_session_path_for_task =
+            state.with(|shell| terminal_runtime_session_path(&shell, &session_path));
+        let session_path_for_task = session_path.clone();
+        let trace_home_for_task = trace_home.clone();
+        let remote_starting_codex_session_for_task = remote_starting_codex_session;
+        spawn(async move {
+            for attempt in 1_u64..=60 {
+                let still_recovering = state.with(|shell| {
+                    shell.server.active_view_mode() == WorkspaceViewMode::Terminal
+                        && shell.server.active_session_path()
+                            == Some(session_path_for_task.as_str())
+                        && shell
+                            .latest_terminal_open_attempt_for_path(&session_path_for_task)
+                            .is_some_and(|attempt| {
+                                !matches!(attempt.state, TerminalOpenAttemptState::Ready)
+                            })
+                });
+                if !still_recovering {
+                    break;
+                }
+                match terminal_snapshot_async(
+                    endpoint_for_task.clone(),
+                    runtime_session_path_for_task.clone(),
+                    &trace_home_for_task,
+                )
+                .await
+                {
+                    Ok((snapshot_text, running, runtime_output_seen))
+                        if remote_resume_snapshot_is_replayable_for_session(
+                            &snapshot_text,
+                            remote_starting_codex_session_for_task,
+                        ) =>
+                    {
+                        let _ = document::eval(&terminal_replay_retained_data_script_for_session(
+                            &session_path_for_task,
+                            &snapshot_text,
+                        ));
+                        append_trace_event(
+                            &trace_home_for_task,
+                            "ui",
+                            "terminal_mount",
+                            "active_recovery_snapshot_replay",
+                            json!({
+                                "session_path": session_path_for_task.clone(),
+                                "attempt": attempt,
+                                "bytes": snapshot_text.len(),
+                                "running": running,
+                                "runtime_output_seen": runtime_output_seen,
+                            }),
+                        );
+                        set_signal_if_changed(terminal_resume_surface_staged, true);
+                        set_signal_if_changed(terminal_has_meaningful_output, true);
+                        set_signal_if_changed(terminal_prompt_only, false);
+                        set_signal_if_changed(terminal_live_host_connected, true);
+                        set_signal_if_changed(terminal_overlay_dismissed, true);
+                        set_signal_if_changed(resume_overlay_failed, false);
+                        set_signal_if_changed(resume_overlay_timed_out, false);
+                        clear_terminal_resume_notification(state, &session_path_for_task);
+                        let _ = safe_shell_mut(
+                            state,
+                            "terminal_attach_active_recovery_snapshot_replay",
+                            |shell| {
+                                shell.retain_terminal_session_path(&session_path_for_task);
+                                shell
+                                    .terminal_resume_ready_paths
+                                    .insert(session_path_for_task.clone());
+                                shell
+                                    .terminal_attach_in_flight
+                                    .remove(&session_path_for_task);
+                                shell.mark_terminal_open_attempt_ready_for_session(
+                                    &session_path_for_task,
+                                    "active_recovery_snapshot_replay",
+                                );
+                                shell.maybe_finish_terminal_surface_request_for_session(
+                                    &session_path_for_task,
+                                );
+                            },
+                        );
+                        maybe_spawn_missing_remote_machine_refreshes(state);
+                        maybe_spawn_missing_managed_cli_refreshes(state);
+                        break;
+                    }
+                    Ok(_) | Err(_) => {
+                        if let Some(snapshot_text) = state.with(|shell| {
+                            remote_live_session_prompt_ready_replay_text_for_session_path(
+                                shell.server.live_sessions().iter(),
+                                &session_path_for_task,
+                            )
+                        }) {
+                            let _ = document::eval(&terminal_replay_retained_data_script_for_session(
+                                &session_path_for_task,
+                                &snapshot_text,
+                            ));
+                            append_trace_event(
+                                &trace_home_for_task,
+                                "ui",
+                                "terminal_mount",
+                                "active_recovery_server_prompt_snapshot_replay",
+                                json!({
+                                    "session_path": session_path_for_task.clone(),
+                                    "attempt": attempt,
+                                    "bytes": snapshot_text.len(),
+                                }),
+                            );
+                            set_signal_if_changed(terminal_resume_surface_staged, true);
+                            set_signal_if_changed(terminal_has_meaningful_output, true);
+                            set_signal_if_changed(terminal_prompt_only, false);
+                            set_signal_if_changed(terminal_live_host_connected, true);
+                            set_signal_if_changed(terminal_overlay_dismissed, true);
+                            set_signal_if_changed(resume_overlay_failed, false);
+                            set_signal_if_changed(resume_overlay_timed_out, false);
+                            clear_terminal_resume_notification(state, &session_path_for_task);
+                            let _ = safe_shell_mut(
+                                state,
+                                "terminal_attach_active_recovery_server_prompt_snapshot_replay",
+                                |shell| {
+                                    shell.retain_terminal_session_path(&session_path_for_task);
+                                    shell
+                                        .terminal_resume_ready_paths
+                                        .insert(session_path_for_task.clone());
+                                    shell
+                                        .terminal_attach_in_flight
+                                        .remove(&session_path_for_task);
+                                    shell.mark_terminal_open_attempt_ready_for_session(
+                                        &session_path_for_task,
+                                        "active_recovery_server_prompt_snapshot_replay",
+                                    );
+                                    shell.maybe_finish_terminal_surface_request_for_session(
+                                        &session_path_for_task,
+                                    );
+                                },
+                            );
+                            maybe_spawn_missing_remote_machine_refreshes(state);
+                            maybe_spawn_missing_managed_cli_refreshes(state);
+                            break;
+                        }
+                    }
+                }
+                sleep(Duration::from_millis(if attempt < 8 { 750 } else { 1_500 })).await;
+            }
+        });
+    }
     let retained_rehydrate_key = retained_rehydrate_identity_key(
         &session_path,
         &mount_identity,
@@ -33022,6 +33583,8 @@ fn TerminalCanvas(
             let endpoint = endpoint;
             let session_path = session_path;
             let runtime_session_path = runtime_session_path;
+            let terminal_input_session_path =
+                terminal_input_write_path_for_runtime(&session_path, runtime_session_path.clone());
             let host_id = host_id;
             let bootstrap_owner_identity = bootstrap_owner_identity;
             let bootstrap_lease_identity = bootstrap_lease_identity;
@@ -33306,6 +33869,9 @@ fn TerminalCanvas(
             let mut resume_runtime_linger_traced = false;
             let mut post_attach_read_recovery_attempts = 0_u64;
             let mut blank_retry_poison_recovery_attempts = 0_u64;
+            let mut non_prompt_retained_recovery_attempts = 0_u64;
+            let mut non_prompt_snapshot_replay_attempts = 0_u64;
+            let mut blank_host_snapshot_replay_attempts = 0_u64;
             let mut resume_visual_reveal_after_ms = None::<u64>;
             let mut first_resume_connected_output_ms = None::<u64>;
             let mut initial_read_retry_attempts = 0_u64;
@@ -33506,6 +34072,51 @@ fn TerminalCanvas(
                                     resize_seen = resize_seen || geometry_usable;
                                     terminal_geometry_ready =
                                         terminal_geometry_ready || geometry_usable;
+                                    if terminal_geometry_resize_should_send(
+                                        last_sent_terminal_resize_cols,
+                                        last_sent_terminal_resize_rows,
+                                        cols,
+                                        rows,
+                                    ) {
+                                        match terminal_resize_async(
+                                            endpoint.clone(),
+                                            runtime_session_path.clone(),
+                                            cols,
+                                            rows,
+                                        )
+                                        .await
+                                        {
+                                            Ok(()) => {
+                                                last_sent_terminal_resize_cols = cols;
+                                                last_sent_terminal_resize_rows = rows;
+                                                append_trace_event(
+                                                    &trace_home,
+                                                    "ui",
+                                                    "terminal_mount",
+                                                    "terminal_resize_from_paint",
+                                                    json!({
+                                                        "session_path": session_path.clone(),
+                                                        "cols": cols,
+                                                        "rows": rows,
+                                                    }),
+                                                );
+                                            }
+                                            Err(error) => {
+                                                append_trace_event(
+                                                    &trace_home,
+                                                    "ui",
+                                                    "terminal_mount",
+                                                    "terminal_resize_from_paint_error",
+                                                    json!({
+                                                        "session_path": session_path.clone(),
+                                                        "cols": cols,
+                                                        "rows": rows,
+                                                        "error": error.to_string(),
+                                                    }),
+                                                );
+                                            }
+                                        }
+                                    }
                                     if !terminal_paint_seen {
                                         append_trace_event(
                                             &trace_home,
@@ -33609,7 +34220,7 @@ fn TerminalCanvas(
                                 };
                                 if let Err(write_error) = terminal_write_async(
                                     endpoint.clone(),
-                                    runtime_session_path.clone(),
+                                    terminal_input_session_path.clone(),
                                     data.clone(),
                                 )
                                 .await
@@ -33891,8 +34502,8 @@ fn TerminalCanvas(
                                         "stale_retry_poison_cleared_from_host_health",
                                         json!({
                                             "session_path": session_path.clone(),
-                                            "cursor_line_text": cursor_line_text,
-                                            "text_tail": text_tail,
+                                            "cursor_line_text": cursor_line_text.clone(),
+                                            "text_tail": text_tail.clone(),
                                             "rows": rows,
                                             "blank_rows_below_cursor": blank_rows_below_cursor,
                                         }),
@@ -34035,6 +34646,189 @@ fn TerminalCanvas(
                                         enabled: false,
                                         focus: false,
                                     });
+                                    if non_prompt_snapshot_replay_attempts < 2 {
+                                        non_prompt_snapshot_replay_attempts += 1;
+                                        match terminal_snapshot_async(
+                                            endpoint.clone(),
+                                            runtime_session_path.clone(),
+                                            &trace_home,
+                                        )
+                                        .await
+                                        {
+                                            Ok((snapshot_text, running, runtime_output_seen))
+                                                if remote_resume_non_prompt_snapshot_is_replayable(
+                                                    &snapshot_text,
+                                                    &cursor_line_text,
+                                                    &text_tail,
+                                                ) =>
+                                            {
+                                                append_trace_event(
+                                                    &trace_home,
+                                                    "ui",
+                                                    "terminal_mount",
+                                                    "retained_non_prompt_snapshot_replay",
+                                                    json!({
+                                                        "session_path": session_path.clone(),
+                                                        "attempt": non_prompt_snapshot_replay_attempts,
+                                                        "bytes": snapshot_text.len(),
+                                                        "running": running,
+                                                        "runtime_output_seen": runtime_output_seen,
+                                                    }),
+                                                );
+                                                let _ = eval.send(terminal_reset_command(&title, &theme));
+                                                let _ = eval.send(TerminalJsCommand::Write {
+                                                    data: snapshot_text,
+                                                });
+                                                let _ = eval.send(TerminalJsCommand::Refit);
+                                                let _ = eval.send(TerminalJsCommand::SetInputEnabled {
+                                                    enabled: true,
+                                                    focus: true,
+                                                });
+                                                set_signal_if_changed(
+                                                    terminal_resume_surface_staged,
+                                                    true,
+                                                );
+                                                set_signal_if_changed(
+                                                    terminal_has_meaningful_output,
+                                                    true,
+                                                );
+                                                set_signal_if_changed(terminal_prompt_only, false);
+                                                set_signal_if_changed(
+                                                    terminal_live_host_connected,
+                                                    true,
+                                                );
+                                                set_signal_if_changed(
+                                                    terminal_overlay_dismissed,
+                                                    true,
+                                                );
+                                                set_signal_if_changed(resume_overlay_failed, false);
+                                                set_signal_if_changed(resume_overlay_timed_out, false);
+                                                resume_visual_reveal_after_ms = None;
+                                                post_attach_read_recovery_attempts = 0;
+                                                clear_terminal_resume_notification(
+                                                    state,
+                                                    &session_path,
+                                                );
+                                                let _ = safe_shell_mut(
+                                                    state,
+                                                    "terminal_attach_retained_non_prompt_snapshot_replay",
+                                                    |shell| {
+                                                        shell
+                                                            .retain_terminal_session_path(&session_path);
+                                                        shell
+                                                            .terminal_resume_ready_paths
+                                                            .insert(session_path.clone());
+                                                        shell.terminal_attach_in_flight
+                                                            .remove(&session_path);
+                                                        shell
+                                                            .mark_terminal_open_attempt_ready_for_session(
+                                                                &session_path,
+                                                                "retained_non_prompt_snapshot_replay",
+                                                            );
+                                                        shell
+                                                            .maybe_finish_terminal_surface_request_for_session(
+                                                                &session_path,
+                                                            );
+                                                    },
+                                                );
+                                                maybe_spawn_missing_remote_machine_refreshes(state);
+                                                maybe_spawn_missing_managed_cli_refreshes(state);
+                                                read_poll_ms = TERMINAL_ACTIVE_OUTPUT_READ_POLL_MS;
+                                                next_read_deadline = tokio::time::Instant::now()
+                                                    + Duration::from_millis(read_poll_ms);
+                                                continue;
+                                            }
+                                            Ok((snapshot_text, running, runtime_output_seen)) => {
+                                                append_trace_event(
+                                                    &trace_home,
+                                                    "ui",
+                                                    "terminal_mount",
+                                                    "retained_non_prompt_snapshot_replay_rejected",
+                                                    json!({
+                                                        "session_path": session_path.clone(),
+                                                        "attempt": non_prompt_snapshot_replay_attempts,
+                                                        "bytes": snapshot_text.len(),
+                                                        "running": running,
+                                                        "runtime_output_seen": runtime_output_seen,
+                                                    }),
+                                                );
+                                            }
+                                            Err(error) => {
+                                                append_trace_event(
+                                                    &trace_home,
+                                                    "ui",
+                                                    "terminal_mount",
+                                                    "retained_non_prompt_snapshot_replay_error",
+                                                    json!({
+                                                        "session_path": session_path.clone(),
+                                                        "attempt": non_prompt_snapshot_replay_attempts,
+                                                        "error": error.to_string(),
+                                                    }),
+                                                );
+                                            }
+                                        }
+                                    }
+                                    if non_prompt_retained_recovery_attempts < 2 {
+                                        non_prompt_retained_recovery_attempts += 1;
+                                        set_signal_if_changed(terminal_resume_surface_staged, false);
+                                        set_signal_if_changed(
+                                            terminal_has_meaningful_output,
+                                            false,
+                                        );
+                                        set_signal_if_changed(terminal_prompt_only, false);
+                                        resume_visual_reveal_after_ms = None;
+                                        resume_resize_nudged = false;
+                                        resume_post_attach_redraw_nudged = false;
+                                        resume_post_attach_replay_rebased = false;
+                                        resume_post_attach_replay_deadline_ms = None;
+                                        resume_attach_ready_cursor = 0;
+                                        remote_resume_meaningful_observations = 0;
+                                        traced_attach_ready = false;
+                                        traced_first_output = false;
+                                        traced_first_meaningful_output = false;
+                                        terminal_has_visible_output = false;
+                                        prompt_gap_resize_nudges = 0;
+                                        deferred_resume_output.clear();
+                                        first_resume_connected_output_ms = None;
+                                        append_trace_event(
+                                            &trace_home,
+                                            "ui",
+                                            "terminal_mount",
+                                            "retained_non_prompt_surface_recovery_begin",
+                                            json!({
+                                                "session_path": session_path.clone(),
+                                                "attempt": non_prompt_retained_recovery_attempts,
+                                            }),
+                                        );
+                                        let _ = eval.send(terminal_reset_command(&title, &theme));
+                                        if let Err(recovery_error) =
+                                            terminal_attempt_resume_recovery_async(
+                                                endpoint.clone(),
+                                                runtime_session_path.clone(),
+                                                &trace_home,
+                                                "retained_non_prompt_surface",
+                                                non_prompt_retained_recovery_attempts,
+                                            )
+                                            .await
+                                        {
+                                            append_trace_event(
+                                                &trace_home,
+                                                "ui",
+                                                "terminal_mount",
+                                                "retained_non_prompt_surface_recovery_error",
+                                                json!({
+                                                    "session_path": session_path.clone(),
+                                                    "error": recovery_error.to_string(),
+                                                    "attempt": non_prompt_retained_recovery_attempts,
+                                                }),
+                                            );
+                                        }
+                                        cursor = 0;
+                                        read_poll_ms = 60;
+                                        next_read_deadline = tokio::time::Instant::now()
+                                            + Duration::from_millis(read_poll_ms);
+                                        continue;
+                                    }
                                     upsert_terminal_resume_notification(
                                         state,
                                         &session_path,
@@ -34049,6 +34843,135 @@ fn TerminalCanvas(
                                     next_read_deadline = tokio::time::Instant::now()
                                         + Duration::from_millis(read_poll_ms);
                                     continue;
+                                }
+                                if is_remote_resume_session
+                                    && terminal_paint_seen
+                                    && terminal_geometry_ready
+                                    && !has_transport_error
+                                    && cursor_line_text.trim().is_empty()
+                                    && text_tail.trim().is_empty()
+                                    && (last_runtime_running || session_launch_phase_running)
+                                    && blank_host_snapshot_replay_attempts < 2
+                                {
+                                    blank_host_snapshot_replay_attempts += 1;
+                                    match terminal_snapshot_async(
+                                        endpoint.clone(),
+                                        runtime_session_path.clone(),
+                                        &trace_home,
+                                    )
+                                    .await
+                                    {
+                                        Ok((snapshot_text, running, runtime_output_seen))
+                                            if remote_resume_snapshot_is_replayable_for_session(
+                                                &snapshot_text,
+                                                remote_starting_codex_session,
+                                            ) =>
+                                        {
+                                            append_trace_event(
+                                                &trace_home,
+                                                "ui",
+                                                "terminal_mount",
+                                                "blank_host_snapshot_replay",
+                                                json!({
+                                                    "session_path": session_path.clone(),
+                                                    "attempt": blank_host_snapshot_replay_attempts,
+                                                    "bytes": snapshot_text.len(),
+                                                    "running": running,
+                                                    "runtime_output_seen": runtime_output_seen,
+                                                }),
+                                            );
+                                            let _ = eval.send(terminal_reset_command(&title, &theme));
+                                            let _ = eval.send(TerminalJsCommand::Write {
+                                                data: snapshot_text,
+                                            });
+                                            let _ = eval.send(TerminalJsCommand::Refit);
+                                            let _ = eval.send(TerminalJsCommand::SetInputEnabled {
+                                                enabled: true,
+                                                focus: true,
+                                            });
+                                            set_signal_if_changed(
+                                                terminal_resume_surface_staged,
+                                                true,
+                                            );
+                                            set_signal_if_changed(
+                                                terminal_has_meaningful_output,
+                                                true,
+                                            );
+                                            set_signal_if_changed(terminal_prompt_only, false);
+                                            set_signal_if_changed(
+                                                terminal_live_host_connected,
+                                                true,
+                                            );
+                                            set_signal_if_changed(
+                                                terminal_overlay_dismissed,
+                                                true,
+                                            );
+                                            set_signal_if_changed(resume_overlay_failed, false);
+                                            set_signal_if_changed(resume_overlay_timed_out, false);
+                                            resume_visual_reveal_after_ms = None;
+                                            post_attach_read_recovery_attempts = 0;
+                                            clear_terminal_resume_notification(
+                                                state,
+                                                &session_path,
+                                            );
+                                            let _ = safe_shell_mut(
+                                                state,
+                                                "terminal_attach_blank_host_snapshot_replay",
+                                                |shell| {
+                                                    shell
+                                                        .retain_terminal_session_path(&session_path);
+                                                    shell
+                                                        .terminal_resume_ready_paths
+                                                        .insert(session_path.clone());
+                                                    shell.terminal_attach_in_flight
+                                                        .remove(&session_path);
+                                                    shell
+                                                        .mark_terminal_open_attempt_ready_for_session(
+                                                            &session_path,
+                                                            "blank_host_snapshot_replay",
+                                                        );
+                                                    shell
+                                                        .maybe_finish_terminal_surface_request_for_session(
+                                                            &session_path,
+                                                        );
+                                                },
+                                            );
+                                            maybe_spawn_missing_remote_machine_refreshes(state);
+                                            maybe_spawn_missing_managed_cli_refreshes(state);
+                                            read_poll_ms = TERMINAL_ACTIVE_OUTPUT_READ_POLL_MS;
+                                            next_read_deadline = tokio::time::Instant::now()
+                                                + Duration::from_millis(read_poll_ms);
+                                            continue;
+                                        }
+                                        Ok((snapshot_text, running, runtime_output_seen)) => {
+                                            append_trace_event(
+                                                &trace_home,
+                                                "ui",
+                                                "terminal_mount",
+                                                "blank_host_snapshot_replay_rejected",
+                                                json!({
+                                                    "session_path": session_path.clone(),
+                                                    "attempt": blank_host_snapshot_replay_attempts,
+                                                    "bytes": snapshot_text.len(),
+                                                    "running": running,
+                                                    "runtime_output_seen": runtime_output_seen,
+                                                }),
+                                            );
+                                        }
+                                        Err(error) => {
+                                            append_trace_event(
+                                                &trace_home,
+                                                "ui",
+                                                "terminal_mount",
+                                                "blank_host_snapshot_replay_error",
+                                                json!({
+                                                    "session_path": session_path.clone(),
+                                                    "attempt": blank_host_snapshot_replay_attempts,
+                                                    "error": error.to_string(),
+                                                }),
+                                            );
+                                        }
+                                    }
                                 }
                                 if stale_remote_resume_retry_blank_surface_should_recover(
                                     is_remote_resume_session,
@@ -34229,9 +35152,12 @@ fn TerminalCanvas(
                                 resize_seen = resize_seen || geometry_usable;
                                 terminal_geometry_ready =
                                     terminal_geometry_ready || geometry_usable;
-                                if last_sent_terminal_resize_cols == cols
-                                    && last_sent_terminal_resize_rows == rows
-                                {
+                                if !terminal_geometry_resize_should_send(
+                                    last_sent_terminal_resize_cols,
+                                    last_sent_terminal_resize_rows,
+                                    cols,
+                                    rows,
+                                ) {
                                     continue;
                                 }
                                 match terminal_resize_async(
@@ -34531,6 +35457,9 @@ fn TerminalCanvas(
                                 let saw_codex_prompt_surface = batched_output
                                     .as_deref()
                                     .is_some_and(terminal_chunk_is_codex_prompt_surface);
+                                let saw_prompt_ready_surface = batched_output
+                                    .as_deref()
+                                    .is_some_and(terminal_surface_has_prompt_ready_text);
                                 let saw_local_codex_scaffold = batched_output
                                     .as_deref()
                                     .is_some_and(terminal_chunk_is_local_codex_scaffold);
@@ -34543,6 +35472,136 @@ fn TerminalCanvas(
                                 let tail_generic_idle_footer_output = batched_output
                                     .as_deref()
                                     .is_some_and(terminal_chunk_tail_has_generic_codex_idle_footer);
+                                if is_remote_resume_session
+                                    && batched_output.is_none()
+                                    && runtime_running
+                                    && runtime_output_seen
+                                    && terminal_paint_seen
+                                    && terminal_geometry_ready
+                                    && !terminal_has_visible_output
+                                    && !terminal_live_host_connected()
+                                    && blank_host_snapshot_replay_attempts < 2
+                                {
+                                    blank_host_snapshot_replay_attempts += 1;
+                                    match terminal_snapshot_async(
+                                        endpoint.clone(),
+                                        runtime_session_path.clone(),
+                                        &trace_home,
+                                    )
+                                    .await
+                                    {
+                                        Ok((snapshot_text, snapshot_running, snapshot_output_seen))
+                                            if remote_resume_snapshot_is_replayable_for_session(
+                                                &snapshot_text,
+                                                remote_starting_codex_session,
+                                            ) =>
+                                        {
+                                            append_trace_event(
+                                                &trace_home,
+                                                "ui",
+                                                "terminal_mount",
+                                                "blank_host_snapshot_replay_from_read",
+                                                json!({
+                                                    "session_path": session_path.clone(),
+                                                    "attempt": blank_host_snapshot_replay_attempts,
+                                                    "bytes": snapshot_text.len(),
+                                                    "running": snapshot_running,
+                                                    "runtime_output_seen": snapshot_output_seen,
+                                                }),
+                                            );
+                                            let _ = eval.send(terminal_reset_command(&title, &theme));
+                                            let _ = eval.send(TerminalJsCommand::Write {
+                                                data: snapshot_text,
+                                            });
+                                            let _ = eval.send(TerminalJsCommand::Refit);
+                                            let _ = eval.send(TerminalJsCommand::SetInputEnabled {
+                                                enabled: true,
+                                                focus: true,
+                                            });
+                                            set_signal_if_changed(
+                                                terminal_resume_surface_staged,
+                                                true,
+                                            );
+                                            set_signal_if_changed(
+                                                terminal_has_meaningful_output,
+                                                true,
+                                            );
+                                            set_signal_if_changed(terminal_prompt_only, false);
+                                            set_signal_if_changed(
+                                                terminal_live_host_connected,
+                                                true,
+                                            );
+                                            set_signal_if_changed(
+                                                terminal_overlay_dismissed,
+                                                true,
+                                            );
+                                            set_signal_if_changed(resume_overlay_failed, false);
+                                            set_signal_if_changed(resume_overlay_timed_out, false);
+                                            resume_visual_reveal_after_ms = None;
+                                            post_attach_read_recovery_attempts = 0;
+                                            clear_terminal_resume_notification(
+                                                state,
+                                                &session_path,
+                                            );
+                                            let _ = safe_shell_mut(
+                                                state,
+                                                "terminal_attach_blank_host_snapshot_replay_from_read",
+                                                |shell| {
+                                                    shell
+                                                        .retain_terminal_session_path(&session_path);
+                                                    shell
+                                                        .terminal_resume_ready_paths
+                                                        .insert(session_path.clone());
+                                                    shell.terminal_attach_in_flight
+                                                        .remove(&session_path);
+                                                    shell
+                                                        .mark_terminal_open_attempt_ready_for_session(
+                                                            &session_path,
+                                                            "blank_host_snapshot_replay",
+                                                        );
+                                                    shell
+                                                        .maybe_finish_terminal_surface_request_for_session(
+                                                            &session_path,
+                                                        );
+                                                },
+                                            );
+                                            maybe_spawn_missing_remote_machine_refreshes(state);
+                                            maybe_spawn_missing_managed_cli_refreshes(state);
+                                            read_poll_ms = TERMINAL_ACTIVE_OUTPUT_READ_POLL_MS;
+                                            next_read_deadline = tokio::time::Instant::now()
+                                                + Duration::from_millis(read_poll_ms);
+                                            continue;
+                                        }
+                                        Ok((snapshot_text, snapshot_running, snapshot_output_seen)) => {
+                                            append_trace_event(
+                                                &trace_home,
+                                                "ui",
+                                                "terminal_mount",
+                                                "blank_host_snapshot_replay_from_read_rejected",
+                                                json!({
+                                                    "session_path": session_path.clone(),
+                                                    "attempt": blank_host_snapshot_replay_attempts,
+                                                    "bytes": snapshot_text.len(),
+                                                    "running": snapshot_running,
+                                                    "runtime_output_seen": snapshot_output_seen,
+                                                }),
+                                            );
+                                        }
+                                        Err(error) => {
+                                            append_trace_event(
+                                                &trace_home,
+                                                "ui",
+                                                "terminal_mount",
+                                                "blank_host_snapshot_replay_from_read_error",
+                                                json!({
+                                                    "session_path": session_path.clone(),
+                                                    "attempt": blank_host_snapshot_replay_attempts,
+                                                    "error": error.to_string(),
+                                                }),
+                                            );
+                                        }
+                                    }
+                                }
                                 let saw_shell_prompt_output =
                                     (saw_prompt_output || tail_prompt_only_output)
                                         && !saw_generic_idle_output
@@ -34603,6 +35662,45 @@ fn TerminalCanvas(
                                 let has_transport_error = batched_output
                                     .as_deref()
                                     .is_some_and(terminal_chunk_is_transport_error);
+                                let server_prompt_snapshot_available =
+                                    if is_remote_resume_session
+                                        && (saw_generic_idle_output
+                                            || tail_generic_idle_output
+                                            || saw_generic_idle_footer_output
+                                            || tail_generic_idle_footer_output)
+                                    {
+                                        state.with(|shell| {
+                                            remote_live_session_prompt_ready_replay_text_for_session_path(
+                                                shell.server.live_sessions().iter(),
+                                                &session_path,
+                                            )
+                                            .is_some()
+                                        })
+                                    } else {
+                                        false
+                                    };
+                                let suppress_stale_idle_after_server_prompt =
+                                    should_suppress_stale_remote_idle_after_server_prompt(
+                                        is_remote_resume_session,
+                                        server_prompt_snapshot_available,
+                                        saw_codex_prompt_surface,
+                                        saw_generic_idle_output,
+                                        tail_generic_idle_output,
+                                        saw_generic_idle_footer_output,
+                                        tail_generic_idle_footer_output,
+                                    );
+                                if suppress_stale_idle_after_server_prompt {
+                                    append_trace_event(
+                                        &trace_home,
+                                        "ui",
+                                        "terminal_mount",
+                                        "suppress_stale_idle_after_server_prompt",
+                                        json!({
+                                            "session_path": session_path.clone(),
+                                            "cursor": cursor,
+                                        }),
+                                    );
+                                }
                                 let suppress_resume_control_only_output =
                                     should_suppress_remote_resume_surface_output(
                                         is_remote_resume_session,
@@ -34618,7 +35716,8 @@ fn TerminalCanvas(
                                         tail_generic_idle_footer_output,
                                         saw_prompt_only_surface,
                                         saw_transcript_browser_output,
-                                    ) || saw_local_codex_scaffold;
+                                    ) || saw_local_codex_scaffold
+                                        || suppress_stale_idle_after_server_prompt;
                                 let forward_terminal_protocol_only_output = batched_output
                                     .as_deref()
                                     .is_some_and(terminal_chunk_requires_terminal_emulator_forward);
@@ -35132,6 +36231,64 @@ fn TerminalCanvas(
                                             focus: should_focus_now,
                                         });
                                     }
+                                }
+                                if !terminal_overlay_dismissed()
+                                    && fresh_remote_codex_start_surface_ready(
+                                    is_remote_resume_session,
+                                    remote_starting_codex_session,
+                                    attach_ready,
+                                    visible_resume_surface,
+                                    saw_prompt_ready_surface,
+                                    saw_transcript_browser_output,
+                                    saw_generic_idle_output,
+                                    tail_generic_idle_output,
+                                    saw_generic_idle_footer_output,
+                                    tail_generic_idle_footer_output,
+                                    saw_prompt_only_surface,
+                                ) {
+                                    append_trace_event(
+                                        &trace_home,
+                                        "ui",
+                                        "terminal_mount",
+                                        "fresh_remote_codex_start_ready",
+                                        json!({
+                                            "session_path": session_path.clone(),
+                                            "cursor": cursor,
+                                        }),
+                                    );
+                                    let _ = eval.send(TerminalJsCommand::Refit);
+                                    let _ = eval.send(TerminalJsCommand::SetInputEnabled {
+                                        enabled: true,
+                                        focus: true,
+                                    });
+                                    clear_terminal_resume_notification(state, &session_path);
+                                    let _ = safe_shell_mut(
+                                        state,
+                                        "terminal_attach_fresh_remote_codex_start_ready",
+                                        |shell| {
+                                            shell.retain_terminal_session_path(&session_path);
+                                            shell
+                                                .terminal_resume_ready_paths
+                                                .insert(session_path.clone());
+                                            shell.terminal_attach_in_flight
+                                                .remove(&session_path);
+                                            shell.mark_terminal_open_attempt_ready_for_session(
+                                                &session_path,
+                                                "fresh_remote_codex_start",
+                                            );
+                                            shell.maybe_finish_terminal_surface_request_for_session(
+                                                &session_path,
+                                            );
+                                        },
+                                    );
+                                    maybe_spawn_missing_remote_machine_refreshes(state);
+                                    maybe_spawn_missing_managed_cli_refreshes(state);
+                                    set_signal_if_changed(terminal_overlay_dismissed, true);
+                                    set_signal_if_changed(terminal_live_host_connected, true);
+                                    set_signal_if_changed(resume_overlay_failed, false);
+                                    set_signal_if_changed(resume_overlay_timed_out, false);
+                                    resume_visual_reveal_after_ms = None;
+                                    post_attach_read_recovery_attempts = 0;
                                 }
                                 if is_remote_resume_session
                                     && attach_ready
@@ -36493,6 +37650,23 @@ fn should_suppress_remote_resume_surface_output(
                     || saw_generic_idle_footer_output
                     || tail_generic_idle_footer_output)))
 }
+fn should_suppress_stale_remote_idle_after_server_prompt(
+    is_remote_resume_session: bool,
+    server_prompt_snapshot_available: bool,
+    saw_codex_prompt_surface: bool,
+    saw_generic_idle_output: bool,
+    tail_generic_idle_output: bool,
+    saw_generic_idle_footer_output: bool,
+    tail_generic_idle_footer_output: bool,
+) -> bool {
+    is_remote_resume_session
+        && server_prompt_snapshot_available
+        && !saw_codex_prompt_surface
+        && (saw_generic_idle_output
+            || tail_generic_idle_output
+            || saw_generic_idle_footer_output
+            || tail_generic_idle_footer_output)
+}
 fn terminal_chunk_requires_terminal_emulator_forward(data: &str) -> bool {
     !terminal_chunk_is_transport_error(data)
         && !terminal_chunk_has_visible_output(data)
@@ -36701,6 +37875,77 @@ fn remote_terminal_placeholder_text(
     let _ = (session, active_summary);
     None
 }
+fn remote_live_session_prompt_ready_replay_text(session: &ManagedSessionView) -> Option<String> {
+    if !is_remote_resume_agent_session(session) {
+        return None;
+    }
+    let mut chunks = session
+        .terminal_lines
+        .iter()
+        .map(String::as_str)
+        .map(str::trim_end)
+        .filter(|line| !line.trim().is_empty())
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+    let status_line = session.status_line.trim_end();
+    if !status_line.trim().is_empty() {
+        chunks.push(status_line.to_string());
+    }
+    if chunks.is_empty() {
+        return None;
+    }
+    let replay = format_terminal_prefill_text(&chunks.join("\r\n"));
+    remote_resume_blank_host_snapshot_is_replayable(&replay).then_some(replay)
+}
+fn remote_live_session_prompt_ready_replay_text_for_session_path<'a>(
+    sessions: impl Iterator<Item = &'a ManagedSessionView>,
+    session_path: &str,
+) -> Option<String> {
+    sessions
+        .filter(|session| session.session_path == session_path)
+        .find_map(remote_live_session_prompt_ready_replay_text)
+}
+fn snapshot_session_prompt_ready_replay_text(session: &SnapshotSessionView) -> Option<String> {
+    if !(session.source == SessionSource::LiveSsh
+        && session.session_path.starts_with("remote-session://")
+        && matches!(session.kind, SessionKind::Codex | SessionKind::CodexLiteLlm))
+    {
+        return None;
+    }
+    let mut chunks = session
+        .terminal_lines
+        .iter()
+        .map(String::as_str)
+        .map(str::trim_end)
+        .filter(|line| !line.trim().is_empty())
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+    let status_line = session.status_line.trim_end();
+    if !status_line.trim().is_empty() {
+        chunks.push(status_line.to_string());
+    }
+    if chunks.is_empty() {
+        return None;
+    }
+    let replay = format_terminal_prefill_text(&chunks.join("\r\n"));
+    remote_resume_blank_host_snapshot_is_replayable(&replay).then_some(replay)
+}
+fn snapshot_session_prompt_ready_replay_text_for_session_path<'a>(
+    sessions: impl Iterator<Item = &'a SnapshotSessionView>,
+    session_path: &str,
+) -> Option<String> {
+    sessions
+        .filter(|session| session.session_path == session_path)
+        .find_map(snapshot_session_prompt_ready_replay_text)
+}
+fn remote_live_session_prompt_ready_replay_text_for_active_session<'a>(
+    active_session: &ManagedSessionView,
+    live_sessions: impl Iterator<Item = &'a ManagedSessionView>,
+    session_path: &str,
+) -> Option<String> {
+    remote_live_session_prompt_ready_replay_text_for_session_path(live_sessions, session_path)
+        .or_else(|| remote_live_session_prompt_ready_replay_text(active_session))
+}
 fn remote_terminal_prefill_text_before_2_1_103(session: &ManagedSessionView) -> Option<String> {
     if remote_session_starts_new_codex(session) {
         return None;
@@ -36731,6 +37976,22 @@ fn remote_terminal_placeholder_text_before_2_1_103(
 fn remote_session_starts_new_codex(session: &ManagedSessionView) -> bool {
     session.session_path.starts_with("remote-session://")
         && metadata_value(session, "Remote Launch Action") == "start-codex"
+}
+fn app_control_terminal_input_write_path(shell: &ShellState, session_path: &str) -> String {
+    terminal_input_write_path_for_runtime(
+        session_path,
+        terminal_runtime_session_path(shell, session_path),
+    )
+}
+fn terminal_input_write_path_for_runtime(
+    session_path: &str,
+    runtime_path: String,
+) -> String {
+    if session_path.trim_start().starts_with("remote-session://") {
+        session_path.to_string()
+    } else {
+        runtime_path
+    }
 }
 async fn terminal_ensure_async(
     endpoint: ServerEndpoint,
@@ -36900,6 +38161,91 @@ async fn terminal_ensure_with_retry_async(
             Err(error) => return Err(error),
         }
     }
+}
+fn spawn_created_remote_terminal_prewarm(
+    endpoint: ServerEndpoint,
+    session_path: String,
+    trace_home: PathBuf,
+) {
+    if !created_remote_terminal_should_prewarm(&session_path) {
+        return;
+    }
+    append_trace_event(
+        &trace_home,
+        "ui",
+        "terminal_mount",
+        "created_remote_terminal_prewarm_scheduled",
+        json!({
+            "session_path": session_path.clone(),
+            "cols": REMOTE_LIVE_PREWARM_COLS,
+            "rows": REMOTE_LIVE_PREWARM_ROWS,
+        }),
+    );
+    tokio::spawn(async move {
+        append_trace_event(
+            &trace_home,
+            "ui",
+            "terminal_mount",
+            "created_remote_terminal_prewarm_begin",
+            json!({
+                "session_path": session_path.clone(),
+                "cols": REMOTE_LIVE_PREWARM_COLS,
+                "rows": REMOTE_LIVE_PREWARM_ROWS,
+            }),
+        );
+        match terminal_ensure_with_retry_async(endpoint.clone(), session_path.clone(), &trace_home)
+            .await
+        {
+            Ok(_) => {
+                match terminal_resize_async(
+                    endpoint,
+                    session_path.clone(),
+                    REMOTE_LIVE_PREWARM_COLS,
+                    REMOTE_LIVE_PREWARM_ROWS,
+                )
+                .await
+                {
+                    Ok(()) => {
+                        append_trace_event(
+                            &trace_home,
+                            "ui",
+                            "terminal_mount",
+                            "created_remote_terminal_prewarm_ready",
+                            json!({
+                                "session_path": session_path,
+                                "cols": REMOTE_LIVE_PREWARM_COLS,
+                                "rows": REMOTE_LIVE_PREWARM_ROWS,
+                            }),
+                        );
+                    }
+                    Err(error) => {
+                        append_trace_event(
+                            &trace_home,
+                            "ui",
+                            "terminal_mount",
+                            "created_remote_terminal_prewarm_resize_error",
+                            json!({
+                                "session_path": session_path,
+                                "error": error.to_string(),
+                            }),
+                        );
+                    }
+                }
+            }
+            Err(error) => {
+                append_trace_event(
+                    &trace_home,
+                    "ui",
+                    "terminal_mount",
+                    "created_remote_terminal_prewarm_ensure_error",
+                    json!({
+                        "session_path": session_path,
+                        "error": error.to_string(),
+                    }),
+                );
+            }
+        }
+    });
 }
 async fn terminal_attempt_resume_recovery_async(
     endpoint: ServerEndpoint,
@@ -37078,6 +38424,22 @@ async fn terminal_read_async(
     })
     .await
 }
+async fn terminal_snapshot_async(
+    endpoint: ServerEndpoint,
+    session_path: String,
+    trace_home: &Path,
+) -> Result<(String, bool, bool)> {
+    run_dedicated_terminal_io("terminal_snapshot", trace_home, move || {
+        terminal_snapshot(&endpoint, &session_path)
+    })
+    .await
+}
+async fn daemon_snapshot_async(endpoint: ServerEndpoint, trace_home: &Path) -> Result<ServerUiSnapshot> {
+    run_dedicated_terminal_io("daemon_snapshot", trace_home, move || {
+        daemon_snapshot(&endpoint).map(|(snapshot, _)| snapshot)
+    })
+    .await
+}
 async fn terminal_write_async(
     endpoint: ServerEndpoint,
     session_path: String,
@@ -37121,13 +38483,28 @@ async fn terminal_write_with_local_runtime_retry_async(
 fn app_control_terminal_input_write_chunks(data: &str) -> Vec<String> {
     let mut chunks = Vec::new();
     let mut start_ix = 0usize;
-    for (ix, ch) in data.char_indices() {
+    let mut iter = data.char_indices().peekable();
+    while let Some((ix, ch)) = iter.next() {
         if ch == '\u{3}' && ix + ch.len_utf8() < data.len() {
             if start_ix < ix {
                 chunks.push(data[start_ix..ix].to_string());
             }
             chunks.push(ch.to_string());
             start_ix = ix + ch.len_utf8();
+        } else if ch == '\r' || ch == '\n' {
+            if start_ix < ix {
+                chunks.push(data[start_ix..ix].to_string());
+            }
+            let mut end_ix = ix + ch.len_utf8();
+            if ch == '\r'
+                && let Some((next_ix, next_ch)) = iter.peek().copied()
+                && next_ch == '\n'
+            {
+                let _ = iter.next();
+                end_ix = next_ix + next_ch.len_utf8();
+            }
+            chunks.push(data[ix..end_ix].to_string());
+            start_ix = end_ix;
         }
     }
     if start_ix < data.len() {
@@ -37137,6 +38514,10 @@ fn app_control_terminal_input_write_chunks(data: &str) -> Vec<String> {
         chunks.push(data.to_string());
     }
     chunks
+}
+
+fn app_control_terminal_input_chunk_is_enter(chunk: &str) -> bool {
+    matches!(chunk, "\r" | "\n" | "\r\n")
 }
 
 async fn terminal_write_app_control_input_async(
@@ -37160,6 +38541,11 @@ async fn terminal_write_app_control_input_async(
                 APP_CONTROL_TERMINAL_INTERRUPT_SETTLE_MS,
             ))
             .await;
+        } else if chunks
+            .peek()
+            .is_some_and(|next| app_control_terminal_input_chunk_is_enter(next))
+        {
+            sleep(Duration::from_millis(APP_CONTROL_TERMINAL_ENTER_SETTLE_MS)).await;
         }
     }
     Ok(())
@@ -41806,71 +43192,177 @@ fn terminal_replay_retained_data_script_for_session(session_path: &str, data: &s
         (() => {{
           const sessionPath = {session_path};
           const data = {data};
-          const registry = window.__yggtermXtermHosts || {{}};
-          const entries = Object.values(registry)
-            .filter((entry) => entry && entry.term && entry.sessionPath === sessionPath)
-            .sort((a, b) => (b.mountedAt || 0) - (a.mountedAt || 0));
-          const visibleEntries = entries.filter((entry) => {{
-            try {{
-              const host = document.getElementById(entry.hostId);
-              if (!host) {{
+          if (!data) {{
+            return;
+          }}
+          const replayKey = `${{sessionPath}}:${{data.length}}:${{data.slice(-160)}}`;
+          const retryDelayMs = 100;
+          const deadlineMs = Date.now() + 15000;
+          const stableUntilMs = Date.now() + 3500;
+          const strippedReplayText = String(data)
+            .replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "")
+            .replace(/\x1b[=>]/g, "");
+          const promptIx = strippedReplayText.lastIndexOf("›");
+          const promptNeedle = promptIx >= 0
+            ? strippedReplayText.slice(promptIx, promptIx + 96).replace(/\s+/g, " ").trim()
+            : "";
+          window.__yggtermPendingRetainedReplays = window.__yggtermPendingRetainedReplays || {{}};
+          const pending = window.__yggtermPendingRetainedReplays;
+          if (pending[sessionPath] && pending[sessionPath].key === replayKey && !pending[sessionPath].complete) {{
+            return;
+          }}
+          pending[sessionPath] = {{ key: replayKey, complete: false, deadlineMs, stableUntilMs }};
+          const visibleEntryForSession = () => {{
+            const registry = window.__yggtermXtermHosts || {{}};
+            const entries = Object.values(registry)
+              .filter((entry) => entry && entry.term && entry.sessionPath === sessionPath)
+              .sort((a, b) => (b.mountedAt || 0) - (a.mountedAt || 0));
+            const visibleEntries = entries.filter((entry) => {{
+              try {{
+                const host = document.getElementById(entry.hostId);
+                if (!host) {{
+                  return false;
+                }}
+                const rect = host.getBoundingClientRect();
+                const style = window.getComputedStyle(host);
+                return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
+              }} catch (_error) {{
                 return false;
               }}
-              const rect = host.getBoundingClientRect();
-              const style = window.getComputedStyle(host);
-              return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
+            }});
+            return visibleEntries[0] || null;
+          }};
+          const visibleTextForEntry = (entry) => {{
+            try {{
+              const buffer = entry && entry.term && entry.term.buffer && entry.term.buffer.active;
+              if (!buffer || typeof buffer.getLine !== "function") {{
+                return "";
+              }}
+              const baseY = Number(buffer.baseY || 0);
+              const rows = Math.max(1, Number(entry.term.rows || 1));
+              const length = Math.max(0, Number(buffer.length || rows));
+              const start = Math.max(0, Math.min(baseY, length));
+              const end = Math.min(length, start + rows);
+              const lines = [];
+              for (let row = start; row < end; row += 1) {{
+                const line = buffer.getLine(row);
+                if (line && typeof line.translateToString === "function") {{
+                  lines.push(line.translateToString(true));
+                }}
+              }}
+              return lines.join("\n");
             }} catch (_error) {{
+              return "";
+            }}
+          }};
+          const replayVisibleInEntry = (entry) => {{
+            const visibleText = visibleTextForEntry(entry);
+            if (!visibleText) {{
               return false;
             }}
-          }});
-          const entry = visibleEntries[0] || entries[0] || null;
-          if (!entry || !entry.term || !data) {{
-            return;
-          }}
-          const buffer = entry.term.buffer && entry.term.buffer.active;
-          const baseY = buffer ? Number(buffer.baseY || 0) : 0;
-          if (baseY > 0) {{
-            return;
-          }}
-          try {{
-            if (typeof entry.term.reset === "function") {{
-              entry.term.reset();
+            if (visibleText.includes("›")) {{
+              return true;
             }}
-          }} catch (_error) {{}}
-          const writeSync = entry.term && entry.term._core && typeof entry.term._core.writeSync === "function"
-            ? entry.term._core.writeSync.bind(entry.term._core)
-            : entry.term && entry.term._core && entry.term._core._writeBuffer && typeof entry.term._core._writeBuffer.writeSync === "function"
-              ? entry.term._core._writeBuffer.writeSync.bind(entry.term._core._writeBuffer)
-              : null;
-          try {{
-            if (writeSync) {{
-              writeSync(data);
-            }} else if (typeof entry.term.write === "function") {{
-              entry.term.write(data);
+            return Boolean(promptNeedle && visibleText.replace(/\s+/g, " ").includes(promptNeedle));
+          }};
+          const retryLater = () => {{
+            const current = pending[sessionPath];
+            if (!current || current.key !== replayKey || current.complete || Date.now() >= deadlineMs) {{
+              return;
             }}
-          }} catch (_error) {{}}
-          try {{
-            entry.lastRawPayloadLength = data.length;
-            entry.lastRawPayloadLineCount = (data.match(/\n/g) || []).length;
-            if (entry.lastRawPayloadLineCount > Math.max(4, Number(entry.term.rows || 0) + 4)) {{
-              entry.scrollbackExpected = true;
+            window.setTimeout(attemptReplay, retryDelayMs);
+          }};
+          const attemptReplay = () => {{
+            const current = pending[sessionPath];
+            if (!current || current.key !== replayKey || current.complete) {{
+              return;
             }}
-          }} catch (_error) {{}}
-          try {{
-            if (typeof entry.term.scrollToBottom === "function") {{
-              entry.term.scrollToBottom();
+            const entry = visibleEntryForSession();
+            if (!entry || !entry.term) {{
+              retryLater();
+              return;
             }}
-          }} catch (_error) {{}}
-          try {{
-            if (typeof entry.term.refresh === "function") {{
-              entry.term.refresh(0, Math.max(0, Number(entry.term.rows || 1) - 1));
+            if (entry.__yggtermLastRetainedReplayKey === replayKey) {{
+              try {{
+                if (typeof entry.setInputEnabled === "function") {{
+                  entry.setInputEnabled(true, true);
+                }}
+              }} catch (_error) {{}}
+              if (replayVisibleInEntry(entry)) {{
+                if (Date.now() >= current.stableUntilMs) {{
+                  current.complete = true;
+                }} else {{
+                  retryLater();
+                }}
+                return;
+              }}
             }}
-          }} catch (_error) {{}}
-          try {{
-            if (typeof entry.setInputEnabled === "function") {{
-              entry.setInputEnabled(true, true);
+            if (replayVisibleInEntry(entry)) {{
+              try {{
+                if (typeof entry.setInputEnabled === "function") {{
+                  entry.setInputEnabled(true, true);
+                }}
+              }} catch (_error) {{}}
+              if (Date.now() >= current.stableUntilMs) {{
+                current.complete = true;
+              }} else {{
+                retryLater();
+              }}
+              return;
             }}
-          }} catch (_error) {{}}
+            const buffer = entry.term.buffer && entry.term.buffer.active;
+            const baseY = buffer ? Number(buffer.baseY || 0) : 0;
+            if (baseY > 0) {{
+              current.complete = true;
+              return;
+            }}
+            try {{
+              if (typeof entry.term.reset === "function") {{
+                entry.term.reset();
+              }}
+            }} catch (_error) {{}}
+            const writeSync = entry.term && entry.term._core && typeof entry.term._core.writeSync === "function"
+              ? entry.term._core.writeSync.bind(entry.term._core)
+              : entry.term && entry.term._core && entry.term._core._writeBuffer && typeof entry.term._core._writeBuffer.writeSync === "function"
+                ? entry.term._core._writeBuffer.writeSync.bind(entry.term._core._writeBuffer)
+                : null;
+            try {{
+              if (writeSync) {{
+                writeSync(data);
+              }} else if (typeof entry.term.write === "function") {{
+                entry.term.write(data);
+              }}
+            }} catch (_error) {{}}
+            try {{
+              entry.__yggtermLastRetainedReplayKey = replayKey;
+              entry.lastRawPayloadLength = data.length;
+              entry.lastRawPayloadLineCount = (data.match(/\n/g) || []).length;
+              if (entry.lastRawPayloadLineCount > Math.max(4, Number(entry.term.rows || 0) + 4)) {{
+                entry.scrollbackExpected = true;
+              }}
+            }} catch (_error) {{}}
+            try {{
+              if (typeof entry.term.scrollToBottom === "function") {{
+                entry.term.scrollToBottom();
+              }}
+            }} catch (_error) {{}}
+            try {{
+              if (typeof entry.term.refresh === "function") {{
+                entry.term.refresh(0, Math.max(0, Number(entry.term.rows || 1) - 1));
+              }}
+            }} catch (_error) {{}}
+            try {{
+              if (typeof entry.setInputEnabled === "function") {{
+                entry.setInputEnabled(true, true);
+              }}
+            }} catch (_error) {{}}
+            if (Date.now() >= current.stableUntilMs && replayVisibleInEntry(entry)) {{
+              current.complete = true;
+            }} else {{
+              retryLater();
+            }}
+          }};
+          attemptReplay();
         }})();
         "#,
         session_path = session_path,
@@ -47318,6 +48810,12 @@ mod tests {
             "remote-session://dev/test",
             "\x1b[2J\x1b[Hline 1\r\nline 2\r\n",
         );
+        assert!(script.contains("const retryDelayMs = 100;"));
+        assert!(script.contains("const stableUntilMs = Date.now() + 3500;"));
+        assert!(script.contains("translateToString(true)"));
+        assert!(script.contains("visibleText.includes(\"›\")"));
+        assert!(script.contains("window.setTimeout(attemptReplay, retryDelayMs);"));
+        assert!(script.contains("return visibleEntries[0] || null;"));
         assert!(script.contains("if (baseY > 0)"));
         assert!(script.contains("entry.term.reset();"));
         assert!(script.contains("writeSync(data);"));
@@ -52697,6 +54195,91 @@ Waiting for the remote terminal to paint...\n";
         ));
     }
     #[test]
+    fn remote_resume_blank_host_snapshot_replay_accepts_prompt_ready_screen() {
+        let snapshot = "\
+\u{1b}[?25h\u{1b}[H\u{1b}[J╭────────────────────╮
+│ >_ OpenAI Codex   │
+╰────────────────────╯
+\u{1b}[13;1H› Implement {feature}
+  gpt-5.5 xhigh · ~/gh/yggterm";
+        assert!(remote_resume_blank_host_snapshot_is_replayable(snapshot));
+        assert!(!remote_resume_blank_host_snapshot_is_replayable(""));
+        assert!(!remote_resume_blank_host_snapshot_is_replayable(
+            "The release build is complete but no prompt is visible."
+        ));
+        assert!(!remote_resume_blank_host_snapshot_is_replayable(
+            "__YGGTERM_ATTACH_READY__"
+        ));
+        assert!(!remote_resume_blank_host_snapshot_is_replayable(
+            "\
+╭─────────────────────────────────────────────╮
+│ >_ OpenAI Codex (v0.128.0)                  │
+│                                             │
+│ model:     gpt-5.5 xhigh   /model to change │
+│ directory: ~/gh/yggterm                     │"
+        ));
+        assert!(remote_resume_blank_host_snapshot_is_replayable(
+            "› Implement {feature}\n  gpt-5.5 xhigh · ~/gh/yggterm"
+        ));
+    }
+    #[test]
+    fn remote_codex_resume_snapshot_replay_rejects_generic_shell_prompt() {
+        assert!(remote_resume_snapshot_is_replayable_for_session(
+            "pi@dev:~/gh/yggterm$ ",
+            false
+        ));
+        assert!(!remote_resume_snapshot_is_replayable_for_session(
+            "pi@dev:~/gh/yggterm$ ",
+            true
+        ));
+        assert!(remote_resume_snapshot_is_replayable_for_session(
+            "› Implement {feature}\n  gpt-5.5 xhigh · ~/gh/yggterm",
+            true
+        ));
+    }
+    #[test]
+    fn remote_resume_non_prompt_snapshot_replay_accepts_prompt_ready_snapshot() {
+        let host_tail = "\
+╭─────────────────────────────────────────────╮
+│ >_ OpenAI Codex (v0.128.0)                  │
+│                                             │
+│ model:     gpt-5.5 xhigh   /model to change │
+│ directory: ~/gh/yggterm                     │";
+        let snapshot = "\
+╭─────────────────────────────────────────────╮
+│ >_ OpenAI Codex (v0.128.0)                  │
+│                                             │
+│ model:     gpt-5.5 xhigh   /model to change │
+│ directory: ~/gh/yggterm                     │
+╰─────────────────────────────────────────────╯
+
+  Tip: You can run any shell command from Codex using ! (e.g. !ls)
+
+› Find and fix a bug in @filename
+
+  gpt-5.5 xhigh · ~/gh/yggterm";
+        assert!(remote_resume_non_prompt_snapshot_is_replayable(
+            snapshot,
+            "│ directory: ~/gh/yggterm                     │",
+            host_tail,
+        ));
+        assert!(remote_resume_non_prompt_snapshot_is_replayable(
+            "› Find and fix a bug in @filename\n\n  gpt-5.5 xhigh · ~/gh/yggterm",
+            "│ directory: ~/gh/yggterm                     │",
+            host_tail,
+        ));
+        assert!(!remote_resume_non_prompt_snapshot_is_replayable(
+            host_tail,
+            "│ directory: ~/gh/yggterm                     │",
+            host_tail,
+        ));
+        assert!(!remote_resume_non_prompt_snapshot_is_replayable(
+            snapshot,
+            "› Find and fix a bug in @filename",
+            host_tail,
+        ));
+    }
+    #[test]
     fn remote_resume_visual_reveal_rejects_stale_retained_handoff_tail() {
         let stale_tail = "The final 2.1.59 artifacts are built. Before replacing the live jojo install, I’m taking one more runtime/install snapshot and recording the exact active GUI/daemon paths, then I’ll install only the new direct version and clean the queued stale scan processes.";
         assert!(retained_remote_surface_has_non_prompt_text("", stale_tail));
@@ -54157,6 +55740,158 @@ q to quit   pgup/pgdn to page   enter to edit message
         assert!(shell.terminal_session_is_retained_live(active_session_path));
     }
     #[test]
+    fn active_remote_bootstrap_lease_is_not_retained_live_until_ready() {
+        let active_session_path = "remote-session://dev/unready";
+        let bootstrap = test_shell_bootstrap_with_active_session(active_session_path);
+        let mut shell = ShellState::new(bootstrap);
+        shell.server_busy = false;
+        shell.server.set_view_mode(WorkspaceViewMode::Terminal);
+        shell.retain_terminal_session_path(active_session_path);
+        shell.bump_terminal_mount_epoch_for_session(active_session_path);
+        shell
+            .terminal_bootstrap_owner_by_session
+            .insert(active_session_path.to_string(), "owner:test".to_string());
+        shell
+            .terminal_bootstrap_lease_by_session
+            .insert(active_session_path.to_string(), "lease:test".to_string());
+
+        assert!(!shell.terminal_session_is_retained_live(active_session_path));
+
+        shell
+            .terminal_bootstrap_owner_by_session
+            .remove(active_session_path);
+        shell
+            .terminal_bootstrap_lease_by_session
+            .remove(active_session_path);
+        shell
+            .terminal_resume_ready_paths
+            .insert(active_session_path.to_string());
+        assert!(shell.terminal_session_is_retained_live(active_session_path));
+    }
+    #[test]
+    fn new_mount_bootstrap_lease_replaces_inflight_older_lease() {
+        let active_session_path = "remote-session://dev/remount";
+        let bootstrap = test_shell_bootstrap_with_active_session(active_session_path);
+        let mut shell = ShellState::new(bootstrap);
+        shell.server_busy = false;
+        shell.server.set_view_mode(WorkspaceViewMode::Terminal);
+        shell
+            .terminal_attach_in_flight
+            .insert(active_session_path.to_string());
+        shell
+            .terminal_bootstrap_owner_by_session
+            .insert(active_session_path.to_string(), "owner:old".to_string());
+        shell
+            .terminal_bootstrap_lease_by_session
+            .insert(active_session_path.to_string(), "mount:1".to_string());
+
+        assert!(acquire_terminal_bootstrap_lease(
+            &mut shell,
+            active_session_path,
+            "mount:2",
+            "owner:new",
+        ));
+        assert_eq!(
+            shell
+                .terminal_bootstrap_lease_by_session
+                .get(active_session_path)
+                .map(String::as_str),
+            Some("mount:2")
+        );
+        assert_eq!(
+            shell
+                .terminal_bootstrap_owner_by_session
+                .get(active_session_path)
+                .map(String::as_str),
+            Some("owner:new")
+        );
+        assert!(!acquire_terminal_bootstrap_lease(
+            &mut shell,
+            active_session_path,
+            "mount:2",
+            "owner:another",
+        ));
+    }
+    #[test]
+    fn remote_open_rearms_unready_retained_bootstrap() {
+        let active_session_path = "remote-session://dev/unready";
+        let bootstrap = test_shell_bootstrap_with_active_session(active_session_path);
+        let mut shell = ShellState::new(bootstrap);
+        shell.server_busy = false;
+        shell.server.set_view_mode(WorkspaceViewMode::Terminal);
+        shell.retain_terminal_session_path(active_session_path);
+        let old_epoch = shell.bump_terminal_mount_epoch_for_session(active_session_path);
+        shell
+            .terminal_bootstrap_owner_by_session
+            .insert(active_session_path.to_string(), "owner:test".to_string());
+        shell
+            .terminal_bootstrap_lease_by_session
+            .insert(active_session_path.to_string(), "lease:test".to_string());
+        shell
+            .terminal_attach_in_flight
+            .insert(active_session_path.to_string());
+
+        assert!(shell.rearm_unready_remote_terminal_bootstrap_for_open(active_session_path));
+
+        assert!(
+            !shell
+                .terminal_bootstrap_owner_by_session
+                .contains_key(active_session_path)
+        );
+        assert!(
+            !shell
+                .terminal_bootstrap_lease_by_session
+                .contains_key(active_session_path)
+        );
+        assert!(
+            !shell
+                .terminal_attach_in_flight
+                .contains(active_session_path)
+        );
+        assert!(
+            shell
+                .terminal_mount_epochs
+                .get(active_session_path)
+                .copied()
+                .unwrap_or_default()
+                > old_epoch
+        );
+    }
+    #[test]
+    fn terminal_paint_geometry_sends_initial_resize_once() {
+        assert!(terminal_geometry_resize_should_send(0, 0, 110, 50));
+        assert!(terminal_geometry_resize_should_send(80, 24, 110, 50));
+        assert!(!terminal_geometry_resize_should_send(110, 50, 110, 50));
+        assert!(!terminal_geometry_resize_should_send(0, 0, 10, 2));
+    }
+    #[test]
+    fn fresh_remote_codex_start_surface_requires_prompt_ready_surface() {
+        assert!(!fresh_remote_codex_start_surface_ready(
+            true, true, true, true, false, false, false, false, false, false, false,
+        ));
+        assert!(fresh_remote_codex_start_surface_ready(
+            true, true, true, true, true, false, false, false, false, false, false,
+        ));
+        assert!(!fresh_remote_codex_start_surface_ready(
+            true, true, true, true, true, true, false, false, false, false, false,
+        ));
+        assert!(!fresh_remote_codex_start_surface_ready(
+            true, false, true, true, true, false, false, false, false, false, false,
+        ));
+        assert!(!fresh_remote_codex_start_surface_ready(
+            true, true, false, true, true, false, false, false, false, false, false,
+        ));
+    }
+    #[test]
+    fn created_remote_terminal_prewarm_targets_live_remote_paths() {
+        assert!(created_remote_terminal_should_prewarm(
+            "remote-session://dev/new"
+        ));
+        assert!(created_remote_terminal_should_prewarm("ssh://dev/new"));
+        assert!(!created_remote_terminal_should_prewarm("local://new"));
+        assert!(!created_remote_terminal_should_prewarm("codex://new"));
+    }
+    #[test]
     fn startup_terminal_restore_recovers_poisoned_local_attach() {
         let active_session_path = "local://test";
         let bootstrap = test_shell_bootstrap_with_active_session(active_session_path);
@@ -54959,6 +56694,35 @@ q to quit   pgup/pgdn to page   enter to edit message
             &shell,
             active_session_path,
             "host-active"
+        ));
+    }
+
+    #[test]
+    fn inactive_retained_ready_session_keeps_current_host_hot() {
+        let active_session_path = "codex://active";
+        let inactive_session_path = "remote-session://dev/inactive";
+        let bootstrap = test_shell_bootstrap_with_active_session(active_session_path);
+        let mut shell = ShellState::new(bootstrap);
+        shell.server.set_view_mode(WorkspaceViewMode::Terminal);
+        shell.bump_terminal_mount_epoch_for_session(inactive_session_path);
+        let inactive_host = shell
+            .terminal_session_host_id(inactive_session_path)
+            .expect("inactive retained session should have a host id");
+        shell.retain_terminal_session_path(inactive_session_path);
+        shell
+            .terminal_resume_ready_paths
+            .insert(inactive_session_path.to_string());
+        shell.active_terminal_host_id = Some("host-active".to_string());
+
+        assert!(terminal_session_still_active(
+            &shell,
+            inactive_session_path,
+            &inactive_host
+        ));
+        assert!(!terminal_session_still_active(
+            &shell,
+            inactive_session_path,
+            "stale-host"
         ));
     }
 
@@ -57882,14 +59646,19 @@ q to quit   pgup/pgdn to page   enter to edit message
         );
         assert_eq!(
             app_control_terminal_input_write_chunks("echo ok\r"),
-            vec!["echo ok\r".to_string()]
+            vec!["echo ok".to_string(), "\r".to_string()]
+        );
+        assert_eq!(
+            app_control_terminal_input_write_chunks("/status\r\n"),
+            vec!["/status".to_string(), "\r\n".to_string()]
         );
         assert_eq!(
             app_control_terminal_input_write_chunks("before\u{3}after\r"),
             vec![
                 "before".to_string(),
                 "\u{3}".to_string(),
-                "after\r".to_string()
+                "after".to_string(),
+                "\r".to_string()
             ]
         );
         assert_eq!(
@@ -58623,6 +60392,288 @@ q to quit   pgup/pgdn to page   enter to edit message
             &shell,
             &test_sidebar_row(session_path)
         ));
+    }
+
+    #[test]
+    fn inactive_live_remote_row_is_hot_terminal_fast_path() {
+        let session_path = "remote-session://dev/abc123";
+        let mut shell = ShellState::new(test_shell_bootstrap_with_active_session("local://seed"));
+        let mut session = test_live_shell_session(session_path);
+        session.id = "abc123".to_string();
+        session.kind = SessionKind::Codex;
+        session.source = SessionSource::LiveSsh;
+        session.ssh_target = Some("dev".to_string());
+        shell.server.apply_snapshot(ServerUiSnapshot {
+            active_session_path: Some("local://seed".to_string()),
+            active_session: None,
+            active_view_mode: WorkspaceViewMode::Terminal,
+            remote_machines: Vec::new(),
+            ssh_targets: Vec::new(),
+            live_sessions: vec![snapshot_session_view_for_ui(session)],
+        });
+
+        assert!(session_is_hot_terminal_row(
+            &shell,
+            &test_sidebar_row(session_path)
+        ));
+    }
+
+    #[test]
+    fn remote_live_session_prompt_ready_replay_uses_server_snapshot_tail() {
+        let mut session = test_live_shell_session("remote-session://dev/abc123");
+        session.source = SessionSource::LiveSsh;
+        session.terminal_lines = vec![
+            "╭─────────────────────────────────────────────╮".to_string(),
+            "│ >_ OpenAI Codex (v0.128.0)                  │".to_string(),
+            "⚠ MCP startup incomplete (failed: codex_apps)\x1b[19;1H›\x1b[CUse /skills to list available skills\x1b[21;1H  gpt-5.5 xhigh · ~/gh/yggterm\x1b[19;3H\x1b[m\x1b>\x1b[?1l\x1b[?2004h".to_string(),
+        ];
+        session.status_line = "\x1b[19;1H›\x1b[CUse /skills to list available skills\x1b[21;1H  gpt-5.5 xhigh · ~/gh/yggterm\x1b[19;3H\x1b[m\x1b>\x1b[?1l\x1b[?2004h".to_string();
+
+        let replay = remote_live_session_prompt_ready_replay_text(&session)
+            .expect("server snapshot prompt should be replayable");
+
+        assert!(replay.contains("Use /skills to list available skills"));
+        assert!(remote_resume_blank_host_snapshot_is_replayable(&replay));
+    }
+
+    #[test]
+    fn remote_live_session_prompt_ready_replay_can_be_selected_by_session_path() {
+        let mut target = test_live_shell_session("remote-session://dev/target");
+        target.source = SessionSource::LiveSsh;
+        target.terminal_lines = vec![
+            "│ >_ OpenAI Codex (v0.128.0)                  │".to_string(),
+            "╰─────────────────────────────────────────────╯\x1b[13;1H›\x1b[CImplement {feature}\x1b[15;1H  gpt-5.5 xhigh · ~/gh/yggterm\x1b[13;3H\x1b[m\x1b>\x1b[?1l\x1b[?2004h".to_string(),
+        ];
+        target.status_line = "\x1b[13;1H›\x1b[CImplement {feature}\x1b[15;1H  gpt-5.5 xhigh · ~/gh/yggterm\x1b[13;3H\x1b[m\x1b>\x1b[?1l\x1b[?2004h".to_string();
+        let mut other = test_live_shell_session("remote-session://dev/other");
+        other.source = SessionSource::LiveSsh;
+        other.terminal_lines = vec!["plain stale card".to_string()];
+
+        let sessions = vec![other, target];
+        let replay = remote_live_session_prompt_ready_replay_text_for_session_path(
+            sessions.iter(),
+            "remote-session://dev/target",
+        )
+        .expect("active recovery should be able to select the prompt-ready server snapshot");
+
+        assert!(replay.contains("Implement {feature}"));
+        assert!(remote_resume_blank_host_snapshot_is_replayable(&replay));
+    }
+
+    #[test]
+    fn remote_live_session_prompt_ready_replay_does_not_require_codex_card() {
+        let mut session = test_live_shell_session("remote-session://dev/no-card");
+        session.source = SessionSource::LiveSsh;
+        session.terminal_lines = vec![
+            "\x1b[13;1H›\x1b[CReview current changes".to_string(),
+            "\x1b[15;1H  gpt-5.5 xhigh · ~/gh/yggterm\x1b[13;3H\x1b[m\x1b>\x1b[?1l\x1b[?2004h"
+                .to_string(),
+        ];
+        session.status_line =
+            "\x1b[13;1H›\x1b[CReview current changes\x1b[15;1H  gpt-5.5 xhigh · ~/gh/yggterm"
+                .to_string();
+
+        let replay = remote_live_session_prompt_ready_replay_text(&session)
+            .expect("prompt-ready replay must not depend on the Codex welcome card");
+
+        assert!(replay.contains("Review current changes"));
+        assert!(!replay.contains("OpenAI Codex"));
+        assert!(remote_resume_blank_host_snapshot_is_replayable(&replay));
+    }
+
+    #[test]
+    fn remote_live_session_prompt_ready_replay_accepts_cursor_addressed_default_prompt() {
+        let mut session = test_live_shell_session("remote-session://dev/default-prompt");
+        session.source = SessionSource::LiveSsh;
+        session.terminal_lines = vec![
+            "\x1b[?25h\x1b[m\x1b[H\x1b[J\x1b[2m╭─────────────────────────────────────────────╮".to_string(),
+            "│ >_ \x1b[1mOpenAI Codex\x1b[2m (v0.128.0)                  │".to_string(),
+            "│                                             │".to_string(),
+            "│ model:     \x1b[mgpt-5.5 xhigh\x1b[2m   \x1b[36;22m/model\x1b[39;2m to change │".to_string(),
+            "│ directory: \x1b[m~/gh/yggterm\x1b[2m                     │".to_string(),
+            "╰─────────────────────────────────────────────╯\x1b[8;1H\x1b[m  \x1b[1mTip:\x1b[m \x1b[3mNew\x1b[m Use \x1b[1m/fast\x1b[m to enable our fastest inference with increased plan usage.\x1b[10;1H\x1b[33m⚠ Heads up, you have less than 10% of your weekly limit left. Run /status for a breakdown.\x1b[13;1H\x1b[39;1m›\x1b[C\x1b[2mSummarize recent commits\x1b[15;1H  gpt-5.5 xhigh · ~/gh/yggterm\x1b[13;3H\x1b[m\x1b>\x1b[?1l\x1b[?2004h".to_string(),
+        ];
+        session.status_line = "╰─────────────────────────────────────────────╯\x1b[8;1H\x1b[m  \x1b[1mTip:\x1b[m \x1b[3mNew\x1b[m Use \x1b[1m/fast\x1b[m to enable our fastest inference with increased plan usage.\x1b[10;1H\x1b[33m⚠ Heads up, you have less than 10% of your weekly limit left. Run /status for a breakdown.\x1b[13;1H\x1b[39;1m›\x1b[C\x1b[2mSummarize recent commits\x1b[15;1H  gpt-5.5 xhigh · ~/gh/yggterm\x1b[13;3H\x1b[m\x1b>\x1b[?1l\x1b[?2004h".to_string();
+
+        let replay = remote_live_session_prompt_ready_replay_text(&session)
+            .expect("cursor-addressed default Codex prompt should be replayable from live PTY bytes");
+
+        assert!(replay.contains("Summarize recent commits"));
+        assert!(remote_resume_blank_host_snapshot_is_replayable(&replay));
+    }
+
+    #[test]
+    fn app_control_terminal_input_preserves_remote_session_write_path() {
+        let remote_path = "remote-session://dev/abc123";
+
+        assert_eq!(
+            terminal_input_write_path_for_runtime(
+                remote_path,
+                "ssh://dev/runtime-proxy".to_string()
+            ),
+            remote_path
+        );
+        assert_eq!(
+            terminal_input_write_path_for_runtime(
+                "local::abc123",
+                "local-runtime::abc123".to_string()
+            ),
+            "local-runtime::abc123"
+        );
+    }
+
+    #[test]
+    fn active_prompt_replay_falls_back_to_server_live_session_snapshot() {
+        let mut stale_active = test_live_shell_session("remote-session://dev/target");
+        stale_active.source = SessionSource::LiveSsh;
+        stale_active.terminal_lines = vec![
+            "╭─────────────────────────────────────────────╮".to_string(),
+            "│ >_ OpenAI Codex (v0.128.0)                  │".to_string(),
+            "│ directory: ~/gh/yggterm                     │".to_string(),
+        ];
+        stale_active.status_line.clear();
+
+        let mut current = stale_active.clone();
+        current.terminal_lines = vec![
+            "╭─────────────────────────────────────────────╮".to_string(),
+            "│ >_ OpenAI Codex (v0.128.0)                  │".to_string(),
+            "╰─────────────────────────────────────────────╯\x1b[13;1H›\x1b[CReview current changes\x1b[15;1H  gpt-5.5 xhigh · ~/gh/yggterm\x1b[13;3H\x1b[m\x1b>\x1b[?1l\x1b[?2004h".to_string(),
+        ];
+        current.status_line =
+            "\x1b[13;1H›\x1b[CReview current changes\x1b[15;1H  gpt-5.5 xhigh · ~/gh/yggterm"
+                .to_string();
+        let live_sessions = vec![current];
+
+        let replay = remote_live_session_prompt_ready_replay_text_for_active_session(
+            &stale_active,
+            live_sessions.iter(),
+            "remote-session://dev/target",
+        )
+        .expect("active render should fall back to the current server live-session prompt snapshot");
+
+        assert!(replay.contains("Review current changes"));
+        assert!(remote_resume_blank_host_snapshot_is_replayable(&replay));
+    }
+
+    #[test]
+    fn active_replay_prefers_current_live_runtime_snapshot_over_stale_active_copy() {
+        let mut stale_active = test_live_shell_session("remote-session://dev/target");
+        stale_active.source = SessionSource::LiveSsh;
+        stale_active.terminal_lines = vec![
+            "YGGTERM_STALE_ACTIVE_COPY".to_string(),
+            "pi@dev:~/old$".to_string(),
+        ];
+        stale_active.status_line = "pi@dev:~/old$".to_string();
+
+        let mut current = stale_active.clone();
+        current.terminal_lines = vec![
+            "YGGTERM_RUNTIME_STREAM_SEQ_42".to_string(),
+            "pi@dev:~/gh/yggterm$".to_string(),
+        ];
+        current.status_line.clear();
+        let live_sessions = vec![current];
+
+        let replay = remote_live_session_prompt_ready_replay_text_for_active_session(
+            &stale_active,
+            live_sessions.iter(),
+            "remote-session://dev/target",
+        )
+        .expect("terminal replay should prefer the current live runtime snapshot over stale active display copy");
+
+        assert!(replay.contains("YGGTERM_RUNTIME_STREAM_SEQ_42"));
+        assert!(replay.contains("pi@dev:~/gh/yggterm$"));
+        assert!(!replay.contains("YGGTERM_STALE_ACTIVE_COPY"));
+        assert!(!replay.contains("pi@dev:~/old$"));
+        assert!(remote_resume_blank_host_snapshot_is_replayable(&replay));
+    }
+
+    #[test]
+    fn active_recovery_snapshot_probe_only_starts_for_unready_active_remote() {
+        assert!(active_remote_recovery_snapshot_probe_should_start(
+            true, true, false, true
+        ));
+        assert!(!active_remote_recovery_snapshot_probe_should_start(
+            false, true, false, true
+        ));
+        assert!(!active_remote_recovery_snapshot_probe_should_start(
+            true, false, false, true
+        ));
+        assert!(active_remote_recovery_snapshot_probe_should_start(
+            true, true, true, true
+        ));
+        assert!(!active_remote_recovery_snapshot_probe_should_start(
+            true, true, false, false
+        ));
+    }
+
+    #[test]
+    fn active_recovery_snapshot_probe_identity_tracks_open_attempts() {
+        let mount_identity = "remote-session://dev/abc123:7";
+        assert_eq!(
+            active_recovery_snapshot_probe_key(mount_identity, Some("terminal-open-1")),
+            "active-recovery-snapshot:remote-session://dev/abc123:7:terminal-open-1"
+        );
+        assert_ne!(
+            active_recovery_snapshot_probe_key(mount_identity, Some("terminal-open-1")),
+            active_recovery_snapshot_probe_key(mount_identity, Some("terminal-open-2"))
+        );
+    }
+
+    #[test]
+    fn server_prompt_snapshot_replay_starts_for_retained_recovering_remote() {
+        assert!(server_prompt_snapshot_replay_should_start(
+            true, true, true, false
+        ));
+        assert!(server_prompt_snapshot_replay_should_start(
+            true, true, false, true
+        ));
+        assert!(!server_prompt_snapshot_replay_should_start(
+            true, true, false, false
+        ));
+        assert!(!server_prompt_snapshot_replay_should_start(
+            true, false, true, true
+        ));
+        assert!(!server_prompt_snapshot_replay_should_start(
+            false, true, true, true
+        ));
+    }
+
+    #[test]
+    fn server_prompt_snapshot_replay_identity_tracks_recovery_attempts() {
+        let mount_identity = "remote-session://dev/abc123:7";
+        assert_eq!(
+            server_prompt_snapshot_replay_identity(
+                mount_identity,
+                42,
+                11,
+                Some("terminal-open-1")
+            ),
+            "server-snapshot-replay:remote-session://dev/abc123:7:42:11:terminal-open-1"
+        );
+        assert_ne!(
+            server_prompt_snapshot_replay_identity(
+                mount_identity,
+                42,
+                11,
+                Some("terminal-open-1")
+            ),
+            server_prompt_snapshot_replay_identity(
+                mount_identity,
+                42,
+                11,
+                Some("terminal-open-2")
+            )
+        );
+    }
+
+    #[test]
+    fn remote_retained_surface_fault_invalidates_empty_and_idle_hosts() {
+        assert!(remote_retained_surface_fault_should_invalidate(Some(
+            "active terminal host exists but xterm surface is empty"
+        )));
+        assert!(remote_retained_surface_fault_should_invalidate(Some(
+            "active terminal host is still showing generic Codex idle chrome"
+        )));
     }
     #[test]
     fn shell_snapshot_retains_live_local_stored_codex_sessions() {
@@ -60105,6 +62156,24 @@ Updated at   Branch  Conversation\n\
     fn suppress_resume_output_allows_live_codex_prompt_surface() {
         assert!(!should_suppress_remote_resume_surface_output(
             true, false, false, true, false, false, true, true, false, false, false, false, false,
+        ));
+    }
+    #[test]
+    fn suppress_stale_remote_idle_after_server_prompt_blocks_card_overwrites() {
+        assert!(should_suppress_stale_remote_idle_after_server_prompt(
+            true, true, false, true, false, false, false,
+        ));
+        assert!(should_suppress_stale_remote_idle_after_server_prompt(
+            true, true, false, false, false, true, false,
+        ));
+        assert!(!should_suppress_stale_remote_idle_after_server_prompt(
+            true, false, false, true, false, false, false,
+        ));
+        assert!(!should_suppress_stale_remote_idle_after_server_prompt(
+            true, true, true, true, false, false, false,
+        ));
+        assert!(!should_suppress_stale_remote_idle_after_server_prompt(
+            false, true, false, true, false, false, false,
         ));
     }
     #[test]

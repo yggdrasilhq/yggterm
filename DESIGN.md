@@ -441,6 +441,14 @@ The product has three separate identities that must not be conflated:
 
 Selecting a row may focus or hydrate already-cached data. It must not rename, regenerate, relaunch, or move a runtime unless the user took an explicit action for that side effect.
 
+Each app surface has exactly one source of truth:
+
+- Terminal mode is a live runtime attachment. Its viewport is fed only by daemon-owned PTY bytes, daemon-owned retained scrollback for that same runtime, or an explicit runtime-unavailable error. It must never be fed by generated preview copy, Codex JSONL transcript blocks, semantic status-card guesses, or display-copy fallbacks.
+- Preview mode is a read-only presentation of a session for inspection, similar to a chat transcript. Its source of truth is stored/generated presentation data, not the live PTY. It may show `USER`/`ASSISTANT` style blocks when presenting an agent transcript, but those blocks are illegal in Terminal mode.
+- Display copy is metadata. It can label, summarize, and help users re-enter work, but it never decides which runtime receives input and never repairs a terminal viewport.
+- Retained xterm hosts are display caches. If the cache is missing, stale, or corrupt, the rebuild source is the daemon runtime stream/scrollback for that runtime, not preview text.
+- Codex-class semantic state is advisory. Codex welcome cards, `/status` output, prompt wording, and model banners are not stable contracts and must not be used as the primary proof that a terminal is healthy.
+
 ### Live sessions and updates
 
 `Live Sessions` is a runtime monitor, not the user's only home for a session.
@@ -460,6 +468,7 @@ Preview mode is read-only by default.
 - Preview hydration may update the preview body from existing cache.
 - Preview hydration must not rewrite a user title or start LLM copy generation.
 - Generated copy is an explicit background job with visible state and a bounded budget, not an incidental selection effect.
+- Preview hydration must not write into Terminal-mode buffers, retained xterm buffers, or terminal recovery paths. Preview and terminal are sibling views over the same session identity, not fallback renderers for each other.
 
 Terminal recipes are experimental. They should not be created implicitly from drag/drop or ordinary session movement unless an explicit development flag enables that behavior.
 
@@ -479,6 +488,7 @@ Terminal focus, input, scroll, selection, and retained-host recovery must have o
 - A terminal that can scroll but cannot type is a broken state.
 - A terminal that can type but cannot scroll while the user is reading scrollback is also broken.
 - Retained terminal hosts may stay mounted only while their active session identity and input policy match the shell state.
+- Live session switching should feel like attaching Ghostty or xterm to an already-running `screen`/`tmux` session: if the runtime is alive, focusing it attaches to the current stream without relaunching, regenerating, previewing, or replaying transcript text.
 - Activity indicators represent real work: `idle`, `running`, `recent-output`, `recovering`, or `kept`. They should not spin for cosmetic debounce after a blank Enter or already-rendered keypress.
 - App-control typing proofs should use the same viewport keyboard path a user exercises. Direct PTY writes are still useful for controlled setup, but interrupt bytes such as `Ctrl-C` must not be batched with later line-editing or command bytes.
 
