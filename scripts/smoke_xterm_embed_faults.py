@@ -4186,6 +4186,119 @@ def host_has_live_codex_prompt(host: dict) -> bool:
     )
 
 
+def host_has_prompt_ready_text(host: dict) -> bool:
+    chunks = (
+        str(host.get("cursor_line_text") or host.get("cursor_row_text") or ""),
+        str(host.get("text_tail") or ""),
+        str(host.get("text_sample") or ""),
+        terminal_host_text(host),
+    )
+    if any(terminal_chunk_has_prompt_output(chunk) for chunk in chunks):
+        return True
+    if any(terminal_chunk_has_codex_prompt_output(chunk) for chunk in chunks):
+        return True
+    return False
+
+
+def assert_live_remote_terminal_surface_contract(pid: int) -> dict:
+    state = app_state(pid)
+    active_path = normalize_live_path(str(state.get("active_session_path") or ""))
+    if not active_path.startswith("remote-session://"):
+        return {"skipped": True, "reason": "active session is not remote live"}
+    viewport = viewport_state(state)
+    surface = viewport.get("active_terminal_surface") or {}
+    host = host_for_session_or_none(state, active_path) or active_host_or_none(state) or {}
+    host_text = terminal_host_text(host)
+    prompt_ready = host_has_prompt_ready_text(host)
+    notifications = visible_notifications(state)
+    stale_attention = [
+        notification
+        for notification in notifications
+        if "terminal" in str(notification.get("title") or "").lower()
+        or "terminal" in str(notification.get("message") or "").lower()
+    ]
+    if state.get("active_view_mode") != "Terminal":
+        raise AssertionError(
+            "active remote live session is not in Terminal view: "
+            f"active_path={active_path!r} active_view_mode={state.get('active_view_mode')!r} "
+            f"settled={viewport.get('terminal_settled_kind')!r}"
+        )
+    if viewport.get("terminal_settled_kind") == "preview":
+        raise AssertionError(
+            "active remote live session settled as Preview instead of terminal: "
+            f"active_path={active_path!r} viewport={viewport!r}"
+        )
+    if surface.get("problem"):
+        raise AssertionError(
+            f"active remote terminal surface reports a problem: surface={surface!r} host={host!r}"
+        )
+    if stale_attention:
+        raise AssertionError(
+            f"active remote terminal still has attention/retry notifications: {stale_attention!r}"
+        )
+    if host.get("input_enabled") is not True:
+        raise AssertionError(
+            "active remote terminal is not input-enabled after restore/switch: "
+            f"active_path={active_path!r} prompt_ready={prompt_ready!r} host={host!r}"
+        )
+    if not prompt_ready:
+        raise AssertionError(
+            "active remote terminal has no prompt-ready runtime surface after restore/switch: "
+            f"active_path={active_path!r} text_tail={host_text[-1200:]!r} host={host!r}"
+        )
+    marker = f"YGGTERM_STREAM_PROOF_{int(time.time() * 1000)}"
+    marker_response = terminal_send(
+        pid,
+        active_path,
+        marker,
+    )
+    marker_data = marker_response.get("data") or {}
+    if marker_response.get("error") or marker_data.get("accepted") is False:
+        raise AssertionError(
+            "active remote terminal rejected the app-owned stream marker input proof: "
+            f"active_path={active_path!r} response={marker_response!r}"
+        )
+    marker_host = host
+    marker_deadline = time.time() + 10.0
+    while time.time() < marker_deadline:
+        marker_state = app_state(pid)
+        marker_host = (
+            host_for_session_or_none(marker_state, active_path)
+            or active_host_or_none(marker_state)
+            or {}
+        )
+        marker_text = terminal_host_text(marker_host)
+        if marker in marker_text:
+            break
+        time.sleep(0.5)
+    marker_text = terminal_host_text(marker_host)
+    if marker not in marker_text:
+        raise AssertionError(
+            "active remote terminal accepted input but did not show the runtime stream marker: "
+            f"active_path={active_path!r} response={marker_response!r} "
+            f"text_tail={marker_text[-1600:]!r}"
+        )
+    cleanup_response = terminal_send(pid, active_path, "\x15")
+    cleanup_data = cleanup_response.get("data") or {}
+    if cleanup_response.get("error") or cleanup_data.get("accepted") is False:
+        raise AssertionError(
+            "active remote terminal accepted marker input but rejected prompt cleanup: "
+            f"active_path={active_path!r} response={cleanup_response!r}"
+        )
+    assert_no_attach_ready_protocol_markers(marker_host, "live remote surface")
+    assert_no_transcript_artifacts(marker_host, "live remote surface")
+    return {
+        "active_session_path": active_path,
+        "input_enabled": marker_host.get("input_enabled"),
+        "prompt_ready": prompt_ready,
+        "stream_marker": marker,
+        "stream_marker_backend": marker_data.get("keyboard_backend"),
+        "stream_marker_visible": marker in marker_text,
+        "text_tail": terminal_host_text(marker_host)[-500:],
+        "surface": surface,
+    }
+
+
 def host_has_shell_status_failure(host: dict) -> bool:
     haystack = terminal_host_text(host)
     recent = haystack[-400:].lower()
@@ -16037,6 +16150,7 @@ def main() -> int:
         "live_session_keep_alive_toggle",
         "live_session_metadata_consistency",
         "live_sessions_tree_contract",
+        "live_remote_terminal_surface_contract",
         "webkit_child_rss_soak",
         "window_corner_artifact",
     }
@@ -16177,6 +16291,10 @@ def main() -> int:
         if "stored_codex_session_open" in selected_checks:
             run_check("stored_codex_session_open", lambda: assert_stored_codex_session_open_contract(args.pid))
         run_check("live_sessions_tree_contract", lambda: assert_live_sessions_tree_contract(args.pid))
+        run_check(
+            "live_remote_terminal_surface_contract",
+            lambda: assert_live_remote_terminal_surface_contract(args.pid),
+        )
         run_check("session_drag_to_folder", lambda: assert_session_drag_to_folder_contract(args.pid))
         run_check(
             "folder_create_rename_collapse",

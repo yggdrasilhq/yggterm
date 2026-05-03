@@ -1,3 +1,12 @@
+yggterm (2.1.109-1) unstable; urgency=medium
+
+  * Enforce daemon-owned PTY/runtime stream as the Terminal-mode source of truth.
+  * Keep retained remote live terminal read loops hot while inactive.
+  * Replace Codex status-card readiness gates with deterministic stream-marker
+    and retained-session switch regression coverage.
+
+ -- Yggdrasil HQ <avi@gour.top>  Mon, 04 May 2026 03:15:00 +0530
+
 yggterm (2.1.108-1) unstable; urgency=medium
 
   * Restore normal close semantics for non-Keep-Alive live sessions.
