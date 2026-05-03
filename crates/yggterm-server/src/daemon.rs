@@ -1625,10 +1625,33 @@ impl DaemonRuntime {
                 }
             }
             ServerRequest::TerminalWrite { path, data } => {
-                if self.server.remote_terminal_write_for_path(&path, &data)? {
+                let runtime_path = self.terminal_runtime_key_for_path(&path);
+                if self.terminals.session_is_running(&runtime_path) {
+                    self.terminals.write(&runtime_path, &data)?;
                     return Ok(ServerResponse::Ack { message: None });
                 }
-                let runtime_path = self.terminal_runtime_key_for_path(&path);
+                match self.server.remote_terminal_write_for_path(&path, &data) {
+                    Ok(true) => {
+                        return Ok(ServerResponse::Ack { message: None });
+                    }
+                    Ok(false) => {}
+                    Err(error) => {
+                        if let Ok(home) = resolve_yggterm_home() {
+                            append_trace_event(
+                                &home,
+                                "daemon",
+                                "terminal_io",
+                                "remote_terminal_write_direct_failed_fallback_local_pty",
+                                serde_json::json!({
+                                    "path": path,
+                                    "runtime_path": runtime_path,
+                                    "error": format!("{error:#}"),
+                                    "bytes": data.len(),
+                                }),
+                            );
+                        }
+                    }
+                }
                 self.terminals.write(&runtime_path, &data)?;
                 ServerResponse::Ack { message: None }
             }

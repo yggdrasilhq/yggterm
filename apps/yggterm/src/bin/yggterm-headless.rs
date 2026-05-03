@@ -14,15 +14,16 @@ use yggterm_server::{
     run_app_control_paste_terminal_clipboard_image, run_app_control_probe_terminal_viewport_input,
     run_app_control_probe_terminal_viewport_scroll, run_app_control_probe_terminal_viewport_select,
     run_app_control_reclaim_terminal_focus, run_app_control_remove_session,
-    run_app_control_restart_pending_update, run_app_control_scroll_preview,
-    run_app_control_send_terminal_input, run_app_control_set_clipboard_png_base64,
-    run_app_control_set_clipboard_text, run_app_control_set_fullscreen,
-    run_app_control_set_main_zoom, run_app_control_set_right_panel_mode,
-    run_app_control_set_row_expanded, run_app_control_set_search,
-    run_app_control_set_session_keep_alive, run_app_control_set_window_chrome_hover,
-    run_app_control_trigger_update_check, run_attach, run_daemon, run_screenrecord_capture,
-    run_screenshot_capture, run_trace_bundle, run_trace_follow, run_trace_tail, shutdown, snapshot,
-    status, terminal_write, try_run_remote_server_command,
+    run_app_control_resize_window, run_app_control_restart_pending_update,
+    run_app_control_scroll_preview, run_app_control_send_terminal_input,
+    run_app_control_set_clipboard_png_base64, run_app_control_set_clipboard_text,
+    run_app_control_set_fullscreen, run_app_control_set_main_zoom,
+    run_app_control_set_right_panel_mode, run_app_control_set_row_expanded,
+    run_app_control_set_search, run_app_control_set_session_keep_alive,
+    run_app_control_set_window_chrome_hover, run_app_control_trigger_update_check, run_attach,
+    run_daemon, run_screenrecord_capture, run_screenshot_capture, run_trace_bundle,
+    run_trace_follow, run_trace_tail, shutdown, snapshot, status, terminal_write,
+    try_run_remote_server_command,
 };
 
 #[path = "../headless_monitor.rs"]
@@ -105,6 +106,7 @@ fn print_server_app_help() {
   yggterm-headless server app state [--pid <pid>]
   yggterm-headless server app rows [--pid <pid>]
   yggterm-headless server app screenshot [output] [--pid <pid>]
+  yggterm-headless server app resize-window --width <px> --height <px> [--pid <pid>]
   yggterm-headless server app update <check|restart>
   yggterm-headless server app terminal <new|send|focus|probe-type|probe-scroll|probe-select> ..."
     );
@@ -572,6 +574,27 @@ fn main() -> Result<()> {
                 run_app_control_move_window_by(
                     delta_x.context("missing --delta-x/--dx for server app move-window")?,
                     delta_y.context("missing --delta-y/--dy for server app move-window")?,
+                    timeout_ms,
+                )
+            }
+            "resize-window" | "set-window-size" | "size" => {
+                let width = args.windows(2).find_map(|window| {
+                    if window[0] == "--width" || window[0] == "--w" {
+                        window[1].parse::<f64>().ok()
+                    } else {
+                        None
+                    }
+                });
+                let height = args.windows(2).find_map(|window| {
+                    if window[0] == "--height" || window[0] == "--h" {
+                        window[1].parse::<f64>().ok()
+                    } else {
+                        None
+                    }
+                });
+                run_app_control_resize_window(
+                    width.context("missing --width/--w for server app resize-window")?,
+                    height.context("missing --height/--h for server app resize-window")?,
                     timeout_ms,
                 )
             }
