@@ -46,6 +46,7 @@ const DEFAULT_ORPHAN_DAEMON_REAP_AFTER_MS: u64 = 180_000;
 #[cfg(target_os = "linux")]
 const DUPLICATE_SAME_HOME_GRACE_MS: u64 = 2_000;
 const DAEMON_REQUEST_IO_TIMEOUT_MS: u64 = 10_000;
+const DAEMON_LONG_REQUEST_IO_TIMEOUT_MS: u64 = 60_000;
 const REMOTE_ATTACH_STARTUP_GRACE_MS: u64 = 900;
 const REMOTE_START_CODEX_ATTACH_STARTUP_GRACE_MS: u64 = 18_000;
 const CLIENT_CLOSE_FORCE_SHUTDOWN_AFTER_SECS: u64 = 60 * 60;
@@ -1734,6 +1735,32 @@ impl DaemonRuntime {
             }
             ServerRequest::TerminalWrite { path, data } => {
                 let runtime_path = self.terminal_runtime_key_for_path(&path);
+                let prefer_remote_direct = terminal_write_prefers_remote_direct(&path);
+                if prefer_remote_direct {
+                    match self.server.remote_terminal_write_for_path(&path, &data) {
+                        Ok(true) => {
+                            return Ok(ServerResponse::Ack { message: None });
+                        }
+                        Ok(false) => {}
+                        Err(error) => {
+                            if let Ok(home) = resolve_yggterm_home() {
+                                append_trace_event(
+                                    &home,
+                                    "daemon",
+                                    "terminal_io",
+                                    "remote_terminal_write_direct_failed",
+                                    serde_json::json!({
+                                        "path": path,
+                                        "runtime_path": runtime_path,
+                                        "error": format!("{error:#}"),
+                                        "bytes": data.len(),
+                                    }),
+                                );
+                            }
+                            return Err(error);
+                        }
+                    }
+                }
                 if self.terminals.session_is_running(&runtime_path) {
                     self.terminals.write(&runtime_path, &data)?;
                     return Ok(ServerResponse::Ack { message: None });
@@ -4198,14 +4225,14 @@ fn send_request(endpoint: &ServerEndpoint, request: &ServerRequest) -> Result<Se
     let mut request_bytes =
         serde_json::to_vec(request).context("serializing daemon request payload")?;
     request_bytes.push(b'\n');
+    let io_timeout = Some(std::time::Duration::from_millis(
+        daemon_request_io_timeout_ms(request),
+    ));
     match endpoint {
         #[cfg(unix)]
         ServerEndpoint::UnixSocket(path) => {
             let mut stream = std::os::unix::net::UnixStream::connect(path)
                 .with_context(|| format!("connecting to {}", path.display()))?;
-            let io_timeout = Some(std::time::Duration::from_millis(
-                DAEMON_REQUEST_IO_TIMEOUT_MS,
-            ));
             stream
                 .set_read_timeout(io_timeout)
                 .context("setting daemon request read timeout")?;
@@ -4234,9 +4261,6 @@ fn send_request(endpoint: &ServerEndpoint, request: &ServerRequest) -> Result<Se
         ServerEndpoint::Tcp { host, port } => {
             let mut stream = std::net::TcpStream::connect((host.as_str(), *port))
                 .with_context(|| format!("connecting to {}:{}", host, port))?;
-            let io_timeout = Some(std::time::Duration::from_millis(
-                DAEMON_REQUEST_IO_TIMEOUT_MS,
-            ));
             stream
                 .set_read_timeout(io_timeout)
                 .context("setting daemon request read timeout")?;
@@ -4263,6 +4287,23 @@ fn send_request(endpoint: &ServerEndpoint, request: &ServerRequest) -> Result<Se
             })
         }
     }
+}
+
+fn daemon_request_io_timeout_ms(request: &ServerRequest) -> u64 {
+    match request {
+        ServerRequest::StartSshSession { .. }
+        | ServerRequest::StartRemoteCodexSession { .. }
+        | ServerRequest::OpenRemoteSession { .. }
+        | ServerRequest::EnsureRemoteRuntimeCodexSession { .. }
+        | ServerRequest::StartRemoteRuntimeCodexSession { .. } => {
+            DAEMON_LONG_REQUEST_IO_TIMEOUT_MS
+        }
+        _ => DAEMON_REQUEST_IO_TIMEOUT_MS,
+    }
+}
+
+fn terminal_write_prefers_remote_direct(path: &str) -> bool {
+    path.trim_start().starts_with("remote-session://")
 }
 
 #[cfg(test)]
@@ -4327,6 +4368,48 @@ mod tests {
             mark_remote_machine_refresh_queued(&mut in_flight, "local", false),
             RemoteMachineRefreshQueueStatus::Loopback
         );
+    }
+
+    #[test]
+    fn remote_start_requests_get_longer_daemon_response_budget() {
+        assert_eq!(
+            super::daemon_request_io_timeout_ms(&super::ServerRequest::Status),
+            super::DAEMON_REQUEST_IO_TIMEOUT_MS
+        );
+        assert_eq!(
+            super::daemon_request_io_timeout_ms(&super::ServerRequest::StartRemoteCodexSession {
+                target: "dev".to_string(),
+                prefix: None,
+                cwd: Some("/home/pi/gh/yggterm".to_string()),
+                title_hint: Some("Debug".to_string()),
+            }),
+            super::DAEMON_LONG_REQUEST_IO_TIMEOUT_MS
+        );
+        assert_eq!(
+            super::daemon_request_io_timeout_ms(&super::ServerRequest::StartSshSession {
+                target: "dev".to_string(),
+                prefix: None,
+                cwd: None,
+                title_hint: None,
+            }),
+            super::DAEMON_LONG_REQUEST_IO_TIMEOUT_MS
+        );
+    }
+
+    #[test]
+    fn remote_session_terminal_input_prefers_remote_runtime_write() {
+        assert!(super::terminal_write_prefers_remote_direct(
+            "remote-session://dev/8931728b-30a7-428a-8b8e-35bee0480444"
+        ));
+        assert!(super::terminal_write_prefers_remote_direct(
+            "  remote-session://dev/d98bc22f-91e4-4332-8696-122cca33c71c"
+        ));
+        assert!(!super::terminal_write_prefers_remote_direct(
+            "ssh://dev/home/pi/gh/yggterm"
+        ));
+        assert!(!super::terminal_write_prefers_remote_direct(
+            "local://shell"
+        ));
     }
 
     #[test]

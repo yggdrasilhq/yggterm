@@ -1352,6 +1352,7 @@ impl YggtermServer {
         let machine_key = normalize_machine_key(raw_machine_key);
         let target = self.remote_target_for_machine_key(&machine_key)?;
         let runtime_key = remote_runtime_codex_session_key(session_id);
+        let write_data = normalize_remote_terminal_write_data(data);
         let debug_binary_override = std::env::var("YGGTERM_REMOTE_YGGTERM_BINARY_EXPR")
             .ok()
             .map(|value| value.trim().to_string())
@@ -1369,14 +1370,14 @@ impl YggtermServer {
                 target.prefix.as_deref(),
                 binary_expr,
                 &write_args,
-                Some(data.as_bytes()),
+                Some(write_data.as_bytes()),
             )
         } else {
             run_remote_yggterm_command(
                 &target.ssh_target,
                 target.prefix.as_deref(),
                 &write_args,
-                Some(data.as_bytes()),
+                Some(write_data.as_bytes()),
             )
         };
         write_result.with_context(|| {
@@ -1397,6 +1398,7 @@ impl YggtermServer {
                     "ssh_target": target.ssh_target,
                     "runtime_key": runtime_key,
                     "bytes": data.len(),
+                    "write_bytes": write_data.len(),
                 }),
             );
         }
@@ -4616,8 +4618,36 @@ fn remote_runtime_codex_session_key(session_id: &str) -> String {
     format!("codex-runtime://{session_id}")
 }
 
+fn normalize_remote_terminal_write_data(data: &str) -> String {
+    if !data.contains('\r') {
+        return data.to_string();
+    }
+    let mut normalized = String::with_capacity(data.len() + 4);
+    let mut chars = data.chars().peekable();
+    while let Some(ch) = chars.next() {
+        normalized.push(ch);
+        if ch == '\r' && chars.peek() != Some(&'\n') {
+            normalized.push('\n');
+        }
+    }
+    normalized
+}
+
 fn parse_remote_runtime_codex_session_key(path: &str) -> Option<&str> {
     path.strip_prefix("codex-runtime://")
+}
+
+#[cfg(test)]
+mod remote_terminal_write_data_tests {
+    use super::normalize_remote_terminal_write_data;
+
+    #[test]
+    fn remote_terminal_write_normalizes_bare_carriage_return_for_codex_runtime() {
+        assert_eq!(normalize_remote_terminal_write_data("/status\r"), "/status\r\n");
+        assert_eq!(normalize_remote_terminal_write_data("\r"), "\r\n");
+        assert_eq!(normalize_remote_terminal_write_data("/status\r\n"), "/status\r\n");
+        assert_eq!(normalize_remote_terminal_write_data("plain\n"), "plain\n");
+    }
 }
 
 fn remote_resume_shell_command(
