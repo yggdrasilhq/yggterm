@@ -271,6 +271,7 @@ Yggterm should be designed for sessions that stay alive for days, weeks, or mont
 
 - A long-lived workspace must survive local daemon restarts, stale sockets, transient helper failures, and app relaunches without dropping into a dead terminal whenever recovery is still possible.
 - Live terminal runtimes and durable workspace organization are separate concepts. New terminals are ephemeral runtime attachments by default; a user must explicitly choose `Keep Alive` before a live terminal is restored across restart.
+- A normal final client close starts graceful shutdown for live sessions that are not marked `Keep Alive`, removes them from durable restore state, notifies the user, and schedules force cleanup after one hour. This is intentionally different from update restart.
 - `Close Terminal`, `Remove From Sidebar`, and `Delete Permanently` must stay distinct. Runtime close kills the daemon-owned PTY; it must not imply stored transcript or workspace-item deletion.
 - Restore flows should prefer bounded retry and self-healing over fatal blank or frozen terminals when the underlying failure is a transient local-helper problem.
 - Performance work only counts if restore and interaction stay reliable over long runtimes. A faster shell that strands active sessions is not a win.
@@ -448,6 +449,7 @@ Selecting a row may focus or hydrate already-cached data. It must not rename, re
 - The original workspace row remains the user's visual bookmark.
 - The `X` affordance in `Live Sessions` kills the runtime after confirmation. It does not delete stored transcript history.
 - Keep Alive means durable restore after a normal cold restart.
+- Normal app close prunes non-Keep-Alive live rows and gracefully closes their runtimes with a one-hour force-cleanup deadline.
 - Update restart protection temporarily treats all recoverable live runtimes as restorable. It must not silently turn unkept sessions into durable Keep Alive sessions.
 
 ### Preview and copy

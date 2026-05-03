@@ -25,15 +25,15 @@ pub use daemon::{
     cleanup_legacy_daemons, connect_ssh, connect_ssh_custom, default_endpoint,
     ensure_remote_runtime_codex_session as daemon_ensure_remote_runtime_codex_session, focus_live,
     focus_live_with_view, hot_restart, open_remote_session, open_remote_session_with_view,
-    open_stored_session, open_stored_session_with_view, ping, prepare_update_restart,
-    raise_external_window, reachable_versioned_daemon_statuses, refresh_managed_cli,
-    refresh_preview, refresh_remote_machine, remove_session, remove_ssh_target,
-    request_terminal_launch, run_daemon, set_all_preview_blocks_folded, set_session_keep_alive,
-    set_view_mode, shutdown, snapshot, start_command_session, start_local_session,
-    start_local_session_at, start_remote_codex_session_at, start_remote_runtime_codex_session,
-    start_ssh_session_at, status, switch_agent_session_mode, sync_external_window, sync_theme,
-    terminal_ensure, terminal_read, terminal_resize, terminal_snapshot, terminal_write,
-    toggle_preview_block, update_session_copy,
+    open_stored_session, open_stored_session_with_view, ping, prepare_client_close,
+    prepare_update_restart, raise_external_window, reachable_versioned_daemon_statuses,
+    refresh_managed_cli, refresh_preview, refresh_remote_machine, remove_session,
+    remove_ssh_target, request_terminal_launch, run_daemon, set_all_preview_blocks_folded,
+    set_session_keep_alive, set_view_mode, shutdown, snapshot, start_command_session,
+    start_local_session, start_local_session_at, start_remote_codex_session_at,
+    start_remote_runtime_codex_session, start_ssh_session_at, status, switch_agent_session_mode,
+    sync_external_window, sync_theme, terminal_ensure, terminal_read, terminal_resize,
+    terminal_snapshot, terminal_write, toggle_preview_block, update_session_copy,
 };
 pub use host::{GhosttyHostKind, GhosttyHostSupport, GhosttyTerminalHostMode, detect_ghostty_host};
 pub use protocol::{
@@ -1492,6 +1492,19 @@ impl YggtermServer {
         Ok(true)
     }
 
+    pub fn non_keep_alive_live_session_paths(&self) -> Vec<String> {
+        self.live_session_order
+            .iter()
+            .filter_map(|key| {
+                self.sessions
+                    .get(key)
+                    .filter(|session| managed_session_is_promoted_live_session(key, session))
+                    .filter(|session| !session_keep_alive(session))
+                    .map(|_| key.clone())
+            })
+            .collect()
+    }
+
     pub fn set_session_title_hint(&mut self, session_path: &str, title: &str) {
         if let Some(session) = self.sessions.get_mut(session_path) {
             session.title = title.to_string();
@@ -1865,6 +1878,9 @@ impl YggtermServer {
             .filter(|(key, session)| managed_live_session_is_recoverable(key, session))
             .filter_map(|(key, session)| {
                 let keep_alive = session_keep_alive(session);
+                if !keep_alive && !protect_all_live {
+                    return None;
+                }
                 let restore_reason = (!keep_alive && protect_all_live)
                     .then(|| UPDATE_RESTART_RESTORE_REASON.to_string());
                 persisted_live_session_from_managed(key, session, keep_alive, restore_reason)
@@ -3407,6 +3423,9 @@ impl YggtermServer {
         let temporary_update_restore =
             restore_reason.as_deref() == Some(UPDATE_RESTART_RESTORE_REASON);
         if kind == SessionKind::Document {
+            return;
+        }
+        if !keep_alive && !temporary_update_restore {
             return;
         }
         let remote_scanned_key =
@@ -13449,6 +13468,61 @@ pub fn terminate_remote_codex_session(
     }
 }
 
+pub fn request_remote_codex_session_shutdown(
+    machine: &RemoteMachineSnapshot,
+    session_id: &str,
+    force_after: Duration,
+) -> anyhow::Result<()> {
+    request_remote_codex_session_quit(machine, session_id)?;
+    let machine = machine.clone();
+    let session_id = session_id.to_string();
+    std::thread::spawn(move || {
+        std::thread::sleep(force_after);
+        let _ = terminate_remote_codex_session(&machine, &session_id);
+    });
+    Ok(())
+}
+
+fn request_remote_codex_session_quit(
+    machine: &RemoteMachineSnapshot,
+    session_id: &str,
+) -> anyhow::Result<()> {
+    let session_name = remote_tmux_session_name(session_id);
+    let command = format!(
+        "if command -v tmux >/dev/null 2>&1 && tmux has-session -t {} 2>/dev/null; then tmux send-keys -t {} /quit Enter >/dev/null 2>&1 || true; \
+         elif command -v screen >/dev/null 2>&1 && screen -ls {} 2>/dev/null | grep -q '\\\\.'; then screen -S {} -X stuff '/quit\\015' >/dev/null 2>&1 || true; fi",
+        shell_single_quote(&session_name),
+        shell_single_quote(&session_name),
+        shell_single_quote(&session_name),
+        shell_single_quote(&session_name),
+    );
+    let remote = remote_shell_command(machine.prefix.as_deref(), &command);
+    let status = Command::new("ssh")
+        .arg("-o")
+        .arg("ConnectTimeout=8")
+        .arg("-o")
+        .arg("BatchMode=yes")
+        .arg(&machine.ssh_target)
+        .arg(remote)
+        .status()
+        .with_context(|| {
+            format!(
+                "failed to request graceful remote codex shutdown {} on {}",
+                session_id, machine.ssh_target
+            )
+        })?;
+    if status.success() {
+        Ok(())
+    } else {
+        anyhow::bail!(
+            "failed to request graceful remote codex shutdown {} on {}: {}",
+            session_id,
+            machine.ssh_target,
+            status
+        );
+    }
+}
+
 fn snapshot_preview_block(block: SessionPreviewBlock) -> SnapshotPreviewBlock {
     SnapshotPreviewBlock {
         role: block.role.to_string(),
@@ -19291,7 +19365,7 @@ terminal_window_id: None,
     }
 
     #[test]
-    fn persisted_state_persists_recoverable_live_sessions_by_default() {
+    fn persisted_state_only_keeps_explicitly_kept_live_sessions() {
         let tree = SessionNode {
             kind: SessionNodeKind::Group,
             name: "sessions".to_string(),
@@ -19316,12 +19390,7 @@ terminal_window_id: None,
         );
 
         let persisted = server.persisted_state();
-        assert_eq!(persisted.live_sessions.len(), 1);
-        assert_eq!(persisted.live_sessions[0].key, local_shell);
-        assert!(
-            !persisted.live_sessions[0].keep_alive,
-            "fresh recoverable live terminals persist by default but do not become keep-alive sessions"
-        );
+        assert!(persisted.live_sessions.is_empty());
 
         assert!(
             server
@@ -19339,9 +19408,7 @@ terminal_window_id: None,
                 .expect("clear shell keep-alive")
         );
         let persisted = server.persisted_state();
-        assert_eq!(persisted.live_sessions.len(), 1);
-        assert_eq!(persisted.live_sessions[0].key, local_shell);
-        assert!(!persisted.live_sessions[0].keep_alive);
+        assert!(persisted.live_sessions.is_empty());
     }
 
     #[test]
@@ -19378,14 +19445,14 @@ terminal_window_id: None,
             .expect("mark codex keep-alive");
 
         let normal = server.persisted_state();
-        assert_eq!(normal.live_sessions.len(), 2);
-        let normal_shell = normal
-            .live_sessions
-            .iter()
-            .find(|live| live.key == local_shell)
-            .expect("unkept local shell included in normal persistence");
-        assert!(!normal_shell.keep_alive);
-        assert_eq!(normal_shell.restore_reason, None);
+        assert_eq!(normal.live_sessions.len(), 1);
+        assert!(
+            normal
+                .live_sessions
+                .iter()
+                .all(|live| live.key != local_shell),
+            "unkept local shell must not be included in normal persistence"
+        );
         let normal_codex = normal
             .live_sessions
             .iter()
@@ -19456,14 +19523,14 @@ terminal_window_id: None,
             Some("keep-alive".to_string())
         );
         let persisted = server.persisted_state();
-        assert_eq!(persisted.live_sessions.len(), 1);
-        assert_eq!(persisted.live_sessions[0].key, "local://update-shell");
-        assert!(!persisted.live_sessions[0].keep_alive);
-        assert_eq!(persisted.live_sessions[0].restore_reason, None);
+        assert!(
+            persisted.live_sessions.is_empty(),
+            "a temporary update restore must not become durable normal-close persistence"
+        );
     }
 
     #[test]
-    fn restore_persisted_state_restores_unkept_recoverable_live_sessions() {
+    fn restore_persisted_state_skips_unkept_recoverable_live_sessions_without_update_reason() {
         let tree = SessionNode {
             kind: SessionNodeKind::Group,
             name: "sessions".to_string(),
@@ -19504,6 +19571,52 @@ terminal_window_id: None,
             None,
         );
 
+        assert!(server.live_sessions().is_empty());
+        assert!(!server.sessions.contains_key("local::old-shell"));
+    }
+
+    #[test]
+    fn restore_persisted_state_restores_unkept_update_restart_live_sessions_once() {
+        let tree = SessionNode {
+            kind: SessionNodeKind::Group,
+            name: "sessions".to_string(),
+            title: None,
+            document_kind: None,
+            group_kind: None,
+            path: PathBuf::from("/"),
+            children: Vec::new(),
+            session_id: None,
+            cwd: None,
+        };
+        let mut server = YggtermServer::new(
+            &tree,
+            false,
+            GhosttyHostSupport::shadow("test".to_string(), false, false),
+            UiTheme::ZedLight,
+        );
+        server.restore_persisted_state(
+            PersistedDaemonState {
+                active_session_path: Some("local::old-shell".to_string()),
+                active_view_mode: WorkspaceViewMode::Terminal,
+                ssh_targets: Vec::new(),
+                remote_machines: Vec::new(),
+                stored_sessions: Vec::new(),
+                live_sessions: vec![PersistedLiveSession {
+                    key: "local::old-shell".to_string(),
+                    id: "old-shell".to_string(),
+                    title: "Old unkept shell".to_string(),
+                    kind: SessionKind::Shell,
+                    keep_alive: false,
+                    ssh_target: "localhost".to_string(),
+                    prefix: None,
+                    cwd: Some("/home/pi".to_string()),
+                    remote_launch_action: None,
+                    restore_reason: Some(UPDATE_RESTART_RESTORE_REASON.to_string()),
+                }],
+            },
+            None,
+        );
+
         assert_eq!(server.live_sessions().len(), 1);
         assert!(
             server
@@ -19512,6 +19625,7 @@ terminal_window_id: None,
         );
         assert_eq!(server.active_view_mode(), WorkspaceViewMode::Terminal);
         assert!(server.sessions.contains_key("local::old-shell"));
+        assert!(server.persisted_state().live_sessions.is_empty());
     }
 
     #[test]
