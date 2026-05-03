@@ -4,12 +4,12 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
-## 2.1.102
+## 2.1.103
 
-- Fixed remote Codex session switching and scrollback probes so app-owned wheel input moves the xterm viewport instead of only incrementing wheel counters.
-- Accepted real remote Codex prompt-only startup surfaces when runtime output and input evidence prove the session is live, preventing false loading/recovery UX when switching back to remote sessions.
-- Tightened the remote Codex smoke harness to seed and require scrollback movement, keep cleanup on app-control APIs, and fail the exact one-line scrollback snap-back regression that was missed before.
-- Added CI coverage for remote prompt-only readiness, xterm wheel bridge scoping, and one-line scrollback locking.
+- Removed saved Codex JSONL transcript prefill from live remote terminal restore, so retained/live Codex sessions wait for or restart the real PTY instead of painting `USER:` / `ASSISTANT:` transcript artifacts into xterm.
+- Treat transcript-browser and role-labeled transcript text as terminal-surface failures in app-control state, even when the xterm host is mounted, input-enabled, and has scrollback.
+- Prewarm restored live terminal sessions by default on daemon startup, not only the active session, so Live Sessions stay attached in the background instead of repeatedly entering visible recovery when selected.
+- Tightened the terminal smoke harness and focused CI gates to reject transcript artifacts during `/status`, retained session switching, and app-control readiness checks before accepting a terminal as interactive.
 
 ## 2.1.101
 
