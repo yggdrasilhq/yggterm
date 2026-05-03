@@ -12,6 +12,7 @@ pub struct TerminalPaletteSpec {
     pub background: String,
     pub foreground: String,
     pub cursor: String,
+    pub cursor_text: String,
     pub selection: String,
     pub black: String,
     pub red: String,
@@ -44,6 +45,7 @@ static TERMINAL_THEME_CATALOG: Lazy<Vec<NamedTerminalTheme>> = Lazy::new(|| {
             background: "#fbfbfd".to_string(),
             foreground: "#151b23".to_string(),
             cursor: "#0451a5".to_string(),
+            cursor_text: "#fbfbfd".to_string(),
             selection: "rgba(9, 105, 218, 0.22)".to_string(),
             black: "#1b1f24".to_string(),
             red: "#a1260d".to_string(),
@@ -116,6 +118,7 @@ fn parse_ghostty_theme(contents: &str) -> Option<TerminalPaletteSpec> {
     let mut background = None;
     let mut foreground = None;
     let mut cursor = None;
+    let mut cursor_text = None;
     let mut selection = None;
 
     for line in contents.lines() {
@@ -140,6 +143,10 @@ fn parse_ghostty_theme(contents: &str) -> Option<TerminalPaletteSpec> {
             cursor = Some(value.to_string());
             continue;
         }
+        if key == "cursor-text" {
+            cursor_text = Some(value.to_string());
+            continue;
+        }
         if key == "selection-background" {
             selection = Some(value.to_string());
             continue;
@@ -160,11 +167,13 @@ fn parse_ghostty_theme(contents: &str) -> Option<TerminalPaletteSpec> {
     let background = background?;
     let foreground = foreground?;
     let cursor = cursor.unwrap_or_else(|| foreground.clone());
+    let cursor_text = cursor_text.unwrap_or_else(|| background.clone());
 
     Some(TerminalPaletteSpec {
         background,
         foreground,
         cursor,
+        cursor_text,
         selection: selection.unwrap_or_else(|| "rgba(128,128,128,0.28)".to_string()),
         black: palette[0].clone(),
         red: palette[1].clone(),
@@ -201,7 +210,23 @@ mod tests {
         .expect("theme should parse");
         assert_eq!(theme.background, "#101010");
         assert_eq!(theme.foreground, "#f0f0f0");
+        assert_eq!(theme.cursor, "#abcdef");
+        assert_eq!(theme.cursor_text, "#101010");
         assert_eq!(theme.bright_white, "#ffffff");
+    }
+
+    #[test]
+    fn parses_ghostty_cursor_text_when_present() {
+        let theme = parse_ghostty_theme(
+            "palette = 0=#000000\npalette = 1=#111111\npalette = 2=#222222\npalette = 3=#333333\n\
+             palette = 4=#444444\npalette = 5=#555555\npalette = 6=#666666\npalette = 7=#777777\n\
+             palette = 8=#888888\npalette = 9=#999999\npalette = 10=#aaaaaa\npalette = 11=#bbbbbb\n\
+             palette = 12=#cccccc\npalette = 13=#dddddd\npalette = 14=#eeeeee\npalette = 15=#ffffff\n\
+             background = #101010\nforeground = #f0f0f0\ncursor-color = #abcdef\ncursor-text = #123456\nselection-background = #121212\n",
+        )
+        .expect("theme should parse");
+        assert_eq!(theme.cursor, "#abcdef");
+        assert_eq!(theme.cursor_text, "#123456");
     }
 
     #[test]

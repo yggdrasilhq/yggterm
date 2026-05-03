@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use vt100::Parser as Vt100Parser;
 use yggterm_core::{append_trace_event, resolve_yggterm_home};
 
@@ -317,6 +317,19 @@ impl TerminalManager {
             return Ok(false);
         };
         runtime.shutdown(stop_command)?;
+        Ok(true)
+    }
+
+    pub fn remove_session_gracefully_with_force_after(
+        &mut self,
+        key: &str,
+        stop_command: Option<&str>,
+        force_after: Duration,
+    ) -> Result<bool> {
+        let Some(runtime) = self.sessions.remove(key) else {
+            return Ok(false);
+        };
+        runtime.shutdown_with_force_after(stop_command, force_after)?;
         Ok(true)
     }
 
@@ -964,6 +977,61 @@ impl PtySessionRuntime {
 
         let _ = child.kill();
         let _ = child.wait();
+        Ok(())
+    }
+
+    fn shutdown_with_force_after(
+        self,
+        stop_command: Option<&str>,
+        force_after: Duration,
+    ) -> Result<()> {
+        if let Some(command) = stop_command
+            && !command.is_empty()
+        {
+            let _ = self.write(command);
+        }
+        let key = self.key.clone();
+        thread::spawn(move || {
+            let started = Instant::now();
+            loop {
+                {
+                    let mut child = self.child.lock().expect("pty child lock poisoned");
+                    match child.try_wait() {
+                        Ok(Some(_)) => {
+                            trace_terminal_event(
+                                "graceful_shutdown_completed",
+                                serde_json::json!({ "path": key }),
+                            );
+                            return;
+                        }
+                        Ok(None) if started.elapsed() >= force_after => {
+                            let _ = child.kill();
+                            let _ = child.wait();
+                            trace_terminal_event(
+                                "graceful_shutdown_forced",
+                                serde_json::json!({
+                                    "path": key,
+                                    "force_after_ms": force_after.as_millis(),
+                                }),
+                            );
+                            return;
+                        }
+                        Ok(None) => {}
+                        Err(error) => {
+                            trace_terminal_event(
+                                "graceful_shutdown_probe_failed",
+                                serde_json::json!({
+                                    "path": key,
+                                    "error": error.to_string(),
+                                }),
+                            );
+                            return;
+                        }
+                    }
+                }
+                thread::sleep(Duration::from_secs(5));
+            }
+        });
         Ok(())
     }
 }
