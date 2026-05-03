@@ -83,9 +83,6 @@ fn startup_prewarm_skip_reason_with_flag(active_path: &str, enabled: bool) -> Op
     if active_path.starts_with("live::") {
         return Some("runtime_owned_live_session");
     }
-    if active_path.starts_with("remote-session://") {
-        return Some("remote_startup_prewarm_deferred_for_latency");
-    }
     None
 }
 
@@ -4683,7 +4680,7 @@ mod tests {
     }
 
     #[test]
-    fn startup_prewarm_is_enabled_by_default_and_still_filters_runtime_owned_paths() {
+    fn startup_prewarm_keeps_remote_live_sessions_eligible_for_background_load() {
         assert_eq!(
             super::startup_prewarm_skip_reason_with_flag("local://shell", false),
             Some("disabled_by_env")
@@ -4709,7 +4706,7 @@ mod tests {
         );
         assert_eq!(
             super::startup_prewarm_skip_reason_with_flag("remote-session://dev/session", true),
-            Some("remote_startup_prewarm_deferred_for_latency")
+            None
         );
     }
 

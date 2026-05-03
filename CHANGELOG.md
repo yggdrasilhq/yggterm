@@ -4,6 +4,10 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+## 2.1.106
+
+- Restored remote live-session startup prewarm as a background load path instead of skipping it entirely. Remote live sessions are eligible to attach before they are selected, while the startup path still refuses saved-transcript prefill so Codex TUI surfaces do not repaint `USER:`/`ASSISTANT:` artifacts.
+
 ## 2.1.105
 
 - Kept startup live-session restore within the daemon latency budget by deferring remote live-session ensure work out of daemon startup prewarm. Restored remote terminal runtimes remain visible to the app, but `Status`, `server-list`, and latency checks are not blocked by slow remote terminal attach work.
