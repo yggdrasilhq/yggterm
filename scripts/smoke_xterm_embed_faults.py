@@ -13534,14 +13534,67 @@ def assert_remote_session_switch_scrollback(pid: int, session: str, out_dir: Pat
     assert_no_attach_ready_protocol_markers(initial_host, "remote switch initial")
     initial_base_y = int(initial_host.get("base_y") or 0)
     initial_expected = host_expects_scrollback(initial_host)
+    compact_resize = None
     if not initial_expected and initial_base_y <= 0:
-        return {
-            "skipped": True,
-            "reason": "remote session has no observed retained scrollback payload",
-            "base_y": initial_base_y,
-            "last_raw_payload_line_count": int(initial_host.get("last_raw_payload_line_count") or 0),
-            "scrollback_expected": bool(initial_host.get("scrollback_expected")),
-        }
+        window = initial_state.get("window") or {}
+        inner_size = window.get("inner_size") or {}
+        baseline_width = float(inner_size.get("width") or 1460.0)
+        baseline_height = float(inner_size.get("height") or 920.0)
+        compact_height = min(520.0, max(380.0, baseline_height * 0.55))
+        if compact_height < baseline_height - 24.0:
+            compact_resize = app_resize_window(pid, baseline_width, compact_height)
+            time.sleep(0.35)
+            initial_state = wait_for_session_focus(pid, target_path, timeout_seconds=15.0)
+            try:
+                initial_state = wait_for_terminal_quiescent(pid, timeout_seconds=8.0)
+            except AssertionError:
+                initial_state = wait_for_interactive(pid, timeout_seconds=6.0)
+            initial_host = host_for_session(initial_state, target_path)
+            assert_no_attach_ready_protocol_markers(initial_host, "remote switch compact resize")
+            initial_base_y = int(initial_host.get("base_y") or 0)
+            initial_expected = host_expects_scrollback(initial_host)
+    if not initial_expected and initial_base_y <= 0:
+        if not host_has_live_codex_prompt(initial_host):
+            return {
+                "skipped": True,
+                "reason": "remote session has no observed retained scrollback payload",
+                "base_y": initial_base_y,
+                "last_raw_payload_line_count": int(initial_host.get("last_raw_payload_line_count") or 0),
+                "scrollback_expected": bool(initial_host.get("scrollback_expected")),
+            }
+        seed_attempts = []
+        for attempt in range(5):
+            clear_codex_prompt_line(pid, target_path, timeout_seconds=8.0)
+            typed = probe_type(
+                pid,
+                target_path,
+                "/status",
+                mode="keyboard",
+                press_enter=True,
+            )
+            try:
+                seeded_state = wait_for_terminal_quiescent(pid, timeout_seconds=8.0)
+            except AssertionError:
+                seeded_state = wait_for_interactive(pid, timeout_seconds=6.0)
+            seeded_host = host_for_session(seeded_state, target_path)
+            seed_attempts.append({
+                "attempt": attempt + 1,
+                "accepted": bool(typed.get("accepted")),
+                "base_y": int(seeded_host.get("base_y") or 0),
+                "scrollback_expected": bool(seeded_host.get("scrollback_expected")),
+                "last_raw_payload_line_count": int(seeded_host.get("last_raw_payload_line_count") or 0),
+            })
+            if host_expects_scrollback(seeded_host) or int(seeded_host.get("base_y") or 0) > 0:
+                initial_state = seeded_state
+                initial_host = seeded_host
+                initial_base_y = int(initial_host.get("base_y") or 0)
+                initial_expected = host_expects_scrollback(initial_host)
+                break
+        if not initial_expected and initial_base_y <= 0:
+            raise AssertionError(
+                "remote Codex scrollback smoke could not seed enough retained output to test scrolling: "
+                f"seed_attempts={seed_attempts!r} initial_host={initial_host!r}"
+            )
     initial_scroll = assert_scroll(pid, target_path, initial_state)
 
     ok, _, detail = app_open_raw(pid, partner_path, view="terminal")
@@ -13584,6 +13637,7 @@ def assert_remote_session_switch_scrollback(pid: int, session: str, out_dir: Pat
     return {
         "partner_path": partner_path,
         "created_partner": created_partner,
+        "compact_resize": compact_resize,
         "initial_base_y": initial_base_y,
         "initial_scroll": initial_scroll,
         "final_base_y": int(final_host.get("base_y") or 0),
@@ -14939,13 +14993,27 @@ def wait_for_status_panel(pid: int, timeout_seconds: float = 12.0) -> dict:
 def wait_for_live_codex_prompt(pid: int, session: str, timeout_seconds: float = 20.0) -> dict:
     deadline = time.time() + timeout_seconds
     last_state = {}
+    last_error = None
     while time.time() < deadline:
-        last_state = wait_for_interactive_session(pid, session, timeout_seconds=8.0)
+        remaining = max(0.25, deadline - time.time())
+        try:
+            last_state = wait_for_interactive_session(
+                pid,
+                session,
+                timeout_seconds=min(8.0, remaining),
+            )
+        except AssertionError as exc:
+            last_error = exc
+            time.sleep(0.25)
+            continue
         host = host_for_session(last_state, session)
         if host_has_live_codex_prompt(host):
             return last_state
         time.sleep(0.25)
-    raise AssertionError(f"live Codex prompt did not become visible in time: {last_state!r}")
+    detail = f": {last_state!r}" if last_state else ""
+    if last_error is not None:
+        detail = f": last interactive wait error={last_error}; last_state={last_state!r}"
+    raise AssertionError(f"live Codex prompt did not become visible in time{detail}")
 
 
 def assert_codex_spawn_timeline(pid: int, out_dir: Path) -> dict:
@@ -16104,7 +16172,7 @@ def main() -> int:
                 if isinstance(final_corner_rounding, dict):
                     summary["checks"]["final_screenshot_corner_rounding"] = final_corner_rounding
         if disposable_codex_session:
-            summary["checks"]["disposable_codex_session_deleted"] = delete_session_via_context_menu(
+            summary["checks"]["disposable_codex_session_deleted"] = app_remove_session(
                 args.pid, disposable_codex_session
             )
             disposable_codex_deleted = True
