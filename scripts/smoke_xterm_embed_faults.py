@@ -13969,6 +13969,9 @@ def assert_cursor_glyph_visibility(state: dict) -> dict:
     cursor_background = str(host.get("cursor_sample_background") or "")
     cursor_border_left = str(host.get("cursor_sample_border_left") or "")
     cursor_class_name = str(host.get("cursor_sample_class_name") or "")
+    cursor_option_style = str(host.get("xterm_cursor_style") or "").strip().lower()
+    cursor_option_width = host.get("xterm_cursor_width")
+    cursor_line_text = str(host.get("cursor_line_text") or host.get("cursor_row_text") or "")
     row_background = str(
         host.get("cursor_row_background")
         or host.get("viewport_background_color")
@@ -13980,6 +13983,32 @@ def assert_cursor_glyph_visibility(state: dict) -> dict:
     visibility = str(active_node.get("visibility") or "").strip().lower()
     opacity = active_node.get("opacity")
     block_cursor = "xterm-cursor-block" in cursor_class_name
+    if cursor_option_style != "block":
+        raise AssertionError(
+            "terminal cursor style regressed away from the Ghostty-style block cursor: "
+            f"style={cursor_option_style!r} host={host!r}"
+        )
+    theme_cursor = str(
+        host.get("xterm_theme_cursor")
+        or host.get("host_css_cursor")
+        or ""
+    )
+    theme_cursor_accent = str(
+        host.get("xterm_theme_cursor_accent")
+        or host.get("host_css_cursor_block_text")
+        or host.get("host_css_cursor_text")
+        or ""
+    )
+    if is_transparent_css_color(theme_cursor):
+        raise AssertionError(f"block cursor theme fill is transparent: {host!r}")
+    if is_transparent_css_color(theme_cursor_accent):
+        raise AssertionError(f"block cursor theme accent is transparent: {host!r}")
+    theme_cursor_contrast = contrast_ratio(theme_cursor_accent, theme_cursor)
+    if theme_cursor_contrast is not None and theme_cursor_contrast < 1.15:
+        raise AssertionError(
+            f"block cursor theme fill/accent are visually collapsed: cursor={theme_cursor!r} "
+            f"accent={theme_cursor_accent!r} contrast={theme_cursor_contrast!r}"
+        )
     contrast_background = (
         cursor_background if block_cursor and not is_transparent_css_color(cursor_background) else row_background
     )
@@ -14020,9 +14049,72 @@ def assert_cursor_glyph_visibility(state: dict) -> dict:
         "contrast_background": contrast_background,
         "cursor_sample_border_left": cursor_border_left,
         "cursor_sample_class_name": cursor_class_name,
+        "xterm_cursor_style": cursor_option_style,
+        "xterm_cursor_width": cursor_option_width,
+        "xterm_theme_cursor": theme_cursor,
+        "xterm_theme_cursor_accent": theme_cursor_accent,
+        "xterm_theme_cursor_contrast": round(theme_cursor_contrast, 2)
+        if theme_cursor_contrast is not None
+        else None,
         "cursor_glyph_visibility": visibility,
         "cursor_glyph_opacity": opacity,
         "cursor_glyph_contrast": round(glyph_contrast, 2) if glyph_contrast is not None else None,
+    }
+
+
+def assert_prompt_line_screenshot_pixels_visible(
+    screenshot_path: Path,
+    state: dict,
+    *,
+    context: str,
+) -> dict:
+    host = active_host(state)
+    cursor_line_text = str(host.get("cursor_line_text") or host.get("cursor_row_text") or "")
+    if not cursor_line_text.strip():
+        raise AssertionError(f"{context}: prompt line has no buffer text")
+    cursor_style = str(host.get("xterm_cursor_style") or "").strip().lower()
+    if cursor_style != "block":
+        raise AssertionError(
+            f"{context}: prompt line rendered with non-block cursor style {cursor_style!r}: {host!r}"
+        )
+    host_rect = host.get("host_rect") or {}
+    cursor_rect = host.get("cursor_sample_rect") or host.get("cursor_expected_rect") or {}
+    dimensions = host.get("xterm_dimensions") or {}
+    cell_width = float(dimensions.get("css_cell_width") or 8.0)
+    cell_height = float(dimensions.get("css_cell_height") or 18.0)
+    if not rect_is_visible(host_rect) or not rect_is_visible(cursor_rect):
+        raise AssertionError(
+            f"{context}: cannot crop prompt row without visible host/cursor rect: host={host_rect!r} cursor={cursor_rect!r}"
+        )
+    image = Image.open(screenshot_path)
+    host_left = float(host_rect.get("left") or 0)
+    cursor_top = float(cursor_rect.get("top") or 0)
+    prompt_width = min(
+        float(host_rect.get("width") or 0),
+        max(80.0, (len(cursor_line_text) + 3) * cell_width),
+    )
+    box = (
+        int(max(0, host_left)),
+        int(max(0, cursor_top - 1)),
+        int(min(image.size[0], host_left + prompt_width)),
+        int(min(image.size[1], cursor_top + max(cell_height, float(cursor_rect.get("height") or 0)) + 1)),
+    )
+    if box[2] <= box[0] or box[3] <= box[1]:
+        raise AssertionError(f"{context}: invalid prompt row crop: box={box!r}")
+    crop = image.crop(box)
+    non_background_pixels, background = count_non_background_pixels(crop)
+    if non_background_pixels <= 24:
+        raise AssertionError(
+            f"{context}: prompt row exists in the buffer but is not visibly painted in the screenshot: "
+            f"non_background_pixels={non_background_pixels} background={background!r} box={box!r}"
+        )
+    return {
+        "cursor_line_text": cursor_line_text,
+        "xterm_cursor_style": cursor_style,
+        "xterm_cursor_width": host.get("xterm_cursor_width"),
+        "prompt_crop_box": box,
+        "prompt_non_background_pixels": non_background_pixels,
+        "prompt_background": background,
     }
 
 
@@ -15792,6 +15884,11 @@ def assert_status_command(pid: int, session: str, out_dir: Path) -> dict:
         state,
         context="after /status",
     )
+    prompt_line_pixels = assert_prompt_line_screenshot_pixels_visible(
+        shot_path,
+        state,
+        context="after /status",
+    )
     return {
         "ensure_live_codex": ensure,
         "clear_probe": clear,
@@ -15803,6 +15900,7 @@ def assert_status_command(pid: int, session: str, out_dir: Path) -> dict:
         "cursor_glyph": cursor_glyph,
         "cursor_cell_pixels": cursor_cell_pixels,
         "prompt_anchor": prompt_anchor,
+        "prompt_line_pixels": prompt_line_pixels,
         "status_surface": status_surface,
         "text_tail": host_text[-400:],
     }

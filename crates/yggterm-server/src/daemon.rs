@@ -5,8 +5,8 @@ use crate::{
     TerminalManager, WorkspaceViewMode, YggtermServer, active_client_instance_records,
     current_millis, fetch_remote_generation_context,
     local_headless_companion_executable_from_current, persist_remote_generated_copy,
-    remote_resume_runtime_output_requires_restart, spawn_hot_restart_daemon_process,
-    terminate_remote_codex_session,
+    remote_resume_runtime_output_requires_restart, request_remote_codex_session_shutdown,
+    spawn_hot_restart_daemon_process, terminate_remote_codex_session,
 };
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -48,6 +48,7 @@ const DUPLICATE_SAME_HOME_GRACE_MS: u64 = 2_000;
 const DAEMON_REQUEST_IO_TIMEOUT_MS: u64 = 10_000;
 const REMOTE_ATTACH_STARTUP_GRACE_MS: u64 = 900;
 const REMOTE_START_CODEX_ATTACH_STARTUP_GRACE_MS: u64 = 18_000;
+const CLIENT_CLOSE_FORCE_SHUTDOWN_AFTER_SECS: u64 = 60 * 60;
 const ENV_YGGTERM_ENABLE_BACKGROUND_COPY_CHORE: &str = "YGGTERM_ENABLE_BACKGROUND_COPY_CHORE";
 
 fn daemon_env_flag_truthy(name: &str) -> bool {
@@ -445,6 +446,7 @@ pub enum ServerRequest {
     Status,
     Snapshot,
     PrepareUpdateRestart,
+    PrepareClientClose,
     HotRestart {
         daemon_executable: String,
         expected_version: Option<String>,
@@ -1151,6 +1153,68 @@ impl DaemonRuntime {
                 )?;
                 ServerResponse::Ack {
                     message: Some("update restart prepared".to_string()),
+                }
+            }
+            ServerRequest::PrepareClientClose => {
+                let force_after =
+                    std::time::Duration::from_secs(CLIENT_CLOSE_FORCE_SHUTDOWN_AFTER_SECS);
+                let paths = self.server.non_keep_alive_live_session_paths();
+                let mut metadata_removed = 0usize;
+                let mut terminal_shutdowns = 0usize;
+                let mut remote_shutdowns = 0usize;
+                let mut errors = Vec::<String>::new();
+                for path in paths {
+                    let remote_target = self.server.remote_shutdown_target_for_path(&path);
+                    let stop_command = self.server.terminal_stop_command(&path);
+                    let runtime_path = self.server.terminal_runtime_key_for_path(&path);
+                    if let Some((machine, session_id)) = remote_target {
+                        match request_remote_codex_session_shutdown(
+                            &machine,
+                            &session_id,
+                            force_after,
+                        ) {
+                            Ok(()) => remote_shutdowns += 1,
+                            Err(error) => errors.push(format!("{path}: {error}")),
+                        }
+                    }
+                    match self.terminals.remove_session_gracefully_with_force_after(
+                        &runtime_path,
+                        stop_command.as_deref(),
+                        force_after,
+                    ) {
+                        Ok(true) => terminal_shutdowns += 1,
+                        Ok(false) => {}
+                        Err(error) => errors.push(format!("{path}: {error}")),
+                    }
+                    match self.server.remove_live_session(&path) {
+                        Ok(true) => metadata_removed += 1,
+                        Ok(false) => {}
+                        Err(error) => errors.push(format!("{path}: {error}")),
+                    }
+                }
+                self.persist()?;
+                append_trace_event(
+                    self.store.home_dir(),
+                    "daemon",
+                    "lifecycle",
+                    "client_close_prepared",
+                    serde_json::json!({
+                        "metadata_removed": metadata_removed,
+                        "terminal_shutdowns": terminal_shutdowns,
+                        "remote_shutdowns": remote_shutdowns,
+                        "force_after_seconds": CLIENT_CLOSE_FORCE_SHUTDOWN_AFTER_SECS,
+                        "errors": errors,
+                    }),
+                );
+                let message = if metadata_removed == 0 {
+                    "no non-keep-alive live sessions to close".to_string()
+                } else {
+                    format!(
+                        "closing {metadata_removed} non-keep-alive live session(s) gracefully; force cleanup is scheduled after 1 hour"
+                    )
+                };
+                ServerResponse::Ack {
+                    message: Some(message),
                 }
             }
             ServerRequest::HotRestart {
@@ -2215,6 +2279,7 @@ fn server_request_name(request: &ServerRequest) -> &'static str {
         ServerRequest::Status => "status",
         ServerRequest::Snapshot => "snapshot",
         ServerRequest::PrepareUpdateRestart => "prepare_update_restart",
+        ServerRequest::PrepareClientClose => "prepare_client_close",
         ServerRequest::HotRestart { .. } => "hot_restart",
         ServerRequest::OpenStoredSession { .. } => "open_stored_session",
         ServerRequest::ConnectSsh { .. } => "connect_ssh",
@@ -2873,6 +2938,10 @@ pub fn prepare_update_restart(endpoint: &ServerEndpoint) -> Result<Option<String
         endpoint,
         &ServerRequest::PrepareUpdateRestart,
     )?)
+}
+
+pub fn prepare_client_close(endpoint: &ServerEndpoint) -> Result<Option<String>> {
+    expect_ack(send_request(endpoint, &ServerRequest::PrepareClientClose)?)
 }
 
 pub fn hot_restart(
