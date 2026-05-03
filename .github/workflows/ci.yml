@@ -72,6 +72,7 @@ jobs:
           cargo test -p yggterm-server --no-default-features initial_remote_resume_attach
           cargo test -p yggterm-server --no-default-features terminal_manager_reports_missing_remote_scrollback_after_tail_only
           cargo test -p yggterm-server --no-default-features saved_session_reuses_recovered_interrupted_runtime_snapshot
+          cargo test -p yggterm-server --no-default-features terminal_utf8_decoder_preserves_box_drawing_across_read_boundaries
           cargo test -p yggterm-server --no-default-features remote_resume_runtime_output_requires_restart_for_shell_prompt
           cargo test -p yggterm-server --no-default-features remote_resume_seed_snapshot_prefill_keeps_recovered_transcript_after_breakage
           cargo test -p yggterm-server --no-default-features remote_preview_payload_terminal_prefill_provides_scrollback
@@ -89,6 +90,7 @@ jobs:
           cargo test -p yggterm-shell --no-default-features retained_remote_lost_scrollback_invalidates_live_host
           cargo test -p yggterm-shell --no-default-features retained_fault_bootstrap_uses_live_active_session_when_snapshot_is_stale
           python3 -m py_compile scripts/smoke_xterm_embed_faults.py
+          python3 -m py_compile scripts/smoke_terminal_status_input.py
 
       - name: Check shell scripts
         run: |

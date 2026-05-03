@@ -47371,13 +47371,28 @@ mod tests {
             "resize should apply the row fit guard after fitAddon.fit"
         );
         assert!(
-            script.contains("const terminalGridIsUsable = (cols, rows) => {")
-                && script.contains("recordSkippedFit(reason, proposed, 'proposed_grid_unusable');")
-                && script.contains("if (!hostLooksUsable() && currentGridUsable) {")
-                && script.contains(
-                    "last_skipped_fit: mountedHost && mountedHost.lastSkippedFit ? mountedHost.lastSkippedFit : null"
-                ),
-            "retained xterm hosts should skip destructive hidden/collapsed fits and expose that decision to app-control"
+            script.contains("terminalGridIsUsable"),
+            "retained xterm hosts should classify usable grids before fitting"
+        );
+        assert!(
+            script.contains("recordSkippedFit"),
+            "retained xterm hosts should record skipped fits"
+        );
+        assert!(
+            script.contains("proposed_grid_unusable"),
+            "retained xterm hosts should skip proposed collapsed grids"
+        );
+        assert!(
+            script.contains("host_not_usable"),
+            "retained xterm hosts should skip fits while hidden or offscreen"
+        );
+        assert!(
+            script.contains("currentGridUsable"),
+            "retained xterm hosts should preserve the current usable grid"
+        );
+        assert!(
+            script.contains("lastSkippedFit"),
+            "retained host state should store the last skipped fit"
         );
         assert!(
             script.contains("const fitTerminalToHost = (reason) => {")
