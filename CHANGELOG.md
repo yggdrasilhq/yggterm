@@ -4,6 +4,12 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+## 2.1.101
+
+- Preserved rich TUI glyph rendering by decoding PTY output as a continuous UTF-8 stream instead of lossy-decoding each read chunk, preventing split box-drawing and progress glyphs from turning into replacement characters.
+- Tightened the `/status` terminal smoke so it fails on duplicate visible Codex status panels, replacement characters, shell fallback, or pre-polluted retained user sessions before accepting a viewport as fixed.
+- Added the regression-first workflow rule to `AGENTS.md` so future UI/runtime fixes update the harness or CI gate before the runtime patch.
+
 ## 2.1.100
 
 - Fixed retained remote Codex restore/input after stale runtime reuse: `resume-codex --require-existing` now goes through the daemon ensure/restart checks before bridging, so shell-prompt or interrupted runtimes are restarted instead of being exposed as an input-enabled xterm.

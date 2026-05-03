@@ -495,6 +495,15 @@ def app_create_terminal(
     return payload
 
 
+def smoke_codex_machine_key() -> str | None:
+    machine_key = (
+        ENV.get("YGGTERM_SMOKE_REMOTE_MACHINE")
+        or ENV.get("YGGTERM_SMOKE_CODEX_MACHINE")
+        or ""
+    ).strip()
+    return machine_key or None
+
+
 def app_remove_session(pid: int, session_path: str) -> dict:
     return unwrap_data(run(
         "server",
@@ -4174,6 +4183,48 @@ def host_has_shell_status_failure(host: dict) -> bool:
     return "bash: /status" in recent or (
         "/status" in recent and "no such file or directory" in recent
     )
+
+
+def codex_status_viewport_text(host: dict) -> str:
+    for key in ("text_tail", "text_sample"):
+        value = str(host.get(key) or "")
+        if "Session:" in value or "Weekly limit:" in value or "/status" in value:
+            return value
+    return terminal_host_text(host)
+
+
+def codex_status_panel_count(text: str) -> int:
+    return str(text or "").count("Session:")
+
+
+def codex_status_command_echo_count(text: str) -> int:
+    count = 0
+    for line in str(text or "").splitlines():
+        stripped = strip_terminal_border(line)
+        if stripped == "/status":
+            count += 1
+    return count
+
+
+def assert_single_clean_codex_status_surface(host: dict, *, context: str) -> dict:
+    text = codex_status_viewport_text(host)
+    replacement_count = text.count("\ufffd")
+    if replacement_count:
+        raise AssertionError(
+            f"{context}: terminal viewport contains replacement characters in Codex status output: "
+            f"replacement_count={replacement_count} text_tail={text[-1200:]!r}"
+        )
+    panel_count = codex_status_panel_count(text)
+    if panel_count != 1:
+        raise AssertionError(
+            f"{context}: expected exactly one visible Codex status panel, saw {panel_count}: "
+            f"text_tail={text[-1600:]!r}"
+        )
+    return {
+        "status_panel_count": panel_count,
+        "replacement_char_count": replacement_count,
+        "text_tail": text[-500:],
+    }
 
 
 def terminal_host_text(host: dict) -> str:
@@ -13516,6 +13567,12 @@ def assert_remote_session_switch_scrollback(pid: int, session: str, out_dir: Pat
         )
     final_host = host_for_session(final_state, target_path)
     assert_no_attach_ready_protocol_markers(final_host, "remote switch return")
+    final_status_surface = None
+    if "Session:" in codex_status_viewport_text(final_host):
+        final_status_surface = assert_single_clean_codex_status_surface(
+            final_host,
+            context="remote switch return",
+        )
     if not host_expects_scrollback(final_host) and int(final_host.get("base_y") or 0) <= 0:
         raise AssertionError(
             "remote switch return lost retained scrollback expectation and xterm scrollback: "
@@ -13531,6 +13588,7 @@ def assert_remote_session_switch_scrollback(pid: int, session: str, out_dir: Pat
         "initial_scroll": initial_scroll,
         "final_base_y": int(final_host.get("base_y") or 0),
         "final_scroll": final_scroll,
+        "final_status_surface": final_status_surface,
         "screenshot": str(shot_path),
     }
 
@@ -14852,7 +14910,6 @@ def wait_for_status_panel(pid: int, timeout_seconds: float = 12.0) -> dict:
     deadline = time.time() + timeout_seconds
     last_state = {}
     markers = (
-        "OpenAI Codex",
         "Session:",
         "Collaboration mode:",
         "Weekly limit:",
@@ -15575,10 +15632,17 @@ def assert_status_command(pid: int, session: str, out_dir: Path) -> dict:
         cleared_host.get("cursor_line_text") or cleared_host.get("cursor_row_text") or ""
     )
     cleared_text = terminal_host_text(cleared_host)
-    if "/status" in cleared_cursor_line or "/status" in cleared_text:
+    prior_status_panel_count = codex_status_panel_count(codex_status_viewport_text(cleared_host))
+    prior_status_echo_count = codex_status_command_echo_count(cleared_text)
+    if (
+        "/status" in cleared_cursor_line
+        or prior_status_panel_count > 0
+        or prior_status_echo_count > 0
+    ):
         raise AssertionError(
             "status command prompt was not clean before typing: "
-            f"cursor_line={cleared_cursor_line!r} text_tail={cleared_text[-200:]!r}"
+            f"cursor_line={cleared_cursor_line!r} prior_status_panel_count={prior_status_panel_count} "
+            f"prior_status_echo_count={prior_status_echo_count} text_tail={cleared_text[-300:]!r}"
         )
     if not host_has_live_codex_prompt(cleared_host):
         raise AssertionError(
@@ -15609,6 +15673,10 @@ def assert_status_command(pid: int, session: str, out_dir: Path) -> dict:
         raise AssertionError("Codex status probe typed /status into the shell instead of the live Codex runtime")
     if "OpenAI Codex" not in host_text and "Session:" not in host_text:
         raise AssertionError("Codex status panel is not visible after /status<Enter>")
+    status_surface = assert_single_clean_codex_status_surface(
+        host,
+        context="after /status",
+    )
     assert_cursor_alignment(state)
     cursor_glyph = assert_cursor_glyph_visibility(state)
     prompt_anchor = assert_cursor_prompt_visibility(state, context="after /status")
@@ -15628,6 +15696,7 @@ def assert_status_command(pid: int, session: str, out_dir: Path) -> dict:
         "cursor_glyph": cursor_glyph,
         "cursor_cell_pixels": cursor_cell_pixels,
         "prompt_anchor": prompt_anchor,
+        "status_surface": status_surface,
         "text_tail": host_text[-400:],
     }
 
@@ -15804,6 +15873,7 @@ def main() -> int:
                 args.pid,
                 title="Smoke Codex Session",
                 kind="codex",
+                machine_key=smoke_codex_machine_key(),
             )
             disposable_codex_session = disposable_codex_create["session_path"]
             args.session = disposable_codex_session
