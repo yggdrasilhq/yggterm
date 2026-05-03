@@ -245,12 +245,25 @@ def wait_for_terminal_interactive(pid: int, timeout_seconds: float = 15.0) -> di
 def wait_for_live_codex_prompt(pid: int, timeout_seconds: float = 20.0) -> dict:
     deadline = time.time() + timeout_seconds
     last_state = {}
+    last_error = None
     while time.time() < deadline:
-        last_state = wait_for_terminal_interactive(pid, timeout_seconds=8.0)
+        remaining = max(0.25, deadline - time.time())
+        try:
+            last_state = wait_for_terminal_interactive(
+                pid,
+                timeout_seconds=min(8.0, remaining),
+            )
+        except AssertionError as exc:
+            last_error = exc
+            time.sleep(0.25)
+            continue
         if host_has_live_codex_prompt(active_host(last_state)):
             return last_state
         time.sleep(0.25)
-    raise AssertionError(f"live Codex prompt did not become visible in time: {last_state!r}")
+    detail = f": {last_state!r}" if last_state else ""
+    if last_error is not None:
+        detail = f": last interactive wait error={last_error}; last_state={last_state!r}"
+    raise AssertionError(f"live Codex prompt did not become visible in time{detail}")
 
 
 def ensure_live_codex_runtime(pid: int, session: str) -> dict:
