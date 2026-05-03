@@ -45,6 +45,46 @@ pub struct TerminalBufferStats {
     pub retained_bytes: usize,
 }
 
+fn decode_terminal_utf8_chunk(pending: &mut Vec<u8>, bytes: &[u8]) -> String {
+    pending.extend_from_slice(bytes);
+    let mut decoded = String::new();
+    loop {
+        match std::str::from_utf8(pending) {
+            Ok(text) => {
+                decoded.push_str(text);
+                pending.clear();
+                break;
+            }
+            Err(error) => {
+                let valid_up_to = error.valid_up_to();
+                if valid_up_to > 0 {
+                    decoded.push_str(
+                        std::str::from_utf8(&pending[..valid_up_to]).expect("valid UTF-8 prefix"),
+                    );
+                    pending.drain(..valid_up_to);
+                    continue;
+                }
+                if let Some(error_len) = error.error_len() {
+                    decoded.push('\u{fffd}');
+                    pending.drain(..error_len);
+                    continue;
+                }
+                break;
+            }
+        }
+    }
+    decoded
+}
+
+fn flush_terminal_utf8_pending(pending: &mut Vec<u8>) -> String {
+    if pending.is_empty() {
+        return String::new();
+    }
+    let decoded = String::from_utf8_lossy(pending).to_string();
+    pending.clear();
+    decoded
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TerminalTrimSummary {
     pub trimmed_sessions: usize,
@@ -503,12 +543,47 @@ impl PtySessionRuntime {
             .name(format!("pty-reader-{key}"))
             .spawn(move || {
                 let mut buffer = [0u8; 8192];
+                let mut pending_utf8 = Vec::<u8>::new();
                 let mut saw_any_output = false;
                 loop {
                     match reader.read(&mut buffer) {
-                        Ok(0) => break,
+                        Ok(0) => {
+                            let data = flush_terminal_utf8_pending(&mut pending_utf8);
+                            if !data.is_empty() {
+                                if let Ok(mut screen_state) = reader_screen_state.lock() {
+                                    screen_state.process(data.as_bytes());
+                                }
+                                reader_runtime_output_seen.store(true, Ordering::SeqCst);
+                                reader_activity.store(now_millis(), Ordering::SeqCst);
+                                let seq_value = reader_seq.fetch_add(1, Ordering::SeqCst) + 1;
+                                let mut chunks =
+                                    reader_chunks.lock().expect("pty chunk lock poisoned");
+                                let mut retained =
+                                    reader_retained_bytes.load(Ordering::SeqCst);
+                                chunks.push_back(TerminalChunk {
+                                    seq: seq_value,
+                                    data,
+                                });
+                                retained = retained.saturating_add(
+                                    chunks.back().map(|chunk| chunk.data.len()).unwrap_or(0),
+                                );
+                                trim_chunk_buffer(
+                                    &mut chunks,
+                                    &mut retained,
+                                    MAX_CHUNKS,
+                                    MAX_BUFFER_BYTES,
+                                );
+                                reader_retained_bytes.store(retained, Ordering::SeqCst);
+                            }
+                            break;
+                        }
                         Ok(bytes) => {
-                            let raw_data = String::from_utf8_lossy(&buffer[..bytes]).to_string();
+                            let raw_data =
+                                decode_terminal_utf8_chunk(&mut pending_utf8, &buffer[..bytes]);
+                            if raw_data.is_empty() {
+                                reader_activity.store(now_millis(), Ordering::SeqCst);
+                                continue;
+                            }
                             let (data, stripped_attach_ready_marker) =
                                 if launch_command_looks_like_remote_resume_attach(
                                     &launch_command_label,
@@ -1385,6 +1460,33 @@ mod tests {
     use std::io;
     use std::sync::mpsc;
     use std::time::Instant;
+
+    #[test]
+    fn terminal_utf8_decoder_preserves_box_drawing_across_read_boundaries() {
+        let mut pending = Vec::new();
+        let first = decode_terminal_utf8_chunk(&mut pending, &[0xe2, 0x95]);
+        assert_eq!(first, "");
+        assert_eq!(pending, vec![0xe2, 0x95]);
+
+        let second = decode_terminal_utf8_chunk(&mut pending, &[0xad, b'\n', 0xe2]);
+        assert_eq!(second, "╭\n");
+        assert_eq!(pending, vec![0xe2]);
+
+        let third = decode_terminal_utf8_chunk(&mut pending, &[0x94, 0x80]);
+        assert_eq!(third, "─");
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn terminal_utf8_decoder_flushes_incomplete_trailing_bytes_once() {
+        let mut pending = Vec::new();
+        assert_eq!(
+            decode_terminal_utf8_chunk(&mut pending, &[b'a', 0xe2, 0x95]),
+            "a"
+        );
+        assert_eq!(flush_terminal_utf8_pending(&mut pending), "\u{fffd}");
+        assert!(pending.is_empty());
+    }
 
     struct BlockingFirstWrite {
         first_started: mpsc::Sender<()>,
