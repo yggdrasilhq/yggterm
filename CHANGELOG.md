@@ -4,6 +4,10 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+## 2.1.105
+
+- Kept startup live-session restore within the daemon latency budget by deferring remote live-session ensure work out of daemon startup prewarm. Restored remote terminal runtimes remain visible to the app, but `Status`, `server-list`, and latency checks are not blocked by slow remote terminal attach work.
+
 ## 2.1.104
 
 - Fixed post-update daemon observability when legacy socket aliases point at the same current daemon socket: `server-list` and latency checks now dedupe symlink aliases before probing, preventing a hot-restart/install check from blocking on repeated aliases.
