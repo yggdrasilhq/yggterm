@@ -490,6 +490,13 @@ def app_create_terminal(
         args.extend(["--machine-key", machine_key])
     payload = unwrap_data(run(*args))
     session_path = str(payload.get("session_path") or payload.get("active_session_path") or "").strip()
+    if not session_path:
+        state = app_state(pid)
+        session_path = str(
+            state.get("active_session_path")
+            or (state.get("viewport") or {}).get("active_session_path")
+            or ""
+        ).strip()
     if session_path and not payload.get("session_path"):
         payload["session_path"] = session_path
     return payload
