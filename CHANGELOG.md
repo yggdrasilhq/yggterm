@@ -4,6 +4,13 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+## 2.1.108
+
+- Restored the intended live-session lifecycle split: normal final app close prunes and gracefully closes non-Keep-Alive live sessions with one-hour force cleanup, while update restart still temporarily protects every recoverable live session.
+- Tightened terminal readiness so an interrupted Codex banner without a real prompt/status/setup surface cannot be accepted as an interactive retained terminal.
+- Restored the native block cursor with Ghostty-style cursor fill/text theme handling, including cursor-text parsing from bundled Ghostty themes and prompt screenshot smoke coverage.
+- Added focused CI gates for normal-close persistence, update-restart restore, interrupted-banner prompt readiness, and cursor theme contract regressions.
+
 ## 2.1.107
 
 - Fixed live-session persistence so recoverable live terminals survive normal app restarts and are eligible for startup background prewarm even when the user has not explicitly toggled keep-alive. This closes the gap where restored sidebar sessions existed but no terminal runtimes loaded until the user selected them.

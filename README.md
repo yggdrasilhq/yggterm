@@ -267,7 +267,7 @@ The intent is simple: organizing the tree should naturally create the right plac
 
 Virtual folders and separators are stored under `~/.yggterm/workspace.db`, so they load quickly and do not depend on walking a large on-disk workspace before the UI becomes useful.
 
-Live terminals are runtime attachments, not automatic workspace clutter. Creating a terminal from a folder starts it in that folder and shows it under `Live Sessions`; it becomes restart-restored only after you explicitly mark it `Keep Alive`. Closing a live terminal kills the daemon-owned PTY, while stored transcripts and workspace items remain unless you choose a hard delete action.
+Live terminals are runtime attachments, not automatic workspace clutter. Creating a terminal from a folder starts it in that folder and shows it under `Live Sessions`; it becomes restart-restored after a normal app close only when you explicitly mark it `Keep Alive`. A normal final app close asks the daemon to close non-Keep-Alive live sessions gracefully and force-cleans them after one hour, while stored transcripts and workspace items remain unless you choose a hard delete action.
 
 The SSH connect rail is guided on purpose:
 
@@ -334,8 +334,8 @@ This matters because terminals should not disappear just because the UI changed 
 Current lifecycle behavior:
 
 - live PTYs remain available while you switch between preview and terminal
-- the UI asks the daemon to shut down on exit
-- Codex-flavored sessions receive `/quit`
+- the UI asks the daemon to close non-Keep-Alive live sessions on normal final-client exit
+- Codex-flavored sessions receive `/quit`, with force cleanup scheduled after one hour
 - plain shells receive `exit`
 - the PTY manager escalates only if the graceful stop path fails
 
