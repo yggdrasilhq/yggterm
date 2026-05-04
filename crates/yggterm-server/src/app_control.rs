@@ -215,6 +215,10 @@ pub enum AppControlCommand {
         height: f64,
     },
     CloseWindow,
+    CloseWindowPreservingSessions {
+        #[serde(default)]
+        reason: Option<String>,
+    },
     Pointer {
         command: AppControlPointerCommand,
     },
@@ -317,6 +321,7 @@ impl AppControlCommand {
             Self::MoveWindowBy { .. } => "move_window_by",
             Self::ResizeWindow { .. } => "resize_window",
             Self::CloseWindow => "close_window",
+            Self::CloseWindowPreservingSessions { .. } => "close_window_preserving_sessions",
             Self::Pointer { .. } => "pointer",
             Self::Key { .. } => "key",
             Self::Drag { .. } => "drag",
@@ -714,6 +719,24 @@ mod tests {
         let home = std::env::temp_dir().join(format!("yggterm-app-control-{}", Uuid::new_v4()));
         fs::create_dir_all(&home).unwrap();
         home
+    }
+
+    #[test]
+    fn preserving_close_command_serializes_as_distinct_restart_safe_kind() {
+        let command = AppControlCommand::CloseWindowPreservingSessions {
+            reason: Some("superseded-client-handoff".to_string()),
+        };
+        let value = serde_json::to_value(&command).expect("serialize preserving close");
+
+        assert_eq!(
+            value.get("kind").and_then(serde_json::Value::as_str),
+            Some("close_window_preserving_sessions")
+        );
+        assert_eq!(
+            value.get("reason").and_then(serde_json::Value::as_str),
+            Some("superseded-client-handoff")
+        );
+        assert_eq!(command.name(), "close_window_preserving_sessions");
     }
 
     #[test]

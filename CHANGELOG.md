@@ -4,6 +4,13 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+## 2.1.119
+
+- Restore remote live-session scrollback from daemon-retained terminal history instead of relying on a small screen/status tail after a session is already marked ready.
+- Make retained replay hydrate collapsed xterm buffers even when the prompt is visible, so “usable but unscrollable” sessions fail the smoke harness instead of passing as ready.
+- Make GUI restarts preserve live sessions, and make superseded-client handoffs hard-kill only the old window process instead of letting older GUI signal handlers run daemon shutdown cleanup.
+- Extend app-control and CI coverage for retained scrollback replay evidence.
+
 ## 2.1.118
 
 - Stabilize terminal redraw after resize/session switching by forcing settled xterm geometry to converge with the PTY resize notification path.

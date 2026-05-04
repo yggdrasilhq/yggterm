@@ -20,12 +20,13 @@ use yggterm_core::{
 };
 use yggterm_platform::configure_gui_entry_process;
 use yggterm_server::{
-    AppControlCommand, AppControlPreviewLayout, AppControlRightPanelMode, AppControlViewMode,
-    ClientInstanceRecord, PersistedDaemonState, ProbeTerminalViewportInputMode, SessionKind,
-    YggtermServer, active_client_instance_records, default_endpoint, detect_ghostty_host,
+    AppControlPreviewLayout, AppControlRightPanelMode, AppControlViewMode, ClientInstanceRecord,
+    PersistedDaemonState, ProbeTerminalViewportInputMode, SessionKind, YggtermServer,
+    active_client_instance_records, default_endpoint, detect_ghostty_host,
     ensure_local_daemon_running, local_headless_companion_executable_from_current, ping,
-    request_app_control, run_app_control_background_window, run_app_control_close_window,
-    run_app_control_create_terminal, run_app_control_describe_rows, run_app_control_describe_state,
+    run_app_control_background_window, run_app_control_close_window,
+    run_app_control_close_window_preserving_sessions, run_app_control_create_terminal,
+    run_app_control_describe_rows, run_app_control_describe_state,
     run_app_control_desktop_identity, run_app_control_drag, run_app_control_dump_state,
     run_app_control_focus_window, run_app_control_key, run_app_control_list_clients,
     run_app_control_move_window_by, run_app_control_open_path,
@@ -815,7 +816,16 @@ fn main() -> Result<()> {
                     timeout_ms,
                 )
             }
-            "close" | "quit" | "exit" => run_app_control_close_window(timeout_ms),
+            "close" | "quit" | "exit" => {
+                if app_control_close_preserve_flag(&args) {
+                    run_app_control_close_window_preserving_sessions(
+                        timeout_ms,
+                        Some("manual-preserve-close".to_string()),
+                    )
+                } else {
+                    run_app_control_close_window(timeout_ms)
+                }
+            }
             "chrome-hover" | "titlebar-hover" => {
                 let active = cli_positional_args(&args, 3)
                     .into_iter()
@@ -2107,10 +2117,7 @@ fn maybe_retire_superseded_same_home_clients(
                 "xdg_session_id": record.xdg_session_id.as_deref(),
             }),
         );
-        let close_ok = request_close_client_pid(home_dir, record.pid, 1_500).is_ok();
-        if !close_ok || signal_process_is_alive(record.pid) {
-            terminate_gui_client_process(record.pid);
-        }
+        let close_ok = terminate_superseded_client_pid(record.pid);
         let exited = wait_for_process_exit(record.pid, Duration::from_millis(2_500));
         append_trace_event(
             home_dir,
@@ -2120,6 +2127,7 @@ fn maybe_retire_superseded_same_home_clients(
             serde_json::json!({
                 "pid": record.pid,
                 "close_ok": close_ok,
+                "strategy": superseded_client_retirement_strategy_label(),
                 "exited": exited,
             }),
         );
@@ -2159,21 +2167,29 @@ fn signal_client_record_scope_matches(
     signal_client_scope_matches(&candidate, current)
 }
 
-fn request_close_client_pid(home_dir: &std::path::Path, pid: u32, timeout_ms: u64) -> Result<()> {
-    let previous = std::env::var_os("YGGTERM_APP_CONTROL_PID");
-    unsafe {
-        std::env::set_var("YGGTERM_APP_CONTROL_PID", pid.to_string());
+fn terminate_superseded_client_pid(pid: u32) -> bool {
+    terminate_gui_client_process(pid);
+    true
+}
+
+#[cfg(test)]
+fn superseded_client_close_command() -> yggterm_server::AppControlCommand {
+    yggterm_server::AppControlCommand::CloseWindowPreservingSessions {
+        reason: Some("superseded-client-handoff".to_string()),
     }
-    let result = request_app_control(home_dir, AppControlCommand::CloseWindow, timeout_ms);
-    match previous {
-        Some(value) => unsafe {
-            std::env::set_var("YGGTERM_APP_CONTROL_PID", value);
-        },
-        None => unsafe {
-            std::env::remove_var("YGGTERM_APP_CONTROL_PID");
-        },
-    }
-    result.map(|_| ())
+}
+
+fn superseded_client_retirement_strategy_label() -> &'static str {
+    "kill_process_only_no_client_cleanup"
+}
+
+fn app_control_close_preserve_flag(args: &[String]) -> bool {
+    args.iter().any(|arg| {
+        matches!(
+            arg.as_str(),
+            "--preserve-live-sessions" | "--preserve-sessions" | "--handoff" | "--restart-safe"
+        )
+    })
 }
 
 fn wait_for_process_exit(pid: u32, timeout: Duration) -> bool {
@@ -2190,18 +2206,17 @@ fn wait_for_process_exit(pid: u32, timeout: Duration) -> bool {
 }
 
 #[cfg(unix)]
+fn superseded_client_termination_signal() -> i32 {
+    libc::SIGKILL
+}
+
+#[cfg(unix)]
 fn terminate_gui_client_process(pid: u32) {
     if pid == 0 || pid == std::process::id() {
         return;
     }
     unsafe {
-        libc::kill(pid as i32, libc::SIGTERM);
-    }
-    if wait_for_process_exit(pid, Duration::from_millis(800)) {
-        return;
-    }
-    unsafe {
-        libc::kill(pid as i32, libc::SIGKILL);
+        libc::kill(pid as i32, superseded_client_termination_signal());
     }
 }
 
@@ -2778,12 +2793,15 @@ fn run_server_smoke() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    use super::superseded_client_termination_signal;
     use super::{
         BuiltinCliCommand, LinuxWindowProfileInput, SignalClientScope,
         classify_builtin_cli_command, compatible_signal_client_count,
         linux_window_profile_from_input, record_matches_executable,
         should_retire_superseded_client, signal_client_instances_dir, signal_client_scope_matches,
         signal_parse_process_start_ticks_from_stat, signal_process_start_ticks,
+        superseded_client_close_command, superseded_client_retirement_strategy_label,
     };
     #[cfg(target_os = "linux")]
     use super::{linux_choose_desktop_environment, linux_environ_bytes_to_map};
@@ -3141,5 +3159,23 @@ mod tests {
             &current,
             &scope
         ));
+    }
+
+    #[test]
+    fn superseded_client_close_command_preserves_live_sessions() {
+        assert!(matches!(
+            superseded_client_close_command(),
+            yggterm_server::AppControlCommand::CloseWindowPreservingSessions { .. }
+        ));
+    }
+
+    #[test]
+    fn superseded_client_retirement_is_process_only_not_app_control_close() {
+        assert_eq!(
+            superseded_client_retirement_strategy_label(),
+            "kill_process_only_no_client_cleanup"
+        );
+        #[cfg(unix)]
+        assert_eq!(superseded_client_termination_signal(), libc::SIGKILL);
     }
 }
