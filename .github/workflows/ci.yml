@@ -118,6 +118,8 @@ jobs:
           cargo test -p yggterm-shell --no-default-features terminal_eval_script_focuses_host_and_scopes_wheel_capture
           cargo test -p yggterm-shell --no-default-features app_control_terminal_input_splits_interrupt_from_following_bytes
           cargo test -p yggterm-shell --no-default-features terminal_eval_script_locks_even_one_line_scrollback
+          cargo test -p yggterm-shell --no-default-features xterm_canvas_renderer_keeps_dim_prompt_text_readable
+          cargo test -p yggterm-shell --no-default-features focused_terminal_defers_background_refreshes
           cargo test -p yggterm-shell --no-default-features terminal_cursor_colors_follow_ghostty_theme_contract_across_themes
           cargo test -p yggterm-shell --no-default-features terminal_eval_script_preserves_native_xterm_cursor_contract
           cargo test -p yggterm-shell --no-default-features parses_ghostty_cursor_text_when_present
@@ -129,6 +131,7 @@ jobs:
           cargo test -p yggterm-shell --no-default-features codex_interrupted_input_surface_without_prompt_is_not_prompt_ready
           cargo test -p yggterm-shell --no-default-features terminal_host_problem_rejects_input_enabled_codex_status_surface_without_prompt
           cargo test -p yggterm-shell --no-default-features terminal_host_problem_accepts_remote_codex_prompt_only_surface_with_real_output
+          cargo test -p yggterm-shell --no-default-features terminal_host_problem_rejects_accepted_remote_input_without_stream_echo
           cargo test -p yggterm-shell --no-default-features terminal_chunk_has_codex_prompt_output_accepts_codex_prompt_line
           cargo test -p yggterm-shell --no-default-features terminal_host_problem_rejects_remote_codex_title_card_without_prompt
           cargo test -p yggterm-shell --no-default-features terminal_host_problem_rejects_input_enabled_interrupted_codex_banner_without_prompt
