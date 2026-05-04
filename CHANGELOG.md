@@ -4,6 +4,11 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+## 2.1.112
+
+- Route remote live-session input through the already-running local SSH bridge/runtime before falling back to remote-direct writes, removing per-character remote command startup from the hot typing path.
+- Add CI coverage for the remote live input write strategy so latency regressions cannot silently reintroduce remote-direct writes while a local runtime is hot.
+
 ## 2.1.111
 
 - Treat focused Codex conversation-interrupted input surfaces as live interactive terminals even when Codex does not render the normal prompt glyph.
