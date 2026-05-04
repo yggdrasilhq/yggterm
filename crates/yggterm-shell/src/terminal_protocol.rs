@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -85,5 +86,9 @@ pub(crate) enum TerminalJsEvent {
     },
     Debug {
         message: String,
+    },
+    Perf {
+        name: String,
+        payload: Value,
     },
 }

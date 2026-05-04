@@ -4,6 +4,12 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+## 2.1.116
+
+- Keep user scrollback under user control: wheel/page scrolling now records explicit scrollback intent, passive terminal output no longer snaps the viewport back to the prompt, and the smoke harness fails if release causes a bottom snap after wheel release.
+- Reduce live terminal typing latency by keeping small echo writes out of the full-canvas retained-session paint repair path and skipping expensive full refresh work while input is hot.
+- Improve live-session lifecycle truth with terminal-specific close notifications and startup daemon hot-swap scaffolding for stale same-profile daemons.
+
 ## 2.1.115
 
 - Force the active xterm viewport back to the live cursor when terminal input or focus occurs, so switching/typing into a live session cannot leave the prompt hidden in scrollback.
