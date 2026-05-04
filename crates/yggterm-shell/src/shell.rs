@@ -22037,7 +22037,7 @@ fn terminal_probe_input_script(
                     }}
                     if (perChar && Array.from(textChunk).length > 1) {{
                         for (const char of Array.from(textChunk)) {{
-                            await dispatchTextInput(char, true);
+                            await dispatchTextInput(char, false);
                         }}
                         if (settleAfter) {{
                             await settle(12);
@@ -48933,6 +48933,29 @@ mod tests {
     }
 
     #[test]
+    fn terminal_probe_per_char_does_not_sleep_after_every_character() {
+        let script = terminal_probe_input_script(
+            "remote-session://dev/test",
+            "abcd",
+            ProbeTerminalViewportInputMode::Keyboard,
+            true,
+            false,
+            false,
+            false,
+            false,
+            false,
+        );
+        assert!(
+            script.contains("await dispatchTextInput(char, false);"),
+            "per-char latency probes should dispatch real key events without adding a frame sleep after every character"
+        );
+        assert!(
+            !script.contains("await dispatchTextInput(char, true);"),
+            "per-char latency probes must not measure artificial per-character settle sleeps"
+        );
+    }
+
+    #[test]
     fn terminal_eval_script_locks_even_one_line_scrollback() {
         let theme = terminal_theme(UiTheme::ZedLight, palette(UiTheme::ZedLight), 13.0, "");
         let script = terminal_eval_script("yggterm-terminal-test", &theme, true);
@@ -49334,7 +49357,7 @@ mod tests {
         assert!(script.contains("target.dispatchEvent(new KeyboardEvent('keydown', keyInit));"));
         assert!(script.contains("target.dispatchEvent(new KeyboardEvent('keypress', keyInit));"));
         assert!(script.contains("await dispatchPrintableKey(spec, false);"));
-        assert!(script.contains("await dispatchTextInput(char, true);"));
+        assert!(script.contains("await dispatchTextInput(char, false);"));
         assert!(script.contains("await settle(24);"));
     }
 
