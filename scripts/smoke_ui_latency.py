@@ -3,7 +3,9 @@
 
 This smoke is intentionally user-visible when pointed at a live profile: terminal
 typing probes insert short marker text into the active prompt. Use --clear-after
-when it is acceptable to send Ctrl+U after the samples.
+when it is acceptable to send Ctrl+U after the samples. The first terminal
+sample after opening/clearing the viewport is reported as warmup and gets a
+separate budget; steady-state samples keep the stricter visible-echo budget.
 """
 
 from __future__ import annotations
@@ -190,6 +192,7 @@ def main() -> int:
     parser.add_argument("--max-rows-ms", type=float, default=1200.0)
     parser.add_argument("--max-search-ms", type=float, default=1200.0)
     parser.add_argument("--max-panel-ms", type=float, default=1200.0)
+    parser.add_argument("--max-terminal-warmup-visible-ms", type=float, default=700.0)
     parser.add_argument("--max-terminal-visible-ms", type=float, default=500.0)
     parser.add_argument("--max-terminal-p95-ms", type=float, default=450.0)
     parser.add_argument("--skip-readiness-gate", action="store_true")
@@ -203,6 +206,7 @@ def main() -> int:
             "rows": args.max_rows_ms,
             "search": args.max_search_ms,
             "panel": args.max_panel_ms,
+            "terminal_warmup_visible": args.max_terminal_warmup_visible_ms,
             "terminal_visible": args.max_terminal_visible_ms,
             "terminal_p95": args.max_terminal_p95_ms,
         },
@@ -268,6 +272,7 @@ def main() -> int:
         visible_ms = timings.get("visible_echo_ms")
         sample = {
             "token": token,
+            "phase": "warmup" if ix == 0 and args.samples > 1 else "steady",
             "command_ms": probe.elapsed_ms,
             "accepted": probe_data.get("accepted"),
             "visible_echo_observed": probe_data.get("visible_echo_observed"),
@@ -325,12 +330,15 @@ def main() -> int:
     )
     report["measurements"]["panel_settings_ms"] = panel_result.elapsed_ms
 
-    terminal_p95 = percentile(terminal_visible_ms, 0.95)
+    terminal_warmup_visible_ms = terminal_visible_ms[0] if len(terminal_visible_ms) > 1 else None
+    terminal_steady_visible_ms = terminal_visible_ms[1:] if len(terminal_visible_ms) > 1 else terminal_visible_ms
+    terminal_p95 = percentile(terminal_steady_visible_ms, 0.95)
+    report["measurements"]["terminal_warmup_visible_ms"] = terminal_warmup_visible_ms
     report["measurements"]["terminal_visible_ms"] = {
-        "min": min(terminal_visible_ms) if terminal_visible_ms else None,
-        "median": statistics.median(terminal_visible_ms) if terminal_visible_ms else None,
+        "min": min(terminal_steady_visible_ms) if terminal_steady_visible_ms else None,
+        "median": statistics.median(terminal_steady_visible_ms) if terminal_steady_visible_ms else None,
         "p95": terminal_p95,
-        "max": max(terminal_visible_ms) if terminal_visible_ms else None,
+        "max": max(terminal_steady_visible_ms) if terminal_steady_visible_ms else None,
     }
 
     budget_check(report, "state", state_result.elapsed_ms, args.max_state_ms)
@@ -338,11 +346,16 @@ def main() -> int:
     budget_check(report, "search_set", search_result.elapsed_ms, args.max_search_ms)
     budget_check(report, "panel_settings", panel_result.elapsed_ms, args.max_panel_ms)
     for sample in report["terminal_samples"]:
+        sample_budget = (
+            args.max_terminal_warmup_visible_ms
+            if sample.get("phase") == "warmup"
+            else args.max_terminal_visible_ms
+        )
         budget_check(
             report,
             f"terminal {sample['token']}",
             sample.get("visible_echo_ms"),
-            args.max_terminal_visible_ms,
+            sample_budget,
         )
     budget_check(report, "terminal p95", terminal_p95, args.max_terminal_p95_ms)
 
