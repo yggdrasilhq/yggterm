@@ -11379,6 +11379,8 @@ def assert_terminal_viewport_resize_refits_xterm(pid: int, session: str, out_dir
             "cell_height": cell_height,
             "fit_overflow_px": float(host.get("fit_overflow_px") or 0.0),
             "cursor_bottom_overflow_px": float(host.get("cursor_bottom_overflow_px") or 0.0),
+            "last_fit_guard": host.get("last_fit_guard") or {},
+            "last_skipped_fit": host.get("last_skipped_fit") or {},
             "geometry_problem": ((sample_state.get("viewport") or {}).get("active_terminal_surface") or {}).get("geometry_problem"),
             "surface_problem": ((sample_state.get("viewport") or {}).get("active_terminal_surface") or {}).get("problem"),
         }
@@ -11401,6 +11403,16 @@ def assert_terminal_viewport_resize_refits_xterm(pid: int, session: str, out_dir
             return False
         if summary["geometry_problem"]:
             return False
+        skipped = summary["last_skipped_fit"]
+        if isinstance(skipped, dict) and skipped.get("cause") == "host_not_usable":
+            try:
+                skipped_width = float(skipped.get("available_width_px") or 0.0)
+                skipped_height = float(skipped.get("available_height_px") or 0.0)
+            except (TypeError, ValueError):
+                skipped_width = 0.0
+                skipped_height = 0.0
+            if skipped_width >= 640.0 and skipped_height >= 460.0:
+                return False
         return True
 
     samples = {}
@@ -11422,6 +11434,12 @@ def assert_terminal_viewport_resize_refits_xterm(pid: int, session: str, out_dir
             "summary": fit_summary(settled),
             "screenshot": str(shot_path),
         }
+        skipped = samples[label]["summary"].get("last_skipped_fit") or {}
+        if isinstance(skipped, dict) and skipped.get("cause") == "host_not_usable":
+            raise AssertionError(
+                f"terminal viewport {label} resize settled with a usable host still classified unusable: "
+                f"{samples[label]!r}"
+            )
     return samples
 
 
@@ -12141,6 +12159,13 @@ def assert_live_session_keep_alive_toggle(pid: int) -> dict:
         keep_rect = kept_row.get("live_keep_alive_rect") or {}
         if not rect_is_visible(keep_rect):
             raise AssertionError(f"kept live session did not expose a visible keep-alive dot: {kept_row!r}")
+        row_left = float(kept_row.get("left") or 0.0)
+        keep_left = float(keep_rect.get("left") or 0.0)
+        if keep_left > row_left + 36.0:
+            raise AssertionError(
+                "kept live session keep-alive dot is trailing the variable label instead of using the leading rail: "
+                f"row_left={row_left} keep_rect={keep_rect!r} row={kept_row!r}"
+            )
         keep_color = str(kept_row.get("live_keep_alive_color") or "").strip()
         if not keep_color:
             raise AssertionError(f"kept live session keep-alive dot has no computed color: {kept_row!r}")
@@ -12823,6 +12848,31 @@ def assert_live_sessions_tree_contract(pid: int) -> dict:
         raise AssertionError(
             f"live session close affordances are present but not visibly readable: {live_close_low_visibility!r}"
         )
+    misaligned_keep_alive = []
+    for row in live_group_children:
+        if str(row.get("kind") or "").strip() != "Session" or not bool(row.get("live_keep_alive")):
+            continue
+        keep_rect = row.get("live_keep_alive_rect") or {}
+        if not rect_is_visible(keep_rect):
+            misaligned_keep_alive.append({"row": row, "error": "missing visible keep-alive dot"})
+            continue
+        try:
+            row_left = float(row.get("left") or 0.0)
+            keep_left = float(keep_rect.get("left") or 0.0)
+        except (TypeError, ValueError):
+            misaligned_keep_alive.append({"row": row, "error": "invalid keep-alive geometry"})
+            continue
+        if keep_left > row_left + 36.0:
+            misaligned_keep_alive.append(
+                {
+                    "row": row,
+                    "error": "keep-alive dot is not in the fixed leading rail",
+                    "row_left": row_left,
+                    "keep_left": keep_left,
+                }
+            )
+    if misaligned_keep_alive:
+        raise AssertionError(f"live keep-alive dots are misaligned: {misaligned_keep_alive!r}")
     invalid_busy_live_rows = []
     active_state_for_busy = state
     for row in live_group_children:
@@ -12872,6 +12922,7 @@ def assert_live_sessions_tree_contract(pid: int) -> dict:
         "duplicate_tree_live_row_count": len(duplicate_tree_live_rows),
         "live_close_count": len(live_group_children) - len(live_close_missing) - len(live_group_documents),
         "live_close_visibility": live_close_visibility,
+        "misaligned_keep_alive_count": len(misaligned_keep_alive),
         "invalid_busy_live_row_count": len(invalid_busy_live_rows),
         "invalid_cached_ready_machine_row_count": len(invalid_cached_ready_machine_rows),
         "snapshot_live_session_count": len(snapshot_live_sessions),

@@ -1,3 +1,11 @@
+yggterm (2.1.118-1) unstable; urgency=medium
+
+  * Stabilize terminal redraw after resize and session switching.
+  * Throttle input-hot terminal observability to reduce typing latency and CPU churn.
+  * Move Live Sessions keep-alive dots into a fixed leading status rail.
+
+ -- Avikalpa Kundu <avikalpa.com>  Mon, 04 May 2026 16:30:00 +0530
+
 yggterm (2.1.117-1) unstable; urgency=medium
 
   * Keep remote preview refresh cache-only on the daemon request path.
