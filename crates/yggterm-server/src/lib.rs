@@ -90,6 +90,7 @@ pub enum WorkspaceViewMode {
 
 const REMOTE_COMMAND_CACHE_VERIFY_TTL_MS: u64 = 10 * 60_000;
 const REMOTE_YGGTERM_COMMAND_TIMEOUT_MS: u64 = 45_000;
+const REMOTE_PYTHON_COMMAND_TIMEOUT_MS: u64 = 20_000;
 
 pub fn refresh_local_managed_cli_now(background: bool) -> anyhow::Result<String> {
     Ok(summarize_managed_cli_report(
@@ -925,11 +926,7 @@ impl YggtermServer {
     pub fn refresh_session_preview_from_source(&mut self, path: &str) -> anyhow::Result<()> {
         if let Some((raw_machine_key, session_id)) = parse_remote_scanned_session_path(&path) {
             let machine_key = normalize_machine_key(raw_machine_key);
-            if self.sessions.contains_key(path) {
-                self.refresh_remote_preview_from_active_session(&machine_key, session_id)?;
-            } else {
-                self.refresh_remote_scanned_session_preview(&machine_key, session_id)?;
-            }
+            self.refresh_remote_scanned_session_preview_from_cache(&machine_key, session_id);
             return Ok(());
         }
         let Some(session) = self.sessions.get(path).cloned() else {
@@ -942,7 +939,7 @@ impl YggtermServer {
                 if let Some((raw_machine_key, session_id)) = parse_remote_scanned_session_path(path)
                 {
                     let machine_key = normalize_machine_key(raw_machine_key);
-                    self.refresh_remote_scanned_session_preview(&machine_key, session_id)?;
+                    self.refresh_remote_scanned_session_preview_from_cache(&machine_key, session_id);
                 }
             }
         }
@@ -4242,20 +4239,19 @@ impl YggtermServer {
         Ok(())
     }
 
-    fn refresh_remote_scanned_session_preview(
+    fn refresh_remote_scanned_session_preview_from_cache(
         &mut self,
         machine_key: &str,
         session_id: &str,
-    ) -> anyhow::Result<()> {
+    ) {
         let machine_key = normalize_machine_key(machine_key);
-        self.refresh_remote_machine_by_key(&machine_key)?;
         let Some(machine) = self
             .remote_machines
             .iter()
             .find(|machine| machine.machine_key == machine_key)
             .cloned()
         else {
-            return Ok(());
+            return;
         };
         let Some(scanned) = machine
             .sessions
@@ -4263,143 +4259,26 @@ impl YggtermServer {
             .find(|session| session.session_id == session_id)
             .cloned()
         else {
-            return self.refresh_remote_preview_from_active_session(&machine_key, session_id);
+            return;
         };
         let path = remote_scanned_session_path(&machine_key, session_id);
-        let mut refreshed_title = None::<String>;
-        let mut refreshed_precis = None::<String>;
-        let mut refreshed_summary = None::<String>;
-        let mut fetched_live_payload = false;
         if let Some(session) = self.sessions.get_mut(&path) {
-            let target = SshConnectTarget {
-                label: machine.label.clone(),
-                kind: SessionKind::SshShell,
-                ssh_target: machine.ssh_target.clone(),
-                prefix: machine.prefix.clone(),
-                cwd: Some(scanned.cwd.clone()),
-            };
-            match fetch_remote_preview_payload(&target, &scanned.storage_path) {
-                Ok(payload) => {
-                    refreshed_title = payload.title_hint.clone();
-                    refreshed_precis = payload.cached_precis.clone();
-                    refreshed_summary = payload.cached_summary.clone();
-                    fetched_live_payload = true;
-                    apply_remote_preview_payload(session, payload);
-                    upsert_session_metadata(
-                        &mut session.metadata,
-                        "Source",
-                        "remote-codex".to_string(),
-                    );
-                    upsert_session_metadata(
-                        &mut session.metadata,
-                        "Host",
-                        machine.ssh_target.clone(),
-                    );
-                    upsert_session_metadata(
-                        &mut session.metadata,
-                        "UUID",
-                        scanned.session_id.clone(),
-                    );
-                    upsert_session_metadata(&mut session.metadata, "Cwd", scanned.cwd.clone());
-                }
-                Err(error) => {
-                    warn!(machine_key, session_id, error=%error, "failed to fetch remote preview payload");
-                    apply_remote_scanned_session_preview(
-                        session,
-                        &scanned,
-                        &machine.label,
-                        &machine.ssh_target,
-                    );
-                }
-            }
-        }
-        if fetched_live_payload {
-            let target = SshConnectTarget {
-                label: machine.label.clone(),
-                kind: SessionKind::SshShell,
-                ssh_target: machine.ssh_target.clone(),
-                prefix: machine.prefix.clone(),
-                cwd: Some(scanned.cwd.clone()),
-            };
-            self.promote_remote_machine_health(
-                &machine_key,
-                Some(&target),
-                machine.remote_binary_expr.clone(),
-                Some(machine.remote_deploy_state),
+            apply_remote_scanned_session_preview(
+                session,
+                &scanned,
+                &machine.label,
+                &machine.ssh_target,
             );
         }
-        if let Some(title) = refreshed_title.as_deref() {
-            self.set_session_title_hint_passive(&path, title);
+        if !scanned.title_hint.trim().is_empty() {
+            self.set_session_title_hint_passive(&path, &scanned.title_hint);
         }
-        if let Some(precis) = refreshed_precis.as_deref() {
+        if let Some(precis) = scanned.cached_precis.as_deref() {
             self.set_session_precis_hint(&path, precis);
         }
-        if let Some(summary) = refreshed_summary.as_deref() {
+        if let Some(summary) = scanned.cached_summary.as_deref() {
             self.set_session_summary_hint(&path, summary);
         }
-        Ok(())
-    }
-
-    fn refresh_remote_preview_from_active_session(
-        &mut self,
-        machine_key: &str,
-        session_id: &str,
-    ) -> anyhow::Result<()> {
-        let machine_key = normalize_machine_key(machine_key);
-        let path = remote_scanned_session_path(&machine_key, session_id);
-        let Some(session) = self.sessions.get_mut(&path) else {
-            return Ok(());
-        };
-        let ssh_target = session
-            .ssh_target
-            .clone()
-            .or_else(|| session_metadata_value(session, "Host"))
-            .unwrap_or_else(|| machine_key.to_string());
-        let cwd = session_metadata_value(session, "Cwd");
-        let storage_path = session_metadata_value(session, "Storage").unwrap_or_default();
-        if storage_path.trim().is_empty() {
-            return Ok(());
-        }
-        let target = SshConnectTarget {
-            label: machine_key.to_string(),
-            kind: SessionKind::SshShell,
-            ssh_target: ssh_target.clone(),
-            prefix: session.ssh_prefix.clone(),
-            cwd,
-        };
-        let mut fetched_live_payload = false;
-        match fetch_remote_preview_payload(&target, &storage_path) {
-            Ok(payload) => {
-                let refreshed_title = payload.title_hint.clone();
-                let refreshed_precis = payload.cached_precis.clone();
-                let refreshed_summary = payload.cached_summary.clone();
-                fetched_live_payload = true;
-                apply_remote_preview_payload(session, payload);
-                upsert_session_metadata(
-                    &mut session.metadata,
-                    "Source",
-                    "remote-codex".to_string(),
-                );
-                upsert_session_metadata(&mut session.metadata, "Host", ssh_target);
-                upsert_session_metadata(&mut session.metadata, "UUID", session_id.to_string());
-                if let Some(title) = refreshed_title.as_deref() {
-                    self.set_session_title_hint_passive(&path, title);
-                }
-                if let Some(precis) = refreshed_precis.as_deref() {
-                    self.set_session_precis_hint(&path, precis);
-                }
-                if let Some(summary) = refreshed_summary.as_deref() {
-                    self.set_session_summary_hint(&path, summary);
-                }
-            }
-            Err(error) => {
-                warn!(machine_key, session_id, error=%error, "failed to fetch remote preview payload from active session");
-            }
-        }
-        if fetched_live_payload {
-            self.promote_remote_machine_health(&machine_key, Some(&target), None, None);
-        }
-        Ok(())
     }
 
     fn connect_ssh_like_target(&mut self, target: &SshConnectTarget) -> (Option<String>, bool) {
@@ -7991,9 +7870,12 @@ fn run_remote_python_lines(
             .write_all(script.as_bytes())
             .with_context(|| format!("failed to send script to {ssh_target}"))?;
     }
-    let output = child
-        .wait_with_output()
-        .with_context(|| format!("failed waiting for ssh python on {ssh_target}"))?;
+    let output = wait_remote_command_with_timeout(
+        child,
+        REMOTE_PYTHON_COMMAND_TIMEOUT_MS,
+        &format!("{ssh_target} python remote helper"),
+    )
+    .with_context(|| format!("failed waiting for ssh python on {ssh_target}"))?;
     if !output.status.success() {
         anyhow::bail!(
             "remote command failed for {}: {}",
@@ -17929,6 +17811,76 @@ terminal_window_id: None,
         assert_eq!(server.active_session_path(), Some(session_path.as_str()));
         assert_eq!(server.active_view_mode, WorkspaceViewMode::Rendered);
         assert!(!server.live_session_order.contains(&session_path));
+        Ok(())
+    }
+
+    #[test]
+    fn remote_preview_refresh_uses_cached_scan_without_remote_io_for_live_session() -> Result<()> {
+        let tree = SessionNode {
+            kind: SessionNodeKind::Group,
+            name: "root".to_string(),
+            title: None,
+            document_kind: None,
+            group_kind: None,
+            path: PathBuf::from("/"),
+            children: Vec::new(),
+            session_id: None,
+            cwd: None,
+        };
+        let mut server = YggtermServer::new(
+            &tree,
+            false,
+            GhosttyHostSupport::shadow("test".to_string(), false, false),
+            UiTheme::ZedLight,
+        );
+        let session_id = "019cf00a-57bd-7480-a642-495ac1389b8e";
+        server.remote_machines.push(RemoteMachineSnapshot {
+            machine_key: "dev".to_string(),
+            label: "dev".to_string(),
+            ssh_target: "invalid ssh target with spaces".to_string(),
+            prefix: None,
+            remote_binary_expr: Some("$HOME/.yggterm/bin/yggterm".to_string()),
+            remote_deploy_state: RemoteDeployState::Ready,
+            health: RemoteMachineHealth::Healthy,
+            sessions: vec![RemoteScannedSession {
+                session_path: remote_scanned_session_path("dev", session_id),
+                session_id: session_id.to_string(),
+                cwd: "/home/pi/gh/yggterm".to_string(),
+                started_at: "2026-04-01T00:00:00Z".to_string(),
+                modified_epoch: 1,
+                event_count: 8,
+                user_message_count: 4,
+                assistant_message_count: 4,
+                title_hint: "Cached Remote Title".to_string(),
+                recent_context: "cached scan context".to_string(),
+                cached_precis: Some("cached precis".to_string()),
+                cached_summary: Some("cached summary".to_string()),
+                live_runtime: true,
+                storage_path: "/home/pi/.codex/sessions/preview.jsonl".to_string(),
+            }],
+        });
+        let session_path = server
+            .stage_remote_scanned_session_with_view("dev", session_id, WorkspaceViewMode::Terminal)
+            .expect("staged remote live session");
+
+        let started = Instant::now();
+        server.refresh_session_preview_from_source(&session_path)?;
+
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "remote preview refresh should be cache-only, not an ssh scan/fetch"
+        );
+        let session = server.sessions.get(&session_path).expect("session");
+        assert_eq!(session.source, SessionSource::LiveSsh);
+        assert_eq!(session.title, "Cached Remote Title");
+        assert_eq!(
+            session
+                .metadata
+                .iter()
+                .find(|entry| entry.label == "Host")
+                .map(|entry| entry.value.as_str()),
+            Some("invalid ssh target with spaces")
+        );
         Ok(())
     }
 
