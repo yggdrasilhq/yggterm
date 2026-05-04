@@ -4,6 +4,11 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+## 2.1.114
+
+- Classify the first post-open terminal latency token as warmup with its own budget, while keeping strict steady-state visible-echo max and p95 budgets.
+- Add CI syntax coverage for the latency smoke script so harness regressions are caught before release.
+
 ## 2.1.113
 
 - Remove artificial per-character settle sleeps from app-control keyboard latency probes so the live latency gate measures terminal echo instead of harness delay.
