@@ -14889,6 +14889,95 @@ def assert_scroll(pid: int, session: str, before_state: dict) -> dict:
     }
 
 
+def assert_scrollback_retention_after_wheel_release(pid: int, session: str, out_dir: Path) -> dict:
+    wait_for_session_focus(pid, session, timeout_seconds=12.0)
+    terminal_reclaim_focus(pid, session)
+    state = app_state(pid)
+    host = host_for_session_or_none(state, session) or active_host(state)
+    before_viewport_y = int(host.get("viewport_y") or 0)
+    before_base_y = int(host.get("base_y") or 0)
+    buffer_kind = str(host.get("xterm_buffer_kind") or "")
+    mouse_tracking_mode = str(host.get("xterm_mouse_tracking_mode") or "")
+    alternate_mouse_owned = buffer_kind == "alternate" and mouse_tracking_mode not in ("", "none", "None")
+    if alternate_mouse_owned:
+        return {
+            "reason": "alternate_buffer_mouse_owned",
+            "buffer_kind": buffer_kind,
+            "mouse_tracking_mode": mouse_tracking_mode,
+        }
+    if before_base_y <= before_viewport_y <= 0:
+        if host_expects_scrollback(host):
+            raise AssertionError(
+                "scrollback retention expected retained scrollback, but xterm reported no scrollback: "
+                f"host={host!r}"
+            )
+        return {
+            "reason": "no_scrollback_available",
+            "before": {
+                "base_y": before_base_y,
+                "viewport_y": before_viewport_y,
+                "scrollback_intent": host.get("scrollback_intent"),
+            },
+        }
+
+    bottom_probe = probe_scroll(pid, session, 9999)
+    time.sleep(0.18)
+    up_probe = probe_scroll(pid, session, -5)
+    after_scroll = up_probe.get("after") or {}
+    if int(after_scroll.get("base_y") or 0) <= int(after_scroll.get("viewport_y") or 0):
+        up_probe = probe_scroll(pid, session, -12)
+        after_scroll = up_probe.get("after") or {}
+    after_base_y = int(after_scroll.get("base_y") or 0)
+    after_viewport_y = int(after_scroll.get("viewport_y") or 0)
+    if after_base_y <= after_viewport_y:
+        raise AssertionError(
+            "wheel scroll did not leave the terminal in scrollback before retention check: "
+            f"bottom_probe={bottom_probe!r} up_probe={up_probe!r}"
+        )
+    if after_scroll.get("scrollback_intent") != "UserScrollback":
+        raise AssertionError(
+            "wheel scroll moved into scrollback without recording explicit UserScrollback intent: "
+            f"after={after_scroll!r} probe={up_probe!r}"
+        )
+
+    time.sleep(0.9)
+    settled_state = app_state(pid)
+    settled_host = host_for_session_or_none(settled_state, session) or active_host(settled_state)
+    settled_base_y = int(settled_host.get("base_y") or 0)
+    settled_viewport_y = int(settled_host.get("viewport_y") or 0)
+    if settled_base_y <= settled_viewport_y:
+        raise AssertionError(
+            "terminal snapped back to bottom after wheel release while user scrollback should be retained: "
+            f"after_scroll={after_scroll!r} settled_host={settled_host!r}"
+        )
+    if settled_host.get("scrollback_intent") != "UserScrollback":
+        raise AssertionError(
+            "terminal retained scrollback position but lost explicit UserScrollback intent after wheel release: "
+            f"after_scroll={after_scroll!r} settled_host={settled_host!r}"
+        )
+
+    shot_path = out_dir / "scrollback-retention.png"
+    app_screenshot(pid, shot_path)
+    state_path = out_dir / "scrollback-retention-state.json"
+    with state_path.open("w") as fh:
+        json.dump(settled_state, fh, indent=2)
+    restore_probe = probe_scroll(pid, session, 9999)
+    return {
+        "bottom_probe": bottom_probe,
+        "up_probe": up_probe,
+        "settled": {
+            "base_y": settled_base_y,
+            "viewport_y": settled_viewport_y,
+            "scrollback_intent": settled_host.get("scrollback_intent"),
+            "scrollback_intent_reason": settled_host.get("scrollback_intent_reason"),
+            "scrollback_snapback_reason": settled_host.get("scrollback_snapback_reason"),
+        },
+        "restore_probe": restore_probe,
+        "screenshot": str(shot_path),
+        "state": str(state_path),
+    }
+
+
 def assert_cursor_prompt_visibility(state: dict, *, context: str) -> dict:
     host = active_host(state)
     cursor_rect = host.get("cursor_sample_rect") or {}
@@ -16112,6 +16201,7 @@ def main() -> int:
         "clipboard_image",
         "partial_input",
         "scroll",
+        "scrollback_retention",
         "hidden_cursor_tui",
         "codex_session_tui_vitality",
         "status_command",
@@ -16396,6 +16486,12 @@ def main() -> int:
                 args.pid, late_phase_session, out_dir
             ))
             run_check("scroll", lambda: assert_scroll(args.pid, late_phase_session, state))
+            run_check(
+                "scrollback_retention",
+                lambda: assert_scrollback_retention_after_wheel_release(
+                    args.pid, late_phase_session, out_dir
+                ),
+            )
             run_check("hidden_cursor_tui", lambda: assert_hidden_cursor_tui(args.pid, late_phase_session, out_dir))
             if late_phase_session.startswith("local://"):
                 run_check("codex_session_tui_vitality", lambda: assert_codex_session_tui_vitality(

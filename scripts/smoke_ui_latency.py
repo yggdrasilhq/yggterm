@@ -209,6 +209,9 @@ def main() -> int:
     parser.add_argument("--max-terminal-warmup-visible-ms", type=float, default=700.0)
     parser.add_argument("--max-terminal-visible-ms", type=float, default=500.0)
     parser.add_argument("--max-terminal-p95-ms", type=float, default=450.0)
+    parser.add_argument("--max-terminal-drift-ms", type=float, default=175.0)
+    parser.add_argument("--max-terminal-scroll-ms", type=float, default=800.0)
+    parser.add_argument("--skip-scroll-check", action="store_true")
     parser.add_argument("--skip-readiness-gate", action="store_true")
     args = parser.parse_args()
 
@@ -223,9 +226,12 @@ def main() -> int:
             "terminal_warmup_visible": args.max_terminal_warmup_visible_ms,
             "terminal_visible": args.max_terminal_visible_ms,
             "terminal_p95": args.max_terminal_p95_ms,
+            "terminal_drift": args.max_terminal_drift_ms,
+            "terminal_scroll": args.max_terminal_scroll_ms,
         },
         "measurements": {},
         "terminal_samples": [],
+        "terminal_scroll": None,
         "failures": [],
     }
 
@@ -347,13 +353,81 @@ def main() -> int:
     terminal_warmup_visible_ms = terminal_visible_ms[0] if len(terminal_visible_ms) > 1 else None
     terminal_steady_visible_ms = terminal_visible_ms[1:] if len(terminal_visible_ms) > 1 else terminal_visible_ms
     terminal_p95 = percentile(terminal_steady_visible_ms, 0.95)
+    terminal_drift_ms = None
+    if len(terminal_steady_visible_ms) >= 4:
+        midpoint = len(terminal_steady_visible_ms) // 2
+        early = terminal_steady_visible_ms[:midpoint]
+        late = terminal_steady_visible_ms[midpoint:]
+        terminal_drift_ms = statistics.median(late) - statistics.median(early)
     report["measurements"]["terminal_warmup_visible_ms"] = terminal_warmup_visible_ms
     report["measurements"]["terminal_visible_ms"] = {
         "min": min(terminal_steady_visible_ms) if terminal_steady_visible_ms else None,
         "median": statistics.median(terminal_steady_visible_ms) if terminal_steady_visible_ms else None,
         "p95": terminal_p95,
         "max": max(terminal_steady_visible_ms) if terminal_steady_visible_ms else None,
+        "drift_ms": terminal_drift_ms,
     }
+
+    if not args.skip_scroll_check:
+        try:
+            scroll_started = time.perf_counter()
+            scroll_result = run_json(
+                args,
+                "terminal_scroll",
+                terminal_args(args, session_path, "probe-scroll", session_path, "--lines", "-5"),
+            )
+            scroll_elapsed_ms = (time.perf_counter() - scroll_started) * 1000.0
+            scroll_data = data_from(scroll_result)
+            report["terminal_scroll"] = {
+                "elapsed_ms": scroll_elapsed_ms,
+                "accepted": scroll_data.get("accepted"),
+                "movement_expected": scroll_data.get("movement_expected"),
+                "scroll_probe_moved": scroll_data.get("scroll_probe_moved"),
+                "after": scroll_data.get("after"),
+            }
+            if scroll_data.get("accepted") is not True:
+                report["failures"].append(f"terminal scroll not accepted: {scroll_data!r}")
+            if scroll_elapsed_ms > args.max_terminal_scroll_ms:
+                report["failures"].append(
+                    f"terminal scroll: {scroll_elapsed_ms:.1f}ms > {args.max_terminal_scroll_ms:.1f}ms"
+                )
+            if scroll_data.get("movement_expected") and not scroll_data.get("scroll_probe_moved"):
+                report["failures"].append(f"terminal scroll expected movement but did not move: {scroll_data!r}")
+            after_scroll = scroll_data.get("after") if isinstance(scroll_data.get("after"), dict) else {}
+            if scroll_data.get("movement_expected") and scroll_data.get("scroll_probe_moved"):
+                if after_scroll.get("scrollback_intent") not in (None, "UserScrollback"):
+                    report["failures"].append(
+                        "terminal scroll moved into scrollback without UserScrollback intent: "
+                        f"{after_scroll!r}"
+                    )
+                time.sleep(0.65)
+                settled_state = data_from(run_json(args, "state_after_scroll", app_args(args, "state")))
+                settled_host = active_terminal_host(active_terminal_viewport(settled_state), session_path)
+                try:
+                    settled_base = int(settled_host.get("base_y") or 0)
+                    settled_viewport = int(settled_host.get("viewport_y") or 0)
+                    if settled_base > 0 and settled_base <= settled_viewport:
+                        report["failures"].append(
+                            "terminal scrollback snapped back to bottom after wheel release: "
+                            f"{settled_host!r}"
+                        )
+                except (TypeError, ValueError):
+                    pass
+                if settled_host.get("scrollback_intent") not in (None, "UserScrollback"):
+                    report["failures"].append(
+                        "terminal scrollback lost UserScrollback intent after wheel release: "
+                        f"{settled_host!r}"
+                    )
+            try:
+                run_json(
+                    args,
+                    "terminal_scroll_restore",
+                    terminal_args(args, session_path, "probe-scroll", session_path, "--lines", "9999"),
+                )
+            except Exception as error:  # noqa: BLE001
+                report["failures"].append(f"terminal scroll restore failed: {error}")
+        except Exception as error:  # noqa: BLE001
+            report["failures"].append(f"terminal scroll check failed: {error}")
 
     budget_check(report, "state", state_result.elapsed_ms, args.max_state_ms)
     budget_check(report, "rows", rows_result.elapsed_ms, args.max_rows_ms)
@@ -372,6 +446,10 @@ def main() -> int:
             sample_budget,
         )
     budget_check(report, "terminal p95", terminal_p95, args.max_terminal_p95_ms)
+    if terminal_drift_ms is not None and terminal_drift_ms > args.max_terminal_drift_ms:
+        report["failures"].append(
+            f"terminal visible echo drift: {terminal_drift_ms:.1f}ms > {args.max_terminal_drift_ms:.1f}ms"
+        )
 
     report["ok"] = not report["failures"]
     output = json.dumps(report, indent=2, sort_keys=True)
