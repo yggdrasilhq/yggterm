@@ -7,7 +7,8 @@ use yggterm_server::{
     AppControlRightPanelMode, AppControlViewMode, ProbeTerminalViewportInputMode,
     cleanup_legacy_daemons, default_endpoint, detect_ghostty_host, ensure_local_daemon_running,
     ping, run_app_control_background_window, run_app_control_close_window,
-    run_app_control_create_terminal, run_app_control_describe_rows, run_app_control_describe_state,
+    run_app_control_close_window_preserving_sessions, run_app_control_create_terminal,
+    run_app_control_describe_rows, run_app_control_describe_state,
     run_app_control_desktop_identity, run_app_control_drag, run_app_control_dump_state,
     run_app_control_focus_window, run_app_control_list_clients, run_app_control_move_window_by,
     run_app_control_open_path, run_app_control_paste_terminal_clipboard,
@@ -31,6 +32,15 @@ mod headless_monitor;
 
 const ENV_YGGTERM_DIRECT_INSTALL_ROOT: &str = "YGGTERM_DIRECT_INSTALL_ROOT";
 const ENV_YGGTERM_SKIP_ACTIVE_EXEC_HANDOFF: &str = "YGGTERM_SKIP_ACTIVE_EXEC_HANDOFF";
+
+fn app_control_close_preserve_flag(args: &[String]) -> bool {
+    args.iter().any(|arg| {
+        matches!(
+            arg.as_str(),
+            "--preserve-live-sessions" | "--preserve-sessions" | "--handoff" | "--restart-safe"
+        )
+    })
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BuiltinCliCommand {
@@ -598,7 +608,16 @@ fn main() -> Result<()> {
                     timeout_ms,
                 )
             }
-            "close" | "quit" | "exit" => run_app_control_close_window(timeout_ms),
+            "close" | "quit" | "exit" => {
+                if app_control_close_preserve_flag(&args) {
+                    run_app_control_close_window_preserving_sessions(
+                        timeout_ms,
+                        Some("manual-preserve-close".to_string()),
+                    )
+                } else {
+                    run_app_control_close_window(timeout_ms)
+                }
+            }
             "chrome-hover" | "titlebar-hover" => {
                 let active = cli_positional_args(&args, 3)
                     .into_iter()

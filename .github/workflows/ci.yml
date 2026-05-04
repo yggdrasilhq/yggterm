@@ -76,6 +76,8 @@ jobs:
           cargo test -p yggterm-server --no-default-features remote_resume_runtime_output_requires_restart_for_shell_prompt
           cargo test -p yggterm-server --no-default-features remote_resume_seed_snapshot_prefill_rejects_codex_role_transcript
           cargo test -p yggterm-server --no-default-features initial_remote_resume_attach_prefers_screen_snapshot_over_stale_prose_tail
+          cargo test -p yggterm-server --no-default-features terminal_manager_retained_snapshot_exposes_full_history_for_ui_replay
+          cargo test -p yggterm-server --no-default-features preserving_close_command_serializes_as_distinct_restart_safe_kind
           cargo test -p yggterm-server --no-default-features remote_preview_payload_terminal_prefill_is_disabled_for_live_terminal
           cargo test -p yggterm-server --no-default-features persisted_state_only_keeps_explicitly_kept_live_sessions
           cargo test -p yggterm-server --no-default-features restore_persisted_state_skips_unkept_recoverable_live_sessions_without_update_reason
@@ -114,6 +116,7 @@ jobs:
           cargo test -p yggterm-shell --no-default-features fresh_remote_codex_start_surface_requires_prompt_ready_surface
           cargo test -p yggterm-shell --no-default-features created_remote_terminal_prewarm_targets_live_remote_paths
           cargo test -p yggterm-shell --no-default-features retained_rehydrate_script_replays_only_collapsed_xterm_buffers
+          cargo test -p yggterm-shell --no-default-features daemon_retained_snapshot_replay_starts_for_ready_active_remote_session
           cargo test -p yggterm-shell --no-default-features terminal_eval_script_defers_initial_blank_host_rebuild_until_after_first_paint_probe
           cargo test -p yggterm-shell --no-default-features terminal_eval_script_throttles_hot_render_bridge_work
           cargo test -p yggterm-shell --no-default-features terminal_eval_script_focuses_host_and_scopes_wheel_capture
@@ -123,6 +126,8 @@ jobs:
           cargo test -p yggterm-shell --no-default-features terminal_eval_script_tracks_explicit_scrollback_intent
           cargo test -p yggterm-shell --no-default-features live_session_close_success_uses_terminal_copy_not_item_delete_copy
           cargo test -p yggterm-shell --no-default-features live_session_keep_alive_dot_renders_in_fixed_leading_rail
+          cargo test -p yggterm --no-default-features superseded_client_close_command_preserves_live_sessions
+          cargo test -p yggterm --no-default-features superseded_client_retirement_is_process_only_not_app_control_close
           cargo test -p yggterm-shell --no-default-features startup_hot_swap_reason_targets_stale_daemon_versions_only
           cargo test -p yggterm-shell --no-default-features xterm_canvas_renderer_keeps_dim_prompt_text_readable
           cargo test -p yggterm-shell --no-default-features focused_terminal_defers_background_refreshes
