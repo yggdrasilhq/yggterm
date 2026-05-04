@@ -1,3 +1,12 @@
+yggterm (2.1.119-1) unstable; urgency=medium
+
+  * Restore remote live-session scrollback from daemon-retained terminal history.
+  * Hydrate collapsed xterm buffers even when the prompt is already visible.
+  * Preserve live sessions during GUI restart and hard-kill superseded GUI clients without daemon cleanup.
+  * Extend app-control and CI coverage for retained replay evidence.
+
+ -- Avikalpa Kundu <avikalpa.com>  Mon, 04 May 2026 17:20:00 +0530
+
 yggterm (2.1.118-1) unstable; urgency=medium
 
   * Stabilize terminal redraw after resize and session switching.
