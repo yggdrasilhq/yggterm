@@ -1,3 +1,10 @@
+yggterm (2.1.114-1) unstable; urgency=medium
+
+  * Classify first terminal latency token as warmup while enforcing steady-state budgets.
+  * Add CI syntax coverage for the latency smoke script.
+
+ -- Avikalpa Kundu <avikalpa.com>  Mon, 04 May 2026 13:30:00 +0530
+
 yggterm (2.1.113-1) unstable; urgency=medium
 
   * Remove artificial per-character settle sleeps from app-control latency probes.
