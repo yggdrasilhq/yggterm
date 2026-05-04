@@ -134,7 +134,7 @@ jobs:
           cargo test -p yggterm-shell --no-default-features terminal_host_problem_rejects_accepted_remote_input_without_stream_echo
           cargo test -p yggterm-shell --no-default-features terminal_chunk_has_codex_prompt_output_accepts_codex_prompt_line
           cargo test -p yggterm-shell --no-default-features terminal_host_problem_rejects_remote_codex_title_card_without_prompt
-          cargo test -p yggterm-shell --no-default-features terminal_host_problem_rejects_input_enabled_interrupted_codex_banner_without_prompt
+          cargo test -p yggterm-shell --no-default-features terminal_host_problem_accepts_input_enabled_interrupted_codex_input_surface
           cargo test -p yggterm-shell --no-default-features terminal_host_problem_rejects_input_disabled_stale_retained_remote_prose
           cargo test -p yggterm-shell --no-default-features terminal_host_problem_rejects_offscreen_active_host
           cargo test -p yggterm-shell --no-default-features viewport_rejects_remote_live_preview_fallback

@@ -1,3 +1,10 @@
+yggterm (2.1.111-1) unstable; urgency=medium
+
+  * Treat focused Codex conversation-interrupted input surfaces as interactive.
+  * Keep foreground terminal latency work and canvas prompt contrast covered.
+
+ -- Avikalpa Kundu <avikalpa.com>  Mon, 04 May 2026 12:36:33 +0530
+
 yggterm (2.1.110-1) unstable; urgency=medium
 
   * Keep canvas-rendered dim Codex prompt text readable.

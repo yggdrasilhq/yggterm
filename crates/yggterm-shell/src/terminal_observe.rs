@@ -867,6 +867,8 @@ fn terminal_host_problem_for_app_control(host: &Value) -> Option<&'static str> {
     let codex_interactive_setup_prompt =
         terminal_chunk_is_codex_interactive_setup_prompt(visible_text);
     let codex_prompt_surface = terminal_chunk_is_codex_prompt_surface(visible_text);
+    let codex_interrupted_input_surface =
+        terminal_chunk_is_codex_interrupted_input_surface(visible_text);
     let remote_codex_prompt_has_real_output = data_event_count > 0
         || last_data_event_at_ms > 0
         || last_raw_payload_length > 0
@@ -886,6 +888,12 @@ fn terminal_host_problem_for_app_control(host: &Value) -> Option<&'static str> {
         && (codex_prompt_surface || live_remote_codex_prompt_only_surface)
         && mounted_entry_host_connected
         && (xterm_present || screen_present || rows_present || canvas_count > 0);
+    let live_remote_codex_interrupted_input_surface = session_path.starts_with("remote-session://")
+        && codex_interrupted_input_surface
+        && mounted_entry_host_connected
+        && input_enabled
+        && (helper_textarea_focused || cursor_sample_visible)
+        && (xterm_present || screen_present || rows_present || canvas_count > 0);
     let transcript_browser_surface = terminal_chunk_is_transcript_browser(visible_text);
     let last_stream_output_after_input_ms = last_write_queued_at_ms
         .max(last_write_flush_started_at_ms)
@@ -898,7 +906,8 @@ fn terminal_host_problem_for_app_control(host: &Value) -> Option<&'static str> {
         && last_data_event_at_ms > last_stream_output_after_input_ms.saturating_add(250)
         && last_data_event_at_ms > 0
         && (terminal_chunk_has_codex_prompt_output(visible_text)
-            || terminal_chunk_is_codex_prompt_surface(visible_text))
+            || terminal_chunk_is_codex_prompt_surface(visible_text)
+            || codex_interrupted_input_surface)
         && (xterm_present || screen_present || rows_present || canvas_count > 0);
     let visible_text_prompt = terminal_chunk_has_prompt_output(visible_text)
         || terminal_chunk_has_codex_prompt_output(visible_text);
@@ -911,12 +920,13 @@ fn terminal_host_problem_for_app_control(host: &Value) -> Option<&'static str> {
             && (terminal_chunk_has_prompt_output(cursor_line_text)
                 || terminal_chunk_has_codex_prompt_output(cursor_line_text)));
     let local_prompt_surface = session_path.starts_with("local://") && prompt_visible;
-    let prompt_ready_surface = prompt_visible
-        && (input_enabled
-            || helper_textarea_focused
-            || cursor_sample_visible
-            || local_prompt_surface
-            || live_remote_codex_prompt_surface);
+    let prompt_ready_surface = live_remote_codex_interrupted_input_surface
+        || (prompt_visible
+            && (input_enabled
+                || helper_textarea_focused
+                || cursor_sample_visible
+                || local_prompt_surface
+                || live_remote_codex_prompt_surface));
     let transcript_browser_ready_surface = false;
     if !cursor_line_text.is_empty() && terminal_chunk_is_transport_error(cursor_line_text) {
         return Some("active terminal host is showing transport/error output");
@@ -1394,6 +1404,20 @@ pub(crate) fn terminal_chunk_is_codex_interactive_setup_prompt(data: &str) -> bo
         || normalized.contains("enter to confirm")
         || normalized.contains("esc to go back");
     codex_context && permissions_menu && explicit_input
+}
+
+fn terminal_chunk_is_codex_interrupted_input_surface(data: &str) -> bool {
+    let stripped = strip_terminal_control_sequences(data);
+    let mut tail_lines = stripped
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .rev()
+        .take(6)
+        .collect::<Vec<_>>();
+    tail_lines.reverse();
+    let tail = tail_lines.join(" ").to_ascii_lowercase();
+    tail.contains("conversation interrupted - tell the model what to do differently")
 }
 
 pub(crate) fn terminal_chunk_is_codex_prompt_surface(data: &str) -> bool {
@@ -2147,6 +2171,7 @@ mod tests {
             "screen_present": true,
             "rows_present": false,
             "canvas_count": 4,
+            "mounted_entry_host_connected": true,
             "render_event_count": 12,
             "data_event_count": 1,
             "xterm_buffer_kind": "normal",
@@ -2174,6 +2199,7 @@ mod tests {
             "screen_present": true,
             "rows_present": false,
             "canvas_count": 4,
+            "mounted_entry_host_connected": true,
             "render_event_count": 12,
             "data_event_count": 1,
             "xterm_buffer_kind": "normal",
@@ -2223,12 +2249,13 @@ mod tests {
     }
 
     #[test]
-    fn terminal_host_problem_rejects_input_enabled_interrupted_codex_banner_without_prompt() {
+    fn terminal_host_problem_accepts_input_enabled_interrupted_codex_input_surface() {
         let host = json!({
             "session_path": "remote-session://dev/interrupted-codex",
-            "text_sample": "• I found a concrete rename root cause.\n\n■ Conversation interrupted - tell the model what to do differently. Something went wrong? Hit /feedback to report the issue.",
-            "text_tail": "• I found a concrete rename root cause.\n\n■ Conversation interrupted - tell the model what to do differently. Something went wrong? Hit /feedback to report the issue.",
-            "cursor_line_text": "",
+            "mounted_entry_host_connected": true,
+            "text_sample": "• I found a concrete rename root cause.\n\n■ Conversation interrupted - tell the model what to do differently. Something went wrong? Hit `/feedback` to",
+            "text_tail": "• I found a concrete rename root cause.\n\n■ Conversation interrupted - tell the model what to do differently. Something went wrong? Hit `/feedback` to",
+            "cursor_line_text": "■ Conversation interrupted - tell the model what to do differently. Something went wrong? Hit `/feedback` to",
             "input_enabled": true,
             "helper_textarea_focused": true,
             "cursor_node_count": 1,
@@ -2247,10 +2274,7 @@ mod tests {
             "helpers_rect": {"width": 840.0, "height": 830.0},
             "helper_textarea_rect": {"left": -10000.0, "top": 68.0, "width": 1.0, "height": 1.0}
         });
-        assert_eq!(
-            terminal_host_problem_for_app_control(&host),
-            Some("active remote terminal is input-enabled without a prompt-ready surface")
-        );
+        assert_eq!(terminal_host_problem_for_app_control(&host), None);
     }
 
     #[test]
