@@ -4,6 +4,12 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+## 2.1.117
+
+- Keep daemon control-plane requests responsive while remote session previews refresh: preview refresh now uses cached scan/session data instead of running SSH scan or preview fetches under the daemon lock.
+- Add a regression test for remote live-session preview refresh against an invalid SSH target so CI fails if the preview path tries remote I/O again.
+- Time-bound the Python remote-scan fallback helper so failed remote Yggterm scan fallback cannot run indefinitely.
+
 ## 2.1.116
 
 - Keep user scrollback under user control: wheel/page scrolling now records explicit scrollback intent, passive terminal output no longer snaps the viewport back to the prompt, and the smoke harness fails if release causes a bottom snap after wheel release.
