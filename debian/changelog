@@ -1,3 +1,11 @@
+yggterm (2.1.116-1) unstable; urgency=medium
+
+  * Preserve explicit terminal scrollback intent after wheel release.
+  * Keep small input echoes out of full-canvas retained paint repair.
+  * Add terminal close wording and startup stale-daemon hot-swap coverage.
+
+ -- Avikalpa Kundu <avikalpa.com>  Mon, 04 May 2026 14:20:00 +0530
+
 yggterm (2.1.115-1) unstable; urgency=medium
 
   * Force active terminal input/focus to reveal the live cursor.
