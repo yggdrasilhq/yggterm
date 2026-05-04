@@ -41568,7 +41568,7 @@ fn terminal_eval_script_with_canvas_renderer(
             }}
             ensureVisibleHost('set_input_enabled');
             emitResize();
-            scrollLiveCursorIntoView();
+            scrollLiveCursorIntoView(Boolean(focus));
             requestVisiblePaint();
             window.requestAnimationFrame(() => {{
                 stretchXtermRoot();
@@ -41876,13 +41876,19 @@ fn terminal_eval_script_with_canvas_renderer(
                 return true;
             }}
         }};
-        const scrollLiveCursorIntoView = () => {{
+        const scrollLiveCursorIntoView = (force = false) => {{
             try {{
                 if (!term || !term.buffer || !term.buffer.active) {{
                     return;
                 }}
-                if (syncScrollbackLock()) {{
+                if (!force && syncScrollbackLock()) {{
                     return;
+                }}
+                if (force) {{
+                    scrollbackLocked = false;
+                    if (window.__yggtermXtermHosts && window.__yggtermXtermHosts[hostId]) {{
+                        window.__yggtermXtermHosts[hostId].scrollbackLocked = false;
+                    }}
                 }}
                 const active = term.buffer.active;
                 const baseY = Math.max(0, Number(active.baseY || 0));
@@ -41901,6 +41907,7 @@ fn terminal_eval_script_with_canvas_renderer(
                 }} else if (typeof term.scrollToBottom === 'function') {{
                     term.scrollToBottom();
                 }}
+                syncScrollbackLock();
             }} catch (_error) {{}}
         }};
         attachHostInteractions(host);
@@ -42762,7 +42769,7 @@ fn terminal_eval_script_with_canvas_renderer(
             if (window.__yggtermXtermHosts && window.__yggtermXtermHosts[hostId]) {{
                 window.__yggtermXtermHosts[hostId].scrollbackLocked = scrollbackLocked;
             }}
-            scrollLiveCursorIntoView();
+            scrollLiveCursorIntoView(true);
             dioxus.send({{ kind: "input", data }});
         }});
         window.__yggtermXtermCleanups[hostId] = () => {{
@@ -48966,6 +48973,28 @@ mod tests {
         assert!(
             !script.contains("scrollbackLocked = viewportY + 1 < baseY;"),
             "one-line scrollback must not be treated as near-bottom or remote panes snap back while scrolling"
+        );
+    }
+
+    #[test]
+    fn terminal_eval_script_forces_cursor_follow_on_input_and_focus() {
+        let theme = terminal_theme(UiTheme::ZedLight, palette(UiTheme::ZedLight), 13.0, "");
+        let script = terminal_eval_script("yggterm-terminal-test", &theme, true);
+        assert!(
+            script.contains("const scrollLiveCursorIntoView = (force = false) => {"),
+            "cursor-follow helper should support a forced path for user input"
+        );
+        assert!(
+            script.contains("if (!force && syncScrollbackLock()) {"),
+            "manual scrollback should still block passive output follow"
+        );
+        assert!(
+            script.contains("scrollLiveCursorIntoView(Boolean(focus));"),
+            "opening/focusing an active terminal should reveal the live cursor"
+        );
+        assert!(
+            script.contains("scrollLiveCursorIntoView(true);\n            dioxus.send({ kind: \"input\", data });"),
+            "real terminal input should reveal the prompt before forwarding bytes"
         );
     }
 
