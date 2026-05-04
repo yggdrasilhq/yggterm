@@ -19086,6 +19086,7 @@ async fn capture_dom_debug_snapshot_for(active_session_path: Option<&str>) -> Va
                         live_keep_alive: Boolean(keepAlive),
                         live_keep_alive_color: keepAliveStyle ? keepAliveStyle.backgroundColor : null,
                         live_keep_alive_rect: rectSummary(keepAlive),
+                        live_keep_alive_rail_rect: rectSummary(row.querySelector('[data-sidebar-live-session-status-rail]')),
                         hit_target: elementSummaryAtPoint(centerPointRect),
                     };
                 })
@@ -20045,6 +20046,8 @@ async fn capture_dom_debug_snapshot_for(active_session_path: Option<&str>) -> Va
                     write_bridge_flush_count: mountedHost ? Number(mountedHost.writeBridgeFlushCount || 0) : 0,
                     write_bridge_in_flight: mountedHost ? Boolean(mountedHost.writeBridgeInFlight) : false,
                     write_bridge_pending_chars: mountedHost ? String(mountedHost.writeBridgePendingData || '').length : 0,
+                    skippedPerfEventCount: mountedHost ? Number(mountedHost.skippedPerfEventCount || 0) : 0,
+                    lastSkippedPerfEventName: mountedHost ? String(mountedHost.lastSkippedPerfEventName || '') : '',
                     last_write_queued_at_ms: mountedHost ? Number(mountedHost.lastWriteQueuedAtMs || 0) : 0,
                     last_write_callback_at_ms: mountedHost ? Number(mountedHost.lastWriteCallbackAtMs || 0) : 0,
                     last_wheel_delta_y: mountedHost ? Number(mountedHost.lastWheelDeltaY || 0) : 0,
@@ -20647,6 +20650,7 @@ async fn capture_dom_debug_snapshot_basic_for(active_session_path: Option<&str>)
                         live_keep_alive: Boolean(keepAlive),
                         live_keep_alive_color: keepAliveStyle ? keepAliveStyle.backgroundColor : null,
                         live_keep_alive_rect: rectSummary(keepAlive),
+                        live_keep_alive_rail_rect: rectSummary(row.querySelector('[data-sidebar-live-session-status-rail]')),
                         hit_target: elementSummaryAtPoint(rectSummary(row)),
                     };
                 })
@@ -21237,6 +21241,8 @@ async fn capture_dom_debug_snapshot_basic_for(active_session_path: Option<&str>)
                         write_bridge_flush_count: mountedHost ? Number(mountedHost.writeBridgeFlushCount || 0) : 0,
                         write_bridge_in_flight: mountedHost ? Boolean(mountedHost.writeBridgeInFlight) : false,
                         write_bridge_pending_chars: mountedHost ? String(mountedHost.writeBridgePendingData || '').length : 0,
+                    skippedPerfEventCount: mountedHost ? Number(mountedHost.skippedPerfEventCount || 0) : 0,
+                    lastSkippedPerfEventName: mountedHost ? String(mountedHost.lastSkippedPerfEventName || '') : '',
                         retained_write_paint_repair_count: mountedHost ? Number(mountedHost.retainedWritePaintRepairCount || 0) : 0,
                         last_retained_write_paint_repair_reason: mountedHost ? String(mountedHost.lastRetainedWritePaintRepairReason || '') : '',
                         last_raw_payload_length: mountedHost ? Number(mountedHost.lastRawPayloadLength || 0) : 0,
@@ -30196,6 +30202,19 @@ fn SidebarRow(
                     style: "display:flex; align-items:center; justify-content:space-between; gap:6px;",
                     div {
                     style: "display:flex; align-items:center; gap:8px; min-width:0;",
+                    if show_live_close {
+                        span {
+                            "data-sidebar-live-session-status-rail": "1",
+                            style: "display:inline-flex; align-items:center; justify-content:center; width:9px; min-width:9px; height:20px;",
+                            if row_kept_alive {
+                                span {
+                                    "data-sidebar-live-session-keep-alive": "1",
+                                    title: "Keep alive",
+                                    style: live_session_keep_alive_dot_style(palette),
+                                }
+                            }
+                        }
+                    }
                     div {
                         "data-tree-icon": "1",
                         "data-tree-icon-kind": if busy_icon { "busy" } else { icon_kind.as_str() },
@@ -30281,13 +30300,6 @@ fn SidebarRow(
                                 machine_indicator_color_value(health)
                             ),
                         }
-                    }
-                }
-                if row_kept_alive {
-                    span {
-                        "data-sidebar-live-session-keep-alive": "1",
-                        title: "Keep alive",
-                        style: live_session_keep_alive_dot_style(palette),
                     }
                 }
                 if show_live_close {
@@ -40449,6 +40461,25 @@ fn terminal_eval_script_with_canvas_renderer(
                 }};
             }} catch (_error) {{}}
         }};
+        const clearSkippedFit = (reason, proposed) => {{
+            try {{
+                const entry = window.__yggtermXtermHosts && window.__yggtermXtermHosts[hostId]
+                    ? window.__yggtermXtermHosts[hostId]
+                    : null;
+                if (!entry || !entry.lastSkippedFit) {{
+                    return;
+                }}
+                entry.lastRecoveredFit = {{
+                    reason,
+                    cols: proposed ? proposed.cols : (term ? term.cols : null),
+                    rows: proposed ? proposed.rows : (term ? term.rows : null),
+                    available_width_px: proposed ? proposed.available_width_px : null,
+                    available_height_px: proposed ? proposed.available_height_px : null,
+                    at_ms: Date.now(),
+                }};
+                entry.lastSkippedFit = null;
+            }} catch (_error) {{}}
+        }};
         const fitTerminalToHost = (reason) => {{
             try {{
                 const proposed = proposedTerminalFitDimensions();
@@ -40465,11 +40496,15 @@ fn terminal_eval_script_with_canvas_renderer(
                     return false;
                 }}
                 if (term.cols === proposed.cols && term.rows === proposed.rows) {{
+                    if (hostLooksUsable() && terminalGridIsUsable(proposed.cols, proposed.rows)) {{
+                        clearSkippedFit(`${{reason}}:already_fit`, proposed);
+                    }}
                     return false;
                 }}
                 const previousCols = term.cols;
                 const previousRows = term.rows;
                 term.resize(proposed.cols, proposed.rows);
+                clearSkippedFit(reason, proposed);
                 if (window.__yggtermXtermHosts && window.__yggtermXtermHosts[hostId]) {{
                     window.__yggtermXtermHosts[hostId].lastExplicitFit = {{
                         reason,
@@ -40545,6 +40580,12 @@ fn terminal_eval_script_with_canvas_renderer(
                     return false;
                 }}
                 term.resize(diagnostics.cols, safeRows);
+                clearSkippedFit(reason, {{
+                    cols: diagnostics.cols,
+                    rows: safeRows,
+                    available_width_px: null,
+                    available_height_px: diagnostics.available_height_px,
+                }});
                 if (window.__yggtermXtermHosts && window.__yggtermXtermHosts[hostId]) {{
                     window.__yggtermXtermHosts[hostId].lastFitGuard = {{
                         reason,
@@ -41229,11 +41270,15 @@ fn terminal_eval_script_with_canvas_renderer(
         let resizeNotifyTimer = null;
         let lastResizeNotifyAtMs = 0;
         let settledResizePaintTimer = null;
+        let settledResizeFollowupTimer = null;
         let lastWriteAppliedSampleAtMs = 0;
         let lastWriteFlushStartedAtMs = 0;
         let writeBridgeFlushTimer = null;
         let hostHealthFramePending = false;
         let lastHostHealthAtMs = 0;
+        let lastInputHotHostHealthAtMs = 0;
+        let lastPerfEventAtMs = 0;
+        let skippedPerfEventCount = 0;
         let terminalInputHotUntilMs = 0;
         let scrollbackLocked = false;
         let scrollbackIntent = 'PromptFollow';
@@ -41355,11 +41400,30 @@ fn terminal_eval_script_with_canvas_renderer(
         }};
         const emitPerf = (name, payload = {{}}) => {{
             try {{
+                const eventName = String(name || "terminal_event");
+                const now = Date.now();
+                const hotHighFrequencyEvent =
+                    eventName === "xterm_write_flush"
+                    || eventName === "xterm_fit"
+                    || eventName === "xterm_forced_refresh_skipped";
+                if (terminalInputHot() && hotHighFrequencyEvent && now - lastPerfEventAtMs < 900) {{
+                    skippedPerfEventCount += 1;
+                    const entry = window.__yggtermXtermHosts && window.__yggtermXtermHosts[hostId]
+                        ? window.__yggtermXtermHosts[hostId]
+                        : null;
+                    if (entry) {{
+                        entry.skippedPerfEventCount = skippedPerfEventCount;
+                        entry.lastSkippedPerfEventName = eventName;
+                    }}
+                    return;
+                }}
+                lastPerfEventAtMs = now;
                 dioxus.send({{
                     kind: "perf",
-                    name: String(name || "terminal_event"),
+                    name: eventName,
                     payload: {{
                         ...payload,
+                        skipped_perf_events: skippedPerfEventCount,
                         host_id: hostId,
                         session_path: host.getAttribute("data-terminal-session-path") || "",
                         cols: term ? Number(term.cols || 0) : 0,
@@ -41566,13 +41630,29 @@ fn terminal_eval_script_with_canvas_renderer(
             requestAnimationFrame(() => {{
                 rebindCurrentHost('request_visible_paint', true);
                 const inputHot = terminalInputHot();
+                const beforeFitKey = term ? `${{term.cols}}x${{term.rows}}` : '';
+                let rowFitGuardApplied = false;
                 try {{
                     stretchXtermRoot();
                     if (!inputHot) {{
                         fitTerminalToHost('visible_paint');
-                        applyTerminalRowFitGuard('visible_paint');
+                        rowFitGuardApplied = applyTerminalRowFitGuard('visible_paint');
                     }}
                 }} catch (_error) {{}}
+                const afterFitKey = term ? `${{term.cols}}x${{term.rows}}` : '';
+                if (!inputHot && afterFitKey && afterFitKey !== beforeFitKey) {{
+                    lastResizeKey = afterFitKey;
+                    scheduleResizeNotification();
+                    emitPerf("xterm_resize", {{
+                        reason: "visible_paint",
+                        cols: term.cols,
+                        rows: term.rows,
+                        row_fit_guard_applied: Boolean(rowFitGuardApplied),
+                    }});
+                }} else if (!inputHot && rowFitGuardApplied && afterFitKey && afterFitKey !== lastResizeKey) {{
+                    lastResizeKey = afterFitKey;
+                    scheduleResizeNotification();
+                }}
                 const metrics = hostMetrics();
                 if (hostLooksUsable() && term.rows <= 1) {{
                     try {{
@@ -41636,10 +41716,19 @@ fn terminal_eval_script_with_canvas_renderer(
             if (settledResizePaintTimer !== null) {{
                 window.clearTimeout(settledResizePaintTimer);
             }}
+            if (settledResizeFollowupTimer !== null) {{
+                window.clearTimeout(settledResizeFollowupTimer);
+            }}
             settledResizePaintTimer = window.setTimeout(() => {{
                 settledResizePaintTimer = null;
                 requestVisiblePaint(false);
             }}, 140);
+            settledResizeFollowupTimer = window.setTimeout(() => {{
+                settledResizeFollowupTimer = null;
+                emitResize();
+                requestVisiblePaint(false);
+                emitHostHealth();
+            }}, 260);
         }};
         const scheduleRetainedWritePaintRepair = (reason) => {{
             if (retainedWritePaintRepairPending) {{
@@ -42499,6 +42588,8 @@ fn terminal_eval_script_with_canvas_renderer(
             lastWriteFlushStartedAtMs: 0,
             lastWriteCallbackAtMs: 0,
             terminalWriteFrameMs,
+            skippedPerfEventCount,
+            lastSkippedPerfEventName: '',
             lowPowerTuiActive: false,
             lowPowerTuiFrameCount: 0,
             lastLowPowerTuiText: '',
@@ -42830,7 +42921,8 @@ fn terminal_eval_script_with_canvas_renderer(
                         Number(currentEntry.writeCallbackCount || 0) + 1;
                     currentEntry.lastWriteCallbackAtMs = Date.now();
                 }}
-                if (now - lastWriteAppliedSampleAtMs >= 250) {{
+                const sampleIntervalMs = terminalInputHot() ? 1000 : 250;
+                if (now - lastWriteAppliedSampleAtMs >= sampleIntervalMs) {{
                     lastWriteAppliedSampleAtMs = now;
                     currentEntry.lastWriteAppliedTail =
                         readTerminalBufferSample().slice(-240);
@@ -43086,6 +43178,14 @@ fn terminal_eval_script_with_canvas_renderer(
         const emitHostHealth = () => {{
             try {{
                 rebindCurrentHost('emit_host_health', false);
+                const now = Date.now();
+                const inputHot = terminalInputHot();
+                if (inputHot && now - lastInputHotHostHealthAtMs < 650) {{
+                    return;
+                }}
+                if (inputHot) {{
+                    lastInputHotHostHealthAtMs = now;
+                }}
                 const active = term && term.buffer ? term.buffer.active : null;
                 const cursorLineIndex = active ? Number((active.baseY || 0) + (active.cursorY || 0)) : null;
                 const cursorLine = (
@@ -43102,7 +43202,12 @@ fn terminal_eval_script_with_canvas_renderer(
                 const cursorY = active ? Number(active.cursorY || 0) : 0;
                 const rows = Number(term.rows || 0);
                 const blankRowsBelowCursor = Math.max(0, rows - (cursorY + 1));
-                const textTail = readTerminalBufferSample().slice(-240);
+                const entry = window.__yggtermXtermHosts && window.__yggtermXtermHosts[hostId]
+                    ? window.__yggtermXtermHosts[hostId]
+                    : null;
+                const textTail = inputHot && entry
+                    ? String(entry.lastWriteAppliedTail || '').slice(-240)
+                    : readTerminalBufferSample().slice(-240);
                 const hasTransportError = terminalChunkIsTransportError(cursorLineText)
                     || terminalChunkIsTransportError(textTail);
                 const nextKey = JSON.stringify([
@@ -43196,6 +43301,10 @@ fn terminal_eval_script_with_canvas_renderer(
                 if (settledResizePaintTimer !== null) {{
                     window.clearTimeout(settledResizePaintTimer);
                     settledResizePaintTimer = null;
+                }}
+                if (settledResizeFollowupTimer !== null) {{
+                    window.clearTimeout(settledResizeFollowupTimer);
+                    settledResizeFollowupTimer = null;
                 }}
             }} catch (_error) {{}}
             try {{
@@ -49550,6 +49659,8 @@ mod tests {
         assert!(
             script.contains("const emitPerf = (name, payload = {}) => {")
                 && script.contains("kind: \"perf\"")
+                && script.contains("skippedPerfEventCount")
+                && script.contains("lastSkippedPerfEventName")
                 && script.contains("emitPerf(\"xterm_write_flush\"")
                 && script.contains("emitPerf(\"xterm_fit\"")
                 && script.contains("emitPerf(\"xterm_resize\""),
@@ -49558,6 +49669,12 @@ mod tests {
         assert!(
             script.contains("if (renderProbeFramePending || (now - lastRenderProbeAtMs < 220))"),
             "render bridge probes should be rate-limited so TUI output does not churn WebKit"
+        );
+        assert!(
+            script.contains("let lastInputHotHostHealthAtMs = 0;")
+                && script.contains("if (inputHot && now - lastInputHotHostHealthAtMs < 650)")
+                && script.contains("const sampleIntervalMs = terminalInputHot() ? 1000 : 250;"),
+            "input-hot terminal health sampling should not reread the whole xterm buffer for every typed character"
         );
         assert!(
             script.contains("requestRenderProbe('write_flush');"),
@@ -49684,6 +49801,14 @@ mod tests {
             "retained host state should store the last skipped fit"
         );
         assert!(
+            script.contains("const clearSkippedFit = (reason, proposed) => {")
+                && script.contains("entry.lastRecoveredFit")
+                && script.contains("entry.lastSkippedFit = null;")
+                && script.contains("clearSkippedFit(`${reason}:already_fit`, proposed);")
+                && script.contains("clearSkippedFit(reason, proposed);"),
+            "fit observability should clear stale skipped-fit state once the current host is usable again"
+        );
+        assert!(
             script.contains("const fitTerminalToHost = (reason) => {")
                 && script.contains("term.resize(proposed.cols, proposed.rows);")
                 && script.contains("fitTerminalToHost('resize');"),
@@ -49702,9 +49827,37 @@ mod tests {
             "PTY resize notifications should be rate-limited so resize drags do not force a TUI redraw for every DOM event"
         );
         assert!(
+            script.contains("let settledResizeFollowupTimer = null;")
+                && script.contains("emitResize();\n                requestVisiblePaint(false);\n                emitHostHealth();")
+                && script.contains("const beforeFitKey = term ? `${term.cols}x${term.rows}` : '';")
+                && script.contains("scheduleResizeNotification();\n                    emitPerf(\"xterm_resize\""),
+            "resize settle must converge xterm geometry and notify the PTY after visible-paint row-fit correction"
+        );
+        assert!(
             !script.contains("forceRendererResize"),
             "the resize path should not force full-canvas refreshes on every viewport size change"
         );
+    }
+
+    #[test]
+    fn live_session_keep_alive_dot_renders_in_fixed_leading_rail() {
+        let source = include_str!("shell.rs");
+        let row_layout_ix = source
+            .find("style: \"display:flex; align-items:center; gap:8px; min-width:0;\"")
+            .expect("sidebar row label group should be present");
+        let row_layout_source = &source[row_layout_ix..];
+        let rail_ix = row_layout_source
+            .find("data-sidebar-live-session-status-rail")
+            .expect("live session rows should expose a leading status rail");
+        let icon_ix = row_layout_source
+            .find("data-tree-icon")
+            .expect("tree icon should render after the live status rail");
+        let trailing_close_ix = row_layout_source
+            .find("data-sidebar-live-session-close")
+            .expect("live close remains a trailing affordance");
+        assert!(rail_ix < icon_ix);
+        assert!(icon_ix < trailing_close_ix);
+        assert!(source.contains("width:9px; min-width:9px; height:20px;"));
     }
 
     #[test]
