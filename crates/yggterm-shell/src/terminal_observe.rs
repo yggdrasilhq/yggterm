@@ -822,6 +822,18 @@ fn terminal_host_problem_for_app_control(host: &Value) -> Option<&'static str> {
         .get("last_data_event_at_ms")
         .and_then(Value::as_u64)
         .unwrap_or(0);
+    let last_write_queued_at_ms = host
+        .get("last_write_queued_at_ms")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let last_write_flush_started_at_ms = host
+        .get("last_write_flush_started_at_ms")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let last_write_callback_at_ms = host
+        .get("last_write_callback_at_ms")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
     let write_command_count = host
         .get("write_command_count")
         .and_then(Value::as_u64)
@@ -875,6 +887,19 @@ fn terminal_host_problem_for_app_control(host: &Value) -> Option<&'static str> {
         && mounted_entry_host_connected
         && (xterm_present || screen_present || rows_present || canvas_count > 0);
     let transcript_browser_surface = terminal_chunk_is_transcript_browser(visible_text);
+    let last_stream_output_after_input_ms = last_write_queued_at_ms
+        .max(last_write_flush_started_at_ms)
+        .max(last_write_callback_at_ms);
+    let accepted_input_without_following_stream_echo = session_path.starts_with("remote-session://")
+        && input_enabled
+        && helper_textarea_focused
+        && mounted_entry_host_connected
+        && last_stream_output_after_input_ms > 0
+        && last_data_event_at_ms > last_stream_output_after_input_ms.saturating_add(250)
+        && last_data_event_at_ms > 0
+        && (terminal_chunk_has_codex_prompt_output(visible_text)
+            || terminal_chunk_is_codex_prompt_surface(visible_text))
+        && (xterm_present || screen_present || rows_present || canvas_count > 0);
     let visible_text_prompt = terminal_chunk_has_prompt_output(visible_text)
         || terminal_chunk_has_codex_prompt_output(visible_text);
     let prompt_visible = terminal_chunk_has_prompt_output(text_sample)
@@ -951,6 +976,9 @@ fn terminal_host_problem_for_app_control(host: &Value) -> Option<&'static str> {
     }
     if transcript_browser_surface {
         return Some("active terminal host is still showing the transcript browser");
+    }
+    if accepted_input_without_following_stream_echo {
+        return Some("active remote terminal accepted input without a following daemon stream echo");
     }
     if terminal_chunk_is_saved_transcript_prefill(visible_text) {
         return Some("active terminal host is still showing saved transcript prefill");
@@ -2001,6 +2029,49 @@ mod tests {
             "helper_textarea_rect": {"left": -10000.0, "top": 68.0, "width": 1.0, "height": 1.0}
         });
         assert_eq!(terminal_host_problem_for_app_control(&host), None);
+    }
+
+    #[test]
+    fn terminal_host_problem_rejects_accepted_remote_input_without_stream_echo() {
+        let text_tail = "⚠ Heads up, you have less than 25% of your weekly limit left. Run /status for a breakdown.\n\n\n› Find and fix a bug in @filename\n\n  gpt-5.5 xhigh · ~";
+        let host = json!({
+            "session_path": "remote-session://dev/no-echo-after-input",
+            "text_sample": text_tail,
+            "text_tail": text_tail,
+            "buffer_text_sample": text_tail,
+            "cursor_line_text": "› Find and fix a bug in @filename",
+            "input_enabled": true,
+            "helper_textarea_focused": true,
+            "xterm_present": true,
+            "screen_present": true,
+            "rows_present": false,
+            "canvas_count": 4,
+            "render_event_count": 249,
+            "data_event_count": 2,
+            "last_data_event_at_ms": 1777876167708_u64,
+            "last_write_queued_at_ms": 1777875854493_u64,
+            "last_write_flush_started_at_ms": 1777875854749_u64,
+            "last_write_callback_at_ms": 1777875854749_u64,
+            "last_raw_payload_length": 140,
+            "write_command_count": 12,
+            "xterm_buffer_kind": "normal",
+            "xterm_cursor_hidden": false,
+            "mounted_entry_host_connected": true,
+            "blank_rows_below_cursor": 43,
+            "rows": 48,
+            "host_rect": {"left": 0.0, "top": 0.0, "width": 840.0, "height": 830.0},
+            "host_content_width": 840.0,
+            "host_content_height": 830.0,
+            "screen_rect": {"width": 840.0, "height": 830.0},
+            "viewport_rect": {"width": 840.0, "height": 830.0},
+            "helpers_rect": {"width": 840.0, "height": 830.0},
+            "helper_textarea_rect": {"left": -10000.0, "top": 68.0, "width": 1.0, "height": 1.0}
+        });
+
+        assert_eq!(
+            terminal_host_problem_for_app_control(&host),
+            Some("active remote terminal accepted input without a following daemon stream echo")
+        );
     }
 
     #[test]
