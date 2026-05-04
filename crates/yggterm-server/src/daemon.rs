@@ -570,6 +570,9 @@ pub enum ServerRequest {
     TerminalSnapshot {
         path: String,
     },
+    TerminalRetainedSnapshot {
+        path: String,
+    },
     TerminalWrite {
         path: String,
         data: String,
@@ -604,6 +607,11 @@ pub enum ServerResponse {
         eof_without_output: bool,
     },
     TerminalSnapshot {
+        text: String,
+        running: bool,
+        runtime_output_seen: bool,
+    },
+    TerminalRetainedSnapshot {
         text: String,
         running: bool,
         runtime_output_seen: bool,
@@ -1733,6 +1741,18 @@ impl DaemonRuntime {
                     runtime_output_seen: self.terminals.session_has_runtime_output(&runtime_path),
                 }
             }
+            ServerRequest::TerminalRetainedSnapshot { path } => {
+                let runtime_path = self.terminal_runtime_key_for_path(&path);
+                let text = self
+                    .terminals
+                    .session_snapshot(&runtime_path)
+                    .unwrap_or_default();
+                ServerResponse::TerminalRetainedSnapshot {
+                    text,
+                    running: self.terminals.session_is_running(&runtime_path),
+                    runtime_output_seen: self.terminals.session_has_runtime_output(&runtime_path),
+                }
+            }
             ServerRequest::TerminalWrite { path, data } => {
                 let runtime_path = self.terminal_runtime_key_for_path(&path);
                 let local_runtime_running = self.terminals.session_is_running(&runtime_path);
@@ -2339,6 +2359,7 @@ fn server_request_name(request: &ServerRequest) -> &'static str {
         ServerRequest::TerminalEnsure { .. } => "terminal_ensure",
         ServerRequest::TerminalRead { .. } => "terminal_read",
         ServerRequest::TerminalSnapshot { .. } => "terminal_snapshot",
+        ServerRequest::TerminalRetainedSnapshot { .. } => "terminal_retained_snapshot",
         ServerRequest::TerminalWrite { .. } => "terminal_write",
         ServerRequest::TerminalResize { .. } => "terminal_resize",
         ServerRequest::SyncExternalWindow => "sync_external_window",
@@ -2913,6 +2934,29 @@ pub fn terminal_snapshot(endpoint: &ServerEndpoint, path: &str) -> Result<(Strin
         } => Ok((text, running, runtime_output_seen)),
         ServerResponse::Error { message } => bail!(message),
         other => bail!("unexpected terminal snapshot response: {:?}", other),
+    }
+}
+
+pub fn terminal_retained_snapshot(
+    endpoint: &ServerEndpoint,
+    path: &str,
+) -> Result<(String, bool, bool)> {
+    match send_request(
+        endpoint,
+        &ServerRequest::TerminalRetainedSnapshot {
+            path: path.to_string(),
+        },
+    )? {
+        ServerResponse::TerminalRetainedSnapshot {
+            text,
+            running,
+            runtime_output_seen,
+        } => Ok((text, running, runtime_output_seen)),
+        ServerResponse::Error { message } => bail!(message),
+        other => bail!(
+            "unexpected terminal retained snapshot response: {:?}",
+            other
+        ),
     }
 }
 
@@ -4296,9 +4340,7 @@ fn daemon_request_io_timeout_ms(request: &ServerRequest) -> u64 {
         | ServerRequest::StartRemoteCodexSession { .. }
         | ServerRequest::OpenRemoteSession { .. }
         | ServerRequest::EnsureRemoteRuntimeCodexSession { .. }
-        | ServerRequest::StartRemoteRuntimeCodexSession { .. } => {
-            DAEMON_LONG_REQUEST_IO_TIMEOUT_MS
-        }
+        | ServerRequest::StartRemoteRuntimeCodexSession { .. } => DAEMON_LONG_REQUEST_IO_TIMEOUT_MS,
         _ => DAEMON_REQUEST_IO_TIMEOUT_MS,
     }
 }
@@ -4310,7 +4352,10 @@ enum TerminalWriteStrategy {
     LocalRuntimeFallback,
 }
 
-fn terminal_write_strategy_for_path(path: &str, local_runtime_running: bool) -> TerminalWriteStrategy {
+fn terminal_write_strategy_for_path(
+    path: &str,
+    local_runtime_running: bool,
+) -> TerminalWriteStrategy {
     if local_runtime_running {
         TerminalWriteStrategy::LocalRuntime
     } else if path.trim_start().starts_with("remote-session://") {

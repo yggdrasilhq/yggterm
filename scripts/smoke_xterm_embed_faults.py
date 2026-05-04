@@ -2946,9 +2946,13 @@ def scroll_probe_moved(probe: dict) -> bool:
 
 
 def host_expects_scrollback(host: dict) -> bool:
-    return bool(host.get("scrollback_expected")) or (
+    rows = int(host.get("rows") or 0)
+    return bool(host.get("scrollback_expected")) or bool(host.get("retained_replay_expected")) or (
         int(host.get("last_raw_payload_line_count") or 0)
-        > int(host.get("rows") or 0) + 4
+        > rows + 4
+    ) or (
+        int(host.get("retained_replay_line_count") or 0)
+        > rows + 4
     )
 
 

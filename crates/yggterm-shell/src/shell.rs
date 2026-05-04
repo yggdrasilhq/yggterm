@@ -10,12 +10,11 @@ use crate::terminal_observe::{
     terminal_chunk_has_generic_codex_idle_footer, terminal_chunk_has_meaningful_output,
     terminal_chunk_has_prompt_output, terminal_chunk_has_visible_output,
     terminal_chunk_is_codex_interactive_setup_prompt, terminal_chunk_is_codex_prompt_surface,
-    terminal_chunk_is_generic_codex_idle,
-    terminal_chunk_is_loading_placeholder, terminal_chunk_is_local_codex_scaffold,
-    terminal_chunk_is_low_signal_terminal_noise, terminal_chunk_is_saved_transcript_prefill,
-    terminal_chunk_is_transcript_browser, terminal_chunk_is_transport_error,
-    terminal_open_attempt_failure_reason_from_viewport, terminal_open_attempt_state_label,
-    terminal_tail_excerpt,
+    terminal_chunk_is_generic_codex_idle, terminal_chunk_is_loading_placeholder,
+    terminal_chunk_is_local_codex_scaffold, terminal_chunk_is_low_signal_terminal_noise,
+    terminal_chunk_is_saved_transcript_prefill, terminal_chunk_is_transcript_browser,
+    terminal_chunk_is_transport_error, terminal_open_attempt_failure_reason_from_viewport,
+    terminal_open_attempt_state_label, terminal_tail_excerpt,
 };
 #[cfg(test)]
 use crate::terminal_observe::{
@@ -99,22 +98,23 @@ use yggterm_server::{
     AppControlRightPanelMode, AppControlViewMode, GhosttyTerminalHostMode, ManagedSessionView,
     PreviewTone, ProbeTerminalViewportInputMode, RemoteDeployState, RemoteMachineHealth,
     RemoteMachineSnapshot, RemoteScannedSession, ServerEndpoint, ServerRuntimeStatus,
-    ServerUiSnapshot, SessionKind, SessionMetadataEntry, SessionPreviewBlock, SnapshotSessionView,
-    SessionRenderedSection, SessionSource, SshConnectTarget, TerminalBackend, WorkspaceViewMode,
-    YGG_LOADING_NOTIFICATION_AFTER_MS, YggOperationPriority, YggRequestMeta, YggSurface, YggTarget,
-    YggtermServer, app_control_requests_pending, cleanup_legacy_daemons,
+    ServerUiSnapshot, SessionKind, SessionMetadataEntry, SessionPreviewBlock,
+    SessionRenderedSection, SessionSource, SnapshotSessionView, SshConnectTarget, TerminalBackend,
+    WorkspaceViewMode, YGG_LOADING_NOTIFICATION_AFTER_MS, YggOperationPriority, YggRequestMeta,
+    YggSurface, YggTarget, YggtermServer, app_control_requests_pending, cleanup_legacy_daemons,
     complete_app_control_request, connect_ssh_custom, fetch_remote_generation_context,
-    focus_live_with_view, local_headless_companion_executable_from_current,
-    hot_restart, managed_cli_refresh_ttl_ms, open_remote_session_with_view, open_stored_session,
+    focus_live_with_view, hot_restart, local_headless_companion_executable_from_current,
+    managed_cli_refresh_ttl_ms, open_remote_session_with_view, open_stored_session,
     open_stored_session_with_view, persist_remote_generated_copy, ping, prepare_client_close,
-    prepare_update_restart, reachable_versioned_daemon_statuses,
-    refresh_local_managed_cli_now, refresh_managed_cli, refresh_preview, refresh_remote_machine,
-    remove_session, remove_ssh_target, request_terminal_launch, set_all_preview_blocks_folded,
+    prepare_update_restart, reachable_versioned_daemon_statuses, refresh_local_managed_cli_now,
+    refresh_managed_cli, refresh_preview, refresh_remote_machine, remove_session,
+    remove_ssh_target, request_terminal_launch, set_all_preview_blocks_folded,
     set_session_keep_alive, set_view_mode as daemon_set_view_mode, shutdown as daemon_shutdown,
     snapshot as daemon_snapshot, snapshot_session_view_for_ui, stage_remote_clipboard_png,
     start_command_session, start_local_session_at, start_remote_codex_session_at,
     start_ssh_session_at, status, take_next_app_control_request, terminal_ensure, terminal_read,
-    terminal_resize, terminal_snapshot, terminal_write, toggle_preview_block as daemon_toggle_preview_block,
+    terminal_resize, terminal_retained_snapshot, terminal_snapshot, terminal_write,
+    toggle_preview_block as daemon_toggle_preview_block,
     update_session_copy as daemon_update_session_copy, validate_server_ui_snapshot,
 };
 use yggui::{
@@ -3234,9 +3234,11 @@ impl ShellState {
     }
     fn terminal_session_is_retained_live(&self, session_path: &str) -> bool {
         let retained = self.retained_terminal_session_paths.contains(session_path);
-        let active_remote_terminal_session = self.server.active_view_mode() == WorkspaceViewMode::Terminal
+        let active_remote_terminal_session = self.server.active_view_mode()
+            == WorkspaceViewMode::Terminal
             && self.server.active_session_path() == Some(session_path)
-            && (session_path.starts_with("remote-session://") || session_path.starts_with("ssh://"));
+            && (session_path.starts_with("remote-session://")
+                || session_path.starts_with("ssh://"));
         let non_prompt_recovering_attempt = self
             .latest_terminal_open_attempt_for_path(session_path)
             .is_some_and(|attempt| {
@@ -5523,10 +5525,8 @@ fn remote_resume_non_prompt_snapshot_is_replayable(
     host_health_cursor_line_text: &str,
     host_health_text_tail: &str,
 ) -> bool {
-    retained_remote_surface_has_non_prompt_text(
-        host_health_cursor_line_text,
-        host_health_text_tail,
-    ) && remote_resume_blank_host_snapshot_is_replayable(snapshot)
+    retained_remote_surface_has_non_prompt_text(host_health_cursor_line_text, host_health_text_tail)
+        && remote_resume_blank_host_snapshot_is_replayable(snapshot)
 }
 fn terminal_max_blank_rows_below_live_cursor(rows: u16) -> u16 {
     if rows >= 36 {
@@ -5574,6 +5574,24 @@ fn retained_ready_remote_host_should_rehydrate(
     ready_history: bool,
 ) -> bool {
     retained_ready_remote_host && active_host_selected && !ready_attempt && !ready_history
+}
+fn daemon_retained_snapshot_replay_identity_key(
+    session_path: &str,
+    mount_identity: &str,
+    is_remote_resume_session: bool,
+    host_is_active_session: bool,
+    active_host_selected: bool,
+) -> String {
+    format!(
+        "daemon-retained-replay:{session_path}:{mount_identity}:{is_remote_resume_session}:{host_is_active_session}:{active_host_selected}"
+    )
+}
+fn daemon_retained_snapshot_replay_should_start(
+    is_remote_resume_session: bool,
+    host_is_active_session: bool,
+    active_host_selected: bool,
+) -> bool {
+    is_remote_resume_session && host_is_active_session && active_host_selected
 }
 fn remote_retained_surface_fault_should_invalidate(reason: Option<&str>) -> bool {
     matches!(
@@ -7048,7 +7066,14 @@ fn restart_into_pending_update(mut state: Signal<ShellState>) {
         }
     });
 }
-fn close_window_after_update_restart(mut state: Signal<ShellState>) {
+fn close_window_after_update_restart(state: Signal<ShellState>) {
+    close_window_preserving_live_sessions(state, Some("update-restart".to_string()));
+}
+
+fn close_window_preserving_live_sessions(mut state: Signal<ShellState>, reason: Option<String>) {
+    if state.read().closing_app {
+        return;
+    }
     let detach_terminal_before_close = {
         let shell = state.read();
         linux_close_requires_terminal_detach()
@@ -7059,7 +7084,12 @@ fn close_window_after_update_restart(mut state: Signal<ShellState>) {
     INTENTIONAL_CLIENT_SHUTDOWN.store(true, Ordering::SeqCst);
     state.with_mut(|shell| {
         shell.closing_app = true;
-        shell.last_action = "restarting yggterm".to_string();
+        shell.last_action = match reason.as_deref() {
+            Some("update-restart") => "restarting yggterm".to_string(),
+            Some("superseded-client-handoff") => "handing off yggterm client".to_string(),
+            Some(reason) => format!("closing yggterm client: {reason}"),
+            None => "closing yggterm client without session cleanup".to_string(),
+        };
     });
     spawn_close_force_exit_watchdog();
     spawn(async move {
@@ -7137,11 +7167,11 @@ fn spawn_close_force_exit_watchdog() {
                 "shutdown",
                 "force_exit_after_close_timeout",
                 json!({
-                    "pid": std::process::id(),
+                        "pid": std::process::id(),
                     "timeout_ms": CLOSE_FORCE_EXIT_WATCHDOG_MS,
                 }),
             );
-            let _ = maybe_shutdown_daemon_for_last_client(&settings_path, &endpoint);
+            let _ = finalize_client_shutdown(&settings_path, &endpoint);
         }
         std::process::exit(0);
     });
@@ -7855,17 +7885,18 @@ fn reconcile_stale_daemon_on_startup(endpoint: &ServerEndpoint, current_exe: &Pa
     let Ok(home) = resolve_yggterm_home() else {
         return false;
     };
-    let Some((target_endpoint, runtime_status)) =
-        startup_stale_daemon_hot_swap_target(reachable_versioned_daemon_statuses(&home), &expected_version)
-    else {
+    let Some((target_endpoint, runtime_status)) = startup_stale_daemon_hot_swap_target(
+        reachable_versioned_daemon_statuses(&home),
+        &expected_version,
+    ) else {
         trace_daemon_step(
             endpoint,
-                "startup_hot_swap_no_stale_target",
-                json!({
-                    "home": home.display().to_string(),
-                    "current_version": expected_version.as_str(),
-                }),
-            );
+            "startup_hot_swap_no_stale_target",
+            json!({
+                "home": home.display().to_string(),
+                "current_version": expected_version.as_str(),
+            }),
+        );
         return false;
     };
     let reason = startup_daemon_hot_swap_reason(&runtime_status, expected_version.as_str())
@@ -20053,6 +20084,9 @@ async fn capture_dom_debug_snapshot_for(active_session_path: Option<&str>) -> Va
                     last_wheel_delta_y: mountedHost ? Number(mountedHost.lastWheelDeltaY || 0) : 0,
                     last_raw_payload_length: mountedHost ? Number(mountedHost.lastRawPayloadLength || 0) : 0,
                     last_raw_payload_line_count: mountedHost ? Number(mountedHost.lastRawPayloadLineCount || 0) : 0,
+                    retained_replay_line_count: mountedHost ? Number(mountedHost.lastRetainedReplayLineCount || 0) : 0,
+                    retained_replay_expected: mountedHost ? Boolean(mountedHost.lastRetainedReplayExpected) : false,
+                    retained_replay_source: mountedHost ? String(mountedHost.lastRetainedReplaySource || '') : '',
                     scrollback_expected: mountedHost ? Boolean(mountedHost.scrollbackExpected) : false,
                     scrollback_locked: mountedHost ? Boolean(mountedHost.scrollbackLocked) : false,
                     scrollback_intent: mountedHost ? String(mountedHost.scrollbackIntent || 'PromptFollow') : 'PromptFollow',
@@ -22653,6 +22687,9 @@ async fn probe_terminal_viewport_scroll_for(session_path: &str, lines: i32) -> V
                         scrollback_intent_at_ms: Number(entry.lastScrollbackIntentAtMs || 0),
                         scrollback_snapback_reason: String(entry.lastScrollbackSnapbackReason || ''),
                         last_raw_payload_line_count: Number(entry.lastRawPayloadLineCount || 0),
+                        retained_replay_line_count: Number(entry.lastRetainedReplayLineCount || 0),
+                        retained_replay_expected: Boolean(entry.lastRetainedReplayExpected),
+                        retained_replay_source: String(entry.lastRetainedReplaySource || ''),
                         data_event_count: Number(entry.dataEventCount || 0),
                         render_event_count: Number(entry.renderEventCount || 0),
                         text_head: String(host.innerText || "").trim().slice(0, 240),
@@ -23655,6 +23692,28 @@ async fn process_pending_app_control_requests(
             spawn(async move {
                 sleep(Duration::from_millis(80)).await;
                 spawn_graceful_shutdown_and_close(close_state);
+            });
+            AppControlResponse {
+                request_id: request.request_id.clone(),
+                handled_by_pid: std::process::id(),
+                completed_at_ms: current_millis() as u128,
+                output_path: None,
+                data: Some(data),
+                error: None,
+            }
+        }
+        AppControlCommand::CloseWindowPreservingSessions { reason } => {
+            let data = json!({
+                "close_requested": true,
+                "preserve_live_sessions": true,
+                "reason": reason,
+                "window": describe_window(&desktop),
+            });
+            let close_state = state;
+            let reason_for_task = reason.clone();
+            spawn(async move {
+                sleep(Duration::from_millis(80)).await;
+                close_window_preserving_live_sessions(close_state, reason_for_task);
             });
             AppControlResponse {
                 request_id: request.request_id.clone(),
@@ -32835,6 +32894,8 @@ fn TerminalCanvas(
         use_hook(|| std::rc::Rc::new(std::cell::RefCell::new(String::new()))).clone();
     let retained_rehydrate_identity =
         use_hook(|| std::rc::Rc::new(std::cell::RefCell::new(String::new()))).clone();
+    let daemon_retained_replay_identity =
+        use_hook(|| std::rc::Rc::new(std::cell::RefCell::new(String::new()))).clone();
     let server_snapshot_replay_identity =
         use_hook(|| std::rc::Rc::new(std::cell::RefCell::new(String::new()))).clone();
     let recovery_snapshot_probe_identity =
@@ -33212,70 +33273,72 @@ fn TerminalCanvas(
     });
     if host_is_active_session && is_remote_resume_session && should_replay_server_prompt {
         if let Some(replay) = server_prompt_replay.as_ref() {
-        let replay_identity = server_prompt_snapshot_replay_identity(
-            &mount_identity,
-            replay.len(),
-            session.status_line.len(),
-            latest_unready_attempt_id.as_deref(),
-        );
-        if should_replay_server_prompt
-            && *server_snapshot_replay_identity.borrow() != replay_identity
-        {
-            *server_snapshot_replay_identity.borrow_mut() = replay_identity;
-            let session_path_for_task = session_path.clone();
-            let replay_for_task = replay.clone();
-            let trace_home_for_task = trace_home.clone();
-            spawn(async move {
-                let _ = document::eval(&terminal_replay_retained_data_script_for_session(
-                    &session_path_for_task,
-                    &replay_for_task,
-                ));
-                append_trace_event(
-                    &trace_home_for_task,
-                    "ui",
-                    "terminal_mount",
-                    "server_prompt_snapshot_replay",
-                    json!({
-                        "session_path": session_path_for_task.clone(),
-                        "bytes": replay_for_task.len(),
-                    }),
-                );
-                set_signal_if_changed(terminal_resume_surface_staged, true);
-                set_signal_if_changed(terminal_has_meaningful_output, true);
-                set_signal_if_changed(terminal_prompt_only, false);
-                set_signal_if_changed(terminal_live_host_connected, true);
-                set_signal_if_changed(terminal_overlay_dismissed, true);
-                set_signal_if_changed(resume_overlay_failed, false);
-                set_signal_if_changed(resume_overlay_timed_out, false);
-                clear_terminal_resume_notification(state, &session_path_for_task);
-                let _ = safe_shell_mut(
-                    state,
-                    "terminal_attach_server_prompt_snapshot_replay",
-                    |shell| {
-                        shell.retain_terminal_session_path(&session_path_for_task);
-                        shell
-                            .terminal_resume_ready_paths
-                            .insert(session_path_for_task.clone());
-                        shell
-                            .terminal_attach_in_flight
-                            .remove(&session_path_for_task);
-                        shell.mark_terminal_open_attempt_ready_for_session(
-                            &session_path_for_task,
-                            "server_prompt_snapshot_replay",
-                        );
-                        shell.maybe_finish_terminal_surface_request_for_session(
-                            &session_path_for_task,
-                        );
-                    },
-                );
-                maybe_spawn_missing_remote_machine_refreshes(state);
-                maybe_spawn_missing_managed_cli_refreshes(state);
-            });
-        }
+            let replay_identity = server_prompt_snapshot_replay_identity(
+                &mount_identity,
+                replay.len(),
+                session.status_line.len(),
+                latest_unready_attempt_id.as_deref(),
+            );
+            if should_replay_server_prompt
+                && *server_snapshot_replay_identity.borrow() != replay_identity
+            {
+                *server_snapshot_replay_identity.borrow_mut() = replay_identity;
+                let session_path_for_task = session_path.clone();
+                let replay_for_task = replay.clone();
+                let trace_home_for_task = trace_home.clone();
+                spawn(async move {
+                    let _ = document::eval(&terminal_replay_retained_data_script_for_session(
+                        &session_path_for_task,
+                        &replay_for_task,
+                    ));
+                    append_trace_event(
+                        &trace_home_for_task,
+                        "ui",
+                        "terminal_mount",
+                        "server_prompt_snapshot_replay",
+                        json!({
+                            "session_path": session_path_for_task.clone(),
+                            "bytes": replay_for_task.len(),
+                        }),
+                    );
+                    set_signal_if_changed(terminal_resume_surface_staged, true);
+                    set_signal_if_changed(terminal_has_meaningful_output, true);
+                    set_signal_if_changed(terminal_prompt_only, false);
+                    set_signal_if_changed(terminal_live_host_connected, true);
+                    set_signal_if_changed(terminal_overlay_dismissed, true);
+                    set_signal_if_changed(resume_overlay_failed, false);
+                    set_signal_if_changed(resume_overlay_timed_out, false);
+                    clear_terminal_resume_notification(state, &session_path_for_task);
+                    let _ = safe_shell_mut(
+                        state,
+                        "terminal_attach_server_prompt_snapshot_replay",
+                        |shell| {
+                            shell.retain_terminal_session_path(&session_path_for_task);
+                            shell
+                                .terminal_resume_ready_paths
+                                .insert(session_path_for_task.clone());
+                            shell
+                                .terminal_attach_in_flight
+                                .remove(&session_path_for_task);
+                            shell.mark_terminal_open_attempt_ready_for_session(
+                                &session_path_for_task,
+                                "server_prompt_snapshot_replay",
+                            );
+                            shell.maybe_finish_terminal_surface_request_for_session(
+                                &session_path_for_task,
+                            );
+                        },
+                    );
+                    maybe_spawn_missing_remote_machine_refreshes(state);
+                    maybe_spawn_missing_managed_cli_refreshes(state);
+                });
+            }
         } else {
             let replay_identity = format!(
                 "server-snapshot-replay-daemon:{mount_identity}:{}",
-                latest_unready_attempt_id.as_deref().unwrap_or("no-unready-attempt")
+                latest_unready_attempt_id
+                    .as_deref()
+                    .unwrap_or("no-unready-attempt")
             );
             if *server_snapshot_replay_identity.borrow() != replay_identity {
                 *server_snapshot_replay_identity.borrow_mut() = replay_identity;
@@ -33297,7 +33360,9 @@ fn TerminalCanvas(
                         if !still_recovering {
                             break;
                         }
-                        match daemon_snapshot_async(endpoint_for_task.clone(), &trace_home_for_task).await {
+                        match daemon_snapshot_async(endpoint_for_task.clone(), &trace_home_for_task)
+                            .await
+                        {
                             Ok(snapshot) => {
                                 if let Some(snapshot_text) =
                                     snapshot_session_prompt_ready_replay_text_for_session_path(
@@ -33329,12 +33394,17 @@ fn TerminalCanvas(
                                     set_signal_if_changed(terminal_overlay_dismissed, true);
                                     set_signal_if_changed(resume_overlay_failed, false);
                                     set_signal_if_changed(resume_overlay_timed_out, false);
-                                    clear_terminal_resume_notification(state, &session_path_for_task);
+                                    clear_terminal_resume_notification(
+                                        state,
+                                        &session_path_for_task,
+                                    );
                                     let _ = safe_shell_mut(
                                         state,
                                         "terminal_attach_daemon_server_prompt_snapshot_replay",
                                         |shell| {
-                                            shell.retain_terminal_session_path(&session_path_for_task);
+                                            shell.retain_terminal_session_path(
+                                                &session_path_for_task,
+                                            );
                                             shell
                                                 .terminal_resume_ready_paths
                                                 .insert(session_path_for_task.clone());
@@ -33345,9 +33415,10 @@ fn TerminalCanvas(
                                                 &session_path_for_task,
                                                 "daemon_server_prompt_snapshot_replay",
                                             );
-                                            shell.maybe_finish_terminal_surface_request_for_session(
-                                                &session_path_for_task,
-                                            );
+                                            shell
+                                                .maybe_finish_terminal_surface_request_for_session(
+                                                    &session_path_for_task,
+                                                );
                                         },
                                     );
                                     maybe_spawn_missing_remote_machine_refreshes(state);
@@ -33382,9 +33453,9 @@ fn TerminalCanvas(
             .map(|attempt| attempt.attempt_id.clone());
         (
             active_remote_recovery_snapshot_probe_should_start(
-            is_remote_resume_session,
-            host_is_active_session,
-            shell.terminal_session_is_retained_live(&session_path),
+                is_remote_resume_session,
+                host_is_active_session,
+                shell.terminal_session_is_retained_live(&session_path),
                 latest_unready_attempt_id.is_some(),
             ),
             latest_unready_attempt_id,
@@ -33486,10 +33557,11 @@ fn TerminalCanvas(
                                 &session_path_for_task,
                             )
                         }) {
-                            let _ = document::eval(&terminal_replay_retained_data_script_for_session(
-                                &session_path_for_task,
-                                &snapshot_text,
-                            ));
+                            let _ =
+                                document::eval(&terminal_replay_retained_data_script_for_session(
+                                    &session_path_for_task,
+                                    &snapshot_text,
+                                ));
                             append_trace_event(
                                 &trace_home_for_task,
                                 "ui",
@@ -33631,6 +33703,102 @@ fn TerminalCanvas(
                         "ui",
                         "terminal_mount",
                         "retained_rehydrate_error",
+                        json!({
+                            "session_path": session_path_for_task,
+                            "error": error.to_string(),
+                        }),
+                    );
+                }
+            }
+        });
+    }
+    let daemon_retained_replay_key = daemon_retained_snapshot_replay_identity_key(
+        &session_path,
+        &mount_identity,
+        is_remote_resume_session,
+        host_is_active_session,
+        active_host_selected,
+    );
+    if daemon_retained_snapshot_replay_should_start(
+        is_remote_resume_session,
+        host_is_active_session,
+        active_host_selected,
+    ) && *daemon_retained_replay_identity.borrow() != daemon_retained_replay_key
+    {
+        *daemon_retained_replay_identity.borrow_mut() = daemon_retained_replay_key;
+        let endpoint = endpoint.clone();
+        let runtime_session_path =
+            state.with(|shell| terminal_runtime_session_path(&shell, &session_path));
+        let session_path_for_task = session_path.clone();
+        let trace_home = trace_home.clone();
+        spawn(async move {
+            sleep(Duration::from_millis(120)).await;
+            let still_active = state.with(|shell| {
+                shell.server.active_view_mode() == WorkspaceViewMode::Terminal
+                    && shell.server.active_session_path() == Some(session_path_for_task.as_str())
+            });
+            if !still_active {
+                append_trace_event(
+                    &trace_home,
+                    "ui",
+                    "terminal_mount",
+                    "daemon_retained_replay_skipped_inactive",
+                    json!({
+                        "session_path": session_path_for_task,
+                    }),
+                );
+                return;
+            }
+            match terminal_retained_snapshot_async(endpoint, runtime_session_path, &trace_home)
+                .await
+            {
+                Ok((snapshot_text, running, runtime_output_seen)) => {
+                    let (snapshot_text, saw_attach_ready_marker) =
+                        strip_terminal_attach_ready_marker(&snapshot_text);
+                    let line_count = snapshot_text.matches('\n').count();
+                    if line_count <= 4 || snapshot_text.trim().is_empty() {
+                        append_trace_event(
+                            &trace_home,
+                            "ui",
+                            "terminal_mount",
+                            "daemon_retained_replay_skip_low_signal",
+                            json!({
+                                "session_path": session_path_for_task,
+                                "bytes": snapshot_text.len(),
+                                "lines": line_count,
+                                "running": running,
+                                "runtime_output_seen": runtime_output_seen,
+                                "attach_ready_marker": saw_attach_ready_marker,
+                            }),
+                        );
+                        return;
+                    }
+                    let bytes = snapshot_text.len();
+                    let _ = document::eval(&terminal_replay_retained_data_script_for_session(
+                        &session_path_for_task,
+                        &snapshot_text,
+                    ));
+                    append_trace_event(
+                        &trace_home,
+                        "ui",
+                        "terminal_mount",
+                        "daemon_retained_snapshot_replay",
+                        json!({
+                            "session_path": session_path_for_task,
+                            "bytes": bytes,
+                            "lines": line_count,
+                            "running": running,
+                            "runtime_output_seen": runtime_output_seen,
+                            "attach_ready_marker": saw_attach_ready_marker,
+                        }),
+                    );
+                }
+                Err(error) => {
+                    append_trace_event(
+                        &trace_home,
+                        "ui",
+                        "terminal_mount",
+                        "daemon_retained_replay_error",
                         json!({
                             "session_path": session_path_for_task,
                             "error": error.to_string(),
@@ -38239,10 +38407,7 @@ fn app_control_terminal_input_write_path(shell: &ShellState, session_path: &str)
         terminal_runtime_session_path(shell, session_path),
     )
 }
-fn terminal_input_write_path_for_runtime(
-    session_path: &str,
-    runtime_path: String,
-) -> String {
+fn terminal_input_write_path_for_runtime(session_path: &str, runtime_path: String) -> String {
     if session_path.trim_start().starts_with("remote-session://") {
         session_path.to_string()
     } else {
@@ -38690,7 +38855,20 @@ async fn terminal_snapshot_async(
     })
     .await
 }
-async fn daemon_snapshot_async(endpoint: ServerEndpoint, trace_home: &Path) -> Result<ServerUiSnapshot> {
+async fn terminal_retained_snapshot_async(
+    endpoint: ServerEndpoint,
+    session_path: String,
+    trace_home: &Path,
+) -> Result<(String, bool, bool)> {
+    run_dedicated_terminal_io("terminal_retained_snapshot", trace_home, move || {
+        terminal_retained_snapshot(&endpoint, &session_path)
+    })
+    .await
+}
+async fn daemon_snapshot_async(
+    endpoint: ServerEndpoint,
+    trace_home: &Path,
+) -> Result<ServerUiSnapshot> {
     run_dedicated_terminal_io("daemon_snapshot", trace_home, move || {
         daemon_snapshot(&endpoint).map(|(snapshot, _)| snapshot)
     })
@@ -43728,6 +43906,7 @@ fn terminal_replay_retained_data_script_for_session(session_path: &str, data: &s
           const strippedReplayText = String(data)
             .replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "")
             .replace(/\x1b[=>]/g, "");
+          const rawPayloadLineCount = (data.match(/\n/g) || []).length;
           const promptIx = strippedReplayText.lastIndexOf("›");
           const promptNeedle = promptIx >= 0
             ? strippedReplayText.slice(promptIx, promptIx + 96).replace(/\s+/g, " ").trim()
@@ -43808,13 +43987,26 @@ fn terminal_replay_retained_data_script_for_session(session_path: &str, data: &s
               retryLater();
               return;
             }}
+            const buffer = entry.term.buffer && entry.term.buffer.active;
+            const baseY = buffer ? Number(buffer.baseY || 0) : 0;
+            const rows = Math.max(0, Number(entry.term.rows || 0));
+            const expectsReplayScrollback = rawPayloadLineCount > Math.max(4, rows + 4);
+            const collapsedScrollbackNeedsReplay = expectsReplayScrollback && baseY <= 0;
+            try {{
+              entry.lastRetainedReplayLineCount = rawPayloadLineCount;
+              entry.lastRetainedReplaySource = "daemon_retained_snapshot";
+              entry.lastRetainedReplayExpected = expectsReplayScrollback;
+              if (expectsReplayScrollback) {{
+                entry.scrollbackExpected = true;
+              }}
+            }} catch (_error) {{}}
             if (entry.__yggtermLastRetainedReplayKey === replayKey) {{
               try {{
                 if (typeof entry.setInputEnabled === "function") {{
                   entry.setInputEnabled(true, true);
                 }}
               }} catch (_error) {{}}
-              if (replayVisibleInEntry(entry)) {{
+              if (!collapsedScrollbackNeedsReplay && replayVisibleInEntry(entry)) {{
                 if (Date.now() >= current.stableUntilMs) {{
                   current.complete = true;
                 }} else {{
@@ -43823,7 +44015,7 @@ fn terminal_replay_retained_data_script_for_session(session_path: &str, data: &s
                 return;
               }}
             }}
-            if (replayVisibleInEntry(entry)) {{
+            if (!collapsedScrollbackNeedsReplay && replayVisibleInEntry(entry)) {{
               try {{
                 if (typeof entry.setInputEnabled === "function") {{
                   entry.setInputEnabled(true, true);
@@ -43836,8 +44028,6 @@ fn terminal_replay_retained_data_script_for_session(session_path: &str, data: &s
               }}
               return;
             }}
-            const buffer = entry.term.buffer && entry.term.buffer.active;
-            const baseY = buffer ? Number(buffer.baseY || 0) : 0;
             if (baseY > 0) {{
               current.complete = true;
               return;
@@ -43862,7 +44052,7 @@ fn terminal_replay_retained_data_script_for_session(session_path: &str, data: &s
             try {{
               entry.__yggtermLastRetainedReplayKey = replayKey;
               entry.lastRawPayloadLength = data.length;
-              entry.lastRawPayloadLineCount = (data.match(/\n/g) || []).length;
+              entry.lastRawPayloadLineCount = rawPayloadLineCount;
               if (entry.lastRawPayloadLineCount > Math.max(4, Number(entry.term.rows || 0) + 4)) {{
                 entry.scrollbackExpected = true;
               }}
@@ -49464,6 +49654,14 @@ mod tests {
         );
         assert!(script.contains("const retryDelayMs = 100;"));
         assert!(script.contains("const stableUntilMs = Date.now() + 3500;"));
+        assert!(script.contains("const rawPayloadLineCount = (data.match(/\\n/g) || []).length;"));
+        assert!(script.contains(
+            "const collapsedScrollbackNeedsReplay = expectsReplayScrollback && baseY <= 0;"
+        ));
+        assert!(script.contains("entry.lastRetainedReplayExpected = expectsReplayScrollback;"));
+        assert!(
+            script.contains("if (!collapsedScrollbackNeedsReplay && replayVisibleInEntry(entry))")
+        );
         assert!(script.contains("translateToString(true)"));
         assert!(script.contains("visibleText.includes(\"›\")"));
         assert!(script.contains("window.setTimeout(attemptReplay, retryDelayMs);"));
@@ -49472,6 +49670,31 @@ mod tests {
         assert!(script.contains("entry.term.reset();"));
         assert!(script.contains("writeSync(data);"));
         assert!(script.contains("entry.scrollbackExpected = true;"));
+    }
+
+    #[test]
+    fn daemon_retained_snapshot_replay_starts_for_ready_active_remote_session() {
+        assert!(daemon_retained_snapshot_replay_should_start(
+            true, true, true
+        ));
+        assert!(!daemon_retained_snapshot_replay_should_start(
+            false, true, true
+        ));
+        assert!(!daemon_retained_snapshot_replay_should_start(
+            true, false, true
+        ));
+        assert!(!daemon_retained_snapshot_replay_should_start(
+            true, true, false
+        ));
+        let key = daemon_retained_snapshot_replay_identity_key(
+            "remote-session://dev/019dbdcf",
+            "remote-session://dev/019dbdcf:7",
+            true,
+            true,
+            true,
+        );
+        assert!(key.starts_with("daemon-retained-replay:remote-session://dev/019dbdcf"));
+        assert!(key.contains(":true:true:true"));
     }
 
     #[test]
@@ -49637,7 +49860,9 @@ mod tests {
         assert!(script.contains("let scrollbackIntent = 'PromptFollow';"));
         assert!(script.contains("const setScrollbackIntent = (intent, reason) => {"));
         assert!(script.contains("const markTerminalInputHot = (reason = 'input') => {"));
-        assert!(script.contains("const terminalInputHot = () => Date.now() < terminalInputHotUntilMs;"));
+        assert!(
+            script.contains("const terminalInputHot = () => Date.now() < terminalInputHotUntilMs;")
+        );
         assert!(script.contains("setScrollbackIntent('UserScrollback', 'wheel');"));
         assert!(script.contains("setScrollbackIntent('PromptFollow', 'wheel_reached_bottom');"));
         assert!(script.contains("entry.scrollbackIntent = scrollbackIntent;"));
@@ -49684,9 +49909,7 @@ mod tests {
             script.contains("const scheduleRetainedWritePaintRepair = (reason) => {")
                 && script.contains("const initialRetainedRepair =")
                 && script.contains("&& expectedScrollbackPayload")
-                && script.contains(
-                    "retainedWritePaintRepairCount < 4"
-                ),
+                && script.contains("retainedWritePaintRepairCount < 4"),
             "only retained-session and non-frame bulk writes should schedule a bounded visible repaint repair for WebKit canvas"
         );
         assert!(
@@ -61305,8 +61528,9 @@ q to quit   pgup/pgdn to page   enter to edit message
         ];
         session.status_line = "╰─────────────────────────────────────────────╯\x1b[8;1H\x1b[m  \x1b[1mTip:\x1b[m \x1b[3mNew\x1b[m Use \x1b[1m/fast\x1b[m to enable our fastest inference with increased plan usage.\x1b[10;1H\x1b[33m⚠ Heads up, you have less than 10% of your weekly limit left. Run /status for a breakdown.\x1b[13;1H\x1b[39;1m›\x1b[C\x1b[2mSummarize recent commits\x1b[15;1H  gpt-5.5 xhigh · ~/gh/yggterm\x1b[13;3H\x1b[m\x1b>\x1b[?1l\x1b[?2004h".to_string();
 
-        let replay = remote_live_session_prompt_ready_replay_text(&session)
-            .expect("cursor-addressed default Codex prompt should be replayable from live PTY bytes");
+        let replay = remote_live_session_prompt_ready_replay_text(&session).expect(
+            "cursor-addressed default Codex prompt should be replayable from live PTY bytes",
+        );
 
         assert!(replay.contains("Summarize recent commits"));
         assert!(remote_resume_blank_host_snapshot_is_replayable(&replay));
@@ -61359,7 +61583,9 @@ q to quit   pgup/pgdn to page   enter to edit message
             live_sessions.iter(),
             "remote-session://dev/target",
         )
-        .expect("active render should fall back to the current server live-session prompt snapshot");
+        .expect(
+            "active render should fall back to the current server live-session prompt snapshot",
+        );
 
         assert!(replay.contains("Review current changes"));
         assert!(remote_resume_blank_host_snapshot_is_replayable(&replay));
@@ -61452,27 +61678,12 @@ q to quit   pgup/pgdn to page   enter to edit message
     fn server_prompt_snapshot_replay_identity_tracks_recovery_attempts() {
         let mount_identity = "remote-session://dev/abc123:7";
         assert_eq!(
-            server_prompt_snapshot_replay_identity(
-                mount_identity,
-                42,
-                11,
-                Some("terminal-open-1")
-            ),
+            server_prompt_snapshot_replay_identity(mount_identity, 42, 11, Some("terminal-open-1")),
             "server-snapshot-replay:remote-session://dev/abc123:7:42:11:terminal-open-1"
         );
         assert_ne!(
-            server_prompt_snapshot_replay_identity(
-                mount_identity,
-                42,
-                11,
-                Some("terminal-open-1")
-            ),
-            server_prompt_snapshot_replay_identity(
-                mount_identity,
-                42,
-                11,
-                Some("terminal-open-2")
-            )
+            server_prompt_snapshot_replay_identity(mount_identity, 42, 11, Some("terminal-open-1")),
+            server_prompt_snapshot_replay_identity(mount_identity, 42, 11, Some("terminal-open-2"))
         );
     }
 
