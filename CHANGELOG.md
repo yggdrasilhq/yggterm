@@ -4,6 +4,12 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+## 2.1.118
+
+- Stabilize terminal redraw after resize/session switching by forcing settled xterm geometry to converge with the PTY resize notification path.
+- Reduce typing-time client churn by throttling input-hot terminal perf/health sampling and extending the latency smoke to measure render/write churn and process CPU.
+- Move Live Sessions keep-alive markers into a fixed leading status rail so kept sessions do not show jagged title-width-dependent dots.
+
 ## 2.1.117
 
 - Keep daemon control-plane requests responsive while remote session previews refresh: preview refresh now uses cached scan/session data instead of running SSH scan or preview fetches under the daemon lock.
