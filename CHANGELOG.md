@@ -4,6 +4,11 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+## 2.1.115
+
+- Force the active xterm viewport back to the live cursor when terminal input or focus occurs, so switching/typing into a live session cannot leave the prompt hidden in scrollback.
+- Extend the latency smoke readiness gate to fail when the active terminal is scrollback-locked away from the prompt or reports the cursor outside the visible viewport.
+
 ## 2.1.114
 
 - Classify the first post-open terminal latency token as warmup with its own budget, while keeping strict steady-state visible-echo max and p95 budgets.
