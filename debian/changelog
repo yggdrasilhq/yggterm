@@ -1,3 +1,11 @@
+yggterm (2.1.117-1) unstable; urgency=medium
+
+  * Keep remote preview refresh cache-only on the daemon request path.
+  * Add regression coverage for remote preview refresh without SSH I/O.
+  * Time-bound Python remote scan fallback helpers.
+
+ -- Avikalpa Kundu <avikalpa.com>  Mon, 04 May 2026 15:30:00 +0530
+
 yggterm (2.1.116-1) unstable; urgency=medium
 
   * Preserve explicit terminal scrollback intent after wheel release.
