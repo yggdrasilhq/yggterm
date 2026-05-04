@@ -4,6 +4,12 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+## 2.1.111
+
+- Treat focused Codex conversation-interrupted input surfaces as live interactive terminals even when Codex does not render the normal prompt glyph.
+- Keep foreground terminal latency work gated while a live terminal is active, and keep the canvas-rendered dim prompt text readable.
+- Add CI coverage for interrupted Codex input readiness, foreground refresh deferral, no-echo detection, and canvas dim prompt readability.
+
 ## 2.1.110
 
 - Fixed canvas-rendered Codex prompt readability by keeping xterm.js dim text close to Ghostty-style terminal contrast instead of halving prompt opacity.

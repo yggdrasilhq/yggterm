@@ -4197,6 +4197,15 @@ def host_has_prompt_ready_text(host: dict) -> bool:
         return True
     if any(terminal_chunk_has_codex_prompt_output(chunk) for chunk in chunks):
         return True
+    if (
+        host.get("input_enabled") is True
+        and host.get("mounted_entry_host_connected") is True
+        and any(
+            "conversation interrupted - tell the model what to do differently" in chunk.lower()
+            for chunk in chunks
+        )
+    ):
+        return True
     return False
 
 
