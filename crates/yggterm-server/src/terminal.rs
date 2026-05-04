@@ -1919,6 +1919,35 @@ mod tests {
     }
 
     #[test]
+    fn terminal_manager_retained_snapshot_exposes_full_history_for_ui_replay() {
+        let mut manager = TerminalManager::new();
+        let key = "remote-session://dev/ui-retained-history";
+        manager
+            .ensure_session(key, "sh -lc 'sleep 30'", None)
+            .expect("spawn retained history session");
+        let retained = (1..=96)
+            .map(|line| format!("YGG_UI_RETAINED_HISTORY_{line:03}\n"))
+            .collect::<String>();
+        manager
+            .seed_session(key, &retained)
+            .expect("seed retained history");
+
+        let snapshot = manager
+            .session_snapshot(key)
+            .expect("retained snapshot exists");
+
+        assert!(snapshot.contains("YGG_UI_RETAINED_HISTORY_001"));
+        assert!(snapshot.contains("YGG_UI_RETAINED_HISTORY_096"));
+        assert!(
+            snapshot.matches("YGG_UI_RETAINED_HISTORY_").count() >= 96,
+            "{snapshot:?}"
+        );
+        manager
+            .remove_session(key, None)
+            .expect("shutdown retained history session");
+    }
+
+    #[test]
     fn initial_remote_resume_attach_recovers_older_seed_scrollback_after_tail_noise() {
         let mut chunks = VecDeque::new();
         let seed = (1..=80)

@@ -33,7 +33,8 @@ pub use daemon::{
     start_local_session, start_local_session_at, start_remote_codex_session_at,
     start_remote_runtime_codex_session, start_ssh_session_at, status, switch_agent_session_mode,
     sync_external_window, sync_theme, terminal_ensure, terminal_read, terminal_resize,
-    terminal_snapshot, terminal_write, toggle_preview_block, update_session_copy,
+    terminal_retained_snapshot, terminal_snapshot, terminal_write, toggle_preview_block,
+    update_session_copy,
 };
 pub use host::{GhosttyHostKind, GhosttyHostSupport, GhosttyTerminalHostMode, detect_ghostty_host};
 pub use protocol::{
@@ -939,7 +940,10 @@ impl YggtermServer {
                 if let Some((raw_machine_key, session_id)) = parse_remote_scanned_session_path(path)
                 {
                     let machine_key = normalize_machine_key(raw_machine_key);
-                    self.refresh_remote_scanned_session_preview_from_cache(&machine_key, session_id);
+                    self.refresh_remote_scanned_session_preview_from_cache(
+                        &machine_key,
+                        session_id,
+                    );
                 }
             }
         }
@@ -4522,9 +4526,15 @@ mod remote_terminal_write_data_tests {
 
     #[test]
     fn remote_terminal_write_normalizes_bare_carriage_return_for_codex_runtime() {
-        assert_eq!(normalize_remote_terminal_write_data("/status\r"), "/status\r\n");
+        assert_eq!(
+            normalize_remote_terminal_write_data("/status\r"),
+            "/status\r\n"
+        );
         assert_eq!(normalize_remote_terminal_write_data("\r"), "\r\n");
-        assert_eq!(normalize_remote_terminal_write_data("/status\r\n"), "/status\r\n");
+        assert_eq!(
+            normalize_remote_terminal_write_data("/status\r\n"),
+            "/status\r\n"
+        );
         assert_eq!(normalize_remote_terminal_write_data("plain\n"), "plain\n");
     }
 }
@@ -11234,6 +11244,20 @@ pub fn run_app_control_resize_window(
 pub fn run_app_control_close_window(timeout_ms: u64) -> anyhow::Result<()> {
     let home = resolve_yggterm_home()?;
     let response = request_app_control(&home, AppControlCommand::CloseWindow, timeout_ms)?;
+    write_stdout_payload(&serde_json::to_string_pretty(&response)?)?;
+    Ok(())
+}
+
+pub fn run_app_control_close_window_preserving_sessions(
+    timeout_ms: u64,
+    reason: Option<String>,
+) -> anyhow::Result<()> {
+    let home = resolve_yggterm_home()?;
+    let response = request_app_control(
+        &home,
+        AppControlCommand::CloseWindowPreservingSessions { reason },
+        timeout_ms,
+    )?;
     write_stdout_payload(&serde_json::to_string_pretty(&response)?)?;
     Ok(())
 }
