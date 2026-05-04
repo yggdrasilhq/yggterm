@@ -1479,9 +1479,9 @@ impl DaemonRuntime {
                 self.persist()?;
                 self.snapshot_response(Some(if removed_session {
                     if removed_terminal {
-                        format!("removed {path}")
+                        format!("closed terminal runtime for {path}")
                     } else {
-                        format!("removed metadata for {path}")
+                        format!("closed terminal metadata for {path}")
                     }
                 } else {
                     format!("no live session for {path}")
