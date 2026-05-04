@@ -4,6 +4,13 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+## 2.1.110
+
+- Fixed canvas-rendered Codex prompt readability by keeping xterm.js dim text close to Ghostty-style terminal contrast instead of halving prompt opacity.
+- Deferred remote-machine and managed-Codex background refresh work while a focused terminal is active, reducing latency spikes from SSH binary/version probes competing with interactive terminal input.
+- Tightened app-control observability so a remote terminal that accepts input but does not receive a following daemon stream echo is reported as unhealthy instead of ready.
+- Added focused CI regression gates for canvas dim prompt contrast, foreground terminal refresh deferral, and accepted-input-without-stream-echo detection.
+
 ## 2.1.109
 
 - Enforced the terminal single-source contract: Terminal mode is backed by the daemon-owned PTY/runtime stream and no longer accepts generated Codex card/status-copy surfaces as prompt-ready terminal truth.
