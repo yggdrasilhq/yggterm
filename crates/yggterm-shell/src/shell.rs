@@ -8516,8 +8516,27 @@ fn interactive_surface_request_in_flight(shell: &ShellState) -> bool {
         )
     })
 }
+fn terminal_foreground_should_defer_background_refreshes(
+    window_focused: bool,
+    active_view_mode: WorkspaceViewMode,
+    active_session_path: Option<&str>,
+) -> bool {
+    window_focused
+        && active_view_mode == WorkspaceViewMode::Terminal
+        && active_session_path.is_some()
+}
+
+fn focused_terminal_should_defer_background_refreshes(shell: &ShellState) -> bool {
+    terminal_foreground_should_defer_background_refreshes(
+        shell.window_focused,
+        shell.server.active_view_mode(),
+        shell.server.active_session_path(),
+    )
+}
+
 fn background_refreshes_deferred(shell: &ShellState) -> bool {
     current_millis() < shell.background_refresh_after_ms
+        || focused_terminal_should_defer_background_refreshes(shell)
 }
 fn allocator_trim_can_run(shell: &ShellState) -> bool {
     !shell.needs_initial_server_sync
@@ -49418,6 +49437,37 @@ mod tests {
             "node.style.setProperty('color', contrastSafeForeground(rowBackground), 'important');"
         ));
     }
+
+    #[test]
+    fn xterm_canvas_renderer_keeps_dim_prompt_text_readable() {
+        assert!(XTERM_CANVAS_JS.contains("t.DIM_OPACITY=.78"));
+        assert!(!XTERM_CANVAS_JS.contains("t.DIM_OPACITY=.5"));
+    }
+
+    #[test]
+    fn focused_terminal_defers_background_refreshes() {
+        assert!(terminal_foreground_should_defer_background_refreshes(
+            true,
+            WorkspaceViewMode::Terminal,
+            Some("remote-session://dev/live")
+        ));
+        assert!(!terminal_foreground_should_defer_background_refreshes(
+            false,
+            WorkspaceViewMode::Terminal,
+            Some("remote-session://dev/live")
+        ));
+        assert!(!terminal_foreground_should_defer_background_refreshes(
+            true,
+            WorkspaceViewMode::Rendered,
+            Some("remote-session://dev/live")
+        ));
+        assert!(!terminal_foreground_should_defer_background_refreshes(
+            true,
+            WorkspaceViewMode::Terminal,
+            None
+        ));
+    }
+
     #[test]
     fn terminal_theme_uses_one_dark_palette_for_dark_mode() {
         let theme = terminal_theme(UiTheme::ZedDark, palette(UiTheme::ZedDark), 13.0, "");
