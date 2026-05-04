@@ -898,7 +898,8 @@ fn terminal_host_problem_for_app_control(host: &Value) -> Option<&'static str> {
     let last_stream_output_after_input_ms = last_write_queued_at_ms
         .max(last_write_flush_started_at_ms)
         .max(last_write_callback_at_ms);
-    let accepted_input_without_following_stream_echo = session_path.starts_with("remote-session://")
+    let accepted_input_without_following_stream_echo = session_path
+        .starts_with("remote-session://")
         && input_enabled
         && helper_textarea_focused
         && mounted_entry_host_connected
@@ -988,7 +989,9 @@ fn terminal_host_problem_for_app_control(host: &Value) -> Option<&'static str> {
         return Some("active terminal host is still showing the transcript browser");
     }
     if accepted_input_without_following_stream_echo {
-        return Some("active remote terminal accepted input without a following daemon stream echo");
+        return Some(
+            "active remote terminal accepted input without a following daemon stream echo",
+        );
     }
     if terminal_chunk_is_saved_transcript_prefill(visible_text) {
         return Some("active terminal host is still showing saved transcript prefill");
@@ -1007,7 +1010,9 @@ fn terminal_host_problem_for_app_control(host: &Value) -> Option<&'static str> {
         && !prompt_ready_surface
         && !transcript_browser_ready_surface
     {
-        return Some("active remote terminal is showing stale retained text before prompt-ready surface");
+        return Some(
+            "active remote terminal is showing stale retained text before prompt-ready surface",
+        );
     }
     if session_path.starts_with("remote-session://")
         && input_enabled
@@ -1481,7 +1486,8 @@ pub(crate) fn terminal_chunk_has_codex_prompt_output(data: &str) -> bool {
             let semantic =
                 line.trim_matches(|ch: char| matches!(ch, '╭' | '╮' | '╰' | '╯' | '─' | '│' | ' '));
             semantic.starts_with('›')
-        }) {
+        })
+    {
         return true;
     }
     if terminal_chunk_is_transport_error(&stripped)
@@ -1495,9 +1501,8 @@ pub(crate) fn terminal_chunk_has_codex_prompt_output(data: &str) -> bool {
     let Some(prompt_ix) = compact.rfind('›') else {
         return false;
     };
-    let prompt_suffix = compact[prompt_ix..].trim_matches(|ch: char| {
-        matches!(ch, '╭' | '╮' | '╰' | '╯' | '─' | '│' | ' ')
-    });
+    let prompt_suffix = compact[prompt_ix..]
+        .trim_matches(|ch: char| matches!(ch, '╭' | '╮' | '╰' | '╯' | '─' | '│' | ' '));
     prompt_suffix.starts_with('›')
         && prompt_suffix.chars().count() <= 260
         && (prompt_suffix.contains("gpt-")
@@ -2309,7 +2314,9 @@ mod tests {
         });
         assert_eq!(
             terminal_host_problem_for_app_control(&host),
-            Some("active remote terminal is showing stale retained text before prompt-ready surface")
+            Some(
+                "active remote terminal is showing stale retained text before prompt-ready surface"
+            )
         );
     }
 
