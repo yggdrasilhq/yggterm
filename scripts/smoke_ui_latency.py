@@ -151,6 +151,20 @@ def collect_terminal_readiness_failures(state: dict[str, Any], session_path: str
         for key in ("xterm_present", "viewport_present", "input_enabled"):
             if host.get(key) is not True:
                 failures.append(f"active terminal host {key}={host.get(key)!r}")
+        if host.get("scrollback_locked") is True:
+            failures.append("active terminal host is scrollback-locked away from the live cursor")
+        cursor_rect = host.get("cursor_expected_rect")
+        viewport_rect = host.get("viewport_rect")
+        if isinstance(cursor_rect, dict) and isinstance(viewport_rect, dict):
+            try:
+                cursor_top = float(cursor_rect.get("top"))
+                cursor_bottom = float(cursor_rect.get("bottom", cursor_top + float(cursor_rect.get("height", 0.0))))
+                viewport_top = float(viewport_rect.get("top"))
+                viewport_bottom = float(viewport_rect.get("bottom", viewport_top + float(viewport_rect.get("height", 0.0))))
+                if cursor_bottom < viewport_top - 1.0 or cursor_top > viewport_bottom + 1.0:
+                    failures.append("active terminal cursor is outside the visible viewport")
+            except (TypeError, ValueError):
+                pass
     return failures
 
 
