@@ -1,3 +1,10 @@
+yggterm (2.1.115-1) unstable; urgency=medium
+
+  * Force active terminal input/focus to reveal the live cursor.
+  * Fail latency smoke when the active prompt is hidden in scrollback.
+
+ -- Avikalpa Kundu <avikalpa.com>  Mon, 04 May 2026 13:45:00 +0530
+
 yggterm (2.1.114-1) unstable; urgency=medium
 
   * Classify first terminal latency token as warmup while enforcing steady-state budgets.
