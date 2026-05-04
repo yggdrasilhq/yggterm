@@ -183,6 +183,55 @@ def terminal_probe(args: argparse.Namespace, session_path: str, token: str) -> C
     return run_json(args, f"terminal_type_{token}", argv)
 
 
+def sample_process_cpu(args: argparse.Namespace) -> dict[str, Any] | None:
+    if args.pid is None:
+        return None
+    if args.host:
+        cmd = [
+            "ssh",
+            args.host,
+            f"ps -p {int(args.pid)} -o pid=,pcpu=,rss=,etime=,cmd=",
+        ]
+    else:
+        cmd = ["ps", "-p", str(int(args.pid)), "-o", "pid=,pcpu=,rss=,etime=,cmd="]
+    proc = subprocess.run(
+        cmd,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=args.command_timeout_sec,
+    )
+    if proc.returncode != 0:
+        return {"error": proc.stderr.strip() or proc.stdout.strip()}
+    line = proc.stdout.strip()
+    parts = line.split(None, 4)
+    if len(parts) < 4:
+        return {"raw": line}
+    result: dict[str, Any] = {
+        "pid": parts[0],
+        "pcpu": None,
+        "rss_kb": None,
+        "etime": parts[3],
+        "cmd": parts[4] if len(parts) > 4 else "",
+    }
+    try:
+        result["pcpu"] = float(parts[1])
+    except ValueError:
+        pass
+    try:
+        result["rss_kb"] = int(parts[2])
+    except ValueError:
+        pass
+    return result
+
+
+def host_counter(host: dict[str, Any], key: str) -> int:
+    try:
+        return int(host.get(key) or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
 def budget_check(report: dict[str, Any], name: str, value: float | None, budget: float) -> None:
     if value is None:
         report["failures"].append(f"{name}: missing measurement")
@@ -201,6 +250,12 @@ def main() -> int:
     parser.add_argument("--command-timeout-sec", type=float, default=25.0)
     parser.add_argument("--terminal-mode", choices=["keyboard", "xterm", "auto"], default="keyboard")
     parser.add_argument("--clear-after", action="store_true", help="Send Ctrl+U after terminal samples.")
+    parser.add_argument(
+        "--clear-every-samples",
+        type=int,
+        default=16,
+        help="When --clear-after is set, also clear the prompt every N samples to prevent line-wrap false negatives.",
+    )
     parser.add_argument("--json-out", type=Path)
     parser.add_argument("--max-state-ms", type=float, default=1200.0)
     parser.add_argument("--max-rows-ms", type=float, default=1200.0)
@@ -211,6 +266,9 @@ def main() -> int:
     parser.add_argument("--max-terminal-p95-ms", type=float, default=450.0)
     parser.add_argument("--max-terminal-drift-ms", type=float, default=175.0)
     parser.add_argument("--max-terminal-scroll-ms", type=float, default=800.0)
+    parser.add_argument("--max-render-events-per-sample", type=float, default=18.0)
+    parser.add_argument("--max-write-flushes-per-sample", type=float, default=4.0)
+    parser.add_argument("--max-app-cpu-percent", type=float, default=65.0)
     parser.add_argument("--skip-scroll-check", action="store_true")
     parser.add_argument("--skip-readiness-gate", action="store_true")
     args = parser.parse_args()
@@ -228,10 +286,14 @@ def main() -> int:
             "terminal_p95": args.max_terminal_p95_ms,
             "terminal_drift": args.max_terminal_drift_ms,
             "terminal_scroll": args.max_terminal_scroll_ms,
+            "render_events_per_sample": args.max_render_events_per_sample,
+            "write_flushes_per_sample": args.max_write_flushes_per_sample,
+            "app_cpu_percent": args.max_app_cpu_percent,
         },
         "measurements": {},
         "terminal_samples": [],
         "terminal_scroll": None,
+        "process_samples": [],
         "failures": [],
     }
 
@@ -282,9 +344,34 @@ def main() -> int:
         except Exception as error:  # noqa: BLE001
             report["failures"].append(f"terminal initial clear failed: {error}")
 
+    pre_type_host = active_terminal_host(active_terminal_viewport(state_data), session_path)
+    pre_type_cpu = sample_process_cpu(args)
+    if pre_type_cpu:
+        report["process_samples"].append({"phase": "before_typing", **pre_type_cpu})
+
     token_prefix = f"l{int(time.time()) % 100:02d}"
     terminal_visible_ms: list[float] = []
     for ix in range(max(1, args.samples)):
+        if args.clear_after and args.clear_every_samples > 0 and ix > 0 and ix % args.clear_every_samples == 0:
+            try:
+                run_json(
+                    args,
+                    f"terminal_periodic_clear_{ix}",
+                    terminal_args(
+                        args,
+                        session_path,
+                        "probe-type",
+                        session_path,
+                        "--mode",
+                        args.terminal_mode,
+                        "--data",
+                        "",
+                        "--ctrl-u",
+                    ),
+                )
+                time.sleep(0.08)
+            except Exception as error:  # noqa: BLE001
+                report["failures"].append(f"terminal periodic clear {ix} failed: {error}")
         token = f"{token_prefix}{ix:x}"
         probe = terminal_probe(args, session_path, token)
         probe_data = data_from(probe)
@@ -308,6 +395,46 @@ def main() -> int:
             terminal_visible_ms.append(float(visible_ms))
         if not probe_data.get("visible_echo_observed"):
             report["failures"].append(f"terminal sample {ix}: visible echo not observed")
+
+    post_type_state = data_from(run_json(args, "state_after_typing", app_args(args, "state")))
+    post_type_host = active_terminal_host(active_terminal_viewport(post_type_state), session_path)
+    post_type_cpu = sample_process_cpu(args)
+    if post_type_cpu:
+        report["process_samples"].append({"phase": "after_typing", **post_type_cpu})
+    sample_count = max(1, args.samples)
+    render_delta = host_counter(post_type_host, "render_event_count") - host_counter(
+        pre_type_host, "render_event_count"
+    )
+    write_flush_delta = host_counter(post_type_host, "write_bridge_flush_count") - host_counter(
+        pre_type_host, "write_bridge_flush_count"
+    )
+    write_command_delta = host_counter(post_type_host, "write_command_count") - host_counter(
+        pre_type_host, "write_command_count"
+    )
+    report["measurements"]["terminal_render_events_per_sample"] = render_delta / sample_count
+    report["measurements"]["terminal_write_flushes_per_sample"] = write_flush_delta / sample_count
+    report["measurements"]["terminal_write_commands_per_sample"] = write_command_delta / sample_count
+    report["measurements"]["terminal_skipped_perf_events"] = host_counter(
+        post_type_host, "skippedPerfEventCount"
+    )
+    for process_sample in report["process_samples"]:
+        pcpu = process_sample.get("pcpu")
+        if isinstance(pcpu, (int, float)) and pcpu > args.max_app_cpu_percent:
+            report["failures"].append(
+                f"app CPU {process_sample['phase']}: {pcpu:.1f}% > {args.max_app_cpu_percent:.1f}%"
+            )
+    if report["measurements"]["terminal_render_events_per_sample"] > args.max_render_events_per_sample:
+        report["failures"].append(
+            "terminal render churn while typing: "
+            f"{report['measurements']['terminal_render_events_per_sample']:.2f} render events/sample "
+            f"> {args.max_render_events_per_sample:.2f}"
+        )
+    if report["measurements"]["terminal_write_flushes_per_sample"] > args.max_write_flushes_per_sample:
+        report["failures"].append(
+            "terminal write flush churn while typing: "
+            f"{report['measurements']['terminal_write_flushes_per_sample']:.2f} flushes/sample "
+            f"> {args.max_write_flushes_per_sample:.2f}"
+        )
 
     if args.clear_after:
         try:
