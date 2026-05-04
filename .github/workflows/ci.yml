@@ -86,6 +86,7 @@ jobs:
           cargo test -p yggterm-server --no-default-features remote_session_terminal_input_uses_hot_local_runtime_before_remote_fallback
           cargo test -p yggterm-server --no-default-features remote_terminal_write_normalizes_bare_carriage_return_for_codex_runtime
           cargo test -p yggterm-server --no-default-features versioned_server_status_probe_paths_dedupe_symlink_aliases_before_status
+          cargo test -p yggterm-server --no-default-features remote_preview_refresh_uses_cached_scan_without_remote_io_for_live_session
           cargo test -p yggterm-shell --no-default-features linux_desktop_app_id_ignores_update_handoff_multi_window_env
           cargo test -p yggterm-shell --no-default-features retained_ready_remote_host_reuses_bootstrap_on_focus_return
           cargo test -p yggterm-shell --no-default-features remote_resume_bootstrap_epoch_stays_stable_until_failure
