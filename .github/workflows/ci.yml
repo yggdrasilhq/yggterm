@@ -118,6 +118,7 @@ jobs:
           cargo test -p yggterm-shell --no-default-features terminal_eval_script_focuses_host_and_scopes_wheel_capture
           cargo test -p yggterm-shell --no-default-features app_control_terminal_input_splits_interrupt_from_following_bytes
           cargo test -p yggterm-shell --no-default-features terminal_eval_script_locks_even_one_line_scrollback
+          cargo test -p yggterm-shell --no-default-features terminal_eval_script_forces_cursor_follow_on_input_and_focus
           cargo test -p yggterm-shell --no-default-features xterm_canvas_renderer_keeps_dim_prompt_text_readable
           cargo test -p yggterm-shell --no-default-features focused_terminal_defers_background_refreshes
           cargo test -p yggterm-shell --no-default-features terminal_probe_per_char_does_not_sleep_after_every_character
