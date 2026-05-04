@@ -1735,8 +1735,13 @@ impl DaemonRuntime {
             }
             ServerRequest::TerminalWrite { path, data } => {
                 let runtime_path = self.terminal_runtime_key_for_path(&path);
-                let prefer_remote_direct = terminal_write_prefers_remote_direct(&path);
-                if prefer_remote_direct {
+                let local_runtime_running = self.terminals.session_is_running(&runtime_path);
+                let write_strategy = terminal_write_strategy_for_path(&path, local_runtime_running);
+                if matches!(write_strategy, TerminalWriteStrategy::LocalRuntime) {
+                    self.terminals.write(&runtime_path, &data)?;
+                    return Ok(ServerResponse::Ack { message: None });
+                }
+                if matches!(write_strategy, TerminalWriteStrategy::RemoteDirectFallback) {
                     match self.server.remote_terminal_write_for_path(&path, &data) {
                         Ok(true) => {
                             return Ok(ServerResponse::Ack { message: None });
@@ -1760,10 +1765,6 @@ impl DaemonRuntime {
                             return Err(error);
                         }
                     }
-                }
-                if self.terminals.session_is_running(&runtime_path) {
-                    self.terminals.write(&runtime_path, &data)?;
-                    return Ok(ServerResponse::Ack { message: None });
                 }
                 match self.server.remote_terminal_write_for_path(&path, &data) {
                     Ok(true) => {
@@ -4302,8 +4303,21 @@ fn daemon_request_io_timeout_ms(request: &ServerRequest) -> u64 {
     }
 }
 
-fn terminal_write_prefers_remote_direct(path: &str) -> bool {
-    path.trim_start().starts_with("remote-session://")
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TerminalWriteStrategy {
+    LocalRuntime,
+    RemoteDirectFallback,
+    LocalRuntimeFallback,
+}
+
+fn terminal_write_strategy_for_path(path: &str, local_runtime_running: bool) -> TerminalWriteStrategy {
+    if local_runtime_running {
+        TerminalWriteStrategy::LocalRuntime
+    } else if path.trim_start().starts_with("remote-session://") {
+        TerminalWriteStrategy::RemoteDirectFallback
+    } else {
+        TerminalWriteStrategy::LocalRuntimeFallback
+    }
 }
 
 #[cfg(test)]
@@ -4397,19 +4411,29 @@ mod tests {
     }
 
     #[test]
-    fn remote_session_terminal_input_prefers_remote_runtime_write() {
-        assert!(super::terminal_write_prefers_remote_direct(
-            "remote-session://dev/8931728b-30a7-428a-8b8e-35bee0480444"
-        ));
-        assert!(super::terminal_write_prefers_remote_direct(
-            "  remote-session://dev/d98bc22f-91e4-4332-8696-122cca33c71c"
-        ));
-        assert!(!super::terminal_write_prefers_remote_direct(
-            "ssh://dev/home/pi/gh/yggterm"
-        ));
-        assert!(!super::terminal_write_prefers_remote_direct(
-            "local://shell"
-        ));
+    fn remote_session_terminal_input_uses_hot_local_runtime_before_remote_fallback() {
+        assert_eq!(
+            super::terminal_write_strategy_for_path(
+                "remote-session://dev/8931728b-30a7-428a-8b8e-35bee0480444",
+                true
+            ),
+            super::TerminalWriteStrategy::LocalRuntime
+        );
+        assert_eq!(
+            super::terminal_write_strategy_for_path(
+                "  remote-session://dev/d98bc22f-91e4-4332-8696-122cca33c71c",
+                false
+            ),
+            super::TerminalWriteStrategy::RemoteDirectFallback
+        );
+        assert_eq!(
+            super::terminal_write_strategy_for_path("ssh://dev/home/pi/gh/yggterm", false),
+            super::TerminalWriteStrategy::LocalRuntimeFallback
+        );
+        assert_eq!(
+            super::terminal_write_strategy_for_path("local://shell", true),
+            super::TerminalWriteStrategy::LocalRuntime
+        );
     }
 
     #[test]
