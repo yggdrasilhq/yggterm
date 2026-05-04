@@ -4,6 +4,11 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+## 2.1.113
+
+- Remove artificial per-character settle sleeps from app-control keyboard latency probes so the live latency gate measures terminal echo instead of harness delay.
+- Add CI coverage for the per-character probe path.
+
 ## 2.1.112
 
 - Route remote live-session input through the already-running local SSH bridge/runtime before falling back to remote-direct writes, removing per-character remote command startup from the hot typing path.
