@@ -105,16 +105,16 @@ use yggterm_server::{
     YggtermServer, app_control_requests_pending, cleanup_legacy_daemons,
     complete_app_control_request, connect_ssh_custom, fetch_remote_generation_context,
     focus_live_with_view, local_headless_companion_executable_from_current,
-    managed_cli_refresh_ttl_ms, open_remote_session_with_view, open_stored_session,
+    hot_restart, managed_cli_refresh_ttl_ms, open_remote_session_with_view, open_stored_session,
     open_stored_session_with_view, persist_remote_generated_copy, ping, prepare_client_close,
-    prepare_update_restart, refresh_local_managed_cli_now, refresh_managed_cli, refresh_preview,
-    refresh_remote_machine, remove_session, remove_ssh_target, request_terminal_launch,
-    set_all_preview_blocks_folded, set_session_keep_alive, set_view_mode as daemon_set_view_mode,
-    shutdown as daemon_shutdown, snapshot as daemon_snapshot, snapshot_session_view_for_ui,
-    stage_remote_clipboard_png, start_command_session, start_local_session_at,
-    start_remote_codex_session_at, start_ssh_session_at, status, take_next_app_control_request,
-    terminal_ensure, terminal_read, terminal_resize, terminal_snapshot, terminal_write,
-    toggle_preview_block as daemon_toggle_preview_block,
+    prepare_update_restart, reachable_versioned_daemon_statuses,
+    refresh_local_managed_cli_now, refresh_managed_cli, refresh_preview, refresh_remote_machine,
+    remove_session, remove_ssh_target, request_terminal_launch, set_all_preview_blocks_folded,
+    set_session_keep_alive, set_view_mode as daemon_set_view_mode, shutdown as daemon_shutdown,
+    snapshot as daemon_snapshot, snapshot_session_view_for_ui, stage_remote_clipboard_png,
+    start_command_session, start_local_session_at, start_remote_codex_session_at,
+    start_ssh_session_at, status, take_next_app_control_request, terminal_ensure, terminal_read,
+    terminal_resize, terminal_snapshot, terminal_write, toggle_preview_block as daemon_toggle_preview_block,
     update_session_copy as daemon_update_session_copy, validate_server_ui_snapshot,
 };
 use yggui::{
@@ -7687,6 +7687,198 @@ fn runtime_status_matches_current_app(runtime_status: &ServerRuntimeStatus) -> b
     runtime_status.server_version.as_str() == expected_version.as_str()
 }
 
+fn startup_daemon_hot_swap_reason(
+    runtime_status: &ServerRuntimeStatus,
+    expected_version: &str,
+) -> Option<&'static str> {
+    let expected_version = expected_version.trim();
+    let runtime_version = runtime_status.server_version.trim();
+    if expected_version.is_empty()
+        || runtime_version.is_empty()
+        || runtime_version == expected_version
+    {
+        return None;
+    }
+    Some("startup_version_reconcile")
+}
+
+fn startup_daemon_status_recoverable_weight(runtime_status: &ServerRuntimeStatus) -> usize {
+    runtime_status
+        .terminal_session_count
+        .saturating_mul(4)
+        .saturating_add(runtime_status.terminal_session_keys.len().saturating_mul(2))
+        .saturating_add(runtime_status.restored_live_sessions)
+        .saturating_add(runtime_status.managed_session_count)
+}
+
+fn startup_stale_daemon_hot_swap_target<I>(
+    statuses: I,
+    expected_version: &str,
+) -> Option<(ServerEndpoint, ServerRuntimeStatus)>
+where
+    I: IntoIterator<Item = (ServerEndpoint, ServerRuntimeStatus)>,
+{
+    statuses
+        .into_iter()
+        .filter(|(_, runtime_status)| {
+            startup_daemon_hot_swap_reason(runtime_status, expected_version).is_some()
+        })
+        .max_by_key(|(_, runtime_status)| {
+            (
+                usize::from(startup_daemon_status_recoverable_weight(runtime_status) > 0),
+                startup_daemon_status_recoverable_weight(runtime_status),
+                runtime_status.server_pid as usize,
+            )
+        })
+}
+
+fn startup_hot_swap_daemon_executable(current_exe: &Path) -> PathBuf {
+    local_headless_companion_executable_from_current(current_exe)
+        .unwrap_or_else(|| current_exe.to_path_buf())
+}
+
+fn try_startup_stale_daemon_hot_swap(
+    startup_endpoint: &ServerEndpoint,
+    target_endpoint: &ServerEndpoint,
+    runtime_status: &ServerRuntimeStatus,
+    current_exe: &Path,
+    reason: &'static str,
+) -> bool {
+    let expected_version = current_version();
+    let daemon_executable = startup_hot_swap_daemon_executable(current_exe);
+    trace_daemon_step(
+        startup_endpoint,
+        "startup_hot_swap_begin",
+        json!({
+            "reason": reason,
+            "startup_endpoint": format!("{startup_endpoint:?}"),
+            "target_endpoint": format!("{target_endpoint:?}"),
+            "daemon_executable": daemon_executable.display().to_string(),
+            "current_version": expected_version.as_str(),
+            "stale_version": runtime_status.server_version.as_str(),
+            "stale_build_id": runtime_status.server_build_id,
+            "stale_pid": runtime_status.server_pid,
+            "terminal_session_count": runtime_status.terminal_session_count,
+            "terminal_session_keys": &runtime_status.terminal_session_keys,
+            "restored_live_sessions": runtime_status.restored_live_sessions,
+            "managed_session_count": runtime_status.managed_session_count,
+        }),
+    );
+    match hot_restart(
+        target_endpoint,
+        &daemon_executable,
+        Some(expected_version.as_str()),
+        None,
+        Some(reason),
+    ) {
+        Ok(message) => {
+            trace_daemon_step(
+                startup_endpoint,
+                "startup_hot_swap_requested",
+                json!({
+                    "reason": reason,
+                    "target_endpoint": format!("{target_endpoint:?}"),
+                    "message": message,
+                }),
+            );
+        }
+        Err(error) => {
+            trace_daemon_step(
+                startup_endpoint,
+                "startup_hot_swap_request_failed",
+                json!({
+                    "reason": reason,
+                    "target_endpoint": format!("{target_endpoint:?}"),
+                    "error": error.to_string(),
+                }),
+            );
+            return false;
+        }
+    }
+    match wait_for_daemon(startup_endpoint) {
+        Ok(()) => {
+            note_recent_daemon_start(startup_endpoint);
+            trace_daemon_step(
+                startup_endpoint,
+                "startup_hot_swap_ok",
+                json!({
+                    "reason": reason,
+                    "target_endpoint": format!("{target_endpoint:?}"),
+                }),
+            );
+            true
+        }
+        Err(error) => {
+            trace_daemon_step(
+                startup_endpoint,
+                "startup_hot_swap_wait_failed",
+                json!({
+                    "reason": reason,
+                    "target_endpoint": format!("{target_endpoint:?}"),
+                    "error": error.to_string(),
+                }),
+            );
+            false
+        }
+    }
+}
+
+fn reconcile_stale_daemon_on_startup(endpoint: &ServerEndpoint, current_exe: &Path) -> bool {
+    let expected_version = current_version();
+    match status(endpoint) {
+        Ok(runtime_status) if runtime_status_matches_current_app(&runtime_status) => {
+            return false;
+        }
+        Ok(runtime_status) => {
+            let Some(reason) =
+                startup_daemon_hot_swap_reason(&runtime_status, expected_version.as_str())
+            else {
+                return false;
+            };
+            return try_startup_stale_daemon_hot_swap(
+                endpoint,
+                endpoint,
+                &runtime_status,
+                current_exe,
+                reason,
+            );
+        }
+        Err(error) => {
+            trace_daemon_step(
+                endpoint,
+                "startup_hot_swap_direct_status_unreachable",
+                json!({ "error": error.to_string() }),
+            );
+        }
+    }
+
+    let Ok(home) = resolve_yggterm_home() else {
+        return false;
+    };
+    let Some((target_endpoint, runtime_status)) =
+        startup_stale_daemon_hot_swap_target(reachable_versioned_daemon_statuses(&home), &expected_version)
+    else {
+        trace_daemon_step(
+            endpoint,
+                "startup_hot_swap_no_stale_target",
+                json!({
+                    "home": home.display().to_string(),
+                    "current_version": expected_version.as_str(),
+                }),
+            );
+        return false;
+    };
+    let reason = startup_daemon_hot_swap_reason(&runtime_status, expected_version.as_str())
+        .unwrap_or("startup_version_reconcile");
+    try_startup_stale_daemon_hot_swap(
+        endpoint,
+        &target_endpoint,
+        &runtime_status,
+        current_exe,
+        reason,
+    )
+}
+
 fn current_daemon_is_reachable(endpoint: &ServerEndpoint, stage: &'static str) -> bool {
     match status(endpoint) {
         Ok(runtime_status) if runtime_status_matches_current_app(&runtime_status) => true,
@@ -7994,6 +8186,9 @@ fn ensure_daemon_running(endpoint: &ServerEndpoint) -> Result<()> {
         json!({ "path": current_exe.display().to_string() }),
     );
     clear_current_endpoint_link_escaping_home(endpoint);
+    if reconcile_stale_daemon_on_startup(endpoint, &current_exe) {
+        return Ok(());
+    }
     if current_daemon_is_reachable(endpoint, "existing_before_cleanup") {
         note_recent_daemon_start(endpoint);
         trace_daemon_step(
@@ -16844,7 +17039,9 @@ fn queue_delete_selected_items(mut state: Signal<ShellState>, hard_delete: bool)
         {
             shell.server.set_view_mode(WorkspaceViewMode::Rendered);
         }
-        shell.last_action = if hard_delete {
+        shell.last_action = if pending.live_session_close {
+            format!("closing {item_count} terminal runtime(s)")
+        } else if hard_delete {
             format!("permanently deleting {item_count} item(s)")
         } else {
             format!("deleting {item_count} item(s)")
@@ -16938,13 +17135,14 @@ fn queue_delete_selected_items(mut state: Signal<ShellState>, hard_delete: bool)
                 }
                 shell.server_busy = false;
                 shell.clear_drag_state();
-                shell.last_action = format!("deleted {deleted} item(s)");
+                shell.last_action = if pending.live_session_close {
+                    format!("closed {deleted} terminal runtime(s)")
+                } else {
+                    format!("deleted {deleted} item(s)")
+                };
                 shell.refresh_tree_debug("delete_finished");
-                shell.push_notification(
-                    NotificationTone::Success,
-                    "Items Deleted",
-                    format!("Removed {deleted} item(s)."),
-                );
+                let (title, message) = delete_success_notification_text(&pending, deleted);
+                shell.push_notification(NotificationTone::Success, title, message);
             }
             Ok(Err(error)) => {
                 shell.server_busy = false;
@@ -19854,6 +20052,10 @@ async fn capture_dom_debug_snapshot_for(active_session_path: Option<&str>) -> Va
                     last_raw_payload_line_count: mountedHost ? Number(mountedHost.lastRawPayloadLineCount || 0) : 0,
                     scrollback_expected: mountedHost ? Boolean(mountedHost.scrollbackExpected) : false,
                     scrollback_locked: mountedHost ? Boolean(mountedHost.scrollbackLocked) : false,
+                    scrollback_intent: mountedHost ? String(mountedHost.scrollbackIntent || 'PromptFollow') : 'PromptFollow',
+                    scrollback_intent_reason: mountedHost ? String(mountedHost.lastScrollbackIntentReason || '') : '',
+                    scrollback_intent_at_ms: mountedHost ? Number(mountedHost.lastScrollbackIntentAtMs || 0) : 0,
+                    scrollback_snapback_reason: mountedHost ? String(mountedHost.lastScrollbackSnapbackReason || '') : '',
                     screen_present: Boolean(screen),
                     viewport_present: Boolean(viewport),
                     viewport_scroll_top: viewport ? Number(viewport.scrollTop || 0) : null,
@@ -21017,6 +21219,10 @@ async fn capture_dom_debug_snapshot_basic_for(active_session_path: Option<&str>)
                         mounted_entry_host_same: Boolean(mountedHost && mountedHost.host === host),
                         mounted_entry_host_connected: Boolean(mountedHost && mountedHost.host && mountedHost.host.isConnected),
                         scrollback_locked: mountedHost ? Boolean(mountedHost.scrollbackLocked) : false,
+                        scrollback_intent: mountedHost ? String(mountedHost.scrollbackIntent || 'PromptFollow') : 'PromptFollow',
+                        scrollback_intent_reason: mountedHost ? String(mountedHost.lastScrollbackIntentReason || '') : '',
+                        scrollback_intent_at_ms: mountedHost ? Number(mountedHost.lastScrollbackIntentAtMs || 0) : 0,
+                        scrollback_snapback_reason: mountedHost ? String(mountedHost.lastScrollbackSnapbackReason || '') : '',
                         scroll_event_count: mountedHost ? Number(mountedHost.scrollEventCount || 0) : 0,
                         wheel_event_count: mountedHost ? Number(mountedHost.wheelEventCount || 0) : 0,
                         data_event_count: mountedHost ? Number(mountedHost.dataEventCount || 0) : 0,
@@ -22434,6 +22640,13 @@ async fn probe_terminal_viewport_scroll_for(session_path: &str, lines: i32) -> V
                         wheel_event_count: Number(entry.wheelEventCount || 0),
                         scroll_event_count: Number(entry.scrollEventCount || 0),
                         last_wheel_scroll_debug: entry.lastWheelScrollDebug || null,
+                        scrollback_expected: Boolean(entry.scrollbackExpected),
+                        scrollback_locked: Boolean(entry.scrollbackLocked),
+                        scrollback_intent: String(entry.scrollbackIntent || 'PromptFollow'),
+                        scrollback_intent_reason: String(entry.lastScrollbackIntentReason || ''),
+                        scrollback_intent_at_ms: Number(entry.lastScrollbackIntentAtMs || 0),
+                        scrollback_snapback_reason: String(entry.lastScrollbackSnapbackReason || ''),
+                        last_raw_payload_line_count: Number(entry.lastRawPayloadLineCount || 0),
                         data_event_count: Number(entry.dataEventCount || 0),
                         render_event_count: Number(entry.renderEventCount || 0),
                         text_head: String(host.innerText || "").trim().slice(0, 240),
@@ -35375,6 +35588,18 @@ fn TerminalCanvas(
                                     warn!(session=%session_path, %message, "terminal js debug");
                                 }
                             }
+                            Ok(TerminalJsEvent::Perf { name, payload }) => {
+                                append_perf_event(
+                                    &trace_home,
+                                    "terminal_js",
+                                    &name,
+                                    json!({
+                                        "session_path": session_path.clone(),
+                                        "host_id": host_id.clone(),
+                                        "payload": payload,
+                                    }),
+                                );
+                            }
                             Err(error) => {
                                 let _ = safe_shell_mut(state, "terminal_attach_bridge_closed", |shell| {
                                     release_terminal_bootstrap_lease_if_current(
@@ -40242,6 +40467,8 @@ fn terminal_eval_script_with_canvas_renderer(
                 if (term.cols === proposed.cols && term.rows === proposed.rows) {{
                     return false;
                 }}
+                const previousCols = term.cols;
+                const previousRows = term.rows;
                 term.resize(proposed.cols, proposed.rows);
                 if (window.__yggtermXtermHosts && window.__yggtermXtermHosts[hostId]) {{
                     window.__yggtermXtermHosts[hostId].lastExplicitFit = {{
@@ -40255,6 +40482,15 @@ fn terminal_eval_script_with_canvas_renderer(
                         at_ms: Date.now(),
                     }};
                 }}
+                emitPerf("xterm_fit", {{
+                    reason,
+                    previous_cols: previousCols,
+                    previous_rows: previousRows,
+                    proposed_cols: proposed.cols,
+                    proposed_rows: proposed.rows,
+                    available_width_px: proposed.available_width_px,
+                    available_height_px: proposed.available_height_px,
+                }});
                 return true;
             }} catch (_error) {{
                 try {{
@@ -40998,7 +41234,13 @@ fn terminal_eval_script_with_canvas_renderer(
         let writeBridgeFlushTimer = null;
         let hostHealthFramePending = false;
         let lastHostHealthAtMs = 0;
+        let terminalInputHotUntilMs = 0;
         let scrollbackLocked = false;
+        let scrollbackIntent = 'PromptFollow';
+        let lastScrollbackIntentReason = 'initial';
+        let lastScrollbackIntentAtMs = Date.now();
+        let promptFollowScrollGuardUntilMs = 0;
+        let lastScrollbackSnapbackReason = '';
         let lowPowerTuiOverlay = null;
         let lowPowerTuiActive = false;
         let lowPowerTuiFrameCount = 0;
@@ -41039,7 +41281,50 @@ fn terminal_eval_script_with_canvas_renderer(
         const syncCursorOverlay = () => {{
             syncFocusClass();
         }};
-        const syncScrollbackLock = () => {{
+        const syncHostScrollbackIntent = () => {{
+            try {{
+                const entry = window.__yggtermXtermHosts && window.__yggtermXtermHosts[hostId]
+                    ? window.__yggtermXtermHosts[hostId]
+                    : null;
+                if (!entry) {{
+                    return;
+                }}
+                entry.scrollbackIntent = scrollbackIntent;
+                entry.lastScrollbackIntentReason = lastScrollbackIntentReason;
+                entry.lastScrollbackIntentAtMs = lastScrollbackIntentAtMs;
+                entry.lastScrollbackSnapbackReason = lastScrollbackSnapbackReason;
+            }} catch (_error) {{}}
+        }};
+        const setScrollbackIntent = (intent, reason) => {{
+            const next = intent === 'UserScrollback' ? 'UserScrollback' : 'PromptFollow';
+            const nextReason = String(reason || 'unknown');
+            if (scrollbackIntent === next && lastScrollbackIntentReason === nextReason) {{
+                syncHostScrollbackIntent();
+                return;
+            }}
+            scrollbackIntent = next;
+            lastScrollbackIntentReason = nextReason;
+            lastScrollbackIntentAtMs = Date.now();
+            syncHostScrollbackIntent();
+            dioxus.send({{
+                kind: "debug",
+                message: `scrollback_intent host=${{hostId}} intent=${{scrollbackIntent}} reason=${{lastScrollbackIntentReason}}`
+            }});
+        }};
+        const markTerminalInputHot = (reason = 'input') => {{
+            terminalInputHotUntilMs = Math.max(terminalInputHotUntilMs, Date.now() + 650);
+            try {{
+                const entry = window.__yggtermXtermHosts && window.__yggtermXtermHosts[hostId]
+                    ? window.__yggtermXtermHosts[hostId]
+                    : null;
+                if (entry) {{
+                    entry.terminalInputHotUntilMs = terminalInputHotUntilMs;
+                    entry.lastTerminalInputHotReason = String(reason || 'input');
+                }}
+            }} catch (_error) {{}}
+        }};
+        const terminalInputHot = () => Date.now() < terminalInputHotUntilMs;
+        const syncScrollbackLock = (reason = '') => {{
             try {{
                 if (!term || !term.buffer || !term.buffer.active) {{
                     scrollbackLocked = false;
@@ -41048,6 +41333,16 @@ fn terminal_eval_script_with_canvas_renderer(
                     const viewportY = Math.max(0, Number(active.viewportY || 0));
                     const baseY = Math.max(0, Number(active.baseY || 0));
                     scrollbackLocked = viewportY < baseY;
+                    if (!scrollbackLocked && scrollbackIntent === 'UserScrollback') {{
+                        setScrollbackIntent('PromptFollow', reason ? `${{reason}}_reached_bottom` : 'reached_bottom');
+                    }} else if (
+                        scrollbackLocked
+                        && scrollbackIntent !== 'UserScrollback'
+                        && reason === 'scroll_event'
+                        && Date.now() > promptFollowScrollGuardUntilMs
+                    ) {{
+                        setScrollbackIntent('UserScrollback', 'scroll_event');
+                    }}
                 }}
             }} catch (_error) {{
                 scrollbackLocked = false;
@@ -41055,7 +41350,25 @@ fn terminal_eval_script_with_canvas_renderer(
             if (window.__yggtermXtermHosts && window.__yggtermXtermHosts[hostId]) {{
                 window.__yggtermXtermHosts[hostId].scrollbackLocked = scrollbackLocked;
             }}
+            syncHostScrollbackIntent();
             return scrollbackLocked;
+        }};
+        const emitPerf = (name, payload = {{}}) => {{
+            try {{
+                dioxus.send({{
+                    kind: "perf",
+                    name: String(name || "terminal_event"),
+                    payload: {{
+                        ...payload,
+                        host_id: hostId,
+                        session_path: host.getAttribute("data-terminal-session-path") || "",
+                        cols: term ? Number(term.cols || 0) : 0,
+                        rows: term ? Number(term.rows || 0) : 0,
+                        scrollback_intent: scrollbackIntent,
+                        scrollback_locked: Boolean(scrollbackLocked),
+                    }},
+                }});
+            }} catch (_error) {{}}
         }};
         const stretchXtermRoot = () => {{
             const xtermRoot = host.querySelector('.xterm');
@@ -41252,10 +41565,13 @@ fn terminal_eval_script_with_canvas_renderer(
         const requestVisiblePaint = (forceFullRefresh = true) => {{
             requestAnimationFrame(() => {{
                 rebindCurrentHost('request_visible_paint', true);
+                const inputHot = terminalInputHot();
                 try {{
                     stretchXtermRoot();
-                    fitTerminalToHost('visible_paint');
-                    applyTerminalRowFitGuard('visible_paint');
+                    if (!inputHot) {{
+                        fitTerminalToHost('visible_paint');
+                        applyTerminalRowFitGuard('visible_paint');
+                    }}
                 }} catch (_error) {{}}
                 const metrics = hostMetrics();
                 if (hostLooksUsable() && term.rows <= 1) {{
@@ -41275,8 +41591,17 @@ fn terminal_eval_script_with_canvas_renderer(
                     }});
                 }}
                 try {{
-                    if (forceFullRefresh && term.refresh) {{
+                    if (forceFullRefresh && term.refresh && !inputHot) {{
                         term.refresh(0, Math.max(0, term.rows - 1));
+                        emitPerf("xterm_forced_refresh", {{
+                            reason: "visible_paint",
+                            force_full_refresh: Boolean(forceFullRefresh),
+                        }});
+                    }} else if (forceFullRefresh && inputHot) {{
+                        emitPerf("xterm_forced_refresh_skipped", {{
+                            reason: "input_hot",
+                            force_full_refresh: Boolean(forceFullRefresh),
+                        }});
                     }}
                 }} catch (_error) {{}}
                 emitPaint();
@@ -41335,6 +41660,12 @@ fn terminal_eval_script_with_canvas_renderer(
         }};
         const requestRenderProbe = (reason) => {{
             const now = Date.now();
+            if (
+                terminalInputHot()
+                && (reason === 'render' || reason === 'write_parsed' || reason === 'write_flush')
+            ) {{
+                return;
+            }}
             if (renderProbeFramePending || (now - lastRenderProbeAtMs < 220)) {{
                 return;
             }}
@@ -41568,7 +41899,8 @@ fn terminal_eval_script_with_canvas_renderer(
             }}
             ensureVisibleHost('set_input_enabled');
             emitResize();
-            scrollLiveCursorIntoView(Boolean(focus));
+            const focusShouldFollowPrompt = Boolean(focus) && scrollbackIntent !== 'UserScrollback';
+            scrollLiveCursorIntoView(focusShouldFollowPrompt, focus ? 'focus' : 'set_input_enabled');
             requestVisiblePaint();
             window.requestAnimationFrame(() => {{
                 stretchXtermRoot();
@@ -41633,6 +41965,11 @@ fn terminal_eval_script_with_canvas_renderer(
                     0,
                     Math.min(baseY, currentViewportY + (event.deltaY > 0 ? deltaLines : -deltaLines)),
                 );
+                if (targetViewportY < baseY) {{
+                    setScrollbackIntent('UserScrollback', 'wheel');
+                }} else {{
+                    setScrollbackIntent('PromptFollow', 'wheel_reached_bottom');
+                }}
                 wheelDebug.target_viewport_y = targetViewportY;
                 if (typeof term.scrollToLine === "function") {{
                     term.scrollToLine(targetViewportY);
@@ -41689,12 +42026,15 @@ fn terminal_eval_script_with_canvas_renderer(
             }} else {{
                 const scrollLinesDelta = event.deltaY > 0 ? deltaLines : -deltaLines;
                 wheelDebug.scroll_lines_delta = scrollLinesDelta;
+                if (scrollLinesDelta < 0) {{
+                    setScrollbackIntent('UserScrollback', 'wheel_scroll_lines');
+                }}
                 term.scrollLines(scrollLinesDelta);
             }}
             if (window.__yggtermXtermHosts && window.__yggtermXtermHosts[hostId]) {{
                 window.__yggtermXtermHosts[hostId].lastWheelScrollDebug = wheelDebug;
             }}
-            syncScrollbackLock();
+            syncScrollbackLock('wheel');
             event.preventDefault();
             if (event.stopImmediatePropagation) {{
                 event.stopImmediatePropagation();
@@ -41876,16 +42216,22 @@ fn terminal_eval_script_with_canvas_renderer(
                 return true;
             }}
         }};
-        const scrollLiveCursorIntoView = (force = false) => {{
+        const scrollLiveCursorIntoView = (force = false, reason = '') => {{
             try {{
                 if (!term || !term.buffer || !term.buffer.active) {{
+                    return;
+                }}
+                if (!force && scrollbackIntent === 'UserScrollback') {{
+                    syncScrollbackLock(reason || 'user_scrollback');
                     return;
                 }}
                 if (!force && syncScrollbackLock()) {{
                     return;
                 }}
                 if (force) {{
+                    setScrollbackIntent('PromptFollow', reason || 'prompt_follow');
                     scrollbackLocked = false;
+                    promptFollowScrollGuardUntilMs = Date.now() + 180;
                     if (window.__yggtermXtermHosts && window.__yggtermXtermHosts[hostId]) {{
                         window.__yggtermXtermHosts[hostId].scrollbackLocked = false;
                     }}
@@ -41907,7 +42253,7 @@ fn terminal_eval_script_with_canvas_renderer(
                 }} else if (typeof term.scrollToBottom === 'function') {{
                     term.scrollToBottom();
                 }}
-                syncScrollbackLock();
+                syncScrollbackLock(reason || 'prompt_follow');
             }} catch (_error) {{}}
         }};
         attachHostInteractions(host);
@@ -41994,6 +42340,14 @@ fn terminal_eval_script_with_canvas_renderer(
                     event.stopPropagation();
                 }}
                 return false;
+            }}
+            const rawKey = String(event.key || '');
+            if (rawKey === 'PageUp' || rawKey === 'PageDown' || rawKey === 'Home' || rawKey === 'End') {{
+                if (rawKey === 'PageUp' || rawKey === 'Home') {{
+                    setScrollbackIntent('UserScrollback', `key_${{rawKey}}`);
+                }} else {{
+                    window.setTimeout(() => syncScrollbackLock(`key_${{rawKey}}`), 0);
+                }}
             }}
             const accel = event.ctrlKey || event.metaKey;
             const key = (event.key || '').toLowerCase();
@@ -42082,6 +42436,12 @@ fn terminal_eval_script_with_canvas_renderer(
                     requestRenderProbe('resize');
                     scheduleSettledResizePaint();
                     if (resizeChanged) {{
+                        emitPerf("xterm_resize", {{
+                            reason: "resize",
+                            cols: term.cols,
+                            rows: term.rows,
+                            row_fit_guard_applied: Boolean(rowFitGuardApplied),
+                        }});
                         scheduleResizeNotification();
                     }}
                 }}
@@ -42149,6 +42509,10 @@ fn terminal_eval_script_with_canvas_renderer(
             lastRawPayloadLineCount: 0,
             scrollbackExpected: false,
             scrollbackLocked,
+            scrollbackIntent,
+            lastScrollbackIntentReason,
+            lastScrollbackIntentAtMs,
+            lastScrollbackSnapbackReason,
         }};
         dioxus.send({{
             kind: "debug",
@@ -42455,6 +42819,10 @@ fn terminal_eval_script_with_canvas_renderer(
         }};
         const finalizeWriteFlush = (flushShouldFollow, callbackFired, paintRepairReason = '') => {{
             const currentEntry = window.__yggtermXtermHosts && window.__yggtermXtermHosts[hostId];
+            const now = Date.now();
+            const flushElapsedMs = lastWriteFlushStartedAtMs > 0
+                ? Math.max(0, now - lastWriteFlushStartedAtMs)
+                : null;
             if (currentEntry) {{
                 currentEntry.writeBridgeInFlight = false;
                 if (callbackFired) {{
@@ -42462,7 +42830,6 @@ fn terminal_eval_script_with_canvas_renderer(
                         Number(currentEntry.writeCallbackCount || 0) + 1;
                     currentEntry.lastWriteCallbackAtMs = Date.now();
                 }}
-                const now = Date.now();
                 if (now - lastWriteAppliedSampleAtMs >= 250) {{
                     lastWriteAppliedSampleAtMs = now;
                     currentEntry.lastWriteAppliedTail =
@@ -42479,6 +42846,16 @@ fn terminal_eval_script_with_canvas_renderer(
             }} else {{
                 requestRenderProbe('write_flush');
             }}
+                emitPerf("xterm_write_flush", {{
+                    callback_fired: Boolean(callbackFired),
+                    flush_should_follow: Boolean(flushShouldFollow),
+                    paint_repair: Boolean(paintRepairReason),
+                    paint_repair_reason: String(paintRepairReason || ''),
+                    elapsed_ms: flushElapsedMs,
+                    pending_chars: currentEntry ? String(currentEntry.writeBridgePendingData || '').length : 0,
+                    last_raw_payload_length: currentEntry ? Number(currentEntry.lastRawPayloadLength || 0) : 0,
+                    last_raw_payload_line_count: currentEntry ? Number(currentEntry.lastRawPayloadLineCount || 0) : 0,
+                }});
                 emitHostHealthThrottled();
                 schedulePendingWriteFlush(false);
             }};
@@ -42523,15 +42900,27 @@ fn terminal_eval_script_with_canvas_renderer(
             if (!retainedScrollbackReplay) {{
                 payload = coalesceHighVolumeTerminalPayload(payload);
             }}
-            const paintRepairReason = (
+            const initialRetainedRepair =
                 retainedWritePaintRepairCount < 2
-                || (retainedWritePaintRepairCount < 4 && rawPayloadLength >= 4096 && !rawFrameLike)
+                && expectedScrollbackPayload
+                && rawPayloadLength >= 1024;
+            const bulkNormalRepair =
+                retainedWritePaintRepairCount < 4
+                && rawPayloadLength >= 4096
+                && !rawFrameLike;
+            const paintRepairReason = (
+                retainedScrollbackReplay
+                || initialRetainedRepair
+                || bulkNormalRepair
             ) ? `write_flush_retained len=${{rawPayloadLength}} frame=${{rawFrameLike}}` : '';
             entry.writeBridgeInFlight = true;
                 entry.writeBridgeFlushCount = Number(entry.writeBridgeFlushCount || 0) + 1;
                 lastWriteFlushStartedAtMs = Date.now();
                 entry.lastWriteFlushStartedAtMs = lastWriteFlushStartedAtMs;
-                const flushShouldFollow = !syncScrollbackLock() && liveCursorNearBottom();
+                const flushShouldFollow =
+                    scrollbackIntent !== 'UserScrollback'
+                    && !syncScrollbackLock()
+                    && liveCursorNearBottom();
             const syncWrite = term && term._core && typeof term._core.writeSync === 'function'
                 ? term._core.writeSync.bind(term._core)
                 : entry && entry.term && entry.term._core && entry.term._core._writeBuffer && typeof entry.term._core._writeBuffer.writeSync === 'function'
@@ -42633,7 +43022,7 @@ fn terminal_eval_script_with_canvas_renderer(
                 if (window.__yggtermXtermHosts && window.__yggtermXtermHosts[hostId]) {{
                     window.__yggtermXtermHosts[hostId].scrollEventCount = scrollEventCount;
                 }}
-                syncScrollbackLock();
+                syncScrollbackLock('scroll_event');
                 emitHostHealth();
             }})
             : null;
@@ -42765,11 +43154,13 @@ fn terminal_eval_script_with_canvas_renderer(
                 window.__yggtermXtermHosts[hostId].dataEventCount = dataEventCount;
                 window.__yggtermXtermHosts[hostId].lastDataEventAtMs = Date.now();
             }}
+            markTerminalInputHot('data');
+            setScrollbackIntent('PromptFollow', 'input');
             scrollbackLocked = false;
             if (window.__yggtermXtermHosts && window.__yggtermXtermHosts[hostId]) {{
                 window.__yggtermXtermHosts[hostId].scrollbackLocked = scrollbackLocked;
             }}
-            scrollLiveCursorIntoView(true);
+            scrollLiveCursorIntoView(true, 'input');
             dioxus.send({{ kind: "input", data }});
         }});
         window.__yggtermXtermCleanups[hostId] = () => {{
@@ -44944,6 +45335,29 @@ fn delete_confirm_dialog_text(pending: &PendingDeleteDialog) -> DeleteConfirmDia
         },
         action_label: "Delete".to_string(),
     }
+}
+fn delete_success_notification_text(
+    pending: &PendingDeleteDialog,
+    affected: usize,
+) -> (&'static str, String) {
+    if pending.live_session_close {
+        return (
+            if affected == 1 {
+                "Terminal Closed"
+            } else {
+                "Terminals Closed"
+            },
+            if affected == 1 {
+                "Closed the live terminal runtime. Stored session metadata and transcripts remain."
+                    .to_string()
+            } else {
+                format!(
+                    "Closed {affected} live terminal runtimes. Stored session metadata and transcripts remain."
+                )
+            },
+        );
+    }
+    ("Items Deleted", format!("Removed {affected} item(s)."))
 }
 #[component]
 fn DeleteConfirmOverlay(
@@ -47629,6 +48043,32 @@ mod tests {
     use super::*;
     use yggterm_core::SessionNodeKind;
     use yggterm_server::SessionPreview;
+
+    fn runtime_status_for_test(
+        server_version: &str,
+        terminal_session_count: usize,
+        server_pid: u32,
+    ) -> ServerRuntimeStatus {
+        serde_json::from_value(json!({
+            "server_version": server_version,
+            "server_build_id": 0,
+            "server_pid": server_pid,
+            "host_kind": "local",
+            "host_detail": "test",
+            "embedded_surface_supported": true,
+            "bridge_enabled": true,
+            "restored_live_sessions": terminal_session_count,
+            "terminal_session_count": terminal_session_count,
+            "terminal_session_keys": if terminal_session_count > 0 {
+                vec!["local://test".to_string()]
+            } else {
+                Vec::<String>::new()
+            },
+            "managed_session_count": 0,
+        }))
+        .expect("test runtime status")
+    }
+
     #[test]
     fn terminal_zoom_clamps_to_fifty_percent_floor() {
         assert_eq!(clamp_zoom_value_main(0.0, WorkspaceViewMode::Terminal), 7.0);
@@ -47871,6 +48311,46 @@ mod tests {
         );
         assert!(!text.copy.contains("permanently remove"));
     }
+
+    #[test]
+    fn live_session_close_success_uses_terminal_copy_not_item_delete_copy() {
+        let pending = PendingDeleteDialog {
+            document_paths: Vec::new(),
+            group_paths: Vec::new(),
+            session_paths: vec!["local://abc123".to_string()],
+            ssh_machine_keys: Vec::new(),
+            labels: vec!["Local Shell".to_string()],
+            hard_delete: false,
+            live_session_close: true,
+        };
+
+        let (title, message) = delete_success_notification_text(&pending, 1);
+
+        assert_eq!(title, "Terminal Closed");
+        assert!(message.contains("Closed the live terminal runtime"));
+        assert!(message.contains("Stored session metadata and transcripts remain"));
+        assert!(!title.contains("Item"));
+        assert!(!message.to_ascii_lowercase().contains("deleted"));
+    }
+
+    #[test]
+    fn generic_delete_success_keeps_item_delete_copy() {
+        let pending = PendingDeleteDialog {
+            document_paths: vec!["notes/readme".to_string()],
+            group_paths: Vec::new(),
+            session_paths: Vec::new(),
+            ssh_machine_keys: Vec::new(),
+            labels: vec!["Readme".to_string()],
+            hard_delete: false,
+            live_session_close: false,
+        };
+
+        let (title, message) = delete_success_notification_text(&pending, 2);
+
+        assert_eq!(title, "Items Deleted");
+        assert_eq!(message, "Removed 2 item(s).");
+    }
+
     #[test]
     fn selected_session_delete_dialog_does_not_claim_live_runtime_close() {
         let pending = PendingDeleteDialog {
@@ -47889,6 +48369,43 @@ mod tests {
         assert_eq!(text.action_label, "Delete");
         assert!(text.copy.contains("selected session rows"));
         assert!(!text.copy.contains("server-owned terminal runtime"));
+    }
+
+    #[test]
+    fn startup_hot_swap_reason_targets_stale_daemon_versions_only() {
+        let stale = runtime_status_for_test("2.1.51", 1, 4100);
+        let current = runtime_status_for_test("2.1.52", 1, 4101);
+
+        assert_eq!(
+            startup_daemon_hot_swap_reason(&stale, "2.1.52"),
+            Some("startup_version_reconcile")
+        );
+        assert_eq!(startup_daemon_hot_swap_reason(&current, "2.1.52"), None);
+        assert_eq!(startup_daemon_hot_swap_reason(&stale, ""), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn startup_hot_swap_target_prefers_recoverable_stale_daemon() {
+        let stale_empty = runtime_status_for_test("2.1.49", 0, 100);
+        let stale_with_sessions = runtime_status_for_test("2.1.50", 2, 90);
+        let current = runtime_status_for_test("2.1.52", 9, 999);
+        let empty_endpoint = ServerEndpoint::UnixSocket(PathBuf::from("/tmp/server-2-1-49.sock"));
+        let live_endpoint = ServerEndpoint::UnixSocket(PathBuf::from("/tmp/server-2-1-50.sock"));
+        let current_endpoint = ServerEndpoint::UnixSocket(PathBuf::from("/tmp/server-2-1-52.sock"));
+
+        let target = startup_stale_daemon_hot_swap_target(
+            vec![
+                (empty_endpoint, stale_empty),
+                (live_endpoint.clone(), stale_with_sessions),
+                (current_endpoint, current),
+            ],
+            "2.1.52",
+        )
+        .expect("stale hot-swap target");
+
+        assert_eq!(target.0, live_endpoint);
+        assert_eq!(target.1.terminal_session_count, 2);
     }
 
     #[test]
@@ -48981,20 +49498,44 @@ mod tests {
         let theme = terminal_theme(UiTheme::ZedLight, palette(UiTheme::ZedLight), 13.0, "");
         let script = terminal_eval_script("yggterm-terminal-test", &theme, true);
         assert!(
-            script.contains("const scrollLiveCursorIntoView = (force = false) => {"),
+            script.contains("const scrollLiveCursorIntoView = (force = false, reason = '') => {"),
             "cursor-follow helper should support a forced path for user input"
+        );
+        assert!(
+            script.contains("if (!force && scrollbackIntent === 'UserScrollback') {")
+                && script.contains("syncScrollbackLock(reason || 'user_scrollback');"),
+            "explicit user scrollback should block passive follow even before xterm emits a settled scroll lock"
         );
         assert!(
             script.contains("if (!force && syncScrollbackLock()) {"),
             "manual scrollback should still block passive output follow"
         );
         assert!(
-            script.contains("scrollLiveCursorIntoView(Boolean(focus));"),
-            "opening/focusing an active terminal should reveal the live cursor"
+            script.contains("const focusShouldFollowPrompt = Boolean(focus) && scrollbackIntent !== 'UserScrollback';"),
+            "focus repair should not steal an active user scrollback viewport"
         );
         assert!(
-            script.contains("scrollLiveCursorIntoView(true);\n            dioxus.send({ kind: \"input\", data });"),
+            script.contains("setScrollbackIntent('PromptFollow', 'input');")
+                && script.contains("scrollLiveCursorIntoView(true, 'input');\n            dioxus.send({ kind: \"input\", data });"),
             "real terminal input should reveal the prompt before forwarding bytes"
+        );
+    }
+
+    #[test]
+    fn terminal_eval_script_tracks_explicit_scrollback_intent() {
+        let theme = terminal_theme(UiTheme::ZedLight, palette(UiTheme::ZedLight), 13.0, "");
+        let script = terminal_eval_script("yggterm-terminal-test", &theme, true);
+        assert!(script.contains("let scrollbackIntent = 'PromptFollow';"));
+        assert!(script.contains("const setScrollbackIntent = (intent, reason) => {"));
+        assert!(script.contains("const markTerminalInputHot = (reason = 'input') => {"));
+        assert!(script.contains("const terminalInputHot = () => Date.now() < terminalInputHotUntilMs;"));
+        assert!(script.contains("setScrollbackIntent('UserScrollback', 'wheel');"));
+        assert!(script.contains("setScrollbackIntent('PromptFollow', 'wheel_reached_bottom');"));
+        assert!(script.contains("entry.scrollbackIntent = scrollbackIntent;"));
+        assert!(script.contains("scrollbackIntent,"));
+        assert!(
+            script.contains("syncScrollbackLock('scroll_event');"),
+            "xterm scroll events should keep the explicit intent observable"
         );
     }
 
@@ -49007,6 +49548,14 @@ mod tests {
             "hot xterm render callbacks should use a throttled probe helper"
         );
         assert!(
+            script.contains("const emitPerf = (name, payload = {}) => {")
+                && script.contains("kind: \"perf\"")
+                && script.contains("emitPerf(\"xterm_write_flush\"")
+                && script.contains("emitPerf(\"xterm_fit\"")
+                && script.contains("emitPerf(\"xterm_resize\""),
+            "terminal hot paths should emit bounded local perf telemetry for latency investigations"
+        );
+        assert!(
             script.contains("if (renderProbeFramePending || (now - lastRenderProbeAtMs < 220))"),
             "render bridge probes should be rate-limited so TUI output does not churn WebKit"
         );
@@ -49016,11 +49565,17 @@ mod tests {
         );
         assert!(
             script.contains("const scheduleRetainedWritePaintRepair = (reason) => {")
-                && script.contains("retainedWritePaintRepairCount < 2")
+                && script.contains("const initialRetainedRepair =")
+                && script.contains("&& expectedScrollbackPayload")
                 && script.contains(
-                    "retainedWritePaintRepairCount < 4 && rawPayloadLength >= 4096 && !rawFrameLike"
+                    "retainedWritePaintRepairCount < 4"
                 ),
-            "retained-session and non-frame bulk writes should schedule a bounded visible repaint repair for WebKit canvas"
+            "only retained-session and non-frame bulk writes should schedule a bounded visible repaint repair for WebKit canvas"
+        );
+        assert!(
+            script.contains("if (forceFullRefresh && term.refresh && !inputHot)")
+                && script.contains("xterm_forced_refresh_skipped"),
+            "input-hot paint repairs must skip full-canvas refreshes while the user is typing"
         );
         assert!(
             script.contains("scrollbackExpected: false")
