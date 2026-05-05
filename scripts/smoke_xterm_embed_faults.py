@@ -33,6 +33,8 @@ IDLE_TERMINAL_IO_MAX_DELTA = 44
 IDLE_TERMINAL_IO_BUSY_MAX_DELTA = 56
 IDLE_TERMINAL_IO_BASELINE_HOST_COUNT = 4
 TERMINAL_INTERACTION_LATENCY_MAX_MS = 3000.0
+TERMINAL_INTERACTION_FORCED_REFRESH_MAX = 80
+TERMINAL_INTERACTION_FORCED_REFRESH_DELTA_MAX = 12
 SIDEBAR_MIN_WIDTH = 220.0
 SIDEBAR_MAX_WIDTH = 420.0
 TITLEBAR_AUTOHIDE_SENSOR_HEIGHT_MAX_PX = 8.5
@@ -14680,6 +14682,37 @@ def assert_selection(pid: int, session: str) -> dict:
     }
 
 
+def assert_active_runtime_truth_present(state: dict, session: str, context: str) -> None:
+    runtime_truth = state.get("runtime_truth") or {}
+    viewport = viewport_state(state)
+    active_view_mode = str(
+        viewport.get("active_view_mode") or state.get("active_view_mode") or ""
+    ).strip()
+    if active_view_mode != "Terminal":
+        return
+    host = host_for_session_or_none(state, session)
+    if host is None:
+        return
+    host_ready = (
+        runtime_truth.get("active_host_ready") is True
+        or viewport.get("ready") is True
+    )
+    host_input_enabled = (
+        runtime_truth.get("active_host_input_enabled") is True
+        or host.get("input_enabled") is True
+    )
+    if (
+        host_ready
+        and host_input_enabled
+        and runtime_truth.get("active_runtime_present") is not True
+    ):
+        raise AssertionError(
+            "terminal runtime truth lost the active daemon runtime: "
+            f"context={context!r} session={session!r} runtime_truth={runtime_truth!r} "
+            f"active_host={host!r}"
+        )
+
+
 def assert_terminal_interaction_latency(pid: int, session: str) -> dict:
     focus_response, focus_elapsed_ms = run_timed(
         "server",
@@ -14713,6 +14746,13 @@ def assert_terminal_interaction_latency(pid: int, session: str) -> dict:
     if int(select_data.get("selected_text_length") or 0) <= 0:
         raise AssertionError(f"selection probe did not capture visible text during latency check: {select_response!r}")
 
+    ready_state = wait_for_session_focus(pid, session, timeout_seconds=10.0)
+    assert_active_runtime_truth_present(
+        ready_state,
+        session,
+        "terminal_interaction_latency_before_type",
+    )
+
     type_response, type_elapsed_ms = run_timed(
         "server",
         "app",
@@ -14731,9 +14771,19 @@ def assert_terminal_interaction_latency(pid: int, session: str) -> dict:
     )
     type_data = unwrap_data(type_response)
     active_state = wait_for_session_focus(pid, session, timeout_seconds=10.0)
+    assert_active_runtime_truth_present(
+        active_state,
+        session,
+        "terminal_interaction_latency_after_type",
+    )
     active = host_for_session(active_state, session)
     cursor_line_text = str(active.get("cursor_line_text") or active.get("cursor_row_text") or "")
     text_tail = str(active.get("text_sample") or "")
+    type_before = type_data.get("before") or {}
+    type_after = type_data.get("after") or {}
+    forced_refresh_before = int(type_before.get("forced_refresh_count") or 0)
+    forced_refresh_after = int(type_after.get("forced_refresh_count") or 0)
+    forced_refresh_delta = max(0, forced_refresh_after - forced_refresh_before)
     cleanup_response = terminal_send(pid, session, "\u0015")
     if not cleanup_response or not bool((cleanup_response.get("data") or {}).get("accepted")):
         raise AssertionError(
@@ -14741,6 +14791,16 @@ def assert_terminal_interaction_latency(pid: int, session: str) -> dict:
             f"response={cleanup_response!r}"
         )
     time.sleep(0.12)
+    if (
+        forced_refresh_after > TERMINAL_INTERACTION_FORCED_REFRESH_MAX
+        or forced_refresh_delta > TERMINAL_INTERACTION_FORCED_REFRESH_DELTA_MAX
+    ):
+        raise AssertionError(
+            "terminal visible-paint forced refresh loop exceeded budget: "
+            f"after={forced_refresh_after} max={TERMINAL_INTERACTION_FORCED_REFRESH_MAX} "
+            f"delta={forced_refresh_delta} delta_max={TERMINAL_INTERACTION_FORCED_REFRESH_DELTA_MAX} "
+            f"type_data={type_data!r} cursor_line={cursor_line_text!r}"
+        )
     if type_elapsed_ms > TERMINAL_INTERACTION_LATENCY_MAX_MS:
         raise AssertionError(
             f"terminal type probe exceeded latency budget: elapsed_ms={type_elapsed_ms:.1f} "
@@ -14785,6 +14845,8 @@ def assert_terminal_interaction_latency(pid: int, session: str) -> dict:
         "type_elapsed_ms": round(type_elapsed_ms, 1),
         "scroll_elapsed_ms": round(scroll_elapsed_ms, 1),
         "latency_budget_ms": TERMINAL_INTERACTION_LATENCY_MAX_MS,
+        "forced_refresh_after_type": forced_refresh_after,
+        "forced_refresh_delta_type": forced_refresh_delta,
         "type_cursor_line_text": cursor_line_text,
         "type_text_tail": text_tail[-240:],
         "type_keyboard_backend": type_data.get("keyboard_backend"),
