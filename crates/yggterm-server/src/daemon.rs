@@ -767,6 +767,8 @@ impl DaemonRuntime {
 
     fn snapshot_response(&self, message: Option<String>) -> ServerResponse {
         let mut snapshot = self.server.snapshot();
+        let runtime_keys = self.terminals.session_keys().into_iter().collect();
+        apply_terminal_runtime_truth_to_snapshot(&self.server, &runtime_keys, &mut snapshot);
         if let Some(active_session) = snapshot.active_session.as_mut() {
             self.overlay_terminal_runtime_snapshot_session(active_session);
         }
@@ -1873,6 +1875,52 @@ impl DaemonRuntime {
         }
         Ok(response)
     }
+}
+
+fn snapshot_session_requires_terminal_runtime(session: &SnapshotSessionView) -> bool {
+    matches!(
+        session.source,
+        crate::SessionSource::LiveLocal | crate::SessionSource::LiveSsh
+    ) && session.kind != SessionKind::Document
+}
+
+fn apply_terminal_runtime_truth_to_snapshot(
+    server: &YggtermServer,
+    runtime_keys: &HashSet<String>,
+    snapshot: &mut ServerUiSnapshot,
+) {
+    snapshot.live_sessions.retain(|session| {
+        runtime_keys.contains(&server.terminal_runtime_key_for_path(&session.session_path))
+    });
+
+    let active_path = snapshot.active_session_path.clone().or_else(|| {
+        snapshot
+            .active_session
+            .as_ref()
+            .map(|session| session.session_path.clone())
+    });
+    let Some(active_path) = active_path else {
+        return;
+    };
+    let active_runtime_present =
+        runtime_keys.contains(&server.terminal_runtime_key_for_path(&active_path));
+    let active_requires_runtime = snapshot
+        .active_session
+        .as_ref()
+        .is_some_and(snapshot_session_requires_terminal_runtime)
+        || snapshot.active_view_mode == WorkspaceViewMode::Terminal;
+    if !active_requires_runtime || active_runtime_present {
+        return;
+    }
+
+    if let Some(preview) = server.remote_preview_snapshot_session_for_path(&active_path) {
+        snapshot.active_session_path = Some(preview.session_path.clone());
+        snapshot.active_session = Some(preview);
+    } else {
+        snapshot.active_session_path = None;
+        snapshot.active_session = None;
+    }
+    snapshot.active_view_mode = WorkspaceViewMode::Rendered;
 }
 
 fn trim_terminal_buffers(
@@ -4368,8 +4416,9 @@ fn terminal_write_strategy_for_path(
 #[cfg(test)]
 mod tests {
     use super::{
-        RemoteMachineRefreshQueueStatus, daemon_background_copy_chore_enabled_from_env,
-        mark_remote_machine_refresh_queued, terminal_sidebar_snapshot_from_screen,
+        RemoteMachineRefreshQueueStatus, apply_terminal_runtime_truth_to_snapshot,
+        daemon_background_copy_chore_enabled_from_env, mark_remote_machine_refresh_queued,
+        terminal_sidebar_snapshot_from_screen,
     };
     use std::collections::HashSet;
     use std::fs;
@@ -4396,9 +4445,61 @@ mod tests {
         versioned_server_socket_alias_candidates, versioned_socket_alias_is_legacy,
     };
     use crate::{
-        PersistedDaemonState, PersistedLiveSession, RemoteDeployState, RemoteMachineHealth,
-        RemoteMachineSnapshot, RemoteScannedSession, remote_scanned_session_path,
+        GhosttyHostSupport, PersistedDaemonState, PersistedLiveSession, RemoteDeployState,
+        RemoteMachineHealth, RemoteMachineSnapshot, RemoteScannedSession, ServerUiSnapshot,
+        SessionKind, SessionSource, SnapshotPreview, SnapshotSessionView, TerminalBackend,
+        TerminalLaunchPhase, WorkspaceViewMode, YggtermServer, remote_scanned_session_path,
     };
+    use yggui_contract::UiTheme;
+
+    fn daemon_test_tree() -> yggterm_core::SessionNode {
+        yggterm_core::SessionNode {
+            kind: yggterm_core::SessionNodeKind::Group,
+            name: "sessions".to_string(),
+            title: None,
+            document_kind: None,
+            group_kind: None,
+            path: PathBuf::from("/"),
+            children: Vec::new(),
+            session_id: None,
+            cwd: None,
+        }
+    }
+
+    fn daemon_test_snapshot_session(path: &str, source: SessionSource) -> SnapshotSessionView {
+        SnapshotSessionView {
+            id: path.rsplit('/').next().unwrap_or(path).to_string(),
+            session_path: path.to_string(),
+            title: path.rsplit('/').next().unwrap_or(path).to_string(),
+            kind: SessionKind::Codex,
+            host_label: "dev".to_string(),
+            source,
+            backend: TerminalBackend::Xterm,
+            bridge_available: true,
+            launch_phase: TerminalLaunchPhase::Running,
+            remote_deploy_state: RemoteDeployState::Ready,
+            launch_command: String::new(),
+            status_line: String::new(),
+            terminal_lines: Vec::new(),
+            rendered_sections: Vec::new(),
+            preview: SnapshotPreview {
+                summary: Vec::new(),
+                blocks: Vec::new(),
+            },
+            metadata: Vec::new(),
+            terminal_process_id: None,
+            terminal_foreground_active: None,
+            terminal_window_id: None,
+            terminal_host_token: None,
+            terminal_host_mode: crate::GhosttyTerminalHostMode::Unsupported,
+            embedded_surface_id: None,
+            embedded_surface_detail: None,
+            last_launch_error: None,
+            last_window_error: None,
+            ssh_target: Some("dev".to_string()),
+            ssh_prefix: None,
+        }
+    }
 
     #[test]
     fn daemon_background_copy_chore_is_explicit_opt_in() {
@@ -4426,6 +4527,144 @@ mod tests {
         assert_eq!(
             mark_remote_machine_refresh_queued(&mut in_flight, "local", false),
             RemoteMachineRefreshQueueStatus::Loopback
+        );
+    }
+
+    #[test]
+    fn daemon_snapshot_filters_live_rows_to_terminal_runtime_keys() {
+        let tree = daemon_test_tree();
+        let server = YggtermServer::new(
+            &tree,
+            false,
+            GhosttyHostSupport::shadow("test".to_string(), false, false),
+            UiTheme::ZedLight,
+        );
+        let live_sessions = (0..5)
+            .map(|ix| {
+                daemon_test_snapshot_session(
+                    &remote_scanned_session_path("dev", &format!("runtime-{ix}")),
+                    SessionSource::LiveSsh,
+                )
+            })
+            .collect::<Vec<_>>();
+        let runtime_keys = live_sessions
+            .iter()
+            .take(4)
+            .map(|session| session.session_path.clone())
+            .collect::<HashSet<_>>();
+        let mut snapshot = ServerUiSnapshot {
+            active_session_path: Some(live_sessions[0].session_path.clone()),
+            active_session: Some(live_sessions[0].clone()),
+            active_view_mode: WorkspaceViewMode::Terminal,
+            remote_machines: vec![RemoteMachineSnapshot {
+                machine_key: "dev".to_string(),
+                label: "dev".to_string(),
+                ssh_target: "dev".to_string(),
+                prefix: None,
+                remote_binary_expr: Some("$HOME/.yggterm/bin/yggterm".to_string()),
+                remote_deploy_state: RemoteDeployState::Ready,
+                health: RemoteMachineHealth::Healthy,
+                sessions: (0..5)
+                    .map(|ix| RemoteScannedSession {
+                        session_path: remote_scanned_session_path("dev", &format!("runtime-{ix}")),
+                        session_id: format!("runtime-{ix}"),
+                        cwd: "/home/pi".to_string(),
+                        started_at: "2026-05-04T00:00:00Z".to_string(),
+                        modified_epoch: ix,
+                        event_count: 1,
+                        user_message_count: 1,
+                        assistant_message_count: 0,
+                        title_hint: format!("candidate {ix}"),
+                        recent_context: String::new(),
+                        cached_precis: None,
+                        cached_summary: None,
+                        live_runtime: true,
+                        storage_path: format!("/home/pi/.codex/sessions/runtime-{ix}.jsonl"),
+                    })
+                    .collect(),
+            }],
+            ssh_targets: Vec::new(),
+            live_sessions,
+        };
+
+        apply_terminal_runtime_truth_to_snapshot(&server, &runtime_keys, &mut snapshot);
+
+        assert_eq!(snapshot.live_sessions.len(), 4);
+        assert!(
+            snapshot
+                .live_sessions
+                .iter()
+                .all(|session| runtime_keys.contains(&session.session_path))
+        );
+    }
+
+    #[test]
+    fn daemon_snapshot_downgrades_restored_remote_live_without_runtime_to_preview() {
+        let tree = daemon_test_tree();
+        let mut server = YggtermServer::new(
+            &tree,
+            false,
+            GhosttyHostSupport::shadow("test".to_string(), false, false),
+            UiTheme::ZedLight,
+        );
+        let active_path = remote_scanned_session_path("dev", "missing-runtime");
+        let remote_machine = RemoteMachineSnapshot {
+            machine_key: "dev".to_string(),
+            label: "dev".to_string(),
+            ssh_target: "dev".to_string(),
+            prefix: None,
+            remote_binary_expr: Some("$HOME/.yggterm/bin/yggterm".to_string()),
+            remote_deploy_state: RemoteDeployState::Ready,
+            health: RemoteMachineHealth::Healthy,
+            sessions: vec![RemoteScannedSession {
+                session_path: active_path.clone(),
+                session_id: "missing-runtime".to_string(),
+                cwd: "/home/pi".to_string(),
+                started_at: "2026-05-04T00:00:00Z".to_string(),
+                modified_epoch: 1,
+                event_count: 1,
+                user_message_count: 1,
+                assistant_message_count: 0,
+                title_hint: "Recovered preview".to_string(),
+                recent_context: "USER: htop".to_string(),
+                cached_precis: Some("preview only".to_string()),
+                cached_summary: None,
+                live_runtime: true,
+                storage_path: "/home/pi/.codex/sessions/missing-runtime.jsonl".to_string(),
+            }],
+        };
+        server.apply_snapshot(ServerUiSnapshot {
+            active_session_path: None,
+            active_session: None,
+            active_view_mode: WorkspaceViewMode::Rendered,
+            remote_machines: vec![remote_machine.clone()],
+            ssh_targets: Vec::new(),
+            live_sessions: Vec::new(),
+        });
+        let active = daemon_test_snapshot_session(&active_path, SessionSource::LiveSsh);
+        let mut snapshot = ServerUiSnapshot {
+            active_session_path: Some(active_path.clone()),
+            active_session: Some(active.clone()),
+            active_view_mode: WorkspaceViewMode::Terminal,
+            remote_machines: vec![remote_machine],
+            ssh_targets: Vec::new(),
+            live_sessions: vec![active],
+        };
+
+        apply_terminal_runtime_truth_to_snapshot(&server, &HashSet::new(), &mut snapshot);
+
+        assert!(snapshot.live_sessions.is_empty());
+        assert_eq!(snapshot.active_view_mode, WorkspaceViewMode::Rendered);
+        assert_eq!(
+            snapshot.active_session_path.as_deref(),
+            Some(active_path.as_str())
+        );
+        assert_eq!(
+            snapshot
+                .active_session
+                .as_ref()
+                .map(|session| session.source),
+            Some(SessionSource::Stored)
         );
     }
 

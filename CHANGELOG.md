@@ -4,6 +4,17 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+## 2.1.120
+
+- Make `Live Sessions` rows runtime-truth-only: daemon snapshots now filter live metadata against real terminal runtime keys, and restored remote metadata without a runtime downgrades to preview instead of a blank terminal shell.
+- Make the shell stop reviving missing live rows from cached retained hosts, so explicit close and lost runtimes remove the live row instead of preserving stale UI state.
+- Keep retained xterm hosts as visual caches only: inactive retained sessions now release their Rust bridge, and focus return bootstraps a fresh bridge so typed input cannot disappear into a stale DOM handler.
+- Harden the terminal JS bridge against long-lived handler drift by capturing the Dioxus channel at mount time and ignoring stray app-control payloads instead of poisoning the terminal event loop.
+- Flush locally toggled keep-alive state before client close so a kept session survives the close/reopen path instead of being reaped by stale daemon state.
+- Reduce typing-time snapshot churn by replacing the immediate live-session snapshot nudge with an input-hot window, plus app-control counters for live-row/runtime counts, input-hot state, and forced refresh activity.
+- Extend regression coverage for stale remote metadata overcounting, runtime-missing restore, cached live-row rejection, retained-host cleanup, and input-hot background snapshot scheduling.
+- Extend terminal smoke coverage for close confirmation, keep-alive dot placement, stale retained bridge regressions, app-control payload isolation, and jojo debug-build input latency after live-session switching.
+
 ## 2.1.119
 
 - Restore remote live-session scrollback from daemon-retained terminal history instead of relying on a small screen/status tail after a session is already marked ready.
