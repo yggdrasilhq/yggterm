@@ -389,12 +389,6 @@ fn managed_session_is_promoted_live_session(key: &str, session: &ManagedSessionV
     true
 }
 
-fn active_session_snapshot_gap_is_recoverable(path: &str) -> bool {
-    path.starts_with("local://")
-        || path.starts_with("ssh://")
-        || path.starts_with("remote-session://")
-}
-
 fn live_session_uses_remote_runtime(session: &ManagedSessionView) -> bool {
     session.source == SessionSource::LiveSsh
         && (is_remote_scanned_live_session_path(&session.session_path)
@@ -1668,7 +1662,7 @@ impl YggtermServer {
             .collect::<Vec<_>>();
         let active_session = self.active_session().cloned().or_else(|| {
             self.active_session_path.as_deref().and_then(|path| {
-                synthesize_remote_active_session(
+                synthesize_remote_active_preview_session(
                     path,
                     &self.remote_machines,
                     self.backend,
@@ -1679,20 +1673,7 @@ impl YggtermServer {
         });
         let active_session_path = active_session
             .as_ref()
-            .map(|session| session.session_path.clone())
-            .or_else(|| {
-                self.active_session_path.as_deref().and_then(|path| {
-                    (active_session_snapshot_gap_is_recoverable(path)
-                        && self.live_session_order.iter().any(|candidate| {
-                            candidate == path
-                                || self
-                                    .sessions
-                                    .get(candidate)
-                                    .is_some_and(|session| session.session_path == path)
-                        }))
-                    .then(|| path.to_string())
-                })
-            });
+            .map(|session| session.session_path.clone());
         let active_view_mode =
             snapshot_active_view_mode_for_session(self.active_view_mode, active_session.as_ref());
         let snapshot = ServerUiSnapshot {
@@ -1761,22 +1742,6 @@ impl YggtermServer {
     }
 
     pub fn apply_snapshot(&mut self, snapshot: ServerUiSnapshot) {
-        let previous_active_path = self.active_session_path.clone();
-        let previous_active_session = previous_active_path
-            .as_ref()
-            .and_then(|path| self.sessions.get(path).cloned());
-        let preserve_active_snapshot_gap = previous_active_path
-            .as_deref()
-            .zip(previous_active_session.as_ref())
-            .is_some_and(|(path, _session)| {
-                snapshot.active_session_path.as_deref() == Some(path)
-                    && snapshot.active_session.is_none()
-                    && snapshot
-                        .live_sessions
-                        .iter()
-                        .all(|session| session.session_path != path)
-                    && active_session_snapshot_gap_is_recoverable(path)
-            });
         self.active_view_mode = snapshot.active_view_mode;
         self.active_session_path = snapshot.active_session_path.clone();
         self.remote_machines = snapshot.remote_machines;
@@ -1797,23 +1762,9 @@ impl YggtermServer {
             self.sessions
                 .insert(key, managed_session_from_snapshot(live));
         }
-        if preserve_active_snapshot_gap
-            && let Some(active_path) = self.active_session_path.clone()
-            && let Some(session) = previous_active_session
-            && !self.sessions.contains_key(&active_path)
-        {
-            if !self
-                .live_session_order
-                .iter()
-                .any(|path| path == &active_path)
-            {
-                self.live_session_order.insert(0, active_path.clone());
-            }
-            self.sessions.insert(active_path, session);
-        }
         if let Some(active_path) = self.active_session_path.clone()
             && !self.sessions.contains_key(&active_path)
-            && let Some(session) = synthesize_remote_active_session(
+            && let Some(session) = synthesize_remote_active_preview_session(
                 &active_path,
                 &self.remote_machines,
                 self.backend,
@@ -1821,16 +1772,7 @@ impl YggtermServer {
                 self.ghostty_host.bridge_enabled,
             )
         {
-            let restored_as_live = session.source == SessionSource::LiveSsh;
-            if restored_as_live {
-                if !self
-                    .live_session_order
-                    .iter()
-                    .any(|path| path == &active_path)
-                {
-                    self.live_session_order.insert(0, active_path.clone());
-                }
-            } else if self.active_view_mode == WorkspaceViewMode::Terminal {
+            if self.active_view_mode == WorkspaceViewMode::Terminal {
                 self.active_view_mode = WorkspaceViewMode::Rendered;
             }
             self.sessions.insert(active_path, session);
@@ -1843,6 +1785,20 @@ impl YggtermServer {
             self.active_session_path = self.live_session_order.first().cloned();
         }
         self.normalize_active_view_mode();
+    }
+
+    pub fn remote_preview_snapshot_session_for_path(
+        &self,
+        path: &str,
+    ) -> Option<SnapshotSessionView> {
+        synthesize_remote_active_preview_session(
+            path,
+            &self.remote_machines,
+            self.backend,
+            self.theme,
+            self.ghostty_host.bridge_enabled,
+        )
+        .map(snapshot_session_view)
     }
 
     pub fn persisted_state(&self) -> PersistedDaemonState {
@@ -2115,7 +2071,7 @@ impl YggtermServer {
                     path
                 };
             if !self.sessions.contains_key(&active_path)
-                && let Some(session) = synthesize_remote_active_session(
+                && let Some(session) = synthesize_remote_active_preview_session(
                     &active_path,
                     &self.remote_machines,
                     self.backend,
@@ -2123,16 +2079,7 @@ impl YggtermServer {
                     self.ghostty_host.bridge_enabled,
                 )
             {
-                let restored_as_live = session.source == SessionSource::LiveSsh;
-                if restored_as_live {
-                    if !self
-                        .live_session_order
-                        .iter()
-                        .any(|existing| existing == &active_path)
-                    {
-                        self.live_session_order.insert(0, active_path.clone());
-                    }
-                } else if self.active_view_mode == WorkspaceViewMode::Terminal {
+                if self.active_view_mode == WorkspaceViewMode::Terminal {
                     self.active_view_mode = WorkspaceViewMode::Rendered;
                 }
                 self.sessions.insert(active_path.clone(), session);
@@ -14458,7 +14405,7 @@ fn synthesize_remote_scanned_preview_session_view(
     session
 }
 
-fn synthesize_remote_active_session(
+fn synthesize_remote_active_preview_session(
     active_path: &str,
     remote_machines: &[RemoteMachineSnapshot],
     backend: TerminalBackend,
@@ -14474,23 +14421,13 @@ fn synthesize_remote_active_session(
         .sessions
         .iter()
         .find(|session| session.session_path == active_path || session.session_id == session_id)?;
-    if scanned.live_runtime {
-        Some(synthesize_remote_scanned_session_view(
-            machine,
-            scanned,
-            backend,
-            theme,
-            ghostty_bridge_enabled,
-        ))
-    } else {
-        Some(synthesize_remote_scanned_preview_session_view(
-            machine,
-            scanned,
-            backend,
-            theme,
-            ghostty_bridge_enabled,
-        ))
-    }
+    Some(synthesize_remote_scanned_preview_session_view(
+        machine,
+        scanned,
+        backend,
+        theme,
+        ghostty_bridge_enabled,
+    ))
 }
 
 fn hydrate_document_session(session: &mut ManagedSessionView, document: &WorkspaceDocument) {
@@ -18978,7 +18915,7 @@ terminal_window_id: None,
     }
 
     #[test]
-    fn apply_snapshot_rehydrates_current_remote_active_session_into_live_order() {
+    fn apply_snapshot_turns_remote_scan_active_without_runtime_into_preview() {
         let tree = SessionNode {
             kind: SessionNodeKind::Group,
             name: "sessions".to_string(),
@@ -19038,10 +18975,12 @@ terminal_window_id: None,
 
         let live_sessions = server.live_sessions();
         assert_eq!(server.active_session_path(), Some(active_path.as_str()));
-        assert_eq!(server.active_view_mode(), WorkspaceViewMode::Terminal);
-        assert_eq!(live_sessions.len(), 1);
-        assert_eq!(live_sessions[0].session_path, active_path);
-        assert_eq!(live_sessions[0].source, SessionSource::LiveSsh);
+        assert_eq!(server.active_view_mode(), WorkspaceViewMode::Rendered);
+        assert!(live_sessions.is_empty());
+        assert_eq!(
+            server.active_session().map(|session| session.source),
+            Some(SessionSource::Stored)
+        );
     }
 
     #[test]
