@@ -231,7 +231,8 @@ const TERMINAL_UNFOCUSED_LOCAL_IDLE_READ_POLL_MAX_MS: u64 = 8_000;
 const TERMINAL_IDLE_READ_BACKOFF_STEP_MS: u64 = 100;
 const TERMINAL_UNFOCUSED_IDLE_READ_BACKOFF_STEP_MS: u64 = 800;
 const TERMINAL_INPUT_ECHO_READ_POLL_MS: u64 = 45;
-const TERMINAL_INPUT_ECHO_READ_DELAY_MS: u64 = 12;
+const TERMINAL_INPUT_ECHO_READ_DELAY_MS: u64 = 0;
+const TERMINAL_INPUT_ECHO_READ_BURST_READS: u8 = 8;
 static XTERM_ASSETS_BOOTSTRAPPED: OnceCell<()> = OnceCell::new();
 const TREE_LOADING_DOT_CSS: &str = "@keyframes yggterm-tree-loading-dot { 0%, 80%, 100% { opacity: 0.28; transform: translateY(0px); } 40% { opacity: 1; transform: translateY(-1px); } }";
 const TREE_SPINNER_CSS: &str = "@keyframes yggterm-tree-spinner { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }";
@@ -247,12 +248,11 @@ const BACKGROUND_REFRESH_STARTUP_DEFER_MS: u64 = 120_000;
 const BACKGROUND_REFRESH_INTERACTIVE_DEFER_MS: u64 = 15_000;
 const BACKGROUND_REFRESH_POLL_MS: u64 = 15_000;
 const REMOTE_MACHINE_REFRESH_QUEUED_RETRY_MS: u64 = 60_000;
-const LIVE_SESSION_SNAPSHOT_TRIGGER_DEBOUNCE_MS: u64 = 360;
-const LIVE_SESSION_SNAPSHOT_BUSY_POLL_MS: u64 = 2_500;
+const LIVE_SESSION_SNAPSHOT_TRIGGER_DEBOUNCE_MS: u64 = 1_200;
+const LIVE_SESSION_SNAPSHOT_BUSY_POLL_MS: u64 = 10_000;
 const LIVE_SESSION_SNAPSHOT_BACKGROUND_BUSY_POLL_MS: u64 = 15_000;
 const LIVE_SESSION_SNAPSHOT_IDLE_POLL_MS: u64 = 60_000;
-const LIVE_SESSION_SNAPSHOT_NUDGE_INTERVAL_MS: u64 = 250;
-const LIVE_SESSION_SNAPSHOT_NUDGE_POLLS: usize = 3;
+const TERMINAL_INPUT_HOT_SUPPRESS_MS: u64 = 2_000;
 // Inline tree rename focuses asynchronously after context-menu and sidebar
 // interactions. Treat Enter as the commit action so transient WebView focus
 // churn during controlled input updates cannot commit a half-typed label.
@@ -539,6 +539,10 @@ struct ShellState {
     live_session_snapshot_refresh_in_flight: bool,
     live_session_snapshot_nudge_in_flight: bool,
     next_live_session_snapshot_after_ms: u64,
+    terminal_input_hot_until_ms: u64,
+    background_live_session_snapshot_apply_count: u64,
+    background_live_session_snapshot_skipped_input_hot_count: u64,
+    latest_runtime_status: Option<ServerRuntimeStatus>,
     drag_paths: Vec<String>,
     drag_hover_target: Option<DragDropTarget>,
     optimistic_drag_paths: Vec<String>,
@@ -1505,6 +1509,10 @@ impl ShellState {
             live_session_snapshot_refresh_in_flight: false,
             live_session_snapshot_nudge_in_flight: false,
             next_live_session_snapshot_after_ms: 0,
+            terminal_input_hot_until_ms: 0,
+            background_live_session_snapshot_apply_count: 0,
+            background_live_session_snapshot_skipped_input_hot_count: 0,
+            latest_runtime_status: None,
             drag_paths: Vec::new(),
             drag_hover_target: None,
             optimistic_drag_paths: Vec::new(),
@@ -1727,39 +1735,6 @@ impl ShellState {
             self.closing_app && linux_close_requires_terminal_detach();
         let render_active_view_mode =
             render_active_view_mode_for_snapshot(active_view_mode, detach_terminal_before_close);
-        let mut live_session_paths = live_sessions
-            .iter()
-            .map(|session| session.session_path.clone())
-            .collect::<HashSet<_>>();
-        let mut maybe_append_cached_live_session = |session_path: &str| {
-            if live_session_paths.contains(session_path) {
-                return;
-            }
-            let Some(mut session) = self
-                .cached_hot_session_view(session_path)
-                .map(|session| snapshot_live_sidebar_session_view(&session))
-            else {
-                return;
-            };
-            self.overlay_live_terminal_sidebar_sample(&mut session);
-            live_session_paths.insert(session_path.to_string());
-            live_sessions.push(session);
-        };
-        if render_active_view_mode == WorkspaceViewMode::Terminal {
-            if let Some(session_path) = active_session_path
-                .as_deref()
-                .filter(|path| is_hot_terminal_sidebar_path(path))
-            {
-                maybe_append_cached_live_session(session_path);
-            }
-            for session_path in self
-                .retained_terminal_session_paths
-                .iter()
-                .filter(|path| is_hot_terminal_sidebar_path(path))
-            {
-                maybe_append_cached_live_session(session_path);
-            }
-        }
         let active_live_session = active_session_path.as_deref().and_then(|path| {
             live_sessions
                 .iter()
@@ -1775,16 +1750,6 @@ impl ShellState {
                 self.overlay_live_terminal_sidebar_sample(&mut session);
                 session
             });
-        let active_cached_session = || {
-            (render_active_view_mode == WorkspaceViewMode::Terminal)
-                .then(|| active_session_path.as_deref())
-                .flatten()
-                .and_then(|path| self.cached_hot_session_view(path))
-                .map(|mut session| {
-                    self.overlay_live_terminal_sidebar_sample(&mut session);
-                    session
-                })
-        };
         let active_server_is_stale_stored_terminal = active_server_session
             .as_ref()
             .is_some_and(|session| session.source == SessionSource::Stored)
@@ -1793,9 +1758,7 @@ impl ShellState {
         let active_session = if active_server_is_stale_stored_terminal {
             active_live_session
         } else {
-            active_server_session
-                .or(active_live_session)
-                .or_else(active_cached_session)
+            active_server_session.or(active_live_session)
         };
         let mut retained_terminal_sessions = if detach_terminal_before_close {
             Vec::new()
@@ -2516,6 +2479,26 @@ impl ShellState {
         self.latest_terminal_open_attempt_for_path(session_path)
             .map(describe_terminal_open_attempt)
     }
+    fn clear_terminal_open_attempt_for_session(
+        &mut self,
+        session_path: &str,
+        reason: &'static str,
+    ) {
+        let Some(attempt_id) = self.terminal_open_attempt_by_session.remove(session_path) else {
+            return;
+        };
+        self.terminal_open_attempt_order
+            .retain(|candidate| candidate != &attempt_id);
+        if let Some(attempt) = self.terminal_open_attempts.remove(&attempt_id) {
+            self.record_terminal_open_attempt_event(
+                "cleared",
+                &attempt,
+                Some(json!({
+                    "reason": reason,
+                })),
+            );
+        }
+    }
     fn mark_terminal_open_attempt_ready_for_session(
         &mut self,
         session_path: &str,
@@ -3190,9 +3173,6 @@ impl ShellState {
                 .map(|session| session.session_path.clone())
                 .collect::<HashSet<_>>()
         };
-        if !limit_to_active_session {
-            keep_paths.extend(self.retained_terminal_session_paths.iter().cloned());
-        }
         if let Some(active_path) = self.server.active_session_path()
             && self.server.session_supports_terminal(active_path)
             && (self.server.active_view_mode() == WorkspaceViewMode::Terminal
@@ -6909,8 +6889,10 @@ fn spawn_initial_server_sync(
             |shell| match outcome {
                 Ok(Ok((snapshot, runtime, detail))) => {
                     let message = runtime
+                        .as_ref()
                         .map(|runtime| format!("server ready · {}", runtime.host_kind))
                         .unwrap_or_else(|| "server ready".to_string());
+                    shell.latest_runtime_status = runtime;
                     shell.apply_daemon_snapshot_result(Ok((snapshot, Some(message))));
                     shell.server_daemon_detail = detail;
                     shell.next_background_copy_scan_after_ms = current_millis() + 2_500;
@@ -7070,6 +7052,70 @@ fn close_window_after_update_restart(state: Signal<ShellState>) {
     close_window_preserving_live_sessions(state, Some("update-restart".to_string()));
 }
 
+fn mark_live_session_keep_alive_locally(
+    shell: &mut ShellState,
+    path: &str,
+    keep_alive: bool,
+) -> bool {
+    shell
+        .server
+        .set_live_session_keep_alive(path, keep_alive)
+        .unwrap_or(false)
+}
+
+fn local_keep_alive_session_paths(shell: &ShellState) -> Vec<String> {
+    shell
+        .server
+        .live_sessions()
+        .into_iter()
+        .filter(live_session_keep_alive)
+        .map(|session| session.session_path)
+        .collect()
+}
+
+async fn flush_keep_alive_paths_before_client_close(
+    endpoint: ServerEndpoint,
+    trace_home: PathBuf,
+    paths: Vec<String>,
+) {
+    if paths.is_empty() {
+        return;
+    }
+    let path_count = paths.len();
+    let outcome = task::spawn_blocking(move || {
+        let mut errors = Vec::<String>::new();
+        for path in paths {
+            if let Err(error) = set_session_keep_alive(&endpoint, &path, true) {
+                errors.push(format!("{path}: {error}"));
+            }
+        }
+        errors
+    })
+    .await;
+    match outcome {
+        Ok(errors) => append_trace_event(
+            &trace_home,
+            "ui",
+            "shutdown",
+            "keep_alive_flush_before_close",
+            json!({
+                "path_count": path_count,
+                "errors": errors,
+            }),
+        ),
+        Err(error) => append_trace_event(
+            &trace_home,
+            "ui",
+            "shutdown",
+            "keep_alive_flush_before_close_failed",
+            json!({
+                "path_count": path_count,
+                "error": error.to_string(),
+            }),
+        ),
+    }
+}
+
 fn close_window_preserving_live_sessions(mut state: Signal<ShellState>, reason: Option<String>) {
     if state.read().closing_app {
         return;
@@ -7113,11 +7159,16 @@ fn spawn_graceful_shutdown_and_close(mut state: Signal<ShellState>) {
     if state.read().closing_app {
         return;
     }
-    let detach_terminal_before_close = {
+    let (detach_terminal_before_close, keep_alive_paths, endpoint, trace_home) = {
         let shell = state.read();
-        linux_close_requires_terminal_detach()
-            && shell.server.active_view_mode() == WorkspaceViewMode::Terminal
-            && shell.server.active_session_path().is_some()
+        (
+            linux_close_requires_terminal_detach()
+                && shell.server.active_view_mode() == WorkspaceViewMode::Terminal
+                && shell.server.active_session_path().is_some(),
+            local_keep_alive_session_paths(&shell),
+            shell.bootstrap.server_endpoint.clone(),
+            perf_home_dir(&shell.bootstrap.settings_path),
+        )
     };
     INTENTIONAL_CLIENT_SHUTDOWN.store(true, Ordering::SeqCst);
     state.with_mut(|shell| {
@@ -7135,6 +7186,7 @@ fn spawn_graceful_shutdown_and_close(mut state: Signal<ShellState>) {
     );
     spawn_close_force_exit_watchdog();
     spawn(async move {
+        flush_keep_alive_paths_before_client_close(endpoint, trace_home, keep_alive_paths).await;
         if detach_terminal_before_close {
             window().set_decorations(true);
         }
@@ -8903,48 +8955,56 @@ fn schedule_live_session_snapshot_refresh(shell: &mut ShellState, debounce_ms: u
         shell.next_live_session_snapshot_after_ms = due_at_ms;
     }
 }
-fn spawn_live_session_snapshot_nudge(state: Signal<ShellState>) {
-    let should_spawn = safe_shell_mut(state, "live_session_snapshot_nudge_begin", |shell| {
-        if !shell_has_live_session_snapshot_refresh_target(shell) {
-            return false;
-        }
-        shell.next_live_session_snapshot_after_ms = current_millis();
-        if shell.live_session_snapshot_nudge_in_flight {
-            return false;
-        }
-        shell.live_session_snapshot_nudge_in_flight = true;
-        true
-    })
-    .ok()
-    .unwrap_or(false);
-    maybe_spawn_background_live_session_snapshot(state);
-    if !should_spawn {
-        return;
+fn schedule_live_session_snapshot_after_terminal_input(
+    shell: &mut ShellState,
+    session_path: &str,
+    show_busy_hint: bool,
+) {
+    let now_ms = current_millis();
+    shell.terminal_input_hot_until_ms = shell
+        .terminal_input_hot_until_ms
+        .max(now_ms.saturating_add(TERMINAL_INPUT_HOT_SUPPRESS_MS));
+    if show_busy_hint {
+        shell.terminal_busy_hint_until_ms.insert(
+            session_path.to_string(),
+            now_ms.saturating_add(TERMINAL_BUSY_HINT_MS),
+        );
     }
-    spawn(async move {
-        for _ in 1..LIVE_SESSION_SNAPSHOT_NUDGE_POLLS {
-            sleep(Duration::from_millis(
-                LIVE_SESSION_SNAPSHOT_NUDGE_INTERVAL_MS,
-            ))
-            .await;
-            let _ = safe_shell_mut(state, "live_session_snapshot_nudge_schedule", |shell| {
-                if shell_has_live_session_snapshot_refresh_target(shell) {
-                    shell.next_live_session_snapshot_after_ms = current_millis();
-                }
-            });
-            maybe_spawn_background_live_session_snapshot(state);
-        }
-        let should_flush = safe_shell_mut(state, "live_session_snapshot_nudge_end", |shell| {
-            shell.live_session_snapshot_nudge_in_flight = false;
-            shell_has_live_session_snapshot_refresh_target(shell)
-                && current_millis() >= shell.next_live_session_snapshot_after_ms
-        })
-        .ok()
-        .unwrap_or(false);
-        if should_flush {
-            maybe_spawn_background_live_session_snapshot(state);
-        }
-    });
+    schedule_live_session_snapshot_refresh(
+        shell,
+        LIVE_SESSION_SNAPSHOT_TRIGGER_DEBOUNCE_MS.max(TERMINAL_INPUT_HOT_SUPPRESS_MS),
+    );
+}
+
+fn background_snapshot_changes_active_runtime_identity(
+    shell: &ShellState,
+    snapshot: &ServerUiSnapshot,
+) -> bool {
+    let current_path = shell.server.active_session_path();
+    let incoming_path = snapshot.active_session_path.as_deref();
+    if current_path != incoming_path {
+        return true;
+    }
+    let Some(path) = current_path else {
+        return false;
+    };
+    let current_runtime_present = shell
+        .server
+        .live_sessions()
+        .iter()
+        .any(|session| session.session_path == path);
+    let incoming_runtime_present = snapshot
+        .live_sessions
+        .iter()
+        .any(|session| session.session_path == path)
+        || snapshot.active_session.as_ref().is_some_and(|session| {
+            session.session_path == path
+                && matches!(
+                    session.source,
+                    SessionSource::LiveLocal | SessionSource::LiveSsh
+                )
+        });
+    current_runtime_present != incoming_runtime_present
 }
 
 fn maybe_spawn_background_live_session_snapshot(state: Signal<ShellState>) {
@@ -8957,6 +9017,7 @@ fn maybe_spawn_background_live_session_snapshot(state: Signal<ShellState>) {
                 || interactive_surface_request_in_flight(shell)
                 || !shell_has_live_session_snapshot_refresh_target(shell)
                 || current_millis() < shell.next_live_session_snapshot_after_ms
+                || current_millis() < shell.terminal_input_hot_until_ms
             {
                 return None;
             }
@@ -9000,15 +9061,34 @@ fn maybe_spawn_background_live_session_snapshot(state: Signal<ShellState>) {
             |shell| {
                 shell.live_session_snapshot_refresh_in_flight = false;
                 match outcome {
-                    Ok(result) => {
-                        shell.apply_snapshot_result_without_request(
-                            Ok(result),
-                            true,
-                            "background_live_session_snapshot",
-                            false,
-                        );
-                        shell.next_live_session_snapshot_after_ms = current_millis()
-                            .saturating_add(shell_live_session_snapshot_refresh_interval_ms(shell));
+                    Ok((snapshot, message)) => {
+                        let input_hot = current_millis() < shell.terminal_input_hot_until_ms;
+                        if input_hot
+                            && !background_snapshot_changes_active_runtime_identity(
+                                shell, &snapshot,
+                            )
+                        {
+                            shell.background_live_session_snapshot_skipped_input_hot_count = shell
+                                .background_live_session_snapshot_skipped_input_hot_count
+                                .saturating_add(1);
+                            shell.next_live_session_snapshot_after_ms = shell
+                                .terminal_input_hot_until_ms
+                                .saturating_add(LIVE_SESSION_SNAPSHOT_TRIGGER_DEBOUNCE_MS);
+                        } else {
+                            shell.background_live_session_snapshot_apply_count = shell
+                                .background_live_session_snapshot_apply_count
+                                .saturating_add(1);
+                            shell.apply_snapshot_result_without_request(
+                                Ok((snapshot, message)),
+                                true,
+                                "background_live_session_snapshot",
+                                false,
+                            );
+                            shell.next_live_session_snapshot_after_ms = current_millis()
+                                .saturating_add(shell_live_session_snapshot_refresh_interval_ms(
+                                    shell,
+                                ));
+                        }
                     }
                     Err(error) => {
                         shell.next_live_session_snapshot_after_ms =
@@ -10295,6 +10375,40 @@ fn normalize_live_session_path(session_path: &str) -> String {
         .map(|id| format!("local://{id}"))
         .unwrap_or_else(|| session_path.to_string())
 }
+fn daemon_runtime_key_for_session_path(session_path: &str) -> String {
+    if let Some(id) = session_path.strip_prefix("local://") {
+        return format!("local::{id}");
+    }
+    if let Some(id) = session_path.strip_prefix("codex://") {
+        return format!("codex::{id}");
+    }
+    if let Some(id) = session_path.strip_prefix("codex-litellm://") {
+        return format!("codex-litellm::{id}");
+    }
+    if let Some(rest) = session_path.strip_prefix("ssh://")
+        && let Some(id) = rest.rsplit('/').next()
+        && !id.trim().is_empty()
+    {
+        return format!("live::{id}");
+    }
+    session_path.to_string()
+}
+fn terminal_runtime_key_candidates_for_session_path(
+    shell: &ShellState,
+    session_path: &str,
+) -> Vec<String> {
+    let mut candidates = Vec::<String>::new();
+    for candidate in [
+        daemon_runtime_key_for_session_path(session_path),
+        shell.server.terminal_runtime_key_for_path(session_path),
+        session_path.to_string(),
+    ] {
+        if !candidates.iter().any(|existing| existing == &candidate) {
+            candidates.push(candidate);
+        }
+    }
+    candidates
+}
 fn terminal_runtime_session_path(shell: &ShellState, session_path: &str) -> String {
     shell.server.terminal_runtime_key_for_path(session_path)
 }
@@ -11198,18 +11312,9 @@ fn is_local_codex_history_session_path(path: &str) -> bool {
 
 fn merge_hot_sidebar_sessions(
     live_sessions: &[ManagedSessionView],
-    retained_terminal_sessions: &[ManagedSessionView],
+    _retained_terminal_sessions: &[ManagedSessionView],
 ) -> Vec<ManagedSessionView> {
-    let mut sessions_by_path = BTreeMap::<String, ManagedSessionView>::new();
-    for session in live_sessions {
-        sessions_by_path.insert(session.session_path.clone(), session.clone());
-    }
-    for session in retained_terminal_sessions {
-        sessions_by_path
-            .entry(session.session_path.clone())
-            .or_insert_with(|| session.clone());
-    }
-    sessions_by_path.into_values().collect()
+    live_sessions.to_vec()
 }
 
 fn session_kind_for_row(row: &BrowserRow) -> SessionKind {
@@ -11236,10 +11341,11 @@ fn is_live_sidebar_row(row: &BrowserRow) -> bool {
 }
 
 fn session_is_hot_terminal_row(shell: &ShellState, row: &BrowserRow) -> bool {
-    shell.terminal_session_is_retained_live(&row.full_path)
-        || shell.server.live_sessions().iter().any(|session| {
-            session.session_path == row.full_path && is_promoted_live_session(session)
-        })
+    shell
+        .server
+        .live_sessions()
+        .iter()
+        .any(|session| session.session_path == row.full_path && is_promoted_live_session(session))
         || shell.server.active_session().is_some_and(|session| {
             session.session_path == row.full_path && is_promoted_live_session(session)
         })
@@ -17006,6 +17112,16 @@ fn deletion_redirect_row(shell: &ShellState, pending: &PendingDeleteDialog) -> O
         .cloned()
 }
 
+fn deletion_redirect_row_for_pending(
+    shell: &ShellState,
+    pending: &PendingDeleteDialog,
+) -> Option<BrowserRow> {
+    if pending.live_session_close {
+        return None;
+    }
+    deletion_redirect_row(shell, pending)
+}
+
 fn queue_delete_selected_items(mut state: Signal<ShellState>, hard_delete: bool) {
     let pending = if let Some(pending) = state.read().pending_delete.clone() {
         pending
@@ -17047,7 +17163,8 @@ fn queue_delete_selected_items(mut state: Signal<ShellState>, hard_delete: bool)
         }
         pending
     };
-    let deletion_redirect_row = state.with(|shell| deletion_redirect_row(shell, &pending));
+    let deletion_redirect_row =
+        state.with(|shell| deletion_redirect_row_for_pending(shell, &pending));
     state.with_mut(|shell| {
         shell.server_busy = true;
         shell.pending_delete = None;
@@ -17163,6 +17280,17 @@ fn queue_delete_selected_items(mut state: Signal<ShellState>, hard_delete: bool)
                         "delete_finished",
                         true,
                     );
+                }
+                if pending.live_session_close {
+                    for session_path in &pending.session_paths {
+                        shell.clear_terminal_open_attempt_for_session(
+                            session_path,
+                            "live_session_close",
+                        );
+                        shell.terminal_attach_in_flight.remove(session_path);
+                        shell.terminal_resume_ready_paths.remove(session_path);
+                        shell.terminal_busy_hint_until_ms.remove(session_path);
+                    }
                 }
                 shell.server_busy = false;
                 shell.clear_drag_state();
@@ -18499,6 +18627,44 @@ fn describe_app_state_snapshot(
             })
         })
         .collect::<Vec<_>>();
+    let live_sidebar_row_count = snapshot
+        .rows
+        .iter()
+        .skip_while(|row| row.full_path != "__live_sessions__")
+        .skip(1)
+        .take_while(|row| row.depth > 0)
+        .filter(|row| row.kind == BrowserRowKind::Session)
+        .count();
+    let daemon_runtime_keys = shell
+        .latest_runtime_status
+        .as_ref()
+        .map(|status| status.terminal_session_keys.clone())
+        .unwrap_or_default();
+    let active_runtime_key_candidates = snapshot
+        .active_session_path
+        .as_deref()
+        .map(|path| terminal_runtime_key_candidates_for_session_path(&shell, path))
+        .unwrap_or_default();
+    let active_runtime_key = active_runtime_key_candidates.first().cloned();
+    let active_runtime_present = active_runtime_key_candidates
+        .iter()
+        .any(|key| daemon_runtime_keys.iter().any(|candidate| candidate == key));
+    let runtime_truth = json!({
+        "live_row_count": live_sidebar_row_count,
+        "snapshot_live_session_count": snapshot.live_sessions.len(),
+        "daemon_runtime_count": shell
+            .latest_runtime_status
+            .as_ref()
+            .map(|status| status.terminal_session_count),
+        "daemon_runtime_keys": daemon_runtime_keys,
+        "active_runtime_key": active_runtime_key,
+        "active_runtime_key_candidates": active_runtime_key_candidates,
+        "active_runtime_present": active_runtime_present,
+        "terminal_input_hot_until_ms": shell.terminal_input_hot_until_ms,
+        "terminal_input_hot": notification_now_ms < shell.terminal_input_hot_until_ms,
+        "background_live_session_snapshot_apply_count": shell.background_live_session_snapshot_apply_count,
+        "background_live_session_snapshot_skipped_input_hot_count": shell.background_live_session_snapshot_skipped_input_hot_count,
+    });
     let session_view_contract_violations =
         render_snapshot_session_view_contract_violations(&shell, &snapshot);
     let update_call_to_action = shell.update_call_to_action();
@@ -18529,6 +18695,7 @@ fn describe_app_state_snapshot(
         "active_summary": snapshot.active_summary.clone(),
         "session_view_contract_violations": session_view_contract_violations,
         "live_session_snapshot_debug": live_session_snapshot_debug,
+        "runtime_truth": runtime_truth,
         "settings": settings_snapshot,
         "browser": {
             "selected_path": selected_path.clone(),
@@ -18665,6 +18832,10 @@ fn describe_app_state_snapshot(
             "live_session_snapshot_refresh_in_flight": shell.live_session_snapshot_refresh_in_flight,
             "live_session_snapshot_nudge_in_flight": shell.live_session_snapshot_nudge_in_flight,
             "next_live_session_snapshot_after_ms": shell.next_live_session_snapshot_after_ms,
+            "terminal_input_hot_until_ms": shell.terminal_input_hot_until_ms,
+            "terminal_input_hot": notification_now_ms < shell.terminal_input_hot_until_ms,
+            "background_live_session_snapshot_apply_count": shell.background_live_session_snapshot_apply_count,
+            "background_live_session_snapshot_skipped_input_hot_count": shell.background_live_session_snapshot_skipped_input_hot_count,
             "background_refresh_after_ms": shell.background_refresh_after_ms,
             "terminal_busy_hint_until_ms": shell.terminal_busy_hint_until_ms,
             "update_call_to_action": {
@@ -18776,6 +18947,63 @@ fn describe_app_state_snapshot(
         },
         "active_surface_requests": active_requests,
     })
+}
+fn enrich_runtime_truth_with_viewport(snapshot: &mut Value, viewport: &Value) {
+    let active_surface = viewport
+        .get("active_terminal_surface")
+        .cloned()
+        .unwrap_or(Value::Null);
+    let active_host_ready = viewport
+        .get("ready")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let active_host_input_enabled = active_surface
+        .get("input_enabled")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let active_hosts = viewport
+        .get("active_terminal_hosts")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let forced_refresh_count = active_hosts
+        .iter()
+        .filter_map(|host| host.get("forced_refresh_count").and_then(Value::as_u64))
+        .sum::<u64>();
+    let forced_refresh_skipped_count = active_hosts
+        .iter()
+        .filter_map(|host| {
+            host.get("forced_refresh_skipped_count")
+                .and_then(Value::as_u64)
+        })
+        .sum::<u64>();
+    let active_host_input_hot = active_hosts.iter().any(|host| {
+        host.get("terminal_input_hot")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+    });
+    if let Some(runtime_truth) = snapshot
+        .get_mut("runtime_truth")
+        .and_then(Value::as_object_mut)
+    {
+        runtime_truth.insert("active_host_ready".to_string(), json!(active_host_ready));
+        runtime_truth.insert(
+            "active_host_input_enabled".to_string(),
+            json!(active_host_input_enabled),
+        );
+        runtime_truth.insert(
+            "active_host_input_hot".to_string(),
+            json!(active_host_input_hot),
+        );
+        runtime_truth.insert(
+            "active_host_forced_refresh_count".to_string(),
+            json!(forced_refresh_count),
+        );
+        runtime_truth.insert(
+            "active_host_forced_refresh_skipped_count".to_string(),
+            json!(forced_refresh_skipped_count),
+        );
+    }
 }
 fn describe_app_rows_snapshot(state: &Signal<ShellState>) -> Value {
     let shell = state.read();
@@ -20077,6 +20305,10 @@ async fn capture_dom_debug_snapshot_for(active_session_path: Option<&str>) -> Va
                     write_bridge_flush_count: mountedHost ? Number(mountedHost.writeBridgeFlushCount || 0) : 0,
                     write_bridge_in_flight: mountedHost ? Boolean(mountedHost.writeBridgeInFlight) : false,
                     write_bridge_pending_chars: mountedHost ? String(mountedHost.writeBridgePendingData || '').length : 0,
+                    terminal_input_hot_until_ms: mountedHost ? Number(mountedHost.terminalInputHotUntilMs || 0) : 0,
+                    terminal_input_hot: mountedHost ? Date.now() < Number(mountedHost.terminalInputHotUntilMs || 0) : false,
+                    forced_refresh_count: mountedHost ? Number(mountedHost.forcedRefreshCount || 0) : 0,
+                    forced_refresh_skipped_count: mountedHost ? Number(mountedHost.forcedRefreshSkippedCount || 0) : 0,
                     skippedPerfEventCount: mountedHost ? Number(mountedHost.skippedPerfEventCount || 0) : 0,
                     lastSkippedPerfEventName: mountedHost ? String(mountedHost.lastSkippedPerfEventName || '') : '',
                     last_write_queued_at_ms: mountedHost ? Number(mountedHost.lastWriteQueuedAtMs || 0) : 0,
@@ -21275,6 +21507,10 @@ async fn capture_dom_debug_snapshot_basic_for(active_session_path: Option<&str>)
                         write_bridge_flush_count: mountedHost ? Number(mountedHost.writeBridgeFlushCount || 0) : 0,
                         write_bridge_in_flight: mountedHost ? Boolean(mountedHost.writeBridgeInFlight) : false,
                         write_bridge_pending_chars: mountedHost ? String(mountedHost.writeBridgePendingData || '').length : 0,
+                        terminal_input_hot_until_ms: mountedHost ? Number(mountedHost.terminalInputHotUntilMs || 0) : 0,
+                        terminal_input_hot: mountedHost ? Date.now() < Number(mountedHost.terminalInputHotUntilMs || 0) : false,
+                        forced_refresh_count: mountedHost ? Number(mountedHost.forcedRefreshCount || 0) : 0,
+                        forced_refresh_skipped_count: mountedHost ? Number(mountedHost.forcedRefreshSkippedCount || 0) : 0,
                     skippedPerfEventCount: mountedHost ? Number(mountedHost.skippedPerfEventCount || 0) : 0,
                     lastSkippedPerfEventName: mountedHost ? String(mountedHost.lastSkippedPerfEventName || '') : '',
                         retained_write_paint_repair_count: mountedHost ? Number(mountedHost.retainedWritePaintRepairCount || 0) : 0,
@@ -22077,6 +22313,10 @@ fn terminal_probe_input_script(
                         render_event_count: Number(entry.renderEventCount || 0),
                         write_command_count: Number(entry.writeCommandCount || 0),
                         write_bridge_flush_count: Number(entry.writeBridgeFlushCount || 0),
+                        terminal_input_hot_until_ms: Number(entry.terminalInputHotUntilMs || 0),
+                        terminal_input_hot: Date.now() < Number(entry.terminalInputHotUntilMs || 0),
+                        forced_refresh_count: Number(entry.forcedRefreshCount || 0),
+                        forced_refresh_skipped_count: Number(entry.forcedRefreshSkippedCount || 0),
                         last_data_event_at_ms: Number(entry.lastDataEventAtMs || 0),
                         last_render_event_at_ms: Number(entry.lastRenderEventAtMs || 0),
                         last_write_queued_at_ms: Number(entry.lastWriteQueuedAtMs || 0),
@@ -23023,6 +23263,42 @@ async fn probe_terminal_viewport_select_for(session_path: &str) -> Value {
     );
     receive_probe_eval_value(&script, session_path).await
 }
+async fn refresh_runtime_status_for_app_control(
+    state: Signal<ShellState>,
+    reason: &'static str,
+) -> Value {
+    let endpoint = state.read().bootstrap.server_endpoint.clone();
+    let outcome = task::spawn_blocking(move || status(&endpoint)).await;
+    match outcome {
+        Ok(Ok(runtime_status)) => {
+            let terminal_session_count = runtime_status.terminal_session_count;
+            let terminal_session_keys = runtime_status.terminal_session_keys.clone();
+            let server_version = runtime_status.server_version.clone();
+            let server_pid = runtime_status.server_pid;
+            let _ = safe_shell_mut(state, "app_control_refresh_runtime_status", |shell| {
+                shell.latest_runtime_status = Some(runtime_status);
+            });
+            json!({
+                "ok": true,
+                "reason": reason,
+                "server_version": server_version,
+                "server_pid": server_pid,
+                "terminal_session_count": terminal_session_count,
+                "terminal_session_keys": terminal_session_keys,
+            })
+        }
+        Ok(Err(error)) => json!({
+            "ok": false,
+            "reason": reason,
+            "error": error.to_string(),
+        }),
+        Err(error) => json!({
+            "ok": false,
+            "reason": reason,
+            "join_error": error.to_string(),
+        }),
+    }
+}
 async fn process_pending_app_control_requests(
     settings_path: &std::path::Path,
     desktop: dioxus::desktop::DesktopContext,
@@ -23197,6 +23473,7 @@ async fn process_pending_app_control_requests(
                     "viewport_reason": viewport.get("reason").and_then(Value::as_str),
                 }),
             );
+            enrich_runtime_truth_with_viewport(&mut state_snapshot, &viewport);
             if let Some(map) = state_snapshot.as_object_mut() {
                 map.insert("dom".to_string(), dom_snapshot.clone());
                 map.insert("viewport".to_string(), viewport);
@@ -23231,6 +23508,7 @@ async fn process_pending_app_control_requests(
                 capture_dom_debug_snapshot_for_or_empty(active_session_path.as_deref()).await;
             let mut state_snapshot = describe_app_state_snapshot(&state, &desktop);
             let viewport = describe_viewport_snapshot(&state_snapshot, &dom_snapshot);
+            enrich_runtime_truth_with_viewport(&mut state_snapshot, &viewport);
             if let Some(map) = state_snapshot.as_object_mut() {
                 map.insert("dom".to_string(), dom_snapshot.clone());
                 map.insert("viewport".to_string(), viewport);
@@ -23262,6 +23540,7 @@ async fn process_pending_app_control_requests(
                 capture_dom_debug_snapshot_for_or_empty(active_session_path.as_deref()).await;
             let mut state_snapshot = describe_app_state_snapshot(&state, &desktop);
             let viewport = describe_viewport_snapshot(&state_snapshot, &dom_snapshot);
+            enrich_runtime_truth_with_viewport(&mut state_snapshot, &viewport);
             if let Some(map) = state_snapshot.as_object_mut() {
                 map.insert("dom".to_string(), dom_snapshot.clone());
                 map.insert("viewport".to_string(), viewport);
@@ -23295,6 +23574,7 @@ async fn process_pending_app_control_requests(
                 capture_dom_debug_snapshot_for_or_empty(active_session_path.as_deref()).await;
             let mut state_snapshot = describe_app_state_snapshot(&state, &desktop);
             let viewport = describe_viewport_snapshot(&state_snapshot, &dom_snapshot);
+            enrich_runtime_truth_with_viewport(&mut state_snapshot, &viewport);
             if let Some(map) = state_snapshot.as_object_mut() {
                 map.insert("dom".to_string(), dom_snapshot.clone());
                 map.insert("viewport".to_string(), viewport);
@@ -23328,6 +23608,7 @@ async fn process_pending_app_control_requests(
                 capture_dom_debug_snapshot_for_or_empty(active_session_path.as_deref()).await;
             let mut state_snapshot = describe_app_state_snapshot(&state, &desktop);
             let viewport = describe_viewport_snapshot(&state_snapshot, &dom_snapshot);
+            enrich_runtime_truth_with_viewport(&mut state_snapshot, &viewport);
             if let Some(map) = state_snapshot.as_object_mut() {
                 map.insert("dom".to_string(), dom_snapshot.clone());
                 map.insert("viewport".to_string(), viewport);
@@ -23555,6 +23836,7 @@ async fn process_pending_app_control_requests(
                 capture_dom_debug_snapshot_for_or_empty(active_session_path.as_deref()).await;
             let mut state_snapshot = describe_app_state_snapshot(&state, &desktop);
             let viewport = describe_viewport_snapshot(&state_snapshot, &dom_snapshot);
+            enrich_runtime_truth_with_viewport(&mut state_snapshot, &viewport);
             if let Some(map) = state_snapshot.as_object_mut() {
                 map.insert("dom".to_string(), dom_snapshot.clone());
                 map.insert("viewport".to_string(), viewport);
@@ -24106,23 +24388,22 @@ async fn process_pending_app_control_requests(
                             state,
                             "app_control_send_terminal_input_schedule_live_snapshot_refresh",
                             |shell| {
-                                let now_ms = current_millis();
-                                shell.next_live_session_snapshot_after_ms = now_ms;
-                                shell.terminal_busy_hint_until_ms.insert(
-                                    session_path.clone(),
-                                    now_ms.saturating_add(TERMINAL_BUSY_HINT_MS),
+                                schedule_live_session_snapshot_after_terminal_input(
+                                    shell,
+                                    &session_path,
+                                    true,
                                 );
                             },
                         );
-                        spawn_live_session_snapshot_nudge(state);
                     } else {
                         let _ = safe_shell_mut(
                             state,
                             "app_control_send_terminal_input_schedule_live_snapshot_refresh",
                             |shell| {
-                                schedule_live_session_snapshot_refresh(
+                                schedule_live_session_snapshot_after_terminal_input(
                                     shell,
-                                    LIVE_SESSION_SNAPSHOT_TRIGGER_DEBOUNCE_MS,
+                                    &session_path,
+                                    false,
                                 );
                             },
                         );
@@ -24684,6 +24965,13 @@ async fn process_pending_app_control_requests(
             completed_at_ms: current_millis() as u128,
             output_path: None,
             data: Some({
+                trace_stage("describe_state_runtime_status_begin", json!({}));
+                let runtime_status_refresh =
+                    refresh_runtime_status_for_app_control(state, "describe_state").await;
+                trace_stage(
+                    "describe_state_runtime_status_end",
+                    runtime_status_refresh.clone(),
+                );
                 trace_stage("describe_state_snapshot_begin", json!({}));
                 let mut snapshot = describe_app_state_snapshot(&state, &desktop);
                 trace_stage("describe_state_snapshot_end", json!({}));
@@ -24728,6 +25016,7 @@ async fn process_pending_app_control_requests(
                         terminal_open_attempt.clone().unwrap_or(Value::Null),
                     );
                 }
+                enrich_runtime_truth_with_viewport(&mut snapshot, &viewport);
                 if let Some(map) = snapshot.as_object_mut() {
                     map.insert("dom".to_string(), dom.clone());
                     map.insert(
@@ -25143,7 +25432,6 @@ fn preserve_client_focus_for_background_snapshot(
     snapshot: &mut ServerUiSnapshot,
 ) {
     let fallback_active_path = shell.server.active_session_path();
-    let fallback_active_session = shell.server.active_session().cloned();
     let (preserved_view_mode, preserved_active_path) =
         if let Some(request) = shell.active_surface_requests.get(&YggSurface::Terminal) {
             (
@@ -25187,13 +25475,6 @@ fn preserve_client_focus_for_background_snapshot(
                             .as_ref()
                             .filter(|session| session.session_path == path)
                             .cloned()
-                    })
-                    .or_else(|| {
-                        fallback_active_session
-                            .as_ref()
-                            .filter(|session| session.session_path == path)
-                            .cloned()
-                            .map(snapshot_session_view_for_ui)
                     })
             })
         })
@@ -28050,7 +28331,15 @@ fn app() -> Element {
                             let row = row.clone();
                             move |keep_alive| {
                                 let path = row.full_path.clone();
-                                state.with_mut(|shell| shell.close_context_menu());
+                                state.with_mut(|shell| {
+                                    mark_live_session_keep_alive_locally(
+                                        shell,
+                                        &path,
+                                        keep_alive,
+                                    );
+                                    shell.close_context_menu();
+                                    shell.refresh_tree_debug("keep_alive_optimistic_toggle");
+                                });
                                 spawn_server_snapshot_action(
                                     state,
                                     if keep_alive {
@@ -31888,13 +32177,10 @@ fn terminal_resume_context_fallback(
     Some((title, summary))
 }
 fn terminal_session_still_active(shell: &ShellState, session_path: &str, host_id: &str) -> bool {
-    let active_terminal_session = shell.server.active_view_mode() == WorkspaceViewMode::Terminal
+    shell.server.active_view_mode() == WorkspaceViewMode::Terminal
         && shell.server.active_session_path() == Some(session_path)
         && (shell.active_terminal_host_id.as_deref() == Some(host_id)
-            || shell.terminal_attach_in_flight.contains(session_path));
-    active_terminal_session
-        || (shell.terminal_session_is_retained_live(session_path)
-            && shell.terminal_session_host_id(session_path).as_deref() == Some(host_id))
+            || shell.terminal_attach_in_flight.contains(session_path))
 }
 fn terminal_session_should_bootstrap_host(
     shell: &ShellState,
@@ -31908,7 +32194,6 @@ fn terminal_session_should_bootstrap_host(
         None
     };
     live_active_session_path == Some(session_path)
-        && !shell.terminal_session_is_retained_live(session_path)
 }
 
 fn retained_ready_remote_host_should_reuse_bootstrap(
@@ -31948,9 +32233,12 @@ fn acquire_terminal_bootstrap_lease(
                 .get(session_path)
                 .map(String::as_str)
                 == Some(owner_id);
+            let attach_in_flight = shell.terminal_attach_in_flight.contains(session_path);
+            let can_replace_inflight_mount =
+                session_path.starts_with("remote-session://") || session_path.starts_with("ssh://");
             if owner_matches {
                 false
-            } else if same_lease && shell.terminal_attach_in_flight.contains(session_path) {
+            } else if attach_in_flight && (same_lease || !can_replace_inflight_mount) {
                 false
             } else {
                 shell
@@ -33817,6 +34105,9 @@ fn TerminalCanvas(
         )
     };
     if !should_bootstrap_host {
+        if !bootstrap_task_identity.borrow().is_empty() {
+            *bootstrap_task_identity.borrow_mut() = String::new();
+        }
         let skip_key = format!("inactive-skip:{bootstrap_identity}");
         if *inactive_bootstrap_skip_identity.borrow() != skip_key {
             *inactive_bootstrap_skip_identity.borrow_mut() = skip_key;
@@ -34295,6 +34586,7 @@ fn TerminalCanvas(
             let mut last_host_health_blank_rows_below_cursor = 0_u16;
             let mut last_runtime_running = session_launch_phase_running;
             let mut pending_terminal_input_has_text = false;
+            let mut input_echo_read_burst_remaining = 0_u8;
             let codex_completion_notifications_enabled =
                 matches!(session_kind, SessionKind::Codex | SessionKind::CodexLiteLlm);
             let mut codex_busy_since_input = false;
@@ -34738,6 +35030,8 @@ fn TerminalCanvas(
                                     }
                                 } else {
                                     read_poll_ms = TERMINAL_INPUT_ECHO_READ_POLL_MS;
+                                    input_echo_read_burst_remaining =
+                                        TERMINAL_INPUT_ECHO_READ_BURST_READS;
                                     next_read_deadline = tokio::time::Instant::now()
                                         + Duration::from_millis(TERMINAL_INPUT_ECHO_READ_DELAY_MS);
                                     let (show_busy_hint, next_pending_input_has_text) =
@@ -34758,22 +35052,22 @@ fn TerminalCanvas(
                                             state,
                                             "terminal_input_schedule_live_snapshot_refresh_immediate",
                                             |shell| {
-                                                let now_ms = current_millis();
-                                                shell.next_live_session_snapshot_after_ms = now_ms;
-                                                shell
-                                                    .terminal_busy_hint_until_ms
-                                                    .insert(session_path.clone(), now_ms.saturating_add(TERMINAL_BUSY_HINT_MS));
+                                                schedule_live_session_snapshot_after_terminal_input(
+                                                    shell,
+                                                    &session_path,
+                                                    true,
+                                                );
                                             },
                                         );
-                                        spawn_live_session_snapshot_nudge(state);
                                     } else {
                                         let _ = safe_shell_mut(
                                             state,
                                             "terminal_input_schedule_live_snapshot_refresh",
                                             |shell| {
-                                                schedule_live_session_snapshot_refresh(
+                                                schedule_live_session_snapshot_after_terminal_input(
                                                     shell,
-                                                    LIVE_SESSION_SNAPSHOT_TRIGGER_DEBOUNCE_MS,
+                                                    &session_path,
+                                                    false,
                                                 );
                                             },
                                         );
@@ -35780,6 +36074,19 @@ fn TerminalCanvas(
                                     }),
                                 );
                             }
+                            Ok(TerminalJsEvent::Ignored { reason, value }) => {
+                                append_trace_event(
+                                    &trace_home,
+                                    "ui",
+                                    "terminal_mount",
+                                    "js_event_ignored",
+                                    json!({
+                                        "session_path": session_path.clone(),
+                                        "reason": reason,
+                                        "value": value,
+                                    }),
+                                );
+                            }
                             Err(error) => {
                                 let _ = safe_shell_mut(state, "terminal_attach_bridge_closed", |shell| {
                                     release_terminal_bootstrap_lease_if_current(
@@ -35834,7 +36141,11 @@ fn TerminalCanvas(
                                 cursor = next_cursor;
                                 last_runtime_running = runtime_running;
                                 read_poll_ms = if chunks.is_empty() {
-                                    if is_remote_resume_session && !traced_attach_ready {
+                                    if input_echo_read_burst_remaining > 0 {
+                                        input_echo_read_burst_remaining =
+                                            input_echo_read_burst_remaining.saturating_sub(1);
+                                        TERMINAL_INPUT_ECHO_READ_POLL_MS
+                                    } else if is_remote_resume_session && !traced_attach_ready {
                                         TERMINAL_REMOTE_RESUME_READ_POLL_MS
                                     } else {
                                         let idle_poll_max_ms = if is_remote_resume_session {
@@ -35854,6 +36165,7 @@ fn TerminalCanvas(
                                         (read_poll_ms + idle_poll_step_ms).min(idle_poll_max_ms)
                                     }
                                 } else {
+                                    input_echo_read_burst_remaining = 0;
                                     TERMINAL_ACTIVE_OUTPUT_READ_POLL_MS
                                 };
                                 let (
@@ -40244,12 +40556,12 @@ fn terminal_eval_script_with_canvas_renderer(
     let moz_font_smoothing = serde_json::to_string(terminal_moz_font_smoothing(theme))
         .expect("serialize terminal moz font smoothing");
     let constructed_debug = if cfg!(debug_assertions) {
-        "dioxus.send({ kind: \"debug\", message: `constructed host=${hostId} fontSize=${term.options.fontSize} cols=${term.cols} rows=${term.rows}` });"
+        "sendTerminalEvent({ kind: \"debug\", message: `constructed host=${hostId} fontSize=${term.options.fontSize} cols=${term.cols} rows=${term.rows}` });"
     } else {
         ""
     };
     let reset_debug = if cfg!(debug_assertions) {
-        "dioxus.send({ kind: \"debug\", message: `reset host=${hostId} fontSize=${term.options.fontSize}` });"
+        "sendTerminalEvent({ kind: \"debug\", message: `reset host=${hostId} fontSize=${term.options.fontSize}` });"
     } else {
         ""
     };
@@ -40257,15 +40569,34 @@ fn terminal_eval_script_with_canvas_renderer(
         r#"
         const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
         const hostId = {host_id:?};
+        const terminalDioxusSend =
+            dioxus && typeof dioxus.send === "function"
+                ? dioxus.send.bind(dioxus)
+                : null;
+        const terminalDioxusRecv =
+            dioxus && typeof dioxus.recv === "function"
+                ? dioxus.recv.bind(dioxus)
+                : null;
+        const sendTerminalEvent = (payload) => {{
+            if (terminalDioxusSend) {{
+                terminalDioxusSend(payload);
+            }}
+        }};
+        const recvTerminalCommand = async () => {{
+            if (!terminalDioxusRecv) {{
+                return null;
+            }}
+            return await terminalDioxusRecv();
+        }};
         const terminalWriteFrameMs = Math.max(0, Number({terminal_write_frame_ms} || 0));
         let host = document.getElementById(hostId);
-        dioxus.send({{ kind: "debug", message: `bootstrap host=${{hostId}} present=${{!!host}}` }});
+        sendTerminalEvent({{ kind: "debug", message: `bootstrap host=${{hostId}} present=${{!!host}}` }});
         if (!host) {{
             for (let attempt = 0; attempt < 80; attempt += 1) {{
                 await sleep(25);
                 host = document.getElementById(hostId);
                 if (host) {{
-                    dioxus.send({{
+                    sendTerminalEvent({{
                         kind: "debug",
                         message: `bootstrap host=${{hostId}} mounted on retry=${{attempt + 1}}`
                     }});
@@ -40274,8 +40605,8 @@ fn terminal_eval_script_with_canvas_renderer(
             }}
         }}
         if (!host) {{
-            dioxus.send({{ kind: "debug", message: `bootstrap host missing for ${{hostId}} after retries` }});
-            dioxus.send({{ kind: "ready" }});
+            sendTerminalEvent({{ kind: "debug", message: `bootstrap host missing for ${{hostId}} after retries` }});
+            sendTerminalEvent({{ kind: "ready" }});
             return;
         }}
         const ensureXtermAssets = async () => {{
@@ -40324,7 +40655,7 @@ fn terminal_eval_script_with_canvas_renderer(
             }}
         }};
         const assetsReady = await ensureXtermAssets();
-        dioxus.send({{
+        sendTerminalEvent({{
             kind: "debug",
             message: `assets host=${{hostId}} ready=${{assetsReady}} terminal=${{!!window.Terminal}} fit=${{!!(window.FitAddon && window.FitAddon.FitAddon)}} canvas=${{!!(window.CanvasAddon && window.CanvasAddon.CanvasAddon)}} bootstrap=${{window.__yggtermXtermBootstrapError || "none"}}`
         }});
@@ -40340,10 +40671,10 @@ fn terminal_eval_script_with_canvas_renderer(
               window.__yggtermXtermBootstrapError ? `Bootstrap:${{window.__yggtermXtermBootstrapError}}` : "Bootstrap:none",
             ].join(" · ");
             host.innerHTML = `<div style="padding:18px;color:#fca5a5;font:13px system-ui;">xterm.js assets failed to load.<br><span style="opacity:0.75">${{details}}</span></div>`;
-            dioxus.send({{ kind: "debug", message: details }});
-            dioxus.send({{ kind: "ready" }});
+            sendTerminalEvent({{ kind: "debug", message: details }});
+            sendTerminalEvent({{ kind: "ready" }});
             while (true) {{
-                await dioxus.recv();
+                await recvTerminalCommand();
             }}
         }}
         window.__yggtermXtermCleanups = window.__yggtermXtermCleanups || {{}};
@@ -40419,11 +40750,11 @@ fn terminal_eval_script_with_canvas_renderer(
             await sleep(20);
         }}
         const initialMetrics = hostMetrics();
-        dioxus.send({{
+        sendTerminalEvent({{
             kind: "debug",
             message: `host_metrics host=${{hostId}} width=${{initialMetrics.width}} height=${{initialMetrics.height}} visible=${{initialMetrics.visible}}`
         }});
-        dioxus.send({{
+        sendTerminalEvent({{
             kind: "debug",
             message: `host_chain host=${{hostId}} ${{elementChainMetrics(host)}}`
         }});
@@ -40521,7 +40852,7 @@ fn terminal_eval_script_with_canvas_renderer(
                 preferredCanvasRenderer = true;
             }}
         }} catch (error) {{
-            dioxus.send({{
+            sendTerminalEvent({{
                 kind: "debug",
                 message: `canvas_addon_failed host=${{hostId}} error=${{error && error.message ? error.message : String(error)}}`
             }});
@@ -40775,7 +41106,7 @@ fn terminal_eval_script_with_canvas_renderer(
                         at_ms: Date.now(),
                     }};
                 }}
-                dioxus.send({{
+                sendTerminalEvent({{
                     kind: "debug",
                     message: `row_fit_guard host=${{hostId}} reason=${{reason}} rows=${{diagnostics.rows}}->${{safeRows}} overflow=${{diagnostics.overflow_px}} cell=${{diagnostics.raster_cell_height_px}} avail=${{diagnostics.available_height_px}}`
                 }});
@@ -40878,7 +41209,7 @@ fn terminal_eval_script_with_canvas_renderer(
                     attachHostInteractions(host);
                 }} catch (_error) {{}}
                 syncCurrentHostEntry();
-                dioxus.send({{
+                sendTerminalEvent({{
                     kind: "debug",
                     message: `rebind_host host=${{hostId}} reason=${{reason}} reopened=${{reopen}} reattached=${{termElementReattached}} same_host=${{sameHost}} same_host_reopen=${{sameHostNeedsReopen}} term_disconnected=${{termElementDisconnected}} host_missing_root=${{hostMissingXtermRoot}} prev_connected=${{!!(previousHost && previousHost.isConnected)}} current_connected=${{!!(host && host.isConnected)}}`
                 }});
@@ -41458,6 +41789,8 @@ fn terminal_eval_script_with_canvas_renderer(
         let lastPerfEventAtMs = 0;
         let skippedPerfEventCount = 0;
         let terminalInputHotUntilMs = 0;
+        let forcedRefreshCount = 0;
+        let forcedRefreshSkippedCount = 0;
         let scrollbackLocked = false;
         let scrollbackIntent = 'PromptFollow';
         let lastScrollbackIntentReason = 'initial';
@@ -41529,13 +41862,16 @@ fn terminal_eval_script_with_canvas_renderer(
             lastScrollbackIntentReason = nextReason;
             lastScrollbackIntentAtMs = Date.now();
             syncHostScrollbackIntent();
-            dioxus.send({{
+            sendTerminalEvent({{
                 kind: "debug",
                 message: `scrollback_intent host=${{hostId}} intent=${{scrollbackIntent}} reason=${{lastScrollbackIntentReason}}`
             }});
         }};
         const markTerminalInputHot = (reason = 'input') => {{
-            terminalInputHotUntilMs = Math.max(terminalInputHotUntilMs, Date.now() + 650);
+            terminalInputHotUntilMs = Math.max(
+                terminalInputHotUntilMs,
+                Date.now() + {terminal_input_hot_suppress_ms}
+            );
             try {{
                 const entry = window.__yggtermXtermHosts && window.__yggtermXtermHosts[hostId]
                     ? window.__yggtermXtermHosts[hostId]
@@ -41583,6 +41919,7 @@ fn terminal_eval_script_with_canvas_renderer(
                 const hotHighFrequencyEvent =
                     eventName === "xterm_write_flush"
                     || eventName === "xterm_fit"
+                    || eventName === "xterm_forced_refresh"
                     || eventName === "xterm_forced_refresh_skipped";
                 if (terminalInputHot() && hotHighFrequencyEvent && now - lastPerfEventAtMs < 900) {{
                     skippedPerfEventCount += 1;
@@ -41596,7 +41933,7 @@ fn terminal_eval_script_with_canvas_renderer(
                     return;
                 }}
                 lastPerfEventAtMs = now;
-                dioxus.send({{
+                sendTerminalEvent({{
                     kind: "perf",
                     name: eventName,
                     payload: {{
@@ -41686,6 +42023,13 @@ fn terminal_eval_script_with_canvas_renderer(
         refreshCursorContrastContract();
         let paintCount = 0;
         let lastPaintKey = '';
+        let visiblePaintFramePending = false;
+        let pendingVisiblePaintForceFullRefresh = false;
+        let lastVisiblePaintRunAtMs = 0;
+        let lastVisiblePaintFullRefreshAtMs = 0;
+        let lastVisiblePaintRefreshSkipPerfAtMs = 0;
+        const visiblePaintMinIntervalMs = 120;
+        const visiblePaintFullRefreshMinIntervalMs = 750;
         let rebuildAttempts = 0;
         const emitPaint = () => {{
             rebindCurrentHost('emit_paint', true);
@@ -41716,7 +42060,7 @@ fn terminal_eval_script_with_canvas_renderer(
             ]);
             if (nextPaintKey !== lastPaintKey) {{
                 lastPaintKey = nextPaintKey;
-                dioxus.send({{
+                sendTerminalEvent({{
                     kind: "paint",
                     child_count: host.childElementCount,
                     xterm_present: Boolean(xtermRoot),
@@ -41769,7 +42113,7 @@ fn terminal_eval_script_with_canvas_renderer(
                 enforceHelperTextareaContract();
                 emitHostHealth();
             }});
-            dioxus.send({{
+            sendTerminalEvent({{
                 kind: "debug",
                 message: `terminal_repaint host=${{hostId}} reason=${{reason}}`
             }});
@@ -41804,8 +42148,45 @@ fn terminal_eval_script_with_canvas_renderer(
             }}
             forceTerminalRepaint(lastVisualTransitionReason);
         }};
-        const requestVisiblePaint = (forceFullRefresh = true) => {{
+        const recordVisiblePaintRefreshSkipped = (reason, forceFullRefresh) => {{
+            forcedRefreshSkippedCount += 1;
+            if (window.__yggtermXtermHosts && window.__yggtermXtermHosts[hostId]) {{
+                window.__yggtermXtermHosts[hostId].forcedRefreshSkippedCount =
+                    forcedRefreshSkippedCount;
+            }}
+            const now = Date.now();
+            const skipReason = String(reason || 'skipped');
+            if (skipReason === 'input_hot' || now - lastVisiblePaintRefreshSkipPerfAtMs >= 1000) {{
+                lastVisiblePaintRefreshSkipPerfAtMs = now;
+                emitPerf("xterm_forced_refresh_skipped", {{
+                    reason: skipReason,
+                    force_full_refresh: Boolean(forceFullRefresh),
+                }});
+            }}
+        }};
+        const requestVisiblePaint = (forceFullRefresh = false) => {{
+            pendingVisiblePaintForceFullRefresh = Boolean(
+                pendingVisiblePaintForceFullRefresh || forceFullRefresh
+            );
+            if (visiblePaintFramePending) {{
+                return;
+            }}
+            visiblePaintFramePending = true;
             requestAnimationFrame(() => {{
+                visiblePaintFramePending = false;
+                const requestedForceFullRefresh = Boolean(pendingVisiblePaintForceFullRefresh);
+                pendingVisiblePaintForceFullRefresh = false;
+                const now = Date.now();
+                if (
+                    lastVisiblePaintRunAtMs > 0
+                    && now - lastVisiblePaintRunAtMs < visiblePaintMinIntervalMs
+                ) {{
+                    if (requestedForceFullRefresh) {{
+                        recordVisiblePaintRefreshSkipped('rate_limited', requestedForceFullRefresh);
+                    }}
+                    return;
+                }}
+                lastVisiblePaintRunAtMs = now;
                 rebindCurrentHost('request_visible_paint', true);
                 const inputHot = terminalInputHot();
                 const beforeFitKey = term ? `${{term.cols}}x${{term.rows}}` : '';
@@ -41843,23 +42224,37 @@ fn terminal_eval_script_with_canvas_renderer(
                             recordSkippedFit('visible_paint_degenerate', proposed, 'proposed_grid_unusable');
                         }}
                     }} catch (_error) {{}}
-                    dioxus.send({{
+                    sendTerminalEvent({{
                         kind: "debug",
                         message: `degenerate_fit host=${{hostId}} width=${{metrics.width}} height=${{metrics.height}} cols=${{term.cols}} rows=${{term.rows}}`
                     }});
                 }}
                 try {{
-                    if (forceFullRefresh && term.refresh && !inputHot) {{
+                    const fullRefreshRateLimited =
+                        lastVisiblePaintFullRefreshAtMs > 0
+                        && now - lastVisiblePaintFullRefreshAtMs
+                            < visiblePaintFullRefreshMinIntervalMs;
+                    if (
+                        requestedForceFullRefresh
+                        && term.refresh
+                        && !inputHot
+                        && !fullRefreshRateLimited
+                    ) {{
+                        lastVisiblePaintFullRefreshAtMs = now;
+                        forcedRefreshCount += 1;
+                        if (window.__yggtermXtermHosts && window.__yggtermXtermHosts[hostId]) {{
+                            window.__yggtermXtermHosts[hostId].forcedRefreshCount = forcedRefreshCount;
+                        }}
                         term.refresh(0, Math.max(0, term.rows - 1));
                         emitPerf("xterm_forced_refresh", {{
                             reason: "visible_paint",
-                            force_full_refresh: Boolean(forceFullRefresh),
+                            force_full_refresh: Boolean(requestedForceFullRefresh),
                         }});
-                    }} else if (forceFullRefresh && inputHot) {{
-                        emitPerf("xterm_forced_refresh_skipped", {{
-                            reason: "input_hot",
-                            force_full_refresh: Boolean(forceFullRefresh),
-                        }});
+                    }} else if (requestedForceFullRefresh) {{
+                        recordVisiblePaintRefreshSkipped(
+                            inputHot ? 'input_hot' : 'rate_limited',
+                            requestedForceFullRefresh
+                        );
                     }}
                 }} catch (_error) {{}}
                 emitPaint();
@@ -41876,7 +42271,7 @@ fn terminal_eval_script_with_canvas_renderer(
                 return;
             }}
             lastResizeNotifyAtMs = Date.now();
-            dioxus.send({{ kind: "resize", cols: pending.cols, rows: pending.rows }});
+            sendTerminalEvent({{ kind: "resize", cols: pending.cols, rows: pending.rows }});
         }};
         const scheduleResizeNotification = () => {{
             pendingResizeNotify = {{ cols: term.cols, rows: term.rows }};
@@ -41989,7 +42384,7 @@ fn terminal_eval_script_with_canvas_renderer(
                 return;
             }}
             rebuildAttempts += 1;
-            dioxus.send({{
+            sendTerminalEvent({{
                 kind: "debug",
                 message: `rebuild_blank_host host=${{hostId}} reason=${{reason}} attempts=${{rebuildAttempts}}`
             }});
@@ -42577,7 +42972,7 @@ fn terminal_eval_script_with_canvas_renderer(
                     if (event.stopPropagation) {{
                         event.stopPropagation();
                     }}
-                    dioxus.send({{ kind: "clipboard_image_request" }});
+                    sendTerminalEvent({{ kind: "clipboard_image_request" }});
                 }}
                 window.setTimeout(() => {{
                     if (inputEnabled) {{
@@ -42642,7 +43037,7 @@ fn terminal_eval_script_with_canvas_renderer(
                         if (lastPasteEventAt > 0 && Date.now() - lastPasteEventAt < terminalNativePasteDedupeMs) {{
                             return;
                         }}
-                        dioxus.send({{ kind: "clipboard_paste_request" }});
+                        sendTerminalEvent({{ kind: "clipboard_paste_request" }});
                     }} catch (_error) {{}}
                 }}, 90);
                 window.setTimeout(() => {{
@@ -42657,7 +43052,7 @@ fn terminal_eval_script_with_canvas_renderer(
             }}
             const selection = term.getSelection ? term.getSelection() : "";
             if (!selection) {{
-                dioxus.send({{
+                sendTerminalEvent({{
                     kind: "clipboard_error",
                     action: key === 'x' ? "cut" : "copy",
                     message: "Select terminal text before using the clipboard shortcut.",
@@ -42671,10 +43066,10 @@ fn terminal_eval_script_with_canvas_renderer(
                         term.clearSelection();
                     }}
                 }} catch (_error) {{}}
-                dioxus.send({{ kind: "clipboard", action, chars: selection.length }});
+                sendTerminalEvent({{ kind: "clipboard", action, chars: selection.length }});
             }};
             const fail = (error) => {{
-                dioxus.send({{
+                sendTerminalEvent({{
                     kind: "clipboard_error",
                     action,
                     message: error && error.message ? error.message : "Clipboard access was denied.",
@@ -42768,6 +43163,9 @@ fn terminal_eval_script_with_canvas_renderer(
             terminalWriteFrameMs,
             skippedPerfEventCount,
             lastSkippedPerfEventName: '',
+            terminalInputHotUntilMs,
+            forcedRefreshCount,
+            forcedRefreshSkippedCount,
             lowPowerTuiActive: false,
             lowPowerTuiFrameCount: 0,
             lastLowPowerTuiText: '',
@@ -42783,7 +43181,7 @@ fn terminal_eval_script_with_canvas_renderer(
             lastScrollbackIntentAtMs,
             lastScrollbackSnapbackReason,
         }};
-        dioxus.send({{
+        sendTerminalEvent({{
             kind: "debug",
             message: `constructed host=${{hostId}} cols=${{term.cols}} rows=${{term.rows}}`
         }});
@@ -43028,7 +43426,7 @@ fn terminal_eval_script_with_canvas_renderer(
             lowPowerTuiLastText = renderedText;
             if (!tracedLowPowerTuiActive) {{
                 tracedLowPowerTuiActive = true;
-                dioxus.send({{
+                sendTerminalEvent({{
                     kind: "debug",
                     message: `low_power_tui_active host=${{hostId}} frames=${{lowPowerTuiFrameCount}} chars=${{renderedText.length}}`
                 }});
@@ -43051,7 +43449,7 @@ fn terminal_eval_script_with_canvas_renderer(
             const activeRenderSurface = hostIsActiveRenderSurface();
             if (!tracedTuiFilterProbe && (value.includes('?1049') || value.includes('\x1b[?25l') || frameLike || protocolOnly)) {{
                 tracedTuiFilterProbe = true;
-                dioxus.send({{
+                sendTerminalEvent({{
                     kind: "debug",
                     message: `tui_filter_probe host=${{hostId}} enters=${{entersAltScreen}} exits=${{exitsAltScreen}} activeSurface=${{activeRenderSurface}} frameLike=${{frameLike}} protocolOnly=${{protocolOnly}} chars=${{value.length}}`
                 }});
@@ -43065,7 +43463,7 @@ fn terminal_eval_script_with_canvas_renderer(
                 inactiveTuiLastTail = value.slice(-240);
                 if (!tracedInactiveTuiDrop) {{
                     tracedInactiveTuiDrop = true;
-                    dioxus.send({{
+                    sendTerminalEvent({{
                         kind: "debug",
                         message: `inactive_tui_drop host=${{hostId}} frameLike=${{frameLike}} protocolOnly=${{protocolOnly}} chars=${{value.length}}`
                     }});
@@ -43400,7 +43798,7 @@ fn terminal_eval_script_with_canvas_renderer(
                     return;
                 }}
                 lastHostHealthKey = nextKey;
-                dioxus.send({{
+                sendTerminalEvent({{
                     kind: "host_health",
                     cursor_line_text: cursorLineText,
                     text_tail: textTail,
@@ -43444,7 +43842,7 @@ fn terminal_eval_script_with_canvas_renderer(
                 window.__yggtermXtermHosts[hostId].scrollbackLocked = scrollbackLocked;
             }}
             scrollLiveCursorIntoView(true, 'input');
-            dioxus.send({{ kind: "input", data }});
+            sendTerminalEvent({{ kind: "input", data }});
         }});
         window.__yggtermXtermCleanups[hostId] = () => {{
             try {{
@@ -43518,9 +43916,9 @@ fn terminal_eval_script_with_canvas_renderer(
         emitHostHealth();
         scheduleResizeNudges();
         {constructed_debug}
-        dioxus.send({{ kind: "ready" }});
+        sendTerminalEvent({{ kind: "ready" }});
         while (true) {{
-            const message = await dioxus.recv();
+            const message = await recvTerminalCommand();
             if (!message) {{
                 continue;
             }}
@@ -43655,7 +44053,8 @@ fn terminal_eval_script_with_canvas_renderer(
         dim_foreground = dim_foreground,
         cursor_muted = cursor_muted,
         minimum_contrast_ratio = minimum_contrast_ratio,
-        cursor_text = cursor_text
+        cursor_text = cursor_text,
+        terminal_input_hot_suppress_ms = TERMINAL_INPUT_HOT_SUPPRESS_MS
     )
 }
 fn terminal_apply_script(host_id: &str, theme: &TerminalTheme) -> String {
@@ -49766,12 +50165,15 @@ mod tests {
             "rebind helper should trace when the mounted host changes"
         );
         let request_visible_ix = script
-            .find("const requestVisiblePaint = (forceFullRefresh = true) => {")
+            .find("const requestVisiblePaint = (forceFullRefresh = false) => {")
             .expect("requestVisiblePaint declaration present");
         let rebind_ix = script[request_visible_ix..]
             .find("rebindCurrentHost('request_visible_paint', true);")
             .expect("requestVisiblePaint should rebind to the current host before repaint");
-        assert!(rebind_ix < 200);
+        let input_hot_ix = script[request_visible_ix..]
+            .find("const inputHot = terminalInputHot();")
+            .expect("requestVisiblePaint should inspect input-hot state before paint work");
+        assert!(rebind_ix < input_hot_ix);
     }
 
     #[test]
@@ -49848,9 +50250,58 @@ mod tests {
         );
         assert!(
             script.contains("setScrollbackIntent('PromptFollow', 'input');")
-                && script.contains("scrollLiveCursorIntoView(true, 'input');\n            dioxus.send({ kind: \"input\", data });"),
+                && script.contains("scrollLiveCursorIntoView(true, 'input');\n            sendTerminalEvent({ kind: \"input\", data });"),
             "real terminal input should reveal the prompt before forwarding bytes"
         );
+    }
+
+    #[test]
+    fn terminal_eval_script_captures_dioxus_channel_for_long_lived_handlers() {
+        let theme = terminal_theme(UiTheme::ZedLight, palette(UiTheme::ZedLight), 13.0, "");
+        let script = terminal_eval_script("yggterm-terminal-test", &theme, true);
+        assert!(
+            script.contains("const terminalDioxusSend =")
+                && script.contains("dioxus.send.bind(dioxus)")
+                && script.contains("const terminalDioxusRecv =")
+                && script.contains("dioxus.recv.bind(dioxus)")
+                && script.contains("const sendTerminalEvent = (payload) => {")
+                && script.contains("const recvTerminalCommand = async () => {"),
+            "terminal bootstrap should capture its Dioxus channel before app-control evals can replace the global dioxus object"
+        );
+        let stable_channel_start = script
+            .find("const terminalWriteFrameMs")
+            .expect("terminal script should have a stable post-bootstrap body");
+        let stable_channel_body = &script[stable_channel_start..];
+        assert!(
+            stable_channel_body.contains("sendTerminalEvent({ kind: \"input\", data });")
+                && stable_channel_body.contains("const message = await recvTerminalCommand();"),
+            "long-lived terminal handlers should use the captured channel for input and command receive"
+        );
+        assert!(
+            !stable_channel_body.contains("dioxus.send(")
+                && !stable_channel_body.contains("dioxus.recv("),
+            "long-lived terminal handlers must not call the mutable global dioxus channel directly"
+        );
+    }
+
+    #[test]
+    fn terminal_js_event_deserialize_ignores_app_control_payloads() {
+        let ignored: TerminalJsEvent = serde_json::from_value(json!({
+            "accepted": true,
+            "session_path": "local://test",
+            "reason": null,
+        }))
+        .expect("stray app-control payload should not close the terminal bridge");
+        assert!(
+            matches!(ignored, TerminalJsEvent::Ignored { .. }),
+            "non-terminal eval payloads should be ignored instead of terminating the xterm bridge"
+        );
+        let input: TerminalJsEvent = serde_json::from_value(json!({
+            "kind": "input",
+            "data": "/",
+        }))
+        .expect("valid terminal input events should still deserialize");
+        assert!(matches!(input, TerminalJsEvent::Input { data } if data == "/"));
     }
 
     #[test]
@@ -49896,6 +50347,15 @@ mod tests {
             "render bridge probes should be rate-limited so TUI output does not churn WebKit"
         );
         assert!(
+            script.contains("let visiblePaintFramePending = false;")
+                && script.contains("let pendingVisiblePaintForceFullRefresh = false;")
+                && script.contains("const visiblePaintMinIntervalMs = 120;")
+                && script.contains("const visiblePaintFullRefreshMinIntervalMs = 750;")
+                && script.contains("recordVisiblePaintRefreshSkipped('rate_limited'")
+                && script.contains("visiblePaintFramePending = true;"),
+            "visible-paint repairs should be coalesced and rate-limited so they cannot form a full-canvas refresh loop"
+        );
+        assert!(
             script.contains("let lastInputHotHostHealthAtMs = 0;")
                 && script.contains("if (inputHot && now - lastInputHotHostHealthAtMs < 650)")
                 && script.contains("const sampleIntervalMs = terminalInputHot() ? 1000 : 250;"),
@@ -49913,7 +50373,9 @@ mod tests {
             "only retained-session and non-frame bulk writes should schedule a bounded visible repaint repair for WebKit canvas"
         );
         assert!(
-            script.contains("if (forceFullRefresh && term.refresh && !inputHot)")
+            script.contains(
+                "requestedForceFullRefresh\n                        && term.refresh\n                        && !inputHot\n                        && !fullRefreshRateLimited"
+            )
                 && script.contains("xterm_forced_refresh_skipped"),
             "input-hot paint repairs must skip full-canvas refreshes while the user is typing"
         );
@@ -50059,6 +50521,23 @@ mod tests {
         assert!(
             !script.contains("forceRendererResize"),
             "the resize path should not force full-canvas refreshes on every viewport size change"
+        );
+    }
+
+    #[test]
+    fn terminal_input_read_loop_polls_immediately_for_echo() {
+        let source = include_str!("shell.rs");
+        assert!(
+            source.contains("const TERMINAL_INPUT_ECHO_READ_DELAY_MS: u64 = 0;")
+                && source.contains("const TERMINAL_INPUT_ECHO_READ_BURST_READS: u8 = 8;")
+                && source.contains("let mut input_echo_read_burst_remaining = 0_u8;")
+                && source.contains(
+                    "input_echo_read_burst_remaining =\n                                        TERMINAL_INPUT_ECHO_READ_BURST_READS;"
+                )
+                && source.contains(
+                    "if input_echo_read_burst_remaining > 0 {\n                                        input_echo_read_burst_remaining ="
+                ),
+            "accepted terminal input should trigger an immediate short read burst so PTY echo is not delayed behind idle polling"
         );
     }
 
@@ -50249,9 +50728,9 @@ mod tests {
             !script.contains("document.addEventListener('keydown', handleDocumentKeydown, true);")
         );
         assert!(script.contains("if (key === 'v' && !event.shiftKey && !event.altKey) {"));
-        assert!(script.contains("dioxus.send({ kind: \"clipboard_paste_request\" });"));
+        assert!(script.contains("sendTerminalEvent({ kind: \"clipboard_paste_request\" });"));
         assert!(script.contains("if (hasImage) {"));
-        assert!(script.contains("dioxus.send({ kind: \"clipboard_image_request\" });"));
+        assert!(script.contains("sendTerminalEvent({ kind: \"clipboard_image_request\" });"));
         assert!(!script.contains("const pasteTextIntoTerminal = (text) => {"));
         assert!(!script.contains("navigator.clipboard.readText()"));
         assert!(!script.contains("navigator.clipboard.read()"));
@@ -52604,6 +53083,75 @@ mod tests {
         assert_eq!(promoted_count, 1);
     }
     #[test]
+    fn merged_sidebar_rows_reject_stale_remote_metadata_live_candidates() {
+        let remote_sessions = (0..5)
+            .map(|ix| RemoteScannedSession {
+                session_path: format!("remote-session://oc/runtime-{ix}"),
+                session_id: format!("runtime-{ix}"),
+                cwd: "/home/pi".to_string(),
+                started_at: "2026-05-04T00:00:00Z".to_string(),
+                modified_epoch: ix,
+                event_count: 1,
+                user_message_count: 1,
+                assistant_message_count: 0,
+                title_hint: format!("Remote candidate {ix}"),
+                recent_context: String::new(),
+                cached_precis: Some(format!("metadata candidate {ix}")),
+                cached_summary: None,
+                live_runtime: true,
+                storage_path: format!("/home/pi/.codex/sessions/runtime-{ix}.jsonl"),
+            })
+            .collect::<Vec<_>>();
+        let remote_machines = vec![RemoteMachineSnapshot {
+            machine_key: "oc".to_string(),
+            label: "oc [ok]".to_string(),
+            ssh_target: "oc".to_string(),
+            prefix: None,
+            remote_binary_expr: None,
+            remote_deploy_state: RemoteDeployState::Ready,
+            health: RemoteMachineHealth::Healthy,
+            sessions: remote_sessions.clone(),
+        }];
+        let live_sessions = remote_sessions
+            .iter()
+            .take(4)
+            .map(|scanned| {
+                let mut session = test_live_shell_session(&scanned.session_path);
+                session.id = scanned.session_id.clone();
+                session.title = scanned.title_hint.clone();
+                session.kind = SessionKind::Codex;
+                session.host_label = "oc".to_string();
+                session.source = SessionSource::LiveSsh;
+                session.remote_deploy_state = RemoteDeployState::Ready;
+                session.ssh_target = Some("oc".to_string());
+                session
+            })
+            .collect::<Vec<_>>();
+
+        let rows = merged_sidebar_rows(
+            &[],
+            &remote_machines,
+            &[],
+            &live_sessions,
+            &HashSet::from(["__live_sessions__".to_string()]),
+        );
+        let live_rows = rows
+            .iter()
+            .skip_while(|row| row.full_path != "__live_sessions__")
+            .skip(1)
+            .take_while(|row| row.depth > 0)
+            .filter(|row| row.kind == BrowserRowKind::Session)
+            .collect::<Vec<_>>();
+
+        assert_eq!(live_rows.len(), 4);
+        assert!(
+            live_rows
+                .iter()
+                .all(|row| row.full_path != "remote-session://oc/runtime-4"),
+            "remote scan metadata must not create an extra Live Sessions row"
+        );
+    }
+    #[test]
     fn merged_sidebar_rows_refresh_stale_remote_title_from_live_session() {
         let rows = merged_sidebar_rows(
             &[],
@@ -54273,6 +54821,135 @@ mod tests {
             "remote-session://dev/session"
         ));
         assert!(terminal_input_uses_optimistic_busy_hint("codex://local/1"));
+    }
+    #[test]
+    fn terminal_input_snapshot_schedule_uses_hot_window_without_nudge() {
+        let session_path = "local://shell";
+        let mut shell = ShellState::new(test_shell_bootstrap_with_active_session(session_path));
+        let live_session = test_live_shell_session(session_path);
+        shell.server.apply_snapshot(ServerUiSnapshot {
+            active_session_path: Some(session_path.to_string()),
+            active_session: Some(snapshot_session_view_for_ui(live_session.clone())),
+            active_view_mode: WorkspaceViewMode::Terminal,
+            remote_machines: Vec::new(),
+            ssh_targets: Vec::new(),
+            live_sessions: vec![snapshot_session_view_for_ui(live_session)],
+        });
+        shell.next_live_session_snapshot_after_ms = 0;
+
+        schedule_live_session_snapshot_after_terminal_input(&mut shell, session_path, true);
+
+        let now_ms = current_millis();
+        assert!(
+            shell.terminal_input_hot_until_ms >= now_ms,
+            "typing should mark the shell input-hot so background snapshots wait"
+        );
+        assert!(
+            shell.next_live_session_snapshot_after_ms >= shell.terminal_input_hot_until_ms,
+            "input scheduling should not request an immediate daemon snapshot"
+        );
+        assert!(!shell.live_session_snapshot_nudge_in_flight);
+        assert!(shell.terminal_busy_hint_until_ms.contains_key(session_path));
+    }
+
+    #[test]
+    fn live_sidebar_uses_daemon_live_sessions_not_retained_terminal_cache() {
+        let live_path = "local://live-shell";
+        let stale_retained_path = "remote-session://dev/stale-retained";
+        let live_session = test_live_shell_session(live_path);
+        let mut stale_retained = test_live_shell_session(stale_retained_path);
+        stale_retained.source = SessionSource::LiveSsh;
+        stale_retained.kind = SessionKind::Codex;
+
+        let hot_sessions = merge_hot_sidebar_sessions(&[live_session], &[stale_retained]);
+
+        assert_eq!(hot_sessions.len(), 1);
+        assert_eq!(hot_sessions[0].session_path, live_path);
+        assert!(
+            hot_sessions
+                .iter()
+                .all(|session| session.session_path != stale_retained_path),
+            "retained terminal hosts are render caches and must not resurrect Live Sessions rows"
+        );
+    }
+
+    #[test]
+    fn live_session_close_waits_for_authoritative_daemon_redirect() {
+        let active_path = "local://closing-shell";
+        let shell = ShellState::new(test_shell_bootstrap_with_active_session(active_path));
+        let pending = PendingDeleteDialog {
+            document_paths: Vec::new(),
+            group_paths: Vec::new(),
+            session_paths: vec![active_path.to_string()],
+            ssh_machine_keys: Vec::new(),
+            labels: vec!["Closing Shell".to_string()],
+            hard_delete: false,
+            live_session_close: true,
+        };
+
+        assert!(
+            deletion_redirect_row_for_pending(&shell, &pending).is_none(),
+            "explicit terminal close should not preselect from a stale mixed sidebar before the daemon confirms the new live set"
+        );
+    }
+
+    #[test]
+    fn optimistic_keep_alive_toggle_updates_close_truth_before_daemon_reply() {
+        let session_path = "local://active-shell";
+        let mut shell = ShellState::new(test_shell_bootstrap_with_active_session(session_path));
+        let live_session = test_live_shell_session(session_path);
+        shell.server.apply_snapshot(ServerUiSnapshot {
+            active_session_path: Some(session_path.to_string()),
+            active_session: Some(snapshot_session_view_for_ui(live_session.clone())),
+            active_view_mode: WorkspaceViewMode::Terminal,
+            remote_machines: Vec::new(),
+            ssh_targets: Vec::new(),
+            live_sessions: vec![snapshot_session_view_for_ui(live_session)],
+        });
+
+        assert!(local_keep_alive_session_paths(&shell).is_empty());
+        assert!(mark_live_session_keep_alive_locally(
+            &mut shell,
+            session_path,
+            true
+        ));
+
+        assert_eq!(local_keep_alive_session_paths(&shell), vec![session_path]);
+        assert!(
+            shell.server.live_sessions().iter().any(|session| {
+                session.session_path == session_path && live_session_keep_alive(session)
+            }),
+            "close-time keep-alive flush must see the optimistic state even before the daemon snapshot reply returns"
+        );
+    }
+
+    #[test]
+    fn terminal_open_attempt_can_be_cleared_after_live_session_close() {
+        let session_path = "local://closing-shell";
+        let mut shell = ShellState::new(test_shell_bootstrap_with_active_session(session_path));
+        let attempt_id = shell.begin_terminal_open_attempt(session_path, "req-test", 1, "open_row");
+        shell.mark_terminal_open_attempt_ready_for_session(session_path, "visual_reveal");
+        assert!(shell.terminal_open_attempts.contains_key(&attempt_id));
+        assert!(
+            shell
+                .latest_terminal_open_attempt_for_path(session_path)
+                .is_some()
+        );
+
+        shell.clear_terminal_open_attempt_for_session(session_path, "live_session_close");
+
+        assert!(!shell.terminal_open_attempts.contains_key(&attempt_id));
+        assert!(
+            shell
+                .terminal_open_attempt_by_session
+                .get(session_path)
+                .is_none()
+        );
+        assert!(
+            shell
+                .latest_terminal_open_attempt_for_path(session_path)
+                .is_none()
+        );
     }
     #[test]
     fn preferred_open_mode_for_stored_codex_session_row_forces_terminal() {
@@ -57731,7 +58408,7 @@ q to quit   pgup/pgdn to page   enter to edit message
     }
 
     #[test]
-    fn inactive_retained_ready_session_keeps_current_host_hot() {
+    fn inactive_retained_ready_session_releases_current_bridge() {
         let active_session_path = "codex://active";
         let inactive_session_path = "remote-session://dev/inactive";
         let bootstrap = test_shell_bootstrap_with_active_session(active_session_path);
@@ -57747,7 +58424,7 @@ q to quit   pgup/pgdn to page   enter to edit message
             .insert(inactive_session_path.to_string());
         shell.active_terminal_host_id = Some("host-active".to_string());
 
-        assert!(terminal_session_still_active(
+        assert!(!terminal_session_still_active(
             &shell,
             inactive_session_path,
             &inactive_host
@@ -57760,7 +58437,7 @@ q to quit   pgup/pgdn to page   enter to edit message
     }
 
     #[test]
-    fn active_retained_remote_session_does_not_bootstrap_again_on_focus_return() {
+    fn active_retained_remote_session_rebootstraps_bridge_on_focus_return() {
         let session_path = "remote-session://dev/019dbdc7-7e63-7211-a7f8-51eb4d6e80b2";
         let bootstrap = test_shell_bootstrap_with_active_session(session_path);
         let mut shell = ShellState::new(bootstrap);
@@ -57771,7 +58448,7 @@ q to quit   pgup/pgdn to page   enter to edit message
             .terminal_resume_ready_paths
             .insert(session_path.to_string());
 
-        assert!(!terminal_session_should_bootstrap_host(
+        assert!(terminal_session_should_bootstrap_host(
             &shell,
             Some(session_path),
             session_path
@@ -58468,6 +59145,37 @@ q to quit   pgup/pgdn to page   enter to edit message
         assert_eq!(active.title, "Fresh Shell");
         assert_eq!(active.terminal_foreground_active, Some(true));
         assert_eq!(active.terminal_process_id, Some(42));
+    }
+    #[test]
+    fn background_snapshot_identity_check_ignores_stale_active_copy_without_runtime_change() {
+        let active_session_path = "local://fresh-shell";
+        let mut shell = ShellState::new(test_shell_bootstrap_with_active_session(
+            active_session_path,
+        ));
+        let live_session = test_live_shell_session(active_session_path);
+        shell.server.apply_snapshot(ServerUiSnapshot {
+            active_session_path: Some(active_session_path.to_string()),
+            active_session: Some(snapshot_session_view_for_ui(live_session.clone())),
+            active_view_mode: WorkspaceViewMode::Terminal,
+            remote_machines: Vec::new(),
+            ssh_targets: Vec::new(),
+            live_sessions: vec![snapshot_session_view_for_ui(live_session.clone())],
+        });
+        let mut stale_active = snapshot_session_view_for_ui(live_session.clone());
+        stale_active.title = "Stale Active Copy".to_string();
+        let snapshot = ServerUiSnapshot {
+            active_session_path: Some(active_session_path.to_string()),
+            active_session: Some(stale_active),
+            active_view_mode: WorkspaceViewMode::Terminal,
+            remote_machines: Vec::new(),
+            ssh_targets: Vec::new(),
+            live_sessions: vec![snapshot_session_view_for_ui(live_session)],
+        };
+
+        assert!(
+            !background_snapshot_changes_active_runtime_identity(&shell, &snapshot),
+            "background snapshots should not replace active terminal state during input-hot unless runtime identity changes"
+        );
     }
     #[test]
     fn apply_snapshot_result_without_request_clears_stale_server_busy_without_active_requests() {
@@ -61082,6 +61790,34 @@ q to quit   pgup/pgdn to page   enter to edit message
     }
 
     #[test]
+    fn runtime_truth_candidates_include_daemon_key_after_snapshot_apply() {
+        let session_path = "local://fresh-shell";
+        let mut shell = ShellState::new(test_shell_bootstrap_with_active_session(session_path));
+        let live_session = test_live_shell_session(session_path);
+        shell.server.apply_snapshot(ServerUiSnapshot {
+            active_session_path: Some(session_path.to_string()),
+            active_session: Some(snapshot_session_view_for_ui(live_session.clone())),
+            active_view_mode: WorkspaceViewMode::Terminal,
+            remote_machines: Vec::new(),
+            ssh_targets: Vec::new(),
+            live_sessions: vec![snapshot_session_view_for_ui(live_session)],
+        });
+
+        let candidates = terminal_runtime_key_candidates_for_session_path(&shell, session_path);
+
+        assert!(
+            candidates
+                .iter()
+                .any(|candidate| candidate == "local::fresh-shell"),
+            "runtime truth must compare the display path with the daemon's local:: PTY key"
+        );
+        assert!(
+            candidates.iter().any(|candidate| candidate == session_path),
+            "display path remains a fallback candidate for legacy/runtime-direct paths"
+        );
+    }
+
+    #[test]
     fn update_call_to_action_defaults_to_check_for_updates() {
         let shell = ShellState::new(test_shell_bootstrap_with_active_session("local://test"));
         let cta = shell.update_call_to_action();
@@ -61799,7 +62535,7 @@ q to quit   pgup/pgdn to page   enter to edit message
     }
 
     #[test]
-    fn sync_live_terminal_retention_keeps_cached_retained_remote_on_focus_switch() {
+    fn sync_live_terminal_retention_drops_retained_remote_when_snapshot_loses_runtime() {
         let remote_path = "remote-session://dev/019dbdc7-7e63-7211-a7f8-51eb4d6e80b2";
         let local_path = "local://active-shell";
         let mut shell = ShellState::new(test_shell_bootstrap_with_active_session(remote_path));
@@ -61851,17 +62587,16 @@ q to quit   pgup/pgdn to page   enter to edit message
         shell.sync_live_terminal_retention();
 
         assert!(
-            shell.retained_terminal_session_paths.contains(remote_path),
-            "focus switch must not drop a ready retained remote host just because the latest daemon snapshot omits it from live_sessions"
+            !shell.retained_terminal_session_paths.contains(remote_path),
+            "retained terminal hosts must not preserve a live session after daemon runtime truth omits it"
         );
-        assert!(shell.terminal_session_is_retained_live(remote_path));
         let snapshot = shell.snapshot();
         assert!(
-            snapshot
+            !snapshot
                 .retained_terminal_sessions
                 .iter()
                 .any(|session| session.session_path == remote_path),
-            "cached retained remote must remain renderable for focus return"
+            "cached retained remote must not keep rendering after runtime loss"
         );
     }
 
@@ -61922,7 +62657,7 @@ q to quit   pgup/pgdn to page   enter to edit message
     }
 
     #[test]
-    fn shell_snapshot_recovers_blank_terminal_view_from_cached_hot_session() {
+    fn shell_snapshot_does_not_recover_live_row_from_cached_hot_session() {
         let session_path = "local://cached-shell";
         let mut shell = ShellState::new(test_shell_bootstrap_with_active_session(session_path));
         let session = ManagedSessionView {
@@ -61984,23 +62719,23 @@ q to quit   pgup/pgdn to page   enter to edit message
         )));
 
         let snapshot = shell.snapshot();
-        let active = snapshot
-            .active_session
-            .as_ref()
-            .expect("cached active session should keep terminal view alive");
-        assert_eq!(active.session_path, session_path);
-        assert_eq!(active.title, "Cached Shell");
         assert!(
-            snapshot
-                .live_sessions
-                .iter()
-                .any(|session| session.session_path == session_path)
+            snapshot.active_session.is_none(),
+            "cached metadata must not keep a missing runtime active in terminal mode"
         );
         assert!(
-            snapshot
+            !snapshot
+                .live_sessions
+                .iter()
+                .any(|session| session.session_path == session_path),
+            "cached metadata must not manufacture a Live Sessions row"
+        );
+        assert!(
+            !snapshot
                 .retained_terminal_sessions
                 .iter()
-                .any(|session| session.session_path == session_path)
+                .any(|session| session.session_path == session_path),
+            "cached metadata must not keep a missing runtime retained"
         );
     }
 
@@ -62044,7 +62779,7 @@ q to quit   pgup/pgdn to page   enter to edit message
     }
 
     #[test]
-    fn apply_snapshot_preserves_active_live_session_across_snapshot_gap() {
+    fn apply_snapshot_drops_active_live_session_across_runtime_gap() {
         let session_path = "local://cached-shell";
         let mut shell = ShellState::new(test_shell_bootstrap_with_active_session(session_path));
         let session = ManagedSessionView {
@@ -62099,13 +62834,12 @@ q to quit   pgup/pgdn to page   enter to edit message
             ssh_targets: Vec::new(),
             live_sessions: Vec::new(),
         });
-        assert_eq!(shell.server.active_session_path(), Some(session_path));
-        let active = shell
-            .server
-            .active_session()
-            .expect("previous live session should survive snapshot gap");
-        assert_eq!(active.session_path, session_path);
-        assert_eq!(active.title, "Cached Shell");
+        assert_eq!(shell.server.active_session_path(), None);
+        assert!(
+            shell.server.active_session().is_none(),
+            "previous live metadata must not survive a daemon snapshot gap"
+        );
+        assert!(shell.server.live_sessions().is_empty());
     }
 
     #[test]
