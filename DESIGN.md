@@ -176,6 +176,7 @@ If a user says “this does not look like a button”, that is a design failure.
 - If the product has a global or sidebar search, the default preference is a centered search field in the titlebar.
 - The search field should feel like part of the shell, not a floating badge.
 - Search should generally be the visual anchor of the center titlebar slot.
+- Titlebar search is centered against the full titlebar, not the remaining space between left and right controls. At narrower widths it must shrink or simplify neighboring controls before it overlaps Connect SSH, overflow, settings, metadata, or window controls.
 - In its idle state, search should read as a single compact field, not a stacked control with helper copy always visible.
 - In its focused state, the search result surface should wrap the search field itself into one continuous shell, closer to VS Code command/search behavior than to a detached popover under the field.
 - Search typography in chrome should err slightly larger and crisper than default web utility text. Tiny soft-looking placeholder or helper text is a design miss.
@@ -288,13 +289,13 @@ If a project has drag-and-drop tree or list reordering:
 - multi-select drag can use stacked-card visuals
 - the final placement must match the visible snap indicator exactly
 
-### Preview surfaces
+### Web View Surfaces
 
-If a project has a conversation preview surface:
+If a project has a conversation Web View surface:
 
-- preview reading mode and runtime/live mode should share one header system
+- Web View reading mode and runtime/live mode should share one header system
 - generated title and summary should be treated as refreshable navigational aids
-- preview content should render like content, not raw log lines
+- Web View content should render like content, not raw log lines
 - headings, bullets, task items, quotes, and code fences should each have distinct treatment
 - overview/graph mode should feel structural, not like the same chat list in a second skin
 - overview mode should highlight summary, counts, and message progression before full transcript detail
@@ -437,16 +438,16 @@ The product has three separate identities that must not be conflated:
 
 - `Workspace row`: the durable place in the sidebar tree.
 - `Runtime`: the daemon-owned PTY or SSH session that receives bytes.
-- `Display copy`: title, precis, summary, preview text, and generated labels.
+- `Display copy`: title, precis, summary, Web View text, and generated labels.
 
 Selecting a row may focus or hydrate already-cached data. It must not rename, regenerate, relaunch, or move a runtime unless the user took an explicit action for that side effect.
 
 Each app surface has exactly one source of truth:
 
-- Terminal mode is a live runtime attachment. Its viewport is fed only by daemon-owned PTY bytes, daemon-owned retained scrollback for that same runtime, or an explicit runtime-unavailable error. It must never be fed by generated preview copy, Codex JSONL transcript blocks, semantic status-card guesses, or display-copy fallbacks.
-- Preview mode is a read-only presentation of a session for inspection, similar to a chat transcript. Its source of truth is stored/generated presentation data, not the live PTY. It may show `USER`/`ASSISTANT` style blocks when presenting an agent transcript, but those blocks are illegal in Terminal mode.
+- Terminal mode is a live runtime attachment. Its viewport is fed only by daemon-owned PTY bytes, daemon-owned retained scrollback for that same runtime, or an explicit runtime-unavailable error. It must never be fed by generated Web View copy, Codex JSONL transcript blocks, semantic status-card guesses, or display-copy fallbacks.
+- Web View mode is a read-only presentation of a session for inspection, similar to a chat transcript. Its source of truth is stored/generated presentation data, not the live PTY. It may show `USER`/`ASSISTANT` style blocks when presenting an agent transcript, but those blocks are illegal in Terminal mode. Internal schemas may still use the legacy `Preview` name for compatibility, but user-facing UI should say `Web View`.
 - Display copy is metadata. It can label, summarize, and help users re-enter work, but it never decides which runtime receives input and never repairs a terminal viewport.
-- Retained xterm hosts are display caches. If the cache is missing, stale, or corrupt, the rebuild source is the daemon runtime stream/scrollback for that runtime, not preview text.
+- Retained xterm hosts are display caches. If the cache is missing, stale, or corrupt, the rebuild source is the daemon runtime stream/scrollback for that runtime, not Web View text.
 - Codex-class semantic state is advisory. Codex welcome cards, `/status` output, prompt wording, and model banners are not stable contracts and must not be used as the primary proof that a terminal is healthy.
 
 ### Live sessions and updates
@@ -460,15 +461,15 @@ Each app surface has exactly one source of truth:
 - Normal app close prunes non-Keep-Alive live rows and gracefully closes their runtimes with a one-hour force-cleanup deadline.
 - Update restart protection temporarily treats all recoverable live runtimes as restorable. It must not silently turn unkept sessions into durable Keep Alive sessions.
 
-### Preview and copy
+### Web View and copy
 
-Preview mode is read-only by default.
+Web View mode is read-only by default.
 
-- Switching Terminal -> Preview -> Terminal must preserve session identity, title, summary, runtime, scroll intent, and input routing.
-- Preview hydration may update the preview body from existing cache.
-- Preview hydration must not rewrite a user title or start LLM copy generation.
+- Switching Terminal -> Web View -> Terminal must preserve session identity, title, summary, runtime, scroll intent, and input routing.
+- Web View hydration may update the Web View body from existing cache.
+- Web View hydration must not rewrite a user title or start LLM copy generation.
 - Generated copy is an explicit background job with visible state and a bounded budget, not an incidental selection effect.
-- Preview hydration must not write into Terminal-mode buffers, retained xterm buffers, or terminal recovery paths. Preview and terminal are sibling views over the same session identity, not fallback renderers for each other.
+- Web View hydration must not write into Terminal-mode buffers, retained xterm buffers, or terminal recovery paths. Web View and Terminal are sibling views over the same session identity, not fallback renderers for each other.
 
 Terminal recipes are experimental. They should not be created implicitly from drag/drop or ordinary session movement unless an explicit development flag enables that behavior.
 
@@ -527,6 +528,7 @@ Avoid by default:
 - icons should be grayscale by default
 - expanded root emphasis may use blue subtly
 - sessions should not drown users in hashes or duplicate metadata lines
+- focusing a folder should open that folder's scoped Startpage, clear the active terminal viewport, and leave live runtimes untouched; folder expansion belongs to the disclosure control and keyboard arrows, not the row focus action
 
 ### Tree creation language
 
@@ -538,15 +540,22 @@ Primary quick actions:
 
 Folder context menu defaults:
 
-- `New Session`
+- `New Codex Session`
 - `New Terminal`
 - `New Paper`
 - `Add Folder`
 - `Add Separator`
 
+Sidebar iconography is semantic and greyscale by default.
+
+- Use a compact boxed SVG mark with `>_` text for Session and Codex session rows, including live Codex sessions and stored Codex transcripts. The box is the SVG outline; do not encode literal `[` or `]` characters into the mark.
+- Use a compact boxed SVG mark with `$_` text for Terminal rows, including local shells and SSH terminals. The box is the SVG outline; do not encode literal `[` or `]` characters into the mark.
+- Keep Paper/document icons as the current page mark until the Paper surface is developed further.
+- Busy state may temporarily replace the mark with the spinner, but idle rows must return to the correct boxed mark.
+
 ### Header behavior
 
-Preview mode and terminal mode should share the same header system.
+Web View mode and Terminal mode should share the same header system.
 
 That shared header may contain:
 
@@ -588,9 +597,9 @@ The header should not contain:
 - noisy fake status cards
 - gratuitous terminal framing
 
-### Preview surfaces
+### Web View surfaces
 
-Session preview should move toward the quality bar of Open WebUI:
+Session Web View should move toward the quality bar of Open WebUI:
 
 - a clean chat-like message stack for the main reading mode
 - a strong graph/overview mode for branch or flow understanding

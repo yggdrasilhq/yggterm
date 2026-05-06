@@ -152,7 +152,7 @@ pub(crate) fn describe_viewport_snapshot(snapshot: &Value, dom: &Value) -> Value
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
-    let active_terminal_hosts = active_session_path
+    let mut active_terminal_hosts = active_session_path
         .as_deref()
         .map(|path| {
             terminal_hosts
@@ -166,6 +166,14 @@ pub(crate) fn describe_viewport_snapshot(snapshot: &Value, dom: &Value) -> Value
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
+    active_terminal_hosts.sort_by(|left, right| {
+        terminal_host_active_rank_for_app_control(left)
+            .cmp(&terminal_host_active_rank_for_app_control(right))
+            .then_with(|| {
+                terminal_host_sort_key_for_app_control(right)
+                    .cmp(&terminal_host_sort_key_for_app_control(left))
+            })
+    });
     let dom_terminal_resume_overlay =
         dom.get("terminal_resume_overlay")
             .cloned()
@@ -688,18 +696,280 @@ pub(crate) fn summarize_terminal_surface_for_app_control(
         .iter()
         .find_map(terminal_host_problem_for_app_control)
         .map(str::to_string);
+    let render_health = terminal_render_health_for_app_control(hosts);
+    let active_host = hosts
+        .iter()
+        .min_by_key(|host| terminal_host_active_rank_for_app_control(host));
+    let input_enabled = hosts.iter().any(|host| {
+        host.get("input_enabled")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+    });
+    let helper_textarea_focused = hosts.iter().any(|host| {
+        host.get("helper_textarea_focused")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+    });
+    let terminal_input_hot = hosts.iter().any(|host| {
+        host.get("terminal_input_hot")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+    });
+    let render_health_problem = render_health
+        .get("healthy")
+        .and_then(Value::as_bool)
+        .filter(|healthy| !healthy)
+        .and_then(|_| render_health.get("reason"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
     let problem = if overlay_context_visible {
         None::<String>
     } else {
-        geometry_problem.clone().or(live_problem.clone())
+        geometry_problem
+            .clone()
+            .or(live_problem.clone())
+            .or(render_health_problem.clone())
     };
     json!({
         "rendered": rendered,
         "problem": problem,
         "geometry_problem": geometry_problem,
         "live_problem": live_problem,
+        "render_health": render_health,
         "overlay_context_visible": overlay_context_visible,
+        "input_enabled": input_enabled,
+        "helper_textarea_focused": helper_textarea_focused,
+        "terminal_input_hot": terminal_input_hot,
+        "host_id": active_host.and_then(|host| host.get("host_id")).cloned().unwrap_or(Value::Null),
+        "session_path": active_host.and_then(|host| host.get("session_path")).cloned().unwrap_or(Value::Null),
+        "content_source": active_host.and_then(|host| host.get("terminal_content_source")).cloned().unwrap_or(Value::Null),
+        "retained_replay_source": active_host.and_then(|host| host.get("retained_replay_source")).cloned().unwrap_or(Value::Null),
+        "source_mismatch_reason": active_host.and_then(|host| host.get("terminal_source_mismatch_reason")).cloned().unwrap_or(Value::Null),
+        "prompt_band": terminal_prompt_band_for_app_control(active_host),
+        "timing": terminal_timing_for_app_control(active_host),
     })
+}
+
+fn terminal_host_active_rank_for_app_control(host: &Value) -> u8 {
+    let focused = host
+        .get("helper_textarea_focused")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+        || host
+            .get("host_has_active_element")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+    if focused {
+        return 0;
+    }
+    if host
+        .get("input_enabled")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        return 1;
+    }
+    if terminal_host_has_rendered_surface_for_app_control(host) {
+        return 2;
+    }
+    3
+}
+
+fn terminal_host_sort_key_for_app_control(host: &Value) -> String {
+    [
+        host.get("last_render_event_at_ms")
+            .and_then(Value::as_u64)
+            .unwrap_or(0)
+            .to_string(),
+        host.get("last_write_flush_started_at_ms")
+            .and_then(Value::as_u64)
+            .unwrap_or(0)
+            .to_string(),
+        host.get("host_id")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+    ]
+    .join(":")
+}
+
+fn terminal_prompt_band_for_app_control(host: Option<&Value>) -> Value {
+    let Some(host) = host else {
+        return Value::Null;
+    };
+    json!({
+        "cursor_line_text": host.get("cursor_line_text").or_else(|| host.get("cursor_row_text")).cloned().unwrap_or(Value::Null),
+        "cursor_row_rect": host.get("cursor_row_rect").cloned().unwrap_or(Value::Null),
+        "cursor_sample_rect": host.get("cursor_sample_rect").cloned().unwrap_or(Value::Null),
+        "cursor_expected_rect": host.get("cursor_expected_rect").cloned().unwrap_or(Value::Null),
+        "cursor_bottom_overflow_px": host.get("cursor_bottom_overflow_px").cloned().unwrap_or(Value::Null),
+        "fit_overflow_px": host.get("fit_overflow_px").cloned().unwrap_or(Value::Null),
+        "fit_required_height_px": host.get("fit_required_height_px").cloned().unwrap_or(Value::Null),
+        "fit_available_height_px": host.get("fit_available_height_px").cloned().unwrap_or(Value::Null),
+        "blank_rows_below_cursor": host.get("blank_rows_below_cursor").cloned().unwrap_or(Value::Null),
+        "base_y": host.get("base_y").cloned().unwrap_or(Value::Null),
+        "viewport_y": host.get("viewport_y").cloned().unwrap_or(Value::Null),
+        "low_power_tui_overlay_active": host.get("low_power_tui_overlay_active").cloned().unwrap_or(Value::Bool(false)),
+        "low_power_tui_overlay_present": host.get("low_power_tui_overlay_present").cloned().unwrap_or(Value::Bool(false)),
+    })
+}
+
+fn terminal_timing_for_app_control(host: Option<&Value>) -> Value {
+    let Some(host) = host else {
+        return Value::Null;
+    };
+    json!({
+        "last_data_event_at_ms": host.get("last_data_event_at_ms").cloned().unwrap_or(Value::Null),
+        "last_write_queued_at_ms": host.get("last_write_queued_at_ms").cloned().unwrap_or(Value::Null),
+        "last_write_flush_started_at_ms": host.get("last_write_flush_started_at_ms").cloned().unwrap_or(Value::Null),
+        "last_write_callback_at_ms": host.get("last_write_callback_at_ms").cloned().unwrap_or(Value::Null),
+        "last_render_event_at_ms": host.get("last_render_event_at_ms").cloned().unwrap_or(Value::Null),
+        "last_render_health_checked_at_ms": host.get("last_render_health_checked_at_ms").cloned().unwrap_or(Value::Null),
+        "last_manual_redraw_at_ms": host.get("last_manual_redraw_at_ms").cloned().unwrap_or(Value::Null),
+        "last_manual_redraw_started_at_ms": host.get("last_manual_redraw_started_at_ms").cloned().unwrap_or(Value::Null),
+        "last_manual_redraw_settled_at_ms": host.get("last_manual_redraw_settled_at_ms").cloned().unwrap_or(Value::Null),
+        "last_manual_redraw_duration_ms": host.get("last_manual_redraw_duration_ms").cloned().unwrap_or(Value::Null),
+        "last_manual_redraw_effect": host.get("last_manual_redraw_effect").cloned().unwrap_or(Value::Null),
+        "terminal_write_frame_ms": host.get("terminal_write_frame_ms").cloned().unwrap_or(Value::Null),
+        "terminal_active_write_frame_ms": host.get("terminal_active_write_frame_ms").cloned().unwrap_or(Value::Null),
+        "effective_terminal_write_frame_ms": host.get("effective_terminal_write_frame_ms").cloned().unwrap_or(Value::Null),
+        "active_write_frame_budget": host.get("active_write_frame_budget").cloned().unwrap_or(Value::Null),
+        "recent_frame_like_write_hot": host.get("recent_frame_like_write_hot").cloned().unwrap_or(Value::Null),
+        "last_raw_payload_length": host.get("last_raw_payload_length").cloned().unwrap_or(Value::Null),
+        "last_raw_payload_line_count": host.get("last_raw_payload_line_count").cloned().unwrap_or(Value::Null),
+        "write_command_count": host.get("write_command_count").cloned().unwrap_or(Value::Null),
+        "write_bridge_flush_count": host.get("write_bridge_flush_count").cloned().unwrap_or(Value::Null),
+        "render_event_count": host.get("render_event_count").cloned().unwrap_or(Value::Null),
+        "forced_refresh_count": host.get("forced_refresh_count").cloned().unwrap_or(Value::Null),
+        "forced_refresh_skipped_count": host.get("forced_refresh_skipped_count").cloned().unwrap_or(Value::Null),
+        "manual_redraw_count": host.get("manual_redraw_count").cloned().unwrap_or(Value::Null),
+    })
+}
+
+fn terminal_render_health_for_app_control(hosts: &[Value]) -> Value {
+    for host in hosts {
+        if let Some(health) = terminal_host_render_health_for_app_control(host) {
+            return health;
+        }
+    }
+    json!({
+        "healthy": true,
+        "status": "unknown",
+        "reason": Value::Null,
+        "recovery_scheduled": false,
+    })
+}
+
+fn terminal_host_render_health_for_app_control(host: &Value) -> Option<Value> {
+    let status = host
+        .get("render_health_status")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let reason = host
+        .get("render_health_reason")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let recovery_scheduled = host
+        .get("pending_render_health_recovery")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let recovery_count = host
+        .get("render_health_recovery_count")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    if status == "unhealthy" {
+        return Some(json!({
+            "healthy": false,
+            "status": status,
+            "reason": if reason.is_empty() { "render_health_unhealthy" } else { reason },
+            "recovery_scheduled": recovery_scheduled,
+            "recovery_count": recovery_count,
+        }));
+    }
+
+    let text = [
+        host.get("text_sample")
+            .and_then(Value::as_str)
+            .unwrap_or(""),
+        host.get("text_tail").and_then(Value::as_str).unwrap_or(""),
+        host.get("buffer_text_sample")
+            .and_then(Value::as_str)
+            .unwrap_or(""),
+        host.get("cursor_line_text")
+            .or_else(|| host.get("cursor_row_text"))
+            .and_then(Value::as_str)
+            .unwrap_or(""),
+    ]
+    .join("\n");
+    let has_buffer_text = text.chars().any(|ch| ch.is_ascii_alphanumeric());
+    let canvas_count = host
+        .get("canvas_count")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let (sampled_pixels, nontransparent_pixels, alpha_sum) = terminal_host_canvas_ink_totals(host);
+    if has_buffer_text
+        && canvas_count > 0
+        && sampled_pixels > 0
+        && (nontransparent_pixels == 0 || alpha_sum <= 12)
+    {
+        return Some(json!({
+            "healthy": false,
+            "status": "unhealthy",
+            "reason": "canvas_blank_with_buffer_text",
+            "recovery_scheduled": recovery_scheduled,
+            "recovery_count": recovery_count,
+            "sampled_pixels": sampled_pixels,
+            "nontransparent_pixels": nontransparent_pixels,
+            "alpha_sum": alpha_sum,
+        }));
+    }
+    if status == "healthy" {
+        return Some(json!({
+            "healthy": true,
+            "status": status,
+            "reason": Value::Null,
+            "recovery_scheduled": recovery_scheduled,
+            "recovery_count": recovery_count,
+            "sampled_pixels": sampled_pixels,
+            "nontransparent_pixels": nontransparent_pixels,
+            "alpha_sum": alpha_sum,
+        }));
+    }
+    None
+}
+
+fn terminal_host_canvas_ink_totals(host: &Value) -> (u64, u64, u64) {
+    let mut sampled_pixels = 0;
+    let mut nontransparent_pixels = 0;
+    let mut alpha_sum = 0;
+    if let Some(layers) = host.get("canvas_layers").and_then(Value::as_array) {
+        for layer in layers {
+            let Some(sample) = layer.get("ink_sample") else {
+                continue;
+            };
+            sampled_pixels += sample
+                .get("sampled_pixels")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            nontransparent_pixels += sample
+                .get("nontransparent_pixels")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            alpha_sum += sample.get("alpha_sum").and_then(Value::as_u64).unwrap_or(0);
+        }
+    }
+    if let Some(sample) = host.get("render_health_ink_sample") {
+        sampled_pixels += sample
+            .get("sampled_pixels")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        nontransparent_pixels += sample
+            .get("nontransparent_pixels")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        alpha_sum += sample.get("alpha_sum").and_then(Value::as_u64).unwrap_or(0);
+    }
+    (sampled_pixels, nontransparent_pixels, alpha_sum)
 }
 
 fn terminal_host_has_rendered_surface_for_app_control(host: &Value) -> bool {
@@ -838,6 +1108,16 @@ fn terminal_host_problem_for_app_control(host: &Value) -> Option<&'static str> {
         .get("write_command_count")
         .and_then(Value::as_u64)
         .unwrap_or(0);
+    let terminal_content_source = host
+        .get("terminal_content_source")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or("");
+    let retained_replay_source = host
+        .get("retained_replay_source")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or("");
     let xterm_buffer_kind = host
         .get("xterm_buffer_kind")
         .and_then(Value::as_str)
@@ -1001,6 +1281,13 @@ fn terminal_host_problem_for_app_control(host: &Value) -> Option<&'static str> {
     }
     if terminal_chunk_is_low_signal_terminal_noise(visible_text) {
         return Some("active terminal host is still showing low-signal terminal noise");
+    }
+    if session_path.starts_with("remote-session://")
+        && (terminal_content_source.contains("server_prompt")
+            || retained_replay_source.contains("server_prompt"))
+        && (xterm_present || screen_present || rows_present || canvas_count > 0)
+    {
+        return Some("active remote terminal is showing non-PTY server snapshot content");
     }
     if session_path.starts_with("remote-session://")
         && !input_enabled
@@ -1197,6 +1484,11 @@ fn terminal_host_geometry_problem_for_app_control(host: &Value) -> Option<&'stat
         .get("scrollback_locked")
         .and_then(Value::as_bool)
         .unwrap_or(false);
+    let scrollback_intent = host
+        .get("scrollback_intent")
+        .and_then(Value::as_str)
+        .unwrap_or("PromptFollow");
+    let user_scrollback_locked = scrollback_locked && scrollback_intent == "UserScrollback";
     let fit_overflow_px = host
         .get("fit_overflow_px")
         .and_then(Value::as_f64)
@@ -1263,7 +1555,10 @@ fn terminal_host_geometry_problem_for_app_control(host: &Value) -> Option<&'stat
     {
         return Some("active terminal host geometry does not match the xterm viewport height");
     }
-    if !scrollback_locked
+    if scrollback_locked && !user_scrollback_locked {
+        return Some("active terminal prompt-follow viewport is stuck in scrollback");
+    }
+    if !user_scrollback_locked
         && cursor_expected_height >= 8.0
         && let Some(cursor_top) = cursor_expected_top
     {
@@ -1272,7 +1567,7 @@ fn terminal_host_geometry_problem_for_app_control(host: &Value) -> Option<&'stat
             return Some("active terminal cursor row is clipped below the visible host");
         }
     }
-    if !scrollback_locked && fit_overflow_px > 0.05 {
+    if !user_scrollback_locked && fit_overflow_px > 0.05 {
         return Some("active terminal xterm rows exceed the visible host height");
     }
     if helpers_width >= 200.0
@@ -1316,6 +1611,36 @@ fn terminal_host_geometry_problem_for_app_control(host: &Value) -> Option<&'stat
             return Some(
                 "active terminal host helper textarea drifted outside the expected hidden contract",
             );
+        }
+    }
+    let active_visible_terminal = host
+        .get("input_enabled")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+        && host
+            .get("viewport_present")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        && host
+            .get("screen_present")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+    let write_budget_fields_present = host.get("active_write_frame_budget").is_some()
+        || host.get("effective_terminal_write_frame_ms").is_some()
+        || host.get("terminal_active_write_frame_ms").is_some();
+    if active_visible_terminal && write_budget_fields_present {
+        let active_write_frame_budget = host
+            .get("active_write_frame_budget")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let effective_frame_ms = host
+            .get("effective_terminal_write_frame_ms")
+            .and_then(Value::as_f64);
+        if !active_write_frame_budget {
+            return Some("active visible terminal is using the background write budget");
+        }
+        if effective_frame_ms.is_none_or(|value| value > 750.0) {
+            return Some("active visible terminal write budget is too slow");
         }
     }
     None
@@ -1825,11 +2150,11 @@ pub(crate) fn strip_terminal_control_sequences(data: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        WorkspaceViewMode, describe_viewport_snapshot, terminal_bootstrap_activation_epoch,
-        terminal_chunk_has_codex_prompt_output, terminal_chunk_has_meaningful_output,
-        terminal_chunk_is_codex_interactive_setup_prompt, terminal_chunk_is_codex_prompt_surface,
-        terminal_chunk_is_local_codex_scaffold, terminal_chunk_is_transport_error,
-        terminal_host_problem_for_app_control,
+        WorkspaceViewMode, describe_viewport_snapshot, summarize_terminal_surface_for_app_control,
+        terminal_bootstrap_activation_epoch, terminal_chunk_has_codex_prompt_output,
+        terminal_chunk_has_meaningful_output, terminal_chunk_is_codex_interactive_setup_prompt,
+        terminal_chunk_is_codex_prompt_surface, terminal_chunk_is_local_codex_scaffold,
+        terminal_chunk_is_transport_error, terminal_host_problem_for_app_control,
     };
     use serde_json::{Value, json};
 
@@ -2192,6 +2517,110 @@ mod tests {
     }
 
     #[test]
+    fn app_control_terminal_surface_flags_blank_canvas_with_buffer_text() {
+        let host = json!({
+            "session_path": "local://codex-session",
+            "text_tail": "OpenAI Codex ready",
+            "buffer_text_sample": "OpenAI Codex\n› /status",
+            "cursor_line_text": "› /status",
+            "xterm_present": true,
+            "screen_present": true,
+            "rows_present": false,
+            "canvas_count": 2,
+            "canvas_layers": [
+                {
+                    "ink_sample": {
+                        "sampled_pixels": 24,
+                        "nontransparent_pixels": 0,
+                        "alpha_sum": 0
+                    }
+                }
+            ]
+        });
+        let summary = summarize_terminal_surface_for_app_control(&[host], false);
+        assert_eq!(
+            summary
+                .get("render_health")
+                .and_then(|health| health.get("healthy"))
+                .and_then(Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            summary
+                .get("render_health")
+                .and_then(|health| health.get("reason"))
+                .and_then(Value::as_str),
+            Some("canvas_blank_with_buffer_text")
+        );
+        assert_eq!(
+            summary.get("problem").and_then(Value::as_str),
+            Some("canvas_blank_with_buffer_text")
+        );
+    }
+
+    #[test]
+    fn app_control_terminal_surface_exposes_active_prompt_and_timing_truth() {
+        let host = json!({
+            "host_id": "host-active",
+            "session_path": "remote-session://dev/live",
+            "text_tail": "OpenAI Codex\n› Improve docs",
+            "cursor_line_text": "› Improve docs",
+            "xterm_present": true,
+            "screen_present": true,
+            "viewport_present": true,
+            "canvas_count": 2,
+            "input_enabled": true,
+            "helper_textarea_focused": true,
+            "terminal_input_hot": true,
+            "terminal_content_source": "daemon_pty",
+            "retained_replay_source": "",
+            "terminal_source_mismatch_reason": "",
+            "cursor_expected_rect": {"left": 12.0, "top": 24.0, "width": 8.0, "height": 18.0},
+            "cursor_bottom_overflow_px": 0.0,
+            "fit_overflow_px": 0.0,
+            "last_write_flush_started_at_ms": 1200,
+            "last_render_event_at_ms": 1234,
+            "last_manual_redraw_started_at_ms": 1300,
+            "last_manual_redraw_settled_at_ms": 1324,
+            "last_manual_redraw_duration_ms": 24,
+            "last_manual_redraw_effect": "rendered",
+            "write_bridge_flush_count": 7,
+            "render_event_count": 9,
+            "manual_redraw_count": 2
+        });
+        let summary = summarize_terminal_surface_for_app_control(&[host], false);
+        assert_eq!(
+            summary.get("input_enabled").and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            summary.get("content_source").and_then(Value::as_str),
+            Some("daemon_pty")
+        );
+        assert_eq!(
+            summary
+                .get("prompt_band")
+                .and_then(|prompt| prompt.get("cursor_line_text"))
+                .and_then(Value::as_str),
+            Some("› Improve docs")
+        );
+        assert_eq!(
+            summary
+                .get("timing")
+                .and_then(|timing| timing.get("last_manual_redraw_effect"))
+                .and_then(Value::as_str),
+            Some("rendered")
+        );
+        assert_eq!(
+            summary
+                .get("timing")
+                .and_then(|timing| timing.get("write_bridge_flush_count"))
+                .and_then(Value::as_u64),
+            Some(7)
+        );
+    }
+
+    #[test]
     fn terminal_host_problem_keeps_remote_prompt_only_surface_recovering_until_ready() {
         let host = json!({
             "session_path": "remote-session://dev/fresh-shell",
@@ -2317,6 +2746,44 @@ mod tests {
             Some(
                 "active remote terminal is showing stale retained text before prompt-ready surface"
             )
+        );
+    }
+
+    #[test]
+    fn terminal_host_problem_rejects_server_prompt_snapshot_as_terminal_source() {
+        let stale_tail = "Killing the stale helper exposed another deterministic bug instead of hiding it: the 2.1.150 helper relaunched\nand the daemon now has two runtime keys for the same id.\n\n› Improve documentation in @filename\n\n  gpt-5.5 xhigh · ~/gh/yggterm";
+        let host = json!({
+            "session_path": "remote-session://dev/stale-codex",
+            "text_sample": stale_tail,
+            "text_tail": stale_tail,
+            "buffer_text_sample": stale_tail,
+            "cursor_line_text": "› Improve documentation in @filename",
+            "terminal_content_source": "server_prompt_snapshot",
+            "retained_replay_source": "server_prompt_snapshot",
+            "input_enabled": true,
+            "helper_textarea_focused": true,
+            "cursor_node_count": 1,
+            "xterm_present": true,
+            "screen_present": true,
+            "rows_present": false,
+            "canvas_count": 4,
+            "render_event_count": 12,
+            "data_event_count": 0,
+            "last_raw_payload_length": 886,
+            "write_command_count": 1,
+            "mounted_entry_host_connected": true,
+            "xterm_buffer_kind": "normal",
+            "host_rect": {"left": 0.0, "top": 0.0, "width": 840.0, "height": 830.0},
+            "host_content_width": 840.0,
+            "host_content_height": 830.0,
+            "screen_rect": {"width": 840.0, "height": 830.0},
+            "viewport_rect": {"width": 840.0, "height": 830.0},
+            "helpers_rect": {"width": 840.0, "height": 830.0},
+            "helper_textarea_rect": {"left": -10000.0, "top": 68.0, "width": 1.0, "height": 1.0}
+        });
+        assert_eq!(
+            terminal_host_problem_for_app_control(&host),
+            Some("active remote terminal is showing non-PTY server snapshot content")
         );
     }
 
