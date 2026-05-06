@@ -334,7 +334,10 @@ fn persisted_live_session_from_managed(
     session: &ManagedSessionView,
     keep_alive: bool,
     restore_reason: Option<String>,
+    protect_for_update_restart: bool,
 ) -> Option<PersistedLiveSession> {
+    let remote_launch_action = session_metadata_value(session, REMOTE_LAUNCH_ACTION_METADATA_LABEL)
+        .filter(|action| !(protect_for_update_restart && action.as_str() == "start-codex"));
     session
         .ssh_target
         .as_ref()
@@ -351,11 +354,7 @@ fn persisted_live_session_from_managed(
                 .iter()
                 .find(|entry| entry.label == "Cwd")
                 .map(|entry| entry.value.clone()),
-            remote_launch_action: session
-                .metadata
-                .iter()
-                .find(|entry| entry.label == REMOTE_LAUNCH_ACTION_METADATA_LABEL)
-                .map(|entry| entry.value.clone()),
+            remote_launch_action,
             storage_path: session_metadata_value(session, "Storage"),
             restore_reason,
         })
@@ -2290,7 +2289,13 @@ impl YggtermServer {
                 }
                 let restore_reason = (!keep_alive && protect_all_live)
                     .then(|| UPDATE_RESTART_RESTORE_REASON.to_string());
-                persisted_live_session_from_managed(key, session, keep_alive, restore_reason)
+                persisted_live_session_from_managed(
+                    key,
+                    session,
+                    keep_alive,
+                    restore_reason,
+                    protect_all_live,
+                )
             })
             .collect();
 
@@ -3917,7 +3922,8 @@ impl YggtermServer {
         };
         self.upsert_ssh_target(&target);
         if let Some((machine_key, session_id, normalized_live_key)) = remote_scanned_key.as_ref() {
-            let starts_new_codex = remote_launch_action.as_deref() == Some("start-codex");
+            let starts_new_codex =
+                remote_launch_action.as_deref() == Some("start-codex") && !temporary_update_restore;
             let machine_ix = self
                 .remote_machines
                 .iter()
@@ -16200,17 +16206,18 @@ mod tests {
     use super::{
         ClientInstanceRecord, GhosttyHostSupport, GhosttyTerminalHostMode, ManagedSessionView,
         PersistedDaemonState, PersistedLiveSession, PersistedStoredSession, PreviewTone,
-        REMOTE_LAUNCH_ACTION_METADATA_LABEL, REMOTE_OUTPUT_SENTINEL, RemoteCommandCacheEntry,
-        RemoteDeployState, RemoteMachineHealth, RemoteMachineRefreshScan, RemoteMachineSnapshot,
-        RemotePreviewPayload, RemoteScannedSession, ServerEndpoint, ServerRuntimeStatus,
-        ServerUiSnapshot, SessionKind, SessionMetadataEntry, SessionNode, SessionPreview,
-        SessionPreviewBlock, SessionSource, SnapshotPreview, SnapshotPreviewBlock,
-        SnapshotRenderedSection, SnapshotSessionView, SshConnectTarget, StoredPreviewHydrationMode,
-        TerminalBackend, TerminalLaunchPhase, UPDATE_RESTART_RESTORE_REASON, UiTheme,
-        WorkspaceViewMode, YggtermServer, active_client_instance_records,
-        apply_remote_preview_payload, apply_remote_preview_payload_for_path,
-        apply_remote_scanned_session_preview, build_session, canonical_static_label,
-        choose_app_control_pid, clear_local_daemon_socket_link_escaping_home,
+        REMOTE_LAUNCH_ACTION_METADATA_LABEL, REMOTE_OUTPUT_SENTINEL,
+        RUNTIME_RESTORE_REASON_METADATA_LABEL, RemoteCommandCacheEntry, RemoteDeployState,
+        RemoteMachineHealth, RemoteMachineRefreshScan, RemoteMachineSnapshot, RemotePreviewPayload,
+        RemoteScannedSession, ServerEndpoint, ServerRuntimeStatus, ServerUiSnapshot, SessionKind,
+        SessionMetadataEntry, SessionNode, SessionPreview, SessionPreviewBlock, SessionSource,
+        SnapshotPreview, SnapshotPreviewBlock, SnapshotRenderedSection, SnapshotSessionView,
+        SshConnectTarget, StoredPreviewHydrationMode, TerminalBackend, TerminalLaunchPhase,
+        UPDATE_RESTART_RESTORE_REASON, UiTheme, WorkspaceViewMode, YggtermServer,
+        active_client_instance_records, apply_remote_preview_payload,
+        apply_remote_preview_payload_for_path, apply_remote_scanned_session_preview, build_session,
+        canonical_static_label, choose_app_control_pid,
+        clear_local_daemon_socket_link_escaping_home,
         clear_local_daemon_socket_link_for_version_mismatch, clear_session_preview_for_loading,
         clear_stale_local_daemon_socket_when_no_daemon, client_instances_dir, current_millis_u64,
         dedupe_remote_scanned_sessions, describe_status_line, legacy_agent_launch_command,
@@ -22231,7 +22238,8 @@ terminal_window_id: None,
             .expect("persisted remote codex session");
         assert_eq!(
             persisted_session.remote_launch_action.as_deref(),
-            Some("start-codex")
+            None,
+            "update restart persistence must not replay a fresh Codex launch"
         );
     }
 
@@ -22353,6 +22361,85 @@ terminal_window_id: None,
         assert!(!session.launch_command.contains("'resume-codex'"));
         assert!(!session.launch_command.contains("--require-existing"));
         assert!(server.session_starts_new_remote_codex("remote-session://dev/fresh-codex"));
+    }
+
+    #[test]
+    fn update_restart_restore_remote_start_codex_requires_existing_session() {
+        let tree = SessionNode {
+            kind: SessionNodeKind::Group,
+            name: "sessions".to_string(),
+            title: None,
+            document_kind: None,
+            group_kind: None,
+            path: PathBuf::from("/"),
+            children: Vec::new(),
+            session_id: None,
+            cwd: None,
+        };
+        let mut server = YggtermServer::new(
+            &tree,
+            false,
+            GhosttyHostSupport::shadow("test".to_string(), false, false),
+            UiTheme::ZedLight,
+        );
+        server.remote_machines.push(RemoteMachineSnapshot {
+            machine_key: "dev".to_string(),
+            label: "dev".to_string(),
+            ssh_target: "dev".to_string(),
+            prefix: None,
+            remote_binary_expr: Some("$HOME/.yggterm/bin/yggterm".to_string()),
+            remote_deploy_state: RemoteDeployState::Ready,
+            health: RemoteMachineHealth::Healthy,
+            sessions: Vec::new(),
+        });
+
+        server.restore_live_session(PersistedLiveSession {
+            key: "remote-session://dev/synthetic-runtime".to_string(),
+            id: "synthetic-runtime".to_string(),
+            title: "Update-restored Codex".to_string(),
+            kind: SessionKind::Codex,
+            keep_alive: false,
+            ssh_target: "dev".to_string(),
+            prefix: None,
+            cwd: Some("/home/pi/gh/yggterm".to_string()),
+            remote_launch_action: Some("start-codex".to_string()),
+            storage_path: None,
+            restore_reason: Some(UPDATE_RESTART_RESTORE_REASON.to_string()),
+        });
+        server.active_session_path = Some("remote-session://dev/synthetic-runtime".to_string());
+        server.active_view_mode = WorkspaceViewMode::Terminal;
+        server.request_terminal_launch_for_active();
+
+        let session = server
+            .sessions
+            .get("remote-session://dev/synthetic-runtime")
+            .expect("update-restored remote Codex session");
+        assert_eq!(session.kind, SessionKind::Codex);
+        assert_eq!(session.source, SessionSource::LiveSsh);
+        assert_eq!(
+            session_metadata_value(session, REMOTE_LAUNCH_ACTION_METADATA_LABEL),
+            None
+        );
+        assert!(
+            session.launch_command.contains("'resume-codex'"),
+            "{}",
+            session.launch_command
+        );
+        assert!(
+            session.launch_command.contains("'--require-existing'"),
+            "{}",
+            session.launch_command
+        );
+        assert!(
+            !session.launch_command.contains("'start-codex'"),
+            "{}",
+            session.launch_command
+        );
+        assert!(!server.session_starts_new_remote_codex("remote-session://dev/synthetic-runtime"));
+        assert_eq!(
+            session_metadata_value(session, RUNTIME_RESTORE_REASON_METADATA_LABEL).as_deref(),
+            Some(UPDATE_RESTART_RESTORE_REASON)
+        );
     }
 
     #[test]
