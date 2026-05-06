@@ -10,21 +10,24 @@ use yggterm_server::{
     run_app_control_close_window_preserving_sessions, run_app_control_create_terminal,
     run_app_control_describe_rows, run_app_control_describe_state,
     run_app_control_desktop_identity, run_app_control_drag, run_app_control_dump_state,
-    run_app_control_focus_window, run_app_control_list_clients, run_app_control_move_window_by,
-    run_app_control_open_path, run_app_control_paste_terminal_clipboard,
-    run_app_control_paste_terminal_clipboard_image, run_app_control_probe_terminal_viewport_input,
+    run_app_control_focus_window, run_app_control_key, run_app_control_list_clients,
+    run_app_control_move_window_by, run_app_control_open_path,
+    run_app_control_paste_terminal_clipboard, run_app_control_paste_terminal_clipboard_image,
+    run_app_control_pointer, run_app_control_probe_terminal_viewport_input,
     run_app_control_probe_terminal_viewport_scroll, run_app_control_probe_terminal_viewport_select,
-    run_app_control_reclaim_terminal_focus, run_app_control_remove_session,
-    run_app_control_resize_window, run_app_control_restart_pending_update,
-    run_app_control_scroll_preview, run_app_control_send_terminal_input,
+    run_app_control_reclaim_terminal_focus, run_app_control_redraw_terminal,
+    run_app_control_remove_session, run_app_control_resize_window,
+    run_app_control_restart_pending_update, run_app_control_scroll_preview,
+    run_app_control_scroll_right_panel, run_app_control_send_terminal_input,
     run_app_control_set_clipboard_png_base64, run_app_control_set_clipboard_text,
     run_app_control_set_fullscreen, run_app_control_set_main_zoom,
     run_app_control_set_right_panel_mode, run_app_control_set_row_expanded,
     run_app_control_set_search, run_app_control_set_session_keep_alive,
-    run_app_control_set_window_chrome_hover, run_app_control_trigger_update_check, run_attach,
-    run_daemon, run_screenrecord_capture, run_screenshot_capture, run_trace_bundle,
-    run_trace_follow, run_trace_tail, shutdown, snapshot, status, terminal_write,
-    try_run_remote_server_command,
+    run_app_control_set_tree_selection, run_app_control_set_window_chrome_hover,
+    run_app_control_show_start_page, run_app_control_start_action,
+    run_app_control_trigger_update_check, run_attach, run_daemon, run_screenrecord_capture,
+    run_screenshot_capture, run_trace_bundle, run_trace_follow, run_trace_tail, shutdown, snapshot,
+    status, terminal_write, try_run_remote_server_command,
 };
 
 #[path = "../headless_monitor.rs"]
@@ -117,6 +120,7 @@ fn print_server_app_help() {
   yggterm-headless server app rows [--pid <pid>]
   yggterm-headless server app screenshot [output] [--pid <pid>]
   yggterm-headless server app resize-window --width <px> --height <px> [--pid <pid>]
+  yggterm-headless server app start-page [--pid <pid>]
   yggterm-headless server app update <check|restart>
   yggterm-headless server app terminal <new|send|focus|probe-type|probe-scroll|probe-select> ..."
     );
@@ -512,7 +516,7 @@ fn main() -> Result<()> {
                 run_app_control_dump_state(output_path, timeout_ms)
             }
             "rows" => run_app_control_describe_rows(timeout_ms),
-            "preview" => {
+            "preview" | "web-view" | "webview" => {
                 let action = args.get(3).map(String::as_str).unwrap_or("scroll");
                 match action {
                     "scroll" => {
@@ -532,7 +536,7 @@ fn main() -> Result<()> {
                         });
                         run_app_control_scroll_preview(top_px, ratio, timeout_ms)
                     }
-                    other => anyhow::bail!("unsupported app preview action: {other}"),
+                    other => anyhow::bail!("unsupported app web view action: {other}"),
                 }
             }
             "zoom" => {
@@ -548,7 +552,9 @@ fn main() -> Result<()> {
                         return None;
                     }
                     match window[1].as_str() {
-                        "preview" | "rendered" => Some(AppControlViewMode::Preview),
+                        "preview" | "rendered" | "web-view" | "webview" => {
+                            Some(AppControlViewMode::Preview)
+                        }
                         "terminal" => Some(AppControlViewMode::Terminal),
                         _ => None,
                     }
@@ -694,6 +700,23 @@ fn main() -> Result<()> {
                     .into_iter()
                     .next()
                     .unwrap_or("hidden");
+                if mode == "scroll" {
+                    let top_px = args.windows(2).find_map(|window| {
+                        if window[0] == "--top" {
+                            window[1].parse::<f64>().ok()
+                        } else {
+                            None
+                        }
+                    });
+                    let ratio = args.windows(2).find_map(|window| {
+                        if window[0] == "--ratio" {
+                            window[1].parse::<f64>().ok()
+                        } else {
+                            None
+                        }
+                    });
+                    return run_app_control_scroll_right_panel(top_px, ratio, timeout_ms);
+                }
                 let mode = match mode {
                     "hidden" | "hide" | "close" | "none" => AppControlRightPanelMode::Hidden,
                     "connect" => AppControlRightPanelMode::Connect,
@@ -750,7 +773,9 @@ fn main() -> Result<()> {
                         return None;
                     }
                     match window[1].as_str() {
-                        "preview" | "rendered" => Some(AppControlViewMode::Preview),
+                        "preview" | "rendered" | "web-view" | "webview" => {
+                            Some(AppControlViewMode::Preview)
+                        }
                         "terminal" => Some(AppControlViewMode::Terminal),
                         _ => None,
                     }
@@ -771,6 +796,152 @@ fn main() -> Result<()> {
                     }
                 });
                 run_app_control_drag(action, row_path, placement, timeout_ms)
+            }
+            "pointer" => {
+                let action = args
+                    .get(3)
+                    .map(String::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("missing action for server app pointer"))?;
+                let x = args.windows(2).find_map(|window| {
+                    if window[0] == "--x" {
+                        window[1].parse::<f64>().ok()
+                    } else {
+                        None
+                    }
+                });
+                let y = args.windows(2).find_map(|window| {
+                    if window[0] == "--y" {
+                        window[1].parse::<f64>().ok()
+                    } else {
+                        None
+                    }
+                });
+                let start_x = args.windows(2).find_map(|window| {
+                    if window[0] == "--start-x" {
+                        window[1].parse::<f64>().ok()
+                    } else {
+                        None
+                    }
+                });
+                let start_y = args.windows(2).find_map(|window| {
+                    if window[0] == "--start-y" {
+                        window[1].parse::<f64>().ok()
+                    } else {
+                        None
+                    }
+                });
+                let end_x = args.windows(2).find_map(|window| {
+                    if window[0] == "--end-x" {
+                        window[1].parse::<f64>().ok()
+                    } else {
+                        None
+                    }
+                });
+                let end_y = args.windows(2).find_map(|window| {
+                    if window[0] == "--end-y" {
+                        window[1].parse::<f64>().ok()
+                    } else {
+                        None
+                    }
+                });
+                let button = args.windows(2).find_map(|window| {
+                    if window[0] == "--button" {
+                        Some(window[1].as_str())
+                    } else {
+                        None
+                    }
+                });
+                let count = args.windows(2).find_map(|window| {
+                    if window[0] == "--count" {
+                        window[1].parse::<u8>().ok()
+                    } else {
+                        None
+                    }
+                });
+                let steps = args.windows(2).find_map(|window| {
+                    if window[0] == "--steps" {
+                        window[1].parse::<u16>().ok()
+                    } else {
+                        None
+                    }
+                });
+                let step_delay_ms = args.windows(2).find_map(|window| {
+                    if window[0] == "--step-delay-ms" {
+                        window[1].parse::<u64>().ok()
+                    } else {
+                        None
+                    }
+                });
+                run_app_control_pointer(
+                    action,
+                    x,
+                    y,
+                    start_x,
+                    start_y,
+                    end_x,
+                    end_y,
+                    button,
+                    count,
+                    steps,
+                    step_delay_ms,
+                    timeout_ms,
+                )
+            }
+            "start-action" | "start" => {
+                let action = args
+                    .get(3)
+                    .map(String::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("missing action for server app start-action"))?;
+                run_app_control_start_action(action, timeout_ms)
+            }
+            "start-page" | "show-start-page" | "home" => {
+                run_app_control_show_start_page(timeout_ms)
+            }
+            "tree" => {
+                let action = args
+                    .get(3)
+                    .map(String::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("missing action for server app tree"))?;
+                match action {
+                    "select" | "selection" => {
+                        let paths = cli_positional_args(&args, 4)
+                            .into_iter()
+                            .map(ToOwned::to_owned)
+                            .collect::<Vec<_>>();
+                        let anchor_path = cli_flag_value(&args, "--anchor").map(ToOwned::to_owned);
+                        run_app_control_set_tree_selection(paths, anchor_path, timeout_ms)
+                    }
+                    other => anyhow::bail!("unsupported app tree action: {other}"),
+                }
+            }
+            "key" => {
+                let action = args
+                    .get(3)
+                    .map(String::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("missing action for server app key"))?;
+                let positional = cli_positional_args(&args, 4);
+                let positional_owned = positional
+                    .iter()
+                    .map(|value| (*value).to_string())
+                    .collect::<Vec<_>>();
+                let text = args.windows(2).find_map(|window| {
+                    if window[0] == "--text" {
+                        Some(window[1].as_str())
+                    } else {
+                        None
+                    }
+                });
+                let keys = if action == "press" {
+                    positional_owned.clone()
+                } else {
+                    Vec::new()
+                };
+                run_app_control_key(
+                    action,
+                    &keys,
+                    text.or_else(|| positional.first().copied()),
+                    timeout_ms,
+                )
             }
             "terminal" => {
                 let action = args
@@ -846,6 +1017,17 @@ fn main() -> Result<()> {
                                 )
                             })?;
                         run_app_control_reclaim_terminal_focus(session_path, timeout_ms)
+                    }
+                    "redraw" => {
+                        let session_path = cli_positional_args(&args, 4)
+                            .into_iter()
+                            .next()
+                            .ok_or_else(|| {
+                                anyhow::anyhow!(
+                                    "missing session path for server app terminal redraw"
+                                )
+                            })?;
+                        run_app_control_redraw_terminal(session_path, timeout_ms)
                     }
                     "paste" => {
                         let session_path = cli_positional_args(&args, 4)

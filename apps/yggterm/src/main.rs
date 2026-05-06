@@ -33,16 +33,18 @@ use yggterm_server::{
     run_app_control_paste_terminal_clipboard, run_app_control_paste_terminal_clipboard_image,
     run_app_control_pointer, run_app_control_probe_terminal_viewport_input,
     run_app_control_probe_terminal_viewport_scroll, run_app_control_probe_terminal_viewport_select,
-    run_app_control_reclaim_terminal_focus, run_app_control_remove_session,
-    run_app_control_reset_theme_editor, run_app_control_resize_window,
-    run_app_control_restart_pending_update, run_app_control_scroll_preview,
-    run_app_control_scroll_right_panel, run_app_control_send_terminal_input,
-    run_app_control_set_clipboard_png_base64, run_app_control_set_clipboard_text,
-    run_app_control_set_fullscreen, run_app_control_set_main_zoom, run_app_control_set_maximized,
+    run_app_control_reclaim_terminal_focus, run_app_control_redraw_terminal,
+    run_app_control_remove_session, run_app_control_reset_theme_editor,
+    run_app_control_resize_window, run_app_control_restart_pending_update,
+    run_app_control_scroll_preview, run_app_control_scroll_right_panel,
+    run_app_control_send_terminal_input, run_app_control_set_clipboard_png_base64,
+    run_app_control_set_clipboard_text, run_app_control_set_fullscreen,
+    run_app_control_set_main_zoom, run_app_control_set_maximized,
     run_app_control_set_preview_layout, run_app_control_set_right_panel_mode,
     run_app_control_set_row_expanded, run_app_control_set_search,
     run_app_control_set_session_keep_alive, run_app_control_set_theme_editor_open,
-    run_app_control_set_ui_theme, run_app_control_set_window_chrome_hover,
+    run_app_control_set_tree_selection, run_app_control_set_ui_theme,
+    run_app_control_set_window_chrome_hover, run_app_control_start_action,
     run_app_control_trigger_update_check, run_attach, run_daemon, run_screenrecord_capture,
     run_screenshot_capture, run_trace_bundle, run_trace_follow, run_trace_tail, shutdown, snapshot,
     start_local_session, status, terminal_write, try_run_remote_server_command,
@@ -105,18 +107,109 @@ fn app_control_state_visible_for_pid(payload: &serde_json::Value, pid: u32) -> b
     client_pid == Some(pid as u64) || handled_by_pid == Some(pid as u64)
 }
 
+fn app_control_state_settled_for_launch(payload: &serde_json::Value) -> bool {
+    let Some(data) = payload.get("data") else {
+        return false;
+    };
+    let initial_sync_done = data
+        .get("shell")
+        .and_then(|shell| shell.get("needs_initial_server_sync"))
+        .and_then(serde_json::Value::as_bool)
+        == Some(false);
+    if !initial_sync_done {
+        return false;
+    }
+    let contract_clean = data
+        .get("session_view_contract_violations")
+        .and_then(serde_json::Value::as_array)
+        .is_none_or(Vec::is_empty);
+    if !contract_clean {
+        return false;
+    }
+    let Some(runtime_truth) = data.get("runtime_truth") else {
+        return true;
+    };
+    let daemon_runtime_count = runtime_truth
+        .get("daemon_runtime_count")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    if daemon_runtime_count == 0 {
+        return true;
+    }
+    let active_runtime_present = runtime_truth
+        .get("active_runtime_present")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let live_row_count = runtime_truth
+        .get("live_row_count")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    active_runtime_present && live_row_count > 0
+}
+
 fn app_control_state_launch_summary(
     payload: &serde_json::Value,
     pid: u32,
 ) -> Option<serde_json::Value> {
     let data = payload.get("data")?;
     let dom = data.get("dom").cloned().unwrap_or(serde_json::Value::Null);
+    let shell = data
+        .get("shell")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    let runtime_truth = data
+        .get("runtime_truth")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
     Some(serde_json::json!({
         "request_id": payload.get("request_id").cloned().unwrap_or(serde_json::Value::Null),
         "handled_by_pid": payload.get("handled_by_pid").cloned().unwrap_or(serde_json::Value::Null),
         "visible": app_control_state_visible_for_pid(payload, pid),
+        "settled": app_control_state_settled_for_launch(payload),
+        "active_session_path": data.get("active_session_path").cloned().unwrap_or(serde_json::Value::Null),
+        "active_view_mode": data.get("active_view_mode").cloned().unwrap_or(serde_json::Value::Null),
+        "session_view_contract_violations": data
+            .get("session_view_contract_violations")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
+        "runtime_truth": {
+            "daemon_runtime_count": runtime_truth
+                .get("daemon_runtime_count")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null),
+            "daemon_runtime_keys": runtime_truth
+                .get("daemon_runtime_keys")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null),
+            "active_runtime_key": runtime_truth
+                .get("active_runtime_key")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null),
+            "active_runtime_present": runtime_truth
+                .get("active_runtime_present")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null),
+            "live_row_count": runtime_truth
+                .get("live_row_count")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null),
+            "snapshot_live_session_count": runtime_truth
+                .get("snapshot_live_session_count")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null),
+        },
         "window": data.get("window").cloned().unwrap_or(serde_json::Value::Null),
         "client_instance": data.get("client_instance").cloned().unwrap_or(serde_json::Value::Null),
+        "shell": {
+            "needs_initial_server_sync": shell
+                .get("needs_initial_server_sync")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null),
+            "server_busy": shell
+                .get("server_busy")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null),
+        },
         "dom": {
             "shell_root_count": dom.get("shell_root_count").cloned().unwrap_or(serde_json::Value::Null),
             "degraded_reason": dom.get("degraded_reason").cloned().unwrap_or(serde_json::Value::Null),
@@ -208,6 +301,7 @@ fn launch_app_background(
     home_dir: &std::path::Path,
     timeout_ms: u64,
     wait_visible: bool,
+    wait_settled: bool,
     allow_multi_window: bool,
     skip_active_exec_handoff: bool,
     log_path: Option<&str>,
@@ -255,6 +349,15 @@ fn launch_app_background(
     if skip_active_exec_handoff {
         command.env("YGGTERM_SKIP_ACTIVE_EXEC_HANDOFF", "1");
     }
+    #[cfg(unix)]
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
     let child = command
         .spawn()
         .with_context(|| format!("spawning background yggterm from {}", current_exe.display()))?;
@@ -262,7 +365,8 @@ fn launch_app_background(
     let mut client = None::<serde_json::Value>;
     let mut visibility = None::<serde_json::Value>;
     let mut visibility_error = None::<String>;
-    if wait_visible {
+    let should_wait_for_app = wait_visible || wait_settled;
+    if should_wait_for_app {
         let deadline = std::time::Instant::now() + Duration::from_millis(timeout_ms.max(100));
         let state_timeout_ms = timeout_ms.clamp(250, 1_500);
         let control_cwd = control_exe
@@ -307,7 +411,10 @@ fn launch_app_background(
                     match serde_json::from_slice::<serde_json::Value>(&output.stdout) {
                         Ok(payload) => {
                             if let Some(summary) = app_control_state_launch_summary(&payload, pid) {
-                                if app_control_state_visible_for_pid(&payload, pid) {
+                                if app_control_state_visible_for_pid(&payload, pid)
+                                    && (!wait_settled
+                                        || app_control_state_settled_for_launch(&payload))
+                                {
                                     visibility_error = None;
                                     visibility = Some(summary);
                                     break;
@@ -339,10 +446,16 @@ fn launch_app_background(
             "pid": pid,
             "log_path": chosen_log_path,
             "wait_visible": wait_visible,
+            "wait_settled": wait_settled,
             "registered": client.is_some(),
             "visible": visibility
                 .as_ref()
                 .and_then(|value| value.get("visible"))
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false),
+            "settled": visibility
+                .as_ref()
+                .and_then(|value| value.get("settled"))
                 .and_then(serde_json::Value::as_bool)
                 .unwrap_or(false),
             "client": client,
@@ -419,9 +532,11 @@ fn print_server_app_help() {
         "usage:
   yggterm server app clients
   yggterm server app desktop-identity
+  yggterm server app launch [--wait-visible] [--wait-settled] [--allow-multi-window]
   yggterm server app state [--pid <pid>]
   yggterm server app rows [--pid <pid>]
   yggterm server app screenshot [output] [--pid <pid>]
+  yggterm server app start-page [--pid <pid>]
   yggterm server app terminal <new|send|focus|probe-type|probe-scroll|probe-select> ..."
     );
 }
@@ -680,6 +795,7 @@ fn main() -> Result<()> {
             }
             "launch" => {
                 let wait_visible = args.iter().any(|arg| arg == "--wait-visible");
+                let wait_settled = args.iter().any(|arg| arg == "--wait-settled");
                 let allow_multi_window = args.iter().any(|arg| arg == "--allow-multi-window");
                 let skip_active_exec_handoff =
                     args.iter().any(|arg| arg == "--skip-active-exec-handoff");
@@ -694,6 +810,7 @@ fn main() -> Result<()> {
                     store.home_dir(),
                     timeout_ms,
                     wait_visible,
+                    wait_settled,
                     allow_multi_window,
                     skip_active_exec_handoff,
                     log_path,
@@ -710,7 +827,7 @@ fn main() -> Result<()> {
                 run_app_control_dump_state(output_path, timeout_ms)
             }
             "rows" => run_app_control_describe_rows(timeout_ms),
-            "preview" => {
+            "preview" | "web-view" | "webview" => {
                 let action = args.get(3).map(String::as_str).unwrap_or("scroll");
                 match action {
                     "scroll" => {
@@ -738,11 +855,11 @@ fn main() -> Result<()> {
                         let layout = match layout {
                             "chat" => AppControlPreviewLayout::Chat,
                             "graph" | "overview" => AppControlPreviewLayout::Graph,
-                            other => anyhow::bail!("unsupported app preview layout: {other}"),
+                            other => anyhow::bail!("unsupported app web view layout: {other}"),
                         };
                         run_app_control_set_preview_layout(layout, timeout_ms)
                     }
-                    other => anyhow::bail!("unsupported app preview action: {other}"),
+                    other => anyhow::bail!("unsupported app web view action: {other}"),
                 }
             }
             "zoom" => {
@@ -758,7 +875,9 @@ fn main() -> Result<()> {
                         return None;
                     }
                     match window[1].as_str() {
-                        "preview" | "rendered" => Some(AppControlViewMode::Preview),
+                        "preview" | "rendered" | "web-view" | "webview" => {
+                            Some(AppControlViewMode::Preview)
+                        }
                         "terminal" => Some(AppControlViewMode::Terminal),
                         _ => None,
                     }
@@ -1018,7 +1137,9 @@ fn main() -> Result<()> {
                         return None;
                     }
                     match window[1].as_str() {
-                        "preview" | "rendered" => Some(AppControlViewMode::Preview),
+                        "preview" | "rendered" | "web-view" | "webview" => {
+                            Some(AppControlViewMode::Preview)
+                        }
                         "terminal" => Some(AppControlViewMode::Terminal),
                         _ => None,
                     }
@@ -1130,6 +1251,33 @@ fn main() -> Result<()> {
                     timeout_ms,
                 )
             }
+            "start-action" | "start" => {
+                let action = args
+                    .get(3)
+                    .map(String::as_str)
+                    .context("missing action for server app start-action")?;
+                run_app_control_start_action(action, timeout_ms)
+            }
+            "start-page" | "show-start-page" | "home" => {
+                yggterm_server::run_app_control_show_start_page(timeout_ms)
+            }
+            "tree" => {
+                let action = args
+                    .get(3)
+                    .map(String::as_str)
+                    .context("missing action for server app tree")?;
+                match action {
+                    "select" | "selection" => {
+                        let paths = cli_positional_args(&args, 4)
+                            .into_iter()
+                            .map(ToOwned::to_owned)
+                            .collect::<Vec<_>>();
+                        let anchor_path = cli_flag_value(&args, "--anchor").map(ToOwned::to_owned);
+                        run_app_control_set_tree_selection(paths, anchor_path, timeout_ms)
+                    }
+                    other => anyhow::bail!("unsupported app tree action: {other}"),
+                }
+            }
             "key" => {
                 let action = args
                     .get(3)
@@ -1225,6 +1373,13 @@ fn main() -> Result<()> {
                             .next()
                             .context("missing session path for server app terminal focus")?;
                         run_app_control_reclaim_terminal_focus(session_path, timeout_ms)
+                    }
+                    "redraw" => {
+                        let session_path = cli_positional_args(&args, 4)
+                            .into_iter()
+                            .next()
+                            .context("missing session path for server app terminal redraw")?;
+                        run_app_control_redraw_terminal(session_path, timeout_ms)
                     }
                     "paste" => {
                         let session_path = cli_positional_args(&args, 4)

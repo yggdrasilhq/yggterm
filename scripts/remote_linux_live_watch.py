@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import json
+import shlex
 import time
 from pathlib import Path
 
@@ -21,9 +22,10 @@ import json
 import os
 import pathlib
 import pwd
+import time
 
 user = pwd.getpwuid(os.getuid()).pw_name
-rows = []
+SAMPLE_SEC = float(%SAMPLE_SEC%)
 targets = {
     "plasmashell",
     "kwin_wayland",
@@ -31,55 +33,108 @@ targets = {
     "Xwayland",
     "yggterm",
     "yggterm-headless",
+    "WebKitWebProcess",
 }
-ssh_generation_context_count = 0
-for pid in os.listdir("/proc"):
-    if not pid.isdigit():
-        continue
-    proc = pathlib.Path("/proc") / pid
-    try:
-        owner = proc.stat().st_uid
-        if owner != os.getuid():
+
+
+def read_total_jiffies():
+    line = pathlib.Path("/proc/stat").read_text(encoding="utf-8").splitlines()[0]
+    return sum(int(part) for part in line.split()[1:] if part.isdigit())
+
+
+def cpu_count():
+    return max(
+        1,
+        sum(
+            1
+            for line in pathlib.Path("/proc/stat").read_text(encoding="utf-8").splitlines()
+            if line.startswith("cpu") and len(line) > 3 and line[3].isdigit()
+        ),
+    )
+
+
+def collect_rows():
+    rows = []
+    remote_scan_helpers = []
+    ssh_generation_context_count = 0
+    ssh_remote_scan_count = 0
+    for pid in os.listdir("/proc"):
+        if not pid.isdigit():
             continue
-        comm = (proc / "comm").read_text(encoding="utf-8").strip()
-        cmdline = [
-            part.decode("utf-8", "ignore")
-            for part in (proc / "cmdline").read_bytes().split(b"\0")
-            if part
-        ]
-        cmdline_text = " ".join(cmdline)
-        if comm == "ssh" and " server " in f" {cmdline_text} " and " generation-context " in f" {cmdline_text} ":
-            ssh_generation_context_count += 1
-        if comm not in targets:
-            continue
-        rss_kb = 0
-        for line in (proc / "status").read_text(encoding="utf-8").splitlines():
-            if line.startswith("VmRSS:"):
-                rss_kb = int(line.split()[1])
-                break
+        proc = pathlib.Path("/proc") / pid
         try:
-            fd_count = len(os.listdir(proc / "fd"))
+            owner = proc.stat().st_uid
+            if owner != os.getuid():
+                continue
+            comm = (proc / "comm").read_text(encoding="utf-8").strip()
+            cmdline = [
+                part.decode("utf-8", "ignore")
+                for part in (proc / "cmdline").read_bytes().split(b"\0")
+                if part
+            ]
+            cmdline_text = " ".join(cmdline)
+            if comm == "ssh" and " server " in f" {cmdline_text} " and " generation-context " in f" {cmdline_text} ":
+                ssh_generation_context_count += 1
+            if comm == "ssh" and " server " in f" {cmdline_text} " and " remote " in f" {cmdline_text} " and " scan " in f" {cmdline_text} ":
+                ssh_remote_scan_count += 1
+                remote_scan_helpers.append(
+                    {
+                        "pid": int(pid),
+                        "target": cmdline[1] if len(cmdline) > 1 else "",
+                        "cmdline": cmdline,
+                    }
+                )
+            if comm not in targets:
+                continue
+            rss_kb = 0
+            for line in (proc / "status").read_text(encoding="utf-8").splitlines():
+                if line.startswith("VmRSS:"):
+                    rss_kb = int(line.split()[1])
+                    break
+            try:
+                fd_count = len(os.listdir(proc / "fd"))
+            except Exception:
+                fd_count = None
+            stat_fields = (proc / "stat").read_text(encoding="utf-8").split(") ", 1)[1].split()
+            rows.append(
+                {
+                    "pid": int(pid),
+                    "comm": comm,
+                    "rss_kb": rss_kb,
+                    "fd_count": fd_count,
+                    "state": stat_fields[0],
+                    "start_ticks": int(stat_fields[19]),
+                    "jiffies": int(stat_fields[11]) + int(stat_fields[12]),
+                    "cmdline": cmdline,
+                }
+            )
         except Exception:
-            fd_count = None
-        stat_fields = (proc / "stat").read_text(encoding="utf-8").split(") ", 1)[1].split()
-        rows.append(
-            {
-                "pid": int(pid),
-                "comm": comm,
-                "rss_kb": rss_kb,
-                "fd_count": fd_count,
-                "state": stat_fields[0],
-                "start_ticks": int(stat_fields[19]),
-                "cmdline": cmdline,
-            }
-        )
-    except Exception:
-        continue
+            continue
+    return rows, ssh_generation_context_count, ssh_remote_scan_count, remote_scan_helpers
+
+
+start_total = read_total_jiffies()
+start_rows, _, _, _ = collect_rows()
+time.sleep(SAMPLE_SEC)
+end_total = read_total_jiffies()
+rows, ssh_generation_context_count, ssh_remote_scan_count, remote_scan_helpers = collect_rows()
+start_jiffies = {row["pid"]: row["jiffies"] for row in start_rows}
+denominator = max(1, end_total - start_total)
+cores = cpu_count()
+for row in rows:
+    delta = max(0, int(row["jiffies"]) - int(start_jiffies.get(row["pid"], row["jiffies"])))
+    row["delta_jiffies"] = delta
+    row["cpu_percent"] = round((delta / denominator) * cores * 100.0, 3)
+    row.pop("jiffies", None)
 rows.sort(key=lambda row: (row["comm"], row["pid"]))
 print(json.dumps({
     "user": user,
     "rows": rows,
+    "sample_sec": SAMPLE_SEC,
+    "total_cpu_percent": round(sum(row.get("cpu_percent") or 0 for row in rows), 3),
     "ssh_generation_context_count": ssh_generation_context_count,
+    "ssh_remote_scan_count": ssh_remote_scan_count,
+    "remote_scan_helpers": remote_scan_helpers,
 }))
 """
 
@@ -94,7 +149,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--backend", choices=("native", "x11"), default="native")
     parser.add_argument("--duration-sec", type=float, default=90.0)
     parser.add_argument("--poll-sec", type=float, default=2.0)
+    parser.add_argument("--process-sample-sec", type=float, default=0.25)
     parser.add_argument("--timeout-ms", type=int, default=8000)
+    parser.add_argument(
+        "--pid",
+        type=int,
+        help="Attach to an existing live Yggterm GUI PID instead of launching one.",
+    )
     parser.add_argument("--out-dir")
     parser.add_argument("--remote-dir")
     parser.add_argument("--reuse-existing-home", action="store_true")
@@ -214,6 +275,12 @@ def remote_pid_alive(host: str, pid: int) -> bool:
     )
 
 
+def remote_shell_path(path: str) -> str:
+    if path.startswith("~/"):
+        return "$HOME/" + shlex.quote(path[2:])
+    return shlex.quote(path)
+
+
 def wait_for_remote_pid_exit(
     host: str,
     pid: int,
@@ -279,12 +346,18 @@ def main() -> int:
             daemon_log_size_before = 0
         metadata["daemon_log_size_before"] = daemon_log_size_before
 
-        launch = ssh_shell(
-            args.host,
-            f"{exports}; nohup '{remote_bin}' > '{remote_dir}/client.log' 2>&1 < /dev/null & echo $!",
-        )
-        pid = int(launch.stdout.strip())
+        launched_by_harness = args.pid is None
+        remote_bin_cmd = remote_shell_path(remote_bin)
+        if args.pid is None:
+            launch = ssh_shell(
+                args.host,
+                f"{exports}; nohup {remote_bin_cmd} > '{remote_dir}/client.log' 2>&1 < /dev/null & echo $!",
+            )
+            pid = int(launch.stdout.strip())
+        else:
+            pid = int(args.pid)
         metadata["pid"] = pid
+        metadata["launched_by_harness"] = launched_by_harness
 
         samples: list[dict] = []
         started = time.time()
@@ -292,7 +365,7 @@ def main() -> int:
             sample: dict[str, object] = {"elapsed_sec": round(time.time() - started, 2)}
             state_proc = ssh_shell(
                 args.host,
-                f"{exports}; '{remote_bin}' server app state --pid {pid} --timeout-ms {args.timeout_ms}",
+                f"{exports}; {remote_bin_cmd} server app state --pid {pid} --timeout-ms {args.timeout_ms}",
                 check=False,
             )
             sample["state_returncode"] = state_proc.returncode
@@ -304,7 +377,10 @@ def main() -> int:
                     sample["state"] = payload.get("data") or {}
                 except json.JSONDecodeError as exc:
                     sample["state_json_error"] = str(exc)
-            sample["processes"] = ssh_python_json(args.host, PROCESS_SAMPLE_SNIPPET)
+            sample["processes"] = ssh_python_json(
+                args.host,
+                PROCESS_SAMPLE_SNIPPET.replace("%SAMPLE_SEC%", repr(args.process_sample_sec)),
+            )
             process_rows = (sample["processes"] or {}).get("rows") or []
             sample["owned_pid_present"] = any(int(row.get("pid") or 0) == pid for row in process_rows)
             sample["plasmashell_pids"] = sorted(
@@ -323,6 +399,11 @@ def main() -> int:
         metadata["samples"] = samples
         yggterm_fd_counts: list[int] = []
         ssh_generation_context_counts: list[int] = []
+        ssh_remote_scan_counts: list[int] = []
+        remote_scan_helper_targets: dict[str, int] = {}
+        duplicate_remote_scan_helper_samples = 0
+        consecutive_remote_scan_helper_samples = 0
+        max_consecutive_remote_scan_helper_samples = 0
         plasmashell_pid_samples: list[tuple[int, ...]] = []
         kwin_pid_samples: list[tuple[int, ...]] = []
         missing_owned_pid_samples = 0
@@ -331,6 +412,27 @@ def main() -> int:
             ssh_generation_context_counts.append(
                 int(processes.get("ssh_generation_context_count") or 0)
             )
+            ssh_remote_scan_counts.append(int(processes.get("ssh_remote_scan_count") or 0))
+            remote_scan_helpers = [
+                helper
+                for helper in (processes.get("remote_scan_helpers") or [])
+                if isinstance(helper, dict)
+            ]
+            if remote_scan_helpers:
+                consecutive_remote_scan_helper_samples += 1
+            else:
+                consecutive_remote_scan_helper_samples = 0
+            max_consecutive_remote_scan_helper_samples = max(
+                max_consecutive_remote_scan_helper_samples,
+                consecutive_remote_scan_helper_samples,
+            )
+            targets_in_sample: dict[str, int] = {}
+            for helper in remote_scan_helpers:
+                target = str(helper.get("target") or "unknown")
+                remote_scan_helper_targets[target] = remote_scan_helper_targets.get(target, 0) + 1
+                targets_in_sample[target] = targets_in_sample.get(target, 0) + 1
+            if any(count > 1 for count in targets_in_sample.values()):
+                duplicate_remote_scan_helper_samples += 1
             plasmashell_pid_samples.append(
                 tuple(int(pid_value) for pid_value in (sample.get("plasmashell_pids") or []))
             )
@@ -362,6 +464,12 @@ def main() -> int:
             "max_ssh_generation_context_count": (
                 max(ssh_generation_context_counts) if ssh_generation_context_counts else 0
             ),
+            "max_ssh_remote_scan_count": (
+                max(ssh_remote_scan_counts) if ssh_remote_scan_counts else 0
+            ),
+            "remote_scan_helper_targets": remote_scan_helper_targets,
+            "duplicate_remote_scan_helper_samples": duplicate_remote_scan_helper_samples,
+            "max_consecutive_remote_scan_helper_samples": max_consecutive_remote_scan_helper_samples,
             "plasmashell": pid_sequence_summary(plasmashell_pid_samples),
             "kwin": pid_sequence_summary(kwin_pid_samples),
         }
@@ -414,7 +522,7 @@ def main() -> int:
             if isinstance(last_state, dict):
                 ssh_shell(
                     args.host,
-                    f"{exports}; '{remote_bin}' server app screenshot --pid {pid} '{remote_shot}' --timeout-ms {args.timeout_ms}",
+                    f"{exports}; {remote_bin_cmd} server app screenshot --pid {pid} '{remote_shot}' --timeout-ms {args.timeout_ms}",
                     check=False,
                 )
                 shot_exists = ssh_shell(args.host, f"test -f '{remote_shot}'", check=False)
@@ -445,38 +553,42 @@ def main() -> int:
         summary_path = out_dir / "summary.json"
         summary_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
         cleanup: dict[str, object] = {}
-        close_proc = ssh_shell(
-            args.host,
-            f"{exports}; '{remote_bin}' server app close --pid {pid} --timeout-ms {args.timeout_ms}",
-            check=False,
-        )
-        cleanup["close_returncode"] = close_proc.returncode
-        if close_proc.stdout.strip():
-            cleanup["close_stdout"] = close_proc.stdout.strip()
-        if close_proc.stderr.strip():
-            cleanup["close_stderr"] = close_proc.stderr.strip()
-        exited = wait_for_remote_pid_exit(
-            args.host,
-            pid,
-            timeout_sec=max(2.0, min(8.0, args.timeout_ms / 1000.0)),
-        )
-        cleanup["owned_pid_exited_after_close"] = exited
-        if not exited:
-            ssh_shell(args.host, f"kill -TERM {pid} >/dev/null 2>&1 || true", check=False)
-            cleanup["sent_sigterm"] = True
-            exited = wait_for_remote_pid_exit(args.host, pid, timeout_sec=3.0)
-            cleanup["owned_pid_exited_after_sigterm"] = exited
-        if not exited:
-            ssh_shell(args.host, f"kill -KILL {pid} >/dev/null 2>&1 || true", check=False)
-            cleanup["sent_sigkill"] = True
-            exited = wait_for_remote_pid_exit(args.host, pid, timeout_sec=1.5)
-            cleanup["owned_pid_exited_after_sigkill"] = exited
-        cleanup["owned_pid_alive_after_cleanup"] = remote_pid_alive(args.host, pid)
+        if launched_by_harness:
+            close_proc = ssh_shell(
+                args.host,
+                f"{exports}; {remote_bin_cmd} server app close --pid {pid} --timeout-ms {args.timeout_ms}",
+                check=False,
+            )
+            cleanup["close_returncode"] = close_proc.returncode
+            if close_proc.stdout.strip():
+                cleanup["close_stdout"] = close_proc.stdout.strip()
+            if close_proc.stderr.strip():
+                cleanup["close_stderr"] = close_proc.stderr.strip()
+            exited = wait_for_remote_pid_exit(
+                args.host,
+                pid,
+                timeout_sec=max(2.0, min(8.0, args.timeout_ms / 1000.0)),
+            )
+            cleanup["owned_pid_exited_after_close"] = exited
+            if not exited:
+                ssh_shell(args.host, f"kill -TERM {pid} >/dev/null 2>&1 || true", check=False)
+                cleanup["sent_sigterm"] = True
+                exited = wait_for_remote_pid_exit(args.host, pid, timeout_sec=3.0)
+                cleanup["owned_pid_exited_after_sigterm"] = exited
+            if not exited:
+                ssh_shell(args.host, f"kill -KILL {pid} >/dev/null 2>&1 || true", check=False)
+                cleanup["sent_sigkill"] = True
+                exited = wait_for_remote_pid_exit(args.host, pid, timeout_sec=1.5)
+                cleanup["owned_pid_exited_after_sigkill"] = exited
+            cleanup["owned_pid_alive_after_cleanup"] = remote_pid_alive(args.host, pid)
+        else:
+            cleanup["attached_existing_pid"] = True
+            cleanup["owned_pid_alive_after_cleanup"] = remote_pid_alive(args.host, pid)
         metadata["cleanup"] = cleanup
-        if not args.reuse_existing_home:
+        if launched_by_harness and not args.reuse_existing_home:
             ssh_shell(
                 args.host,
-                f"{exports}; '{remote_bin}' server shutdown >/dev/null 2>&1 || true",
+                f"{exports}; {remote_bin_cmd} server shutdown >/dev/null 2>&1 || true",
                 check=False,
             )
         if not args.keep_remote_dir:
@@ -518,13 +630,20 @@ def main() -> int:
         )
         owned_pid_missing = int(watch_summary.get("owned_pid_missing_samples") or 0) > 0
         cleanup_problem = bool((metadata.get("cleanup") or {}).get("owned_pid_alive_after_cleanup"))
+        if not launched_by_harness:
+            cleanup_problem = False
         problem_notification_failure = bool(metadata.get("problem_notifications"))
         app_control_never_ready = bool(watch_summary.get("app_control_never_ready"))
+        repeated_remote_scan_helpers = (
+            int(watch_summary.get("duplicate_remote_scan_helper_samples") or 0) > 0
+            or int(watch_summary.get("max_consecutive_remote_scan_helper_samples") or 0) >= 3
+        )
         return 0 if not (
             app_control_failures
             or app_control_never_ready
             or runaway_journal
             or runaway_fd
+            or repeated_remote_scan_helpers
             or daemon_integration_side_effects
             or owned_pid_missing
             or plasmashell_changes

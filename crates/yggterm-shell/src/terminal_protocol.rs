@@ -39,9 +39,18 @@ pub(crate) enum TerminalJsCommand {
     Write {
         data: String,
     },
+    DropUnfocusedTuiFrame {
+        tail: String,
+        chars: usize,
+        frame_like: bool,
+        protocol_only: bool,
+    },
     SetInputEnabled {
         enabled: bool,
         focus: bool,
+    },
+    Redraw {
+        reason: String,
     },
     Refit,
 }

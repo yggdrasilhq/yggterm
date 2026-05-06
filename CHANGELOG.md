@@ -4,6 +4,223 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+## 2.1.163
+
+- Start daemon hot-update as a fault-tolerant handoff when live PTYs exist: the new daemon comes up on the updated socket while the old daemon remains the preserved terminal owner, and terminal read/write/resize calls route through that owner instead of killing the session.
+- Expose active hot-update handoff through daemon status, app-control `daemon_update_state`, and `yggterm-headless server monitor --scenario hot-restart` with preserved owner/runtime keys, so release proof can distinguish real hot update from a fatal session restart.
+- Defer update completion, not session ownership, when a live runtime cannot be handed off safely; app-control reports `hot_update_pending` instead of treating session-preserving deferral as a clean version match.
+- Make `yggterm-headless server monitor --scenario hot-restart` refuse the destructive prepare/shutdown fallback when live runtimes are present; session survival takes priority over completing an update.
+- Extend read-only UI latency smoke coverage with idle render/write churn and combined GUI/WebKit CPU sampling, so live sessions can fail deterministic proof when they are visually readable but burning CPU or rendering too slowly.
+- Keep unfocused remote frame streams on the slow unfocused read cadence instead of clamping them back to the 3s local idle poll, reducing background xterm/WebKit churn while live sessions remain preserved.
+
+## 2.1.162
+
+- Preserve same-major/minor stale daemons that still own live terminal runtimes during update handoff, avoiding hot-restart drops of keep-alive PTYs while the new GUI reconnects.
+- Gate daemon retained snapshot replay until the active terminal is already ready, and keep retained replay from enabling input or seeding fresh remote Codex starts before the real prompt-ready surface exists.
+- Report `daemon ready` for xterm.js daemon-backed sessions independently of the legacy Ghostty bridge flag, so live terminal status reflects the active runtime contract.
+- Make read-only terminal drawing smoke fail when retained daemon snapshots become visible before readiness settles.
+
+## 2.1.161
+
+- Keep the selected visible terminal on the fast active write-frame budget even when the desktop window is not focused, so watching an active Codex/TUI viewport cannot fall back to the 4s background cadence.
+- Restore the VS Code-style focused titlebar search palette so real clicks elevate it into a usable command/search surface instead of leaving it clipped to the idle titlebar field.
+- Keep focused search centered and wide through compact resize cycles while preserving the non-overlap contract for the idle titlebar search field.
+
+## 2.1.160
+
+- Give visible focused terminal TUI/Codex frames a separate fast write-frame budget while keeping the slow protective budget for hidden/background output.
+- Expose active/effective terminal write-frame budgets through app-control timing so low-FPS terminal incidents are observable from state, telemetry, and smoke proofs.
+- Make read-only terminal drawing smoke fail when an active frame-like terminal is still using the background write budget.
+
+## 2.1.159
+
+- Make manual terminal redraw restore prompt-follow scrollback before and after repaint, so a retained Codex/xterm buffer cannot stay blank or scrolled away from the prompt after a redraw.
+- Treat `PromptFollow` terminals that remain scrollback-locked as app-control geometry failures while still allowing explicit user scrollback to inspect history.
+- Tighten redraw smoke coverage to fail when redraw leaves the prompt cursor below the visible viewport.
+
+## 2.1.158
+
+- Keep the titlebar search centered after focus and resize cycles, with focused search resize coverage in the small-window chrome smoke.
+- Make the read-only terminal drawing smoke wait for retained replay/render readiness while preserving the initial transient state in the proof report, so post-relaunch drawing latency is measured instead of misreported as a settled bad frame.
+
+## 2.1.157
+
+- Mirror app-control terminal host truth at both the viewport and compatibility state levels, and derive active input/runtime counters from the focused active xterm host so drawing probes no longer miss a visible terminal.
+- Add prompt-band and redraw timing diagnostics for live xterm hosts, including manual redraw settle timing, render deltas, content-source truth, fit overflow, cursor geometry, and low-power overlay state.
+- Add a read-only drawing mode to the UI latency smoke so live Codex sessions can be checked with state, rows, screenshot timing, and drawing diagnostics without typing into the active prompt.
+
+## 2.1.156
+
+- Stop replaying managed session/status metadata into xterm surfaces during remote live restore; terminal bytes now come from daemon PTY reads or retained PTY snapshots, not sidebar/server prompt summaries.
+- Expose terminal content-source and retained-replay source through app-control, make manual redraw reject non-PTY server prompt snapshots, and teach terminal observability to flag that mismatch explicitly.
+- Extend redraw and shell regression coverage so stale server prompt prose cannot be accepted as a repaired terminal frame.
+- Tighten the Linux installed-profile smoke cleanup so it ignores daemon/SSH terminal transport children that inherit smoke env, avoiding accidental live-session disruption during harness proof.
+
+## 2.1.155
+
+- Make focusing a sidebar folder show the scoped start page instead of preserving or reactivating the previously focused terminal, so folder navigation has deterministic Startpage context and no hidden terminal input target.
+- Split sidebar folder focus from expansion: clicking a folder opens the scoped Startpage, while the disclosure control and arrow keys expand or collapse the tree.
+- Add app-control smoke coverage for the folder-focus Startpage contract, including active-session clearing, selected-folder truth, terminal input gating, and a successful `server app open <folder>` settle path.
+
+## 2.1.154
+
+- Preserve the real Codex saved-session id for app-created `local://...` live Codex runtimes during update restart restore, so the daemon keeps the terminal runtime key but launches `codex resume <saved-session>` instead of a fresh bare Codex process.
+
+## 2.1.153
+
+- Persist the real Codex saved-session id and transcript path for daemon-owned `codex-runtime://...` live sessions before update restarts, then restore them with `codex resume <saved-session>` while preserving the runtime key.
+- Keep server restore and terminal-launch persistence on `codex-runtime://...` plus Terminal mode, avoiding restart states that revive a kept live session as Web View or as a fresh Codex process under an old row.
+
+## 2.1.152
+
+- Keep daemon-owned `codex-runtime://...` sessions visible under Live Sessions without rewriting them to `local://...`, so the sidebar, active terminal, app-control contract, and daemon runtime key stay on one identity.
+- Make `server app launch --wait-settled` wait for initial daemon sync, clean session/view contract truth, and live runtime rows before returning harness success; Linux app-owned launches now detach the GUI process from the CLI session so the proof window remains inspectable after launch.
+
+## 2.1.151
+
+- Preserve daemon-owned Codex runtime keys as `codex-runtime://...` during update restore, and adopt any legacy `local://...` PTY under the canonical runtime key instead of spawning a second Codex process for the same session.
+
+## 2.1.150
+
+- Resolve daemon-owned Codex live sessions from the current Codex SQLite log/state files when no transcript JSONL fd is open yet, keeping saved-session identity deterministic for newer Codex CLIs without turning snapshots into full-table log scans.
+- Cache resolved Codex process identities in the daemon and keep the app-owned terminal write path compatible with Codex carriage-return submission, so `/status`-class smoke proof uses the real PTY path.
+
+## 2.1.149
+
+- Serialize daemon socket ownership with a lifetime bind lock and existing-owner check, so update/hot-restart recovery cannot spawn multiple same-version daemons that all replay the same kept Codex sessions.
+- Resolve daemon-owned Codex live sessions through the PTY process tree's real transcript JSONL, so freshly started sessions appear in remote scans/search by their saved Codex id and `resume-codex` reuses the existing runtime instead of opening a duplicate session.
+
+## 2.1.148
+
+- Flush input-hot prompt echoes through the xterm write bridge immediately even when a frame-like TUI payload is pending, so SSH/Codex terminals do not hold typed characters behind the high-volume frame timer.
+- Resolve daemon-owned Codex live sessions through the PTY process tree's real transcript JSONL, so freshly started sessions appear in remote scans/search by their saved Codex id and `resume-codex` reuses the existing runtime instead of opening a duplicate session.
+
+## 2.1.147
+
+- Keep daemon-owned terminal runtimes from idling out when no GUI/client record is present, so preserved remote Codex sessions survive the bridge gap during GUI and daemon restarts.
+- Report daemon-owned remote Codex runtimes as live in remote scans even when an older runtime exposed its terminal key as `local://...`, keeping Live Sessions and remote session refresh truth aligned.
+- Tighten the live keep-alive recovery harness so an active kept Terminal must have a clean active terminal surface, not just a matching daemon runtime key.
+- Reduce high-volume plain-terminal TUI repaint churn by lengthening the frame budget, preserving frame-mode coalescing across chunked alt-screen/cursor-hidden PTY rows, slowing unfocused output reads and active-terminal sidebar tree refreshes, suppressing stateful background TUI frames before they cross into WebView while the app does not own focus, avoiding full health probes for dropped background frames, keeping the visible low-power overlay off active terminals, and avoiding redundant full-canvas refreshes after frame-like writes.
+
+## 2.1.146
+
+- Restore remote Codex keep-alive sessions as live runtime targets even when their persisted storage path points at the remote `~/.codex/sessions` tree, so preserved GUI restarts keep the intended remote Terminal active instead of falling back to the local update-restart shell.
+
+## 2.1.145
+
+- Keep visible active Codex/TUI sessions on the xterm render path even while the Yggterm window is unfocused, preventing the low-power overlay from corrupting kept-alive terminal output.
+
+## 2.1.144
+
+- Accept live daemon runtime truth during implicit startup restore even when the shell first rendered the start page, so keep-alive sessions reactivate as Terminal instead of staying collapsed while `Live Sessions` shows the row.
+- Keep foreground Codex/TUI terminals on the real xterm render path when the terminal host owns input focus, even if the WebView document focus signal is stale.
+- Clear the low-power TUI overlay during manual redraws and make the live keep-alive harness reject foreground terminals that still expose that overlay.
+
+## 2.1.143
+
+- Persist restart-safe daemon state before closing a GUI with live-session preservation, so direct-install handoffs keep the intended keep-alive Terminal target instead of briefly restoring stale Web View state.
+- Sanitize implicit startup snapshots so stored sessions are not auto-opened as Web View; startup now falls back to a matching live Terminal row or the start page unless the user explicitly opens a stored preview.
+
+## 2.1.142
+
+- Keep explicit live-session keep-alive rows in Terminal recovery mode across GUI/update restarts until their daemon runtime is recreated, avoiding nondeterministic Web View launches.
+- Route Terminal view launches to the shell's selected session path instead of the daemon's stale active path, so recovery cannot unexpectedly switch into a different live shell.
+
+## 2.1.141
+
+- Throttle unfocused high-volume terminal output and route visible-but-unfocused TUI frames through the observable low-power surface instead of repainting xterm canvas at full rate.
+- Extend the remote Linux idle CPU smoke with a background active-TUI phase and app-control counters for unfocused TUI frame drops.
+
+## 2.1.140
+
+- Keep newly requested start-page terminal sessions in daemon snapshots while their runtime is still mounting, so Agent and Terminal buttons no longer create a session and immediately hide it as stale.
+- Reuse the selected remote folder or live-session cwd when starting terminal sessions from the start page, and let the harness pin start-page proof to a configured remote cwd.
+
+## 2.1.139
+
+- Scope start-page Recent Work to the selected remote folder and let remote scan metadata win over duplicate sidebar rows, so cwd-specific sessions are sorted by last-used time instead of stale sidebar order.
+- Make the app-control start-page route immediately queue remote refresh work, giving the live harness a deterministic path to prove Recent Work against transcript mtimes.
+
+## 2.1.138
+
+- Drain remote Codex scan stdout/stderr while the SSH helper is still running, so large remote transcript histories refresh instead of timing out and falling back to stale cached sessions.
+- Add an app-control start-page command and harness route so Recent Work truth checks and start-page action smokes can run against the live profile without desktop-wide input-device automation.
+
+## 2.1.137
+
+- Refresh healthy remote machines while the start page is visible instead of treating their cached Codex session list as permanently fresh, so newer cwd sessions appear without waiting for manual interaction.
+- Sort start-page Recent Work from remote session `modified_epoch`/`started_at` metadata rather than sidebar traversal order, and add a harness truth check that can compare the daemon and UI against remote Codex transcript mtimes for a configured machine/cwd.
+
+## 2.1.136
+
+- Apply the compact focused-search width limit to the 520px breakpoint as well, preventing the active search shell from colliding with the right titlebar controls.
+
+## 2.1.135
+
+- Tighten the 620px titlebar search width so the focused search shell stays centered without overlapping the compact right controls.
+
+## 2.1.134
+
+- Keep the compact right settings rail below the revealed auto-hide titlebar, and make the compact chrome smoke assert terminal-theme controls only when the active surface is a terminal.
+
+## 2.1.133
+
+- Mirror right-panel scroll app-control in the headless companion so installed launchers can run compact titlebar harness checks through the same single-source control path.
+
+## 2.1.132
+
+- Preserve the full selected sidebar set when context-menu Delete is invoked from an already-selected folder or session, and expose pending delete paths/counts through app-control so the harness can prove the modal before canceling.
+- Show local stored Codex transcript rows under their metadata cwd, including the home folder, without requiring the hidden `.codex` storage root to be expanded.
+- Keep titlebar search centered against the full titlebar and shrink it responsively before it overlaps Connect SSH or the right titlebar controls.
+- Add app-control `tree select` plus live harness checks for multi-select Delete and local stored-session visibility.
+- Let the remote X11 harness keep an installed-profile smoke window open after a passing run, so the final proof can also leave the updated desktop app running.
+
+## 2.1.131
+
+- Search sidebar rows with the same local/remote session context used for previews and generated copy, so version strings and recent transcript text can find collapsed Codex sessions under their cwd folders.
+- Add initial context-menu Delete and titlebar-search harness coverage; 2.1.132 completes the multi-selection and compact titlebar fixes.
+
+## 2.1.130
+
+- Mirror app-control `pointer`, `key`, and `start-action` commands in the headless companion so direct launchers can run live harness checks without desktop input-device automation.
+
+## 2.1.129
+
+- Add a Yggterm-owned `server app start-action` harness command for start-page Agent, Terminal, and SSH actions so live desktop proof does not require KDE input-device control.
+
+## 2.1.128
+
+- Render sidebar Session and Terminal marks as boxed SVG icons with `>_` and `$_` text, avoiding literal bracket characters inside the icon payload.
+
+## 2.1.127
+
+- Fix sidebar and start-page creation actions so Codex sessions and terminals launch through the selected local/remote context, keep live-session close in Terminal mode when another runtime remains, refresh stored Codex transcript rows deterministically, and use boxed greyscale `>_` / `$_` SVG sidebar marks.
+- Add installed-profile X11 harness coverage for start-page action buttons so live desktop proof exercises the updated target profile instead of only an isolated temporary home.
+
+## 2.1.126
+
+- Fix sidebar and start-page creation actions so Codex sessions and terminals launch through the selected local/remote context, keep live-session close in Terminal mode when another runtime remains, refresh stored Codex transcript rows deterministically, and use boxed greyscale `>_` / `$_` SVG sidebar marks.
+
+## 2.1.125
+
+- Keep collapsed `.codex` storage roots authoritative in the merged sidebar, so stored transcript leaves no longer stay visible as project-cwd siblings after collapse or restart.
+- Preserve the live-runtime identity contract while filtering stored transcript rows: live Codex terminals remain `local://<id>` rows with `Storage` metadata, without duplicating the stored transcript row.
+
+## 2.1.122
+
+- Fix a Dioxus nested-borrow crash when restoring or switching a live session between Web View and Terminal, so the GUI no longer aborts seconds after launch.
+- Keep live runtime rows authoritative in Terminal mode even if a stale Web View request is replayed during startup or app-control open.
+- Rename user-facing Preview mode copy to Web View while keeping legacy `preview` app-control and CLI aliases compatible.
+
+## 2.1.121
+
+- Make daemon terminal runtime identity deterministic: local shell and local Codex live sessions now use `local://<id>` runtime keys, while stored `.codex/sessions/*.jsonl` paths stay transcript metadata instead of becoming live PTY keys.
+- Migrate legacy/raw Codex live runtime keys on restore and keep `Live Sessions` rows tied to daemon runtime truth, including keep-alive rows that must have a matching terminal runtime.
+- Add manual terminal redraw through app-control and the live-terminal context menu, with xterm refit/row-guard/texture-refresh recovery for blank or stale canvases.
+- Report render-health problems when app-control sees non-empty terminal buffer text but a blank or low-ink canvas, so stale-pixel failures are visible in state instead of only screenshots.
+- Keep large stored `.codex` transcript trees collapsed unless the user explicitly expands them, even when a stored transcript is selected after restart.
+- Extend focused Rust and smoke coverage for live-session identity, stored transcript promotion, keep-alive restore, tree-collapse persistence, redraw routing, and render-health classification.
+
 ## 2.1.120
 
 - Make `Live Sessions` rows runtime-truth-only: daemon snapshots now filter live metadata against real terminal runtime keys, and restored remote metadata without a runtime downgrades to preview instead of a blank terminal shell.
