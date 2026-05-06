@@ -4,6 +4,11 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+## 2.1.164
+
+- Fail closed when an update-restored remote Codex session only has a synthetic `start-codex` launch marker: update restore now strips the fresh-start action and queues `resume-codex --require-existing` instead of silently starting a new Codex session.
+- Add a regression test for the fatal update-restore class where a synthetic remote runtime key could reconnect as a generic fresh Codex surface rather than the saved transcript identity.
+
 ## 2.1.163
 
 - Start daemon hot-update as a fault-tolerant handoff when live PTYs exist: the new daemon comes up on the updated socket while the old daemon remains the preserved terminal owner, and terminal read/write/resize calls route through that owner instead of killing the session.
