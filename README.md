@@ -18,6 +18,8 @@ Yggterm installs into a managed user-space location, wires up desktop integratio
 
 Rerun the same one-liner any time to force a manual update of a direct install.
 
+Hot update is a session-preservation contract. When an updated client finds a running daemon that still owns live PTYs, the new daemon should come up without killing those runtimes; the old daemon remains a preserved terminal owner and the updated daemon routes terminal I/O through it until the session naturally ends or can be moved safely. If that fault-tolerant handoff cannot be proven, update completion is deferred. Losing the PTY session is a failed update, not a hot update.
+
 Direct installs also expose `yggterm-headless`, the panic-management CLI for terminal incidents. Use it from SSH when a session is hung, slow, missing after restore, drawing incorrectly, or connected to a stale daemon; it gathers a structured picture of daemon reachability, session presence, latency, and restart/update state without depending on the full desktop shell.
 
 Useful daemon-control scenarios:

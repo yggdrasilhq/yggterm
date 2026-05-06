@@ -145,6 +145,14 @@ pub enum AppControlKeyCommand {
     Type { text: String },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AppControlStartAction {
+    Agent,
+    Terminal,
+    Ssh,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum AppControlCommand {
@@ -228,6 +236,10 @@ pub enum AppControlCommand {
     Drag {
         command: AppControlDragCommand,
     },
+    ShowStartPage,
+    StartAction {
+        action: AppControlStartAction,
+    },
     CreateTerminal {
         #[serde(default)]
         machine_key: Option<String>,
@@ -243,6 +255,9 @@ pub enum AppControlCommand {
         data: String,
     },
     ReclaimTerminalFocus {
+        session_path: String,
+    },
+    RedrawTerminal {
         session_path: String,
     },
     PasteTerminalClipboard {
@@ -287,6 +302,11 @@ pub enum AppControlCommand {
         row_path: String,
         expanded: bool,
     },
+    SetTreeSelection {
+        paths: Vec<String>,
+        #[serde(default)]
+        anchor_path: Option<String>,
+    },
     DescribeRows,
     OpenPath {
         session_path: String,
@@ -325,9 +345,12 @@ impl AppControlCommand {
             Self::Pointer { .. } => "pointer",
             Self::Key { .. } => "key",
             Self::Drag { .. } => "drag",
+            Self::ShowStartPage => "show_start_page",
+            Self::StartAction { .. } => "start_action",
             Self::CreateTerminal { .. } => "create_terminal",
             Self::SendTerminalInput { .. } => "send_terminal_input",
             Self::ReclaimTerminalFocus { .. } => "reclaim_terminal_focus",
+            Self::RedrawTerminal { .. } => "redraw_terminal",
             Self::PasteTerminalClipboard { .. } => "paste_terminal_clipboard",
             Self::PasteTerminalClipboardImage { .. } => "paste_terminal_clipboard_image",
             Self::ProbeTerminalViewportInput { .. } => "probe_terminal_viewport_input",
@@ -336,6 +359,7 @@ impl AppControlCommand {
             Self::RemoveSession { .. } => "remove_session",
             Self::SetSessionKeepAlive { .. } => "set_session_keep_alive",
             Self::SetRowExpanded { .. } => "set_row_expanded",
+            Self::SetTreeSelection { .. } => "set_tree_selection",
             Self::DescribeRows => "describe_rows",
             Self::OpenPath { .. } => "open_path",
             Self::FocusWindow => "focus_window",
