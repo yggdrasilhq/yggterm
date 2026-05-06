@@ -151,6 +151,15 @@ for pid_text, end_row in end_rows.items():
     row["cpu_percent"] = round((delta / denominator) * cores * 100.0, 3)
     rows.append(row)
 rows.sort(key=lambda row: (-row["cpu_percent"], row["comm"], row["pid"]))
+app_cpu_percent = 0.0
+workload_cpu_percent = 0.0
+for row in rows:
+    comm = str(row.get("comm") or "").lower()
+    cmdline = " ".join(str(part) for part in row.get("cmdline") or []).lower()
+    if "yggterm" in comm or "webkit" in comm or "yggterm" in cmdline or "webkit" in cmdline:
+        app_cpu_percent += float(row.get("cpu_percent") or 0.0)
+    else:
+        workload_cpu_percent += float(row.get("cpu_percent") or 0.0)
 print(
     json.dumps(
         {
@@ -160,6 +169,8 @@ print(
             "root_pid": ROOT_PID,
             "home": YGGTERM_HOME,
             "total_cpu_percent": round(sum(row["cpu_percent"] for row in rows), 3),
+            "app_cpu_percent": round(app_cpu_percent, 3),
+            "workload_cpu_percent": round(workload_cpu_percent, 3),
             "rows": rows,
             "start_pids": sorted(int(pid) for pid in start_rows),
             "end_pids": sorted(int(pid) for pid in end_rows),
@@ -188,7 +199,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--focused-max-cpu", type=float, default=2.5)
     parser.add_argument("--tui-max-cpu", type=float, default=18.0)
     parser.add_argument("--background-max-cpu", type=float, default=1.2)
+    parser.add_argument("--background-tui-max-cpu", type=float, default=6.0)
     parser.add_argument("--refocused-max-cpu", type=float, default=2.5)
+    parser.add_argument(
+        "--long-quiet-soak-sec",
+        type=float,
+        default=0.0,
+        help="After backgrounding, keep the GUI idle for this many seconds and sample CPU again.",
+    )
+    parser.add_argument("--long-quiet-max-cpu", type=float, default=1.2)
     parser.add_argument("--skip-tui", action="store_true")
     parser.add_argument("--keep-remote-dir", action="store_true")
     return parser.parse_args()
@@ -298,6 +317,11 @@ def state_summary(state: dict) -> dict:
             "session_path": host.get("session_path"),
             "active": host.get("active"),
             "input_enabled": host.get("input_enabled"),
+            "programmatic_focus_enabled": host.get("programmatic_focus_enabled"),
+            "terminal_write_frame_ms": host.get("terminal_write_frame_ms"),
+            "recent_frame_like_write_hot": host.get("recent_frame_like_write_hot"),
+            "document_focused": host.get("document_focused"),
+            "host_input_focused": host.get("host_input_focused"),
             "text_sample": str(host.get("text_sample") or "")[-240:],
             "text_tail": str(host.get("text_tail") or "")[-240:],
             "buffer_text_sample": str(host.get("buffer_text_sample") or "")[-240:],
@@ -315,6 +339,8 @@ def state_summary(state: dict) -> dict:
             "low_power_tui_text_sample": str(host.get("low_power_tui_text_sample") or "")[-240:],
             "inactive_tui_frame_drop_count": host.get("inactive_tui_frame_drop_count"),
             "inactive_tui_last_tail": str(host.get("inactive_tui_last_tail") or "")[-240:],
+            "unfocused_tui_frame_drop_count": host.get("unfocused_tui_frame_drop_count"),
+            "unfocused_tui_last_tail": str(host.get("unfocused_tui_last_tail") or "")[-240:],
             "rect": host.get("rect"),
             "host_rect": host.get("host_rect"),
             "screen_rect": host.get("screen_rect"),
@@ -348,9 +374,11 @@ def terminal_quiescent_key(summary: dict) -> tuple:
         host.get("write_bridge_flush_count"),
         host.get("write_bridge_in_flight"),
         host.get("write_bridge_pending_chars"),
+        host.get("recent_frame_like_write_hot"),
         host.get("low_power_tui_overlay_active"),
         host.get("low_power_tui_frame_count"),
         host.get("inactive_tui_frame_drop_count"),
+        host.get("unfocused_tui_frame_drop_count"),
         host.get("cursor_line_text"),
         host.get("text_tail"),
     )
@@ -365,6 +393,7 @@ def wait_for_terminal_quiescent_state(
     *,
     timeout_seconds: float = 20.0,
     require_visible: bool = False,
+    require_cool: bool = False,
 ) -> tuple[dict, dict]:
     deadline = time.time() + max(1.0, timeout_seconds)
     last_key: tuple | None = None
@@ -388,6 +417,10 @@ def wait_for_terminal_quiescent_state(
             host_summary.get("write_bridge_in_flight") is not True
             and int(host_summary.get("write_bridge_pending_chars") or 0) == 0
             and host_summary.get("low_power_tui_overlay_active") is not True
+            and (
+                not require_cool
+                or host_summary.get("recent_frame_like_write_hot") is not True
+            )
         )
         if key and key == last_key and idle_bridge:
             stable_polls += 1
@@ -406,6 +439,85 @@ def wait_for_terminal_quiescent_state(
         "quiescent": False,
         "stable_polls": stable_polls,
         "last_key": last_key,
+        "last_summary": last_summary,
+    }
+
+
+def synthetic_tui_signal(summary: dict) -> tuple[bool, dict]:
+    hosts = summary.get("terminal_host_details") or []
+    if not hosts:
+        return False, {"reason": "no_terminal_host"}
+    host = hosts[0]
+    text = "\n".join(
+        str(host.get(key) or "")
+        for key in ("text_sample", "text_tail", "buffer_text_sample", "cursor_line_text")
+    )
+    tui_tail = "\n".join(
+        str(host.get(key) or "")
+        for key in (
+            "inactive_tui_last_tail",
+            "unfocused_tui_last_tail",
+            "low_power_tui_text_sample",
+        )
+    )
+    visible_has_frame = (
+        "Yggterm synthetic TUI CPU smoke frame" in text
+        and any(f"{row:02d} [" in text for row in range(1, 42))
+    )
+    dropped_has_frame = any(f"{row:02d} [" in tui_tail for row in range(1, 42))
+    drop_count = sum(
+        int(host.get(key) or 0)
+        for key in (
+            "inactive_tui_frame_drop_count",
+            "unfocused_tui_frame_drop_count",
+            "low_power_tui_frame_count",
+        )
+    )
+    if visible_has_frame:
+        return True, {"reason": "visible_frame_text", "drop_count": drop_count}
+    if drop_count > 0 and dropped_has_frame:
+        return True, {"reason": "frame_drop_counter", "drop_count": drop_count}
+    return False, {
+        "reason": "waiting_for_frame",
+        "drop_count": drop_count,
+        "cursor_line_text": host.get("cursor_line_text"),
+        "text_tail": host.get("text_tail"),
+    }
+
+
+def wait_for_synthetic_tui_started(
+    host: str,
+    remote_bin: str,
+    launch_env: dict[str, str],
+    pid: int,
+    timeout_ms: int,
+    *,
+    timeout_seconds: float = 14.0,
+    require_visible: bool = False,
+) -> tuple[dict, dict]:
+    deadline = time.time() + max(1.0, timeout_seconds)
+    last_summary: dict = {}
+    last_signal: dict = {}
+    while time.time() < deadline:
+        state = linux_smoke.wait_for_remote_state(
+            host,
+            remote_bin,
+            launch_env,
+            pid,
+            timeout_ms,
+            timeout_seconds=5.0,
+            require_visible=require_visible,
+        )
+        summary = state_summary(state)
+        started, signal = synthetic_tui_signal(summary)
+        if started:
+            return state, {"started": True, **signal}
+        last_summary = summary
+        last_signal = signal
+        time.sleep(0.5)
+    return state, {
+        "started": False,
+        "last_signal": last_signal,
         "last_summary": last_summary,
     }
 
@@ -557,6 +669,7 @@ def main() -> int:
             "focused_max_cpu": args.focused_max_cpu,
             "tui_max_cpu": args.tui_max_cpu,
             "background_max_cpu": args.background_max_cpu,
+            "background_tui_max_cpu": args.background_tui_max_cpu,
             "refocused_max_cpu": args.refocused_max_cpu,
         },
     }
@@ -584,7 +697,7 @@ def main() -> int:
         summary["launch"] = launch
         summary["launch_info"] = launch_info
         summary["pid"] = pid
-        time.sleep(args.settle_sec)
+        time.sleep(max(args.settle_sec, 8.0))
         summary["state_after_launch"] = state_summary(state)
         summary["cpu_after_launch_idle_visible"] = remote_cpu_sample(
             args.host, "after_launch_idle_visible", pid, remote_home, args.sample_sec
@@ -610,7 +723,7 @@ def main() -> int:
             args.host, "terminal_focused_idle", pid, remote_home, args.sample_sec
         )
         if not args.skip_tui:
-            tui_duration = args.sample_sec + 3.0
+            tui_duration = args.sample_sec + 12.0
             summary["synthetic_tui_send"] = remote_terminal_send(
                 args.host,
                 remote_bin,
@@ -620,12 +733,20 @@ def main() -> int:
                 synthetic_tui_command(tui_duration) + "\r",
                 args.timeout_ms,
             )
-            time.sleep(1.0)
-            summary["state_during_synthetic_tui"] = state_summary(
-                linux_smoke.wait_for_remote_state(
-                    args.host, remote_bin, launch_env, pid, args.timeout_ms, timeout_seconds=20.0
-                )
+            tui_state, tui_start = wait_for_synthetic_tui_started(
+                args.host,
+                remote_bin,
+                launch_env,
+                pid,
+                args.timeout_ms,
+                timeout_seconds=max(8.0, args.settle_sec + 12.0),
             )
+            summary["synthetic_tui_start"] = tui_start
+            summary["state_during_synthetic_tui"] = state_summary(tui_state)
+            if not tui_start.get("started"):
+                raise RuntimeError(
+                    f"synthetic TUI did not start before active sample: {tui_start!r}"
+                )
             summary["cpu_terminal_active_tui"] = remote_cpu_sample(
                 args.host, "terminal_active_tui", pid, remote_home, args.sample_sec
             )
@@ -667,12 +788,94 @@ def main() -> int:
             args.timeout_ms,
             timeout_seconds=max(6.0, args.settle_sec + 10.0),
             require_visible=False,
+            require_cool=True,
         )
         summary["background_quiescence"] = quiescence
         summary["state_after_background_quiescent"] = state_summary(quiescent_state)
+        if not args.skip_tui:
+            background_tui_duration = args.sample_sec + args.settle_sec + 28.0
+            summary["synthetic_tui_background_send"] = remote_terminal_send(
+                args.host,
+                remote_bin,
+                launch_env,
+                pid,
+                session_path,
+                synthetic_tui_command(background_tui_duration) + "\r",
+                args.timeout_ms,
+            )
+            background_tui_pre_sample_wait_sec = max(4.0, args.settle_sec)
+            summary["background_tui_pre_sample_wait_sec"] = background_tui_pre_sample_wait_sec
+            time.sleep(background_tui_pre_sample_wait_sec)
+            summary["cpu_terminal_background_tui"] = remote_cpu_sample(
+                args.host, "terminal_background_tui", pid, remote_home, args.sample_sec
+            )
+            background_tui_state = linux_smoke.wait_for_remote_state(
+                args.host,
+                remote_bin,
+                launch_env,
+                pid,
+                args.timeout_ms,
+                timeout_seconds=20.0,
+                require_visible=False,
+            )
+            background_tui_summary = state_summary(background_tui_state)
+            background_tui_started, background_tui_signal = synthetic_tui_signal(
+                background_tui_summary
+            )
+            summary["synthetic_tui_background_start"] = {
+                "started": background_tui_started,
+                "source": "post_sample_state",
+                **background_tui_signal,
+            }
+            summary["state_during_background_tui"] = background_tui_summary
+            if not background_tui_started:
+                raise RuntimeError(
+                    "synthetic TUI was not observed after background sample: "
+                    f"{summary['synthetic_tui_background_start']!r}"
+                )
+            summary["synthetic_tui_background_interrupt"] = remote_terminal_send(
+                args.host,
+                remote_bin,
+                launch_env,
+                pid,
+                session_path,
+                "\u0003",
+                args.timeout_ms,
+            )
+            time.sleep(1.0)
+            post_background_tui_state, post_background_tui_quiescence = wait_for_terminal_quiescent_state(
+                args.host,
+                remote_bin,
+                launch_env,
+                pid,
+                args.timeout_ms,
+                timeout_seconds=max(14.0, args.settle_sec + 18.0),
+                require_visible=False,
+                require_cool=True,
+            )
+            summary["post_background_tui_quiescence"] = post_background_tui_quiescence
+            summary["state_after_background_tui_quiescent"] = state_summary(
+                post_background_tui_state
+            )
         summary["cpu_terminal_background_idle"] = remote_cpu_sample(
             args.host, "terminal_background_idle", pid, remote_home, args.sample_sec
         )
+        if args.long_quiet_soak_sec > 0:
+            time.sleep(args.long_quiet_soak_sec)
+            summary["state_after_long_quiet_soak"] = state_summary(
+                linux_smoke.wait_for_remote_state(
+                    args.host,
+                    remote_bin,
+                    launch_env,
+                    pid,
+                    args.timeout_ms,
+                    timeout_seconds=20.0,
+                    require_visible=False,
+                )
+            )
+            summary["cpu_terminal_long_quiet_soak"] = remote_cpu_sample(
+                args.host, "terminal_long_quiet_soak", pid, remote_home, args.sample_sec
+            )
         focus_proc = linux_smoke.ssh_shell(
             args.host,
             f"{linux_smoke.remote_env_exports(launch_env)}; "
@@ -694,6 +897,7 @@ def main() -> int:
             args.timeout_ms,
             timeout_seconds=max(6.0, args.settle_sec + 10.0),
             require_visible=False,
+            require_cool=True,
         )
         summary["refocus_quiescence"] = refocus_quiescence
         summary["state_after_refocus_quiescent"] = state_summary(refocus_quiescent_state)
@@ -704,9 +908,12 @@ def main() -> int:
             "cpu_after_launch_idle_visible": args.visible_max_cpu,
             "cpu_terminal_focused_idle": args.focused_max_cpu,
             "cpu_terminal_active_tui": args.tui_max_cpu,
+            "cpu_terminal_background_tui": args.background_tui_max_cpu,
             "cpu_terminal_background_idle": args.background_max_cpu,
             "cpu_terminal_refocused_idle": args.refocused_max_cpu,
         }
+        if args.long_quiet_soak_sec > 0:
+            budgets["cpu_terminal_long_quiet_soak"] = args.long_quiet_max_cpu
         failures = []
         if not background_effective:
             failures.append(
@@ -719,8 +926,17 @@ def main() -> int:
         for key, max_cpu in budgets.items():
             sample = summary.get(key) or {}
             total = float(sample.get("total_cpu_percent") or 0.0)
-            if total > max_cpu:
-                failures.append({"sample": key, "total_cpu_percent": total, "max_cpu": max_cpu})
+            app_total = float(sample.get("app_cpu_percent") or total)
+            if app_total > max_cpu:
+                failures.append(
+                    {
+                        "sample": key,
+                        "app_cpu_percent": app_total,
+                        "total_cpu_percent": total,
+                        "workload_cpu_percent": float(sample.get("workload_cpu_percent") or 0.0),
+                        "max_cpu": max_cpu,
+                    }
+                )
         summary["failures"] = failures
         summary["ok"] = not failures
     except Exception as exc:
