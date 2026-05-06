@@ -1,3 +1,11 @@
+yggterm (2.1.164-1) unstable; urgency=medium
+
+  * Strip fresh remote Codex start actions from update-restart persistence.
+  * Restore update-restarted remote Codex sessions with require-existing resume.
+  * Add regression coverage for synthetic remote Codex update restore.
+
+ -- Avikalpa Kundu <avi@gour.top>  Thu, 07 May 2026 00:14:22 +0530
+
 yggterm (2.1.163-1) unstable; urgency=medium
 
   * Add preserved-owner daemon hot-update handoff for live PTY runtimes.
