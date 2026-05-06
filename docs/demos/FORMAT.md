@@ -74,6 +74,10 @@ The manifest should be machine-readable and stable enough for CI. Recommended fi
 
 Keep it concise and visual.
 
+## Hot-Update Proof Fields
+
+Daemon hot-update bundles must record whether the update preserved live PTY ownership. Include the monitor `hot-restart` result, `server-list`, and app-control `daemon_update_state`. A successful session-preserving handoff should show `hot_update_handoff == true`, `fallback_shutdown_skipped == true`, `daemon_update_state.state == "hot_update_handoff_active"`, `update_priority == "handoff_preserve_sessions"`, and preserved runtime keys. If handoff is deferred, the proof should show `hot_update_pending` plus a skipped destructive fallback. A live-PTY owner shutdown is failed proof.
+
 ## Commit Policy
 
 Small manifests, summaries, and selected screenshots can live in git. Heavy recordings and transient capture outputs may be published externally or attached in CI artifacts rather than committed by default.

@@ -1134,7 +1134,7 @@ def main() -> int:
                             "server",
                             "app",
                             "launch",
-                            "--wait-visible",
+                            "--wait-settled",
                             "--allow-multi-window",
                             "--skip-active-exec-handoff",
                             "--timeout-ms",
