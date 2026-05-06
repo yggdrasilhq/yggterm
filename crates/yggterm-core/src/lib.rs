@@ -50,7 +50,7 @@ pub use trace::{
 pub use transcript::{
     TranscriptMessage, TranscriptRole, generation_context_from_messages,
     message_lines_from_payload, read_codex_transcript_messages,
-    read_codex_transcript_messages_limited,
+    read_codex_transcript_messages_limited, read_codex_transcript_messages_tail_limited,
 };
 pub use workspace::{
     WorkspaceDocument, WorkspaceDocumentInput, WorkspaceDocumentKind, WorkspaceDocumentSummary,

@@ -8,12 +8,13 @@ use std::time::Duration;
 use std::time::Instant;
 use yggterm_core::resolve_yggterm_home;
 use yggterm_server::{
-    ServerEndpoint, SessionKind, YGG_LOADING_NOTIFICATION_AFTER_MS, YggEventEnvelope, YggEventKind,
-    YggProgress, YggRequestMeta, YggSurface, YggTarget, default_endpoint,
-    ensure_local_daemon_running, hot_restart, local_headless_companion_executable_from_current,
-    ping, prepare_update_restart, reachable_versioned_daemon_statuses, refresh_managed_cli,
-    refresh_remote_machine, request_terminal_launch, shutdown, snapshot, start_local_session_at,
-    status, terminal_ensure, terminal_read, terminal_write,
+    HotRestartResult, ServerEndpoint, SessionKind, YGG_LOADING_NOTIFICATION_AFTER_MS,
+    YggEventEnvelope, YggEventKind, YggProgress, YggRequestMeta, YggSurface, YggTarget,
+    default_endpoint, ensure_local_daemon_running, hot_restart_detailed,
+    local_headless_companion_executable_from_current, ping, prepare_update_restart,
+    reachable_versioned_daemon_statuses, refresh_managed_cli, refresh_remote_machine,
+    request_terminal_launch, shutdown, snapshot, start_local_session_at, status, terminal_ensure,
+    terminal_read, terminal_write,
 };
 
 fn remote_machine_details_json(snap: &yggterm_server::ServerUiSnapshot) -> serde_json::Value {
@@ -392,9 +393,20 @@ fn server_status_json(
         "host_detail": daemon_status.host_detail,
         "terminal_session_count": daemon_status.terminal_session_count,
         "terminal_session_keys": daemon_status.terminal_session_keys,
+        "restored_live_sessions": daemon_status.restored_live_sessions,
+        "preserved_terminal_owner_count": daemon_status.preserved_terminal_owner_count,
+        "preserved_terminal_owner_keys": daemon_status.preserved_terminal_owner_keys,
         "managed_session_count": daemon_status.managed_session_count,
         "restored_from_persisted_state": daemon_status.restored_from_persisted_state,
     })
+}
+
+fn daemon_status_has_live_terminal_runtime(
+    daemon_status: &yggterm_server::ServerRuntimeStatus,
+) -> bool {
+    daemon_status.terminal_session_count > 0
+        || !daemon_status.terminal_session_keys.is_empty()
+        || daemon_status.restored_live_sessions > 0
 }
 
 fn reachable_servers_json(home_dir: &Path) -> serde_json::Value {
@@ -915,13 +927,16 @@ fn run_scenario(
                     vec![(endpoint.clone(), status(endpoint)?)]
                 };
                 let mut fallback_used = false;
+                let mut fallback_shutdown_skipped = false;
+                let mut hot_update_handoff_used = false;
+                let mut ready_skip_reason = None::<&'static str>;
                 let mut target_results = Vec::new();
                 for (target, daemon_status) in &targets {
                     let expected_version = cfg
                         .expected_version
                         .as_deref()
                         .or(Some(env!("CARGO_PKG_VERSION")));
-                    let hot_result = hot_restart(
+                    let hot_result = hot_restart_detailed(
                         target,
                         &daemon_exe,
                         expected_version,
@@ -931,43 +946,102 @@ fn run_scenario(
                             .or(Some("yggterm-headless monitor hot restart")),
                     );
                     match hot_result {
-                        Ok(message) => target_results.push(json!({
-                            "endpoint": endpoint_json(target),
-                            "server": server_status_json(target, daemon_status),
-                            "native_hot_restart": true,
-                            "message": message,
-                        })),
-                        Err(error) => {
-                            fallback_used = true;
-                            let prepare = prepare_update_restart(target)
-                            .map(|message| json!({"ok": true, "message": message}))
-                            .unwrap_or_else(|prepare_error| {
-                                json!({"ok": false, "error": prepare_error.to_string()})
-                            });
-                            let shutdown_result = shutdown(target)
-                            .map(|message| json!({"ok": true, "message": message}))
-                            .unwrap_or_else(|shutdown_error| {
-                                json!({"ok": false, "error": shutdown_error.to_string()})
-                            });
+                        Ok(HotRestartResult::Restarting { message }) => {
+                            target_results.push(json!({
+                                "endpoint": endpoint_json(target),
+                                "server": server_status_json(target, daemon_status),
+                                "native_hot_restart": true,
+                                "hot_update_handoff": false,
+                                "message": message,
+                            }))
+                        }
+                        Ok(HotRestartResult::Handoff {
+                            message,
+                            owner_endpoint,
+                            owner_server_version,
+                            owner_server_pid,
+                            target_server_version,
+                            runtime_keys,
+                        }) => {
+                            hot_update_handoff_used = true;
+                            fallback_shutdown_skipped = true;
+                            ready_skip_reason = Some("hot_update_handoff_preserved_owner");
                             target_results.push(json!({
                                 "endpoint": endpoint_json(target),
                                 "server": server_status_json(target, daemon_status),
                                 "native_hot_restart": false,
-                                "hot_restart_error": error.to_string(),
-                                "prepare_update_restart": prepare,
-                                "shutdown": shutdown_result,
-                            }));
+                                "hot_update_handoff": true,
+                                "fallback_shutdown_skipped": true,
+                                "fallback_shutdown_skip_reason": "handoff_preserved_owner",
+                                "message": message,
+                                "owner_endpoint": owner_endpoint,
+                                "owner_server_version": owner_server_version,
+                                "owner_server_pid": owner_server_pid,
+                                "target_server_version": target_server_version,
+                                "runtime_keys": runtime_keys,
+                                "update_priority": "handoff_preserve_sessions",
+                            }))
+                        }
+                        Err(error) => {
+                            if daemon_status_has_live_terminal_runtime(daemon_status) {
+                                fallback_shutdown_skipped = true;
+                                ready_skip_reason = Some("session_survival_required");
+                                target_results.push(json!({
+                                    "endpoint": endpoint_json(target),
+                                    "server": server_status_json(target, daemon_status),
+                                    "native_hot_restart": false,
+                                    "hot_restart_error": error.to_string(),
+                                    "fallback_shutdown_skipped": true,
+                                    "fallback_shutdown_skip_reason": "session_survival_required",
+                                    "update_priority": "defer_update_preserve_sessions",
+                                }));
+                            } else {
+                                fallback_used = true;
+                                let prepare = prepare_update_restart(target)
+                                .map(|message| json!({"ok": true, "message": message}))
+                                .unwrap_or_else(|prepare_error| {
+                                    json!({"ok": false, "error": prepare_error.to_string()})
+                                });
+                                let shutdown_result = shutdown(target)
+                                .map(|message| json!({"ok": true, "message": message}))
+                                .unwrap_or_else(|shutdown_error| {
+                                    json!({"ok": false, "error": shutdown_error.to_string()})
+                                });
+                                target_results.push(json!({
+                                    "endpoint": endpoint_json(target),
+                                    "server": server_status_json(target, daemon_status),
+                                    "native_hot_restart": false,
+                                    "hot_restart_error": error.to_string(),
+                                    "fallback_shutdown_skipped": false,
+                                    "prepare_update_restart": prepare,
+                                    "shutdown": shutdown_result,
+                                }));
+                            }
                         }
                     }
                 }
                 if fallback_used || targets.is_empty() {
                     ensure_local_daemon_running(endpoint)?;
                 }
-                let ready = wait_for_daemon_status(endpoint, cfg)?;
+                let ready = if fallback_shutdown_skipped {
+                    let observed = status(endpoint)
+                        .map(|daemon_status| server_status_json(endpoint, &daemon_status))
+                        .ok();
+                    json!({
+                        "ready": false,
+                        "deferred": true,
+                        "reason": ready_skip_reason.unwrap_or("session_survival_required"),
+                        "server": observed,
+                    })
+                } else {
+                    wait_for_daemon_status(endpoint, cfg)?
+                };
                 Ok(json!({
                     "daemon_executable": daemon_exe.display().to_string(),
                     "target_count": targets.len(),
                     "fallback_used": fallback_used,
+                    "fallback_shutdown_skipped": fallback_shutdown_skipped,
+                    "hot_update_handoff_used": hot_update_handoff_used,
                     "targets": target_results,
                     "ready": ready,
                 }))
@@ -1107,6 +1181,79 @@ mod tests {
         assert_eq!(cfg.expected_version.as_deref(), Some("2.1.61"));
         assert_eq!(cfg.expected_build_id, Some(123));
         assert_eq!(cfg.reason.as_deref(), Some("release"));
+    }
+
+    #[test]
+    fn hot_restart_monitor_detects_live_runtime_before_fallback_shutdown() {
+        let live_status: yggterm_server::ServerRuntimeStatus =
+            serde_json::from_value(serde_json::json!({
+                "server_version": "2.1.61",
+                "server_build_id": 0,
+                "server_pid": 44,
+                "host_kind": "local",
+                "host_detail": "test",
+                "embedded_surface_supported": true,
+                "bridge_enabled": true,
+                "restored_live_sessions": 1,
+                "terminal_session_count": 1,
+                "terminal_session_keys": ["local://kept"],
+                "managed_session_count": 0,
+            }))
+            .expect("live status");
+        assert!(daemon_status_has_live_terminal_runtime(&live_status));
+
+        let empty_status: yggterm_server::ServerRuntimeStatus =
+            serde_json::from_value(serde_json::json!({
+                "server_version": "2.1.61",
+                "server_build_id": 0,
+                "server_pid": 45,
+                "host_kind": "local",
+                "host_detail": "test",
+                "embedded_surface_supported": true,
+                "bridge_enabled": true,
+                "restored_live_sessions": 0,
+                "terminal_session_count": 0,
+                "terminal_session_keys": [],
+                "managed_session_count": 0,
+            }))
+            .expect("empty status");
+        assert!(!daemon_status_has_live_terminal_runtime(&empty_status));
+    }
+
+    #[test]
+    fn server_status_json_reports_hot_update_handoff_owners() {
+        let status: yggterm_server::ServerRuntimeStatus =
+            serde_json::from_value(serde_json::json!({
+                "server_version": "2.1.62",
+                "server_build_id": 0,
+                "server_pid": 62,
+                "host_kind": "local",
+                "host_detail": "test",
+                "embedded_surface_supported": true,
+                "bridge_enabled": true,
+                "restored_live_sessions": 0,
+                "terminal_session_count": 1,
+                "terminal_session_keys": ["codex-runtime://kept"],
+                "preserved_terminal_owner_count": 1,
+                "preserved_terminal_owner_keys": ["codex-runtime://kept"],
+                "managed_session_count": 0,
+            }))
+            .expect("handoff status");
+        let endpoint = yggterm_server::default_endpoint(std::path::Path::new("/tmp/yggterm-test"));
+        let json = server_status_json(&endpoint, &status);
+
+        assert_eq!(
+            json.get("preserved_terminal_owner_count")
+                .and_then(serde_json::Value::as_u64),
+            Some(1)
+        );
+        assert_eq!(
+            json.get("preserved_terminal_owner_keys")
+                .and_then(serde_json::Value::as_array)
+                .and_then(|keys| keys.first())
+                .and_then(serde_json::Value::as_str),
+            Some("codex-runtime://kept")
+        );
     }
 
     #[test]
