@@ -12,6 +12,49 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_ARTIFACT = ROOT / "dist" / "yggterm-linux-x86_64"
 SMOKE_SCRIPT = ROOT / "scripts" / "smoke_xterm_embed_faults.py"
+REMOTE_NO_SESSION_SETUP_CHECKS = {
+    "background_blur",
+    "client_memory_budget",
+    "codex_spawn_timeline",
+    "context_menu_delete_session",
+    "context_menu_rename_session",
+    "context_menu_delete_multiselection",
+    "focus",
+    "folder_create_rename_collapse",
+    "geometry",
+    "local_stored_sessions_visible",
+    "live_session_close_button",
+    "live_session_keep_alive_toggle",
+    "live_session_metadata_consistency",
+    "live_sessions_tree_contract",
+    "managed_cli_refresh_ttl",
+    "maximize_roundtrip_layout",
+    "notification_health_initial",
+    "right_panel_animation",
+    "search_focus_overlay",
+    "session_drag_to_folder",
+    "session_view_contract_initial",
+    "settings_terminal_reclaim",
+    "settings_zoom_input",
+    "sidebar_cursor_contract",
+    "small_window_chrome",
+    "start_page_actions",
+    "stored_codex_session_open",
+    "terminal_redraw_context_menu",
+    "theme_editor_contract",
+    "titlebar_always_on_top",
+    "titlebar_autohide_hover",
+    "titlebar_centering",
+    "titlebar_copy_regeneration",
+    "titlebar_empty_lane_window_controls",
+    "titlebar_modal_visual_parity",
+    "titlebar_new_menu_shell",
+    "titlebar_overflow_menu",
+    "titlebar_search_typing",
+    "titlebar_session_shell",
+    "webkit_child_rss_soak",
+    "window_corner_artifact",
+}
 LINUX_SESSION_SNIPPET = r"""
 import json
 import os
@@ -227,7 +270,11 @@ for pid in sorted(os.listdir("/proc")):
     if smoke_tag != "1" and not home.startswith("/tmp/yggterm-remote-smoke-"):
         continue
     exe = str(cmdline[0] or "")
-    if "yggterm" not in pathlib.Path(exe).name.lower() and not any("yggterm" in part.lower() for part in cmdline):
+    exe_name = pathlib.Path(exe).name.lower()
+    # This inventory is for GUI clients owned by the smoke harness. Daemons and
+    # terminal transport children inherit the smoke environment, but killing them
+    # on an installed live profile destroys the user's active sessions.
+    if exe_name != "yggterm":
         continue
     clients.append(
         {
@@ -276,7 +323,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--smoke-timeout-sec", type=int)
     parser.add_argument("--only-check", action="append", default=[])
     parser.add_argument("--keep-remote-dir", action="store_true")
+    parser.add_argument(
+        "--keep-app-open",
+        action="store_true",
+        help="Leave the harness-launched app open after a passing smoke. Requires --use-installed-profile.",
+    )
+    parser.add_argument(
+        "--use-installed-profile",
+        action="store_true",
+        help="Run the smoke against the remote user's installed ~/.yggterm profile instead of an isolated harness home.",
+    )
     args = parser.parse_args()
+    if args.keep_app_open and not args.use_installed_profile:
+        parser.error("--keep-app-open requires --use-installed-profile")
     if args.smoke_timeout_sec is None:
         if args.only_check:
             args.smoke_timeout_sec = max(420, 120 + 40 * len(args.only_check))
@@ -783,11 +842,14 @@ def remote_close_window(
     env: dict[str, str],
     pid: int,
     timeout_ms: int,
+    *,
+    preserve_live_sessions: bool = False,
 ) -> dict:
     exports = remote_env_exports(env)
+    preserve_arg = " --preserve-live-sessions" if preserve_live_sessions else ""
     proc = ssh_shell(
         host,
-        f"{exports}; {quote(remote_bin)} server app close --pid {pid} --timeout-ms {timeout_ms}",
+        f"{exports}; {quote(remote_bin)} server app close --pid {pid}{preserve_arg} --timeout-ms {timeout_ms}",
         check=False,
     )
     text = proc.stdout.strip()
@@ -827,19 +889,28 @@ def remote_problem_notifications(state: dict) -> list[dict]:
     return bad
 
 
-def remote_cleanup_owned_clients(host: str, timeout_ms: int) -> dict:
+def remote_cleanup_owned_clients(
+    host: str, timeout_ms: int, *, preserve_daemon: bool = False
+) -> dict:
     inventory = remote_owned_clients(host)
     results: list[dict] = []
     for client in list(inventory.get("clients") or []):
         pid = int(client.get("pid") or 0)
         home = str(client.get("home") or "").strip()
         exe = str(client.get("exe") or "").strip()
+        cmdline = [str(part) for part in (client.get("cmdline") or [])]
+        is_daemon = len(cmdline) >= 3 and cmdline[1:3] == ["server", "daemon"]
         result: dict[str, object] = {
             "pid": pid,
             "home": home,
             "exe": exe,
+            "preserved": False,
         }
         if pid <= 0:
+            results.append(result)
+            continue
+        if preserve_daemon and is_daemon:
+            result["preserved"] = True
             results.append(result)
             continue
         if home and exe:
@@ -854,12 +925,13 @@ def remote_cleanup_owned_clients(host: str, timeout_ms: int) -> dict:
                 result["close_stdout"] = close_proc.stdout.strip()
             if close_proc.stderr.strip():
                 result["close_stderr"] = close_proc.stderr.strip()
-            shutdown_proc = ssh_shell(
-                host,
-                f"export YGGTERM_HOME={quote(home)}; {quote(exe)} server shutdown >/dev/null 2>&1 || true",
-                check=False,
-            )
-            result["shutdown_returncode"] = shutdown_proc.returncode
+            if not preserve_daemon:
+                shutdown_proc = ssh_shell(
+                    host,
+                    f"export YGGTERM_HOME={quote(home)}; {quote(exe)} server shutdown >/dev/null 2>&1 || true",
+                    check=False,
+                )
+                result["shutdown_returncode"] = shutdown_proc.returncode
         alive = ssh_shell(host, f"kill -0 {pid} >/dev/null 2>&1", check=False).returncode == 0
         result["alive_after_close"] = alive
         if alive:
@@ -971,7 +1043,7 @@ def remote_launch_visible_window(
     launch = ssh_shell(
         host,
         f"{exports}; {quote(remote_bin)} server app launch "
-        f"--allow-multi-window --skip-active-exec-handoff --timeout-ms {timeout_ms} "
+        f"--wait-settled --allow-multi-window --skip-active-exec-handoff --timeout-ms {timeout_ms} "
         f"--log {quote(remote_log)}",
     )
     payload = json.loads(launch.stdout.strip() or "{}")
@@ -1227,7 +1299,11 @@ def main() -> int:
     smoke_proc: subprocess.CompletedProcess | None = None
     remote_dir: str | None = None
     try:
-        cleanup_summary = remote_cleanup_owned_clients(args.host, args.timeout_ms)
+        cleanup_summary = remote_cleanup_owned_clients(
+            args.host,
+            args.timeout_ms,
+            preserve_daemon=args.use_installed_profile,
+        )
         metadata["owned_clients_cleanup"] = cleanup_summary
         session_info = ssh_python_json(args.host, LINUX_SESSION_SNIPPET)
         metadata["session_info"] = session_info
@@ -1276,9 +1352,13 @@ def main() -> int:
         python_cmd = smoke_python(args.host, remote_dir)
         metadata["remote_python"] = python_cmd
 
-        remote_home = f"{remote_dir}/home"
+        if args.use_installed_profile:
+            remote_home = f"{str(session_info.get('home_dir') or '').rstrip('/')}/.yggterm"
+        else:
+            remote_home = f"{remote_dir}/home"
         remote_out = f"{remote_dir}/proof"
         remote_log = f"{remote_dir}/client.log"
+        metadata["use_installed_profile"] = bool(args.use_installed_profile)
         launch_env = {
             "DBUS_SESSION_BUS_ADDRESS": dbus_bus,
             "XDG_RUNTIME_DIR": runtime_dir,
@@ -1521,7 +1601,15 @@ def main() -> int:
                     "stored Codex fixture auto-opened on cold start before explicit user/app-control open"
                 )
         smoke_session = args.session
-        if args.session_kind == "plain" and smoke_session == "local://remote-smoke":
+        only_no_session_checks = bool(args.only_check) and set(args.only_check).issubset(
+            REMOTE_NO_SESSION_SETUP_CHECKS
+        )
+        metadata["only_no_session_checks"] = only_no_session_checks
+        if (
+            args.session_kind == "plain"
+            and smoke_session == "local://remote-smoke"
+            and not only_no_session_checks
+        ):
             smoke_session = remote_create_plain_terminal(
                 args.host,
                 remote_bin,
@@ -1575,16 +1663,22 @@ def main() -> int:
             raise RuntimeError(
                 f"bad daemon/socket notifications were observed during smoke: {metadata['final_problem_notifications']!r}"
             )
-        try:
-            metadata["background_response_after_smoke"] = remote_background_window(
-                args.host,
-                remote_bin,
-                launch_env,
-                pid,
-                args.timeout_ms,
-            )
-        except Exception as exc:
-            metadata["background_error_after_smoke"] = str(exc)
+        if args.keep_app_open:
+            metadata["background_after_smoke"] = {
+                "skipped": True,
+                "reason": "keep-app-open",
+            }
+        else:
+            try:
+                metadata["background_response_after_smoke"] = remote_background_window(
+                    args.host,
+                    remote_bin,
+                    launch_env,
+                    pid,
+                    args.timeout_ms,
+                )
+            except Exception as exc:
+                metadata["background_error_after_smoke"] = str(exc)
 
         pulled_dir = out_dir / "proof"
         pulled_dir.mkdir(parents=True, exist_ok=True)
@@ -1615,35 +1709,57 @@ def main() -> int:
 
         write_json(metadata_path, metadata)
 
-        try:
-            metadata["close_response"] = remote_close_window(
-                args.host,
-                remote_bin,
-                launch_env,
-                pid,
-                args.timeout_ms,
-            )
-        except Exception as exc:
-            metadata["close_error"] = str(exc)
-        ssh_shell(
-            args.host,
-            f"{exports}; {quote(remote_bin)} server shutdown >/dev/null 2>&1 || true",
-            check=False,
-        )
-        metadata["owned_clients_after_close"] = wait_for_remote_owned_clients_gone(args.host)
-        final_owned_clients = metadata["owned_clients_after_close"]
-        if int((final_owned_clients or {}).get("count") or 0) != 0:
+        if args.keep_app_open:
+            metadata["kept_app_open"] = True
+            metadata["kept_app_open_pid"] = pid
+            metadata["close_exit"] = {"skipped": True, "exited": True, "pid": pid}
+            metadata["owned_clients_after_smoke"] = remote_owned_clients(args.host)
+            final_owned_clients = metadata["owned_clients_after_smoke"]
+        else:
+            try:
+                metadata["close_response"] = remote_close_window(
+                    args.host,
+                    remote_bin,
+                    launch_env,
+                    pid,
+                    args.timeout_ms,
+                    preserve_live_sessions=args.use_installed_profile,
+                )
+            except Exception as exc:
+                metadata["close_error"] = str(exc)
+            metadata["close_exit"] = wait_for_remote_pid_gone(args.host, pid)
+            if not args.use_installed_profile:
+                ssh_shell(
+                    args.host,
+                    f"{exports}; {quote(remote_bin)} server shutdown >/dev/null 2>&1 || true",
+                    check=False,
+                )
+            if args.use_installed_profile:
+                metadata["owned_clients_after_close"] = remote_owned_clients(args.host)
+                final_owned_clients = metadata["owned_clients_after_close"]
+            else:
+                metadata["owned_clients_after_close"] = wait_for_remote_owned_clients_gone(args.host)
+                final_owned_clients = metadata["owned_clients_after_close"]
+        if (
+            not args.use_installed_profile
+            and int((final_owned_clients or {}).get("count") or 0) != 0
+        ):
             metadata["owned_clients_cleanup_after_close"] = remote_cleanup_owned_clients(
                 args.host,
                 args.timeout_ms,
+                preserve_daemon=args.use_installed_profile,
             )
             final_owned_clients = (metadata["owned_clients_cleanup_after_close"] or {}).get(
                 "after"
             )
-        if int((final_owned_clients or {}).get("count") or 0) != 0:
+        if (
+            not args.use_installed_profile
+            and int((final_owned_clients or {}).get("count") or 0) != 0
+        ):
             metadata["owned_clients_cleanup_after_close_retry"] = remote_cleanup_owned_clients(
                 args.host,
                 args.timeout_ms,
+                preserve_daemon=args.use_installed_profile,
             )
             final_owned_clients = (
                 metadata["owned_clients_cleanup_after_close_retry"] or {}
@@ -1662,13 +1778,19 @@ def main() -> int:
                     args.host,
                     "plasma-plasmashell.service",
                 )
-        owned_clients_survived = int((final_owned_clients or {}).get("count") or 0) != 0
+        owned_clients_survived = (
+            not args.use_installed_profile
+            and int((final_owned_clients or {}).get("count") or 0) != 0
+        )
         metadata["ok"] = (
             (smoke_proc is not None and smoke_proc.returncode == 0)
             and not bool(metadata.get("final_problem_notifications"))
             and not bool(metadata.get("plasmashell_problem"))
+            and bool((metadata.get("close_exit") or {}).get("exited"))
             and not owned_clients_survived
         )
+        if not (metadata.get("close_exit") or {}).get("exited") and not metadata.get("error"):
+            metadata["error"] = "automation-owned Yggterm window survived app-control close"
         if metadata.get("plasmashell_problem") and not metadata.get("error"):
             metadata["error"] = metadata["plasmashell_problem"]
         if owned_clients_survived and not metadata.get("error"):

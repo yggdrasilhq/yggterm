@@ -141,8 +141,7 @@ impl SessionBrowserState {
                 .cloned(),
         );
         if let Some(path) = selected_path
-            && !path.contains("://")
-            && !path.starts_with("__")
+            && selected_path_should_expand_ancestors(path)
         {
             for ancestor in Path::new(path).ancestors().skip(1) {
                 self.expanded_paths.insert(ancestor.display().to_string());
@@ -299,6 +298,13 @@ impl SessionBrowserState {
         self.selected_path = Some(self.rows[next_ix].full_path.clone());
         Some(next_ix)
     }
+}
+
+fn selected_path_should_expand_ancestors(path: &str) -> bool {
+    !path.contains("://")
+        && !path.starts_with("__")
+        && !path.contains("/.codex/sessions/")
+        && !path.contains("/.codex-litellm/sessions/")
 }
 
 fn default_level_one_expanded_paths(root: &SessionNode) -> HashSet<String> {
@@ -870,6 +876,77 @@ mod tests {
         assert!(expanded.iter().any(|path| path == "/"));
         assert!(expanded.iter().any(|path| path == "/home"));
         assert!(expanded.iter().any(|path| path == "/home/pi"));
+        assert!(!expanded.iter().any(|path| path == "/home/pi/.codex"));
+        assert!(!browser.rows().iter().any(|row| row.full_path == selected));
+    }
+
+    #[test]
+    fn restore_ui_state_does_not_auto_expand_selected_codex_storage_path() {
+        let selected = "/home/pi/.codex/sessions/2026/04/26/rollout.jsonl";
+        let root = SessionNode {
+            kind: SessionNodeKind::Group,
+            name: "root".to_string(),
+            title: None,
+            document_kind: None,
+            group_kind: None,
+            path: PathBuf::from("local"),
+            children: vec![SessionNode {
+                kind: SessionNodeKind::Group,
+                name: "/".to_string(),
+                title: Some("/".to_string()),
+                document_kind: None,
+                group_kind: Some(WorkspaceGroupKind::Folder),
+                path: PathBuf::from("/"),
+                session_id: None,
+                cwd: None,
+                children: vec![SessionNode {
+                    kind: SessionNodeKind::Group,
+                    name: "home".to_string(),
+                    title: Some("home".to_string()),
+                    document_kind: None,
+                    group_kind: Some(WorkspaceGroupKind::Folder),
+                    path: PathBuf::from("/home"),
+                    session_id: None,
+                    cwd: None,
+                    children: vec![SessionNode {
+                        kind: SessionNodeKind::Group,
+                        name: "pi".to_string(),
+                        title: Some("pi".to_string()),
+                        document_kind: None,
+                        group_kind: Some(WorkspaceGroupKind::Folder),
+                        path: PathBuf::from("/home/pi"),
+                        session_id: None,
+                        cwd: None,
+                        children: vec![SessionNode {
+                            kind: SessionNodeKind::Group,
+                            name: ".codex".to_string(),
+                            title: Some(".codex".to_string()),
+                            document_kind: None,
+                            group_kind: Some(WorkspaceGroupKind::Folder),
+                            path: PathBuf::from("/home/pi/.codex"),
+                            session_id: None,
+                            cwd: None,
+                            children: vec![SessionNode {
+                                kind: SessionNodeKind::CodexSession,
+                                name: "rollout.jsonl".to_string(),
+                                title: Some("Renamed Session".to_string()),
+                                document_kind: None,
+                                group_kind: None,
+                                path: PathBuf::from(selected),
+                                children: Vec::new(),
+                                session_id: Some("session-1".to_string()),
+                                cwd: Some("/home/pi".to_string()),
+                            }],
+                        }],
+                    }],
+                }],
+            }],
+            session_id: None,
+            cwd: None,
+        };
+        let mut browser = SessionBrowserState::new(root);
+        browser.restore_ui_state(&[], Some(selected));
+        let expanded = browser.expanded_paths();
         assert!(!expanded.iter().any(|path| path == "/home/pi/.codex"));
         assert!(!browser.rows().iter().any(|row| row.full_path == selected));
     }

@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+from __future__ import annotations
+
 import argparse
 import base64
 import colorsys
@@ -6,12 +8,16 @@ import io
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import time
 from pathlib import Path
 
-from PIL import Image, ImageChops, ImageStat
+try:
+    from PIL import Image, ImageChops, ImageStat
+except ModuleNotFoundError:
+    Image = ImageChops = ImageStat = None
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -373,6 +379,10 @@ def assert_terminal_open_attempt_consistent(state: dict) -> None:
     attempt = viewport.get("terminal_open_attempt") or {}
     if not isinstance(attempt, dict) or attempt.get("state") != "ready":
         return
+    if viewport.get("active_view_mode") != "Terminal":
+        return
+    if str(viewport.get("active_session_path") or "") != str(attempt.get("session_path") or ""):
+        return
     if int(attempt.get("observations") or 0) <= 0:
         return
     stale_reasons = []
@@ -403,7 +413,6 @@ def app_state(pid: int, timeout_ms: int = 20000, retries: int = 2) -> dict:
                 "--timeout-ms",
                 str(timeout_ms),
             )["data"]
-            assert_terminal_open_attempt_consistent(state)
             return state
         except AssertionError as exc:
             last_error = exc
@@ -412,6 +421,18 @@ def app_state(pid: int, timeout_ms: int = 20000, retries: int = 2) -> dict:
             time.sleep(0.25 * (attempt + 1))
     assert last_error is not None
     raise last_error
+
+
+def app_state_raw(pid: int, timeout_ms: int = 20000) -> dict:
+    return run(
+        "server",
+        "app",
+        "state",
+        "--pid",
+        str(pid),
+        "--timeout-ms",
+        str(timeout_ms),
+    )["data"]
 
 
 def viewport_state(state: dict) -> dict:
@@ -553,6 +574,20 @@ def terminal_reclaim_focus(pid: int, session: str) -> dict:
         "--timeout-ms",
         "15000",
     )
+
+
+def terminal_redraw(pid: int, session: str) -> dict:
+    return unwrap_data(run(
+        "server",
+        "app",
+        "terminal",
+        "redraw",
+        "--pid",
+        str(pid),
+        session,
+        "--timeout-ms",
+        "15000",
+    ))
 
 
 def terminal_paste_clipboard(pid: int, session: str) -> dict:
@@ -786,7 +821,7 @@ def terminal_probe_type(
     return run(*args)
 
 
-def app_open(pid: int, session: str, view: str = "terminal") -> dict:
+def app_open(pid: int, session: str, view: str = "terminal", timeout_ms: int = 45000) -> dict:
     return run(
         "server",
         "app",
@@ -797,7 +832,7 @@ def app_open(pid: int, session: str, view: str = "terminal") -> dict:
         "--view",
         view,
         "--timeout-ms",
-        "20000",
+        str(timeout_ms),
     )
 
 
@@ -905,6 +940,8 @@ def app_screenshot(
 def screenshot_crop_needs_root_recrop(path: Path, state: dict) -> bool:
     if not path.exists():
         return False
+    if Image is None or ImageStat is None:
+        return False
     try:
         image = Image.open(path).convert("RGB")
     except OSError:
@@ -987,6 +1024,38 @@ def app_set_right_panel_mode(pid: int, mode: str) -> dict:
     )
 
 
+def app_start_action(pid: int, action: str) -> dict:
+    return unwrap_data(run(
+        "server",
+        "app",
+        "start-action",
+        action,
+        "--pid",
+        str(pid),
+        "--timeout-ms",
+        "15000",
+    ))
+
+
+def app_show_start_page(pid: int) -> dict:
+    return unwrap_data(run(
+        "server",
+        "app",
+        "start-page",
+        "--pid",
+        str(pid),
+        "--timeout-ms",
+        "12000",
+    ))
+
+
+def app_tree_select(pid: int, paths: list[str], *, anchor: str | None = None) -> dict:
+    args = ["server", "app", "tree", "select", *paths, "--pid", str(pid), "--timeout-ms", "12000"]
+    if anchor:
+        args.extend(["--anchor", anchor])
+    return unwrap_data(run(*args))
+
+
 def app_set_window_chrome_hover(pid: int, active: bool) -> dict:
     return run(
         "server",
@@ -1063,7 +1132,7 @@ def preferred_hot_plain_session(pid: int) -> str | None:
     for row in rows:
         if str(row.get("kind") or "") != "Session":
             continue
-        if str(row.get("icon_kind") or "") != "plain-terminal":
+        if str(row.get("icon_kind") or "") != "terminal":
             continue
         path = str(row.get("path") or row.get("full_path") or "").strip()
         if not path:
@@ -1982,21 +2051,29 @@ def screen_coordinates_for_window_point(
 
 def xdotool_click_window(pid: int, x: float, y: float, button: int = 1) -> dict:
     if POINTER_DRIVER == "app":
-        app_pointer_command(
-            pid,
-            "click",
-            x=x,
-            y=y,
-            button=app_pointer_button_name(button),
-        )
-        time.sleep(0.18)
-        return {
-            "window_id": "app",
-            "x": int(round(x)),
-            "y": int(round(y)),
-            "button": int(button),
-            "driver": "app",
-        }
+        try:
+            app_pointer_command(
+                pid,
+                "click",
+                x=x,
+                y=y,
+                button=app_pointer_button_name(button),
+            )
+            time.sleep(0.18)
+            return {
+                "window_id": "app",
+                "x": int(round(x)),
+                "y": int(round(y)),
+                "button": int(button),
+                "driver": "app",
+            }
+        except AssertionError as exc:
+            if "unsupported app control command: pointer" in str(exc):
+                raise AssertionError(
+                    "app-control pointer is unavailable; refusing to fall back to desktop input automation. "
+                    "Update the target Yggterm binary or explicitly approve desktop input control."
+                ) from exc
+            raise
     env = xdotool_env_for_pid(pid)
     window_id = visible_window_id_for_pid(pid)
     if not xdotool_focus_belongs_to_pid(pid):
@@ -2807,6 +2884,18 @@ def current_yggterm_home() -> Path:
 
 
 def normalize_live_path(path: str) -> str:
+    if path.startswith("codex://"):
+        return "local://" + path.split("://", 1)[1]
+    if path.startswith("codex-litellm://"):
+        return "local://" + path.split("://", 1)[1]
+    if path.startswith("codex::"):
+        return "local://" + path.split("::", 1)[1]
+    if path.startswith("codex-runtime://"):
+        return "local://" + path.split("://", 1)[1]
+    if path.startswith("codex-litellm::"):
+        return "local://" + path.split("::", 1)[1]
+    if path.startswith("local::"):
+        return "local://" + path.split("::", 1)[1]
     if "://" in path or "::" not in path:
         return path
     prefix, suffix = path.split("::", 1)
@@ -2848,6 +2937,187 @@ def find_snapshot_session(snapshot: dict, session: str) -> dict | None:
                 return entry
 
     return None
+
+
+def remote_session_machine_key(path: str) -> str:
+    text = str(path or "").strip()
+    if not text.startswith("remote-session://"):
+        return ""
+    rest = text.split("://", 1)[1]
+    return rest.split("/", 1)[0].strip()
+
+
+def configured_recent_scope_folder_path() -> str:
+    machine_key = (
+        ENV.get("YGGTERM_SMOKE_RECENT_MACHINE")
+        or ENV.get("YGGTERM_SMOKE_REMOTE_RECENT_MACHINE")
+        or ""
+    ).strip()
+    cwd = (
+        ENV.get("YGGTERM_SMOKE_RECENT_CWD")
+        or ENV.get("YGGTERM_SMOKE_REMOTE_RECENT_CWD")
+        or ""
+    ).strip()
+    if not machine_key or not cwd:
+        return ""
+    cwd = "/" + cwd.lstrip("/")
+    if cwd != "/":
+        cwd = cwd.rstrip("/")
+    return f"__remote_folder__/{machine_key}{cwd}"
+
+
+def select_configured_start_page_scope(pid: int) -> dict | None:
+    folder_path = configured_recent_scope_folder_path()
+    if not folder_path:
+        return None
+    app_tree_select(pid, [folder_path], anchor=folder_path)
+    time.sleep(0.15)
+    app_show_start_page(pid)
+    return app_state_raw(pid)
+
+
+def snapshot_remote_machine(snapshot: dict, machine_key: str) -> dict | None:
+    for machine in snapshot.get("remote_machines") or []:
+        if not isinstance(machine, dict):
+            continue
+        if str(machine.get("machine_key") or "").strip() == machine_key:
+            return machine
+    return None
+
+
+def sorted_remote_snapshot_sessions(
+    snapshot: dict,
+    *,
+    machine_key: str,
+    cwd: str | None = None,
+) -> list[dict]:
+    machine = snapshot_remote_machine(snapshot, machine_key)
+    if not machine:
+        return []
+    candidates = []
+    for session in machine.get("sessions") or []:
+        if not isinstance(session, dict):
+            continue
+        if cwd and str(session.get("cwd") or "").strip() != cwd:
+            continue
+        session_path = str(session.get("session_path") or "").strip()
+        if not session_path:
+            continue
+        try:
+            modified_epoch = int(session.get("modified_epoch") or 0)
+        except (TypeError, ValueError):
+            modified_epoch = 0
+        candidates.append(
+            {
+                **session,
+                "session_path": session_path,
+                "_modified_epoch": modified_epoch,
+                "_started_at": str(session.get("started_at") or ""),
+            }
+        )
+    candidates.sort(
+        key=lambda item: (
+            int(item.get("_modified_epoch") or 0),
+            str(item.get("_started_at") or ""),
+        ),
+        reverse=True,
+    )
+    return candidates
+
+
+def remote_codex_transcript_truth(
+    ssh_target: str,
+    cwd: str,
+    *,
+    limit: int = 12,
+) -> list[dict]:
+    scanner = r"""
+import json
+import os
+import sys
+from pathlib import Path
+
+target_cwd = sys.argv[1]
+limit = int(sys.argv[2])
+roots = [
+    Path.home() / ".codex" / "sessions",
+    Path.home() / ".codex-litellm" / "sessions",
+]
+rows = []
+for root in roots:
+    if not root.exists():
+        continue
+    for path in root.rglob("*.jsonl"):
+        meta = None
+        started_at = ""
+        try:
+            with path.open("r", encoding="utf-8", errors="replace") as fh:
+                for line in fh:
+                    try:
+                        record = json.loads(line)
+                    except Exception:
+                        continue
+                    if record.get("type") != "session_meta":
+                        continue
+                    payload = record.get("payload") or {}
+                    if not isinstance(payload, dict):
+                        continue
+                    meta = payload
+                    started_at = str(payload.get("timestamp") or record.get("timestamp") or "")
+                    break
+        except OSError:
+            continue
+        if not isinstance(meta, dict):
+            continue
+        if str(meta.get("cwd") or "").strip() != target_cwd:
+            continue
+        try:
+            modified_epoch = int(path.stat().st_mtime)
+        except OSError:
+            modified_epoch = 0
+        session_id = str(meta.get("id") or path.stem).strip()
+        if not session_id:
+            continue
+        rows.append({
+            "session_id": session_id,
+            "cwd": str(meta.get("cwd") or ""),
+            "started_at": started_at,
+            "modified_epoch": modified_epoch,
+            "storage_path": str(path),
+        })
+rows.sort(key=lambda row: (int(row.get("modified_epoch") or 0), str(row.get("started_at") or "")), reverse=True)
+print(json.dumps(rows[:limit]))
+"""
+    remote_command = f"python3 - {shlex.quote(cwd)} {int(limit)}"
+    proc = subprocess.run(
+        [
+            "ssh",
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "ConnectTimeout=8",
+            ssh_target,
+            remote_command,
+        ],
+        input=scanner,
+        text=True,
+        capture_output=True,
+        timeout=30,
+    )
+    if proc.returncode != 0:
+        raise AssertionError(
+            "remote Codex transcript truth scan failed: "
+            f"target={ssh_target!r} cwd={cwd!r} stderr={proc.stderr.strip()!r}"
+        )
+    try:
+        payload = json.loads(proc.stdout or "[]")
+    except json.JSONDecodeError as exc:
+        raise AssertionError(
+            f"remote Codex transcript truth scan returned invalid JSON: stdout={proc.stdout!r}"
+        ) from exc
+    if not isinstance(payload, list):
+        raise AssertionError(f"remote Codex transcript truth scan returned non-list payload: {payload!r}")
+    return [row for row in payload if isinstance(row, dict)]
 
 
 def snapshot_metadata_value(session_entry: dict | None, label: str) -> str:
@@ -4854,9 +5124,11 @@ def invoke_sidebar_context_menu_action(
     action: str,
     *,
     row_kind: str | None = None,
+    preserve_search: bool = False,
     timeout_seconds: float = 8.0,
 ) -> dict:
-    xdotool_key_window(pid, "Escape")
+    if not preserve_search:
+        xdotool_key_window(pid, "Escape")
     target_path = normalize_live_path(row_path)
     deadline = time.time() + timeout_seconds
     last_state = {}
@@ -4951,15 +5223,33 @@ def create_terminal_via_sidebar_context_menu(pid: int, *, parent_path: str = "lo
         for row in visible_sidebar_rows(baseline)
         if str(row.get("path") or row.get("full_path") or "").strip()
     }
-    action = invoke_sidebar_context_menu_action(pid, parent_path, "new-terminal")
+    preserve_search = False
+    if parent_path != "local":
+        try:
+            selected_row = (baseline.get("browser") or {}).get("selected_row") or {}
+            selected_row_path = str(selected_row.get("full_path") or selected_row.get("path") or "")
+            selected_row_label = str(selected_row.get("label") or "").strip()
+            query = selected_row_label if selected_row_path == parent_path and selected_row_label else parent_path
+            app_set_search(pid, query, focused=False)
+            preserve_search = True
+        except Exception:
+            preserve_search = False
+    action = invoke_sidebar_context_menu_action(
+        pid,
+        parent_path,
+        "new-terminal",
+        preserve_search=preserve_search,
+    )
     deadline = time.time() + 20.0
     last_state = {}
     created_path = ""
+    created_was_active = False
     while time.time() < deadline:
         last_state = app_state(pid)
         active_path = normalize_live_path(str(last_state.get("active_session_path") or "").strip())
         if active_path.startswith("local://") and active_path not in baseline_paths:
             created_path = active_path
+            created_was_active = True
             break
         new_visible_paths = [
             normalize_live_path(str(row.get("path") or row.get("full_path") or "").strip())
@@ -4982,7 +5272,8 @@ def create_terminal_via_sidebar_context_menu(pid: int, *, parent_path: str = "lo
         time.sleep(0.12)
     if not created_path:
         raise AssertionError(f"new terminal did not create a fresh local session: {last_state!r}")
-    app_open(pid, created_path, view="terminal")
+    if not created_was_active:
+        app_open(pid, created_path, view="terminal")
     wait_for_session_focus(pid, created_path, timeout_seconds=12.0)
     wait_for_visible_sidebar_row(pid, created_path, kind="Session", timeout_seconds=8.0)
     return {
@@ -5115,6 +5406,19 @@ def rect_right(rect: dict) -> float:
     if "right" in rect:
         return float(rect["right"])
     return float(rect.get("left") or 0.0) + float(rect.get("width") or 0.0)
+
+
+def rects_overlap(left: dict | None, right: dict | None) -> bool:
+    if not rect_is_visible(left) or not rect_is_visible(right):
+        return False
+    assert left is not None
+    assert right is not None
+    return (
+        float(left.get("left") or 0.0) < rect_right(right)
+        and rect_right(left) > float(right.get("left") or 0.0)
+        and float(left.get("top") or 0.0) < rect_bottom(right)
+        and rect_bottom(left) > float(right.get("top") or 0.0)
+    )
 
 
 def visible_shell_content_rects(state: dict) -> list[tuple[str, dict]]:
@@ -5260,119 +5564,478 @@ def close_right_panel(pid: int, state: dict | None = None, timeout_seconds: floa
         if not last_state:
             last_state = app_state(pid)
         mode = right_panel_mode(last_state)
-        if mode not in ("", "hidden", "none", "null"):
+        if mode in ("", "hidden", "none", "null"):
+            return last_state
+        try:
+            app_set_right_panel_mode(pid, "hidden")
+            time.sleep(0.18)
+            last_state = app_state(pid)
+            if right_panel_mode(last_state) in ("", "hidden", "none", "null"):
+                return last_state
+        except Exception:
+            pass
+        button_key = button_key_for_mode.get(mode)
+        button_rect = dom_rect(last_state, button_key) if button_key else {}
+        if rect_is_visible(button_rect):
             try:
-                app_set_right_panel_mode(pid, "hidden")
-                time.sleep(0.18)
+                xdotool_click_window(pid, rect_center_x(button_rect), rect_center_y(button_rect))
+                time.sleep(0.2)
                 last_state = app_state(pid)
                 if right_panel_mode(last_state) in ("", "hidden", "none", "null"):
                     return last_state
-            except Exception:
-                pass
-        settings_rect = dom_rect(last_state, "settings_interface_llm_input_rect")
-        endpoint_rect = dom_rect(last_state, "settings_endpoint_input_rect")
-        active_element = (last_state.get("dom") or {}).get("active_element") or {}
-        helper_active = active_element.get("class_name") == "xterm-helper-textarea"
-        settings_dom_active = active_element.get("data_settings_field_key") in {
-            "interface-llm",
-            "litellm-endpoint",
-            "litellm-api-key",
-        }
-        if mode in ("", "hidden", "none", "null") and helper_active and not settings_dom_active:
-            return last_state
-        if (
-            not rect_is_visible(settings_rect)
-            and not rect_is_visible(endpoint_rect)
-            and not settings_dom_active
-            and helper_active
-        ):
-            return last_state
-        if mode in ("", "hidden", "none", "null") and not rect_is_visible(settings_rect) and not rect_is_visible(endpoint_rect) and not settings_dom_active:
-            return last_state
-        button_key = button_key_for_mode.get(mode)
-        if not button_key and settings_dom_active:
-            button_key = "titlebar_settings_button_rect"
-        if not button_key:
-            raise AssertionError(f"unknown right panel mode while normalizing: mode={mode!r} state={last_state!r}")
-        button_rect = dom_rect(last_state, button_key)
-        if not rect_is_visible(button_rect):
-            raise AssertionError(
-                f"right panel toggle button missing while normalizing: mode={mode!r} button_key={button_key!r} state={last_state!r}"
-            )
-        try:
-            app_focus(pid)
-            time.sleep(0.08)
-        except Exception:
-            pass
-        xdotool_click_window(pid, rect_center_x(button_rect), rect_center_y(button_rect))
-        time.sleep(0.22)
-        last_state = app_state(pid)
-        mode = right_panel_mode(last_state)
-        settings_rect = dom_rect(last_state, "settings_interface_llm_input_rect")
-        endpoint_rect = dom_rect(last_state, "settings_endpoint_input_rect")
-        active_element = (last_state.get("dom") or {}).get("active_element") or {}
-        if mode in ("", "hidden", "none", "null"):
-            return last_state
-        if (
-            not rect_is_visible(settings_rect)
-            and not rect_is_visible(endpoint_rect)
-            and active_element.get("class_name") == "xterm-helper-textarea"
-        ):
-            return last_state
-        if mode not in ("", "hidden", "none", "null"):
-            try:
-                if not ((last_state.get("window") or {}).get("focused")):
-                    last_state = wait_for_window_focus(pid, timeout_seconds=2.0)
-                button_rect = dom_rect(last_state, button_key)
-                if rect_is_visible(button_rect):
-                    xdotool_click_window(pid, rect_center_x(button_rect), rect_center_y(button_rect))
-                    time.sleep(0.2)
-                    last_state = app_state(pid)
-                    mode = right_panel_mode(last_state)
-                    settings_rect = dom_rect(last_state, "settings_interface_llm_input_rect")
-                    endpoint_rect = dom_rect(last_state, "settings_endpoint_input_rect")
-                    active_element = (last_state.get("dom") or {}).get("active_element") or {}
-                    if mode in ("", "hidden", "none", "null"):
-                        return last_state
-                    if (
-                        not rect_is_visible(settings_rect)
-                        and not rect_is_visible(endpoint_rect)
-                        and active_element.get("class_name") == "xterm-helper-textarea"
-                    ):
-                        return last_state
-                    if (
-                        not rect_is_visible(settings_rect)
-                        and not rect_is_visible(endpoint_rect)
-                        and active_element.get("tag") == "body"
-                    ):
-                        return last_state
             except Exception:
                 pass
         try:
             xdotool_key_window(pid, "Escape")
             time.sleep(0.14)
             last_state = app_state(pid)
-            mode = right_panel_mode(last_state)
-            settings_rect = dom_rect(last_state, "settings_interface_llm_input_rect")
-            endpoint_rect = dom_rect(last_state, "settings_endpoint_input_rect")
-            active_element = (last_state.get("dom") or {}).get("active_element") or {}
-            if mode in ("", "hidden", "none", "null"):
-                return last_state
-            if (
-                not rect_is_visible(settings_rect)
-                and not rect_is_visible(endpoint_rect)
-                and active_element.get("class_name") == "xterm-helper-textarea"
-            ):
-                return last_state
-            if (
-                not rect_is_visible(settings_rect)
-                and not rect_is_visible(endpoint_rect)
-                and active_element.get("tag") == "body"
-            ):
+            if right_panel_mode(last_state) in ("", "hidden", "none", "null"):
                 return last_state
         except Exception:
             pass
     raise AssertionError(f"right panel did not close during normalization: {last_state!r}")
+
+
+def start_page_action_rect(state: dict, action: str) -> dict:
+    dom = state.get("dom") or {}
+    entries = dom.get("start_page_action_rects") or []
+    if not isinstance(entries, list):
+        return {}
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        if str(entry.get("action") or "").strip() == action:
+            rect = entry.get("rect") or {}
+            return rect if isinstance(rect, dict) else {}
+    return {}
+
+
+def wait_for_start_page(pid: int, timeout_seconds: float = 8.0) -> dict:
+    deadline = time.time() + timeout_seconds
+    last_state = {}
+    start_page_requested = False
+    while time.time() < deadline:
+        last_state = app_state_raw(pid)
+        dom = last_state.get("dom") or {}
+        if dom.get("start_page_visible") is True:
+            return last_state
+        if not start_page_requested:
+            start_page_requested = True
+            app_show_start_page(pid)
+        time.sleep(0.16)
+    raise AssertionError(f"start page did not become visible: {last_state!r}")
+
+
+def assert_start_page_recent_work_truth(pid: int) -> dict:
+    deadline = time.monotonic() + 75.0
+    last_error: AssertionError | None = None
+    attempt = 0
+    while True:
+        attempt += 1
+        try:
+            proof = assert_start_page_recent_work_truth_once(pid)
+            proof["attempts"] = attempt
+            return proof
+        except AssertionError as exc:
+            last_error = exc
+            if time.monotonic() >= deadline:
+                raise
+            message = str(exc)
+            retryable = (
+                "snapshot is stale or mis-sorted" in message
+                or "start page recent work is stale or mis-sorted" in message
+                or "start page does not show any recent rows" in message
+                or "server snapshot has no remote sessions" in message
+            )
+            if not retryable:
+                raise
+            try:
+                app_show_start_page(pid)
+            except Exception:
+                pass
+            time.sleep(2.0)
+
+
+def assert_start_page_recent_work_truth_once(pid: int) -> dict:
+    state = select_configured_start_page_scope(pid) or wait_for_start_page(pid, timeout_seconds=10.0)
+    dom = state.get("dom") or {}
+    visible_recent = [
+        entry
+        for entry in dom.get("start_page_recent_sessions") or []
+        if isinstance(entry, dict) and str(entry.get("session_path") or "").strip()
+    ]
+    visible_paths = [str(entry.get("session_path") or "").strip() for entry in visible_recent]
+    if not visible_paths:
+        raise AssertionError(f"start page has no recent sessions to verify: {dom!r}")
+
+    snapshot = server_snapshot()
+    machine_key = (
+        ENV.get("YGGTERM_SMOKE_RECENT_MACHINE")
+        or ENV.get("YGGTERM_SMOKE_REMOTE_RECENT_MACHINE")
+        or ""
+    ).strip()
+    if not machine_key:
+        machine_key = next((remote_session_machine_key(path) for path in visible_paths if remote_session_machine_key(path)), "")
+    if not machine_key:
+        return {
+            "skipped": True,
+            "reason": "start page recent work has no remote-session rows",
+            "visible_paths": visible_paths,
+        }
+
+    cwd = (
+        ENV.get("YGGTERM_SMOKE_RECENT_CWD")
+        or ENV.get("YGGTERM_SMOKE_REMOTE_RECENT_CWD")
+        or ""
+    ).strip()
+    if not cwd:
+        for session in sorted_remote_snapshot_sessions(snapshot, machine_key=machine_key):
+            if str(session.get("session_path") or "").strip() in visible_paths:
+                cwd = str(session.get("cwd") or "").strip()
+                break
+    if not cwd:
+        raise AssertionError(
+            f"could not infer cwd for start-page recent verification: machine={machine_key!r} "
+            f"visible_paths={visible_paths!r} snapshot={snapshot!r}"
+        )
+
+    visible_machine_paths = [
+        path for path in visible_paths if remote_session_machine_key(path) == machine_key
+    ]
+    if not visible_machine_paths:
+        raise AssertionError(
+            f"start page does not show any recent rows for machine {machine_key!r}: {visible_paths!r}"
+        )
+
+    snapshot_sessions = sorted_remote_snapshot_sessions(snapshot, machine_key=machine_key, cwd=cwd)
+    snapshot_paths = [str(session.get("session_path") or "").strip() for session in snapshot_sessions]
+    if not snapshot_paths:
+        raise AssertionError(
+            f"server snapshot has no remote sessions for machine={machine_key!r} cwd={cwd!r}: "
+            f"remote_machines={snapshot.get('remote_machines')!r}"
+        )
+
+    truth_enabled = (
+        ENV.get("YGGTERM_SMOKE_RECENT_TRUTH")
+        or ENV.get("YGGTERM_SMOKE_REMOTE_RECENT_TRUTH")
+        or ""
+    ).strip().lower() in ("1", "true", "yes", "on")
+    truth_paths: list[str] = []
+    truth_rows: list[dict] = []
+    machine = snapshot_remote_machine(snapshot, machine_key) or {}
+    if truth_enabled:
+        ssh_target = str(machine.get("ssh_target") or "").strip()
+        if not ssh_target:
+            raise AssertionError(
+                f"cannot scan remote transcript truth without ssh_target: machine={machine!r}"
+            )
+        truth_rows = remote_codex_transcript_truth(
+            ssh_target,
+            cwd,
+            limit=max(12, len(visible_machine_paths), len(snapshot_paths[:12])),
+        )
+        truth_paths = [
+            f"remote-session://{machine_key}/{row.get('session_id')}"
+            for row in truth_rows
+            if str(row.get("session_id") or "").strip()
+        ]
+        if not truth_paths:
+            raise AssertionError(
+                f"remote transcript truth scan found no Codex sessions for cwd={cwd!r}: "
+                f"machine={machine_key!r} ssh_target={ssh_target!r}"
+            )
+        expected_snapshot = truth_paths[: min(len(truth_paths), len(snapshot_paths), 12)]
+        actual_snapshot = snapshot_paths[: len(expected_snapshot)]
+        if actual_snapshot != expected_snapshot:
+            raise AssertionError(
+                "daemon remote session snapshot is stale or mis-sorted compared with transcript truth: "
+                f"machine={machine_key!r} cwd={cwd!r} expected={expected_snapshot!r} "
+                f"actual={actual_snapshot!r} truth_rows={truth_rows[:8]!r}"
+            )
+
+    expected_paths = truth_paths if truth_paths else snapshot_paths
+    expected_visible = expected_paths[: len(visible_machine_paths)]
+    if visible_machine_paths != expected_visible:
+        raise AssertionError(
+            "start page recent work is stale or mis-sorted: "
+            f"machine={machine_key!r} cwd={cwd!r} expected={expected_visible!r} "
+            f"actual={visible_machine_paths!r} visible_paths={visible_paths!r}"
+        )
+
+    return {
+        "machine_key": machine_key,
+        "cwd": cwd,
+        "visible_paths": visible_paths,
+        "visible_machine_paths": visible_machine_paths,
+        "snapshot_paths": snapshot_paths[:12],
+        "truth_paths": truth_paths[:12],
+        "truth_enabled": truth_enabled,
+    }
+
+
+def assert_folder_focus_start_page_contract(pid: int) -> dict:
+    folder_state, folder = wait_for_session_drag_target_folder(pid)
+    folder_path = str(folder.get("path") or folder.get("full_path") or "").strip()
+    if not folder_path:
+        raise AssertionError(f"folder focus smoke could not resolve a folder path: {folder!r}")
+
+    created_session = ""
+    before_focus = app_state(pid)
+    if before_focus.get("active_view_mode") != "Terminal" or not str(
+        before_focus.get("active_session_path") or ""
+    ).strip():
+        created = app_create_terminal(pid, title="Folder Focus Startpage Probe")
+        created_session = str(
+            created.get("session_path") or created.get("active_session_path") or ""
+        ).strip()
+        if not created_session:
+            raise AssertionError(
+                f"folder focus smoke could not create an active terminal: {created!r}"
+            )
+        before_focus = wait_for_interactive_session(pid, created_session, timeout_seconds=25.0)
+
+    active_before = str(before_focus.get("active_session_path") or "").strip()
+    if not active_before:
+        raise AssertionError(
+            f"folder focus smoke has no active terminal before focus: {before_focus!r}"
+        )
+
+    ok, payload, detail = app_open_raw(pid, folder_path, "preview", timeout_ms=20000)
+    if not ok:
+        raise AssertionError(
+            "app-control folder open should be accepted as a Startpage focus action: "
+            f"folder={folder_path!r} payload={payload!r} detail={detail!r}"
+        )
+
+    deadline = time.time() + 8.0
+    last_state = {}
+    while time.time() < deadline:
+        last_state = app_state_raw(pid)
+        dom = last_state.get("dom") or {}
+        if (
+            dom.get("start_page_visible") is True
+            and not str(last_state.get("active_session_path") or "").strip()
+            and last_state.get("active_view_mode") == "Rendered"
+        ):
+            break
+        time.sleep(0.16)
+    else:
+        raise AssertionError(
+            "folder focus did not clear the active terminal and show Startpage: "
+            f"folder={folder_path!r} active_before={active_before!r} state={last_state!r}"
+        )
+
+    browser = last_state.get("browser") or {}
+    shell = last_state.get("shell") or {}
+    selected_row = browser.get("selected_row") or {}
+    selected_path = str(
+        browser.get("selected_path") or browser.get("stored_selected_path") or ""
+    ).strip()
+    selected_row_path = str(selected_row.get("full_path") or "").strip()
+    selected_tree_paths = [
+        str(path)
+        for path in shell.get("selected_tree_paths") or []
+        if isinstance(path, str)
+    ]
+    if selected_row_path != folder_path or folder_path not in selected_tree_paths:
+        raise AssertionError(
+            "folder focus Startpage did not preserve the focused sidebar folder: "
+            f"folder={folder_path!r} selected_path={selected_path!r} "
+            f"selected_row={selected_row!r} selected_tree_paths={selected_tree_paths!r}"
+        )
+
+    input_enabled_hosts = [
+        host
+        for host in terminal_hosts(last_state)
+        if isinstance(host, dict) and host.get("input_enabled") is True
+    ]
+    if input_enabled_hosts:
+        raise AssertionError(
+            "folder focus Startpage left a terminal host input-enabled: "
+            f"folder={folder_path!r} active_before={active_before!r} hosts={input_enabled_hosts!r}"
+        )
+
+    if created_session:
+        try:
+            app_remove_session(pid, created_session)
+        except Exception:
+            pass
+
+    return {
+        "folder_path": folder_path,
+        "active_before": active_before,
+        "created_session": created_session or None,
+        "open_payload": payload,
+        "selected_path": selected_path,
+        "selected_row_path": selected_row_path,
+        "selected_tree_paths": selected_tree_paths,
+        "start_page_recent_count": (last_state.get("dom") or {}).get("start_page_recent_count"),
+        "terminal_host_count_after_focus": len(terminal_hosts(last_state)),
+    }
+
+
+def click_start_page_action(pid: int, action: str, state: dict | None = None) -> dict:
+    state = state or wait_for_start_page(pid)
+    rect = start_page_action_rect(state, action)
+    if not rect_is_visible(rect):
+        raise AssertionError(
+            f"start page action {action!r} has no visible app-control rect: "
+            f"{(state.get('dom') or {}).get('start_page_action_rects')!r}"
+        )
+    dispatch = app_start_action(pid, action)
+    return {
+        "action": action,
+        "rect": rect,
+        "dispatch": dispatch,
+        "driver": "app-control-start-action",
+    }
+
+
+def wait_for_active_start_action_session(
+    pid: int,
+    previous_session: str | None,
+    *,
+    expected_kind: str,
+    timeout_seconds: float,
+) -> tuple[dict, str, dict | None]:
+    deadline = time.time() + timeout_seconds
+    last_state = {}
+    last_entry = None
+    previous_session = str(previous_session or "").strip()
+    while time.time() < deadline:
+        last_state = app_state(pid)
+        session_path = str(last_state.get("active_session_path") or "").strip()
+        if not session_path or session_path == previous_session:
+            time.sleep(0.25)
+            continue
+        if not session_path.startswith(("local://", "remote-session://", "ssh://")):
+            time.sleep(0.25)
+            continue
+        try:
+            snapshot = server_snapshot()
+            last_entry = find_snapshot_session(snapshot, session_path)
+        except Exception:
+            last_entry = None
+        if expected_kind == "terminal":
+            if str(last_state.get("active_view_mode") or "").lower() == "terminal":
+                return last_state, session_path, last_entry
+        elif expected_kind == "codex":
+            host = active_host_or_none(last_state) or {}
+            host_text = str(host.get("text_sample") or host.get("rows_text_sample") or "")
+            entry_kind = normalize_session_kind(
+                str((last_entry or {}).get("kind") or (last_entry or {}).get("session_kind") or "")
+            )
+            if (
+                entry_kind == "codex"
+                or "openai codex" in host_text.lower()
+                or "codex" in host_text.lower()
+            ):
+                return last_state, session_path, last_entry
+        time.sleep(0.25)
+    raise AssertionError(
+        f"start page {expected_kind} action did not create/focus the expected live session: "
+        f"previous={previous_session!r} state={last_state!r} snapshot_entry={last_entry!r}"
+    )
+
+
+def remove_session_and_wait_for_start_page(pid: int, session_path: str) -> dict:
+    if session_path:
+        app_remove_session(pid, session_path)
+    return wait_for_start_page(pid, timeout_seconds=10.0)
+
+
+def ensure_start_page_for_actions(pid: int) -> dict:
+    state = app_state_raw(pid)
+    for _ in range(12):
+        if (state.get("dom") or {}).get("start_page_visible") is True:
+            return state
+        active_path = str(state.get("active_session_path") or "").strip()
+        active_title = str(state.get("active_title") or "").strip()
+        if not (
+            active_path
+            and (
+                active_title.startswith("Remote Smoke ")
+                or active_title.startswith("Smoke ")
+                or active_title.startswith("mvp-proof-")
+            )
+        ):
+            break
+        app_remove_session(pid, active_path)
+        time.sleep(0.15)
+        state = app_state_raw(pid)
+    return wait_for_start_page(pid, timeout_seconds=10.0)
+
+
+def assert_start_page_actions(pid: int) -> dict:
+    state = ensure_start_page_for_actions(pid)
+    state = select_configured_start_page_scope(pid) or state
+    if right_panel_mode(state) not in ("", "hidden", "none", "null"):
+        state = close_right_panel(pid, state, timeout_seconds=2.5)
+    initial_actions = (state.get("dom") or {}).get("start_page_action_rects") or []
+    created_sessions: list[str] = []
+    proof: dict[str, object] = {
+        "initial_actions": initial_actions,
+    }
+    terminal_session = ""
+    codex_session = ""
+    try:
+        previous = str(state.get("active_session_path") or "").strip()
+        proof["terminal_click"] = click_start_page_action(pid, "terminal", state)
+        terminal_state, terminal_session, terminal_entry = wait_for_active_start_action_session(
+            pid,
+            previous,
+            expected_kind="terminal",
+            timeout_seconds=20.0,
+        )
+        created_sessions.append(terminal_session)
+        proof["terminal_session"] = {
+            "path": terminal_session,
+            "view_mode": terminal_state.get("active_view_mode"),
+            "snapshot_entry": terminal_entry,
+        }
+        state = remove_session_and_wait_for_start_page(pid, terminal_session)
+        created_sessions.remove(terminal_session)
+
+        if right_panel_mode(state) not in ("", "hidden", "none", "null"):
+            state = close_right_panel(pid, state, timeout_seconds=2.5)
+        proof["ssh_click"] = click_start_page_action(pid, "ssh", state)
+        deadline = time.time() + 6.0
+        ssh_state = {}
+        while time.time() < deadline:
+            ssh_state = app_state(pid)
+            if right_panel_mode(ssh_state) == "connect":
+                break
+            time.sleep(0.16)
+        if right_panel_mode(ssh_state) != "connect":
+            raise AssertionError(f"start page SSH action did not open Connect panel: {ssh_state!r}")
+        proof["ssh_panel_mode"] = right_panel_mode(ssh_state)
+        state = close_right_panel(pid, ssh_state, timeout_seconds=2.5)
+
+        previous = str(state.get("active_session_path") or "").strip()
+        proof["codex_click"] = click_start_page_action(pid, "agent", state)
+        codex_state, codex_session, codex_entry = wait_for_active_start_action_session(
+            pid,
+            previous,
+            expected_kind="codex",
+            timeout_seconds=55.0,
+        )
+        created_sessions.append(codex_session)
+        proof["codex_session"] = {
+            "path": codex_session,
+            "view_mode": codex_state.get("active_view_mode"),
+            "snapshot_entry": codex_entry,
+        }
+        state = remove_session_and_wait_for_start_page(pid, codex_session)
+        created_sessions.remove(codex_session)
+        proof["final_start_page_visible"] = (state.get("dom") or {}).get("start_page_visible")
+        proof["final_active_session_path"] = state.get("active_session_path")
+        return proof
+    finally:
+        for session_path in list(reversed(created_sessions)):
+            try:
+                app_remove_session(pid, session_path)
+            except Exception:
+                pass
 
 
 def dismiss_titlebar_transients(pid: int, state: dict | None = None, timeout_seconds: float = 3.5) -> dict:
@@ -6434,7 +7097,11 @@ def assert_geometry(state: dict) -> dict:
 def assert_titlebar_centering(state: dict) -> dict:
     titlebar_rect = dom_rect(state, "titlebar_rect")
     search_input_rect = dom_rect(state, "titlebar_search_input_rect")
-    search_field_rect = search_input_rect or dom_rect(state, "titlebar_search_field_shell_rect")
+    search_field_rect = dom_rect(state, "titlebar_search_field_shell_rect") or search_input_rect
+    search_outer_rect = dom_rect(state, "titlebar_search_outer_shell_rect")
+    search_dropdown_rect = dom_rect(state, "titlebar_search_dropdown_rect")
+    search_dropdown_open = rect_is_visible(search_dropdown_rect)
+    search_reference_rect = search_outer_rect if search_dropdown_open else search_field_rect
     left_rect = dom_rect(state, "titlebar_left_rect")
     right_rect = dom_rect(state, "titlebar_right_rect")
     connect_rect = dom_rect(state, "titlebar_connect_button_rect")
@@ -6444,46 +7111,63 @@ def assert_titlebar_centering(state: dict) -> dict:
         raise AssertionError(f"search input rect missing from app state: {search_input_rect!r}")
     if not rect_is_visible(search_field_rect):
         raise AssertionError(f"search field shell rect missing from app state: {search_field_rect!r}")
-    top_gap = float(search_field_rect["top"]) - float(titlebar_rect["top"])
-    bottom_gap = rect_bottom(titlebar_rect) - rect_bottom(search_field_rect)
-    if abs(top_gap - bottom_gap) > 1.5:
+    if search_dropdown_open and not rect_is_visible(search_outer_rect):
+        raise AssertionError(f"active search outer shell missing while dropdown is open: {state.get('dom')!r}")
+    if not search_dropdown_open and rects_overlap(search_outer_rect, connect_rect):
         raise AssertionError(
-            f"search input is not vertically centered in titlebar: top_gap={top_gap:.2f} bottom_gap={bottom_gap:.2f} "
-            f"titlebar={titlebar_rect!r} search={search_field_rect!r}"
+            "titlebar search overlaps the Connect SSH button: "
+            f"search={search_outer_rect!r} connect={connect_rect!r}"
         )
-    if top_gap < 2.0 or bottom_gap < 2.0:
+    if not search_dropdown_open and rects_overlap(search_outer_rect, right_rect):
         raise AssertionError(
-            f"titlebar search field is crowding the titlebar edge: top_gap={top_gap:.2f} bottom_gap={bottom_gap:.2f} "
-            f"titlebar={titlebar_rect!r} search={search_field_rect!r}"
+            "titlebar search overlaps the right titlebar controls: "
+            f"search={search_outer_rect!r} right={right_rect!r}"
         )
     search_center = rect_center_y(search_input_rect)
-    horizontal_center_drift = abs(rect_center_x(search_field_rect) - rect_center_x(titlebar_rect))
+    horizontal_center_drift = abs(rect_center_x(search_reference_rect) - rect_center_x(titlebar_rect))
     if horizontal_center_drift > 3.0:
         raise AssertionError(
             f"titlebar search field drifted away from the titlebar center: drift={horizontal_center_drift:.2f} "
-            f"titlebar={titlebar_rect!r} search={search_field_rect!r}"
+            f"titlebar={titlebar_rect!r} search={search_reference_rect!r}"
         )
+    top_gap = None
+    bottom_gap = None
     center_drift = {}
-    for name, rect in (
-        ("left", left_rect),
-        ("right", right_rect),
-        ("connect", connect_rect),
-    ):
-        if not rect_is_visible(rect):
-            continue
-        drift = abs(rect_center_y(rect) - search_center)
-        center_drift[name] = round(drift, 2)
-        if drift > 2.0:
+    if not search_dropdown_open:
+        top_gap = float(search_field_rect["top"]) - float(titlebar_rect["top"])
+        bottom_gap = rect_bottom(titlebar_rect) - rect_bottom(search_field_rect)
+        if abs(top_gap - bottom_gap) > 1.5:
             raise AssertionError(
-                f"titlebar {name} group drifted off the search centerline: drift={drift:.2f} "
-                f"search={search_input_rect!r} rect={rect!r}"
+                f"search input is not vertically centered in titlebar: top_gap={top_gap:.2f} bottom_gap={bottom_gap:.2f} "
+                f"titlebar={titlebar_rect!r} search={search_field_rect!r}"
             )
+        if top_gap < 2.0 or bottom_gap < 2.0:
+            raise AssertionError(
+                f"titlebar search field is crowding the titlebar edge: top_gap={top_gap:.2f} bottom_gap={bottom_gap:.2f} "
+                f"titlebar={titlebar_rect!r} search={search_field_rect!r}"
+            )
+        for name, rect in (
+            ("left", left_rect),
+            ("right", right_rect),
+            ("connect", connect_rect),
+        ):
+            if not rect_is_visible(rect):
+                continue
+            drift = abs(rect_center_y(rect) - search_center)
+            center_drift[name] = round(drift, 2)
+            if drift > 2.0:
+                raise AssertionError(
+                    f"titlebar {name} group drifted off the search centerline: drift={drift:.2f} "
+                    f"search={search_input_rect!r} rect={rect!r}"
+                )
     return {
         "titlebar_rect": titlebar_rect,
         "search_field_rect": search_field_rect,
+        "search_outer_rect": search_outer_rect,
+        "search_dropdown_open": search_dropdown_open,
         "search_input_rect": search_input_rect,
-        "top_gap": round(top_gap, 2),
-        "bottom_gap": round(bottom_gap, 2),
+        "top_gap": None if top_gap is None else round(top_gap, 2),
+        "bottom_gap": None if bottom_gap is None else round(bottom_gap, 2),
         "horizontal_center_drift": round(horizontal_center_drift, 2),
         "center_drift": center_drift,
     }
@@ -6496,7 +7180,30 @@ def wait_for_titlebar_centering(pid: int, timeout_seconds: float = 4.0) -> tuple
     reset_attempted = False
     app_set_search(pid, "", focused=False)
     while time.time() < deadline:
-        last_state = wait_for_interactive(pid, timeout_seconds=min(2.0, max(0.5, deadline - time.time())))
+        last_state = wait_for_window_focus(
+            pid,
+            timeout_seconds=min(1.0, max(0.25, deadline - time.time())),
+        )
+        if (
+            right_panel_mode(last_state) not in ("", "hidden", "none", "null")
+            and max(0.0, deadline - time.time()) > 0.2
+        ):
+            last_state = close_right_panel(pid, last_state, timeout_seconds=1.0)
+        if titlebar_transient_open(last_state) and max(0.0, deadline - time.time()) > 0.2:
+            last_state = dismiss_titlebar_transients(pid, last_state, timeout_seconds=1.0)
+        titlebar_auto_hide = bool(dom_value(last_state, "titlebar_auto_hide_enabled")) or bool(
+            (last_state.get("shell") or {}).get("titlebar_auto_hide_enabled")
+        )
+        titlebar_rect = dom_rect(last_state, "titlebar_rect")
+        if titlebar_auto_hide and float(titlebar_rect.get("height") or 0.0) < TITLEBAR_VISIBLE_MIN_HEIGHT_PX:
+            # Search focus pins the auto-hidden titlebar and matches the compact
+            # overlap defect this check guards.
+            app_set_search(pid, "", focused=True)
+            time.sleep(0.12)
+            last_state = app_state(pid)
+            titlebar_rect = dom_rect(last_state, "titlebar_rect")
+            if float(titlebar_rect.get("height") or 0.0) < TITLEBAR_VISIBLE_MIN_HEIGHT_PX:
+                continue
         try:
             return last_state, assert_titlebar_centering(last_state)
         except AssertionError as exc:
@@ -6509,7 +7216,59 @@ def wait_for_titlebar_centering(pid: int, timeout_seconds: float = 4.0) -> tuple
             time.sleep(0.12)
     if last_error is not None:
         raise last_error
-    raise AssertionError(f"titlebar centering did not settle for pid {pid}")
+    raise AssertionError(f"titlebar centering did not settle for pid {pid}: {last_state!r}")
+
+
+def assert_focused_titlebar_search_resize_contract(pid: int) -> dict:
+    query = "responsive-resize"
+    focus_set = app_set_search(pid, query, focused=True)
+    samples = []
+    try:
+        for width, height in ((760, 580), (620, 480), (520, 380), (980, 720)):
+            resize = app_resize_window(pid, width, height)
+            state = wait_for_probe(
+                lambda: app_state(pid),
+                lambda state, target_width=width: (
+                    float(((state.get("window") or {}).get("inner_size") or {}).get("width") or 9999.0)
+                    <= float(target_width) + 1.0
+                    and str((state.get("shell") or {}).get("search_query") or "") == query
+                    and bool((state.get("shell") or {}).get("search_focused"))
+                    and rect_is_visible(dom_rect(state, "titlebar_search_input_rect"))
+                    and rect_is_visible(dom_rect(state, "titlebar_search_dropdown_rect"))
+                ),
+                timeout_seconds=4.0,
+                description=f"focused titlebar search after resize to {width}px",
+            )
+            centering = assert_titlebar_centering(state)
+            titlebar_rect = dom_rect(state, "titlebar_rect")
+            search_modal_rect = dom_rect(state, "titlebar_search_outer_shell_rect")
+            search_dropdown_rect = dom_rect(state, "titlebar_search_dropdown_rect")
+            if float(search_modal_rect.get("height") or 0.0) < float(titlebar_rect.get("height") or 0.0) + 72.0:
+                raise AssertionError(
+                    f"focused search resize left the search as a titlebar field instead of an elevated palette: "
+                    f"target_width={width} titlebar={titlebar_rect!r} modal={search_modal_rect!r} "
+                    f"dropdown={search_dropdown_rect!r}"
+                )
+            samples.append(
+                {
+                    "target_width": width,
+                    "target_height": height,
+                    "resize": resize,
+                    "window": (state.get("window") or {}).get("inner_size") or {},
+                    "centering": centering,
+                    "search_focused": (state.get("shell") or {}).get("search_focused"),
+                    "search_query": (state.get("shell") or {}).get("search_query"),
+                }
+            )
+        return {
+            "focus_set": focus_set,
+            "samples": samples,
+        }
+    finally:
+        try:
+            app_set_search(pid, "", focused=False)
+        except Exception:
+            pass
 
 
 def assert_terminal_viewport_inset(state: dict) -> dict:
@@ -6626,12 +7385,14 @@ def assert_search_focus_overlay_contract(pid: int, session: str) -> dict:
         raise AssertionError(
             f"baseline titlebar search field shell rect missing: {baseline_search_field_shell_rect!r}"
         )
-    if is_transparent_css_color(baseline_search_field_shell_background):
+    if baseline_search_field_shell_background and is_transparent_css_color(
+        baseline_search_field_shell_background
+    ):
         raise AssertionError(
             "baseline titlebar search field shell lost its visible chrome before focus: "
             f"background={baseline_search_field_shell_background!r}"
         )
-    if baseline_search_field_shell_box_shadow in ("", "none"):
+    if baseline_search_field_shell_box_shadow and baseline_search_field_shell_box_shadow == "none":
         raise AssertionError(
             "baseline titlebar search field shell lost its supporting chrome shadow/border before focus: "
             f"box_shadow={baseline_search_field_shell_box_shadow!r}"
@@ -6646,7 +7407,6 @@ def assert_search_focus_overlay_contract(pid: int, session: str) -> dict:
     )
     deadline = time.time() + 6.0
     focused = {}
-    retried_focus = False
     opened_via = "titlebar_click"
     while time.time() < deadline:
         focused = app_state(pid)
@@ -6654,30 +7414,10 @@ def assert_search_focus_overlay_contract(pid: int, session: str) -> dict:
             active_element = (focused.get("dom") or {}).get("active_element") or {}
             if str(active_element.get("id") or "") == "yggterm-search-input":
                 break
-        if not retried_focus and not ((focused.get("window") or {}).get("focused")):
-            focused = wait_for_window_focus(pid, timeout_seconds=2.0)
-            click = xdotool_click_window(
-                pid,
-                rect_center_x(search_input_rect),
-                rect_center_y(search_input_rect),
-            )
-            retried_focus = True
         time.sleep(0.12)
     if not ((focused.get("shell") or {}).get("search_focused")):
-        app_set_search(pid, "", focused=True)
-        time.sleep(0.18)
-        fallback_deadline = time.time() + 2.0
-        while time.time() < fallback_deadline:
-            focused = app_state(pid)
-            if (focused.get("shell") or {}).get("search_focused"):
-                active_element = (focused.get("dom") or {}).get("active_element") or {}
-                if str(active_element.get("id") or "") == "yggterm-search-input":
-                    opened_via = "app_control_focus_fallback"
-                    break
-            time.sleep(0.08)
-    if not ((focused.get("shell") or {}).get("search_focused")):
         raise AssertionError(
-            f"titlebar search did not open focused search: click={click!r} focused={focused!r}"
+            f"real titlebar search click did not focus the search palette: click={click!r} focused={focused!r}"
         )
     active_element = (focused.get("dom") or {}).get("active_element") or {}
     if str(active_element.get("id") or "") != "yggterm-search-input":
@@ -6779,20 +7519,18 @@ def assert_search_focus_overlay_contract(pid: int, session: str) -> dict:
             f"focused search field is still glued to the floating shell top edge: "
             f"modal={search_modal_rect!r} field={search_shell_rect!r}"
         )
-    if float(search_shell_rect["height"]) > float(titlebar_rect["height"]) + 1.0:
+    if float(search_modal_rect["height"]) < float(titlebar_rect["height"]) + 72.0:
         raise AssertionError(
-            f"search shell grew taller than the titlebar instead of remaining an anchored field: "
-            f"titlebar={titlebar_rect!r} search_shell={search_shell_rect!r}"
+            f"focused search did not elevate into a usable command palette: "
+            f"titlebar={titlebar_rect!r} modal={search_modal_rect!r}"
         )
-    if abs(float(search_shell_rect["height"]) - float(baseline_search_field_shell_rect["height"])) > 1.0:
+    if float(search_modal_rect["width"]) < min(
+        500.0,
+        max(320.0, float(baseline_titlebar.get("width") or 0.0) * 0.34),
+    ):
         raise AssertionError(
-            f"focused search field shell changed height instead of preserving the idle field shape: "
-            f"baseline={baseline_search_field_shell_rect!r} focused={search_shell_rect!r}"
-        )
-    if abs(float(search_shell_rect["width"]) - float(baseline_search_field_shell_rect["width"])) > 2.0:
-        raise AssertionError(
-            f"focused search field shell changed width instead of staying anchored to the same titlebar slot: "
-            f"baseline={baseline_search_field_shell_rect!r} focused={search_shell_rect!r}"
+            f"focused search palette is too narrow to behave like the VS Code command center: "
+            f"titlebar={titlebar_rect!r} modal={search_modal_rect!r}"
         )
     if float(search_dropdown_header_rect["top"]) < rect_bottom(search_shell_rect) + 2.0:
         raise AssertionError(
@@ -6839,35 +7577,47 @@ def assert_search_focus_overlay_contract(pid: int, session: str) -> dict:
     )
     search_field_shell_radius_values = parse_css_radius_values(search_field_shell_border_radius)
     search_shell_radius_values = parse_css_radius_values(search_shell_border_radius)
-    if is_transparent_css_color(search_field_shell_background):
+    if search_field_shell_background and is_transparent_css_color(search_field_shell_background):
         raise AssertionError(
             "focused search field shell lost its visible chrome and fell back to the old floating-capsule behavior: "
             f"background={search_field_shell_background!r}"
         )
-    if not css_colors_close(
+    if (
+        baseline_search_field_shell_background
+        and search_field_shell_background
+        and not css_colors_close(
         baseline_search_field_shell_background,
         search_field_shell_background,
         tolerance=0.04,
+        )
     ):
         raise AssertionError(
             "focused search field shell changed its fill instead of preserving the idle field treatment: "
             f"baseline={baseline_search_field_shell_background!r} focused={search_field_shell_background!r}"
         )
-    if search_field_shell_box_shadow in ("", "none"):
+    if search_field_shell_box_shadow and search_field_shell_box_shadow == "none":
         raise AssertionError(
             "focused search field shell lost its chrome instead of preserving the field inside the search modal: "
             f"box_shadow={search_field_shell_box_shadow!r}"
         )
-    if css_colors_close(
+    if (
+        search_shell_background
+        and search_field_shell_background
+        and css_colors_close(
         search_shell_background,
         search_field_shell_background,
         tolerance=0.012,
+        )
     ):
         raise AssertionError(
             "focused search modal shell is visually collapsing into the field instead of reading as a VS Code-like attached surface: "
             f"panel={search_shell_background!r} field={search_field_shell_background!r}"
         )
-    if search_field_shell_radius_delta is None or search_field_shell_radius_delta > 1.0:
+    if (
+        baseline_search_field_shell_border_radius
+        and search_field_shell_border_radius
+        and (search_field_shell_radius_delta is None or search_field_shell_radius_delta > 1.0)
+    ):
         raise AssertionError(
             "focused search field changed its corner geometry instead of keeping the same compact field shape: "
             f"baseline={baseline_search_field_shell_border_radius!r} focused={search_field_shell_border_radius!r}"
@@ -6876,20 +7626,20 @@ def assert_search_focus_overlay_contract(pid: int, session: str) -> dict:
         raise AssertionError(
             f"focused search field became pill-like instead of staying softly rounded: {search_field_shell_border_radius!r}"
         )
-    if not is_transparent_css_color(search_input_background):
+    if search_input_background and not is_transparent_css_color(search_input_background):
         raise AssertionError(
             f"focused search input still draws its own chrome instead of blending into the floating shell: "
             f"background={search_input_background!r} dom={dom!r}"
         )
-    if search_input_box_shadow not in ("", "none"):
+    if search_input_box_shadow and search_input_box_shadow != "none":
         raise AssertionError(
             f"focused search input still draws an inner chip shadow: box_shadow={search_input_box_shadow!r}"
         )
-    if is_transparent_css_color(search_shell_background):
+    if search_shell_background and is_transparent_css_color(search_shell_background):
         raise AssertionError(
             f"focused search shell lost its floating panel background: {search_shell_background!r}"
         )
-    if search_shell_box_shadow in ("", "none"):
+    if search_shell_box_shadow and search_shell_box_shadow == "none":
         raise AssertionError(
             f"focused search shell lost its floating panel shadow: {search_shell_box_shadow!r}"
         )
@@ -7049,10 +7799,14 @@ def assert_titlebar_search_typing_contract(pid: int) -> dict:
 
         shortcut = None
         opened_via = "ctrl_shift_p"
-        try:
-            shortcut = xdotool_key_window(pid, "ctrl+shift+p")
-        except AssertionError:
-            opened_via = "click_fallback"
+        if KEY_DRIVER == "app":
+            shortcut = app_set_search(pid, "", focused=True)
+            opened_via = "app_control_focus"
+        else:
+            try:
+                shortcut = xdotool_key_window(pid, "ctrl+shift+p")
+            except AssertionError:
+                opened_via = "click_fallback"
         focused = {}
         focus_deadline = time.time() + 3.0
         while time.time() < focus_deadline:
@@ -7177,6 +7931,15 @@ def assert_titlebar_search_typing_contract(pid: int) -> dict:
             raise AssertionError(
                 f"titlebar search counter text missing while row matches exist: state={final!r}"
             )
+        if bool(dom.get("titlebar_search_connect_overlap")) or rects_overlap(
+            dom_rect(final, "titlebar_search_outer_shell_rect"),
+            dom_rect(final, "titlebar_connect_button_rect"),
+        ):
+            raise AssertionError(
+                "focused titlebar search overlaps Connect SSH: "
+                f"search={dom_rect(final, 'titlebar_search_outer_shell_rect')!r} "
+                f"connect={dom_rect(final, 'titlebar_connect_button_rect')!r} state={final!r}"
+            )
 
         app_set_search(pid, "", focused=False)
         return {
@@ -7206,6 +7969,7 @@ def assert_titlebar_search_typing_contract(pid: int) -> dict:
 def visible_session_drag_target_folder(state: dict) -> dict | None:
     preferred = {"/home/pi", str(Path.home())}
     fallback = None
+    remote_fallback = None
     for row in visible_sidebar_rows(state):
         if str(row.get("kind") or "").strip() != "Group":
             continue
@@ -7215,9 +7979,13 @@ def visible_session_drag_target_folder(state: dict) -> dict | None:
             or path == "local"
             or path == "/"
             or path.startswith("__live_")
-            or path.startswith("__remote_")
-            or not path.startswith("/")
         ):
+            continue
+        if path.startswith("__remote_folder__"):
+            if remote_fallback is None:
+                remote_fallback = row
+            continue
+        if not path.startswith("/"):
             continue
         if path in preferred:
             return row
@@ -7225,26 +7993,34 @@ def visible_session_drag_target_folder(state: dict) -> dict | None:
             fallback = row
         elif fallback is None and not path.startswith(("/sys", "/proc", "/dev", "/run")):
             fallback = row
-    return fallback
+    return fallback or remote_fallback
 
 
 def wait_for_session_drag_target_folder(pid: int, timeout_seconds: float = 8.0) -> tuple[dict, dict]:
-    try:
-        app_expand(pid, "local", True)
-    except Exception:
-        pass
-    try:
-        app_expand(pid, "/", True)
-    except Exception:
-        pass
-    deadline = time.time() + timeout_seconds
     last_state = {}
-    while time.time() < deadline:
-        last_state = app_state(pid)
-        row = visible_session_drag_target_folder(last_state)
-        if row is not None and rect_is_visible(sidebar_row_rect(row)):
-            return last_state, row
-        time.sleep(0.12)
+    home = str(Path.home())
+    queries = ["", home, home.rsplit("/", 1)[-1], "gh yggterm"]
+    per_query_timeout = max(1.5, timeout_seconds / max(len(queries), 1))
+    for query in queries:
+        try:
+            app_set_search(pid, query, focused=False)
+        except Exception:
+            pass
+        try:
+            app_expand(pid, "local", True)
+        except Exception:
+            pass
+        try:
+            app_expand(pid, "/", True)
+        except Exception:
+            pass
+        deadline = time.time() + per_query_timeout
+        while time.time() < deadline:
+            last_state = app_state(pid)
+            row = visible_session_drag_target_folder(last_state)
+            if row is not None and rect_is_visible(sidebar_row_rect(row)):
+                return last_state, row
+            time.sleep(0.12)
     raise AssertionError(f"no visible writable folder target for session drag smoke: state={last_state!r}")
 
 
@@ -7391,7 +8167,13 @@ def assert_folder_create_rename_collapse_contract(pid: int) -> dict:
     except Exception:
         pass
 
-    action = invoke_sidebar_context_menu_action(pid, parent_path, "add-folder", row_kind="Group")
+    action = invoke_sidebar_context_menu_action(
+        pid,
+        parent_path,
+        "add-folder",
+        row_kind="Group",
+        preserve_search=True,
+    )
     created_path = ""
     focused_trace: list[dict] = []
     created = {}
@@ -7452,10 +8234,27 @@ def assert_folder_create_rename_collapse_contract(pid: int) -> dict:
     while time.time() < deadline:
         committed = app_state(pid)
         committed_row = find_visible_sidebar_row_by_path(committed, created_path, kind="Group")
+        selected_row = (committed.get("browser") or {}).get("selected_row") or {}
+        selected_path = str(
+            (committed.get("browser") or {}).get("selected_path")
+            or selected_row.get("path")
+            or selected_row.get("full_path")
+            or ""
+        ).strip()
+        selected_matches = (
+            selected_path == created_path
+            and str(selected_row.get("kind") or "") == "Group"
+            and str(selected_row.get("label") or "").strip() == rename_target
+        )
         if (
             not str(((committed.get("shell") or {}).get("tree_rename_path") or "")).strip()
-            and committed_row is not None
-            and str(committed_row.get("label") or "").strip() == rename_target
+            and (
+                (
+                    committed_row is not None
+                    and str(committed_row.get("label") or "").strip() == rename_target
+                )
+                or selected_matches
+            )
         ):
             break
         time.sleep(0.08)
@@ -7485,7 +8284,26 @@ def assert_folder_create_rename_collapse_contract(pid: int) -> dict:
     while time.time() < deadline:
         parent_expanded_state = app_state(pid)
         parent_expanded_row = find_visible_sidebar_row_by_path(parent_expanded_state, created_path, kind="Group")
-        if parent_expanded_row is not None and rect_is_visible(sidebar_row_rect(parent_expanded_row)):
+        selected_row = (parent_expanded_state.get("browser") or {}).get("selected_row") or {}
+        selected_path = str(
+            (parent_expanded_state.get("browser") or {}).get("selected_path")
+            or selected_row.get("path")
+            or selected_row.get("full_path")
+            or ""
+        ).strip()
+        selected_tree_paths = {
+            str(path)
+            for path in (parent_expanded_state.get("shell") or {}).get("selected_tree_paths") or []
+        }
+        selected_matches = (
+            (selected_path == created_path or created_path in selected_tree_paths)
+            and str(selected_row.get("kind") or "") == "Group"
+            and str(selected_row.get("full_path") or selected_row.get("path") or "") == created_path
+        )
+        if (
+            parent_expanded_row is not None
+            and rect_is_visible(sidebar_row_rect(parent_expanded_row))
+        ) or selected_matches:
             break
         time.sleep(0.08)
     else:
@@ -10283,12 +11101,52 @@ def assert_small_window_chrome_contract(pid: int, out_dir: Path) -> dict:
     baseline_width = float(baseline_inner.get("width") or 0.0)
     baseline_height = float(baseline_inner.get("height") or 0.0)
     baseline_maximized = bool(baseline_window.get("maximized"))
+    baseline_auto_hide = bool(dom_value(baseline, "titlebar_auto_hide_enabled")) or bool(
+        (baseline.get("shell") or {}).get("titlebar_auto_hide_enabled")
+    )
     if baseline_maximized:
         app_set_maximized(pid, False)
         baseline = wait_for_window_maximized(pid, False) or app_state(pid)
     try:
+        if baseline_auto_hide:
+            app_set_window_chrome_hover(pid, True)
+            wait_for_probe(
+                lambda: app_state(pid),
+                lambda state: (
+                    (
+                        bool(dom_value(state, "titlebar_auto_hide_enabled"))
+                        or bool((state.get("shell") or {}).get("titlebar_auto_hide_enabled"))
+                    )
+                    and float(dom_rect(state, "titlebar_rect").get("height") or 0.0)
+                    >= TITLEBAR_VISIBLE_MIN_HEIGHT_PX
+                ),
+                timeout_seconds=3.0,
+                description="compact titlebar reveal before resize",
+            )
         settings_open = app_set_right_panel_mode(pid, "settings")
+        focus_resize_samples = assert_focused_titlebar_search_resize_contract(pid)
+        post_focus_resize_restore = {}
+        post_focus_resize_idle_centering = {}
+        if baseline_width > 0 and baseline_height > 0:
+            post_focus_resize_restore = app_resize_window(pid, baseline_width, baseline_height)
+            if baseline_auto_hide:
+                app_set_window_chrome_hover(pid, True)
+            post_focus_resize_idle = wait_for_probe(
+                lambda: app_state(pid),
+                lambda state: (
+                    float(((state.get("window") or {}).get("inner_size") or {}).get("width") or 0.0)
+                    >= baseline_width - 1.0
+                    and str((state.get("shell") or {}).get("search_query") or "") == ""
+                    and not bool((state.get("shell") or {}).get("search_focused"))
+                    and rect_is_visible(dom_rect(state, "titlebar_search_input_rect"))
+                ),
+                timeout_seconds=4.0,
+                description="idle titlebar search after focused resize restore",
+            )
+            post_focus_resize_idle_centering = assert_titlebar_centering(post_focus_resize_idle)
         resize = app_resize_window(pid, 520, 380)
+        if baseline_auto_hide:
+            app_set_window_chrome_hover(pid, True)
         compact = wait_for_probe(
             lambda: app_state(pid),
             lambda state: (
@@ -10297,6 +11155,17 @@ def assert_small_window_chrome_contract(pid: int, out_dir: Path) -> dict:
                 and float(((state.get("window") or {}).get("inner_size") or {}).get("height") or 9999.0)
                 <= 480.0
                 and rect_is_visible(dom_rect(state, "right_side_rail_rect"))
+                and (
+                    not baseline_auto_hide
+                    or (
+                        (
+                            bool(dom_value(state, "titlebar_auto_hide_enabled"))
+                            or bool((state.get("shell") or {}).get("titlebar_auto_hide_enabled"))
+                        )
+                        and float(dom_rect(state, "titlebar_rect").get("height") or 0.0)
+                        >= TITLEBAR_VISIBLE_MIN_HEIGHT_PX
+                    )
+                )
             ),
             timeout_seconds=6.0,
             description="compact window resize",
@@ -10355,6 +11224,7 @@ def assert_small_window_chrome_contract(pid: int, out_dir: Path) -> dict:
             if isinstance(rect, dict) and rect_is_visible(rect)
         ]
         terminal_theme_button_modes = dom_value(compact, "terminal_theme_button_modes") or []
+        terminal_theme_selectors_expected = str(compact.get("active_view_mode") or "").lower() == "terminal"
         failures = []
         if not rect_is_visible(shell_rect):
             failures.append("shell root rect missing")
@@ -10406,26 +11276,50 @@ def assert_small_window_chrome_contract(pid: int, out_dir: Path) -> dict:
             )
         if rail_background_alpha is None or rail_background_alpha < 0.92:
             failures.append(f"compact settings rail is not opaque enough: background={rail_background!r}")
-        if len(terminal_theme_button_rects) < 2:
+        if terminal_theme_selectors_expected and len(terminal_theme_button_rects) < 2:
             failures.append(
                 f"compact settings rail did not expose both terminal theme selectors: modes={terminal_theme_button_modes!r} rects={terminal_theme_button_rects!r}"
             )
-        for rect in terminal_theme_button_rects:
-            if rect_is_visible(shell_rect) and not rect_contains_rect(shell_rect, rect, tolerance=2.5):
-                failures.append(f"terminal theme selector overflows compact shell: shell={shell_rect!r} rect={rect!r}")
-            if rect_is_visible(rail_scroll_rect) and not rect_contains_rect(
-                rail_scroll_rect, rect, tolerance=2.5
-            ):
-                failures.append(
-                    f"terminal theme selector is clipped outside compact rail scroll body: scroll={rail_scroll_rect!r} rect={rect!r}"
-                )
+        if terminal_theme_selectors_expected:
+            for rect in terminal_theme_button_rects:
+                if rect_is_visible(shell_rect) and not rect_contains_rect(shell_rect, rect, tolerance=2.5):
+                    failures.append(f"terminal theme selector overflows compact shell: shell={shell_rect!r} rect={rect!r}")
+                if rect_is_visible(rail_scroll_rect) and not rect_contains_rect(
+                    rail_scroll_rect, rect, tolerance=2.5
+                ):
+                    failures.append(
+                        f"terminal theme selector is clipped outside compact rail scroll body: scroll={rail_scroll_rect!r} rect={rect!r}"
+                    )
         if failures:
             raise AssertionError("; ".join(failures))
+        responsive_search_set = app_set_search(pid, "responsive-check", focused=True)
+        responsive_search_state = wait_for_probe(
+            lambda: app_state(pid),
+            lambda state: (
+                bool((state.get("dom") or {}).get("titlebar_search_active"))
+                or (
+                    bool((state.get("search") or {}).get("focused"))
+                    and str((state.get("search") or {}).get("query") or "") == "responsive-check"
+                )
+                or (
+                    bool((state.get("shell") or {}).get("search_focused"))
+                    and str((state.get("shell") or {}).get("search_query") or "") == "responsive-check"
+                )
+            )
+            and float(((state.get("window") or {}).get("inner_size") or {}).get("width") or 9999.0) <= 620.0,
+            timeout_seconds=4.0,
+            description="compact focused titlebar search",
+        )
+        responsive_titlebar_centering = assert_titlebar_centering(responsive_search_state)
         shot_path = out_dir / "small-window-chrome.png"
-        shot = app_screenshot(pid, shot_path, crop_state=compact, check_corners=True)
+        shot = app_screenshot(pid, shot_path, crop_state=responsive_search_state, check_corners=True)
         return {
             "settings_open": settings_open,
+            "focus_resize_samples": focus_resize_samples,
+            "post_focus_resize_restore": post_focus_resize_restore,
+            "post_focus_resize_idle_centering": post_focus_resize_idle_centering,
             "resize": resize,
+            "baseline_auto_hide": baseline_auto_hide,
             "panel_scroll_samples": panel_scroll_samples,
             "window": compact.get("window") or {},
             "shell_rect": shell_rect,
@@ -10439,15 +11333,27 @@ def assert_small_window_chrome_contract(pid: int, out_dir: Path) -> dict:
             "right_side_rail_rect": rail_rect,
             "right_side_rail_scroll_rect": rail_scroll_rect,
             "right_side_rail_background": rail_background,
+            "terminal_theme_selectors_expected": terminal_theme_selectors_expected,
             "terminal_theme_button_rects": terminal_theme_button_rects,
             "terminal_theme_button_modes": terminal_theme_button_modes,
+            "responsive_search_set": responsive_search_set,
+            "responsive_search_state": responsive_titlebar_centering,
             "screenshot": str(shot_path),
             "screenshot_result": (shot.get("data") or shot) if isinstance(shot, dict) else shot,
         }
     finally:
+        try:
+            app_set_search(pid, "", focused=False)
+        except Exception:
+            pass
         if baseline_width > 0 and baseline_height > 0:
             app_resize_window(pid, baseline_width, baseline_height)
             time.sleep(0.25)
+        if baseline_auto_hide:
+            try:
+                app_set_window_chrome_hover(pid, False)
+            except Exception:
+                pass
         if baseline_maximized:
             app_set_maximized(pid, True)
 
@@ -11435,10 +12341,21 @@ def assert_terminal_viewport_resize_refits_xterm(pid: int, session: str, out_dir
         )
         shot_path = out_dir / f"terminal-viewport-resize-{label}.png"
         app_screenshot(pid, shot_path)
+        prompt_prefix_pixels = assert_prompt_prefix_pixels_visible(
+            shot_path,
+            settled,
+            context=f"terminal viewport {label} resize prompt pixels",
+        )
+        if prompt_prefix_pixels.get("skipped"):
+            raise AssertionError(
+                f"terminal viewport {label} resize prompt pixels not assertable: "
+                f"{prompt_prefix_pixels!r}"
+            )
         samples[label] = {
             "resize": resize,
             "summary": fit_summary(settled),
             "screenshot": str(shot_path),
+            "prompt_prefix_pixels": prompt_prefix_pixels,
         }
         skipped = samples[label]["summary"].get("last_skipped_fit") or {}
         if isinstance(skipped, dict) and skipped.get("cause") == "host_not_usable":
@@ -12224,6 +13141,576 @@ def assert_live_session_keep_alive_toggle(pid: int) -> dict:
             pass
 
 
+def assert_terminal_redraw_context_menu(pid: int) -> dict:
+    created = app_create_terminal(pid, title="Smoke Redraw Terminal")
+    target_path = str(created.get("active_session_path") or "").strip()
+    if not target_path:
+        raise AssertionError(f"terminal create did not return an active session path: {created!r}")
+    try:
+        wait_for_interactive_session(pid, target_path, timeout_seconds=20.0)
+        action = invoke_sidebar_context_menu_action(
+            pid,
+            target_path,
+            "redraw-terminal",
+            row_kind="Session",
+        )
+        result = terminal_redraw(pid, target_path)
+        if result.get("accepted") is not True:
+            raise AssertionError(f"redraw app-control command was rejected: {result!r}")
+        content_source = str(result.get("content_source") or result.get("retained_replay_source") or "")
+        if "server_prompt" in content_source:
+            raise AssertionError(
+                f"redraw accepted a non-PTY server prompt snapshot as terminal content: {result!r}"
+            )
+        redraw_effect = str(result.get("redraw_effect") or "")
+        if redraw_effect in {"source_mismatch", "stale_source"}:
+            raise AssertionError(f"redraw did not repair the active terminal frame: {result!r}")
+        if int(result.get("redraw_count") or 0) <= int(result.get("manual_redraw_count_before") or 0):
+            raise AssertionError(f"redraw did not advance the manual redraw counter: {result!r}")
+        if int(result.get("redraw_settled_at_ms") or 0) < int(result.get("redraw_started_at_ms") or 0):
+            raise AssertionError(f"redraw did not report a settled timing window: {result!r}")
+        if result.get("redraw_duration_ms") is None:
+            raise AssertionError(f"redraw did not report duration: {result!r}")
+        after = result.get("after") or {}
+        if isinstance(after, dict):
+            after_scrollback_intent = str(after.get("scrollback_intent") or "PromptFollow")
+            if bool(after.get("scrollback_locked")) and after_scrollback_intent != "UserScrollback":
+                raise AssertionError(
+                    f"redraw left a prompt-follow terminal locked in scrollback: {result!r}"
+                )
+            cursor_overflow = float(after.get("cursor_bottom_overflow_px") or 0.0)
+            if cursor_overflow > 1.0 and after_scrollback_intent != "UserScrollback":
+                raise AssertionError(
+                    f"redraw left the prompt cursor below the visible viewport: {result!r}"
+                )
+        return {
+            "target_path": target_path,
+            "context_menu_action": action,
+            "redraw": result,
+        }
+    finally:
+        try:
+            app_remove_session(pid, target_path)
+        except Exception:
+            pass
+
+
+def assert_live_session_identity_contract(pid: int) -> dict:
+    state = app_state(pid)
+    runtime_truth = state.get("runtime_truth") or {}
+    rows = ((state.get("dom") or {}).get("sidebar_visible_rows") or [])
+    live_group_index = next(
+        (
+            index
+            for index, row in enumerate(rows)
+            if str(row.get("path") or "") == "__live_sessions__"
+        ),
+        None,
+    )
+    live_rows: list[dict] = []
+    if live_group_index is not None:
+        for row in rows[live_group_index + 1 :]:
+            if int(row.get("depth") or 0) <= 0:
+                break
+            if str(row.get("kind") or "") == "Session":
+                live_rows.append(row)
+    raw_storage_rows = [
+        row
+        for row in live_rows
+        if "/.codex/sessions/" in str(row.get("path") or "")
+        or "/.codex-litellm/sessions/" in str(row.get("path") or "")
+    ]
+    if raw_storage_rows:
+        raise AssertionError(f"Live Sessions contains raw stored transcript paths: {raw_storage_rows!r}")
+    noncanonical_local_rows = [
+        row
+        for row in live_rows
+        if str(row.get("path") or "").startswith(("codex://", "codex-litellm://", "local::", "codex::"))
+    ]
+    if noncanonical_local_rows:
+        raise AssertionError(f"Live Sessions contains non-canonical local runtime paths: {noncanonical_local_rows!r}")
+    daemon_keys = {
+        normalize_live_path(str(key or ""))
+        for key in (runtime_truth.get("daemon_runtime_keys") or [])
+        if str(key or "").strip()
+    }
+    live_paths = {
+        normalize_live_path(str(row.get("path") or ""))
+        for row in live_rows
+        if str(row.get("path") or "").strip()
+    }
+    missing_rows = sorted(
+        key
+        for key in daemon_keys
+        if key.startswith(("local://", "remote-session://")) and key not in live_paths
+    )
+    if missing_rows:
+        raise AssertionError(
+            f"daemon runtime keys are missing from Live Sessions rows: missing={missing_rows!r} "
+            f"live_paths={sorted(live_paths)!r} runtime_truth={runtime_truth!r}"
+        )
+    return {
+        "live_row_count": len(live_rows),
+        "daemon_runtime_count": len(daemon_keys),
+        "live_paths": sorted(live_paths),
+        "daemon_runtime_keys": sorted(daemon_keys),
+    }
+
+
+def assert_render_health_watchdog_contract(pid: int) -> dict:
+    state = app_state(pid)
+    surface = (state.get("viewport") or state).get("active_terminal_surface") or {}
+    render_health = surface.get("render_health") or {}
+    if "healthy" not in render_health:
+        raise AssertionError(f"active terminal surface does not expose render_health: {surface!r}")
+    return {
+        "render_health": render_health,
+        "problem": surface.get("problem"),
+        "rendered": surface.get("rendered"),
+    }
+
+
+def assert_tree_collapse_persistence(pid: int) -> dict:
+    target = str(ENV.get("YGGTERM_SMOKE_COLLAPSE_PATH") or str(Path.home() / ".codex"))
+    rows_before = app_rows(pid)
+    if not any(str(row.get("path") or row.get("full_path") or "") == target for row in rows_before):
+        return {
+            "skipped": True,
+            "reason": "collapse target not visible",
+            "target": target,
+        }
+    app_expand(pid, target, False)
+    state = app_state(pid)
+    expanded = set(str(path) for path in ((state.get("browser") or {}).get("expanded_paths") or []))
+    if target in expanded:
+        raise AssertionError(f"collapsed path remained expanded in app state: target={target!r} expanded={sorted(expanded)!r}")
+    rows_after = app_rows(pid)
+    visible_stored_descendants = [
+        row
+        for row in rows_after
+        if str(row.get("path") or row.get("full_path") or "").startswith(target + "/sessions/")
+    ]
+    if visible_stored_descendants:
+        raise AssertionError(
+            f"collapsed Codex storage path still exposes session descendants: {visible_stored_descendants[:5]!r}"
+        )
+    return {
+        "target": target,
+        "expanded_count": len(expanded),
+        "descendant_count": len(visible_stored_descendants),
+    }
+
+
+def ensure_local_home_tree_visible(pid: int) -> dict:
+    try:
+        app_set_search(pid, "", focused=False)
+    except Exception:
+        pass
+    for path in ("local", "/", str(Path.home())):
+        try:
+            app_expand(pid, path, True)
+        except Exception:
+            pass
+    return app_state(pid)
+
+
+def assert_local_stored_sessions_visible(pid: int) -> dict:
+    ensure_local_home_tree_visible(pid)
+    home = str(Path.home())
+    deadline = time.time() + 6.0
+    last_rows: list[dict] = []
+    home_row: dict | None = None
+    visible_sessions: list[dict] = []
+    while time.time() < deadline:
+        last_rows = app_rows(pid)
+        home_row = next(
+            (
+                row
+                for row in last_rows
+                if str(row.get("path") or row.get("full_path") or "").strip() == home
+            ),
+            None,
+        )
+        visible_sessions = [
+            row
+            for row in last_rows
+            if str(row.get("kind") or "").strip() == "Session"
+            and str(row.get("session_cwd") or "").strip() == home
+            and (
+                "/.codex/sessions/" in str(row.get("path") or row.get("full_path") or "")
+                or "/.codex-litellm/sessions/" in str(row.get("path") or row.get("full_path") or "")
+            )
+        ]
+        if visible_sessions:
+            break
+        time.sleep(0.25)
+    child_count = int((home_row or {}).get("child_count") or 0)
+    if child_count > 0 and not visible_sessions:
+        sample = [
+            {
+                "path": row.get("path") or row.get("full_path"),
+                "label": row.get("label"),
+                "kind": row.get("kind"),
+                "session_cwd": row.get("session_cwd"),
+                "child_count": row.get("child_count"),
+            }
+            for row in last_rows[:40]
+        ]
+        raise AssertionError(
+            f"{home} reports stored descendants but no local stored Codex session rows are visible: "
+            f"home_row={home_row!r} sample={sample!r}"
+        )
+    if child_count == 0 and not visible_sessions:
+        return {
+            "skipped": True,
+            "reason": "home tree has no stored session descendants",
+            "home": home,
+            "home_row": home_row,
+        }
+    return {
+        "home": home,
+        "home_child_count": child_count,
+        "visible_session_count": len(visible_sessions),
+        "sample_sessions": visible_sessions[:6],
+    }
+
+
+def context_menu_action_rect(state: dict, action: str) -> dict:
+    actions = (state.get("dom") or {}).get("context_menu_action_rects") or []
+    if not isinstance(actions, list):
+        return {}
+    for entry in actions:
+        if not isinstance(entry, dict):
+            continue
+        if str(entry.get("action") or "").strip() == action:
+            rect = entry.get("rect") or {}
+            return rect if isinstance(rect, dict) else {}
+    return {}
+
+
+def context_menu_delete_action_rect(state: dict) -> dict:
+    return context_menu_action_rect(state, "delete") or context_menu_action_rect(state, "delete-session")
+
+
+def visible_multiselect_delete_group_candidates(state: dict) -> list[dict]:
+    home = str(Path.home())
+    rows = []
+    for row in visible_sidebar_rows(state):
+        path = str(row.get("path") or row.get("full_path") or "").strip()
+        label = str(row.get("label") or "").strip()
+        if str(row.get("kind") or "").strip() != "Group":
+            continue
+        if path in {"local", "/", home} or path.startswith("__"):
+            continue
+        if not path.startswith(home + "/"):
+            continue
+        if not rect_is_visible(sidebar_row_rect(row)):
+            continue
+        preferred = path.startswith(home + "/folder-") or label.startswith("mvp-proof") or label == "New Folder"
+        rows.append((0 if preferred else 1, path, row))
+    rows.sort(key=lambda entry: (entry[0], entry[1]))
+    return [row for _, _, row in rows]
+
+
+def assert_context_menu_delete_multiselection_contract(pid: int) -> dict:
+    baseline = ensure_local_home_tree_visible(pid)
+    selected_paths = {
+        str(path)
+        for path in ((baseline.get("shell") or {}).get("selected_tree_paths") or [])
+        if str(path or "").strip()
+    }
+    selected_rows = [
+        row
+        for row in visible_sidebar_rows(baseline)
+        if str(row.get("path") or row.get("full_path") or "").strip() in selected_paths
+        and str(row.get("kind") or "").strip() == "Group"
+        and rect_is_visible(sidebar_row_rect(row))
+    ]
+    candidates = selected_rows if len(selected_rows) >= 2 else visible_multiselect_delete_group_candidates(baseline)
+    if len(candidates) < 2:
+        return {
+            "skipped": True,
+            "reason": "fewer than two visible workspace folders for non-destructive delete modal smoke",
+            "visible_groups": [
+                {
+                    "path": row.get("path") or row.get("full_path"),
+                    "label": row.get("label"),
+                    "kind": row.get("kind"),
+                }
+                for row in visible_sidebar_rows(baseline)
+                if str(row.get("kind") or "").strip() == "Group"
+            ][:16],
+        }
+    targets = candidates[: min(7, len(candidates))]
+    target_paths = [str(row.get("path") or row.get("full_path") or "").strip() for row in targets]
+    anchor_path = target_paths[-1]
+    selection = app_tree_select(pid, target_paths, anchor=anchor_path)
+    selected_state = wait_for_probe(
+        lambda: app_state(pid),
+        lambda state: set(target_paths).issubset(
+            {
+                str(path)
+                for path in ((state.get("shell") or {}).get("selected_tree_paths") or [])
+            }
+        ),
+        timeout_seconds=4.0,
+        description="app-control multiselect tree selection",
+    )
+    anchor_row = find_visible_sidebar_row_by_path(selected_state, anchor_path, kind="Group")
+    if anchor_row is None:
+        raise AssertionError(f"selected anchor row is not visible before context delete: {selected_state!r}")
+    open_click = xdotool_right_click_window(
+        pid,
+        sidebar_row_click_x(selected_state),
+        rect_center_y(sidebar_row_rect(anchor_row)),
+    )
+    opened = wait_for_probe(
+        lambda: app_state(pid),
+        lambda state: shell_context_menu_row_path(state) == anchor_path
+        and rect_is_visible(context_menu_delete_action_rect(state)),
+        timeout_seconds=4.0,
+        description="context menu delete action for selected group",
+    )
+    action_rect = context_menu_delete_action_rect(opened)
+    action_click = xdotool_click_window(pid, rect_center_x(action_rect), rect_center_y(action_rect))
+    dialog_state = wait_for_probe(
+        lambda: app_state(pid),
+        lambda state: rect_is_visible(dom_rect(state, "delete_confirm_dialog_rect")),
+        timeout_seconds=4.0,
+        description="delete confirmation dialog for multiselection",
+    )
+    shell = dialog_state.get("shell") or {}
+    pending = shell.get("pending_delete") or {}
+    selected_after = {str(path) for path in shell.get("selected_tree_paths") or []}
+    pending_groups = {str(path) for path in pending.get("group_paths") or []}
+    if not set(target_paths).issubset(selected_after):
+        raise AssertionError(
+            f"context-menu Delete collapsed selection: expected={target_paths!r} selected={sorted(selected_after)!r}"
+        )
+    if not set(target_paths).issubset(pending_groups):
+        raise AssertionError(
+            f"delete modal did not include the selected folders: expected={target_paths!r} pending={pending!r}"
+        )
+    if int(pending.get("display_count") or 0) < len(target_paths):
+        raise AssertionError(
+            f"delete modal display count is smaller than selected folders: pending={pending!r}"
+        )
+    cancel_rect = dom_rect(dialog_state, "delete_confirm_cancel_rect")
+    cancel_click = {}
+    if rect_is_visible(cancel_rect):
+        cancel_click = xdotool_click_window(pid, rect_center_x(cancel_rect), rect_center_y(cancel_rect))
+    return {
+        "target_paths": target_paths,
+        "selection": selection,
+        "open_click": open_click,
+        "action_click": action_click,
+        "pending_delete": pending,
+        "selected_after": sorted(selected_after),
+        "cancel_click": cancel_click,
+    }
+
+
+def assert_live_local_keep_alive_restore(pid: int) -> dict:
+    created = app_create_terminal(pid, title="Smoke Keep Alive Restore")
+    target_path = str(created.get("active_session_path") or "").strip()
+    if not target_path:
+        raise AssertionError(f"terminal create did not return an active session path: {created!r}")
+    try:
+        wait_for_interactive_session(pid, target_path, timeout_seconds=20.0)
+        kept = app_set_session_keep_alive(pid, target_path, True)
+        state, row = wait_for_live_keep_alive_state(pid, target_path, True, timeout_seconds=8.0)
+        runtime_truth = state.get("runtime_truth") or {}
+        daemon_keys = {
+            normalize_live_path(str(key or ""))
+            for key in (runtime_truth.get("daemon_runtime_keys") or [])
+            if str(key or "").strip()
+        }
+        if normalize_live_path(target_path) not in daemon_keys:
+            raise AssertionError(
+                f"kept live row lacks a matching daemon runtime key: session={target_path!r} "
+                f"daemon_keys={sorted(daemon_keys)!r} runtime_truth={runtime_truth!r}"
+            )
+        return {
+            "target_path": target_path,
+            "keep": kept,
+            "row_keep_alive": bool(row.get("live_keep_alive")),
+            "daemon_runtime_keys": sorted(daemon_keys),
+        }
+    finally:
+        try:
+            app_set_session_keep_alive(pid, target_path, False)
+            app_remove_session(pid, target_path)
+        except Exception:
+            pass
+
+
+def kept_live_session_debug_entries(state: dict) -> list[dict]:
+    return [
+        entry
+        for entry in (state.get("live_session_snapshot_debug") or [])
+        if bool(entry.get("keep_alive"))
+        and normalize_live_path(str(entry.get("path") or entry.get("session_path") or "")).strip()
+    ]
+
+
+def runtime_truth_keys(state: dict) -> set[str]:
+    runtime_truth = state.get("runtime_truth") or {}
+    return {
+        normalize_live_path(str(key or ""))
+        for key in (runtime_truth.get("daemon_runtime_keys") or [])
+        if str(key or "").strip()
+    }
+
+
+def assert_live_keep_alive_terminal_recovery_contract(pid: int, out_dir: Path | None = None) -> dict:
+    expected_path = normalize_live_path(
+        str(ENV.get("YGGTERM_SMOKE_KEEPALIVE_SESSION") or "").strip()
+    )
+    require_kept = (ENV.get("YGGTERM_SMOKE_REQUIRE_KEEPALIVE_RECOVERY") or "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+    deadline = time.time() + 45.0
+    last_state = {}
+    last_target = expected_path
+    last_entries: list[dict] = []
+    last_host: dict = {}
+    while time.time() < deadline:
+        last_state = app_state(pid)
+        entries = kept_live_session_debug_entries(last_state)
+        last_entries = entries
+        active_path = normalize_live_path(str(last_state.get("active_session_path") or ""))
+        target_path = expected_path
+        if not target_path:
+            active_kept = next(
+                (
+                    normalize_live_path(str(entry.get("path") or entry.get("session_path") or ""))
+                    for entry in entries
+                    if normalize_live_path(str(entry.get("path") or entry.get("session_path") or ""))
+                    == active_path
+                ),
+                "",
+            )
+            target_path = active_kept or (
+                normalize_live_path(str(entries[0].get("path") or entries[0].get("session_path") or ""))
+                if entries
+                else ""
+            )
+        last_target = target_path
+        if not target_path:
+            if require_kept:
+                time.sleep(0.2)
+                continue
+            return {"skipped": True, "reason": "no kept live session rows"}
+
+        matching_entry = next(
+            (
+                entry
+                for entry in entries
+                if normalize_live_path(str(entry.get("path") or entry.get("session_path") or ""))
+                == target_path
+            ),
+            None,
+        )
+        runtime_keys = runtime_truth_keys(last_state)
+        runtime_truth = last_state.get("runtime_truth") or {}
+        surface = (viewport_state(last_state).get("active_terminal_surface") or {})
+        active_view_mode = str(last_state.get("active_view_mode") or "")
+        active_runtime_present = runtime_truth.get("active_runtime_present") is True
+        active_terminal_host = host_for_session_or_none(last_state, target_path) or {}
+        screenshot_path = None
+        if not active_terminal_host and active_path == target_path and out_dir is not None:
+            screenshot_path = out_dir / "live-keepalive-terminal-recovery.png"
+            screenshot_payload = app_screenshot(pid, screenshot_path, crop_state=last_state)
+            screenshot_state = (screenshot_payload.get("data") or {}) if isinstance(screenshot_payload, dict) else {}
+            active_terminal_host = host_for_session_or_none(screenshot_state, target_path) or {}
+        last_host = active_terminal_host
+        active_terminal_overlay_clean = (
+            active_terminal_host
+            and active_terminal_host.get("low_power_tui_overlay_active") is not True
+            and active_terminal_host.get("low_power_tui_overlay_present") is not True
+        )
+        active_surface_clean = not (surface.get("problem") or surface.get("geometry_problem"))
+        if (
+            matching_entry is not None
+            and active_path == target_path
+            and active_view_mode == "Terminal"
+            and target_path in runtime_keys
+            and active_runtime_present
+            and active_terminal_overlay_clean
+            and active_surface_clean
+        ):
+            return {
+                "target_path": target_path,
+                "active_session_path": active_path,
+                "active_view_mode": active_view_mode,
+                "active_runtime_present": active_runtime_present,
+                "daemon_runtime_keys": sorted(runtime_keys),
+                "active_terminal_surface": surface,
+                "screenshot": str(screenshot_path) if screenshot_path is not None else None,
+                "kept_entry": matching_entry,
+                "active_terminal_host": {
+                    "input_enabled": active_terminal_host.get("input_enabled"),
+                    "helper_textarea_focused": active_terminal_host.get("helper_textarea_focused"),
+                    "host_has_active_element": active_terminal_host.get("host_has_active_element"),
+                    "low_power_tui_overlay_active": active_terminal_host.get("low_power_tui_overlay_active"),
+                    "low_power_tui_overlay_present": active_terminal_host.get("low_power_tui_overlay_present"),
+                    "xterm_buffer_kind": active_terminal_host.get("xterm_buffer_kind"),
+                    "cursor_line_text": active_terminal_host.get("cursor_line_text")
+                    or active_terminal_host.get("cursor_row_text"),
+                },
+            }
+        time.sleep(0.2)
+
+    raise AssertionError(
+        "kept live session did not settle as the active Terminal runtime after restart: "
+        f"expected_path={expected_path!r} target_path={last_target!r} "
+        f"active_session_path={last_state.get('active_session_path')!r} "
+        f"active_view_mode={last_state.get('active_view_mode')!r} "
+        f"runtime_truth={last_state.get('runtime_truth')!r} "
+        f"kept_entries={last_entries!r} "
+        f"active_terminal_surface={(viewport_state(last_state).get('active_terminal_surface') or {})!r} "
+        f"active_terminal_host={last_host!r}"
+    )
+
+
+def assert_web_view_terminal_toggle_no_crash(pid: int) -> dict:
+    created = app_create_terminal(pid, title="Smoke Web View Toggle")
+    target_path = str(created.get("active_session_path") or "").strip()
+    if not target_path:
+        raise AssertionError(f"terminal create did not return an active session path: {created!r}")
+    try:
+        wait_for_interactive_session(pid, target_path, timeout_seconds=20.0)
+        opened_web_view = app_open(pid, target_path, view="web-view")
+        time.sleep(1.0)
+        after_web_view = app_state(pid)
+        if after_web_view.get("active_session_path") != target_path:
+            raise AssertionError(
+                f"web-view request changed active session: target={target_path!r} state={after_web_view!r}"
+            )
+        if after_web_view.get("active_view_mode") != "Terminal":
+            raise AssertionError(
+                f"live runtime accepted Web View mode instead of staying Terminal: {after_web_view!r}"
+            )
+        opened_terminal = app_open(pid, target_path, view="terminal")
+        after_terminal = app_state(pid)
+        if after_terminal.get("active_view_mode") != "Terminal":
+            raise AssertionError(f"terminal reopen did not settle in Terminal mode: {after_terminal!r}")
+        return {
+            "target_path": target_path,
+            "opened_web_view": opened_web_view,
+            "opened_terminal": opened_terminal,
+            "active_view_mode": after_terminal.get("active_view_mode"),
+        }
+    finally:
+        try:
+            app_remove_session(pid, target_path)
+        except Exception:
+            pass
+
+
 def assert_focus_and_visibility(pid: int, state: dict) -> dict:
     def current_focus_snapshot(snapshot: dict) -> tuple[dict, dict, dict, list[dict]]:
         return (
@@ -12652,7 +14139,7 @@ def assert_busy_icon_lifecycle(pid: int, session: str, *, sleep_seconds: int = 8
     idle_deadline = time.time() + max(16.0, sleep_seconds + 10.0)
     while time.time() < idle_deadline:
         row = row_from_app_rows()
-        if row and not bool(row.get("busy")) and str(row.get("icon_kind") or "") == "plain-terminal":
+        if row and not bool(row.get("busy")) and str(row.get("icon_kind") or "") == "terminal":
             idle_row = row
             break
         time.sleep(0.25)
@@ -13121,28 +14608,18 @@ def assert_sidebar_contract(pid: int, session: str) -> dict:
             raise AssertionError(
                 f"selected busy local terminal row lost the busy spinner contract: {selected_row!r}"
             )
-    elif selected_icon_kind != "plain-terminal" or selected_icon_text != "⌘":
+    elif selected_icon_kind != "terminal" or selected_icon_text != "$_":
         raise AssertionError(
             f"selected local terminal row lost the plain terminal icon contract: {selected_row!r}"
         )
 
-    inconsistent_generic_session_icons = [
-        row
-        for row in dom_rows
-        if str(row.get("kind") or "") == "Session"
-        and str(row.get("icon_kind") or "") == "session"
-    ]
-    if inconsistent_generic_session_icons:
-        raise AssertionError(
-            f"terminal sessions still use the inconsistent generic session icon: {inconsistent_generic_session_icons!r}"
-        )
     invalid_codex_icons = [
         row
         for row in dom_rows
         if "/.codex/sessions/" in str(row.get("path") or "")
         and (
-            str(row.get("icon_kind") or "") != "codex"
-            or str(row.get("icon_text") or "") != "✦"
+            str(row.get("icon_kind") or "") != "session"
+            or str(row.get("icon_text") or "") != ">_"
         )
     ]
     if invalid_codex_icons:
@@ -13175,7 +14652,7 @@ def assert_sidebar_contract(pid: int, session: str) -> dict:
         "invalid_busy_live_row_count": len(invalid_busy_live_rows),
         "invalid_cached_ready_machine_row_count": len(invalid_cached_ready_machine_rows),
         "invalid_codex_icon_count": len(invalid_codex_icons),
-        "generic_session_icon_count": len(inconsistent_generic_session_icons),
+        "generic_session_icon_count": 0,
         "cursor_contract": cursor_contract,
         "failed_notification_count": len(failed_notifications),
     }
@@ -13479,7 +14956,7 @@ def find_hot_switch_partner(snapshot: dict, session: str, session_kind: str) -> 
 
 
 def warm_hot_switch_partner(pid: int, session: str, session_kind: str) -> dict | None:
-    preferred_icon = "codex" if session_kind == "plain" else "plain-terminal"
+    preferred_icon = "session" if session_kind == "plain" else "terminal"
     normalized_session = normalize_live_path(session)
     snapshot = server_snapshot()
     live_paths = {
@@ -16347,6 +17824,8 @@ def main() -> int:
         "settings_terminal_reclaim",
         "settings_zoom_input",
         "small_window_chrome",
+        "start_page_actions",
+        "start_page_recent_work_truth",
         "theme_editor_contract",
         "active_session_copy_quality",
         "titlebar_autohide_hover",
@@ -16359,11 +17838,15 @@ def main() -> int:
         "titlebar_overflow_menu",
         "titlebar_session_shell",
         "context_menu_rename_session",
+        "context_menu_delete_multiselection",
         "folder_create_rename_collapse",
+        "folder_focus_start_page",
+        "local_stored_sessions_visible",
         "session_drag_to_folder",
         "titlebar_copy_regeneration",
         "live_session_close_button",
         "live_session_keep_alive_toggle",
+        "live_keep_alive_terminal_recovery",
         "live_session_metadata_consistency",
         "live_sessions_tree_contract",
         "live_remote_terminal_surface_contract",
@@ -16503,6 +17986,10 @@ def main() -> int:
             lambda: assert_settings_terminal_theme_dropdown_contract(args.pid),
         )
         run_check("right_panel_animation", lambda: assert_right_panel_animation_contract(args.pid))
+        run_check("start_page_recent_work_truth", lambda: assert_start_page_recent_work_truth(args.pid))
+        run_check("folder_focus_start_page", lambda: assert_folder_focus_start_page_contract(args.pid))
+        run_check("start_page_actions", lambda: assert_start_page_actions(args.pid))
+        run_check("local_stored_sessions_visible", lambda: assert_local_stored_sessions_visible(args.pid))
         run_check("sidebar_cursor_contract", lambda: assert_sidebar_cursor_contract(args.pid))
         if "stored_codex_session_open" in selected_checks:
             run_check("stored_codex_session_open", lambda: assert_stored_codex_session_open_contract(args.pid))
@@ -16530,8 +18017,19 @@ def main() -> int:
         )
         run_check("context_menu_rename_session", lambda: assert_context_menu_rename_session(args.pid))
         run_check("context_menu_delete_session", lambda: assert_context_menu_delete_session(args.pid))
+        run_check("context_menu_delete_multiselection", lambda: assert_context_menu_delete_multiselection_contract(args.pid))
         run_check("live_session_close_button", lambda: assert_live_session_close_button(args.pid))
         run_check("live_session_keep_alive_toggle", lambda: assert_live_session_keep_alive_toggle(args.pid))
+        run_check(
+            "live_keep_alive_terminal_recovery",
+            lambda: assert_live_keep_alive_terminal_recovery_contract(args.pid, out_dir),
+        )
+        run_check("terminal_redraw_context_menu", lambda: assert_terminal_redraw_context_menu(args.pid))
+        run_check("live_local_keep_alive_restore", lambda: assert_live_local_keep_alive_restore(args.pid))
+        run_check("tree_collapse_persistence", lambda: assert_tree_collapse_persistence(args.pid))
+        run_check("live_session_identity_contract", lambda: assert_live_session_identity_contract(args.pid))
+        run_check("render_health_watchdog", lambda: assert_render_health_watchdog_contract(args.pid))
+        run_check("web_view_terminal_toggle_no_crash", lambda: assert_web_view_terminal_toggle_no_crash(args.pid))
         run_check(
             "titlebar_empty_lane_window_controls",
             lambda: assert_titlebar_empty_lane_window_controls_contract(args.pid, out_dir),

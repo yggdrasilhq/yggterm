@@ -234,6 +234,25 @@ impl TerminalManager {
         self.sessions.contains_key(key)
     }
 
+    pub fn rename_session(&mut self, from: &str, to: &str) -> bool {
+        if from == to || self.sessions.contains_key(to) {
+            return false;
+        }
+        let Some(mut runtime) = self.sessions.remove(from) else {
+            return false;
+        };
+        trace_terminal_event(
+            "rename",
+            serde_json::json!({
+                "from": from,
+                "to": to,
+            }),
+        );
+        runtime.key = to.to_string();
+        self.sessions.insert(to.to_string(), runtime);
+        true
+    }
+
     pub fn seed_session(&self, key: &str, data: &str) -> Result<()> {
         let session = self
             .sessions
@@ -1618,6 +1637,27 @@ mod tests {
         );
         assert!(chunks.len() <= IDLE_TRIM_MAX_CHUNKS);
         assert!(retained <= IDLE_TRIM_MAX_BYTES);
+    }
+
+    #[test]
+    fn terminal_manager_renames_runtime_without_respawning_child() {
+        let mut manager = TerminalManager::new();
+        manager
+            .ensure_session("local://codex", "sleep 5", None)
+            .expect("spawn test session");
+        let pid_before = manager.session_process_id("local://codex");
+
+        assert!(manager.rename_session("local://codex", "codex-runtime://codex"));
+
+        assert!(!manager.has_session("local://codex"));
+        assert!(manager.has_session("codex-runtime://codex"));
+        assert_eq!(
+            manager.session_process_id("codex-runtime://codex"),
+            pid_before
+        );
+        manager
+            .remove_session("codex-runtime://codex", None)
+            .expect("remove renamed session");
     }
 
     #[test]

@@ -50,8 +50,8 @@ pub fn TitlebarChrome(
     rsx! {
         div {
             style: format!(
-                "position:relative; display:grid; grid-template-columns:minmax(42px, 1fr) minmax(84px, 560px) max-content; align-items:center; \
-                 gap:6px; height:32px; padding:0 8px 0 8px; box-sizing:border-box; background:{}; zoom:{}%; user-select:none; overflow:visible; \
+                "position:relative; display:flex; align-items:center; justify-content:center; \
+                 height:32px; padding:0 8px 0 8px; box-sizing:border-box; background:{}; zoom:{}%; user-select:none; overflow:visible; \
                  -webkit-user-select:none;",
                 background, zoom_percent
             ),
@@ -110,21 +110,21 @@ pub fn TitlebarChrome(
                 on_toggle_maximized.call(());
             },
             div {
-                style: "position:relative; z-index:1; min-width:0; height:100%; display:flex; align-items:center; justify-content:flex-start; box-sizing:border-box; pointer-events:none;",
+                style: "position:absolute; z-index:1; left:8px; top:0; bottom:0; min-width:0; max-width:calc(100% - 16px); height:100%; display:flex; align-items:center; justify-content:flex-start; box-sizing:border-box; pointer-events:none;",
                 div {
                     style: "display:inline-flex; align-items:center; justify-content:flex-start; min-width:0; max-width:100%; height:100%; pointer-events:auto;",
                     {left}
                 }
             }
             div {
-                style: "position:relative; z-index:1; min-width:0; height:100%; display:flex; align-items:center; justify-content:center; box-sizing:border-box; pointer-events:none;",
+                style: "position:relative; z-index:2; min-width:0; width:min(560px, calc(100% - 24px)); height:100%; display:flex; align-items:center; justify-content:center; box-sizing:border-box; pointer-events:none;",
                 div {
-                    style: "display:flex; align-items:center; justify-content:center; min-width:0; width:100%; height:100%; pointer-events:auto;",
+                    style: "display:flex; align-items:center; justify-content:center; min-width:0; width:100%; height:100%; pointer-events:none;",
                     {center}
                 }
             }
             div {
-                style: "position:relative; z-index:1; min-width:0; height:100%; display:flex; align-items:center; justify-content:flex-end; box-sizing:border-box; pointer-events:none;",
+                style: "position:absolute; z-index:1; right:8px; top:0; bottom:0; min-width:0; max-width:calc(100% - 16px); height:100%; display:flex; align-items:center; justify-content:flex-end; box-sizing:border-box; pointer-events:none;",
                 div {
                     style: "display:inline-flex; align-items:center; justify-content:flex-end; min-width:0; max-width:100%; height:100%; pointer-events:auto;",
                     {right}
