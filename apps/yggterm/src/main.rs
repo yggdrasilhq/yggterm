@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::io::Read;
 use std::io::Write;
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
 use std::sync::Arc;
