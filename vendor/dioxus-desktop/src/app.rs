@@ -645,11 +645,35 @@ impl App {
                         std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
                     }
                 }
-                unsafe {
-                    std::env::set_var("GDK_BACKEND", "x11");
+                if linux_dma_buf_workaround_should_force_x11(std::env::var("GDK_BACKEND").ok().as_deref()) {
+                    unsafe {
+                        std::env::set_var("GDK_BACKEND", "x11");
+                    }
                 }
             });
         }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_dma_buf_workaround_should_force_x11(gdk_backend: Option<&str>) -> bool {
+    !gdk_backend
+        .map(|value| value.split(',').any(|part| !part.trim().is_empty()))
+        .unwrap_or(false)
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::linux_dma_buf_workaround_should_force_x11;
+
+    #[test]
+    fn linux_dma_buf_workaround_honors_explicit_gdk_backend() {
+        assert!(linux_dma_buf_workaround_should_force_x11(None));
+        assert!(linux_dma_buf_workaround_should_force_x11(Some("")));
+        assert!(linux_dma_buf_workaround_should_force_x11(Some(" , ")));
+        assert!(!linux_dma_buf_workaround_should_force_x11(Some("wayland")));
+        assert!(!linux_dma_buf_workaround_should_force_x11(Some("x11")));
+        assert!(!linux_dma_buf_workaround_should_force_x11(Some("wayland,x11")));
     }
 }
 

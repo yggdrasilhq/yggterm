@@ -264,11 +264,12 @@ pub(crate) fn describe_viewport_snapshot(snapshot: &Value, dom: &Value) -> Value
         .get("problem")
         .and_then(Value::as_str)
         .map(str::to_string);
-    let terminal_input_enabled = active_terminal_hosts.iter().any(|host| {
-        host.get("input_enabled")
-            .and_then(Value::as_bool)
-            .unwrap_or(false)
-    });
+    let terminal_input_enabled = active_terminal_surface
+        .get("input_enabled")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let clean_daemon_pty_surface_visible =
+        active_terminal_hosts_have_clean_daemon_pty_output(&active_terminal_hosts);
     let active_resume_notification_visible = active_session_path
         .as_deref()
         .is_some_and(|path| active_terminal_resume_notification_visible(&notifications, path));
@@ -410,15 +411,18 @@ pub(crate) fn describe_viewport_snapshot(snapshot: &Value, dom: &Value) -> Value
                     Some("terminal resume overlay is still visible".to_string()),
                 )
             }
-        } else if active_resume_notification_visible && !terminal_input_enabled {
+        } else if let Some(problem) = terminal_surface_problem.clone() {
+            (false, false, Some("problem".to_string()), Some(problem))
+        } else if active_resume_notification_visible
+            && !terminal_input_enabled
+            && !clean_daemon_pty_surface_visible
+        {
             (
                 false,
                 false,
                 Some("recovering".to_string()),
                 Some("terminal resume notification is still visible".to_string()),
             )
-        } else if let Some(problem) = terminal_surface_problem.clone() {
-            (false, false, Some("problem".to_string()), Some(problem))
         } else if terminal_rendered && terminal_input_enabled {
             (true, true, Some("interactive".to_string()), None)
         } else if terminal_rendered && !terminal_input_enabled {
@@ -511,6 +515,62 @@ fn active_terminal_resume_notification_visible(
             .and_then(|job_key| job_key.strip_prefix("terminal-resume:"))
             .is_some_and(|candidate| candidate == session_path)
     })
+}
+
+fn active_terminal_hosts_have_clean_daemon_pty_output(hosts: &[Value]) -> bool {
+    hosts.iter().any(terminal_host_has_clean_daemon_pty_output)
+}
+
+fn terminal_host_has_clean_daemon_pty_output(host: &Value) -> bool {
+    let content_source = host
+        .get("terminal_content_source")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or("");
+    let last_raw_payload_length = host
+        .get("last_raw_payload_length")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let retained_prompt_follow_ready = host
+        .get("retained_replay_prompt_follow_ready")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let pty_source_ready = content_source == "daemon_pty"
+        || (matches!(
+            content_source,
+            "active_recovery_pty_snapshot" | "daemon_terminal_read"
+        ) && retained_prompt_follow_ready);
+    if !pty_source_ready || !terminal_host_has_rendered_surface_for_app_control(host) {
+        return false;
+    }
+    if terminal_host_problem_for_app_control(host).is_some() {
+        return false;
+    }
+    let visible_text = [
+        "text_tail",
+        "text_sample",
+        "buffer_text_sample",
+        "cursor_line_text",
+        "cursor_row_text",
+    ]
+    .into_iter()
+    .filter_map(|key| host.get(key).and_then(Value::as_str))
+    .map(str::trim)
+    .filter(|value| !value.is_empty())
+    .collect::<Vec<_>>()
+    .join("\n");
+    !visible_text.is_empty()
+        && !terminal_chunk_is_transport_error(&visible_text)
+        && !terminal_chunk_is_loading_placeholder(&visible_text)
+        && !terminal_chunk_is_transcript_browser(&visible_text)
+        && !terminal_chunk_is_saved_transcript_prefill(&visible_text)
+        && !terminal_chunk_is_low_signal_terminal_noise(&visible_text)
+        && (content_source != "daemon_pty"
+            || (last_raw_payload_length > 0 && terminal_chunk_has_meaningful_output(&visible_text)))
+        && (terminal_chunk_has_prompt_output(&visible_text)
+            || terminal_chunk_has_codex_prompt_output(&visible_text)
+            || terminal_chunk_is_codex_prompt_surface(&visible_text)
+            || content_source == "daemon_pty")
 }
 
 pub(crate) fn preview_text_looks_like_loading_placeholder(text: &str) -> bool {
@@ -700,7 +760,7 @@ pub(crate) fn summarize_terminal_surface_for_app_control(
     let active_host = hosts
         .iter()
         .min_by_key(|host| terminal_host_active_rank_for_app_control(host));
-    let input_enabled = hosts.iter().any(|host| {
+    let raw_input_enabled = hosts.iter().any(|host| {
         host.get("input_enabled")
             .and_then(Value::as_bool)
             .unwrap_or(false)
@@ -709,6 +769,23 @@ pub(crate) fn summarize_terminal_surface_for_app_control(
         host.get("helper_textarea_focused")
             .and_then(Value::as_bool)
             .unwrap_or(false)
+    });
+    let raw_effective_input_focus = hosts.iter().any(|host| {
+        host.get("effective_input_focus")
+            .and_then(Value::as_bool)
+            .unwrap_or_else(|| {
+                host.get("input_enabled")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+                    && host
+                        .get("helper_textarea_focused")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false)
+                    && host
+                        .get("host_has_active_element")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false)
+            })
     });
     let terminal_input_hot = hosts.iter().any(|host| {
         host.get("terminal_input_hot")
@@ -730,6 +807,8 @@ pub(crate) fn summarize_terminal_surface_for_app_control(
             .or(live_problem.clone())
             .or(render_health_problem.clone())
     };
+    let input_enabled = raw_input_enabled && raw_effective_input_focus && problem.is_none();
+    let effective_input_focus = raw_effective_input_focus && problem.is_none();
     json!({
         "rendered": rendered,
         "problem": problem,
@@ -738,6 +817,9 @@ pub(crate) fn summarize_terminal_surface_for_app_control(
         "render_health": render_health,
         "overlay_context_visible": overlay_context_visible,
         "input_enabled": input_enabled,
+        "raw_input_enabled": raw_input_enabled,
+        "effective_input_focus": effective_input_focus,
+        "raw_effective_input_focus": raw_effective_input_focus,
         "helper_textarea_focused": helper_textarea_focused,
         "terminal_input_hot": terminal_input_hot,
         "host_id": active_host.and_then(|host| host.get("host_id")).cloned().unwrap_or(Value::Null),
@@ -793,6 +875,20 @@ fn terminal_host_sort_key_for_app_control(host: &Value) -> String {
     .join(":")
 }
 
+fn terminal_observe_max_blank_rows_below_live_cursor(rows: u64) -> u64 {
+    if rows >= 36 {
+        3
+    } else if rows >= 20 {
+        2
+    } else {
+        1
+    }
+}
+
+fn terminal_observe_prompt_layout_is_acceptable(rows: u64, blank_rows_below_cursor: u64) -> bool {
+    rows == 0 || blank_rows_below_cursor <= terminal_observe_max_blank_rows_below_live_cursor(rows)
+}
+
 fn terminal_prompt_band_for_app_control(host: Option<&Value>) -> Value {
     let Some(host) = host else {
         return Value::Null;
@@ -802,6 +898,28 @@ fn terminal_prompt_band_for_app_control(host: Option<&Value>) -> Value {
         "cursor_row_rect": host.get("cursor_row_rect").cloned().unwrap_or(Value::Null),
         "cursor_sample_rect": host.get("cursor_sample_rect").cloned().unwrap_or(Value::Null),
         "cursor_expected_rect": host.get("cursor_expected_rect").cloned().unwrap_or(Value::Null),
+        "input_line_overlay_rect": host.get("input_line_overlay_rect").cloned().unwrap_or(Value::Null),
+        "input_line_overlay_background": host.get("input_line_overlay_background").cloned().unwrap_or(Value::Null),
+        "input_line_overlay_box_shadow": host.get("input_line_overlay_box_shadow").cloned().unwrap_or(Value::Null),
+        "software_canvas_input_line_overlay_present": host.get("software_canvas_input_line_overlay_present").cloned().unwrap_or(Value::Bool(false)),
+        "software_canvas_input_line_overlay_visible": host.get("software_canvas_input_line_overlay_visible").cloned().unwrap_or(Value::Bool(false)),
+        "software_canvas_cursor_overlay_present": host.get("software_canvas_cursor_overlay_present").cloned().unwrap_or(Value::Bool(false)),
+        "software_canvas_cursor_overlay_visible": host.get("software_canvas_cursor_overlay_visible").cloned().unwrap_or(Value::Bool(false)),
+        "xterm_input_line_decoration_present": host.get("xterm_input_line_decoration_present").cloned().unwrap_or(Value::Bool(false)),
+        "xterm_input_line_decoration_visible": host.get("xterm_input_line_decoration_visible").cloned().unwrap_or(Value::Bool(false)),
+        "xterm_input_line_decoration_line": host.get("xterm_input_line_decoration_line").cloned().unwrap_or(Value::Null),
+        "xterm_input_line_decoration_width": host.get("xterm_input_line_decoration_width").cloned().unwrap_or(Value::Null),
+        "xterm_input_line_decoration_background": host.get("xterm_input_line_decoration_background").cloned().unwrap_or(Value::Null),
+        "xterm_input_line_decoration_error": host.get("xterm_input_line_decoration_error").cloned().unwrap_or(Value::Null),
+        "xterm_input_line_decoration_disposed": host.get("xterm_input_line_decoration_disposed").cloned().unwrap_or(Value::Bool(false)),
+        "xterm_input_line_decoration_marker_line": host.get("xterm_input_line_decoration_marker_line").cloned().unwrap_or(Value::Null),
+        "xterm_input_line_decoration_element_present": host.get("xterm_input_line_decoration_element_present").cloned().unwrap_or(Value::Bool(false)),
+        "xterm_input_line_decoration_element_visible": host.get("xterm_input_line_decoration_element_visible").cloned().unwrap_or(Value::Bool(false)),
+        "xterm_input_line_decoration_element_background": host.get("xterm_input_line_decoration_element_background").cloned().unwrap_or(Value::Null),
+        "xterm_input_line_decoration_element_display": host.get("xterm_input_line_decoration_element_display").cloned().unwrap_or(Value::Null),
+        "xterm_input_line_decoration_element_rect": host.get("xterm_input_line_decoration_element_rect").cloned().unwrap_or(Value::Null),
+        "xterm_input_line_decoration_render_count": host.get("xterm_input_line_decoration_render_count").cloned().unwrap_or(Value::Number(0.into())),
+        "last_raw_payload_sample": host.get("last_raw_payload_sample").cloned().unwrap_or(Value::Null),
         "cursor_bottom_overflow_px": host.get("cursor_bottom_overflow_px").cloned().unwrap_or(Value::Null),
         "fit_overflow_px": host.get("fit_overflow_px").cloned().unwrap_or(Value::Null),
         "fit_required_height_px": host.get("fit_required_height_px").cloned().unwrap_or(Value::Null),
@@ -809,6 +927,18 @@ fn terminal_prompt_band_for_app_control(host: Option<&Value>) -> Value {
         "blank_rows_below_cursor": host.get("blank_rows_below_cursor").cloned().unwrap_or(Value::Null),
         "base_y": host.get("base_y").cloned().unwrap_or(Value::Null),
         "viewport_y": host.get("viewport_y").cloned().unwrap_or(Value::Null),
+        "retained_replay_expected": host.get("retained_replay_expected").cloned().unwrap_or(Value::Bool(false)),
+        "retained_replay_source": host.get("retained_replay_source").cloned().unwrap_or(Value::Null),
+        "retained_replay_prompt_follow_ready": host.get("retained_replay_prompt_follow_ready").cloned().unwrap_or(Value::Null),
+        "retained_replay_unsafe_skip_prompt_ready": host.get("retained_replay_unsafe_skip_prompt_ready").cloned().unwrap_or(Value::Bool(false)),
+        "retained_replay_rejected_visible_text": host.get("retained_replay_rejected_visible_text").cloned().unwrap_or(Value::Null),
+        "last_retained_replay_follow_debug": host.get("last_retained_replay_follow_debug").cloned().unwrap_or(Value::Null),
+        "scrollback_expected": host.get("scrollback_expected").cloned().unwrap_or(Value::Bool(false)),
+        "scrollback_locked": host.get("scrollback_locked").cloned().unwrap_or(Value::Bool(false)),
+        "scrollback_intent": host.get("scrollback_intent").cloned().unwrap_or(Value::String("PromptFollow".to_string())),
+        "last_viewport_force_debug": host.get("last_viewport_force_debug").cloned().unwrap_or(Value::Null),
+        "last_viewport_force_reason": host.get("last_viewport_force_reason").cloned().unwrap_or(Value::Null),
+        "last_viewport_force_at_ms": host.get("last_viewport_force_at_ms").cloned().unwrap_or(Value::Null),
         "low_power_tui_overlay_active": host.get("low_power_tui_overlay_active").cloned().unwrap_or(Value::Bool(false)),
         "low_power_tui_overlay_present": host.get("low_power_tui_overlay_present").cloned().unwrap_or(Value::Bool(false)),
     })
@@ -820,6 +950,8 @@ fn terminal_timing_for_app_control(host: Option<&Value>) -> Value {
     };
     json!({
         "last_data_event_at_ms": host.get("last_data_event_at_ms").cloned().unwrap_or(Value::Null),
+        "protocol_data_event_count": host.get("protocol_data_event_count").cloned().unwrap_or(Value::Null),
+        "ignored_data_event_count": host.get("ignored_data_event_count").cloned().unwrap_or(Value::Null),
         "last_write_queued_at_ms": host.get("last_write_queued_at_ms").cloned().unwrap_or(Value::Null),
         "last_write_flush_started_at_ms": host.get("last_write_flush_started_at_ms").cloned().unwrap_or(Value::Null),
         "last_write_callback_at_ms": host.get("last_write_callback_at_ms").cloned().unwrap_or(Value::Null),
@@ -832,9 +964,11 @@ fn terminal_timing_for_app_control(host: Option<&Value>) -> Value {
         "last_manual_redraw_effect": host.get("last_manual_redraw_effect").cloned().unwrap_or(Value::Null),
         "terminal_write_frame_ms": host.get("terminal_write_frame_ms").cloned().unwrap_or(Value::Null),
         "terminal_active_write_frame_ms": host.get("terminal_active_write_frame_ms").cloned().unwrap_or(Value::Null),
+        "terminal_active_animation_write_frame_ms": host.get("terminal_active_animation_write_frame_ms").cloned().unwrap_or(Value::Null),
         "effective_terminal_write_frame_ms": host.get("effective_terminal_write_frame_ms").cloned().unwrap_or(Value::Null),
         "active_write_frame_budget": host.get("active_write_frame_budget").cloned().unwrap_or(Value::Null),
         "recent_frame_like_write_hot": host.get("recent_frame_like_write_hot").cloned().unwrap_or(Value::Null),
+        "recent_inline_status_animation_hot": host.get("recent_inline_status_animation_hot").cloned().unwrap_or(Value::Null),
         "last_raw_payload_length": host.get("last_raw_payload_length").cloned().unwrap_or(Value::Null),
         "last_raw_payload_line_count": host.get("last_raw_payload_line_count").cloned().unwrap_or(Value::Null),
         "write_command_count": host.get("write_command_count").cloned().unwrap_or(Value::Null),
@@ -887,21 +1021,7 @@ fn terminal_host_render_health_for_app_control(host: &Value) -> Option<Value> {
         }));
     }
 
-    let text = [
-        host.get("text_sample")
-            .and_then(Value::as_str)
-            .unwrap_or(""),
-        host.get("text_tail").and_then(Value::as_str).unwrap_or(""),
-        host.get("buffer_text_sample")
-            .and_then(Value::as_str)
-            .unwrap_or(""),
-        host.get("cursor_line_text")
-            .or_else(|| host.get("cursor_row_text"))
-            .and_then(Value::as_str)
-            .unwrap_or(""),
-    ]
-    .join("\n");
-    let has_buffer_text = text.chars().any(|ch| ch.is_ascii_alphanumeric());
+    let has_buffer_text = terminal_host_has_buffer_text_for_app_control(host);
     let canvas_count = host
         .get("canvas_count")
         .and_then(Value::as_u64)
@@ -923,6 +1043,18 @@ fn terminal_host_render_health_for_app_control(host: &Value) -> Option<Value> {
             "alpha_sum": alpha_sum,
         }));
     }
+    if terminal_host_dom_rows_transparent_with_buffer_text(host) {
+        return Some(json!({
+            "healthy": false,
+            "status": "unhealthy",
+            "reason": "dom_rows_transparent_with_buffer_text",
+            "recovery_scheduled": recovery_scheduled,
+            "recovery_count": recovery_count,
+            "sampled_pixels": sampled_pixels,
+            "nontransparent_pixels": nontransparent_pixels,
+            "alpha_sum": alpha_sum,
+        }));
+    }
     if status == "healthy" {
         return Some(json!({
             "healthy": true,
@@ -936,6 +1068,87 @@ fn terminal_host_render_health_for_app_control(host: &Value) -> Option<Value> {
         }));
     }
     None
+}
+
+fn terminal_host_has_buffer_text_for_app_control(host: &Value) -> bool {
+    [
+        host.get("text_sample")
+            .and_then(Value::as_str)
+            .unwrap_or(""),
+        host.get("text_tail").and_then(Value::as_str).unwrap_or(""),
+        host.get("buffer_text_sample")
+            .and_then(Value::as_str)
+            .unwrap_or(""),
+        host.get("cursor_line_text")
+            .or_else(|| host.get("cursor_row_text"))
+            .and_then(Value::as_str)
+            .unwrap_or(""),
+    ]
+    .join("\n")
+    .chars()
+    .any(|ch| ch.is_ascii_alphanumeric())
+}
+
+fn terminal_host_dom_rows_transparent_with_buffer_text(host: &Value) -> bool {
+    if !terminal_host_has_buffer_text_for_app_control(host) {
+        return false;
+    }
+    if !host
+        .get("rows_present")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        return false;
+    }
+    let canvas_count = host
+        .get("canvas_count")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let renderer_mode = host
+        .get("xterm_renderer_mode")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    if canvas_count > 0 && renderer_mode != "dom" {
+        return false;
+    }
+    let direct_fields = [
+        "rows_text_fill_color",
+        "rows_sample_text_fill_color",
+        "cursor_row_text_fill_color",
+    ];
+    if direct_fields.iter().any(|field| {
+        host.get(*field)
+            .and_then(Value::as_str)
+            .is_some_and(terminal_css_color_is_transparent)
+    }) {
+        return true;
+    }
+    for field in [
+        "visible_row_samples_head",
+        "visible_row_samples_tail",
+        "cursor_row_span_samples",
+    ] {
+        let Some(samples) = host.get(field).and_then(Value::as_array) else {
+            continue;
+        };
+        if samples.iter().any(|sample| {
+            sample
+                .get("text_fill_color")
+                .and_then(Value::as_str)
+                .is_some_and(terminal_css_color_is_transparent)
+        }) {
+            return true;
+        }
+    }
+    false
+}
+
+fn terminal_css_color_is_transparent(value: &str) -> bool {
+    let normalized = value.trim().to_ascii_lowercase().replace(' ', "");
+    matches!(
+        normalized.as_str(),
+        "transparent" | "rgba(0,0,0,0)" | "rgba(0,0,0,0.0)" | "#0000"
+    )
 }
 
 fn terminal_host_canvas_ink_totals(host: &Value) -> (u64, u64, u64) {
@@ -1041,6 +1254,10 @@ fn terminal_host_problem_for_app_control(host: &Value) -> Option<&'static str> {
         .get("helper_textarea_focused")
         .and_then(Value::as_bool)
         .unwrap_or(false);
+    let host_has_active_element = host
+        .get("host_has_active_element")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     let xterm_present = host
         .get("xterm_present")
         .and_then(Value::as_bool)
@@ -1069,12 +1286,18 @@ fn terminal_host_problem_for_app_control(host: &Value) -> Option<&'static str> {
         .get("data_event_count")
         .and_then(Value::as_u64)
         .unwrap_or(0);
+    let protocol_data_event_count = host
+        .get("protocol_data_event_count")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let user_data_event_count = data_event_count.saturating_sub(protocol_data_event_count);
     let blank_rows_below_cursor = host
         .get("blank_rows_below_cursor")
         .and_then(Value::as_u64)
         .unwrap_or(0);
     let rows = host.get("rows").and_then(Value::as_u64).unwrap_or(0);
     let cols = host.get("cols").and_then(Value::as_u64).unwrap_or(0);
+    let cursor_y = host.get("cursor_y").and_then(Value::as_u64).unwrap_or(rows);
     let base_y = host.get("base_y").and_then(Value::as_u64).unwrap_or(0);
     let scrollback_expected = host
         .get("scrollback_expected")
@@ -1088,6 +1311,11 @@ fn terminal_host_problem_for_app_control(host: &Value) -> Option<&'static str> {
         .get("last_raw_payload_length")
         .and_then(Value::as_u64)
         .unwrap_or(0);
+    let last_raw_payload_sample = host
+        .get("last_raw_payload_sample")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or("");
     let last_data_event_at_ms = host
         .get("last_data_event_at_ms")
         .and_then(Value::as_u64)
@@ -1118,6 +1346,14 @@ fn terminal_host_problem_for_app_control(host: &Value) -> Option<&'static str> {
         .and_then(Value::as_str)
         .map(str::trim)
         .unwrap_or("");
+    let retained_replay_prompt_follow_ready = host
+        .get("retained_replay_prompt_follow_ready")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let retained_replay_unsafe_skip_prompt_ready = host
+        .get("retained_replay_unsafe_skip_prompt_ready")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     let xterm_buffer_kind = host
         .get("xterm_buffer_kind")
         .and_then(Value::as_str)
@@ -1136,6 +1372,13 @@ fn terminal_host_problem_for_app_control(host: &Value) -> Option<&'static str> {
         .and_then(Value::as_object)
         .is_some()
         || cursor_node_count > 0;
+    let cursor_geometry_visible = !xterm_cursor_hidden
+        && rows > 0
+        && cursor_y < rows
+        && host
+            .get("cursor_expected_rect")
+            .and_then(Value::as_object)
+            .is_some();
     let mut visible_text_parts = Vec::new();
     for part in [text_sample, text_tail, buffer_text_sample, cursor_line_text] {
         if !part.is_empty() && !visible_text_parts.contains(&part) {
@@ -1144,6 +1387,9 @@ fn terminal_host_problem_for_app_control(host: &Value) -> Option<&'static str> {
     }
     let visible_text = visible_text_parts.join("\n");
     let visible_text = visible_text.as_str();
+    if terminal_host_dom_rows_transparent_with_buffer_text(host) {
+        return Some("dom_rows_transparent_with_buffer_text");
+    }
     let codex_interactive_setup_prompt =
         terminal_chunk_is_codex_interactive_setup_prompt(visible_text);
     let codex_prompt_surface = terminal_chunk_is_codex_prompt_surface(visible_text);
@@ -1164,8 +1410,82 @@ fn terminal_host_problem_for_app_control(host: &Value) -> Option<&'static str> {
         && !terminal_chunk_is_loading_placeholder(visible_text)
         && !terminal_chunk_is_transcript_browser(visible_text)
         && !terminal_chunk_is_generic_codex_idle(visible_text);
+    let live_remote_codex_retained_prompt_surface = session_path.starts_with("remote-session://")
+        && !codex_prompt_surface
+        && terminal_chunk_has_codex_prompt_output(visible_text)
+        && terminal_chunk_has_meaningful_output(visible_text)
+        && mounted_entry_host_connected
+        && remote_codex_prompt_has_real_output
+        && terminal_observe_prompt_layout_is_acceptable(rows, blank_rows_below_cursor)
+        && (xterm_present || screen_present || rows_present || canvas_count > 0)
+        && !terminal_chunk_is_transport_error(visible_text)
+        && !terminal_chunk_is_loading_placeholder(visible_text)
+        && !terminal_chunk_is_transcript_browser(visible_text)
+        && !terminal_chunk_is_generic_codex_idle(visible_text);
+    let retained_replay_from_pty = matches!(
+        terminal_content_source,
+        "active_recovery_pty_snapshot" | "daemon_pty" | "daemon_terminal_read"
+    ) || matches!(
+        retained_replay_source,
+        "active_recovery_pty_snapshot" | "daemon_retained_snapshot" | "daemon_terminal_read"
+    );
+    let live_remote_daemon_pty_current_output_surface = session_path
+        .starts_with("remote-session://")
+        && terminal_content_source == "daemon_pty"
+        && mounted_entry_host_connected
+        && remote_codex_prompt_has_real_output
+        && terminal_chunk_has_meaningful_output(visible_text)
+        && (xterm_present || screen_present || rows_present || canvas_count > 0)
+        && !terminal_chunk_is_transport_error(visible_text)
+        && !terminal_chunk_is_loading_placeholder(visible_text)
+        && !terminal_chunk_is_transcript_browser(visible_text)
+        && !terminal_chunk_is_generic_codex_idle(visible_text)
+        && !terminal_chunk_is_saved_transcript_prefill(visible_text)
+        && !terminal_chunk_is_low_signal_terminal_noise(visible_text);
+    let last_raw_payload_is_control_only = last_raw_payload_length > 0
+        && last_raw_payload_line_count == 0
+        && terminal_chunk_printable_signal_count(last_raw_payload_sample) < 3;
+    let live_remote_current_frame_has_prompt_signal =
+        !cursor_line_text.is_empty() || !last_raw_payload_is_control_only;
+    let live_remote_retained_pty_prompt_follow_surface = session_path
+        .starts_with("remote-session://")
+        && retained_replay_prompt_follow_ready
+        && retained_replay_from_pty
+        && mounted_entry_host_connected
+        && remote_codex_prompt_has_real_output
+        && terminal_chunk_has_meaningful_output(visible_text)
+        && (terminal_chunk_has_prompt_output(visible_text)
+            || terminal_chunk_has_codex_prompt_output(visible_text))
+        && (xterm_present || screen_present || rows_present || canvas_count > 0)
+        && !terminal_chunk_is_transport_error(visible_text)
+        && !terminal_chunk_is_loading_placeholder(visible_text)
+        && !terminal_chunk_is_transcript_browser(visible_text)
+        && !terminal_chunk_is_generic_codex_idle(visible_text);
+    let live_remote_daemon_pty_scrollback_prompt_surface = session_path
+        .starts_with("remote-session://")
+        && retained_replay_from_pty
+        && mounted_entry_host_connected
+        && remote_codex_prompt_has_real_output
+        && (base_y > 0 || last_raw_payload_line_count > rows.saturating_add(4))
+        && terminal_observe_prompt_layout_is_acceptable(
+            rows,
+            blank_rows_below_cursor.saturating_sub(2),
+        )
+        && terminal_chunk_has_meaningful_output(visible_text)
+        && terminal_chunk_has_codex_prompt_output(visible_text)
+        && (cursor_sample_visible || cursor_geometry_visible)
+        && live_remote_current_frame_has_prompt_signal
+        && (xterm_present || screen_present || rows_present || canvas_count > 0)
+        && !terminal_chunk_is_transport_error(visible_text)
+        && !terminal_chunk_is_loading_placeholder(visible_text)
+        && !terminal_chunk_is_transcript_browser(visible_text)
+        && !terminal_chunk_is_generic_codex_idle(visible_text);
     let live_remote_codex_prompt_surface = session_path.starts_with("remote-session://")
-        && (codex_prompt_surface || live_remote_codex_prompt_only_surface)
+        && (codex_prompt_surface
+            || live_remote_codex_prompt_only_surface
+            || live_remote_codex_retained_prompt_surface
+            || live_remote_retained_pty_prompt_follow_surface
+            || live_remote_daemon_pty_scrollback_prompt_surface)
         && mounted_entry_host_connected
         && (xterm_present || screen_present || rows_present || canvas_count > 0);
     let live_remote_codex_interrupted_input_surface = session_path.starts_with("remote-session://")
@@ -1174,6 +1494,13 @@ fn terminal_host_problem_for_app_control(host: &Value) -> Option<&'static str> {
         && input_enabled
         && (helper_textarea_focused || cursor_sample_visible)
         && (xterm_present || screen_present || rows_present || canvas_count > 0);
+    let local_codex_welcome_with_active_cursor_surface = session_path.starts_with("local://")
+        && terminal_chunk_is_generic_codex_idle(visible_text)
+        && mounted_entry_host_connected
+        && input_enabled
+        && (helper_textarea_focused || host_has_active_element || cursor_sample_visible)
+        && (xterm_present || screen_present || rows_present || canvas_count > 0)
+        && (last_raw_payload_length > 0 || write_command_count > 0);
     let transcript_browser_surface = terminal_chunk_is_transcript_browser(visible_text);
     let last_stream_output_after_input_ms = last_write_queued_at_ms
         .max(last_write_flush_started_at_ms)
@@ -1183,6 +1510,7 @@ fn terminal_host_problem_for_app_control(host: &Value) -> Option<&'static str> {
         && input_enabled
         && helper_textarea_focused
         && mounted_entry_host_connected
+        && user_data_event_count > 0
         && last_stream_output_after_input_ms > 0
         && last_data_event_at_ms > last_stream_output_after_input_ms.saturating_add(250)
         && last_data_event_at_ms > 0
@@ -1190,6 +1518,16 @@ fn terminal_host_problem_for_app_control(host: &Value) -> Option<&'static str> {
             || terminal_chunk_is_codex_prompt_surface(visible_text)
             || codex_interrupted_input_surface)
         && (xterm_present || screen_present || rows_present || canvas_count > 0);
+    let remote_codex_sparse_prompt_missing_welcome = session_path.starts_with("remote-session://")
+        && terminal_chunk_has_codex_prompt_output(visible_text)
+        && !codex_prompt_surface
+        && !codex_interactive_setup_prompt
+        && rows >= 24
+        && blank_rows_below_cursor > rows / 2
+        && !terminal_chunk_is_transport_error(visible_text)
+        && !terminal_chunk_is_loading_placeholder(visible_text)
+        && !terminal_chunk_is_transcript_browser(visible_text)
+        && !terminal_chunk_is_generic_codex_idle(visible_text);
     let visible_text_prompt = terminal_chunk_has_prompt_output(visible_text)
         || terminal_chunk_has_codex_prompt_output(visible_text);
     let prompt_visible = terminal_chunk_has_prompt_output(text_sample)
@@ -1202,12 +1540,21 @@ fn terminal_host_problem_for_app_control(host: &Value) -> Option<&'static str> {
                 || terminal_chunk_has_codex_prompt_output(cursor_line_text)));
     let local_prompt_surface = session_path.starts_with("local://") && prompt_visible;
     let prompt_ready_surface = live_remote_codex_interrupted_input_surface
+        || local_codex_welcome_with_active_cursor_surface
         || (prompt_visible
             && (input_enabled
                 || helper_textarea_focused
                 || cursor_sample_visible
                 || local_prompt_surface
                 || live_remote_codex_prompt_surface));
+    let prompt_ready_retained_unsafe_skip = retained_replay_unsafe_skip_prompt_ready
+        && retained_replay_prompt_follow_ready
+        && prompt_ready_surface
+        && !cursor_line_text.is_empty()
+        && terminal_chunk_has_codex_prompt_output(visible_text)
+        && !terminal_chunk_is_transport_error(visible_text)
+        && !terminal_chunk_is_loading_placeholder(visible_text)
+        && !terminal_chunk_is_transcript_browser(visible_text);
     let transcript_browser_ready_surface = false;
     if !cursor_line_text.is_empty() && terminal_chunk_is_transport_error(cursor_line_text) {
         return Some("active terminal host is showing transport/error output");
@@ -1237,6 +1584,11 @@ fn terminal_host_problem_for_app_control(host: &Value) -> Option<&'static str> {
     if terminal_chunk_is_loading_placeholder(visible_text) {
         return Some("active terminal host is still showing resume placeholder content");
     }
+    if session_path.starts_with("remote-session://")
+        && terminal_chunk_is_codex_resume_instruction(visible_text)
+    {
+        return Some("active remote Codex runtime has exited and is showing a resume instruction");
+    }
     if terminal_chunk_is_local_codex_scaffold(visible_text) {
         return Some("active terminal host is still showing local Codex scaffold content");
     }
@@ -1249,6 +1601,38 @@ fn terminal_host_problem_for_app_control(host: &Value) -> Option<&'static str> {
     {
         return Some("active terminal host is still showing generic Codex idle footer");
     }
+    if session_path.starts_with("remote-session://")
+        && input_enabled
+        && retained_replay_from_pty
+        && (base_y > 0
+            || scrollback_expected
+            || terminal_chunk_has_codex_prompt_output(visible_text))
+        && terminal_chunk_has_meaningful_output(visible_text)
+        && terminal_chunk_has_codex_prompt_output(visible_text)
+        && cursor_line_text.is_empty()
+        && last_raw_payload_is_control_only
+        && !terminal_chunk_is_transport_error(visible_text)
+        && !terminal_chunk_is_loading_placeholder(visible_text)
+        && !terminal_chunk_is_transcript_browser(visible_text)
+        && !terminal_chunk_is_generic_codex_idle(visible_text)
+    {
+        return Some(
+            "active remote Codex prompt surface has stale scrollback but no current prompt",
+        );
+    }
+    if session_path.starts_with("remote-session://")
+        && retained_replay_from_pty
+        && terminal_chunk_has_meaningful_output(visible_text)
+        && terminal_chunk_has_codex_prompt_output(visible_text)
+        && cursor_line_text.is_empty()
+        && !terminal_chunk_has_current_codex_input_row(visible_text)
+        && !terminal_chunk_is_transport_error(visible_text)
+        && !terminal_chunk_is_loading_placeholder(visible_text)
+        && !terminal_chunk_is_transcript_browser(visible_text)
+        && !terminal_chunk_is_generic_codex_idle(visible_text)
+    {
+        return Some("active remote Codex prompt surface has no current input row");
+    }
     if (terminal_chunk_has_prompt_output(visible_text)
         || terminal_chunk_has_codex_prompt_output(visible_text))
         && !prompt_ready_surface
@@ -1256,12 +1640,8 @@ fn terminal_host_problem_for_app_control(host: &Value) -> Option<&'static str> {
         return Some("active terminal host is only showing a plain shell prompt");
     }
     if session_path.starts_with("remote-session://")
-        && terminal_chunk_has_codex_prompt_output(visible_text)
-        && !codex_prompt_surface
-        && !live_remote_codex_prompt_only_surface
-        && !codex_interactive_setup_prompt
-        && rows >= 24
-        && blank_rows_below_cursor > rows / 2
+        && remote_codex_sparse_prompt_missing_welcome
+        && !accepted_input_without_following_stream_echo
     {
         return Some("active remote Codex prompt surface is missing the welcome frame");
     }
@@ -1296,6 +1676,7 @@ fn terminal_host_problem_for_app_control(host: &Value) -> Option<&'static str> {
         && (last_raw_payload_length > 0 || write_command_count > 0)
         && !prompt_ready_surface
         && !transcript_browser_ready_surface
+        && !live_remote_daemon_pty_current_output_surface
     {
         return Some(
             "active remote terminal is showing stale retained text before prompt-ready surface",
@@ -1304,6 +1685,7 @@ fn terminal_host_problem_for_app_control(host: &Value) -> Option<&'static str> {
     if session_path.starts_with("remote-session://")
         && input_enabled
         && scrollback_expected
+        && !prompt_ready_retained_unsafe_skip
         && rows >= 8
         && cols >= 20
         && base_y == 0
@@ -1314,6 +1696,7 @@ fn terminal_host_problem_for_app_control(host: &Value) -> Option<&'static str> {
     if session_path.starts_with("remote-session://")
         && input_enabled
         && last_raw_payload_line_count > rows.saturating_add(4)
+        && !prompt_ready_retained_unsafe_skip
         && rows >= 8
         && cols >= 20
         && base_y == 0
@@ -1323,8 +1706,10 @@ fn terminal_host_problem_for_app_control(host: &Value) -> Option<&'static str> {
     }
     if session_path.starts_with("remote-session://")
         && input_enabled
+        && (helper_textarea_focused || host_has_active_element)
         && !prompt_ready_surface
         && !transcript_browser_ready_surface
+        && !live_remote_daemon_pty_current_output_surface
     {
         return Some("active remote terminal is input-enabled without a prompt-ready surface");
     }
@@ -1651,6 +2036,7 @@ pub(crate) fn terminal_chunk_has_meaningful_output(data: &str) -> bool {
         || terminal_chunk_is_transcript_browser(data)
         || terminal_chunk_is_loading_placeholder(data)
         || terminal_chunk_is_local_codex_scaffold(data)
+        || terminal_chunk_is_codex_resume_instruction(data)
     {
         return false;
     }
@@ -1680,6 +2066,17 @@ pub(crate) fn terminal_chunk_has_meaningful_output(data: &str) -> bool {
         .filter(|ch| *ch == '\n' || *ch == '\r')
         .count();
     printable >= 80 || newline_count >= 6 || normalized_lines.len() >= 4
+}
+
+pub(crate) fn terminal_chunk_is_codex_resume_instruction(data: &str) -> bool {
+    let stripped = strip_terminal_control_sequences(data);
+    let normalized = stripped
+        .to_ascii_lowercase()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    normalized.contains("to continue this session, run codex resume")
+        || normalized.contains("run codex resume ")
 }
 
 pub(crate) fn terminal_chunk_is_local_codex_scaffold(data: &str) -> bool {
@@ -1788,6 +2185,33 @@ pub(crate) fn terminal_chunk_has_prompt_output(data: &str) -> bool {
         && normalized_lines.iter().any(|line| {
             line.ends_with('$') || line.ends_with('#') || line.ends_with('>') || line.ends_with('%')
         })
+}
+
+pub(crate) fn terminal_chunk_has_current_codex_input_row(data: &str) -> bool {
+    let stripped = strip_terminal_control_sequences(data);
+    let lines = stripped
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(|line| {
+            line.trim_matches(|ch: char| matches!(ch, '╭' | '╮' | '╰' | '╯' | '─' | '│' | ' '))
+        })
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>();
+    let Some(prompt_index) = lines.iter().rposition(|line| line.starts_with('›')) else {
+        return false;
+    };
+    if lines.len().saturating_sub(prompt_index) > 5 {
+        return false;
+    }
+    lines[prompt_index + 1..].iter().all(|line| {
+        let lower = line.to_ascii_lowercase();
+        lower.contains("gpt-")
+            || lower.contains("claude")
+            || lower.starts_with("tab to ")
+            || lower.starts_with("ctrl")
+            || lower.starts_with("esc")
+    })
 }
 
 pub(crate) fn terminal_chunk_has_codex_prompt_output(data: &str) -> bool {
@@ -2037,17 +2461,42 @@ pub(crate) fn terminal_chunk_is_low_signal_terminal_noise(data: &str) -> bool {
 
 pub(crate) fn terminal_chunk_is_transport_error(data: &str) -> bool {
     let stripped = strip_terminal_control_sequences(data);
-    let lines = stripped
+    let all_lines = stripped
         .lines()
         .map(str::trim)
         .filter(|line| !line.is_empty())
-        .take(4)
         .map(str::to_ascii_lowercase)
         .collect::<Vec<_>>();
-    if lines.is_empty() {
+    if all_lines.is_empty() {
         return false;
     }
+    if all_lines
+        .iter()
+        .any(|line| terminal_line_is_internal_transport_error(line))
+    {
+        return true;
+    }
+    let all_text = all_lines.join(" ");
+    let compact_all_text = all_text.split_whitespace().collect::<String>();
+    if (all_text.contains("error: connecting to ")
+        && all_text.contains("server-")
+        && all_text.contains(".sock"))
+        || (compact_all_text.contains("error:connectingto")
+            && compact_all_text.contains("server-")
+            && compact_all_text.contains(".sock"))
+    {
+        return true;
+    }
+    let lines = all_lines.iter().take(4).cloned().collect::<Vec<_>>();
     let head = lines.join(" ");
+    let compact_head = head.split_whitespace().collect::<String>();
+    if head.contains("error: connecting to ") && head.contains("server-") && head.contains(".sock")
+        || (compact_head.contains("error:connectingto")
+            && compact_head.contains("server-")
+            && compact_head.contains(".sock"))
+    {
+        return true;
+    }
     if [
         "[yggterm] terminal reader stopped",
         "error: reading /tmp/yggterm-screen",
@@ -2056,7 +2505,6 @@ pub(crate) fn terminal_chunk_is_transport_error(data: &str) -> bool {
         "controlsocket",
         "exec: export: not found",
         "exec: __yggterm_initial_tty_size",
-        "terminal session not found",
         "[screen is terminating]",
         "saved codex session",
         "cannot be restored as a live terminal",
@@ -2069,7 +2517,10 @@ pub(crate) fn terminal_chunk_is_transport_error(data: &str) -> bool {
     lines.iter().any(|line| {
         let line = line.trim();
         (line.starts_with("shared connection to ")
-            && (line.contains(" closed") || line.contains("refused") || line.contains("timed out")))
+            && (line.contains(" closed")
+                || line.contains("refused")
+                || line.contains("timed out")
+                || looks_like_incomplete_shared_connection_notice(line)))
             || (line.starts_with("connection to ")
                 && (line.contains(" closed")
                     || line.contains("refused")
@@ -2085,11 +2536,45 @@ pub(crate) fn terminal_chunk_is_transport_error(data: &str) -> bool {
                 || line.starts_with("fatal:")
                 || line.starts_with("rsync:"))
                 && (line.contains("permission denied")
+                    || (line.contains("connecting to ")
+                        && line.contains("server-")
+                        && line.contains(".sock"))
                     || line.contains("connection refused")
                     || line.contains("no route to host")
                     || line.contains("connection timed out")
                     || line.contains("broken pipe")))
     })
+}
+
+fn looks_like_incomplete_shared_connection_notice(line: &str) -> bool {
+    line.starts_with("shared connection to ")
+        && !line.contains(" closed")
+        && !line.contains(" refused")
+        && !line.contains(" timed out")
+}
+
+pub(crate) fn terminal_line_is_internal_transport_error(line: &str) -> bool {
+    let stripped = strip_terminal_control_sequences(line);
+    let normalized = stripped
+        .trim()
+        .trim_start_matches(|ch: char| matches!(ch, '›' | '>' | ' ' | '\t'))
+        .trim()
+        .to_ascii_lowercase();
+    normalized.starts_with("error: terminal session not found: local://")
+        || normalized.starts_with("terminal session not found: local://")
+        || normalized.starts_with("error: terminal session not found: remote-session://")
+        || normalized.starts_with("terminal session not found: remote-session://")
+        || normalized.starts_with("error: terminal session not found: codex-runtime://")
+        || normalized.starts_with("terminal session not found: codex-runtime://")
+        || normalized.starts_with("error: hot update failed before bridging stale remote runtime")
+        || normalized.starts_with("hot update failed before bridging stale remote runtime")
+        || normalized.contains("hot update failed before bridging stale remote runtime")
+        || normalized.starts_with("warn ignoring stale yggterm daemon for current app version")
+        || normalized.contains("warn ignoring stale yggterm daemon for current app version")
+        || normalized == "reading daemon response"
+        || normalized.contains("error: terminal session not found: local://")
+        || normalized.contains("error: terminal session not found: remote-session://")
+        || normalized.contains("error: terminal session not found: codex-runtime://")
 }
 
 pub(crate) fn terminal_tail_excerpt(data: &str, max_chars: usize) -> String {
@@ -2103,6 +2588,23 @@ pub(crate) fn terminal_tail_excerpt(data: &str, max_chars: usize) -> String {
 }
 
 pub(crate) fn strip_terminal_control_sequences(data: &str) -> String {
+    let normalized_data = if data.contains("\\x1b")
+        || data.contains("\\u001b")
+        || data.contains("\\u{1b}")
+        || data.contains("\\x07")
+        || data.contains("\\u0007")
+    {
+        Some(
+            data.replace("\\x1b", "\u{1b}")
+                .replace("\\u001b", "\u{1b}")
+                .replace("\\u{1b}", "\u{1b}")
+                .replace("\\x07", "\u{7}")
+                .replace("\\u0007", "\u{7}"),
+        )
+    } else {
+        None
+    };
+    let data = normalized_data.as_deref().unwrap_or(data);
     let chars = data.chars().collect::<Vec<_>>();
     let mut out = String::with_capacity(data.len());
     let mut ix = 0usize;
@@ -2147,14 +2649,23 @@ pub(crate) fn strip_terminal_control_sequences(data: &str) -> String {
     out
 }
 
+fn terminal_chunk_printable_signal_count(data: &str) -> usize {
+    strip_terminal_control_sequences(data)
+        .chars()
+        .filter(|ch| !ch.is_control() && !ch.is_whitespace())
+        .take(3)
+        .count()
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         WorkspaceViewMode, describe_viewport_snapshot, summarize_terminal_surface_for_app_control,
         terminal_bootstrap_activation_epoch, terminal_chunk_has_codex_prompt_output,
-        terminal_chunk_has_meaningful_output, terminal_chunk_is_codex_interactive_setup_prompt,
-        terminal_chunk_is_codex_prompt_surface, terminal_chunk_is_local_codex_scaffold,
-        terminal_chunk_is_transport_error, terminal_host_problem_for_app_control,
+        terminal_chunk_has_current_codex_input_row, terminal_chunk_has_meaningful_output,
+        terminal_chunk_is_codex_interactive_setup_prompt, terminal_chunk_is_codex_prompt_surface,
+        terminal_chunk_is_local_codex_scaffold, terminal_chunk_is_transport_error,
+        terminal_host_problem_for_app_control,
     };
     use serde_json::{Value, json};
 
@@ -2176,6 +2687,79 @@ mod tests {
             "helper_textarea_rect": {"left": 0.0, "top": 0.0, "width": 1.0, "height": 1.0}
         });
         assert_eq!(terminal_host_problem_for_app_control(&host), None);
+    }
+
+    #[test]
+    fn terminal_chunk_marks_hot_update_bridge_failure_as_transport_error() {
+        let data = "Error: hot update failed before bridging stale remote runtime codex-runtime://019dfde8 from 2.2.49 pid 1629132\r\n\r\nCaused by:\r\n    reading daemon response\r\n    Resource temporarily unavailable (os error 11)\r\n";
+
+        assert!(terminal_chunk_is_transport_error(data));
+        assert_eq!(
+            terminal_host_problem_for_app_control(&json!({
+                "session_path": "remote-session://dev/019dfde8",
+                "text_sample": data,
+                "xterm_present": true,
+                "screen_present": true,
+                "rows_present": true,
+                "canvas_count": 1,
+                "terminal_content_source": "daemon_pty"
+            })),
+            Some("active terminal host is showing transport/error output")
+        );
+    }
+
+    #[test]
+    fn terminal_chunk_marks_stale_daemon_warning_as_transport_error() {
+        let data = "\x1b[33m WARN\x1b[0m ignoring stale yggterm daemon for current app version \x1b[3mstage\x1b[0m=\"initial_status\" \x1b[3mcurrent_version\x1b[0m=\"2.2.52\" \x1b[3mstale_version\x1b[0m=\"2.2.51\"\r\n";
+
+        assert!(terminal_chunk_is_transport_error(data));
+        assert_eq!(
+            terminal_host_problem_for_app_control(&json!({
+                "session_path": "remote-session://dev/019dbdcf",
+                "cursor_line_text": data,
+                "xterm_present": true,
+                "screen_present": true,
+                "rows_present": true,
+                "canvas_count": 1,
+                "terminal_content_source": "daemon_pty"
+            })),
+            Some("active terminal host is showing transport/error output")
+        );
+    }
+
+    #[test]
+    fn terminal_chunk_marks_stale_yggterm_socket_connect_error_as_transport_error() {
+        let data = "╭─────────────────────────────────────────────╮\n\
+                                               │ >_ OpenAI Codex (v0.130.0)                  │\n\
+                               │ model:     gpt-5.5 xhigh   /model to change │\n\
+                                                                              │ directory: ~/git/samplenotes         \n\
+               ╰─────────────────────────────────────────────╯\n\
+                                                              Error: connecting to /home/pi/.yggterm/server-2-\n\
+1-10.sock\n\n\
+Caused by:\n\
+    No such file or directory (os error 2)";
+
+        assert!(terminal_chunk_is_transport_error(data));
+        assert_eq!(
+            terminal_host_problem_for_app_control(&json!({
+                "session_path": "remote-session://dev/019dbdcf",
+                "text_sample": data,
+                "text_tail": data,
+                "buffer_text_sample": data,
+                "xterm_present": true,
+                "screen_present": true,
+                "rows_present": false,
+                "canvas_count": 4,
+                "terminal_content_source": "daemon_pty",
+                "mounted_entry_host_connected": true,
+                "last_raw_payload_length": 117,
+                "write_command_count": 2,
+                "rows": 50,
+                "blank_rows_below_cursor": 35,
+                "xterm_buffer_kind": "normal"
+            })),
+            Some("active terminal host is showing transport/error output")
+        );
     }
 
     #[test]
@@ -2224,6 +2808,37 @@ mod tests {
             terminal_host_problem_for_app_control(&host),
             Some("active terminal host is still showing generic Codex idle chrome")
         );
+    }
+
+    #[test]
+    fn terminal_host_problem_accepts_local_codex_blank_prompt_with_active_cursor() {
+        let text = "╭─────────────────────────────────────────────╮\n│ >_ OpenAI Codex (v0.128.0)                  │\n│                                             │\n│ model:     gpt-5.5 xhigh   /model to change │\n│ directory: ~                                │\n╰─────────────────────────────────────────────╯";
+        let host = json!({
+            "session_path": "local://blank-prompt-codex",
+            "text_sample": text,
+            "text_tail": text,
+            "buffer_text_sample": text,
+            "cursor_line_text": "",
+            "input_enabled": true,
+            "helper_textarea_focused": true,
+            "host_has_active_element": true,
+            "xterm_present": true,
+            "screen_present": true,
+            "canvas_count": 4,
+            "mounted_entry_host_connected": true,
+            "last_raw_payload_length": 181,
+            "write_command_count": 9,
+            "rows": 48,
+            "blank_rows_below_cursor": 37,
+            "host_rect": {"left": 0.0, "top": 0.0, "width": 840.0, "height": 830.0},
+            "host_content_width": 840.0,
+            "host_content_height": 830.0,
+            "screen_rect": {"width": 840.0, "height": 830.0},
+            "viewport_rect": {"width": 840.0, "height": 830.0},
+            "helpers_rect": {"width": 840.0, "height": 830.0},
+            "helper_textarea_rect": {"left": -10000.0, "top": 296.0, "width": 1.0, "height": 1.0}
+        });
+        assert_eq!(terminal_host_problem_for_app_control(&host), None);
     }
 
     #[test]
@@ -2288,8 +2903,8 @@ mod tests {
             "text_tail": text_tail,
             "buffer_text_sample": text_tail,
             "cursor_line_text": "› Explain this codebase",
-            "input_enabled": false,
-            "helper_textarea_focused": false,
+            "input_enabled": true,
+            "helper_textarea_focused": true,
             "xterm_present": true,
             "screen_present": true,
             "rows_present": false,
@@ -2350,7 +2965,7 @@ mod tests {
     }
 
     #[test]
-    fn terminal_host_problem_accepts_remote_codex_prompt_only_surface_with_real_output() {
+    fn terminal_host_problem_rejects_remote_codex_prompt_only_surface_with_real_output() {
         let text_tail = "⚠ Heads up, you have less than 25% of your weekly limit left. Run /status for a breakdown.\n\n\n› Write tests for @filename\n\n  gpt-5.5 xhigh · ~";
         let host = json!({
             "session_path": "remote-session://dev/prompt-only-codex",
@@ -2382,7 +2997,307 @@ mod tests {
             "helpers_rect": {"width": 840.0, "height": 830.0},
             "helper_textarea_rect": {"left": -10000.0, "top": 68.0, "width": 1.0, "height": 1.0}
         });
+        assert_eq!(
+            terminal_host_problem_for_app_control(&host),
+            Some("active remote Codex prompt surface is missing the welcome frame")
+        );
+    }
+
+    #[test]
+    fn terminal_host_problem_rejects_jojo_sparse_prompt_after_update() {
+        let text_tail = "› say hi\n\n\n•\n\n\n\n\n\n\n\n\n \n› Use /skills to list available skills\n \n  gpt-5.5 xhigh · ~/gh/yggterm";
+        let host = json!({
+            "session_path": "remote-session://dev/019dfc5a-f5ca-7793-a44f-ee7f423aed38",
+            "text_sample": text_tail,
+            "text_tail": text_tail,
+            "buffer_text_sample": text_tail,
+            "cursor_line_text": "› Use /skills to list available skills",
+            "input_enabled": true,
+            "helper_textarea_focused": true,
+            "xterm_present": true,
+            "screen_present": true,
+            "rows_present": false,
+            "canvas_count": 4,
+            "render_event_count": 30,
+            "data_event_count": 2,
+            "last_raw_payload_length": 491,
+            "write_command_count": 9,
+            "xterm_buffer_kind": "normal",
+            "xterm_cursor_hidden": false,
+            "mounted_entry_host_connected": true,
+            "blank_rows_below_cursor": 46,
+            "rows": 63,
+            "host_rect": {"left": 0.0, "top": 0.0, "width": 1336.0, "height": 1134.0},
+            "host_content_width": 1336.0,
+            "host_content_height": 1134.0,
+            "screen_rect": {"width": 1336.0, "height": 1134.0},
+            "viewport_rect": {"width": 1336.0, "height": 1134.0},
+            "helpers_rect": {"width": 1336.0, "height": 1134.0},
+            "helper_textarea_rect": {"left": -10000.0, "top": 296.0, "width": 1.0, "height": 1.0}
+        });
+        assert_eq!(
+            terminal_host_problem_for_app_control(&host),
+            Some("active remote Codex prompt surface is missing the welcome frame")
+        );
+    }
+
+    #[test]
+    fn terminal_host_problem_accepts_retained_remote_codex_prompt_with_real_scrollback_when_unfocused()
+     {
+        let text_tail = "Fixes Applied\n\n- Updated app_control.rs to capture resource baselines.\n- Added smoke coverage for remote startup.\n\nVerification\n\n- cargo test passed.\n- jojo screenshot showed a readable terminal.\n\n› Use /skills to list available skills\n\n  gpt-5.5 xhigh · ~/gh/yggterm";
+        let host = json!({
+            "session_path": "remote-session://dev/retained-ready",
+            "text_sample": text_tail,
+            "text_tail": text_tail,
+            "buffer_text_sample": text_tail,
+            "cursor_line_text": "› Use /skills to list available skills",
+            "input_enabled": true,
+            "helper_textarea_focused": true,
+            "xterm_present": true,
+            "screen_present": true,
+            "rows_present": false,
+            "canvas_count": 4,
+            "render_event_count": 33,
+            "data_event_count": 0,
+            "last_raw_payload_length": 193514,
+            "write_command_count": 8,
+            "terminal_content_source": "daemon_pty",
+            "retained_replay_source": "daemon_retained_snapshot",
+            "xterm_buffer_kind": "normal",
+            "xterm_cursor_hidden": false,
+            "mounted_entry_host_connected": true,
+            "blank_rows_below_cursor": 2,
+            "rows": 50,
+            "host_rect": {"left": 0.0, "top": 0.0, "width": 880.0, "height": 900.0},
+            "host_content_width": 880.0,
+            "host_content_height": 900.0,
+            "screen_rect": {"width": 880.0, "height": 900.0},
+            "viewport_rect": {"width": 880.0, "height": 900.0},
+            "helpers_rect": {"width": 880.0, "height": 900.0},
+            "helper_textarea_rect": {"left": -10000.0, "top": 8.0, "width": 1.0, "height": 1.0}
+        });
         assert_eq!(terminal_host_problem_for_app_control(&host), None);
+    }
+
+    #[test]
+    fn terminal_host_problem_accepts_hot_update_retained_pty_prompt_follow_surface_with_current_input_row()
+     {
+        let text_tail = "Status as of 2026-05-08 11:53 IST:\n\n- PL9 batch is still alive.\n- Current action: generating PH2.\n\nProgress:\n\n- Charts reached: up to 0307.\n\n› /status\n\n  gpt-5.5 xhigh · ~/gh/yggterm";
+        let host = json!({
+            "session_path": "remote-session://dev/hot-update-kept",
+            "text_sample": text_tail,
+            "text_tail": text_tail,
+            "buffer_text_sample": text_tail,
+            "cursor_line_text": "",
+            "input_enabled": false,
+            "helper_textarea_focused": false,
+            "xterm_present": true,
+            "screen_present": true,
+            "rows_present": false,
+            "canvas_count": 4,
+            "render_event_count": 86,
+            "data_event_count": 0,
+            "last_raw_payload_length": 185570,
+            "write_command_count": 1,
+            "terminal_content_source": "active_recovery_pty_snapshot",
+            "retained_replay_source": "active_recovery_pty_snapshot",
+            "retained_replay_prompt_follow_ready": true,
+            "xterm_buffer_kind": "normal",
+            "xterm_cursor_hidden": false,
+            "mounted_entry_host_connected": true,
+            "blank_rows_below_cursor": 5,
+            "rows": 50,
+            "host_rect": {"left": 0.0, "top": 0.0, "width": 880.0, "height": 900.0},
+            "host_content_width": 880.0,
+            "host_content_height": 900.0,
+            "screen_rect": {"width": 880.0, "height": 900.0},
+            "viewport_rect": {"width": 880.0, "height": 900.0},
+            "helpers_rect": {"width": 880.0, "height": 900.0},
+            "helper_textarea_rect": {"left": -10000.0, "top": 8.0, "width": 1.0, "height": 1.0}
+        });
+        assert_eq!(terminal_host_problem_for_app_control(&host), None);
+    }
+
+    #[test]
+    fn terminal_host_problem_rejects_daemon_pty_scrollback_prompt_with_blank_current_frame() {
+        let text_tail = "Status as of 2026-05-08 11:53 IST:\n\n- PL9 batch is still alive.\n- Current action: generating PH2.\n\nProgress:\n\n- Charts reached: up to 0307.\n\n› 2\n\n• I’m not sure what 2 refers to. If you mean status again, say so and I’ll check the live batch state.";
+        let host = json!({
+            "session_path": "remote-session://dev/hot-update-daemon-pty",
+            "text_sample": text_tail,
+            "text_tail": text_tail,
+            "buffer_text_sample": text_tail,
+            "cursor_line_text": "",
+            "cursor_y": 44,
+            "cursor_expected_rect": {"left": 1005.0, "top": 800.0, "width": 8.0, "height": 18.0},
+            "input_enabled": true,
+            "helper_textarea_focused": true,
+            "xterm_present": true,
+            "screen_present": true,
+            "rows_present": false,
+            "canvas_count": 4,
+            "render_event_count": 63,
+            "data_event_count": 0,
+            "last_raw_payload_length": 178,
+            "last_raw_payload_line_count": 0,
+            "last_raw_payload_sample": "\u{1b}[?2026h\u{1b}[46;2H\u{1b}[0m\u{1b}[49m\u{1b}[K\u{1b}[47;2H\u{1b}[0m\u{1b}[48;2;57;57;57m\u{1b}[K\u{1b}[48;22H\u{1b}[0m\u{1b}[48;2;57;57;57m\u{1b}[K\u{1b}[49;2H\u{1b}[0m\u{1b}[48;2;57;57;57m\u{1b}[K\u{1b}[50;30H\u{1b}[0m\u{1b}[49m\u{1b}[K\u{1b}[39m\u{1b}[49m\u{1b}[0m\u{1b}[0 q\u{1b}[?25h\u{1b}[48;3H\u{1b}[?2026l",
+            "write_command_count": 1,
+            "terminal_content_source": "daemon_pty",
+            "retained_replay_source": "",
+            "retained_replay_prompt_follow_ready": false,
+            "xterm_buffer_kind": "normal",
+            "xterm_cursor_hidden": false,
+            "mounted_entry_host_connected": true,
+            "blank_rows_below_cursor": 5,
+            "rows": 50,
+            "base_y": 1000,
+            "host_rect": {"left": 0.0, "top": 0.0, "width": 880.0, "height": 900.0},
+            "host_content_width": 880.0,
+            "host_content_height": 900.0,
+            "screen_rect": {"width": 880.0, "height": 900.0},
+            "viewport_rect": {"width": 880.0, "height": 900.0},
+            "helpers_rect": {"width": 880.0, "height": 900.0},
+            "helper_textarea_rect": {"left": -10000.0, "top": 8.0, "width": 1.0, "height": 1.0}
+        });
+        assert_eq!(
+            terminal_host_problem_for_app_control(&host),
+            Some("active remote Codex prompt surface has stale scrollback but no current prompt")
+        );
+    }
+
+    #[test]
+    fn terminal_host_problem_rejects_retained_recovery_tail_without_current_input_row() {
+        let text_tail = "Status as of 2026-05-08 11:53 IST:\n\n- PL9 batch is still alive: PID 3573158.\n- Current chart: JYAS_BENCH_0307.\n- Current action: generating PH2.\n\nProgress:\n\n- Charts reached: up to 0307.\n- Physical PL9 PDFs present: 1253.\n\n› 2\n\n• I’m not sure what 2 refers to. If you mean status again, say so and I’ll check the live batch\nstate.";
+        let host = json!({
+            "session_path": "remote-session://dev/hot-update-retained-recovery",
+            "text_sample": text_tail,
+            "text_tail": text_tail,
+            "buffer_text_sample": text_tail,
+            "cursor_line_text": "",
+            "cursor_y": 44,
+            "cursor_expected_rect": {"left": 1005.0, "top": 800.0, "width": 8.0, "height": 18.0},
+            "input_enabled": true,
+            "helper_textarea_focused": true,
+            "xterm_present": true,
+            "screen_present": true,
+            "viewport_present": true,
+            "rows_present": false,
+            "canvas_count": 4,
+            "render_event_count": 79,
+            "data_event_count": 0,
+            "last_raw_payload_length": 185570,
+            "last_raw_payload_line_count": 2009,
+            "write_command_count": 1,
+            "terminal_content_source": "active_recovery_pty_snapshot",
+            "retained_replay_source": "active_recovery_pty_snapshot",
+            "retained_replay_prompt_follow_ready": true,
+            "xterm_buffer_kind": "normal",
+            "xterm_cursor_hidden": false,
+            "mounted_entry_host_connected": true,
+            "blank_rows_below_cursor": 5,
+            "rows": 50,
+            "base_y": 1000,
+            "scrollback_expected": true,
+            "host_rect": {"left": 0.0, "top": 0.0, "width": 880.0, "height": 900.0},
+            "host_content_width": 880.0,
+            "host_content_height": 900.0,
+            "screen_rect": {"width": 880.0, "height": 900.0},
+            "viewport_rect": {"width": 880.0, "height": 900.0},
+            "helpers_rect": {"width": 880.0, "height": 900.0},
+            "helper_textarea_rect": {"left": -10000.0, "top": 8.0, "width": 1.0, "height": 1.0}
+        });
+        assert_eq!(
+            terminal_host_problem_for_app_control(&host),
+            Some("active remote Codex prompt surface has no current input row")
+        );
+    }
+
+    #[test]
+    fn terminal_host_problem_rejects_gated_daemon_pty_tail_without_current_input_row() {
+        let text_tail = "─────────────────────────────────────────────────────────────────────────────────────────────────────────────\n\n• Status as of 2026-05-08 11:53 IST:\n\n- PL9 batch is still alive: PID 3573158.\n- Current chart: JYAS_BENCH_0307.\n\n› 2\n\n• I’m not sure what 2 refers to. If you mean status again, say so and I’ll check the live PL9 batch\nstate.";
+        let host = json!({
+            "session_path": "remote-session://dev/hot-update-gated-daemon-pty",
+            "text_sample": text_tail,
+            "text_tail": text_tail,
+            "buffer_text_sample": text_tail,
+            "cursor_line_text": "",
+            "input_enabled": false,
+            "helper_textarea_focused": false,
+            "xterm_present": true,
+            "screen_present": true,
+            "viewport_present": true,
+            "rows_present": false,
+            "canvas_count": 4,
+            "render_event_count": 63,
+            "data_event_count": 0,
+            "last_raw_payload_length": 185570,
+            "last_raw_payload_line_count": 2009,
+            "write_command_count": 1,
+            "terminal_content_source": "daemon_pty",
+            "retained_replay_source": "",
+            "retained_replay_prompt_follow_ready": false,
+            "xterm_buffer_kind": "normal",
+            "xterm_cursor_hidden": false,
+            "mounted_entry_host_connected": true,
+            "blank_rows_below_cursor": 5,
+            "rows": 50,
+            "base_y": 1000,
+            "scrollback_expected": true,
+            "host_rect": {"left": 0.0, "top": 0.0, "width": 880.0, "height": 900.0},
+            "host_content_width": 880.0,
+            "host_content_height": 900.0,
+            "screen_rect": {"width": 880.0, "height": 900.0},
+            "viewport_rect": {"width": 880.0, "height": 900.0},
+            "helpers_rect": {"width": 880.0, "height": 900.0}
+        });
+        assert_eq!(
+            terminal_host_problem_for_app_control(&host),
+            Some("active remote Codex prompt surface has no current input row")
+        );
+    }
+
+    #[test]
+    fn terminal_host_problem_rejects_codex_resume_instruction_as_interactive() {
+        let text_tail = "⚠ Heads up, you have less than 5% of your weekly limit left. Run /status for a breakdown.\nToken usage: total=1,064,406 input=1,023,193 (+ 11,361,664 cached) output=41,213 (reasoning 10,977)\nTo continue this session, run codex resume 019d0000-0000-7000-8000-000000000001";
+        let host = json!({
+            "session_path": "remote-session://dev/exited-codex",
+            "text_sample": text_tail,
+            "text_tail": text_tail,
+            "buffer_text_sample": text_tail,
+            "cursor_line_text": " this session, run codex resume 019d0000-0000-7000-8000-000000000001",
+            "input_enabled": true,
+            "helper_textarea_focused": true,
+            "xterm_present": true,
+            "screen_present": true,
+            "viewport_present": true,
+            "rows_present": false,
+            "canvas_count": 4,
+            "render_event_count": 102,
+            "data_event_count": 13,
+            "last_raw_payload_length": 194,
+            "last_raw_payload_line_count": 1,
+            "write_command_count": 6,
+            "terminal_content_source": "daemon_pty",
+            "retained_replay_source": "daemon_retained_snapshot",
+            "retained_replay_prompt_follow_ready": true,
+            "xterm_buffer_kind": "normal",
+            "xterm_cursor_hidden": false,
+            "mounted_entry_host_connected": true,
+            "blank_rows_below_cursor": 2,
+            "rows": 50,
+            "base_y": 0,
+            "scrollback_expected": false,
+            "host_rect": {"left": 0.0, "top": 0.0, "width": 880.0, "height": 900.0},
+            "host_content_width": 880.0,
+            "host_content_height": 900.0,
+            "screen_rect": {"width": 880.0, "height": 900.0},
+            "viewport_rect": {"width": 880.0, "height": 900.0},
+            "helpers_rect": {"width": 880.0, "height": 900.0}
+        });
+
+        assert_eq!(
+            terminal_host_problem_for_app_control(&host),
+            Some("active remote Codex runtime has exited and is showing a resume instruction")
+        );
     }
 
     #[test]
@@ -2429,6 +3344,61 @@ mod tests {
     }
 
     #[test]
+    fn terminal_host_problem_ignores_remote_focus_protocol_without_stream_echo() {
+        let text_tail = "\
+╭─────────────────────────────────────────────╮
+│ >_ OpenAI Codex (v0.128.0)                  │
+│                                             │
+│ model:     gpt-5.5 xhigh   /model to change │
+│ directory: ~/gh/yggterm                     │
+╰─────────────────────────────────────────────╯
+
+  Tip: Use /feedback to send logs to the maintainers when something looks off.
+
+
+› Run /review on my current changes
+
+  gpt-5.5 xhigh · ~/gh/yggterm";
+        let host = json!({
+            "session_path": "remote-session://dev/focus-protocol-only",
+            "text_sample": text_tail,
+            "text_tail": text_tail,
+            "buffer_text_sample": text_tail,
+            "cursor_line_text": "› Run /review on my current changes",
+            "input_enabled": true,
+            "helper_textarea_focused": true,
+            "host_has_active_element": true,
+            "xterm_present": true,
+            "screen_present": true,
+            "rows_present": false,
+            "canvas_count": 4,
+            "render_event_count": 13,
+            "data_event_count": 1,
+            "protocol_data_event_count": 1,
+            "last_data_event_at_ms": 1778152763642_u64,
+            "last_write_queued_at_ms": 1778152744451_u64,
+            "last_write_flush_started_at_ms": 1778152744451_u64,
+            "last_write_callback_at_ms": 1778152744188_u64,
+            "last_raw_payload_length": 139,
+            "write_command_count": 7,
+            "xterm_buffer_kind": "normal",
+            "xterm_cursor_hidden": false,
+            "mounted_entry_host_connected": true,
+            "blank_rows_below_cursor": 37,
+            "rows": 48,
+            "host_rect": {"left": 0.0, "top": 0.0, "width": 840.0, "height": 830.0},
+            "host_content_width": 840.0,
+            "host_content_height": 830.0,
+            "screen_rect": {"width": 840.0, "height": 830.0},
+            "viewport_rect": {"width": 840.0, "height": 830.0},
+            "helpers_rect": {"width": 840.0, "height": 830.0},
+            "helper_textarea_rect": {"left": -10000.0, "top": 68.0, "width": 1.0, "height": 1.0}
+        });
+
+        assert_eq!(terminal_host_problem_for_app_control(&host), None);
+    }
+
+    #[test]
     fn terminal_chunk_has_codex_prompt_output_accepts_codex_prompt_line() {
         assert!(terminal_chunk_has_codex_prompt_output(
             "› Explain this codebase"
@@ -2464,6 +3434,19 @@ mod tests {
 ╰────────────────────────────────────────────────────────╯"
         ));
         assert!(!terminal_chunk_has_codex_prompt_output("$ echo hi"));
+    }
+
+    #[test]
+    fn terminal_chunk_has_current_codex_input_row_rejects_old_prompt_before_output() {
+        assert!(terminal_chunk_has_current_codex_input_row(
+            "Status rows\n\n› /status\n\n  gpt-5.5 xhigh · ~/gh/yggterm"
+        ));
+        assert!(terminal_chunk_has_current_codex_input_row(
+            "Status rows\n\n›"
+        ));
+        assert!(!terminal_chunk_has_current_codex_input_row(
+            "Status rows\n\n› 2\n\n• I’m not sure what 2 refers to.\nstate."
+        ));
     }
 
     #[test]
@@ -2559,6 +3542,49 @@ mod tests {
     }
 
     #[test]
+    fn app_control_terminal_surface_flags_transparent_dom_rows_with_buffer_text() {
+        let host = json!({
+            "session_path": "remote-session://dev/codex",
+            "text_tail": "OpenAI Codex ready",
+            "buffer_text_sample": "OpenAI Codex\n› /status",
+            "cursor_line_text": "› /status",
+            "xterm_present": true,
+            "screen_present": true,
+            "rows_present": true,
+            "canvas_count": 0,
+            "xterm_renderer_mode": "dom",
+            "rows_text_fill_color": "rgb(251, 251, 253)",
+            "rows_sample_text_fill_color": "rgba(0, 0, 0, 0)",
+            "cursor_row_text_fill_color": "rgb(251, 251, 253)",
+            "visible_row_samples_tail": [
+                {
+                    "text": "› /status",
+                    "text_fill_color": "rgba(0, 0, 0, 0)"
+                }
+            ]
+        });
+        let summary = summarize_terminal_surface_for_app_control(&[host], false);
+        assert_eq!(
+            summary
+                .get("render_health")
+                .and_then(|health| health.get("healthy"))
+                .and_then(Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            summary
+                .get("render_health")
+                .and_then(|health| health.get("reason"))
+                .and_then(Value::as_str),
+            Some("dom_rows_transparent_with_buffer_text")
+        );
+        assert_eq!(
+            summary.get("problem").and_then(Value::as_str),
+            Some("dom_rows_transparent_with_buffer_text")
+        );
+    }
+
+    #[test]
     fn app_control_terminal_surface_exposes_active_prompt_and_timing_truth() {
         let host = json!({
             "host_id": "host-active",
@@ -2617,6 +3643,86 @@ mod tests {
                 .and_then(|timing| timing.get("write_bridge_flush_count"))
                 .and_then(Value::as_u64),
             Some(7)
+        );
+    }
+
+    #[test]
+    fn app_control_terminal_surface_gates_input_when_surface_has_problem() {
+        let host = json!({
+            "host_id": "host-blank",
+            "session_path": "local://blank-codex",
+            "text_sample": "",
+            "text_tail": "",
+            "buffer_text_sample": "",
+            "cursor_line_text": "",
+            "xterm_present": true,
+            "screen_present": true,
+            "canvas_count": 2,
+            "render_event_count": 1,
+            "input_enabled": true,
+            "helper_textarea_focused": true,
+            "terminal_content_source": "empty"
+        });
+        let summary = summarize_terminal_surface_for_app_control(&[host], false);
+        assert_eq!(
+            summary.get("problem").and_then(Value::as_str),
+            Some("active terminal host exists but xterm surface is empty")
+        );
+        assert_eq!(
+            summary.get("raw_input_enabled").and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            summary.get("input_enabled").and_then(Value::as_bool),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn app_control_terminal_surface_accepts_unfocused_busy_daemon_pty_output() {
+        let host = json!({
+            "host_id": "remote-busy",
+            "session_path": "remote-session://dev/busy-codex",
+            "text_sample": "The official full validation coverage is stale from 2026-05-06 20:40 IST.\n\n─ Worked for 1m 42s ─",
+            "text_tail": "The official full validation coverage is stale from 2026-05-06 20:40 IST.\n\n─ Worked for 1m 42s ─",
+            "buffer_text_sample": "The official full validation coverage is stale from 2026-05-06 20:40 IST.\n\n─ Worked for 1m 42s ─",
+            "cursor_line_text": "",
+            "xterm_present": true,
+            "screen_present": true,
+            "canvas_count": 4,
+            "render_event_count": 69,
+            "data_event_count": 1,
+            "last_raw_payload_length": 7648,
+            "last_raw_payload_line_count": 6,
+            "write_command_count": 1,
+            "terminal_content_source": "daemon_pty",
+            "mounted_entry_host_connected": true,
+            "input_enabled": true,
+            "helper_textarea_focused": false,
+            "host_has_active_element": false,
+            "xterm_buffer_kind": "normal",
+            "rows": 50,
+            "cols": 110,
+            "base_y": 6,
+            "cursor_y": 47,
+            "blank_rows_below_cursor": 2,
+            "host_rect": {"left": 0.0, "top": 0.0, "width": 840.0, "height": 830.0},
+            "host_content_width": 840.0,
+            "host_content_height": 830.0,
+            "screen_rect": {"width": 840.0, "height": 830.0},
+            "viewport_rect": {"width": 840.0, "height": 830.0},
+            "helpers_rect": {"width": 840.0, "height": 830.0}
+        });
+        let summary = summarize_terminal_surface_for_app_control(&[host], false);
+        assert_eq!(summary.get("problem"), Some(&Value::Null));
+        assert_eq!(
+            summary.get("raw_input_enabled").and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            summary.get("input_enabled").and_then(Value::as_bool),
+            Some(false),
+            "raw protocol bridge may stay open, but user input is not ready without prompt focus"
         );
     }
 
@@ -2680,6 +3786,44 @@ mod tests {
             terminal_host_problem_for_app_control(&host),
             Some("active remote terminal is input-enabled without a prompt-ready surface")
         );
+    }
+
+    #[test]
+    fn terminal_host_problem_accepts_connected_daemon_pty_output_without_prompt() {
+        let host = json!({
+            "session_path": "remote-session://dev/current-output",
+            "text_sample": "Status as of 2026-05-13 11:26 IST:\n\nThe batch is no longer running and the validation coverage is stale.",
+            "text_tail": "The official full validation coverage is stale from 2026-05-06 20:40 IST, still showing 48/1000 ready charts. So v3 readiness remains blocked until we restart or repair the batch.",
+            "cursor_line_text": "",
+            "input_enabled": true,
+            "helper_textarea_focused": true,
+            "cursor_node_count": 1,
+            "xterm_present": true,
+            "screen_present": true,
+            "rows_present": false,
+            "canvas_count": 4,
+            "render_event_count": 12,
+            "data_event_count": 5,
+            "last_raw_payload_length": 512,
+            "last_raw_payload_line_count": 8,
+            "terminal_content_source": "daemon_pty",
+            "retained_replay_source": "daemon_retained_snapshot",
+            "retained_replay_prompt_follow_ready": true,
+            "mounted_entry_host_connected": true,
+            "xterm_buffer_kind": "normal",
+            "rows": 50,
+            "cols": 110,
+            "base_y": 963,
+            "viewport_y": 963,
+            "host_rect": {"left": 0.0, "top": 0.0, "width": 840.0, "height": 830.0},
+            "host_content_width": 840.0,
+            "host_content_height": 830.0,
+            "screen_rect": {"width": 840.0, "height": 830.0},
+            "viewport_rect": {"width": 840.0, "height": 830.0},
+            "helpers_rect": {"width": 840.0, "height": 830.0},
+            "helper_textarea_rect": {"left": -10000.0, "top": 68.0, "width": 1.0, "height": 1.0}
+        });
+        assert_eq!(terminal_host_problem_for_app_control(&host), None);
     }
 
     #[test]
@@ -2946,6 +4090,44 @@ Weekly limit:                21% left
             terminal_host_problem_for_app_control(&host),
             Some("active remote terminal lost expected scrollback after retained replay")
         );
+    }
+
+    #[test]
+    fn terminal_host_problem_accepts_prompt_ready_unsafe_retained_replay_skip() {
+        let host = json!({
+            "session_path": "remote-session://dev/live-codex",
+            "text_sample": "• Previous output\n\n› Run /review on my current changes\n \n  gpt-5.5 medium · ~/git/samplenotes",
+            "text_tail": "• Previous output\n\n› Run /review on my current changes\n \n  gpt-5.5 medium · ~/git/samplenotes",
+            "cursor_line_text": "› Run /review on my current changes",
+            "input_enabled": true,
+            "helper_textarea_focused": true,
+            "cursor_node_count": 0,
+            "xterm_present": true,
+            "screen_present": true,
+            "rows_present": false,
+            "canvas_count": 4,
+            "render_event_count": 218,
+            "data_event_count": 5,
+            "base_y": 0,
+            "rows": 50,
+            "cols": 110,
+            "blank_rows_below_cursor": 2,
+            "scrollback_expected": true,
+            "retained_replay_source": "daemon_retained_snapshot",
+            "retained_replay_prompt_follow_ready": true,
+            "retained_replay_unsafe_skip_prompt_ready": true,
+            "last_raw_payload_line_count": 1000,
+            "xterm_buffer_kind": "normal",
+            "mounted_entry_host_connected": true,
+            "host_rect": {"left": 0.0, "top": 0.0, "width": 840.0, "height": 830.0},
+            "host_content_width": 840.0,
+            "host_content_height": 830.0,
+            "screen_rect": {"width": 840.0, "height": 830.0},
+            "viewport_rect": {"width": 840.0, "height": 830.0},
+            "helpers_rect": {"width": 840.0, "height": 830.0},
+            "helper_textarea_rect": {"left": -10000.0, "top": 68.0, "width": 1.0, "height": 1.0}
+        });
+        assert_eq!(terminal_host_problem_for_app_control(&host), None);
     }
 
     #[test]
@@ -3419,9 +4601,39 @@ So the current state is:
     }
 
     #[test]
+    fn transport_error_detector_keeps_wrapped_shared_connection_fragment() {
+        let data = "Shared connection to 192.168.\r\n";
+        assert!(terminal_chunk_is_transport_error(data));
+    }
+
+    #[test]
     fn transport_error_detector_keeps_line_shaped_ssh_failure() {
         let data = "ssh: connect to host 192.0.2.10 port 22: No route to host\r\n";
         assert!(terminal_chunk_is_transport_error(data));
+    }
+
+    #[test]
+    fn transport_error_detector_flags_tail_internal_session_not_found() {
+        let data = "\
+I inspected the active session and the prompt is still usable.
+The previous command output stays in scrollback.
+There are enough normal rows before the stale transport line.
+The old detector only sampled the head of the terminal text.
+This needs to behave like a bottom-of-viewport problem.
+› Error: terminal session not found: local://019d0000-0000-7000-8000-000000000001
+Shared connection to 192.0.2.14 closed.
+›
+";
+        assert!(terminal_chunk_is_transport_error(data));
+    }
+
+    #[test]
+    fn transport_error_detector_ignores_prose_about_missing_sessions() {
+        let data = "\
+The fix should explain why a terminal session not found message leaked into the viewport.
+That sentence is part of the saved Codex transcript and is not a live transport error line.
+";
+        assert!(!terminal_chunk_is_transport_error(data));
     }
 
     #[test]

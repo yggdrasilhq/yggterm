@@ -56,6 +56,19 @@ def proc_exe_target(pid: int) -> str:
         return ""
 
 
+def allowed_daemon_exes(current_bin: Path) -> list[Path]:
+    allowed = [current_bin]
+    names = [
+        "yggterm-headless",
+        "yggterm-headless-linux-x86_64",
+    ]
+    for name in names:
+        candidate = current_bin.parent / name
+        if candidate.exists() and candidate not in allowed:
+            allowed.append(candidate.resolve())
+    return allowed
+
+
 def wait_for(predicate, *, timeout: float, step: float = 0.1):
     deadline = time.time() + timeout
     last = None
@@ -75,8 +88,9 @@ def ensure_single_current_daemon(home: Path, current_bin: Path) -> dict:
     exe = proc_exe_target(pid)
     if " (deleted)" in exe:
         raise AssertionError(f"daemon {pid} still runs a deleted binary: {exe}")
-    if exe != str(current_bin):
-        raise AssertionError(f"daemon {pid} runs unexpected binary: exe={exe} expected={current_bin}")
+    allowed = [str(path) for path in allowed_daemon_exes(current_bin)]
+    if exe not in allowed:
+        raise AssertionError(f"daemon {pid} runs unexpected binary: exe={exe} expected one of {allowed}")
     return {"pid": pid, "exe": exe}
 
 

@@ -236,7 +236,7 @@ def main() -> int:
         + DISPLAY
         + " XDG_RUNTIME_DIR="
         + shlex.quote(str(RUNTIME_ROOT))
-        + " GDK_BACKEND=x11; "
+        + " GDK_BACKEND=x11 YGGTERM_FORCE_X11_BACKEND=1; "
         + "RUST_BACKTRACE=full ./target/debug/yggterm >/tmp/yggterm-live-search.log 2>&1'",
         cwd=ROOT,
         env=env,
