@@ -4,6 +4,730 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+## 2.4.0
+
+- Blend the autohidden titlebar with the same shell chrome background/gradient as the visible titlebar while keeping hover reveal from resizing the terminal grid.
+- Deduplicate live-session close confirmation rows when the same runtime is also projected under a cwd group.
+- Harden Codex session title/summary generation so malformed labels such as quoted bad generated titles and tiny summary fragments are rejected before they reach the sidebar.
+- Extend `yggterm-headless server sessions regenerate-copy` to refresh local plus app-discovered remote Codex session copy, support remote-only `--skip-local` release-gate runs, and reset remote summary timelines when requested.
+- Keep remote `regenerate-copy` non-force retries cached so release smokes do not re-run every remote precis/summary generation job after a successful reset pass.
+- Keep daemon-owned live runtimes durable while limiting fresh GUI xterm retention to the active terminal or already-mounted render state, fixing the 23-session restore case where daemon truth existed but the active xterm host was not mounted yet.
+- Disable SSH ControlMaster multiplexing for new Yggterm remote PTYs so closing smoke/test sessions cannot interact with an unrelated user SSH master.
+- Treat connected daemon-PTY output as a valid visible terminal surface even when Codex is busy and no prompt row is visible, preventing false resume overlays on readable retained sessions.
+- Make the 23-smoke heavy-TUI detector accept real `codex-session-tui` Browser/Preview frames while rejecting command-echo-only false positives.
+- Document the 23-smoke release gate, including resource budgets, terminal quirks, restore checks, and title/summary quality checks.
+
+## 2.2.66
+
+- Treat a running same-version daemon whose Linux `/proc/<pid>/exe` target is reported as the active install path plus ` (deleted)` as current, preventing remote helper reinstall from spinning on false stale-daemon detection.
+- Keep stale-daemon lifecycle detection in trace evidence instead of warning into terminal-attached helper commands.
+- Add regression coverage for deleted-path same-version daemon detection in both app and daemon cleanup paths.
+- Use the short UUID fallback, not a generic `Codex Session` label, when remote scanned sessions still have no meaningful generated copy.
+
+## 2.2.65
+
+- Derive remote stored-session sidebar labels from cached summaries or recent transcript context before falling back to a generic `Codex Session` label.
+- Keep app-control synthesized remote rows on the same generated-title path as the visible sidebar rows.
+- Add regression coverage for summary/recent-context title fallback after generic remote labels are rejected.
+
+## 2.2.64
+
+- Treat generic `Yggterm Codex` / `Yggterm Shell` sidebar labels as generated fallbacks, so generated remote titles from `session-titles.db` can replace them instead of being blocked as if they were user-authored names.
+- Add regression coverage for replacing generic remote Codex rows with generated titles.
+
+## 2.2.63
+
+- Keep passive title/summary/precis generation bounded per session instead of globally suspending all background copy work after one no-context or failed transcript.
+- Add regression coverage so passive copy failures stay on the per-session retry path and cannot disable the scheduler.
+
+## 2.2.62
+
+- Treat wrapped `Error: connecting to .../server-*.sock` output from stale remote Yggterm daemons as terminal transport failure, not meaningful Codex output.
+- Extend remote Codex hot-update recovery so rejected preserved-owner surfaces, including stale socket errors and generic title-card output, cannot linger as progress and trigger one controlled force-remote restart after the hard-fail window.
+- Add regression coverage for the jojo stale-socket Codex surface and rejected preserved-owner restart decision.
+
+## 2.2.61
+
+- Treat remote Codex prompt-only hot-update surfaces as recovery failures, not ready terminals, and perform one controlled force-remote restart after the hard-fail window instead of lingering on a sparse prompt.
+- Keep full-screen cursor-home terminal frames on the frame-budgeted xterm path while preserving the faster Codex inline status animation path.
+- Add regression coverage for prompt-only Codex handoffs, attach confirmation, hard-fail restart decisions, and full-screen frame budgeting.
+
+## 2.2.60
+
+- Make `server sessions ... --help` non-mutating for both the GUI launcher CLI and `yggterm-headless`, so asking for title/summary bookkeeping help cannot accidentally run a regeneration pass.
+- Add CLI regression coverage for the sessions help path that slipped during jojo bookkeeping validation.
+
+## 2.2.59
+
+- Let the hot-restart monitor retire a stale duplicate daemon when an expected-version daemon already owns the same terminal runtime keys, preserving the sessions without keeping an obsolete sidecar alive forever.
+- Report owned terminal runtime counts/keys in monitor JSON and add regression coverage for the duplicate-owner cleanup decision.
+
+## 2.2.58
+
+- Keep raw xterm protocol input separate from user-input readiness in app-control: a busy remote Codex PTY with visible daemon output but no focused prompt now settles as visible, not as an input-enabled terminal problem.
+- Add regression coverage for the jojo post-update busy-output state where the raw xterm bridge is open while the user prompt is not ready.
+
+## 2.2.57
+
+- Route app-control session removal through the same live-session close fallback contract as the sidebar close affordance, so active close returns to validated viewport history and background close leaves the viewport unchanged under automation too.
+- Add regression coverage for the app-control live-close path that the jojo proof harness uses.
+
+## 2.2.56
+
+- Accept current daemon-owned remote PTY output as a visible live terminal even when Codex is still busy and no prompt row is present yet, avoiding a false stale-retained recovery gate after hot update.
+- Add a regression fixture for the jojo busy-Codex resume state: real daemon PTY bytes, input still gated, no current prompt row, and a stale resume notification.
+
+## 2.2.55
+
+- Define and enforce live-session close navigation: active close now falls back through validated viewport history, background close leaves the viewport alone, and closed paths are pruned so chained closes cannot return to dead sessions.
+- Stop the daemon from choosing an arbitrary replacement active session after runtime removal; the GUI now makes any close-time focus choice explicitly from viewport history.
+- Pump bounded passive title/summary generation from the GUI background loop so missing session copy can converge after startup/snapshots without a manual row click.
+- Remove the `Connect SSH` action from Startpage and document Startpage as a recent/scoped local work surface.
+
+## 2.2.54
+
+- Settle focused restored xterm cursors through a throttled prompt-follow repaint even when the active input-policy update is otherwise unchanged, so the cursor does not stay on an old row until the first typed byte.
+- Expose and smoke-check the input-policy no-op prompt-follow counter for Codex prompt layouts, making the cursor-settle path observable before publishing.
+- Strip and classify internal stale-daemon startup warnings as terminal transport noise, preventing version-handoff diagnostics from appearing in the active PTY after update.
+- Bound the no-op cursor-settle repair per mounted terminal and make the read-only latency smoke fail if it keeps repainting while no terminal writes are happening, preserving the fan/idle budget.
+
+## 2.2.51
+
+- Treat stale remote-runtime hot-update failures as preserved-owner fallback, so a retryable bridge/update error cannot stall the active Codex PTY before attachment.
+- Classify leaked hot-update bridge errors as terminal transport output in app-control, making the 2.2.50 jojo failure release-blocking instead of passable as retained text.
+- Reject same-version daemons that are running from deleted or non-current executables during mutating recovery, and keep CLI JSON output parseable by sending recovery logs to stderr.
+- Add `docs/protocol.md` with the hot-update/session-preservation contract and mark active PTY loss during update as a protocol violation.
+
+## 2.2.50
+
+- Restore visible autohide titlebar chrome on hover while preserving the terminal grid height, so hovering the hidden titlebar no longer triggers terminal resize churn.
+- Add the canonical session identity/title/summary contract in `docs/sessions.md`, including UUID fallback rules and timeline-style summary history.
+- Persist summary timelines, expose a headless `server sessions regenerate-copy` pipeline, and enable budgeted passive copy generation by default so new Codex sessions converge away from generic or short-UUID titles.
+- Show long UUIDs and pencil edit actions on Startpage session cards, and render titlebar summaries as a selectable timeline.
+- Stop terminal pointer-release focus repair from forcing prompt-follow scroll, avoiding the click-induced viewport flicker seen on jojo.
+
+## 2.2.49
+
+- Treat app-control open as a foreground terminal intent after an app-control background/cooling pass, so switch-back smokes cannot leave the target terminal in a cooled blank state.
+- Add regression coverage for the exact background-then-open path that hid a live htop TUI during jojo proof.
+
+## 2.2.48
+
+- Keep not-yet-measured and inactive alternate-screen TUI frames on the xterm.js path when the low-power TUI renderer is disabled, fixing blank htop/top startup and switch-back surfaces without adding an overlay renderer.
+- Tighten the terminal bridge smoke assertion so disabled low-power TUI mode cannot still drop offscreen frame-like PTY bytes.
+
+## 2.2.47
+
+- Force one xterm renderer refresh when the first observed terminal visual state is an alternate-screen TUI or hidden-cursor TUI, preventing htop/top from existing in xterm's buffer while WebKit's canvas remains blank until a manual redraw.
+- Add regression coverage for the first alternate-screen TUI paint path that slipped through the prior smoke pass.
+
+## 2.2.46
+
+- Keep xterm scroll anchoring and titlebar auto-hide on the xterm viewport contract, so titlebar reveal and small resizes no longer force terminal grid remounts or throw the viewport into stale scrollback.
+- Preserve remote Codex session identity when daemon-owned live sessions close, promoting synthetic runtime paths back to real Codex transcript ids so sidebar rows, shutdown, rename, and summary truth stay durable.
+- Replace short UUID-style sidebar fallbacks with cwd/kind-derived labels, and make manual title plus summary edits write through the same durable title store.
+- Add startpage/titlebar/context actions for session title and summary edits, plus a startpage entry point for creating scoped folders.
+- Add a YggUI scroll controller over xterm.js viewport APIs for page/top/bottom navigation while keeping terminal text, cursor, prompt, and redraw owned by xterm.js.
+- Extend app-control and smoke coverage for retained replay, scroll controller state, prompt-ready unsafe-skip diagnostics, and manual copy-edit entry points.
+
+## 2.2.45
+
+- Treat prompt-ready retained xterm surfaces as live PTY truth when a large cursor-addressed snapshot is intentionally skipped after resize, so app-control does not gate input or trigger recovery on a usable Codex prompt.
+- Expose retained-replay unsafe-skip diagnostics in app-control state for resize and scrollback smoke coverage.
+
+## 2.2.44
+
+- Keep background managed-Codex refresh probe-only by default, so live terminal recovery and remote scans cannot spawn `npm install @latest` and blow the fan/CPU budget. Unattended background installs now require `YGGTERM_MANAGED_CLI_BACKGROUND_INSTALL=1`.
+
+## 2.2.43
+
+- Sync daemon terminal identity from the effective xterm theme before warm-start and initial restore, so a light Yggterm shell using a dark terminal theme launches remote Codex with dark `YGGTERM_TERMINAL_APPEARANCE`/`COLORFGBG` instead of producing low-contrast prompt bands.
+- Let app-control terminal focus use the active xterm write budget even when Wayland refuses native window focus, keeping terminal readiness smokes from conflating compositor focus with terminal interactivity.
+
+## 2.2.42
+
+- Require direct PTY ownership before retiring an older hot-update daemon; preserved/runtime-known keys no longer count as proof that the updated daemon has adopted the session.
+- Tighten duplicate-owner tests so cleanup cannot kill a preserved owner while the current daemon only has metadata for that runtime.
+
+## 2.2.41
+
+- Retire stale hot-update daemons when the current daemon already owns the same live runtime keys, preventing duplicate daemons from re-registering themselves as preserved owners after `hot-restart --all`.
+- Tighten cleanup coverage for preserved-owner registries so session survival does not become a second source of runtime truth once the updated daemon has taken over.
+
+## 2.2.40
+
+- Seed retained remote Codex scrollback for the restored active terminal during startup prewarm, while keeping background prewarm on the lighter latency path.
+- Add prewarm coverage for the active-versus-background remote snapshot contract so a prompt-only restored viewport cannot be mistaken for a ready terminal after hot update.
+
+## 2.2.39
+
+- Cool active terminal read/write cadence when the Yggterm window is unfocused, while keeping remote resume on the fast path only until the restore surface is connected.
+- Make xterm write-budget observability reflect document focus so an unfocused visible terminal no longer masquerades as an active 160 ms render budget.
+
+## 2.2.38
+
+- Treat terminal stream cursor rewind as a runtime restart boundary: the daemon replays initial chunks when a client cursor belongs to a previous runtime, and the GUI clears/remounts the stale xterm host instead of preserving old broken pixels after a forced restart.
+
+## 2.2.37
+
+- Keep remote Codex bridge PTYs in raw input mode while restoring `opost onlcr` output newline processing, so bare-LF Codex/TUI frames do not repaint as diagonal/right-shifted line stacks in xterm.js.
+- Normalize captured terminal snapshot emission to CRLF before writing it back through a PTY, matching terminal line-discipline semantics without adding a renderer overlay.
+
+## 2.2.36
+
+- Tighten active-recovery snapshot replay for remote Codex/TUI sessions so compact cursor-addressed full-screen snapshots are rejected before they can repaint old-width line stacks.
+
+## 2.2.35
+
+- Stop the daemon from using its vt100 side-parser snapshot as the initial viewport replay for remote Codex/TUI sessions; xterm now receives retained raw PTY bytes only, and attach-ready is emitted only after the remote helper actually reports it.
+
+## 2.2.34
+
+- Stop titlebar auto-hide reveal from resizing the terminal canvas; the chrome now overlays the top edge instead of adding content padding.
+- Disable the lossy low-power TUI overlay/frame-drop path so inactive htop-like TUIs keep flowing through xterm.js rather than returning to a stale screen.
+- Reject cursor-addressed multi-row Codex recovery snapshots that can repaint old-width output over a good live xterm surface.
+
+## 2.2.33
+
+- Rearm active keep-alive remote terminals immediately when daemon snapshot truth says the runtime is in recovery/bootstrap, even if the retained xterm host still has an old ready ledger entry.
+- Tighten the read-only latency smoke so an active remote terminal with no daemon runtime cannot pass as healthy while stale retained text remains visible.
+
+## 2.2.32
+
+- Mark keep-alive remote sessions whose daemon runtime is missing as recovery/bootstrap targets instead of `Running`, so hot-updated clients remount and recreate the PTY rather than reusing stale retained xterm content.
+- Make the shell refuse retained-host reuse for active remote sessions in a recovery launch phase, closing the gap where app-control correctly reported `active_runtime_present=false` but the viewport stayed stuck on old scrollback.
+
+## 2.2.31
+
+- Treat `codex resume ...` continuation text in a remote Codex viewport as an exited runtime, not as an interactive terminal, and restart the daemon-owned PTY instead of accepting the stale surface.
+- Stop advertising exited daemon PTYs as live runtime truth, so app-control, preserved-owner handoff, and smoke tests cannot pass while the active terminal process is already gone.
+- Tighten the terminal status smoke to reject Codex resume-instruction surfaces and avoid using Ctrl+C as a prompt-clear shortcut on live Codex sessions.
+
+## 2.2.30
+
+- Start forced remote Codex restarts at the mounted xterm geometry and ignore same-size resize nudges, so the hot-update recovery path does not immediately mark fresh restart output as pre-resize.
+
+## 2.2.29
+
+- Recover blank hot-update remote Codex handoffs by treating filtered pre-resize output as non-progress and performing one controlled force-remote restart instead of spinning on an empty xterm.
+
+## 2.2.28
+
+- Stop treating hot-update remote Codex pre-resize PTY scrollback as current terminal truth during preserved-owner handoff, so old-width retained output cannot block the resize/recovery path.
+- Make app-control and the read-only latency smoke reject gated remote Codex recovery tails with no current input row, even when user input is already disabled.
+
+## 2.2.27
+
+- Reject input-enabled remote Codex recovery surfaces when the visible tail contains an old prompt followed by assistant output instead of a current input row, and route that state through retained-surface recovery instead of accepting it as interactive.
+
+## 2.2.26
+
+- Treat retained active-recovery PTY prompt-follow snapshots as visible terminal truth after hot update, so stale resume notifications clear only when the mounted xterm surface contains real PTY output and never by blessing stale scrollback.
+
+## 2.2.25
+
+- Reject input-enabled remote Codex PTY scrollback when the cursor row is blank and the latest daemon frame is only terminal control traffic, and remount/recover that surface instead of treating stale scrollback as current prompt truth.
+
+## 2.2.24
+
+- Accept daemon-owned remote Codex PTY scrollback as prompt-ready when xterm exposes visible cursor geometry and real Codex output after a hot-update handoff, even if the cursor row text is empty after replay.
+
+## 2.2.23
+
+- Treat a hot-update retained PTY replay as terminal-ready when app-control proves prompt-followed real PTY output even if the cursor line text is empty after pre-resize replay, so preserved Codex sessions regain input after GUI replacement.
+
+## 2.2.22
+
+- Preserve hot-update Codex viewports when the session owner has not produced post-resize output yet by allowing retained pre-resize PTY bytes only for explicit preserved-owner handoff keys; ordinary resize recovery still waits for post-resize output.
+
+## 2.2.21
+
+- Remount a hot-updated remote terminal only when app-control proves the retained xterm host is mounted but empty, preserving the generic remote attach guard while recovering blank live Codex viewports after a session-preserving GUI/daemon update.
+
+## 2.2.20
+
+- Route terminal right-click through xterm.js into Yggterm's existing terminal context menu, and add app-control/smoke proof for right-click plus middle-click terminal shortcuts.
+- Lower the active visible terminal write-frame budget to keep typing and Codex TUI animation responsive while preserving heavy coalescing for background terminals.
+
+## 2.2.19
+
+- Add xterm-owned primary-selection paste: selecting terminal text records a terminal-local primary selection, and middle-click pastes it through xterm.js without touching the clipboard.
+- Keep PromptFollow terminals pinned to the live bottom across titlebar auto-hide hover/layout resizes, so chrome nudges cannot leave the viewport at the top of scrollback.
+
+## 2.2.18
+
+- Keep xterm scroll events caused by command output from being classified as user scrollback while input or write flushing is hot, so `/status`-style terminal output stays prompt-following after it renders.
+
+## 2.2.17
+
+- Fence remote Codex restore/replay on post-resize daemon PTY output, so old-width retained TUI separators do not settle as the current xterm screen after resize.
+
+## 2.2.16
+
+- Keep remote Codex visual-reveal recovery gated until post-attach output proves a Codex prompt-ready surface, preventing stale transcript/prose bytes from marking a restarted terminal interactive.
+
+## 2.2.15
+
+- Reject stale active-recovery Codex snapshots unless they prove a real Codex prompt-ready tail, so old transcript/prose text cannot be replayed into a restarted live terminal as if it were the current PTY screen.
+
+## 2.2.14
+
+- Treat daemon-retained replay as post-ready scrollback repair only: a remote session must have a clean observed interactive viewport before retained daemon scrollback can be replayed, preventing stale Codex transcript text from filling the terminal during restart/reconnect.
+
+## 2.2.13
+
+- Block daemon-retained replay while a remote resume notification is still active, preventing stale Codex transcript/prose from painting under the reconnect overlay before the live prompt-ready surface arrives.
+
+## 2.2.12
+
+- Add `LogLevel=ERROR` to Yggterm-owned remote SSH terminal launch commands so OpenSSH control-master close notices such as `Shared connection ... closed.` cannot leak into Codex xterm content when a remote bridge exits or is interrupted.
+
+## 2.2.11
+
+- Keep xterm host-health throttling from suppressing the all-empty retained remote surface sample, so the live mount can remount a blank retained Codex viewport before any app-control state probe observes it.
+
+## 2.2.10
+
+- Let the live terminal mount itself remount a previously-ready retained remote xterm when host-health sees an all-empty active surface, so recovery does not depend on an external app-control state probe.
+
+## 2.2.9
+
+- Remount retained remote xterm surfaces immediately when app-control observes an empty active xterm after update/restart, while keeping the two-sample guard for ambiguous scrollback checks.
+
+## 2.2.8
+
+- After a forced remote restart takes over preserved hot-update sessions, rerun Linux daemon cleanup so older duplicate daemons that only advertise already-owned terminal keys are retired instead of remaining as a second source of runtime truth.
+
+## 2.2.7
+
+- Make forced remote terminal restarts terminate plain `yggterm server remote resume-codex/start-codex <session>` bridge processes on the remote host, so halted keep-alive Codex sessions are actually recreated instead of reattaching to stale cached TUI state.
+
+## 2.2.6
+
+- Answer OSC 10/11 default foreground/background color queries in the daemon PTY path before GUI attach, and strip those terminal-emulator queries from retained output so Codex can render prompt backgrounds from real xterm cell attributes instead of shell overlays.
+
+## 2.2.5
+
+- Make remote bootstrap prefer the active direct-install headless binary from install metadata instead of the caller process's adjacent binary, preventing an older preserved daemon from reinstalling an old helper onto a remote machine during hot update.
+
+## 2.2.4
+
+- Let forced terminal restart recover a remote Codex session from the scanned remote-session row before terminating or recreating the runtime, so a partially migrated live membership does not make a known session unrestartable.
+
+## 2.2.3
+
+- Give forced remote terminal restarts the long daemon response budget so headless control does not time out while the server is safely terminating a remote Codex runtime before recreating it.
+
+## 2.2.2
+
+- Carry terminal appearance into remote-runtime daemon requests so a dark jojo xterm session does not ask a stale remote dev daemon to launch Codex with light `COLORFGBG`/terminal identity, and make remote Codex termination scan versioned daemons before a forced restart.
+
+## 2.2.1
+
+- Refresh daemon-owned remote Codex launch commands when the GUI syncs terminal identity, and add a headless `server terminal restart` path so halted kept sessions can be restarted with the current xterm identity instead of preserving stale `COLORFGBG`/terminal-appearance exports.
+
+## 2.2.0
+
+- Ship the terminal stabilization line: byte-exact app-control terminal sends, app-control-backgrounded low-power terminal budgets, stricter idle CPU/resource probes, and second-display proof for terminal readability, cursor visibility, input, scrollback, resize, and inline status animation smoothness.
+
+## 2.1.250
+
+- Let app-control terminal sends read multiline/control-byte payloads from stdin, and make the idle CPU smoke use that byte-exact path so terminal proof commands cannot be corrupted by shell-quoted carriage returns.
+- Accept an app-control-backgrounded TUI sample with no new xterm frames only when the state proves input is disabled, active write budgets are off, xterm counters are flat, the PTY workload is still alive, and CPU is under budget.
+
+## 2.1.249
+
+- Slow the unfocused TUI drop-drain cadence and pause sidebar loading animations while app-control has backgrounded a proof window, keeping background resource samples quiet without changing active terminal behavior.
+
+## 2.1.248
+
+- Make app-control-backgrounded terminal hosts publish the inactive write-budget truth in app-control state, and make the idle CPU smoke fail if a lowered proof window still reports active terminal input or active write budgets.
+
+## 2.1.247
+
+- Treat app-control-backgrounded windows as inactive for terminal read/write budgets and input policy, and cap background multiline read bursts, so lowered smoke windows do not keep consuming active-terminal CPU after launching TUI probes.
+
+## 2.1.246
+
+- Wake the terminal read loop during app-control multiline sends and report write-chunk/read-nudge telemetry in the response, so background terminal probes can distinguish a missing PTY write from a stale mounted xterm surface.
+
+## 2.1.245
+
+- Make daemon terminal writes acknowledge only after the PTY writer thread flushes the bytes, so app-control multiline commands cannot report success while the heredoc terminator is still queued behind the daemon writer.
+
+## 2.1.244
+
+- Pace app-control multiline terminal sends as line writes, avoiding PTY echo backpressure that could leave background heredoc/TUI probes visibly stuck partway through a command despite the send being accepted.
+
+## 2.1.243
+
+- Keep the visible active terminal on active read cadence even when toolkit window-focus truth is stale, preventing selected terminals from degrading to background-FPS output after app-control focus/background transitions.
+
+## 2.1.242
+
+- Give app-control multiline terminal sends a longer bounded fast-read window, so background heredoc/TUI commands do not exhaust the short input-echo burst before real command output and frame-drop telemetry arrive.
+
+## 2.1.241
+
+- Normalize app-control terminal-send newlines to PTY Enter bytes before writing, so multiline heredoc/TUI probes execute after the terminator instead of visibly stopping at the secondary prompt.
+
+## 2.1.240
+
+- Preserve multiline app-control terminal sends as one PTY payload, splitting only around Ctrl-C, so long heredoc/TUI probes cannot report the whole command accepted while the background terminal only receives the first prompt line.
+
+## 2.1.239
+
+- Keep the terminal read loop on the fast input-echo cadence across the first non-empty command echo, so background app-control sends for multiline/TUI commands do not fall back to the slow unfocused poll before real output arrives.
+
+## 2.1.238
+
+- Acknowledge app-control terminal read nudges before reporting daemon-side input writes as complete, making background terminal sends wake the xterm read loop deterministically for resource and latency probes.
+- Tighten the Linux idle CPU smoke's background TUI detector to compare low-power frame counters against a per-phase baseline instead of treating stale foreground counters as proof.
+
+## 2.1.237
+
+- Keep active inline terminal status animations on the low-latency read-poll cadence even when toolkit focus is stale, so Codex `Working`-style redraws keep producing smooth xterm flushes.
+
+## 2.1.236
+
+- Wake the mounted xterm read loop after app-control terminal sends, so daemon-side injected input paints promptly instead of waiting on the unfocused idle poll.
+
+## 2.1.235
+
+- Include terminal font family, weight, line-height, and contrast settings in terminal fallback app-control snapshots so readability smokes keep enforcing the viewport typography contract.
+
+## 2.1.234
+
+- Preserve live-session close/keep-alive affordance geometry in terminal fallback app-control snapshots, keeping sidebar contract probes strict even when terminal activity forces the lightweight DOM path.
+
+## 2.1.233
+
+- Keep sidebar row truth available in terminal-focused app-control fallback snapshots, so live-session tree smokes still prove the sidebar contract when full DOM probes time out during terminal activity.
+
+## 2.1.232
+
+- Keep viewport probe typing on the same terminal busy contract as real input, so a foreground command injected through app-control flips the live-session busy row and cannot be hidden by stale idle daemon snapshots.
+
+## 2.1.231
+
+- Tighten terminal typing observability so app-control only reports visible input when the marker is in the viewport or visible cursor line, rejects inactive hosts, and smoke-tests typing from scrollback back to the prompt.
+
+## 2.1.230
+
+- Carry the effective terminal palette identity through daemon terminal-start requests, so fresh local/remote Codex launches export dark `YGGTERM_TERMINAL_APPEARANCE`/`COLORFGBG` when the viewport is dark even if the outer shell is light.
+
+## 2.1.229
+
+- Match Codex launch identity to the effective terminal palette instead of the shell chrome theme, so dark terminal viewports advertise dark `COLORFGBG`/`YGGTERM_TERMINAL_APPEARANCE` even inside the light Yggterm shell.
+- Add a canvas-rendered Codex input-line band plus app-control/smoke assertions for its visibility, catching missing prompt contrast before release.
+
+## 2.1.228
+
+- Clear stale remote resume notifications and attach gates once app-control sees clean daemon-owned PTY output, so a hot-updated terminal does not remain visible-but-input-disabled after the overlay disappears.
+
+## 2.1.227
+
+- Strip cursor-addressed internal terminal attach errors that are appended after xterm control sequences in retained daemon snapshots, preserving useful prompt/footer text while removing stale `terminal session not found` replay residue.
+
+## 2.1.226
+
+- Strip wrapped internal SSH attach footers such as bare `Shared connection to ...` fragments from retained/live terminal replay and classify them in app-control/smoke probes, so contaminated Codex surfaces cannot reopen with stale transport lines after hot update.
+
+## 2.1.225
+
+- Hard-clear the xterm screen and scrollback before sanitized retained/live replay when a visible internal transport leak is detected, avoiding stale painted attach errors that survive xterm reset.
+
+## 2.1.224
+
+- Reset a contaminated visible xterm buffer before applying clean live terminal writes, so stale internal attach failures from a prior hot update cannot remain painted after the daemon resumes streaming real output.
+
+## 2.1.223
+
+- Suppress remote resume transport-error batches even after the resume overlay has been dismissed, preventing the live read loop from writing internal attach failures into xterm while input remains gated.
+
+## 2.1.222
+
+- Strip internal retained-replay transport residue even when Codex/xterm rewrites place the error after a bare carriage return, closing the remaining hot-update leak that could keep `terminal session not found` visible and input-gated.
+
+## 2.1.221
+
+- Reject already-visible retained xterm buffers that contain internal attach/SSH transport residue, forcing sanitized daemon replay instead of letting a hot-update restore reopen on `terminal session not found` or `Shared connection ... closed` lines.
+- Add CI-focused guards for the retained replay rejection path and KDE Wayland transparent corner profile so these regressions fail before release packaging.
+
+## 2.1.220
+
+- Treat orphaned line-shaped SSH close text as replay-only transport residue during retained daemon-terminal restore, so a previously contaminated hot-update replay cannot keep reopening to `Shared connection ... closed` as the active cursor line.
+
+## 2.1.219
+
+- Strip the paired `Shared connection to ... closed` line from contaminated retained terminal replay even when escape traffic or blank lines separate it from the internal attach error, while keeping ordinary user transcripts with SSH close text intact.
+
+## 2.1.218
+
+- Sanitize retained daemon-terminal replay before script-based restore and direct xterm snapshot writes, preventing hot-update rehydration from showing stale internal `terminal session not found` transport lines in live Codex terminals.
+
+## 2.1.217
+
+- Apply the internal terminal attach-error sanitizer to raw terminal-control payloads too, so retained Codex/xterm replay cannot leak `terminal session not found` lines through the control-forwarding path after hot update.
+
+## 2.1.216
+
+- Strip leaked internal terminal attach errors from live terminal replay, detect tail-position `terminal session not found` transport leaks in app-control/read-only smokes, and keep the surrounding user scrollback intact.
+- Restore lightly rounded KDE Wayland window corners by using the transparent Wayland profile, and require final xterm smoke screenshots to run the corner proof.
+
+## 2.1.215
+
+- Retarget stale versioned socket symlink aliases without pinging their old target during daemon startup, preventing a failed update sidecar from slowing or blocking the next hot-update attempt.
+
+## 2.1.214
+
+- Avoid hot-update daemon startup deadlocks when old versioned socket aliases already point at the freshly bound daemon socket, so the updated daemon does not ping itself before its accept loop is running.
+
+## 2.1.213
+
+- Keep Codex inline `Working` animations on the low-latency terminal path across split/color-only rewrite frames, lower the active animation budget to 40ms, and add smoke coverage that fails when app-control sees a hot inline status animation using the slower TUI budget.
+
+## 2.1.212
+
+- Defer Linux legacy-daemon cleanup until after the new daemon has bound its current socket, preventing stale wedged sockets from blocking fresh daemon startup during hot update.
+
+## 2.1.211
+
+- Dispatch accepted Unix daemon clients off the accept loop and collect request outcomes asynchronously, so one partial or wedged GUI connection cannot block ping, status, hot-update, or terminal recovery requests.
+
+## 2.1.210
+
+- Bound partial Unix daemon requests after the readiness poll, so a client that sends incomplete JSON cannot wedge the synchronous accept loop during hot update or app startup recovery.
+
+## 2.1.209
+
+- Refuse stale hot-update handoff target regressions, so an older launcher cannot overwrite a newer session-survival owner registry after the current update has already prepared a newer daemon target.
+
+## 2.1.208
+
+- Treat a stale remote daemon that still owns a Codex runtime as a hot-update owner during remote stdio attach, preserving the PTY first and routing through the current daemon when the handoff becomes available instead of spawning a duplicate failed resume path.
+
+## 2.1.207
+
+- Clear stale remote-disconnect resume notifications when the daemon PTY is visibly showing a real Codex prompt with real scrollback after a retry, so hot-update recovery does not leave an interactive-looking terminal input-gated.
+
+## 2.1.206
+
+- Pause hidden loading-dot animations so retained invisible UI cannot keep WebKit's animation clock hot while the terminal is idle.
+- Persist remote generated copy hints asynchronously so daemon status and runtime truth are not blocked by SSH copy-hint writes during hot update.
+
+## 2.1.205
+
+- Add an app-control CSS/Web animation census to state/read-only CPU probes so live fan spikes can distinguish terminal write/render work from compositor animation churn.
+
+## 2.1.204
+
+- Guard daemon Unix client reads with an explicit poll timeout before parsing requests, preventing a silent or half-open local client from monopolizing the daemon accept loop during hot update.
+
+## 2.1.203
+
+- Give visible Codex inline `Working` status animations a separate low-latency write budget and expose the animation-hot state in app-control/read-only probes, while keeping background and full-frame TUI throttling intact.
+
+## 2.1.202
+
+- Retire duplicate non-registry daemon owners once the registry's real PTY owner is clean, so older stale daemons cannot keep claiming the same live runtime keys after hot update.
+
+## 2.1.201
+
+- Short-circuit unchanged terminal input-policy syncs so idle active xterm views stop rescheduling focus, resize, and visible-paint work; read-only CPU smokes now expose input-policy apply/no-op churn.
+- Retire preserved-only startup bridge sidecars once the registry's real PTY owner already cleanly matches the preserved runtime set, reducing stale daemon fan load without sacrificing hot-update session survival.
+
+## 2.1.200
+
+- Protect the daemon accept loop from silent local clients by timing out accepted request reads, preventing a stuck observability/status connection from wedging hot-update session recovery.
+
+## 2.1.199
+
+- Make `yggterm-headless server app ... --help` non-mutating, so live observability commands cannot accidentally execute screenshot or probe actions when the operator asks for command help.
+
+## 2.1.198
+
+- Start daemon-retained scrollback replay from the terminal loop's own visual-ready signal instead of waiting for an app-control state probe, so hot-updated remote sessions recover prompt-follow scrollback and manual viewport scrolling on their own.
+
+## 2.1.197
+
+- Split expandable sidebar row hit targets: clicking the visible row name selects the group and opens its scoped Startpage, while the icon, disclosure/count control, and trailing row surface toggle expansion. The same contract now applies to cwd folders, machine groups, and `Live Sessions`.
+
+## 2.1.196
+
+- Project remote live sessions with a known cwd under that cwd whether or not they are marked Keep Alive, so selecting a live session from its folder does not make the folder row vanish. Keep Alive now controls daemon retention only, not cwd findability.
+
+## 2.1.195
+
+- Keep hot update pointed at the stale daemon that explicitly owns a newly launched live PTY, even when an older owner allow-list would otherwise make a preserved-only sidecar look cleaner; this preserves sessions such as `muhurta` across direct-install replacement.
+
+## 2.1.194
+
+- Preserve manual Codex session titles when a live remote runtime is promoted from a synthetic Yggterm id to the real transcript id, and keep fallback hash titles from overwriting existing meaningful copy.
+- Make sidebar rows for live remote sessions prefer daemon live-session title truth over stale scanned remote row titles, so renames such as `muhurta` remain visible after restore/reopen.
+
+## 2.1.193
+
+- Bound app-control DOM snapshot fallback latency during live terminal load, and carry retained replay prompt-follow diagnostics through the terminal fallback snapshot so read-only CPU/state smokes stay both fast and truthful.
+
+## 2.1.192
+
+- Fall back to the preserved owner daemon's client-close cleanup when direct ghost-runtime removal is blocked by already-gone remote Codex shutdown errors, but only when all owner-protected registry keys are explicitly keep-alive.
+
+## 2.1.191
+
+- Prune stale PTYs from hot-update owner daemons when their runtime keys are no longer represented by the current live-session graph, and route explicit live-session closes to the preserved owner so non-keep-alive sessions cannot survive as ghost sidecar truth.
+
+## 2.1.190
+
+- Force retained xterm replay to follow the live prompt after hot update, exposing viewport-force/replay-follow diagnostics and failing CPU/latency smoke tests when retained scrollback exists but the cursor is still below the visible viewport.
+
+## 2.1.189
+
+- Trim idle xterm canvas compositing on software WebKit by hiding non-text full-viewport canvas layers when selection/link/cursor overlays are inactive, replacing the cursor layer with a tiny Yggterm-owned overlay, and exposing the visible canvas-layer contract through app-control/read-only CPU smoke evidence.
+
+## 2.1.188
+
+- Honor Yggterm's selected Linux desktop backend inside the vendored Dioxus Wayland DMA-BUF workaround, so KDE Wayland launches can disable WebKit DMA-BUF without forcing the WebKit child back to X11 and recreating canvas idle CPU/fan burn.
+
+## 2.1.187
+
+- Force the native Wayland backend on KDE Wayland+Xwayland launches before choosing the xterm canvas renderer, preventing X11 WebKit canvas idle CPU/fan burn while preserving the low-CPU native Wayland path.
+
+## 2.1.186
+
+- Keep the newest clean preserved-owner sidecar alive during startup cleanup and reject legacy owners whose inferred runtime set contains unauthorized closed-session keys, so hot update can retarget without reserializing ghost sessions.
+
+## 2.1.185
+
+- Scope Linux daemon cleanup client checks to the candidate daemon's own client-instance directory, so a replacement GUI no longer protects every stale versioned sidecar from cleanup.
+
+## 2.1.184
+
+- Ignore unauthorized ghost-owned runtimes when selecting a startup hot-update handoff target, so stale daemons that only own closed sessions cannot outrank the clean preserved sidecar.
+
+## 2.1.183
+
+- Retire stale preserved-only Linux daemon sidecars during cleanup while keeping the actual hot-update PTY owner protected, reducing jojo fan load without sacrificing session survival.
+
+## 2.1.182
+
+- Treat preserved-only stale daemons as retarget/reconcile candidates during startup instead of skipping them and selecting older orphaned PTY owners, preventing old ghost daemons from repopulating closed sessions during direct-install replacement.
+
+## 2.1.181
+
+- Limit update-restart protection for unkept live rows to sessions that still have current daemon runtime truth, preventing stale in-memory live rows from being serialized back into the next daemon during direct-install replacement.
+- Filter carried preserved-owner sidecar entries through the current runtime status before handoff or retarget, so hidden stale owner records cannot be reintroduced by the next patch-line update.
+
+## 2.1.180
+
+- Prune unrepresented hot-update preserved-owner entries from disk on daemon load and after live-session keep/close changes, so old non-keep-alive sessions cannot remain latent in `hot-update-terminal-owners.json`.
+- Expose `live_keep_alive` in app-control sidebar row snapshots and keep the regression harness focused on the allowed duplicate shape: an explicitly kept remote live row in `Live Sessions` and its own cwd folder.
+- Add a two-kept-session sidebar regression covering `dev:/home/pi/git/jyas` and `dev:/home/pi/git/p01scripts` so kept remote terminals cannot be projected under the wrong cwd folder.
+
+## 2.1.179
+
+- Keep hot-update preserved-owner runtime keys subordinate to current live-session metadata so sessions closed or no longer kept alive cannot resurrect after a restart.
+- Allow Keep Alive toggles for live terminals whose PTY is still owned by a preserved hot-update daemon, preserving the session instead of rejecting the action because the new daemon does not own the PTY locally.
+- Show explicitly kept remote live sessions under their remote cwd folder as well as under `Live Sessions`, so a kept `dev:/home/pi/git/jyas` terminal remains findable from the `jyas` folder after restart.
+
+## 2.1.178
+
+- Default KDE sessions with native Wayland available to the Wayland backend, keeping `YGGTERM_FORCE_X11_BACKEND=1` as the explicit fallback for X11-only investigations.
+- Gate xterm canvas off on X11 by default while keeping canvas active on Wayland and available through `YGGTERM_ENABLE_XTERM_CANVAS=1`, reducing idle WebKit/GUI CPU in visible terminal sessions.
+- Stamp the resolved xterm canvas policy into the GUI process environment and expose `xterm_canvas_renderer_requested` through app-control/idle smokes, so Wayland fan-budget tests fail on requested-vs-mounted renderer mismatches instead of reporting ambiguous CPU truth.
+
+## 2.1.177
+
+- Make direct-install hot update choose the stale daemon behind the active GUI client instead of an older orphaned same-home daemon when multiple versioned sockets are alive.
+- Scan all same-home client-instance scopes during replacement GUI startup so older versioned windows are retired only after their active terminal state has been captured for handoff.
+- Keep daemon startup prewarm from changing the active terminal or live-session row order while it prepares background live terminals.
+
+## 2.1.176
+
+- Resolve suffixed packaged headless companions such as `yggterm-headless-linux-x86_64` so remote bootstrap and timeline cleanup use the exact matched release helper instead of falling back to an older installed remote binary.
+
+## 2.1.175
+
+- Slow the unfocused disposable TUI drain cadence to keep backgrounded terminal workloads under the jojo fan budget while still bounding PTY backlog growth.
+
+## 2.1.174
+
+- Preserve the outgoing GUI's active terminal during direct-install handoff by deferring superseded-client retirement to the shell path that captures app-control active state before terminating the old process.
+- Prevent daemon retained scrollback replay from using stale ready history on a new unready terminal mount, avoiding transient visible retained snapshots before the current viewport is actually interactive.
+
+## 2.1.173
+
+- Suspend periodic browser-tree scans while a terminal is the active viewport, eliminating minute-bound saved-tree refresh wakeups from focused/background terminal CPU samples.
+
+## 2.1.172
+
+- Drain backgrounded disposable TUI output every 2s while xterm rendering is suppressed, preventing large PTY backlogs from intermittently spiking GUI/WebKit CPU and reducing prompt-restore lag after stopping the TUI.
+- Add remote CPU sample timestamps to the Linux idle/fan smoke so CPU windows can be aligned with remote event and perf traces without guessing across machine clock skew.
+
+## 2.1.171
+
+- Slow the browser-tree refresh cadence while the shell is on the quiet Startpage with no live sessions, reducing empty-window launch-idle CPU and root-render churn before terminal work starts.
+
+## 2.1.170
+
+- Preserve the outgoing GUI's active live terminal during direct-install hot-update handoff by capturing the retiring client's app-control state before termination and seeding the replacement client and daemon with that live path.
+- Prevent normal persistence from writing an active session path that points to a live runtime excluded from durable `live_sessions`, while keeping update-restart persistence protective for all live runtimes.
+
+## 2.1.169
+
+- Route Linux idle CPU smoke probes through the matched `yggterm-headless` sibling so fan-budget tests cannot launch extra GUI clients while measuring the target window.
+- Retarget stale busy live-session snapshot timers after terminal output quiets, preventing a full background daemon snapshot from firing during the quiet CPU budget window.
+- Allow idle CPU smoke runs to pass through render tracing so root-render evidence can be aligned with CPU phases when investigating fan spikes.
+- Split Codex launch timeline CPU into pre-test baseline, live-profile, isolated test-profile, SSH, Codex, and WebKit categories so jojo fan spikes can be traced before and after each test phase.
+- Make the Codex launch timeline smoke classify focus-gated rendered prompts separately from terminal input failures, report focus-command/state disagreement, and verify generated remote Codex worker processes are gone during cleanup.
+- Prefer real X11 window activation for Linux app-control focus requests when `xdotool` is available, while still reporting the fallback backend and native window id in focus proof.
+- Keep remote timeline smoke artifacts and temp profiles under `/home/pi/.cache` by default, with storage preflight output in the report, to avoid `/tmp` pressure corrupting staged proof runs.
+- Treat xterm focus-in/focus-out control bytes as terminal protocol traffic rather than user input, avoiding false "input accepted without echo" failures on healthy remote Codex prompts.
+- Have the Codex launch timeline reclaim terminal focus through app-control before captures so screenshot evidence, active-host focus, and input-readiness probes can be compared directly.
+- Expose `effective_input_focus` and the app-control terminal input override in state/smoke reports so X11/toolkit focus drift is distinguished from a genuinely unfocused xterm helper.
+- Record a post-screenshot app-control state in Codex launch timeline captures so screenshot evidence is reconciled against the same settled viewport instead of the pre-screenshot probe response.
+
+## 2.1.168
+
+- Start Codex launch timeline resource logging before app launch or terminal creation, with phase-trace boundaries for baseline, launch, capture, and cleanup.
+- Summarize Codex launch resource usage by phase in the smoke report so baseline, app launch, capture, and cleanup CPU spikes can be compared without hand-joining JSONL traces.
+- Add pre-test host resource baselines and explicit phase events to the Linux idle CPU smoke so fan/CPU regressions have cause/effect evidence before the app mutates the target.
+- Split daemon status into owned terminal runtimes and preserved terminal owners, and make hot restart preserve only daemons that actually own PTYs while retargeting the preserved-owner registry across safe sidecar restarts.
+- Make app-control focus truth follow the native window focus result instead of marking the shell focused when the compositor refused focus.
+- Route Codex launch timeline app-control probes through the matched `yggterm-headless` sibling so state, rows, and screenshot captures do not launch extra GUI clients or perturb focus.
+- Forward xterm protocol replies through the raw terminal bridge even while user input is readiness-gated, preventing Codex startup handshakes from stalling behind an input-disabled viewport.
+- Accept retained remote Codex scrollback only when real PTY bytes, meaningful output, and prompt-layout geometry agree, while preserving sparse prompt-only failure coverage.
+- Tighten the Codex launch timeline smoke so a rendered prompt is not accepted until terminal input is ready, focus the owned proof window before captures, and separate sampler overhead from measured Yggterm CPU.
+- Treat fresh `start-codex` remote attach markers as transport control just like `resume-codex`, preventing attach handshakes from leaking into terminal-output truth.
+
+## 2.1.167
+
+- Force WebKit DOM-rendered xterm rows to paint with `currentColor` text fill so hot-updated retained terminals cannot keep buffer text while the real viewport appears blank.
+- Add app-control row text-fill diagnostics and mark DOM terminals unhealthy when retained buffer text is present but row text fill is transparent.
+- Require hot-session switch smoke tests to prove prompt-region screenshot pixels after switching away and back, catching state-ready but visually blank retained surfaces.
+
+## 2.1.166
+
+- Add an isolated Codex launch timeline smoke that captures state, rows, screenshots, CPU, and cleanup truth at 0.5s through 60s for fresh local and remote Codex terminals.
+- Keep terminal-emulator protocol handshakes, Codex welcome frames, prompt frames, and prompt-like setup frames out of the unfocused TUI drop path, preventing blank mounted xterm surfaces while Codex burns CPU.
+- Retry transient app-control DOM eval-finished failures in basic/action snapshots and make the timeline smoke report DOM snapshot failures explicitly instead of misclassifying them as terminal-host loss.
+- Gate app-control `input_enabled` behind actual surface readiness while exposing `raw_input_enabled` separately so protocol responses can keep flowing during startup without claiming user-input readiness.
+- Restrict retained remote-surface recovery to actually retained or previously ready sessions, so fresh remote Codex launches are not remounted as stale retained failures.
+- Back off active high-volume terminal frame writes to a 500ms default, keep chunked alt-screen output on the frame-budgeted read cadence, route bulk/frame-like xterm writes through the async parser path, and throttle frame-like render probes, perf events, buffer reads, and canvas health sampling so active TUI output cannot keep WebKit and the GUI pegged.
+- Render active plain local full-screen TUI frames through a low-power text surface after the xterm control prefix is applied, while keeping Codex and remote sessions on the normal xterm path so saved-session and input semantics stay exact.
+- Suppress sidebar/sample churn from hot frame-like host-health events, slow the idle app-control watchdog fallback, disarm terminal input when the desktop window is unfocused, and lengthen the local idle read backoff so refocus idle CPU settles instead of keeping jojo's fan hot.
+- Keep background frame-budgeted local TUI streams on the unfocused 16s read cadence instead of accidentally clamping them back to the 3s local idle cap, reducing GUI/WebKit wakeups while the window is not focused.
+- Add a post-state cooldown plus active/effective frame-budget fields to the remote Linux idle CPU smoke so app-control state probes do not contaminate the CPU sample they are meant to measure and the proof can show whether active TUI output is actually using the intended budget.
+- Extend the remote Linux idle CPU smoke with per-thread CPU rows, render-counter deltas, low-power TUI overlay state, hot host-health suppression counters, background TUI frame-signal gating, and a post-interrupt drain before background-idle sampling.
+
+## 2.1.165
+
+- Treat sparse remote Codex prompt-only xterm surfaces as unhealthy when the `OpenAI Codex` welcome frame is missing and most rows below the prompt are blank, even if the PTY delivered real bytes.
+- Extend read-only UI latency smoke output with root-render churn, browser rebuild churn, and top per-thread CPU deltas so GUI/WebKit spin can be diagnosed when terminal write/render counters stay idle.
+- Make app-control wakeups worker-aware so requests targeted at a different live GUI PID do not keep unrelated clients scheduling root renders while the terminal itself is idle.
+- Treat `server app <command> --help` as help instead of executing the app-control command, preventing accidental live GUI launches during diagnostics.
+
 ## 2.1.164
 
 - Fail closed when an update-restored remote Codex session only has a synthetic `start-codex` launch marker: update restore now strips the fresh-start action and queues `resume-codex --require-existing` instead of silently starting a new Codex session.

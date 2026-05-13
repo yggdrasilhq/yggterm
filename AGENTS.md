@@ -31,6 +31,9 @@ Build **Yggdrasil Terminal**: a Rust-first, cross-platform, remote-first termina
 - Fast startup and interactive responsiveness.
 - Cross-platform support (Linux/macOS/Windows where feasible).
 - Keep terminal semantics owned by the Yggterm daemon plus xterm.js unless the Ghostty tradeoff is revisited explicitly.
+- Keep the minimal session promise front and center: a Yggterm session should feel like a durable, snappy automation of `ssh <machine>; cd <cwd>; codex resume <uuid>` or the equivalent shell task. Metadata, sidebar placement, hot update, screenshots, and observability support that terminal routine; they must not become alternate renderers, alternate input targets, or alternate sources of session truth.
+- For terminal rendering bugs, fix the daemon PTY/xterm.js path first. Do not hide prompt-background, cursor, resize redraw, animation, typed-echo, or scrollback defects behind shell-owned decorative layers just to satisfy screenshots. xterm.js-native renderer APIs such as decorations are part of the terminal surface; Yggterm-owned cursor/prompt/visibility aids must be explicit, narrow, observable, and secondary to PTY/xterm truth.
+- Keep terminal implementation notes and local xterm.js reproduction fixtures in `docs/xterm.md`; consult it before terminal rendering, resize, or PTY identity changes.
 - For SSH targets, prefer Yggterm-owned remote commands and metadata/clipboard flows over ad hoc shell-text or Python-side workarounds whenever the remote machine has a Yggterm binary available.
 - Remote SSH flows should version-check and, when needed, bootstrap a matching `yggterm` binary into `~/.yggterm/bin/yggterm` on the target machine before depending on remote Yggterm commands.
 - Yggterm should feel remote-first: multiple machines, SSH-heavy workflows, and restoring many live terminal contexts is a core use case.

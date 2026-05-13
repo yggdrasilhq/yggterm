@@ -137,7 +137,10 @@ def host_has_live_codex_prompt(host: dict) -> bool:
     input_ready = host.get("input_enabled") is True or host.get("helper_textarea_focused") is True
     if not input_ready:
         return False
-    if terminal_text_has_transcript_artifacts(terminal_host_text(host)):
+    text = terminal_host_text(host)
+    if terminal_text_has_transcript_artifacts(text):
+        return False
+    if terminal_text_has_codex_resume_instruction(text):
         return False
     return any(
         terminal_chunk_has_codex_prompt_output(chunk)
@@ -181,6 +184,11 @@ def assert_single_clean_codex_status_surface(host: dict, *, context: str) -> dic
             f"{context}: terminal viewport contains saved Codex transcript artifacts: "
             f"text_tail={text[-1600:]!r}"
         )
+    if terminal_text_has_codex_resume_instruction(text):
+        raise AssertionError(
+            f"{context}: terminal viewport contains an exited Codex resume instruction: "
+            f"text_tail={text[-1200:]!r}"
+        )
     replacement_count = text.count("\ufffd")
     if replacement_count:
         raise AssertionError(
@@ -219,6 +227,14 @@ def terminal_text_has_transcript_artifacts(text: str) -> bool:
         or ("transcript" in joined and ("q to quit" in joined or "pgup/pgdn" in joined))
     )
     return (len(role_lines) >= 2 and len(lines) >= 4) or transcript_browser
+
+
+def terminal_text_has_codex_resume_instruction(text: str) -> bool:
+    normalized = " ".join(str(text or "").lower().split())
+    return (
+        "to continue this session, run codex resume" in normalized
+        or "run codex resume " in normalized
+    )
 
 
 def terminal_host_text_chunks(host: dict) -> list[str]:
@@ -301,7 +317,6 @@ def ensure_live_codex_runtime(pid: int, session: str) -> dict:
         pid,
         session,
         "",
-        press_ctrl_c=True,
         press_ctrl_e=True,
         press_ctrl_u=True,
     )

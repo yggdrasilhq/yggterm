@@ -12,6 +12,7 @@ import shlex
 import shutil
 import subprocess
 import time
+from collections import Counter
 from pathlib import Path
 
 try:
@@ -73,6 +74,9 @@ AVOID_FOREGROUND = (ENV.get("YGGTERM_SMOKE_AVOID_FOREGROUND") or "").strip().low
 ALLOW_DESKTOP_SYNTHETIC_INPUT = (
     ENV.get("YGGTERM_SMOKE_ALLOW_DESKTOP_SYNTHETIC_INPUT") or ""
 ).strip().lower() in ("1", "true", "yes", "on")
+ALLOW_XTERM_INPUT_LINE_DECORATION = (
+    ENV.get("YGGTERM_ALLOW_XTERM_INPUT_LINE_DECORATION") or ""
+).strip().lower() in ("1", "true", "yes", "on")
 PROBLEM_NOTIFICATION_MARKERS = (
     "connection refused",
     "no such file or directory",
@@ -86,6 +90,13 @@ PROBLEM_NOTIFICATION_MARKERS = (
     "sock connection",
     ".sock",
 )
+
+
+def numeric(value) -> float | None:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def event_trace_paths() -> list[Path]:
@@ -2902,6 +2913,15 @@ def normalize_live_path(path: str) -> str:
     return f"{prefix}://{suffix}"
 
 
+def is_allowed_kept_remote_live_tree_duplicate(row: dict) -> bool:
+    path = normalize_live_path(str(row.get("path") or row.get("full_path") or "").strip())
+    return (
+        path.startswith("remote-session://")
+        and bool(row.get("live_member"))
+        and bool(row.get("live_keep_alive"))
+    )
+
+
 def normalize_session_kind(kind: str | None) -> str:
     normalized = str(kind or "").strip().lower()
     if normalized == "codex-litellm":
@@ -3178,6 +3198,36 @@ def probe_select(pid: int, session: str) -> dict:
     ))
 
 
+def probe_primary_selection_paste(pid: int, session: str, data: str) -> dict:
+    return unwrap_data(run(
+        "server",
+        "app",
+        "terminal",
+        "probe-primary-paste",
+        "--pid",
+        str(pid),
+        session,
+        "--data",
+        data,
+        "--timeout-ms",
+        "12000",
+    ))
+
+
+def probe_terminal_context_menu(pid: int, session: str) -> dict:
+    return unwrap_data(run(
+        "server",
+        "app",
+        "terminal",
+        "probe-context-menu",
+        "--pid",
+        str(pid),
+        session,
+        "--timeout-ms",
+        "12000",
+    ))
+
+
 def probe_scroll(pid: int, session: str, lines: int, *, timeout_ms: int = 12000, retries: int = 2) -> dict:
     last_error: AssertionError | None = None
     for attempt in range(retries):
@@ -3226,6 +3276,30 @@ def host_expects_scrollback(host: dict) -> bool:
         int(host.get("retained_replay_line_count") or 0)
         > rows + 4
     )
+
+
+def assert_host_prompt_following(host: dict, context: str) -> dict:
+    viewport_y = int(host.get("viewport_y") or 0)
+    base_y = int(host.get("base_y") or 0)
+    rows = int(host.get("rows") or 0)
+    gap = max(0, base_y - viewport_y)
+    intent = str(host.get("scrollback_intent") or "")
+    locked = bool(host.get("scrollback_locked"))
+    if intent == "UserScrollback":
+        raise AssertionError(f"{context}: host entered user scrollback during programmatic layout: {host!r}")
+    if gap > 2 or locked:
+        raise AssertionError(
+            f"{context}: prompt-follow host drifted away from the live bottom: "
+            f"viewport_y={viewport_y} base_y={base_y} gap={gap} rows={rows} locked={locked} host={host!r}"
+        )
+    return {
+        "viewport_y": viewport_y,
+        "base_y": base_y,
+        "gap": gap,
+        "rows": rows,
+        "scrollback_intent": intent,
+        "scrollback_locked": locked,
+    }
 
 
 def probe_type(
@@ -3334,8 +3408,8 @@ def relative_luminance(rgb: tuple[float, float, float]) -> float:
 
 
 def contrast_ratio(foreground: str, background: str) -> float | None:
-    fg = parse_css_rgb(foreground)
-    bg = parse_css_rgb(background)
+    fg = normalize_css_rgb_for_contrast(parse_css_rgb(foreground))
+    bg = normalize_css_rgb_for_contrast(parse_css_rgb(background))
     if fg is None or bg is None:
         return None
     fg_l = relative_luminance(fg)
@@ -3345,9 +3419,20 @@ def contrast_ratio(foreground: str, background: str) -> float | None:
     return (lighter + 0.05) / (darker + 0.05)
 
 
+def normalize_css_rgb_for_contrast(
+    rgb: tuple[float, float, float] | tuple[int, int, int] | None,
+) -> tuple[float, float, float] | None:
+    if rgb is None:
+        return None
+    red, green, blue = (float(rgb[0]), float(rgb[1]), float(rgb[2]))
+    if max(red, green, blue) > 1.0:
+        return (red / 255.0, green / 255.0, blue / 255.0)
+    return (red, green, blue)
+
+
 def css_colors_close(left: str, right: str, *, tolerance: float = 0.035) -> bool:
-    left_rgb = parse_css_rgb(left)
-    right_rgb = parse_css_rgb(right)
+    left_rgb = normalize_css_rgb_for_contrast(parse_css_rgb(left))
+    right_rgb = normalize_css_rgb_for_contrast(parse_css_rgb(right))
     if left_rgb is None or right_rgb is None:
         return False
     return all(abs(l - r) <= tolerance for l, r in zip(left_rgb, right_rgb))
@@ -3973,6 +4058,38 @@ def pixel_delta(a: tuple[int, int, int], b: tuple[int, int, int]) -> int:
     return max(abs(a[0] - b[0]), abs(a[1] - b[1]), abs(a[2] - b[2]))
 
 
+def parse_css_rgb(value: str | None) -> tuple[int, int, int] | None:
+    if not value:
+        return None
+    text = str(value).strip()
+    if re.fullmatch(r"#[0-9a-fA-F]{6}", text):
+        return (
+            int(text[1:3], 16),
+            int(text[3:5], 16),
+            int(text[5:7], 16),
+        )
+    if re.fullmatch(r"#[0-9a-fA-F]{3}", text):
+        return (
+            int(text[1] * 2, 16),
+            int(text[2] * 2, 16),
+            int(text[3] * 2, 16),
+        )
+    match = re.search(r"rgba?\(([^)]+)\)", text)
+    if not match:
+        return None
+    parts = [part.strip() for part in match.group(1).split(",")]
+    if len(parts) < 3:
+        return None
+    try:
+        return (
+            max(0, min(255, int(round(float(parts[0]))))),
+            max(0, min(255, int(round(float(parts[1]))))),
+            max(0, min(255, int(round(float(parts[2]))))),
+        )
+    except ValueError:
+        return None
+
+
 def dominant_border_color(image: Image.Image) -> tuple[int, int, int]:
     width, height = image.size
     samples: list[tuple[int, int, int]] = []
@@ -4004,6 +4121,21 @@ def count_non_background_pixels(
             if pixel_delta(pixel[:3], background) > tolerance:
                 count += 1
     return count, background
+
+
+def median_rgb(image: Image.Image) -> tuple[int, int, int]:
+    rgb = image.convert("RGBA")
+    pixels: list[tuple[int, int, int]] = []
+    for pixel in rgb.getdata():
+        if pixel[3] > 16:
+            pixels.append(pixel[:3])
+    if not pixels:
+        return (0, 0, 0)
+    channels = []
+    for index in range(3):
+        values = sorted(pixel[index] for pixel in pixels)
+        channels.append(values[len(values) // 2])
+    return channels[0], channels[1], channels[2]
 
 
 def count_background_mismatch_pixels(
@@ -4320,6 +4452,230 @@ def assert_prompt_prefix_pixels_visible(
     }
 
 
+def contrast_ratio_for_rgb(
+    foreground: tuple[int, int, int],
+    background: tuple[int, int, int],
+) -> float:
+    fg = normalize_css_rgb_for_contrast(foreground)
+    bg = normalize_css_rgb_for_contrast(background)
+    assert fg is not None
+    assert bg is not None
+    fg_l = relative_luminance(fg)
+    bg_l = relative_luminance(bg)
+    lighter = max(fg_l, bg_l)
+    darker = min(fg_l, bg_l)
+    return (lighter + 0.05) / (darker + 0.05)
+
+
+def assert_prompt_line_glyph_pixels_visible(
+    screenshot_path: Path,
+    state: dict,
+    *,
+    context: str,
+) -> dict:
+    host = active_host(state)
+    cursor_line_text = str(host.get("cursor_line_text") or host.get("cursor_row_text") or "")
+    if not cursor_line_text.strip():
+        return {"skipped": "missing_cursor_text"}
+    host_rect = host.get("host_rect") or host.get("screen_rect") or host.get("viewport_rect") or {}
+    cursor_rect = host.get("cursor_expected_rect") or host.get("cursor_sample_rect") or {}
+    if not rect_is_visible(host_rect) or not rect_is_visible(cursor_rect):
+        raise AssertionError(
+            f"{context}: cannot sample prompt glyph pixels without visible host/cursor geometry: "
+            f"host={host_rect!r} cursor={cursor_rect!r}"
+        )
+    image = Image.open(screenshot_path).convert("RGBA")
+    dimensions = host.get("xterm_dimensions") or {}
+    css_cell = dimensions.get("css_cell") or {}
+    cell_width = float(css_cell.get("width") or dimensions.get("css_cell_width") or cursor_rect.get("width") or 8.0)
+    cell_height = float(css_cell.get("height") or dimensions.get("css_cell_height") or cursor_rect.get("height") or 18.0)
+    host_left = float(host_rect.get("left") or 0.0)
+    host_right = host_left + float(host_rect.get("width") or 0.0)
+    cursor_left = float(cursor_rect.get("left") or 0.0)
+    cursor_right = cursor_left + float(cursor_rect.get("width") or cell_width)
+    row_top = float(cursor_rect.get("top") or 0.0)
+    row_height = max(float(cursor_rect.get("height") or 0.0), cell_height, 8.0)
+    row_bottom = row_top + row_height
+    prefix_left = max(host_left, cursor_left - max(cell_width * min(max(len(cursor_line_text), 2), 24), cell_width * 2.0))
+    prefix_right = min(cursor_left, host_right)
+    prefix_box = clamp_box(
+        (
+            int(prefix_left),
+            int(row_top + 1.0),
+            int(prefix_right),
+            int(row_bottom - 1.0),
+        ),
+        image.size,
+    )
+    if prefix_box is None or prefix_box[2] <= prefix_box[0] or prefix_box[3] <= prefix_box[1]:
+        return {"skipped": "prompt_prefix_before_cursor_outside_image"}
+    background_box = clamp_box(
+        (
+            int(min(max(cursor_right + cell_width, host_left), max(host_left, host_right - cell_width))),
+            int(row_top + 1.0),
+            int(host_right - max(2.0, cell_width)),
+            int(row_bottom - 1.0),
+        ),
+        image.size,
+    )
+    if background_box is not None and background_box[2] > background_box[0] and background_box[3] > background_box[1]:
+        background = median_rgb(image.crop(background_box))
+    else:
+        _, background = count_non_background_pixels(image.crop(prefix_box))
+    crop = image.crop(prefix_box)
+    colors: Counter[tuple[int, int, int]] = Counter()
+    for pixel in crop.getdata():
+        rgb = pixel[:3]
+        if pixel[3] > 0 and pixel_delta(rgb, background) > 22:
+            colors[rgb] += 1
+    non_background_pixels = sum(colors.values())
+    non_space_cells = max(
+        1,
+        sum(1 for ch in cursor_line_text if not ch.isspace()),
+        int((prefix_box[2] - prefix_box[0]) / max(cell_width, 1.0)),
+    )
+    min_visible_pixels = max(24, min(160, int(non_space_cells * 7.5)))
+    if non_background_pixels < min_visible_pixels:
+        raise AssertionError(
+            f"{context}: prompt text is present in xterm state but has too few visible glyph pixels: "
+            f"cursor_line={cursor_line_text!r} non_background_pixels={non_background_pixels} "
+            f"required={min_visible_pixels} background={background!r} prefix_box={prefix_box!r}"
+        )
+    glyph_rgb = colors.most_common(1)[0][0]
+    glyph_contrast = contrast_ratio_for_rgb(glyph_rgb, background)
+    if glyph_contrast < 4.5:
+        raise AssertionError(
+            f"{context}: prompt glyph pixels are too low contrast: cursor_line={cursor_line_text!r} "
+            f"glyph_rgb={glyph_rgb!r} background={background!r} contrast={glyph_contrast:.2f} "
+            f"prefix_box={prefix_box!r}"
+        )
+    return {
+        "cursor_line_text": cursor_line_text,
+        "prefix_box": {
+            "left": prefix_box[0],
+            "top": prefix_box[1],
+            "width": prefix_box[2] - prefix_box[0],
+            "height": prefix_box[3] - prefix_box[1],
+        },
+        "background_box": {
+            "left": background_box[0],
+            "top": background_box[1],
+            "width": background_box[2] - background_box[0],
+            "height": background_box[3] - background_box[1],
+        }
+        if background_box is not None
+        else None,
+        "background_rgb": background,
+        "glyph_rgb": glyph_rgb,
+        "glyph_contrast": round(glyph_contrast, 2),
+        "non_background_pixels": non_background_pixels,
+        "min_visible_pixels": min_visible_pixels,
+    }
+
+
+def assert_codex_xterm_prompt_band_pixels_visible(
+    screenshot_path: Path,
+    state: dict,
+    *,
+    context: str,
+) -> dict:
+    host = active_host(state)
+    cursor_line_text = str(host.get("cursor_line_text") or host.get("cursor_row_text") or "")
+    if not cursor_line_text.lstrip().startswith("›"):
+        return {
+            "skipped": True,
+            "reason": "cursor_line_not_codex_prompt",
+            "cursor_line_text": cursor_line_text,
+        }
+    if (
+        host.get("software_canvas_input_line_overlay_present")
+        or host.get("software_canvas_input_line_overlay_visible")
+        or host.get("software_canvas_cursor_overlay_present")
+        or host.get("software_canvas_cursor_overlay_visible")
+    ):
+        raise AssertionError(
+            f"{context}: Codex prompt/cursor must be painted by xterm.js, not Yggterm software overlays: {host!r}"
+        )
+    xterm_decoration = {
+        "present": host.get("xterm_input_line_decoration_present"),
+        "visible": host.get("xterm_input_line_decoration_visible"),
+        "line": host.get("xterm_input_line_decoration_line"),
+        "width": host.get("xterm_input_line_decoration_width"),
+        "background": host.get("xterm_input_line_decoration_background"),
+        "error": host.get("xterm_input_line_decoration_error"),
+        "disposed": host.get("xterm_input_line_decoration_disposed"),
+        "marker_line": host.get("xterm_input_line_decoration_marker_line"),
+        "element_present": host.get("xterm_input_line_decoration_element_present"),
+        "element_visible": host.get("xterm_input_line_decoration_element_visible"),
+        "element_background": host.get("xterm_input_line_decoration_element_background"),
+        "element_rect": host.get("xterm_input_line_decoration_element_rect"),
+        "render_count": host.get("xterm_input_line_decoration_render_count"),
+    }
+    row_rect = host.get("cursor_expected_rect") or host.get("cursor_sample_rect") or {}
+    host_rect = host.get("host_rect") or host.get("screen_rect") or host.get("viewport_rect") or {}
+    if not rect_is_visible(row_rect) or not rect_is_visible(host_rect):
+        raise AssertionError(
+            f"{context}: cannot sample Codex xterm prompt band without visible row/host rects: "
+            f"row={row_rect!r} host={host_rect!r}"
+        )
+    image = Image.open(screenshot_path)
+    dimensions = host.get("xterm_dimensions") or {}
+    cell = dimensions.get("css_cell") or {}
+    cell_width = float(cell.get("width") or dimensions.get("css_cell_width") or 8.0)
+    cell_height = float(cell.get("height") or dimensions.get("css_cell_height") or 18.0)
+    host_left = float(host_rect.get("left") or 0.0)
+    host_width = float(host_rect.get("width") or 0.0)
+    row_top = float(row_rect.get("top") or 0.0)
+    row_height = max(float(row_rect.get("height") or 0.0), cell_height, 8.0)
+    left = max(
+        host_left + host_width * 0.45,
+        float(row_rect.get("left") or host_left) + max(6.0, cell_width * 8.0),
+    )
+    right = host_left + host_width - max(4.0, cell_width)
+    sample_box = clamp_box(
+        (
+            int(left),
+            int(row_top + 1),
+            int(right),
+            int(row_top + row_height - 1),
+        ),
+        image.size,
+    )
+    if sample_box is None:
+        raise AssertionError(f"{context}: Codex xterm prompt-band sample is outside the screenshot")
+    sample = image.crop(sample_box)
+    prompt_band_rgb = median_rgb(sample)
+    terminal_background = (
+        parse_css_rgb(str(host.get("viewport_background_color") or ""))
+        or parse_css_rgb(str(host.get("background_color") or ""))
+        or parse_css_rgb(str(host.get("xterm_theme_background") or ""))
+    )
+    if terminal_background is None:
+        _, terminal_background = count_non_background_pixels(sample)
+    contrast_delta = pixel_delta(prompt_band_rgb, terminal_background)
+    if contrast_delta < 8:
+        raise AssertionError(
+            f"{context}: Codex prompt band is not visibly painted by xterm.js: "
+            f"prompt_band_rgb={prompt_band_rgb!r} terminal_background={terminal_background!r} "
+            f"delta={contrast_delta} xterm_decoration={xterm_decoration!r} "
+            f"raw_tail={str(host.get('last_raw_payload_sample') or '')[-800:]!r}"
+        )
+    return {
+        "prompt_band_sample_box": {
+            "left": sample_box[0],
+            "top": sample_box[1],
+            "width": sample_box[2] - sample_box[0],
+            "height": sample_box[3] - sample_box[1],
+        },
+        "prompt_band_rgb": prompt_band_rgb,
+        "terminal_background_rgb": terminal_background,
+        "contrast_delta": contrast_delta,
+        "cursor_line_text": cursor_line_text,
+        "renderer_mode": host.get("xterm_renderer_mode"),
+        "xterm_input_line_decoration": xterm_decoration,
+    }
+
+
 def wait_for_window_geometry_settle(
     pid: int,
     *,
@@ -4391,13 +4747,31 @@ def capture_prompt_visible_screenshot(
             continue
         app_screenshot(pid, screenshot_path, crop_state=last_state)
         try:
-            return last_state, assert_prompt_prefix_pixels_visible(
+            prompt_pixels = assert_prompt_prefix_pixels_visible(
                 screenshot_path,
                 last_state,
                 context=context,
             )
+            xterm_prompt_band_pixels = assert_codex_xterm_prompt_band_pixels_visible(
+                screenshot_path,
+                last_state,
+                context=context,
+            )
+            if not xterm_prompt_band_pixels.get("skipped"):
+                prompt_pixels["xterm_prompt_band_pixels"] = xterm_prompt_band_pixels
+            return last_state, prompt_pixels
         except AssertionError as exc:
             last_error = exc
+            failure_payload = {
+                "context": context,
+                "error": str(exc),
+                "state": last_state,
+            }
+            failure_path = screenshot_path.with_name(
+                f"{screenshot_path.stem}-failure-state.json"
+            )
+            with failure_path.open("w", encoding="utf-8") as fh:
+                json.dump(failure_payload, fh, indent=2)
             time.sleep(0.18)
     raise AssertionError(
         f"{context}: prompt pixels never became visible in screenshots after retries: {last_error}"
@@ -4460,6 +4834,11 @@ def host_has_live_codex_prompt(host: dict) -> bool:
             text_sample,
         )
     )
+
+
+def host_has_codex_update_prompt(host: dict) -> bool:
+    host_text = terminal_host_text(host)
+    return "Update available!" in host_text and "Press enter to continue" in host_text
 
 
 def host_has_prompt_ready_text(host: dict) -> bool:
@@ -6249,6 +6628,11 @@ def codex_spawn_host_excerpt(host: dict | None) -> dict:
         "rows": host.get("rows"),
         "fit_overflow_px": host.get("fit_overflow_px"),
         "cursor_bottom_overflow_px": host.get("cursor_bottom_overflow_px"),
+        "input_policy_noop_count": host.get("input_policy_noop_count"),
+        "input_policy_noop_prompt_follow_count": host.get("input_policy_noop_prompt_follow_count"),
+        "last_input_policy_noop_prompt_follow_reason": host.get(
+            "last_input_policy_noop_prompt_follow_reason"
+        ),
         "text_tail": host_text[-700:],
         "has_live_codex_prompt": host_has_live_codex_prompt(host),
         "has_codex_welcome_frame": terminal_text_has_codex_welcome_frame(host_text),
@@ -6259,6 +6643,12 @@ def codex_spawn_host_excerpt(host: dict | None) -> dict:
 def assert_codex_spawn_layout_sane(host: dict, *, context: str) -> dict:
     host_text = terminal_host_text(host)
     has_codex_welcome_frame = terminal_text_has_codex_welcome_frame(host_text)
+    cursor_line_text = str(host.get("cursor_line_text") or host.get("cursor_row_text") or "")
+    if terminal_chunk_has_codex_prompt_output(host_text) and not cursor_line_text.lstrip().startswith("›"):
+        raise AssertionError(
+            f"{context}: Codex prompt prefix and input cursor are split across rows: "
+            f"{codex_spawn_host_excerpt(host)!r}"
+        )
     prompt_counts = []
     for chunk in (str(host.get("text_tail") or ""), str(host.get("text_sample") or "")):
         prompt_counts.append(
@@ -6318,7 +6708,26 @@ def assert_codex_prompt_layout_for_state(state: dict, session: str, *, context: 
             "session_path": host.get("session_path"),
         }
     result = assert_codex_spawn_layout_sane(host, context=context)
+    result["xterm_owned_visuals"] = assert_codex_terminal_xterm_owned_visuals(
+        state,
+        context=f"{context} Codex prompt layout",
+    )
+    noop_count = int_or_none(host.get("input_policy_noop_count")) or 0
+    noop_prompt_follow_count = int_or_none(host.get("input_policy_noop_prompt_follow_count")) or 0
+    if (
+        noop_count > 0
+        and host.get("input_enabled") is True
+        and host.get("programmatic_focus_enabled") is True
+        and str(host.get("scrollback_intent") or "PromptFollow") != "UserScrollback"
+        and noop_prompt_follow_count <= 0
+    ):
+        raise AssertionError(
+            f"{context}: focused input-policy no-ops did not run prompt-follow cursor settle before typing: "
+            f"{codex_spawn_host_excerpt(host)!r}"
+        )
     result["checked"] = True
+    result["input_policy_noop_count"] = noop_count
+    result["input_policy_noop_prompt_follow_count"] = noop_prompt_follow_count
     result["session_path"] = host.get("session_path")
     return result
 
@@ -10902,6 +11311,48 @@ def assert_titlebar_autohide_hover_contract(pid: int, out_dir: Path) -> dict:
     }
 
 
+def assert_titlebar_autohide_prompt_follow_contract(pid: int, session: str, out_dir: Path) -> dict:
+    terminal_reclaim_focus(pid, session)
+    state = wait_for_visible_cursor_session(pid, session, timeout_seconds=10.0)
+    baseline_host = host_for_session(state, session)
+    baseline = assert_host_prompt_following(baseline_host, "titlebar hover baseline")
+    samples: list[dict] = []
+    try:
+        for cycle in range(1, 9):
+            for active in (True, False):
+                app_set_window_chrome_hover(pid, active)
+                time.sleep(0.18)
+                current = app_state(pid)
+                host = host_for_session(current, session)
+                sample = assert_host_prompt_following(
+                    host,
+                    f"titlebar hover prompt-follow cycle={cycle} active={active}",
+                )
+                sample.update(
+                    {
+                        "cycle": cycle,
+                        "hover_active": active,
+                        "guard_reason": host.get("last_prompt_follow_layout_guard_reason"),
+                    }
+                )
+                samples.append(sample)
+        shot = app_screenshot(pid, out_dir / "titlebar-autohide-prompt-follow.png")
+        return {
+            "baseline": baseline,
+            "samples": samples,
+            "screenshot": str(out_dir / "titlebar-autohide-prompt-follow.png"),
+            "screenshot_response": shot,
+        }
+    finally:
+        try:
+            app_set_window_chrome_hover(pid, False)
+            time.sleep(0.15)
+            terminal_redraw(pid, session)
+            terminal_reclaim_focus(pid, session)
+        except Exception:
+            pass
+
+
 def assert_titlebar_empty_lane_window_controls_contract(pid: int, out_dir: Path) -> dict:
     app_set_search(pid, "", focused=False)
     time.sleep(0.1)
@@ -14299,6 +14750,7 @@ def assert_live_sessions_tree_contract(pid: int) -> dict:
         if index not in live_group_child_indexes
         and normalize_live_path(str(row.get("path") or "")) in live_group_paths
         and str(row.get("kind") or "").strip() == "Session"
+        and not is_allowed_kept_remote_live_tree_duplicate(row)
     ]
     if duplicate_tree_live_rows:
         raise AssertionError(
@@ -14481,6 +14933,7 @@ def assert_sidebar_contract(pid: int, session: str) -> dict:
         if index not in live_group_child_indexes
         and normalize_live_path(str(row.get("path") or "")) in live_group_paths
         and str(row.get("kind") or "").strip() == "Session"
+        and not is_allowed_kept_remote_live_tree_duplicate(row)
     ]
     if duplicate_tree_live_rows:
         raise AssertionError(
@@ -15123,6 +15576,16 @@ def assert_hot_session_switch(pid: int, session: str, session_kind: str, out_dir
         )
     partner_shot = out_dir / "hot-switch-partner.png"
     app_screenshot(pid, partner_shot)
+    partner_prompt_pixels = assert_prompt_prefix_pixels_visible(
+        partner_shot,
+        partner_state,
+        context="hot switch partner prompt pixels",
+    )
+    if partner_prompt_pixels.get("skipped"):
+        raise AssertionError(
+            "hot switch partner prompt pixel proof was skipped despite interactive state: "
+            f"{partner_prompt_pixels!r}"
+        )
 
     ok, _, detail = app_open_raw(pid, session, view="terminal")
     if not ok:
@@ -15184,6 +15647,16 @@ def assert_hot_session_switch(pid: int, session: str, session_kind: str, out_dir
         )
     final_shot = out_dir / "hot-switch-return.png"
     app_screenshot(pid, final_shot)
+    final_prompt_pixels = assert_prompt_prefix_pixels_visible(
+        final_shot,
+        final_state,
+        context="hot switch return prompt pixels",
+    )
+    if final_prompt_pixels.get("skipped"):
+        raise AssertionError(
+            "hot switch return prompt pixel proof was skipped despite interactive state: "
+            f"{final_prompt_pixels!r}"
+        )
     return {
         "partner_path": partner_path,
         "partner_kind": partner.get("kind"),
@@ -15191,6 +15664,8 @@ def assert_hot_session_switch(pid: int, session: str, session_kind: str, out_dir
         "open_recoveries": open_recoveries,
         "partner_screenshot": str(partner_shot),
         "return_screenshot": str(final_shot),
+        "partner_prompt_pixels": partner_prompt_pixels,
+        "return_prompt_pixels": final_prompt_pixels,
         "final_text_sample": final_text[-240:],
     }
 
@@ -15627,6 +16102,7 @@ def assert_cursor_glyph_visibility(state: dict) -> dict:
     cursor_class_name = str(host.get("cursor_sample_class_name") or "")
     cursor_option_style = str(host.get("xterm_cursor_style") or "").strip().lower()
     cursor_option_width = host.get("xterm_cursor_width")
+    renderer_mode = str(host.get("xterm_renderer_mode") or "").strip().lower()
     cursor_line_text = str(host.get("cursor_line_text") or host.get("cursor_row_text") or "")
     row_background = str(
         host.get("cursor_row_background")
@@ -15665,6 +16141,41 @@ def assert_cursor_glyph_visibility(state: dict) -> dict:
             f"block cursor theme fill/accent are visually collapsed: cursor={theme_cursor!r} "
             f"accent={theme_cursor_accent!r} contrast={theme_cursor_contrast!r}"
         )
+    canvas_cursor_css_unavailable = (
+        renderer_mode == "canvas"
+        and bool(cursor_text.strip())
+        and is_transparent_css_color(cursor_color)
+    )
+    if canvas_cursor_css_unavailable:
+        cursor_rect = host.get("cursor_sample_rect") or host.get("cursor_expected_rect") or {}
+        if host.get("xterm_cursor_hidden") is True:
+            raise AssertionError(f"canvas-rendered cursor is hidden while showing text {cursor_text!r}: {host!r}")
+        if not rect_is_visible(cursor_rect):
+            raise AssertionError(
+                f"canvas-rendered cursor has no visible expected rect while showing text {cursor_text!r}: "
+                f"rect={cursor_rect!r} host={host!r}"
+            )
+        return {
+            "cursor_sample_text": cursor_text,
+            "cursor_buffer_cell_text": str(host.get("cursor_buffer_cell_text") or ""),
+            "cursor_buffer_prev_cell_text": str(host.get("cursor_buffer_prev_cell_text") or ""),
+            "cursor_sample_color": cursor_color,
+            "cursor_sample_background": cursor_background,
+            "cursor_sample_border_left": cursor_border_left,
+            "cursor_sample_class_name": cursor_class_name,
+            "xterm_cursor_style": cursor_option_style,
+            "xterm_cursor_width": cursor_option_width,
+            "xterm_renderer_mode": renderer_mode,
+            "xterm_theme_cursor": theme_cursor,
+            "xterm_theme_cursor_accent": theme_cursor_accent,
+            "xterm_theme_cursor_contrast": round(theme_cursor_contrast, 2)
+            if theme_cursor_contrast is not None
+            else None,
+            "cursor_glyph_visibility": visibility,
+            "cursor_glyph_opacity": opacity,
+            "cursor_expected_rect": cursor_rect,
+            "css_cursor_sample_unavailable": True,
+        }
     contrast_background = (
         cursor_background if block_cursor and not is_transparent_css_color(cursor_background) else row_background
     )
@@ -15707,6 +16218,7 @@ def assert_cursor_glyph_visibility(state: dict) -> dict:
         "cursor_sample_class_name": cursor_class_name,
         "xterm_cursor_style": cursor_option_style,
         "xterm_cursor_width": cursor_option_width,
+        "xterm_renderer_mode": renderer_mode,
         "xterm_theme_cursor": theme_cursor,
         "xterm_theme_cursor_accent": theme_cursor_accent,
         "xterm_theme_cursor_contrast": round(theme_cursor_contrast, 2)
@@ -15771,6 +16283,102 @@ def assert_prompt_line_screenshot_pixels_visible(
         "prompt_crop_box": box,
         "prompt_non_background_pixels": non_background_pixels,
         "prompt_background": background,
+    }
+
+
+def assert_codex_terminal_xterm_owned_visuals(state: dict, *, context: str) -> dict:
+    host = active_host(state)
+    cursor_line_text = str(host.get("cursor_line_text") or host.get("cursor_row_text") or "")
+    if not cursor_line_text.lstrip().startswith("›"):
+        return {
+            "skipped": True,
+            "reason": "cursor_line_not_codex_prompt",
+            "cursor_line_text": cursor_line_text,
+        }
+    overlay_flags = {
+        "software_canvas_input_line_overlay_present": host.get("software_canvas_input_line_overlay_present"),
+        "software_canvas_input_line_overlay_visible": host.get("software_canvas_input_line_overlay_visible"),
+        "software_canvas_cursor_overlay_present": host.get("software_canvas_cursor_overlay_present"),
+        "software_canvas_cursor_overlay_visible": host.get("software_canvas_cursor_overlay_visible"),
+        "low_power_tui_overlay_present": host.get("low_power_tui_overlay_present"),
+        "low_power_tui_overlay_active": host.get("low_power_tui_overlay_active"),
+    }
+    if any(value is True for value in overlay_flags.values()):
+        raise AssertionError(
+            f"{context}: live Codex terminal visuals must be xterm-owned, overlay flags={overlay_flags!r}"
+        )
+    xterm_decoration = {
+        "present": host.get("xterm_input_line_decoration_present"),
+        "visible": host.get("xterm_input_line_decoration_visible"),
+        "line": host.get("xterm_input_line_decoration_line"),
+        "width": host.get("xterm_input_line_decoration_width"),
+        "background": host.get("xterm_input_line_decoration_background"),
+        "error": host.get("xterm_input_line_decoration_error"),
+        "disposed": host.get("xterm_input_line_decoration_disposed"),
+        "marker_line": host.get("xterm_input_line_decoration_marker_line"),
+        "element_present": host.get("xterm_input_line_decoration_element_present"),
+        "element_visible": host.get("xterm_input_line_decoration_element_visible"),
+        "element_background": host.get("xterm_input_line_decoration_element_background"),
+        "element_rect": host.get("xterm_input_line_decoration_element_rect"),
+        "render_count": host.get("xterm_input_line_decoration_render_count"),
+    }
+    if xterm_decoration["present"] is True and not ALLOW_XTERM_INPUT_LINE_DECORATION:
+        raise AssertionError(
+            f"{context}: Codex prompt visuals must come from PTY bytes/xterm cells in release smokes, "
+            f"not an extra input-line decoration: {xterm_decoration!r}"
+        )
+    renderer_mode = str(host.get("xterm_renderer_mode") or "")
+    if xterm_decoration["present"] is True:
+        if xterm_decoration["visible"] is not True:
+            raise AssertionError(
+                f"{context}: enabled Codex xterm input-line decoration is not visible: {xterm_decoration!r}"
+            )
+        if (
+            renderer_mode == "dom"
+            and (
+                xterm_decoration["element_present"] is not True
+                or xterm_decoration["element_visible"] is not True
+            )
+        ):
+            raise AssertionError(
+                f"{context}: Codex xterm input-line decoration element is not visibly mounted: {xterm_decoration!r}"
+            )
+        if (
+            renderer_mode == "dom"
+            and (
+                int_or_none(xterm_decoration["render_count"]) is None
+                or int_or_none(xterm_decoration["render_count"]) <= 0
+            )
+        ):
+            raise AssertionError(
+                f"{context}: Codex xterm input-line decoration never rendered its element: {xterm_decoration!r}"
+            )
+        if int_or_none(xterm_decoration["width"]) is None or int_or_none(xterm_decoration["width"]) <= 0:
+            raise AssertionError(
+                f"{context}: Codex xterm input-line decoration has an unusable width: {xterm_decoration!r}"
+            )
+        if str(xterm_decoration["error"] or "").strip():
+            raise AssertionError(
+                f"{context}: Codex xterm input-line decoration reported an error: {xterm_decoration!r}"
+            )
+        if xterm_decoration["disposed"] is True:
+            raise AssertionError(
+                f"{context}: Codex xterm input-line decoration marker was disposed: {xterm_decoration!r}"
+            )
+    else:
+        xterm_decoration = {**xterm_decoration, "release_disabled": True}
+    if host.get("xterm_cursor_hidden") is True:
+        raise AssertionError(f"{context}: xterm reports the Codex prompt cursor as hidden: {host!r}")
+    cursor_rect = host.get("cursor_sample_rect") or host.get("cursor_expected_rect") or {}
+    if not rect_is_visible(cursor_rect):
+        raise AssertionError(f"{context}: xterm prompt cursor rect is not visible: {cursor_rect!r}")
+    return {
+        "cursor_line_text": cursor_line_text,
+        "renderer_mode": host.get("xterm_renderer_mode"),
+        "cursor_rect": cursor_rect,
+        "overlay_flags": overlay_flags,
+        "xterm_input_line_decoration": xterm_decoration,
+        "xterm_cursor_hidden": host.get("xterm_cursor_hidden"),
     }
 
 
@@ -16159,6 +16767,68 @@ def assert_selection(pid: int, session: str) -> dict:
     }
 
 
+def assert_primary_selection_paste_contract(pid: int, session: str) -> dict:
+    terminal_reclaim_focus(pid, session)
+    token = f"YGGTERM_PRIMARY_PASTE_{int(time.time() * 1000)}"
+    command = f"printf '%s\\n' {shlex.quote(token)}"
+    terminal_send(pid, session, f"\x15{command}\r")
+    seen_state: dict = {}
+    deadline = time.time() + 8.0
+    while time.time() < deadline:
+        seen_state = app_state(pid)
+        host = host_for_session_or_none(seen_state, session) or {}
+        if token in terminal_host_text(host):
+            break
+        time.sleep(0.15)
+    host = host_for_session_or_none(seen_state, session) or {}
+    if token not in terminal_host_text(host):
+        raise AssertionError(
+            "primary-selection smoke could not seed a visible terminal token before selection: "
+            f"token={token!r} host={host!r}"
+        )
+    terminal_send(pid, session, "\x15")
+    probe = probe_primary_selection_paste(pid, session, token)
+    if not probe.get("accepted"):
+        raise AssertionError(f"primary selection middle-click paste probe failed: {probe!r}")
+    if token not in str(probe.get("last_primary_selection_paste_text") or ""):
+        raise AssertionError(f"primary selection paste did not carry the selected token: {probe!r}")
+    cleanup = terminal_send(pid, session, "\x15")
+    return {
+        "token": token,
+        "selection_probe": probe,
+        "cleanup": cleanup.get("data") or cleanup,
+    }
+
+
+def assert_terminal_context_menu_contract(pid: int, session: str) -> dict:
+    terminal_reclaim_focus(pid, session)
+    probe = probe_terminal_context_menu(pid, session)
+    if not probe.get("accepted"):
+        raise AssertionError(f"terminal right-click context-menu probe failed: {probe!r}")
+    action_names = set(probe.get("action_names") or [])
+    expected_terminal_actions = {"redraw-terminal", "keep-alive", "stop-keep-alive"}
+    if action_names.isdisjoint(expected_terminal_actions):
+        raise AssertionError(
+            "terminal context menu did not expose terminal actions: "
+            f"actions={sorted(action_names)!r} probe={probe!r}"
+        )
+    menu_rect = probe.get("menu_rect") or {}
+    if not rect_is_visible(menu_rect):
+        raise AssertionError(f"terminal context menu did not report a visible menu rect: {probe!r}")
+    if int(probe.get("context_menu_open_count_after") or 0) <= int(
+        probe.get("context_menu_open_count_before") or 0
+    ):
+        raise AssertionError(f"terminal context-menu open counter did not advance: {probe!r}")
+    return {
+        "menu_rect": menu_rect,
+        "action_names": sorted(action_names),
+        "open_count_before": probe.get("context_menu_open_count_before"),
+        "open_count_after": probe.get("context_menu_open_count_after"),
+        "client_x": probe.get("client_x"),
+        "client_y": probe.get("client_y"),
+    }
+
+
 def assert_active_runtime_truth_present(state: dict, session: str, context: str) -> None:
     runtime_truth = state.get("runtime_truth") or {}
     viewport = viewport_state(state)
@@ -16254,6 +16924,12 @@ def assert_terminal_interaction_latency(pid: int, session: str) -> dict:
         "terminal_interaction_latency_after_type",
     )
     active = host_for_session(active_state, session)
+    effective_frame_ms = numeric(active.get("effective_terminal_write_frame_ms"))
+    if effective_frame_ms is None or effective_frame_ms > 220.0:
+        raise AssertionError(
+            "active terminal write frame budget is too slow for interactive use: "
+            f"effective_frame_ms={effective_frame_ms!r} active_host={active!r}"
+        )
     cursor_line_text = str(active.get("cursor_line_text") or active.get("cursor_row_text") or "")
     text_tail = str(active.get("text_sample") or "")
     type_before = type_data.get("before") or {}
@@ -16324,6 +17000,7 @@ def assert_terminal_interaction_latency(pid: int, session: str) -> dict:
         "latency_budget_ms": TERMINAL_INTERACTION_LATENCY_MAX_MS,
         "forced_refresh_after_type": forced_refresh_after,
         "forced_refresh_delta_type": forced_refresh_delta,
+        "effective_terminal_write_frame_ms": effective_frame_ms,
         "type_cursor_line_text": cursor_line_text,
         "type_text_tail": text_tail[-240:],
         "type_keyboard_backend": type_data.get("keyboard_backend"),
@@ -16572,8 +17249,87 @@ def assert_scrollback_retention_after_wheel_release(pid: int, session: str, out_
     }
 
 
+def assert_input_returns_from_scrollback(pid: int, session: str, out_dir: Path) -> dict:
+    clear = clear_prompt_line(pid, session, timeout_seconds=8.0)
+    seed_command = (
+        "for i in $(seq -w 0 179); do echo yggterm-input-scroll-$i; done\n"
+        "read -r -p \"YGGTERM_INPUT_SCROLL> \" yggterm_input_scroll\n"
+    )
+    seed = terminal_send(pid, session, seed_command)
+
+    def prompt_ready() -> dict:
+        state = app_state(pid)
+        host = host_for_session(state, session)
+        return {
+            "state": state,
+            "host": host,
+            "cursor_line": str(host.get("cursor_line_text") or host.get("cursor_row_text") or ""),
+        }
+
+    ready = wait_for_probe(
+        prompt_ready,
+        lambda sample: "YGGTERM_INPUT_SCROLL> " in sample.get("cursor_line", ""),
+        timeout_seconds=8.0,
+        description="scrollback input smoke prompt",
+    )
+    up_probe = probe_scroll(pid, session, -30)
+    after_scroll = up_probe.get("after") or {}
+    if int(after_scroll.get("base_y") or 0) <= int(after_scroll.get("viewport_y") or 0):
+        raise AssertionError(
+            "input-from-scrollback setup did not leave the viewport above the prompt: "
+            f"up_probe={up_probe!r}"
+        )
+    if after_scroll.get("scrollback_intent") != "UserScrollback":
+        raise AssertionError(
+            "input-from-scrollback setup did not mark explicit UserScrollback intent: "
+            f"up_probe={up_probe!r}"
+        )
+
+    probe = probe_type(pid, session, "snap", mode="keyboard", retries=1)
+    if not bool(probe.get("accepted")):
+        raise AssertionError(f"typing from scrollback was rejected: {probe!r}")
+    if not bool(probe.get("visible_echo_observed")):
+        raise AssertionError(f"typing from scrollback did not visibly echo: {probe!r}")
+    after_type = probe.get("after") or {}
+    cursor_visible = after_type.get("cursor_visible")
+    if cursor_visible is not True:
+        raise AssertionError(
+            "typing from scrollback echoed only offscreen; the prompt cursor is not visible: "
+            f"probe={probe!r}"
+        )
+    if int(after_type.get("viewport_y") or 0) < int(after_type.get("base_y") or 0):
+        raise AssertionError(
+            "typing from scrollback left xterm locked above the live prompt: "
+            f"probe={probe!r}"
+        )
+    if "snap" not in str(after_type.get("visible_text") or ""):
+        raise AssertionError(
+            "typing from scrollback did not put the typed marker in the visible viewport text: "
+            f"probe={probe!r}"
+        )
+
+    state = app_state(pid)
+    shot_path = out_dir / "input-from-scrollback.png"
+    state_path = out_dir / "input-from-scrollback-state.json"
+    app_screenshot(pid, shot_path)
+    with state_path.open("w") as fh:
+        json.dump(state, fh, indent=2)
+    cleanup = terminal_send(pid, session, "\u0003")
+    return {
+        "clear": clear,
+        "seed": seed,
+        "ready_cursor_line": ready["cursor_line"],
+        "up_probe": up_probe,
+        "type_probe": probe,
+        "cleanup": cleanup,
+        "screenshot": str(shot_path),
+        "state": str(state_path),
+    }
+
+
 def assert_cursor_prompt_visibility(state: dict, *, context: str) -> dict:
     host = active_host(state)
+    renderer_mode = str(host.get("xterm_renderer_mode") or "").strip().lower()
     cursor_rect = host.get("cursor_sample_rect") or {}
     expected_rect = host.get("cursor_expected_rect") or {}
     cursor_row_rect = host.get("cursor_row_rect") or {}
@@ -16599,28 +17355,43 @@ def assert_cursor_prompt_visibility(state: dict, *, context: str) -> dict:
         active_cursor_rect = expected_rect
     if not cursor_line_text.strip():
         raise AssertionError(f"{context}: cursor line text is empty")
+    prompt_band_uses_xterm_decoration = (
+        cursor_line_text.lstrip().startswith("›")
+        and host.get("xterm_input_line_decoration_visible") is True
+    )
+    canvas_state_style_requires_pixel_probe = renderer_mode == "canvas" and not (
+        host.get("cursor_row_color") or host.get("rows_color")
+    )
     row_color = str(
         host.get("cursor_row_color")
         or host.get("rows_color")
-        or host.get("foreground_color")
         or host.get("xterm_theme_foreground")
+        or host.get("effective_foreground_color")
+        or host.get("foreground_color")
         or ""
     )
     row_background = str(
         host.get("cursor_row_background")
+        or host.get("effective_background_color")
         or host.get("viewport_background_color")
         or host.get("xterm_theme_background")
         or ""
     )
-    row_contrast = contrast_ratio(row_color, row_background)
-    if row_contrast is None and (row_color or row_background):
-        raise AssertionError(
-            f"{context}: cursor row contrast unavailable despite partial style data: color={row_color!r} background={row_background!r}"
-        )
-    if row_contrast is not None and row_contrast < 7.0:
-        raise AssertionError(
-            f"{context}: cursor row contrast too low: color={row_color!r} background={row_background!r} contrast={row_contrast!r}"
-        )
+    contrast_skipped_reason = None
+    if canvas_state_style_requires_pixel_probe:
+        contrast_skipped_reason = "canvas_renderer_uses_screenshot_pixel_probe"
+    elif prompt_band_uses_xterm_decoration:
+        contrast_skipped_reason = "xterm_decoration_prompt_band_uses_screenshot_pixel_probe"
+    row_contrast = None if contrast_skipped_reason else contrast_ratio(row_color, row_background)
+    if contrast_skipped_reason is None:
+        if row_contrast is None and (row_color or row_background):
+            raise AssertionError(
+                f"{context}: cursor row contrast unavailable despite partial style data: color={row_color!r} background={row_background!r}"
+            )
+        if row_contrast is not None and row_contrast < 7.0:
+            raise AssertionError(
+                f"{context}: cursor row contrast too low: color={row_color!r} background={row_background!r} contrast={row_contrast!r}"
+            )
     if rect_is_visible(host_rect) and rect_is_visible(cursor_row_rect):
         host_left = float(host_rect.get("left") or 0)
         host_top = float(host_rect.get("top") or 0)
@@ -16652,6 +17423,8 @@ def assert_cursor_prompt_visibility(state: dict, *, context: str) -> dict:
         "active_cursor_rect": active_cursor_rect,
         "cursor_row_rect": cursor_row_rect,
         "cursor_row_contrast": round(row_contrast, 2) if row_contrast is not None else None,
+        "cursor_row_contrast_skipped": contrast_skipped_reason,
+        "renderer_mode": renderer_mode,
         "cursor_visible_row_index": host.get("cursor_visible_row_index"),
         "blank_rows_below_cursor": host.get("blank_rows_below_cursor"),
     }
@@ -16753,6 +17526,15 @@ def type_with_cursor_artifact_checks(
             state,
             context=f"{prefix} after typing {typed_so_far!r}",
         )
+        prompt_glyph_pixels = assert_prompt_line_glyph_pixels_visible(
+            screenshot_path,
+            state,
+            context=f"{prefix} after typing {typed_so_far!r}",
+        )
+        xterm_owned_visuals = assert_codex_terminal_xterm_owned_visuals(
+            state,
+            context=f"{prefix} after typing {typed_so_far!r}",
+        )
         steps.append(
             {
                 "typed": typed_so_far,
@@ -16765,6 +17547,8 @@ def type_with_cursor_artifact_checks(
                 "pixel_probe": pixel_probe,
                 "cursor_cell_pixels": cursor_cell_pixels,
                 "prompt_pixels": prompt_pixels,
+                "prompt_glyph_pixels": prompt_glyph_pixels,
+                "xterm_owned_visuals": xterm_owned_visuals,
             }
         )
     return {
@@ -16929,6 +17713,7 @@ def wait_for_live_codex_prompt(pid: int, session: str, timeout_seconds: float = 
     deadline = time.time() + timeout_seconds
     last_state = {}
     last_error = None
+    last_update_skip_at = 0.0
     while time.time() < deadline:
         remaining = max(0.25, deadline - time.time())
         try:
@@ -16944,6 +17729,11 @@ def wait_for_live_codex_prompt(pid: int, session: str, timeout_seconds: float = 
         host = host_for_session(last_state, session)
         if host_has_live_codex_prompt(host):
             return last_state
+        if host_has_codex_update_prompt(host) and time.time() - last_update_skip_at >= 1.0:
+            terminal_send(pid, session, "2\r")
+            last_update_skip_at = time.time()
+            time.sleep(0.75)
+            continue
         time.sleep(0.25)
     detail = f": {last_state!r}" if last_state else ""
     if last_error is not None:
@@ -17521,18 +18311,158 @@ def assert_codex_session_tui_vitality(pid: int, session: str, out_dir: Path) -> 
     }
 
 
+def assert_inline_status_animation_budget(pid: int, out_dir: Path) -> dict:
+    def numeric(value) -> float | None:
+        try:
+            if value is None:
+                return None
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    created = app_create_terminal(pid, title="Smoke Inline Working Animation")
+    session = str(created.get("session_path") or created.get("active_session_path") or "").strip()
+    if not session:
+        raise AssertionError(
+            f"inline status animation terminal create returned no session: {created!r}"
+        )
+
+    samples: list[dict] = []
+    screenshot_path = out_dir / "inline-status-animation-budget.png"
+    removed = False
+    try:
+        wait_for_interactive_session(pid, session, timeout_seconds=20.0)
+        clear_prompt_line(pid, session, timeout_seconds=6.0)
+        script = "\r".join(
+            [
+                "python3 - <<'PY'",
+                "import sys, time",
+                "frames = [",
+                "    '\\r\\x1b[2K\\x1b[?25l\\x1b[38;5;244mWorking\\x1b[0m',",
+                "    '\\r\\x1b[1G\\x1b[38;5;250mW\\x1b[0m',",
+                "    '\\r\\x1b[2G\\x1b[38;5;250mo\\x1b[0m',",
+                "    '\\r\\x1b[3G\\x1b[38;5;250mr\\x1b[0m',",
+                "    '\\r\\x1b[4G\\x1b[38;5;250mk\\x1b[0m',",
+                "    '\\r\\x1b[5G\\x1b[38;5;250mi\\x1b[0m',",
+                "    '\\r\\x1b[6G\\x1b[38;5;250mn\\x1b[0m',",
+                "    '\\r\\x1b[7G\\x1b[38;5;250mg\\x1b[0m',",
+                "]",
+                "deadline = time.time() + 2.4",
+                "while time.time() < deadline:",
+                "    for frame in frames:",
+                "        sys.stdout.write(frame)",
+                "        sys.stdout.flush()",
+                "        time.sleep(0.035)",
+                "sys.stdout.write('\\r\\x1b[2K\\x1b[?25h')",
+                "sys.stdout.flush()",
+                "PY",
+                "",
+            ]
+        )
+        send = unwrap_data(terminal_send(pid, session, script))
+        if not bool(send.get("accepted")):
+            raise AssertionError(f"inline status animation command was not accepted: {send!r}")
+
+        deadline = time.time() + 3.4
+        hot_samples: list[dict] = []
+        first_flush = None
+        last_flush = None
+        captured_screenshot = False
+        while time.time() < deadline:
+            state = app_state(pid, timeout_ms=12000, retries=1)
+            host = host_for_session(state, session)
+            sample = {
+                "recent_inline_status_animation_hot": host.get(
+                    "recent_inline_status_animation_hot"
+                ),
+                "effective_terminal_write_frame_ms": host.get(
+                    "effective_terminal_write_frame_ms"
+                ),
+                "terminal_active_animation_write_frame_ms": host.get(
+                    "terminal_active_animation_write_frame_ms"
+                ),
+                "terminal_active_write_frame_ms": host.get("terminal_active_write_frame_ms"),
+                "active_write_frame_budget": host.get("active_write_frame_budget"),
+                "write_bridge_flush_count": host.get("write_bridge_flush_count"),
+                "write_command_count": host.get("write_command_count"),
+                "last_raw_payload_length": host.get("last_raw_payload_length"),
+                "cursor_line_text": host.get("cursor_line_text")
+                or host.get("cursor_row_text"),
+            }
+            samples.append(sample)
+            flush_count = numeric(sample.get("write_bridge_flush_count"))
+            if flush_count is not None:
+                first_flush = flush_count if first_flush is None else first_flush
+                last_flush = flush_count
+            if sample.get("recent_inline_status_animation_hot") is True:
+                hot_samples.append(sample)
+                if not captured_screenshot:
+                    app_screenshot(pid, screenshot_path, crop_state=state)
+                    captured_screenshot = True
+            time.sleep(0.08)
+
+        if not hot_samples:
+            raise AssertionError(
+                "inline Working animation smoke never observed recent_inline_status_animation_hot=true: "
+                f"samples={samples!r}"
+            )
+        slow_hot = [
+            sample
+            for sample in hot_samples
+            if numeric(sample.get("effective_terminal_write_frame_ms")) is None
+            or numeric(sample.get("terminal_active_animation_write_frame_ms")) is None
+            or numeric(sample.get("effective_terminal_write_frame_ms"))
+            > numeric(sample.get("terminal_active_animation_write_frame_ms")) + 5.0
+        ]
+        if slow_hot:
+            raise AssertionError(
+                "inline Working animation hot path used a slow write frame budget: "
+                f"slow_hot={slow_hot!r} samples={samples!r}"
+            )
+        flush_delta = (
+            None
+            if first_flush is None or last_flush is None
+            else max(0.0, float(last_flush) - float(first_flush))
+        )
+        if flush_delta is None or flush_delta < 8.0:
+            raise AssertionError(
+                "inline Working animation did not produce enough xterm flushes for a smooth visible cadence: "
+                f"flush_delta={flush_delta!r} samples={samples!r}"
+            )
+        remove_result = app_remove_session(pid, session)
+        removed = True
+        return {
+            "created": created,
+            "session": session,
+            "hot_sample_count": len(hot_samples),
+            "flush_delta": flush_delta,
+            "samples": samples,
+            "screenshot": str(screenshot_path) if screenshot_path.exists() else None,
+            "remove": remove_result,
+        }
+    finally:
+        if session and not removed:
+            try:
+                app_remove_session(pid, session)
+            except Exception:
+                pass
+
+
 def assert_hidden_cursor_tui(pid: int, session: str, out_dir: Path) -> dict:
     clear = terminal_send(pid, session, "\u0003")
     wait_for_terminal_quiescent(pid, timeout_seconds=6.0)
-    command = (
-        "python3 -c 'import sys,time; "
-        "sys.stdout.write(\"\\x1b[?1049h\\x1b[?25lhc\"); "
-        "sys.stdout.flush(); time.sleep(4); "
-        "sys.stdout.write(\"\\x1b[?25h\\x1b[?1049l\"); "
-        "sys.stdout.flush()'"
+    command = "tput smcup; tput civis; printf hc; sleep 10; tput cnorm; tput rmcup"
+    probe = probe_type(
+        pid,
+        session,
+        command,
+        mode="xterm",
+        press_ctrl_u=True,
+        press_enter=True,
     )
-    probe = terminal_send(pid, session, f"{command}\n")
-    deadline = time.time() + 8.0
+    if not bool(probe.get("accepted")):
+        probe = terminal_send(pid, session, f"\x15{command}\r")
+    deadline = time.time() + 14.0
     state = {}
     host = {}
     while time.time() < deadline:
@@ -17545,15 +18475,14 @@ def assert_hidden_cursor_tui(pid: int, session: str, out_dir: Path) -> dict:
             host.get("xterm_buffer_kind") == "alternate"
             and host.get("xterm_cursor_hidden") is True
         )
+        observed_low_power_tui = (
+            host.get("low_power_tui_overlay_active") is True
+            and bool(int(host.get("low_power_tui_frame_count") or 0))
+            and ("hc" in low_power_text)
+        )
         observed_xterm_alt = (
             observed_control_state
             and ("hc" in text_sample or "hc" in cursor_line_text)
-        )
-        observed_low_power_tui = (
-            observed_control_state
-            and host.get("low_power_tui_overlay_active") is True
-            and bool(int(host.get("low_power_tui_frame_count") or 0))
-            and ("hc" in text_sample or "hc" in cursor_line_text or "hc" in low_power_text)
         )
         if observed_xterm_alt or observed_low_power_tui:
             break
@@ -17562,7 +18491,7 @@ def assert_hidden_cursor_tui(pid: int, session: str, out_dir: Path) -> dict:
     app_screenshot(pid, shot_path)
     with (out_dir / "hidden-cursor-tui-state.json").open("w") as fh:
         json.dump(state, fh, indent=2)
-    observed_live = (
+    observed_xterm_live = (
         host.get("xterm_buffer_kind") == "alternate"
         and host.get("xterm_cursor_hidden") is True
     )
@@ -17570,9 +18499,10 @@ def assert_hidden_cursor_tui(pid: int, session: str, out_dir: Path) -> dict:
         host.get("low_power_tui_overlay_active") is True
         and int(host.get("low_power_tui_frame_count") or 0) >= 1
     )
+    observed_live = observed_xterm_live or observed_low_power_tui
     if not observed_live:
         raise AssertionError(
-            f"hidden-cursor fixture did not enter live alternate buffer with hidden cursor: {host!r}"
+            f"hidden-cursor fixture did not expose xterm alternate state or low-power TUI text: {host!r}"
         )
     if cursor_sample_is_visibly_active(host):
         raise AssertionError(
@@ -17593,14 +18523,14 @@ def assert_hidden_cursor_tui(pid: int, session: str, out_dir: Path) -> dict:
         raise AssertionError(
             f"hidden-cursor fixture text is missing from the terminal buffer: text={text_sample!r} cursor={cursor_line_text!r}"
         )
-    restored_state = wait_for_terminal_restore(pid, timeout_seconds=8.0)
+    restored_state = wait_for_terminal_restore(pid, timeout_seconds=18.0)
     restored_host = active_host(restored_state)
     if restored_host.get("xterm_buffer_kind") != "normal":
         raise AssertionError(f"hidden-cursor fixture did not restore the normal buffer: {restored_host!r}")
     restored_low_power_frame_count = int(restored_host.get("low_power_tui_frame_count") or 0)
-    if int(restored_host.get("xterm_buffer_transition_count") or 0) < 2:
+    if not observed_xterm_live and int(restored_host.get("xterm_buffer_transition_count") or 0) < 2:
         raise AssertionError(f"expected alternate-buffer transitions, saw {restored_host!r}")
-    if int(restored_host.get("xterm_cursor_hidden_toggle_count") or 0) < 2:
+    if not observed_xterm_live and int(restored_host.get("xterm_cursor_hidden_toggle_count") or 0) < 2:
         raise AssertionError(f"expected hidden-cursor toggles, saw {restored_host!r}")
     assert_cursor_alignment(restored_state)
     return {
@@ -17608,6 +18538,7 @@ def assert_hidden_cursor_tui(pid: int, session: str, out_dir: Path) -> dict:
         "probe": probe,
         "screenshot": str(shot_path),
         "observed_live_alternate_buffer": observed_live,
+        "observed_live_xterm_alternate_buffer": observed_xterm_live,
         "observed_live_low_power_tui": observed_low_power_tui,
         "buffer_kind": host.get("xterm_buffer_kind"),
         "cursor_hidden": host.get("xterm_cursor_hidden"),
@@ -17694,6 +18625,39 @@ def assert_status_command(pid: int, session: str, out_dir: Path) -> dict:
         state,
         context="after /status",
     )
+    before_reopen_host_id = str(host.get("host_id") or "").strip()
+    ok, _payload, detail = app_open_raw(pid, session, view="terminal", timeout_ms=8000)
+    if not ok:
+        raise AssertionError(
+            "reopening the active Codex terminal after /status failed: "
+            f"session={session!r} detail={detail!r}"
+        )
+    reopened_state = wait_for_session_focus(pid, session, timeout_seconds=8.0)
+    reopened_host = active_host(reopened_state)
+    reopened_host_id = str(reopened_host.get("host_id") or "").strip()
+    reopened_attempt = (
+        (reopened_state.get("viewport") or {}).get("terminal_open_attempt")
+        or reopened_state.get("terminal_open_attempt")
+        or {}
+    )
+    if (
+        str(reopened_attempt.get("source") or "") == "retained_fault_recovery"
+        and str(reopened_attempt.get("state") or "") in {"pending", "recovering"}
+    ):
+        raise AssertionError(
+            "reopening the already-active Codex terminal entered retained recovery: "
+            f"attempt={reopened_attempt!r} host={reopened_host!r}"
+        )
+    if before_reopen_host_id and reopened_host_id and before_reopen_host_id != reopened_host_id:
+        raise AssertionError(
+            "reopening the already-active Codex terminal remounted the xterm host: "
+            f"before={before_reopen_host_id!r} after={reopened_host_id!r}"
+        )
+    if not host_has_live_codex_prompt(reopened_host):
+        raise AssertionError(
+            "reopening the already-active Codex terminal lost the prompt-ready surface: "
+            f"text_tail={terminal_host_text(reopened_host)[-500:]!r} host={reopened_host!r}"
+        )
     return {
         "ensure_live_codex": ensure,
         "clear_probe": clear,
@@ -17707,6 +18671,12 @@ def assert_status_command(pid: int, session: str, out_dir: Path) -> dict:
         "prompt_anchor": prompt_anchor,
         "prompt_line_pixels": prompt_line_pixels,
         "status_surface": status_surface,
+        "active_reopen": {
+            "before_host_id": before_reopen_host_id,
+            "after_host_id": reopened_host_id,
+            "terminal_open_attempt": reopened_attempt,
+            "cursor_line_text": str(reopened_host.get("cursor_line_text") or ""),
+        },
         "text_tail": host_text[-400:],
     }
 
@@ -17787,7 +18757,10 @@ def main() -> int:
         "cursor_mouse_hold",
         "live_sessions_restore",
         "selection",
+        "terminal_context_menu",
+        "primary_selection_paste",
         "terminal_viewport_resize",
+        "titlebar_autohide_prompt_follow",
         "terminal_interaction_latency",
         "terminal_interactive_lifecycle",
         "terminal_delete_key",
@@ -17796,7 +18769,9 @@ def main() -> int:
         "partial_input",
         "scroll",
         "scrollback_retention",
+        "input_from_scrollback",
         "hidden_cursor_tui",
+        "inline_status_animation_budget",
         "codex_session_tui_vitality",
         "status_command",
         "local_tree",
@@ -17858,6 +18833,14 @@ def main() -> int:
     )
 
     initial_state = app_state(args.pid)
+    forced_app_theme = str(os.environ.get("YGGTERM_SMOKE_FORCE_APP_THEME") or "").strip().lower()
+    if forced_app_theme:
+        if forced_app_theme not in {"dark", "light"}:
+            raise AssertionError(
+                f"unsupported YGGTERM_SMOKE_FORCE_APP_THEME={forced_app_theme!r}; expected dark or light"
+            )
+        app_theme(args.pid, forced_app_theme)
+        initial_state = app_state(args.pid)
     initial_prompt_pixels = None
     if needs_session_setup:
         if (
@@ -18084,6 +19067,7 @@ def main() -> int:
         run_check("cursor_mouse_hold", lambda: assert_cursor_mouse_hold_contract(args.pid, late_phase_session))
         run_check("live_sessions_restore", lambda: assert_live_sessions_restore_visibility(args.pid))
         run_check("selection", lambda: assert_selection(args.pid, late_phase_session))
+        run_check("terminal_context_menu", lambda: assert_terminal_context_menu_contract(args.pid, late_phase_session))
         run_check(
             "terminal_interaction_latency",
             lambda: assert_terminal_interaction_latency(args.pid, late_phase_session),
@@ -18092,7 +19076,15 @@ def main() -> int:
             "terminal_viewport_resize",
             lambda: assert_terminal_viewport_resize_refits_xterm(args.pid, late_phase_session, out_dir),
         )
+        run_check(
+            "titlebar_autohide_prompt_follow",
+            lambda: assert_titlebar_autohide_prompt_follow_contract(args.pid, late_phase_session, out_dir),
+        )
         if args.session_kind == "plain":
+            run_check(
+                "primary_selection_paste",
+                lambda: assert_primary_selection_paste_contract(args.pid, late_phase_session),
+            )
             run_check("clipboard_image", lambda: assert_clipboard_image_contract(
                 args.pid, late_phase_session, out_dir
             ))
@@ -18107,7 +19099,17 @@ def main() -> int:
                     args.pid, late_phase_session, out_dir
                 ),
             )
+            run_check(
+                "input_from_scrollback",
+                lambda: assert_input_returns_from_scrollback(
+                    args.pid, late_phase_session, out_dir
+                ),
+            )
             run_check("hidden_cursor_tui", lambda: assert_hidden_cursor_tui(args.pid, late_phase_session, out_dir))
+            run_check(
+                "inline_status_animation_budget",
+                lambda: assert_inline_status_animation_budget(args.pid, out_dir),
+            )
             if late_phase_session.startswith("local://"):
                 run_check("codex_session_tui_vitality", lambda: assert_codex_session_tui_vitality(
                     args.pid, late_phase_session, out_dir
@@ -18139,7 +19141,7 @@ def main() -> int:
         final_state = app_state(args.pid)
         with (out_dir / "final-state.json").open("w") as fh:
             json.dump(final_state, fh, indent=2)
-        final_screenshot = app_screenshot(args.pid, out_dir / "final.png")
+        final_screenshot = app_screenshot(args.pid, out_dir / "final.png", check_corners=True)
         if isinstance(final_screenshot, dict):
             final_screenshot_data = final_screenshot.get("data")
             if isinstance(final_screenshot_data, dict):
