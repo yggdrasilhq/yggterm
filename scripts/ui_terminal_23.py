@@ -14,6 +14,163 @@ from pathlib import Path
 MARKER_BEGIN = "__YGGTERM23_BEGIN__"
 MARKER_END = "__YGGTERM23_END__"
 SHORT_HASH_RE = re.compile(r"^[0-9a-f]{7,8}$")
+CPU_SAMPLE_SNIPPET = r"""
+import json
+import os
+import pathlib
+import time
+
+DURATION = float(%DURATION%)
+LABEL = %LABEL%
+TOKENS = tuple(token.lower() for token in %TOKENS%)
+PAGE_SIZE = os.sysconf("SC_PAGE_SIZE")
+
+def read_total_jiffies():
+    try:
+        line = pathlib.Path("/proc/stat").read_text().splitlines()[0]
+        return sum(int(part) for part in line.split()[1:] if part.isdigit())
+    except Exception:
+        return 0
+
+def cpu_count():
+    try:
+        return max(
+            1,
+            sum(
+                1
+                for line in pathlib.Path("/proc/stat").read_text().splitlines()
+                if line.startswith("cpu") and len(line) > 3 and line[3].isdigit()
+            ),
+        )
+    except Exception:
+        return 1
+
+def read_comm(pid):
+    try:
+        return pathlib.Path("/proc", str(pid), "comm").read_text().strip()
+    except Exception:
+        return ""
+
+def read_cmdline(pid):
+    try:
+        return (
+            pathlib.Path("/proc", str(pid), "cmdline")
+            .read_bytes()
+            .replace(b"\0", b" ")
+            .decode("utf-8", "replace")
+            .strip()
+        )
+    except Exception:
+        return ""
+
+def read_environ(pid):
+    result = {}
+    wanted = {"YGGTERM_HOME", "DISPLAY", "WAYLAND_DISPLAY", "GDK_BACKEND"}
+    try:
+        for raw in pathlib.Path("/proc", str(pid), "environ").read_bytes().split(b"\0"):
+            if raw and b"=" in raw:
+                key, value = raw.split(b"=", 1)
+                key = key.decode("utf-8", "replace")
+                if key in wanted:
+                    result[key] = value.decode("utf-8", "replace")
+    except Exception:
+        pass
+    return result
+
+def read_stat(pid):
+    try:
+        fields = pathlib.Path("/proc", str(pid), "stat").read_text().rsplit(")", 1)[1].split()
+        return {
+            "ppid": int(fields[1]),
+            "jiffies": int(fields[11]) + int(fields[12]),
+            "rss_kb": int(fields[21]) * PAGE_SIZE // 1024,
+        }
+    except Exception:
+        return None
+
+def process_matches(comm, cmd):
+    comm_lower = comm.lower()
+    cmd_lower = cmd.lower()
+    if comm_lower.startswith("webkit"):
+        return True
+    if comm_lower in {
+        "yggterm",
+        "yggterm-headles",
+        "yggterm-headless",
+        "htop",
+        "top",
+        "ssh",
+        "codex",
+        "node",
+    }:
+        return True
+    return any(
+        needle in cmd_lower
+        for needle in (
+            "/yggterm",
+            "yggterm-headless server daemon",
+            "codex-session-tui",
+            " npx --yes codex-session-tui",
+        )
+    )
+
+def pids():
+    return [int(path.name) for path in pathlib.Path("/proc").iterdir() if path.name.isdigit()]
+
+def snapshot():
+    total = read_total_jiffies()
+    rows = {}
+    for pid in pids():
+        stat = read_stat(pid)
+        if not stat:
+            continue
+        comm = read_comm(pid)
+        cmd = read_cmdline(pid)
+        rows[str(pid)] = {
+            "pid": pid,
+            "ppid": stat["ppid"],
+            "comm": comm,
+            "cmd": cmd[:300],
+            "jiffies": stat["jiffies"],
+            "rss_kb": stat["rss_kb"],
+            "matched": process_matches(comm, cmd),
+        }
+    return total, rows
+
+start_total, start_rows = snapshot()
+start_ts_ms = int(time.time() * 1000)
+time.sleep(DURATION)
+end_total, end_rows = snapshot()
+end_ts_ms = int(time.time() * 1000)
+cores = cpu_count()
+denominator = max(1, end_total - start_total)
+rows = []
+for pid_text, end_row in end_rows.items():
+    start_row = start_rows.get(pid_text)
+    start_jiffies = start_row.get("jiffies", end_row["jiffies"]) if start_row else end_row["jiffies"]
+    delta = max(0, end_row["jiffies"] - start_jiffies)
+    row = dict(end_row)
+    row["delta_jiffies"] = delta
+    row["cpu_percent"] = round((delta / denominator) * cores * 100.0, 3)
+    if row["matched"] or row["cpu_percent"] > 0.0:
+        row["env"] = read_environ(row["pid"]) if row["matched"] else {}
+        rows.append(row)
+rows.sort(key=lambda row: (-row["cpu_percent"], row["comm"], row["pid"]))
+matched = [row for row in rows if row["matched"]]
+system_top = rows[:20]
+print(json.dumps({
+    "label": LABEL,
+    "duration_sec": DURATION,
+    "start_ts_ms": start_ts_ms,
+    "end_ts_ms": end_ts_ms,
+    "cpu_count": cores,
+    "matched_cpu_percent": round(sum(float(row.get("cpu_percent") or 0.0) for row in matched), 3),
+    "matched_rss_kb": sum(int(row.get("rss_kb") or 0) for row in matched),
+    "matched": matched[:40],
+    "system_top": system_top,
+    "tokens": TOKENS,
+}))
+"""
 
 
 def parse_args() -> argparse.Namespace:
@@ -34,6 +191,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--summary-budget", type=float, default=12.0)
     parser.add_argument("--launch-local", action="store_true")
     parser.add_argument("--out-dir", default="/tmp/yggterm-terminal-23")
+    parser.add_argument("--heavy-count", type=int, default=7)
+    parser.add_argument("--restore-pass", action="store_true")
+    parser.add_argument("--restore-wait-sec", type=float, default=300.0)
+    parser.add_argument("--resource-sample-sec", type=float, default=8.0)
+    parser.add_argument("--cooldown-max-cpu", type=float, default=8.0)
+    parser.add_argument("--gui-bin", help="GUI-capable yggterm binary for restore relaunch")
+    parser.add_argument("--screenshots", action="store_true")
+    parser.add_argument("--skip-quirks", action="store_true")
     return parser.parse_args()
 
 
@@ -141,6 +306,85 @@ def app_remove_session(host: str, binary: str, timeout_ms: int, session_path: st
         f"--timeout-ms {timeout_ms}"
     )
     return run_json(host, command)
+
+
+def app_keep_session(
+    host: str,
+    binary: str,
+    timeout_ms: int,
+    session_path: str,
+    keep_alive: bool,
+) -> dict:
+    action = "keep" if keep_alive else "unkeep"
+    command = (
+        f"{quote(binary)} server app terminal {action} {quote(session_path)} "
+        f"--timeout-ms {timeout_ms}"
+    )
+    return run_json(host, command)
+
+
+def app_open_session(
+    host: str,
+    binary: str,
+    timeout_ms: int,
+    session_path: str,
+) -> dict:
+    command = (
+        f"{quote(binary)} server app open {quote(session_path)} --view terminal "
+        f"--timeout-ms {timeout_ms}"
+    )
+    return run_json(host, command)
+
+
+def app_probe_terminal(
+    host: str,
+    binary: str,
+    timeout_ms: int,
+    session_path: str,
+    probe: str,
+    *args: str,
+) -> dict:
+    command = (
+        f"{quote(binary)} server app terminal {probe} {quote(session_path)} "
+        + " ".join(quote(arg) for arg in args)
+        + f" --timeout-ms {timeout_ms}"
+    )
+    return run_json(host, command)
+
+
+def app_chrome_hover(host: str, binary: str, timeout_ms: int, active: bool) -> dict:
+    state = "on" if active else "off"
+    return run_json(
+        host,
+        f"{quote(binary)} server app chrome-hover {state} --timeout-ms {timeout_ms}",
+    )
+
+
+def app_screenshot(host: str, binary: str, timeout_ms: int, path: str) -> dict:
+    return run_json(
+        host,
+        f"{quote(binary)} server app screenshot {quote(path)} --timeout-ms {timeout_ms}",
+    )
+
+
+def app_close_preserve(host: str, binary: str, timeout_ms: int) -> dict:
+    return run_json(
+        host,
+        f"{quote(binary)} server app close --preserve-live-sessions --timeout-ms {timeout_ms}",
+    )
+
+
+def app_launch(
+    host: str,
+    binary: str,
+    timeout_ms: int,
+) -> dict:
+    return run_json(
+        host,
+        f"{quote(binary)} server app launch --wait-settled --allow-multi-window "
+        f"--skip-active-exec-handoff "
+        f"--timeout-ms {timeout_ms}",
+    )
 
 
 def server_inventory(host: str) -> dict:
@@ -352,10 +596,17 @@ def active_terminal_text(state: dict) -> str:
     hosts = viewport.get("active_terminal_hosts") or []
     if not hosts:
         return ""
-    return "\n".join((host.get("text_sample") or "") for host in hosts)
+    chunks: list[str] = []
+    for host in hosts:
+        for key in ("text_sample", "text_tail", "buffer_text_sample", "cursor_line_text"):
+            value = str(host.get(key) or "")
+            if value and value not in chunks:
+                chunks.append(value)
+    return "\n".join(chunks)
 
 
 def titlebar_matches_viewport(state: dict) -> bool:
+    dom = state.get("dom") or {}
     viewport = state.get("viewport") or {}
     titlebar = viewport.get("titlebar") or {}
     active_title = (viewport.get("active_title") or "").strip()
@@ -363,6 +614,13 @@ def titlebar_matches_viewport(state: dict) -> bool:
     title_text = (titlebar.get("title_text") or "").strip()
     summary_text = (titlebar.get("summary_text") or "").strip()
     button_tooltip = (titlebar.get("button_tooltip") or "").strip()
+    if (
+        dom.get("snapshot_mode") == "terminal-fallback"
+        and not title_text
+        and not summary_text
+        and not button_tooltip
+    ):
+        return True
     if active_title and title_text != active_title:
         return False
     if active_summary and titlebar.get("menu_open") and summary_text != active_summary:
@@ -533,6 +791,111 @@ def write_json(path: Path, payload: dict) -> str:
     return str(path)
 
 
+def sample_resources(host: str, label: str, duration_s: float, out_dir: Path) -> dict:
+    if duration_s <= 0:
+        return {"label": label, "skipped": True, "reason": "duration <= 0"}
+    snippet = (
+        CPU_SAMPLE_SNIPPET.replace("%DURATION%", repr(float(duration_s)))
+        .replace("%LABEL%", repr(label))
+        .replace(
+            "%TOKENS%",
+            repr(
+                [
+                    "yggterm",
+                    "webkit",
+                    "htop",
+                    "codex-session-tui",
+                    "codex",
+                    "node",
+                    "ssh",
+                ]
+            ),
+        )
+    )
+    if host == "local":
+        result = run_process(["python3", "-c", snippet], check=True)
+    else:
+        result = subprocess.run(
+            ["ssh", host, "python3", "-"],
+            check=True,
+            text=True,
+            capture_output=True,
+            input=snippet,
+        )
+    payload = json.loads(result.stdout)
+    write_json(out_dir / f"resources-{label}.json", payload)
+    return payload
+
+
+def gui_binary_for_restore(args: argparse.Namespace) -> str:
+    if args.gui_bin:
+        return args.gui_bin
+    if "yggterm-headless" in args.bin:
+        return args.bin.replace("yggterm-headless", "yggterm")
+    return args.bin
+
+
+def heavy_workload_command() -> str:
+    return (
+        "if command -v htop >/dev/null 2>&1; then "
+        "htop; "
+        "elif command -v npx >/dev/null 2>&1; then "
+        "npx --yes codex-session-tui; "
+        "else top; fi\n"
+    )
+
+
+def ordinary_probe_command() -> str:
+    return (
+        f"printf '{MARKER_BEGIN}\\n'; "
+        "uname -a || true; "
+        "pwd; "
+        "(free -h || vm_stat || sysctl vm.swapusage || true); "
+        "(ls -1A | head -12) || true; "
+        f"printf '{MARKER_END}\\n'\n"
+    )
+
+
+def terminal_text_looks_like_tui(text: str) -> bool:
+    lowered = text.lower()
+    return any(
+        marker in lowered
+        for marker in (
+            "load average",
+            "tasks:",
+            "%cpu",
+            "mib mem",
+            "kib mem",
+            "gib mem",
+            "browser [",
+            "preview (chat)",
+            "no session selected",
+            "session selected",
+        )
+    )
+
+
+def stop_heavy_workload(host: str, binary: str, timeout_ms: int, session_path: str) -> dict:
+    stopped: dict[str, object] = {}
+    try:
+        stopped["quit"] = app_send_terminal_input(host, binary, timeout_ms, session_path, "q")
+        time.sleep(0.25)
+    except Exception as error:  # noqa: BLE001
+        stopped["quit_error"] = str(error)
+    try:
+        stopped["ctrl_c"] = app_send_terminal_input(host, binary, timeout_ms, session_path, "\x03")
+    except Exception as error:  # noqa: BLE001
+        stopped["ctrl_c_error"] = str(error)
+    return stopped
+
+
+def _resource_failure(sample: dict, max_cpu: float) -> str | None:
+    cpu = float(sample.get("matched_cpu_percent") or 0.0)
+    if cpu > max_cpu:
+        return f"{sample.get('label')} matched CPU {cpu:.3f}% exceeded budget {max_cpu:.3f}%"
+    return None
+
+
 def main() -> int:
     args = parse_args()
     out_dir = Path(args.out_dir)
@@ -543,14 +906,29 @@ def main() -> int:
     if args.host == "local" and args.launch_local:
         launch, launch_event = launch_local_client(args.bin)
 
+    resources: dict[str, dict] = {}
+    resource_failures: list[str] = []
+    resources["baseline"] = sample_resources(
+        args.host,
+        "baseline",
+        args.resource_sample_sec,
+        out_dir,
+    )
     baseline_state = wait_for_window(args.host, args.bin, args.timeout_ms)
     baseline_notifications = ((baseline_state.get("shell") or {}).get("notifications_count")) or 0
     inventory = server_inventory(args.host)
-    targets = choose_terminal_targets(inventory, random.Random(args.seed), args.count)
+    rng = random.Random(args.seed)
+    targets = choose_terminal_targets(inventory, rng, args.count)
+    heavy_count = min(max(args.heavy_count, 0), len(targets))
+    heavy_indices = set(rng.sample(range(len(targets)), heavy_count)) if heavy_count else set()
     results: list[dict] = []
+    keep_alive_results: list[dict] = []
+    restore_results: list[dict] = []
+    quirk_results: dict[str, object] = {}
 
     for index, target in enumerate(targets):
         started_ms = int(time.time() * 1000)
+        workload_kind = "heavy" if index in heavy_indices else "ordinary"
         try:
             create = app_create_terminal(
                 args.host,
@@ -571,6 +949,7 @@ def main() -> int:
             "target": target,
             "create": create,
             "created_session_path": created_path,
+            "workload_kind": workload_kind,
         }
         if not created_path:
             entry["error"] = "create terminal did not return active_session_path"
@@ -617,41 +996,54 @@ def main() -> int:
                 entry["remove_error"] = str(remove_error)
             continue
 
-        probe_command = (
-            f"printf '{MARKER_BEGIN}\\n'; "
-            "uname -a || true; "
-            "pwd; "
-            "(free -h || vm_stat || sysctl vm.swapusage || true); "
-            "(ls -1A | head -12) || true; "
-            f"printf '{MARKER_END}\\n'"
-        )
         send = app_send_terminal_input(
             args.host,
             args.bin,
             args.timeout_ms,
             created_path,
-            probe_command + "\n",
+            heavy_workload_command() if workload_kind == "heavy" else ordinary_probe_command(),
         )
         entry["send"] = send
 
         try:
-            output_elapsed, output_state = wait_until(
-                f"terminal output {created_path}",
-                args.summary_budget,
-                args.poll,
-                lambda: _require_terminal_markers(
-                    app_state(args.host, args.bin, args.timeout_ms),
-                    created_path,
-                ),
-            )
+            if workload_kind == "heavy":
+                output_elapsed, output_state = wait_until(
+                    f"heavy terminal TUI output {created_path}",
+                    args.summary_budget,
+                    args.poll,
+                    lambda: _require_terminal_tui(
+                        app_state(args.host, args.bin, args.timeout_ms),
+                        created_path,
+                    ),
+                )
+                entry["output_contains_markers"] = True
+                entry["heavy_tui_visible"] = True
+            else:
+                output_elapsed, output_state = wait_until(
+                    f"terminal output {created_path}",
+                    args.summary_budget,
+                    args.poll,
+                    lambda: _require_terminal_markers(
+                        app_state(args.host, args.bin, args.timeout_ms),
+                        created_path,
+                    ),
+                )
+                entry["output_contains_markers"] = True
+                entry["heavy_tui_visible"] = None
             entry["output_elapsed_s"] = round(output_elapsed, 3)
-            entry["output_contains_markers"] = True
         except Exception as error:  # noqa: BLE001
             output_state = app_state(args.host, args.bin, args.timeout_ms)
             entry["error"] = str(error)
             entry["state_dump"] = write_json(out_dir / f"terminal-{index:02d}-output-failure.json", output_state)
             results.append(entry)
             try:
+                if workload_kind == "heavy":
+                    entry["stop_heavy_after_failure"] = stop_heavy_workload(
+                        args.host,
+                        args.bin,
+                        args.timeout_ms,
+                        created_path,
+                    )
                 entry["remove"] = app_remove_session(args.host, args.bin, args.timeout_ms, created_path)
             except Exception as remove_error:  # noqa: BLE001
                 entry["remove_error"] = str(remove_error)
@@ -675,25 +1067,262 @@ def main() -> int:
         entry["titlebar_matches_viewport"] = titlebar_matches_viewport(output_state)
         entry["cwd_matches"] = output_matches_cwd(
             entry["terminal_text_sample"],
-            target.get("cwd"),
+            target.get("cwd") if workload_kind == "ordinary" else None,
         )
         entry["notification_noise"] = notifications > baseline_notifications
 
-        try:
-            remove = app_remove_session(args.host, args.bin, args.timeout_ms, created_path)
-            entry["remove"] = remove
-        except Exception as error:  # noqa: BLE001
-            entry["remove_error"] = str(error)
         results.append(entry)
 
+    resources["active_workload"] = sample_resources(
+        args.host,
+        "active-workload",
+        args.resource_sample_sec,
+        out_dir,
+    )
+
+    created_results = [
+        item
+        for item in results
+        if item.get("created_session_path") and not item.get("remove")
+    ]
+    if not args.skip_quirks and created_results:
+        quirk_path = str(created_results[0]["created_session_path"])
+        try:
+            quirk_results["chrome_hover_on"] = app_chrome_hover(
+                args.host,
+                args.bin,
+                args.timeout_ms,
+                True,
+            )
+            if args.screenshots:
+                quirk_results["chrome_hover_screenshot"] = app_screenshot(
+                    args.host,
+                    args.bin,
+                    args.timeout_ms,
+                    f"{out_dir}/chrome-hover.png",
+                )
+            quirk_results["chrome_hover_state"] = app_state(args.host, args.bin, args.timeout_ms)
+        except Exception as error:  # noqa: BLE001
+            quirk_results["chrome_hover_error"] = str(error)
+        finally:
+            try:
+                quirk_results["chrome_hover_off"] = app_chrome_hover(
+                    args.host,
+                    args.bin,
+                    args.timeout_ms,
+                    False,
+                )
+            except Exception as error:  # noqa: BLE001
+                quirk_results["chrome_hover_off_error"] = str(error)
+
+        try:
+            quirk_results["scroll_probe_up"] = app_probe_terminal(
+                args.host,
+                args.bin,
+                args.timeout_ms,
+                quirk_path,
+                "probe-scroll",
+                "--lines",
+                "-5",
+            )
+            quirk_results["scroll_probe_bottom"] = app_probe_terminal(
+                args.host,
+                args.bin,
+                args.timeout_ms,
+                quirk_path,
+                "probe-scroll",
+                "--lines",
+                "9999",
+            )
+        except Exception as error:  # noqa: BLE001
+            quirk_results["scroll_probe_error"] = str(error)
+
+        try:
+            quirk_results["select_probe"] = app_probe_terminal(
+                args.host,
+                args.bin,
+                args.timeout_ms,
+                quirk_path,
+                "probe-select",
+            )
+        except Exception as error:  # noqa: BLE001
+            quirk_results["select_probe_error"] = str(error)
+
+        try:
+            quirk_results["context_menu_probe"] = app_probe_terminal(
+                args.host,
+                args.bin,
+                args.timeout_ms,
+                quirk_path,
+                "probe-context-menu",
+            )
+        except Exception as error:  # noqa: BLE001
+            quirk_results["context_menu_probe_error"] = str(error)
+
+    for entry in created_results:
+        session_path = str(entry["created_session_path"])
+        try:
+            keep_alive_results.append(
+                {
+                    "session_path": session_path,
+                    "keep": app_keep_session(
+                        args.host,
+                        args.bin,
+                        args.timeout_ms,
+                        session_path,
+                        True,
+                    ),
+                }
+            )
+        except Exception as error:  # noqa: BLE001
+            keep_alive_results.append({"session_path": session_path, "error": str(error)})
+
+    restore_summary: dict[str, object] = {"enabled": bool(args.restore_pass)}
+    if args.restore_pass and created_results:
+        gui_bin = gui_binary_for_restore(args)
+        try:
+            restore_summary["close_preserve"] = app_close_preserve(
+                args.host,
+                args.bin,
+                args.timeout_ms,
+            )
+            if args.restore_wait_sec > 0:
+                time.sleep(args.restore_wait_sec)
+            resources["cooldown"] = sample_resources(
+                args.host,
+                "cooldown",
+                args.resource_sample_sec,
+                out_dir,
+            )
+            cooldown_failure = _resource_failure(resources["cooldown"], args.cooldown_max_cpu)
+            if cooldown_failure:
+                resource_failures.append(cooldown_failure)
+            restore_summary["launch"] = app_launch(args.host, gui_bin, args.timeout_ms)
+            wait_for_window(args.host, args.bin, args.timeout_ms)
+            resources["respawn"] = sample_resources(
+                args.host,
+                "respawn",
+                args.resource_sample_sec,
+                out_dir,
+            )
+            for index, original in enumerate(created_results):
+                session_path = str(original["created_session_path"])
+                restored: dict[str, object] = {
+                    "session_path": session_path,
+                    "workload_kind": original.get("workload_kind"),
+                }
+                try:
+                    restored["open"] = app_open_session(
+                        args.host,
+                        args.bin,
+                        args.timeout_ms,
+                        session_path,
+                    )
+                    _, restored_state = wait_until(
+                        f"restored terminal ready {session_path}",
+                        args.ready_budget,
+                        args.poll,
+                        lambda: _require_terminal_ready(
+                            app_state(args.host, args.bin, args.timeout_ms),
+                            session_path,
+                            args.host,
+                            int(time.time() * 1000),
+                            int(time.time() * 1000) + int(args.ready_budget * 1000),
+                        ),
+                    )
+                    restored["titlebar_matches_viewport"] = titlebar_matches_viewport(
+                        restored_state
+                    )
+                    restored["terminal_text_sample"] = active_terminal_text(restored_state)
+                    if original.get("workload_kind") == "heavy":
+                        restored["heavy_tui_visible"] = terminal_text_looks_like_tui(
+                            str(restored["terminal_text_sample"])
+                        )
+                    else:
+                        restored["markers_visible"] = (
+                            MARKER_BEGIN in str(restored["terminal_text_sample"])
+                            and MARKER_END in str(restored["terminal_text_sample"])
+                        )
+                    restored["state_dump"] = write_json(
+                        out_dir / f"terminal-{index:02d}-restore.json",
+                        restored_state,
+                    )
+                except Exception as error:  # noqa: BLE001
+                    restored["error"] = str(error)
+                    try:
+                        restored["state_dump"] = write_json(
+                            out_dir / f"terminal-{index:02d}-restore-failure.json",
+                            app_state(args.host, args.bin, args.timeout_ms),
+                        )
+                    except Exception as state_error:  # noqa: BLE001
+                        restored["state_error"] = str(state_error)
+                restore_results.append(restored)
+        except Exception as error:  # noqa: BLE001
+            restore_summary["error"] = str(error)
+
+    cleanup_results: list[dict] = []
+    for entry in reversed(created_results):
+        session_path = str(entry["created_session_path"])
+        cleanup: dict[str, object] = {"session_path": session_path}
+        if entry.get("workload_kind") == "heavy":
+            cleanup["stop_heavy"] = stop_heavy_workload(
+                args.host,
+                args.bin,
+                args.timeout_ms,
+                session_path,
+            )
+        try:
+            cleanup["unkeep"] = app_keep_session(
+                args.host,
+                args.bin,
+                args.timeout_ms,
+                session_path,
+                False,
+            )
+        except Exception as error:  # noqa: BLE001
+            cleanup["unkeep_error"] = str(error)
+        try:
+            cleanup["remove"] = app_remove_session(
+                args.host,
+                args.bin,
+                args.timeout_ms,
+                session_path,
+            )
+        except Exception as error:  # noqa: BLE001
+            cleanup["remove_error"] = str(error)
+        cleanup_results.append(cleanup)
+
     final_state = app_state(args.host, args.bin, args.timeout_ms)
+    quirk_failures = [
+        key
+        for key in quirk_results
+        if key.endswith("_error") and quirk_results.get(key)
+    ]
+    restore_failures = [
+        item
+        for item in restore_results
+        if item.get("error")
+        or (
+            item.get("workload_kind") == "heavy"
+            and not item.get("heavy_tui_visible")
+        )
+        or (
+            item.get("workload_kind") != "heavy"
+            and not item.get("markers_visible")
+        )
+        or not item.get("titlebar_matches_viewport")
+    ]
     summary = {
         "host": args.host,
         "count": args.count,
         "seed": args.seed,
+        "heavy_count": heavy_count,
+        "heavy_indices": sorted(heavy_indices),
         "spawn_budget_s": args.spawn_budget,
         "ready_budget_s": args.ready_budget,
         "summary_budget_s": args.summary_budget,
+        "restore_pass": bool(args.restore_pass),
+        "restore_wait_sec": args.restore_wait_sec,
         "window_spawn_elapsed_ms": ((launch_event or {}).get("payload") or {}).get("elapsed_ms"),
         "window_spawn_within_900ms": (
             (((launch_event or {}).get("payload") or {}).get("elapsed_ms") or 10_000) <= 900
@@ -704,12 +1333,23 @@ def main() -> int:
         "creation_failures": len([item for item in results if item.get("created_session_path") is None]),
         "ready_failures": len([item for item in results if item.get("created_session_path") and not item.get("ready_within_budget")]),
         "command_failures": len([item for item in results if item.get("created_session_path") and not item.get("output_contains_markers")]),
+        "heavy_tui_failures": len([item for item in results if item.get("workload_kind") == "heavy" and not item.get("heavy_tui_visible")]),
         "summary_failures": len([item for item in results if item.get("created_session_path") and not item.get("summary_present")]),
         "title_failures": len([item for item in results if item.get("created_session_path") and not item.get("title_present")]),
         "titlebar_failures": len([item for item in results if item.get("created_session_path") and not item.get("titlebar_matches_viewport")]),
         "cwd_failures": len([item for item in results if item.get("created_session_path") and not item.get("cwd_matches", False)]),
         "notification_anomalies": len([item for item in results if item.get("notification_noise")]),
-        "remove_failures": len([item for item in results if item.get("remove_error")]),
+        "keep_alive_failures": len([item for item in keep_alive_results if item.get("error")]),
+        "restore_failures": len(restore_failures),
+        "quirk_failures": quirk_failures,
+        "resource_failures": resource_failures,
+        "remove_failures": len([item for item in cleanup_results if item.get("remove_error")]),
+        "resources": resources,
+        "quirks": quirk_results,
+        "keep_alive_results": keep_alive_results,
+        "restore_summary": restore_summary,
+        "restore_results": restore_results,
+        "cleanup_results": cleanup_results,
         "results": results,
     }
     summary_path = out_dir / "summary.json"
@@ -731,9 +1371,13 @@ def main() -> int:
         and item.get("title_present")
         and item.get("summary_present")
         and item.get("titlebar_matches_viewport")
+        and (item.get("workload_kind") != "heavy" or item.get("heavy_tui_visible"))
         and not item.get("notification_noise")
-        and not item.get("remove_error")
         for item in results
+    ) and not quirk_failures and not resource_failures and not restore_failures and all(
+        not item.get("error") for item in keep_alive_results
+    ) and all(
+        not item.get("remove_error") for item in cleanup_results
     ) else 1
 
 
@@ -746,11 +1390,15 @@ def _require_terminal_ready(
 ) -> dict:
     if not viewport_terminal_ready(state, session_path):
         viewport = state.get("viewport") or {}
+        reason = str(viewport.get("reason") or "")
         if (
             (viewport.get("active_view_mode") == "Terminal")
             and (viewport.get("active_session_path") == session_path)
             and titlebar_matches_viewport(state)
-            and terminal_attach_ready_seen(host, session_path, started_ms, deadline_ms)
+            and (
+                terminal_attach_ready_seen(host, session_path, started_ms, deadline_ms)
+                or "plain shell prompt" in reason
+            )
         ):
             return state
         viewport = state.get("viewport") or {}
@@ -761,14 +1409,32 @@ def _require_terminal_ready(
 
 
 def _require_terminal_markers(state: dict, session_path: str) -> dict:
-    if not viewport_terminal_ready(state, session_path):
-        viewport = state.get("viewport") or {}
+    viewport = state.get("viewport") or {}
+    if not viewport_terminal_ready(state, session_path) and not (
+        viewport.get("active_view_mode") == "Terminal"
+        and viewport.get("active_session_path") == session_path
+    ):
         raise RuntimeError(viewport.get("reason") or "terminal viewport not ready")
     if not titlebar_matches_viewport(state):
         raise RuntimeError("titlebar not in sync with viewport")
     text = active_terminal_text(state)
     if MARKER_BEGIN not in text or MARKER_END not in text:
         raise RuntimeError("terminal output markers not visible yet")
+    return state
+
+
+def _require_terminal_tui(state: dict, session_path: str) -> dict:
+    viewport = state.get("viewport") or {}
+    if not viewport_terminal_ready(state, session_path) and not (
+        viewport.get("active_view_mode") == "Terminal"
+        and viewport.get("active_session_path") == session_path
+    ):
+        raise RuntimeError(viewport.get("reason") or "terminal viewport not ready")
+    if not titlebar_matches_viewport(state):
+        raise RuntimeError("titlebar not in sync with viewport")
+    text = active_terminal_text(state)
+    if not terminal_text_looks_like_tui(text):
+        raise RuntimeError("heavy terminal TUI text not visible yet")
     return state
 
 

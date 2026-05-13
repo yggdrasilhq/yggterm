@@ -1,9 +1,12 @@
-use crate::codex_cli::{terminal_identity_env_pairs, terminal_identity_env_removals};
+use crate::codex_cli::{
+    terminal_identity_appearance_from_environment, terminal_identity_env_pairs,
+    terminal_identity_env_removals,
+};
 use anyhow::{Context, Result, bail};
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -22,6 +25,10 @@ const INITIAL_ATTACH_MAX_BYTES: usize = 512 * 1024;
 const INITIAL_ATTACH_TRAILING_NOISE_CHUNKS: usize = 16;
 const ATTACH_READY_MARKER: &str = "__YGGTERM_ATTACH_READY__\n";
 const TERMINAL_WRITE_QUEUE_CAPACITY: usize = 64;
+const TERMINAL_WRITE_FLUSH_ACK_TIMEOUT_MS: u64 = 1_500;
+const TERMINAL_PROTOCOL_MAX_PENDING_BYTES: usize = 256;
+const OSC_COLOR_FOREGROUND_SLOT: u8 = 10;
+const OSC_COLOR_BACKGROUND_SLOT: u8 = 11;
 
 #[derive(Debug, Clone)]
 pub struct TerminalChunk {
@@ -36,6 +43,8 @@ pub struct TerminalReadResult {
     pub running: bool,
     pub runtime_output_seen: bool,
     pub eof_without_output: bool,
+    pub post_resize_output_seen: bool,
+    pub last_resize_seq: u64,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -85,6 +94,187 @@ fn flush_terminal_utf8_pending(pending: &mut Vec<u8>) -> String {
     decoded
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TerminalProtocolProfile {
+    appearance: &'static str,
+    foreground: (u8, u8, u8),
+    background: (u8, u8, u8),
+}
+
+impl TerminalProtocolProfile {
+    fn from_launch_command(launch_command: &str) -> Self {
+        let appearance = infer_terminal_appearance_from_launch_command(launch_command)
+            .or_else(
+                || match terminal_identity_appearance_from_environment().as_str() {
+                    "dark" => Some("dark"),
+                    "light" => Some("light"),
+                    _ => None,
+                },
+            )
+            .unwrap_or("light");
+        match appearance {
+            "dark" => Self {
+                appearance: "dark",
+                foreground: (0xcc, 0xcc, 0xcc),
+                background: (0x1e, 0x1e, 0x1e),
+            },
+            _ => Self {
+                appearance: "light",
+                foreground: (0x15, 0x1b, 0x23),
+                background: (0xfb, 0xfb, 0xfd),
+            },
+        }
+    }
+
+    fn osc_color_response(self, slot: u8) -> Option<String> {
+        let color = match slot {
+            OSC_COLOR_FOREGROUND_SLOT => self.foreground,
+            OSC_COLOR_BACKGROUND_SLOT => self.background,
+            _ => return None,
+        };
+        Some(format!(
+            "\u{1b}]{slot};rgb:{}/{}/{}\u{1b}\\",
+            osc_rgb_component(color.0),
+            osc_rgb_component(color.1),
+            osc_rgb_component(color.2)
+        ))
+    }
+}
+
+#[derive(Debug, Default)]
+struct TerminalProtocolFilter {
+    pending: String,
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct TerminalProtocolFilterResult {
+    data: String,
+    responses: Vec<String>,
+    answered_slots: Vec<u8>,
+}
+
+impl TerminalProtocolFilter {
+    fn process(
+        &mut self,
+        data: &str,
+        profile: TerminalProtocolProfile,
+    ) -> TerminalProtocolFilterResult {
+        if data.is_empty() && self.pending.is_empty() {
+            return TerminalProtocolFilterResult::default();
+        }
+        let mut combined = String::new();
+        if !self.pending.is_empty() {
+            combined.push_str(&self.pending);
+            self.pending.clear();
+        }
+        combined.push_str(data);
+
+        let mut visible = String::with_capacity(combined.len());
+        let mut responses = Vec::new();
+        let mut answered_slots = Vec::new();
+        let mut cursor = 0usize;
+        while let Some(relative_start) = combined[cursor..].find("\u{1b}]") {
+            let sequence_start = cursor + relative_start;
+            visible.push_str(&combined[cursor..sequence_start]);
+            let content_start = sequence_start + "\u{1b}]".len();
+            let Some((slot, terminator_search_start)) =
+                parse_osc_default_color_query_start(&combined, content_start)
+            else {
+                visible.push_str("\u{1b}]");
+                cursor = content_start;
+                continue;
+            };
+            let Some((terminator_start, terminator_len)) =
+                find_osc_terminator(&combined, terminator_search_start)
+            else {
+                self.pending = combined[sequence_start..].to_string();
+                if self.pending.len() > TERMINAL_PROTOCOL_MAX_PENDING_BYTES {
+                    visible.push_str(&self.pending);
+                    self.pending.clear();
+                }
+                cursor = combined.len();
+                break;
+            };
+            if let Some(response) = profile.osc_color_response(slot) {
+                responses.push(response);
+                answered_slots.push(slot);
+            }
+            cursor = terminator_start + terminator_len;
+        }
+        if cursor < combined.len() {
+            visible.push_str(&combined[cursor..]);
+        }
+
+        TerminalProtocolFilterResult {
+            data: visible,
+            responses,
+            answered_slots,
+        }
+    }
+
+    fn discard_pending(&mut self) {
+        self.pending.clear();
+    }
+}
+
+fn infer_terminal_appearance_from_launch_command(launch_command: &str) -> Option<&'static str> {
+    if launch_command_has_assignment(launch_command, "YGGTERM_TERMINAL_APPEARANCE", "dark")
+        || launch_command_has_assignment(launch_command, "YGGTERM_APPEARANCE", "dark")
+        || launch_command_has_assignment(launch_command, "COLORFGBG", "15;0")
+    {
+        return Some("dark");
+    }
+    if launch_command_has_assignment(launch_command, "YGGTERM_TERMINAL_APPEARANCE", "light")
+        || launch_command_has_assignment(launch_command, "YGGTERM_APPEARANCE", "light")
+        || launch_command_has_assignment(launch_command, "COLORFGBG", "0;15")
+    {
+        return Some("light");
+    }
+    None
+}
+
+fn launch_command_has_assignment(launch_command: &str, key: &str, value: &str) -> bool {
+    let plain = format!("{key}={value}");
+    let single_quoted = format!("{key}='{value}'");
+    let double_quoted = format!("{key}=\"{value}\"");
+    let exported_plain = format!("export {plain}");
+    let exported_single = format!("export {single_quoted}");
+    let exported_double = format!("export {double_quoted}");
+    launch_command.contains(&plain)
+        || launch_command.contains(&single_quoted)
+        || launch_command.contains(&double_quoted)
+        || launch_command.contains(&exported_plain)
+        || launch_command.contains(&exported_single)
+        || launch_command.contains(&exported_double)
+}
+
+fn parse_osc_default_color_query_start(data: &str, content_start: usize) -> Option<(u8, usize)> {
+    let rest = &data[content_start..];
+    if rest.starts_with("10;?") {
+        Some((OSC_COLOR_FOREGROUND_SLOT, content_start + "10;?".len()))
+    } else if rest.starts_with("11;?") {
+        Some((OSC_COLOR_BACKGROUND_SLOT, content_start + "11;?".len()))
+    } else {
+        None
+    }
+}
+
+fn find_osc_terminator(data: &str, start: usize) -> Option<(usize, usize)> {
+    let rest = &data[start..];
+    let bel = rest.find('\u{7}').map(|offset| (start + offset, 1usize));
+    let st = rest.find("\u{1b}\\").map(|offset| (start + offset, 2usize));
+    match (bel, st) {
+        (Some(bel), Some(st)) => Some(if bel.0 < st.0 { bel } else { st }),
+        (Some(bel), None) => Some(bel),
+        (None, Some(st)) => Some(st),
+        (None, None) => None,
+    }
+}
+
+fn osc_rgb_component(value: u8) -> String {
+    format!("{value:02x}{value:02x}")
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TerminalTrimSummary {
     pub trimmed_sessions: usize,
@@ -124,8 +314,22 @@ impl TerminalManager {
         cwd: Option<&str>,
         initial_size: Option<(u16, u16)>,
     ) -> Result<()> {
-        if self.sessions.contains_key(key) {
+        if self
+            .sessions
+            .get(key)
+            .is_some_and(|session| session.is_running())
+        {
             return Ok(());
+        }
+        if let Some(runtime) = self.sessions.remove(key) {
+            trace_terminal_event(
+                "replace_exited_runtime",
+                serde_json::json!({
+                    "path": key,
+                    "launch_command": launch_command,
+                }),
+            );
+            let _ = runtime.shutdown(None);
         }
         let runtime = PtySessionRuntime::spawn(key, launch_command, cwd, initial_size)?;
         self.sessions.insert(key.to_string(), runtime);
@@ -201,7 +405,12 @@ impl TerminalManager {
     }
 
     pub fn session_keys(&self) -> Vec<String> {
-        let mut keys = self.sessions.keys().cloned().collect::<Vec<_>>();
+        let mut keys = self
+            .sessions
+            .iter()
+            .filter(|(_key, session)| session.is_running())
+            .map(|(key, _session)| key.clone())
+            .collect::<Vec<_>>();
         keys.sort();
         keys
     }
@@ -230,8 +439,23 @@ impl TerminalManager {
         session.resize(cols, rows)
     }
 
+    pub fn session_post_resize_output_seen(&self, key: &str) -> bool {
+        self.sessions
+            .get(key)
+            .is_some_and(|session| session.post_resize_output_seen())
+    }
+
+    pub fn session_last_resize_seq(&self, key: &str) -> u64 {
+        self.sessions
+            .get(key)
+            .map(|session| session.last_resize_seq())
+            .unwrap_or(0)
+    }
+
     pub fn has_session(&self, key: &str) -> bool {
-        self.sessions.contains_key(key)
+        self.sessions
+            .get(key)
+            .is_some_and(|session| session.is_running())
     }
 
     pub fn rename_session(&mut self, from: &str, to: &str) -> bool {
@@ -264,7 +488,11 @@ impl TerminalManager {
 
     pub fn stats(&self) -> TerminalBufferStats {
         let mut stats = TerminalBufferStats {
-            session_count: self.sessions.len(),
+            session_count: self
+                .sessions
+                .values()
+                .filter(|session| session.is_running())
+                .count(),
             ..TerminalBufferStats::default()
         };
         for session in self.sessions.values() {
@@ -398,18 +626,35 @@ impl TerminalManager {
 struct PtySessionRuntime {
     key: String,
     master: Arc<Mutex<Box<dyn MasterPty + Send>>>,
-    writer_tx: SyncSender<Vec<u8>>,
+    writer_tx: SyncSender<TerminalWriteRequest>,
     child: Arc<Mutex<Box<dyn Child + Send + Sync>>>,
     chunks: Arc<Mutex<VecDeque<TerminalChunk>>>,
     retained_bytes: Arc<AtomicUsize>,
     seq: Arc<AtomicU64>,
     started_at_ms: u64,
     last_activity_ms: Arc<AtomicU64>,
-    runtime_output_seen: Arc<std::sync::atomic::AtomicBool>,
-    eof_without_output: Arc<std::sync::atomic::AtomicBool>,
+    runtime_output_seen: Arc<AtomicBool>,
+    eof_without_output: Arc<AtomicBool>,
+    attach_ready_seen: Arc<AtomicBool>,
+    resize_count: Arc<AtomicU64>,
+    last_resize_seq: Arc<AtomicU64>,
+    current_cols: Arc<AtomicU16>,
+    current_rows: Arc<AtomicU16>,
     screen_state: Arc<Mutex<TerminalScreenState>>,
     launch_command: String,
     cwd: Option<String>,
+}
+
+struct TerminalWriteRequest {
+    data: Vec<u8>,
+    completion_tx: Option<mpsc::Sender<std::result::Result<(), String>>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
+enum TerminalWriteAckMode {
+    Enqueued,
+    Flushed,
 }
 
 struct TerminalScreenState {
@@ -445,22 +690,29 @@ fn spawn_terminal_writer_thread(
     writer: Box<dyn Write + Send>,
     last_activity_ms: Arc<AtomicU64>,
     capacity: usize,
-) -> Result<SyncSender<Vec<u8>>> {
-    let (tx, rx) = mpsc::sync_channel::<Vec<u8>>(capacity);
+) -> Result<SyncSender<TerminalWriteRequest>> {
+    let (tx, rx) = mpsc::sync_channel::<TerminalWriteRequest>(capacity);
     thread::Builder::new()
         .name(format!("pty-writer-{key}"))
         .spawn(move || {
             let mut writer = writer;
-            while let Ok(data) = rx.recv() {
+            while let Ok(request) = rx.recv() {
                 last_activity_ms.store(now_millis(), Ordering::SeqCst);
-                let byte_count = data.len();
-                if let Err(error) = writer.write_all(&data).and_then(|()| writer.flush()) {
+                let byte_count = request.data.len();
+                let write_result = writer
+                    .write_all(&request.data)
+                    .and_then(|()| writer.flush())
+                    .map_err(|error| error.to_string());
+                if let Some(completion_tx) = request.completion_tx {
+                    let _ = completion_tx.send(write_result.clone());
+                }
+                if let Err(error) = write_result {
                     trace_terminal_event(
                         "write_failed",
                         serde_json::json!({
                             "path": key,
                             "bytes": byte_count,
-                            "error": error.to_string(),
+                            "error": error,
                         }),
                     );
                     break;
@@ -472,18 +724,65 @@ fn spawn_terminal_writer_thread(
 }
 
 fn enqueue_terminal_write(
-    writer_tx: &SyncSender<Vec<u8>>,
+    writer_tx: &SyncSender<TerminalWriteRequest>,
     key: &str,
     data: &str,
     capacity: usize,
+    ack_mode: TerminalWriteAckMode,
 ) -> Result<()> {
     if data.is_empty() {
         return Ok(());
     }
     let bytes = data.as_bytes().to_vec();
     let byte_count = bytes.len();
-    match writer_tx.try_send(bytes) {
-        Ok(()) => Ok(()),
+    let (completion_tx, completion_rx) = if ack_mode == TerminalWriteAckMode::Flushed {
+        let (tx, rx) = mpsc::channel();
+        (Some(tx), Some(rx))
+    } else {
+        (None, None)
+    };
+    let request = TerminalWriteRequest {
+        data: bytes,
+        completion_tx,
+    };
+    match writer_tx.try_send(request) {
+        Ok(()) => {
+            let Some(completion_rx) = completion_rx else {
+                return Ok(());
+            };
+            match completion_rx
+                .recv_timeout(Duration::from_millis(TERMINAL_WRITE_FLUSH_ACK_TIMEOUT_MS))
+            {
+                Ok(Ok(())) => Ok(()),
+                Ok(Err(error)) => {
+                    trace_terminal_event(
+                        "write_flush_failed",
+                        serde_json::json!({
+                            "path": key,
+                            "bytes": byte_count,
+                            "error": error,
+                        }),
+                    );
+                    bail!("terminal writer failed for {key}: {error}")
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    trace_terminal_event(
+                        "write_flush_timeout",
+                        serde_json::json!({
+                            "path": key,
+                            "bytes": byte_count,
+                            "timeout_ms": TERMINAL_WRITE_FLUSH_ACK_TIMEOUT_MS,
+                        }),
+                    );
+                    bail!(
+                        "terminal writer did not flush input for {key} within {TERMINAL_WRITE_FLUSH_ACK_TIMEOUT_MS}ms"
+                    )
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    bail!("terminal writer exited before flushing input for {key}")
+                }
+            }
+        }
         Err(TrySendError::Full(_)) => {
             trace_terminal_event(
                 "write_backpressure",
@@ -499,6 +798,46 @@ fn enqueue_terminal_write(
             bail!("terminal writer is no longer available for {key}")
         }
     }
+}
+
+fn enqueue_terminal_protocol_responses(
+    writer_tx: &SyncSender<TerminalWriteRequest>,
+    key: &str,
+    profile: TerminalProtocolProfile,
+    result: &TerminalProtocolFilterResult,
+) {
+    if result.responses.is_empty() {
+        return;
+    }
+    for response in &result.responses {
+        if let Err(error) = enqueue_terminal_write(
+            writer_tx,
+            key,
+            response,
+            TERMINAL_WRITE_QUEUE_CAPACITY,
+            TerminalWriteAckMode::Enqueued,
+        ) {
+            trace_terminal_event(
+                "protocol_color_response_failed",
+                serde_json::json!({
+                    "path": key,
+                    "appearance": profile.appearance,
+                    "slots": &result.answered_slots,
+                    "error": error.to_string(),
+                }),
+            );
+            return;
+        }
+    }
+    trace_terminal_event(
+        "protocol_color_response_sent",
+        serde_json::json!({
+            "path": key,
+            "appearance": profile.appearance,
+            "slots": &result.answered_slots,
+            "response_count": result.responses.len(),
+        }),
+    );
 }
 
 impl PtySessionRuntime {
@@ -548,8 +887,13 @@ impl PtySessionRuntime {
         let seq = Arc::new(AtomicU64::new(0));
         let started_at_ms = now_millis();
         let last_activity_ms = Arc::new(AtomicU64::new(started_at_ms));
-        let runtime_output_seen = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let eof_without_output = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let runtime_output_seen = Arc::new(AtomicBool::new(false));
+        let eof_without_output = Arc::new(AtomicBool::new(false));
+        let attach_ready_seen = Arc::new(AtomicBool::new(false));
+        let resize_count = Arc::new(AtomicU64::new(0));
+        let last_resize_seq = Arc::new(AtomicU64::new(0));
+        let current_cols = Arc::new(AtomicU16::new(initial_cols));
+        let current_rows = Arc::new(AtomicU16::new(initial_rows));
         let screen_state = Arc::new(Mutex::new(TerminalScreenState::new(
             initial_rows,
             initial_cols,
@@ -560,9 +904,12 @@ impl PtySessionRuntime {
         let reader_activity = Arc::clone(&last_activity_ms);
         let reader_runtime_output_seen = Arc::clone(&runtime_output_seen);
         let reader_eof_without_output = Arc::clone(&eof_without_output);
+        let reader_attach_ready_seen = Arc::clone(&attach_ready_seen);
         let reader_screen_state = Arc::clone(&screen_state);
         let key_label = key.to_string();
         let launch_command_label = launch_command.to_string();
+        let terminal_protocol_profile =
+            TerminalProtocolProfile::from_launch_command(&launch_command_label);
         let writer_tx = spawn_terminal_writer_thread(
             key.to_string(),
             writer,
@@ -570,17 +917,29 @@ impl PtySessionRuntime {
             TERMINAL_WRITE_QUEUE_CAPACITY,
         )
         .context("spawning pty writer thread")?;
+        let reader_writer_tx = writer_tx.clone();
 
         thread::Builder::new()
             .name(format!("pty-reader-{key}"))
             .spawn(move || {
                 let mut buffer = [0u8; 8192];
                 let mut pending_utf8 = Vec::<u8>::new();
+                let mut protocol_filter = TerminalProtocolFilter::default();
                 let mut saw_any_output = false;
                 loop {
                     match reader.read(&mut buffer) {
                         Ok(0) => {
-                            let data = flush_terminal_utf8_pending(&mut pending_utf8);
+                            let raw_data = flush_terminal_utf8_pending(&mut pending_utf8);
+                            let protocol_result =
+                                protocol_filter.process(&raw_data, terminal_protocol_profile);
+                            enqueue_terminal_protocol_responses(
+                                &reader_writer_tx,
+                                &key_label,
+                                terminal_protocol_profile,
+                                &protocol_result,
+                            );
+                            protocol_filter.discard_pending();
+                            let data = protocol_result.data;
                             if !data.is_empty() {
                                 if let Ok(mut screen_state) = reader_screen_state.lock() {
                                     screen_state.process(data.as_bytes());
@@ -624,8 +983,22 @@ impl PtySessionRuntime {
                                 } else {
                                     (raw_data, false)
                                 };
+                            if stripped_attach_ready_marker {
+                                reader_attach_ready_seen.store(true, Ordering::SeqCst);
+                            }
+                            let protocol_result =
+                                protocol_filter.process(&data, terminal_protocol_profile);
+                            enqueue_terminal_protocol_responses(
+                                &reader_writer_tx,
+                                &key_label,
+                                terminal_protocol_profile,
+                                &protocol_result,
+                            );
+                            let answered_terminal_protocol =
+                                !protocol_result.answered_slots.is_empty();
+                            let data = protocol_result.data;
                             if data.is_empty() {
-                                if stripped_attach_ready_marker {
+                                if stripped_attach_ready_marker || answered_terminal_protocol {
                                     reader_activity.store(now_millis(), Ordering::SeqCst);
                                 }
                                 continue;
@@ -711,6 +1084,11 @@ impl PtySessionRuntime {
             last_activity_ms,
             runtime_output_seen,
             eof_without_output,
+            attach_ready_seen,
+            resize_count,
+            last_resize_seq,
+            current_cols,
+            current_rows,
             screen_state,
             launch_command: launch_command.to_string(),
             cwd: cwd.map(|value| value.to_string()),
@@ -776,6 +1154,15 @@ impl PtySessionRuntime {
         self.runtime_output_seen.load(Ordering::SeqCst)
     }
 
+    fn last_resize_seq(&self) -> u64 {
+        self.last_resize_seq.load(Ordering::SeqCst)
+    }
+
+    fn post_resize_output_seen(&self) -> bool {
+        self.resize_count.load(Ordering::SeqCst) == 0
+            || self.seq.load(Ordering::SeqCst) > self.last_resize_seq()
+    }
+
     fn hit_eof_without_output(&self) -> bool {
         self.eof_without_output.load(Ordering::SeqCst)
     }
@@ -819,9 +1206,10 @@ impl PtySessionRuntime {
     fn read(&self, cursor: u64) -> TerminalReadResult {
         let retained_chunks = self.chunks.lock().expect("pty chunk lock poisoned");
         let next_cursor = self.seq.load(Ordering::SeqCst);
+        let effective_cursor = if cursor > next_cursor { 0 } else { cursor };
         let prefer_initial_screen_snapshot =
             terminal_key_prefers_initial_screen_snapshot(&self.key, &self.launch_command);
-        let mut chunks = if cursor == 0 {
+        let mut chunks = if effective_cursor == 0 {
             if prefer_initial_screen_snapshot {
                 let retained_initial = select_remote_retained_initial_chunks(
                     &self.key,
@@ -835,9 +1223,7 @@ impl PtySessionRuntime {
                 ) {
                     retained_initial
                 } else {
-                    self.screen_snapshot_chunk(next_cursor)
-                        .into_iter()
-                        .collect::<Vec<_>>()
+                    retained_initial
                 }
             } else {
                 select_remote_retained_initial_chunks(
@@ -849,15 +1235,16 @@ impl PtySessionRuntime {
         } else {
             retained_chunks
                 .iter()
-                .filter(|chunk| chunk.seq > cursor)
+                .filter(|chunk| chunk.seq > effective_cursor)
                 .cloned()
                 .collect()
         };
-        if cursor == 0 && chunks.is_empty() {
+        if effective_cursor == 0 && chunks.is_empty() {
             chunks =
                 select_initial_attach_chunks_for_launch(&retained_chunks, &self.launch_command);
         }
-        if cursor == 0
+        if effective_cursor == 0
+            && !prefer_initial_screen_snapshot
             && !chunks
                 .iter()
                 .any(|chunk| terminal_chunk_has_visible_text(&chunk.data))
@@ -865,7 +1252,11 @@ impl PtySessionRuntime {
         {
             chunks = vec![snapshot_chunk];
         }
-        if cursor == 0 && self.is_running() && prefer_initial_screen_snapshot {
+        if effective_cursor == 0
+            && self.is_running()
+            && prefer_initial_screen_snapshot
+            && self.attach_ready_seen.load(Ordering::SeqCst)
+        {
             chunks.push(TerminalChunk {
                 seq: next_cursor.saturating_add(1),
                 data: ATTACH_READY_MARKER.to_string(),
@@ -877,6 +1268,8 @@ impl PtySessionRuntime {
             running: self.is_running(),
             runtime_output_seen: self.has_runtime_output(),
             eof_without_output: self.eof_without_output.load(Ordering::SeqCst),
+            post_resize_output_seen: self.post_resize_output_seen(),
+            last_resize_seq: self.last_resize_seq(),
         }
     }
 
@@ -902,6 +1295,7 @@ impl PtySessionRuntime {
             &self.key,
             data,
             TERMINAL_WRITE_QUEUE_CAPACITY,
+            TerminalWriteAckMode::Flushed,
         )
     }
 
@@ -955,6 +1349,19 @@ impl PtySessionRuntime {
         if cols == 0 || rows == 0 {
             bail!("terminal size must be greater than zero");
         }
+        let previous_cols = self.current_cols.load(Ordering::SeqCst);
+        let previous_rows = self.current_rows.load(Ordering::SeqCst);
+        if previous_cols == cols && previous_rows == rows {
+            trace_terminal_event(
+                "resize_noop",
+                serde_json::json!({
+                    "path": self.key,
+                    "cols": cols,
+                    "rows": rows,
+                }),
+            );
+            return Ok(());
+        }
         let master = self.master.lock().expect("pty master lock poisoned");
         master
             .resize(PtySize {
@@ -964,9 +1371,14 @@ impl PtySessionRuntime {
                 pixel_height: 0,
             })
             .context("resizing pty")?;
+        self.current_cols.store(cols, Ordering::SeqCst);
+        self.current_rows.store(rows, Ordering::SeqCst);
         if let Ok(mut screen_state) = self.screen_state.lock() {
             screen_state.resize(rows, cols);
         }
+        let seq = self.seq.load(Ordering::SeqCst);
+        self.last_resize_seq.store(seq, Ordering::SeqCst);
+        self.resize_count.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
 
@@ -1123,6 +1535,7 @@ fn shell_command(launch_command: &str, cwd: Option<&str>) -> CommandBuilder {
 
 fn launch_command_looks_like_remote_resume_attach(launch_command: &str) -> bool {
     launch_command.contains("server'\\'' '\\''remote'\\'' '\\''resume-codex")
+        || launch_command.contains("server'\\'' '\\''remote'\\'' '\\''start-codex")
 }
 
 fn remote_resume_attach_shell_command(launch_command: &str) -> String {
@@ -1133,7 +1546,7 @@ fn remote_resume_attach_shell_command(launch_command: &str) -> String {
         } else {
             format!("exec {launch_command}")
         };
-    format!("stty raw -echo </dev/tty >/dev/tty 2>/dev/null || true; {launch}")
+    format!("stty raw -echo opost onlcr </dev/tty >/dev/tty 2>/dev/null || true; {launch}")
 }
 
 fn terminal_key_prefers_initial_screen_snapshot(key: &str, launch_command: &str) -> bool {
@@ -1575,6 +1988,94 @@ mod tests {
         assert!(pending.is_empty());
     }
 
+    #[test]
+    fn terminal_protocol_filter_answers_default_color_queries() {
+        let profile = TerminalProtocolProfile::from_launch_command(
+            "export YGGTERM_TERMINAL_APPEARANCE=dark; codex",
+        );
+        let mut filter = TerminalProtocolFilter::default();
+
+        let result = filter.process("hello\u{1b}]10;?\u{1b}\\mid\u{1b}]11;?\u{7}done", profile);
+
+        assert_eq!(result.data, "hellomiddone");
+        assert_eq!(
+            result.responses,
+            vec![
+                "\u{1b}]10;rgb:cccc/cccc/cccc\u{1b}\\".to_string(),
+                "\u{1b}]11;rgb:1e1e/1e1e/1e1e\u{1b}\\".to_string(),
+            ]
+        );
+        assert_eq!(result.answered_slots, vec![10, 11]);
+    }
+
+    #[test]
+    fn terminal_protocol_filter_holds_split_color_query() {
+        let profile =
+            TerminalProtocolProfile::from_launch_command("export COLORFGBG='15;0'; codex");
+        let mut filter = TerminalProtocolFilter::default();
+
+        let first = filter.process("left\u{1b}]11;?", profile);
+        let second = filter.process("\u{1b}\\right", profile);
+
+        assert_eq!(first.data, "left");
+        assert!(first.responses.is_empty());
+        assert_eq!(second.data, "right");
+        assert_eq!(
+            second.responses,
+            vec!["\u{1b}]11;rgb:1e1e/1e1e/1e1e\u{1b}\\".to_string()]
+        );
+    }
+
+    #[test]
+    fn pty_runtime_answers_default_color_query_to_child() {
+        let runtime = PtySessionRuntime::spawn(
+            "local://osc-color-query",
+            r#"export YGGTERM_TERMINAL_APPEARANCE=dark; python3 - <<'PY'
+import os
+import select
+import sys
+import termios
+import tty
+
+fd = os.open('/dev/tty', os.O_RDWR | getattr(os, 'O_NOCTTY', 0))
+old = termios.tcgetattr(fd)
+data = b''
+try:
+    tty.setraw(fd)
+    os.write(fd, b'\x1b]10;?\x1b\\')
+    ready, _, _ = select.select([fd], [], [], 2.0)
+    if ready:
+        data = os.read(fd, 64)
+finally:
+    termios.tcsetattr(fd, termios.TCSADRAIN, old)
+    os.close(fd)
+
+expected = b'\x1b]10;rgb:cccc/cccc/cccc\x1b\\'
+sys.stdout.write('COLOR_OK\n' if data == expected else f'COLOR_BAD:{data!r}\n')
+PY"#,
+            None,
+            None,
+        )
+        .expect("spawn OSC color query test runtime");
+        let mut combined = String::new();
+        for _ in 0..80 {
+            let read = runtime.read(0);
+            combined = read
+                .chunks
+                .iter()
+                .map(|chunk| chunk.data.as_str())
+                .collect::<String>();
+            if combined.contains("COLOR_") {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        runtime.shutdown(None).expect("shutdown test runtime");
+
+        assert!(combined.contains("COLOR_OK"), "{combined:?}");
+        assert!(!combined.contains("\u{1b}]10;?\u{1b}\\"));
+    }
+
     struct BlockingFirstWrite {
         first_started: mpsc::Sender<()>,
         release_first: mpsc::Receiver<()>,
@@ -1730,6 +2231,33 @@ mod tests {
     }
 
     #[test]
+    fn pty_read_replays_initial_chunks_when_client_cursor_is_from_previous_runtime() {
+        let runtime = PtySessionRuntime::spawn(
+            "local://cursor-rewind-test",
+            "bash -lc 'printf restarted'",
+            None,
+            None,
+        )
+        .expect("spawn cursor rewind test runtime");
+        let mut combined = String::new();
+        for _ in 0..80 {
+            let read = runtime.read(9999);
+            combined = read
+                .chunks
+                .iter()
+                .map(|chunk| chunk.data.as_str())
+                .collect::<String>();
+            if combined.contains("restarted") {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        runtime.shutdown(None).expect("shutdown test runtime");
+
+        assert!(combined.contains("restarted"), "{combined:?}");
+    }
+
+    #[test]
     fn initial_attach_selection_keeps_last_meaningful_surface_ahead_of_trailing_noise() {
         let mut chunks = VecDeque::new();
         chunks.push_back(TerminalChunk {
@@ -1853,9 +2381,13 @@ mod tests {
     #[test]
     fn launch_command_detects_remote_resume_attach() {
         let launch_command = "ssh -tt jojo 'exec $HOME/.yggterm/bin/yggterm '\\''server'\\'' '\\''remote'\\'' '\\''resume-codex'\\'' '\\''019ce5d8-c94c-7b62-ae19-3818ae400b65'\\'' '\\''/home/pi'\\'''";
+        let start_command = "ssh -tt jojo 'exec $HOME/.yggterm/bin/yggterm '\\''server'\\'' '\\''remote'\\'' '\\''start-codex'\\'' '\\''019ce5d8-c94c-7b62-ae19-3818ae400b65'\\'' '\\''/home/pi'\\'''";
 
         assert!(launch_command_looks_like_remote_resume_attach(
             launch_command
+        ));
+        assert!(launch_command_looks_like_remote_resume_attach(
+            start_command
         ));
         assert!(!launch_command_looks_like_remote_resume_attach(
             "bash -lc 'ls'"
@@ -1869,7 +2401,7 @@ mod tests {
         let wrapped = remote_resume_attach_shell_command(launch_command);
 
         assert!(wrapped.starts_with(
-            "stty raw -echo </dev/tty >/dev/tty 2>/dev/null || true; __yggterm_initial_tty_size="
+            "stty raw -echo opost onlcr </dev/tty >/dev/tty 2>/dev/null || true; __yggterm_initial_tty_size="
         ));
         assert!(!wrapped.contains("; exec __yggterm_initial_tty_size="));
         assert!(wrapped.contains("; exec ssh -tt jojo"));
@@ -1883,7 +2415,7 @@ mod tests {
         let wrapped = remote_resume_attach_shell_command(launch_command);
 
         assert!(wrapped.starts_with(
-            "stty raw -echo </dev/tty >/dev/tty 2>/dev/null || true; exec ssh -tt jojo"
+            "stty raw -echo opost onlcr </dev/tty >/dev/tty 2>/dev/null || true; exec ssh -tt jojo"
         ));
     }
 
@@ -1900,6 +2432,10 @@ mod tests {
         assert!(terminal_key_prefers_initial_screen_snapshot(
             "local://legacy-resume",
             "ssh -tt jojo 'exec $HOME/.yggterm/bin/yggterm '\\''server'\\'' '\\''remote'\\'' '\\''resume-codex'\\'' '\\''test-session'\\'' '\\''/home/pi'\\'''",
+        ));
+        assert!(terminal_key_prefers_initial_screen_snapshot(
+            "local://fresh-start",
+            "ssh -tt jojo 'exec $HOME/.yggterm/bin/yggterm '\\''server'\\'' '\\''remote'\\'' '\\''start-codex'\\'' '\\''test-session'\\'' '\\''/home/pi'\\'''",
         ));
         assert!(!terminal_key_prefers_initial_screen_snapshot(
             "local://plain",
@@ -1940,6 +2476,7 @@ mod tests {
             .map(|line| format!("YGG_REMOTE_RETAINED_SCROLLBACK_{line:03}\n"))
             .collect::<String>();
         runtime.seed_snapshot(&seeded_scrollback);
+        runtime.attach_ready_seen.store(true, Ordering::SeqCst);
 
         let result = runtime.read(0);
         let combined = result
@@ -1985,6 +2522,130 @@ mod tests {
         manager
             .remove_session(key, None)
             .expect("shutdown retained history session");
+    }
+
+    #[test]
+    fn terminal_manager_reports_post_resize_output_fence() {
+        let mut manager = TerminalManager::new();
+        let key = "remote-session://dev/resize-fence";
+        manager
+            .ensure_session(key, "sh -lc 'sleep 30'", None)
+            .expect("spawn resize fence session");
+        manager
+            .seed_session(key, "pre-resize retained separator\n")
+            .expect("seed pre-resize output");
+
+        let before_resize = manager.read(key, 0).expect("read before resize");
+        assert!(before_resize.post_resize_output_seen);
+        assert_eq!(before_resize.last_resize_seq, 0);
+
+        manager.resize(key, 110, 50).expect("resize session");
+        let after_resize = manager.read(key, 0).expect("read after resize");
+        assert!(!after_resize.post_resize_output_seen);
+        assert_eq!(after_resize.last_resize_seq, before_resize.cursor);
+        assert!(!manager.session_post_resize_output_seen(key));
+
+        manager
+            .seed_session(key, "post-resize prompt surface\n")
+            .expect("seed post-resize output");
+        let after_output = manager.read(key, 0).expect("read after output");
+        assert!(after_output.post_resize_output_seen);
+        assert_eq!(after_output.last_resize_seq, after_resize.last_resize_seq);
+        assert!(
+            after_output
+                .chunks
+                .iter()
+                .any(|chunk| chunk.seq > after_output.last_resize_seq),
+            "{:?}",
+            after_output.chunks
+        );
+
+        manager
+            .remove_session(key, None)
+            .expect("shutdown resize fence session");
+    }
+
+    #[test]
+    fn terminal_same_size_resize_after_sized_restart_does_not_open_resize_fence() {
+        let mut manager = TerminalManager::new();
+        let key = "remote-session://dev/sized-restart";
+        manager
+            .restart_session_with_size(key, "sh -lc 'sleep 30'", None, None, Some((110, 50)))
+            .expect("spawn sized restart session");
+        manager
+            .seed_session(key, "post-restart prompt surface\n")
+            .expect("seed prompt output");
+
+        let before_resize = manager.read(key, 0).expect("read before same-size resize");
+        assert!(before_resize.post_resize_output_seen);
+        assert_eq!(before_resize.last_resize_seq, 0);
+
+        manager
+            .resize(key, 110, 50)
+            .expect("same-size resize should be a no-op");
+        let after_resize = manager.read(key, 0).expect("read after same-size resize");
+        assert!(
+            after_resize.post_resize_output_seen,
+            "same-size resize must not fence fresh restart output"
+        );
+        assert_eq!(
+            after_resize.last_resize_seq, 0,
+            "same-size resize must not mark retained prompt output pre-resize"
+        );
+
+        manager
+            .remove_session(key, None)
+            .expect("shutdown sized restart session");
+    }
+
+    #[test]
+    fn terminal_manager_session_keys_exclude_exited_runtime() {
+        let mut manager = TerminalManager::new();
+        let key = "local://exited-runtime";
+        manager
+            .ensure_session(key, "sh -lc 'printf exited'", None)
+            .expect("spawn short runtime");
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while manager.session_is_running(key) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        assert!(
+            !manager.session_is_running(key),
+            "short runtime should exit during the test"
+        );
+        assert!(
+            !manager.session_keys().iter().any(|value| value == key),
+            "exited runtime must not be advertised as a live terminal session"
+        );
+    }
+
+    #[test]
+    fn terminal_manager_ensure_restarts_exited_runtime() {
+        let mut manager = TerminalManager::new();
+        let key = "local://restart-exited-runtime";
+        manager
+            .ensure_session(key, "sh -lc 'printf first'", None)
+            .expect("spawn first short runtime");
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while manager.session_is_running(key) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            !manager.session_is_running(key),
+            "first runtime should exit during the test"
+        );
+
+        manager
+            .ensure_session(key, "sh -lc 'sleep 30'", None)
+            .expect("ensure should replace an exited runtime");
+        assert!(
+            manager.session_is_running(key),
+            "ensure_session must recreate an exited runtime"
+        );
+        manager.remove_session(key, None).expect("remove session");
     }
 
     #[test]
@@ -2072,6 +2733,7 @@ mod tests {
         runtime.seed_snapshot(
             "› Use /skills to list available skills\n\n  gpt-5.4 high fast · 100% left · ~/git\n",
         );
+        runtime.attach_ready_seen.store(true, Ordering::SeqCst);
 
         let result = runtime.read(0);
         let combined = result
@@ -2085,7 +2747,7 @@ mod tests {
     }
 
     #[test]
-    fn initial_remote_resume_attach_prefers_screen_snapshot_state() {
+    fn initial_remote_resume_attach_uses_raw_pty_bytes_not_screen_snapshot_state() {
         let runtime = PtySessionRuntime::spawn(
             "remote-session://oc/test",
             "ssh -tt oc 'exec $HOME/.yggterm/bin/yggterm '\\''server'\\'' '\\''remote'\\'' '\\''resume-codex'\\'' '\\''test-session'\\'' '\\''/home/pi'\\'''",
@@ -2102,13 +2764,13 @@ mod tests {
             .map(|chunk| chunk.data.as_str())
             .collect::<String>();
 
-        assert!(combined.contains("XYZdef"));
-        assert!(!combined.contains("abcdef\rXYZ"));
+        assert!(combined.contains("abcdef\rXYZ"));
+        assert!(!combined.contains("XYZdef"));
         runtime.shutdown(None).expect("shutdown test runtime");
     }
 
     #[test]
-    fn initial_remote_resume_attach_prefers_screen_snapshot_over_stale_prose_tail() {
+    fn initial_remote_resume_attach_does_not_fabricate_screen_snapshot_over_stale_prose_tail() {
         let runtime = PtySessionRuntime::spawn(
             "remote-session://oc/stale-prose",
             "ssh -tt oc 'exec $HOME/.yggterm/bin/yggterm '\\''server'\\'' '\\''remote'\\'' '\\''resume-codex'\\'' '\\''stale-prose'\\'' '\\''/home/pi'\\'''",
@@ -2141,14 +2803,14 @@ mod tests {
             .collect::<String>();
         let visible = strip_terminal_control_sequences(&combined);
 
-        assert!(combined.contains("__YGGTERM_ATTACH_READY__"));
-        assert!(visible.contains("› Write tests for @filename"));
-        assert!(!visible.contains("GitHub release directly"));
+        assert!(!combined.contains("__YGGTERM_ATTACH_READY__"));
+        assert!(!visible.contains("› Write tests for @filename"));
+        assert!(visible.contains("GitHub release directly"));
         runtime.shutdown(None).expect("shutdown test runtime");
     }
 
     #[test]
-    fn initial_runtime_owned_attach_ignores_partial_retained_prompt_tail() {
+    fn initial_runtime_owned_attach_keeps_raw_retained_tail_instead_of_screen_snapshot() {
         let runtime = PtySessionRuntime::spawn(
             "remote-session://oc/test",
             "bash -lc 'sleep 30'",
@@ -2181,9 +2843,9 @@ mod tests {
             .collect::<String>();
         let visible = strip_terminal_control_sequences(&combined);
 
-        assert!(combined.contains("__YGGTERM_ATTACH_READY__"));
-        assert!(!combined.contains("\u{1b}[60;1H›"));
-        assert_eq!(visible.matches('›').count(), 1, "{visible:?}");
+        assert!(!combined.contains("__YGGTERM_ATTACH_READY__"));
+        assert!(combined.contains("\u{1b}[60;1H›"));
+        assert_eq!(visible.matches('›').count(), 2, "{visible:?}");
         runtime.shutdown(None).expect("shutdown test runtime");
     }
 
@@ -2284,21 +2946,87 @@ mod tests {
         )
         .expect("spawn writer");
 
-        enqueue_terminal_write(&writer_tx, "local://blocked", "first", 1)
-            .expect("enqueue first write");
+        enqueue_terminal_write(
+            &writer_tx,
+            "local://blocked",
+            "first",
+            1,
+            TerminalWriteAckMode::Enqueued,
+        )
+        .expect("enqueue first write");
         first_started_rx
             .recv_timeout(Duration::from_secs(1))
             .expect("writer should start first write");
-        enqueue_terminal_write(&writer_tx, "local://blocked", "second", 1)
-            .expect("enqueue second write behind blocked writer");
+        enqueue_terminal_write(
+            &writer_tx,
+            "local://blocked",
+            "second",
+            1,
+            TerminalWriteAckMode::Enqueued,
+        )
+        .expect("enqueue second write behind blocked writer");
 
         let started = Instant::now();
-        let error = enqueue_terminal_write(&writer_tx, "local://blocked", "third", 1)
-            .expect_err("full queue should fail fast");
+        let error = enqueue_terminal_write(
+            &writer_tx,
+            "local://blocked",
+            "third",
+            1,
+            TerminalWriteAckMode::Enqueued,
+        )
+        .expect_err("full queue should fail fast");
 
         assert!(started.elapsed() < Duration::from_millis(100));
         assert!(error.to_string().contains("terminal input queue is full"));
         release_first_tx.send(()).expect("release blocked writer");
+        drop(writer_tx);
+    }
+
+    #[test]
+    fn terminal_write_flush_ack_waits_for_writer_thread() {
+        let (first_started_tx, first_started_rx) = mpsc::channel();
+        let (release_first_tx, release_first_rx) = mpsc::channel();
+        let (result_tx, result_rx) = mpsc::channel();
+        let writes = Arc::new(AtomicUsize::new(0));
+        let writer = BlockingFirstWrite {
+            first_started: first_started_tx,
+            release_first: release_first_rx,
+            writes,
+        };
+        let writer_tx = spawn_terminal_writer_thread(
+            "local://flush-ack".to_string(),
+            Box::new(writer),
+            Arc::new(AtomicU64::new(0)),
+            1,
+        )
+        .expect("spawn writer");
+
+        let write_tx = writer_tx.clone();
+        thread::spawn(move || {
+            let result = enqueue_terminal_write(
+                &write_tx,
+                "local://flush-ack",
+                "first",
+                1,
+                TerminalWriteAckMode::Flushed,
+            )
+            .map_err(|error| error.to_string());
+            result_tx.send(result).expect("send write result");
+        });
+
+        first_started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("writer should start first write");
+        assert!(
+            result_rx.recv_timeout(Duration::from_millis(100)).is_err(),
+            "flushed terminal writes must not acknowledge before the writer flushes the PTY"
+        );
+
+        release_first_tx.send(()).expect("release blocked writer");
+        result_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("write should finish after writer flushes")
+            .expect("write should succeed");
         drop(writer_tx);
     }
 }

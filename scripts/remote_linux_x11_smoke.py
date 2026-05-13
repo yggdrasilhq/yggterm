@@ -1371,6 +1371,13 @@ def main() -> int:
             "YGGTERM_REMOTE_SMOKE_TAG": "1",
             "NO_AT_BRIDGE": "1",
         }
+        for passthrough_key in (
+            "YGGTERM_SMOKE_FORCE_APP_THEME",
+            "YGGTERM_ENABLE_XTERM_CANVAS",
+        ):
+            passthrough_value = str(os.environ.get(passthrough_key) or "").strip()
+            if passthrough_value:
+                launch_env[passthrough_key] = passthrough_value
         if "stored_codex_session_open" in args.only_check:
             remote_codex_home = f"{remote_dir}/.codex"
             launch_env["YGGTERM_CODEX_HOME"] = remote_codex_home
@@ -1456,6 +1463,7 @@ def main() -> int:
             launch_env["DISPLAY"] = x11_display
             launch_env["XAUTHORITY"] = x11_xauthority
             launch_env["GDK_BACKEND"] = "x11"
+            launch_env["YGGTERM_FORCE_X11_BACKEND"] = "1"
             launch_env["WEBKIT_DISABLE_COMPOSITING_MODE"] = "1"
         metadata["effective_backend"] = effective_backend
         metadata["launch_env"] = launch_env

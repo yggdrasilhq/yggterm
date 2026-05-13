@@ -39,9 +39,10 @@ pub use perf::{
     append_bounded_jsonl_record, append_perf_event, perf_telemetry_path,
 };
 pub use titles::{
-    SessionTitleStore, best_effort_context_from_session_path, best_effort_precis_from_context,
-    best_effort_summary_from_context, best_effort_title_from_context,
-    looks_like_generated_fallback_title, looks_like_low_signal_generated_copy,
+    SessionSummaryTimelineEntry, SessionTitleStore, best_effort_context_from_session_path,
+    best_effort_precis_from_context, best_effort_summary_from_context,
+    best_effort_title_from_context, looks_like_generated_fallback_title,
+    looks_like_low_signal_generated_copy,
 };
 pub use trace::{
     EVENT_TRACE_FILENAME, EventTraceRecord, EventTraceSpan, append_trace_event, event_trace_path,
@@ -90,6 +91,25 @@ pub enum SessionNodeKind {
 pub struct SessionStore {
     home: PathBuf,
     sessions_root: PathBuf,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct SessionCopyRegenerationReport {
+    pub scanned: usize,
+    pub title_generated: usize,
+    pub precis_generated: usize,
+    pub summary_generated: usize,
+    pub summary_history_reset: usize,
+    pub skipped: usize,
+    pub failed: Vec<SessionCopyRegenerationFailure>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SessionCopyRegenerationFailure {
+    pub session_id: String,
+    pub path: String,
+    pub stage: String,
+    pub error: String,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -356,6 +376,16 @@ impl SessionStore {
         resolver.save_manual_title_for_session(session_id, cwd, title)
     }
 
+    pub fn save_manual_summary_for_session_id(
+        &self,
+        session_id: &str,
+        cwd: &str,
+        summary: &str,
+    ) -> Result<()> {
+        let resolver = SessionTitleResolver::new(&self.home)?;
+        resolver.save_manual_summary_for_session(session_id, cwd, summary)
+    }
+
     pub fn save_manual_title_for_session_path(
         &self,
         session_path: &str,
@@ -430,6 +460,20 @@ impl SessionStore {
     pub fn resolve_summary_for_session_id(&self, session_id: &str) -> Result<Option<String>> {
         let resolver = SessionTitleResolver::new(&self.home)?;
         resolver.resolve_summary_for_session(session_id)
+    }
+
+    pub fn summary_timeline_for_session_id(
+        &self,
+        session_id: &str,
+        limit: usize,
+    ) -> Result<Vec<SessionSummaryTimelineEntry>> {
+        let resolver = SessionTitleResolver::new(&self.home)?;
+        resolver.summary_timeline_for_session(session_id, limit)
+    }
+
+    pub fn reset_summary_timeline_for_session_id(&self, session_id: &str) -> Result<()> {
+        let resolver = SessionTitleResolver::new(&self.home)?;
+        resolver.reset_summary_timeline_for_session(session_id)
     }
 
     pub fn resolve_summary_for_session_path(&self, session_path: &str) -> Result<Option<String>> {
@@ -533,6 +577,155 @@ impl SessionStore {
     ) -> Result<Option<String>> {
         let resolver = SessionTitleResolver::new(&self.home)?;
         resolver.generate_summary_for_context(settings, session_id, cwd, context, force)
+    }
+
+    pub fn regenerate_codex_session_copy(
+        &self,
+        settings: &AppSettings,
+        budget: usize,
+        force: bool,
+        reset_summary_history: bool,
+    ) -> Result<SessionCopyRegenerationReport> {
+        let codex_root = resolve_codex_sessions_root()?;
+        let resolver = SessionTitleResolver::new(&self.home)?;
+        let mut sessions = if codex_root.exists() {
+            scan_codex_sessions(&codex_root, Some(&resolver))?
+        } else {
+            Vec::new()
+        };
+        sessions.sort_by(|a, b| {
+            b.modified_epoch_ms
+                .cmp(&a.modified_epoch_ms)
+                .then_with(|| a.session_id.cmp(&b.session_id))
+        });
+
+        let mut report = SessionCopyRegenerationReport::default();
+        let limit = if budget == 0 { usize::MAX } else { budget };
+        for session in sessions.into_iter().take(limit) {
+            report.scanned += 1;
+            let path = session.file_path.to_string_lossy().to_string();
+            let mut touched = false;
+            if reset_summary_history {
+                match resolver.reset_summary_timeline_for_session(&session.session_id) {
+                    Ok(()) => {
+                        report.summary_history_reset += 1;
+                        touched = true;
+                    }
+                    Err(error) => {
+                        report.failed.push(SessionCopyRegenerationFailure {
+                            session_id: session.session_id.clone(),
+                            path: path.clone(),
+                            stage: "reset_summary_history".to_string(),
+                            error: error.to_string(),
+                        });
+                        continue;
+                    }
+                }
+            }
+
+            let title_was_missing = resolver
+                .resolve_for_session(&session.session_id)
+                .ok()
+                .flatten()
+                .as_deref()
+                .is_none_or(|title| {
+                    title.trim().is_empty() || looks_like_generated_fallback_title(title)
+                });
+            if force || title_was_missing {
+                match resolver.generate_for_session(
+                    settings,
+                    &session.session_id,
+                    &session.cwd,
+                    &session.file_path,
+                    force,
+                ) {
+                    Ok(Some(_)) => {
+                        report.title_generated += 1;
+                        touched = true;
+                    }
+                    Ok(None) => {}
+                    Err(error) => report.failed.push(SessionCopyRegenerationFailure {
+                        session_id: session.session_id.clone(),
+                        path: path.clone(),
+                        stage: "title".to_string(),
+                        error: error.to_string(),
+                    }),
+                }
+            }
+
+            let precis_was_missing = resolver
+                .resolve_precis_for_session(&session.session_id)
+                .ok()
+                .flatten()
+                .as_deref()
+                .is_none_or(looks_like_low_signal_generated_copy);
+            if force || precis_was_missing {
+                match resolver.generate_precis_for_session(
+                    settings,
+                    &session.session_id,
+                    &session.cwd,
+                    &session.file_path,
+                    force,
+                ) {
+                    Ok(Some(_)) => {
+                        report.precis_generated += 1;
+                        touched = true;
+                    }
+                    Ok(None) => {}
+                    Err(error) => report.failed.push(SessionCopyRegenerationFailure {
+                        session_id: session.session_id.clone(),
+                        path: path.clone(),
+                        stage: "precis".to_string(),
+                        error: error.to_string(),
+                    }),
+                }
+            }
+
+            let source_updated_at = session
+                .modified_epoch_ms
+                .checked_div(1000)
+                .and_then(|secs| i64::try_from(secs).ok())
+                .and_then(|secs| OffsetDateTime::from_unix_timestamp(secs).ok());
+            let summary_was_missing = resolver
+                .resolve_summary_for_session(&session.session_id)
+                .ok()
+                .flatten()
+                .as_deref()
+                .is_none_or(looks_like_low_signal_generated_copy);
+            let summary_stale = source_updated_at
+                .and_then(|updated_at| {
+                    resolver
+                        .summary_needs_refresh(&session.session_id, updated_at)
+                        .ok()
+                })
+                .unwrap_or(summary_was_missing);
+            if force || reset_summary_history || summary_was_missing || summary_stale {
+                match resolver.generate_summary_for_session(
+                    settings,
+                    &session.session_id,
+                    &session.cwd,
+                    &session.file_path,
+                    force || reset_summary_history || summary_stale,
+                ) {
+                    Ok(Some(_)) => {
+                        report.summary_generated += 1;
+                        touched = true;
+                    }
+                    Ok(None) => {}
+                    Err(error) => report.failed.push(SessionCopyRegenerationFailure {
+                        session_id: session.session_id.clone(),
+                        path: path.clone(),
+                        stage: "summary".to_string(),
+                        error: error.to_string(),
+                    }),
+                }
+            }
+
+            if !touched {
+                report.skipped += 1;
+            }
+        }
+        Ok(report)
     }
 }
 
