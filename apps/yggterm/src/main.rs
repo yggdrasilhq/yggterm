@@ -31,15 +31,16 @@ use yggterm_server::{
     run_app_control_focus_window, run_app_control_key, run_app_control_list_clients,
     run_app_control_move_window_by, run_app_control_open_path,
     run_app_control_paste_terminal_clipboard, run_app_control_paste_terminal_clipboard_image,
-    run_app_control_pointer, run_app_control_probe_terminal_viewport_input,
-    run_app_control_probe_terminal_viewport_scroll, run_app_control_probe_terminal_viewport_select,
-    run_app_control_reclaim_terminal_focus, run_app_control_redraw_terminal,
-    run_app_control_remove_session, run_app_control_reset_theme_editor,
-    run_app_control_resize_window, run_app_control_restart_pending_update,
-    run_app_control_scroll_preview, run_app_control_scroll_right_panel,
-    run_app_control_send_terminal_input, run_app_control_set_clipboard_png_base64,
-    run_app_control_set_clipboard_text, run_app_control_set_fullscreen,
-    run_app_control_set_main_zoom, run_app_control_set_maximized,
+    run_app_control_pointer, run_app_control_probe_terminal_context_menu,
+    run_app_control_probe_terminal_primary_selection_paste,
+    run_app_control_probe_terminal_viewport_input, run_app_control_probe_terminal_viewport_scroll,
+    run_app_control_probe_terminal_viewport_select, run_app_control_reclaim_terminal_focus,
+    run_app_control_redraw_terminal, run_app_control_remove_session,
+    run_app_control_reset_theme_editor, run_app_control_resize_window,
+    run_app_control_restart_pending_update, run_app_control_scroll_preview,
+    run_app_control_scroll_right_panel, run_app_control_send_terminal_input,
+    run_app_control_set_clipboard_png_base64, run_app_control_set_clipboard_text,
+    run_app_control_set_fullscreen, run_app_control_set_main_zoom, run_app_control_set_maximized,
     run_app_control_set_preview_layout, run_app_control_set_right_panel_mode,
     run_app_control_set_row_expanded, run_app_control_set_search,
     run_app_control_set_session_keep_alive, run_app_control_set_theme_editor_open,
@@ -47,9 +48,12 @@ use yggterm_server::{
     run_app_control_set_window_chrome_hover, run_app_control_start_action,
     run_app_control_trigger_update_check, run_attach, run_daemon, run_screenrecord_capture,
     run_screenshot_capture, run_trace_bundle, run_trace_follow, run_trace_tail, shutdown, snapshot,
-    start_local_session, status, terminal_write, try_run_remote_server_command,
+    start_local_session, status, terminal_restart, terminal_write, try_run_remote_server_command,
 };
-use yggterm_shell::{ShellBootstrap, launch_shell, start_daemon_watchdog, warm_daemon_start};
+use yggterm_shell::{
+    ShellBootstrap, launch_shell, start_daemon_watchdog, terminal_identity_appearance_for_settings,
+    warm_daemon_start,
+};
 use yggui_contract::UiTheme;
 
 const DEBUG_DISABLE_CACHED_SERVER_SNAPSHOT_ENV: &str =
@@ -57,6 +61,8 @@ const DEBUG_DISABLE_CACHED_SERVER_SNAPSHOT_ENV: &str =
 const ENV_YGGTERM_SKIP_ACTIVE_EXEC_HANDOFF: &str = "YGGTERM_SKIP_ACTIVE_EXEC_HANDOFF";
 const ENV_YGGTERM_ENABLE_ACCESSIBILITY: &str = "YGGTERM_ENABLE_ACCESSIBILITY";
 const ENV_YGGTERM_ALLOW_WAYLAND_BACKEND: &str = "YGGTERM_ALLOW_WAYLAND_BACKEND";
+const ENV_YGGTERM_FORCE_X11_BACKEND: &str = "YGGTERM_FORCE_X11_BACKEND";
+const ENV_YGGTERM_ENABLE_XTERM_CANVAS: &str = "YGGTERM_ENABLE_XTERM_CANVAS";
 const ENV_YGGTERM_ENABLE_WEBKIT_COMPOSITING: &str = "YGGTERM_ENABLE_WEBKIT_COMPOSITING";
 const ENV_YGGTERM_ALLOW_MULTI_WINDOW: &str = "YGGTERM_ALLOW_MULTI_WINDOW";
 const ENV_YGGTERM_ENABLE_TRANSPARENT_WINDOW: &str = "YGGTERM_ENABLE_TRANSPARENT_WINDOW";
@@ -470,6 +476,8 @@ fn launch_app_background(
 enum BuiltinCliCommand {
     MainHelp,
     ServerHelp,
+    ServerAppHelp,
+    ServerSessionsHelp,
     ServerSnapshot,
 }
 
@@ -483,6 +491,32 @@ fn classify_builtin_cli_command(args: &[String]) -> Option<BuiltinCliCommand> {
             if command == "server" && matches!(arg.as_str(), "--help" | "-h" | "help") =>
         {
             Some(BuiltinCliCommand::ServerHelp)
+        }
+        [server, app] if server == "server" && app == "app" => {
+            Some(BuiltinCliCommand::ServerAppHelp)
+        }
+        [server, app, rest @ ..]
+            if server == "server"
+                && app == "app"
+                && rest
+                    .iter()
+                    .any(|arg| matches!(arg.as_str(), "--help" | "-h" | "help")) =>
+        {
+            Some(BuiltinCliCommand::ServerAppHelp)
+        }
+        [server, sessions]
+            if server == "server" && matches!(sessions.as_str(), "sessions" | "session-copy") =>
+        {
+            Some(BuiltinCliCommand::ServerSessionsHelp)
+        }
+        [server, sessions, rest @ ..]
+            if server == "server"
+                && matches!(sessions.as_str(), "sessions" | "session-copy")
+                && rest
+                    .iter()
+                    .any(|arg| matches!(arg.as_str(), "--help" | "-h" | "help")) =>
+        {
+            Some(BuiltinCliCommand::ServerSessionsHelp)
         }
         [command, arg] if command == "server" && arg == "snapshot" => {
             Some(BuiltinCliCommand::ServerSnapshot)
@@ -519,6 +553,8 @@ fn print_server_help() {
   yggterm server snapshot
   yggterm server shutdown
   yggterm server terminal write <session> (--data <data>|--stdin)
+  yggterm server terminal restart <session> [--terminal-appearance <dark|light>] [--force-remote]
+  yggterm server sessions regenerate-copy [--budget <n>] [--force] [--reset-summary-history] [--json]
   yggterm server smoke
   yggterm server trace <tail|follow|bundle>
   yggterm server screenshot <target> [output]
@@ -536,9 +572,71 @@ fn print_server_app_help() {
   yggterm server app state [--pid <pid>]
   yggterm server app rows [--pid <pid>]
   yggterm server app screenshot [output] [--pid <pid>]
+  yggterm server app session <remove|delete> <session-path> [--pid <pid>]
   yggterm server app start-page [--pid <pid>]
-  yggterm server app terminal <new|send|focus|probe-type|probe-scroll|probe-select> ..."
+  yggterm server app terminal <new|send|focus|probe-type|probe-scroll|probe-select|probe-context-menu> ...
+  yggterm server app terminal send <session> (--data <data>|--stdin)"
     );
+}
+
+fn print_server_sessions_help() {
+    println!(
+        "usage:
+  yggterm server sessions regenerate-copy [--budget <n>] [--force] [--reset-summary-history] [--json]
+
+commands:
+  regenerate-copy    Generate missing Codex session titles and summary timelines.
+
+options:
+  --budget <n>                Limit the number of sessions processed; 0 means no explicit limit.
+  --force                     Regenerate existing generated copy.
+  --reset-summary-history     Rebuild summary timeline history from scratch.
+  --json                      Print a machine-readable report."
+    );
+}
+
+fn run_sessions_regenerate_copy_cli(store: &SessionStore, args: &[String]) -> Result<()> {
+    let action = args
+        .get(2)
+        .map(String::as_str)
+        .context("missing server sessions action")?;
+    if !matches!(
+        action,
+        "regenerate-copy" | "regenerate" | "copy" | "refresh-copy"
+    ) {
+        anyhow::bail!("unsupported server sessions action: {action}");
+    }
+    let settings = store.load_settings()?;
+    let budget = cli_flag_value(args, "--budget")
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(0);
+    let force = args.iter().any(|arg| arg == "--force");
+    let reset_summary_history = args
+        .iter()
+        .any(|arg| arg == "--reset-summary-history" || arg == "--reset-history");
+    let report =
+        store.regenerate_codex_session_copy(&settings, budget, force, reset_summary_history)?;
+    if args.iter().any(|arg| arg == "--json") {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        println!(
+            "scanned={} title_generated={} precis_generated={} summary_generated={} summary_history_reset={} skipped={} failed={}",
+            report.scanned,
+            report.title_generated,
+            report.precis_generated,
+            report.summary_generated,
+            report.summary_history_reset,
+            report.skipped,
+            report.failed.len()
+        );
+        for failure in report.failed.iter().take(12) {
+            println!(
+                "failed {} {}: {}",
+                failure.stage, failure.session_id, failure.error
+            );
+        }
+    }
+    Ok(())
 }
 
 fn ensure_local_server_ready_for_cli(store: &SessionStore) -> Result<()> {
@@ -555,6 +653,7 @@ fn main() -> Result<()> {
     }
     configure_linux_allocator_limits()?;
     configure_linux_desktop_backend();
+    configure_linux_terminal_renderer_policy();
     configure_linux_accessibility_bridge();
     configure_linux_webkit_compositing();
     configure_linux_webkit_memory_policy();
@@ -562,6 +661,7 @@ fn main() -> Result<()> {
         .with_env_filter("info")
         .with_target(false)
         .without_time()
+        .with_writer(std::io::stderr)
         .init();
 
     if args.is_empty() {
@@ -574,7 +674,19 @@ fn main() -> Result<()> {
     install_panic_logging(store.home_dir());
     let startup_home = store.home_dir().to_path_buf();
     maybe_focus_existing_client(store.home_dir(), &args, &current_exe)?;
-    maybe_retire_superseded_same_home_clients(store.home_dir(), &args, &current_exe)?;
+    if main_should_retire_superseded_clients_before_shell(&args) {
+        maybe_retire_superseded_same_home_clients(store.home_dir(), &args, &current_exe)?;
+    } else if args.is_empty() {
+        append_trace_event(
+            &startup_home,
+            "gui",
+            "startup",
+            "main_superseded_retirement_deferred_to_shell_handoff",
+            serde_json::json!({
+                "reason": "shell captures outgoing active session before process retirement"
+            }),
+        );
+    }
     append_trace_event(
         &startup_home,
         "gui",
@@ -592,6 +704,8 @@ fn main() -> Result<()> {
             "gdk_backend": std::env::var("GDK_BACKEND").ok(),
             "winit_unix_backend": std::env::var("WINIT_UNIX_BACKEND").ok(),
             "policy": std::env::var("YGGTERM_LINUX_BACKEND_POLICY").ok(),
+            "xterm_canvas_renderer": std::env::var(ENV_YGGTERM_ENABLE_XTERM_CANVAS).ok(),
+            "xterm_canvas_policy": std::env::var("YGGTERM_XTERM_CANVAS_POLICY").ok(),
             "wayland_display_present": std::env::var_os("WAYLAND_DISPLAY").is_some(),
             "display_present": std::env::var_os("DISPLAY").is_some(),
         }),
@@ -599,6 +713,33 @@ fn main() -> Result<()> {
     let startup_span = PerfSpan::start(&startup_home, "startup", "gui_main");
     let pending_update_restart = None;
     let launch_install_context = install_context.clone();
+    if let Some(command) = classify_builtin_cli_command(&args) {
+        match command {
+            BuiltinCliCommand::MainHelp => {
+                print_main_help();
+                return Ok(());
+            }
+            BuiltinCliCommand::ServerHelp => {
+                print_server_help();
+                return Ok(());
+            }
+            BuiltinCliCommand::ServerAppHelp => {
+                print_server_app_help();
+                return Ok(());
+            }
+            BuiltinCliCommand::ServerSessionsHelp => {
+                print_server_sessions_help();
+                return Ok(());
+            }
+            BuiltinCliCommand::ServerSnapshot => {
+                ensure_local_server_ready_for_cli(&store)?;
+                let endpoint = default_endpoint(store.home_dir());
+                let (snapshot, _) = snapshot(&endpoint)?;
+                println!("{}", serde_json::to_string_pretty(&snapshot)?);
+                return Ok(());
+            }
+        }
+    }
     if args.as_slice() == ["server", "daemon"] {
         let endpoint = default_endpoint(store.home_dir());
         let host = detect_ghostty_host();
@@ -636,6 +777,31 @@ fn main() -> Result<()> {
             }))?
         );
         return Ok(());
+    }
+    if args.len() >= 4 && args[0] == "server" && args[1] == "terminal" && args[2] == "restart" {
+        ensure_local_server_ready_for_cli(&store)?;
+        let endpoint = default_endpoint(store.home_dir());
+        let terminal_appearance = cli_flag_value(&args, "--terminal-appearance");
+        let force_remote = args.iter().any(|arg| arg == "--force-remote");
+        let (snapshot, message) =
+            terminal_restart(&endpoint, &args[3], terminal_appearance, force_remote)?;
+        println!(
+            "{}",
+            serde_json::to_string(&serde_json::json!({
+                "accepted": true,
+                "session_path": args[3],
+                "force_remote": force_remote,
+                "message": message,
+                "active_session_path": snapshot.active_session_path,
+            }))?
+        );
+        return Ok(());
+    }
+    if args.len() >= 3
+        && args[0] == "server"
+        && matches!(args[1].as_str(), "sessions" | "session-copy")
+    {
+        return run_sessions_regenerate_copy_cli(&store, &args);
     }
     if try_run_remote_server_command(&args)? {
         return Ok(());
@@ -711,25 +877,6 @@ fn main() -> Result<()> {
             .find(|value| !value.starts_with("--"))
             .map(String::as_str);
         return run_screenrecord_capture(&args[2], output_path, timeout_ms, duration_secs);
-    }
-    if let Some(command) = classify_builtin_cli_command(&args) {
-        match command {
-            BuiltinCliCommand::MainHelp => {
-                print_main_help();
-                return Ok(());
-            }
-            BuiltinCliCommand::ServerHelp => {
-                print_server_help();
-                return Ok(());
-            }
-            BuiltinCliCommand::ServerSnapshot => {
-                ensure_local_server_ready_for_cli(&store)?;
-                let endpoint = default_endpoint(store.home_dir());
-                let (snapshot, _) = snapshot(&endpoint)?;
-                println!("{}", serde_json::to_string_pretty(&snapshot)?);
-                return Ok(());
-            }
-        }
     }
     if args.len() >= 3 && args[0] == "server" && args[1] == "app" {
         let preferred_pid = args.windows(2).find_map(|window| {
@@ -1355,17 +1502,25 @@ fn main() -> Result<()> {
                             .into_iter()
                             .next()
                             .context("missing session path for server app terminal send")?;
-                        let data = args
-                            .windows(2)
-                            .find_map(|window| {
-                                if window[0] == "--data" {
-                                    Some(window[1].as_str())
-                                } else {
-                                    None
-                                }
-                            })
-                            .context("missing --data for server app terminal send")?;
-                        run_app_control_send_terminal_input(session_path, data, timeout_ms)
+                        let data = if args.iter().any(|arg| arg == "--stdin") {
+                            let mut value = String::new();
+                            std::io::stdin()
+                                .read_to_string(&mut value)
+                                .context("reading app terminal send stdin")?;
+                            value
+                        } else {
+                            args.windows(2)
+                                .find_map(|window| {
+                                    if window[0] == "--data" {
+                                        Some(window[1].as_str())
+                                    } else {
+                                        None
+                                    }
+                                })
+                                .context("missing --data or --stdin for server app terminal send")?
+                                .to_string()
+                        };
+                        run_app_control_send_terminal_input(session_path, &data, timeout_ms)
                     }
                     "focus" => {
                         let session_path = cli_positional_args(&args, 4)
@@ -1485,6 +1640,36 @@ fn main() -> Result<()> {
                             .context("missing session path for server app terminal probe-select")?;
                         run_app_control_probe_terminal_viewport_select(session_path, timeout_ms)
                     }
+                    "probe-primary-paste" | "probe-primary-selection-paste" => {
+                        let session_path =
+                            cli_positional_args(&args, 4).into_iter().next().context(
+                                "missing session path for server app terminal probe-primary-paste",
+                            )?;
+                        let data = args
+                            .windows(2)
+                            .find_map(|window| {
+                                if window[0] == "--data" {
+                                    Some(window[1].as_str())
+                                } else {
+                                    None
+                                }
+                            })
+                            .context(
+                                "missing --data for server app terminal probe-primary-paste",
+                            )?;
+                        run_app_control_probe_terminal_primary_selection_paste(
+                            session_path,
+                            data,
+                            timeout_ms,
+                        )
+                    }
+                    "probe-context-menu" | "probe-right-click-menu" => {
+                        let session_path =
+                            cli_positional_args(&args, 4).into_iter().next().context(
+                                "missing session path for server app terminal probe-context-menu",
+                            )?;
+                        run_app_control_probe_terminal_context_menu(session_path, timeout_ms)
+                    }
                     other => anyhow::bail!("unsupported app terminal action: {other}"),
                 }
             }
@@ -1565,6 +1750,8 @@ fn main() -> Result<()> {
     let settings_span = PerfSpan::start(&startup_home, "startup", "load_settings");
     let settings = store.load_settings().unwrap_or_default();
     settings_span.finish(serde_json::json!({}));
+    let terminal_appearance = terminal_identity_appearance_for_settings(&settings).to_string();
+    yggterm_server::sync_terminal_identity_appearance(&terminal_appearance);
     let tree = placeholder_session_tree(store.sessions_root().to_path_buf(), settings.theme);
     let browser_tree_span = PerfSpan::start(&startup_home, "startup", "load_browser_tree");
     let (browser_tree, browser_tree_loaded) = match store.load_codex_tree(&settings) {
@@ -1585,8 +1772,16 @@ fn main() -> Result<()> {
     let prefer_ghostty_backend = settings.prefer_ghostty_backend;
     let endpoint = default_endpoint(store.home_dir());
     install_signal_shutdown(store.home_dir().to_path_buf(), endpoint.clone());
-    warm_daemon_start(endpoint.clone(), Some(startup_home.clone()));
-    start_daemon_watchdog(endpoint.clone(), Some(startup_home.clone()));
+    warm_daemon_start(
+        endpoint.clone(),
+        Some(startup_home.clone()),
+        Some(terminal_appearance.clone()),
+    );
+    start_daemon_watchdog(
+        endpoint.clone(),
+        Some(startup_home.clone()),
+        Some(terminal_appearance.clone()),
+    );
     let linux_window_profile = detect_linux_window_profile();
     append_trace_event(
         &startup_home,
@@ -1632,6 +1827,7 @@ fn main() -> Result<()> {
             "profile_reason": linux_window_profile.reason,
             "browser_tree_loaded": browser_tree_loaded,
             "initial_server_snapshot": initial_server_snapshot.is_some(),
+            "terminal_appearance": terminal_appearance,
         }),
     );
 
@@ -1692,6 +1888,7 @@ struct LinuxWindowProfileInput {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct LinuxDesktopBackendPolicyInput {
     allow_wayland_backend: bool,
+    force_x11_backend: bool,
     gdk_backend_set: bool,
     winit_backend_set: bool,
     kde_session: bool,
@@ -1705,6 +1902,23 @@ struct LinuxDesktopBackendPolicy {
     force_x11_backend: bool,
     set_gdk_backend: bool,
     set_winit_backend: bool,
+    backend: Option<&'static str>,
+    reason: &'static str,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LinuxTerminalRendererPolicyInput {
+    explicit_canvas_env: bool,
+    gdk_backend_x11: bool,
+    wayland_display_present: bool,
+    display_present: bool,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LinuxTerminalRendererPolicy {
+    set_canvas_env: Option<&'static str>,
     reason: &'static str,
 }
 
@@ -1717,7 +1931,21 @@ fn linux_desktop_backend_policy_from_input(
             force_x11_backend: false,
             set_gdk_backend: false,
             set_winit_backend: false,
+            backend: None,
             reason: "wayland_backend_explicitly_allowed",
+        };
+    }
+    if input.force_x11_backend {
+        return LinuxDesktopBackendPolicy {
+            force_x11_backend: input.display_present,
+            set_gdk_backend: input.display_present && !input.gdk_backend_set,
+            set_winit_backend: input.display_present && !input.winit_backend_set,
+            backend: input.display_present.then_some("x11"),
+            reason: if input.display_present {
+                "x11_backend_explicitly_forced"
+            } else {
+                "x11_backend_force_without_display"
+            },
         };
     }
     if input.gdk_backend_set {
@@ -1725,6 +1953,7 @@ fn linux_desktop_backend_policy_from_input(
             force_x11_backend: false,
             set_gdk_backend: false,
             set_winit_backend: false,
+            backend: None,
             reason: "gdk_backend_explicit",
         };
     }
@@ -1733,14 +1962,44 @@ fn linux_desktop_backend_policy_from_input(
             force_x11_backend: false,
             set_gdk_backend: false,
             set_winit_backend: false,
+            backend: None,
             reason: "no_kde_wayland_x11_pair",
         };
     }
     LinuxDesktopBackendPolicy {
-        force_x11_backend: true,
-        set_gdk_backend: true,
+        force_x11_backend: false,
+        set_gdk_backend: !input.gdk_backend_set,
         set_winit_backend: !input.winit_backend_set,
-        reason: "kde_wayland_x11_default",
+        backend: Some("wayland"),
+        reason: "kde_wayland_native_default",
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_terminal_renderer_policy_from_input(
+    input: LinuxTerminalRendererPolicyInput,
+) -> LinuxTerminalRendererPolicy {
+    if input.explicit_canvas_env {
+        return LinuxTerminalRendererPolicy {
+            set_canvas_env: None,
+            reason: "xterm_canvas_explicit",
+        };
+    }
+    if input.gdk_backend_x11 || (!input.wayland_display_present && input.display_present) {
+        return LinuxTerminalRendererPolicy {
+            set_canvas_env: Some("0"),
+            reason: "xterm_canvas_disabled_for_x11",
+        };
+    }
+    if input.wayland_display_present {
+        return LinuxTerminalRendererPolicy {
+            set_canvas_env: Some("1"),
+            reason: "xterm_canvas_enabled_for_wayland",
+        };
+    }
+    LinuxTerminalRendererPolicy {
+        set_canvas_env: None,
+        reason: "xterm_canvas_default",
     }
 }
 
@@ -1901,26 +2160,46 @@ fn hydrate_linux_gui_entry_environment_from_desktop() {
 fn configure_linux_desktop_backend() {
     let policy = linux_desktop_backend_policy_from_input(LinuxDesktopBackendPolicyInput {
         allow_wayland_backend: linux_env_flag_truthy(ENV_YGGTERM_ALLOW_WAYLAND_BACKEND),
+        force_x11_backend: linux_env_flag_truthy(ENV_YGGTERM_FORCE_X11_BACKEND),
         gdk_backend_set: std::env::var_os("GDK_BACKEND").is_some(),
         winit_backend_set: std::env::var_os("WINIT_UNIX_BACKEND").is_some(),
         kde_session: linux_session_env_looks_like_kde_plasma(),
         wayland_display_present: std::env::var_os("WAYLAND_DISPLAY").is_some(),
         display_present: std::env::var_os("DISPLAY").is_some(),
     });
-    if !policy.force_x11_backend {
+    let Some(backend) = policy.backend else {
         return;
-    }
+    };
     if policy.set_gdk_backend {
-        unsafe { std::env::set_var("GDK_BACKEND", "x11") };
+        unsafe { std::env::set_var("GDK_BACKEND", backend) };
     }
     if policy.set_winit_backend {
-        unsafe { std::env::set_var("WINIT_UNIX_BACKEND", "x11") };
+        unsafe { std::env::set_var("WINIT_UNIX_BACKEND", backend) };
     }
     unsafe { std::env::set_var("YGGTERM_LINUX_BACKEND_POLICY", policy.reason) };
 }
 
 #[cfg(not(target_os = "linux"))]
 fn configure_linux_desktop_backend() {}
+
+#[cfg(target_os = "linux")]
+fn configure_linux_terminal_renderer_policy() {
+    let policy = linux_terminal_renderer_policy_from_input(LinuxTerminalRendererPolicyInput {
+        explicit_canvas_env: std::env::var_os(ENV_YGGTERM_ENABLE_XTERM_CANVAS).is_some(),
+        gdk_backend_x11: std::env::var("GDK_BACKEND")
+            .ok()
+            .is_some_and(|value| value.split(',').any(|part| part.trim() == "x11")),
+        wayland_display_present: std::env::var_os("WAYLAND_DISPLAY").is_some(),
+        display_present: std::env::var_os("DISPLAY").is_some(),
+    });
+    if let Some(value) = policy.set_canvas_env {
+        unsafe { std::env::set_var(ENV_YGGTERM_ENABLE_XTERM_CANVAS, value) };
+    }
+    unsafe { std::env::set_var("YGGTERM_XTERM_CANVAS_POLICY", policy.reason) };
+}
+
+#[cfg(not(target_os = "linux"))]
+fn configure_linux_terminal_renderer_policy() {}
 
 fn linux_window_profile_from_input(input: LinuxWindowProfileInput) -> LinuxWindowProfile {
     if input.transparent_opt_in {
@@ -1944,6 +2223,13 @@ fn linux_window_profile_from_input(input: LinuxWindowProfileInput) -> LinuxWindo
             transparent: true,
             xrpd_session: false,
             reason: "kde_x11_transparent_profile",
+        };
+    }
+    if input.kde_session && input.wayland_display_present {
+        return LinuxWindowProfile {
+            transparent: true,
+            xrpd_session: false,
+            reason: "kde_wayland_transparent_profile",
         };
     }
     if input.gdk_backend_x11 || (input.display_present && !input.wayland_display_present) {
@@ -2288,6 +2574,12 @@ fn maybe_retire_superseded_same_home_clients(
         );
     }
     Ok(())
+}
+
+fn main_should_retire_superseded_clients_before_shell(_args: &[String]) -> bool {
+    // The shell owns superseded-client retirement because it can first query the
+    // outgoing GUI over app-control and preserve the active terminal selection.
+    false
 }
 
 fn should_retire_superseded_client(
@@ -2953,10 +3245,11 @@ mod tests {
     use super::{
         BuiltinCliCommand, LinuxWindowProfileInput, SignalClientScope,
         classify_builtin_cli_command, compatible_signal_client_count,
-        linux_window_profile_from_input, record_matches_executable,
-        should_retire_superseded_client, signal_client_instances_dir, signal_client_scope_matches,
-        signal_parse_process_start_ticks_from_stat, signal_process_start_ticks,
-        superseded_client_close_command, superseded_client_retirement_strategy_label,
+        linux_window_profile_from_input, main_should_retire_superseded_clients_before_shell,
+        record_matches_executable, should_retire_superseded_client, signal_client_instances_dir,
+        signal_client_scope_matches, signal_parse_process_start_ticks_from_stat,
+        signal_process_start_ticks, superseded_client_close_command,
+        superseded_client_retirement_strategy_label,
     };
     #[cfg(target_os = "linux")]
     use super::{linux_choose_desktop_environment, linux_environ_bytes_to_map};
@@ -2982,6 +3275,32 @@ mod tests {
         assert_eq!(
             classify_builtin_cli_command(&["server".to_string(), "--help".to_string()]),
             Some(BuiltinCliCommand::ServerHelp)
+        );
+        assert_eq!(
+            classify_builtin_cli_command(&["server".to_string(), "app".to_string()]),
+            Some(BuiltinCliCommand::ServerAppHelp)
+        );
+        assert_eq!(
+            classify_builtin_cli_command(&[
+                "server".to_string(),
+                "app".to_string(),
+                "launch".to_string(),
+                "--help".to_string()
+            ]),
+            Some(BuiltinCliCommand::ServerAppHelp)
+        );
+        assert_eq!(
+            classify_builtin_cli_command(&["server".to_string(), "sessions".to_string()]),
+            Some(BuiltinCliCommand::ServerSessionsHelp)
+        );
+        assert_eq!(
+            classify_builtin_cli_command(&[
+                "server".to_string(),
+                "sessions".to_string(),
+                "regenerate-copy".to_string(),
+                "--help".to_string()
+            ]),
+            Some(BuiltinCliCommand::ServerSessionsHelp)
         );
     }
 
@@ -3055,13 +3374,49 @@ mod tests {
         assert_eq!(profile.reason, "wayland_opaque_default");
     }
 
+    #[test]
+    fn linux_kde_wayland_window_profile_uses_transparent_corners() {
+        let profile = linux_window_profile_from_input(LinuxWindowProfileInput {
+            transparent_opt_in: false,
+            wayland_display_present: true,
+            display_present: true,
+            gdk_backend_x11: false,
+            kde_session: true,
+            xrpd_session: false,
+        });
+        assert!(profile.transparent);
+        assert_eq!(profile.reason, "kde_wayland_transparent_profile");
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
-    fn linux_kde_wayland_defaults_to_x11_backend_when_xwayland_exists() {
+    fn linux_kde_wayland_defaults_to_native_backend_when_xwayland_exists() {
         use super::{LinuxDesktopBackendPolicyInput, linux_desktop_backend_policy_from_input};
 
         let policy = linux_desktop_backend_policy_from_input(LinuxDesktopBackendPolicyInput {
             allow_wayland_backend: false,
+            force_x11_backend: false,
+            gdk_backend_set: false,
+            winit_backend_set: false,
+            kde_session: true,
+            wayland_display_present: true,
+            display_present: true,
+        });
+        assert!(!policy.force_x11_backend);
+        assert!(policy.set_gdk_backend);
+        assert!(policy.set_winit_backend);
+        assert_eq!(policy.backend, Some("wayland"));
+        assert_eq!(policy.reason, "kde_wayland_native_default");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_kde_wayland_backend_policy_respects_forced_x11_fallback() {
+        use super::{LinuxDesktopBackendPolicyInput, linux_desktop_backend_policy_from_input};
+
+        let policy = linux_desktop_backend_policy_from_input(LinuxDesktopBackendPolicyInput {
+            allow_wayland_backend: false,
+            force_x11_backend: true,
             gdk_backend_set: false,
             winit_backend_set: false,
             kde_session: true,
@@ -3071,7 +3426,8 @@ mod tests {
         assert!(policy.force_x11_backend);
         assert!(policy.set_gdk_backend);
         assert!(policy.set_winit_backend);
-        assert_eq!(policy.reason, "kde_wayland_x11_default");
+        assert_eq!(policy.backend, Some("x11"));
+        assert_eq!(policy.reason, "x11_backend_explicitly_forced");
     }
 
     #[cfg(target_os = "linux")]
@@ -3082,6 +3438,7 @@ mod tests {
         let explicit_gdk =
             linux_desktop_backend_policy_from_input(LinuxDesktopBackendPolicyInput {
                 allow_wayland_backend: false,
+                force_x11_backend: false,
                 gdk_backend_set: true,
                 winit_backend_set: false,
                 kde_session: true,
@@ -3089,10 +3446,12 @@ mod tests {
                 display_present: true,
             });
         assert!(!explicit_gdk.force_x11_backend);
+        assert_eq!(explicit_gdk.backend, None);
         assert_eq!(explicit_gdk.reason, "gdk_backend_explicit");
 
         let opt_in = linux_desktop_backend_policy_from_input(LinuxDesktopBackendPolicyInput {
             allow_wayland_backend: true,
+            force_x11_backend: false,
             gdk_backend_set: false,
             winit_backend_set: false,
             kde_session: true,
@@ -3100,7 +3459,42 @@ mod tests {
             display_present: true,
         });
         assert!(!opt_in.force_x11_backend);
+        assert_eq!(opt_in.backend, None);
         assert_eq!(opt_in.reason, "wayland_backend_explicitly_allowed");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_terminal_renderer_policy_makes_wayland_canvas_explicit() {
+        use super::{LinuxTerminalRendererPolicyInput, linux_terminal_renderer_policy_from_input};
+
+        let wayland = linux_terminal_renderer_policy_from_input(LinuxTerminalRendererPolicyInput {
+            explicit_canvas_env: false,
+            gdk_backend_x11: false,
+            wayland_display_present: true,
+            display_present: true,
+        });
+        assert_eq!(wayland.set_canvas_env, Some("1"));
+        assert_eq!(wayland.reason, "xterm_canvas_enabled_for_wayland");
+
+        let x11 = linux_terminal_renderer_policy_from_input(LinuxTerminalRendererPolicyInput {
+            explicit_canvas_env: false,
+            gdk_backend_x11: true,
+            wayland_display_present: true,
+            display_present: true,
+        });
+        assert_eq!(x11.set_canvas_env, Some("0"));
+        assert_eq!(x11.reason, "xterm_canvas_disabled_for_x11");
+
+        let explicit =
+            linux_terminal_renderer_policy_from_input(LinuxTerminalRendererPolicyInput {
+                explicit_canvas_env: true,
+                gdk_backend_x11: true,
+                wayland_display_present: true,
+                display_present: true,
+            });
+        assert_eq!(explicit.set_canvas_env, None);
+        assert_eq!(explicit.reason, "xterm_canvas_explicit");
     }
 
     #[cfg(target_os = "linux")]
@@ -3332,5 +3726,13 @@ mod tests {
         );
         #[cfg(unix)]
         assert_eq!(superseded_client_termination_signal(), libc::SIGKILL);
+    }
+
+    #[test]
+    fn gui_entry_defers_superseded_retirement_until_shell_active_handoff() {
+        assert!(!main_should_retire_superseded_clients_before_shell(&[]));
+        assert!(!main_should_retire_superseded_clients_before_shell(&[
+            "server".to_string()
+        ]));
     }
 }

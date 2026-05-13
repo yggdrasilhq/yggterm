@@ -188,6 +188,59 @@ pub fn capture_linux_x11_window_screenshot(pid: u32, output_path: &Path) -> Resu
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone)]
+pub struct LinuxX11FocusResult {
+    pub window_id: String,
+    pub active_window_id: Option<String>,
+    pub active: bool,
+}
+
+#[cfg(target_os = "linux")]
+pub fn focus_linux_x11_window(pid: u32) -> Result<LinuxX11FocusResult> {
+    let window_id = xdotool_search(["search", "--onlyvisible", "--pid", &pid.to_string()])
+        .context("resolving current X11 window for focus")?;
+    let activate_status = Command::new("xdotool")
+        .args(["windowactivate", &window_id])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .context("running xdotool windowactivate")?;
+    if !activate_status.success() {
+        bail!("xdotool windowactivate exited with status {activate_status}");
+    }
+    let focus_status = Command::new("xdotool")
+        .args(["windowfocus", &window_id])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .context("running xdotool windowfocus")?;
+    if !focus_status.success() {
+        bail!("xdotool windowfocus exited with status {focus_status}");
+    }
+    let active_window_id = Command::new("xdotool")
+        .arg("getactivewindow")
+        .stdin(Stdio::null())
+        .output()
+        .ok()
+        .and_then(|output| {
+            if output.status.success() {
+                Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
+            } else {
+                None
+            }
+        })
+        .filter(|value| !value.is_empty());
+    let active = active_window_id.as_deref() == Some(window_id.as_str());
+    Ok(LinuxX11FocusResult {
+        window_id,
+        active_window_id,
+        active,
+    })
+}
+
 #[cfg(target_os = "macos")]
 pub fn capture_macos_window_screenshot(
     ns_window_ptr: *mut std::ffi::c_void,

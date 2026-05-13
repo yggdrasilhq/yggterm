@@ -1,3 +1,1251 @@
+yggterm (2.4.0-1) unstable; urgency=medium
+
+  * Blend autohidden titlebar hover chrome with the visible shell chrome.
+  * Deduplicate live-session close confirmation rows across live/cwd projections.
+  * Harden title and summary generation against malformed generated copy.
+  * Refresh local and app-discovered remote Codex session copy from
+    yggterm-headless, including resettable remote summary timelines.
+  * Keep daemon-owned live runtimes durable while limiting fresh GUI xterm
+    retention to active or already-mounted terminal surfaces.
+  * Disable SSH ControlMaster multiplexing for new remote PTYs.
+  * Accept connected daemon PTY output without a prompt row as a valid visible
+    terminal surface, avoiding false resume overlays on busy Codex frames.
+  * Harden the 23-smoke heavy-TUI detector for codex-session-tui frames.
+  * Document the 23-smoke release gate with resource and quirk checks.
+
+ -- Avikalpa Kundu <avi@gour.top>  Wed, 13 May 2026 16:45:57 +0530
+
+yggterm (2.2.66-1) unstable; urgency=medium
+
+  * Treat Linux proc exe targets ending in " (deleted)" as current when the
+    stripped path still matches the active install path and daemon version.
+  * Keep stale-daemon lifecycle evidence in traces instead of terminal-visible
+    warnings during helper commands.
+  * Add regression coverage for deleted-path same-version daemon detection.
+  * Use the short UUID fallback instead of generic Codex Session when remote
+    scanned sessions still have no meaningful generated copy.
+
+ -- Avikalpa Kundu <avi@gour.top>  Wed, 13 May 2026 15:42:55 +0530
+
+yggterm (2.2.65-1) unstable; urgency=medium
+
+  * Derive remote stored-session sidebar labels from cached summaries or
+    recent transcript context before falling back to generic Codex Session.
+  * Keep app-control synthesized remote rows on the same generated-title path
+    as visible sidebar rows.
+  * Add regression coverage for generated title fallback from cached copy.
+
+ -- Avikalpa Kundu <avi@gour.top>  Wed, 13 May 2026 15:31:58 +0530
+
+yggterm (2.2.64-1) unstable; urgency=medium
+
+  * Treat generic Yggterm Codex/Shell sidebar labels as generated fallbacks,
+    so remote generated titles can replace them deterministically.
+  * Add regression coverage for generic remote Codex row title replacement.
+
+ -- Avikalpa Kundu <avi@gour.top>  Wed, 13 May 2026 15:19:22 +0530
+
+yggterm (2.2.63-1) unstable; urgency=medium
+
+  * Keep passive title/summary/precis generation bounded per session instead
+    of globally suspending background copy generation after one failed or
+    no-context transcript.
+  * Add regression coverage for the passive copy scheduler kill-switch defect.
+
+ -- Avikalpa Kundu <avi@gour.top>  Wed, 13 May 2026 14:57:12 +0530
+
+yggterm (2.2.62-1) unstable; urgency=medium
+
+  * Treat wrapped Error: connecting to server-*.sock output from stale remote
+    daemons as terminal transport failure, not meaningful Codex output.
+  * Force one remote restart after hard-fail for rejected preserved-owner Codex
+    surfaces such as stale socket errors and generic title-card output.
+  * Add regression coverage for the jojo stale-socket surface and rejected
+    preserved-owner restart decision.
+
+ -- Avikalpa Kundu <avi@gour.top>  Wed, 13 May 2026 14:09:47 +0530
+
+yggterm (2.2.61-1) unstable; urgency=medium
+
+  * Treat remote Codex prompt-only hot-update surfaces as recovery failures,
+    not ready terminals, and perform one controlled force-remote restart after
+    the hard-fail window.
+  * Keep full-screen cursor-home terminal frames on the frame-budgeted xterm
+    path while preserving the faster Codex inline status animation path.
+  * Add regression coverage for prompt-only handoff readiness and frame
+    budgeting.
+
+ -- Avikalpa Kundu <avi@gour.top>  Wed, 13 May 2026 13:45:00 +0530
+
+yggterm (2.2.60-1) unstable; urgency=medium
+
+  * Make server sessions --help non-mutating for both yggterm and
+    yggterm-headless, so bookkeeping help cannot accidentally run copy
+    regeneration.
+  * Add CLI regression coverage for the sessions help path.
+
+ -- Avikalpa Kundu <avi@gour.top>  Wed, 13 May 2026 13:13:00 +0530
+
+yggterm (2.2.59-1) unstable; urgency=medium
+
+  * Retire stale duplicate daemons when the expected-version daemon already
+    owns the same terminal runtime keys, preserving sessions without keeping
+    obsolete sidecars alive.
+  * Report owned terminal runtime keys in monitor JSON and add regression
+    coverage for duplicate-owner cleanup.
+
+ -- Avikalpa Kundu <avi@gour.top>  Wed, 13 May 2026 13:03:00 +0530
+
+yggterm (2.2.58-1) unstable; urgency=medium
+
+  * Keep raw xterm protocol input separate from user-input readiness in
+    app-control, so busy remote Codex PTY output can settle as visible without
+    being marked input-enabled before the prompt is ready.
+  * Add regression coverage for the jojo post-update busy-output state.
+
+ -- Avikalpa Kundu <avi@gour.top>  Wed, 13 May 2026 12:36:04 +0530
+
+yggterm (2.2.57-1) unstable; urgency=medium
+
+  * Route app-control session removal through the same live-session close
+    fallback contract as the sidebar close affordance.
+  * Add regression coverage for the app-control live-close path used by the
+    jojo proof harness.
+
+ -- Avikalpa Kundu <avi@gour.top>  Wed, 13 May 2026 12:22:51 +0530
+
+yggterm (2.2.56-1) unstable; urgency=medium
+
+  * Accept busy remote Codex daemon PTY output as a visible live terminal even
+    before the next prompt row appears, avoiding a false stale-retained gate
+    after hot update.
+  * Add regression coverage for the jojo busy-output resume state.
+
+ -- Avikalpa Kundu <avi@gour.top>  Wed, 13 May 2026 12:03:46 +0530
+
+yggterm (2.2.55-1) unstable; urgency=medium
+
+  * Add deterministic live-session close fallback through validated viewport
+    history, while keeping background closes from moving the viewport.
+  * Keep daemon runtime removal from selecting an arbitrary replacement active
+    session; the GUI owns close-time viewport fallback.
+  * Pump bounded passive title/summary generation from the GUI background loop.
+  * Remove Connect SSH from Startpage and document the Startpage contract.
+
+ -- Avikalpa Kundu <avi@gour.top>  Wed, 13 May 2026 11:47:50 +0530
+
+yggterm (2.2.54-1) unstable; urgency=medium
+
+  * Settle focused restored xterm cursors through a throttled prompt-follow
+    repaint when an input-policy update is otherwise unchanged.
+  * Expose and smoke-check the input-policy no-op prompt-follow counter so
+    cursor-settle regressions are observable before typing.
+  * Strip and classify internal stale-daemon startup warnings as terminal
+    transport noise so update diagnostics cannot paint into the active PTY.
+  * Bound no-op cursor-settle repairs per mounted terminal and fail read-only
+    smokes if the repair keeps repainting while no terminal writes happen.
+
+ -- Avikalpa Kundu <avi@gour.top>  Wed, 13 May 2026 11:18:00 +0530
+
+yggterm (2.2.51-1) unstable; urgency=medium
+
+  * Preserve stale remote-runtime owners when hot-update adoption fails before
+    the bridge attaches, keeping session survival ahead of update completion.
+  * Mark leaked hot-update bridge failures as terminal transport errors so
+    app-control and smoke checks reject the 2.2.50 jojo failure class.
+  * Reject same-version daemons running from deleted or non-current binaries
+    during mutating recovery, while keeping CLI JSON output parseable by
+    writing recovery logs to stderr.
+  * Document the hot-update/session-preservation protocol in docs/protocol.md.
+
+ -- Avikalpa Kundu <avi@gour.top>  Wed, 13 May 2026 10:09:04 +0530
+
+yggterm (2.2.50-1) unstable; urgency=medium
+
+  * Restore autohide titlebar hover chrome without resizing the terminal grid.
+  * Add deterministic session title/summary/timeline contract docs and
+    headless regeneration tooling.
+  * Show long UUIDs and pencil edit affordances on Startpage session cards.
+  * Prevent terminal pointer-release focus repair from forcing prompt-follow
+    scroll and causing click flicker.
+
+ -- Avikalpa Kundu <avi@gour.top>  Wed, 13 May 2026 00:52:59 +0530
+
+yggterm (2.2.49-1) unstable; urgency=medium
+
+  * Treat app-control open as a foreground terminal intent after background
+    cooling, so switch-back smoke tests do not leave a live htop TUI blank.
+  * Add regression coverage for the background-then-open terminal visibility
+    contract.
+
+ -- Avikalpa Kundu <avi@gour.top>  Tue, 12 May 2026 23:06:00 +0530
+
+yggterm (2.2.48-1) unstable; urgency=medium
+
+  * Keep inactive or not-yet-measured alternate-screen TUI frames on the
+    xterm.js path when low-power TUI rendering is disabled.
+  * Tighten terminal bridge smoke coverage so disabled low-power mode cannot
+    still drop frame-like PTY bytes.
+
+ -- Avikalpa Kundu <avi@gour.top>  Tue, 12 May 2026 22:42:45 +0530
+
+yggterm (2.2.47-1) unstable; urgency=medium
+
+  * Force one xterm renderer refresh when the first observed visual state is
+    an alternate-screen or hidden-cursor TUI, so htop/top cannot sit in the
+    xterm buffer while WebKit shows a blank canvas.
+  * Add smoke coverage for first alternate-screen TUI paint recovery.
+
+ -- Avikalpa Kundu <avi@gour.top>  Tue, 12 May 2026 22:35:30 +0530
+
+yggterm (2.2.46-1) unstable; urgency=medium
+
+  * Keep titlebar reveal and resize scroll anchoring on the xterm viewport
+    contract instead of remounting or resizing terminal rows.
+  * Preserve remote Codex transcript identity when live synthetic runtime
+    sessions close, keeping sidebar rows, shutdown, title, and summary truth
+    durable.
+  * Replace short UUID sidebar fallbacks with cwd/kind-derived labels.
+  * Add title/summary edit entry points and a YggUI scroll controller backed by
+    xterm.js viewport APIs.
+
+ -- Avikalpa Kundu <avi@gour.top>  Tue, 12 May 2026 22:16:03 +0530
+
+yggterm (2.2.45-1) unstable; urgency=medium
+
+  * Keep prompt-ready xterm surfaces interactive when retained replay
+    intentionally skips a large cursor-addressed snapshot after resize.
+  * Expose retained-replay unsafe-skip diagnostics for app-control smoke tests.
+
+ -- Avikalpa Kundu <avi@gour.top>  Tue, 12 May 2026 18:45:00 +0530
+
+yggterm (2.2.44-1) unstable; urgency=medium
+
+  * Keep background managed-Codex refresh probe-only by default, so live
+    terminal recovery cannot spawn npm install @latest unless explicitly
+    opted in with YGGTERM_MANAGED_CLI_BACKGROUND_INSTALL=1.
+
+ -- Avikalpa Kundu <avi@gour.top>  Tue, 12 May 2026 18:05:00 +0530
+
+yggterm (2.2.43-1) unstable; urgency=medium
+
+  * Sync daemon terminal identity from the effective xterm theme before
+    warm-start and initial restore, so dark terminal themes do not launch
+    remote Codex with light terminal identity.
+  * Let app-control terminal focus use the active xterm write budget even when
+    Wayland refuses native window focus.
+
+ -- Avikalpa Kundu <avi@gour.top>  Tue, 12 May 2026 17:23:30 +0530
+
+yggterm (2.2.42-1) unstable; urgency=medium
+
+  * Require direct PTY ownership before retiring an older hot-update daemon;
+    preserved/runtime-known keys no longer count as adoption proof.
+
+ -- Avikalpa Kundu <avi@gour.top>  Tue, 12 May 2026 16:18:37 +0530
+
+yggterm (2.2.41-1) unstable; urgency=medium
+
+  * Retire stale hot-update daemons when the current daemon already owns the
+    same live runtime keys, preventing duplicate preserved-owner truth after
+    hot-restart-all.
+
+ -- Avikalpa Kundu <avi@gour.top>  Tue, 12 May 2026 16:11:05 +0530
+
+yggterm (2.2.40-1) unstable; urgency=medium
+
+  * Seed retained remote Codex scrollback for the restored active terminal
+    during startup prewarm, while background prewarm keeps the lighter latency
+    path.
+
+ -- Avikalpa Kundu <avi@gour.top>  Tue, 12 May 2026 15:46:30 +0530
+
+yggterm (2.2.39-1) unstable; urgency=medium
+
+  * Cool active terminal read/write cadence when the Yggterm window is
+    unfocused while preserving fast remote restore until the terminal connects.
+
+ -- Avikalpa Kundu <avi@gour.top>  Tue, 12 May 2026 15:35:00 +0530
+
+yggterm (2.2.38-1) unstable; urgency=medium
+
+  * Treat terminal stream cursor rewind as a runtime restart boundary so the
+    daemon replays initial chunks and the GUI clears stale xterm content after
+    a forced terminal restart.
+
+ -- Avikalpa Kundu <avi@gour.top>  Tue, 12 May 2026 15:20:44 +0530
+
+yggterm (2.2.37-1) unstable; urgency=medium
+
+  * Restore output newline post-processing on raw remote Codex bridge PTYs so
+    Codex/TUI frames do not repaint as diagonal line stacks in xterm.js.
+  * Normalize captured terminal snapshot emission to CRLF before replaying it
+    through a PTY.
+
+ -- Avikalpa Kundu <avi@gour.top>  Tue, 12 May 2026 15:04:22 +0530
+
+yggterm (2.2.36-1) unstable; urgency=medium
+
+  * Reject compact cursor-addressed active-recovery snapshots for remote
+    Codex/TUI sessions instead of replaying them as terminal-ready content.
+
+ -- Avikalpa Kundu <avi@gour.top>  Tue, 12 May 2026 14:43:27 +0530
+
+yggterm (2.2.35-1) unstable; urgency=medium
+
+  * Keep remote Codex/TUI initial viewport replay on raw PTY bytes instead of
+    the daemon vt100 side-parser snapshot.
+  * Emit attach-ready only after the remote helper reports it, so stale retained
+    tails cannot be promoted to terminal-ready by a synthetic marker.
+
+ -- Avikalpa Kundu <avi@gour.top>  Tue, 12 May 2026 14:33:13 +0530
+
+yggterm (2.2.34-1) unstable; urgency=medium
+
+  * Keep titlebar auto-hide reveal from resizing terminal content.
+  * Disable lossy low-power TUI overlays and unfocused frame drops so
+    alternate-screen TUIs remain xterm-owned across view switches.
+  * Reject cursor-addressed multi-row Codex recovery snapshots before they can
+    repaint old-width output over a live terminal.
+
+ -- Avikalpa Kundu <avi@gour.top>  Tue, 12 May 2026 14:13:25 +0530
+
+yggterm (2.2.33-1) unstable; urgency=medium
+
+  * Rearm active keep-alive remote terminals from daemon recovery/bootstrap
+    snapshot truth even when an old retained ready attempt is still present.
+  * Make read-only latency smoke fail active remote terminals that have no
+    daemon runtime instead of accepting retained viewport text.
+
+ -- Avikalpa Kundu <avi@gour.top>  Sat, 09 May 2026 21:50:47 +0530
+
+yggterm (2.2.32-1) unstable; urgency=medium
+
+  * Mark keep-alive remote sessions with missing daemon runtimes as recovery
+    targets instead of Running.
+  * Refuse retained-host reuse for active remote sessions in recovery launch
+    phases, forcing the hot-updated client to recreate the PTY.
+
+ -- Avikalpa Kundu <avi@gour.top>  Sat, 09 May 2026 21:23:19 +0530
+
+yggterm (2.2.31-1) unstable; urgency=medium
+
+  * Treat remote Codex continuation instructions as exited runtime surfaces and
+    restart the daemon-owned PTY instead of accepting the stale viewport.
+  * Stop counting exited PTYs as live daemon runtime truth.
+  * Tighten terminal status smokes to reject continuation text and avoid using
+    Ctrl+C as a prompt-clear shortcut on live Codex sessions.
+
+ -- Avikalpa Kundu <avi@gour.top>  Sat, 09 May 2026 21:11:35 +0530
+
+yggterm (2.2.30-1) unstable; urgency=medium
+
+  * Start forced remote Codex restarts at the mounted xterm geometry and
+    ignore same-size resize nudges, so fresh restart output is not immediately
+    fenced as pre-resize output.
+
+ -- Avikalpa Kundu <avi@gour.top>  Sat, 09 May 2026 20:40:19 +0530
+
+yggterm (2.2.29-1) unstable; urgency=medium
+
+  * Recover blank hot-update remote Codex handoffs by treating filtered
+    pre-resize output as non-progress and performing one controlled
+    force-remote restart instead of spinning on an empty xterm.
+
+ -- Avikalpa Kundu <avi@gour.top>  Sat, 09 May 2026 20:22:32 +0530
+
+yggterm (2.2.28-1) unstable; urgency=medium
+
+  * Stop accepting hot-update remote Codex pre-resize PTY scrollback as
+    current terminal truth during preserved-owner handoff, so old-width
+    retained output cannot block resize recovery.
+  * Reject gated remote Codex recovery tails with no current input row in
+    app-control and read-only latency smoke proof.
+
+ -- Avikalpa Kundu <avi@gour.top>  Sat, 09 May 2026 20:05:07 +0530
+
+yggterm (2.2.27-1) unstable; urgency=medium
+
+  * Reject input-enabled remote Codex recovery surfaces when the visible tail
+    has an old prompt followed by assistant output instead of a current input
+    row, and recover that retained surface instead of accepting it as
+    interactive.
+
+ -- Avikalpa Kundu <avi@gour.top>  Sat, 09 May 2026 19:48:14 +0530
+
+yggterm (2.2.26-1) unstable; urgency=medium
+
+  * Treat retained active-recovery PTY prompt-follow snapshots as visible
+    terminal truth after hot update, so stale resume notifications clear only
+    when mounted xterm output contains real PTY content.
+
+ -- Avikalpa Kundu <avi@gour.top>  Sat, 09 May 2026 19:37:22 +0530
+
+yggterm (2.2.25-1) unstable; urgency=medium
+
+  * Reject input-enabled remote Codex PTY scrollback when the cursor row is
+    blank and the latest daemon frame is only terminal control traffic, then
+    recover the surface instead of treating stale scrollback as prompt-ready.
+
+ -- Avikalpa Kundu <avi@gour.top>  Sat, 09 May 2026 19:36:00 +0530
+
+yggterm (2.2.24-1) unstable; urgency=medium
+
+  * Accept daemon-owned remote Codex PTY scrollback as prompt-ready when
+    xterm exposes visible cursor geometry and real Codex output after a
+    hot-update handoff, even if the cursor row text is empty after replay.
+
+ -- Avikalpa Kundu <avi@gour.top>  Sat, 09 May 2026 19:12:00 +0530
+
+yggterm (2.2.23-1) unstable; urgency=medium
+
+  * Treat hot-update retained PTY replay as terminal-ready when prompt-followed
+    real PTY output is visible even if pre-resize replay leaves cursor-line text
+    empty, so preserved Codex sessions regain input after GUI replacement.
+
+ -- Avikalpa Kundu <avi@gour.top>  Sat, 09 May 2026 18:57:00 +0530
+
+yggterm (2.2.22-1) unstable; urgency=medium
+
+  * Preserve hot-update Codex viewports when the preserved owner has not
+    produced post-resize output yet by allowing retained pre-resize PTY bytes
+    only for explicit preserved-owner handoff runtime keys.
+
+ -- Avikalpa Kundu <avi@gour.top>  Sat, 09 May 2026 18:43:00 +0530
+
+yggterm (2.2.21-1) unstable; urgency=medium
+
+  * Remount hot-updated remote terminals only for the proven mounted-but-empty
+    xterm surface state, preserving the generic remote attach guard while
+    recovering blank live Codex viewports after session-preserving updates.
+
+ -- Avikalpa Kundu <avi@gour.top>  Sat, 09 May 2026 18:06:50 +0530
+
+yggterm (2.2.20-1) unstable; urgency=medium
+
+  * Route terminal right-click through xterm.js into Yggterm's existing terminal
+    context menu, add a context-menu app-control probe, and reduce the active
+    terminal write-frame budget for snappier visible typing/animation.
+
+ -- Avikalpa Kundu <avi@gour.top>  Sat, 09 May 2026 16:35:00 +0530
+
+yggterm (2.2.19-1) unstable; urgency=medium
+
+  * Add xterm-owned primary-selection middle-click paste without using the
+    clipboard, and keep prompt-follow terminals pinned to the live bottom across
+    titlebar auto-hide hover/layout resizes.
+
+ -- Avikalpa Kundu <avi@gour.top>  Sat, 09 May 2026 15:13:00 +0530
+
+yggterm (2.2.18-1) unstable; urgency=medium
+
+  * Keep xterm scroll events caused by command output from being classified as
+    user scrollback while input or write flushing is hot, so status-style output
+    stays prompt-following after it renders.
+
+ -- Avikalpa Kundu <avi@gour.top>  Sat, 09 May 2026 14:27:24 +0530
+
+yggterm (2.2.17-1) unstable; urgency=medium
+
+  * Fence remote Codex restore/replay on post-resize daemon PTY output, so
+    old-width retained TUI separators do not settle as the current xterm screen
+    after resize.
+
+ -- Avikalpa Kundu <avi@gour.top>  Sat, 09 May 2026 14:16:30 +0530
+
+yggterm (2.2.16-1) unstable; urgency=medium
+
+  * Keep remote Codex visual-reveal recovery gated until post-attach output
+    proves a Codex prompt-ready surface, preventing stale transcript/prose bytes
+    from marking a restarted terminal interactive.
+
+ -- Avikalpa Kundu <avi@gour.top>  Sat, 09 May 2026 13:18:00 +0530
+
+yggterm (2.2.15-1) unstable; urgency=medium
+
+  * Reject stale active-recovery Codex snapshots unless they prove a real Codex
+    prompt-ready tail, so old transcript/prose text cannot be replayed into a
+    restarted live terminal as if it were the current PTY screen.
+
+ -- Avikalpa Kundu <avi@gour.top>  Sat, 09 May 2026 12:57:30 +0530
+
+yggterm (2.2.14-1) unstable; urgency=medium
+
+  * Treat daemon-retained replay as post-ready scrollback repair only, so a
+    remote session must have a clean observed interactive viewport before
+    retained daemon scrollback can be replayed during restart/reconnect.
+
+ -- Avikalpa Kundu <avi@gour.top>  Sat, 09 May 2026 12:55:00 +0530
+
+yggterm (2.2.13-1) unstable; urgency=medium
+
+  * Block daemon-retained replay while a remote resume notification is still
+    active, preventing stale Codex transcript/prose from painting under the
+    reconnect overlay before the live prompt-ready surface arrives.
+
+ -- Avikalpa Kundu <avi@gour.top>  Sat, 09 May 2026 12:38:00 +0530
+
+yggterm (2.2.12-1) unstable; urgency=medium
+
+  * Add LogLevel=ERROR to Yggterm-owned remote SSH terminal launch commands so
+    OpenSSH control-master close notices cannot leak into Codex xterm content
+    when a remote bridge exits or is interrupted.
+
+ -- Avikalpa Kundu <avi@gour.top>  Sat, 09 May 2026 12:29:00 +0530
+
+yggterm (2.2.11-1) unstable; urgency=medium
+
+  * Keep xterm host-health throttling from suppressing the all-empty retained
+    remote surface sample, so the live mount can remount a blank retained Codex
+    viewport before any app-control state probe observes it.
+
+ -- Avikalpa Kundu <avi@gour.top>  Sat, 09 May 2026 12:15:38 +0530
+
+yggterm (2.2.10-1) unstable; urgency=medium
+
+  * Let the live terminal mount itself remount a previously-ready retained
+    remote xterm when host-health sees an all-empty active surface, so recovery
+    does not depend on an external app-control state probe.
+
+ -- Avikalpa Kundu <avi@gour.top>  Sat, 09 May 2026 12:06:32 +0530
+
+yggterm (2.2.9-1) unstable; urgency=medium
+
+  * Remount retained remote xterm surfaces immediately when app-control
+    observes an empty active xterm after update/restart, while keeping the
+    two-sample guard for ambiguous scrollback checks.
+
+ -- Avikalpa Kundu <avi@gour.top>  Sat, 09 May 2026 11:51:33 +0530
+
+yggterm (2.2.8-1) unstable; urgency=medium
+
+  * After a forced remote restart takes over preserved hot-update sessions,
+    rerun Linux daemon cleanup so older duplicate daemons that only advertise
+    already-owned terminal keys are retired instead of remaining as a second
+    source of runtime truth.
+
+ -- Avikalpa Kundu <avi@gour.top>  Sat, 09 May 2026 11:43:00 +0530
+
+yggterm (2.2.7-1) unstable; urgency=medium
+
+  * Make forced remote terminal restarts terminate plain yggterm remote
+    resume/start bridge processes on the remote host, so halted keep-alive
+    Codex sessions are actually recreated instead of reattaching to stale
+    cached TUI state.
+
+ -- Avikalpa Kundu <avi@gour.top>  Sat, 09 May 2026 11:32:00 +0530
+
+yggterm (2.2.6-1) unstable; urgency=medium
+
+  * Answer OSC 10/11 default foreground/background color queries in the daemon
+    PTY path before GUI attach, and strip those terminal-emulator queries from
+    retained output so Codex can render prompt backgrounds from real xterm cell
+    attributes instead of shell overlays.
+
+ -- Avikalpa Kundu <avi@gour.top>  Sat, 09 May 2026 11:14:21 +0530
+
+yggterm (2.2.5-1) unstable; urgency=medium
+
+  * Make remote bootstrap prefer the active direct-install headless binary from
+    install metadata instead of the caller process's adjacent binary, preventing
+    an older preserved daemon from reinstalling an old helper onto a remote
+    machine during hot update.
+
+ -- Avikalpa Kundu <avi@gour.top>  Sat, 09 May 2026 10:52:50 +0530
+
+yggterm (2.2.4-1) unstable; urgency=medium
+
+  * Let forced terminal restart recover a remote Codex session from the scanned
+    remote-session row before terminating or recreating the runtime, so a
+    partially migrated live membership does not make a known session
+    unrestartable.
+
+ -- Avikalpa Kundu <avi@gour.top>  Sat, 09 May 2026 10:44:53 +0530
+
+yggterm (2.2.3-1) unstable; urgency=medium
+
+  * Give forced remote terminal restarts the long daemon response budget so
+    headless control does not time out while the server is safely terminating a
+    remote Codex runtime before recreating it.
+
+ -- Avikalpa Kundu <avi@gour.top>  Sat, 09 May 2026 10:35:45 +0530
+
+yggterm (2.2.2-1) unstable; urgency=medium
+
+  * Carry terminal appearance into remote-runtime daemon requests so a dark
+    jojo xterm session does not ask a stale remote dev daemon to launch Codex
+    with light COLORFGBG/terminal identity, and make remote Codex termination
+    scan versioned daemons before a forced restart.
+
+ -- Avikalpa Kundu <avi@gour.top>  Sat, 09 May 2026 10:58:00 +0530
+
+yggterm (2.2.1-1) unstable; urgency=medium
+
+  * Refresh daemon-owned remote Codex launch commands when the GUI syncs
+    terminal identity, and add a headless terminal restart path so halted kept
+    sessions can be restarted with the current xterm identity instead of
+    preserving stale COLORFGBG/terminal-appearance exports.
+
+ -- Avikalpa Kundu <avi@gour.top>  Sat, 09 May 2026 10:42:00 +0530
+
+yggterm (2.2.0-1) unstable; urgency=medium
+
+  * Ship the terminal stabilization line: byte-exact app-control terminal
+    sends, app-control-backgrounded low-power terminal budgets, stricter idle
+    CPU/resource probes, and second-display proof for terminal readability,
+    cursor visibility, input, scrollback, resize, and inline status animation
+    smoothness.
+
+ -- Avikalpa Kundu <avi@gour.top>  Sat, 09 May 2026 03:33:15 +0530
+
+yggterm (2.1.250-1) unstable; urgency=medium
+
+  * Let app-control terminal sends read multiline/control-byte payloads from
+    stdin, and make the idle CPU smoke use that byte-exact path so terminal
+    proof commands cannot be corrupted by shell-quoted carriage returns.
+  * Accept an app-control-backgrounded TUI sample with no new xterm frames only
+    when the state proves input is disabled, active write budgets are off,
+    xterm counters are flat, the PTY workload is still alive, and CPU is under
+    budget.
+
+ -- Avikalpa Kundu <avi@gour.top>  Sat, 09 May 2026 03:12:28 +0530
+
+yggterm (2.1.249-1) unstable; urgency=medium
+
+  * Slow the unfocused TUI drop-drain cadence and pause sidebar loading
+    animations while app-control has backgrounded a proof window, keeping
+    background resource samples quiet without changing active terminal
+    behavior.
+
+ -- Avikalpa Kundu <avi@gour.top>  Sat, 09 May 2026 02:56:13 +0530
+
+yggterm (2.1.248-1) unstable; urgency=medium
+
+  * Make app-control-backgrounded terminal hosts publish the inactive
+    write-budget truth in app-control state, and make the idle CPU smoke fail
+    if a lowered proof window still reports active terminal input or active
+    write budgets.
+
+ -- Avikalpa Kundu <avi@gour.top>  Sat, 09 May 2026 02:46:45 +0530
+
+yggterm (2.1.247-1) unstable; urgency=medium
+
+  * Treat app-control-backgrounded windows as inactive for terminal read/write
+    budgets and input policy, and cap background multiline read bursts so
+    lowered smoke windows do not keep consuming active-terminal CPU after
+    launching TUI probes.
+
+ -- Avikalpa Kundu <avi@gour.top>  Sat, 09 May 2026 02:35:42 +0530
+
+yggterm (2.1.246-1) unstable; urgency=medium
+
+  * Wake the terminal read loop during app-control multiline sends and report
+    write-chunk/read-nudge telemetry in the response, so background terminal
+    probes can distinguish a missing PTY write from a stale mounted xterm
+    surface.
+
+ -- Avikalpa Kundu <avi@gour.top>  Sat, 09 May 2026 02:13:28 +0530
+
+yggterm (2.1.245-1) unstable; urgency=medium
+
+  * Make daemon terminal writes acknowledge only after the PTY writer thread
+    flushes the bytes, so app-control multiline commands cannot report success
+    while the heredoc terminator is still queued behind the daemon writer.
+
+ -- Avikalpa Kundu <avi@gour.top>  Sat, 09 May 2026 02:00:45 +0530
+
+yggterm (2.1.244-1) unstable; urgency=medium
+
+  * Pace app-control multiline terminal sends as line writes, avoiding PTY echo
+    backpressure that could leave background heredoc/TUI probes visibly stuck
+    partway through a command despite the send being accepted.
+
+ -- Avikalpa Kundu <avi@gour.top>  Sat, 09 May 2026 02:43:18 +0530
+
+yggterm (2.1.243-1) unstable; urgency=medium
+
+  * Keep the visible active terminal on active read cadence even when toolkit
+    window-focus truth is stale, preventing selected terminals from degrading to
+    background-FPS output after app-control focus/background transitions.
+
+ -- Avikalpa Kundu <avi@gour.top>  Sat, 09 May 2026 02:25:09 +0530
+
+yggterm (2.1.242-1) unstable; urgency=medium
+
+  * Give app-control multiline terminal sends a longer bounded fast-read window,
+    so background heredoc/TUI commands do not exhaust the short input-echo burst
+    before real command output and frame-drop telemetry arrive.
+
+ -- Avikalpa Kundu <avi@gour.top>  Sat, 09 May 2026 02:08:35 +0530
+
+yggterm (2.1.241-1) unstable; urgency=medium
+
+  * Normalize app-control terminal-send newlines to PTY Enter bytes before
+    writing, so multiline heredoc/TUI probes execute after the terminator
+    instead of visibly stopping at the secondary prompt.
+
+ -- Avikalpa Kundu <avi@gour.top>  Sat, 09 May 2026 01:52:48 +0530
+
+yggterm (2.1.240-1) unstable; urgency=medium
+
+  * Preserve multiline app-control terminal sends as one PTY payload, splitting
+    only around Ctrl-C, so long heredoc/TUI probes cannot acknowledge the whole
+    command while only the first prompt line reaches the background terminal.
+
+ -- Avikalpa Kundu <avi@gour.top>  Sat, 09 May 2026 01:34:22 +0530
+
+yggterm (2.1.239-1) unstable; urgency=medium
+
+  * Keep terminal reads on the fast input-echo cadence across the first echoed
+    output so background app-control multiline/TUI commands do not fall back to
+    the slow unfocused poll before real command output arrives.
+
+ -- Avikalpa Kundu <avi@gour.top>  Sat, 09 May 2026 01:10:31 +0530
+
+yggterm (2.1.238-1) unstable; urgency=medium
+
+  * Acknowledge app-control terminal read nudges before completing daemon-side
+    input writes so background terminal sends wake the xterm read loop
+    deterministically for resource and latency probes.
+  * Tighten the idle CPU smoke's background TUI detector with per-phase
+    low-power frame counter baselines.
+
+ -- Avikalpa Kundu <avi@gour.top>  Sat, 09 May 2026 01:00:09 +0530
+
+yggterm (2.1.237-1) unstable; urgency=medium
+
+  * Keep active inline terminal status animations on the low-latency read-poll
+    cadence so Codex Working redraws continue producing smooth xterm flushes.
+
+ -- Avikalpa Kundu <avi@gour.top>  Sat, 09 May 2026 00:41:31 +0530
+
+yggterm (2.1.236-1) unstable; urgency=medium
+
+  * Wake the mounted xterm read loop after app-control terminal sends so
+    daemon-side injected input is visible promptly in the active viewport.
+
+ -- Avikalpa Kundu <avi@gour.top>  Sat, 09 May 2026 00:29:41 +0530
+
+yggterm (2.1.235-1) unstable; urgency=medium
+
+  * Include terminal typography and contrast fields in fallback app-control
+    snapshots so readability probes stay strict under terminal activity.
+
+ -- Avikalpa Kundu <avi@gour.top>  Sat, 09 May 2026 00:19:47 +0530
+
+yggterm (2.1.234-1) unstable; urgency=medium
+
+  * Preserve live-session close and keep-alive geometry in terminal fallback
+    app-control snapshots so strict sidebar contract probes still run.
+
+ -- Avikalpa Kundu <avi@gour.top>  Sat, 09 May 2026 00:15:07 +0530
+
+yggterm (2.1.233-1) unstable; urgency=medium
+
+  * Preserve sidebar row truth in terminal fallback app-control snapshots so
+    live-session tree probes remain deterministic during terminal activity.
+
+ -- Avikalpa Kundu <avi@gour.top>  Sat, 09 May 2026 00:09:38 +0530
+
+yggterm (2.1.232-1) unstable; urgency=medium
+
+  * Keep app-control viewport typing on the same busy-row contract as real
+    terminal input so foreground commands show the live-session spinner.
+
+ -- Avikalpa Kundu <avi@gour.top>  Sat, 09 May 2026 00:04:10 +0530
+
+yggterm (2.1.231-1) unstable; urgency=medium
+
+  * Tighten app-control typing probes so visible echo must be in the viewport
+    or visible cursor line, inactive hosts cannot pass, and scrollback-input
+    proof catches prompt-follow regressions.
+
+ -- Avikalpa Kundu <avi@gour.top>  Fri, 08 May 2026 23:22:41 +0530
+
+yggterm (2.1.230-1) unstable; urgency=medium
+
+  * Carry effective terminal palette identity through daemon terminal-start
+    requests so fresh Codex launches export the correct dark/light terminal
+    environment.
+
+ -- Avikalpa Kundu <avi@gour.top>  Fri, 08 May 2026 21:51:00 +0530
+
+yggterm (2.1.229-1) unstable; urgency=medium
+
+  * Match Codex terminal identity to the effective terminal palette and add a
+    canvas prompt input-line band with app-control smoke coverage.
+
+ -- Avikalpa Kundu <avi@gour.top>  Fri, 08 May 2026 21:36:33 +0530
+
+yggterm (2.1.228-1) unstable; urgency=medium
+
+  * Clear stale remote resume notifications and attach gates once clean
+    daemon-owned PTY output is visible after hot update.
+
+ -- Avikalpa Kundu <avi@gour.top>  Fri, 08 May 2026 20:34:15 +0530
+
+yggterm (2.1.227-1) unstable; urgency=medium
+
+  * Strip cursor-addressed internal terminal attach errors appended after xterm
+    control sequences in retained daemon snapshots.
+
+ -- Avikalpa Kundu <avi@gour.top>  Fri, 08 May 2026 20:32:00 +0530
+
+yggterm (2.1.226-1) unstable; urgency=medium
+
+  * Strip wrapped internal SSH attach footers from retained/live terminal
+    replay and classify bare Shared connection fragments in app-control smoke
+    probes.
+
+ -- Avikalpa Kundu <avi@gour.top>  Fri, 08 May 2026 20:18:00 +0530
+
+yggterm (2.1.225-1) unstable; urgency=medium
+
+  * Hard-clear xterm screen and scrollback before sanitized retained/live
+    replay when a visible internal transport leak is detected.
+
+ -- Avikalpa Kundu <avi@gour.top>  Fri, 08 May 2026 20:12:00 +0530
+
+yggterm (2.1.224-1) unstable; urgency=medium
+
+  * Reset contaminated visible xterm buffers before applying clean live
+    terminal writes so stale internal attach failures cannot stay painted
+    after a hot-update restore resumes real output.
+
+ -- Avikalpa Kundu <avi@gour.top>  Fri, 08 May 2026 20:02:00 +0530
+
+yggterm (2.1.223-1) unstable; urgency=medium
+
+  * Suppress remote resume transport-error batches after overlay dismissal so
+    the live read loop cannot render internal attach failures into xterm while
+    input remains gated.
+
+ -- Avikalpa Kundu <avi@gour.top>  Fri, 08 May 2026 19:52:00 +0530
+
+yggterm (2.1.222-1) unstable; urgency=medium
+
+  * Strip internal retained-replay transport residue after bare carriage-return
+    rewrites so hot-update restore cannot keep terminal-session-not-found
+    output visible and input-gated.
+
+ -- Avikalpa Kundu <avi@gour.top>  Fri, 08 May 2026 19:43:00 +0530
+
+yggterm (2.1.221-1) unstable; urgency=medium
+
+  * Reject already-visible retained xterm buffers containing internal transport
+    residue and force sanitized daemon replay.
+  * Add CI gates for the retained replay rejection path and KDE Wayland
+    transparent corner profile.
+
+ -- Avikalpa Kundu <avi@gour.top>  Fri, 08 May 2026 19:33:00 +0530
+
+yggterm (2.1.220-1) unstable; urgency=medium
+
+  * Treat orphaned SSH close text as retained-replay transport residue so
+    previously contaminated hot-update restores do not reopen on that line.
+
+ -- Avikalpa Kundu <avi@gour.top>  Fri, 08 May 2026 19:19:00 +0530
+
+yggterm (2.1.219-1) unstable; urgency=medium
+
+  * Strip paired SSH close lines from contaminated retained terminal replay even
+    when escape traffic separates them from the internal attach error.
+
+ -- Avikalpa Kundu <avi@gour.top>  Fri, 08 May 2026 19:09:00 +0530
+
+yggterm (2.1.218-1) unstable; urgency=medium
+
+  * Sanitize retained daemon-terminal replay before script-based restore and
+    direct xterm snapshot writes, preventing stale internal attach errors from
+    becoming visible terminal contents after hot update.
+
+ -- Avikalpa Kundu <avi@gour.top>  Fri, 08 May 2026 18:59:00 +0530
+
+yggterm (2.1.217-1) unstable; urgency=medium
+
+  * Apply the internal attach-error sanitizer before forwarding raw terminal
+    control payloads, closing the retained xterm replay leak path.
+
+ -- Avikalpa Kundu <avi@gour.top>  Fri, 08 May 2026 18:58:00 +0530
+
+yggterm (2.1.216-1) unstable; urgency=medium
+
+  * Strip leaked internal terminal attach errors from live terminal replay and
+    add read-only smoke coverage for tail-position transport leaks.
+  * Restore lightly rounded KDE Wayland window corners with a transparent
+    Wayland profile and require final xterm smoke corner proof.
+
+ -- Avikalpa Kundu <avi@gour.top>  Fri, 08 May 2026 18:42:00 +0530
+
+yggterm (2.1.215-1) unstable; urgency=medium
+
+  * Retarget stale versioned socket symlink aliases without pinging their old
+    target during daemon startup.
+
+ -- Avikalpa Kundu <avi@gour.top>  Fri, 08 May 2026 18:08:00 +0530
+
+yggterm (2.1.214-1) unstable; urgency=medium
+
+  * Avoid hot-update daemon startup deadlocks when legacy versioned socket
+    aliases already point at the freshly bound daemon socket.
+
+ -- Avikalpa Kundu <avi@gour.top>  Fri, 08 May 2026 18:02:00 +0530
+
+yggterm (2.1.213-1) unstable; urgency=medium
+
+  * Keep Codex inline Working animations on the low-latency terminal path
+    across split rewrite frames and add smoke coverage for the animation
+    budget.
+
+ -- Avikalpa Kundu <avi@gour.top>  Fri, 08 May 2026 17:42:00 +0530
+
+yggterm (2.1.212-1) unstable; urgency=medium
+
+  * Defer Linux legacy-daemon cleanup until after the new daemon binds its
+    current socket so stale wedged sockets cannot block hot-update startup.
+
+ -- Avikalpa Kundu <avi@gour.top>  Fri, 08 May 2026 16:59:00 +0530
+
+yggterm (2.1.211-1) unstable; urgency=medium
+
+  * Dispatch accepted Unix daemon clients off the accept loop so one partial or
+    wedged local connection cannot block ping, status, hot update, or recovery.
+
+ -- Avikalpa Kundu <avi@gour.top>  Fri, 08 May 2026 16:56:00 +0530
+
+yggterm (2.1.210-1) unstable; urgency=medium
+
+  * Bound partial daemon Unix requests after the readiness poll so incomplete
+    local JSON cannot wedge the accept loop during hot update or recovery.
+
+ -- Avikalpa Kundu <avi@gour.top>  Fri, 08 May 2026 16:38:00 +0530
+
+yggterm (2.1.209-1) unstable; urgency=medium
+
+  * Refuse stale hot-update handoff target regressions so older launchers
+    cannot overwrite a newer session-survival owner registry.
+
+ -- Avikalpa Kundu <avi@gour.top>  Fri, 08 May 2026 16:32:00 +0530
+
+yggterm (2.1.208-1) unstable; urgency=medium
+
+  * Treat stale remote daemons that still own Codex runtimes as hot-update
+    owners during remote stdio attach, preserving the PTY before update
+    completion.
+
+ -- Avikalpa Kundu <avi@gour.top>  Fri, 08 May 2026 16:09:22 +0530
+
+yggterm (2.1.207-1) unstable; urgency=medium
+
+  * Clear stale remote-disconnect resume notifications when the daemon PTY is
+    visibly showing a real Codex prompt with real scrollback after a retry.
+
+ -- Avikalpa Kundu <avi@gour.top>  Fri, 08 May 2026 15:58:00 +0530
+
+yggterm (2.1.206-1) unstable; urgency=medium
+
+  * Pause hidden loading-dot animations so retained invisible UI cannot keep
+    WebKit's animation clock hot while the terminal is idle.
+  * Persist remote generated copy hints asynchronously so daemon status and
+    runtime truth are not blocked by SSH copy-hint writes during hot update.
+
+ -- Avikalpa Kundu <avi@gour.top>  Fri, 08 May 2026 15:42:00 +0530
+
+yggterm (2.1.205-1) unstable; urgency=medium
+
+  * Add an app-control CSS/Web animation census to state/read-only CPU probes
+    so live fan spikes can be separated from terminal write/render work.
+
+ -- Avikalpa Kundu <avi@gour.top>  Fri, 08 May 2026 15:32:00 +0530
+
+yggterm (2.1.204-1) unstable; urgency=medium
+
+  * Guard daemon Unix client reads with an explicit poll timeout before
+    parsing requests so silent local clients cannot monopolize the accept loop
+    during hot update.
+
+ -- Avikalpa Kundu <avi@gour.top>  Fri, 08 May 2026 15:00:00 +0530
+
+yggterm (2.1.203-1) unstable; urgency=medium
+
+  * Give visible Codex inline Working animations a separate low-latency write
+    budget and expose the animation-hot state in app-control/read-only probes.
+
+ -- Avikalpa Kundu <avi@gour.top>  Fri, 08 May 2026 14:30:00 +0530
+
+yggterm (2.1.202-1) unstable; urgency=medium
+
+  * Retire duplicate non-registry daemon owners once the registry's real PTY
+    owner is clean, preventing stale daemons from claiming the same hot-update
+    runtime keys.
+
+ -- Avikalpa Kundu <avi@gour.top>  Fri, 08 May 2026 14:00:00 +0530
+
+yggterm (2.1.201-1) unstable; urgency=medium
+
+  * Short-circuit unchanged terminal input-policy syncs and expose the
+    apply/no-op counters in read-only CPU smokes.
+  * Retire preserved-only startup bridge sidecars once the real PTY owner
+    cleanly matches the hot-update registry.
+
+ -- Avikalpa Kundu <avi@gour.top>  Fri, 08 May 2026 13:44:42 +0530
+
+yggterm (2.1.200-1) unstable; urgency=medium
+
+  * Timeout silent daemon clients so hot-update session recovery cannot be
+    wedged by an accepted connection that never sends a request.
+
+ -- Avikalpa Kundu <avi@gour.top>  Fri, 08 May 2026 12:39:00 +0530
+
+yggterm (2.1.199-1) unstable; urgency=medium
+
+  * Make headless app-control help non-mutating for live observability
+    commands.
+
+ -- Avikalpa Kundu <avi@gour.top>  Fri, 08 May 2026 12:24:00 +0530
+
+yggterm (2.1.198-1) unstable; urgency=medium
+
+  * Start daemon-retained scrollback replay from terminal-loop readiness so
+    restored remote sessions recover scrolling without app-control probes.
+
+ -- Avikalpa Kundu <avi@gour.top>  Fri, 08 May 2026 12:04:00 +0530
+
+yggterm (2.1.197-1) unstable; urgency=medium
+
+  * Split expandable sidebar row hit targets between name selection and
+    non-name expansion controls.
+
+ -- Avikalpa Kundu <avi@gour.top>  Fri, 08 May 2026 10:58:00 +0530
+
+yggterm (2.1.196-1) unstable; urgency=medium
+
+  * Keep remote live sessions visible under their cwd regardless of keep-alive.
+
+ -- Avikalpa Kundu <avi@gour.top>  Fri, 08 May 2026 10:35:00 +0530
+
+yggterm (2.1.195-1) unstable; urgency=medium
+
+  * Preserve newly owned live PTYs when choosing the hot-update handoff daemon.
+
+ -- Avikalpa Kundu <avi@gour.top>  Fri, 08 May 2026 09:55:00 +0530
+
+yggterm (2.1.194-1) unstable; urgency=medium
+
+  * Preserve renamed remote Codex titles across runtime identity promotion.
+  * Prefer live daemon title truth over stale scanned sidebar titles.
+
+ -- Avikalpa Kundu <avi@gour.top>  Fri, 08 May 2026 09:22:00 +0530
+
+yggterm (2.1.193-1) unstable; urgency=medium
+
+  * Bound app-control state snapshot fallback latency under live terminal load.
+
+ -- Avikalpa Kundu <avi@gour.top>  Fri, 08 May 2026 05:04:00 +0530
+
+yggterm (2.1.192-1) unstable; urgency=medium
+
+  * Let preserved owner daemons self-clean ghost non-keep sessions safely.
+
+ -- Avikalpa Kundu <avi@gour.top>  Fri, 08 May 2026 04:51:00 +0530
+
+yggterm (2.1.191-1) unstable; urgency=medium
+
+  * Prune stale sidecar-owned PTYs that are not current live-session truth.
+
+ -- Avikalpa Kundu <avi@gour.top>  Fri, 08 May 2026 04:32:00 +0530
+
+yggterm (2.1.190-1) unstable; urgency=medium
+
+  * Keep retained hot-update replays pinned to the live prompt viewport.
+
+ -- Avikalpa Kundu <avi@gour.top>  Fri, 08 May 2026 03:58:00 +0530
+
+yggterm (2.1.189-1) unstable; urgency=medium
+
+  * Trim idle xterm canvas overlay compositing and expose visible layer probes.
+
+ -- Avikalpa Kundu <avi@gour.top>  Fri, 08 May 2026 02:28:09 +0530
+
+yggterm (2.1.188-1) unstable; urgency=medium
+
+  * Honor explicit Wayland backend through the Dioxus DMA-BUF workaround.
+
+ -- Avikalpa Kundu <avi@gour.top>  Fri, 08 May 2026 01:48:39 +0530
+
+yggterm (2.1.187-1) unstable; urgency=medium
+
+  * Force native Wayland on KDE Wayland+Xwayland before enabling xterm canvas.
+
+ -- Avikalpa Kundu <avi@gour.top>  Fri, 08 May 2026 01:35:48 +0530
+
+yggterm (2.1.186-1) unstable; urgency=medium
+
+  * Keep clean startup bridge sidecars and reject inferred ghost-owner handoffs.
+
+ -- Avikalpa Kundu <avi@gour.top>  Fri, 08 May 2026 01:14:03 +0530
+
+yggterm (2.1.185-1) unstable; urgency=medium
+
+  * Scope Linux daemon cleanup to exact client-instance endpoints.
+
+ -- Avikalpa Kundu <avi@gour.top>  Fri, 08 May 2026 01:03:52 +0530
+
+yggterm (2.1.184-1) unstable; urgency=medium
+
+  * Ignore unauthorized ghost-owned runtimes during startup hot-update target selection.
+
+ -- Avikalpa Kundu <avi@gour.top>  Fri, 08 May 2026 00:53:11 +0530
+
+yggterm (2.1.183-1) unstable; urgency=medium
+
+  * Retire stale preserved-only Linux daemon sidecars while protecting the hot-update PTY owner.
+
+ -- Avikalpa Kundu <avi@gour.top>  Fri, 08 May 2026 00:43:58 +0530
+
+yggterm (2.1.182-1) unstable; urgency=medium
+
+  * Prefer active preserved-only sidecar daemons over orphaned old PTY owners during startup reconcile.
+
+ -- Avikalpa Kundu <avi@gour.top>  Fri, 08 May 2026 00:31:58 +0530
+
+yggterm (2.1.181-1) unstable; urgency=medium
+
+  * Protect unkept update-restart rows only when runtime truth still exists.
+  * Filter sidecar preserved-owner entries before handoff retargeting.
+
+ -- Avikalpa Kundu <avi@gour.top>  Fri, 08 May 2026 00:24:53 +0530
+
+yggterm (2.1.180-1) unstable; urgency=medium
+
+  * Prune stale hot-update owner entries from disk.
+  * Expose kept-live sidebar truth to app-control probes.
+  * Add regression coverage for kept remote sessions in separate cwd folders.
+
+ -- Avikalpa Kundu <avi@gour.top>  Fri, 08 May 2026 00:15:44 +0530
+
+yggterm (2.1.179-1) unstable; urgency=medium
+
+  * Stop stale hot-update preserved owners from resurrecting closed sessions.
+  * Project kept remote live sessions back into their cwd folder.
+
+ -- Avikalpa Kundu <avi@gour.top>  Fri, 08 May 2026 00:02:16 +0530
+
+yggterm (2.1.178-1) unstable; urgency=medium
+
+  * Default KDE/Wayland launches to the native backend for lower idle CPU.
+  * Gate xterm canvas off on X11 unless explicitly enabled.
+
+ -- Avikalpa Kundu <avi@gour.top>  Thu, 07 May 2026 21:43:11 +0530
+
+yggterm (2.1.177-1) unstable; urgency=medium
+
+  * Preserve direct-install hot-update active daemon/client selection.
+  * Prevent startup terminal prewarm from changing active session focus.
+
+ -- Avikalpa Kundu <avi@gour.top>  Thu, 07 May 2026 21:17:27 +0530
+
+yggterm (2.1.176-1) unstable; urgency=medium
+
+  * Resolve suffixed packaged headless companions for remote bootstrap.
+
+ -- Avikalpa Kundu <avi@gour.top>  Thu, 07 May 2026 20:54:07 +0530
+
+yggterm (2.1.175-1) unstable; urgency=medium
+
+  * Slow background disposable TUI drain cadence for idle/fan budgets.
+
+ -- Avikalpa Kundu <avi@gour.top>  Thu, 07 May 2026 20:32:02 +0530
+
+yggterm (2.1.174-1) unstable; urgency=medium
+
+  * Defer superseded GUI retirement to shell active-state handoff.
+  * Require strict current-mount readiness before daemon retained replay.
+
+ -- Avikalpa Kundu <avi@gour.top>  Thu, 07 May 2026 20:15:40 +0530
+
+yggterm (2.1.173-1) unstable; urgency=medium
+
+  * Suspend periodic browser-tree scans while a terminal is active.
+
+ -- Avikalpa Kundu <avi@gour.top>  Thu, 07 May 2026 19:37:24 +0530
+
+yggterm (2.1.172-1) unstable; urgency=medium
+
+  * Drain suppressed background TUI output regularly to avoid PTY backlog spikes.
+  * Timestamp idle CPU smoke samples for remote trace alignment.
+
+ -- Avikalpa Kundu <avi@gour.top>  Thu, 07 May 2026 19:12:55 +0530
+
+yggterm (2.1.171-1) unstable; urgency=medium
+
+  * Slow quiet Startpage browser-tree refreshes to reduce launch-idle CPU.
+
+ -- Avikalpa Kundu <avi@gour.top>  Thu, 07 May 2026 18:50:19 +0530
+
+yggterm (2.1.170-1) unstable; urgency=medium
+
+  * Preserve the outgoing GUI active terminal during hot-update handoff.
+  * Avoid persisting active-session paths for live runtimes that normal
+    durability intentionally excludes.
+
+ -- Avikalpa Kundu <avi@gour.top>  Thu, 07 May 2026 18:31:08 +0530
+
+yggterm (2.1.169-1) unstable; urgency=medium
+
+  * Route idle CPU smoke app-control probes through matched yggterm-headless.
+  * Retarget stale busy live-session snapshot timers after terminal quiets.
+  * Pass render tracing through idle CPU smoke for fan/root-render triage.
+
+ -- Avikalpa Kundu <avi@gour.top>  Thu, 07 May 2026 15:38:49 +0530
+
+yggterm (2.1.168-1) unstable; urgency=medium
+
+  * Start Codex launch timeline resource logging before app launch.
+  * Add pre-test host baselines and phase events to idle CPU smoke.
+  * Forward xterm protocol replies while user input remains gated.
+  * Accept retained remote Codex scrollback only with PTY and geometry proof.
+
+ -- Avikalpa Kundu <avi@gour.top>  Thu, 07 May 2026 14:10:27 +0530
+
+yggterm (2.1.167-1) unstable; urgency=medium
+
+  * Force DOM-rendered xterm rows to paint with currentColor text fill.
+  * Add app-control diagnostics for transparent DOM row text fill.
+  * Require hot-session switch smokes to prove prompt-region screenshot pixels.
+
+ -- Avikalpa Kundu <avi@gour.top>  Thu, 07 May 2026 13:09:04 +0530
+
+yggterm (2.1.166-1) unstable; urgency=medium
+
+  * Add isolated Codex launch timeline smoke coverage.
+  * Preserve protocol handshakes and real Codex prompt/setup frames.
+  * Retry transient app-control DOM eval-finished snapshot failures.
+  * Split raw xterm bridge input truth from readiness-gated input.
+  * Avoid retained-surface recovery on fresh remote Codex launches.
+  * Throttle frame-like probes, use 500ms active frame budget, slow chunked
+    alt-screen reads, and send bulk xterm writes through the async parser path.
+  * Render active plain local full-screen TUI frames through a low-power text
+    surface while keeping Codex and remote sessions on the normal xterm path.
+  * Suppress hot frame-like host-health/sidebar churn, slow idle app-control
+    polling, disarm unfocused-window input, and lengthen local idle read backoff.
+  * Keep background frame-budgeted local TUI reads on the 16s unfocused cadence.
+  * Cool down idle CPU smoke samples and expose active/effective frame budgets.
+  * Record idle CPU smoke per-thread rows, render-counter deltas, low-power
+    overlay state, hot host-health suppression counters, and background TUI
+    frame-signal gating with a post-interrupt drain.
+
+ -- Avikalpa Kundu <avi@gour.top>  Thu, 07 May 2026 04:12:06 +0530
+
+yggterm (2.1.165-1) unstable; urgency=medium
+
+  * Flag sparse remote Codex prompt-only xterm surfaces as missing welcome frame.
+  * Add read-only smoke metrics for root-render churn and per-thread CPU.
+  * Stop wrong-target app-control requests from waking unrelated GUI clients.
+  * Make nested server app --help commands non-mutating.
+
+ -- Avikalpa Kundu <avi@gour.top>  Thu, 07 May 2026 00:40:34 +0530
+
 yggterm (2.1.164-1) unstable; urgency=medium
 
   * Strip fresh remote Codex start actions from update-restart persistence.

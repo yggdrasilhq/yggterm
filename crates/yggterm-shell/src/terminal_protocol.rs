@@ -11,6 +11,8 @@ pub(crate) enum TerminalJsCommand {
         cursor: String,
         cursor_muted: String,
         cursor_text: String,
+        input_line_background: String,
+        input_line_border: String,
         dim_foreground: String,
         selection: String,
         black: String,
@@ -62,6 +64,7 @@ pub(crate) enum TerminalJsEvent {
         cursor_line_text: String,
         text_tail: String,
         has_transport_error: bool,
+        frame_like_hot: bool,
         cursor_y: u16,
         rows: u16,
         blank_rows_below_cursor: u16,
@@ -78,6 +81,9 @@ pub(crate) enum TerminalJsEvent {
     Input {
         data: String,
     },
+    ReadNudge {
+        reason: String,
+    },
     Resize {
         cols: u16,
         rows: u16,
@@ -88,6 +94,10 @@ pub(crate) enum TerminalJsEvent {
     },
     ClipboardPasteRequest,
     ClipboardImageRequest,
+    ContextMenu {
+        client_x: f64,
+        client_y: f64,
+    },
     ClipboardError {
         action: String,
         message: String,
@@ -113,6 +123,8 @@ enum TerminalJsEventWire {
         cursor_line_text: String,
         text_tail: String,
         has_transport_error: bool,
+        #[serde(default)]
+        frame_like_hot: bool,
         cursor_y: u16,
         rows: u16,
         blank_rows_below_cursor: u16,
@@ -129,6 +141,10 @@ enum TerminalJsEventWire {
     Input {
         data: String,
     },
+    ReadNudge {
+        #[serde(default)]
+        reason: String,
+    },
     Resize {
         cols: u16,
         rows: u16,
@@ -139,6 +155,12 @@ enum TerminalJsEventWire {
     },
     ClipboardPasteRequest,
     ClipboardImageRequest,
+    ContextMenu {
+        #[serde(default)]
+        client_x: f64,
+        #[serde(default)]
+        client_y: f64,
+    },
     ClipboardError {
         action: String,
         message: String,
@@ -160,6 +182,7 @@ impl From<TerminalJsEventWire> for TerminalJsEvent {
                 cursor_line_text,
                 text_tail,
                 has_transport_error,
+                frame_like_hot,
                 cursor_y,
                 rows,
                 blank_rows_below_cursor,
@@ -167,6 +190,7 @@ impl From<TerminalJsEventWire> for TerminalJsEvent {
                 cursor_line_text,
                 text_tail,
                 has_transport_error,
+                frame_like_hot,
                 cursor_y,
                 rows,
                 blank_rows_below_cursor,
@@ -189,12 +213,16 @@ impl From<TerminalJsEventWire> for TerminalJsEvent {
                 rows,
             },
             TerminalJsEventWire::Input { data } => TerminalJsEvent::Input { data },
+            TerminalJsEventWire::ReadNudge { reason } => TerminalJsEvent::ReadNudge { reason },
             TerminalJsEventWire::Resize { cols, rows } => TerminalJsEvent::Resize { cols, rows },
             TerminalJsEventWire::Clipboard { action, chars } => {
                 TerminalJsEvent::Clipboard { action, chars }
             }
             TerminalJsEventWire::ClipboardPasteRequest => TerminalJsEvent::ClipboardPasteRequest,
             TerminalJsEventWire::ClipboardImageRequest => TerminalJsEvent::ClipboardImageRequest,
+            TerminalJsEventWire::ContextMenu { client_x, client_y } => {
+                TerminalJsEvent::ContextMenu { client_x, client_y }
+            }
             TerminalJsEventWire::ClipboardError { action, message } => {
                 TerminalJsEvent::ClipboardError { action, message }
             }
@@ -219,5 +247,72 @@ impl<'de> Deserialize<'de> for TerminalJsEvent {
                 },
             },
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn host_health_defaults_frame_like_hot_to_false() {
+        let event: TerminalJsEvent = serde_json::from_value(json!({
+            "kind": "host_health",
+            "cursor_line_text": "pi@jojo:~$ ",
+            "text_tail": "ready",
+            "has_transport_error": false,
+            "cursor_y": 12,
+            "rows": 32,
+            "blank_rows_below_cursor": 0
+        }))
+        .expect("legacy host health payloads should still deserialize");
+        assert!(matches!(
+            event,
+            TerminalJsEvent::HostHealth {
+                frame_like_hot: false,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn host_health_deserializes_frame_like_hot() {
+        let event: TerminalJsEvent = serde_json::from_value(json!({
+            "kind": "host_health",
+            "cursor_line_text": "",
+            "text_tail": "Yggterm synthetic TUI CPU smoke frame",
+            "has_transport_error": false,
+            "frame_like_hot": true,
+            "cursor_y": 0,
+            "rows": 48,
+            "blank_rows_below_cursor": 0
+        }))
+        .expect("frame-like host health payloads should deserialize");
+        assert!(matches!(
+            event,
+            TerminalJsEvent::HostHealth {
+                frame_like_hot: true,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn context_menu_event_deserializes_with_coordinates() {
+        let event: TerminalJsEvent = serde_json::from_value(json!({
+            "kind": "context_menu",
+            "client_x": 42.5,
+            "client_y": 84.25
+        }))
+        .expect("context-menu payloads should deserialize");
+        assert!(matches!(
+            event,
+            TerminalJsEvent::ContextMenu {
+                client_x,
+                client_y,
+            } if (client_x - 42.5).abs() < f64::EPSILON
+                && (client_y - 84.25).abs() < f64::EPSILON
+        ));
     }
 }
