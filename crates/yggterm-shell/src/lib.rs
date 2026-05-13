@@ -9,5 +9,5 @@ mod window_icon;
 
 pub use shell::{
     PendingUpdateRestart, ShellBootstrap, initial_server_sync, launch_shell, start_daemon_watchdog,
-    warm_daemon_start,
+    terminal_identity_appearance_for_settings, warm_daemon_start,
 };

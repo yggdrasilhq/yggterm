@@ -19,9 +19,11 @@ const MANAGED_NPM_CACHE_DIRNAME: &str = "npm-cache";
 const EXPORTED_TERM_PROGRAM: &str = "vscode";
 const YGGTERM_TERM_PROGRAM: &str = "yggterm";
 const YGGTERM_TERM_PROGRAM_VERSION: &str = env!("CARGO_PKG_VERSION");
+const ENV_YGGTERM_TERMINAL_APPEARANCE: &str = "YGGTERM_TERMINAL_APPEARANCE";
 const TERMINAL_IDENTITY_ENV_REMOVALS: &[&str] = &["NO_COLOR"];
 const MANAGED_CLI_REFRESH_STATE_FILENAME: &str = "managed-cli-refresh-state.json";
 const MANAGED_CLI_REFRESH_TTL_ENV: &str = "YGGTERM_MANAGED_CLI_REFRESH_TTL_MS";
+const MANAGED_CLI_BACKGROUND_INSTALL_ENV: &str = "YGGTERM_MANAGED_CLI_BACKGROUND_INSTALL";
 pub const DEFAULT_MANAGED_CLI_REFRESH_TTL_MS: u64 = 6 * 60 * 60_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -385,6 +387,31 @@ fn managed_cli_should_defer_initial_install(
     background && !managed_cli_has_existing_managed_install(probes)
 }
 
+fn managed_cli_background_install_enabled() -> bool {
+    env::var(MANAGED_CLI_BACKGROUND_INSTALL_ENV)
+        .ok()
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
+fn managed_cli_refresh_should_attempt_install(
+    background: bool,
+    npm_available: bool,
+    skipped_recently: bool,
+    install_deferred: bool,
+    background_install_enabled: bool,
+) -> bool {
+    npm_available
+        && !skipped_recently
+        && !install_deferred
+        && (!background || background_install_enabled)
+}
+
 fn managed_cli_deferred_install_detail(tool: ManagedCliTool, probe: &ToolProbe) -> String {
     if probe.source == Some(ManagedCliBinarySource::System) && probe.available {
         format!(
@@ -397,6 +424,25 @@ fn managed_cli_deferred_install_detail(tool: ManagedCliTool, probe: &ToolProbe) 
             "Yggterm deferred the first managed {} install until you explicitly launch or resume a local {} session.",
             tool.display_name(),
             tool.display_name(),
+        )
+    }
+}
+
+fn managed_cli_deferred_background_install_detail(
+    tool: ManagedCliTool,
+    probe: &ToolProbe,
+) -> String {
+    if probe.available {
+        format!(
+            "{} is already available. Background refresh only probes by default; set {}=1 for an explicit unattended managed update.",
+            tool.display_name(),
+            MANAGED_CLI_BACKGROUND_INSTALL_ENV,
+        )
+    } else {
+        format!(
+            "{} is not installed. Background refresh will not run npm install unless {}=1 is set.",
+            tool.display_name(),
+            MANAGED_CLI_BACKGROUND_INSTALL_ENV,
         )
     }
 }
@@ -427,12 +473,42 @@ fn persist_managed_cli_refresh_state(
     save_managed_cli_refresh_state(home, &state)
 }
 
+fn normalize_terminal_appearance(value: &str) -> Option<&'static str> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "dark" => Some("dark"),
+        "light" => Some("light"),
+        _ => None,
+    }
+}
+
 fn ambient_terminal_appearance() -> String {
-    env::var("YGGTERM_APPEARANCE")
+    env::var(ENV_YGGTERM_TERMINAL_APPEARANCE)
         .ok()
-        .map(|value| value.trim().to_ascii_lowercase())
-        .filter(|value| matches!(value.as_str(), "light" | "dark"))
+        .and_then(|value| normalize_terminal_appearance(&value).map(str::to_string))
+        .or_else(|| {
+            env::var("YGGTERM_APPEARANCE")
+                .ok()
+                .and_then(|value| normalize_terminal_appearance(&value).map(str::to_string))
+        })
+        .or_else(|| {
+            env::var("COLORFGBG").ok().and_then(|value| {
+                let mut parts = value.split(';').map(str::trim);
+                let foreground = parts.next()?;
+                let background = parts.next()?;
+                if foreground == "15" && background == "0" {
+                    Some("dark".to_string())
+                } else if foreground == "0" && background == "15" {
+                    Some("light".to_string())
+                } else {
+                    None
+                }
+            })
+        })
         .unwrap_or_else(|| "light".to_string())
+}
+
+pub(crate) fn terminal_identity_appearance_from_environment() -> String {
+    ambient_terminal_appearance()
 }
 
 fn colorfgbg_for_appearance(appearance: &str) -> &'static str {
@@ -458,6 +534,7 @@ fn terminal_identity_env_pairs_with_home(
         ),
         ("YGGTERM_TERM_PROGRAM", YGGTERM_TERM_PROGRAM.to_string()),
         ("YGGTERM_APPEARANCE", appearance.clone()),
+        (ENV_YGGTERM_TERMINAL_APPEARANCE, appearance.clone()),
         (
             "COLORFGBG",
             colorfgbg_for_appearance(&appearance).to_string(),
@@ -503,11 +580,8 @@ pub(crate) fn terminal_identity_shell_exports_for_remote() -> Vec<String> {
         .collect()
 }
 
-pub(crate) fn sync_terminal_identity_env(theme: UiTheme) {
-    let appearance = match theme {
-        UiTheme::ZedLight => "light",
-        UiTheme::ZedDark => "dark",
-    };
+pub fn sync_terminal_identity_appearance(appearance: &str) {
+    let appearance = normalize_terminal_appearance(appearance).unwrap_or("light");
     // The daemon owns terminal launch commands and needs a process-wide identity for child PTYs
     // and remote shell command synthesis. This is updated on startup/theme changes only.
     unsafe {
@@ -520,8 +594,23 @@ pub(crate) fn sync_terminal_identity_env(theme: UiTheme) {
         env::set_var("TERM_PROGRAM_VERSION", YGGTERM_TERM_PROGRAM_VERSION);
         env::set_var("YGGTERM_TERM_PROGRAM", YGGTERM_TERM_PROGRAM);
         env::set_var("YGGTERM_APPEARANCE", appearance);
+        env::set_var(ENV_YGGTERM_TERMINAL_APPEARANCE, appearance);
         env::set_var("COLORFGBG", colorfgbg_for_appearance(appearance));
     }
+}
+
+pub(crate) fn sync_terminal_identity_env(theme: UiTheme) {
+    let appearance = env::var(ENV_YGGTERM_TERMINAL_APPEARANCE)
+        .ok()
+        .and_then(|value| normalize_terminal_appearance(&value).map(str::to_string))
+        .unwrap_or_else(|| {
+            match theme {
+                UiTheme::ZedLight => "light",
+                UiTheme::ZedDark => "dark",
+            }
+            .to_string()
+        });
+    sync_terminal_identity_appearance(&appearance);
 }
 
 #[cfg(test)]
@@ -545,6 +634,115 @@ mod tests {
         match previous {
             Some(value) => unsafe { env::set_var("NO_COLOR", value) },
             None => unsafe { env::remove_var("NO_COLOR") },
+        }
+    }
+
+    #[test]
+    fn sync_terminal_identity_env_preserves_explicit_terminal_appearance() {
+        let previous_terminal = env::var_os(ENV_YGGTERM_TERMINAL_APPEARANCE);
+        let previous_shell = env::var_os("YGGTERM_APPEARANCE");
+        let previous_colorfgbg = env::var_os("COLORFGBG");
+        unsafe {
+            env::set_var(ENV_YGGTERM_TERMINAL_APPEARANCE, "dark");
+            env::set_var("YGGTERM_APPEARANCE", "light");
+            env::set_var("COLORFGBG", "0;15");
+        }
+
+        sync_terminal_identity_env(UiTheme::ZedLight);
+
+        assert_eq!(
+            env::var(ENV_YGGTERM_TERMINAL_APPEARANCE).as_deref(),
+            Ok("dark")
+        );
+        assert_eq!(env::var("COLORFGBG").as_deref(), Ok("15;0"));
+
+        match previous_terminal {
+            Some(value) => unsafe { env::set_var(ENV_YGGTERM_TERMINAL_APPEARANCE, value) },
+            None => unsafe { env::remove_var(ENV_YGGTERM_TERMINAL_APPEARANCE) },
+        }
+        match previous_shell {
+            Some(value) => unsafe { env::set_var("YGGTERM_APPEARANCE", value) },
+            None => unsafe { env::remove_var("YGGTERM_APPEARANCE") },
+        }
+        match previous_colorfgbg {
+            Some(value) => unsafe { env::set_var("COLORFGBG", value) },
+            None => unsafe { env::remove_var("COLORFGBG") },
+        }
+    }
+
+    #[test]
+    fn terminal_identity_prefers_terminal_appearance_over_shell_appearance() {
+        let previous_terminal = env::var_os(ENV_YGGTERM_TERMINAL_APPEARANCE);
+        let previous_shell = env::var_os("YGGTERM_APPEARANCE");
+        unsafe {
+            env::set_var(ENV_YGGTERM_TERMINAL_APPEARANCE, "dark");
+            env::set_var("YGGTERM_APPEARANCE", "light");
+        }
+
+        let pairs = terminal_identity_env_pairs_with_home(false);
+        assert_eq!(
+            pairs
+                .iter()
+                .find(|(key, _)| *key == "COLORFGBG")
+                .map(|(_, value)| value.as_str()),
+            Some("15;0")
+        );
+        assert_eq!(
+            pairs
+                .iter()
+                .find(|(key, _)| *key == ENV_YGGTERM_TERMINAL_APPEARANCE)
+                .map(|(_, value)| value.as_str()),
+            Some("dark")
+        );
+
+        match previous_terminal {
+            Some(value) => unsafe { env::set_var(ENV_YGGTERM_TERMINAL_APPEARANCE, value) },
+            None => unsafe { env::remove_var(ENV_YGGTERM_TERMINAL_APPEARANCE) },
+        }
+        match previous_shell {
+            Some(value) => unsafe { env::set_var("YGGTERM_APPEARANCE", value) },
+            None => unsafe { env::remove_var("YGGTERM_APPEARANCE") },
+        }
+    }
+
+    #[test]
+    fn terminal_identity_falls_back_to_colorfgbg_when_yggterm_vars_missing() {
+        let previous_terminal = env::var_os(ENV_YGGTERM_TERMINAL_APPEARANCE);
+        let previous_shell = env::var_os("YGGTERM_APPEARANCE");
+        let previous_colorfgbg = env::var_os("COLORFGBG");
+        unsafe {
+            env::remove_var(ENV_YGGTERM_TERMINAL_APPEARANCE);
+            env::remove_var("YGGTERM_APPEARANCE");
+            env::set_var("COLORFGBG", "15;0");
+        }
+
+        let pairs = terminal_identity_env_pairs_with_home(false);
+        assert_eq!(
+            pairs
+                .iter()
+                .find(|(key, _)| *key == ENV_YGGTERM_TERMINAL_APPEARANCE)
+                .map(|(_, value)| value.as_str()),
+            Some("dark")
+        );
+        assert_eq!(
+            pairs
+                .iter()
+                .find(|(key, _)| *key == "COLORFGBG")
+                .map(|(_, value)| value.as_str()),
+            Some("15;0")
+        );
+
+        match previous_terminal {
+            Some(value) => unsafe { env::set_var(ENV_YGGTERM_TERMINAL_APPEARANCE, value) },
+            None => unsafe { env::remove_var(ENV_YGGTERM_TERMINAL_APPEARANCE) },
+        }
+        match previous_shell {
+            Some(value) => unsafe { env::set_var("YGGTERM_APPEARANCE", value) },
+            None => unsafe { env::remove_var("YGGTERM_APPEARANCE") },
+        }
+        match previous_colorfgbg {
+            Some(value) => unsafe { env::set_var("COLORFGBG", value) },
+            None => unsafe { env::remove_var("COLORFGBG") },
         }
     }
 
@@ -678,6 +876,25 @@ mod tests {
     }
 
     #[test]
+    fn background_managed_cli_refresh_requires_install_opt_in() {
+        assert!(!managed_cli_refresh_should_attempt_install(
+            true, true, false, false, false
+        ));
+        assert!(managed_cli_refresh_should_attempt_install(
+            true, true, false, false, true
+        ));
+        assert!(managed_cli_refresh_should_attempt_install(
+            false, true, false, false, false
+        ));
+        assert!(!managed_cli_refresh_should_attempt_install(
+            true, true, true, false, true
+        ));
+        assert!(!managed_cli_refresh_should_attempt_install(
+            true, true, false, true, true
+        ));
+    }
+
+    #[test]
     fn explicit_managed_cli_ensure_refreshes_system_or_stale_managed_tools() {
         let now_ms = 10_000u64;
         let ttl_ms = managed_cli_refresh_ttl_ms();
@@ -751,7 +968,7 @@ mod tests {
                     install_deferred: false,
                 },
             ),
-            "local: using existing PATH Codex binaries until npm is available"
+            "local: using existing PATH Codex binaries until explicit managed refresh"
         );
     }
 
@@ -797,6 +1014,35 @@ mod tests {
         assert_eq!(
             summarize_managed_cli_report("local", &report),
             "local: deferred initial managed Codex install until first use"
+        );
+    }
+
+    #[test]
+    fn summarize_managed_cli_report_mentions_deferred_background_install() {
+        let report = ManagedCliRefreshReport {
+            scope: "local".to_string(),
+            background: true,
+            statuses: vec![ManagedCliToolStatus {
+                tool: ManagedCliTool::Codex,
+                package_name: "@openai/codex".to_string(),
+                binary_name: "codex".to_string(),
+                version_before: Some("1.2.3".to_string()),
+                version_after: Some("1.2.3".to_string()),
+                source_before: Some(ManagedCliBinarySource::Managed),
+                source_after: Some(ManagedCliBinarySource::Managed),
+                changed: false,
+                available: true,
+                action: "deferred_background_install".to_string(),
+                detail: "deferred".to_string(),
+            }],
+            skipped_recently: false,
+            ttl_remaining_ms: None,
+            install_attempted: false,
+            install_deferred: true,
+        };
+        assert_eq!(
+            summarize_managed_cli_report("local", &report),
+            "local: deferred background managed Codex install"
         );
     }
 
@@ -972,7 +1218,7 @@ fn managed_cli_launch_status_from_probe(
         (true, Some(ManagedCliBinarySource::System)) => (
             "system_fallback",
             format!(
-                "{} is available from the system PATH; Yggterm will refresh the managed copy in the background.",
+                "{} is available from the system PATH; Yggterm will keep using it until an explicit managed refresh is requested.",
                 tool.display_name()
             ),
         ),
@@ -1195,7 +1441,7 @@ pub(crate) fn ensure_local_managed_cli(tool: ManagedCliTool) -> Result<ManagedCl
                 format!("{} is already managed by Yggterm.", tool.display_name())
             }
             Some(ManagedCliBinarySource::System) => format!(
-                "{} is currently coming from the system PATH. Yggterm will keep using it until the managed copy is refreshed in the background.",
+                "{} is currently coming from the system PATH. Yggterm will keep using it until an explicit managed refresh is requested.",
                 tool.display_name()
             ),
             None => format!("{} is available.", tool.display_name()),
@@ -1308,9 +1554,11 @@ pub(crate) fn refresh_local_managed_cli(background: bool) -> Result<ManagedCliRe
 
     let refresh_state = load_managed_cli_refresh_state(&paths.home);
     let npm_available = npm_binary().is_some();
+    let background_install_enabled = managed_cli_background_install_enabled();
     let mut install_error = None::<String>;
     let mut install_attempted = false;
     let mut install_deferred = false;
+    let mut background_install_deferred = false;
     let mut skipped_recently = false;
     let mut ttl_remaining_ms = None::<u64>;
     if background && npm_available {
@@ -1344,8 +1592,29 @@ pub(crate) fn refresh_local_managed_cli(background: bool) -> Result<ManagedCliRe
                 }),
             );
         }
+        if !skipped_recently && !install_deferred && !background_install_enabled {
+            install_deferred = true;
+            background_install_deferred = true;
+            append_trace_event(
+                &paths.home,
+                "server",
+                "managed_cli",
+                "refresh_defer_background_install",
+                serde_json::json!({
+                    "background": background,
+                    "reason": "background_install_opt_in_required",
+                    "env": MANAGED_CLI_BACKGROUND_INSTALL_ENV,
+                }),
+            );
+        }
     }
-    if npm_available && !skipped_recently && !install_deferred {
+    if managed_cli_refresh_should_attempt_install(
+        background,
+        npm_available,
+        skipped_recently,
+        install_deferred,
+        background_install_enabled,
+    ) {
         install_attempted = true;
         let install_perf = PerfSpan::start(&paths.home, "cli", "refresh_managed_codex_install");
         if let Err(error) = install_latest(&paths, &tools, background) {
@@ -1394,8 +1663,19 @@ pub(crate) fn refresh_local_managed_cli(background: bool) -> Result<ManagedCliRe
                     managed_cli_refresh_skip_detail(tool, remaining_ms, ttl_ms),
                 )
             } else if install_deferred {
-                let detail = managed_cli_deferred_install_detail(tool, &after_probe);
-                tool_status(tool, before_probe, after_probe, "deferred_install", detail)
+                if background_install_deferred {
+                    let detail = managed_cli_deferred_background_install_detail(tool, &after_probe);
+                    tool_status(
+                        tool,
+                        before_probe,
+                        after_probe,
+                        "deferred_background_install",
+                        detail,
+                    )
+                } else {
+                    let detail = managed_cli_deferred_install_detail(tool, &after_probe);
+                    tool_status(tool, before_probe, after_probe, "deferred_install", detail)
+                }
             } else if let Some(error) = install_error.as_ref() {
                 tool_status(
                     tool,
@@ -1457,6 +1737,8 @@ pub(crate) fn refresh_local_managed_cli(background: bool) -> Result<ManagedCliRe
         "npm_available": npm_available,
         "install_attempted": install_attempted,
         "install_deferred": install_deferred,
+        "background_install_deferred": background_install_deferred,
+        "background_install_enabled": background_install_enabled,
         "skipped_recently": skipped_recently,
         "ttl_remaining_ms": ttl_remaining_ms,
         "statuses": statuses.iter().map(|status| serde_json::json!({
@@ -1486,6 +1768,8 @@ pub(crate) fn refresh_local_managed_cli(background: bool) -> Result<ManagedCliRe
             "ttl_ms": ttl_ms,
             "install_attempted": install_attempted,
             "install_deferred": install_deferred,
+            "background_install_deferred": background_install_deferred,
+            "background_install_enabled": background_install_enabled,
             "skipped_recently": skipped_recently,
             "ttl_remaining_ms": ttl_remaining_ms,
             "statuses": report.statuses.iter().map(|status| serde_json::json!({
@@ -1508,6 +1792,13 @@ pub(crate) fn summarize_managed_cli_report(
     }
 
     if report.install_deferred {
+        if report
+            .statuses
+            .iter()
+            .any(|status| status.action == "deferred_background_install")
+        {
+            return format!("{scope}: deferred background managed Codex install");
+        }
         return format!("{scope}: deferred initial managed Codex install until first use");
     }
 
@@ -1536,7 +1827,9 @@ pub(crate) fn summarize_managed_cli_report(
         .iter()
         .any(|status| status.action == "system_fallback");
     if fallback {
-        return format!("{scope}: using existing PATH Codex binaries until npm is available");
+        return format!(
+            "{scope}: using existing PATH Codex binaries until explicit managed refresh"
+        );
     }
 
     format!("{scope}: Codex tools already current")

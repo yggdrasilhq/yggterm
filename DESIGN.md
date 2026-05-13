@@ -336,7 +336,7 @@ If a project owns its own titlebar/chrome:
 - minimize/maximize/always-on-top should stay neutral by default
 - close should gain a red background with a white `X` on hover
 - outer radii should disappear in maximized state
-- optional titlebar auto-hide is acceptable, but it should collapse to a thin top-edge hover strip and return with a restrained desktop-fast reveal rather than snapping or peeking unpredictably
+- optional titlebar auto-hide is acceptable, but it should collapse to a thin top-edge hover strip and return with the same chrome background/gradient as the visible titlebar, using a restrained desktop-fast reveal rather than snapping or peeking unpredictably
 
 ## Project Overlay Interface
 
@@ -434,6 +434,22 @@ The Yggterm app icon should not read as a generic black terminal square, but it 
 
 Yggterm is in a stability freeze. New terminal/session features must wait until the existing shell can be daily-driven without losing work, mutating titles unexpectedly, or making terminal input feel unreliable.
 
+### Minimal terminal promise
+
+A Yggterm session should be understood as a durable, snappy automation of a simple terminal routine:
+
+```bash
+ssh dev
+cd gh/yggterm
+codex resume <uuid>
+```
+
+The shell may add sidebar placement, metadata, restore state, hot-update protection, screenshots, and app-control observability, but those features are supporting structure. They must not change the fundamental promise: a selected session attaches to the real daemon-owned PTY for that work, renders through xterm.js, accepts normal terminal input, keeps scrollback coherent, and survives view switches without becoming a transcript viewer or a semantic mock.
+
+When debugging terminal rendering, the goal is to make xterm.js render the PTY truth correctly. Do not cover terminal defects with Yggterm-owned decorative layers just to make a screenshot pass. Live terminal prompt backgrounds, cursors, selection, input echo, resize redraws, and Codex status animation must be painted by xterm.js from PTY bytes, terminal attributes, or xterm.js-native renderer APIs such as decorations, not by Yggterm overlay DOM. If a diagnostic compatibility shim is ever needed, it must stay behind an explicit development flag, be rejected by release smokes, and never become a second source of terminal content truth. If a Codex prompt background, cursor, resize redraw, working animation, or typed input is wrong, first trace the PTY bytes, xterm buffer, theme mapping, renderer mode, fit/resize state, and retained-host identity before changing shell chrome.
+
+Operational xterm.js notes, fixtures, and current terminal-rendering hypotheses live in `docs/xterm.md`.
+
 The product has three separate identities that must not be conflated:
 
 - `Workspace row`: the durable place in the sidebar tree.
@@ -457,9 +473,21 @@ Each app surface has exactly one source of truth:
 - Every live local and SSH runtime should appear there while it is alive.
 - The original workspace row remains the user's visual bookmark.
 - The `X` affordance in `Live Sessions` kills the runtime after confirmation. It does not delete stored transcript history.
+- Closing a background live runtime must not move the active viewport.
+- Closing the active live runtime should fall back through the validated viewport history: previous live/stored session in its prior mode, previous scoped Startpage, then global Startpage. Closed session paths and aliases must be pruned before choosing this fallback.
+- The daemon should not choose an arbitrary replacement active session after removing a runtime. The GUI owns close-time viewport history; the daemon owns runtime truth.
 - Keep Alive means durable restore after a normal cold restart.
 - Normal app close prunes non-Keep-Alive live rows and gracefully closes their runtimes with a one-hour force-cleanup deadline.
 - Update restart protection temporarily treats all recoverable live runtimes as restorable. It must not silently turn unkept sessions into durable Keep Alive sessions.
+
+### Startpage
+
+Startpage is a re-entry and scoped creation surface, not a connection-settings surface.
+
+- It may offer recent sessions, new Codex session, local terminal, folder creation, rename, and title/summary editing.
+- It should not show `Connect SSH`. SSH connection belongs in titlebar/right-rail/context controls where connection state and settings are available.
+- Selecting a folder opens a scoped Startpage without closing or hiding live runtimes.
+- Startpage must never be used as a terminal recovery fallback for a closed or broken runtime; it is chosen only by explicit folder/startpage focus or by the close-navigation fallback contract.
 
 ### Web View and copy
 
@@ -481,6 +509,8 @@ Image paste is a first-class terminal operation.
 - Local sessions receive staged files under the local Yggterm home.
 - SSH sessions receive staged files through the remote Yggterm helper when available, with the resulting remote path inserted into the terminal.
 - Text paste and image paste share the same intentional paste path so `Ctrl+V`/`Cmd+V` behaves predictably across Linux, Windows, and macOS.
+- Linux-style primary selection is terminal-local and separate from the desktop clipboard. Selecting text in xterm.js records a primary selection, and middle-click pastes it through xterm.js terminal input so bracketed paste and PTY input semantics remain terminal-owned.
+- Terminal right-click opens the normal Yggterm terminal/session context menu through the xterm event bridge. It must suppress the browser/WebKit context menu on the terminal surface, but it must not create terminal-rendering overlays or a second menu implementation.
 
 ### Terminal control
 
@@ -488,7 +518,10 @@ Terminal focus, input, scroll, selection, and retained-host recovery must have o
 
 - A terminal that can scroll but cannot type is a broken state.
 - A terminal that can type but cannot scroll while the user is reading scrollback is also broken.
+- An active visible terminal with a write-frame budget high enough to make typing or TUI animation feel stepped is broken. Keep heavy coalescing for background terminals, not for the active prompt.
 - Retained terminal hosts may stay mounted only while their active session identity and input policy match the shell state.
+- Programmatic layout changes such as titlebar auto-hide reveal/collapse, fit-addon resize, and visible-paint refits must not be interpreted as user scrollback. When the host is in PromptFollow, these changes must converge back to the live buffer bottom; when the user is explicitly in scrollback, the app must preserve that reading position.
+- A scroll controller may appear when the user is intentionally away from the prompt, but it is only a YggUI control surface over xterm viewport APIs. It must not draw terminal content, prompt backgrounds, cursors, or line repairs, and release proof must still come from xterm/app-control/screenshot truth.
 - Live session switching should feel like attaching Ghostty or xterm to an already-running `screen`/`tmux` session: if the runtime is alive, focusing it attaches to the current stream without relaunching, regenerating, previewing, or replaying transcript text.
 - Activity indicators represent real work: `idle`, `running`, `recent-output`, `recovering`, or `kept`. They should not spin for cosmetic debounce after a blank Enter or already-rendered keypress.
 - App-control typing proofs should use the same viewport keyboard path a user exercises. Direct PTY writes are still useful for controlled setup, but interrupt bytes such as `Ctrl-C` must not be batched with later line-editing or command bytes.
