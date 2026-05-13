@@ -11,6 +11,8 @@ yggterm (2.4.0-1) unstable; urgency=medium
   * Accept connected daemon PTY output without a prompt row as a valid visible
     terminal surface, avoiding false resume overlays on busy Codex frames.
   * Harden the 23-smoke heavy-TUI detector for codex-session-tui frames.
+  * Gate Linux-only Dioxus DMA-BUF workaround code behind Linux cfgs and stop
+    release automation from publishing partial package matrices.
   * Document the 23-smoke release gate with resource and quirk checks.
 
  -- Avikalpa Kundu <avi@gour.top>  Wed, 13 May 2026 16:45:57 +0530
