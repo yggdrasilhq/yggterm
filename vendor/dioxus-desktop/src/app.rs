@@ -645,6 +645,7 @@ impl App {
                         std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
                     }
                 }
+                #[cfg(target_os = "linux")]
                 if linux_dma_buf_workaround_should_force_x11(std::env::var("GDK_BACKEND").ok().as_deref()) {
                     unsafe {
                         std::env::set_var("GDK_BACKEND", "x11");
