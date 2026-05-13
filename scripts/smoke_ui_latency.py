@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import shlex
 import statistics
 import subprocess
@@ -147,6 +148,20 @@ def drawing_probe_summary(state: dict[str, Any], session_path: str) -> dict[str,
     }
 
 
+def dom_snapshot_summary(state: dict[str, Any]) -> dict[str, Any]:
+    dom = state.get("dom") if isinstance(state.get("dom"), dict) else {}
+    return {
+        "snapshot_mode": dom.get("snapshot_mode"),
+        "degraded_reason": dom.get("degraded_reason"),
+        "css_animation_count": dom.get("css_animation_count"),
+        "css_running_animation_count": dom.get("css_running_animation_count"),
+        "css_animation_samples": (dom.get("css_animation_samples") or [])[:8],
+        "terminal_host_count": dom.get("terminal_host_count"),
+        "active_terminal_host_count": dom.get("active_terminal_host_count"),
+        "sidebar_visible_row_count": dom.get("sidebar_visible_row_count"),
+    }
+
+
 def wait_for_read_only_terminal_settle(
     args: argparse.Namespace,
     report: dict[str, Any],
@@ -165,6 +180,7 @@ def wait_for_read_only_terminal_settle(
             "state_ms": state_result.elapsed_ms,
             "active_session_path": session_path,
             "failures": readiness_failures,
+            "dom_snapshot": dom_snapshot_summary(state_data),
             "drawing": drawing_probe_summary(state_data, session_path),
         }
     ]
@@ -186,6 +202,7 @@ def wait_for_read_only_terminal_settle(
                 "state_ms": next_result.elapsed_ms,
                 "active_session_path": next_session_path,
                 "failures": next_failures,
+                "dom_snapshot": dom_snapshot_summary(next_state),
                 "drawing": drawing_probe_summary(next_state, next_session_path),
             }
         )
@@ -257,6 +274,88 @@ def number_field(value: Any) -> float | None:
         return None
 
 
+def text_has_internal_terminal_transport_leak(value: Any) -> bool:
+    if not isinstance(value, str) or not value.strip():
+        return False
+    lines = [line.strip().lower() for line in value.splitlines() if line.strip()]
+    for line in lines[-12:]:
+        normalized = line.lstrip("›> ").strip()
+        if normalized.startswith("error: terminal session not found: local://"):
+            return True
+        if normalized.startswith("error: terminal session not found: remote-session://"):
+            return True
+        if normalized.startswith("terminal session not found: local://"):
+            return True
+        if normalized.startswith("terminal session not found: remote-session://"):
+            return True
+        if normalized.startswith("shared connection to "):
+            return True
+    return False
+
+
+ANSI_CONTROL_RE = re.compile(
+    r"\x1b\][^\x07]*(?:\x07|\x1b\\)|\x1b\[[0-?]*[ -/]*[@-~]|\x1b[()][A-Za-z0-9]"
+)
+
+
+def strip_terminal_control_sequences(value: Any) -> str:
+    if not isinstance(value, str):
+        return ""
+    normalized = (
+        value.replace("\\x1b", "\x1b")
+        .replace("\\u001b", "\x1b")
+        .replace("\\u{1b}", "\x1b")
+        .replace("\\x07", "\x07")
+    )
+    return ANSI_CONTROL_RE.sub("", normalized)
+
+
+def printable_signal_count(value: Any) -> int:
+    stripped = strip_terminal_control_sequences(value)
+    return sum(1 for ch in stripped if not ch.isspace() and not ord(ch) < 32)
+
+
+def text_looks_like_codex_surface(value: Any) -> bool:
+    if not isinstance(value, str) or not value.strip():
+        return False
+    normalized = strip_terminal_control_sequences(value).lower()
+    return (
+        "openai codex" in normalized
+        or "gpt-" in normalized
+        or "codex" in normalized
+        or "›" in normalized
+    )
+
+
+def text_has_current_codex_input_row(value: Any) -> bool:
+    if not isinstance(value, str) or not value.strip():
+        return False
+    lines = []
+    for raw_line in strip_terminal_control_sequences(value).splitlines():
+        line = raw_line.strip().strip("╭╮╰╯─│ ")
+        if line:
+            lines.append(line)
+    prompt_index = next(
+        (index for index in range(len(lines) - 1, -1, -1) if lines[index].startswith("›")),
+        None,
+    )
+    if prompt_index is None:
+        return False
+    if len(lines) - prompt_index > 5:
+        return False
+    for line in lines[prompt_index + 1 :]:
+        lower = line.lower()
+        if not (
+            "gpt-" in lower
+            or "claude" in lower
+            or lower.startswith("tab to ")
+            or lower.startswith("ctrl")
+            or lower.startswith("esc")
+        ):
+            return False
+    return True
+
+
 def terminal_drawing_probe(state: dict[str, Any], session_path: str) -> dict[str, Any]:
     viewport = active_terminal_viewport(state)
     surface = viewport.get("active_terminal_surface")
@@ -284,15 +383,89 @@ def terminal_drawing_probe(state: dict[str, Any], session_path: str) -> dict[str
             "screen_present": host.get("screen_present"),
             "rows_present": host.get("rows_present"),
             "xterm_renderer_mode": host.get("xterm_renderer_mode"),
+            "xterm_canvas_renderer_requested": host.get("xterm_canvas_renderer_requested"),
+            "canvas_count": host.get("canvas_count"),
+            "visible_canvas_layer_count": host.get("visible_canvas_layer_count"),
+            "hidden_canvas_layer_count": host.get("hidden_canvas_layer_count"),
+            "software_canvas_layer_optimization_active": host.get(
+                "software_canvas_layer_optimization_active"
+            ),
+            "software_canvas_visible_layer_count": host.get("software_canvas_visible_layer_count"),
+            "software_canvas_hidden_layer_count": host.get("software_canvas_hidden_layer_count"),
+            "software_canvas_input_line_overlay_present": host.get(
+                "software_canvas_input_line_overlay_present"
+            ),
+            "software_canvas_input_line_overlay_visible": host.get(
+                "software_canvas_input_line_overlay_visible"
+            ),
+            "software_canvas_cursor_overlay_present": host.get(
+                "software_canvas_cursor_overlay_present"
+            ),
+            "software_canvas_cursor_overlay_visible": host.get(
+                "software_canvas_cursor_overlay_visible"
+            ),
+            "xterm_input_line_decoration_present": host.get(
+                "xterm_input_line_decoration_present"
+            ),
+            "xterm_input_line_decoration_visible": host.get(
+                "xterm_input_line_decoration_visible"
+            ),
+            "xterm_input_line_decoration_line": host.get(
+                "xterm_input_line_decoration_line"
+            ),
+            "xterm_input_line_decoration_width": host.get(
+                "xterm_input_line_decoration_width"
+            ),
+            "xterm_input_line_decoration_background": host.get(
+                "xterm_input_line_decoration_background"
+            ),
+            "xterm_input_line_decoration_error": host.get(
+                "xterm_input_line_decoration_error"
+            ),
+            "xterm_input_line_decoration_disposed": host.get(
+                "xterm_input_line_decoration_disposed"
+            ),
+            "xterm_input_line_decoration_marker_line": host.get(
+                "xterm_input_line_decoration_marker_line"
+            ),
+            "xterm_input_line_decoration_element_visible": host.get(
+                "xterm_input_line_decoration_element_visible"
+            ),
+            "xterm_input_line_decoration_element_background": host.get(
+                "xterm_input_line_decoration_element_background"
+            ),
+            "xterm_input_line_decoration_render_count": host.get(
+                "xterm_input_line_decoration_render_count"
+            ),
+            "software_canvas_layer_optimization_reason": host.get(
+                "software_canvas_layer_optimization_reason"
+            ),
             "input_enabled": host.get("input_enabled"),
             "helper_textarea_focused": host.get("helper_textarea_focused"),
             "terminal_content_source": host.get("terminal_content_source"),
             "retained_replay_source": host.get("retained_replay_source"),
+            "retained_replay_expected": host.get("retained_replay_expected"),
+            "retained_replay_prompt_follow_ready": host.get(
+                "retained_replay_prompt_follow_ready"
+            ),
+            "last_retained_replay_follow_debug": host.get(
+                "last_retained_replay_follow_debug"
+            ),
             "terminal_source_mismatch_reason": host.get("terminal_source_mismatch_reason"),
             "render_health_status": host.get("render_health_status"),
             "render_health_reason": host.get("render_health_reason"),
             "render_health_ink_sample": host.get("render_health_ink_sample"),
             "cursor_line_text": host.get("cursor_line_text") or host.get("cursor_row_text"),
+            "internal_transport_leak": any(
+                text_has_internal_terminal_transport_leak(host.get(key))
+                for key in (
+                    "text_sample",
+                    "text_tail",
+                    "buffer_text_sample",
+                    "cursor_line_text",
+                    "cursor_row_text",
+                )
+            ),
             "cursor_expected_rect": host.get("cursor_expected_rect"),
             "cursor_sample_rect": host.get("cursor_sample_rect"),
             "cursor_row_rect": host.get("cursor_row_rect"),
@@ -310,9 +483,15 @@ def terminal_drawing_probe(state: dict[str, Any], session_path: str) -> dict[str
             "last_render_event_at_ms": host.get("last_render_event_at_ms"),
             "terminal_write_frame_ms": host.get("terminal_write_frame_ms"),
             "terminal_active_write_frame_ms": host.get("terminal_active_write_frame_ms"),
+            "terminal_active_animation_write_frame_ms": host.get(
+                "terminal_active_animation_write_frame_ms"
+            ),
             "effective_terminal_write_frame_ms": host.get("effective_terminal_write_frame_ms"),
             "active_write_frame_budget": host.get("active_write_frame_budget"),
             "recent_frame_like_write_hot": host.get("recent_frame_like_write_hot"),
+            "recent_inline_status_animation_hot": host.get(
+                "recent_inline_status_animation_hot"
+            ),
             "last_raw_payload_length": host.get("last_raw_payload_length"),
             "last_raw_payload_line_count": host.get("last_raw_payload_line_count"),
             "write_command_count": host.get("write_command_count"),
@@ -328,6 +507,13 @@ def terminal_drawing_probe(state: dict[str, Any], session_path: str) -> dict[str
             "low_power_tui_overlay_active": host.get("low_power_tui_overlay_active"),
             "low_power_tui_overlay_present": host.get("low_power_tui_overlay_present"),
             "last_skipped_fit": host.get("last_skipped_fit"),
+            "last_viewport_force_debug": host.get("last_viewport_force_debug"),
+            "input_policy_noop_prompt_follow_count": host.get(
+                "input_policy_noop_prompt_follow_count"
+            ),
+            "last_input_policy_noop_prompt_follow_reason": host.get(
+                "last_input_policy_noop_prompt_follow_reason"
+            ),
         }
     return probe
 
@@ -336,6 +522,7 @@ def collect_terminal_readiness_failures(state: dict[str, Any], session_path: str
     failures: list[str] = []
     viewport = active_terminal_viewport(state)
     shell = state.get("shell") if isinstance(state.get("shell"), dict) else {}
+    runtime_truth = state.get("runtime_truth") if isinstance(state.get("runtime_truth"), dict) else {}
     active_session = state.get("active_session_path") or viewport.get("active_session_path")
     if isinstance(active_session, str) and active_session and active_session != session_path:
         failures.append(
@@ -346,6 +533,12 @@ def collect_terminal_readiness_failures(state: dict[str, Any], session_path: str
         failures.append(f"terminal attach still in flight for {session_path}")
     if viewport.get("active_view_mode") != "Terminal":
         failures.append(f"active view is {viewport.get('active_view_mode')!r}, not Terminal")
+    if (
+        session_path.startswith("remote-session://")
+        and viewport.get("active_view_mode") == "Terminal"
+        and runtime_truth.get("active_runtime_present") is False
+    ):
+        failures.append("active remote terminal has no daemon runtime")
     if viewport.get("ready") is not True:
         failures.append(f"terminal viewport not ready: {viewport.get('reason') or 'unknown reason'}")
     if viewport.get("interactive") is not True:
@@ -394,6 +587,118 @@ def collect_terminal_readiness_failures(state: dict[str, Any], session_path: str
             failures.append(f"active terminal cursor overflows prompt band by {cursor_overflow:.1f}px")
         if host.get("scrollback_locked") is True:
             failures.append("active terminal host is scrollback-locked away from the live cursor")
+        if any(
+            text_has_internal_terminal_transport_leak(host.get(key))
+            for key in (
+                "text_sample",
+                "text_tail",
+                "buffer_text_sample",
+                "cursor_line_text",
+                "cursor_row_text",
+            )
+        ):
+            failures.append("active terminal host is showing leaked internal transport output")
+        prompt_band = {}
+        surface_timing = {}
+        surface_content_source = ""
+        if isinstance(surface, dict):
+            if isinstance(surface.get("prompt_band"), dict):
+                prompt_band = surface.get("prompt_band") or {}
+            if isinstance(surface.get("timing"), dict):
+                surface_timing = surface.get("timing") or {}
+            surface_content_source = str(surface.get("content_source") or "")
+        visible_terminal_text = "\n".join(
+            str(host.get(key) or "")
+            for key in (
+                "text_sample",
+                "text_tail",
+                "buffer_text_sample",
+                "cursor_line_text",
+                "cursor_row_text",
+            )
+        )
+        cursor_line_text = str(
+            host.get("cursor_line_text")
+            or host.get("cursor_row_text")
+            or prompt_band.get("cursor_line_text")
+            or ""
+        )
+        last_raw_payload_sample = str(
+            host.get("last_raw_payload_sample")
+            or prompt_band.get("last_raw_payload_sample")
+            or ""
+        )
+        last_raw_payload_line_count = number_field(
+            host.get("last_raw_payload_line_count")
+            if host.get("last_raw_payload_line_count") is not None
+            else surface_timing.get("last_raw_payload_line_count")
+        )
+        content_source = str(host.get("terminal_content_source") or surface_content_source)
+        scrollback_expected = (
+            host.get("scrollback_expected") is True
+            or prompt_band.get("scrollback_expected") is True
+            or number_field(host.get("base_y") or prompt_band.get("base_y")) not in (None, 0)
+        )
+        normalized_visible_text = " ".join(visible_terminal_text.lower().split())
+        if (
+            session_path.startswith("remote-session://")
+            and (
+                "to continue this session, run codex resume" in normalized_visible_text
+                or "run codex resume " in normalized_visible_text
+            )
+        ):
+            failures.append(
+                "active remote Codex runtime has exited and is showing a resume instruction"
+            )
+        if (
+            session_path.startswith("remote-session://")
+            and host.get("input_enabled") is True
+            and content_source in {"daemon_pty", "daemon_terminal_read", "active_recovery_pty_snapshot"}
+            and (scrollback_expected or text_looks_like_codex_surface(visible_terminal_text))
+            and not cursor_line_text.strip()
+            and (last_raw_payload_line_count is None or last_raw_payload_line_count == 0)
+            and printable_signal_count(last_raw_payload_sample) < 3
+        ):
+            failures.append(
+                "active remote Codex surface has stale scrollback but no current prompt text"
+            )
+        if (
+            session_path.startswith("remote-session://")
+            and content_source in {"daemon_pty", "daemon_terminal_read", "active_recovery_pty_snapshot"}
+            and text_looks_like_codex_surface(visible_terminal_text)
+            and not cursor_line_text.strip()
+            and not text_has_current_codex_input_row(visible_terminal_text)
+        ):
+            failures.append(
+                "active remote Codex surface has no current input row"
+            )
+        base_y = number_field(host.get("base_y"))
+        viewport_y = number_field(host.get("viewport_y"))
+        retained_prompt_follow = (
+            (host.get("retained_replay_expected") is True or host.get("scrollback_expected") is True)
+            and str(host.get("scrollback_intent") or "PromptFollow") != "UserScrollback"
+        )
+        if (
+            retained_prompt_follow
+            and base_y is not None
+            and viewport_y is not None
+            and base_y > 0
+            and viewport_y < base_y
+        ):
+            failures.append(
+                "retained replay prompt-follow viewport did not reach the live cursor: "
+                f"viewport_y={viewport_y:.0f} base_y={base_y:.0f} "
+                f"follow={host.get('last_retained_replay_follow_debug')!r} "
+                f"force={host.get('last_viewport_force_debug')!r}"
+            )
+        if (
+            retained_prompt_follow
+            and host.get("retained_replay_source")
+            and host.get("retained_replay_prompt_follow_ready") is False
+        ):
+            failures.append(
+                "retained replay did not report prompt-follow readiness after restore"
+            )
         active_visible_terminal = (
             host.get("input_enabled") is True
             and host.get("viewport_present") is True
@@ -406,7 +711,7 @@ def collect_terminal_readiness_failures(state: dict[str, Any], session_path: str
                 failures.append("active visible terminal is not using the active write frame budget")
             if effective_frame_ms is None:
                 failures.append("active visible terminal does not expose effective write frame budget")
-            elif effective_frame_ms > 750.0:
+            elif effective_frame_ms > 220.0:
                 failures.append(
                     f"active visible terminal write frame budget is too slow: {effective_frame_ms:.0f}ms"
                 )
@@ -418,6 +723,19 @@ def collect_terminal_readiness_failures(state: dict[str, Any], session_path: str
                 failures.append(
                     "active visible terminal is using background write budget "
                     f"({effective_frame_ms:.0f}ms > active {active_frame_ms:.0f}ms)"
+                )
+            animation_frame_ms = number_field(
+                host.get("terminal_active_animation_write_frame_ms")
+            )
+            if (
+                host.get("recent_inline_status_animation_hot") is True
+                and animation_frame_ms is not None
+                and effective_frame_ms is not None
+                and effective_frame_ms > animation_frame_ms + 5.0
+            ):
+                failures.append(
+                    "active Codex inline status animation is using a slow write budget "
+                    f"({effective_frame_ms:.0f}ms > animation {animation_frame_ms:.0f}ms)"
                 )
         cursor_rect = host.get("cursor_expected_rect")
         viewport_rect = host.get("viewport_rect")
@@ -574,6 +892,50 @@ def sample_proc_cpu_ticks(args: argparse.Namespace, pids: list[int]) -> dict[str
     return payload if isinstance(payload, dict) else None
 
 
+def sample_proc_thread_cpu_ticks(args: argparse.Namespace, pids: list[int]) -> dict[str, Any] | None:
+    if not pids:
+        return None
+    pid_list = ",".join(str(int(pid)) for pid in pids)
+    script = (
+        "python3 - <<'PY'\n"
+        "import json, os\n"
+        f"pids=[int(part) for part in {pid_list!r}.split(',') if part]\n"
+        "def read_total():\n"
+        "    return sum(int(part) for part in open('/proc/stat').readline().split()[1:])\n"
+        "rows=[]\n"
+        "for pid in pids:\n"
+        "    task_dir=f'/proc/{pid}/task'\n"
+        "    try:\n"
+        "        tids=[name for name in os.listdir(task_dir) if name.isdigit()]\n"
+        "    except Exception:\n"
+        "        continue\n"
+        "    for tid in tids:\n"
+        "        try:\n"
+        "            stat=open(f'{task_dir}/{tid}/stat').read().rsplit(')',1)[1].split()\n"
+        "            comm=open(f'{task_dir}/{tid}/comm').read().strip()\n"
+        "            rows.append({'pid': pid, 'tid': int(tid), 'ticks': int(stat[11]) + int(stat[12]), 'comm': comm})\n"
+        "        except Exception as error:\n"
+        "            rows.append({'pid': pid, 'tid': int(tid), 'error': str(error)})\n"
+        "print(json.dumps({'total_ticks': read_total(), 'cpu_count': os.cpu_count() or 1, 'threads': rows}))\n"
+        "PY"
+    )
+    cmd = ["ssh", args.host, script] if args.host else ["bash", "-lc", script]
+    proc = subprocess.run(
+        cmd,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=args.command_timeout_sec,
+    )
+    if proc.returncode != 0:
+        return {"error": proc.stderr.strip() or proc.stdout.strip()}
+    try:
+        payload = json.loads(proc.stdout)
+    except json.JSONDecodeError as error:
+        return {"error": f"proc thread CPU sample JSON error: {error}"}
+    return payload if isinstance(payload, dict) else None
+
+
 def host_counter(host: dict[str, Any], key: str) -> int:
     try:
         return int(host.get(key) or 0)
@@ -620,26 +982,95 @@ def read_only_counter_sample(
     app_cpu: dict[str, Any] | None,
     webkit_children: list[dict[str, Any]],
     proc_cpu: dict[str, Any] | None,
+    proc_thread_cpu: dict[str, Any] | None,
     elapsed_ms: float,
 ) -> dict[str, Any]:
     host = active_terminal_host(active_terminal_viewport(state), session_path)
+    browser_metrics = state.get("browser", {}).get("metrics", {})
     app_cpu_percent = process_cpu_percent(app_cpu)
     webkit_cpu = webkit_cpu_percent(webkit_children)
     return {
         "elapsed_ms": elapsed_ms,
         "state_ms": result.elapsed_ms,
         "active_session_path": state.get("active_session_path"),
+        "root_render_count": host_counter(browser_metrics, "root_render_count"),
+        "browser_rebuild_count": host_counter(browser_metrics, "rebuild_count"),
+        "browser_row_count": host_counter(browser_metrics, "row_count"),
+        "terminal_host_count": host_counter(state, "terminal_host_count"),
+        "active_terminal_host_count": host_counter(state, "active_terminal_host_count"),
+        "css_animation_count": host_counter(state.get("dom", {}), "css_animation_count"),
+        "css_running_animation_count": host_counter(
+            state.get("dom", {}),
+            "css_running_animation_count",
+        ),
+        "css_animation_samples": (state.get("dom", {}).get("css_animation_samples") or [])[:8],
         "render_event_count": host_counter(host, "render_event_count"),
         "write_bridge_flush_count": host_counter(host, "write_bridge_flush_count"),
         "write_command_count": host_counter(host, "write_command_count"),
         "manual_redraw_count": host_counter(host, "manual_redraw_count"),
         "forced_refresh_count": host_counter(host, "forced_refresh_count"),
         "forced_refresh_skipped_count": host_counter(host, "forced_refresh_skipped_count"),
+        "input_policy_apply_count": host_counter(host, "input_policy_apply_count"),
+        "input_policy_noop_count": host_counter(host, "input_policy_noop_count"),
+        "input_policy_noop_prompt_follow_count": host_counter(
+            host,
+            "input_policy_noop_prompt_follow_count",
+        ),
+        "last_input_policy_reason": host.get("last_input_policy_reason"),
         "effective_terminal_write_frame_ms": number_field(host.get("effective_terminal_write_frame_ms")),
+        "terminal_active_animation_write_frame_ms": number_field(
+            host.get("terminal_active_animation_write_frame_ms")
+        ),
         "active_write_frame_budget": host.get("active_write_frame_budget"),
+        "recent_inline_status_animation_hot": host.get("recent_inline_status_animation_hot"),
+        "xterm_renderer_mode": host.get("xterm_renderer_mode"),
+        "xterm_canvas_renderer_requested": host.get("xterm_canvas_renderer_requested"),
+        "canvas_count": host_counter(host, "canvas_count"),
+        "visible_canvas_layer_count": number_field(host.get("visible_canvas_layer_count")),
+        "hidden_canvas_layer_count": number_field(host.get("hidden_canvas_layer_count")),
+        "software_canvas_layer_optimization_active": host.get(
+            "software_canvas_layer_optimization_active"
+        ),
+        "software_canvas_visible_layer_count": number_field(
+            host.get("software_canvas_visible_layer_count")
+        ),
+        "software_canvas_hidden_layer_count": number_field(
+            host.get("software_canvas_hidden_layer_count")
+        ),
+        "software_canvas_input_line_overlay_visible": host.get(
+            "software_canvas_input_line_overlay_visible"
+        ),
+        "software_canvas_cursor_overlay_visible": host.get(
+            "software_canvas_cursor_overlay_visible"
+        ),
+        "xterm_input_line_decoration_visible": host.get(
+            "xterm_input_line_decoration_visible"
+        ),
+        "xterm_input_line_decoration_width": host.get(
+            "xterm_input_line_decoration_width"
+        ),
+        "xterm_input_line_decoration_error": host.get(
+            "xterm_input_line_decoration_error"
+        ),
+        "xterm_input_line_decoration_disposed": host.get(
+            "xterm_input_line_decoration_disposed"
+        ),
+        "xterm_input_line_decoration_marker_line": host.get(
+            "xterm_input_line_decoration_marker_line"
+        ),
+        "xterm_input_line_decoration_element_visible": host.get(
+            "xterm_input_line_decoration_element_visible"
+        ),
+        "xterm_input_line_decoration_element_background": host.get(
+            "xterm_input_line_decoration_element_background"
+        ),
+        "xterm_input_line_decoration_render_count": host.get(
+            "xterm_input_line_decoration_render_count"
+        ),
         "app_cpu": app_cpu,
         "webkit_children": webkit_children,
         "proc_cpu": proc_cpu,
+        "proc_thread_cpu": proc_thread_cpu,
         "app_cpu_percent": app_cpu_percent,
         "webkit_cpu_percent": webkit_cpu,
         "combined_cpu_percent": app_cpu_percent + webkit_cpu,
@@ -679,6 +1110,72 @@ def proc_cpu_interval_percent(
     return 100.0 * float(tick_delta) * float(cpu_count) / float(total_delta)
 
 
+def proc_thread_cpu_interval_rows(
+    before: dict[str, Any],
+    after: dict[str, Any],
+    limit: int = 8,
+) -> list[dict[str, Any]]:
+    before_threads = (
+        before.get("proc_thread_cpu")
+        if isinstance(before.get("proc_thread_cpu"), dict)
+        else None
+    )
+    after_threads = (
+        after.get("proc_thread_cpu")
+        if isinstance(after.get("proc_thread_cpu"), dict)
+        else None
+    )
+    if not before_threads or not after_threads:
+        return []
+    try:
+        total_delta = int(after_threads["total_ticks"]) - int(before_threads["total_ticks"])
+        cpu_count = int(after_threads.get("cpu_count") or before_threads.get("cpu_count") or 1)
+    except (KeyError, TypeError, ValueError):
+        return []
+    if total_delta <= 0:
+        return []
+    before_rows = before_threads.get("threads")
+    after_rows = after_threads.get("threads")
+    if not isinstance(before_rows, list) or not isinstance(after_rows, list):
+        return []
+    before_by_key: dict[tuple[int, int], dict[str, Any]] = {}
+    for row in before_rows:
+        if not isinstance(row, dict):
+            continue
+        pid = pid_int(row.get("pid"))
+        tid = pid_int(row.get("tid"))
+        if pid is not None and tid is not None:
+            before_by_key[(pid, tid)] = row
+    deltas: list[dict[str, Any]] = []
+    for row in after_rows:
+        if not isinstance(row, dict):
+            continue
+        pid = pid_int(row.get("pid"))
+        tid = pid_int(row.get("tid"))
+        if pid is None or tid is None:
+            continue
+        before_row = before_by_key.get((pid, tid))
+        if not isinstance(before_row, dict):
+            continue
+        try:
+            tick_delta = int(row["ticks"]) - int(before_row["ticks"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if tick_delta <= 0:
+            continue
+        deltas.append(
+            {
+                "pid": pid,
+                "tid": tid,
+                "comm": row.get("comm") or before_row.get("comm"),
+                "cpu_percent": 100.0 * float(tick_delta) * float(cpu_count) / float(total_delta),
+                "tick_delta": tick_delta,
+            }
+        )
+    deltas.sort(key=lambda row: float(row.get("cpu_percent") or 0.0), reverse=True)
+    return deltas[:limit]
+
+
 def collect_read_only_activity(
     args: argparse.Namespace,
     session_path: str,
@@ -701,6 +1198,7 @@ def collect_read_only_activity(
             if child_pid is not None:
                 sample_pids.append(child_pid)
         proc_cpu = sample_proc_cpu_ticks(args, sample_pids)
+        proc_thread_cpu = sample_proc_thread_cpu_ticks(args, sample_pids)
         elapsed_ms = (time.perf_counter() - started) * 1000.0
         samples.append(
             read_only_counter_sample(
@@ -710,6 +1208,7 @@ def collect_read_only_activity(
                 app_cpu,
                 webkit_children,
                 proc_cpu,
+                proc_thread_cpu,
                 elapsed_ms,
             )
         )
@@ -720,6 +1219,11 @@ def collect_read_only_activity(
     last = samples[-1]
     elapsed_sec = max(0.001, (last["elapsed_ms"] - first["elapsed_ms"]) / 1000.0)
     render_delta = max(0, int(last["render_event_count"]) - int(first["render_event_count"]))
+    root_render_delta = max(0, int(last["root_render_count"]) - int(first["root_render_count"]))
+    browser_rebuild_delta = max(
+        0,
+        int(last["browser_rebuild_count"]) - int(first["browser_rebuild_count"]),
+    )
     flush_delta = max(
         0,
         int(last["write_bridge_flush_count"]) - int(first["write_bridge_flush_count"]),
@@ -732,6 +1236,19 @@ def collect_read_only_activity(
     forced_refresh_delta = max(
         0,
         int(last["forced_refresh_count"]) - int(first["forced_refresh_count"]),
+    )
+    input_policy_apply_delta = max(
+        0,
+        int(last["input_policy_apply_count"]) - int(first["input_policy_apply_count"]),
+    )
+    input_policy_noop_delta = max(
+        0,
+        int(last["input_policy_noop_count"]) - int(first["input_policy_noop_count"]),
+    )
+    input_policy_noop_prompt_follow_delta = max(
+        0,
+        int(last["input_policy_noop_prompt_follow_count"])
+        - int(first["input_policy_noop_prompt_follow_count"]),
     )
     combined_cpu_values = [
         float(sample["combined_cpu_percent"])
@@ -751,6 +1268,8 @@ def collect_read_only_activity(
     app_current_cpu_values: list[float] = []
     webkit_current_cpu_values: list[float] = []
     combined_current_cpu_values: list[float] = []
+    thread_cpu_interval_samples: list[dict[str, Any]] = []
+    thread_cpu_values: list[float] = []
     for before, after in zip(samples, samples[1:]):
         app_pid = pid_int((after.get("app_cpu") or {}).get("pid")) if isinstance(after.get("app_cpu"), dict) else None
         child_pids = [
@@ -774,6 +1293,19 @@ def collect_read_only_activity(
             value = proc_cpu_interval_percent(before, after, combined_pids)
             if value is not None:
                 combined_current_cpu_values.append(value)
+        top_threads = proc_thread_cpu_interval_rows(before, after)
+        if top_threads:
+            thread_cpu_interval_samples.append(
+                {
+                    "elapsed_ms": after.get("elapsed_ms"),
+                    "top_threads": top_threads,
+                }
+            )
+            thread_cpu_values.extend(
+                float(row["cpu_percent"])
+                for row in top_threads
+                if isinstance(row.get("cpu_percent"), (int, float))
+            )
     app_current_cpu_max = max(app_current_cpu_values) if app_current_cpu_values else None
     webkit_current_cpu_max = max(webkit_current_cpu_values) if webkit_current_cpu_values else None
     combined_current_cpu_max = (
@@ -783,22 +1315,98 @@ def collect_read_only_activity(
         "sample_count": sample_count,
         "elapsed_sec": elapsed_sec,
         "samples": samples,
+        "root_render_delta": root_render_delta,
+        "browser_rebuild_delta": browser_rebuild_delta,
         "render_event_delta": render_delta,
         "write_bridge_flush_delta": flush_delta,
         "write_command_delta": write_delta,
         "manual_redraw_delta": manual_redraw_delta,
         "forced_refresh_delta": forced_refresh_delta,
+        "input_policy_apply_delta": input_policy_apply_delta,
+        "input_policy_noop_delta": input_policy_noop_delta,
+        "input_policy_noop_prompt_follow_delta": input_policy_noop_prompt_follow_delta,
+        "root_renders_per_sec": root_render_delta / elapsed_sec,
+        "browser_rebuilds_per_sec": browser_rebuild_delta / elapsed_sec,
         "render_events_per_sec": render_delta / elapsed_sec,
         "write_flushes_per_sec": flush_delta / elapsed_sec,
         "write_commands_per_sec": write_delta / elapsed_sec,
         "manual_redraws_per_sec": manual_redraw_delta / elapsed_sec,
         "forced_refreshes_per_sec": forced_refresh_delta / elapsed_sec,
+        "input_policy_applies_per_sec": input_policy_apply_delta / elapsed_sec,
+        "input_policy_noops_per_sec": input_policy_noop_delta / elapsed_sec,
+        "input_policy_noop_prompt_follows_per_sec": input_policy_noop_prompt_follow_delta
+        / elapsed_sec,
         "combined_cpu_max_percent": max(combined_cpu_values) if combined_cpu_values else None,
         "app_cpu_max_percent": max(app_cpu_values) if app_cpu_values else None,
         "webkit_cpu_max_percent": max(webkit_cpu_values) if webkit_cpu_values else None,
         "combined_cpu_current_max_percent": combined_current_cpu_max,
         "app_cpu_current_max_percent": app_current_cpu_max,
         "webkit_cpu_current_max_percent": webkit_current_cpu_max,
+        "thread_cpu_current_max_percent": max(thread_cpu_values) if thread_cpu_values else None,
+        "thread_cpu_interval_samples": thread_cpu_interval_samples,
+    }
+
+
+def collect_passive_cpu_activity(
+    args: argparse.Namespace,
+    sample_ms: float,
+) -> dict[str, Any]:
+    """Sample GUI/WebKit CPU without app-control state probes in the interval."""
+    app_before = sample_process_cpu(args)
+    webkit_before = sample_webkit_child_cpu(args)
+    app_pid = pid_int(app_before.get("pid")) if isinstance(app_before, dict) else None
+    child_pids = [
+        pid
+        for pid in (
+            pid_int(child.get("pid")) if isinstance(child, dict) else None
+            for child in webkit_before
+        )
+        if pid is not None
+    ]
+    pids = ([app_pid] if app_pid is not None else []) + child_pids
+    before = {
+        "proc_cpu": sample_proc_cpu_ticks(args, pids),
+        "proc_thread_cpu": sample_proc_thread_cpu_ticks(args, pids),
+    }
+    sleep_sec = max(0.25, sample_ms / 1000.0)
+    started = time.perf_counter()
+    time.sleep(sleep_sec)
+    elapsed_ms = (time.perf_counter() - started) * 1000.0
+    app_after = sample_process_cpu(args)
+    webkit_after = sample_webkit_child_cpu(args)
+    after = {
+        "proc_cpu": sample_proc_cpu_ticks(args, pids),
+        "proc_thread_cpu": sample_proc_thread_cpu_ticks(args, pids),
+    }
+    app_current = (
+        proc_cpu_interval_percent(before, after, [app_pid])
+        if app_pid is not None
+        else None
+    )
+    webkit_current = (
+        proc_cpu_interval_percent(before, after, child_pids) if child_pids else None
+    )
+    combined_current = proc_cpu_interval_percent(before, after, pids) if pids else None
+    top_threads = proc_thread_cpu_interval_rows(before, after)
+    return {
+        "elapsed_ms": elapsed_ms,
+        "app_cpu_before": app_before,
+        "app_cpu_after": app_after,
+        "webkit_children_before": webkit_before,
+        "webkit_children_after": webkit_after,
+        "sample_pids": pids,
+        "app_cpu_current_percent": app_current,
+        "webkit_cpu_current_percent": webkit_current,
+        "combined_cpu_current_percent": combined_current,
+        "thread_cpu_current_max_percent": max(
+            (
+                float(row["cpu_percent"])
+                for row in top_threads
+                if isinstance(row.get("cpu_percent"), (int, float))
+            ),
+            default=None,
+        ),
+        "top_threads": top_threads,
     }
 
 
@@ -853,6 +1461,15 @@ def main() -> int:
         default=1000.0,
         help="Interval between read-only churn samples.",
     )
+    parser.add_argument(
+        "--read-only-passive-cpu-ms",
+        type=float,
+        default=3000.0,
+        help=(
+            "CPU interval for --read-only-drawing with no app-control state probes; "
+            "this is the fan-budget sample."
+        ),
+    )
     parser.add_argument("--clear-after", action="store_true", help="Send Ctrl+U after terminal samples.")
     parser.add_argument(
         "--clear-every-samples",
@@ -879,8 +1496,22 @@ def main() -> int:
     parser.add_argument("--max-render-events-per-sample", type=float, default=18.0)
     parser.add_argument("--max-write-flushes-per-sample", type=float, default=4.0)
     parser.add_argument("--max-read-only-render-events-per-sec", type=float, default=3.0)
+    parser.add_argument("--max-read-only-root-renders-per-sec", type=float, default=3.0)
     parser.add_argument("--max-read-only-write-flushes-per-sec", type=float, default=1.5)
+    parser.add_argument(
+        "--max-read-only-input-policy-applies",
+        type=int,
+        default=1,
+        help="Maximum active-host input-policy reapplications allowed during read-only idle sampling.",
+    )
+    parser.add_argument(
+        "--max-read-only-noop-prompt-follows",
+        type=int,
+        default=1,
+        help="Maximum no-op prompt-follow cursor repairs allowed during read-only idle sampling.",
+    )
     parser.add_argument("--max-read-only-combined-cpu-percent", type=float, default=25.0)
+    parser.add_argument("--max-read-only-thread-cpu-percent", type=float, default=80.0)
     parser.add_argument("--max-app-cpu-percent", type=float, default=65.0)
     parser.add_argument("--skip-scroll-check", action="store_true")
     parser.add_argument("--skip-readiness-gate", action="store_true")
@@ -903,8 +1534,12 @@ def main() -> int:
             "render_events_per_sample": args.max_render_events_per_sample,
             "write_flushes_per_sample": args.max_write_flushes_per_sample,
             "read_only_render_events_per_sec": args.max_read_only_render_events_per_sec,
+            "read_only_root_renders_per_sec": args.max_read_only_root_renders_per_sec,
             "read_only_write_flushes_per_sec": args.max_read_only_write_flushes_per_sec,
+            "read_only_input_policy_applies": args.max_read_only_input_policy_applies,
+            "read_only_noop_prompt_follows": args.max_read_only_noop_prompt_follows,
             "read_only_combined_cpu_percent": args.max_read_only_combined_cpu_percent,
+            "read_only_thread_cpu_percent": args.max_read_only_thread_cpu_percent,
             "app_cpu_percent": args.max_app_cpu_percent,
         },
         "measurements": {},
@@ -916,6 +1551,7 @@ def main() -> int:
 
     state_result = run_json(args, "state", app_args(args, "state"))
     state_data = data_from(state_result)
+    report["dom_snapshot"] = dom_snapshot_summary(state_data)
     session_path = args.session_path or active_session_from_state(state_data)
     report["active_session_path"] = session_path
     report["measurements"]["initial_state_ms"] = state_result.elapsed_ms
@@ -934,6 +1570,7 @@ def main() -> int:
     )
     report["active_session_path"] = session_path
     report["measurements"]["state_ms"] = state_result.elapsed_ms
+    report["dom_snapshot"] = dom_snapshot_summary(state_data)
     report["terminal_readiness"] = {
         "ok": not readiness_failures,
         "failures": readiness_failures,
@@ -959,10 +1596,33 @@ def main() -> int:
                 screenshot_data,
                 session_path,
             )
+        passive_cpu_activity = collect_passive_cpu_activity(
+            args,
+            args.read_only_passive_cpu_ms,
+        )
+        report["read_only_passive_cpu_activity"] = passive_cpu_activity
+        report["measurements"]["read_only_passive_combined_cpu_current_percent"] = (
+            passive_cpu_activity.get("combined_cpu_current_percent")
+        )
+        report["measurements"]["read_only_passive_app_cpu_current_percent"] = (
+            passive_cpu_activity.get("app_cpu_current_percent")
+        )
+        report["measurements"]["read_only_passive_webkit_cpu_current_percent"] = (
+            passive_cpu_activity.get("webkit_cpu_current_percent")
+        )
+        report["measurements"]["read_only_passive_thread_cpu_current_max_percent"] = (
+            passive_cpu_activity.get("thread_cpu_current_max_percent")
+        )
         read_only_activity = collect_read_only_activity(args, session_path)
         report["read_only_activity"] = read_only_activity
         report["measurements"]["read_only_render_events_per_sec"] = read_only_activity[
             "render_events_per_sec"
+        ]
+        report["measurements"]["read_only_root_renders_per_sec"] = read_only_activity[
+            "root_renders_per_sec"
+        ]
+        report["measurements"]["read_only_browser_rebuilds_per_sec"] = read_only_activity[
+            "browser_rebuilds_per_sec"
         ]
         report["measurements"]["read_only_write_flushes_per_sec"] = read_only_activity[
             "write_flushes_per_sec"
@@ -970,6 +1630,24 @@ def main() -> int:
         report["measurements"]["read_only_write_commands_per_sec"] = read_only_activity[
             "write_commands_per_sec"
         ]
+        report["measurements"]["read_only_input_policy_apply_delta"] = read_only_activity[
+            "input_policy_apply_delta"
+        ]
+        report["measurements"]["read_only_input_policy_applies_per_sec"] = read_only_activity[
+            "input_policy_applies_per_sec"
+        ]
+        report["measurements"]["read_only_input_policy_noop_delta"] = read_only_activity[
+            "input_policy_noop_delta"
+        ]
+        report["measurements"]["read_only_input_policy_noops_per_sec"] = read_only_activity[
+            "input_policy_noops_per_sec"
+        ]
+        report["measurements"]["read_only_input_policy_noop_prompt_follow_delta"] = (
+            read_only_activity["input_policy_noop_prompt_follow_delta"]
+        )
+        report["measurements"]["read_only_input_policy_noop_prompt_follows_per_sec"] = (
+            read_only_activity["input_policy_noop_prompt_follows_per_sec"]
+        )
         report["measurements"]["read_only_combined_cpu_max_percent"] = read_only_activity[
             "combined_cpu_max_percent"
         ]
@@ -988,6 +1666,38 @@ def main() -> int:
         report["measurements"]["read_only_webkit_cpu_current_max_percent"] = read_only_activity[
             "webkit_cpu_current_max_percent"
         ]
+        report["measurements"]["read_only_thread_cpu_current_max_percent"] = read_only_activity[
+            "thread_cpu_current_max_percent"
+        ]
+        drawing_host = (
+            report.get("terminal_drawing", {}).get("host", {})
+            if isinstance(report.get("terminal_drawing"), dict)
+            else {}
+        )
+        if (
+            isinstance(drawing_host, dict)
+            and drawing_host.get("xterm_canvas_renderer_requested") is True
+            and drawing_host.get("xterm_renderer_mode") == "canvas"
+        ):
+            if drawing_host.get("software_canvas_layer_optimization_active") is not True:
+                report["failures"].append(
+                    "read-only canvas renderer idle optimization is not active"
+                )
+            visible_layers = number_field(drawing_host.get("visible_canvas_layer_count"))
+            if visible_layers is not None and visible_layers > 2:
+                report["failures"].append(
+                    "read-only canvas renderer has too many visible full-viewport layers: "
+                    f"{visible_layers:.0f} > 2"
+                )
+        if (
+            read_only_activity["root_renders_per_sec"]
+            > args.max_read_only_root_renders_per_sec
+        ):
+            report["failures"].append(
+                "read-only root render churn: "
+                f"{read_only_activity['root_renders_per_sec']:.2f} root renders/sec "
+                f"> {args.max_read_only_root_renders_per_sec:.2f}"
+            )
         if (
             read_only_activity["render_events_per_sec"]
             > args.max_read_only_render_events_per_sec
@@ -1006,8 +1716,31 @@ def main() -> int:
                 f"{read_only_activity['write_flushes_per_sec']:.2f} flushes/sec "
                 f"> {args.max_read_only_write_flushes_per_sec:.2f}"
             )
-        combined_cpu = read_only_activity.get("combined_cpu_current_max_percent")
-        cpu_sample_kind = "current"
+        if (
+            read_only_activity["write_command_delta"] == 0
+            and read_only_activity["input_policy_apply_delta"]
+            > args.max_read_only_input_policy_applies
+        ):
+            report["failures"].append(
+                "read-only input-policy churn without terminal writes: "
+                f"{read_only_activity['input_policy_apply_delta']} applies "
+                f"> {args.max_read_only_input_policy_applies}"
+            )
+        if (
+            read_only_activity["write_command_delta"] == 0
+            and read_only_activity["input_policy_noop_prompt_follow_delta"]
+            > args.max_read_only_noop_prompt_follows
+        ):
+            report["failures"].append(
+                "read-only no-op prompt-follow churn without terminal writes: "
+                f"{read_only_activity['input_policy_noop_prompt_follow_delta']} repairs "
+                f"> {args.max_read_only_noop_prompt_follows}"
+            )
+        combined_cpu = passive_cpu_activity.get("combined_cpu_current_percent")
+        cpu_sample_kind = "passive"
+        if not isinstance(combined_cpu, (int, float)):
+            combined_cpu = read_only_activity.get("combined_cpu_current_max_percent")
+            cpu_sample_kind = "state-probe-current"
         if not isinstance(combined_cpu, (int, float)):
             combined_cpu = read_only_activity.get("combined_cpu_max_percent")
             cpu_sample_kind = "lifetime"
@@ -1018,6 +1751,15 @@ def main() -> int:
             report["failures"].append(
                 f"read-only combined GUI/WebKit CPU ({cpu_sample_kind}): "
                 f"{combined_cpu:.1f}% > {args.max_read_only_combined_cpu_percent:.1f}%"
+            )
+        thread_cpu = read_only_activity.get("thread_cpu_current_max_percent")
+        if (
+            isinstance(thread_cpu, (int, float))
+            and thread_cpu > args.max_read_only_thread_cpu_percent
+        ):
+            report["failures"].append(
+                "read-only single-thread GUI/WebKit CPU: "
+                f"{thread_cpu:.1f}% > {args.max_read_only_thread_cpu_percent:.1f}%"
             )
         budget_check(report, "state", state_result.elapsed_ms, args.max_state_ms)
         budget_check(report, "rows", rows_result.elapsed_ms, args.max_rows_ms)

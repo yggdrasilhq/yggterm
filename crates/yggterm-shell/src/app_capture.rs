@@ -7,6 +7,8 @@ use std::fs;
 #[cfg(target_os = "linux")]
 use std::fs::File;
 use std::path::{Path, PathBuf};
+use std::thread;
+use std::time::{Duration, Instant};
 use tao::dpi::{LogicalSize, PhysicalPosition};
 use yggterm_server::ScreenshotTarget;
 
@@ -36,12 +38,12 @@ use windows::core::Result as WindowsResult;
 use wry::WebViewExtUnix;
 #[cfg(target_os = "windows")]
 use wry::WebViewExtWindows;
-#[cfg(target_os = "linux")]
-use yggterm_platform::capture_linux_x11_window_screenshot;
 #[cfg(target_os = "windows")]
 use yggterm_platform::capture_windows_hwnd_screenshot;
 #[cfg(target_os = "windows")]
 use yggterm_platform::capture_windows_window_screenshot;
+#[cfg(target_os = "linux")]
+use yggterm_platform::{capture_linux_x11_window_screenshot, focus_linux_x11_window};
 #[cfg(target_os = "macos")]
 use yggterm_platform::{
     capture_macos_screen_rect_screencapture, capture_macos_window_cg_screenshot,
@@ -118,10 +120,69 @@ pub fn focus_app_window(desktop: &DesktopContext) -> Result<Value> {
     desktop.set_always_on_bottom(false);
     desktop.set_visible(true);
     desktop.set_minimized(false);
-    desktop.set_focus();
+    let started = Instant::now();
+    let mut attempts = Vec::new();
+    let mut last_x11_active = false;
+    let mut last_x11_window_id = None::<String>;
+    let mut last_x11_active_window_id = None::<String>;
+    for attempt in 1..=10 {
+        let mut focus_backend = "tao";
+        let mut x11_window_id = None::<String>;
+        let mut x11_active_window_id = None::<String>;
+        let mut x11_active = false;
+        let mut x11_focus_error = None::<String>;
+        #[cfg(target_os = "linux")]
+        {
+            use gtk::prelude::*;
+
+            let gtk_window = desktop.gtk_window();
+            gtk_window.present();
+            if let Some(gdk_window) = gtk_window.window() {
+                gdk_window.raise();
+            }
+            match focus_linux_x11_window(std::process::id()) {
+                Ok(result) => {
+                    focus_backend = "x11_xdotool";
+                    x11_active = result.active;
+                    x11_active_window_id = result.active_window_id;
+                    x11_window_id = Some(result.window_id);
+                }
+                Err(error) => {
+                    x11_focus_error = Some(error.to_string());
+                }
+            }
+        }
+        desktop.set_focus();
+        last_x11_active = x11_active;
+        last_x11_window_id = x11_window_id.clone();
+        last_x11_active_window_id = x11_active_window_id.clone();
+        let tao_focused = desktop.is_focused();
+        let focused = tao_focused || x11_active;
+        attempts.push(json!({
+            "attempt": attempt,
+            "focused": focused,
+            "tao_focused": tao_focused,
+            "backend": focus_backend,
+            "x11_window_id": x11_window_id,
+            "x11_active_window_id": x11_active_window_id,
+            "x11_active": x11_active,
+            "x11_error": x11_focus_error,
+        }));
+        if focused {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    let tao_focused = desktop.is_focused();
     Ok(json!({
         "focused_requested": true,
-        "focused": desktop.is_focused(),
+        "focused": tao_focused || last_x11_active,
+        "tao_focused": tao_focused,
+        "x11_active": last_x11_active,
+        "x11_window_id": last_x11_window_id,
+        "x11_active_window_id": last_x11_active_window_id,
+        "focus_wait_ms": started.elapsed().as_millis(),
+        "focus_attempts": attempts,
         "window": describe_window(desktop),
     }))
 }

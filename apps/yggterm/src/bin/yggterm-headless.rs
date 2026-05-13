@@ -1,22 +1,31 @@
 use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
 use std::io::Read;
 use std::path::Path;
 use std::process::Command;
-use yggterm_core::{InstallContext, SessionStore, detect_install_context};
+use yggterm_core::{
+    AppSettings, InstallContext, SessionCopyRegenerationFailure, SessionStore,
+    best_effort_precis_from_context, best_effort_summary_from_context,
+    best_effort_title_from_context, detect_install_context, looks_like_generated_fallback_title,
+    looks_like_low_signal_generated_copy,
+};
 use yggterm_server::{
     AppControlRightPanelMode, AppControlViewMode, ProbeTerminalViewportInputMode,
-    cleanup_legacy_daemons, default_endpoint, detect_ghostty_host, ensure_local_daemon_running,
-    ping, run_app_control_background_window, run_app_control_close_window,
-    run_app_control_close_window_preserving_sessions, run_app_control_create_terminal,
-    run_app_control_describe_rows, run_app_control_describe_state,
+    RemoteDeployState, RemoteMachineHealth, RemoteMachineSnapshot, RemoteScannedSession,
+    SessionKind, SshConnectTarget, default_endpoint, detect_ghostty_host,
+    ensure_local_daemon_running, fetch_remote_generation_context,
+    persist_remote_generated_copy_with_options, ping, run_app_control_background_window,
+    run_app_control_close_window, run_app_control_close_window_preserving_sessions,
+    run_app_control_create_terminal, run_app_control_describe_rows, run_app_control_describe_state,
     run_app_control_desktop_identity, run_app_control_drag, run_app_control_dump_state,
     run_app_control_focus_window, run_app_control_key, run_app_control_list_clients,
     run_app_control_move_window_by, run_app_control_open_path,
     run_app_control_paste_terminal_clipboard, run_app_control_paste_terminal_clipboard_image,
-    run_app_control_pointer, run_app_control_probe_terminal_viewport_input,
-    run_app_control_probe_terminal_viewport_scroll, run_app_control_probe_terminal_viewport_select,
-    run_app_control_reclaim_terminal_focus, run_app_control_redraw_terminal,
-    run_app_control_remove_session, run_app_control_resize_window,
+    run_app_control_pointer, run_app_control_probe_terminal_context_menu,
+    run_app_control_probe_terminal_primary_selection_paste,
+    run_app_control_probe_terminal_viewport_input, run_app_control_probe_terminal_viewport_scroll,
+    run_app_control_probe_terminal_viewport_select, run_app_control_reclaim_terminal_focus,
+    run_app_control_redraw_terminal, run_app_control_remove_session, run_app_control_resize_window,
     run_app_control_restart_pending_update, run_app_control_scroll_preview,
     run_app_control_scroll_right_panel, run_app_control_send_terminal_input,
     run_app_control_set_clipboard_png_base64, run_app_control_set_clipboard_text,
@@ -26,8 +35,9 @@ use yggterm_server::{
     run_app_control_set_tree_selection, run_app_control_set_window_chrome_hover,
     run_app_control_show_start_page, run_app_control_start_action,
     run_app_control_trigger_update_check, run_attach, run_daemon, run_screenrecord_capture,
-    run_screenshot_capture, run_trace_bundle, run_trace_follow, run_trace_tail, shutdown, snapshot,
-    status, terminal_write, try_run_remote_server_command,
+    run_screenshot_capture, run_trace_bundle, run_trace_follow, run_trace_tail,
+    scan_remote_machine_sessions_for_target, shutdown, snapshot, status, terminal_restart,
+    terminal_write, try_run_remote_server_command,
 };
 
 #[path = "../headless_monitor.rs"]
@@ -50,6 +60,8 @@ enum BuiltinCliCommand {
     MainHelp,
     Version,
     ServerHelp,
+    ServerAppHelp,
+    ServerSessionsHelp,
     ServerSnapshot,
 }
 
@@ -67,6 +79,32 @@ fn classify_builtin_cli_command(args: &[String]) -> Option<BuiltinCliCommand> {
             if command == "server" && matches!(arg.as_str(), "--help" | "-h" | "help") =>
         {
             Some(BuiltinCliCommand::ServerHelp)
+        }
+        [server, app] if server == "server" && app == "app" => {
+            Some(BuiltinCliCommand::ServerAppHelp)
+        }
+        [server, app, rest @ ..]
+            if server == "server"
+                && app == "app"
+                && rest
+                    .iter()
+                    .any(|arg| matches!(arg.as_str(), "--help" | "-h" | "help")) =>
+        {
+            Some(BuiltinCliCommand::ServerAppHelp)
+        }
+        [server, sessions]
+            if server == "server" && matches!(sessions.as_str(), "sessions" | "session-copy") =>
+        {
+            Some(BuiltinCliCommand::ServerSessionsHelp)
+        }
+        [server, sessions, rest @ ..]
+            if server == "server"
+                && matches!(sessions.as_str(), "sessions" | "session-copy")
+                && rest
+                    .iter()
+                    .any(|arg| matches!(arg.as_str(), "--help" | "-h" | "help")) =>
+        {
+            Some(BuiltinCliCommand::ServerSessionsHelp)
         }
         [command, arg] if command == "server" && arg == "snapshot" => {
             Some(BuiltinCliCommand::ServerSnapshot)
@@ -103,6 +141,8 @@ fn print_server_help() {
   yggterm-headless server snapshot
   yggterm-headless server shutdown
   yggterm-headless server terminal write <session> (--data <data>|--stdin)
+  yggterm-headless server terminal restart <session> [--terminal-appearance <dark|light>] [--force-remote]
+  yggterm-headless server sessions regenerate-copy [--budget <n>] [--force] [--reset-summary-history] [--skip-local] [--skip-remote] [--json]
   yggterm-headless server monitor --scenario <panic-report|server-list|latency-check|wait-session|hot-restart|managed-cli-refresh>
   yggterm-headless server trace <tail|follow|bundle>
   yggterm-headless server screenshot <target> [output]
@@ -120,10 +160,72 @@ fn print_server_app_help() {
   yggterm-headless server app rows [--pid <pid>]
   yggterm-headless server app screenshot [output] [--pid <pid>]
   yggterm-headless server app resize-window --width <px> --height <px> [--pid <pid>]
+  yggterm-headless server app session <remove|delete> <session-path> [--pid <pid>]
   yggterm-headless server app start-page [--pid <pid>]
   yggterm-headless server app update <check|restart>
-  yggterm-headless server app terminal <new|send|focus|probe-type|probe-scroll|probe-select> ..."
+  yggterm-headless server app terminal <new|send|focus|probe-type|probe-scroll|probe-select|probe-context-menu> ...
+  yggterm-headless server app terminal send <session> (--data <data>|--stdin)"
     );
+}
+
+fn print_server_sessions_help() {
+    println!(
+        "usage:
+  yggterm-headless server sessions regenerate-copy [--budget <n>] [--force] [--reset-summary-history] [--skip-local] [--skip-remote] [--json]
+
+commands:
+  regenerate-copy    Generate Codex session titles and summary timelines for local and app-discovered remote machines.
+
+options:
+  --budget <n>                Limit the number of sessions processed; 0 means no explicit limit.
+  --force                     Regenerate existing generated copy.
+  --reset-summary-history     Rebuild summary timeline history from scratch.
+  --skip-local                Skip local ~/.codex history and refresh only app-discovered remote machines.
+  --skip-remote               Only regenerate local Codex session copy.
+  --json                      Print a machine-readable report."
+    );
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct AppControlEnvelope<T> {
+    data: T,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct AppControlStateData {
+    remote: AppControlRemoteState,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct AppControlRemoteState {
+    #[serde(default)]
+    machines: Vec<AppControlRemoteMachine>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct AppControlRemoteMachine {
+    machine_key: String,
+    label: String,
+    ssh_target: String,
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
+struct RemoteSessionCopyRegenerationReport {
+    machine_key: String,
+    ssh_target: String,
+    scanned: usize,
+    title_generated: usize,
+    precis_generated: usize,
+    summary_generated: usize,
+    summary_history_reset: usize,
+    skipped: usize,
+    failed: Vec<SessionCopyRegenerationFailure>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct CombinedSessionCopyRegenerationReport {
+    local: yggterm_core::SessionCopyRegenerationReport,
+    remote: Vec<RemoteSessionCopyRegenerationReport>,
 }
 
 fn monitor_scenario_alias(command: &str) -> Option<&'static str> {
@@ -203,6 +305,425 @@ fn cli_flag_value<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
 fn ensure_local_server_ready_for_cli(store: &SessionStore) -> Result<()> {
     let endpoint = default_endpoint(store.home_dir());
     ensure_local_daemon_running(&endpoint)
+}
+
+fn discover_remote_machines_from_app_state() -> Result<Vec<RemoteMachineSnapshot>> {
+    let binary = std::env::current_exe()
+        .context("locating current executable")?
+        .with_file_name(if cfg!(target_os = "windows") {
+            "yggterm.exe"
+        } else {
+            "yggterm"
+        });
+    if !binary.exists() {
+        return Ok(Vec::new());
+    }
+    let output = Command::new(binary)
+        .args(["server", "app", "state", "--timeout-ms", "5000"])
+        .output()
+        .context("running app-control state for remote machine discovery")?;
+    if !output.status.success() {
+        return Ok(Vec::new());
+    }
+    let envelope: AppControlEnvelope<AppControlStateData> =
+        serde_json::from_slice(&output.stdout).context("parsing app-control state")?;
+    Ok(envelope
+        .data
+        .remote
+        .machines
+        .into_iter()
+        .map(|machine| RemoteMachineSnapshot {
+            machine_key: machine.machine_key,
+            label: machine.label,
+            ssh_target: machine.ssh_target,
+            prefix: None,
+            remote_binary_expr: None,
+            remote_deploy_state: RemoteDeployState::Ready,
+            health: RemoteMachineHealth::Healthy,
+            sessions: Vec::new(),
+        })
+        .collect())
+}
+
+fn dedupe_remote_machines(machines: Vec<RemoteMachineSnapshot>) -> Vec<RemoteMachineSnapshot> {
+    let mut seen = std::collections::BTreeSet::<(String, String)>::new();
+    let mut deduped = Vec::new();
+    for machine in machines {
+        let key = (machine.machine_key.clone(), machine.ssh_target.clone());
+        if seen.insert(key) {
+            deduped.push(machine);
+        }
+    }
+    deduped
+}
+
+fn merge_context_fragments(primary: &str, secondary: &str) -> String {
+    let primary = primary.trim();
+    let secondary = secondary.trim();
+    match (primary.is_empty(), secondary.is_empty()) {
+        (true, true) => String::new(),
+        (false, true) => primary.to_string(),
+        (true, false) => secondary.to_string(),
+        (false, false) => {
+            let primary_lower = primary.to_ascii_lowercase();
+            let secondary_lower = secondary.to_ascii_lowercase();
+            if primary_lower.contains(&secondary_lower) {
+                primary.to_string()
+            } else if secondary_lower.contains(&primary_lower) {
+                secondary.to_string()
+            } else {
+                format!("{primary}\n{secondary}")
+            }
+        }
+    }
+}
+
+fn cached_copy_hint_is_usable(value: Option<&str>) -> bool {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .is_some_and(|value| !looks_like_low_signal_generated_copy(value))
+}
+
+fn title_case_path_segment(segment: &str) -> Option<String> {
+    let words = segment
+        .split(|ch: char| !ch.is_ascii_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .map(|word| {
+            let mut chars = word.chars();
+            let Some(first) = chars.next() else {
+                return String::new();
+            };
+            let mut title = first.to_ascii_uppercase().to_string();
+            title.push_str(&chars.as_str().to_ascii_lowercase());
+            title
+        })
+        .filter(|word| !word.is_empty())
+        .collect::<Vec<_>>();
+    (!words.is_empty()).then(|| words.join(" "))
+}
+
+fn cwd_title_fallback(cwd: &str) -> Option<String> {
+    let meaningful_segment = cwd.split('/').rev().map(str::trim).find(|segment| {
+        !segment.is_empty()
+            && !matches!(
+                segment.to_ascii_lowercase().as_str(),
+                "." | "home" | "users" | "user" | "pi" | "gh" | "git" | "src" | "tmp"
+            )
+    })?;
+    let label = title_case_path_segment(meaningful_segment)?;
+    let candidate = format!("{label} Workspace");
+    (!looks_like_generated_fallback_title(&candidate)).then_some(candidate)
+}
+
+fn remote_session_title_fallback(scanned: &RemoteScannedSession, context: &str) -> Option<String> {
+    best_effort_title_from_context(context).or_else(|| cwd_title_fallback(&scanned.cwd))
+}
+
+fn regenerate_remote_machine_copy(
+    store: &SessionStore,
+    settings: &AppSettings,
+    machine: RemoteMachineSnapshot,
+    budget: usize,
+    force: bool,
+    reset_summary_history: bool,
+) -> RemoteSessionCopyRegenerationReport {
+    let target = SshConnectTarget {
+        label: machine.label.clone(),
+        kind: SessionKind::SshShell,
+        ssh_target: machine.ssh_target.clone(),
+        prefix: machine.prefix.clone(),
+        cwd: None,
+    };
+    let mut report = RemoteSessionCopyRegenerationReport {
+        machine_key: machine.machine_key.clone(),
+        ssh_target: machine.ssh_target.clone(),
+        ..RemoteSessionCopyRegenerationReport::default()
+    };
+    let sessions = match scan_remote_machine_sessions_for_target(&target) {
+        Ok(mut sessions) => {
+            sessions.sort_by(|left, right| {
+                right
+                    .modified_epoch
+                    .cmp(&left.modified_epoch)
+                    .then_with(|| left.session_id.cmp(&right.session_id))
+            });
+            if budget > 0 && sessions.len() > budget {
+                sessions.truncate(budget);
+            }
+            sessions
+        }
+        Err(error) => {
+            report.failed.push(SessionCopyRegenerationFailure {
+                session_id: String::new(),
+                path: machine.ssh_target.clone(),
+                stage: "remote_scan".to_string(),
+                error: error.to_string(),
+            });
+            return report;
+        }
+    };
+
+    for scanned in sessions {
+        report.scanned += 1;
+        let context = match fetch_remote_generation_context(&target, &scanned.storage_path) {
+            Ok(fetched) => merge_context_fragments(&fetched, &scanned.recent_context),
+            Err(error) => {
+                report.failed.push(SessionCopyRegenerationFailure {
+                    session_id: scanned.session_id.clone(),
+                    path: scanned.storage_path.clone(),
+                    stage: "remote_context".to_string(),
+                    error: error.to_string(),
+                });
+                continue;
+            }
+        };
+        let mut touched = false;
+        let should_generate_title = force
+            || scanned.title_hint.trim().is_empty()
+            || looks_like_generated_fallback_title(&scanned.title_hint);
+        let title = if should_generate_title {
+            match store.generate_title_for_context(
+                settings,
+                &scanned.session_id,
+                &scanned.cwd,
+                &context,
+                force,
+            ) {
+                Ok(Some(value)) => {
+                    report.title_generated += 1;
+                    touched = true;
+                    Some(value)
+                }
+                Ok(None) => {
+                    let fallback = remote_session_title_fallback(&scanned, &context);
+                    if fallback.is_some() {
+                        report.title_generated += 1;
+                        touched = true;
+                    }
+                    fallback
+                }
+                Err(error) => {
+                    let fallback = remote_session_title_fallback(&scanned, &context);
+                    if fallback.is_some() {
+                        report.title_generated += 1;
+                        touched = true;
+                    } else {
+                        report.failed.push(SessionCopyRegenerationFailure {
+                            session_id: scanned.session_id.clone(),
+                            path: scanned.storage_path.clone(),
+                            stage: "remote_title".to_string(),
+                            error: error.to_string(),
+                        });
+                    }
+                    fallback
+                }
+            }
+        } else {
+            Some(scanned.title_hint.clone())
+        };
+        let should_generate_precis =
+            force || !cached_copy_hint_is_usable(scanned.cached_precis.as_deref());
+        let precis = if should_generate_precis {
+            match store.generate_precis_for_context(
+                settings,
+                &scanned.session_id,
+                &scanned.cwd,
+                &context,
+                force,
+            ) {
+                Ok(Some(value)) => {
+                    report.precis_generated += 1;
+                    touched = true;
+                    Some(value)
+                }
+                Ok(None) => {
+                    let fallback = best_effort_precis_from_context(&context);
+                    if fallback.is_some() {
+                        report.precis_generated += 1;
+                        touched = true;
+                    }
+                    fallback
+                }
+                Err(error) => {
+                    report.failed.push(SessionCopyRegenerationFailure {
+                        session_id: scanned.session_id.clone(),
+                        path: scanned.storage_path.clone(),
+                        stage: "remote_precis".to_string(),
+                        error: error.to_string(),
+                    });
+                    let fallback = best_effort_precis_from_context(&context);
+                    if fallback.is_some() {
+                        report.precis_generated += 1;
+                        touched = true;
+                    }
+                    fallback
+                }
+            }
+        } else {
+            scanned.cached_precis.clone()
+        };
+        if reset_summary_history {
+            report.summary_history_reset += 1;
+            touched = true;
+        }
+        let should_generate_summary = force
+            || reset_summary_history
+            || !cached_copy_hint_is_usable(scanned.cached_summary.as_deref());
+        let summary = if should_generate_summary {
+            match store.generate_summary_for_context(
+                settings,
+                &scanned.session_id,
+                &scanned.cwd,
+                &context,
+                force || reset_summary_history,
+            ) {
+                Ok(Some(value)) => {
+                    report.summary_generated += 1;
+                    touched = true;
+                    Some(value)
+                }
+                Ok(None) => {
+                    let fallback = best_effort_summary_from_context(&context);
+                    if fallback.is_some() {
+                        report.summary_generated += 1;
+                        touched = true;
+                    }
+                    fallback
+                }
+                Err(error) => {
+                    report.failed.push(SessionCopyRegenerationFailure {
+                        session_id: scanned.session_id.clone(),
+                        path: scanned.storage_path.clone(),
+                        stage: "remote_summary".to_string(),
+                        error: error.to_string(),
+                    });
+                    let fallback = best_effort_summary_from_context(&context);
+                    if fallback.is_some() {
+                        report.summary_generated += 1;
+                        touched = true;
+                    }
+                    fallback
+                }
+            }
+        } else {
+            scanned.cached_summary.clone()
+        };
+        if let Err(error) = persist_remote_generated_copy_with_options(
+            &machine,
+            &scanned.session_id,
+            &scanned.cwd,
+            title.as_deref(),
+            precis.as_deref(),
+            summary.as_deref(),
+            &settings.interface_llm_model,
+            reset_summary_history,
+        ) {
+            report.failed.push(SessionCopyRegenerationFailure {
+                session_id: scanned.session_id.clone(),
+                path: scanned.storage_path.clone(),
+                stage: "remote_persist".to_string(),
+                error: error.to_string(),
+            });
+            continue;
+        }
+        if !touched {
+            report.skipped += 1;
+        }
+    }
+
+    report
+}
+
+fn run_sessions_regenerate_copy_cli(store: &SessionStore, args: &[String]) -> Result<()> {
+    let action = args
+        .get(2)
+        .map(String::as_str)
+        .context("missing server sessions action")?;
+    if !matches!(
+        action,
+        "regenerate-copy" | "regenerate" | "copy" | "refresh-copy"
+    ) {
+        anyhow::bail!("unsupported server sessions action: {action}");
+    }
+    let settings = store.load_settings()?;
+    let budget = cli_flag_value(args, "--budget")
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(0);
+    let force = args.iter().any(|arg| arg == "--force");
+    let reset_summary_history = args
+        .iter()
+        .any(|arg| arg == "--reset-summary-history" || arg == "--reset-history");
+    let skip_local = args.iter().any(|arg| arg == "--skip-local");
+    let skip_remote = args.iter().any(|arg| arg == "--skip-remote");
+    let local_report = if skip_local {
+        yggterm_core::SessionCopyRegenerationReport::default()
+    } else {
+        store.regenerate_codex_session_copy(&settings, budget, force, reset_summary_history)?
+    };
+    let remote_reports = if skip_remote {
+        Vec::new()
+    } else {
+        dedupe_remote_machines(discover_remote_machines_from_app_state().unwrap_or_default())
+            .into_iter()
+            .map(|machine| {
+                regenerate_remote_machine_copy(
+                    store,
+                    &settings,
+                    machine,
+                    budget,
+                    force,
+                    reset_summary_history,
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    if args.iter().any(|arg| arg == "--json") {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&CombinedSessionCopyRegenerationReport {
+                local: local_report,
+                remote: remote_reports,
+            })?
+        );
+    } else {
+        println!(
+            "scanned={} title_generated={} precis_generated={} summary_generated={} summary_history_reset={} skipped={} failed={}",
+            local_report.scanned,
+            local_report.title_generated,
+            local_report.precis_generated,
+            local_report.summary_generated,
+            local_report.summary_history_reset,
+            local_report.skipped,
+            local_report.failed.len()
+        );
+        for failure in local_report.failed.iter().take(12) {
+            println!(
+                "failed {} {}: {}",
+                failure.stage, failure.session_id, failure.error
+            );
+        }
+        for remote in &remote_reports {
+            println!(
+                "remote machine={} scanned={} title_generated={} precis_generated={} summary_generated={} summary_history_reset={} skipped={} failed={}",
+                remote.ssh_target,
+                remote.scanned,
+                remote.title_generated,
+                remote.precis_generated,
+                remote.summary_generated,
+                remote.summary_history_reset,
+                remote.skipped,
+                remote.failed.len()
+            );
+            for failure in remote.failed.iter().take(12) {
+                println!(
+                    "failed remote {} {} {}: {}",
+                    remote.ssh_target, failure.stage, failure.session_id, failure.error
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 fn paths_same_executable(left: &Path, right: &Path) -> bool {
@@ -295,6 +816,7 @@ fn main() -> Result<()> {
         .with_env_filter("info")
         .with_target(false)
         .without_time()
+        .with_writer(std::io::stderr)
         .init();
 
     let args = std::env::args().skip(1).collect::<Vec<_>>();
@@ -303,9 +825,40 @@ fn main() -> Result<()> {
     maybe_handoff_to_preferred_headless_executable(&current_exe, &args, &install_context)?;
     let store = SessionStore::open_or_init()?;
 
+    if let Some(command) = classify_builtin_cli_command(&args) {
+        match command {
+            BuiltinCliCommand::MainHelp => {
+                print_main_help();
+                return Ok(());
+            }
+            BuiltinCliCommand::Version => {
+                println!("{}", env!("CARGO_PKG_VERSION"));
+                return Ok(());
+            }
+            BuiltinCliCommand::ServerHelp => {
+                print_server_help();
+                return Ok(());
+            }
+            BuiltinCliCommand::ServerAppHelp => {
+                print_server_app_help();
+                return Ok(());
+            }
+            BuiltinCliCommand::ServerSessionsHelp => {
+                print_server_sessions_help();
+                return Ok(());
+            }
+            BuiltinCliCommand::ServerSnapshot => {
+                ensure_local_server_ready_for_cli(&store)?;
+                let endpoint = default_endpoint(store.home_dir());
+                let (snapshot, _) = snapshot(&endpoint)?;
+                println!("{}", serde_json::to_string_pretty(&snapshot)?);
+                return Ok(());
+            }
+        }
+    }
+
     if args.as_slice() == ["server", "daemon"] {
         let endpoint = default_endpoint(store.home_dir());
-        let _ = cleanup_legacy_daemons(&endpoint, &current_exe);
         let host = detect_ghostty_host();
         return run_daemon(&endpoint, host);
     }
@@ -341,6 +894,31 @@ fn main() -> Result<()> {
             }))?
         );
         return Ok(());
+    }
+    if args.len() >= 4 && args[0] == "server" && args[1] == "terminal" && args[2] == "restart" {
+        ensure_local_server_ready_for_cli(&store)?;
+        let endpoint = default_endpoint(store.home_dir());
+        let terminal_appearance = cli_flag_value(&args, "--terminal-appearance");
+        let force_remote = args.iter().any(|arg| arg == "--force-remote");
+        let (snapshot, message) =
+            terminal_restart(&endpoint, &args[3], terminal_appearance, force_remote)?;
+        println!(
+            "{}",
+            serde_json::to_string(&serde_json::json!({
+                "accepted": true,
+                "session_path": args[3],
+                "force_remote": force_remote,
+                "message": message,
+                "active_session_path": snapshot.active_session_path,
+            }))?
+        );
+        return Ok(());
+    }
+    if args.len() >= 3
+        && args[0] == "server"
+        && matches!(args[1].as_str(), "sessions" | "session-copy")
+    {
+        return run_sessions_regenerate_copy_cli(&store, &args);
     }
     if let Some(monitor_args) = normalize_monitor_args(&args) {
         return headless_monitor::run(monitor_args);
@@ -432,6 +1010,14 @@ fn main() -> Result<()> {
             }
             BuiltinCliCommand::ServerHelp => {
                 print_server_help();
+                return Ok(());
+            }
+            BuiltinCliCommand::ServerAppHelp => {
+                print_server_app_help();
+                return Ok(());
+            }
+            BuiltinCliCommand::ServerSessionsHelp => {
+                print_server_sessions_help();
                 return Ok(());
             }
             BuiltinCliCommand::ServerSnapshot => {
@@ -993,19 +1579,29 @@ fn main() -> Result<()> {
                             .ok_or_else(|| {
                                 anyhow::anyhow!("missing session path for server app terminal send")
                             })?;
-                        let data = args
-                            .windows(2)
-                            .find_map(|window| {
-                                if window[0] == "--data" {
-                                    Some(window[1].as_str())
-                                } else {
-                                    None
-                                }
-                            })
-                            .ok_or_else(|| {
-                                anyhow::anyhow!("missing --data for server app terminal send")
-                            })?;
-                        run_app_control_send_terminal_input(session_path, data, timeout_ms)
+                        let data = if args.iter().any(|arg| arg == "--stdin") {
+                            let mut value = String::new();
+                            std::io::stdin()
+                                .read_to_string(&mut value)
+                                .context("reading app terminal send stdin")?;
+                            value
+                        } else {
+                            args.windows(2)
+                                .find_map(|window| {
+                                    if window[0] == "--data" {
+                                        Some(window[1].as_str())
+                                    } else {
+                                        None
+                                    }
+                                })
+                                .ok_or_else(|| {
+                                    anyhow::anyhow!(
+                                        "missing --data or --stdin for server app terminal send"
+                                    )
+                                })?
+                                .to_string()
+                        };
+                        run_app_control_send_terminal_input(session_path, &data, timeout_ms)
                     }
                     "focus" => {
                         let session_path = cli_positional_args(&args, 4)
@@ -1165,6 +1761,46 @@ fn main() -> Result<()> {
                             })?;
                         run_app_control_probe_terminal_viewport_select(session_path, timeout_ms)
                     }
+                    "probe-primary-paste" | "probe-primary-selection-paste" => {
+                        let session_path = cli_positional_args(&args, 4)
+                            .into_iter()
+                            .next()
+                            .ok_or_else(|| {
+                                anyhow::anyhow!(
+                                    "missing session path for server app terminal probe-primary-paste"
+                                )
+                            })?;
+                        let data = args
+                            .windows(2)
+                            .find_map(|window| {
+                                if window[0] == "--data" {
+                                    Some(window[1].as_str())
+                                } else {
+                                    None
+                                }
+                            })
+                            .ok_or_else(|| {
+                                anyhow::anyhow!(
+                                    "missing --data for server app terminal probe-primary-paste"
+                                )
+                            })?;
+                        run_app_control_probe_terminal_primary_selection_paste(
+                            session_path,
+                            data,
+                            timeout_ms,
+                        )
+                    }
+                    "probe-context-menu" | "probe-right-click-menu" => {
+                        let session_path = cli_positional_args(&args, 4)
+                            .into_iter()
+                            .next()
+                            .ok_or_else(|| {
+                                anyhow::anyhow!(
+                                    "missing session path for server app terminal probe-context-menu"
+                                )
+                            })?;
+                        run_app_control_probe_terminal_context_menu(session_path, timeout_ms)
+                    }
                     other => anyhow::bail!("unsupported app terminal action: {other}"),
                 }
             }
@@ -1231,9 +1867,101 @@ fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{cli_positional_args, normalize_monitor_args, preferred_headless_executable};
+    use super::{
+        BuiltinCliCommand, cached_copy_hint_is_usable, classify_builtin_cli_command,
+        cli_positional_args, normalize_monitor_args, preferred_headless_executable,
+        remote_session_title_fallback,
+    };
     use std::path::PathBuf;
     use yggterm_core::{InstallChannel, InstallContext, UpdatePolicy};
+    use yggterm_server::RemoteScannedSession;
+
+    #[test]
+    fn classify_builtin_cli_command_detects_server_app_help_without_mutating() {
+        assert_eq!(
+            classify_builtin_cli_command(&["server".to_string(), "app".to_string()]),
+            Some(BuiltinCliCommand::ServerAppHelp)
+        );
+        assert_eq!(
+            classify_builtin_cli_command(&[
+                "server".to_string(),
+                "app".to_string(),
+                "screenshot".to_string(),
+                "--help".to_string()
+            ]),
+            Some(BuiltinCliCommand::ServerAppHelp)
+        );
+        assert_eq!(
+            classify_builtin_cli_command(&[
+                "server".to_string(),
+                "app".to_string(),
+                "terminal".to_string(),
+                "probe-scroll".to_string(),
+                "-h".to_string()
+            ]),
+            Some(BuiltinCliCommand::ServerAppHelp)
+        );
+    }
+
+    #[test]
+    fn classify_builtin_cli_command_detects_server_sessions_help_without_mutating() {
+        assert_eq!(
+            classify_builtin_cli_command(&["server".to_string(), "sessions".to_string()]),
+            Some(BuiltinCliCommand::ServerSessionsHelp)
+        );
+        assert_eq!(
+            classify_builtin_cli_command(&[
+                "server".to_string(),
+                "sessions".to_string(),
+                "regenerate-copy".to_string(),
+                "--help".to_string()
+            ]),
+            Some(BuiltinCliCommand::ServerSessionsHelp)
+        );
+        assert_eq!(
+            classify_builtin_cli_command(&[
+                "server".to_string(),
+                "session-copy".to_string(),
+                "regenerate-copy".to_string(),
+                "-h".to_string()
+            ]),
+            Some(BuiltinCliCommand::ServerSessionsHelp)
+        );
+    }
+
+    #[test]
+    fn cached_copy_hint_is_usable_rejects_empty_and_low_signal_copy() {
+        assert!(!cached_copy_hint_is_usable(None));
+        assert!(!cached_copy_hint_is_usable(Some("  ")));
+        assert!(!cached_copy_hint_is_usable(Some("s craft:.")));
+        assert!(cached_copy_hint_is_usable(Some(
+            "The session repaired remote terminal restore behavior and verified the live app-control probes."
+        )));
+    }
+
+    #[test]
+    fn remote_title_fallback_uses_cwd_when_context_is_empty() {
+        let scanned = RemoteScannedSession {
+            session_path: "remote-session://dev/019dfc5a".to_string(),
+            session_id: "019dfc5a-f5ca-7793-a44f-ee7f423aed38".to_string(),
+            cwd: "/home/pi/gh/yggterm".to_string(),
+            started_at: "2026-05-13T00:00:00Z".to_string(),
+            modified_epoch: 0,
+            event_count: 0,
+            user_message_count: 0,
+            assistant_message_count: 0,
+            title_hint: "019dfc5a".to_string(),
+            recent_context: String::new(),
+            cached_precis: None,
+            cached_summary: None,
+            live_runtime: false,
+            storage_path: "/home/pi/.codex/sessions/session.jsonl".to_string(),
+        };
+        assert_eq!(
+            remote_session_title_fallback(&scanned, "").as_deref(),
+            Some("Yggterm Workspace")
+        );
+    }
 
     #[test]
     fn cli_positional_args_skips_flag_values() {

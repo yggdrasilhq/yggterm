@@ -130,6 +130,10 @@ impl SessionBrowserState {
         }
     }
 
+    pub fn clear_selection(&mut self) {
+        self.selected_path = None;
+    }
+
     pub fn restore_ui_state(&mut self, expanded_paths: &[String], selected_path: Option<&str>) {
         self.expanded_paths = default_level_one_expanded_paths(&self.root);
         self.expanded_paths.extend(
