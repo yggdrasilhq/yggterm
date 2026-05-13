@@ -291,6 +291,13 @@ pub enum AppControlCommand {
     ProbeTerminalViewportSelect {
         session_path: String,
     },
+    ProbeTerminalPrimarySelectionPaste {
+        session_path: String,
+        data: String,
+    },
+    ProbeTerminalContextMenu {
+        session_path: String,
+    },
     RemoveSession {
         session_path: String,
     },
@@ -356,6 +363,10 @@ impl AppControlCommand {
             Self::ProbeTerminalViewportInput { .. } => "probe_terminal_viewport_input",
             Self::ProbeTerminalViewportScroll { .. } => "probe_terminal_viewport_scroll",
             Self::ProbeTerminalViewportSelect { .. } => "probe_terminal_viewport_select",
+            Self::ProbeTerminalPrimarySelectionPaste { .. } => {
+                "probe_terminal_primary_selection_paste"
+            }
+            Self::ProbeTerminalContextMenu { .. } => "probe_terminal_context_menu",
             Self::RemoveSession { .. } => "remove_session",
             Self::SetSessionKeepAlive { .. } => "set_session_keep_alive",
             Self::SetRowExpanded { .. } => "set_row_expanded",
@@ -407,6 +418,42 @@ pub fn app_control_requests_pending(home: &Path) -> bool {
                 .and_then(|name| name.to_str())
                 .is_some_and(|name| name.starts_with("inflight-"))
     })
+}
+
+pub fn app_control_requests_pending_for_worker(home: &Path, worker_pid: u32) -> bool {
+    let requests_dir = app_control_requests_dir(home);
+    let Ok(entries) = fs::read_dir(&requests_dir) else {
+        return false;
+    };
+    for entry in entries.filter_map(Result::ok) {
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("json")
+            || path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("inflight-"))
+        {
+            continue;
+        }
+        let request = match fs::read(&path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<AppControlRequest>(&bytes).ok())
+        {
+            Some(request) => request,
+            None => {
+                let _ = fs::remove_file(&path);
+                continue;
+            }
+        };
+        if let Some(preferred_pid) = request.preferred_pid
+            && preferred_pid != worker_pid
+        {
+            remove_request_if_target_is_stale(&path, &request, preferred_pid);
+            continue;
+        }
+        return true;
+    }
+    false
 }
 
 pub fn app_control_responses_dir(home: &Path) -> PathBuf {
@@ -509,12 +556,7 @@ pub fn take_next_app_control_request(
         if let Some(preferred_pid) = request.preferred_pid
             && preferred_pid != worker_pid
         {
-            let request_age_ms = current_millis().saturating_sub(request.created_at_ms);
-            if !process_is_alive(preferred_pid)
-                || request_age_ms > STALE_TARGETED_APP_CONTROL_REQUEST_MS
-            {
-                let _ = fs::remove_file(&path);
-            }
+            remove_request_if_target_is_stale(&path, &request, preferred_pid);
             continue;
         }
         let file_name = path
@@ -528,6 +570,13 @@ pub fn take_next_app_control_request(
         return Ok(Some((inflight_path, request)));
     }
     Ok(None)
+}
+
+fn remove_request_if_target_is_stale(path: &Path, request: &AppControlRequest, preferred_pid: u32) {
+    let request_age_ms = current_millis().saturating_sub(request.created_at_ms);
+    if !process_is_alive(preferred_pid) || request_age_ms > STALE_TARGETED_APP_CONTROL_REQUEST_MS {
+        let _ = fs::remove_file(path);
+    }
 }
 
 fn recover_stale_inflight_requests(requests_dir: &Path) -> Result<()> {
@@ -771,6 +820,46 @@ mod tests {
 
         let taken = take_next_app_control_request(&home, std::process::id()).unwrap();
         assert!(taken.is_none());
+        assert!(
+            !app_control_requests_dir(&home)
+                .join(format!("{}.json", request.request_id))
+                .exists()
+        );
+
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn pending_for_worker_ignores_request_targeted_to_other_live_pid() {
+        let home = temp_home();
+        let target_pid = std::process::id();
+        let worker_pid = target_pid.saturating_add(1);
+        let request =
+            enqueue_app_control_request(&home, AppControlCommand::DescribeState, Some(target_pid))
+                .unwrap();
+
+        assert!(app_control_requests_pending(&home));
+        assert!(!app_control_requests_pending_for_worker(&home, worker_pid));
+        assert!(
+            app_control_requests_dir(&home)
+                .join(format!("{}.json", request.request_id))
+                .exists()
+        );
+        assert!(app_control_requests_pending_for_worker(&home, target_pid));
+
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn pending_for_worker_removes_stale_targeted_request() {
+        let home = temp_home();
+        let request =
+            enqueue_app_control_request(&home, AppControlCommand::DescribeState, Some(0)).unwrap();
+
+        assert!(!app_control_requests_pending_for_worker(
+            &home,
+            std::process::id()
+        ));
         assert!(
             !app_control_requests_dir(&home)
                 .join(format!("{}.json", request.request_id))

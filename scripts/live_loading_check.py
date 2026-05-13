@@ -182,6 +182,7 @@ def main() -> int:
         + " XDG_RUNTIME_DIR="
         + shlex.quote(str(RUNTIME_ROOT))
         + " GDK_BACKEND=x11"
+        + " YGGTERM_FORCE_X11_BACKEND=1"
         + " YGGTERM_DEBUG_DISABLE_CACHED_SERVER_SNAPSHOT=1"
         + " YGGTERM_DEBUG_REQUEST_DELAY_MS="
         + shlex.quote(env["YGGTERM_DEBUG_REQUEST_DELAY_MS"])

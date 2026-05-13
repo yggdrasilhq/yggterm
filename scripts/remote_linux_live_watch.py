@@ -217,6 +217,7 @@ def launch_env_from_session(
             or ""
         )
         env["GDK_BACKEND"] = "x11"
+        env["YGGTERM_FORCE_X11_BACKEND"] = "1"
     elif session_type == "wayland":
         wayland_display = str(
             desktop_env.get("WAYLAND_DISPLAY") or leader_env.get("WAYLAND_DISPLAY") or ""
