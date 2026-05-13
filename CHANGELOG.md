@@ -15,7 +15,7 @@ This file tracks user-visible changes in `yggterm`.
 - Disable SSH ControlMaster multiplexing for new Yggterm remote PTYs so closing smoke/test sessions cannot interact with an unrelated user SSH master.
 - Treat connected daemon-PTY output as a valid visible terminal surface even when Codex is busy and no prompt row is visible, preventing false resume overlays on readable retained sessions.
 - Make the 23-smoke heavy-TUI detector accept real `codex-session-tui` Browser/Preview frames while rejecting command-echo-only false positives.
-- Gate Linux-only Dioxus DMA-BUF workaround code behind Linux cfgs and prevent the release workflow from publishing partial assets when any package leg fails.
+- Gate Linux-only Dioxus DMA-BUF workaround code and Unix process-extension imports behind the correct cfgs, and prevent the release workflow from publishing partial assets when any package leg fails.
 - Document the 23-smoke release gate, including resource budgets, terminal quirks, restore checks, and title/summary quality checks.
 
 ## 2.2.66
