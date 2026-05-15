@@ -1,4 +1,4 @@
-/// Expose the `Java_dev_dioxus_main_WryActivity_create` function to the JNI layer.
+/// Expose the `Java_dev_dioxus_main_Rust_*` functions to the JNI layer.
 /// We hardcode these to have a single trampoline for host Java code to call into.
 ///
 /// This saves us from having to plumb the top-level package name all the way down into
@@ -11,12 +11,142 @@
 #[no_mangle]
 #[inline(never)]
 pub extern "C" fn start_app() {
-    use crate::Config;
-    use dioxus_core::{Element, VirtualDom};
-    use std::any::Any;
-
-    tao::android_binding!(dev_dioxus, main, WryActivity, wry::android_setup, root, tao);
+    use tao::platform::android::prelude::ndk::looper::ThreadLooper;
+    use tao::platform::android::prelude::{
+        android_fn, create as tao_create, generate_package_name,
+        onActivityCreate as tao_on_activity_create, onActivityDestroy as tao_on_activity_destroy,
+        onActivityLowMemory as tao_on_activity_low_memory,
+        onActivitySaveInstanceState as tao_on_activity_save_instance_state,
+        onNewIntent as tao_on_new_intent, onWindowFocusChanged as tao_on_window_focus_changed,
+        pause as tao_pause, resume as tao_resume, start as tao_start, stop as tao_stop, GlobalRef,
+        JClass, JNIEnv, JObject, PACKAGE,
+    };
     wry::android_binding!(dev_dioxus, main, wry);
+
+    fn store_package_name() {
+        PACKAGE.get_or_init(move || generate_package_name!(dev_dioxus, main));
+    }
+
+    unsafe fn create<'local>(env: JNIEnv<'local>, class: JClass<'local>, main: fn()) {
+        tao_create(env, class, JObject::null(), main);
+    }
+
+    #[allow(non_snake_case)]
+    unsafe fn onActivityCreate<'local>(
+        env: JNIEnv<'local>,
+        class: JClass<'local>,
+        activity: JObject<'local>,
+        setup: unsafe fn(&str, JNIEnv, &ThreadLooper, GlobalRef),
+    ) {
+        static NDK_CONTEXT_READY: std::sync::atomic::AtomicBool =
+            std::sync::atomic::AtomicBool::new(false);
+
+        if !NDK_CONTEXT_READY.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            let vm = env
+                .get_java_vm()
+                .expect("Android Java VM should be available");
+            let activity_ref = env
+                .new_global_ref(&activity)
+                .expect("Android activity global ref should be available");
+            unsafe {
+                ndk_context::initialize_android_context(
+                    vm.get_java_vm_pointer() as *mut _,
+                    activity_ref.as_obj().as_raw() as *mut _,
+                );
+            }
+            std::mem::forget(activity_ref);
+        }
+
+        tao_on_activity_create(env, class, activity, setup);
+    }
+
+    unsafe fn start<'local>(env: JNIEnv<'local>, class: JClass<'local>) {
+        tao_start(env, class, JObject::null());
+    }
+
+    unsafe fn stop<'local>(env: JNIEnv<'local>, class: JClass<'local>) {
+        tao_stop(env, class, JObject::null());
+    }
+
+    unsafe fn resume<'local>(env: JNIEnv<'local>, class: JClass<'local>) {
+        tao_resume(env, class, JObject::null());
+    }
+
+    unsafe fn pause<'local>(env: JNIEnv<'local>, class: JClass<'local>) {
+        tao_pause(env, class, JObject::null());
+    }
+
+    #[allow(non_snake_case)]
+    unsafe fn onActivitySaveInstanceState<'local>(env: JNIEnv<'local>, class: JClass<'local>) {
+        tao_on_activity_save_instance_state(env, class, JObject::null());
+    }
+
+    #[allow(non_snake_case)]
+    unsafe fn onActivityLowMemory<'local>(env: JNIEnv<'local>, class: JClass<'local>) {
+        tao_on_activity_low_memory(env, class, JObject::null());
+    }
+
+    #[allow(non_snake_case)]
+    unsafe fn onActivityDestroy<'local>(
+        env: JNIEnv<'local>,
+        class: JClass<'local>,
+        activity: JObject<'local>,
+    ) {
+        tao_on_activity_destroy(env, class, activity);
+    }
+
+    #[allow(non_snake_case)]
+    unsafe fn onWindowFocusChanged<'local>(
+        env: JNIEnv<'local>,
+        class: JClass<'local>,
+        activity: JObject<'local>,
+        has_focus: i32,
+    ) {
+        tao_on_window_focus_changed(env, class, activity, has_focus);
+    }
+
+    #[allow(non_snake_case)]
+    unsafe fn onNewIntent<'local>(
+        env: JNIEnv<'local>,
+        class: JClass<'local>,
+        intent: JObject<'local>,
+    ) {
+        tao_on_new_intent(env, class, intent);
+    }
+
+    #[no_mangle]
+    unsafe extern "C" fn Java_dev_dioxus_main_Rust_create<'local>(
+        env: JNIEnv<'local>,
+        class: JClass<'local>,
+    ) {
+        store_package_name();
+        create(env, class, root);
+    }
+    android_fn!(
+        dev_dioxus,
+        main,
+        Rust,
+        onActivityCreate,
+        [JObject<'local>],
+        __VOID__,
+        [wry::android_setup],
+        store_package_name,
+    );
+    android_fn!(dev_dioxus, main, Rust, start, []);
+    android_fn!(dev_dioxus, main, Rust, stop, []);
+    android_fn!(dev_dioxus, main, Rust, resume, []);
+    android_fn!(dev_dioxus, main, Rust, pause, []);
+    android_fn!(dev_dioxus, main, Rust, onActivitySaveInstanceState, []);
+    android_fn!(dev_dioxus, main, Rust, onActivityLowMemory, []);
+    android_fn!(dev_dioxus, main, Rust, onActivityDestroy, [JObject<'local>]);
+    android_fn!(
+        dev_dioxus,
+        main,
+        Rust,
+        onWindowFocusChanged,
+        [JObject<'local>, i32]
+    );
+    android_fn!(dev_dioxus, main, Rust, onNewIntent, [JObject<'local>]);
 
     #[cfg(target_os = "android")]
     fn root() {
