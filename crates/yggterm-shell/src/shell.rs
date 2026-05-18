@@ -7615,7 +7615,7 @@ fn quiet_retained_remote_surface_ready(
     if saw_prompt_only_surface && !runtime_running {
         return false;
     }
-    false
+    true
 }
 fn retained_remote_transcript_browser_surface_ready(
     _is_remote_resume_session: bool,
