@@ -20,6 +20,26 @@ const EXPORTED_TERM_PROGRAM: &str = "vscode";
 const YGGTERM_TERM_PROGRAM: &str = "yggterm";
 const YGGTERM_TERM_PROGRAM_VERSION: &str = env!("CARGO_PKG_VERSION");
 const ENV_YGGTERM_TERMINAL_APPEARANCE: &str = "YGGTERM_TERMINAL_APPEARANCE";
+const ENV_YGGTERM_TERMINAL_COLOR_FOREGROUND: &str = "YGGTERM_TERMINAL_COLOR_FOREGROUND";
+const ENV_YGGTERM_TERMINAL_COLOR_BACKGROUND: &str = "YGGTERM_TERMINAL_COLOR_BACKGROUND";
+const ENV_YGGTERM_TERMINAL_COLOR_PALETTE: [&str; 16] = [
+    "YGGTERM_TERMINAL_COLOR_0",
+    "YGGTERM_TERMINAL_COLOR_1",
+    "YGGTERM_TERMINAL_COLOR_2",
+    "YGGTERM_TERMINAL_COLOR_3",
+    "YGGTERM_TERMINAL_COLOR_4",
+    "YGGTERM_TERMINAL_COLOR_5",
+    "YGGTERM_TERMINAL_COLOR_6",
+    "YGGTERM_TERMINAL_COLOR_7",
+    "YGGTERM_TERMINAL_COLOR_8",
+    "YGGTERM_TERMINAL_COLOR_9",
+    "YGGTERM_TERMINAL_COLOR_10",
+    "YGGTERM_TERMINAL_COLOR_11",
+    "YGGTERM_TERMINAL_COLOR_12",
+    "YGGTERM_TERMINAL_COLOR_13",
+    "YGGTERM_TERMINAL_COLOR_14",
+    "YGGTERM_TERMINAL_COLOR_15",
+];
 const TERMINAL_IDENTITY_ENV_REMOVALS: &[&str] = &["NO_COLOR"];
 const MANAGED_CLI_REFRESH_STATE_FILENAME: &str = "managed-cli-refresh-state.json";
 const MANAGED_CLI_REFRESH_TTL_ENV: &str = "YGGTERM_MANAGED_CLI_REFRESH_TTL_MS";
@@ -72,6 +92,13 @@ pub struct ManagedCliRefreshReport {
     pub install_attempted: bool,
     #[serde(default)]
     pub install_deferred: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TerminalIdentityColorProfile {
+    pub foreground: String,
+    pub background: String,
+    pub palette: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -173,7 +200,18 @@ impl ManagedCliPaths {
     }
 
     fn shell_exports(&self, tool: ManagedCliTool) -> String {
-        let mut exports = terminal_identity_shell_exports();
+        self.shell_exports_with_terminal_appearance(tool, None)
+    }
+
+    fn shell_exports_with_terminal_appearance(
+        &self,
+        tool: ManagedCliTool,
+        terminal_appearance: Option<&str>,
+    ) -> String {
+        let mut exports = terminal_appearance
+            .and_then(normalize_terminal_appearance)
+            .map(terminal_identity_shell_exports_for_appearance)
+            .unwrap_or_else(terminal_identity_shell_exports);
         exports.extend([
             format!(
                 "export NPM_CONFIG_PREFIX={}",
@@ -518,10 +556,13 @@ fn colorfgbg_for_appearance(appearance: &str) -> &'static str {
     }
 }
 
-fn terminal_identity_env_pairs_with_home(
+fn terminal_identity_env_pairs_for_appearance_with_home(
+    appearance: &str,
     include_yggterm_home: bool,
 ) -> Vec<(&'static str, String)> {
-    let appearance = ambient_terminal_appearance();
+    let appearance = normalize_terminal_appearance(appearance)
+        .unwrap_or("light")
+        .to_string();
     let mut pairs = vec![
         ("TERM", "xterm-256color".to_string()),
         ("COLORTERM", "truecolor".to_string()),
@@ -545,7 +586,92 @@ fn terminal_identity_env_pairs_with_home(
             pairs.push((ENV_YGGTERM_HOME, home));
         }
     }
+    pairs.extend(terminal_identity_color_env_pairs_from_environment());
     pairs
+}
+
+fn terminal_identity_color_env_pairs_from_environment() -> Vec<(&'static str, String)> {
+    let Some(profile) = terminal_identity_color_profile_from_environment() else {
+        return Vec::new();
+    };
+    terminal_identity_color_env_pairs(&profile)
+}
+
+pub(crate) fn terminal_identity_color_env_pairs(
+    profile: &TerminalIdentityColorProfile,
+) -> Vec<(&'static str, String)> {
+    let Some(palette) = normalized_terminal_identity_palette(profile) else {
+        return Vec::new();
+    };
+    let Some(foreground) = normalize_terminal_identity_color(&profile.foreground) else {
+        return Vec::new();
+    };
+    let Some(background) = normalize_terminal_identity_color(&profile.background) else {
+        return Vec::new();
+    };
+    let mut pairs = Vec::with_capacity(18);
+    pairs.push((ENV_YGGTERM_TERMINAL_COLOR_FOREGROUND, foreground));
+    pairs.push((ENV_YGGTERM_TERMINAL_COLOR_BACKGROUND, background));
+    for (key, value) in ENV_YGGTERM_TERMINAL_COLOR_PALETTE
+        .iter()
+        .copied()
+        .zip(palette)
+    {
+        pairs.push((key, value));
+    }
+    pairs
+}
+
+fn normalized_terminal_identity_palette(
+    profile: &TerminalIdentityColorProfile,
+) -> Option<Vec<String>> {
+    if profile.palette.len() != ENV_YGGTERM_TERMINAL_COLOR_PALETTE.len() {
+        return None;
+    }
+    profile
+        .palette
+        .iter()
+        .map(|value| normalize_terminal_identity_color(value))
+        .collect()
+}
+
+pub(crate) fn normalize_terminal_identity_color(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    let hex = trimmed.strip_prefix('#').unwrap_or(trimmed);
+    if hex.len() != 6 || !hex.as_bytes().iter().all(u8::is_ascii_hexdigit) {
+        return None;
+    }
+    Some(format!("#{hex}").to_ascii_lowercase())
+}
+
+pub(crate) fn terminal_identity_color_profile_from_environment()
+-> Option<TerminalIdentityColorProfile> {
+    let foreground =
+        normalize_terminal_identity_color(&env::var(ENV_YGGTERM_TERMINAL_COLOR_FOREGROUND).ok()?)?;
+    let background =
+        normalize_terminal_identity_color(&env::var(ENV_YGGTERM_TERMINAL_COLOR_BACKGROUND).ok()?)?;
+    let palette = ENV_YGGTERM_TERMINAL_COLOR_PALETTE
+        .iter()
+        .map(|key| {
+            env::var(key)
+                .ok()
+                .and_then(|value| normalize_terminal_identity_color(&value))
+        })
+        .collect::<Option<Vec<_>>>()?;
+    Some(TerminalIdentityColorProfile {
+        foreground,
+        background,
+        palette,
+    })
+}
+
+fn terminal_identity_env_pairs_with_home(
+    include_yggterm_home: bool,
+) -> Vec<(&'static str, String)> {
+    terminal_identity_env_pairs_for_appearance_with_home(
+        &ambient_terminal_appearance(),
+        include_yggterm_home,
+    )
 }
 
 pub(crate) fn terminal_identity_env_pairs() -> Vec<(&'static str, String)> {
@@ -568,6 +694,18 @@ pub(crate) fn terminal_identity_shell_exports() -> Vec<String> {
         .collect()
 }
 
+pub(crate) fn terminal_identity_shell_exports_for_appearance(appearance: &str) -> Vec<String> {
+    terminal_identity_env_removals()
+        .iter()
+        .map(|key| format!("unset {key}"))
+        .chain(
+            terminal_identity_env_pairs_for_appearance_with_home(appearance, true)
+                .into_iter()
+                .map(|(key, value)| format!("export {key}={}", shell_single_quote(&value))),
+        )
+        .collect()
+}
+
 pub(crate) fn terminal_identity_shell_exports_for_remote() -> Vec<String> {
     terminal_identity_env_removals()
         .iter()
@@ -581,11 +719,26 @@ pub(crate) fn terminal_identity_shell_exports_for_remote() -> Vec<String> {
 }
 
 pub fn sync_terminal_identity_appearance(appearance: &str) {
+    sync_terminal_identity_appearance_with_profile(appearance, None);
+}
+
+pub fn sync_terminal_identity_appearance_with_profile(
+    appearance: &str,
+    profile: Option<&TerminalIdentityColorProfile>,
+) {
     let appearance = normalize_terminal_appearance(appearance).unwrap_or("light");
+    let profile = profile
+        .cloned()
+        .or_else(terminal_identity_color_profile_from_environment);
     // The daemon owns terminal launch commands and needs a process-wide identity for child PTYs
     // and remote shell command synthesis. This is updated on startup/theme changes only.
     unsafe {
         for key in terminal_identity_env_removals() {
+            env::remove_var(key);
+        }
+        env::remove_var(ENV_YGGTERM_TERMINAL_COLOR_FOREGROUND);
+        env::remove_var(ENV_YGGTERM_TERMINAL_COLOR_BACKGROUND);
+        for key in ENV_YGGTERM_TERMINAL_COLOR_PALETTE {
             env::remove_var(key);
         }
         env::set_var("TERM", "xterm-256color");
@@ -596,6 +749,11 @@ pub fn sync_terminal_identity_appearance(appearance: &str) {
         env::set_var("YGGTERM_APPEARANCE", appearance);
         env::set_var(ENV_YGGTERM_TERMINAL_APPEARANCE, appearance);
         env::set_var("COLORFGBG", colorfgbg_for_appearance(appearance));
+        if let Some(profile) = profile.as_ref() {
+            for (key, value) in terminal_identity_color_env_pairs(profile) {
+                env::set_var(key, value);
+            }
+        }
     }
 }
 
@@ -942,7 +1100,7 @@ mod tests {
     }
 
     #[test]
-    fn managed_cli_launch_probe_uses_system_binary_without_refresh_action() {
+    fn managed_cli_probe_report_uses_system_binary_without_refresh_action() {
         let status = managed_cli_launch_status_from_probe(
             ManagedCliTool::Codex,
             ToolProbe {
@@ -1206,6 +1364,7 @@ fn tool_status(
     }
 }
 
+#[cfg(test)]
 fn managed_cli_launch_status_from_probe(
     tool: ManagedCliTool,
     probe: ToolProbe,
@@ -1234,36 +1393,19 @@ fn managed_cli_launch_status_from_probe(
     tool_status(tool, probe.clone(), probe, action, detail)
 }
 
-pub(crate) fn inspect_local_managed_cli_for_launch(
-    tool: ManagedCliTool,
-) -> Result<ManagedCliToolStatus> {
-    let paths = ManagedCliPaths::resolve()?;
-    append_trace_event(
-        &paths.home,
-        "server",
-        "managed_cli",
-        "launch_probe_begin",
-        serde_json::json!({ "tool": tool.binary_name() }),
-    );
-    let status = managed_cli_launch_status_from_probe(tool, probe_tool(&paths, tool));
-    append_trace_event(
-        &paths.home,
-        "server",
-        "managed_cli",
-        "launch_probe_end",
-        serde_json::json!({
-            "tool": tool.binary_name(),
-            "action": status.action.clone(),
-            "available": status.available,
-        }),
-    );
-    Ok(status)
-}
-
 pub(crate) fn managed_cli_shell_command(
     kind: SessionKind,
     cwd: Option<&str>,
     action: ManagedCliAction<'_>,
+) -> Result<String> {
+    managed_cli_shell_command_with_terminal_appearance(kind, cwd, action, None)
+}
+
+pub(crate) fn managed_cli_shell_command_with_terminal_appearance(
+    kind: SessionKind,
+    cwd: Option<&str>,
+    action: ManagedCliAction<'_>,
+    terminal_appearance: Option<&str>,
 ) -> Result<String> {
     let Some(tool) = ManagedCliTool::from_session_kind(kind) else {
         anyhow::bail!("session kind does not use a managed Codex CLI");
@@ -1274,7 +1416,7 @@ pub(crate) fn managed_cli_shell_command(
     if let Some(preamble) = best_effort_cwd_shell_prefix(cwd) {
         parts.push(preamble);
     }
-    parts.push(paths.shell_exports(tool));
+    parts.push(paths.shell_exports_with_terminal_appearance(tool, terminal_appearance));
     let extra_args = configured_codex_extra_args(kind);
     let invocation = match action {
         ManagedCliAction::Launch => format!("{}{}", tool.binary_name(), extra_args),
