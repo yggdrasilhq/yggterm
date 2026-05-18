@@ -4,6 +4,12 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+## 2.6.66
+
+- Fix retained remote Codex prompt readiness so prompt-ready surfaces that pass
+  every visual, geometry, runtime, and transcript gate actually clear the resume
+  overlay instead of falling through to a false negative.
+
 ## 2.6.65
 
 - Restore generic shell prompt replay for non-Codex remote terminals while
