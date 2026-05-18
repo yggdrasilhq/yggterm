@@ -28,10 +28,20 @@ but should keep this base contract intact.
   `event-trace.jsonl`, install metadata, and relevant app-control proof files.
 - Confirm the active GUI, daemon, launcher, and headless binary versions before
   testing.
+- Confirm direct-install launcher identity before creating sessions. If
+  `~/.local/share/yggterm/direct/install-state.json` exists, `~/.local/bin/yggterm`
+  and `~/.local/bin/yggterm-headless` must be either current launcher scripts or
+  point at the active executable pair in install-state. A symlink or copied
+  binary that still resolves into an older `direct/versions/<version>/` directory
+  is a release-blocking stale-binary failure.
 - Start resource logging before opening any test session so baseline and
   cause/effect data are comparable. Record idle GUI, daemon, WebKit child,
   remote daemon, memory, swap, and app-control latency before the first test
   click.
+- Record `yggterm-headless server monitor --scenario server-list` at baseline,
+  after GUI restore, and after cleanup. The same runtime key must not appear in
+  more than one daemon's `owned_terminal_session_keys`; preserved-owner entries
+  are allowed only when exactly one daemon directly owns the PTY.
 - Reset/generate title-summary copy only for the app graph under test unless
   the release is explicitly validating local archive maintenance:
   `yggterm-headless server sessions regenerate-copy --skip-local --reset-summary-history`.
@@ -57,12 +67,15 @@ but should keep this base contract intact.
 Open 23 sessions from the selected cwd targets.
 
 Choose 7 of those sessions as heavier terminal workloads. In each heavy session,
-run either:
+run the first deterministic TUI available on that target:
 
+- the checked-in smoke harness's Python curses fixture, when Python curses is
+  present
 - `htop`
-- `npx codex-session-tui`
+- `top`
+- a locally available or already cached `codex-session-tui`
 
-Choose the command that is valid for the target machine and cwd. The remaining
+Do not let this gate depend on network package download latency. The remaining
 16 sessions should run ordinary shell workloads such as directory listing,
 prompt interaction, short commands, or PowerShell equivalents on Windows.
 
@@ -80,6 +93,9 @@ Check at minimum:
 - sidebar membership and cwd placement are deterministic
 - active session identity matches saved-session identity
 - prompt, cursor, and typed echo are visible
+- the active terminal renderer is the default DOM row path unless the run
+  explicitly opts into canvas; if canvas is enabled, screenshot pixels,
+  app-control buffer text, and foreground/background contrast must agree
 - full-width TUI lines remain coherent after settle
 - scrollback does not jump without intentional scrolling
 - background sessions do not burn CPU when cooled
@@ -97,7 +113,13 @@ that have previously hidden release-blocking defects:
 
 - reveal and hide the autohidden titlebar while a terminal is active; the hover
   chrome must use the same background/gradient as the visible titlebar and must
-  not resize the terminal grid
+  not resize the terminal grid or shift shell content. Stable builds must not
+  report compositor blur, CSS backdrop blur, or a nonzero material blur budget.
+- open the theme editor, reset the theme, change brightness through
+  app-control, verify the brightness slider/manual field is visible, verify
+  alpha/grain remain pinned to stable defaults even if legacy values are set,
+  verify no repeated grain layer is emitted, verify the saved/effective theme
+  and shell CSS variables change, then reset it again
 - click the active terminal viewport at random positions; the viewport must not
   flicker-scroll or settle at an unintended scrollback location
 - resize or nudge the window; prompt-follow sessions must return to the prompt,
@@ -119,6 +141,34 @@ that have previously hidden release-blocking defects:
 - run the app-control terminal probes for typed echo, scroll, selection/context
   menu, and xterm row style truth; the screenshot, probe, and state JSON must
   agree
+- reject any state where app-control reports daemon-backed buffer text while
+  the screenshot shows a blank terminal, or where canvas mode reports
+  low-contrast foreground/background colors over a dark terminal surface
+- query `~/.yggterm/telemetry/terminal.sqlite3` for the run window; every opened
+  terminal must have `terminal_open_attempt/begin` and either
+  `terminal_open_attempt/ready` or a documented failure/recovery event
+- after the first `terminal_open_attempt/ready` for a retained remote terminal,
+  reject a burst of new retained-fault `begin` events in the settle window. A
+  transient post-ready blank sample may appear as
+  `retained_fault_recovery_suppressed_after_ready`, but repeated remounts are a
+  first-attach failure and a CPU/fan-budget defect.
+- before the first ready event, reject retained rehydrate failures whose error
+  is the current daemon socket being unreachable. A startup run may log
+  `terminal_io/retained_rehydrate_daemon_ready_wait`, but it must not need a
+  retained-fault watchdog remount to make the same preserved PTY snapshot
+  readable. If the watchdog deadline fires during that wait, the only accepted
+  event is `retained_fault_recovery_rearm_deferred_daemon_ready`; a
+  `retained_fault_recovery_rearm` before daemon-ready is a failed smoke run.
+- reject prompt-follow recovery if app-control shows the DOM viewport is already
+  at the prompt while xterm's public `viewportY` is stale. In that case
+  `viewport_y_source=dom_visual` is the accepted proof; a retained-fault remount
+  caused only by the stale public counter is a failed smoke run.
+- reject any active DOM-rendered terminal where xterm text exists but
+  `dom_paint_hit_test_problem` is non-empty. The screenshot, row/cursor
+  hit-test stack, and terminal surface summary must agree before the terminal is
+  treated as drawable. If app-control screenshot capture is suspected to be a
+  background/occlusion artifact, record an OS-level screenshot and classify that
+  separately; do not turn a blank app-control capture into a pass silently.
 
 ## Keep-Alive And Restore Pass
 
@@ -137,15 +187,21 @@ metadata contract.
 
 ## Resource Budget
 
-Resource logging must cover three windows:
+Resource logging must cover five windows:
 
 - baseline before opening test sessions
 - active workload while the 23 sessions are visible/reachable
 - cooled period after the GUI is closed and before it is respawned
+- respawn burst immediately after the GUI is restored
+- respawn settled after the restored sessions have had a short settle period
 
 Record CPU, memory, swap, daemon process list, GUI process list, and app-control
 latency. A pass requires no unexplained sustained CPU spike, no swap growth that
-survives cleanup, and no fan-level load from idle cooled sessions.
+survives cleanup, and no fan-level load from idle cooled or freshly respawned
+sessions. The release script must preserve the configured budget for each
+window, not just the cooldown window. The respawn burst budget may be higher
+than the settled budget, but the proof must show the load decays rather than
+turning into a render loop.
 
 For each resource window, include enough samples to distinguish transient work
 from a leak or loop. The proof bundle should mark the causal boundary between
@@ -164,6 +220,10 @@ The gate passes only when:
 - titles, summaries, cwd placement, and long UUID metadata remain durable
 - no stale runtime or ghost session becomes live
 - app-control state, probes, screenshots, and resource logs agree
+- terminal telemetry contains no unhandled live-truth split for the run,
+  including stored session without runtime ownership, healthy remote machine
+  with no drawable terminal after terminal launch, or empty xterm surface that
+  only recovers after a manual switching pass
 - cleanup closes/removes every test-created non-user session
 
 When this passes, the candidate can be promoted to the next `x.y.0` release.
@@ -176,7 +236,10 @@ Keep a proof bundle for each run with:
 - random seed and selected machine/cwd targets
 - command plan for the 7 heavy and 16 ordinary sessions
 - screenshots and app-control JSON before and after restore
-- resource logs for baseline, active workload, cooldown, and respawn
+- terminal telemetry query output for opened sessions, recovery warnings, and
+  errors during the run window
+- resource logs for baseline, active workload, cooldown, respawn burst, and
+  respawn settled
 - keep-alive set and restore comparison
 - defect notes or explicit "no defect found" summary
 - cleanup report

@@ -14,8 +14,8 @@ use yggterm_server::{
     default_endpoint, ensure_local_daemon_running, hot_restart_detailed,
     local_headless_companion_executable_from_current, ping, prepare_update_restart,
     reachable_versioned_daemon_statuses, refresh_managed_cli, refresh_remote_machine,
-    request_terminal_launch, shutdown, snapshot, start_local_session_at, status, terminal_ensure,
-    terminal_read, terminal_write,
+    request_terminal_launch, retire_daemon, shutdown, snapshot, start_local_session_at, status,
+    terminal_ensure, terminal_read, terminal_write,
 };
 
 fn remote_machine_details_json(snap: &yggterm_server::ServerUiSnapshot) -> serde_json::Value {
@@ -431,6 +431,17 @@ fn daemon_status_owned_terminal_runtime_keys(
     Vec::new()
 }
 
+fn daemon_status_retire_guard_runtime_keys(
+    daemon_status: &yggterm_server::ServerRuntimeStatus,
+) -> Vec<String> {
+    let mut keys = daemon_status_owned_terminal_runtime_keys(daemon_status);
+    keys.extend(daemon_status.terminal_session_keys.iter().cloned());
+    keys.extend(daemon_status.preserved_terminal_owner_keys.iter().cloned());
+    keys.sort();
+    keys.dedup();
+    keys
+}
+
 fn daemon_status_owns_all_runtime_keys(
     daemon_status: &yggterm_server::ServerRuntimeStatus,
     runtime_keys: &[String],
@@ -463,6 +474,118 @@ fn hot_restart_target_runtime_covered_by_expected_server(
         .filter(|status| daemon_status_owns_all_runtime_keys(status, &runtime_keys))
         .cloned()
         .max_by_key(|status| (status.server_build_id, status.server_pid))
+}
+
+fn hot_restart_target_retire_covered_by_expected_server(
+    target_status: &yggterm_server::ServerRuntimeStatus,
+    all_targets: &[(ServerEndpoint, yggterm_server::ServerRuntimeStatus)],
+    cfg: &Config,
+) -> Option<yggterm_server::ServerRuntimeStatus> {
+    if target_status.owned_terminal_session_count > 0
+        || !target_status.owned_terminal_session_keys.is_empty()
+    {
+        return hot_restart_target_runtime_covered_by_expected_server(
+            target_status,
+            all_targets,
+            cfg,
+        );
+    }
+    let guard_keys = daemon_status_retire_guard_runtime_keys(target_status);
+    if guard_keys.is_empty() {
+        return None;
+    }
+    all_targets
+        .iter()
+        .map(|(_, status)| status)
+        .filter(|status| status.server_pid != target_status.server_pid)
+        .filter(|status| status_matches_expected(status, cfg))
+        .filter(|status| daemon_status_owns_all_runtime_keys(status, &guard_keys))
+        .cloned()
+        .max_by_key(|status| (status.server_build_id, status.server_pid))
+}
+
+fn retire_stale_daemon_without_session_shutdown(
+    target: &ServerEndpoint,
+    daemon_status: &yggterm_server::ServerRuntimeStatus,
+    owner_status: &yggterm_server::ServerRuntimeStatus,
+    reason: &'static str,
+) -> serde_json::Value {
+    let retire_result = retire_daemon(target, Some(reason))
+        .map(|message| json!({"ok": true, "message": message}))
+        .unwrap_or_else(|retire_error| json!({"ok": false, "error": retire_error.to_string()}));
+    let process_retire = terminate_stale_daemon_process_if_needed(daemon_status.server_pid);
+    json!({
+        "endpoint": endpoint_json(target),
+        "server": server_status_json(target, daemon_status),
+        "native_hot_restart": false,
+        "hot_update_handoff": false,
+        "fallback_shutdown_skipped": false,
+        "fallback_shutdown_used": false,
+        "duplicate_runtime_owner_retired": true,
+        "daemon_retired_without_session_shutdown": true,
+        "covered_by_pid": owner_status.server_pid,
+        "covered_by_version": owner_status.server_version,
+        "covered_runtime_keys": daemon_status_retire_guard_runtime_keys(daemon_status),
+        "retire": retire_result,
+        "process_retire": process_retire,
+        "update_priority": "duplicate_runtime_retire",
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn linux_process_exists(pid: u32) -> bool {
+    Path::new(&format!("/proc/{pid}")).exists()
+}
+
+#[cfg(target_os = "linux")]
+fn terminate_stale_daemon_process_if_needed(pid: u32) -> serde_json::Value {
+    if pid == std::process::id() || pid == 0 {
+        return json!({
+            "attempted": false,
+            "reason": "refusing_to_terminate_current_or_invalid_pid",
+            "pid": pid,
+        });
+    }
+    if !linux_process_exists(pid) {
+        return json!({
+            "attempted": false,
+            "reason": "already_exited",
+            "pid": pid,
+        });
+    }
+    unsafe {
+        libc::kill(pid as i32, libc::SIGTERM);
+    }
+    for _ in 0..10 {
+        sleep(Duration::from_millis(100));
+        if !linux_process_exists(pid) {
+            return json!({
+                "attempted": true,
+                "pid": pid,
+                "signal": "SIGTERM",
+                "exited": true,
+            });
+        }
+    }
+    unsafe {
+        libc::kill(pid as i32, libc::SIGKILL);
+    }
+    sleep(Duration::from_millis(120));
+    json!({
+        "attempted": true,
+        "pid": pid,
+        "signal": "SIGKILL",
+        "exited": !linux_process_exists(pid),
+    })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn terminate_stale_daemon_process_if_needed(pid: u32) -> serde_json::Value {
+    json!({
+        "attempted": false,
+        "pid": pid,
+        "reason": "process_retire_fallback_linux_only",
+    })
 }
 
 fn reachable_servers_json(home_dir: &Path) -> serde_json::Value {
@@ -1011,24 +1134,30 @@ fn run_scenario(
                             )
                     {
                         fallback_used = true;
-                        let shutdown_result = shutdown(target)
-                            .map(|message| json!({"ok": true, "message": message}))
-                            .unwrap_or_else(|shutdown_error| {
-                                json!({"ok": false, "error": shutdown_error.to_string()})
-                            });
-                        target_results.push(json!({
-                            "endpoint": endpoint_json(target),
-                            "server": server_status_json(target, daemon_status),
-                            "native_hot_restart": false,
-                            "hot_update_handoff": false,
-                            "fallback_shutdown_skipped": false,
-                            "duplicate_runtime_owner_retired": true,
-                            "covered_by_pid": owner_status.server_pid,
-                            "covered_by_version": owner_status.server_version,
-                            "covered_runtime_keys": daemon_status_owned_terminal_runtime_keys(daemon_status),
-                            "shutdown": shutdown_result,
-                            "update_priority": "duplicate_runtime_retire",
-                        }));
+                        target_results.push(retire_stale_daemon_without_session_shutdown(
+                            target,
+                            daemon_status,
+                            &owner_status,
+                            "duplicate runtime owner covered by expected daemon",
+                        ));
+                        continue;
+                    }
+                    if target != endpoint
+                        && !daemon_status_has_live_terminal_runtime(daemon_status)
+                        && let Some(owner_status) =
+                            hot_restart_target_retire_covered_by_expected_server(
+                                daemon_status,
+                                &target_statuses,
+                                cfg,
+                            )
+                    {
+                        fallback_used = true;
+                        target_results.push(retire_stale_daemon_without_session_shutdown(
+                            target,
+                            daemon_status,
+                            &owner_status,
+                            "stale daemon has no owned runtimes covered by expected daemon",
+                        ));
                         continue;
                     }
                     let expected_version = cfg
@@ -1091,24 +1220,19 @@ fn run_scenario(
                                     )
                                 {
                                     fallback_used = true;
-                                    let shutdown_result = shutdown(target)
-                                        .map(|message| json!({"ok": true, "message": message}))
-                                        .unwrap_or_else(|shutdown_error| {
-                                            json!({"ok": false, "error": shutdown_error.to_string()})
-                                        });
-                                    target_results.push(json!({
-                                        "endpoint": endpoint_json(target),
-                                        "server": server_status_json(target, daemon_status),
-                                        "native_hot_restart": false,
-                                        "hot_restart_error": error.to_string(),
-                                        "fallback_shutdown_skipped": false,
-                                        "duplicate_runtime_owner_retired": true,
-                                        "covered_by_pid": owner_status.server_pid,
-                                        "covered_by_version": owner_status.server_version,
-                                        "covered_runtime_keys": daemon_status_owned_terminal_runtime_keys(daemon_status),
-                                        "shutdown": shutdown_result,
-                                        "update_priority": "duplicate_runtime_retire",
-                                    }));
+                                    let mut result = retire_stale_daemon_without_session_shutdown(
+                                        target,
+                                        daemon_status,
+                                        &owner_status,
+                                        "duplicate runtime owner covered by expected daemon after hot restart error",
+                                    );
+                                    if let Some(object) = result.as_object_mut() {
+                                        object.insert(
+                                            "hot_restart_error".to_string(),
+                                            json!(error.to_string()),
+                                        );
+                                    }
+                                    target_results.push(result);
                                 } else {
                                     fallback_shutdown_skipped = true;
                                     ready_skip_reason = Some("session_survival_required");
@@ -1446,6 +1570,145 @@ mod tests {
 
         assert_eq!(owner.server_pid, 590);
         assert_eq!(owner.server_version, "2.2.59");
+    }
+
+    #[test]
+    fn hot_restart_monitor_retire_coverage_accepts_preserved_only_when_current_owns_key() {
+        let stale_preserved_only: yggterm_server::ServerRuntimeStatus =
+            serde_json::from_value(serde_json::json!({
+                "server_version": "2.4.52",
+                "server_build_id": 52,
+                "server_pid": 520,
+                "host_kind": "local",
+                "host_detail": "test",
+                "embedded_surface_supported": true,
+                "bridge_enabled": true,
+                "owned_terminal_session_count": 0,
+                "owned_terminal_session_keys": [],
+                "terminal_session_count": 1,
+                "terminal_session_keys": ["remote-session://dev/jyas"],
+                "preserved_terminal_owner_count": 1,
+                "preserved_terminal_owner_keys": ["remote-session://dev/jyas"],
+                "managed_session_count": 0,
+            }))
+            .expect("stale preserved-only status");
+        let current_owner: yggterm_server::ServerRuntimeStatus =
+            serde_json::from_value(serde_json::json!({
+                "server_version": "2.4.53",
+                "server_build_id": 53,
+                "server_pid": 530,
+                "host_kind": "local",
+                "host_detail": "test",
+                "embedded_surface_supported": true,
+                "bridge_enabled": true,
+                "owned_terminal_session_count": 1,
+                "owned_terminal_session_keys": ["remote-session://dev/jyas"],
+                "terminal_session_count": 1,
+                "terminal_session_keys": ["remote-session://dev/jyas"],
+                "preserved_terminal_owner_count": 0,
+                "preserved_terminal_owner_keys": [],
+                "managed_session_count": 0,
+            }))
+            .expect("current owner status");
+        let cfg = parse_args(vec![
+            "--scenario".to_string(),
+            "hot-restart".to_string(),
+            "--all".to_string(),
+            "--expected-version".to_string(),
+            "2.4.53".to_string(),
+        ])
+        .expect("parse cfg");
+        let endpoint = yggterm_server::default_endpoint(Path::new("/tmp/yggterm-monitor-test"));
+        let targets = vec![
+            (endpoint.clone(), stale_preserved_only.clone()),
+            (endpoint, current_owner),
+        ];
+
+        let owner = hot_restart_target_retire_covered_by_expected_server(
+            &stale_preserved_only,
+            &targets,
+            &cfg,
+        )
+        .expect("preserved-only sidecar coverage");
+        assert_eq!(owner.server_pid, 530);
+
+        let uncovered_targets = vec![(
+            yggterm_server::default_endpoint(Path::new("/tmp/yggterm-monitor-test")),
+            stale_preserved_only.clone(),
+        )];
+        assert!(
+            hot_restart_target_retire_covered_by_expected_server(
+                &stale_preserved_only,
+                &uncovered_targets,
+                &cfg,
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn hot_restart_monitor_retire_rejects_empty_runtime_coverage() {
+        let stale_without_runtime_keys: yggterm_server::ServerRuntimeStatus =
+            serde_json::from_value(serde_json::json!({
+                "server_version": "2.6.12",
+                "server_build_id": 612,
+                "server_pid": 6120,
+                "host_kind": "local",
+                "host_detail": "test",
+                "embedded_surface_supported": true,
+                "bridge_enabled": true,
+                "owned_terminal_session_count": 0,
+                "owned_terminal_session_keys": [],
+                "terminal_session_count": 0,
+                "terminal_session_keys": [],
+                "preserved_terminal_owner_count": 0,
+                "preserved_terminal_owner_keys": [],
+                "managed_session_count": 17,
+                "restored_live_sessions": 4,
+            }))
+            .expect("stale empty-key status");
+        let current: yggterm_server::ServerRuntimeStatus =
+            serde_json::from_value(serde_json::json!({
+                "server_version": "2.6.13",
+                "server_build_id": 613,
+                "server_pid": 6130,
+                "host_kind": "local",
+                "host_detail": "test",
+                "embedded_surface_supported": true,
+                "bridge_enabled": true,
+                "owned_terminal_session_count": 1,
+                "owned_terminal_session_keys": ["remote-session://dev/other"],
+                "terminal_session_count": 1,
+                "terminal_session_keys": ["remote-session://dev/other"],
+                "preserved_terminal_owner_count": 0,
+                "preserved_terminal_owner_keys": [],
+                "managed_session_count": 17,
+                "restored_live_sessions": 4,
+            }))
+            .expect("current status");
+        let cfg = parse_args(vec![
+            "--scenario".to_string(),
+            "hot-restart".to_string(),
+            "--all".to_string(),
+            "--expected-version".to_string(),
+            "2.6.13".to_string(),
+        ])
+        .expect("parse cfg");
+        let endpoint = yggterm_server::default_endpoint(Path::new("/tmp/yggterm-monitor-test"));
+        let targets = vec![
+            (endpoint.clone(), stale_without_runtime_keys.clone()),
+            (endpoint, current),
+        ];
+
+        assert!(
+            hot_restart_target_retire_covered_by_expected_server(
+                &stale_without_runtime_keys,
+                &targets,
+                &cfg,
+            )
+            .is_none(),
+            "an empty covered_runtime_keys set is not proof that retiring a stale daemon is session-safe"
+        );
     }
 
     #[test]

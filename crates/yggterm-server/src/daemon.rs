@@ -1,10 +1,13 @@
-use crate::codex_cli::sync_terminal_identity_appearance;
+use crate::codex_cli::{
+    TerminalIdentityColorProfile, sync_terminal_identity_appearance_with_profile,
+};
 use crate::terminal::{TerminalBufferStats, terminal_data_has_scrollback_text};
 use crate::{
     CodexRuntimeProcessIdentity, GhosttyHostSupport, ManagedSessionView, PersistedDaemonState,
-    RemoteMachineSnapshot, RemoteRuntimeRegistry, ServerUiSnapshot, SessionKind,
-    SnapshotSessionView, SshConnectTarget, TerminalManager, WorkspaceViewMode, YggtermServer,
-    active_client_instance_records, active_client_instance_records_for_endpoint_scope,
+    PersistedLiveSession, RemoteMachineSnapshot, RemoteRuntimeRegistry, ServerUiSnapshot,
+    SessionKind, SessionSource, SnapshotSessionView, SshConnectTarget, TerminalManager,
+    WorkspaceViewMode, YggtermServer, active_client_instance_records,
+    active_client_instance_records_for_endpoint_scope,
     codex_runtime_process_identity_from_root_pid, current_millis, fetch_remote_generation_context,
     local_headless_companion_executable_from_current, overlay_codex_runtime_snapshot_identity,
     persist_remote_generated_copy, remote_resume_runtime_output_requires_restart,
@@ -54,7 +57,63 @@ const DAEMON_CLIENT_REQUEST_READ_TIMEOUT_MS: u64 = 2_000;
 const REMOTE_ATTACH_STARTUP_GRACE_MS: u64 = 900;
 const REMOTE_START_CODEX_ATTACH_STARTUP_GRACE_MS: u64 = 18_000;
 const CLIENT_CLOSE_FORCE_SHUTDOWN_AFTER_SECS: u64 = 60 * 60;
+const EXPLICIT_REMOTE_SESSION_CLOSE_FORCE_AFTER_SECS: u64 = 2;
 const ENV_YGGTERM_ENABLE_BACKGROUND_COPY_CHORE: &str = "YGGTERM_ENABLE_BACKGROUND_COPY_CHORE";
+
+fn spawn_explicit_remote_session_shutdown(
+    home: &Path,
+    path: &str,
+    machine: RemoteMachineSnapshot,
+    session_id: String,
+) {
+    let home = home.to_path_buf();
+    let path = path.to_string();
+    let machine_key = machine.machine_key.clone();
+    let spawn_failure_home = home.clone();
+    let spawn_failure_path = path.clone();
+    let spawn_failure_machine_key = machine_key.clone();
+    let spawn_failure_session_id = session_id.clone();
+    let thread_name = format!("explicit-remote-close-{}", machine.machine_key);
+    let spawn_result = std::thread::Builder::new()
+        .name(thread_name)
+        .spawn(move || {
+            let force_after =
+                std::time::Duration::from_secs(EXPLICIT_REMOTE_SESSION_CLOSE_FORCE_AFTER_SECS);
+            let result = request_remote_codex_session_shutdown(&machine, &session_id, force_after);
+            append_trace_event(
+                &home,
+                "daemon",
+                "session",
+                if result.is_ok() {
+                    "explicit_remote_session_close_requested"
+                } else {
+                    "explicit_remote_session_close_warning"
+                },
+                serde_json::json!({
+                    "path": path,
+                    "machine_key": machine_key,
+                    "ssh_target": machine.ssh_target,
+                    "session_id": session_id,
+                    "force_after_seconds": EXPLICIT_REMOTE_SESSION_CLOSE_FORCE_AFTER_SECS,
+                    "error": result.err().map(|error| error.to_string()),
+                }),
+            );
+        });
+    if let Err(error) = spawn_result {
+        append_trace_event(
+            &spawn_failure_home,
+            "daemon",
+            "session",
+            "explicit_remote_session_close_spawn_failed",
+            serde_json::json!({
+                "path": spawn_failure_path,
+                "machine_key": spawn_failure_machine_key,
+                "session_id": spawn_failure_session_id,
+                "error": error.to_string(),
+            }),
+        );
+    }
+}
 
 fn spawn_remote_generated_copy_persist(
     machine: RemoteMachineSnapshot,
@@ -127,7 +186,7 @@ fn startup_prewarm_enabled() -> bool {
     std::env::var("YGGTERM_ENABLE_STARTUP_TERMINAL_PREWARM")
         .ok()
         .map(|value| !daemon_env_flag_falsey_value(&value))
-        .unwrap_or(true)
+        .unwrap_or(false)
 }
 
 fn startup_prewarm_skip_reason_with_flag(active_path: &str, enabled: bool) -> Option<&'static str> {
@@ -514,6 +573,90 @@ fn remote_resume_stale_attach(
     runtime_output_requires_restart || (!has_runtime_output && runtime_age_ms >= startup_grace_ms)
 }
 
+fn remote_resume_saved_session_mismatch_requires_restart(
+    remote_resume_path: bool,
+    has_runtime_output: bool,
+    runtime_age_ms: u64,
+    runtime_saved_session_mismatch: bool,
+    startup_grace_ms: u64,
+) -> bool {
+    let _ = (
+        remote_resume_path,
+        has_runtime_output,
+        runtime_age_ms,
+        runtime_saved_session_mismatch,
+        startup_grace_ms,
+    );
+    false
+}
+
+fn terminal_reuse_needs_restart(
+    still_running: bool,
+    remote_resume_path: bool,
+    keep_alive_runtime: bool,
+    stale_remote_attach: bool,
+    blank_remote_attach: bool,
+    remote_saved_session_mismatch_requires_restart: bool,
+    spec_matches: bool,
+) -> (bool, bool) {
+    if !still_running {
+        return (true, false);
+    }
+    let restart_blocked_by_keep_alive = remote_resume_path && keep_alive_runtime;
+    let restart_requested = stale_remote_attach
+        || blank_remote_attach
+        || remote_saved_session_mismatch_requires_restart
+        || !spec_matches;
+    (
+        restart_requested && !restart_blocked_by_keep_alive,
+        restart_requested && restart_blocked_by_keep_alive,
+    )
+}
+
+fn terminal_read_runtime_recovery_reason(
+    path: &str,
+    runtime_path: &str,
+    terminals: &TerminalManager,
+) -> Option<&'static str> {
+    if !uses_runtime_owned_terminal_path(path) {
+        return None;
+    }
+    if terminals.session_is_running(runtime_path) {
+        if terminals.session_hit_eof_without_output(runtime_path)
+            && !terminals.session_has_runtime_output(runtime_path)
+        {
+            return Some("eof_without_output");
+        }
+        return None;
+    }
+    let Some(snapshot) = terminals.session_snapshot(runtime_path) else {
+        return Some("missing_runtime_before_read");
+    };
+    if snapshot.trim().is_empty() {
+        return Some("exited_empty_runtime_before_read");
+    }
+    if crate::remote_resume_runtime_output_requires_restart(snapshot.as_bytes()) {
+        return Some("exited_restartable_runtime_output_before_read");
+    }
+    None
+}
+
+fn preserved_owner_saved_session_mismatch_should_detach(
+    path: &str,
+    keep_alive_runtime: bool,
+    temporary_update_restore: bool,
+    runtime_output_mismatches_path: bool,
+) -> bool {
+    runtime_output_mismatches_path
+        && !temporary_update_restore
+        && !(path.starts_with("remote-session://") && keep_alive_runtime)
+}
+
+fn remove_session_should_detach_keep_alive_runtime(keep_alive_runtime: bool) -> bool {
+    let _ = keep_alive_runtime;
+    false
+}
+
 fn valid_initial_terminal_size(cols: Option<u16>, rows: Option<u16>) -> Option<(u16, u16)> {
     match (cols, rows) {
         (Some(cols), Some(rows)) if cols > 0 && rows > 0 => Some((cols, rows)),
@@ -752,6 +895,13 @@ impl PreservedTerminalOwnerRegistry {
         Ok(true)
     }
 
+    fn retarget_loaded_registry_for_current_version(&mut self, home_dir: &Path) -> Result<bool> {
+        if self.expected_server_version.as_deref() == Some(SERVER_PROTOCOL_VERSION) {
+            return Ok(false);
+        }
+        self.retarget_expected_server_version(home_dir, Some(SERVER_PROTOCOL_VERSION.to_string()))
+    }
+
     fn keys(&self) -> Vec<String> {
         let mut keys = self
             .entries
@@ -808,12 +958,229 @@ impl PreservedTerminalOwnerRegistry {
             .find(|entry| entry.runtime_key == runtime_key)
     }
 
+    fn upsert_runtime_owner(
+        &mut self,
+        home_dir: &Path,
+        runtime_key: &str,
+        owner_endpoint: &ServerEndpoint,
+        owner_status: &ServerRuntimeStatus,
+        expected_server_version: Option<String>,
+    ) -> Result<bool> {
+        if let Some((existing_expected, requested_expected)) = hot_update_target_regression(
+            self.expected_server_version.as_deref(),
+            expected_server_version.as_deref(),
+        ) {
+            append_trace_event(
+                home_dir,
+                "daemon",
+                "hot_update",
+                "handoff_target_regression_refused",
+                serde_json::json!({
+                    "existing_expected_server_version": existing_expected,
+                    "requested_expected_server_version": requested_expected,
+                    "runtime_key": runtime_key,
+                    "owner_endpoint": owner_endpoint_label(owner_endpoint),
+                    "owner_server_version": &owner_status.server_version,
+                    "owner_server_pid": owner_status.server_pid,
+                    "reason": "discovered_owner_would_downgrade_existing_handoff",
+                }),
+            );
+            bail!(
+                "refusing hot-update handoff target regression from {existing_expected} to {requested_expected}; preserving the newer session-survival target"
+            );
+        }
+
+        let owner_endpoint = PreservedOwnerEndpoint::from_endpoint(owner_endpoint);
+        if self.expected_server_version != expected_server_version {
+            self.expected_server_version = expected_server_version;
+        }
+        let before = self.entries.clone();
+        self.entries
+            .retain(|entry| entry.runtime_key != runtime_key);
+        self.entries.push(PreservedTerminalOwnerEntry {
+            runtime_key: runtime_key.to_string(),
+            endpoint: owner_endpoint,
+            owner_server_version: owner_status.server_version.clone(),
+            owner_server_build_id: owner_status.server_build_id,
+            owner_server_pid: owner_status.server_pid,
+            created_at_ms: current_millis_u64(),
+        });
+        self.entries
+            .sort_by(|left, right| left.runtime_key.cmp(&right.runtime_key));
+        self.entries
+            .dedup_by(|left, right| left.runtime_key == right.runtime_key);
+        if self.entries == before {
+            return Ok(false);
+        }
+        self.save(home_dir)?;
+        Ok(true)
+    }
+
     fn remove_key(&mut self, runtime_key: &str) -> bool {
         let before = self.entries.len();
         self.entries
             .retain(|entry| entry.runtime_key != runtime_key);
         before != self.entries.len()
     }
+}
+
+fn snapshot_session_metadata_value(session: &SnapshotSessionView, label: &str) -> Option<String> {
+    session
+        .metadata
+        .iter()
+        .find(|entry| entry.label == label)
+        .map(|entry| entry.value.clone())
+}
+
+fn snapshot_session_keep_alive(session: &SnapshotSessionView) -> bool {
+    snapshot_session_metadata_value(session, "Runtime Persistence").as_deref() == Some("keep-alive")
+}
+
+fn snapshot_session_update_restore(session: &SnapshotSessionView) -> bool {
+    snapshot_session_metadata_value(session, "Runtime Restore Reason").as_deref()
+        == Some(crate::UPDATE_RESTART_RESTORE_REASON)
+}
+
+fn snapshot_session_is_preserved_owner_recoverable(session: &SnapshotSessionView) -> bool {
+    snapshot_session_keep_alive(session) || snapshot_session_update_restore(session)
+}
+
+fn persisted_live_session_from_preserved_owner_snapshot(
+    session: &SnapshotSessionView,
+) -> Option<PersistedLiveSession> {
+    if !matches!(
+        session.source,
+        SessionSource::LiveLocal | SessionSource::LiveSsh
+    ) {
+        return None;
+    }
+    let ssh_target = session.ssh_target.clone()?;
+    Some(PersistedLiveSession {
+        key: session.session_path.clone(),
+        id: session.id.clone(),
+        title: session.title.clone(),
+        kind: session.kind,
+        keep_alive: snapshot_session_keep_alive(session),
+        ssh_target,
+        prefix: session.ssh_prefix.clone(),
+        cwd: snapshot_session_metadata_value(session, "Cwd"),
+        remote_launch_action: snapshot_session_metadata_value(session, "Remote Launch Action"),
+        storage_path: snapshot_session_metadata_value(session, "Storage"),
+        restore_reason: Some(crate::UPDATE_RESTART_RESTORE_REASON.to_string()),
+    })
+}
+
+fn restore_preserved_owner_live_sessions_from_snapshot(
+    server: &mut YggtermServer,
+    owner_snapshot: &ServerUiSnapshot,
+    runtime_keys: &HashSet<String>,
+) -> Vec<String> {
+    restore_preserved_owner_live_sessions_from_snapshot_with_policy(
+        server,
+        owner_snapshot,
+        runtime_keys,
+        false,
+    )
+}
+
+fn restore_preserved_owner_live_sessions_from_snapshot_with_policy(
+    server: &mut YggtermServer,
+    owner_snapshot: &ServerUiSnapshot,
+    runtime_keys: &HashSet<String>,
+    require_recoverable_metadata: bool,
+) -> Vec<String> {
+    let mut restored = Vec::<String>::new();
+    let mut seen = HashSet::<String>::new();
+    let owner_sessions = owner_snapshot
+        .live_sessions
+        .iter()
+        .chain(owner_snapshot.active_session.iter());
+    for session in owner_sessions {
+        if !seen.insert(session.session_path.clone()) {
+            continue;
+        }
+        let runtime_key = server.terminal_runtime_key_for_path(&session.session_path);
+        if !runtime_keys.contains(&session.session_path) && !runtime_keys.contains(&runtime_key) {
+            continue;
+        }
+        if server.represents_terminal_runtime_key(&runtime_key) {
+            continue;
+        }
+        if require_recoverable_metadata && !snapshot_session_is_preserved_owner_recoverable(session)
+        {
+            continue;
+        }
+        let Some(live) = persisted_live_session_from_preserved_owner_snapshot(session) else {
+            continue;
+        };
+        server.restore_live_session(live);
+        restored.push(runtime_key);
+    }
+    restored.sort();
+    restored.dedup();
+    restored
+}
+
+fn runtime_status_reports_terminal_key(status: &ServerRuntimeStatus, runtime_key: &str) -> bool {
+    status
+        .owned_terminal_session_keys
+        .iter()
+        .any(|key| key == runtime_key)
+        || status
+            .terminal_session_keys
+            .iter()
+            .any(|key| key == runtime_key)
+}
+
+fn runtime_status_direct_terminal_keys(status: &ServerRuntimeStatus) -> Vec<String> {
+    let mut keys = if status.owned_terminal_session_keys.is_empty() {
+        status.terminal_session_keys.clone()
+    } else {
+        status.owned_terminal_session_keys.clone()
+    };
+    keys.sort();
+    keys.dedup();
+    keys
+}
+
+fn preserved_owner_entries_live_for_handoff(
+    entries: &[PreservedTerminalOwnerEntry],
+    outgoing_owned_runtime_keys: &HashSet<String>,
+    represented_preserved_owner_keys: &HashSet<String>,
+    owner_status_cache: &BTreeMap<String, Option<ServerRuntimeStatus>>,
+) -> Vec<PreservedTerminalOwnerEntry> {
+    let mut live_entries = entries
+        .iter()
+        .filter(|entry| {
+            if outgoing_owned_runtime_keys.contains(&entry.runtime_key) {
+                return false;
+            }
+            if represented_preserved_owner_keys.contains(&entry.runtime_key) {
+                return true;
+            }
+            owner_status_cache
+                .get(&entry.endpoint.label())
+                .and_then(|status| status.as_ref())
+                .is_some_and(|status| {
+                    runtime_status_reports_terminal_key(status, &entry.runtime_key)
+                })
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    live_entries.sort_by(|left, right| left.runtime_key.cmp(&right.runtime_key));
+    live_entries.dedup_by(|left, right| left.runtime_key == right.runtime_key);
+    live_entries
+}
+
+fn represented_live_session_needs_preserved_owner(
+    server: &YggtermServer,
+    terminals: &TerminalManager,
+    runtime_key: &str,
+) -> bool {
+    !terminals.has_session(runtime_key)
+        && server.represents_terminal_runtime_key(runtime_key)
+        && (server.live_session_keep_alive(runtime_key)
+            || server.live_session_is_temporary_update_restore(runtime_key))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -901,6 +1268,9 @@ pub enum ServerRequest {
         expected_build_id: Option<u64>,
         reason: Option<String>,
     },
+    RetireDaemon {
+        reason: Option<String>,
+    },
     OpenStoredSession {
         session_kind: SessionKind,
         path: String,
@@ -961,9 +1331,16 @@ pub enum ServerRequest {
     RemoveSession {
         path: String,
     },
+    DropTerminalRuntime {
+        runtime_key: String,
+        reason: Option<String>,
+    },
     SetSessionKeepAlive {
         path: String,
         keep_alive: bool,
+    },
+    ReorderLiveSessions {
+        ordered_paths: Vec<String>,
     },
     StartLocalSession {
         session_kind: SessionKind,
@@ -1062,6 +1439,8 @@ pub enum ServerRequest {
     },
     SyncTerminalIdentity {
         terminal_appearance: String,
+        #[serde(default)]
+        terminal_profile: Option<TerminalIdentityColorProfile>,
     },
     Shutdown,
 }
@@ -1201,14 +1580,7 @@ impl DaemonRuntime {
             settings.theme,
         );
         let state_path = store.home_dir().join("server-state.json");
-        let mut preserved_terminal_owners = PreservedTerminalOwnerRegistry::load(store.home_dir());
-        if preserved_terminal_owners
-            .expected_server_version
-            .as_deref()
-            .is_some_and(|version| version != SERVER_PROTOCOL_VERSION)
-        {
-            preserved_terminal_owners.entries.clear();
-        }
+        let preserved_terminal_owners = PreservedTerminalOwnerRegistry::load(store.home_dir());
         let mut restored_from_persisted_state = false;
         let mut restored_stored_sessions = 0usize;
         let mut restored_live_sessions = 0usize;
@@ -1236,7 +1608,26 @@ impl DaemonRuntime {
             restored_live_sessions,
             restored_remote_machines,
         };
+        runtime.restore_missing_preserved_owner_live_sessions("runtime_load");
+        runtime
+            .recover_missing_preserved_owner_live_sessions_from_reachable_daemons("runtime_load");
         runtime.prune_unrepresented_preserved_owners("runtime_load");
+        let preserved_owner_registry_retargeted = runtime
+            .preserved_terminal_owners
+            .retarget_loaded_registry_for_current_version(runtime.store.home_dir())?;
+        if preserved_owner_registry_retargeted {
+            append_trace_event(
+                runtime.store.home_dir(),
+                "daemon",
+                "hot_update",
+                "preserved_owner_registry_retargeted_on_load",
+                serde_json::json!({
+                    "expected_server_version": SERVER_PROTOCOL_VERSION,
+                    "remaining_runtime_keys": runtime.preserved_terminal_owners.keys(),
+                    "reason": "runtime_load",
+                }),
+            );
+        }
         runtime.prune_unrepresented_preserved_owner_runtime_sessions("runtime_load");
         perf.finish(serde_json::json!({
             "prefer_ghostty_backend": settings.prefer_ghostty_backend,
@@ -1501,10 +1892,277 @@ impl DaemonRuntime {
         self.remove_preserved_owner(runtime_key, reason);
     }
 
+    fn restore_missing_preserved_owner_live_sessions(&mut self, reason: &'static str) {
+        let endpoint_groups = self.preserved_terminal_owners.endpoint_groups();
+        if endpoint_groups.is_empty() {
+            return;
+        }
+        let current_endpoint = default_endpoint(self.store.home_dir());
+        for (owner_endpoint, owner_registry_keys) in endpoint_groups {
+            if owner_endpoint == current_endpoint {
+                continue;
+            }
+            let missing_keys = owner_registry_keys
+                .iter()
+                .filter(|key| !self.server.represents_terminal_runtime_key(key))
+                .cloned()
+                .collect::<HashSet<_>>();
+            if missing_keys.is_empty() {
+                continue;
+            }
+            let owner_snapshot = match snapshot(&owner_endpoint) {
+                Ok((snapshot, _message)) => snapshot,
+                Err(error) => {
+                    append_trace_event(
+                        self.store.home_dir(),
+                        "daemon",
+                        "hot_update",
+                        "preserved_owner_live_session_restore_snapshot_failed",
+                        serde_json::json!({
+                            "reason": reason,
+                            "owner_endpoint": owner_endpoint_label(&owner_endpoint),
+                            "runtime_keys": owner_registry_keys,
+                            "error": error.to_string(),
+                        }),
+                    );
+                    continue;
+                }
+            };
+            let restored_runtime_keys = restore_preserved_owner_live_sessions_from_snapshot(
+                &mut self.server,
+                &owner_snapshot,
+                &missing_keys,
+            );
+            if restored_runtime_keys.is_empty() {
+                continue;
+            }
+            let owner_active_path = owner_snapshot.active_session_path.as_deref();
+            let active_restored = owner_active_path
+                .filter(|path| restored_runtime_keys.iter().any(|key| key == *path))
+                .is_some_and(|path| {
+                    self.server
+                        .focus_live_session_without_launch_if_active_missing(path)
+                });
+            append_trace_event(
+                self.store.home_dir(),
+                "daemon",
+                "hot_update",
+                "preserved_owner_live_sessions_restored",
+                serde_json::json!({
+                    "reason": reason,
+                    "owner_endpoint": owner_endpoint_label(&owner_endpoint),
+                    "owner_active_path": owner_snapshot.active_session_path,
+                    "active_restored": active_restored,
+                    "missing_runtime_keys": missing_keys,
+                    "restored_runtime_keys": restored_runtime_keys,
+                }),
+            );
+        }
+    }
+
+    fn recover_missing_preserved_owner_live_sessions_from_reachable_daemons(
+        &mut self,
+        reason: &'static str,
+    ) {
+        let current_endpoint = default_endpoint(self.store.home_dir());
+        let mut registered_keys = self
+            .preserved_terminal_owners
+            .keys()
+            .into_iter()
+            .collect::<HashSet<_>>();
+        for (owner_endpoint, owner_status) in reachable_versioned_daemon_statuses_excluding_endpoint(
+            self.store.home_dir(),
+            &current_endpoint,
+        ) {
+            let direct_keys = runtime_status_direct_terminal_keys(&owner_status);
+            let represented_missing_owner_keys = direct_keys
+                .iter()
+                .filter(|key| !registered_keys.contains(*key))
+                .filter(|key| {
+                    represented_live_session_needs_preserved_owner(
+                        &self.server,
+                        &self.terminals,
+                        key,
+                    )
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            let mut represented_registered_runtime_keys = Vec::new();
+            let mut represented_registration_errors = Vec::new();
+            for runtime_key in &represented_missing_owner_keys {
+                match self.preserved_terminal_owners.upsert_runtime_owner(
+                    self.store.home_dir(),
+                    runtime_key,
+                    &owner_endpoint,
+                    &owner_status,
+                    Some(SERVER_PROTOCOL_VERSION.to_string()),
+                ) {
+                    Ok(_) => {
+                        represented_registered_runtime_keys.push(runtime_key.clone());
+                        registered_keys.insert(runtime_key.clone());
+                    }
+                    Err(error) => represented_registration_errors.push(serde_json::json!({
+                        "runtime_key": runtime_key,
+                        "error": error.to_string(),
+                    })),
+                }
+            }
+            if !represented_registered_runtime_keys.is_empty()
+                || !represented_registration_errors.is_empty()
+            {
+                append_trace_event(
+                    self.store.home_dir(),
+                    "daemon",
+                    "hot_update",
+                    "preserved_owner_represented_live_sessions_registered",
+                    serde_json::json!({
+                        "reason": reason,
+                        "owner_endpoint": owner_endpoint_label(&owner_endpoint),
+                        "owner_server_version": owner_status.server_version,
+                        "owner_server_pid": owner_status.server_pid,
+                        "candidate_runtime_keys": represented_missing_owner_keys,
+                        "registered_runtime_keys": represented_registered_runtime_keys,
+                        "registration_errors": represented_registration_errors,
+                    }),
+                );
+            }
+
+            let missing_keys = direct_keys
+                .into_iter()
+                .filter(|key| !registered_keys.contains(key))
+                .filter(|key| !self.terminals.has_session(key))
+                .filter(|key| !self.server.represents_terminal_runtime_key(key))
+                .collect::<HashSet<_>>();
+            if missing_keys.is_empty() {
+                continue;
+            }
+            let owner_snapshot = match snapshot(&owner_endpoint) {
+                Ok((snapshot, _message)) => snapshot,
+                Err(error) => {
+                    append_trace_event(
+                        self.store.home_dir(),
+                        "daemon",
+                        "hot_update",
+                        "preserved_owner_recovery_snapshot_failed",
+                        serde_json::json!({
+                            "reason": reason,
+                            "owner_endpoint": owner_endpoint_label(&owner_endpoint),
+                            "owner_server_version": owner_status.server_version,
+                            "owner_server_pid": owner_status.server_pid,
+                            "runtime_keys": missing_keys,
+                            "error": error.to_string(),
+                        }),
+                    );
+                    continue;
+                }
+            };
+            let restored_runtime_keys =
+                restore_preserved_owner_live_sessions_from_snapshot_with_policy(
+                    &mut self.server,
+                    &owner_snapshot,
+                    &missing_keys,
+                    true,
+                );
+            if restored_runtime_keys.is_empty() {
+                continue;
+            }
+            let mut registered_runtime_keys = Vec::new();
+            let mut registration_errors = Vec::new();
+            for runtime_key in &restored_runtime_keys {
+                match self.preserved_terminal_owners.upsert_runtime_owner(
+                    self.store.home_dir(),
+                    runtime_key,
+                    &owner_endpoint,
+                    &owner_status,
+                    Some(SERVER_PROTOCOL_VERSION.to_string()),
+                ) {
+                    Ok(_) => registered_runtime_keys.push(runtime_key.clone()),
+                    Err(error) => registration_errors.push(serde_json::json!({
+                        "runtime_key": runtime_key,
+                        "error": error.to_string(),
+                    })),
+                }
+            }
+            let owner_active_path = owner_snapshot.active_session_path.as_deref();
+            let active_restored = owner_active_path
+                .filter(|path| restored_runtime_keys.iter().any(|key| key == *path))
+                .is_some_and(|path| {
+                    self.server
+                        .focus_live_session_without_launch_if_active_missing(path)
+                });
+            append_trace_event(
+                self.store.home_dir(),
+                "daemon",
+                "hot_update",
+                "preserved_owner_live_sessions_recovered_from_reachable_daemon",
+                serde_json::json!({
+                    "reason": reason,
+                    "owner_endpoint": owner_endpoint_label(&owner_endpoint),
+                    "owner_server_version": owner_status.server_version,
+                    "owner_server_pid": owner_status.server_pid,
+                    "owner_active_path": owner_snapshot.active_session_path,
+                    "active_restored": active_restored,
+                    "missing_runtime_keys": missing_keys,
+                    "restored_runtime_keys": restored_runtime_keys,
+                    "registered_runtime_keys": registered_runtime_keys,
+                    "registration_errors": registration_errors,
+                }),
+            );
+        }
+    }
+
+    fn preserved_owner_status_cache(&self) -> BTreeMap<String, Option<ServerRuntimeStatus>> {
+        let current_endpoint = default_endpoint(self.store.home_dir());
+        let mut status_cache = BTreeMap::<String, Option<ServerRuntimeStatus>>::new();
+        for entry in &self.preserved_terminal_owners.entries {
+            let owner_endpoint = entry.endpoint.to_endpoint();
+            if owner_endpoint == current_endpoint {
+                continue;
+            }
+            let label = entry.endpoint.label();
+            status_cache
+                .entry(label)
+                .or_insert_with(|| status(&owner_endpoint).ok());
+        }
+        status_cache
+    }
+
     fn prune_unrepresented_preserved_owners(&mut self, reason: &'static str) {
+        let current_endpoint = default_endpoint(self.store.home_dir());
+        let mut owner_status_cache = BTreeMap::<String, Option<ServerRuntimeStatus>>::new();
+        for (owner_endpoint, _runtime_keys) in self.preserved_terminal_owners.endpoint_groups() {
+            if owner_endpoint == current_endpoint {
+                continue;
+            }
+            let label = owner_endpoint_label(&owner_endpoint);
+            owner_status_cache
+                .entry(label)
+                .or_insert_with(|| status(&owner_endpoint).ok());
+        }
+        let preserved_owner_entries = self.preserved_terminal_owners.entries.clone();
         let removed = self
             .preserved_terminal_owners
-            .retain_represented_keys(|key| self.server.represents_terminal_runtime_key(key));
+            .retain_represented_keys(|key| {
+                if self.server.represents_terminal_runtime_key(key) {
+                    return true;
+                }
+                let Some(entry) = preserved_owner_entries
+                    .iter()
+                    .find(|entry| entry.runtime_key == key)
+                else {
+                    return false;
+                };
+                let owner_label = entry.endpoint.label();
+                owner_status_cache
+                    .get(&owner_label)
+                    .and_then(|status| status.as_ref())
+                    .is_some_and(|status| {
+                        status
+                            .terminal_session_keys
+                            .iter()
+                            .any(|candidate| candidate == key)
+                    })
+            });
         if removed.is_empty() {
             return;
         }
@@ -1527,11 +2185,6 @@ impl DaemonRuntime {
         if endpoint_groups.is_empty() {
             return;
         }
-        let represented_runtime_keys = self
-            .preserved_terminal_owners
-            .keys()
-            .into_iter()
-            .collect::<HashSet<_>>();
         let current_endpoint = default_endpoint(self.store.home_dir());
         for (owner_endpoint, owner_registry_keys) in endpoint_groups {
             if owner_endpoint == current_endpoint {
@@ -1561,9 +2214,23 @@ impl DaemonRuntime {
             };
             owner_runtime_keys.sort();
             owner_runtime_keys.dedup();
+            let all_registry_keys = self
+                .preserved_terminal_owners
+                .keys()
+                .into_iter()
+                .collect::<HashSet<_>>();
+            let current_owned_runtime_keys = self
+                .terminals
+                .session_keys()
+                .into_iter()
+                .collect::<HashSet<_>>();
+            let owner_registry_key_set =
+                owner_registry_keys.iter().cloned().collect::<HashSet<_>>();
             let stale_runtime_keys = unrepresented_preserved_owner_runtime_keys(
                 &self.server,
-                &represented_runtime_keys,
+                &owner_registry_key_set,
+                &all_registry_keys,
+                &current_owned_runtime_keys,
                 owner_runtime_keys,
             );
             if stale_runtime_keys.is_empty() {
@@ -1572,8 +2239,12 @@ impl DaemonRuntime {
             let mut removed_runtime_keys = Vec::new();
             let mut errors = Vec::new();
             for runtime_key in stale_runtime_keys {
-                match remove_session(&owner_endpoint, &runtime_key) {
-                    Ok((_snapshot, _message)) => removed_runtime_keys.push(runtime_key),
+                match drop_terminal_runtime(
+                    &owner_endpoint,
+                    &runtime_key,
+                    Some("unrepresented_preserved_owner_prune"),
+                ) {
+                    Ok(_message) => removed_runtime_keys.push(runtime_key),
                     Err(error) => {
                         errors.push(serde_json::json!({
                             "runtime_key": runtime_key,
@@ -1609,7 +2280,9 @@ impl DaemonRuntime {
                     };
                     unrepresented_preserved_owner_runtime_keys(
                         &self.server,
-                        &represented_runtime_keys,
+                        &owner_registry_key_set,
+                        &all_registry_keys,
+                        &current_owned_runtime_keys,
                         after_keys,
                     )
                 }
@@ -1629,6 +2302,107 @@ impl DaemonRuntime {
                     "errors": errors,
                     "fallback_prepare_client_close": fallback_prepare_client_close,
                     "remaining_stale_runtime_keys": remaining_stale_runtime_keys,
+                }),
+            );
+        }
+    }
+
+    fn prune_duplicate_legacy_owned_runtime_sessions(&self, reason: &'static str) {
+        let current_runtime_keys = self
+            .terminals
+            .session_keys()
+            .into_iter()
+            .collect::<HashSet<_>>();
+        if current_runtime_keys.is_empty() {
+            return;
+        }
+        let current_pid = std::process::id();
+        let current_build_id = current_build_id();
+        let current_endpoint = default_endpoint(self.store.home_dir());
+        let statuses = reachable_versioned_daemon_statuses_excluding_endpoint(
+            self.store.home_dir(),
+            &current_endpoint,
+        );
+        for (owner_endpoint, owner_status) in statuses {
+            let duplicate_runtime_keys = duplicate_legacy_owned_runtime_keys(
+                &current_runtime_keys,
+                SERVER_PROTOCOL_VERSION,
+                current_build_id,
+                current_pid,
+                &owner_status,
+            );
+            if duplicate_runtime_keys.is_empty() {
+                continue;
+            }
+            let mut removed_runtime_keys = Vec::new();
+            let mut errors = Vec::new();
+            for runtime_key in duplicate_runtime_keys {
+                match drop_terminal_runtime(
+                    &owner_endpoint,
+                    &runtime_key,
+                    Some("duplicate_legacy_owned_runtime_prune"),
+                ) {
+                    Ok(_message) => removed_runtime_keys.push(runtime_key),
+                    Err(error) => errors.push(serde_json::json!({
+                        "runtime_key": runtime_key,
+                        "error": error.to_string(),
+                    })),
+                }
+            }
+            let status_after = status(&owner_endpoint).ok();
+            let remaining_duplicate_runtime_keys = status_after
+                .as_ref()
+                .map(|status_after| {
+                    duplicate_legacy_owned_runtime_keys(
+                        &current_runtime_keys,
+                        SERVER_PROTOCOL_VERSION,
+                        current_build_id,
+                        current_pid,
+                        &status_after,
+                    )
+                })
+                .unwrap_or_default();
+            let remaining_owned_runtime_keys = status_after
+                .as_ref()
+                .map(|status_after| status_after.owned_terminal_session_keys.clone())
+                .unwrap_or_default();
+            let stale_daemon_retire = if !removed_runtime_keys.is_empty()
+                && remaining_duplicate_runtime_keys.is_empty()
+                && remaining_owned_runtime_keys.is_empty()
+            {
+                Some(
+                    match retire_daemon(&owner_endpoint, Some("duplicate_runtime_pruned")) {
+                        Ok(message) => serde_json::json!({
+                            "attempted": true,
+                            "ok": true,
+                            "message": message,
+                        }),
+                        Err(error) => serde_json::json!({
+                            "attempted": true,
+                            "ok": false,
+                            "error": error.to_string(),
+                        }),
+                    },
+                )
+            } else {
+                None
+            };
+            append_trace_event(
+                self.store.home_dir(),
+                "daemon",
+                "hot_update",
+                "duplicate_legacy_owned_runtimes_pruned",
+                serde_json::json!({
+                    "reason": reason,
+                    "owner_endpoint": owner_endpoint_label(&owner_endpoint),
+                    "owner_server_version": owner_status.server_version,
+                    "owner_server_build_id": owner_status.server_build_id,
+                    "owner_server_pid": owner_status.server_pid,
+                    "removed_runtime_keys": removed_runtime_keys,
+                    "errors": errors,
+                    "remaining_duplicate_runtime_keys": remaining_duplicate_runtime_keys,
+                    "remaining_owned_runtime_keys": remaining_owned_runtime_keys,
+                    "stale_daemon_retire": stale_daemon_retire,
                 }),
             );
         }
@@ -1682,8 +2456,82 @@ impl DaemonRuntime {
         }
     }
 
+    fn discover_keep_alive_preserved_owner_for_runtime_key(
+        &mut self,
+        path: &str,
+        runtime_key: &str,
+    ) -> Option<(ServerEndpoint, ServerRuntimeStatus)> {
+        if !path.starts_with("remote-session://")
+            || !self.server.live_session_keep_alive(path)
+            || self.terminals.has_session(runtime_key)
+            || !self.server.represents_terminal_runtime_key(runtime_key)
+        {
+            return None;
+        }
+        let current_endpoint = default_endpoint(self.store.home_dir());
+        let statuses = reachable_versioned_daemon_statuses_excluding_endpoint(
+            self.store.home_dir(),
+            &current_endpoint,
+        );
+        let (owner_endpoint, owner_status) =
+            preserved_owner_candidate_for_runtime_key(statuses, runtime_key, std::process::id())?;
+        match self.preserved_terminal_owners.upsert_runtime_owner(
+            self.store.home_dir(),
+            runtime_key,
+            &owner_endpoint,
+            &owner_status,
+            Some(SERVER_PROTOCOL_VERSION.to_string()),
+        ) {
+            Ok(changed) => {
+                append_trace_event(
+                    self.store.home_dir(),
+                    "daemon",
+                    "hot_update",
+                    "keep_alive_preserved_owner_discovered",
+                    serde_json::json!({
+                        "path": path,
+                        "runtime_key": runtime_key,
+                        "owner_endpoint": owner_endpoint_label(&owner_endpoint),
+                        "owner_server_version": owner_status.server_version,
+                        "owner_server_build_id": owner_status.server_build_id,
+                        "owner_server_pid": owner_status.server_pid,
+                        "registry_changed": changed,
+                        "source": "reachable_daemon_scan",
+                    }),
+                );
+                Some((owner_endpoint, owner_status))
+            }
+            Err(error) => {
+                append_trace_event(
+                    self.store.home_dir(),
+                    "daemon",
+                    "hot_update",
+                    "keep_alive_preserved_owner_discovery_failed",
+                    serde_json::json!({
+                        "path": path,
+                        "runtime_key": runtime_key,
+                        "owner_endpoint": owner_endpoint_label(&owner_endpoint),
+                        "owner_server_version": owner_status.server_version,
+                        "owner_server_pid": owner_status.server_pid,
+                        "error": error.to_string(),
+                    }),
+                );
+                None
+            }
+        }
+    }
+
     fn preserved_owner_endpoint_for_request(&self, runtime_key: &str) -> Option<ServerEndpoint> {
         self.preserved_owner_for_runtime_key(runtime_key)
+    }
+
+    fn preserved_owner_error_means_missing_runtime(
+        runtime_key: &str,
+        error: &anyhow::Error,
+    ) -> bool {
+        let error_text = format!("{error:#}").to_ascii_lowercase();
+        error_text.contains("terminal session not found")
+            && error_text.contains(&runtime_key.to_ascii_lowercase())
     }
 
     fn handle_preserved_owner_request_error(
@@ -1703,6 +2551,10 @@ impl DaemonRuntime {
                 "error": error.to_string(),
             }),
         );
+        if Self::preserved_owner_error_means_missing_runtime(runtime_key, error) {
+            self.remove_preserved_owner(runtime_key, "owner_reported_missing_runtime");
+            return;
+        }
         match status(owner_endpoint) {
             Ok(status)
                 if status
@@ -1711,6 +2563,74 @@ impl DaemonRuntime {
                     .any(|key| key == runtime_key) => {}
             Ok(_) => self.remove_preserved_owner(runtime_key, "owner_missing_runtime_after_error"),
             Err(_) => self.remove_preserved_owner(runtime_key, "owner_unreachable_after_error"),
+        }
+    }
+
+    fn reject_preserved_owner_saved_session_mismatch(
+        &mut self,
+        path: &str,
+        runtime_path: &str,
+        owner_endpoint: &ServerEndpoint,
+        reason: &'static str,
+    ) -> bool {
+        match terminal_snapshot(owner_endpoint, runtime_path) {
+            Ok((
+                snapshot,
+                _running,
+                runtime_output_seen,
+                _post_resize_output_seen,
+                _last_resize_seq,
+            )) => {
+                if !runtime_output_seen || snapshot.trim().is_empty() {
+                    return false;
+                }
+                let runtime_output_mismatches_path = self
+                    .server
+                    .remote_resume_runtime_output_mismatches_path(path, snapshot.as_bytes());
+                if !preserved_owner_saved_session_mismatch_should_detach(
+                    path,
+                    self.server.live_session_keep_alive(path),
+                    self.server.live_session_is_temporary_update_restore(path),
+                    runtime_output_mismatches_path,
+                ) {
+                    if runtime_output_mismatches_path {
+                        append_trace_event(
+                            self.store.home_dir(),
+                            "daemon",
+                            "hot_update",
+                            "preserved_owner_saved_session_mismatch_ignored_for_keep_alive",
+                            serde_json::json!({
+                                "path": path,
+                                "runtime_path": runtime_path,
+                                "owner_endpoint": owner_endpoint_label(owner_endpoint),
+                                "reason": reason,
+                                "snapshot_bytes": snapshot.len(),
+                            }),
+                        );
+                    }
+                    return false;
+                }
+                append_trace_event(
+                    self.store.home_dir(),
+                    "daemon",
+                    "hot_update",
+                    "preserved_owner_saved_session_mismatch",
+                    serde_json::json!({
+                        "path": path,
+                        "runtime_path": runtime_path,
+                        "owner_endpoint": owner_endpoint_label(owner_endpoint),
+                        "reason": reason,
+                        "snapshot_bytes": snapshot.len(),
+                    }),
+                );
+                self.remove_preserved_owner_runtime(runtime_path, reason);
+                true
+            }
+            Err(error) => {
+                self.handle_preserved_owner_request_error(runtime_path, owner_endpoint, &error);
+                self.preserved_owner_endpoint_for_request(runtime_path)
+                    .is_none()
+            }
         }
     }
 
@@ -1791,9 +2711,18 @@ impl DaemonRuntime {
                 .request_terminal_launch_for_path_preserving_active(path);
         }
         let runtime_path = self.terminal_runtime_key_for_path(path);
-        if self
+        let preserved_owner_status = self
             .preserved_owner_status_for_runtime_key(&runtime_path)
-            .is_some()
+            .or_else(|| {
+                self.discover_keep_alive_preserved_owner_for_runtime_key(path, &runtime_path)
+            });
+        if let Some((owner_endpoint, _owner_status)) = preserved_owner_status
+            && !self.reject_preserved_owner_saved_session_mismatch(
+                path,
+                &runtime_path,
+                &owner_endpoint,
+                "saved_session_mismatch",
+            )
         {
             return Ok(Some(format!(
                 "using hot-update preserved terminal owner for {runtime_path}"
@@ -1913,7 +2842,7 @@ impl DaemonRuntime {
                 .terminals
                 .session_runtime_age_ms(&runtime_path)
                 .unwrap_or(0);
-            let runtime_snapshot = if path.starts_with("remote-session://") && has_runtime_output {
+            let runtime_snapshot = if has_runtime_output {
                 self.terminals.session_snapshot(&runtime_path)
             } else {
                 None
@@ -1940,21 +2869,39 @@ impl DaemonRuntime {
                         remote_resume_runtime_output_requires_restart(snapshot.as_bytes())
                     })
                     .unwrap_or(false);
-            let stale_remote_attach = path.starts_with("remote-session://")
+            let remote_resume_path =
+                path.starts_with("remote-session://") || runtime_saved_session_mismatch;
+            let stale_remote_attach = remote_resume_path
                 && remote_resume_stale_attach(
                     has_runtime_output,
                     runtime_age_ms,
                     remote_runtime_output_requires_restart,
                     remote_attach_startup_grace_ms,
                 );
-            let blank_remote_attach = path.starts_with("remote-session://")
+            let remote_saved_session_mismatch_requires_restart =
+                remote_resume_saved_session_mismatch_requires_restart(
+                    remote_resume_path,
+                    has_runtime_output,
+                    runtime_age_ms,
+                    runtime_saved_session_mismatch,
+                    remote_attach_startup_grace_ms,
+                );
+            let blank_remote_attach = remote_resume_path
                 && !has_runtime_output
                 && runtime_age_ms >= remote_attach_startup_grace_ms;
             let spec_matches =
                 self.terminals
                     .session_matches_spec(&runtime_path, &launch_command, cwd.as_deref());
-            let needs_restart =
-                !still_running || stale_remote_attach || blank_remote_attach || !spec_matches;
+            let keep_alive_runtime = self.server.live_session_keep_alive(path);
+            let (needs_restart, restart_blocked_by_keep_alive) = terminal_reuse_needs_restart(
+                still_running,
+                remote_resume_path,
+                keep_alive_runtime,
+                stale_remote_attach,
+                blank_remote_attach,
+                remote_saved_session_mismatch_requires_restart,
+                spec_matches,
+            );
             if let Ok(home) = crate::resolve_yggterm_home() {
                 append_trace_event(
                     &home,
@@ -1972,8 +2919,11 @@ impl DaemonRuntime {
                         "fresh_remote_codex_start": fresh_remote_codex_start,
                         "remote_attach_startup_grace_ms": remote_attach_startup_grace_ms,
                         "runtime_saved_session_mismatch": runtime_saved_session_mismatch,
+                        "remote_saved_session_mismatch_requires_restart": remote_saved_session_mismatch_requires_restart,
+                        "keep_alive_runtime": keep_alive_runtime,
+                        "restart_blocked_by_keep_alive": restart_blocked_by_keep_alive,
                         "spec_matches": spec_matches,
-                        "remote_resume_path": path.starts_with("remote-session://"),
+                        "remote_resume_path": remote_resume_path,
                         "needs_restart": needs_restart,
                     }),
                 );
@@ -2010,6 +2960,7 @@ impl DaemonRuntime {
                     }
                     self.terminals.seed_session(&runtime_path, prefill)?;
                 }
+                self.prune_duplicate_legacy_owned_runtime_sessions("terminal_ensure_reuse");
                 return Ok(prepare_message);
             }
             if needs_restart {
@@ -2052,6 +3003,7 @@ impl DaemonRuntime {
                     self.terminals.seed_session(&runtime_path, prefill)?;
                 }
             }
+            self.prune_duplicate_legacy_owned_runtime_sessions("terminal_ensure_restart");
             return Ok(prepare_message);
         }
         if let Ok(home) = crate::resolve_yggterm_home() {
@@ -2089,6 +3041,7 @@ impl DaemonRuntime {
         if let Some(prefill) = seed_prefill.as_deref() {
             self.terminals.seed_session(&runtime_path, prefill)?;
         }
+        self.prune_duplicate_legacy_owned_runtime_sessions("terminal_ensure_new");
         Ok(prepare_message)
     }
 
@@ -2280,15 +3233,17 @@ impl DaemonRuntime {
                         .iter()
                         .cloned()
                         .collect::<HashSet<_>>();
-                    let existing_entries = self
-                        .preserved_terminal_owners
-                        .entries
+                    let owned_terminal_session_key_set = owned_terminal_session_keys
                         .iter()
-                        .filter(|entry| {
-                            represented_preserved_owner_keys.contains(&entry.runtime_key)
-                        })
                         .cloned()
-                        .collect::<Vec<_>>();
+                        .collect::<HashSet<_>>();
+                    let preserved_owner_status_cache = self.preserved_owner_status_cache();
+                    let existing_entries = preserved_owner_entries_live_for_handoff(
+                        &self.preserved_terminal_owners.entries,
+                        &owned_terminal_session_key_set,
+                        &represented_preserved_owner_keys,
+                        &preserved_owner_status_cache,
+                    );
                     let registry = PreservedTerminalOwnerRegistry::write_handoff(
                         self.store.home_dir(),
                         &owner_endpoint,
@@ -2351,9 +3306,19 @@ impl DaemonRuntime {
                     .iter()
                     .cloned()
                     .collect::<HashSet<_>>();
+                let preserved_owner_status_cache = self.preserved_owner_status_cache();
+                let retained_preserved_owner_keys = preserved_owner_entries_live_for_handoff(
+                    &self.preserved_terminal_owners.entries,
+                    &HashSet::new(),
+                    &represented_preserved_owner_keys,
+                    &preserved_owner_status_cache,
+                )
+                .into_iter()
+                .map(|entry| entry.runtime_key)
+                .collect::<HashSet<_>>();
                 let removed_preserved_owner_keys = self
                     .preserved_terminal_owners
-                    .retain_represented_keys(|key| represented_preserved_owner_keys.contains(key));
+                    .retain_represented_keys(|key| retained_preserved_owner_keys.contains(key));
                 if !removed_preserved_owner_keys.is_empty() {
                     let _ = self.preserved_terminal_owners.save(self.store.home_dir());
                     append_trace_event(
@@ -2401,6 +3366,23 @@ impl DaemonRuntime {
                         "hot restart prepared: {}",
                         daemon_executable.display()
                     )),
+                }
+            }
+            ServerRequest::RetireDaemon { reason } => {
+                append_trace_event(
+                    self.store.home_dir(),
+                    "daemon",
+                    "lifecycle",
+                    "retire_daemon_requested",
+                    serde_json::json!({
+                        "reason": reason,
+                        "server_version": SERVER_PROTOCOL_VERSION,
+                        "server_build_id": current_build_id(),
+                        "pid": std::process::id(),
+                    }),
+                );
+                ServerResponse::Ack {
+                    message: Some("daemon retire prepared".to_string()),
                 }
             }
             ServerRequest::OpenStoredSession {
@@ -2451,7 +3433,7 @@ impl DaemonRuntime {
                 }))
             }
             ServerRequest::ConnectSsh { target_ix } => {
-                let (key, reused) = self.server.connect_ssh_target(target_ix);
+                let (key, reused) = self.server.connect_ssh_target(target_ix)?;
                 if key.is_some() && self.server.active_session_supports_terminal() {
                     self.ensure_terminal_for_active()?;
                 }
@@ -2483,7 +3465,7 @@ impl DaemonRuntime {
                 title_hint,
                 terminal_appearance,
             } => {
-                sync_terminal_identity_for_request(terminal_appearance.as_deref());
+                sync_terminal_identity_for_request(terminal_appearance.as_deref(), None);
                 let key = self.server.start_ssh_session(
                     &target,
                     prefix.as_deref(),
@@ -2503,7 +3485,7 @@ impl DaemonRuntime {
                 title_hint,
                 terminal_appearance,
             } => {
-                sync_terminal_identity_for_request(terminal_appearance.as_deref());
+                sync_terminal_identity_for_request(terminal_appearance.as_deref(), None);
                 let key = self.server.start_remote_codex_session(
                     &target,
                     prefix.as_deref(),
@@ -2616,35 +3598,81 @@ impl DaemonRuntime {
                 }))
             }
             ServerRequest::RemoveSession { path } => {
-                let remote_target = self.server.remote_shutdown_target_for_path(&path);
-                if let Some((machine, session_id)) = remote_target.as_ref() {
-                    terminate_remote_codex_session(machine, session_id).with_context(|| {
-                        format!(
-                            "failed to terminate remote session {} on {} before removal",
-                            session_id, machine.ssh_target
-                        )
-                    })?;
+                if remove_session_should_detach_keep_alive_runtime(
+                    self.server.live_session_keep_alive(&path),
+                ) {
+                    let detached = self.server.detach_live_session_view(&path)?;
+                    self.persist()?;
+                    append_trace_event(
+                        self.store.home_dir(),
+                        "daemon",
+                        "session",
+                        "keep_alive_live_session_close_detached",
+                        serde_json::json!({
+                            "path": path,
+                            "detached": detached,
+                        }),
+                    );
+                    return Ok(self.snapshot_response(Some(if detached {
+                        format!("detached terminal viewport for {path}")
+                    } else {
+                        format!("no live session for {path}")
+                    })));
                 }
                 let stop_command = self.server.terminal_stop_command(&path);
                 let runtime_path = self.server.terminal_runtime_key_for_path(&path);
+                let remote_target = self.server.remote_shutdown_target_for_path(&path);
                 let removed_terminal = self
                     .terminals
                     .remove_session(&runtime_path, stop_command.as_deref())?;
                 let removed_session = self.server.remove_live_session(&path)?;
-                if removed_session {
+                if removed_session || removed_terminal {
                     self.remove_preserved_owner_runtime(&runtime_path, "live_session_removed");
                 }
                 self.prune_unrepresented_preserved_owners("live_session_removed");
                 self.persist()?;
-                self.snapshot_response(Some(if removed_session {
-                    if removed_terminal {
-                        format!("closed terminal runtime for {path}")
-                    } else {
-                        format!("closed terminal metadata for {path}")
-                    }
+                if let Some((machine, session_id)) = remote_target {
+                    spawn_explicit_remote_session_shutdown(
+                        self.store.home_dir(),
+                        &path,
+                        machine,
+                        session_id,
+                    );
+                }
+                self.snapshot_response(Some(if removed_terminal {
+                    format!("closed terminal runtime for {path}")
+                } else if removed_session {
+                    format!("closed terminal metadata for {path}")
                 } else {
                     format!("no live session for {path}")
                 }))
+            }
+            ServerRequest::DropTerminalRuntime {
+                runtime_key,
+                reason,
+            } => {
+                let removed_terminal = self.terminals.remove_session(&runtime_key, None)?;
+                append_trace_event(
+                    self.store.home_dir(),
+                    "daemon",
+                    "hot_update",
+                    "terminal_runtime_dropped",
+                    serde_json::json!({
+                        "runtime_key": runtime_key,
+                        "reason": reason,
+                        "removed_terminal": removed_terminal,
+                        "server_version": SERVER_PROTOCOL_VERSION,
+                        "server_build_id": current_build_id(),
+                        "pid": std::process::id(),
+                    }),
+                );
+                ServerResponse::Ack {
+                    message: Some(if removed_terminal {
+                        format!("dropped terminal runtime {runtime_key}")
+                    } else {
+                        format!("no terminal runtime for {runtime_key}")
+                    }),
+                }
             }
             ServerRequest::SetSessionKeepAlive { path, keep_alive } => {
                 if keep_alive {
@@ -2673,13 +3701,22 @@ impl DaemonRuntime {
                     format!("no live session for {path}")
                 }))
             }
+            ServerRequest::ReorderLiveSessions { ordered_paths } => {
+                let changed = self.server.replace_live_session_order(&ordered_paths);
+                self.persist()?;
+                self.snapshot_response(Some(if changed {
+                    "reordered live sessions".to_string()
+                } else {
+                    "live session order unchanged".to_string()
+                }))
+            }
             ServerRequest::StartLocalSession {
                 session_kind,
                 cwd,
                 title_hint,
                 terminal_appearance,
             } => {
-                sync_terminal_identity_for_request(terminal_appearance.as_deref());
+                sync_terminal_identity_for_request(terminal_appearance.as_deref(), None);
                 let key = self.server.start_local_session(
                     session_kind,
                     cwd.as_deref(),
@@ -2730,7 +3767,7 @@ impl DaemonRuntime {
                 source_label,
                 terminal_appearance,
             } => {
-                sync_terminal_identity_for_request(terminal_appearance.as_deref());
+                sync_terminal_identity_for_request(terminal_appearance.as_deref(), None);
                 let key = self.server.start_command_session(
                     cwd.as_deref(),
                     title_hint.as_deref(),
@@ -2751,11 +3788,12 @@ impl DaemonRuntime {
                 initial_cols,
                 initial_rows,
             } => {
-                sync_terminal_identity_for_request(terminal_appearance.as_deref());
+                sync_terminal_identity_for_request(terminal_appearance.as_deref(), None);
                 let key = self.server.ensure_remote_runtime_codex_session(
                     &session_id,
                     cwd.as_deref(),
                     require_existing,
+                    terminal_appearance.as_deref(),
                 )?;
                 self.adopt_legacy_local_codex_runtime(&session_id, &key);
                 let _ = self.ensure_terminal_for_path_with_initial_size(
@@ -2772,10 +3810,12 @@ impl DaemonRuntime {
                 initial_cols,
                 initial_rows,
             } => {
-                sync_terminal_identity_for_request(terminal_appearance.as_deref());
-                let key = self
-                    .server
-                    .start_remote_runtime_codex_session(&session_id, cwd.as_deref())?;
+                sync_terminal_identity_for_request(terminal_appearance.as_deref(), None);
+                let key = self.server.start_remote_runtime_codex_session(
+                    &session_id,
+                    cwd.as_deref(),
+                    terminal_appearance.as_deref(),
+                )?;
                 self.adopt_legacy_local_codex_runtime(&session_id, &key);
                 let _ = self.ensure_terminal_for_path_with_initial_size(
                     &key,
@@ -2894,13 +3934,18 @@ impl DaemonRuntime {
                                 &owner_endpoint,
                                 &error,
                             );
-                            return Err(error);
+                            if self
+                                .preserved_owner_endpoint_for_request(&runtime_path)
+                                .is_some()
+                            {
+                                return Err(error);
+                            }
+                            let _ = self.ensure_terminal_for_path(&path)?;
                         }
                     }
                 }
-                if uses_runtime_owned_terminal_path(&path)
-                    && self.terminals.session_hit_eof_without_output(&runtime_path)
-                    && !self.terminals.session_has_runtime_output(&runtime_path)
+                if let Some(recovery_reason) =
+                    terminal_read_runtime_recovery_reason(&path, &runtime_path, &self.terminals)
                     && let Some((stored_launch_command, cwd)) = self.server.terminal_spec(&path)
                 {
                     // Runtime-owned terminals must stay on their stored daemon-owned launch path.
@@ -2917,7 +3962,7 @@ impl DaemonRuntime {
                             serde_json::json!({
                                 "path": path,
                                 "runtime_path": runtime_path,
-                                "reason": "eof_without_output",
+                                "reason": recovery_reason,
                             }),
                         );
                     }
@@ -2951,29 +3996,38 @@ impl DaemonRuntime {
                 if let Some(owner_endpoint) =
                     self.preserved_owner_endpoint_for_request(&runtime_path)
                 {
-                    match terminal_snapshot(&owner_endpoint, &runtime_path) {
-                        Ok((
-                            text,
-                            running,
-                            runtime_output_seen,
-                            post_resize_output_seen,
-                            last_resize_seq,
-                        )) => {
-                            return Ok(ServerResponse::TerminalSnapshot {
+                    if self.reject_preserved_owner_saved_session_mismatch(
+                        &path,
+                        &runtime_path,
+                        &owner_endpoint,
+                        "terminal_snapshot_saved_session_mismatch",
+                    ) {
+                        let _ = self.ensure_terminal_for_path(&path)?;
+                    } else {
+                        match terminal_snapshot(&owner_endpoint, &runtime_path) {
+                            Ok((
                                 text,
                                 running,
                                 runtime_output_seen,
                                 post_resize_output_seen,
                                 last_resize_seq,
-                            });
-                        }
-                        Err(error) => {
-                            self.handle_preserved_owner_request_error(
-                                &runtime_path,
-                                &owner_endpoint,
-                                &error,
-                            );
-                            return Err(error);
+                            )) => {
+                                return Ok(ServerResponse::TerminalSnapshot {
+                                    text,
+                                    running,
+                                    runtime_output_seen,
+                                    post_resize_output_seen,
+                                    last_resize_seq,
+                                });
+                            }
+                            Err(error) => {
+                                self.handle_preserved_owner_request_error(
+                                    &runtime_path,
+                                    &owner_endpoint,
+                                    &error,
+                                );
+                                return Err(error);
+                            }
                         }
                     }
                 }
@@ -2996,29 +4050,38 @@ impl DaemonRuntime {
                 if let Some(owner_endpoint) =
                     self.preserved_owner_endpoint_for_request(&runtime_path)
                 {
-                    match terminal_retained_snapshot(&owner_endpoint, &runtime_path) {
-                        Ok((
-                            text,
-                            running,
-                            runtime_output_seen,
-                            post_resize_output_seen,
-                            last_resize_seq,
-                        )) => {
-                            return Ok(ServerResponse::TerminalRetainedSnapshot {
+                    if self.reject_preserved_owner_saved_session_mismatch(
+                        &path,
+                        &runtime_path,
+                        &owner_endpoint,
+                        "terminal_retained_snapshot_saved_session_mismatch",
+                    ) {
+                        let _ = self.ensure_terminal_for_path(&path)?;
+                    } else {
+                        match terminal_retained_snapshot(&owner_endpoint, &runtime_path) {
+                            Ok((
                                 text,
                                 running,
                                 runtime_output_seen,
                                 post_resize_output_seen,
                                 last_resize_seq,
-                            });
-                        }
-                        Err(error) => {
-                            self.handle_preserved_owner_request_error(
-                                &runtime_path,
-                                &owner_endpoint,
-                                &error,
-                            );
-                            return Err(error);
+                            )) => {
+                                return Ok(ServerResponse::TerminalRetainedSnapshot {
+                                    text,
+                                    running,
+                                    runtime_output_seen,
+                                    post_resize_output_seen,
+                                    last_resize_seq,
+                                });
+                            }
+                            Err(error) => {
+                                self.handle_preserved_owner_request_error(
+                                    &runtime_path,
+                                    &owner_endpoint,
+                                    &error,
+                                );
+                                return Err(error);
+                            }
                         }
                     }
                 }
@@ -3137,7 +4200,7 @@ impl DaemonRuntime {
                 initial_rows,
             } => {
                 if let Some(terminal_appearance) = terminal_appearance.as_deref() {
-                    sync_terminal_identity_for_request(Some(terminal_appearance));
+                    sync_terminal_identity_for_request(Some(terminal_appearance), None);
                 }
                 let recovered_remote_scan = self
                     .server
@@ -3206,8 +4269,12 @@ impl DaemonRuntime {
             }
             ServerRequest::SyncTerminalIdentity {
                 terminal_appearance,
+                terminal_profile,
             } => {
-                sync_terminal_identity_for_request(Some(&terminal_appearance));
+                sync_terminal_identity_for_request(
+                    Some(&terminal_appearance),
+                    terminal_profile.as_ref(),
+                );
                 let refreshed = self.server.refresh_terminal_identity_launch_commands();
                 if refreshed > 0 {
                     self.persist()?;
@@ -3262,12 +4329,15 @@ impl DaemonRuntime {
     }
 }
 
-fn sync_terminal_identity_for_request(terminal_appearance: Option<&str>) {
+fn sync_terminal_identity_for_request(
+    terminal_appearance: Option<&str>,
+    terminal_profile: Option<&TerminalIdentityColorProfile>,
+) {
     if let Some(appearance) = terminal_appearance
         .map(str::trim)
         .filter(|appearance| !appearance.is_empty())
     {
-        sync_terminal_identity_appearance(appearance);
+        sync_terminal_identity_appearance_with_profile(appearance, terminal_profile);
     }
 }
 
@@ -3366,17 +4436,104 @@ fn apply_terminal_runtime_truth_to_snapshot(
 
 fn unrepresented_preserved_owner_runtime_keys(
     server: &YggtermServer,
-    represented_runtime_keys: &HashSet<String>,
+    owner_registry_keys: &HashSet<String>,
+    all_registry_keys: &HashSet<String>,
+    current_owned_runtime_keys: &HashSet<String>,
     owner_runtime_keys: Vec<String>,
 ) -> Vec<String> {
     let mut stale_runtime_keys = owner_runtime_keys
         .into_iter()
-        .filter(|runtime_key| !represented_runtime_keys.contains(runtime_key))
-        .filter(|runtime_key| !server.represents_terminal_runtime_key(runtime_key))
+        .filter(|runtime_key| !owner_registry_keys.contains(runtime_key))
+        .filter(|runtime_key| {
+            current_owned_runtime_keys.contains(runtime_key)
+                || all_registry_keys.contains(runtime_key)
+                || !server.represents_terminal_runtime_key(runtime_key)
+        })
         .collect::<Vec<_>>();
     stale_runtime_keys.sort();
     stale_runtime_keys.dedup();
     stale_runtime_keys
+}
+
+fn daemon_status_version_triplet(version: &str) -> (u64, u64, u64) {
+    let mut parts = version.split('.');
+    let major = parts
+        .next()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or_default();
+    let minor = parts
+        .next()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or_default();
+    let patch = parts
+        .next()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or_default();
+    (major, minor, patch)
+}
+
+fn duplicate_legacy_owned_runtime_keys(
+    current_runtime_keys: &HashSet<String>,
+    current_version: &str,
+    current_build_id: u64,
+    current_pid: u32,
+    owner_status: &ServerRuntimeStatus,
+) -> Vec<String> {
+    if current_runtime_keys.is_empty()
+        || owner_status.server_pid == current_pid
+        || owner_status.owned_terminal_session_keys.is_empty()
+    {
+        return Vec::new();
+    }
+    let owner_rank = (
+        daemon_status_version_triplet(&owner_status.server_version),
+        owner_status.server_build_id,
+        owner_status.server_pid,
+    );
+    let current_rank = (
+        daemon_status_version_triplet(current_version),
+        current_build_id,
+        current_pid,
+    );
+    if owner_rank >= current_rank {
+        return Vec::new();
+    }
+    let mut duplicate_runtime_keys = owner_status
+        .owned_terminal_session_keys
+        .iter()
+        .filter(|runtime_key| current_runtime_keys.contains(runtime_key.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+    duplicate_runtime_keys.sort();
+    duplicate_runtime_keys.dedup();
+    duplicate_runtime_keys
+}
+
+fn preserved_owner_candidate_for_runtime_key(
+    statuses: Vec<(ServerEndpoint, ServerRuntimeStatus)>,
+    runtime_key: &str,
+    current_pid: u32,
+) -> Option<(ServerEndpoint, ServerRuntimeStatus)> {
+    statuses
+        .into_iter()
+        .filter(|(_endpoint, status)| status.server_pid != current_pid)
+        .filter(|(_endpoint, status)| {
+            status
+                .terminal_session_keys
+                .iter()
+                .any(|key| key == runtime_key)
+        })
+        .max_by_key(|(_endpoint, status)| {
+            (
+                status
+                    .owned_terminal_session_keys
+                    .iter()
+                    .any(|key| key == runtime_key),
+                daemon_status_version_triplet(&status.server_version),
+                status.server_build_id,
+                status.server_pid,
+            )
+        })
 }
 
 fn trim_terminal_buffers(
@@ -3844,6 +5001,7 @@ fn server_request_name(request: &ServerRequest) -> &'static str {
         ServerRequest::PrepareUpdateRestart => "prepare_update_restart",
         ServerRequest::PrepareClientClose => "prepare_client_close",
         ServerRequest::HotRestart { .. } => "hot_restart",
+        ServerRequest::RetireDaemon { .. } => "retire_daemon",
         ServerRequest::OpenStoredSession { .. } => "open_stored_session",
         ServerRequest::ConnectSsh { .. } => "connect_ssh",
         ServerRequest::ConnectSshCustom { .. } => "connect_ssh_custom",
@@ -3856,7 +5014,9 @@ fn server_request_name(request: &ServerRequest) -> &'static str {
         ServerRequest::UpdateSessionCopy { .. } => "update_session_copy",
         ServerRequest::RemoveSshTarget { .. } => "remove_ssh_target",
         ServerRequest::RemoveSession { .. } => "remove_session",
+        ServerRequest::DropTerminalRuntime { .. } => "drop_terminal_runtime",
         ServerRequest::SetSessionKeepAlive { .. } => "set_session_keep_alive",
+        ServerRequest::ReorderLiveSessions { .. } => "reorder_live_sessions",
         ServerRequest::StartLocalSession { .. } => "start_local_session",
         ServerRequest::SwitchAgentSessionMode { .. } => "switch_agent_session_mode",
         ServerRequest::StartCommandSession { .. } => "start_command_session",
@@ -4060,6 +5220,29 @@ fn versioned_server_status_probe_paths(home_dir: &Path) -> Vec<PathBuf> {
 }
 
 #[cfg(unix)]
+fn versioned_server_status_probe_paths_excluding_endpoint(
+    home_dir: &Path,
+    excluded_endpoint: &ServerEndpoint,
+) -> Vec<PathBuf> {
+    let excluded_identity = match excluded_endpoint {
+        ServerEndpoint::UnixSocket(path) => Some(fs::canonicalize(path).unwrap_or(path.clone())),
+        ServerEndpoint::Tcp { .. } => None,
+    };
+    versioned_server_status_probe_paths(home_dir)
+        .into_iter()
+        .filter(|path| {
+            let Some(excluded_identity) = excluded_identity.as_ref() else {
+                return true;
+            };
+            fs::canonicalize(path)
+                .unwrap_or_else(|_| path.clone())
+                .as_path()
+                != excluded_identity.as_path()
+        })
+        .collect()
+}
+
+#[cfg(unix)]
 pub fn reachable_versioned_daemon_statuses(
     home_dir: &Path,
 ) -> Vec<(ServerEndpoint, ServerRuntimeStatus)> {
@@ -4067,6 +5250,25 @@ pub fn reachable_versioned_daemon_statuses(
     let mut seen_pids = HashSet::<u32>::new();
 
     paths
+        .into_iter()
+        .filter_map(|path| {
+            let endpoint = ServerEndpoint::UnixSocket(path);
+            let runtime = status(&endpoint).ok()?;
+            if !seen_pids.insert(runtime.server_pid) {
+                return None;
+            }
+            Some((endpoint, runtime))
+        })
+        .collect()
+}
+
+#[cfg(unix)]
+fn reachable_versioned_daemon_statuses_excluding_endpoint(
+    home_dir: &Path,
+    excluded_endpoint: &ServerEndpoint,
+) -> Vec<(ServerEndpoint, ServerRuntimeStatus)> {
+    let mut seen_pids = HashSet::<u32>::new();
+    versioned_server_status_probe_paths_excluding_endpoint(home_dir, excluded_endpoint)
         .into_iter()
         .filter_map(|path| {
             let endpoint = ServerEndpoint::UnixSocket(path);
@@ -4088,6 +5290,14 @@ pub fn reachable_versioned_daemon_statuses(
         .ok()
         .map(|runtime| vec![(endpoint, runtime)])
         .unwrap_or_default()
+}
+
+#[cfg(not(unix))]
+fn reachable_versioned_daemon_statuses_excluding_endpoint(
+    _home_dir: &Path,
+    _excluded_endpoint: &ServerEndpoint,
+) -> Vec<(ServerEndpoint, ServerRuntimeStatus)> {
+    Vec::new()
 }
 
 pub fn snapshot(endpoint: &ServerEndpoint) -> Result<(ServerUiSnapshot, Option<String>)> {
@@ -4323,6 +5533,20 @@ pub fn remove_session(
     )?)
 }
 
+pub fn drop_terminal_runtime(
+    endpoint: &ServerEndpoint,
+    runtime_key: &str,
+    reason: Option<&str>,
+) -> Result<Option<String>> {
+    expect_ack(send_request(
+        endpoint,
+        &ServerRequest::DropTerminalRuntime {
+            runtime_key: runtime_key.to_string(),
+            reason: reason.map(ToOwned::to_owned),
+        },
+    )?)
+}
+
 pub fn set_session_keep_alive(
     endpoint: &ServerEndpoint,
     path: &str,
@@ -4333,6 +5557,18 @@ pub fn set_session_keep_alive(
         &ServerRequest::SetSessionKeepAlive {
             path: path.to_string(),
             keep_alive,
+        },
+    )?)
+}
+
+pub fn reorder_live_sessions(
+    endpoint: &ServerEndpoint,
+    ordered_paths: &[String],
+) -> Result<(ServerUiSnapshot, Option<String>)> {
+    expect_snapshot(send_request(
+        endpoint,
+        &ServerRequest::ReorderLiveSessions {
+            ordered_paths: ordered_paths.to_vec(),
         },
     )?)
 }
@@ -4715,10 +5951,19 @@ pub fn sync_terminal_identity(
     endpoint: &ServerEndpoint,
     terminal_appearance: &str,
 ) -> Result<Option<String>> {
+    sync_terminal_identity_with_profile(endpoint, terminal_appearance, None)
+}
+
+pub fn sync_terminal_identity_with_profile(
+    endpoint: &ServerEndpoint,
+    terminal_appearance: &str,
+    terminal_profile: Option<&TerminalIdentityColorProfile>,
+) -> Result<Option<String>> {
     expect_ack(send_request(
         endpoint,
         &ServerRequest::SyncTerminalIdentity {
             terminal_appearance: terminal_appearance.to_string(),
+            terminal_profile: terminal_profile.cloned(),
         },
     )?)
 }
@@ -4793,6 +6038,15 @@ pub fn hot_restart_detailed(
 
 pub fn shutdown(endpoint: &ServerEndpoint) -> Result<Option<String>> {
     expect_ack(send_request(endpoint, &ServerRequest::Shutdown)?)
+}
+
+pub fn retire_daemon(endpoint: &ServerEndpoint, reason: Option<&str>) -> Result<Option<String>> {
+    expect_ack(send_request(
+        endpoint,
+        &ServerRequest::RetireDaemon {
+            reason: reason.map(ToOwned::to_owned),
+        },
+    )?)
 }
 
 pub fn cleanup_legacy_daemons(endpoint: &ServerEndpoint, current_exe: &Path) -> Result<()> {
@@ -5754,6 +7008,21 @@ fn linux_daemon_runtime_activity_protected_for_cleanup(
         if duplicate_current_runtime {
             return false;
         }
+        if let Some(status) = runtime_status {
+            if !status.owned_terminal_session_keys.is_empty() {
+                let all_owned_keys_already_represented = status
+                    .owned_terminal_session_keys
+                    .iter()
+                    .all(|key| preserved_owner_runtime_keys.contains(key));
+                if clean_preserved_owner_available && all_owned_keys_already_represented {
+                    return false;
+                }
+                return true;
+            }
+            if status.owned_terminal_session_count > 0 {
+                return true;
+            }
+        }
         if preserved_owner_pids.contains(&pid) {
             return true;
         }
@@ -6353,6 +7622,10 @@ fn daemon_request_outcome_for_response(
             should_shutdown: true,
             restart_executable: None,
         },
+        ServerRequest::RetireDaemon { .. } => DaemonRequestOutcome {
+            should_shutdown: true,
+            restart_executable: None,
+        },
         ServerRequest::HotRestart {
             daemon_executable, ..
         } => DaemonRequestOutcome {
@@ -6599,9 +7872,13 @@ mod tests {
     use super::{
         RemoteMachineRefreshQueueStatus, SERVER_PROTOCOL_VERSION,
         apply_terminal_runtime_truth_to_snapshot, daemon_background_copy_chore_enabled_from_env,
-        mark_remote_machine_refresh_queued, terminal_sidebar_snapshot_from_screen,
+        mark_remote_machine_refresh_queued, preserved_owner_candidate_for_runtime_key,
+        preserved_owner_saved_session_mismatch_should_detach,
+        remove_session_should_detach_keep_alive_runtime, terminal_reuse_needs_restart,
+        terminal_sidebar_snapshot_from_screen,
     };
-    use std::collections::{HashMap, HashSet};
+    use crate::TerminalManager;
+    use std::collections::{BTreeMap, HashMap, HashSet};
     use std::fs;
     use std::io::Write;
     use std::path::{Path, PathBuf};
@@ -6622,7 +7899,7 @@ mod tests {
     use super::write_persisted_state;
     use super::{
         REMOTE_ATTACH_STARTUP_GRACE_MS, REMOTE_START_CODEX_ATTACH_STARTUP_GRACE_MS,
-        remote_resume_stale_attach,
+        remote_resume_saved_session_mismatch_requires_restart, remote_resume_stale_attach,
     };
     #[cfg(unix)]
     use super::{
@@ -6636,9 +7913,9 @@ mod tests {
     use crate::{
         GhosttyHostSupport, PersistedDaemonState, PersistedLiveSession, RemoteDeployState,
         RemoteMachineHealth, RemoteMachineSnapshot, RemoteScannedSession, ServerRuntimeStatus,
-        ServerUiSnapshot, SessionKind, SessionSource, SnapshotPreview, SnapshotSessionView,
-        TerminalBackend, TerminalLaunchPhase, WorkspaceViewMode, YggtermServer,
-        remote_scanned_session_path,
+        ServerUiSnapshot, SessionKind, SessionSource, SnapshotMetadataEntry, SnapshotPreview,
+        SnapshotSessionView, TerminalBackend, TerminalLaunchPhase, WorkspaceViewMode,
+        YggtermServer, remote_scanned_session_path,
     };
     use yggui_contract::UiTheme;
 
@@ -6810,6 +8087,36 @@ mod tests {
         assert!(
             !unix_loop.contains("match handle_unix_stream(stream"),
             "unix accept loop must not let one partial client monopolize the daemon"
+        );
+    }
+
+    #[test]
+    fn explicit_remove_session_drops_local_runtime_before_remote_shutdown() {
+        let source = include_str!("daemon.rs");
+        let remove_session_block = source
+            .split("ServerRequest::RemoveSession { path } => {")
+            .nth(1)
+            .and_then(|suffix| suffix.split("ServerRequest::DropTerminalRuntime").next())
+            .expect("remove session handler should be present");
+
+        let local_drop = remove_session_block
+            .find(".remove_session(&runtime_path, stop_command.as_deref())")
+            .expect("explicit close should drop the local terminal runtime");
+        let remote_shutdown = remove_session_block
+            .find("spawn_explicit_remote_session_shutdown(")
+            .expect("explicit close should request remote shutdown in the background");
+        assert!(
+            local_drop < remote_shutdown,
+            "remote cleanup must not block local runtime removal or bulk Close All"
+        );
+        assert!(
+            !remove_session_block.contains("terminate_remote_codex_session(machine, session_id)"),
+            "explicit close must not synchronously run remote yggterm termination before local close"
+        );
+        assert!(
+            remove_session_block.contains("if removed_terminal {")
+                && remove_session_block.contains("format!(\"closed terminal runtime for {path}\")"),
+            "runtime-only closes should report as closed so bulk Close All can count them"
         );
     }
 
@@ -7007,6 +8314,172 @@ mod tests {
             ssh_target: Some("dev".to_string()),
             ssh_prefix: None,
         }
+    }
+
+    #[test]
+    fn preserved_owner_snapshot_restores_missing_live_session_row() {
+        let tree = daemon_test_tree();
+        let mut server = YggtermServer::new(
+            &tree,
+            false,
+            GhosttyHostSupport::shadow("test".to_string(), false, false),
+            UiTheme::ZedLight,
+        );
+        let session_path = remote_scanned_session_path("practice", "241c3f6a");
+        let mut owner_session = daemon_test_snapshot_session(&session_path, SessionSource::LiveSsh);
+        owner_session.title = "practice-rs".to_string();
+        owner_session.host_label = "practice".to_string();
+        owner_session.ssh_target = Some("practice".to_string());
+        owner_session.metadata = vec![
+            SnapshotMetadataEntry {
+                label: "Cwd".to_string(),
+                value: "/home/pi/git/practice-rs".to_string(),
+            },
+            SnapshotMetadataEntry {
+                label: "Runtime Persistence".to_string(),
+                value: "keep-alive".to_string(),
+            },
+            SnapshotMetadataEntry {
+                label: "Storage".to_string(),
+                value: "/home/pi/.codex/sessions/practice.jsonl".to_string(),
+            },
+        ];
+        let owner_snapshot = ServerUiSnapshot {
+            active_session_path: Some(session_path.clone()),
+            active_session: Some(owner_session.clone()),
+            active_view_mode: WorkspaceViewMode::Terminal,
+            remote_machines: Vec::new(),
+            ssh_targets: Vec::new(),
+            live_sessions: vec![owner_session],
+        };
+        let runtime_keys = HashSet::from([session_path.clone()]);
+
+        let restored = super::restore_preserved_owner_live_sessions_from_snapshot(
+            &mut server,
+            &owner_snapshot,
+            &runtime_keys,
+        );
+        let focused = server.focus_live_session_without_launch_if_active_missing(&session_path);
+
+        assert_eq!(restored, vec![session_path.clone()]);
+        assert!(focused);
+        assert!(server.represents_terminal_runtime_key(&session_path));
+        assert!(server.live_session_keep_alive(&session_path));
+        assert_eq!(server.active_session_path(), Some(session_path.as_str()));
+        assert_eq!(server.active_view_mode(), WorkspaceViewMode::Terminal);
+    }
+
+    #[test]
+    fn preserved_owner_recovery_only_restores_kept_or_update_restart_snapshot_rows() {
+        let tree = daemon_test_tree();
+        let mut server = YggtermServer::new(
+            &tree,
+            false,
+            GhosttyHostSupport::shadow("test".to_string(), false, false),
+            UiTheme::ZedLight,
+        );
+        let kept_path = remote_scanned_session_path("practice", "kept");
+        let update_path = remote_scanned_session_path("practice", "update");
+        let ghost_path = remote_scanned_session_path("practice", "ghost");
+        let mut kept = daemon_test_snapshot_session(&kept_path, SessionSource::LiveSsh);
+        kept.ssh_target = Some("practice".to_string());
+        kept.metadata = vec![SnapshotMetadataEntry {
+            label: "Runtime Persistence".to_string(),
+            value: "keep-alive".to_string(),
+        }];
+        let mut update = daemon_test_snapshot_session(&update_path, SessionSource::LiveSsh);
+        update.ssh_target = Some("practice".to_string());
+        update.metadata = vec![SnapshotMetadataEntry {
+            label: "Runtime Restore Reason".to_string(),
+            value: crate::UPDATE_RESTART_RESTORE_REASON.to_string(),
+        }];
+        let mut ghost = daemon_test_snapshot_session(&ghost_path, SessionSource::LiveSsh);
+        ghost.ssh_target = Some("practice".to_string());
+        let owner_snapshot = ServerUiSnapshot {
+            active_session_path: None,
+            active_session: None,
+            active_view_mode: WorkspaceViewMode::Terminal,
+            remote_machines: Vec::new(),
+            ssh_targets: Vec::new(),
+            live_sessions: vec![kept, update, ghost],
+        };
+        let runtime_keys =
+            HashSet::from([kept_path.clone(), update_path.clone(), ghost_path.clone()]);
+
+        let restored = super::restore_preserved_owner_live_sessions_from_snapshot_with_policy(
+            &mut server,
+            &owner_snapshot,
+            &runtime_keys,
+            true,
+        );
+
+        assert_eq!(restored, vec![kept_path.clone(), update_path.clone()]);
+        assert!(server.represents_terminal_runtime_key(&kept_path));
+        assert!(server.represents_terminal_runtime_key(&update_path));
+        assert!(
+            !server.represents_terminal_runtime_key(&ghost_path),
+            "a registry-loss recovery scan must not resurrect unkept closed ghosts"
+        );
+    }
+
+    #[test]
+    fn terminal_read_preserved_owner_path_does_not_run_saved_session_mismatch_probe() {
+        let source = include_str!("daemon.rs");
+        let terminal_read_branch = source
+            .split("ServerRequest::TerminalRead { path, cursor } => {")
+            .nth(1)
+            .expect("terminal read branch")
+            .split("ServerRequest::TerminalSnapshot { path } => {")
+            .next()
+            .expect("terminal snapshot branch follows terminal read");
+
+        assert!(
+            terminal_read_branch.contains("terminal_read(&owner_endpoint, &runtime_path, cursor)"),
+            "preserved-owner terminal read must proxy bytes directly"
+        );
+        assert!(
+            !terminal_read_branch.contains("reject_preserved_owner_saved_session_mismatch"),
+            "terminal read is the hot loop; mismatch probes belong to ensure/snapshot paths"
+        );
+    }
+
+    #[test]
+    fn preserved_owner_terminal_not_found_error_is_missing_runtime() {
+        let error = anyhow::anyhow!(
+            "reading daemon response\n\nCaused by:\n    terminal session not found: codex-runtime://019e2ade"
+        );
+
+        assert!(super::DaemonRuntime::preserved_owner_error_means_missing_runtime(
+            "codex-runtime://019e2ade",
+            &error
+        ));
+        assert!(!super::DaemonRuntime::preserved_owner_error_means_missing_runtime(
+            "codex-runtime://other",
+            &error
+        ));
+    }
+
+    #[test]
+    fn terminal_read_preserved_owner_missing_runtime_falls_back_to_local_ensure() {
+        let source = include_str!("daemon.rs");
+        let terminal_read_branch = source
+            .split("ServerRequest::TerminalRead { path, cursor } => {")
+            .nth(1)
+            .expect("terminal read branch")
+            .split("ServerRequest::TerminalSnapshot { path } => {")
+            .next()
+            .expect("terminal snapshot branch follows terminal read");
+        let owner_error_ix = terminal_read_branch
+            .find("self.handle_preserved_owner_request_error(")
+            .expect("terminal read handles preserved owner errors");
+        let fallback_ix = terminal_read_branch
+            .find("let _ = self.ensure_terminal_for_path(&path)?;")
+            .expect("terminal read should recover locally after a stale owner is removed");
+
+        assert!(
+            owner_error_ix < fallback_ix,
+            "preserved-owner read errors must be classified before local fallback"
+        );
     }
 
     #[test]
@@ -7408,6 +8881,34 @@ mod tests {
     }
 
     #[test]
+    fn drop_terminal_runtime_is_local_only_and_does_not_retire_daemon() {
+        let request = super::ServerRequest::DropTerminalRuntime {
+            runtime_key: "remote-session://dev/current-jyas".to_string(),
+            reason: Some("duplicate_legacy_owned_runtime_prune".to_string()),
+        };
+        assert_eq!(
+            super::server_request_name(&request),
+            "drop_terminal_runtime"
+        );
+
+        let outcome = super::daemon_request_outcome_for_response(
+            &request,
+            &super::ServerResponse::Ack {
+                message: Some("dropped terminal runtime".to_string()),
+            },
+        );
+
+        assert!(
+            !outcome.should_shutdown,
+            "dropping a duplicate PTY must not be confused with daemon shutdown"
+        );
+        assert_eq!(
+            outcome.restart_executable, None,
+            "dropping a duplicate PTY must not start another hot-update chain"
+        );
+    }
+
+    #[test]
     fn remote_runtime_requests_carry_terminal_appearance() {
         let request = super::ServerRequest::EnsureRemoteRuntimeCodexSession {
             session_id: "abc123".to_string(),
@@ -7496,6 +8997,17 @@ mod tests {
         assert!(shutdown_outcome.should_shutdown);
         assert_eq!(shutdown_outcome.restart_executable, None);
 
+        let retire_outcome = super::daemon_request_outcome_for_response(
+            &super::ServerRequest::RetireDaemon {
+                reason: Some("stale covered sidecar".to_string()),
+            },
+            &super::ServerResponse::Ack {
+                message: Some("retire".to_string()),
+            },
+        );
+        assert!(retire_outcome.should_shutdown);
+        assert_eq!(retire_outcome.restart_executable, None);
+
         let handoff_outcome = super::daemon_request_outcome_for_response(
             &request,
             &super::ServerResponse::HotUpdateHandoff {
@@ -7556,7 +9068,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn hot_update_owner_registry_keeps_existing_sidecar_entries() {
+    fn hot_update_owner_registry_retargets_existing_sidecar_entries_for_handoff_keys() {
         let root = std::env::temp_dir().join(format!(
             "yggterm-hot-update-owners-{}-{}",
             std::process::id(),
@@ -7592,7 +9104,10 @@ mod tests {
             &owner_endpoint,
             &owner_status,
             Some("2.1.62".to_string()),
-            vec!["local://new-owner".to_string()],
+            vec![
+                "local://new-owner".to_string(),
+                "local://old-owner".to_string(),
+            ],
             existing,
         )
         .expect("write registry");
@@ -7609,7 +9124,7 @@ mod tests {
                 .owner_for_key("local://old-owner")
                 .expect("old owner")
                 .owner_server_pid,
-            60
+            61
         );
         assert_eq!(
             registry
@@ -7665,6 +9180,59 @@ mod tests {
         let loaded = super::PreservedTerminalOwnerRegistry::load(&home);
         assert_eq!(loaded.expected_server_version.as_deref(), Some("2.1.63"));
         assert_eq!(loaded.keys(), vec!["local://kept".to_string()]);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn runtime_load_retargets_preserved_owner_registry_without_dropping_keys() {
+        let root = std::env::temp_dir().join(format!(
+            "yggterm-runtime-load-owner-retarget-{}-{}",
+            std::process::id(),
+            super::current_millis_u64()
+        ));
+        let home = root.join(".yggterm");
+        fs::create_dir_all(&home).expect("create temp home");
+        let owner_endpoint = super::ServerEndpoint::UnixSocket(home.join("server-0-0-1.sock"));
+        let owner_status: ServerRuntimeStatus = serde_json::from_value(serde_json::json!({
+            "server_version": "0.0.1",
+            "server_build_id": 0,
+            "server_pid": 1,
+            "host_kind": "local",
+            "host_detail": "test",
+            "embedded_surface_supported": true,
+            "bridge_enabled": true,
+            "owned_terminal_session_count": 1,
+            "owned_terminal_session_keys": ["remote-session://dev/kept-work"],
+            "terminal_session_count": 1,
+            "terminal_session_keys": ["remote-session://dev/kept-work"],
+        }))
+        .expect("status");
+        let mut registry = super::PreservedTerminalOwnerRegistry::write_handoff(
+            &home,
+            &owner_endpoint,
+            &owner_status,
+            Some("0.0.1".to_string()),
+            vec!["remote-session://dev/kept-work".to_string()],
+            Vec::new(),
+        )
+        .expect("write registry");
+
+        assert!(
+            registry
+                .retarget_loaded_registry_for_current_version(&home)
+                .expect("retarget loaded registry")
+        );
+
+        let loaded = super::PreservedTerminalOwnerRegistry::load(&home);
+        assert_eq!(
+            loaded.expected_server_version.as_deref(),
+            Some(super::SERVER_PROTOCOL_VERSION)
+        );
+        assert_eq!(
+            loaded.keys(),
+            vec!["remote-session://dev/kept-work".to_string()]
+        );
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -7815,6 +9383,76 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn handoff_existing_entries_preserves_reachable_prior_owner_runtime_not_in_current_rows() {
+        let endpoint = super::ServerEndpoint::UnixSocket(PathBuf::from("/tmp/yggterm-old.sock"));
+        let practice = "remote-session://practice/241c3f6a".to_string();
+        let closed = "remote-session://dev/closed".to_string();
+        let outgoing = "remote-session://dev/outgoing".to_string();
+        let entries = vec![
+            super::PreservedTerminalOwnerEntry {
+                runtime_key: practice.clone(),
+                endpoint: super::PreservedOwnerEndpoint::from_endpoint(&endpoint),
+                owner_server_version: "2.6.30".to_string(),
+                owner_server_build_id: 0,
+                owner_server_pid: 2630,
+                created_at_ms: 1,
+            },
+            super::PreservedTerminalOwnerEntry {
+                runtime_key: closed.clone(),
+                endpoint: super::PreservedOwnerEndpoint::from_endpoint(&endpoint),
+                owner_server_version: "2.6.30".to_string(),
+                owner_server_build_id: 0,
+                owner_server_pid: 2630,
+                created_at_ms: 1,
+            },
+            super::PreservedTerminalOwnerEntry {
+                runtime_key: outgoing.clone(),
+                endpoint: super::PreservedOwnerEndpoint::from_endpoint(&endpoint),
+                owner_server_version: "2.6.30".to_string(),
+                owner_server_build_id: 0,
+                owner_server_pid: 2630,
+                created_at_ms: 1,
+            },
+        ];
+        let owner_status: ServerRuntimeStatus = serde_json::from_value(serde_json::json!({
+            "server_version": "2.6.30",
+            "server_build_id": 0,
+            "server_pid": 2630,
+            "host_kind": "local",
+            "host_detail": "test",
+            "embedded_surface_supported": true,
+            "bridge_enabled": true,
+            "owned_terminal_session_count": 1,
+            "owned_terminal_session_keys": [practice],
+            "terminal_session_count": 1,
+            "terminal_session_keys": [practice],
+        }))
+        .expect("status");
+        let status_cache = BTreeMap::from([(
+            super::PreservedOwnerEndpoint::from_endpoint(&endpoint).label(),
+            Some(owner_status),
+        )]);
+        let outgoing_owned_runtime_keys = HashSet::from([outgoing.clone()]);
+        let represented_preserved_owner_keys = HashSet::new();
+
+        let kept = super::preserved_owner_entries_live_for_handoff(
+            &entries,
+            &outgoing_owned_runtime_keys,
+            &represented_preserved_owner_keys,
+            &status_cache,
+        );
+
+        assert_eq!(
+            kept.iter()
+                .map(|entry| entry.runtime_key.as_str())
+                .collect::<Vec<_>>(),
+            vec![practice.as_str()],
+            "handoff must keep a reachable prior owner runtime and drop closed/outgoing keys"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn hot_update_owner_registry_groups_runtime_keys_by_endpoint() {
         let home = std::env::temp_dir().join(format!(
             "yggterm-hot-update-owner-groups-{}-{}",
@@ -7910,11 +9548,15 @@ mod tests {
             storage_path: None,
             restore_reason: Some("update-restart".to_string()),
         });
-        let represented_runtime_keys = HashSet::from([kept_jyas.clone()]);
+        let owner_registry_keys = HashSet::from([kept_jyas.clone()]);
+        let all_registry_keys = owner_registry_keys.clone();
+        let current_owned_runtime_keys = HashSet::new();
 
         let stale_runtime_keys = super::unrepresented_preserved_owner_runtime_keys(
             &server,
-            &represented_runtime_keys,
+            &owner_registry_keys,
+            &all_registry_keys,
+            &current_owned_runtime_keys,
             vec![
                 kept_jyas,
                 unkept_update_runtime.clone(),
@@ -7934,6 +9576,242 @@ mod tests {
                 "remote-session://dev/closed-may-6".to_string(),
             ],
             "owner daemons must drop PTYs that are neither in the hot-update registry nor represented by current live-session truth"
+        );
+    }
+
+    #[test]
+    fn represented_keep_alive_live_session_still_needs_preserved_owner_without_local_runtime() {
+        let tree = daemon_test_tree();
+        let mut server = YggtermServer::new(
+            &tree,
+            false,
+            GhosttyHostSupport::shadow("test".to_string(), false, false),
+            UiTheme::ZedLight,
+        );
+        let kept_runtime = remote_scanned_session_path("practice", "kept-runtime");
+        server.restore_live_session(PersistedLiveSession {
+            key: kept_runtime.clone(),
+            id: "kept-runtime".to_string(),
+            title: "practice-rs non-data".to_string(),
+            kind: SessionKind::Codex,
+            keep_alive: true,
+            ssh_target: "practice".to_string(),
+            prefix: None,
+            cwd: Some("/home/pi/git/practice-rs".to_string()),
+            remote_launch_action: None,
+            storage_path: None,
+            restore_reason: None,
+        });
+        let terminals = TerminalManager::new();
+
+        assert!(server.represents_terminal_runtime_key(&kept_runtime));
+        assert!(
+            super::represented_live_session_needs_preserved_owner(
+                &server,
+                &terminals,
+                &kept_runtime,
+            ),
+            "a restored live row is not enough truth; a keep-alive row still needs the old PTY owner registered"
+        );
+    }
+
+    #[test]
+    fn represented_plain_live_session_does_not_recover_unregistered_owner() {
+        let tree = daemon_test_tree();
+        let mut server = YggtermServer::new(
+            &tree,
+            false,
+            GhosttyHostSupport::shadow("test".to_string(), false, false),
+            UiTheme::ZedLight,
+        );
+        let plain_runtime = remote_scanned_session_path("practice", "plain-runtime");
+        server.restore_live_session(PersistedLiveSession {
+            key: plain_runtime.clone(),
+            id: "plain-runtime".to_string(),
+            title: "plain runtime".to_string(),
+            kind: SessionKind::Codex,
+            keep_alive: false,
+            ssh_target: "practice".to_string(),
+            prefix: None,
+            cwd: Some("/home/pi/git/practice-rs".to_string()),
+            remote_launch_action: None,
+            storage_path: None,
+            restore_reason: None,
+        });
+        let terminals = TerminalManager::new();
+
+        assert!(
+            !super::represented_live_session_needs_preserved_owner(
+                &server,
+                &terminals,
+                &plain_runtime,
+            ),
+            "plain stale live rows must not resurrect ghost PTY owners"
+        );
+    }
+
+    #[test]
+    fn preserved_owner_runtime_prune_candidates_reject_duplicate_current_owner_keys() {
+        let tree = daemon_test_tree();
+        let mut server = YggtermServer::new(
+            &tree,
+            false,
+            GhosttyHostSupport::shadow("test".to_string(), false, false),
+            UiTheme::ZedLight,
+        );
+        let kept_jyas = remote_scanned_session_path("dev", "kept-jyas");
+        let duplicate_erome = remote_scanned_session_path("dev", "kept-erome");
+        for key in [&kept_jyas, &duplicate_erome] {
+            server.restore_live_session(PersistedLiveSession {
+                key: key.clone(),
+                id: key.rsplit('/').next().unwrap_or("session").to_string(),
+                title: "remote".to_string(),
+                kind: SessionKind::Codex,
+                keep_alive: true,
+                ssh_target: "dev".to_string(),
+                prefix: None,
+                cwd: Some("/home/pi/git/jyas".to_string()),
+                remote_launch_action: None,
+                storage_path: None,
+                restore_reason: None,
+            });
+        }
+        let owner_registry_keys = HashSet::from([kept_jyas.clone()]);
+        let all_registry_keys = owner_registry_keys.clone();
+        let current_owned_runtime_keys = HashSet::from([duplicate_erome.clone()]);
+
+        let stale_runtime_keys = super::unrepresented_preserved_owner_runtime_keys(
+            &server,
+            &owner_registry_keys,
+            &all_registry_keys,
+            &current_owned_runtime_keys,
+            vec![kept_jyas, duplicate_erome.clone()],
+        );
+
+        assert_eq!(
+            stale_runtime_keys,
+            vec![duplicate_erome],
+            "an old preserved owner must drop a runtime once the current daemon already owns that same represented live-session key"
+        );
+    }
+
+    #[test]
+    fn preserved_owner_runtime_prune_candidates_reject_keys_assigned_to_other_owner() {
+        let tree = daemon_test_tree();
+        let mut server = YggtermServer::new(
+            &tree,
+            false,
+            GhosttyHostSupport::shadow("test".to_string(), false, false),
+            UiTheme::ZedLight,
+        );
+        let kept_jyas = remote_scanned_session_path("dev", "kept-jyas");
+        let reassigned_erome = remote_scanned_session_path("dev", "kept-erome");
+        for key in [&kept_jyas, &reassigned_erome] {
+            server.restore_live_session(PersistedLiveSession {
+                key: key.clone(),
+                id: key.rsplit('/').next().unwrap_or("session").to_string(),
+                title: "remote".to_string(),
+                kind: SessionKind::Codex,
+                keep_alive: true,
+                ssh_target: "dev".to_string(),
+                prefix: None,
+                cwd: Some("/home/pi/git/jyas".to_string()),
+                remote_launch_action: None,
+                storage_path: None,
+                restore_reason: None,
+            });
+        }
+        let owner_registry_keys = HashSet::from([kept_jyas.clone()]);
+        let all_registry_keys = HashSet::from([kept_jyas.clone(), reassigned_erome.clone()]);
+        let current_owned_runtime_keys = HashSet::new();
+
+        let stale_runtime_keys = super::unrepresented_preserved_owner_runtime_keys(
+            &server,
+            &owner_registry_keys,
+            &all_registry_keys,
+            &current_owned_runtime_keys,
+            vec![kept_jyas, reassigned_erome.clone()],
+        );
+
+        assert_eq!(
+            stale_runtime_keys,
+            vec![reassigned_erome],
+            "an older owner must drop a runtime key once the preserved-owner registry assigns that key to a different owner endpoint"
+        );
+    }
+
+    #[test]
+    fn duplicate_legacy_owned_runtime_prune_candidates_keep_unique_old_runtime_keys() {
+        let current_runtime_keys = HashSet::from([
+            "remote-session://dev/current-erome".to_string(),
+            "remote-session://dev/current-jyas".to_string(),
+        ]);
+        let owner_status: ServerRuntimeStatus = serde_json::from_value(serde_json::json!({
+            "server_version": "2.6.1",
+            "server_build_id": 1,
+            "server_pid": 261,
+            "host_kind": "local",
+            "host_detail": "test",
+            "embedded_surface_supported": true,
+            "bridge_enabled": true,
+            "owned_terminal_session_count": 2,
+            "owned_terminal_session_keys": [
+                "remote-session://dev/current-erome",
+                "remote-session://dev/old-only-p01scripts"
+            ],
+            "terminal_session_count": 2,
+            "terminal_session_keys": [
+                "remote-session://dev/current-erome",
+                "remote-session://dev/old-only-p01scripts"
+            ],
+        }))
+        .expect("status");
+
+        let stale_runtime_keys = super::duplicate_legacy_owned_runtime_keys(
+            &current_runtime_keys,
+            "2.6.2",
+            2,
+            262,
+            &owner_status,
+        );
+
+        assert_eq!(
+            stale_runtime_keys,
+            vec!["remote-session://dev/current-erome".to_string()],
+            "an old daemon with mixed ownership must drop only the runtime already directly owned by the newer daemon"
+        );
+    }
+
+    #[test]
+    fn duplicate_legacy_owned_runtime_prune_candidates_keep_newer_owner_keys() {
+        let current_runtime_keys =
+            HashSet::from(["remote-session://dev/current-erome".to_string()]);
+        let owner_status: ServerRuntimeStatus = serde_json::from_value(serde_json::json!({
+            "server_version": "2.6.3",
+            "server_build_id": 300,
+            "server_pid": 300,
+            "host_kind": "local",
+            "host_detail": "test",
+            "embedded_surface_supported": true,
+            "bridge_enabled": true,
+            "owned_terminal_session_count": 1,
+            "owned_terminal_session_keys": ["remote-session://dev/current-erome"],
+            "terminal_session_count": 1,
+            "terminal_session_keys": ["remote-session://dev/current-erome"],
+        }))
+        .expect("status");
+
+        let stale_runtime_keys = super::duplicate_legacy_owned_runtime_keys(
+            &current_runtime_keys,
+            "2.6.2",
+            2,
+            262,
+            &owner_status,
+        );
+
+        assert!(
+            stale_runtime_keys.is_empty(),
+            "a daemon must not prune duplicate runtime keys from a newer or higher-ranked owner"
         );
     }
 
@@ -8116,6 +9994,13 @@ mod tests {
         );
         let owned_runtime =
             status_for_cleanup_test("2.1.170", 171, &["local://kept"], &[], &["local://kept"]);
+        let unregistered_owned_runtime = status_for_cleanup_test(
+            "2.1.170",
+            172,
+            &["remote-session://practice/new-work"],
+            &[],
+            &["remote-session://practice/new-work"],
+        );
         let ghost_owned_runtime = status_for_cleanup_test(
             "2.1.170",
             177,
@@ -8201,7 +10086,20 @@ mod tests {
             "once the registry endpoint is clean, duplicate non-registry owners for the same keys should retire"
         );
         assert!(
-            !linux_daemon_runtime_activity_protected_for_cleanup(
+            linux_daemon_runtime_activity_protected_for_cleanup(
+                172,
+                Some(&unregistered_owned_runtime),
+                &preserved_owner_pids,
+                &preserved_owner_runtime_keys,
+                true,
+                true,
+                &HashSet::new(),
+                false,
+            ),
+            "a stale daemon with a direct PTY key missing from the registry must survive cleanup; session survival beats cleanup"
+        );
+        assert!(
+            linux_daemon_runtime_activity_protected_for_cleanup(
                 177,
                 Some(&ghost_owned_runtime),
                 &preserved_owner_pids,
@@ -8211,7 +10109,7 @@ mod tests {
                 &HashSet::new(),
                 true,
             ),
-            "a daemon that only owns closed-session runtime keys should not stay protected"
+            "cleanup cannot prove an unknown direct PTY is closed; explicit close metadata must retire it before cleanup may reap the owner"
         );
         assert!(
             linux_daemon_runtime_activity_protected_for_cleanup(
@@ -8418,6 +10316,34 @@ mod tests {
         let paths = super::versioned_server_status_probe_paths(&sockets_dir);
 
         assert_eq!(paths, vec![current]);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn versioned_server_status_probe_paths_can_skip_current_endpoint_aliases() {
+        let root = std::env::temp_dir().join(format!(
+            "yggterm-daemon-status-exclude-test-{}-{}",
+            std::process::id(),
+            super::current_millis()
+        ));
+        let sockets_dir = root.join("home").join(".yggterm");
+        fs::create_dir_all(&sockets_dir).expect("create sockets dir");
+        let super::ServerEndpoint::UnixSocket(current) = super::default_endpoint(&sockets_dir)
+        else {
+            panic!("unix test requires unix socket endpoint");
+        };
+        let legacy = sockets_dir.join("server-2-6-2.sock");
+        fs::write(&current, b"").expect("write current socket placeholder");
+        fs::write(&legacy, b"").expect("write legacy socket placeholder");
+        std::os::unix::fs::symlink(&current, sockets_dir.join("server-2-1-102.sock"))
+            .expect("create current alias");
+
+        let excluded = super::ServerEndpoint::UnixSocket(current);
+        let paths =
+            super::versioned_server_status_probe_paths_excluding_endpoint(&sockets_dir, &excluded);
+
+        assert_eq!(paths, vec![legacy]);
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -8646,7 +10572,7 @@ mod tests {
     }
 
     #[test]
-    fn startup_prewarm_keeps_remote_live_sessions_eligible_for_background_load() {
+    fn startup_prewarm_is_opt_in_and_skips_when_disabled() {
         assert_eq!(
             super::startup_prewarm_skip_reason_with_flag("local://shell", false),
             Some("disabled_by_env")
@@ -8920,6 +10846,225 @@ mod tests {
             true,
             REMOTE_START_CODEX_ATTACH_STARTUP_GRACE_MS
         ));
+    }
+
+    #[test]
+    fn remote_resume_saved_session_mismatch_does_not_auto_restart_live_runtime() {
+        assert!(!remote_resume_saved_session_mismatch_requires_restart(
+            true,
+            true,
+            REMOTE_ATTACH_STARTUP_GRACE_MS - 1,
+            true,
+            REMOTE_ATTACH_STARTUP_GRACE_MS
+        ));
+        assert!(!remote_resume_saved_session_mismatch_requires_restart(
+            true,
+            true,
+            REMOTE_ATTACH_STARTUP_GRACE_MS,
+            true,
+            REMOTE_ATTACH_STARTUP_GRACE_MS
+        ));
+        assert!(!remote_resume_saved_session_mismatch_requires_restart(
+            true,
+            true,
+            REMOTE_ATTACH_STARTUP_GRACE_MS * 30,
+            true,
+            REMOTE_ATTACH_STARTUP_GRACE_MS
+        ));
+        assert!(!remote_resume_saved_session_mismatch_requires_restart(
+            false,
+            true,
+            REMOTE_ATTACH_STARTUP_GRACE_MS,
+            true,
+            REMOTE_ATTACH_STARTUP_GRACE_MS
+        ));
+        assert!(!remote_resume_saved_session_mismatch_requires_restart(
+            true,
+            false,
+            REMOTE_ATTACH_STARTUP_GRACE_MS,
+            true,
+            REMOTE_ATTACH_STARTUP_GRACE_MS
+        ));
+        assert!(!remote_resume_saved_session_mismatch_requires_restart(
+            true,
+            true,
+            REMOTE_ATTACH_STARTUP_GRACE_MS,
+            false,
+            REMOTE_ATTACH_STARTUP_GRACE_MS
+        ));
+    }
+
+    #[test]
+    fn keep_alive_remote_runtime_blocks_semantic_restart_while_still_running() {
+        let (needs_restart, blocked) =
+            terminal_reuse_needs_restart(true, true, true, true, true, true, false);
+
+        assert!(
+            !needs_restart,
+            "a still-running keep-alive remote runtime must not be replaced because early output or launch spec looks stale"
+        );
+        assert!(
+            blocked,
+            "the trace must expose that restart was requested but blocked by keep-alive"
+        );
+    }
+
+    #[test]
+    fn non_keep_alive_remote_runtime_can_still_restart_after_recovery_failure() {
+        let (needs_restart, blocked) =
+            terminal_reuse_needs_restart(true, true, false, true, false, false, true);
+
+        assert!(needs_restart);
+        assert!(!blocked);
+    }
+
+    #[test]
+    fn keep_alive_remote_runtime_restarts_only_after_process_exit() {
+        let (needs_restart, blocked) =
+            terminal_reuse_needs_restart(false, true, true, false, false, false, true);
+
+        assert!(needs_restart);
+        assert!(
+            !blocked,
+            "keep-alive protects a live runtime; if the runtime is already gone, restart remains the recovery path"
+        );
+    }
+
+    #[test]
+    fn terminal_read_recovers_missing_runtime_owned_session_before_read() {
+        let terminals = TerminalManager::new();
+        assert_eq!(
+            super::terminal_read_runtime_recovery_reason(
+                "remote-session://practice/019e3648",
+                "remote-session://practice/019e3648",
+                &terminals,
+            ),
+            Some("missing_runtime_before_read")
+        );
+        assert_eq!(
+            super::terminal_read_runtime_recovery_reason(
+                "local://shell",
+                "local://shell",
+                &terminals,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn keep_alive_preserved_owner_mismatch_stays_attached() {
+        assert!(
+            !preserved_owner_saved_session_mismatch_should_detach(
+                "remote-session://practice/019e2ade",
+                true,
+                false,
+                true,
+            ),
+            "saved-session text mismatch is recovery evidence for keep-alive, not detach permission"
+        );
+        assert!(preserved_owner_saved_session_mismatch_should_detach(
+            "remote-session://practice/019e2ade",
+            false,
+            false,
+            true,
+        ));
+        assert!(
+            !preserved_owner_saved_session_mismatch_should_detach(
+                "remote-session://practice/019e2ade",
+                false,
+                true,
+                true,
+            ),
+            "update-handoff protected runtimes must stay attached even when early text heuristics look stale"
+        );
+        assert!(preserved_owner_saved_session_mismatch_should_detach(
+            "local://shell",
+            true,
+            false,
+            true,
+        ));
+        assert!(!preserved_owner_saved_session_mismatch_should_detach(
+            "remote-session://practice/019e2ade",
+            true,
+            false,
+            false,
+        ));
+    }
+
+    #[test]
+    fn remove_session_close_terminates_explicit_keep_alive_runtime() {
+        assert!(
+            !remove_session_should_detach_keep_alive_runtime(true),
+            "ordinary close/remove is a destructive terminal close even for explicit keep-alive runtimes; app close is the detach boundary"
+        );
+        assert!(
+            !remove_session_should_detach_keep_alive_runtime(false),
+            "non-kept live sessions use ordinary close as a destructive runtime close"
+        );
+    }
+
+    #[test]
+    fn reachable_preserved_owner_candidate_prefers_live_owner_for_runtime_key() {
+        fn status(
+            version: &str,
+            build_id: u64,
+            pid: u32,
+            owned_keys: &[&str],
+            terminal_keys: &[&str],
+        ) -> ServerRuntimeStatus {
+            serde_json::from_value(serde_json::json!({
+                "server_version": version,
+                "server_build_id": build_id,
+                "server_pid": pid,
+                "host_kind": "local",
+                "host_detail": "test",
+                "embedded_surface_supported": true,
+                "bridge_enabled": true,
+                "owned_terminal_session_count": owned_keys.len(),
+                "owned_terminal_session_keys": owned_keys,
+                "terminal_session_count": terminal_keys.len(),
+                "terminal_session_keys": terminal_keys,
+            }))
+            .expect("runtime status")
+        }
+
+        let runtime_key = "remote-session://practice/019e2ade";
+        let statuses = vec![
+            (
+                super::ServerEndpoint::Tcp {
+                    host: "127.0.0.1".to_string(),
+                    port: 26101,
+                },
+                status("2.6.19", 19, 190, &[], &[runtime_key]),
+            ),
+            (
+                super::ServerEndpoint::Tcp {
+                    host: "127.0.0.1".to_string(),
+                    port: 26100,
+                },
+                status("2.6.18", 18, 180, &[runtime_key], &[runtime_key]),
+            ),
+            (
+                super::ServerEndpoint::Tcp {
+                    host: "127.0.0.1".to_string(),
+                    port: 26102,
+                },
+                status("2.6.20", 20, 200, &[], &["remote-session://dev/other"]),
+            ),
+        ];
+
+        let (endpoint, owner_status) =
+            preserved_owner_candidate_for_runtime_key(statuses, runtime_key, 200)
+                .expect("candidate");
+
+        assert_eq!(owner_status.server_pid, 180);
+        assert_eq!(
+            endpoint,
+            super::ServerEndpoint::Tcp {
+                host: "127.0.0.1".to_string(),
+                port: 26100,
+            }
+        );
     }
 
     #[cfg(unix)]
