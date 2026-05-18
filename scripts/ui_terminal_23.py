@@ -195,10 +195,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--restore-pass", action="store_true")
     parser.add_argument("--restore-wait-sec", type=float, default=300.0)
     parser.add_argument("--resource-sample-sec", type=float, default=8.0)
+    parser.add_argument("--baseline-max-cpu", type=float, default=8.0)
+    parser.add_argument("--active-max-cpu", type=float, default=30.0)
     parser.add_argument("--cooldown-max-cpu", type=float, default=8.0)
+    parser.add_argument("--respawn-max-cpu", type=float, default=18.0)
+    parser.add_argument("--respawn-burst-max-cpu", type=float, default=35.0)
+    parser.add_argument("--respawn-settle-sec", type=float, default=20.0)
     parser.add_argument("--gui-bin", help="GUI-capable yggterm binary for restore relaunch")
     parser.add_argument("--screenshots", action="store_true")
     parser.add_argument("--skip-quirks", action="store_true")
+    parser.add_argument("--skip-launcher-preflight", action="store_true")
     return parser.parse_args()
 
 
@@ -235,6 +241,105 @@ def run_capture(argv: list[str]) -> tuple[int, str, str]:
 
 def quote(value: str) -> str:
     return shlex.quote(value)
+
+
+def direct_install_launcher_preflight(host: str, binary: str, out_dir: Path) -> dict:
+    snippet = r"""
+import json
+import os
+import pathlib
+import sys
+
+MARKER = "yggterm-direct-launcher-v3"
+binary_arg = sys.argv[1]
+home = pathlib.Path.home()
+root = pathlib.Path(os.environ.get("YGGTERM_DIRECT_INSTALL_ROOT") or home / ".local/share/yggterm/direct")
+state_path = root / "install-state.json"
+
+def info_for(path_text, expected):
+    path = pathlib.Path(path_text).expanduser()
+    exists = path.exists() or path.is_symlink()
+    resolved = ""
+    marker = False
+    text_sample = ""
+    if exists:
+        try:
+            resolved = str(path.resolve(strict=False))
+        except Exception:
+            resolved = ""
+        try:
+            text_sample = path.read_text(encoding="utf-8", errors="replace")[:4096]
+            marker = MARKER in text_sample
+        except Exception:
+            text_sample = ""
+    direct_versions = f"{root}/versions/"
+    expected_text = str(expected) if expected else ""
+    stale_direct = bool(resolved and direct_versions in resolved and expected_text and resolved != expected_text)
+    acceptable = (not exists) or marker or (expected_text and resolved == expected_text)
+    return {
+        "path": str(path),
+        "exists": exists,
+        "is_symlink": path.is_symlink(),
+        "resolved": resolved,
+        "expected": expected_text,
+        "has_launcher_marker": marker,
+        "stale_direct_version": stale_direct,
+        "acceptable": acceptable and not stale_direct,
+    }
+
+payload = {
+    "checked": False,
+    "ok": True,
+    "binary_arg": binary_arg,
+    "install_root": str(root),
+    "state_path": str(state_path),
+    "failures": [],
+    "entries": [],
+}
+if state_path.is_file():
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    active = pathlib.Path(str(state.get("active_executable") or "")).expanduser()
+    headless = active.parent / "yggterm-headless" if active else pathlib.Path("")
+    payload["checked"] = True
+    payload["active_version"] = state.get("active_version")
+    payload["active_executable"] = str(active)
+    checks = [
+        (binary_arg, active),
+        (home / ".local/bin/yggterm", active),
+        (home / ".local/bin/yggterm-headless", headless),
+    ]
+    seen = set()
+    for path, expected in checks:
+        path_text = str(path)
+        if path_text in seen:
+            continue
+        seen.add(path_text)
+        entry = info_for(path_text, expected)
+        payload["entries"].append(entry)
+        if entry["exists"] and not entry["acceptable"]:
+            payload["failures"].append(entry)
+    payload["ok"] = not payload["failures"]
+print(json.dumps(payload))
+"""
+    command = f"python3 -c {quote(snippet)} {quote(binary)}"
+    result = run_control(host, command, check=False)
+    stdout = result.stdout.strip()
+    try:
+        payload = json.loads(stdout) if stdout else {"ok": False, "failures": ["empty output"]}
+    except json.JSONDecodeError:
+        payload = {
+            "ok": False,
+            "failures": ["invalid json"],
+            "stdout": stdout,
+            "stderr": result.stderr,
+            "returncode": result.returncode,
+        }
+    payload["returncode"] = result.returncode
+    payload["stderr"] = result.stderr.strip()
+    write_json(out_dir / "launcher-preflight.json", payload)
+    if result.returncode != 0 or not payload.get("ok", False):
+        raise RuntimeError(f"direct install launcher preflight failed: {payload}")
+    return payload
 
 
 def local_yggterm_home() -> Path:
@@ -385,6 +490,59 @@ def app_launch(
         f"--skip-active-exec-handoff "
         f"--timeout-ms {timeout_ms}",
     )
+
+
+def headless_binary_for(binary: str) -> str:
+    path = Path(binary)
+    name = path.name
+    if name == "yggterm-headless":
+        return binary
+    if name == "yggterm":
+        return str(path.with_name("yggterm-headless"))
+    return binary.replace("yggterm", "yggterm-headless")
+
+
+def daemon_server_list(host: str, binary: str) -> dict:
+    headless = headless_binary_for(binary)
+    result = run_control(
+        host,
+        f"{quote(headless)} server monitor --scenario server-list",
+        check=False,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            "server-list failed "
+            f"rc={result.returncode}: {result.stderr.strip() or result.stdout.strip()}"
+        )
+    for line in reversed(result.stdout.splitlines()):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if event.get("event", {}).get("kind") == "result":
+            return event.get("data") or {}
+    raise RuntimeError(f"server-list did not return a result event: {result.stdout[-2000:]}")
+
+
+def daemon_owner_failures(report: dict) -> list[str]:
+    owners_by_key: dict[str, list[str]] = {}
+    for server in report.get("servers") or []:
+        endpoint = ((server.get("endpoint") or {}).get("path")) or str(server.get("endpoint"))
+        label = f"{server.get('server_version')} pid {server.get('server_pid')} {endpoint}"
+        for key in server.get("owned_terminal_session_keys") or []:
+            owners_by_key.setdefault(str(key), []).append(label)
+    failures = []
+    for key, owners in sorted(owners_by_key.items()):
+        unique_owners = sorted(set(owners))
+        if len(unique_owners) > 1:
+            failures.append(
+                f"runtime key {key} is directly owned by multiple daemons: "
+                + " | ".join(unique_owners)
+            )
+    return failures
 
 
 def server_inventory(host: str) -> dict:
@@ -613,23 +771,17 @@ def titlebar_matches_viewport(state: dict) -> bool:
     active_summary = (viewport.get("active_summary") or "").strip()
     title_text = (titlebar.get("title_text") or "").strip()
     summary_text = (titlebar.get("summary_text") or "").strip()
-    button_tooltip = (titlebar.get("button_tooltip") or "").strip()
     if (
         dom.get("snapshot_mode") == "terminal-fallback"
         and not title_text
         and not summary_text
-        and not button_tooltip
     ):
         return True
     if active_title and title_text != active_title:
         return False
     if active_summary and titlebar.get("menu_open") and summary_text != active_summary:
         return False
-    if active_summary and not (
-        active_summary == button_tooltip
-        or active_summary.startswith(button_tooltip)
-        or button_tooltip.startswith(active_summary)
-    ):
+    if active_summary and summary_text and summary_text != active_summary:
         return False
     return True
 
@@ -677,14 +829,14 @@ def remote_dir_exists(ssh_target: str, path: str) -> bool:
 def remote_resolve_cwd(ssh_target: str, path: str) -> str | None:
     command = (
         f"p={quote(path)}; "
-        'while [ -n "$p" ] && [ ! -d "$p" ]; do '
+        'while [ -n "$p" ]; do '
+        'if [ -d "$p" ] && cd "$p" >/dev/null 2>&1; then pwd -P; exit 0; fi; '
         'if [ "$p" = "/" ]; then break; fi; '
         'next=$(dirname -- "$p"); '
         'if [ "$next" = "$p" ]; then break; fi; '
         'p="$next"; '
         "done; "
-        'if [ -d "$p" ]; then printf "%s" "$p"; '
-        'elif [ -n "$HOME" ] && [ -d "$HOME" ]; then printf "%s" "$HOME"; fi'
+        'if [ -n "$HOME" ] && [ -d "$HOME" ] && cd "$HOME" >/dev/null 2>&1; then pwd -P; fi'
     )
     rc, stdout, _ = run_capture(["ssh", ssh_target, command])
     if rc != 0:
@@ -837,11 +989,49 @@ def gui_binary_for_restore(args: argparse.Namespace) -> str:
 
 def heavy_workload_command() -> str:
     return (
-        "if command -v htop >/dev/null 2>&1; then "
+        "if command -v python3 >/dev/null 2>&1 && python3 - <<'PY'\n"
+        "import curses\n"
+        "PY\n"
+        "then\n"
+        "python3 - <<'PY'\n"
+        "import curses\n"
+        "import time\n"
+        "\n"
+        "def main(stdscr):\n"
+        "    try:\n"
+        "        curses.curs_set(0)\n"
+        "    except Exception:\n"
+        "        pass\n"
+        "    stdscr.nodelay(True)\n"
+        "    for frame in range(4500):\n"
+        "        rows, cols = stdscr.getmaxyx()\n"
+        "        width = max(20, cols - 1)\n"
+        "        bar_width = max(8, min(42, width - 14))\n"
+        "        filled = 1 + (frame % bar_width)\n"
+        "        mem_bar = '|' * filled + ' ' * (bar_width - filled)\n"
+        "        stdscr.erase()\n"
+        "        stdscr.addnstr(0, 0, f'YGGTERM TUI SMOKE frame {frame}', width)\n"
+        "        if rows > 1:\n"
+        "            stdscr.addnstr(1, 0, 'Tasks: smoke heavy terminal', width)\n"
+        "        if rows > 2:\n"
+        "            stdscr.addnstr(2, 0, f'Mem[{mem_bar}] {int((filled / bar_width) * 100):02d}%', width)\n"
+        "        if rows > 3:\n"
+        "            stdscr.addnstr(3, 0, 'F1Help F2Setup F10Quit', width)\n"
+        "        stdscr.refresh()\n"
+        "        ch = stdscr.getch()\n"
+        "        if ch in (ord('q'), ord('Q'), 3):\n"
+        "            break\n"
+        "        time.sleep(0.2)\n"
+        "\n"
+        "curses.wrapper(main)\n"
+        "PY\n"
+        "elif command -v htop >/dev/null 2>&1; then "
         "htop; "
+        "elif command -v top >/dev/null 2>&1; then "
+        "top; "
         "elif command -v npx >/dev/null 2>&1; then "
-        "npx --yes codex-session-tui; "
-        "else top; fi\n"
+        "npx --yes --prefer-offline codex-session-tui; "
+        "else printf 'no tui workload available\\n'; sleep 30; fi\n"
     )
 
 
@@ -858,12 +1048,17 @@ def ordinary_probe_command() -> str:
 
 def terminal_text_looks_like_tui(text: str) -> bool:
     lowered = text.lower()
-    return any(
+    if any(
         marker in lowered
         for marker in (
             "load average",
+            "yggterm tui smoke",
             "tasks:",
             "%cpu",
+            "mem[",
+            "swp[",
+            "uptime:",
+            "f1help",
             "mib mem",
             "kib mem",
             "gib mem",
@@ -872,7 +1067,10 @@ def terminal_text_looks_like_tui(text: str) -> bool:
             "no session selected",
             "session selected",
         )
-    )
+    ):
+        return True
+    htop_bar_rows = re.findall(r"(?:^|\s)\d+\[[|#:/\\*.\-=\s]{2,}\d+(?:\.\d+)?%", text)
+    return len(htop_bar_rows) >= 2
 
 
 def stop_heavy_workload(host: str, binary: str, timeout_ms: int, session_path: str) -> dict:
@@ -908,13 +1106,29 @@ def main() -> int:
 
     resources: dict[str, dict] = {}
     resource_failures: list[str] = []
+    daemon_reports: dict[str, dict] = {}
+    daemon_failures: list[str] = []
+    launcher_preflight = None
+    if not args.skip_launcher_preflight:
+        launcher_preflight = direct_install_launcher_preflight(args.host, args.bin, out_dir)
     resources["baseline"] = sample_resources(
         args.host,
         "baseline",
         args.resource_sample_sec,
         out_dir,
     )
+    baseline_failure = _resource_failure(resources["baseline"], args.baseline_max_cpu)
+    if baseline_failure:
+        resource_failures.append(baseline_failure)
     baseline_state = wait_for_window(args.host, args.bin, args.timeout_ms)
+    try:
+        daemon_reports["baseline"] = daemon_server_list(args.host, args.bin)
+        daemon_failures.extend(
+            f"baseline: {failure}"
+            for failure in daemon_owner_failures(daemon_reports["baseline"])
+        )
+    except Exception as error:  # noqa: BLE001
+        daemon_failures.append(f"baseline server-list failed: {error}")
     baseline_notifications = ((baseline_state.get("shell") or {}).get("notifications_count")) or 0
     inventory = server_inventory(args.host)
     rng = random.Random(args.seed)
@@ -1079,6 +1293,9 @@ def main() -> int:
         args.resource_sample_sec,
         out_dir,
     )
+    active_failure = _resource_failure(resources["active_workload"], args.active_max_cpu)
+    if active_failure:
+        resource_failures.append(active_failure)
 
     created_results = [
         item
@@ -1102,6 +1319,66 @@ def main() -> int:
                     f"{out_dir}/chrome-hover.png",
                 )
             quirk_results["chrome_hover_state"] = app_state(args.host, args.bin, args.timeout_ms)
+            hover_shell = (quirk_results["chrome_hover_state"] or {}).get("shell") or {}
+            hover_dom = (quirk_results["chrome_hover_state"] or {}).get("dom") or {}
+            hover_failures = []
+            live_blur_supported = bool(hover_shell.get("live_blur_supported"))
+            compositor_blur_active = bool(hover_shell.get("compositor_blur_active"))
+            css_blur_enabled = bool(hover_shell.get("css_backdrop_filter_enabled"))
+            try:
+                material_blur_px = float(hover_shell.get("material_blur_px") or 0.0)
+            except Exception:
+                material_blur_px = 0.0
+            if (
+                live_blur_supported
+                and hover_shell.get("transparent_window")
+                and not compositor_blur_active
+            ):
+                hover_failures.append("native compositor blur inactive while transparent hover chrome is visible")
+            shell_filter = str(hover_dom.get("shell_frame_backdrop_filter") or "")
+            if compositor_blur_active and shell_filter not in {"", "none"}:
+                hover_failures.append(f"native compositor path mixed CSS backdrop filter {shell_filter!r}")
+            if not live_blur_supported:
+                if compositor_blur_active:
+                    hover_failures.append("native compositor blur active in stable no-blur profile")
+                if css_blur_enabled:
+                    hover_failures.append("CSS backdrop blur active in stable no-blur profile")
+                if material_blur_px != 0.0:
+                    hover_failures.append(
+                        f"stable no-blur profile reported material blur {material_blur_px:.1f}px"
+                    )
+                if shell_filter not in {"", "none"}:
+                    hover_failures.append(
+                        f"stable no-blur profile reported shell backdrop filter {shell_filter!r}"
+                    )
+            titlebar_rect = hover_dom.get("titlebar_rect") or {}
+            titlebar_visible = float(titlebar_rect.get("height") or 0) > 8
+            titlebar_background = str(hover_dom.get("titlebar_background") or "")
+            titlebar_filter = str(hover_dom.get("titlebar_backdrop_filter") or "")
+            if titlebar_visible and not titlebar_background:
+                hover_failures.append("hovered titlebar material background was not observable")
+            if (
+                compositor_blur_active
+                and titlebar_visible
+                and titlebar_filter not in {"", "none"}
+            ):
+                hover_failures.append(
+                    f"native compositor titlebar mixed CSS backdrop filter {titlebar_filter!r}"
+                )
+            if not live_blur_supported and titlebar_filter not in {"", "none"}:
+                hover_failures.append(
+                    f"stable no-blur profile reported titlebar backdrop filter {titlebar_filter!r}"
+                )
+            shell_background = str(hover_dom.get("shell_frame_background") or "")
+            if live_blur_supported and "rgba(" in shell_background:
+                try:
+                    alpha_text = shell_background.rsplit(",", 1)[1].strip().rstrip(")")
+                    if float(alpha_text) >= 0.74:
+                        hover_failures.append(f"shell material alpha {alpha_text} is too opaque for live blur")
+                except Exception:
+                    hover_failures.append(f"could not parse shell material alpha from {shell_background!r}")
+            if hover_failures:
+                quirk_results["chrome_hover_material_error"] = "; ".join(hover_failures)
         except Exception as error:  # noqa: BLE001
             quirk_results["chrome_hover_error"] = str(error)
         finally:
@@ -1199,12 +1476,18 @@ def main() -> int:
                 resource_failures.append(cooldown_failure)
             restore_summary["launch"] = app_launch(args.host, gui_bin, args.timeout_ms)
             wait_for_window(args.host, args.bin, args.timeout_ms)
-            resources["respawn"] = sample_resources(
+            resources["respawn_burst"] = sample_resources(
                 args.host,
-                "respawn",
+                "respawn-burst",
                 args.resource_sample_sec,
                 out_dir,
             )
+            respawn_burst_failure = _resource_failure(
+                resources["respawn_burst"],
+                args.respawn_burst_max_cpu,
+            )
+            if respawn_burst_failure:
+                resource_failures.append(respawn_burst_failure)
             for index, original in enumerate(created_results):
                 session_path = str(original["created_session_path"])
                 restored: dict[str, object] = {
@@ -1257,6 +1540,25 @@ def main() -> int:
                     except Exception as state_error:  # noqa: BLE001
                         restored["state_error"] = str(state_error)
                 restore_results.append(restored)
+            if args.respawn_settle_sec > 0:
+                time.sleep(args.respawn_settle_sec)
+            resources["respawn_settled"] = sample_resources(
+                args.host,
+                "respawn-settled",
+                args.resource_sample_sec,
+                out_dir,
+            )
+            try:
+                daemon_reports["after_restore"] = daemon_server_list(args.host, args.bin)
+                daemon_failures.extend(
+                    f"after_restore: {failure}"
+                    for failure in daemon_owner_failures(daemon_reports["after_restore"])
+                )
+            except Exception as error:  # noqa: BLE001
+                daemon_failures.append(f"after_restore server-list failed: {error}")
+            respawn_failure = _resource_failure(resources["respawn_settled"], args.respawn_max_cpu)
+            if respawn_failure:
+                resource_failures.append(respawn_failure)
         except Exception as error:  # noqa: BLE001
             restore_summary["error"] = str(error)
 
@@ -1293,6 +1595,14 @@ def main() -> int:
         cleanup_results.append(cleanup)
 
     final_state = app_state(args.host, args.bin, args.timeout_ms)
+    try:
+        daemon_reports["final"] = daemon_server_list(args.host, args.bin)
+        daemon_failures.extend(
+            f"final: {failure}"
+            for failure in daemon_owner_failures(daemon_reports["final"])
+        )
+    except Exception as error:  # noqa: BLE001
+        daemon_failures.append(f"final server-list failed: {error}")
     quirk_failures = [
         key
         for key in quirk_results
@@ -1323,6 +1633,15 @@ def main() -> int:
         "summary_budget_s": args.summary_budget,
         "restore_pass": bool(args.restore_pass),
         "restore_wait_sec": args.restore_wait_sec,
+        "resource_budgets": {
+            "baseline_max_cpu": args.baseline_max_cpu,
+            "active_max_cpu": args.active_max_cpu,
+            "cooldown_max_cpu": args.cooldown_max_cpu,
+            "respawn_burst_max_cpu": args.respawn_burst_max_cpu,
+            "respawn_settle_sec": args.respawn_settle_sec,
+            "respawn_max_cpu": args.respawn_max_cpu,
+        },
+        "launcher_preflight": launcher_preflight,
         "window_spawn_elapsed_ms": ((launch_event or {}).get("payload") or {}).get("elapsed_ms"),
         "window_spawn_within_900ms": (
             (((launch_event or {}).get("payload") or {}).get("elapsed_ms") or 10_000) <= 900
@@ -1343,6 +1662,8 @@ def main() -> int:
         "restore_failures": len(restore_failures),
         "quirk_failures": quirk_failures,
         "resource_failures": resource_failures,
+        "daemon_failures": daemon_failures,
+        "daemon_reports": daemon_reports,
         "remove_failures": len([item for item in cleanup_results if item.get("remove_error")]),
         "resources": resources,
         "quirks": quirk_results,
@@ -1374,7 +1695,7 @@ def main() -> int:
         and (item.get("workload_kind") != "heavy" or item.get("heavy_tui_visible"))
         and not item.get("notification_noise")
         for item in results
-    ) and not quirk_failures and not resource_failures and not restore_failures and all(
+    ) and not quirk_failures and not resource_failures and not daemon_failures and not restore_failures and all(
         not item.get("error") for item in keep_alive_results
     ) and all(
         not item.get("remove_error") for item in cleanup_results

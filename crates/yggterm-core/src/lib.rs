@@ -2,6 +2,7 @@ mod browser;
 mod icon;
 mod install;
 mod perf;
+mod telemetry;
 mod titles;
 mod trace;
 mod transcript;
@@ -37,6 +38,11 @@ pub use install::{
 pub use perf::{
     PERF_TELEMETRY_FILENAME, PERF_TELEMETRY_MAX_BYTES, PERF_TELEMETRY_ROTATED_FILENAME, PerfSpan,
     append_bounded_jsonl_record, append_perf_event, perf_telemetry_path,
+};
+pub use telemetry::{
+    TERMINAL_TELEMETRY_DB_FILENAME, TERMINAL_TELEMETRY_DIRNAME, TerminalTelemetryEvent,
+    append_terminal_telemetry_event, ensure_terminal_telemetry_schema,
+    spawn_terminal_telemetry_event, terminal_telemetry_db_path,
 };
 pub use titles::{
     SessionSummaryTimelineEntry, SessionTitleStore, best_effort_context_from_session_path,
@@ -143,6 +149,7 @@ pub struct AppSettings {
     pub in_app_notifications: bool,
     pub system_notifications: bool,
     pub notification_sound: bool,
+    pub terminal_telemetry_enabled: bool,
     pub selected_browser_path: Option<String>,
     pub expanded_browser_paths: Vec<String>,
 }
@@ -170,6 +177,7 @@ impl Default for AppSettings {
             in_app_notifications: true,
             system_notifications: false,
             notification_sound: false,
+            terminal_telemetry_enabled: true,
             selected_browser_path: None,
             expanded_browser_paths: Vec::new(),
         }
@@ -839,6 +847,10 @@ fn parse_settings_value(value: &Value) -> Result<AppSettings> {
         settings.notification_sound =
             serde_json::from_value(value.clone()).context("failed to parse notification_sound")?;
     }
+    if let Some(value) = object.get("terminal_telemetry_enabled") {
+        settings.terminal_telemetry_enabled = serde_json::from_value(value.clone())
+            .context("failed to parse terminal_telemetry_enabled")?;
+    }
     if let Some(value) = object.get("selected_browser_path") {
         settings.selected_browser_path = serde_json::from_value(value.clone())
             .context("failed to parse selected_browser_path")?;
@@ -872,6 +884,7 @@ fn serialize_settings_value(settings: &AppSettings) -> Value {
         "in_app_notifications": settings.in_app_notifications,
         "system_notifications": settings.system_notifications,
         "notification_sound": settings.notification_sound,
+        "terminal_telemetry_enabled": settings.terminal_telemetry_enabled,
         "selected_browser_path": settings.selected_browser_path,
         "expanded_browser_paths": settings.expanded_browser_paths,
     })
@@ -1746,6 +1759,30 @@ mod tests {
         assert_eq!(
             serialize_settings_value(&settings).get("auto_hide_titlebar"),
             Some(&serde_json::json!(true))
+        );
+    }
+
+    #[test]
+    fn settings_default_terminal_telemetry_enabled() {
+        assert!(AppSettings::default().terminal_telemetry_enabled);
+    }
+
+    #[test]
+    fn settings_parse_terminal_telemetry_toggle() {
+        let parsed = parse_settings_value(&serde_json::json!({
+            "terminal_telemetry_enabled": false
+        }))
+        .expect("settings should parse");
+        assert!(!parsed.terminal_telemetry_enabled);
+    }
+
+    #[test]
+    fn settings_serialize_terminal_telemetry_toggle() {
+        let mut settings = AppSettings::default();
+        settings.terminal_telemetry_enabled = false;
+        assert_eq!(
+            serialize_settings_value(&settings).get("terminal_telemetry_enabled"),
+            Some(&serde_json::json!(false))
         );
     }
 

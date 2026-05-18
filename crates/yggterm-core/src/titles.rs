@@ -1467,6 +1467,12 @@ mod tests {
         assert!(looks_like_low_signal_generated_title(
             "Fix But Only Typed First"
         ));
+        assert!(looks_like_low_signal_generated_title(
+            "While Those Are Generating Can"
+        ));
+        assert!(looks_like_low_signal_generated_title(
+            "Current Status Live Erome Service"
+        ));
         assert!(!looks_like_low_signal_generated_title("Install WezTerm"));
     }
 
@@ -1952,6 +1958,13 @@ fn looks_like_low_signal_generated_title(title: &str) -> bool {
                         | "continue"
                         | "into"
                         | "now"
+                        | "while"
+                        | "those"
+                        | "are"
+                        | "generating"
+                        | "current"
+                        | "status"
+                        | "live"
                         | "but"
                         | "only"
                         | "typed"

@@ -18,6 +18,30 @@ animation must come from PTY bytes, xterm.js cell attributes, theme mapping, or
 xterm.js-native APIs that remain part of the terminal surface. Any diagnostic
 shim must be opt-in, observable, and rejected by release smokes.
 
+Cursor blink/off and inactive states must preserve the xterm cell under the
+cursor. When xterm renders an outline, dim, or focused block-dim cursor element,
+Yggterm may copy the current xterm buffer/DOM cell background into a host CSS
+variable used by that native cursor element, but it must not infer a Codex
+prompt row from text or draw a separate cursor/prompt overlay. Restored xterm
+surfaces must refresh this sample after mount as well as after render/write
+events because a preserved session can become visible without a fresh xterm
+render callback. App-control exposes the sampled cursor cell background so a
+one-cell prompt-background hole is treated as a terminal surface regression.
+
+This document owns terminal-rendering law. The cross-system source-of-truth
+audit lives in `docs/architecture-audit-2026-05-16.md`; if a terminal fix needs
+different behavior than this file describes, update this file before changing
+runtime code. App-control fields, telemetry rows, screenshots, retained
+snapshots, and smoke probes are witnesses. They must not become terminal
+content, a terminal input path, or an alternate replay source.
+
+Manual redraw is not a terminal repair primitive. It may refresh xterm's current
+buffer, renderer, texture atlas, and viewport. It cannot recreate PTY bytes that
+were filtered, coalesced, dropped, replayed from the wrong source, or routed to
+the wrong runtime. If manual redraw fixes a surface, classify the incident as a
+renderer-settle or activation bug. If it does not, continue investigation at the
+PTY stream, runtime identity, geometry, or retained-replay boundary.
+
 ## Interaction Contracts
 
 Primary selection is not the clipboard. On Linux-style middle-click paste,
@@ -36,12 +60,22 @@ same Rust bridge as input/resize/clipboard. The shell then opens the existing
 session context menu; it does not create a second menu implementation inside the
 terminal DOM.
 
-Active terminal write coalescing must stay below the threshold where typed input
-or Codex's `Working` animation feels stepped. Background terminals can keep the
-large CPU-saving frame budget, but the active visible terminal defaults to a
-160 ms write frame and the inline status-animation hot path stays at the smaller
-animation budget. App-control and latency smokes reject active visible terminals
-above 220 ms.
+Active terminal write batching must stay below the threshold where typed input
+or Codex's `Working` animation feels stepped. Batching is only a flush-timing
+tool: it may delay a chunk briefly for CPU, but it must never drop, reorder,
+deduplicate, trim, or rewrite PTY bytes. Background terminals can keep the large
+CPU-saving frame budget, but the active visible terminal defaults to a 160 ms
+write frame and the inline status-animation hot path stays at the smaller
+animation budget. Long-running inline status animation may cool after the first
+few seconds because the user's input path and session truth are more important
+than keeping a spinner at the initial cadence for minutes.
+
+Codex synchronized output frames (`CSI ?2026 h` ... `CSI ?2026 l`) are not
+semantic frames that Yggterm may collapse. They can be partial terminal deltas:
+one frame may clear rows, the next may paint only a cursor suffix or prompt
+fragment. If Yggterm drops the earlier frame, xterm.js can show missing letters
+or a broken prompt even though the PTY accepted the input. Deliver synchronized
+frames to xterm in PTY order and let xterm parse them.
 
 Layout-driven resize is not user scrollback. Titlebar auto-hide hover,
 fit-addon row changes, visible-paint refits, and resize-observer bursts arm a
@@ -102,6 +136,150 @@ programs such as `htop` must keep their bytes flowing through xterm.js while the
 session is inactive or the app is unfocused. Dropping frames or drawing a
 Yggterm-owned text overlay creates a second terminal truth and leaves stale TUI
 state when the user switches back.
+
+In 2.6.1, the 23-smoke restore pass exposed the inverse failure for daemon-owned
+live terminals: after a GUI close/relaunch, a fresh xterm could attach to an
+already-running TUI and receive only future incremental cursor-addressed deltas
+(`Mem[...] 59%`, frame counters, and similar fragments). The daemon's vt100 side
+parser already had the current full screen, while the retained raw tail no
+longer had the clear/full-frame bytes needed to seed a fresh renderer. Initial
+attach may therefore replay the current daemon vt screen image only for
+full-screen live or runtime-owned surfaces, only when no retained scrollback is
+being preserved, and only as terminal bytes fed into xterm.js. This is not a
+shell overlay and must not replace retained scrollback or synthetic UI state.
+Regression coverage:
+`initial_live_tui_attach_replays_current_screen_snapshot_over_incremental_tail`
+and the 23-smoke restore pass for seven TUI-heavy terminals.
+
+For explicitly kept live sessions, closing the Yggterm window is the detach
+boundary: xterm may unmount from the GUI, but the daemon PTY, remote Codex
+process, preserved-owner route, and live metadata must remain available for the
+next attach. The sidebar close affordance is different. It means close the
+selected live terminal runtime, even when that runtime is marked Keep Alive.
+Reattaching to a kept session after a GUI close must reuse the same PTY owner or
+stay in recovery; it must not spawn a fresh `codex resume` as a substitute for
+the lost owner.
+
+In 2.6.22, the live jojo scroll incident tightened the retained-replay rule:
+cursor-addressed retained snapshots are dangerous as a visible screen seed, but
+replacing them with a current screen-only snapshot is also wrong because it
+destroys xterm scrollback. The safe recovery shape is two-part terminal input:
+write plain retained PTY history into xterm as scrollback, then clear only the
+visible screen with `CSI 2 J; CSI H` and write the daemon's current screen
+snapshot. Do not use `CSI 3 J` in this path because the history rows are the
+scrollback being preserved. If the history cannot be extracted safely, the
+surface must stay observable as degraded instead of pretending a screen-only
+replay is a full terminal restore.
+
+Wheel scrolling is a viewport operation, not a shell input operation. A terminal
+may have user input gated while a remote resume or retained replay is being
+validated, but its existing xterm scrollback must still respond to wheel and
+app-control `probe-scroll` actions when that host is the active terminal. Paste,
+keyboard input, and terminal writes remain readiness-gated.
+
+The same rule applies to retained-ready rehydrate modes. A preserved-owner
+`CollapsedScrollbackRecovery` must convert cursor-addressed retained history to
+history-plus-current-screen before it reaches xterm. A later short
+`InitialRead`/`daemon_terminal_read` is allowed to update the current screen
+only after the restored xterm already has real scrollback; it must not be the
+final replay source for a session whose daemon retained snapshot still has
+hundreds of lines.
+
+The inverse is also part of the contract. Once a retained rehydrate has already
+staged daemon retained history into xterm for a mount, the separate daemon
+retained replay worker must not run again and overwrite the fresh
+`daemon_terminal_read` screen. A retained-history replay is a scrollback seed,
+not an input-ready terminal truth. If app-control ever reports a remote surface
+with `input_enabled=true` and
+`terminal_content_source=daemon_retained_history_screen_snapshot`, the shell has
+promoted a retained replay too far and must re-enter recovery instead of
+accepting user input.
+
+Retained-fault recovery must not use a non-prompt screen snapshot as an xterm
+writer. That snapshot can be logged for telemetry, but the visible interactive
+surface must come from the live PTY stream. The old shortcut reset the terminal,
+wrote the snapshot, and called the session ready; that created repeated
+remounts, flicker, and occasional selected-session/xterm identity splits.
+
+Retained rehydrate must also wait for the current daemon endpoint before it
+asks for `terminal_read`, `terminal_snapshot`, or `terminal_retained_snapshot`.
+During hot update the current daemon may be a sidecar that forwards terminal I/O
+to an older preserved PTY owner. The GUI must read through the current daemon so
+the owner map and saved-session mismatch checks remain single-source, but it
+must not sample the current socket before that daemon is reachable. A failure
+like `connecting to ~/.yggterm/server-<current>.sock` before the daemon is ready
+is a startup boundary issue, not a reason to reset xterm or wait for a
+5-second retained-fault watchdog remount. The daemon-ready wait is an explicit
+shell state: while it is in flight, retained-fault watchdogs must defer and log
+that deferral instead of bumping the xterm mount epoch. Once the wait clears,
+the same watchdog may remount only if the surface is still stale or blank.
+
+Prompt-follow checks must also use the visible xterm viewport, not only
+xterm.js's public `buffer.active.viewportY`. On WebKit DOM rendering the public
+counter can temporarily stay at `0` while the `.xterm-viewport` element is
+already scrolled to the prompt. Treating the public value as sole truth causes a
+false "stuck in scrollback" recovery and remounts a good PTY surface. The shell
+therefore computes an effective viewport from the DOM scroll position when the
+two disagree, and app-control exposes `public_viewport_y`,
+`visual_viewport_y`, `effective_viewport_y`, and `viewport_y_source` for proof.
+
+Retained xterm hosts must remain in WebKit's normal paint tree. Do not hide
+inactive retained terminals by moving them offscreen with transforms, and do not
+wrap active xterm DOM rows in strict paint containment. The accepted wrapper
+contract is light layout/style containment plus `opacity`, `visibility`, and
+`pointer-events` for inactive hosts. Strict/offscreen compositor isolation can
+produce the bad split where xterm row DOM, buffer text, and app-control state
+exist while the user-visible paint is blank or stale after a session switch.
+
+App-control must expose DOM paint hit-tests for active terminal hosts. The
+snapshot samples the row and cursor rects with `document.elementsFromPoint` and
+reports `dom_paint_hit_test_problem` plus the paint stacks. A state with
+non-empty xterm text and a non-empty paint-hit problem is not terminal-ready,
+even if daemon runtime truth, xterm buffer text, and geometry are otherwise
+healthy. One exception is expected chrome coverage from the auto-hidden titlebar:
+if the top row sample is covered by Yggterm titlebar chrome but the cursor/prompt
+sample is topmost in the xterm rows, the terminal is still paint-ready because
+that chrome is allowed to visually cover the top edge without resizing the PTY.
+This diagnostic is only evidence; it must not draw terminal content or become a
+fallback renderer.
+
+## Jojo Finding, 2026-05-17
+
+Wayland xterm canvas is no longer a default product renderer. A live 2.6.35
+jojo client exposed a split where app-control could read daemon-backed xterm
+buffer text, but the user-perspective screenshot showed a blank dark terminal.
+That means canvas cannot be accepted as ready unless screenshot pixels and
+app-control agree. Canvas remains an explicit diagnostic opt-in through
+`YGGTERM_ENABLE_XTERM_CANVAS=1`; the default release path uses DOM rows so
+terminal text, screenshot proof, selection, and app-control visibility share one
+observable surface.
+
+App-control must reject canvas hosts that report buffered text but a visibly
+low-contrast foreground/background contract, such as black text on the dark
+terminal surface. State-only buffer text is not enough terminal proof.
+
+## Jojo Finding, 2026-05-13
+
+The live 2.4.0 jojo viewport could become visually blank across the upper xterm
+canvas after switching between live sessions while remaining functional at the
+prompt. App-control showed the daemon and xterm buffer still had history,
+`input_enabled=true`, and no geometry problem; a manual app-control
+`terminal redraw <session>` restored the missing rows through xterm.js native
+refresh. This is a stale renderer/canvas texture problem after active host
+switch, not session loss and not a reason to draw shell-owned terminal text.
+
+The shell must schedule a bounded activation repaint when the active terminal
+session changes. That repaint is allowed to call the mounted host's xterm-native
+redraw/refresh/texture-atlas clearing paths and prompt-follow logic. It must be
+bounded and observable through app-control fields such as
+`activation_repaint_count`, `last_activation_repaint_reason`, and
+`last_activation_repaint_at_ms`; it must not become a periodic render loop.
+
+Regression coverage must include a screenshot-pixel check that detects a
+history-backed xterm buffer whose upper canvas is blank after session switching.
+`scripts/smoke_xterm_embed_faults.py` therefore samples the active host's
+history text and verifies visible non-background pixels above the prompt after
+hot session switch and return.
 
 ## Jojo Finding, 2026-05-09
 
@@ -165,15 +343,36 @@ from install metadata before falling back to the caller process. This prevents a
 preserved older daemon from copying its older adjacent binary back onto a remote
 machine while the GUI has already moved to a newer hot-update version.
 
-In 2.2.6, the daemon answers only OSC 10/11 default foreground/background color
+In 2.2.6, the daemon answers OSC 10/11 default foreground/background color
 queries from the PTY stream before GUI attach, using the same dark/light terminal
-identity that Yggterm exports to the child process. The daemon strips those
-query bytes from retained output and writes xterm-style `rgb:rrrr/gggg/bbbb`
-responses back through the PTY writer. This closes the Codex startup race where
-Codex asked `/dev/tty` for the terminal background before the xterm.js viewport
-was mounted, timed out, cached `None`, and then emitted `49m` instead of a real
-prompt background attribute. This is terminal-emulator protocol handling, not a
-shell overlay or prompt decoration.
+identity that Yggterm exports to the child process. In 2.6.50, that same daemon
+protocol filter also answers OSC 4 palette queries and preserves non-query
+palette set sequences for xterm.js. The daemon strips query bytes from retained
+output and writes xterm-style `rgb:rrrr/gggg/bbbb` responses back through the PTY
+writer. The xterm.js frontend also suppresses its own OSC 4/10/11 fallback
+responses, because frontend terminal replies sent through `onData` can echo
+into cooked shells and become visible `rgb:` text. This closes the Codex startup
+race where Codex asked `/dev/tty` for the terminal background before the
+xterm.js viewport was mounted, timed out, cached `None`, and then emitted `49m`
+instead of a real prompt background attribute. This is terminal-emulator
+protocol handling, not a shell overlay or prompt decoration.
+
+In 2.6.53, terminal identity carries the effective xterm color profile, not only
+the light/dark label. The shell syncs foreground, background, and the 16 ANSI
+palette colors into the daemon, and launch commands export those values with
+`YGGTERM_TERMINAL_COLOR_*`. The daemon's OSC 4/10/11 answers must therefore
+match the active terminal theme used by xterm.js. TUI editors such as `edit`
+depend on this: they query `/dev/tty` for palette/default colors and then render
+with that inherited theme. If an older preserved daemon cannot answer OSC 4
+palette queries, the frontend may let xterm.js provide its fallback response only
+while the terminal is clearly in a frame-like or alternate-screen TUI state; the
+normal shell prompt path still suppresses frontend replies so cooked shells do
+not print `rgb:` protocol text.
+
+Some long-lived daemons can already have visible `rgb:` protocol replies in
+their retained screen snapshot. The GUI may strip that legacy pollution before
+replaying a retained payload into xterm.js; it must not strip ordinary PTY output
+that does not match visible OSC color-response text.
 
 In 2.2.43, the identity source was tightened again: daemon warm-start, watchdog
 restart, initial GUI/server sync, and restored launch-command refresh use the
@@ -195,8 +394,11 @@ terminal recovery, machine scans, and idle refresh loops must not run `npm
 install @latest` just because a managed Codex binary exists. That work can spike
 CPU on the remote machine and compete with the PTY/xterm path. Unattended
 background installs require `YGGTERM_MANAGED_CLI_BACKGROUND_INSTALL=1`; normal
-terminal launch keeps using the available managed or PATH binary until an
-explicit foreground ensure/refresh path is used.
+background refresh keeps using the available managed or PATH binary until an
+explicit foreground ensure/refresh path is used. Explicit local terminal launch
+is such a foreground path: before launching or resuming a local Codex session,
+Yggterm must run the managed CLI ensure path so a stale `~/.yggterm/npm/bin/codex`
+does not show Codex's own interactive update prompt inside xterm.
 
 In 2.2.45, retained replay gained an explicit unsafe-skip state for resize
 recovery. A large cursor-addressed retained snapshot is not safe to replay into
@@ -207,6 +409,23 @@ skipped snapshot as expected scrollback. App-control exposes
 `retained_replay_rejected_visible_text`; a prompt-ready unsafe skip may keep the
 terminal interactive, while the same base-y-zero state without that diagnostic is
 still a retained scrollback-loss failure.
+
+In 2.6.15, scroll probe truth was tightened after a false-positive live probe.
+`movement_expected` means the current xterm viewport can actually move in the
+requested direction: `viewport_y > 0` or DOM `viewport_scroll_top > 0` for
+scrollback-up, and `viewport_y < base_y` for return-to-bottom. Historical raw
+line counts or `scrollback_expected` may indicate an unhealthy collapsed surface,
+but they are not proof that the mounted viewport can move. `scroll_probe_moved`
+must only become true when `viewport_y` or DOM `viewport_scroll_top` changes.
+Wheel/scroll event counters and `text_head`/`text_tail` churn are diagnostics
+only; live output during a probe is not scroll movement.
+
+In 2.6.16, remote daemon PTY output without a current prompt row became
+readable-only. A mounted xterm that contains meaningful daemon output can be a
+valid evidence surface while `input_enabled=false`, but it must not be reported
+as user-input-ready unless the current prompt/input row is visible. App-control
+must reject `input_enabled=true` on a remote daemon PTY surface whose cursor row
+is empty or non-prompt text, even if retained replay came from daemon PTY bytes.
 
 In 2.2.7, forced remote restarts also terminate plain remote bridge processes
 whose command line is `yggterm server remote resume-codex/start-codex <session>`.
@@ -263,6 +482,49 @@ because a forced restart can otherwise fill the viewport with old Codex
 transcript text before the current PTY attach has produced a prompt-ready
 surface.
 
+In 2.6.10, retained remote scrollback recovery has a separate policy from the
+initial retained-host read. If a retained remote host once reached ready history
+and is later demoted by app-control as a collapsed or prompt-only xterm surface,
+that ready history must not block a daemon-retained PTY replay. The recovery is
+keyed separately from the initial mount read, uses daemon-owned PTY retained
+snapshot data for collapsed-scrollback repair, and still does not enable input
+by itself. This is the fix class for active terminals where wheel events reach
+xterm but `base_y == 0`, `viewport_y == 0`, and the daemon still owns retained
+PTY history. The pure policy owner is
+`crates/yggterm-shell/src/terminal_retained_replay_policy.rs`; `shell.rs` may
+execute the chosen replay but must not grow a second retained-replay policy.
+
+In 2.6.11, the current-screen blank-host fallback is explicitly lower priority
+than retained scrollback recovery. A small daemon `terminal_snapshot` may repair
+a truly blank host, but it must not overwrite a staged retained replay from
+`terminal_retained_snapshot`; doing so collapses xterm back to `base_y == 0` and
+breaks user scroll even though the daemon still had history. Retained replay
+therefore marks the terminal surface as staged/connected, emits xterm
+host-health, and the blank-host fallback gates live in
+`terminal_retained_replay_policy.rs` beside the retained replay policy.
+
+In 2.6.12, a retained-fault bootstrap is itself a valid retained rehydrate
+target even before the new GUI process has rebuilt `terminal_resume_ready_paths`.
+Hot restart can remount the active remote xterm as an empty shell, clear local
+ready-path memory, and then wait until incidental PTY output happens to arrive.
+That is not a terminal truth boundary. If the current fault is an explicit empty
+xterm surface, retained rehydrate must use the daemon-retained snapshot path, not
+the plain initial-read path, so scrollback is restored from daemon PTY history
+without requiring a manual switch pass or new user output.
+
+In 2.6.13, prompt readiness includes wrapped Codex input regions. A long user
+prompt may occupy several xterm rows between the last `›` prompt marker and the
+Codex footer. That is still daemon PTY truth and must not be classified as
+"input-enabled without a prompt-ready surface" just because the cursor is on a
+continuation row. The classifier accepts this only for the tail prompt region
+and still rejects obvious assistant/output rows after the prompt marker.
+
+In 2.6.14, hot-restart fleet cleanup must not retire a stale daemon through an
+empty runtime-coverage proof. A duplicate-runtime retire is only safe when the
+monitor can name the guarded runtime keys and the expected-version daemon
+directly owns every one of them. `covered_runtime_keys=[]` is unknown, not safe;
+the session-survival rule wins over daemon cleanup.
+
 In 2.2.15, the same rule applies to active-recovery snapshots for Codex-class
 remote sessions. A Codex restart/reconnect snapshot must prove a Codex
 prompt-ready tail, such as the current `›` prompt with model/cwd metadata or the
@@ -285,6 +547,30 @@ This avoids reopening on old-width TUI output, such as full-width separators
 drawn before the current xterm column count was known. The fix deliberately does
 not rewrite xterm history, patch line art, or draw an overlay; the source of
 truth remains the daemon PTY stream after the current size has been applied.
+
+In 2.4.12, resize truth also checks the kernel PTY, not only the daemon's cached
+`current_cols/current_rows`. A same-size resize request may be a repair request:
+if xterm reports `110x50`, the daemon cache says `110x50`, but `get_size()` on
+the PTY master still returns `120x36`, the daemon must send the resize again and
+record `resize_cache_mismatch_repair`. Remote SSH launch waits on the initial
+default `36x120`/`24x80` size long enough for xterm's first fit and follow-up
+repair resize to reach the PTY before the remote `resume-codex` command starts.
+This keeps Codex from drawing its TUI against stale columns after update or GUI
+restart.
+
+In 2.4.13, the write bridge treats Codex synchronized-output repaint regions
+(`ESC[?2026h` ... `ESC[?2026l`) as xterm-native animation frames. If one PTY
+read contains several complete repaint regions and the discarded prefix contains
+only frame separators, title changes, cursor/erase/style controls, or a short
+status gap, Yggterm keeps the newest region and drops the redundant intermediate
+regions before calling `term.write`. If real scrollback or normal text precedes
+that repaint suffix, it is preserved and only the redundant suffix is collapsed.
+That is an emulator scheduling optimization, not a terminal rewrite: normal
+text, newlines, prompts, scrollback, and meaningful visible output outside the
+frame run must not be dropped. Sustained inline-status animation also cools from
+the active animation frame budget to the sustained and long-running frame
+budgets after the initial smooth window, so long Codex background work does not
+keep WebKit hot for minutes.
 
 In 2.2.18, xterm `onScroll` events are treated as ambiguous unless there is a
 real user scroll signal. xterm fires the same event for output-driven viewport
@@ -316,6 +602,12 @@ This is a renderer-settle repair, not an alternate cursor renderer. The same
 release also treats `WARN ignoring stale yggterm daemon for current app version`
 as internal transport noise: it can be emitted by version-handoff probes, but it
 must never become PTY application content or a prompt-ready cursor row.
+The same class includes `terminal session not found: local://`,
+`terminal session not found: remote-session://`, and
+`terminal session not found: codex-runtime://`. Those messages are transport
+failures. They must be stripped from replay, reported through observability, and
+used to recover/recreate the daemon PTY before xterm.js is allowed to accept
+input for the row.
 
 In 2.2.61, a remote Codex prompt-only hot-update surface is explicitly not a
 ready terminal. A surface that only shows the Codex input row/footer can come
@@ -340,6 +632,59 @@ cursor are full-screen TUI frames, not Codex inline status animation frames.
 They stay on the xterm.js path, but they are frame-budgeted so WebKit does not
 burn CPU on background or recovery redraw floods. Small carriage-return
 `Working`/status updates remain eligible for the fast inline animation cadence.
+
+In 2.4.7, that inline animation cadence is still xterm-native but it is no
+longer allowed to poll faster than the active xterm write frame budget. The
+jojo live incident showed that a broad shell render loop was one bug, but even
+after fixing that loop, Codex's `Working` wave could keep WebKit hot if Rust
+continued draining the PTY at the generic 60 ms active-output cadence. Active
+inline-status reads now share the same bounded frame cadence as writes, so
+Yggterm does not create extra xterm/WebKit wakeups just to observe animation
+frames. That cadence is lossless: it changes when bytes flush, not which bytes
+xterm receives.
+
+In 2.6.0, ordinary user input is batched at the xterm.js boundary before it is
+sent to Rust and the daemon. The batch window is deliberately tiny, and Enter,
+interrupt/control keys, protocol replies, and cleanup paths flush immediately.
+This keeps fast Codex typing from creating a Rust IPC hop for every character
+while preserving terminal ordering. App-control exposes `pending_input_bytes`,
+`input_batch_flush_count`, `last_input_batch_length`,
+`last_input_batch_flush_reason`, and `last_input_batch_at_ms`; health checks
+must use those counters instead of treating raw `data_event_count` as daemon
+delivery proof. A no-later-echo alarm is valid only when the visible prompt
+layout is sparse or broken. It must not disable input on a current prompt row
+whose cursor line is visible and whose blank rows below the cursor are within
+the prompt-layout budget.
+
+The same release accepts current daemon screen snapshots for blank retained
+Codex hosts even when the quiet session has not produced new post-resize bytes.
+That relaxation applies only to daemon-owned screen/PTY truth that already
+matches the prompt-ready filters. Stored retained replay remains strict so old
+prose or transcript snapshots cannot become an alternate terminal renderer.
+
+In 2.6.9, the jojo fast-typing incident proved that both the Rust write bridge
+and embedded xterm script must be lossless. The live Codex prompt accepted all
+typed bytes, but the screen showed missing letters because older synchronized
+repaint frames were collapsed before xterm parsed them. The fix is not a prompt
+overlay and not a redraw trick: Rust pending writes now concatenate and flush in
+order, and the JavaScript high-volume helpers return the original payload.
+`active_recovery_pty_snapshot` is observability/recovery evidence only; it must
+not be promoted as an authoritative terminal replay source.
+
+In 2.6.38, the jojo 2.6.37 launch proof exposed a retained-recovery retry
+storm: host health marked a retained remote xterm ready, then a transient blank
+sample milliseconds later reopened the same terminal and remounted xterm. That
+made the terminal eventually look healthy but burned CPU during startup and
+looked like another manual switching-pass fix. The retained-fault invalidation
+gate now treats transient post-ready retained faults inside the settle grace as
+telemetry, not another recovery. If the blank surface survives beyond the grace
+window, normal retained-fault recovery still runs.
+
+The stable Rust ownership boundary for this is
+`crates/yggterm-shell/src/terminal_write_policy.rs` for classification and
+`crates/yggterm-shell/src/terminal_write_bridge.rs` for staging. New terminal
+write throttling or CPU-budget work belongs there first, not in shell chrome,
+session metadata, or telemetry observers.
 
 In 2.2.37, the jojo diagonal line-stack failure was traced to PTY line
 discipline, not xterm painting. Remote Codex bridge PTYs were put into raw mode
@@ -410,9 +755,17 @@ dimensions when available. It is a lab, not product code.
 - Terminal appearance identity must match the effective xterm theme, not the
   outer shell theme. A light shell with a dark terminal theme must export dark
   terminal identity.
+- Terminal color identity must also match the effective xterm theme. Daemon OSC
+  4/10/11 replies should use the synced xterm foreground, background, and ANSI
+  palette, not a generic built-in dark/light palette.
 - Remote and restore launch paths must pass the same terminal appearance
   contract as fresh local starts. A daemon default of light is acceptable only
   before the app has synced the effective terminal identity.
+- A daemon-owned remote Codex runtime may only be bridged when the runtime's
+  recorded launch command matches the attaching terminal's dark/light identity.
+  If a dark terminal asks to attach and the existing runtime advertises light
+  identity (or vice versa), Yggterm must recreate/restart that daemon-owned PTY
+  through the normal server path instead of reusing the stale process.
 - Existing preserved processes cannot have their environment corrected without
   restart. For hot update, session survival wins. The UI should treat stale
   runtime identity as observable state, not as permission to kill the runtime.
@@ -422,6 +775,10 @@ dimensions when available. It is a lab, not product code.
   sessions, but the restored active remote terminal must seed retained daemon
   PTY scrollback. A prompt-only active restore with `scrollback_expected=true`
   is not terminal-ready.
+- A retained remote terminal with ready history may still require retained
+  daemon replay when the current xterm buffer collapses. Ready history is not a
+  replay suppressor after app-control reports a prompt-only, empty, stale, or
+  no-current-input-row surface.
 - App-control state must expose enough evidence to distinguish "xterm did not
   paint a background" from "the PTY never sent a background attribute".
 - Canvas renderer validation cannot rely on `.xterm-rows`. Use xterm buffer
@@ -439,6 +796,42 @@ dimensions when available. It is a lab, not product code.
   but it must only call xterm viewport APIs such as `scrollToLine` or
   `forceXtermViewportY`. It must not draw terminal text, cursors, prompt
   backgrounds, or line-repair layers.
+- Active-session switch repaint is a bounded xterm recovery action. It may clear
+  texture atlas state and refresh the mounted xterm viewport after selection
+  changes, but it must be keyed to activation and exposed to app-control.
+- Retained live terminals must keep their xterm bridge mounted while hidden.
+  Switching away may pause daemon reads to keep the background budget low, but
+  switching back must not recreate the xterm instance, call `reset`, or collapse
+  `base_y`/scrollback. Reactivation should re-enable input, refit, and repaint
+  the existing buffer.
+- A "switching pass" must never be required for correctness. If app-control or
+  host health sees an active retained remote host with an empty xterm surface
+  while the daemon runtime is present or has output, the shell must keep that
+  fault reason on the retained-fault recovery attempt, use the fast
+  empty-surface watchdog, and immediately ask the daemon to ensure/read the PTY.
+  The fallback may remount the xterm bridge, but it must still replay daemon PTY
+  bytes rather than shell-owned placeholder text.
+- During remote-resume recovery, the xterm host may stay mounted so geometry,
+  probes, and lifecycle hooks remain stable, but it must be visually hidden
+  until the surface is current or recovery has failed. A mounted host with stale
+  retained bytes is not terminal truth; app-control must expose host opacity,
+  visibility, and pointer-events so smokes can prove stale retained xterm text is
+  not visible during the startup leak window.
+- For explicit Keep-Alive remote sessions, daemon-side output classifiers such
+  as prompt-only, stale retained text, saved-session mismatch, or launch-spec
+  mismatch are recovery signals only. They must not restart a still-running
+  runtime or send a second resume command. The terminal can remain gated and
+  recovering, but the user's live PTY is the source of truth.
+- Startup prewarm must obey the same rule before xterm is even attached. If a
+  reachable old daemon reports the kept remote runtime key, the current daemon
+  must route terminal read/write/resize through that preserved owner and keep
+  xterm recovering. It must not create a fresh SSH attach just because its local
+  `TerminalManager` is empty.
+- A preserved owner that returns `terminal session not found` for the runtime
+  key is no longer a valid terminal source, even if its status endpoint still
+  lists the key. Remove that owner, recover through the current daemon/saved
+  transcript path, and keep app-control input disabled until fresh PTY bytes
+  make the xterm surface current again.
 
 ## Next Fixes To Apply
 

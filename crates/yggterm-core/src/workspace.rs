@@ -6,7 +6,7 @@ use time::OffsetDateTime;
 
 const WORKSPACE_DB_FILENAME: &str = "workspace.db";
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkspaceDocumentKind {
     #[default]
@@ -14,7 +14,7 @@ pub enum WorkspaceDocumentKind {
     TerminalRecipe,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkspaceGroupKind {
     #[default]

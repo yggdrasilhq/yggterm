@@ -9,6 +9,10 @@ Build **Yggdrasil Terminal**: a Rust-first, cross-platform, remote-first termina
 - `../ghostty` contains legacy Ghostty integration code in Zig.
 - `../zed` is an optional visual/reference checkout for shell design study.
 - This repo (`yggterm`) is the integration layer and product surface.
+- `~/gh/paper` and `~/gh/cellulose` are the intended local checkouts for
+  standalone Paper and Cellulose apps. They should live under
+  `github.com/avikalpa`, remain Apache-2.0 licensed, and expose clean
+  integration boundaries that Yggterm can embed without absorbing the whole app.
 
 ## Engineering constraints
 
@@ -65,6 +69,27 @@ Build **Yggdrasil Terminal**: a Rust-first, cross-platform, remote-first termina
 - Treat this as an integration-heavy systems project.
 - When adding code, include clear ownership boundaries between Rust app logic, PTY runtime, and any optional Ghostty FFI.
 - Prefer incremental, testable changes.
+- `docs/architecture-audit-2026-05-16.md` is required reading before terminal,
+  session, hot-update, theme, telemetry, app-control, or release-gate changes.
+  Its authority table is the standing source-of-truth map.
+- Before fixing any regression, name the authoritative source of truth and the
+  observers involved. Daemon PTY/runtime truth, xterm render truth, session
+  identity, metadata, app-control, telemetry, screenshots, and smoke tests are
+  not interchangeable.
+- Never promote an observer into product truth. App-control, telemetry,
+  screenshots, logs, generated summaries, and smoke results can prove or
+  disprove behavior, but they must not drive terminal rendering, input routing,
+  saved-session identity, daemon ownership, or theme state.
+- Do not patch a symptom by adding a second source of truth. Banned shortcuts
+  include shell-owned terminal text overlays, prompt/cursor repair layers,
+  PTY-byte coalescing or trimming, post-hoc transport cleanup as a normal path,
+  runtime-key identity substitution, alpha/blur/grain behavior in stable theme
+  code, and stale-daemon mutation outside the hot-update protocol.
+- If code and docs disagree, stop and reconcile the interface doc before
+  implementing. The canonical docs are `docs/protocol.md` for runtime/hot-update
+  behavior, `docs/xterm.md` for terminal rendering and PTY bytes,
+  `docs/sessions.md` for saved-session identity and copy, `docs/theme.md` for
+  stable shell chrome, and `docs/telemetry.md` for observer-only telemetry.
 - For every reported regression, update the harness, smoke test, unit test, or CI gate to fail on the exact defect class before applying the runtime fix. Do not accept a fix based only on manual observation when a deterministic regression can be captured.
 - For terminal resize regressions, the harness must assert a visible prompt-prefix pixel sample after settle on resize so partial redraw and prompt-clipping artifacts are caught even when x/y geometry metrics still pass.
 - Document integration assumptions in `README.md` or module-level docs.
@@ -72,8 +97,8 @@ Build **Yggdrasil Terminal**: a Rust-first, cross-platform, remote-first termina
 - Prove versions from canonical metadata before installing, publishing, or replacing a running app: `Cargo.toml`/lockfile, changelog section, git commit/tag, release asset checksum, `install-state.json`, and the active launcher/headless path. If an executable must be probed, use the active launcher on 2.1.52+ or the exact active `yggterm-headless` sibling from `install-state.json`; otherwise isolate it with a temporary `HOME`/`YGGTERM_HOME` and no access to user state.
 - Never "fix" a release or runtime issue by installing, launching, or copying an older artifact unless the user explicitly requests rollback. If rollback is requested, snapshot user state first, state the exact target version/date, and keep the old artifact isolated from normal self-update paths.
 - Before touching a live install or remote GUI session, snapshot the relevant state files (`~/.yggterm/server-state*.json`, `session-titles.db`, `event-trace.jsonl`, install metadata) and confirm the currently running GUI/daemon executable paths. Treat mismatched GUI, daemon, launcher, and install-state versions as an incident until reconciled.
-- Treat `yggterm-headless server monitor` as the first-line panic-management tool for live terminal incidents. When a session is hung, missing after restore, slow to load, input-lagged, or visually blank on a live desktop host, run a read-only incident pass before changing code: `yggterm-headless server monitor --scenario panic-report --expect-path <session-path> --jsonl-out /tmp/yggterm-incident.jsonl`, then `server-list`, `latency-check --all`, `wait-session`, or `hot-restart --all` as the evidence indicates.
-- For repeated or intermittent failures, monitor with `yggterm-headless server monitor --scenario panic-report --iterations <n> --interval-ms <ms> --jsonl-out <path>` so latency/session truth is captured independently of the GUI render loop.
+- Treat `yggterm-headless server monitor` as the first-line panic-management tool for live terminal incidents. When a session is hung, missing after restore, slow to load, input-lagged, or visually blank on a live desktop host, run a read-only incident pass before changing code: `mkdir -p ~/.tmp/yggterm && yggterm-headless server monitor --scenario panic-report --expect-path <session-path> --jsonl-out ~/.tmp/yggterm/yggterm-incident.jsonl`, then `server-list`, `latency-check --all`, `wait-session`, or `hot-restart --all` as the evidence indicates.
+- For repeated or intermittent failures, monitor with `yggterm-headless server monitor --scenario panic-report --iterations <n> --interval-ms <ms> --jsonl-out ~/.tmp/yggterm/<name>.jsonl` so latency/session truth is captured independently of the GUI render loop.
 - Use `yggterm-headless server monitor` evidence to split incidents cleanly: daemon/version/reachability issues belong to server lifecycle and hot-restart paths; missing sessions belong to restore/session graph logic; slow status/snapshot belongs to daemon blocking work; healthy daemon state with bad pixels or input belongs to app-control screenshot/probe investigation.
 - For daemon-owned Codex live sessions, treat the Codex transcript JSONL discovered from the PTY process tree as the saved-session identity. A `codex-runtime://...` terminal key may be synthetic and must remain the terminal I/O key, but sidebar search, remote scans, resume deduplication, and user-facing saved-session identity should use the real Codex session id from the open transcript when available.
 - For KDE duplicate-icons, pinned launcher regressions, or update-handoff identity bugs, run `yggterm-headless server app desktop-identity` before changing code. The report should capture canonical desktop file fields, KDE pinned launchers, live client app ids, and the handoff environment flags.
@@ -119,6 +144,43 @@ Build **Yggdrasil Terminal**: a Rust-first, cross-platform, remote-first termina
 - When cutting a release, move the user-visible notes into an exact version section before or during the tag workstream.
 - Release automation should prefer the exact version section and fall back to `Unreleased` so curated notes still publish when the rename is late.
 - Release pages should use curated changelog text rather than autogenerated notes.
+
+## Experimental Branch And Release Protocol
+
+- `main` contains release-ready work only. Stable end-user releases are cut from
+  `main`; experimental feature work must not land there until the feature is
+  intentionally promoted.
+- Experimental feature branches use the `experimental/<feature>` namespace and
+  live in sibling worktrees named `~/gh/yggterm--<feature>`, for example
+  `~/gh/yggterm--paper-integration`.
+- Daily experiment work starts with `git fetch origin --prune` and a rebase of
+  the experiment branch onto `origin/main`. Do not merge `main` into an
+  experiment branch. Use `scripts/rebase_experimental_worktrees.sh` for the
+  local multi-worktree pass; it must skip dirty worktrees and stop on conflicts.
+- The active experimental worktrees are `experimental/alpha-blur`,
+  `experimental/paper-integration`, `experimental/openwebui-integration`,
+  `experimental/excalidraw-obsidian-integration`, and
+  `experimental/cellulose-integration`.
+- Experimental releases must use `yggterm-` prefixed binaries and package names,
+  such as `yggterm-alpha-blur`, `yggterm-paper`, `yggterm-openwebui`,
+  `yggterm-excalidraw-obsidian`, and `yggterm-cellulose`. Headless siblings
+  should follow the same channel identity, for example
+  `yggterm-paper-headless`.
+- Experimental release channels must not overwrite the stable `yggterm`
+  launcher, desktop identity, direct-install metadata, or stable update channel.
+  Use isolated state homes by default, such as
+  `~/.yggterm-experimental/<channel>`, unless the task is explicitly testing a
+  migration against the stable home after snapshotting it.
+- Experimental CI/release work may default to Linux x64 plus `.deb` and
+  checksums. Run the full cross-platform release matrix when the experiment
+  touches platform-specific shell, installer, compositor, or runtime behavior.
+- The working protocol and experiment scopes live in
+  `docs/experimental-worktrees.md` and `docs/experiments/`.
+- Experimental branches may intentionally carry branch-specific `AGENTS.md`
+  changes, helper docs, scripts, or local operator notes for that feature. Treat
+  those as experiment-local by default. When promoting or merging an experiment,
+  explicitly decide which of those files should be dropped, which should remain
+  branch-only, and which should be reconciled into the stable docs on `main`.
 
 ## Shared YggUI Platform Direction
 

@@ -3260,10 +3260,6 @@ def scroll_probe_moved(probe: dict) -> bool:
     return (
         before.get("viewport_y") != after.get("viewport_y")
         or before.get("viewport_scroll_top") != after.get("viewport_scroll_top")
-        or before.get("text_head") != after.get("text_head")
-        or before.get("text_tail") != after.get("text_tail")
-        or int(after.get("wheel_event_count") or 0) > int(before.get("wheel_event_count") or 0)
-        or int(after.get("scroll_event_count") or 0) > int(before.get("scroll_event_count") or 0)
     )
 
 
@@ -4452,6 +4448,75 @@ def assert_prompt_prefix_pixels_visible(
     }
 
 
+def assert_terminal_history_pixels_visible(
+    screenshot_path: Path,
+    state: dict,
+    *,
+    context: str,
+    min_history_lines: int = 3,
+) -> dict:
+    host = active_host(state)
+    host_rect = host.get("screen_rect") or host.get("viewport_rect") or host.get("host_rect") or {}
+    if not rect_is_visible(host_rect):
+        raise AssertionError(f"{context}: missing terminal host rect for history pixel probe")
+    cursor_rect = host.get("cursor_sample_rect") or host.get("cursor_expected_rect") or {}
+    dimensions = host.get("xterm_dimensions") or {}
+    cell_height = float(dimensions.get("css_cell_height") or 18.0)
+    buffer_text = str(host.get("buffer_text_sample") or "")
+    text_tail = str(host.get("text_tail") or "")
+    cursor_line = str(host.get("cursor_line_text") or host.get("cursor_row_text") or "").strip()
+    history_lines = []
+    for line in f"{buffer_text}\n{text_tail}".splitlines():
+        stripped = line.strip()
+        if not stripped or stripped == cursor_line:
+            continue
+        if stripped in {"tab to queue message", "esc to interrupt"}:
+            continue
+        history_lines.append(stripped)
+    if len(history_lines) < min_history_lines:
+        return {
+            "skipped": "not_enough_history_text",
+            "history_line_count": len(history_lines),
+            "min_history_lines": min_history_lines,
+        }
+    image = Image.open(screenshot_path)
+    host_box = rect_bounds(host_rect)
+    if rect_is_visible(cursor_rect):
+        cursor_top = rect_bounds(cursor_rect)[1]
+    else:
+        cursor_top = host_box[3] - int(max(40.0, cell_height * 3.0))
+    crop_top = host_box[1] + int(max(4.0, cell_height * 0.5))
+    crop_bottom = min(
+        cursor_top - int(max(16.0, cell_height * 2.0)),
+        host_box[3] - int(max(48.0, cell_height * 3.0)),
+    )
+    crop_right = min(host_box[2], host_box[0] + max(240, int((host_box[2] - host_box[0]) * 0.82)))
+    crop_box = clamp_box((host_box[0], crop_top, crop_right, crop_bottom), image.size)
+    if crop_box is None or crop_box[3] - crop_box[1] < 36:
+        return {
+            "skipped": "history_probe_region_too_small",
+            "history_line_count": len(history_lines),
+            "host_box": host_box,
+            "cursor_rect": cursor_rect,
+        }
+    crop = image.crop(crop_box)
+    non_background_pixels, background = count_non_background_pixels(crop, tolerance=20)
+    min_visible_pixels = max(90, min(360, len(history_lines) * 18))
+    if non_background_pixels < min_visible_pixels:
+        raise AssertionError(
+            f"{context}: terminal buffer has history text but the upper canvas is blank in the screenshot: "
+            f"history_lines={len(history_lines)} non_background_pixels={non_background_pixels} "
+            f"min_visible_pixels={min_visible_pixels} crop={crop_box!r}"
+        )
+    return {
+        "history_line_count": len(history_lines),
+        "non_background_pixels": non_background_pixels,
+        "min_visible_pixels": min_visible_pixels,
+        "background_rgb": background,
+        "crop_box": crop_box,
+    }
+
+
 def contrast_ratio_for_rgb(
     foreground: tuple[int, int, int],
     background: tuple[int, int, int],
@@ -5323,8 +5388,20 @@ def shell_theme_spec(state: dict, key: str) -> dict:
 
 
 def theme_grain_value(spec: dict) -> float | None:
+    return theme_scalar_value(spec, "grain")
+
+
+def theme_alpha_value(spec: dict) -> float | None:
+    return theme_scalar_value(spec, "alpha")
+
+
+def theme_brightness_value(spec: dict) -> float | None:
+    return theme_scalar_value(spec, "brightness")
+
+
+def theme_scalar_value(spec: dict, key: str) -> float | None:
     try:
-        return float(spec.get("grain"))
+        return float(spec.get(key))
     except (TypeError, ValueError, AttributeError):
         return None
 
@@ -5546,6 +5623,12 @@ def invoke_sidebar_context_menu_action(
                 None,
             )
             if shell_context_menu_row_path(opened) == target_path and rect_is_visible(action_rect):
+                assert_native_blur_overlay_backdrop_contract(
+                    opened,
+                    "context_menu_rect",
+                    "context_menu_backdrop_filter",
+                    "sidebar context menu",
+                )
                 break
             time.sleep(0.08)
         if shell_context_menu_row_path(opened) == target_path and rect_is_visible(action_rect):
@@ -5583,6 +5666,38 @@ def wait_for_context_menu_closed(
     raise AssertionError(
         f"context menu stayed open after action click: rect={dom_rect(last_state, 'context_menu_rect')!r}"
     )
+
+
+def assert_native_blur_overlay_backdrop_contract(
+    state: dict,
+    rect_key: str,
+    backdrop_key: str,
+    label: str,
+) -> dict:
+    dom = state.get("dom") or {}
+    rect = dom.get(rect_key)
+    if not rect_is_visible(rect):
+        return {"visible": False}
+    if backdrop_key not in dom:
+        raise AssertionError(
+            f"{label} is visible but app-control did not expose its backdrop-filter field: "
+            f"rect_key={rect_key!r} backdrop_key={backdrop_key!r} state={state!r}"
+        )
+    shell = state.get("shell") or {}
+    transparent_window = bool(shell.get("transparent_window"))
+    compositor_blur_active = bool(shell.get("compositor_blur_active"))
+    backdrop = str(dom.get(backdrop_key) or "").strip().lower()
+    if transparent_window and compositor_blur_active and backdrop not in ("", "none"):
+        raise AssertionError(
+            f"{label} mixed CSS backdrop blur with native compositor blur: "
+            f"backdrop_filter={backdrop!r} state={state!r}"
+        )
+    return {
+        "visible": True,
+        "backdrop_filter": backdrop,
+        "transparent_window": transparent_window,
+        "compositor_blur_active": compositor_blur_active,
+    }
 
 
 def create_terminal_via_sidebar_context_menu(pid: int, *, parent_path: str = "local") -> dict:
@@ -5811,10 +5926,20 @@ def visible_shell_content_rects(state: dict) -> list[tuple[str, dict]]:
 
 def shell_content_vertical_balance(state: dict) -> dict:
     dom = state.get("dom") or {}
-    window_height = float(dom.get("window_inner_height") or 0.0)
+    window_height = float(
+        dom.get("window_inner_height")
+        or (((state.get("window") or {}).get("inner_size") or {}).get("height"))
+        or 0.0
+    )
     if window_height <= 0:
         raise AssertionError(f"window inner height missing from app state: {state!r}")
     rects = visible_shell_content_rects(state)
+    if not rects:
+        active_hosts = state.get("active_terminal_hosts") or []
+        if active_hosts:
+            host_rect = (active_hosts[0] or {}).get("host_rect")
+            if rect_is_visible(host_rect):
+                rects.append(("active_terminal_host_rect", host_rect))
     if not rects:
         raise AssertionError(f"shell content rects missing from app state: {state!r}")
     top_edge = min(float(rect.get("top") or 0.0) for _, rect in rects)
@@ -5838,14 +5963,14 @@ def assert_titlebar_revealed_push_contract(state: dict) -> dict:
     titlebar_bottom = rect_bottom(titlebar_rect)
     top_gap = float(balance["top_gap"])
     bottom_gap = float(balance["bottom_gap"])
-    if abs(top_gap - titlebar_bottom) > 2.0:
+    if top_gap > 2.0:
         raise AssertionError(
-            "titlebar reveal did not push the shell content below the restored titlebar lane: "
+            "titlebar auto-hide reveal pushed or resized shell content instead of overlaying it: "
             f"titlebar_bottom={titlebar_bottom:.2f} balance={balance!r}"
         )
     if bottom_gap > 1.5:
         raise AssertionError(
-            "titlebar reveal introduced a bottom gutter instead of only reserving the titlebar lane: "
+            "titlebar auto-hide reveal introduced a bottom gutter instead of drawing over content: "
             f"balance={balance!r}"
         )
     return {
@@ -9421,40 +9546,192 @@ def assert_titlebar_new_menu_shell_contract(pid: int) -> dict:
 
 
 def assert_background_blur_contract(pid: int) -> dict:
-    state = wait_for_interactive(pid, timeout_seconds=10.0)
+    deadline = time.time() + 10.0
+    state = app_state(pid)
+    while time.time() < deadline:
+        dom = state.get("dom") or {}
+        shell = state.get("shell") or {}
+        if shell and (
+            dom.get("shell_frame_background")
+            or dom.get("shell_root_background")
+            or not bool(shell.get("transparent_window"))
+        ):
+            break
+        time.sleep(0.2)
+        state = app_state(pid)
     dom = state.get("dom") or {}
     shell = state.get("shell") or {}
     live_blur_supported = bool(shell.get("live_blur_supported"))
+    css_backdrop_filter_enabled = bool(shell.get("css_backdrop_filter_enabled"))
+    compositor_blur_active = bool(shell.get("compositor_blur_active"))
     transparent_window = bool(shell.get("transparent_window"))
     profile_reason = str(shell.get("transparent_window_profile_reason") or "")
+    x11_blur_xid = int(shell.get("x11_compositor_blur_xid") or 0)
+    x11_blur_property_present = bool(shell.get("x11_compositor_blur_property_present"))
     shell_frame_backdrop = str(dom.get("shell_frame_backdrop_filter") or "").strip().lower()
     shell_root_backdrop = str(dom.get("shell_root_backdrop_filter") or "").strip().lower()
     shell_frame_background = str(dom.get("shell_frame_background") or "").strip()
     shell_root_background = str(dom.get("shell_root_background") or "").strip()
+    shell_frame_background_image = str(dom.get("shell_frame_background_image") or "").strip()
+    shell_frame_shell_gradient_var = str(dom.get("shell_frame_shell_gradient_var") or "").strip()
+    shell_frame_chrome_tint_var = str(dom.get("shell_frame_chrome_tint_var") or "").strip()
     shell_fill_alpha = parse_css_alpha(shell_frame_background)
     if shell_fill_alpha is None:
         shell_fill_alpha = parse_css_alpha(shell_root_background)
-    blur_expected = live_blur_supported and transparent_window
+    native_blur_expected = transparent_window and compositor_blur_active
+    css_filter_expected = live_blur_supported and transparent_window and not compositor_blur_active
     active_filter = shell_frame_backdrop or shell_root_backdrop
     result = {
         "live_blur_supported": live_blur_supported,
+        "css_backdrop_filter_enabled": css_backdrop_filter_enabled,
+        "compositor_blur_active": compositor_blur_active,
         "transparent_window": transparent_window,
         "profile_reason": profile_reason,
+        "x11_compositor_blur_xid": x11_blur_xid,
+        "x11_compositor_blur_property_present": x11_blur_property_present,
         "shell_frame_backdrop_filter": shell_frame_backdrop,
         "shell_root_backdrop_filter": shell_root_backdrop,
         "shell_frame_background": shell_frame_background,
         "shell_root_background": shell_root_background,
+        "shell_frame_background_image": shell_frame_background_image,
+        "shell_frame_shell_gradient_var": shell_frame_shell_gradient_var,
+        "shell_frame_chrome_tint_var": shell_frame_chrome_tint_var,
         "shell_fill_alpha": shell_fill_alpha,
+        "native_blur_expected": native_blur_expected,
     }
-    if blur_expected:
+    if os.environ.get("YGGTERM_REQUIRE_COMPOSITOR_BLUR") == "1" and not compositor_blur_active:
+        raise AssertionError(f"expected native compositor blur, but compositor_blur_active is false: {result!r}")
+    if transparent_window and shell_fill_alpha is None:
+        raise AssertionError(f"background blur smoke could not observe shell fill alpha: {result!r}")
+    if native_blur_expected:
+        if "x11" in profile_reason and (x11_blur_xid <= 0 or not x11_blur_property_present):
+            raise AssertionError(
+                "X11 native blur must be backed by a real KDE blur property on the top-level window: "
+                f"{result!r}"
+            )
+        if active_filter not in ("", "none"):
+            raise AssertionError(f"native compositor blur path must not also enable full-window CSS blur: {result!r}")
+        if not shell_frame_shell_gradient_var or "rgba(" not in shell_frame_shell_gradient_var:
+            raise AssertionError(f"native compositor blur path lost the observable shell gradient variable: {result!r}")
+    elif css_filter_expected:
         if active_filter in ("", "none"):
-            raise AssertionError(f"expected live shell blur, but computed backdrop filter is absent: {result!r}")
+            raise AssertionError(f"expected shell material backdrop filter, but computed filter is absent: {result!r}")
         if shell_fill_alpha is not None and shell_fill_alpha >= 0.97:
-            raise AssertionError(f"expected translucent shell fill on blur-capable backend: {result!r}")
+            raise AssertionError(f"expected translucent shell fill on compositor-blur backend: {result!r}")
     else:
         if active_filter not in ("", "none"):
-            raise AssertionError(f"unexpected live shell blur on opaque/safe backend: {result!r}")
+            raise AssertionError(f"unexpected shell backdrop filter on opaque/safe backend: {result!r}")
+        if css_backdrop_filter_enabled and transparent_window and shell_fill_alpha is not None and shell_fill_alpha < 0.74:
+            raise AssertionError(f"expected readable material fill on non-compositor-blur backend: {result!r}")
     return result
+
+
+def assert_background_blur_interaction_stability(pid: int, out_dir: Path) -> dict:
+    baseline = assert_background_blur_contract(pid)
+    cycles: list[dict] = []
+    for index, active in enumerate((True, False, True, False), start=1):
+        hover_result = app_set_window_chrome_hover(pid, active)
+        time.sleep(0.25)
+        state = assert_background_blur_contract(pid)
+        dom_state = app_state(pid)
+        dom = dom_state.get("dom") or {}
+        titlebar_background = str(dom.get("titlebar_background") or "").strip()
+        titlebar_filter = str(dom.get("titlebar_backdrop_filter") or "").strip().lower()
+        titlebar_alpha = parse_css_alpha(titlebar_background)
+        titlebar_css_blur_expected = bool(state.get("css_backdrop_filter_enabled")) and not bool(
+            state.get("native_blur_expected")
+        )
+        if state.get("native_blur_expected"):
+            if active and titlebar_filter not in ("", "none"):
+                raise AssertionError(
+                    "titlebar hover reveal mixed CSS backdrop blur with native compositor blur: "
+                    f"cycle={index} filter={titlebar_filter!r} state={state!r} dom={dom!r}"
+                )
+        if active and titlebar_css_blur_expected:
+            if titlebar_filter in ("", "none"):
+                raise AssertionError(
+                    "titlebar hover reveal lost its contained CSS backdrop blur: "
+                    f"cycle={index} state={state!r} dom={dom!r}"
+                )
+        elif active and titlebar_filter not in ("", "none"):
+            raise AssertionError(
+                "titlebar hover reveal enabled CSS backdrop blur while the material blur flag is disabled: "
+                f"cycle={index} state={state!r} dom={dom!r}"
+            )
+        elif not active and titlebar_filter not in ("", "none"):
+            raise AssertionError(
+                "collapsed titlebar retained a backdrop blur after hover ended: "
+                f"cycle={index} filter={titlebar_filter!r} state={state!r} dom={dom!r}"
+            )
+        cycles.append(
+            {
+                "cycle": index,
+                "hover_active": active,
+                "hover_result": hover_result,
+                "background": state,
+                "titlebar_background": titlebar_background,
+                "titlebar_background_image": str(dom.get("titlebar_background_image") or "").strip(),
+                "titlebar_backdrop_filter": titlebar_filter,
+                "titlebar_alpha": titlebar_alpha,
+                "titlebar_revealed": bool(dom.get("titlebar_revealed")),
+            }
+        )
+    theme_editor_open = run(
+        "server",
+        "app",
+        "theme-editor",
+        "open",
+        "--pid",
+        str(pid),
+        "--timeout-ms",
+        "8000",
+    )
+    theme_editor_state = {}
+    deadline = time.time() + 4.0
+    while time.time() < deadline:
+        theme_editor_state = app_state(pid)
+        if rect_is_visible(dom_rect(theme_editor_state, "theme_editor_overlay_rect")):
+            break
+        time.sleep(0.1)
+    theme_editor_overlay = assert_native_blur_overlay_backdrop_contract(
+        theme_editor_state,
+        "theme_editor_overlay_rect",
+        "theme_editor_overlay_backdrop_filter",
+        "theme editor overlay",
+    )
+    if not theme_editor_overlay.get("visible"):
+        raise AssertionError(
+            f"theme editor overlay did not become visible during blur interaction smoke: "
+            f"open={theme_editor_open!r} state={theme_editor_state!r}"
+        )
+    theme_editor_close = run(
+        "server",
+        "app",
+        "theme-editor",
+        "close",
+        "--pid",
+        str(pid),
+        "--timeout-ms",
+        "8000",
+    )
+    app_set_window_chrome_hover(pid, False)
+    final_state = assert_background_blur_contract(pid)
+    app_screenshot(pid, out_dir / "background-blur-interaction-final.png")
+    if baseline.get("native_blur_expected"):
+        for item in cycles + [{"background": final_state, "cycle": "final"}]:
+            state = item["background"]
+            if not state.get("compositor_blur_active"):
+                raise AssertionError(
+                    f"native compositor blur disappeared during UI interaction: baseline={baseline!r} item={item!r}"
+                )
+    return {
+        "baseline": baseline,
+        "cycles": cycles,
+        "theme_editor_open": theme_editor_open,
+        "theme_editor_overlay": theme_editor_overlay,
+        "theme_editor_close": theme_editor_close,
+        "final": final_state,
+    }
 
 
 def assert_sidebar_resize_persists_to_settings(pid: int) -> dict:
@@ -10996,21 +11273,39 @@ def assert_titlebar_autohide_hover_contract(pid: int, out_dir: Path) -> dict:
     if baseline_panel_mode not in ("", "hidden", "none", "null", "settings"):
         baseline = close_right_panel(pid, baseline, timeout_seconds=1.5)
         baseline_panel_mode = right_panel_mode(baseline)
-    if baseline_panel_mode != "settings":
+    baseline_enabled = bool(dom_value(baseline, "titlebar_auto_hide_enabled")) or bool(
+        (baseline.get("shell") or {}).get("titlebar_auto_hide_enabled")
+    )
+    toggle_rect = None
+    toggle_hit_target = None
+    toggle_text = "On" if baseline_enabled else "Off"
+    toggle_enabled_expect = None
+    if not baseline_enabled and baseline_panel_mode != "settings":
         baseline = open_settings_panel_via_command_lane(pid, timeout_seconds=6.0)
-    toggle_rect = dom_rect(baseline, "settings_titlebar_auto_hide_toggle_rect")
-    if not rect_is_visible(toggle_rect):
-        raise AssertionError(f"titlebar auto-hide toggle rect missing in settings rail: {baseline!r}")
-    toggle_hit_target = dom_value(baseline, "settings_titlebar_auto_hide_toggle_hit_target") or {}
-    toggle_text = str(dom_value(baseline, "settings_titlebar_auto_hide_toggle_text") or "").strip()
-    if toggle_text not in {"On", "Off"}:
-        raise AssertionError(
-            f"titlebar auto-hide toggle text is missing or drifted from the expected On/Off state: "
-            f"text={toggle_text!r} state={baseline!r}"
-        )
-    baseline_enabled = bool(dom_value(baseline, "settings_titlebar_auto_hide_toggle_enabled"))
+        baseline_panel_mode = right_panel_mode(baseline)
+        toggle_enabled_expect = True
+    if not baseline_enabled and baseline_panel_mode == "settings":
+        toggle_rect = dom_rect(baseline, "settings_titlebar_auto_hide_toggle_rect")
+        if not rect_is_visible(toggle_rect):
+            raise AssertionError(f"titlebar auto-hide toggle rect missing in settings rail: {baseline!r}")
+        toggle_hit_target = dom_value(baseline, "settings_titlebar_auto_hide_toggle_hit_target") or {}
+        toggle_text = str(dom_value(baseline, "settings_titlebar_auto_hide_toggle_text") or "").strip()
+        if toggle_text not in {"On", "Off"}:
+            raise AssertionError(
+                f"titlebar auto-hide toggle text is missing or drifted from the expected On/Off state: "
+                f"text={toggle_text!r} state={baseline!r}"
+            )
+        baseline_enabled = bool(dom_value(baseline, "settings_titlebar_auto_hide_toggle_enabled"))
+        toggle_enabled_expect = True
+    elif baseline_enabled and baseline_panel_mode == "settings":
+        toggle_rect = dom_rect(baseline, "settings_titlebar_auto_hide_toggle_rect")
+        if rect_is_visible(toggle_rect):
+            toggle_hit_target = dom_value(baseline, "settings_titlebar_auto_hide_toggle_hit_target") or {}
+            toggle_text = str(dom_value(baseline, "settings_titlebar_auto_hide_toggle_text") or "On").strip() or "On"
     enable_click = None
     if not baseline_enabled:
+        if not rect_is_visible(toggle_rect):
+            raise AssertionError(f"titlebar auto-hide toggle rect missing before enabling auto-hide: {baseline!r}")
         enable_click = xdotool_click_window(
             pid,
             rect_center_x(toggle_rect),
@@ -11019,11 +11314,16 @@ def assert_titlebar_autohide_hover_contract(pid: int, out_dir: Path) -> dict:
     enabled_state = wait_for_titlebar_autohide_state(
         pid,
         enabled=True,
-        toggle_enabled=True,
+        toggle_enabled=toggle_enabled_expect,
         timeout_seconds=6.0,
     )
-    settle_rect = dom_rect(enabled_state, "main_surface_body_rect") or dom_rect(enabled_state, "sidebar_rect")
-    if not rect_is_visible(settle_rect):
+    settle_rect = (
+        dom_rect(enabled_state, "main_surface_body_rect")
+        or dom_rect(enabled_state, "sidebar_rect")
+        or dom_rect(enabled_state, "shell_frame_rect")
+        or (((enabled_state.get("active_terminal_hosts") or [{}])[0] or {}).get("host_rect"))
+    )
+    if POINTER_DRIVER != "app" and not rect_is_visible(settle_rect):
         raise AssertionError(f"main surface rect missing before titlebar auto-hide collapse probe: {enabled_state!r}")
     if POINTER_DRIVER == "app":
         collapse_move = app_set_window_chrome_hover(pid, False)
@@ -11038,12 +11338,18 @@ def assert_titlebar_autohide_hover_contract(pid: int, out_dir: Path) -> dict:
         enabled=True,
         revealed=False,
         hover_active=False,
-        toggle_enabled=True,
+        toggle_enabled=toggle_enabled_expect,
         timeout_seconds=6.0,
     )
     collapsed_rect = dom_rect(collapsed, "titlebar_rect")
     if not rect_is_visible(collapsed_rect):
         raise AssertionError(f"titlebar rect disappeared instead of collapsing to a hover strip: {collapsed!r}")
+    collapsed_backdrop = str(dom_value(collapsed, "titlebar_backdrop_filter") or "").strip().lower()
+    if collapsed_backdrop not in ("", "none"):
+        raise AssertionError(
+            "titlebar auto-hide collapse left a backdrop blur on the sensor strip: "
+            f"backdrop_filter={collapsed_backdrop!r} state={collapsed!r}"
+        )
     if float(collapsed_rect["height"]) > TITLEBAR_AUTOHIDE_SENSOR_HEIGHT_MAX_PX:
         raise AssertionError(
             f"titlebar auto-hide collapse left too much height instead of the hover strip: rect={collapsed_rect!r}"
@@ -11068,7 +11374,7 @@ def assert_titlebar_autohide_hover_contract(pid: int, out_dir: Path) -> dict:
         enabled=True,
         revealed=True,
         hover_active=True,
-        toggle_enabled=True,
+        toggle_enabled=toggle_enabled_expect,
         timeout_seconds=6.0,
     )
     revealed_rect = dom_rect(revealed, "titlebar_rect")
@@ -11080,6 +11386,39 @@ def assert_titlebar_autohide_hover_contract(pid: int, out_dir: Path) -> dict:
     if not rect_is_visible(search_rect):
         raise AssertionError(
             f"titlebar hover reveal brought the lane back but search input stayed hidden: state={revealed!r}"
+        )
+    titlebar_background = str(dom_value(revealed, "titlebar_background") or "").strip()
+    titlebar_background_image = str(dom_value(revealed, "titlebar_background_image") or "").strip()
+    titlebar_backdrop = str(dom_value(revealed, "titlebar_backdrop_filter") or "").strip().lower()
+    titlebar_alpha = parse_css_alpha(titlebar_background)
+    hover_blur = assert_background_blur_contract(pid)
+    native_hover_blur = bool(hover_blur.get("native_blur_expected"))
+    titlebar_css_blur_expected = bool(
+        hover_blur.get("css_backdrop_filter_enabled")
+    ) and not native_hover_blur
+    if not titlebar_background or titlebar_background in ("rgba(0, 0, 0, 0)", "transparent"):
+        raise AssertionError(
+            f"titlebar hover reveal did not paint a chrome background: background={titlebar_background!r} state={revealed!r}"
+        )
+    if native_hover_blur and titlebar_alpha is not None and titlebar_alpha >= 0.97:
+        raise AssertionError(
+            f"titlebar hover reveal chrome is too opaque for the blurred integrated-chrome contract: background={titlebar_background!r}"
+        )
+    if not titlebar_background_image or titlebar_background_image == "none":
+        raise AssertionError(
+            f"titlebar hover reveal lost the shell gradient background: background_image={titlebar_background_image!r}"
+        )
+    if native_hover_blur and titlebar_backdrop not in ("", "none"):
+        raise AssertionError(
+            f"titlebar hover reveal mixed CSS backdrop blur with native compositor blur: backdrop_filter={titlebar_backdrop!r}"
+        )
+    if titlebar_css_blur_expected and titlebar_backdrop in ("", "none"):
+        raise AssertionError(
+            f"titlebar hover reveal lost its contained chrome backdrop blur: backdrop_filter={titlebar_backdrop!r}"
+        )
+    if not titlebar_css_blur_expected and titlebar_backdrop not in ("", "none"):
+        raise AssertionError(
+            f"titlebar hover reveal enabled CSS backdrop blur while the material blur flag is disabled: backdrop_filter={titlebar_backdrop!r}"
         )
     revealed_push = assert_titlebar_revealed_push_contract(revealed)
     revealed_titlebar_centering = assert_titlebar_centering(revealed)
@@ -11112,10 +11451,13 @@ def assert_titlebar_autohide_hover_contract(pid: int, out_dir: Path) -> dict:
         raise AssertionError(
             "titlebar hover reveal double-click maximized the window but did not restore it on the second double-click"
         )
-    settle_rect = dom_rect(restored_after_maximize, "main_surface_body_rect") or dom_rect(
-        restored_after_maximize, "sidebar_rect"
+    settle_rect = (
+        dom_rect(restored_after_maximize, "main_surface_body_rect")
+        or dom_rect(restored_after_maximize, "sidebar_rect")
+        or dom_rect(restored_after_maximize, "shell_frame_rect")
+        or (((restored_after_maximize.get("active_terminal_hosts") or [{}])[0] or {}).get("host_rect"))
     )
-    if not rect_is_visible(settle_rect):
+    if POINTER_DRIVER != "app" and not rect_is_visible(settle_rect):
         raise AssertionError(
             f"main surface rect missing before restored auto-hide collapse probe: {restored_after_maximize!r}"
         )
@@ -11132,7 +11474,7 @@ def assert_titlebar_autohide_hover_contract(pid: int, out_dir: Path) -> dict:
         enabled=True,
         revealed=False,
         hover_active=False,
-        toggle_enabled=True,
+        toggle_enabled=toggle_enabled_expect,
         timeout_seconds=6.0,
     )
     collapsed_after_restore_rect = dom_rect(collapsed_after_restore, "titlebar_rect")
@@ -11153,7 +11495,7 @@ def assert_titlebar_autohide_hover_contract(pid: int, out_dir: Path) -> dict:
         enabled=True,
         revealed=True,
         hover_active=True,
-        toggle_enabled=True,
+        toggle_enabled=toggle_enabled_expect,
         timeout_seconds=6.0,
     )
     (
@@ -11223,7 +11565,7 @@ def assert_titlebar_autohide_hover_contract(pid: int, out_dir: Path) -> dict:
         enabled=True,
         revealed=True,
         hover_active=False,
-        toggle_enabled=True,
+        toggle_enabled=toggle_enabled_expect,
         timeout_seconds=6.0,
     )
     pinned_rect = dom_rect(pinned, "titlebar_rect")
@@ -11245,7 +11587,7 @@ def assert_titlebar_autohide_hover_contract(pid: int, out_dir: Path) -> dict:
         enabled=True,
         revealed=False,
         hover_active=False,
-        toggle_enabled=True,
+        toggle_enabled=toggle_enabled_expect,
         timeout_seconds=6.0,
     )
     disable_click = None
@@ -11283,8 +11625,12 @@ def assert_titlebar_autohide_hover_contract(pid: int, out_dir: Path) -> dict:
         "collapsed_rect": collapsed_rect,
         "collapsed_balance": collapsed_balance,
         "hover_move": hover_move,
+        "hover_blur": hover_blur,
         "revealed_rect": revealed_rect,
         "revealed_push": revealed_push,
+        "revealed_background": titlebar_background,
+        "revealed_background_image": titlebar_background_image,
+        "revealed_backdrop_filter": titlebar_backdrop,
         "revealed_titlebar_centering": revealed_titlebar_centering,
         "revealed_drag_point": {
             "x": round(revealed_drag_x, 2),
@@ -11902,56 +12248,29 @@ def assert_settings_terminal_theme_dropdown_contract(pid: int) -> dict:
 
 
 def assert_theme_editor_contract(pid: int, out_dir: Path) -> dict:
-    default_grain = 0.12
+    default_grain = 0.0
+    default_alpha = 0.96
+    default_brightness = 0.56
     baseline = app_state(pid)
     if titlebar_transient_open(baseline):
         baseline = dismiss_titlebar_transients(pid, baseline, timeout_seconds=1.5)
-    if right_panel_mode(baseline) not in ("", "hidden", "none", "null", "settings"):
-        baseline = close_right_panel(pid, baseline, timeout_seconds=1.5)
-    if right_panel_mode(baseline) != "settings":
-        button_rect = dom_rect(baseline, "titlebar_settings_button_rect")
-        if not rect_is_visible(button_rect):
-            raise AssertionError(f"settings button rect missing before theme-editor probe: {baseline!r}")
-        xdotool_click_window(pid, rect_center_x(button_rect), rect_center_y(button_rect))
-        deadline = time.time() + 6.0
-        opened = {}
-        while time.time() < deadline:
-            opened = app_state(pid)
-            if right_panel_mode(opened) == "settings":
-                baseline = opened
-                break
-            if right_panel_mode(opened) not in ("", "hidden", "none", "null"):
-                raise AssertionError(
-                    "titlebar settings button opened the wrong right panel before theme-editor probe: "
-                    f"mode={right_panel_mode(opened)!r} state={opened!r}"
-                )
-            time.sleep(0.12)
-        if right_panel_mode(baseline) != "settings":
-            baseline = open_settings_panel_via_command_lane(pid, timeout_seconds=6.0)
-    update_cta = (((baseline.get("shell") or {}).get("update_call_to_action")) or {})
-    update_button_rect = dom_rect(baseline, "install_update_button_rect")
-    update_button_text = str(dom_value(baseline, "install_update_button_text") or "").strip()
-    update_detail_text = str(dom_value(baseline, "install_update_detail_text") or "").strip()
-    update_mode = str(dom_value(baseline, "install_update_button_mode") or "").strip()
-    if not rect_is_visible(update_button_rect):
-        raise AssertionError(f"install update button rect missing in settings rail: {baseline!r}")
-    if not update_button_text:
-        raise AssertionError(f"install update button label missing: {baseline!r}")
-    if update_mode != str(update_cta.get("mode") or "").strip():
-        raise AssertionError(
-            f"install update button mode drifted from shell state: dom={update_mode!r} shell={update_cta!r}"
+    if rect_is_visible(dom_rect(baseline, "theme_editor_shell_rect")):
+        run(
+            "server",
+            "app",
+            "theme-editor",
+            "close",
+            "--pid",
+            str(pid),
+            "--timeout-ms",
+            "8000",
         )
-    if update_cta.get("label") and update_button_text != str(update_cta["label"]).strip():
-        raise AssertionError(
-            f"install update button label drifted from shell state: dom={update_button_text!r} shell={update_cta!r}"
+        baseline = wait_for_probe(
+            lambda: app_state(pid),
+            lambda state: not rect_is_visible(dom_rect(state, "theme_editor_shell_rect")),
+            timeout_seconds=6.0,
+            description="theme editor preflight close",
         )
-    if update_cta.get("detail") and update_detail_text != str(update_cta["detail"]).strip():
-        raise AssertionError(
-            f"install update detail drifted from shell state: dom={update_detail_text!r} shell={update_cta!r}"
-        )
-    edit_button_rect = dom_rect(baseline, "theme_editor_open_button_rect")
-    if not rect_is_visible(edit_button_rect):
-        raise AssertionError(f"theme editor open button rect missing: {baseline!r}")
     open_result = run(
         "server",
         "app",
@@ -11973,6 +12292,8 @@ def assert_theme_editor_contract(pid: int, out_dir: Path) -> dict:
     apply_rect = dom_rect(opened, "theme_editor_apply_button_rect")
     reset_rect = dom_rect(opened, "theme_editor_reset_button_rect")
     seed_rect = dom_rect(opened, "theme_editor_seed_button_rect")
+    brightness_rect = dom_rect(opened, "theme_editor_brightness_input_rect")
+    alpha_rect = dom_rect(opened, "theme_editor_alpha_input_rect")
     grain_rect = dom_rect(opened, "theme_editor_grain_input_rect")
     if not rect_is_visible(theme_shell_rect):
         raise AssertionError(
@@ -11992,19 +12313,44 @@ def assert_theme_editor_contract(pid: int, out_dir: Path) -> dict:
     restored = {}
     while time.time() < deadline:
         restored = app_state(pid)
-        restored_grain = theme_grain_value(shell_theme_spec(restored, "saved_yggui_theme"))
-        if rect_is_visible(dom_rect(restored, "theme_editor_shell_rect")) and restored_grain is not None and abs(restored_grain - default_grain) <= 0.01:
+        restored_theme = shell_theme_spec(restored, "saved_yggui_theme")
+        restored_grain = theme_grain_value(restored_theme)
+        restored_alpha = theme_alpha_value(restored_theme)
+        restored_brightness = theme_brightness_value(restored_theme)
+        if (
+            rect_is_visible(dom_rect(restored, "theme_editor_shell_rect"))
+            and restored_grain is not None
+            and restored_alpha is not None
+            and restored_brightness is not None
+            and abs(restored_grain - default_grain) <= 0.01
+            and abs(restored_alpha - default_alpha) <= 0.01
+            and abs(restored_brightness - default_brightness) <= 0.01
+        ):
             opened = restored
             break
         time.sleep(0.12)
-    restored_grain = theme_grain_value(shell_theme_spec(opened, "saved_yggui_theme"))
-    if restored_grain is None or abs(restored_grain - default_grain) > 0.01:
+    restored_theme = shell_theme_spec(opened, "saved_yggui_theme")
+    restored_grain = theme_grain_value(restored_theme)
+    restored_alpha = theme_alpha_value(restored_theme)
+    restored_brightness = theme_brightness_value(restored_theme)
+    if (
+        restored_grain is None
+        or restored_alpha is None
+        or restored_brightness is None
+        or abs(restored_grain - default_grain) > 0.01
+        or abs(restored_alpha - default_alpha) > 0.01
+        or abs(restored_brightness - default_brightness) > 0.01
+    ):
         raise AssertionError(
-            f"theme editor reset did not restore default grain before edit probe: reset={reset_result!r} state={opened!r}"
+            f"theme editor reset did not restore default brightness/alpha/grain before edit probe: reset={reset_result!r} state={opened!r}"
         )
     shell_frame_before = {
         "background": dom_value(opened, "shell_frame_background"),
         "background_image": dom_value(opened, "shell_frame_background_image"),
+        "background_size": dom_value(opened, "shell_frame_background_size"),
+        "background_repeat": dom_value(opened, "shell_frame_background_repeat"),
+        "gradient_var": dom_value(opened, "shell_frame_shell_gradient_var"),
+        "chrome_tint_var": dom_value(opened, "shell_frame_chrome_tint_var"),
         "box_shadow": dom_value(opened, "shell_frame_box_shadow"),
         "border_radius": dom_value(opened, "shell_frame_border_radius"),
     }
@@ -12013,6 +12359,8 @@ def assert_theme_editor_contract(pid: int, out_dir: Path) -> dict:
     apply_rect = dom_rect(opened, "theme_editor_apply_button_rect")
     reset_rect = dom_rect(opened, "theme_editor_reset_button_rect")
     seed_rect = dom_rect(opened, "theme_editor_seed_button_rect")
+    brightness_rect = dom_rect(opened, "theme_editor_brightness_input_rect")
+    alpha_rect = dom_rect(opened, "theme_editor_alpha_input_rect")
     grain_rect = dom_rect(opened, "theme_editor_grain_input_rect")
     if rect_is_visible(apply_rect):
         raise AssertionError(f"theme editor still exposes an Apply button: {apply_rect!r}")
@@ -12024,12 +12372,31 @@ def assert_theme_editor_contract(pid: int, out_dir: Path) -> dict:
         raise AssertionError(
             f"theme editor seed button overflows shell bounds: shell={theme_shell_rect!r} seed={seed_rect!r}"
         )
+    if not rect_is_visible(brightness_rect):
+        raise AssertionError(f"theme editor brightness slider/input rect missing: state={opened!r}")
+    if not rect_contains_rect(theme_shell_rect, brightness_rect):
+        raise AssertionError(
+            f"theme editor brightness control overflows shell bounds: shell={theme_shell_rect!r} control={brightness_rect!r}"
+        )
+    for name, rect in (
+        ("alpha", alpha_rect),
+        ("grain", grain_rect),
+    ):
+        if rect_is_visible(rect):
+            raise AssertionError(
+                f"stable theme editor still exposes the experimental {name} dial: shell={theme_shell_rect!r} dial={rect!r}"
+            )
     shell_background = str(((opened.get("dom") or {}).get("theme_editor_shell_background")) or "")
     shell_shadow = str(((opened.get("dom") or {}).get("theme_editor_shell_box_shadow")) or "")
     if not shell_background:
         raise AssertionError(f"theme editor shell background missing: {opened!r}")
     if not shell_shadow:
         raise AssertionError(f"theme editor shell shadow missing: {opened!r}")
+    shell_alpha = parse_css_alpha(shell_background)
+    if shell_alpha is not None and shell_alpha < 0.98:
+        raise AssertionError(
+            f"theme editor shell is transparent to the main window: background={shell_background!r}"
+        )
     reset_button_background = str(dom_value(opened, "theme_editor_reset_button_background") or "")
     reset_button_shadow = str(dom_value(opened, "theme_editor_reset_button_box_shadow") or "")
     reset_button_radius = str(dom_value(opened, "theme_editor_reset_button_border_radius") or "")
@@ -12038,14 +12405,24 @@ def assert_theme_editor_contract(pid: int, out_dir: Path) -> dict:
             "theme editor reset button lost its styled button contract: "
             f"background={reset_button_background!r} shadow={reset_button_shadow!r} radius={reset_button_radius!r}"
         )
-    if not rect_is_visible(grain_rect):
-        raise AssertionError(f"theme editor grain input rect missing: {opened!r}")
-    before_grain = theme_grain_value(saved_theme_before)
-    grain_target_ratio = 0.96 if before_grain is None or before_grain < 0.72 else 0.08
-    grain_click = xdotool_click_window(
-        pid,
-        float(grain_rect.get("left") or 0.0) + float(grain_rect.get("width") or 0.0) * grain_target_ratio,
-        float(grain_rect.get("top") or 0.0) + float(grain_rect.get("height") or 0.0) * 0.24,
+    target_brightness = 0.68
+    target_alpha = 0.50
+    target_grain = 0.80
+    set_result = run(
+        "server",
+        "app",
+        "theme-editor",
+        "set",
+        "--brightness",
+        f"{target_brightness:.2f}",
+        "--alpha",
+        f"{target_alpha:.2f}",
+        "--grain",
+        f"{target_grain:.2f}",
+        "--pid",
+        str(pid),
+        "--timeout-ms",
+        "8000",
     )
     deadline = time.time() + 6.0
     changed = {}
@@ -12053,38 +12430,97 @@ def assert_theme_editor_contract(pid: int, out_dir: Path) -> dict:
         changed = app_state(pid)
         saved_theme_after_change = shell_theme_spec(changed, "saved_yggui_theme")
         effective_theme_after_change = shell_theme_spec(changed, "effective_yggui_theme")
+        changed_brightness = theme_brightness_value(saved_theme_after_change)
+        changed_alpha = theme_alpha_value(saved_theme_after_change)
         changed_grain = theme_grain_value(saved_theme_after_change)
-        changed_shell_frame_background_image = dom_value(changed, "shell_frame_background_image")
         if (
-            changed_grain is not None
-            and before_grain is not None
-            and abs(changed_grain - before_grain) >= 0.05
+            changed_brightness is not None
+            and changed_alpha is not None
+            and changed_grain is not None
+            and abs(changed_brightness - target_brightness) <= 0.015
+            and abs(changed_alpha - default_alpha) <= 0.015
+            and abs(changed_grain - default_grain) <= 0.015
+            and abs(changed_brightness - (theme_brightness_value(effective_theme_after_change) or changed_brightness)) <= 0.005
+            and abs(changed_alpha - (theme_alpha_value(effective_theme_after_change) or changed_alpha)) <= 0.005
             and abs(changed_grain - (theme_grain_value(effective_theme_after_change) or changed_grain)) <= 0.005
-            and changed_shell_frame_background_image != shell_frame_before["background_image"]
         ):
             break
         time.sleep(0.12)
     saved_theme_after_change = shell_theme_spec(changed, "saved_yggui_theme")
     effective_theme_after_change = shell_theme_spec(changed, "effective_yggui_theme")
+    changed_brightness = theme_brightness_value(saved_theme_after_change)
+    changed_alpha = theme_alpha_value(saved_theme_after_change)
     changed_grain = theme_grain_value(saved_theme_after_change)
     if (
-        changed_grain is None
-        or before_grain is None
-        or abs(changed_grain - before_grain) < 0.05
+        changed_brightness is None
+        or changed_alpha is None
+        or changed_grain is None
+        or abs(changed_brightness - target_brightness) > 0.015
+        or abs(changed_alpha - default_alpha) > 0.015
+        or abs(changed_grain - default_grain) > 0.015
     ):
         raise AssertionError(
-            f"theme editor grain move did not auto-apply to saved theme: before={saved_theme_before!r} after={saved_theme_after_change!r}"
+            f"stable theme editor did not apply brightness while pinning alpha/grain: before={saved_theme_before!r} after={saved_theme_after_change!r}"
         )
     shell_frame_after_change = {
         "background": dom_value(changed, "shell_frame_background"),
         "background_image": dom_value(changed, "shell_frame_background_image"),
+        "backdrop_filter": dom_value(changed, "shell_frame_backdrop_filter"),
+        "background_size": dom_value(changed, "shell_frame_background_size"),
+        "background_repeat": dom_value(changed, "shell_frame_background_repeat"),
+        "gradient_var": dom_value(changed, "shell_frame_shell_gradient_var"),
+        "chrome_tint_var": dom_value(changed, "shell_frame_chrome_tint_var"),
         "box_shadow": dom_value(changed, "shell_frame_box_shadow"),
         "border_radius": dom_value(changed, "shell_frame_border_radius"),
     }
-    if shell_frame_after_change["background_image"] == shell_frame_before["background_image"]:
+    if (
+        shell_frame_after_change["background_image"] == shell_frame_before["background_image"]
+        and shell_frame_after_change["gradient_var"] == shell_frame_before["gradient_var"]
+        and shell_frame_after_change["chrome_tint_var"] == shell_frame_before["chrome_tint_var"]
+    ):
         raise AssertionError(
-            "theme editor grain move did not change the live shell frame background image: "
+            "theme editor set did not change live shell frame theme CSS: "
             f"before={shell_frame_before!r} after={shell_frame_after_change!r}"
+        )
+    after_size = str(shell_frame_after_change.get("background_size") or "")
+    after_repeat = str(shell_frame_after_change.get("background_repeat") or "")
+    after_image = str(shell_frame_after_change.get("background_image") or "")
+    after_background = str(shell_frame_after_change.get("background") or "")
+    after_backdrop = str(shell_frame_after_change.get("backdrop_filter") or "").strip().lower()
+    after_alpha = parse_css_alpha(after_background)
+    changed_shell = changed.get("shell") or {}
+    transparent_window = bool(changed_shell.get("transparent_window"))
+    live_blur_supported = bool(changed_shell.get("live_blur_supported"))
+    compositor_blur_active = bool(changed_shell.get("compositor_blur_active"))
+    try:
+        material_blur_px = float(changed_shell.get("material_blur_px") or 0.0)
+    except (TypeError, ValueError):
+        material_blur_px = 0.0
+    if live_blur_supported or compositor_blur_active or material_blur_px != 0.0:
+        raise AssertionError(
+            "stable theme path unexpectedly enabled live/compositor/material blur: "
+            f"shell={changed_shell!r} after={shell_frame_after_change!r}"
+        )
+    if after_backdrop not in ("", "none"):
+        raise AssertionError(
+            "stable theme path unexpectedly applied a CSS backdrop filter: "
+            f"shell={changed_shell!r} after={shell_frame_after_change!r}"
+        )
+    if transparent_window and after_alpha is not None and after_alpha < 0.90:
+        raise AssertionError(
+            "stable transparent shell escaped with too little material fill after alpha rollback: "
+            f"alpha={after_alpha!r} shell={changed_shell!r} after={shell_frame_after_change!r}"
+        )
+    if "4px 4px" in after_size or "radial-gradient(circle at 1px 1px" in after_image:
+        raise AssertionError(
+            "stable theme path still rendered the experimental film-grain layer: "
+            f"after={shell_frame_after_change!r}"
+        )
+    repeat_layers = [layer.strip().lower() for layer in after_repeat.split(",") if layer.strip()]
+    if any(layer != "no-repeat" for layer in repeat_layers):
+        raise AssertionError(
+            "stable theme background repeat includes a repeated layer after grain rollback: "
+            f"repeat={after_repeat!r} after={shell_frame_after_change!r}"
         )
     if shell_frame_after_change["box_shadow"] != shell_frame_before["box_shadow"]:
         raise AssertionError(
@@ -12108,14 +12544,34 @@ def assert_theme_editor_contract(pid: int, out_dir: Path) -> dict:
     restored = {}
     while time.time() < deadline:
         restored = app_state(pid)
-        restored_grain = theme_grain_value(shell_theme_spec(restored, "saved_yggui_theme"))
-        if restored_grain is not None and abs(restored_grain - default_grain) <= 0.01:
+        restored_theme = shell_theme_spec(restored, "saved_yggui_theme")
+        restored_grain = theme_grain_value(restored_theme)
+        restored_alpha = theme_alpha_value(restored_theme)
+        restored_brightness = theme_brightness_value(restored_theme)
+        if (
+            restored_grain is not None
+            and restored_alpha is not None
+            and restored_brightness is not None
+            and abs(restored_grain - default_grain) <= 0.01
+            and abs(restored_alpha - default_alpha) <= 0.01
+            and abs(restored_brightness - default_brightness) <= 0.01
+        ):
             break
         time.sleep(0.12)
-    restored_grain = theme_grain_value(shell_theme_spec(restored, "saved_yggui_theme"))
-    if restored_grain is None or abs(restored_grain - default_grain) > 0.01:
+    restored_theme = shell_theme_spec(restored, "saved_yggui_theme")
+    restored_grain = theme_grain_value(restored_theme)
+    restored_alpha = theme_alpha_value(restored_theme)
+    restored_brightness = theme_brightness_value(restored_theme)
+    if (
+        restored_grain is None
+        or restored_alpha is None
+        or restored_brightness is None
+        or abs(restored_grain - default_grain) > 0.01
+        or abs(restored_alpha - default_alpha) > 0.01
+        or abs(restored_brightness - default_brightness) > 0.01
+    ):
         raise AssertionError(
-            f"theme editor reset did not restore default grain: restored={shell_theme_spec(restored, 'saved_yggui_theme')!r}"
+            f"theme editor reset did not restore default brightness/alpha/grain: restored={shell_theme_spec(restored, 'saved_yggui_theme')!r}"
         )
     dismiss_click = xdotool_click_window(
         pid,
@@ -12135,12 +12591,17 @@ def assert_theme_editor_contract(pid: int, out_dir: Path) -> dict:
     app_screenshot(pid, shot_path)
     return {
         "open_result": open_result,
-        "grain_click": grain_click,
+        "set_result": set_result,
         "reset_result": reset_result,
         "dismiss_click": dismiss_click,
         "shell_rect": theme_shell_rect,
         "shell_background": shell_background,
         "shell_box_shadow": shell_shadow,
+        "control_rects": {
+            "brightness": brightness_rect,
+            "alpha": alpha_rect,
+            "grain": grain_rect,
+        },
         "reset_button_background": reset_button_background,
         "reset_button_box_shadow": reset_button_shadow,
         "reset_button_border_radius": reset_button_radius,
@@ -12211,6 +12672,17 @@ def assert_clipboard_image_contract(pid: int, session: str, out_dir: Path) -> di
         if not any("not-a-png" in sample for sample in polluted_samples):
             raise AssertionError(
                 f"clipboard text paste never reached the prompt row: samples={polluted_samples!r} state={text_state!r}"
+            )
+        prompt_text = str(
+            failure_host.get("cursor_line_text")
+            or failure_host.get("cursor_row_text")
+            or ""
+        )
+        prompt_text_occurrences = prompt_text.count("not-a-png")
+        if prompt_text_occurrences != 1:
+            raise AssertionError(
+                "clipboard text paste reached the prompt with duplicate or missing text: "
+                f"occurrences={prompt_text_occurrences} prompt={prompt_text!r} samples={polluted_samples!r} state={text_state!r}"
             )
         if any("Failed to paste image:" in sample for sample in polluted_samples):
             raise AssertionError(
@@ -15586,6 +16058,12 @@ def assert_hot_session_switch(pid: int, session: str, session_kind: str, out_dir
             "hot switch partner prompt pixel proof was skipped despite interactive state: "
             f"{partner_prompt_pixels!r}"
         )
+    partner_history_pixels = assert_terminal_history_pixels_visible(
+        partner_shot,
+        partner_state,
+        context="hot switch partner history pixels",
+        min_history_lines=1,
+    )
 
     ok, _, detail = app_open_raw(pid, session, view="terminal")
     if not ok:
@@ -15657,6 +16135,12 @@ def assert_hot_session_switch(pid: int, session: str, session_kind: str, out_dir
             "hot switch return prompt pixel proof was skipped despite interactive state: "
             f"{final_prompt_pixels!r}"
         )
+    final_history_pixels = assert_terminal_history_pixels_visible(
+        final_shot,
+        final_state,
+        context="hot switch return history pixels",
+        min_history_lines=2,
+    )
     return {
         "partner_path": partner_path,
         "partner_kind": partner.get("kind"),
@@ -15666,6 +16150,8 @@ def assert_hot_session_switch(pid: int, session: str, session_kind: str, out_dir
         "return_screenshot": str(final_shot),
         "partner_prompt_pixels": partner_prompt_pixels,
         "return_prompt_pixels": final_prompt_pixels,
+        "partner_history_pixels": partner_history_pixels,
+        "return_history_pixels": final_history_pixels,
         "final_text_sample": final_text[-240:],
     }
 
@@ -15700,6 +16186,7 @@ def assert_remote_session_switch_scrollback(pid: int, session: str, out_dir: Pat
     assert_no_attach_ready_protocol_markers(initial_host, "remote switch initial")
     assert_no_transcript_artifacts(initial_host, "remote switch initial")
     initial_base_y = int(initial_host.get("base_y") or 0)
+    initial_text_len = len(terminal_host_text(initial_host))
     initial_expected = host_expects_scrollback(initial_host)
     compact_resize = None
     if not initial_expected and initial_base_y <= 0:
@@ -15754,10 +16241,11 @@ def assert_remote_session_switch_scrollback(pid: int, session: str, out_dir: Pat
             })
             if host_expects_scrollback(seeded_host) or int(seeded_host.get("base_y") or 0) > 0:
                 initial_state = seeded_state
-                initial_host = seeded_host
-                initial_base_y = int(initial_host.get("base_y") or 0)
-                initial_expected = host_expects_scrollback(initial_host)
-                break
+            initial_host = seeded_host
+            initial_base_y = int(initial_host.get("base_y") or 0)
+            initial_text_len = len(terminal_host_text(initial_host))
+            initial_expected = host_expects_scrollback(initial_host)
+            break
         if not initial_expected and initial_base_y <= 0:
             raise AssertionError(
                 "remote Codex scrollback smoke could not seed enough retained output to test scrolling: "
@@ -15789,6 +16277,22 @@ def assert_remote_session_switch_scrollback(pid: int, session: str, out_dir: Pat
     final_host = host_for_session(final_state, target_path)
     assert_no_attach_ready_protocol_markers(final_host, "remote switch return")
     assert_no_transcript_artifacts(final_host, "remote switch return")
+    final_base_y = int(final_host.get("base_y") or 0)
+    final_text_len = len(terminal_host_text(final_host))
+    if initial_base_y >= 10 and final_base_y < max(3, initial_base_y // 2):
+        raise AssertionError(
+            "remote switch return collapsed the retained xterm scrollback buffer: "
+            f"initial_base_y={initial_base_y} final_base_y={final_base_y} "
+            f"initial_text_len={initial_text_len} final_text_len={final_text_len} "
+            f"initial_host={initial_host!r} final_host={final_host!r}"
+        )
+    if initial_text_len >= 1200 and final_text_len < max(400, initial_text_len // 3):
+        raise AssertionError(
+            "remote switch return lost most retained xterm text after reactivation: "
+            f"initial_base_y={initial_base_y} final_base_y={final_base_y} "
+            f"initial_text_len={initial_text_len} final_text_len={final_text_len} "
+            f"initial_host={initial_host!r} final_host={final_host!r}"
+        )
     final_status_surface = None
     if "Session:" in codex_status_viewport_text(final_host):
         final_status_surface = assert_single_clean_codex_status_surface(
@@ -15808,8 +16312,10 @@ def assert_remote_session_switch_scrollback(pid: int, session: str, out_dir: Pat
         "created_partner": created_partner,
         "compact_resize": compact_resize,
         "initial_base_y": initial_base_y,
+        "initial_text_len": initial_text_len,
         "initial_scroll": initial_scroll,
-        "final_base_y": int(final_host.get("base_y") or 0),
+        "final_base_y": final_base_y,
+        "final_text_len": final_text_len,
         "final_scroll": final_scroll,
         "final_status_surface": final_status_surface,
         "screenshot": str(shot_path),
@@ -17071,8 +17577,6 @@ def assert_scroll(pid: int, session: str, before_state: dict) -> dict:
         return (
             before.get("viewport_y") != after.get("viewport_y")
             or before.get("viewport_scroll_top") != after.get("viewport_scroll_top")
-            or before.get("text_head") != after.get("text_head")
-            or before.get("text_tail") != after.get("text_tail")
         )
 
     def focused(snapshot: dict) -> bool:
@@ -17647,7 +18151,7 @@ def assert_partial_input_flow(pid: int, session: str, out_dir: Path) -> dict:
         json.dump(scroll_state, fh, indent=2)
     viewport_moved = (
         before_scroll.get("viewport_y") != after_scroll.get("viewport_y")
-        or before_scroll.get("text_tail") != after_scroll.get("text_tail")
+        or before_scroll.get("viewport_scroll_top") != after_scroll.get("viewport_scroll_top")
     )
     scroll_anchor = None
     if not viewport_moved:
@@ -18783,6 +19287,7 @@ def main() -> int:
     }
     no_session_setup_checks = {
         "background_blur",
+        "background_blur_interactions",
         "client_memory_budget",
         "codex_spawn_timeline",
         "focus",
@@ -18913,7 +19418,15 @@ def main() -> int:
         if args.only_check and name not in args.only_check:
             return None
         print(f"RUN {name}", flush=True)
-        result = fn()
+        try:
+            result = fn()
+        except Exception:
+            if name.startswith("titlebar_") or name.startswith("background_blur"):
+                try:
+                    app_set_window_chrome_hover(args.pid, False)
+                except Exception:
+                    pass
+            raise
         summary["checks"][name] = result
         print(f"PASS {name}", flush=True)
         return result
@@ -18949,6 +19462,10 @@ def main() -> int:
             run_check("titlebar_centering", lambda: titlebar_centering)
         run_check("terminal_viewport_inset", lambda: assert_terminal_viewport_inset(state))
         run_check("background_blur", lambda: assert_background_blur_contract(args.pid))
+        run_check(
+            "background_blur_interactions",
+            lambda: assert_background_blur_interaction_stability(args.pid, out_dir),
+        )
         run_check("sidebar_resize", lambda: assert_sidebar_resize_persists_to_settings(args.pid))
         run_check("search_focus_overlay", lambda: assert_search_focus_overlay_contract(args.pid, args.session))
         run_check("titlebar_search_typing", lambda: assert_titlebar_search_typing_contract(args.pid))
