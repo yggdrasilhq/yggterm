@@ -1,3 +1,10 @@
+yggterm (2.6.66-1) unstable; urgency=medium
+
+  * Fix retained remote Codex prompt readiness so a surface that passes every
+    visual, geometry, runtime, and transcript gate can clear the resume overlay.
+
+ -- Avikalpa Kundu <avi@gour.top>  Mon, 18 May 2026 22:45:00 +0530
+
 yggterm (2.6.65-1) unstable; urgency=medium
 
   * Restore generic shell prompt replay for non-Codex remote terminals while
