@@ -151,6 +151,7 @@ pub enum AppControlStartAction {
     Agent,
     Terminal,
     Ssh,
+    Folder,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -176,6 +177,14 @@ pub enum AppControlCommand {
         open: bool,
     },
     ResetThemeEditor,
+    SetThemeEditorValues {
+        #[serde(default)]
+        brightness: Option<f32>,
+        #[serde(default)]
+        alpha: Option<f32>,
+        #[serde(default)]
+        grain: Option<f32>,
+    },
     TriggerUpdateCheck,
     RestartPendingUpdate,
     CaptureScreenshot {
@@ -333,6 +342,7 @@ impl AppControlCommand {
             Self::SetUiTheme { .. } => "set_ui_theme",
             Self::SetThemeEditorOpen { .. } => "set_theme_editor_open",
             Self::ResetThemeEditor => "reset_theme_editor",
+            Self::SetThemeEditorValues { .. } => "set_theme_editor_values",
             Self::TriggerUpdateCheck => "trigger_update_check",
             Self::RestartPendingUpdate => "restart_pending_update",
             Self::CaptureScreenshot { .. } => "capture_screenshot",

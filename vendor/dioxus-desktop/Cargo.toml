@@ -13,7 +13,7 @@
 edition = "2021"
 rust-version = "1.76.0"
 name = "dioxus-desktop"
-version = "0.7.6"
+version = "0.7.9"
 authors = ["Jonathan Kelley"]
 build = "build.rs"
 autolib = false
@@ -105,45 +105,45 @@ version = "0.22.1"
 version = "1.10.1"
 
 [dependencies.dioxus-asset-resolver]
-version = "0.7.6"
+version = "0.7.9"
 features = ["native"]
 
 [dependencies.dioxus-cli-config]
-version = "0.7.6"
+version = "0.7.9"
 
 [dependencies.dioxus-core]
-version = "0.7.6"
+version = "0.7.9"
 features = ["serialize"]
 
 [dependencies.dioxus-devtools]
-version = "0.7.6"
+version = "0.7.9"
 optional = true
 
 [dependencies.dioxus-document]
-version = "0.7.6"
+version = "0.7.9"
 default-features = false
 
 [dependencies.dioxus-history]
-version = "0.7.6"
+version = "0.7.9"
 default-features = false
 
 [dependencies.dioxus-hooks]
-version = "0.7.6"
+version = "0.7.9"
 
 [dependencies.dioxus-html]
-version = "0.7.6"
+version = "0.7.9"
 features = ["serialize"]
 default-features = false
 
 [dependencies.dioxus-interpreter-js]
-version = "0.7.6"
+version = "0.7.9"
 features = [
     "binary-protocol",
     "serialize",
 ]
 
 [dependencies.dioxus-signals]
-version = "0.7.6"
+version = "0.7.9"
 optional = true
 
 [dependencies.dunce]
@@ -157,7 +157,7 @@ version = "0.3.32"
 default-features = false
 
 [dependencies.generational-box]
-version = "0.7.6"
+version = "0.7.9"
 
 [dependencies.image]
 version = "0.25.6"
@@ -229,7 +229,7 @@ features = [
 default-features = false
 
 [build-dependencies.lazy-js-bundle]
-version = "0.7.6"
+version = "0.7.9"
 
 [target.'cfg(any(target_os = "windows",target_os = "macos",target_os = "linux"))'.dependencies.tray-icon]
 version = "0.21.0"

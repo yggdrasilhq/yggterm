@@ -25,13 +25,15 @@ use yggterm_server::{
     run_app_control_probe_terminal_primary_selection_paste,
     run_app_control_probe_terminal_viewport_input, run_app_control_probe_terminal_viewport_scroll,
     run_app_control_probe_terminal_viewport_select, run_app_control_reclaim_terminal_focus,
-    run_app_control_redraw_terminal, run_app_control_remove_session, run_app_control_resize_window,
+    run_app_control_redraw_terminal, run_app_control_remove_session,
+    run_app_control_reset_theme_editor, run_app_control_resize_window,
     run_app_control_restart_pending_update, run_app_control_scroll_preview,
     run_app_control_scroll_right_panel, run_app_control_send_terminal_input,
     run_app_control_set_clipboard_png_base64, run_app_control_set_clipboard_text,
     run_app_control_set_fullscreen, run_app_control_set_main_zoom,
     run_app_control_set_right_panel_mode, run_app_control_set_row_expanded,
     run_app_control_set_search, run_app_control_set_session_keep_alive,
+    run_app_control_set_theme_editor_open, run_app_control_set_theme_editor_values,
     run_app_control_set_tree_selection, run_app_control_set_window_chrome_hover,
     run_app_control_show_start_page, run_app_control_start_action,
     run_app_control_trigger_update_check, run_attach, run_daemon, run_screenrecord_capture,
@@ -63,6 +65,17 @@ enum BuiltinCliCommand {
     ServerAppHelp,
     ServerSessionsHelp,
     ServerSnapshot,
+}
+
+fn builtin_cli_command_is_pure(command: BuiltinCliCommand) -> bool {
+    matches!(
+        command,
+        BuiltinCliCommand::MainHelp
+            | BuiltinCliCommand::Version
+            | BuiltinCliCommand::ServerHelp
+            | BuiltinCliCommand::ServerAppHelp
+            | BuiltinCliCommand::ServerSessionsHelp
+    )
 }
 
 fn classify_builtin_cli_command(args: &[String]) -> Option<BuiltinCliCommand> {
@@ -159,6 +172,7 @@ fn print_server_app_help() {
   yggterm-headless server app state [--pid <pid>]
   yggterm-headless server app rows [--pid <pid>]
   yggterm-headless server app screenshot [output] [--pid <pid>]
+  yggterm-headless server app open <session-path> [--view <terminal|preview>] [--pid <pid>]
   yggterm-headless server app resize-window --width <px> --height <px> [--pid <pid>]
   yggterm-headless server app session <remove|delete> <session-path> [--pid <pid>]
   yggterm-headless server app start-page [--pid <pid>]
@@ -756,12 +770,75 @@ fn preferred_headless_executable(install_context: &InstallContext) -> Option<std
     )
 }
 
+fn gui_companion_executable_from_headless(current_exe: &Path) -> Option<std::path::PathBuf> {
+    let file_name = current_exe.file_name()?.to_string_lossy();
+    let gui_name = if cfg!(target_os = "windows") {
+        file_name.replace("yggterm-headless", "yggterm")
+    } else {
+        file_name.replace("yggterm-headless", "yggterm")
+    };
+    if gui_name == file_name.as_ref() {
+        return None;
+    }
+    Some(
+        current_exe
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join(gui_name),
+    )
+}
+
+fn preferred_gui_executable_from_headless(
+    current_exe: &Path,
+    install_context: &InstallContext,
+) -> Option<std::path::PathBuf> {
+    install_context
+        .preferred_executable
+        .clone()
+        .filter(|path| path.is_file())
+        .or_else(|| {
+            gui_companion_executable_from_headless(current_exe).filter(|path| path.is_file())
+        })
+}
+
+fn run_app_launch_via_gui_companion(
+    current_exe: &Path,
+    args: &[String],
+    install_context: &InstallContext,
+) -> Result<()> {
+    let Some(gui_exe) = preferred_gui_executable_from_headless(current_exe, install_context) else {
+        anyhow::bail!(
+            "server app launch requires a yggterm GUI companion next to {} or in install-state",
+            current_exe.display()
+        );
+    };
+    let mut command = Command::new(&gui_exe);
+    command.args(args);
+    if let Some(root) = install_context.managed_root.as_ref() {
+        command.env(ENV_YGGTERM_DIRECT_INSTALL_ROOT, root);
+    }
+    let status = command
+        .status()
+        .with_context(|| format!("launching app via GUI companion {}", gui_exe.display()))?;
+    if !status.success() {
+        anyhow::bail!(
+            "server app launch via {} exited with status {}",
+            gui_exe.display(),
+            status
+        );
+    }
+    Ok(())
+}
+
 fn maybe_handoff_to_preferred_headless_executable(
     current_exe: &Path,
     args: &[String],
     install_context: &InstallContext,
 ) -> Result<()> {
     if std::env::var_os(ENV_YGGTERM_SKIP_ACTIVE_EXEC_HANDOFF).is_some() {
+        return Ok(());
+    }
+    if classify_builtin_cli_command(args).is_some_and(builtin_cli_command_is_pure) {
         return Ok(());
     }
     let Some(preferred) = preferred_headless_executable(install_context) else {
@@ -1091,6 +1168,7 @@ fn main() -> Result<()> {
                 let output_path = cli_positional_args(&args, 3).into_iter().next();
                 run_screenrecord_capture("app", output_path, timeout_ms, duration_secs)
             }
+            "launch" => run_app_launch_via_gui_companion(&current_exe, &args, &install_context),
             "clients" => run_app_control_list_clients(),
             "desktop-identity" => run_app_control_desktop_identity(),
             "state" => run_app_control_describe_state(timeout_ms),
@@ -1322,6 +1400,39 @@ fn main() -> Result<()> {
                     "check" | "trigger" => run_app_control_trigger_update_check(timeout_ms),
                     "restart" => run_app_control_restart_pending_update(timeout_ms),
                     other => anyhow::bail!("unsupported app update action: {other}"),
+                }
+            }
+            "theme-editor" => {
+                let action = cli_positional_args(&args, 3)
+                    .into_iter()
+                    .next()
+                    .unwrap_or("open");
+                match action {
+                    "open" | "show" | "on" | "true" | "1" => {
+                        run_app_control_set_theme_editor_open(true, timeout_ms)
+                    }
+                    "close" | "hide" | "off" | "false" | "0" => {
+                        run_app_control_set_theme_editor_open(false, timeout_ms)
+                    }
+                    "reset" | "defaults" => run_app_control_reset_theme_editor(timeout_ms),
+                    "set" | "values" => {
+                        let brightness = cli_flag_value(&args, "--brightness")
+                            .map(str::parse::<f32>)
+                            .transpose()
+                            .context("invalid --brightness for server app theme-editor set")?;
+                        let alpha = cli_flag_value(&args, "--alpha")
+                            .map(str::parse::<f32>)
+                            .transpose()
+                            .context("invalid --alpha for server app theme-editor set")?;
+                        let grain = cli_flag_value(&args, "--grain")
+                            .map(str::parse::<f32>)
+                            .transpose()
+                            .context("invalid --grain for server app theme-editor set")?;
+                        run_app_control_set_theme_editor_values(
+                            brightness, alpha, grain, timeout_ms,
+                        )
+                    }
+                    other => anyhow::bail!("unsupported app theme-editor action: {other}"),
                 }
             }
             "fullscreen" => {
@@ -1868,9 +1979,9 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        BuiltinCliCommand, cached_copy_hint_is_usable, classify_builtin_cli_command,
-        cli_positional_args, normalize_monitor_args, preferred_headless_executable,
-        remote_session_title_fallback,
+        BuiltinCliCommand, builtin_cli_command_is_pure, cached_copy_hint_is_usable,
+        classify_builtin_cli_command, cli_positional_args, gui_companion_executable_from_headless,
+        normalize_monitor_args, preferred_headless_executable, remote_session_title_fallback,
     };
     use std::path::PathBuf;
     use yggterm_core::{InstallChannel, InstallContext, UpdatePolicy};
@@ -1900,6 +2011,40 @@ mod tests {
                 "-h".to_string()
             ]),
             Some(BuiltinCliCommand::ServerAppHelp)
+        );
+    }
+
+    #[test]
+    fn headless_app_control_exposes_theme_editor_actions() {
+        let source = include_str!("yggterm-headless.rs");
+        assert!(source.contains("\"theme-editor\" =>"));
+        assert!(source.contains("run_app_control_set_theme_editor_open"));
+        assert!(source.contains("run_app_control_reset_theme_editor"));
+        assert!(source.contains("run_app_control_set_theme_editor_values"));
+    }
+
+    #[test]
+    fn headless_app_control_exposes_settled_open_path_command() {
+        let source = include_str!("yggterm-headless.rs");
+        assert!(source.contains("server app open <session-path>"));
+        assert!(source.contains("\"open\" =>"));
+        assert!(source.contains("run_app_control_open_path(session_path, view_mode, timeout_ms)"));
+    }
+
+    #[test]
+    fn headless_app_control_routes_launch_through_gui_companion() {
+        let source = include_str!("yggterm-headless.rs");
+        assert!(source.contains("\"launch\" => run_app_launch_via_gui_companion"));
+        assert!(source.contains("server app launch requires a yggterm GUI companion"));
+        assert_eq!(
+            gui_companion_executable_from_headless(&PathBuf::from("/opt/yggterm-headless")),
+            Some(PathBuf::from("/opt/yggterm"))
+        );
+        assert_eq!(
+            gui_companion_executable_from_headless(&PathBuf::from(
+                "/opt/yggterm-headless-linux-x86_64"
+            )),
+            Some(PathBuf::from("/opt/yggterm-linux-x86_64"))
         );
     }
 
@@ -2004,6 +2149,20 @@ mod tests {
             preferred,
             PathBuf::from("/direct/versions/2.1.52").join(expected_name)
         );
+    }
+
+    #[test]
+    fn builtin_version_command_is_pure_and_must_not_handoff() {
+        let command = classify_builtin_cli_command(&["--version".to_string()])
+            .expect("version should be builtin");
+        assert_eq!(command, BuiltinCliCommand::Version);
+        assert!(builtin_cli_command_is_pure(command));
+
+        let snapshot =
+            classify_builtin_cli_command(&["server".to_string(), "snapshot".to_string()])
+                .expect("snapshot should be builtin");
+        assert_eq!(snapshot, BuiltinCliCommand::ServerSnapshot);
+        assert!(!builtin_cli_command_is_pure(snapshot));
     }
 
     #[test]

@@ -21,6 +21,9 @@ jobs:
       - name: Validate demo manifests
         run: python3 scripts/validate_demo_manifests.py
 
+      - name: Validate architecture contracts
+        run: python3 scripts/check_architecture_contracts.py
+
   build-linux:
     runs-on: ${{ matrix.runs_on }}
     strategy:
