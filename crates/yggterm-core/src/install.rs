@@ -68,8 +68,18 @@ struct DirectInstallStateCompat {
     repo: String,
     #[serde(default = "default_asset_label_string")]
     asset_label: String,
-    active_version: String,
-    active_executable: PathBuf,
+    #[serde(default)]
+    active_version: Option<String>,
+    #[serde(default)]
+    active_executable: Option<PathBuf>,
+    #[serde(default)]
+    version: Option<String>,
+    #[serde(default)]
+    executable_path: Option<PathBuf>,
+    #[serde(default)]
+    app_path: Option<PathBuf>,
+    #[serde(default)]
+    yggterm_path: Option<PathBuf>,
     #[serde(default)]
     icon_revision: String,
 }
@@ -292,14 +302,47 @@ fn load_direct_install_state(root: &Path) -> Result<Option<DirectInstallState>> 
         .unwrap_or(bytes.as_slice());
     let compat: DirectInstallStateCompat = serde_json::from_slice(json_bytes)
         .with_context(|| format!("failed to parse install state {}", path.display()))?;
+    let modern_version = compat.version.clone().filter(|version| !version.is_empty());
+    let modern_executable = compat
+        .executable_path
+        .clone()
+        .or_else(|| compat.yggterm_path.clone())
+        .or_else(|| compat.app_path.clone());
+    let legacy_version = compat
+        .active_version
+        .clone()
+        .filter(|version| !version.is_empty());
+    let legacy_executable = compat.active_executable.clone();
+    let prefer_modern = modern_version
+        .as_deref()
+        .zip(modern_executable.as_ref())
+        .is_some_and(|(version, executable)| {
+            legacy_version.as_deref() != Some(version)
+                && executable
+                    .to_string_lossy()
+                    .replace('\\', "/")
+                    .contains(&format!("/versions/{version}/"))
+        });
+    let active_version = if prefer_modern {
+        modern_version
+    } else {
+        legacy_version.clone().or(modern_version)
+    }
+    .context("direct install state is missing active_version/version")?;
+    let active_executable = if prefer_modern {
+        modern_executable
+    } else {
+        legacy_executable.or(modern_executable)
+    }
+    .context("direct install state is missing active_executable/executable_path")?;
     let state = DirectInstallState {
         channel: compat.channel,
         repo: compat.repo,
         asset_label: compat.asset_label,
-        active_version: compat.active_version.clone(),
-        active_executable: compat.active_executable,
+        active_version: active_version.clone(),
+        active_executable,
         icon_revision: if compat.icon_revision.is_empty() {
-            compat.active_version
+            active_version
         } else {
             compat.icon_revision
         },
@@ -931,8 +974,12 @@ where
         percent: 99,
         detail: "Refreshing desktop integration".to_string(),
     });
-    if run_install_integrate_with_binary(&binary_path, root).is_err() {
-        let _ = refresh_desktop_integration(&updated_context);
+    let child_integrate_error = run_install_integrate_with_binary(&binary_path, root).err();
+    let local_integrate_error = refresh_desktop_integration(&updated_context).err();
+    if let (Some(child_error), Some(local_error)) = (child_integrate_error, local_integrate_error) {
+        anyhow::bail!(
+            "failed to refresh desktop integration after update: child integrate failed: {child_error}; local integrate failed: {local_error}"
+        );
     }
     on_progress(ReleaseUpdateInstallProgress {
         stage: ReleaseUpdateInstallStage::Finalizing,
@@ -1397,6 +1444,96 @@ mod tests {
         assert!(script.contains("[ \"${2:-}\" = 'app' ] && [ \"${3:-}\" = 'launch' ]"));
         assert!(script.contains("[ \"${1:-}\" = '--version' ]"));
         assert!(script.contains("target=\"$target_dir/yggterm-headless\""));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_launcher_replaces_stale_direct_symlink() {
+        use std::os::unix::fs as unix_fs;
+
+        let root =
+            std::env::temp_dir().join(format!("yggterm-launcher-test-{}", uuid::Uuid::new_v4()));
+        let bin_dir = root.join("bin");
+        let old_dir = root.join("direct").join("versions").join("2.4.56");
+        let new_dir = root.join("direct").join("versions").join("2.5.0");
+        fs::create_dir_all(&bin_dir).expect("create bin dir");
+        fs::create_dir_all(&old_dir).expect("create old dir");
+        fs::create_dir_all(&new_dir).expect("create new dir");
+        let old_binary = old_dir.join("yggterm");
+        let new_binary = new_dir.join("yggterm");
+        fs::write(&old_binary, "#!/bin/sh\n").expect("write old binary");
+        fs::write(&new_binary, "#!/bin/sh\n").expect("write new binary");
+
+        let launcher = bin_dir.join("yggterm");
+        unix_fs::symlink(&old_binary, &launcher).expect("create stale symlink");
+        assert!(
+            fs::symlink_metadata(&launcher)
+                .expect("symlink metadata")
+                .file_type()
+                .is_symlink()
+        );
+
+        let context = InstallContext {
+            channel: InstallChannel::Direct,
+            update_policy: UpdatePolicy::Auto,
+            repo: DEFAULT_RELEASE_REPO.to_string(),
+            asset_label: "linux-x86_64".to_string(),
+            current_version: "2.5.0".to_string(),
+            executable_path: new_binary.clone(),
+            preferred_executable: Some(new_binary.clone()),
+            managed_root: Some(root.join("direct")),
+            manager_hint: Some("Direct install".to_string()),
+        };
+        write_linux_launcher_script(
+            &context,
+            &launcher,
+            "yggterm",
+            &new_binary,
+            "yggterm launcher",
+        )
+        .expect("replace stale launcher");
+
+        let metadata = fs::symlink_metadata(&launcher).expect("launcher metadata");
+        assert!(!metadata.file_type().is_symlink());
+        let contents = fs::read_to_string(&launcher).expect("launcher contents");
+        assert!(contents.contains(LINUX_LAUNCHER_MARKER));
+        assert!(contents.contains("active_executable"));
+        assert!(!contents.contains("2.4.56/yggterm"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn direct_install_state_prefers_modern_version_fields_over_stale_active_fields() {
+        let root = std::env::temp_dir().join(format!(
+            "yggterm-install-state-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&root).expect("create install root");
+        let state = r#"{
+  "channel": "direct",
+  "repo": "test/repo",
+  "asset_label": "linux-x86_64",
+  "active_version": "2.6.46",
+  "active_executable": "/home/pi/.local/share/yggterm/direct/versions/2.6.46/yggterm",
+  "version": "2.6.47",
+  "executable_path": "/home/pi/.local/share/yggterm/direct/versions/2.6.47/yggterm",
+  "headless_path": "/home/pi/.local/share/yggterm/direct/versions/2.6.47/yggterm-headless",
+  "icon_revision": "2.6.46"
+}"#;
+        fs::write(root.join(INSTALL_STATE_FILENAME), state).expect("write install state");
+
+        let loaded = load_direct_install_state(&root)
+            .expect("load install state")
+            .expect("direct state");
+
+        assert_eq!(loaded.active_version, "2.6.47");
+        assert_eq!(
+            loaded.active_executable,
+            PathBuf::from("/home/pi/.local/share/yggterm/direct/versions/2.6.47/yggterm")
+        );
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[cfg(target_os = "linux")]

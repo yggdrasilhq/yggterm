@@ -344,16 +344,11 @@ def titlebar_matches_viewport(state: dict) -> bool:
     active_summary = (viewport.get("active_summary") or "").strip()
     title_text = (titlebar.get("title_text") or "").strip()
     summary_text = (titlebar.get("summary_text") or "").strip()
-    button_tooltip = (titlebar.get("button_tooltip") or "").strip()
     if active_title and title_text != active_title:
         return False
     if active_summary and titlebar.get("menu_open") and summary_text != active_summary:
         return False
-    if active_summary and not (
-        active_summary == button_tooltip
-        or active_summary.startswith(button_tooltip)
-        or button_tooltip.startswith(active_summary)
-    ):
+    if active_summary and summary_text and summary_text != active_summary:
         return False
     return True
 

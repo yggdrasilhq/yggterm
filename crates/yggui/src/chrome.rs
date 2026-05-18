@@ -65,8 +65,6 @@ pub fn TitlebarChrome(
                 evt.prevent_default();
                 let pointer = evt.client_coordinates();
                 pending_drag_origin.set(Some((pointer.x, pointer.y)));
-                on_request_window_drag.call(());
-                window().drag();
             },
             onmousemove: move |evt| {
                 let Some((start_x, start_y)) = pending_drag_origin() else {
@@ -106,6 +104,7 @@ pub fn TitlebarChrome(
                     return;
                 }
                 evt.prevent_default();
+                evt.stop_propagation();
                 pending_drag_origin.set(None);
                 on_toggle_maximized.call(());
             },
@@ -398,4 +397,39 @@ pub fn search_input_style(text_color: &str, _dark_surface: bool) -> String {
          box-shadow:none; user-select:text; -webkit-user-select:text; caret-color:{};",
         text_color, text_color
     )
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn titlebar_waits_for_drag_threshold_so_double_click_can_toggle_maximize() {
+        let source = include_str!("chrome.rs");
+        let mouse_down = source
+            .find("onmousedown: move |evt|")
+            .expect("titlebar mousedown handler");
+        let mouse_move = source
+            .find("onmousemove: move |evt|")
+            .expect("titlebar mousemove handler");
+        let mouse_up = source
+            .find("onmouseup: move |evt|")
+            .expect("titlebar mouseup handler");
+        let double_click = source
+            .find("ondoubleclick: move |evt|")
+            .expect("titlebar double-click handler");
+        let mouse_down_block = &source[mouse_down..mouse_move];
+        let mouse_move_block = &source[mouse_move..mouse_up];
+        let double_click_block = &source[double_click..];
+
+        assert!(
+            !mouse_down_block.contains("window().drag()"),
+            "native drag on mousedown can swallow the second click before Dioxus emits double-click"
+        );
+        assert!(
+            !mouse_down_block.contains("on_request_window_drag.call(())"),
+            "drag telemetry should mean an actual drag threshold was crossed"
+        );
+        assert!(mouse_move_block.contains("TITLEBAR_DRAG_THRESHOLD_PX"));
+        assert!(mouse_move_block.contains("window().drag()"));
+        assert!(double_click_block.contains("on_toggle_maximized.call(())"));
+    }
 }

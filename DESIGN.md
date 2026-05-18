@@ -63,7 +63,10 @@ The surrounding chrome should feel supportive, not dominant.
 
 - Side rails should be lighter and quieter than the main canvas.
 - A faint blue-to-green fresh tint over a muted neutral base is desirable.
-- A light gradient plus blur system is preferred when the platform supports it.
+- A light gradient system is preferred for stable desktop shells. Do not ship
+  compositor blur or alpha-driven transparency in the stable path; keep blur
+  experiments on an explicit experimental branch until they are deterministic
+  across focus changes, restore, and platform compositors.
 - Rails should avoid heavy borders.
 - The shell should feel visually unified rather than partitioned into harsh boxes.
 - Titlebar, side rails, and utility surfaces should feel like one seamless scaffold around the floating main canvas.
@@ -103,20 +106,31 @@ Yggdrasil shells should support a reusable visual theme editor.
   - draggable color stops
   - a lightweight color library
   - a brightness control
-  - a single grain dial control
 - Double-clicking the preview pad should be able to add a color stop.
 - The preview pad should use a visible grid, not a blank field, so stop placement feels intentional.
 - Dragging color stops should live-preview the shell background.
 - Light and dark shell modes should remain selectable independently of the custom gradient.
-- Saving should persist the theme; cancel should revert live preview.
+- Theme edits apply live so the shell can be judged in place. Closing the editor
+  persists the current theme; reset returns to the base theme.
 - Reset should always return to the project’s base shell theme, not an empty placeholder state.
 - The active portable theme should be stored in `~/.yggterm/settings.json` under the `theme` object.
 - If no custom colors exist, the shell should fall back to the system gradient cleanly.
+- Stable Yggterm exposes brightness only as a scalar control. Alpha,
+  translucency, grain, and blur controls are experimental and must not affect
+  stable shell rendering.
+- The theme editor dialog itself should be opaque to the app behind it, while
+  still applying shell edits live around the dialog.
 
 #### Theme surfaces
 
 - The outer shell background should be theme-driven.
-- Supporting chrome should inherit the shell gradient subtly through transparency and blur.
+- Supporting chrome should inherit the shell gradient subtly without blur.
+- Auto-hidden titlebar reveal is chrome, not layout. It must draw over the
+  workspace with the same shell tint/gradient language as the visible
+  titlebar, and must not resize or vertically shift terminal content.
+- Transparent desktop chrome must never be alpha-only. The stable material
+  stack is theme tint, gradient wash, and enough fill opacity to stay readable
+  without compositor blur.
 - The main workspace should remain calmer and more neutral than the shell chrome.
 - Theme accent can be derived from the dominant gradient stop for lightweight emphasis.
 - The theme modal itself should not blur the background. The surrounding UI should remain clearly visible, with a calm blue active-state halo around the modal to signal focused editing.
@@ -448,7 +462,7 @@ The shell may add sidebar placement, metadata, restore state, hot-update protect
 
 When debugging terminal rendering, the goal is to make xterm.js render the PTY truth correctly. Do not cover terminal defects with Yggterm-owned decorative layers just to make a screenshot pass. Live terminal prompt backgrounds, cursors, selection, input echo, resize redraws, and Codex status animation must be painted by xterm.js from PTY bytes, terminal attributes, or xterm.js-native renderer APIs such as decorations, not by Yggterm overlay DOM. If a diagnostic compatibility shim is ever needed, it must stay behind an explicit development flag, be rejected by release smokes, and never become a second source of terminal content truth. If a Codex prompt background, cursor, resize redraw, working animation, or typed input is wrong, first trace the PTY bytes, xterm buffer, theme mapping, renderer mode, fit/resize state, and retained-host identity before changing shell chrome.
 
-Operational xterm.js notes, fixtures, and current terminal-rendering hypotheses live in `docs/xterm.md`.
+Operational xterm.js notes, fixtures, and current terminal-rendering hypotheses live in `docs/xterm.md`. Cross-layer source-of-truth failures and the banned shortcut classes live in `docs/architecture-audit-2026-05-16.md`.
 
 The product has three separate identities that must not be conflated:
 
@@ -472,6 +486,9 @@ Each app surface has exactly one source of truth:
 
 - Every live local and SSH runtime should appear there while it is alive.
 - The original workspace row remains the user's visual bookmark.
+- Dragged row order in `Live Sessions` is durable user layout. Focusing or
+  switching sessions must not reorder the list; only explicit drag/drop and new
+  runtime creation may change it.
 - The `X` affordance in `Live Sessions` kills the runtime after confirmation. It does not delete stored transcript history.
 - Closing a background live runtime must not move the active viewport.
 - Closing the active live runtime should fall back through the validated viewport history: previous live/stored session in its prior mode, previous scoped Startpage, then global Startpage. Closed session paths and aliases must be pruned before choosing this fallback.
@@ -518,7 +535,7 @@ Terminal focus, input, scroll, selection, and retained-host recovery must have o
 
 - A terminal that can scroll but cannot type is a broken state.
 - A terminal that can type but cannot scroll while the user is reading scrollback is also broken.
-- An active visible terminal with a write-frame budget high enough to make typing or TUI animation feel stepped is broken. Keep heavy coalescing for background terminals, not for the active prompt.
+- An active visible terminal with a write-frame budget high enough to make typing or TUI animation feel stepped is broken. Write budgets may batch flush timing, but they must never coalesce, trim, deduplicate, reorder, or rewrite PTY bytes before xterm.js parses them.
 - Retained terminal hosts may stay mounted only while their active session identity and input policy match the shell state.
 - Programmatic layout changes such as titlebar auto-hide reveal/collapse, fit-addon resize, and visible-paint refits must not be interpreted as user scrollback. When the host is in PromptFollow, these changes must converge back to the live buffer bottom; when the user is explicitly in scrollback, the app must preserve that reading position.
 - A scroll controller may appear when the user is intentionally away from the prompt, but it is only a YggUI control surface over xterm viewport APIs. It must not draw terminal content, prompt backgrounds, cursors, or line repairs, and release proof must still come from xterm/app-control/screenshot truth.

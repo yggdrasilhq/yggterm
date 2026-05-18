@@ -32,6 +32,7 @@ impl Default for YgguiThemeColorStop {
 pub struct YgguiThemeSpec {
     pub colors: Vec<YgguiThemeColorStop>,
     pub brightness: f32,
+    pub alpha: f32,
     pub grain: f32,
 }
 
@@ -40,6 +41,7 @@ impl Default for YgguiThemeSpec {
         Self {
             colors: Vec::new(),
             brightness: 0.56,
+            alpha: 0.78,
             grain: 0.12,
         }
     }

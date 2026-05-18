@@ -44,11 +44,12 @@ use yggterm_server::{
     run_app_control_set_preview_layout, run_app_control_set_right_panel_mode,
     run_app_control_set_row_expanded, run_app_control_set_search,
     run_app_control_set_session_keep_alive, run_app_control_set_theme_editor_open,
-    run_app_control_set_tree_selection, run_app_control_set_ui_theme,
-    run_app_control_set_window_chrome_hover, run_app_control_start_action,
-    run_app_control_trigger_update_check, run_attach, run_daemon, run_screenrecord_capture,
-    run_screenshot_capture, run_trace_bundle, run_trace_follow, run_trace_tail, shutdown, snapshot,
-    start_local_session, status, terminal_restart, terminal_write, try_run_remote_server_command,
+    run_app_control_set_theme_editor_values, run_app_control_set_tree_selection,
+    run_app_control_set_ui_theme, run_app_control_set_window_chrome_hover,
+    run_app_control_start_action, run_app_control_trigger_update_check, run_attach, run_daemon,
+    run_screenrecord_capture, run_screenshot_capture, run_trace_bundle, run_trace_follow,
+    run_trace_tail, shutdown, snapshot, start_local_session, status, terminal_restart,
+    terminal_write, try_run_remote_server_command,
 };
 use yggterm_shell::{
     ShellBootstrap, launch_shell, start_daemon_watchdog, terminal_identity_appearance_for_settings,
@@ -224,6 +225,10 @@ fn app_control_state_launch_summary(
     }))
 }
 
+fn app_control_launch_state_timeout_ms(timeout_ms: u64) -> u64 {
+    timeout_ms.clamp(250, 4_000)
+}
+
 fn maybe_wait_for_update_relaunch_parent_exit() {
     let Some(pid) = std::env::var(ENV_YGGTERM_RELAUNCH_AFTER_PID)
         .ok()
@@ -349,6 +354,15 @@ fn launch_app_background(
         .stdout(Stdio::from(stdout_file))
         .stderr(Stdio::from(stderr_file))
         .env(ENV_YGGTERM_HOME, home_dir);
+    #[cfg(target_os = "linux")]
+    {
+        let current_env = linux_current_environment_map();
+        let desktop_overrides = linux_gui_entry_environment_overrides_from_desktop(
+            &current_env,
+            discover_linux_desktop_environment(),
+        );
+        command.envs(desktop_overrides);
+    }
     if allow_multi_window {
         command.env("YGGTERM_ALLOW_MULTI_WINDOW", "1");
     }
@@ -374,7 +388,7 @@ fn launch_app_background(
     let should_wait_for_app = wait_visible || wait_settled;
     if should_wait_for_app {
         let deadline = std::time::Instant::now() + Duration::from_millis(timeout_ms.max(100));
-        let state_timeout_ms = timeout_ms.clamp(250, 1_500);
+        let state_timeout_ms = app_control_launch_state_timeout_ms(timeout_ms);
         let control_cwd = control_exe
             .parent()
             .or_else(|| current_exe.parent())
@@ -572,6 +586,7 @@ fn print_server_app_help() {
   yggterm server app state [--pid <pid>]
   yggterm server app rows [--pid <pid>]
   yggterm server app screenshot [output] [--pid <pid>]
+  yggterm server app open <session-path> [--view <terminal|preview>] [--pid <pid>]
   yggterm server app session <remove|delete> <session-path> [--pid <pid>]
   yggterm server app start-page [--pid <pid>]
   yggterm server app terminal <new|send|focus|probe-type|probe-scroll|probe-select|probe-context-menu> ...
@@ -1206,6 +1221,23 @@ fn main() -> Result<()> {
                         run_app_control_set_theme_editor_open(false, timeout_ms)
                     }
                     "reset" | "defaults" => run_app_control_reset_theme_editor(timeout_ms),
+                    "set" | "values" => {
+                        let brightness = cli_flag_value(&args, "--brightness")
+                            .map(str::parse::<f32>)
+                            .transpose()
+                            .context("invalid --brightness for server app theme-editor set")?;
+                        let alpha = cli_flag_value(&args, "--alpha")
+                            .map(str::parse::<f32>)
+                            .transpose()
+                            .context("invalid --alpha for server app theme-editor set")?;
+                        let grain = cli_flag_value(&args, "--grain")
+                            .map(str::parse::<f32>)
+                            .transpose()
+                            .context("invalid --grain for server app theme-editor set")?;
+                        run_app_control_set_theme_editor_values(
+                            brightness, alpha, grain, timeout_ms,
+                        )
+                    }
                     other => anyhow::bail!("unsupported app theme-editor action: {other}"),
                 }
             }
@@ -1991,15 +2023,13 @@ fn linux_terminal_renderer_policy_from_input(
             reason: "xterm_canvas_disabled_for_x11",
         };
     }
-    if input.wayland_display_present {
-        return LinuxTerminalRendererPolicy {
-            set_canvas_env: Some("1"),
-            reason: "xterm_canvas_enabled_for_wayland",
-        };
-    }
     LinuxTerminalRendererPolicy {
-        set_canvas_env: None,
-        reason: "xterm_canvas_default",
+        set_canvas_env: Some("0"),
+        reason: if input.wayland_display_present {
+            "xterm_canvas_disabled_by_default_for_wayland"
+        } else {
+            "xterm_canvas_disabled_by_default"
+        },
     }
 }
 
@@ -2043,6 +2073,16 @@ const LINUX_GUI_ENTRY_ENV_KEYS: &[&str] = &[
     "KDE_FULL_SESSION",
     "DBUS_SESSION_BUS_ADDRESS",
 ];
+
+#[cfg(target_os = "linux")]
+const LINUX_GUI_ENTRY_ENV_SOURCE_KEY: &str = "YGGTERM_DESKTOP_ENV_HYDRATED_FROM";
+
+#[cfg(target_os = "linux")]
+fn linux_current_environment_map() -> BTreeMap<String, String> {
+    std::env::vars()
+        .filter(|(key, value)| !key.trim().is_empty() && !value.trim().is_empty())
+        .collect()
+}
 
 #[cfg(target_os = "linux")]
 fn linux_environ_bytes_to_map(environ: &[u8]) -> BTreeMap<String, String> {
@@ -2138,22 +2178,54 @@ fn discover_linux_desktop_environment() -> Option<(String, BTreeMap<String, Stri
 }
 
 #[cfg(target_os = "linux")]
-fn hydrate_linux_gui_entry_environment_from_desktop() {
-    if std::env::var_os("DISPLAY").is_some() || std::env::var_os("WAYLAND_DISPLAY").is_some() {
-        return;
+fn linux_gui_entry_environment_overrides_from_desktop(
+    current_env: &BTreeMap<String, String>,
+    desktop_env: Option<(String, BTreeMap<String, String>)>,
+) -> BTreeMap<String, String> {
+    let display_present =
+        current_env.contains_key("DISPLAY") || current_env.contains_key("WAYLAND_DISPLAY");
+    let desktop_identity_present = [
+        "XDG_CURRENT_DESKTOP",
+        "XDG_SESSION_DESKTOP",
+        "DESKTOP_SESSION",
+        "KDE_FULL_SESSION",
+    ]
+    .iter()
+    .any(|key| current_env.contains_key(*key));
+    let runtime_present =
+        current_env.contains_key("XDG_RUNTIME_DIR") && current_env.contains_key("XAUTHORITY");
+    if display_present && desktop_identity_present && runtime_present {
+        return BTreeMap::new();
     }
-    let Some((source, env)) = discover_linux_desktop_environment() else {
-        return;
+    let Some((source, env)) = desktop_env else {
+        return BTreeMap::new();
     };
+    let mut overrides = BTreeMap::new();
     for key in LINUX_GUI_ENTRY_ENV_KEYS {
-        if std::env::var_os(key).is_none()
+        if display_present && matches!(*key, "DISPLAY" | "WAYLAND_DISPLAY") {
+            continue;
+        }
+        if !current_env.contains_key(*key)
             && let Some(value) = env.get(*key)
             && !value.trim().is_empty()
         {
-            unsafe { std::env::set_var(key, value) };
+            overrides.insert((*key).to_string(), value.to_string());
         }
     }
-    unsafe { std::env::set_var("YGGTERM_DESKTOP_ENV_HYDRATED_FROM", source) };
+    overrides.insert(LINUX_GUI_ENTRY_ENV_SOURCE_KEY.to_string(), source);
+    overrides
+}
+
+#[cfg(target_os = "linux")]
+fn hydrate_linux_gui_entry_environment_from_desktop() {
+    let current_env = linux_current_environment_map();
+    let overrides = linux_gui_entry_environment_overrides_from_desktop(
+        &current_env,
+        discover_linux_desktop_environment(),
+    );
+    for (key, value) in overrides {
+        unsafe { std::env::set_var(key, value) };
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -2443,12 +2515,35 @@ fn install_signal_shutdown(home_dir: std::path::PathBuf, endpoint: yggterm_serve
             return;
         }
         if let Ok(remaining_clients) = unregister_signal_client_instance(&home_dir, &endpoint) {
-            if remaining_clients == 0 {
+            let shutdown_daemon = status(&endpoint).ok().is_some_and(|runtime| {
+                signal_shutdown_policy_allows_daemon_shutdown(
+                    remaining_clients,
+                    runtime.terminal_session_count,
+                    runtime.owned_terminal_session_count,
+                    runtime.preserved_terminal_owner_count,
+                    true,
+                )
+            });
+            if shutdown_daemon {
                 let _ = shutdown(&endpoint);
             }
         }
         std::process::exit(130);
     });
+}
+
+fn signal_shutdown_policy_allows_daemon_shutdown(
+    remaining_clients: usize,
+    terminal_session_count: usize,
+    owned_terminal_session_count: usize,
+    preserved_terminal_owner_count: usize,
+    status_reachable: bool,
+) -> bool {
+    status_reachable
+        && remaining_clients == 0
+        && terminal_session_count == 0
+        && owned_terminal_session_count == 0
+        && preserved_terminal_owner_count == 0
 }
 
 fn signal_client_instance_scope(endpoint: &yggterm_server::ServerEndpoint) -> String {
@@ -3244,15 +3339,19 @@ mod tests {
     use super::superseded_client_termination_signal;
     use super::{
         BuiltinCliCommand, LinuxWindowProfileInput, SignalClientScope,
-        classify_builtin_cli_command, compatible_signal_client_count,
-        linux_window_profile_from_input, main_should_retire_superseded_clients_before_shell,
-        record_matches_executable, should_retire_superseded_client, signal_client_instances_dir,
-        signal_client_scope_matches, signal_parse_process_start_ticks_from_stat,
-        signal_process_start_ticks, superseded_client_close_command,
+        app_control_launch_state_timeout_ms, classify_builtin_cli_command,
+        compatible_signal_client_count, linux_window_profile_from_input,
+        main_should_retire_superseded_clients_before_shell, record_matches_executable,
+        should_retire_superseded_client, signal_client_instances_dir, signal_client_scope_matches,
+        signal_parse_process_start_ticks_from_stat, signal_process_start_ticks,
+        signal_shutdown_policy_allows_daemon_shutdown, superseded_client_close_command,
         superseded_client_retirement_strategy_label,
     };
     #[cfg(target_os = "linux")]
-    use super::{linux_choose_desktop_environment, linux_environ_bytes_to_map};
+    use super::{
+        LINUX_GUI_ENTRY_ENV_SOURCE_KEY, linux_choose_desktop_environment,
+        linux_environ_bytes_to_map, linux_gui_entry_environment_overrides_from_desktop,
+    };
     #[cfg(target_os = "linux")]
     use std::collections::BTreeMap;
     use std::fs;
@@ -3302,6 +3401,40 @@ mod tests {
             ]),
             Some(BuiltinCliCommand::ServerSessionsHelp)
         );
+    }
+
+    #[test]
+    fn app_launch_wait_uses_dom_snapshot_sized_state_budget() {
+        assert_eq!(app_control_launch_state_timeout_ms(100), 250);
+        assert_eq!(app_control_launch_state_timeout_ms(1_500), 1_500);
+        assert_eq!(app_control_launch_state_timeout_ms(8_000), 4_000);
+    }
+
+    #[test]
+    fn app_cli_help_exposes_settled_open_path_command() {
+        let source = include_str!("main.rs");
+        assert!(source.contains("server app open <session-path>"));
+        assert!(source.contains("\"open\" =>"));
+        assert!(source.contains("run_app_control_open_path(session_path, view_mode, timeout_ms)"));
+    }
+
+    #[test]
+    fn signal_shutdown_policy_preserves_daemon_with_terminal_runtimes() {
+        assert!(!signal_shutdown_policy_allows_daemon_shutdown(
+            0, 1, 1, 0, true
+        ));
+        assert!(!signal_shutdown_policy_allows_daemon_shutdown(
+            0, 0, 0, 1, true
+        ));
+        assert!(!signal_shutdown_policy_allows_daemon_shutdown(
+            0, 0, 0, 0, false
+        ));
+        assert!(!signal_shutdown_policy_allows_daemon_shutdown(
+            1, 0, 0, 0, true
+        ));
+        assert!(signal_shutdown_policy_allows_daemon_shutdown(
+            0, 0, 0, 0, true
+        ));
     }
 
     #[test]
@@ -3465,7 +3598,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn linux_terminal_renderer_policy_makes_wayland_canvas_explicit() {
+    fn linux_terminal_renderer_policy_keeps_canvas_opt_in() {
         use super::{LinuxTerminalRendererPolicyInput, linux_terminal_renderer_policy_from_input};
 
         let wayland = linux_terminal_renderer_policy_from_input(LinuxTerminalRendererPolicyInput {
@@ -3474,8 +3607,11 @@ mod tests {
             wayland_display_present: true,
             display_present: true,
         });
-        assert_eq!(wayland.set_canvas_env, Some("1"));
-        assert_eq!(wayland.reason, "xterm_canvas_enabled_for_wayland");
+        assert_eq!(wayland.set_canvas_env, Some("0"));
+        assert_eq!(
+            wayland.reason,
+            "xterm_canvas_disabled_by_default_for_wayland"
+        );
 
         let x11 = linux_terminal_renderer_policy_from_input(LinuxTerminalRendererPolicyInput {
             explicit_canvas_env: false,
@@ -3546,6 +3682,88 @@ mod tests {
         assert_eq!(
             picked.1.get("WAYLAND_DISPLAY").map(String::as_str),
             Some("wayland-0")
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_gui_launch_env_hydrates_ssh_child_from_desktop_scope() {
+        let mut current_env = BTreeMap::new();
+        current_env.insert("XDG_RUNTIME_DIR".to_string(), "/run/user/1000".to_string());
+        current_env.insert(
+            "SSH_CONNECTION".to_string(),
+            "192.0.2.1 1 192.0.2.2 2".to_string(),
+        );
+
+        let mut plasma_env = BTreeMap::new();
+        plasma_env.insert("XDG_RUNTIME_DIR".to_string(), "/run/user/1000".to_string());
+        plasma_env.insert("WAYLAND_DISPLAY".to_string(), "wayland-0".to_string());
+        plasma_env.insert("DISPLAY".to_string(), ":1".to_string());
+        plasma_env.insert(
+            "XAUTHORITY".to_string(),
+            "/run/user/1000/xauth_example".to_string(),
+        );
+        plasma_env.insert("XDG_CURRENT_DESKTOP".to_string(), "KDE".to_string());
+        plasma_env.insert("XDG_SESSION_DESKTOP".to_string(), "KDE".to_string());
+        plasma_env.insert("DESKTOP_SESSION".to_string(), "plasma".to_string());
+        plasma_env.insert("KDE_FULL_SESSION".to_string(), "true".to_string());
+        plasma_env.insert(
+            "DBUS_SESSION_BUS_ADDRESS".to_string(),
+            "unix:path=/run/user/1000/bus".to_string(),
+        );
+
+        let overrides = linux_gui_entry_environment_overrides_from_desktop(
+            &current_env,
+            Some(("plasmashell".to_string(), plasma_env)),
+        );
+
+        assert_eq!(overrides.get("DISPLAY").map(String::as_str), Some(":1"));
+        assert_eq!(
+            overrides.get("WAYLAND_DISPLAY").map(String::as_str),
+            Some("wayland-0")
+        );
+        assert_eq!(
+            overrides.get("XAUTHORITY").map(String::as_str),
+            Some("/run/user/1000/xauth_example")
+        );
+        assert!(!overrides.contains_key("XDG_RUNTIME_DIR"));
+        assert_eq!(
+            overrides
+                .get(LINUX_GUI_ENTRY_ENV_SOURCE_KEY)
+                .map(String::as_str),
+            Some("plasmashell")
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_gui_launch_env_keeps_existing_display_scope() {
+        let mut current_env = BTreeMap::new();
+        current_env.insert("DISPLAY".to_string(), ":99".to_string());
+        current_env.insert(
+            "XDG_CURRENT_DESKTOP".to_string(),
+            "test-desktop".to_string(),
+        );
+        current_env.insert("XDG_RUNTIME_DIR".to_string(), "/run/user/1000".to_string());
+
+        let mut plasma_env = BTreeMap::new();
+        plasma_env.insert("WAYLAND_DISPLAY".to_string(), "wayland-0".to_string());
+        plasma_env.insert("DISPLAY".to_string(), ":1".to_string());
+        plasma_env.insert(
+            "XAUTHORITY".to_string(),
+            "/run/user/1000/xauth_example".to_string(),
+        );
+
+        let overrides = linux_gui_entry_environment_overrides_from_desktop(
+            &current_env,
+            Some(("plasmashell".to_string(), plasma_env)),
+        );
+
+        assert_eq!(overrides.get("DISPLAY"), None);
+        assert_eq!(overrides.get("WAYLAND_DISPLAY"), None);
+        assert_eq!(
+            overrides.get("XAUTHORITY").map(String::as_str),
+            Some("/run/user/1000/xauth_example")
         );
     }
 
@@ -3648,6 +3866,7 @@ mod tests {
         let old = ClientInstanceRecord {
             pid: 1234,
             started_at_ms: 1,
+            linux_desktop_app_id: None,
             process_start_ticks: Some(77),
             executable_path: Some(
                 "/home/pi/.local/share/yggterm/direct/versions/2.1.49/yggterm".to_string(),
@@ -3677,6 +3896,7 @@ mod tests {
         let same_exe = ClientInstanceRecord {
             pid: 1234,
             started_at_ms: 1,
+            linux_desktop_app_id: None,
             process_start_ticks: Some(77),
             executable_path: Some(current_text),
             display: Some(":1".to_string()),
@@ -3692,6 +3912,7 @@ mod tests {
         let other_display = ClientInstanceRecord {
             pid: 5678,
             started_at_ms: 1,
+            linux_desktop_app_id: None,
             process_start_ticks: Some(88),
             executable_path: Some(
                 "/home/pi/.local/share/yggterm/direct/versions/2.1.49/yggterm".to_string(),
