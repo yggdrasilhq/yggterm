@@ -68,6 +68,10 @@ pub(crate) enum TerminalJsEvent {
         cursor_y: u16,
         rows: u16,
         blank_rows_below_cursor: u16,
+        render_health_status: String,
+        render_health_reason: String,
+        render_health_recovery_count: u32,
+        render_health_recovery_pending: bool,
     },
     Paint {
         child_count: usize,
@@ -128,6 +132,14 @@ enum TerminalJsEventWire {
         cursor_y: u16,
         rows: u16,
         blank_rows_below_cursor: u16,
+        #[serde(default)]
+        render_health_status: String,
+        #[serde(default)]
+        render_health_reason: String,
+        #[serde(default)]
+        render_health_recovery_count: u32,
+        #[serde(default)]
+        render_health_recovery_pending: bool,
     },
     Paint {
         child_count: usize,
@@ -186,6 +198,10 @@ impl From<TerminalJsEventWire> for TerminalJsEvent {
                 cursor_y,
                 rows,
                 blank_rows_below_cursor,
+                render_health_status,
+                render_health_reason,
+                render_health_recovery_count,
+                render_health_recovery_pending,
             } => TerminalJsEvent::HostHealth {
                 cursor_line_text,
                 text_tail,
@@ -194,6 +210,10 @@ impl From<TerminalJsEventWire> for TerminalJsEvent {
                 cursor_y,
                 rows,
                 blank_rows_below_cursor,
+                render_health_status,
+                render_health_reason,
+                render_health_recovery_count,
+                render_health_recovery_pending,
             },
             TerminalJsEventWire::Paint {
                 child_count,
@@ -271,8 +291,10 @@ mod tests {
             event,
             TerminalJsEvent::HostHealth {
                 frame_like_hot: false,
+                render_health_status,
+                render_health_reason,
                 ..
-            }
+            } if render_health_status.is_empty() && render_health_reason.is_empty()
         ));
     }
 
@@ -299,6 +321,36 @@ mod tests {
     }
 
     #[test]
+    fn host_health_deserializes_render_health_fields() {
+        let event: TerminalJsEvent = serde_json::from_value(json!({
+            "kind": "host_health",
+            "cursor_line_text": "› prompt",
+            "text_tail": "buffer text",
+            "has_transport_error": false,
+            "frame_like_hot": false,
+            "cursor_y": 10,
+            "rows": 40,
+            "blank_rows_below_cursor": 1,
+            "render_health_status": "unhealthy",
+            "render_health_reason": "canvas_blank_with_buffer_text",
+            "render_health_recovery_count": 1,
+            "render_health_recovery_pending": true
+        }))
+        .expect("render-health host health payloads should deserialize");
+        assert!(matches!(
+            event,
+            TerminalJsEvent::HostHealth {
+                render_health_status,
+                render_health_reason,
+                render_health_recovery_count: 1,
+                render_health_recovery_pending: true,
+                ..
+            } if render_health_status == "unhealthy"
+                && render_health_reason == "canvas_blank_with_buffer_text"
+        ));
+    }
+
+    #[test]
     fn context_menu_event_deserializes_with_coordinates() {
         let event: TerminalJsEvent = serde_json::from_value(json!({
             "kind": "context_menu",
@@ -314,5 +366,17 @@ mod tests {
             } if (client_x - 42.5).abs() < f64::EPSILON
                 && (client_y - 84.25).abs() < f64::EPSILON
         ));
+    }
+
+    #[test]
+    fn input_event_preserves_whitespace_only_payloads() {
+        for payload in [" ", "  ", "\t", "\r"] {
+            let event: TerminalJsEvent = serde_json::from_value(json!({
+                "kind": "input",
+                "data": payload,
+            }))
+            .expect("terminal input whitespace should deserialize unchanged");
+            assert!(matches!(event, TerminalJsEvent::Input { data } if data == payload));
+        }
     }
 }

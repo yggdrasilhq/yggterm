@@ -1,5 +1,7 @@
 use crate::codex_cli::{
-    terminal_identity_appearance_from_environment, terminal_identity_env_pairs,
+    TerminalIdentityColorProfile, normalize_terminal_identity_color,
+    terminal_identity_appearance_from_environment,
+    terminal_identity_color_profile_from_environment, terminal_identity_env_pairs,
     terminal_identity_env_removals,
 };
 use anyhow::{Context, Result, bail};
@@ -27,8 +29,9 @@ const ATTACH_READY_MARKER: &str = "__YGGTERM_ATTACH_READY__\n";
 const TERMINAL_WRITE_QUEUE_CAPACITY: usize = 64;
 const TERMINAL_WRITE_FLUSH_ACK_TIMEOUT_MS: u64 = 1_500;
 const TERMINAL_PROTOCOL_MAX_PENDING_BYTES: usize = 256;
-const OSC_COLOR_FOREGROUND_SLOT: u8 = 10;
-const OSC_COLOR_BACKGROUND_SLOT: u8 = 11;
+const OSC_PALETTE_CODE: u16 = 4;
+const OSC_COLOR_FOREGROUND_CODE: u16 = 10;
+const OSC_COLOR_BACKGROUND_CODE: u16 = 11;
 
 #[derive(Debug, Clone)]
 pub struct TerminalChunk {
@@ -99,6 +102,7 @@ struct TerminalProtocolProfile {
     appearance: &'static str,
     foreground: (u8, u8, u8),
     background: (u8, u8, u8),
+    palette: [(u8, u8, u8); 16],
 }
 
 impl TerminalProtocolProfile {
@@ -112,32 +116,153 @@ impl TerminalProtocolProfile {
                 },
             )
             .unwrap_or("light");
-        match appearance {
+        let base = match appearance {
             "dark" => Self {
                 appearance: "dark",
                 foreground: (0xcc, 0xcc, 0xcc),
                 background: (0x1e, 0x1e, 0x1e),
+                palette: TERMINAL_PROTOCOL_DARK_PALETTE,
             },
             _ => Self {
                 appearance: "light",
                 foreground: (0x15, 0x1b, 0x23),
                 background: (0xfb, 0xfb, 0xfd),
+                palette: TERMINAL_PROTOCOL_LIGHT_PALETTE,
             },
-        }
+        };
+        terminal_identity_color_profile_from_launch_command(launch_command)
+            .or_else(terminal_identity_color_profile_from_environment)
+            .and_then(|profile| base.with_color_profile(&profile))
+            .unwrap_or(base)
     }
 
-    fn osc_color_response(self, slot: u8) -> Option<String> {
-        let color = match slot {
-            OSC_COLOR_FOREGROUND_SLOT => self.foreground,
-            OSC_COLOR_BACKGROUND_SLOT => self.background,
+    fn with_color_profile(self, profile: &TerminalIdentityColorProfile) -> Option<Self> {
+        if profile.palette.len() != 16 {
+            return None;
+        }
+        let mut palette = [(0u8, 0u8, 0u8); 16];
+        for (index, value) in profile.palette.iter().enumerate() {
+            palette[index] = parse_terminal_protocol_hex_color(value)?;
+        }
+        Some(Self {
+            appearance: self.appearance,
+            foreground: parse_terminal_protocol_hex_color(&profile.foreground)?,
+            background: parse_terminal_protocol_hex_color(&profile.background)?,
+            palette,
+        })
+    }
+
+    fn osc_color_response(self, query: TerminalProtocolColorQuery) -> Option<String> {
+        let color = match query.code {
+            OSC_COLOR_FOREGROUND_CODE => self.foreground,
+            OSC_COLOR_BACKGROUND_CODE => self.background,
+            OSC_PALETTE_CODE => *self.palette.get(usize::from(query.slot))?,
             _ => return None,
         };
+        let response_slot = if query.code == OSC_PALETTE_CODE {
+            query.slot.to_string()
+        } else {
+            query.code.to_string()
+        };
         Some(format!(
-            "\u{1b}]{slot};rgb:{}/{}/{}\u{1b}\\",
+            "\u{1b}]{};rgb:{}/{}/{}\u{1b}\\",
+            if query.code == OSC_PALETTE_CODE {
+                format!("4;{response_slot}")
+            } else {
+                response_slot
+            },
             osc_rgb_component(color.0),
             osc_rgb_component(color.1),
             osc_rgb_component(color.2)
         ))
+    }
+}
+
+fn terminal_identity_color_profile_from_launch_command(
+    launch_command: &str,
+) -> Option<TerminalIdentityColorProfile> {
+    let foreground =
+        launch_command_assignment_value(launch_command, "YGGTERM_TERMINAL_COLOR_FOREGROUND")
+            .and_then(|value| normalize_terminal_identity_color(&value))?;
+    let background =
+        launch_command_assignment_value(launch_command, "YGGTERM_TERMINAL_COLOR_BACKGROUND")
+            .and_then(|value| normalize_terminal_identity_color(&value))?;
+    let mut palette = Vec::with_capacity(16);
+    for index in 0..16 {
+        let key = format!("YGGTERM_TERMINAL_COLOR_{index}");
+        palette.push(
+            launch_command_assignment_value(launch_command, &key)
+                .and_then(|value| normalize_terminal_identity_color(&value))?,
+        );
+    }
+    Some(TerminalIdentityColorProfile {
+        foreground,
+        background,
+        palette,
+    })
+}
+
+fn parse_terminal_protocol_hex_color(value: &str) -> Option<(u8, u8, u8)> {
+    let normalized = normalize_terminal_identity_color(value)?;
+    let hex = normalized.strip_prefix('#')?;
+    Some((
+        u8::from_str_radix(&hex[0..2], 16).ok()?,
+        u8::from_str_radix(&hex[2..4], 16).ok()?,
+        u8::from_str_radix(&hex[4..6], 16).ok()?,
+    ))
+}
+
+const TERMINAL_PROTOCOL_DARK_PALETTE: [(u8, u8, u8); 16] = [
+    (0x00, 0x00, 0x00),
+    (0xcd, 0x31, 0x31),
+    (0x0d, 0xbc, 0x79),
+    (0xe5, 0xe5, 0x10),
+    (0x24, 0x72, 0xc8),
+    (0xbc, 0x3f, 0xbc),
+    (0x11, 0xa8, 0xcd),
+    (0xe5, 0xe5, 0xe5),
+    (0x66, 0x66, 0x66),
+    (0xf1, 0x4c, 0x4c),
+    (0x23, 0xd1, 0x8b),
+    (0xf5, 0xf5, 0x43),
+    (0x3b, 0x8e, 0xea),
+    (0xd6, 0x70, 0xd6),
+    (0x29, 0xbf, 0xd6),
+    (0xe5, 0xe5, 0xe5),
+];
+
+const TERMINAL_PROTOCOL_LIGHT_PALETTE: [(u8, u8, u8); 16] = [
+    (0x24, 0x29, 0x2f),
+    (0xa1, 0x26, 0x0d),
+    (0x0c, 0x64, 0x28),
+    (0x7a, 0x4f, 0x00),
+    (0x04, 0x51, 0xa5),
+    (0x69, 0x36, 0xaa),
+    (0x0e, 0x65, 0x70),
+    (0x57, 0x60, 0x6a),
+    (0x6e, 0x77, 0x81),
+    (0xa1, 0x26, 0x0d),
+    (0x0c, 0x64, 0x28),
+    (0x74, 0x49, 0x00),
+    (0x04, 0x51, 0xa5),
+    (0x73, 0x40, 0xb3),
+    (0x0e, 0x65, 0x70),
+    (0x8c, 0x95, 0x9f),
+];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TerminalProtocolColorQuery {
+    code: u16,
+    slot: u16,
+}
+
+impl TerminalProtocolColorQuery {
+    fn label(self) -> String {
+        if self.code == OSC_PALETTE_CODE {
+            format!("4:{}", self.slot)
+        } else {
+            self.code.to_string()
+        }
     }
 }
 
@@ -150,7 +275,7 @@ struct TerminalProtocolFilter {
 struct TerminalProtocolFilterResult {
     data: String,
     responses: Vec<String>,
-    answered_slots: Vec<u8>,
+    answered_queries: Vec<TerminalProtocolColorQuery>,
 }
 
 impl TerminalProtocolFilter {
@@ -171,21 +296,19 @@ impl TerminalProtocolFilter {
 
         let mut visible = String::with_capacity(combined.len());
         let mut responses = Vec::new();
-        let mut answered_slots = Vec::new();
+        let mut answered_queries = Vec::new();
         let mut cursor = 0usize;
         while let Some(relative_start) = combined[cursor..].find("\u{1b}]") {
             let sequence_start = cursor + relative_start;
             visible.push_str(&combined[cursor..sequence_start]);
             let content_start = sequence_start + "\u{1b}]".len();
-            let Some((slot, terminator_search_start)) =
-                parse_osc_default_color_query_start(&combined, content_start)
-            else {
+            if !osc_sequence_might_need_filtering(&combined[content_start..]) {
                 visible.push_str("\u{1b}]");
                 cursor = content_start;
                 continue;
-            };
+            }
             let Some((terminator_start, terminator_len)) =
-                find_osc_terminator(&combined, terminator_search_start)
+                find_osc_terminator(&combined, content_start)
             else {
                 self.pending = combined[sequence_start..].to_string();
                 if self.pending.len() > TERMINAL_PROTOCOL_MAX_PENDING_BYTES {
@@ -195,9 +318,17 @@ impl TerminalProtocolFilter {
                 cursor = combined.len();
                 break;
             };
-            if let Some(response) = profile.osc_color_response(slot) {
-                responses.push(response);
-                answered_slots.push(slot);
+            let content = &combined[content_start..terminator_start];
+            let Some(queries) = parse_osc_color_query_content(content) else {
+                visible.push_str(&combined[sequence_start..terminator_start + terminator_len]);
+                cursor = terminator_start + terminator_len;
+                continue;
+            };
+            for query in queries {
+                if let Some(response) = profile.osc_color_response(query) {
+                    responses.push(response);
+                    answered_queries.push(query);
+                }
             }
             cursor = terminator_start + terminator_len;
         }
@@ -208,7 +339,7 @@ impl TerminalProtocolFilter {
         TerminalProtocolFilterResult {
             data: visible,
             responses,
-            answered_slots,
+            answered_queries,
         }
     }
 
@@ -217,7 +348,9 @@ impl TerminalProtocolFilter {
     }
 }
 
-fn infer_terminal_appearance_from_launch_command(launch_command: &str) -> Option<&'static str> {
+pub(crate) fn infer_terminal_appearance_from_launch_command(
+    launch_command: &str,
+) -> Option<&'static str> {
     if launch_command_has_assignment(launch_command, "YGGTERM_TERMINAL_APPEARANCE", "dark")
         || launch_command_has_assignment(launch_command, "YGGTERM_APPEARANCE", "dark")
         || launch_command_has_assignment(launch_command, "COLORFGBG", "15;0")
@@ -248,14 +381,71 @@ fn launch_command_has_assignment(launch_command: &str, key: &str, value: &str) -
         || launch_command.contains(&exported_double)
 }
 
-fn parse_osc_default_color_query_start(data: &str, content_start: usize) -> Option<(u8, usize)> {
-    let rest = &data[content_start..];
-    if rest.starts_with("10;?") {
-        Some((OSC_COLOR_FOREGROUND_SLOT, content_start + "10;?".len()))
-    } else if rest.starts_with("11;?") {
-        Some((OSC_COLOR_BACKGROUND_SLOT, content_start + "11;?".len()))
-    } else {
+fn launch_command_assignment_value(launch_command: &str, key: &str) -> Option<String> {
+    for prefix in [format!("export {key}="), format!("{key}=")] {
+        let Some(start) = launch_command.find(&prefix) else {
+            continue;
+        };
+        let value_start = start + prefix.len();
+        let rest = &launch_command[value_start..];
+        if let Some(stripped) = rest.strip_prefix('\'') {
+            let end = stripped.find('\'')?;
+            return Some(stripped[..end].to_string());
+        }
+        if let Some(stripped) = rest.strip_prefix('"') {
+            let end = stripped.find('"')?;
+            return Some(stripped[..end].to_string());
+        }
+        let end = rest
+            .find(|ch: char| ch == ';' || ch.is_whitespace())
+            .unwrap_or(rest.len());
+        return Some(rest[..end].to_string());
+    }
+    None
+}
+
+fn osc_sequence_might_need_filtering(content: &str) -> bool {
+    content.starts_with("10;?") || content.starts_with("11;?") || content.starts_with("4;")
+}
+
+fn parse_osc_color_query_content(content: &str) -> Option<Vec<TerminalProtocolColorQuery>> {
+    match content {
+        "10;?" => {
+            return Some(vec![TerminalProtocolColorQuery {
+                code: OSC_COLOR_FOREGROUND_CODE,
+                slot: OSC_COLOR_FOREGROUND_CODE,
+            }]);
+        }
+        "11;?" => {
+            return Some(vec![TerminalProtocolColorQuery {
+                code: OSC_COLOR_BACKGROUND_CODE,
+                slot: OSC_COLOR_BACKGROUND_CODE,
+            }]);
+        }
+        _ => {}
+    }
+
+    let rest = content.strip_prefix("4;")?;
+    let mut parts = rest.split(';');
+    let mut queries = Vec::new();
+    while let Some(slot_value) = parts.next() {
+        let request = parts.next()?;
+        if request != "?" {
+            return None;
+        }
+        let slot = slot_value.parse::<u16>().ok()?;
+        if slot > 15 {
+            return None;
+        }
+        queries.push(TerminalProtocolColorQuery {
+            code: OSC_PALETTE_CODE,
+            slot,
+        });
+    }
+    if queries.is_empty() {
         None
+    } else {
+        Some(queries)
     }
 }
 
@@ -822,7 +1012,11 @@ fn enqueue_terminal_protocol_responses(
                 serde_json::json!({
                     "path": key,
                     "appearance": profile.appearance,
-                    "slots": &result.answered_slots,
+                    "queries": result
+                        .answered_queries
+                        .iter()
+                        .map(|query| query.label())
+                        .collect::<Vec<_>>(),
                     "error": error.to_string(),
                 }),
             );
@@ -834,7 +1028,11 @@ fn enqueue_terminal_protocol_responses(
         serde_json::json!({
             "path": key,
             "appearance": profile.appearance,
-            "slots": &result.answered_slots,
+            "queries": result
+                .answered_queries
+                .iter()
+                .map(|query| query.label())
+                .collect::<Vec<_>>(),
             "response_count": result.responses.len(),
         }),
     );
@@ -995,7 +1193,7 @@ impl PtySessionRuntime {
                                 &protocol_result,
                             );
                             let answered_terminal_protocol =
-                                !protocol_result.answered_slots.is_empty();
+                                !protocol_result.answered_queries.is_empty();
                             let data = protocol_result.data;
                             if data.is_empty() {
                                 if stripped_attach_ready_marker || answered_terminal_protocol {
@@ -1244,6 +1442,17 @@ impl PtySessionRuntime {
                 select_initial_attach_chunks_for_launch(&retained_chunks, &self.launch_command);
         }
         if effective_cursor == 0
+            && let Some(snapshot_chunk) = self.screen_snapshot_chunk(next_cursor)
+            && initial_attach_should_replay_screen_snapshot(
+                &self.key,
+                &self.launch_command,
+                &chunks,
+                &snapshot_chunk.data,
+            )
+        {
+            chunks = vec![snapshot_chunk];
+        }
+        if effective_cursor == 0
             && !prefer_initial_screen_snapshot
             && !chunks
                 .iter()
@@ -1351,18 +1560,36 @@ impl PtySessionRuntime {
         }
         let previous_cols = self.current_cols.load(Ordering::SeqCst);
         let previous_rows = self.current_rows.load(Ordering::SeqCst);
-        if previous_cols == cols && previous_rows == rows {
+        let master = self.master.lock().expect("pty master lock poisoned");
+        let observed_before = master.get_size().ok().map(|size| (size.cols, size.rows));
+        let cache_matches_request = previous_cols == cols && previous_rows == rows;
+        if cache_matches_request && observed_before == Some((cols, rows)) {
             trace_terminal_event(
                 "resize_noop",
                 serde_json::json!({
                     "path": self.key,
                     "cols": cols,
                     "rows": rows,
+                    "actual_cols": cols,
+                    "actual_rows": rows,
                 }),
             );
             return Ok(());
         }
-        let master = self.master.lock().expect("pty master lock poisoned");
+        if cache_matches_request {
+            trace_terminal_event(
+                "resize_cache_mismatch_repair",
+                serde_json::json!({
+                    "path": self.key,
+                    "requested_cols": cols,
+                    "requested_rows": rows,
+                    "cached_cols": previous_cols,
+                    "cached_rows": previous_rows,
+                    "actual_cols": observed_before.map(|(actual_cols, _)| actual_cols),
+                    "actual_rows": observed_before.map(|(_, actual_rows)| actual_rows),
+                }),
+            );
+        }
         master
             .resize(PtySize {
                 rows,
@@ -1371,14 +1598,36 @@ impl PtySessionRuntime {
                 pixel_height: 0,
             })
             .context("resizing pty")?;
-        self.current_cols.store(cols, Ordering::SeqCst);
-        self.current_rows.store(rows, Ordering::SeqCst);
+        let observed_after = master.get_size().ok().map(|size| (size.cols, size.rows));
+        let (effective_cols, effective_rows) = observed_after.unwrap_or((cols, rows));
+        self.current_cols.store(effective_cols, Ordering::SeqCst);
+        self.current_rows.store(effective_rows, Ordering::SeqCst);
         if let Ok(mut screen_state) = self.screen_state.lock() {
-            screen_state.resize(rows, cols);
+            screen_state.resize(effective_rows, effective_cols);
         }
         let seq = self.seq.load(Ordering::SeqCst);
         self.last_resize_seq.store(seq, Ordering::SeqCst);
         self.resize_count.fetch_add(1, Ordering::SeqCst);
+        trace_terminal_event(
+            if observed_after == Some((cols, rows)) || observed_after.is_none() {
+                "resize"
+            } else {
+                "resize_actual_mismatch"
+            },
+            serde_json::json!({
+                "path": self.key,
+                "requested_cols": cols,
+                "requested_rows": rows,
+                "cached_cols": previous_cols,
+                "cached_rows": previous_rows,
+                "actual_before_cols": observed_before.map(|(actual_cols, _)| actual_cols),
+                "actual_before_rows": observed_before.map(|(_, actual_rows)| actual_rows),
+                "actual_after_cols": observed_after.map(|(actual_cols, _)| actual_cols),
+                "actual_after_rows": observed_after.map(|(_, actual_rows)| actual_rows),
+                "effective_cols": effective_cols,
+                "effective_rows": effective_rows,
+            }),
+        );
         Ok(())
     }
 
@@ -1679,6 +1928,54 @@ fn select_initial_attach_chunks_for_launch(
         return select_initial_attach_chunks(chunks);
     }
     select_initial_attach_chunks(chunks)
+}
+
+fn initial_attach_should_replay_screen_snapshot(
+    key: &str,
+    launch_command: &str,
+    retained_initial: &[TerminalChunk],
+    snapshot_data: &str,
+) -> bool {
+    if !terminal_snapshot_looks_like_full_screen_surface(snapshot_data) {
+        return false;
+    }
+    if retained_initial
+        .iter()
+        .any(|chunk| terminal_chunk_has_scrollback_text(&chunk.data))
+    {
+        return false;
+    }
+    key.starts_with("live::")
+        || terminal_key_prefers_initial_screen_snapshot(key, launch_command)
+        || launch_command_looks_like_remote_resume_attach(launch_command)
+}
+
+fn terminal_snapshot_looks_like_full_screen_surface(data: &str) -> bool {
+    let stripped = strip_terminal_control_sequences(data);
+    let lines = stripped
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>();
+    if lines.len() < 3 {
+        return false;
+    }
+    let normalized = lines.join("\n").to_ascii_lowercase();
+    if normalized.contains("yggterm tui smoke")
+        || normalized.contains("f1help")
+        || normalized.contains("f10quit")
+        || normalized.contains("openai codex")
+        || normalized.contains("working")
+        || normalized.contains("htop")
+    {
+        return true;
+    }
+    let printable = stripped
+        .chars()
+        .filter(|ch| !ch.is_control() && !ch.is_whitespace())
+        .count();
+    let max_line_len = lines.iter().map(|line| line.len()).max().unwrap_or(0);
+    printable >= 72 && max_line_len >= 20
 }
 
 fn trim_initial_attach_low_signal_suffix(selected: &mut Vec<TerminalChunk>) {
@@ -2005,7 +2302,14 @@ mod tests {
                 "\u{1b}]11;rgb:1e1e/1e1e/1e1e\u{1b}\\".to_string(),
             ]
         );
-        assert_eq!(result.answered_slots, vec![10, 11]);
+        assert_eq!(
+            result
+                .answered_queries
+                .iter()
+                .map(|query| query.label())
+                .collect::<Vec<_>>(),
+            vec!["10".to_string(), "11".to_string()]
+        );
     }
 
     #[test]
@@ -2023,6 +2327,137 @@ mod tests {
         assert_eq!(
             second.responses,
             vec!["\u{1b}]11;rgb:1e1e/1e1e/1e1e\u{1b}\\".to_string()]
+        );
+    }
+
+    #[test]
+    fn terminal_protocol_filter_answers_palette_queries_without_visible_leak() {
+        let profile = TerminalProtocolProfile::from_launch_command(
+            "export YGGTERM_TERMINAL_APPEARANCE=dark; codex",
+        );
+        let mut filter = TerminalProtocolFilter::default();
+
+        let result = filter.process("pre\u{1b}]4;0;?;1;?;15;?\u{1b}\\post", profile);
+
+        assert_eq!(result.data, "prepost");
+        assert_eq!(
+            result.responses,
+            vec![
+                "\u{1b}]4;0;rgb:0000/0000/0000\u{1b}\\".to_string(),
+                "\u{1b}]4;1;rgb:cdcd/3131/3131\u{1b}\\".to_string(),
+                "\u{1b}]4;15;rgb:e5e5/e5e5/e5e5\u{1b}\\".to_string(),
+            ]
+        );
+        assert_eq!(
+            result
+                .answered_queries
+                .iter()
+                .map(|query| query.label())
+                .collect::<Vec<_>>(),
+            vec!["4:0".to_string(), "4:1".to_string(), "4:15".to_string()]
+        );
+    }
+    #[test]
+    fn terminal_protocol_profile_uses_synced_theme_colors_from_launch_command() {
+        let launch_command = "\
+            export YGGTERM_TERMINAL_APPEARANCE=dark; \
+            export YGGTERM_TERMINAL_COLOR_FOREGROUND='#e5e5e5'; \
+            export YGGTERM_TERMINAL_COLOR_BACKGROUND='#262a33'; \
+            export YGGTERM_TERMINAL_COLOR_0='#111111'; \
+            export YGGTERM_TERMINAL_COLOR_1='#222222'; \
+            export YGGTERM_TERMINAL_COLOR_2='#333333'; \
+            export YGGTERM_TERMINAL_COLOR_3='#444444'; \
+            export YGGTERM_TERMINAL_COLOR_4='#555555'; \
+            export YGGTERM_TERMINAL_COLOR_5='#666666'; \
+            export YGGTERM_TERMINAL_COLOR_6='#777777'; \
+            export YGGTERM_TERMINAL_COLOR_7='#888888'; \
+            export YGGTERM_TERMINAL_COLOR_8='#999999'; \
+            export YGGTERM_TERMINAL_COLOR_9='#aaaaaa'; \
+            export YGGTERM_TERMINAL_COLOR_10='#bbbbbb'; \
+            export YGGTERM_TERMINAL_COLOR_11='#cccccc'; \
+            export YGGTERM_TERMINAL_COLOR_12='#dddddd'; \
+            export YGGTERM_TERMINAL_COLOR_13='#eeeeee'; \
+            export YGGTERM_TERMINAL_COLOR_14='#ababab'; \
+            export YGGTERM_TERMINAL_COLOR_15='#fefefe'; edit";
+        let profile = TerminalProtocolProfile::from_launch_command(launch_command);
+        let mut filter = TerminalProtocolFilter::default();
+
+        let result = filter.process("\u{1b}]11;?\u{1b}\\\u{1b}]4;0;?;15;?\u{1b}\\", profile);
+
+        assert_eq!(
+            result.responses,
+            vec![
+                "\u{1b}]11;rgb:2626/2a2a/3333\u{1b}\\".to_string(),
+                "\u{1b}]4;0;rgb:1111/1111/1111\u{1b}\\".to_string(),
+                "\u{1b}]4;15;rgb:fefe/fefe/fefe\u{1b}\\".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn terminal_protocol_filter_holds_split_palette_query() {
+        let profile =
+            TerminalProtocolProfile::from_launch_command("export COLORFGBG='15;0'; codex");
+        let mut filter = TerminalProtocolFilter::default();
+
+        let first = filter.process("left\u{1b}]4;0;?;1;?", profile);
+        let second = filter.process("\u{1b}\\right", profile);
+
+        assert_eq!(first.data, "left");
+        assert!(first.responses.is_empty());
+        assert_eq!(second.data, "right");
+        assert_eq!(
+            second
+                .answered_queries
+                .iter()
+                .map(|query| query.label())
+                .collect::<Vec<_>>(),
+            vec!["4:0".to_string(), "4:1".to_string()]
+        );
+        assert!(
+            second
+                .responses
+                .iter()
+                .all(|response| response.starts_with("\u{1b}]4;")),
+            "{:?}",
+            second.responses
+        );
+    }
+
+    #[test]
+    fn terminal_protocol_filter_preserves_palette_set_sequences_for_xterm() {
+        let profile =
+            TerminalProtocolProfile::from_launch_command("export COLORFGBG='15;0'; codex");
+        let mut filter = TerminalProtocolFilter::default();
+        let payload = "pre\u{1b}]4;1;rgb:1111/2222/3333\u{1b}\\post";
+
+        let result = filter.process(payload, profile);
+
+        assert_eq!(result.data, payload);
+        assert!(result.responses.is_empty());
+        assert!(result.answered_queries.is_empty());
+    }
+
+    #[test]
+    fn terminal_protocol_filter_keeps_cat_crlf_after_palette_query() {
+        let profile =
+            TerminalProtocolProfile::from_launch_command("export COLORFGBG='15;0'; codex");
+        let mut filter = TerminalProtocolFilter::default();
+
+        let result = filter.process(
+            "\u{1b}]4;0;?;1;?\u{1b}\\alpha\r\nbeta\r\ngamma\r\n",
+            profile,
+        );
+
+        assert_eq!(result.data, "alpha\r\nbeta\r\ngamma\r\n");
+        assert_eq!(result.responses.len(), 2);
+        assert_eq!(
+            result
+                .answered_queries
+                .iter()
+                .map(|query| query.label())
+                .collect::<Vec<_>>(),
+            vec!["4:0".to_string(), "4:1".to_string()]
         );
     }
 
@@ -2227,6 +2662,45 @@ PY"#,
             .size();
 
         assert_eq!(size, (48, 104));
+        runtime.shutdown(None).expect("shutdown test runtime");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pty_resize_repairs_kernel_size_when_cache_already_matches_request() {
+        let runtime = PtySessionRuntime::spawn(
+            "local://resize-cache-drift",
+            "bash -lc 'sleep 5'",
+            None,
+            Some((120, 36)),
+        )
+        .expect("spawn resize drift test runtime");
+
+        runtime.resize(110, 50).expect("initial resize");
+        {
+            let master = runtime.master.lock().expect("pty master lock poisoned");
+            let size = master.get_size().expect("read resized pty size");
+            assert_eq!((size.cols, size.rows), (110, 50));
+            master
+                .resize(PtySize {
+                    rows: 36,
+                    cols: 120,
+                    pixel_width: 0,
+                    pixel_height: 0,
+                })
+                .expect("simulate kernel/cache drift");
+        }
+        runtime.current_cols.store(110, Ordering::SeqCst);
+        runtime.current_rows.store(50, Ordering::SeqCst);
+
+        runtime
+            .resize(110, 50)
+            .expect("same-size resize should repair drift");
+        {
+            let master = runtime.master.lock().expect("pty master lock poisoned");
+            let size = master.get_size().expect("read repaired pty size");
+            assert_eq!((size.cols, size.rows), (110, 50));
+        }
         runtime.shutdown(None).expect("shutdown test runtime");
     }
 
@@ -2846,6 +3320,56 @@ PY"#,
         assert!(!combined.contains("__YGGTERM_ATTACH_READY__"));
         assert!(combined.contains("\u{1b}[60;1H›"));
         assert_eq!(visible.matches('›').count(), 2, "{visible:?}");
+        runtime.shutdown(None).expect("shutdown test runtime");
+    }
+
+    #[test]
+    fn initial_live_tui_attach_replays_current_screen_snapshot_over_incremental_tail() {
+        let runtime = PtySessionRuntime::spawn(
+            "live::tui-reattach",
+            "bash -lc 'sleep 30'",
+            None,
+            Some((100, 36)),
+        )
+        .expect("spawn test runtime");
+        let full_frame = "\u{1b}[2J\
+\u{1b}[1;1HYGGTERM TUI SMOKE frame 104\
+\u{1b}[2;1HTasks: smoke heavy terminal\
+\u{1b}[3;1HMem[||||||||||||||||||||                    ] 52%\
+\u{1b}[4;1HF1Help F2Setup F10Quit";
+        let incremental_delta = "\u{1b}[1;25H418\u{1b}[3;5H||||||||||||||||||||||";
+        runtime.seed_snapshot(full_frame);
+        runtime.seed_snapshot(incremental_delta);
+        {
+            let mut chunks = runtime.chunks.lock().expect("pty chunk lock poisoned");
+            chunks.clear();
+            chunks.push_back(TerminalChunk {
+                seq: 2,
+                data: incremental_delta.to_string(),
+            });
+            runtime
+                .retained_bytes
+                .store(incremental_delta.len(), Ordering::SeqCst);
+            runtime.seq.store(2, Ordering::SeqCst);
+        }
+
+        let result = runtime.read(0);
+        let combined = result
+            .chunks
+            .iter()
+            .map(|chunk| chunk.data.as_str())
+            .collect::<String>();
+        let visible = strip_terminal_control_sequences(&combined);
+
+        assert!(
+            visible.contains("YGGTERM TUI SMOKE frame 418"),
+            "{visible:?}"
+        );
+        assert!(
+            visible.contains("Tasks: smoke heavy terminal"),
+            "{visible:?}"
+        );
+        assert!(visible.contains("F1Help F2Setup F10Quit"), "{visible:?}");
         runtime.shutdown(None).expect("shutdown test runtime");
     }
 

@@ -84,6 +84,23 @@ impl SessionBrowserState {
         rows
     }
 
+    pub fn all_rows(&self) -> Vec<BrowserRow> {
+        let short_ids = unique_session_short_ids(&self.root);
+        let mut expanded_paths = HashSet::new();
+        collect_group_paths(&self.root, &mut expanded_paths);
+        let mut rows = Vec::new();
+        flatten_rows(
+            &self.root,
+            0,
+            "",
+            &expanded_paths,
+            &short_ids,
+            &mut rows,
+            true,
+        );
+        rows
+    }
+
     pub fn root(&self) -> &SessionNode {
         &self.root
     }
@@ -378,6 +395,7 @@ fn flatten_rows(
         && node.group_kind != Some(WorkspaceGroupKind::Separator)
         && descendant_sessions == 0
         && node.title.is_none()
+        && !has_workspace_visible_descendant(node)
     {
         return false;
     }
@@ -426,6 +444,13 @@ fn flatten_rows(
     }
 
     true
+}
+
+fn has_workspace_visible_descendant(node: &SessionNode) -> bool {
+    node.group_kind.is_some()
+        || node.document_kind.is_some()
+        || node.title.is_some()
+        || node.children.iter().any(has_workspace_visible_descendant)
 }
 
 fn format_row_label(
@@ -805,6 +830,70 @@ mod tests {
         assert!(expanded.iter().any(|path| path == "/home"));
         assert!(expanded.iter().any(|path| path == "/home/pi"));
         assert!(browser.rows().iter().any(|row| row.full_path == selected));
+    }
+
+    #[test]
+    fn all_rows_keeps_empty_workspace_folder_parent_chain() {
+        let selected = "/__remote_folder__/practice/home/pi/folder-abc";
+        let root = SessionNode {
+            kind: SessionNodeKind::Group,
+            name: "root".to_string(),
+            title: None,
+            document_kind: None,
+            group_kind: None,
+            path: PathBuf::from("local"),
+            children: vec![SessionNode {
+                kind: SessionNodeKind::Group,
+                name: "/".to_string(),
+                title: Some("/".to_string()),
+                document_kind: None,
+                group_kind: Some(WorkspaceGroupKind::Folder),
+                path: PathBuf::from("/"),
+                session_id: None,
+                cwd: None,
+                children: vec![SessionNode {
+                    kind: SessionNodeKind::Group,
+                    name: "__remote_folder__".to_string(),
+                    title: None,
+                    document_kind: None,
+                    group_kind: None,
+                    path: PathBuf::from("/__remote_folder__"),
+                    session_id: None,
+                    cwd: None,
+                    children: vec![SessionNode {
+                        kind: SessionNodeKind::Group,
+                        name: "practice/home/pi".to_string(),
+                        title: None,
+                        document_kind: None,
+                        group_kind: None,
+                        path: PathBuf::from("/__remote_folder__/practice/home/pi"),
+                        session_id: None,
+                        cwd: None,
+                        children: vec![SessionNode {
+                            kind: SessionNodeKind::Group,
+                            name: "New Folder".to_string(),
+                            title: Some("New Folder".to_string()),
+                            document_kind: None,
+                            group_kind: Some(WorkspaceGroupKind::Folder),
+                            path: PathBuf::from(selected),
+                            children: Vec::new(),
+                            session_id: None,
+                            cwd: None,
+                        }],
+                    }],
+                }],
+            }],
+            session_id: None,
+            cwd: None,
+        };
+        let browser = SessionBrowserState::new(root);
+        let all_rows = browser.all_rows();
+        assert!(
+            all_rows
+                .iter()
+                .any(|row| row.full_path == "/__remote_folder__/practice/home/pi")
+        );
+        assert!(all_rows.iter().any(|row| row.full_path == selected));
     }
 
     #[test]

@@ -20,7 +20,9 @@ pub use app_control::{
     enqueue_screenshot_request, take_next_app_control_request, wait_for_app_control_response,
 };
 pub use attach::{AttachMetadata, run_attach};
-pub use codex_cli::{ManagedCliTool, ManagedCliToolStatus, managed_cli_refresh_ttl_ms};
+pub use codex_cli::{
+    ManagedCliTool, ManagedCliToolStatus, TerminalIdentityColorProfile, managed_cli_refresh_ttl_ms,
+};
 pub use daemon::{
     HotRestartResult, ServerEndpoint, ServerRequest, ServerResponse, ServerRuntimeStatus,
     TerminalStreamChunk, cleanup_legacy_daemons, connect_ssh, connect_ssh_custom, default_endpoint,
@@ -29,14 +31,15 @@ pub use daemon::{
     open_remote_session_with_view, open_stored_session, open_stored_session_with_view, ping,
     prepare_client_close, prepare_update_restart, raise_external_window,
     reachable_versioned_daemon_statuses, refresh_managed_cli, refresh_preview,
-    refresh_remote_machine, remove_session, remove_ssh_target, request_terminal_launch,
-    request_terminal_launch_for_path, run_daemon, set_all_preview_blocks_folded,
-    set_session_keep_alive, set_view_mode, shutdown, snapshot, start_command_session,
-    start_command_session_with_terminal_appearance, start_local_session, start_local_session_at,
-    start_local_session_at_with_terminal_appearance, start_remote_codex_session_at,
-    start_remote_codex_session_at_with_terminal_appearance, start_remote_runtime_codex_session,
-    start_ssh_session_at, start_ssh_session_at_with_terminal_appearance, status,
-    switch_agent_session_mode, sync_external_window, sync_terminal_identity, sync_theme,
+    refresh_remote_machine, remove_session, remove_ssh_target, reorder_live_sessions,
+    request_terminal_launch, request_terminal_launch_for_path, retire_daemon, run_daemon,
+    set_all_preview_blocks_folded, set_session_keep_alive, set_view_mode, shutdown, snapshot,
+    start_command_session, start_command_session_with_terminal_appearance, start_local_session,
+    start_local_session_at, start_local_session_at_with_terminal_appearance,
+    start_remote_codex_session_at, start_remote_codex_session_at_with_terminal_appearance,
+    start_remote_runtime_codex_session, start_ssh_session_at,
+    start_ssh_session_at_with_terminal_appearance, status, switch_agent_session_mode,
+    sync_external_window, sync_terminal_identity, sync_terminal_identity_with_profile, sync_theme,
     terminal_ensure, terminal_read, terminal_resize, terminal_restart, terminal_restart_with_size,
     terminal_retained_snapshot, terminal_snapshot, terminal_write, toggle_preview_block,
     update_session_copy,
@@ -56,12 +59,15 @@ pub use remote_runtime::{
 pub use terminal::{TerminalChunk, TerminalManager, TerminalReadResult};
 
 use anyhow::Context;
-pub use codex_cli::sync_terminal_identity_appearance;
 use codex_cli::{
     ManagedCliAction, ManagedCliRefreshReport, best_effort_cwd_shell_prefix,
-    ensure_local_managed_cli, inspect_local_managed_cli_for_launch, managed_cli_shell_command,
-    refresh_local_managed_cli, summarize_managed_cli_report, sync_terminal_identity_env,
+    ensure_local_managed_cli, managed_cli_shell_command,
+    managed_cli_shell_command_with_terminal_appearance, refresh_local_managed_cli,
+    summarize_managed_cli_report, sync_terminal_identity_env,
     terminal_identity_appearance_from_environment, terminal_identity_shell_exports_for_remote,
+};
+pub use codex_cli::{
+    sync_terminal_identity_appearance, sync_terminal_identity_appearance_with_profile,
 };
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
@@ -573,6 +579,214 @@ fn linux_proc_cmdline_args(pid: u32) -> Option<Vec<String>> {
         .map(|part| String::from_utf8_lossy(part).to_string())
         .collect::<Vec<_>>();
     (!args.is_empty()).then_some(args)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_proc_parent_pid(pid: u32) -> Option<u32> {
+    let status = fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+    status.lines().find_map(|line| {
+        line.strip_prefix("PPid:")
+            .and_then(|value| value.trim().parse::<u32>().ok())
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn linux_proc_state(pid: u32) -> Option<char> {
+    let status = fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+    status
+        .lines()
+        .find_map(|line| line.strip_prefix("State:"))
+        .and_then(|value| value.trim().chars().next())
+}
+
+fn command_arg_basename(arg: &str) -> &str {
+    arg.rsplit(['/', '\\'])
+        .next()
+        .filter(|value| !value.is_empty())
+        .unwrap_or(arg)
+}
+
+fn command_arg_is_codex_binary(arg: &str) -> bool {
+    matches!(
+        command_arg_basename(arg),
+        "codex" | "codex.exe" | "codex.cmd"
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn codex_resume_args_match_session(args: &[String], session_id: &str) -> bool {
+    args.iter()
+        .take(3)
+        .any(|arg| command_arg_is_codex_binary(arg))
+        && args.iter().any(|arg| arg == "resume")
+        && args.iter().any(|arg| arg == session_id)
+}
+
+#[cfg(target_os = "linux")]
+fn yggterm_process_args(args: &[String]) -> bool {
+    let Some(argv0) = args.first() else {
+        return false;
+    };
+    matches!(
+        command_arg_basename(argv0),
+        "yggterm" | "yggterm-headless" | "yggterm.exe" | "yggterm-headless.exe"
+    ) || args.windows(3).any(|window| {
+        window[0] == "server"
+            && window[1] == "remote"
+            && matches!(window[2].as_str(), "resume-codex" | "start-codex")
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn codex_resume_process_is_external_for_session(
+    args: &[String],
+    ancestor_args: &[Vec<String>],
+    session_id: &str,
+) -> bool {
+    codex_resume_args_match_session(args, session_id)
+        && !ancestor_args
+            .iter()
+            .any(|ancestor| yggterm_process_args(ancestor))
+}
+
+#[cfg(target_os = "linux")]
+fn linux_proc_ancestor_cmdline_args(pid: u32) -> Vec<Vec<String>> {
+    let mut ancestors = Vec::new();
+    let mut seen = HashSet::new();
+    let mut current = linux_proc_parent_pid(pid);
+    while let Some(parent_pid) = current {
+        if parent_pid == 0 || !seen.insert(parent_pid) {
+            break;
+        }
+        if let Some(args) = linux_proc_cmdline_args(parent_pid) {
+            ancestors.push(args);
+        }
+        current = linux_proc_parent_pid(parent_pid);
+    }
+    ancestors
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ExternalCodexResumeProcess {
+    pid: u32,
+    argv0: String,
+}
+
+#[cfg(target_os = "linux")]
+fn external_codex_resume_processes_for_session(
+    session_id: &str,
+) -> Vec<ExternalCodexResumeProcess> {
+    let Ok(entries) = fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    let current_pid = std::process::id();
+    let mut processes = entries
+        .flatten()
+        .filter_map(|entry| entry.file_name().to_str()?.parse::<u32>().ok())
+        .filter(|pid| *pid != current_pid)
+        .filter(|pid| linux_proc_state(*pid) != Some('Z'))
+        .filter_map(|pid| {
+            let args = linux_proc_cmdline_args(pid)?;
+            if !codex_resume_args_match_session(&args, session_id) {
+                return None;
+            }
+            let ancestor_args = linux_proc_ancestor_cmdline_args(pid);
+            codex_resume_process_is_external_for_session(&args, &ancestor_args, session_id).then(
+                || ExternalCodexResumeProcess {
+                    pid,
+                    argv0: args.first().cloned().unwrap_or_default(),
+                },
+            )
+        })
+        .collect::<Vec<_>>();
+    processes.sort_by_key(|process| process.pid);
+    processes.dedup_by_key(|process| process.pid);
+    processes
+}
+
+#[cfg(not(target_os = "linux"))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ExternalCodexResumeProcess {
+    pid: u32,
+    argv0: String,
+}
+
+#[cfg(not(target_os = "linux"))]
+fn external_codex_resume_processes_for_session(
+    _session_id: &str,
+) -> Vec<ExternalCodexResumeProcess> {
+    Vec::new()
+}
+
+fn remote_resume_external_active_message(
+    session_id: &str,
+    processes: &[ExternalCodexResumeProcess],
+) -> String {
+    let pids = processes
+        .iter()
+        .map(|process| process.pid.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "yggterm: Codex session {session_id} is already active outside Yggterm (pid {pids}); waiting instead of starting a second resume. Close that external terminal to let Yggterm attach."
+    )
+}
+
+fn remote_resume_snapshot_is_external_active_guard(bytes: &[u8]) -> bool {
+    let normalized = String::from_utf8_lossy(bytes).to_ascii_lowercase();
+    normalized.contains("yggterm:")
+        && normalized.contains("already active outside yggterm")
+        && normalized.contains("waiting instead of starting a second resume")
+}
+
+fn wait_for_external_codex_resume_to_clear(home: &Path, session_id: &str) {
+    let mut announced = false;
+    let mut last_pids = Vec::<u32>::new();
+    loop {
+        let processes = external_codex_resume_processes_for_session(session_id);
+        if processes.is_empty() {
+            if announced {
+                append_trace_event(
+                    home,
+                    "remote",
+                    "resume_codex",
+                    "external_active_wait_end",
+                    json!({ "session_id": session_id }),
+                );
+            }
+            return;
+        }
+        let pids = processes
+            .iter()
+            .map(|process| process.pid)
+            .collect::<Vec<_>>();
+        if !announced || pids != last_pids {
+            append_trace_event(
+                home,
+                "remote",
+                "resume_codex",
+                "external_active_wait",
+                json!({
+                    "session_id": session_id,
+                    "pids": pids,
+                    "argv0": processes.iter().map(|process| process.argv0.clone()).collect::<Vec<_>>(),
+                    "policy": "session_survival_before_yggterm_attach",
+                }),
+            );
+            println!(
+                "{}",
+                remote_resume_external_active_message(session_id, &processes)
+            );
+            let _ = std::io::stdout().flush();
+            announced = true;
+            last_pids = processes
+                .iter()
+                .map(|process| process.pid)
+                .collect::<Vec<_>>();
+        }
+        std::thread::sleep(Duration::from_millis(3_000));
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -1687,6 +1901,24 @@ impl YggtermServer {
         self.active_session_path.as_deref()
     }
 
+    pub(crate) fn focus_live_session_without_launch_if_active_missing(
+        &mut self,
+        path: &str,
+    ) -> bool {
+        if self.active_session_path.is_some() {
+            return false;
+        }
+        let Some((resolved_key, session)) = self.resolve_live_session_entry(path) else {
+            return false;
+        };
+        if !managed_session_is_promoted_live_session(&resolved_key, &session) {
+            return false;
+        }
+        self.active_session_path = Some(resolved_key);
+        self.active_view_mode = WorkspaceViewMode::Terminal;
+        true
+    }
+
     pub fn switch_agent_session_mode(
         &mut self,
         path: &str,
@@ -2016,20 +2248,34 @@ impl YggtermServer {
         if snapshot.is_empty() {
             return false;
         }
-        let Some((_, session_id)) = parse_remote_scanned_session_path(path) else {
+        let Some(session_id) = parse_remote_scanned_session_path(path)
+            .map(|(_, session_id)| session_id)
+            .or_else(|| remote_runtime_codex_session_id_from_terminal_key(path))
+        else {
             return false;
         };
+        let saved_session_exists = remote_saved_codex_session_exists(session_id).unwrap_or(false);
         if let Some(key) = self.resolve_session_storage_key(path)
             && let Some(session) = self.sessions.get(key)
         {
+            if remote_live_session_starts_new_codex(session) {
+                return false;
+            }
+            let fragments = local_resume_match_fragments(session);
+            if !saved_session_exists && fragments.is_empty() {
+                return false;
+            }
             let mismatches =
                 remote_resume_runtime_output_mismatches_managed_session(session, snapshot);
             if mismatches {
                 return true;
             }
-            if !local_resume_match_fragments(session).is_empty() {
+            if !fragments.is_empty() {
                 return false;
             }
+        }
+        if !saved_session_exists {
+            return false;
         }
         remote_resume_runtime_output_mismatches_saved_session(session_id, snapshot)
     }
@@ -2113,8 +2359,10 @@ impl YggtermServer {
     pub fn refresh_terminal_identity_launch_commands(&mut self) -> usize {
         let remote_machines = self.remote_machines.clone();
         let mut refreshed = 0usize;
-        for session in self.sessions.values_mut() {
-            if refresh_remote_codex_terminal_identity_launch_command(session, &remote_machines) {
+        for (key, session) in self.sessions.iter_mut() {
+            if refresh_restored_remote_runtime_codex_launch_command(key, session)
+                || refresh_remote_codex_terminal_identity_launch_command(session, &remote_machines)
+            {
                 refreshed += 1;
             }
         }
@@ -2127,7 +2375,8 @@ impl YggtermServer {
         };
         let remote_machines = self.remote_machines.clone();
         self.sessions.get_mut(&key).is_some_and(|session| {
-            refresh_remote_codex_terminal_identity_launch_command(session, &remote_machines)
+            refresh_restored_remote_runtime_codex_launch_command(&key, session)
+                || refresh_remote_codex_terminal_identity_launch_command(session, &remote_machines)
         })
     }
 
@@ -2265,6 +2514,26 @@ impl YggtermServer {
         Ok(true)
     }
 
+    pub fn detach_live_session_view(&mut self, path: &str) -> anyhow::Result<bool> {
+        let Some((resolved_key, session)) = self.resolve_live_session_entry(path) else {
+            return Ok(false);
+        };
+        if !matches!(
+            session.source,
+            SessionSource::LiveLocal | SessionSource::LiveSsh
+        ) {
+            anyhow::bail!("only live local or remote sessions can be detached through this path");
+        }
+        if self.active_session_path.as_deref() == Some(resolved_key.as_str())
+            || self.active_session_path.as_deref() == Some(path)
+            || self.active_session_path.as_deref() == Some(session.session_path.as_str())
+        {
+            self.active_session_path = None;
+            self.active_view_mode = WorkspaceViewMode::Rendered;
+        }
+        Ok(true)
+    }
+
     fn promote_remote_codex_live_session_to_scanned(
         &mut self,
         key: &str,
@@ -2342,6 +2611,11 @@ impl YggtermServer {
     pub fn live_session_keep_alive(&self, path: &str) -> bool {
         self.resolve_live_session_entry(path)
             .is_some_and(|(_resolved_key, session)| session_keep_alive(&session))
+    }
+
+    pub fn live_session_is_temporary_update_restore(&self, path: &str) -> bool {
+        self.resolve_live_session_entry(path)
+            .is_some_and(|(_resolved_key, session)| session_is_temporary_update_restore(&session))
     }
 
     pub fn non_keep_alive_live_session_paths(&self) -> Vec<String> {
@@ -2503,6 +2777,35 @@ impl YggtermServer {
             .collect()
     }
 
+    pub fn replace_live_session_order(&mut self, ordered_paths: &[String]) -> bool {
+        let current = self.live_session_order.clone();
+        let mut seen = HashSet::<String>::new();
+        let mut next = Vec::<String>::new();
+        for path in ordered_paths {
+            if let Some((resolved_key, session)) = self.resolve_live_session_entry(path)
+                && managed_session_is_live_runtime_session(&resolved_key, &session)
+                && seen.insert(resolved_key.clone())
+            {
+                next.push(resolved_key);
+            }
+        }
+        for key in current {
+            if seen.insert(key.clone()) {
+                next.push(key);
+            }
+        }
+        if next == self.live_session_order {
+            return false;
+        }
+        self.live_session_order = next;
+        true
+    }
+
+    fn append_restored_live_session_order(&mut self, key: &str) {
+        self.live_session_order.retain(|existing| existing != key);
+        self.live_session_order.push(key.to_string());
+    }
+
     pub(crate) fn live_codex_session_keys_for_runtime_identity(&self) -> Vec<String> {
         self.live_session_order
             .iter()
@@ -2651,11 +2954,40 @@ impl YggtermServer {
         )
     }
 
-    pub fn apply_snapshot(&mut self, snapshot: ServerUiSnapshot) {
+    pub fn apply_snapshot(&mut self, mut snapshot: ServerUiSnapshot) {
+        for target in &self.ssh_targets {
+            let target_key = (
+                target.kind,
+                canonicalize_ssh_target_alias(&target.ssh_target),
+                target.prefix.clone(),
+            );
+            if !snapshot.ssh_targets.iter().any(|candidate| {
+                (
+                    candidate.kind,
+                    canonicalize_ssh_target_alias(&candidate.ssh_target),
+                    candidate.prefix.clone(),
+                ) == target_key
+            }) {
+                snapshot.ssh_targets.push(target.clone());
+            }
+        }
+        for machine in &self.remote_machines {
+            let machine_key = normalize_machine_key(&machine.machine_key);
+            if !snapshot
+                .remote_machines
+                .iter()
+                .any(|candidate| normalize_machine_key(&candidate.machine_key) == machine_key)
+            {
+                snapshot.remote_machines.push(machine.clone());
+            }
+        }
         self.active_view_mode = snapshot.active_view_mode;
         self.active_session_path = snapshot.active_session_path.clone();
         self.remote_machines = snapshot.remote_machines;
         self.ssh_targets = snapshot.ssh_targets;
+        for target in self.ssh_targets.clone() {
+            self.ensure_remote_machine_stub(&target);
+        }
         self.live_session_order = snapshot
             .live_sessions
             .iter()
@@ -3084,22 +3416,18 @@ impl YggtermServer {
     pub fn focus_live_session(&mut self, key: &str) {
         let resolved_key = self.resolve_live_session_key(key);
         if let Some(resolved_key) = resolved_key {
-            if self.sessions.get(&resolved_key).is_some_and(|session| {
-                managed_session_is_promoted_live_session(&resolved_key, session)
-            }) {
-                self.live_session_order
-                    .retain(|existing| existing != &resolved_key);
-                self.live_session_order.insert(0, resolved_key.clone());
-            }
             self.active_session_path = Some(resolved_key);
             self.active_view_mode = WorkspaceViewMode::Terminal;
             self.request_terminal_launch_for_active();
         }
     }
 
-    pub fn connect_ssh_target(&mut self, target_ix: usize) -> (Option<String>, bool) {
+    pub fn connect_ssh_target(
+        &mut self,
+        target_ix: usize,
+    ) -> anyhow::Result<(Option<String>, bool)> {
         let Some(target) = self.ssh_targets.get(target_ix).cloned() else {
-            return (None, false);
+            return Ok((None, false));
         };
         self.connect_ssh_like_target(&target)
     }
@@ -3129,7 +3457,7 @@ impl YggtermServer {
             prefix,
             cwd: None,
         };
-        let (key, reused) = self.connect_ssh_like_target(&target);
+        let (key, reused) = self.connect_ssh_like_target(&target)?;
         key.map(|key| (key, reused))
             .ok_or_else(|| anyhow::anyhow!("failed to create ssh session"))
     }
@@ -3194,9 +3522,18 @@ impl YggtermServer {
             cwd,
         };
         self.upsert_ssh_target(&target);
+        let resolved_remote_launch = self.resolve_ssh_shell_remote_launch(&target)?;
         let uuid = Uuid::new_v4().to_string();
         let key = format!("live::{uuid}");
         self.insert_live_session(&key, &uuid, SessionKind::SshShell, &target, Some(title));
+        if let Some((remote_binary, remote_deploy_state)) = resolved_remote_launch {
+            self.configure_remote_ssh_shell_live_session(
+                &key,
+                &target,
+                &remote_binary,
+                remote_deploy_state,
+            );
+        }
         Ok(key)
     }
 
@@ -3559,16 +3896,17 @@ impl YggtermServer {
         let Some(tool) = ManagedCliTool::from_session_kind(session.kind) else {
             return Ok(None);
         };
-        let status = inspect_local_managed_cli_for_launch(tool)?;
+        let status = ensure_local_managed_cli(tool)?;
+        let install_attempted = status.action == "installed";
         Ok(Some(summarize_managed_cli_report(
             "local",
             &ManagedCliRefreshReport {
                 scope: "local".to_string(),
-                background: true,
+                background: false,
                 statuses: vec![status],
                 skipped_recently: false,
                 ttl_remaining_ms: None,
-                install_attempted: false,
+                install_attempted,
                 install_deferred: false,
             },
         )))
@@ -4122,6 +4460,7 @@ impl YggtermServer {
         session_id: &str,
         cwd: Option<&str>,
         require_existing: bool,
+        terminal_appearance: Option<&str>,
     ) -> anyhow::Result<String> {
         let saved_session_exists = remote_saved_codex_session_exists(session_id)?;
         if remote_resume_requires_missing_saved_session_failure(
@@ -4129,6 +4468,28 @@ impl YggtermServer {
             saved_session_exists,
         ) {
             anyhow::bail!(remote_resume_missing_saved_session_error(session_id));
+        }
+        if saved_session_exists {
+            let external_processes = external_codex_resume_processes_for_session(session_id);
+            if !external_processes.is_empty() {
+                if let Ok(home) = resolve_yggterm_home() {
+                    append_trace_event(
+                        &home,
+                        "daemon",
+                        "remote_runtime",
+                        "external_active_refused_runtime_spawn",
+                        json!({
+                            "session_id": session_id,
+                            "pids": external_processes.iter().map(|process| process.pid).collect::<Vec<_>>(),
+                            "policy": "session_survival_before_yggterm_attach",
+                        }),
+                    );
+                }
+                anyhow::bail!(remote_resume_external_active_message(
+                    session_id,
+                    &external_processes
+                ));
+            }
         }
         let key = remote_runtime_codex_session_key(session_id);
         let target = local_session_target(SessionKind::Codex, cwd);
@@ -4153,9 +4514,19 @@ impl YggtermServer {
             );
         }
         let launch_command = if saved_session_exists {
-            remote_persistent_resume_shell_command(session_id, cwd)
+            remote_persistent_resume_shell_command_with_terminal_appearance(
+                session_id,
+                cwd,
+                terminal_appearance,
+            )
         } else {
-            remote_resume_picker_shell_command(session_id, cwd, None, true)
+            remote_resume_picker_shell_command_with_terminal_appearance(
+                session_id,
+                cwd,
+                None,
+                true,
+                terminal_appearance,
+            )
         };
         let home = resolve_yggterm_home()?;
         let registry = RemoteRuntimeRegistry::open(&home)?;
@@ -4236,6 +4607,7 @@ impl YggtermServer {
         &mut self,
         session_id: &str,
         cwd: Option<&str>,
+        terminal_appearance: Option<&str>,
     ) -> anyhow::Result<String> {
         let key = remote_runtime_codex_session_key(session_id);
         let legacy_local_key = local_live_runtime_key(session_id);
@@ -4269,7 +4641,13 @@ impl YggtermServer {
                 false,
             );
         }
-        let launch_command = agent_launch_command(SessionKind::Codex, cwd, None);
+        let launch_command = managed_cli_shell_command_with_terminal_appearance(
+            SessionKind::Codex,
+            cwd,
+            ManagedCliAction::Launch,
+            terminal_appearance,
+        )
+        .unwrap_or_else(|_| legacy_agent_launch_command(SessionKind::Codex, cwd, None));
         let home = resolve_yggterm_home()?;
         let registry = RemoteRuntimeRegistry::open(&home)?;
         let _ = registry.register_session(RemoteRuntimeSessionInput {
@@ -4474,10 +4852,7 @@ impl YggtermServer {
                     );
                 }
                 self.sessions.insert(normalized_live_key.clone(), session);
-                self.live_session_order
-                    .retain(|existing| existing != normalized_live_key);
-                self.live_session_order
-                    .insert(0, normalized_live_key.clone());
+                self.append_restored_live_session_order(normalized_live_key);
                 return;
             }
             if !matches!(
@@ -4522,6 +4897,7 @@ impl YggtermServer {
                 Some(resolved_title.clone()),
                 false,
             );
+            self.append_restored_live_session_order(normalized_live_key);
             if let Some(session) = self.sessions.get_mut(normalized_live_key) {
                 if starts_new_codex {
                     configure_remote_new_codex_live_session(
@@ -4569,11 +4945,17 @@ impl YggtermServer {
             Some(title),
             false,
         );
+        self.append_restored_live_session_order(&key);
         if let Some(session) = self.sessions.get_mut(&key) {
+            let _ = refresh_restored_remote_runtime_codex_launch_command(&key, session);
             if let Some(storage_path) = storage_path.as_deref() {
                 upsert_session_metadata(&mut session.metadata, "Storage", storage_path.to_string());
                 let cwd = session_metadata_value(session, "Cwd").unwrap_or_else(local_default_cwd);
-                session.launch_command = stored_session_launch_command(session.kind, &cwd, &id);
+                if !parse_remote_runtime_codex_session_key(&key).is_some_and(|session_id| {
+                    session.kind == SessionKind::Codex && session_id == id.as_str()
+                }) {
+                    session.launch_command = stored_session_launch_command(session.kind, &cwd, &id);
+                }
                 upsert_session_metadata(
                     &mut session.metadata,
                     "Launch",
@@ -5047,6 +5429,7 @@ impl YggtermServer {
                 promote_active_stored_session = true;
             }
             SessionSource::LiveLocal | SessionSource::LiveSsh => {
+                let _ = refresh_restored_remote_runtime_codex_launch_command(&path, session);
                 let uses_remote_runtime = live_session_uses_remote_runtime(session);
                 if uses_remote_runtime && let Some(ssh_target) = session.ssh_target.clone() {
                     let (cached_ssh_target, cached_ssh_prefix, cached_launch) =
@@ -5400,10 +5783,14 @@ impl YggtermServer {
         }
     }
 
-    fn connect_ssh_like_target(&mut self, target: &SshConnectTarget) -> (Option<String>, bool) {
+    fn connect_ssh_like_target(
+        &mut self,
+        target: &SshConnectTarget,
+    ) -> anyhow::Result<(Option<String>, bool)> {
         let mut target = target.clone();
         target.ssh_target = canonicalize_ssh_target_alias(&target.ssh_target);
         self.upsert_ssh_target(&target);
+        let resolved_remote_launch = self.resolve_ssh_shell_remote_launch(&target)?;
         if let Some(existing_key) = self
             .sessions
             .iter()
@@ -5415,8 +5802,16 @@ impl YggtermServer {
             })
             .map(|(key, _)| key.clone())
         {
+            if let Some((remote_binary, remote_deploy_state)) = resolved_remote_launch {
+                self.configure_remote_ssh_shell_live_session(
+                    &existing_key,
+                    &target,
+                    &remote_binary,
+                    remote_deploy_state,
+                );
+            }
             self.focus_live_session(&existing_key);
-            return (Some(existing_key), true);
+            return Ok((Some(existing_key), true));
         }
 
         let uuid = Uuid::new_v4().to_string();
@@ -5431,7 +5826,128 @@ impl YggtermServer {
             &target,
             Some(target.label.clone()),
         );
-        (Some(key), false)
+        if let Some((remote_binary, remote_deploy_state)) = resolved_remote_launch {
+            self.configure_remote_ssh_shell_live_session(
+                &key,
+                &target,
+                &remote_binary,
+                remote_deploy_state,
+            );
+        }
+        Ok((Some(key), false))
+    }
+
+    fn resolve_ssh_shell_remote_launch(
+        &mut self,
+        target: &SshConnectTarget,
+    ) -> anyhow::Result<Option<(String, RemoteDeployState)>> {
+        if target.kind != SessionKind::SshShell || is_loopback_ssh_target(&target.ssh_target) {
+            return Ok(None);
+        }
+        if let Some((remote_binary, remote_deploy_state)) =
+            self.cached_remote_launch_for_target(&target.ssh_target, target.prefix.as_deref())
+        {
+            let machine_key = machine_key_from_ssh_target(&target.ssh_target);
+            self.promote_remote_machine_health(
+                &machine_key,
+                Some(target),
+                Some(remote_binary.clone()),
+                Some(remote_deploy_state),
+            );
+            return Ok(Some((remote_binary, remote_deploy_state)));
+        }
+        let (remote_binary, remote_deploy_state) =
+            resolve_remote_yggterm_binary(&target.ssh_target, target.prefix.as_deref())
+                .with_context(|| {
+                    format!("remote yggterm bootstrap failed for {}", target.ssh_target)
+                })?;
+        let machine_key = machine_key_from_ssh_target(&target.ssh_target);
+        self.promote_remote_machine_health(
+            &machine_key,
+            Some(target),
+            Some(remote_binary.clone()),
+            Some(remote_deploy_state),
+        );
+        Ok(Some((remote_binary, remote_deploy_state)))
+    }
+
+    fn configure_remote_ssh_shell_live_session(
+        &mut self,
+        key: &str,
+        target: &SshConnectTarget,
+        remote_binary: &str,
+        remote_deploy_state: RemoteDeployState,
+    ) {
+        let Some(session) = self.sessions.get_mut(key) else {
+            return;
+        };
+        let launch_cwd = target.cwd.clone().unwrap_or_else(local_default_cwd);
+        session.session_path = key.to_string();
+        session.source = SessionSource::LiveSsh;
+        session.launch_phase = TerminalLaunchPhase::RemoteBootstrap;
+        session.remote_deploy_state = remote_deploy_state;
+        session.ssh_target = Some(target.ssh_target.clone());
+        session.ssh_prefix = target.prefix.clone();
+        session.launch_command = remote_ssh_launch_command(
+            &target.ssh_target,
+            target.prefix.as_deref(),
+            remote_binary,
+            &["server", "attach", session.id.as_str(), launch_cwd.as_str()],
+        );
+        session.terminal_lines = vec![
+            format!("$ {}", session.launch_command),
+            format!("Queue live SSH session {}", session.id),
+            format!("Target: {}", target.ssh_target),
+            format!(
+                "Command: {}",
+                target.prefix.clone().unwrap_or_else(|| "none".to_string())
+            ),
+            match remote_deploy_state {
+                RemoteDeployState::Ready => "Remote bootstrap: matching yggterm ready".to_string(),
+                RemoteDeployState::CopyingBinary => {
+                    "Remote bootstrap: copying yggterm binary".to_string()
+                }
+                RemoteDeployState::Planned => "Remote bootstrap: planned".to_string(),
+                RemoteDeployState::NotRequired => "Remote bootstrap: not required".to_string(),
+            },
+            "Daemon PTY: request main viewport terminal stream".to_string(),
+        ];
+        upsert_session_metadata(
+            &mut session.metadata,
+            "Deploy",
+            match remote_deploy_state {
+                RemoteDeployState::NotRequired => "not required".to_string(),
+                RemoteDeployState::Planned => "planned".to_string(),
+                RemoteDeployState::CopyingBinary => "copying".to_string(),
+                RemoteDeployState::Ready => "ready".to_string(),
+            },
+        );
+        upsert_session_metadata(
+            &mut session.metadata,
+            "Status",
+            format!(
+                "remote attach queued · {}",
+                match remote_deploy_state {
+                    RemoteDeployState::Ready => "remote yggterm ready",
+                    RemoteDeployState::CopyingBinary => "copying yggterm binary",
+                    RemoteDeployState::Planned => "remote bootstrap planned",
+                    RemoteDeployState::NotRequired => "not required",
+                }
+            ),
+        );
+        upsert_session_metadata(
+            &mut session.metadata,
+            "Launch",
+            user_visible_launch_command(&session.launch_command),
+        );
+        session.status_line = describe_status_line(
+            session.backend,
+            self.theme,
+            session.source,
+            session.launch_phase,
+            session.remote_deploy_state,
+            session.bridge_available,
+        );
     }
 
     fn upsert_ssh_target(&mut self, target: &SshConnectTarget) {
@@ -5853,16 +6369,18 @@ fn remote_resume_fallback_line_is_boilerplate(line: &str) -> bool {
         || normalized.contains("__yggterm_cwd_ok=")
 }
 
-fn remote_resume_picker_shell_command(
+fn remote_resume_picker_shell_command_with_terminal_appearance(
     session_id: &str,
     cwd: Option<&str>,
     prefix: Option<&str>,
     persistent: bool,
+    terminal_appearance: Option<&str>,
 ) -> String {
-    let base = managed_cli_shell_command(
+    let base = managed_cli_shell_command_with_terminal_appearance(
         SessionKind::Codex,
         cwd,
         ManagedCliAction::ResumePicker { persistent },
+        terminal_appearance,
     )
     .unwrap_or_else(|_| {
         let codex_command = if persistent {
@@ -5882,8 +6400,17 @@ fn remote_resume_picker_shell_command(
     }
 }
 
-fn remote_persistent_resume_shell_command(session_id: &str, cwd: Option<&str>) -> String {
-    let base = persistent_agent_resume_command(SessionKind::Codex, cwd, session_id);
+fn remote_persistent_resume_shell_command_with_terminal_appearance(
+    session_id: &str,
+    cwd: Option<&str>,
+    terminal_appearance: Option<&str>,
+) -> String {
+    let base = persistent_agent_resume_command_with_terminal_appearance(
+        SessionKind::Codex,
+        cwd,
+        session_id,
+        terminal_appearance,
+    );
     format!("stty raw -echo opost onlcr </dev/tty >/dev/tty 2>/dev/null || true; {base}")
 }
 
@@ -6603,12 +7130,31 @@ fn remote_snapshot_has_codex_resume_instruction(bytes: &[u8]) -> bool {
 
 pub(crate) fn remote_resume_runtime_output_requires_restart(bytes: &[u8]) -> bool {
     !bytes.is_empty()
-        && (remote_snapshot_is_generic_codex_idle(bytes)
+        && !remote_resume_snapshot_is_external_active_guard(bytes)
+        && (remote_snapshot_has_internal_terminal_session_not_found(bytes)
+            || remote_snapshot_is_generic_codex_idle(bytes)
             || remote_snapshot_has_generic_codex_idle_footer(bytes)
             || remote_snapshot_looks_like_shell_prompt(bytes)
             || remote_snapshot_is_transcript_browser(bytes)
             || remote_snapshot_has_resume_breakage(bytes)
             || remote_snapshot_has_codex_resume_instruction(bytes))
+}
+
+fn remote_snapshot_has_internal_terminal_session_not_found(bytes: &[u8]) -> bool {
+    let text = String::from_utf8_lossy(bytes);
+    text.lines().any(|line| {
+        let normalized = line
+            .trim()
+            .trim_start_matches(|ch: char| matches!(ch, '›' | '>' | ' ' | '\t'))
+            .trim()
+            .to_ascii_lowercase();
+        normalized.starts_with("error: terminal session not found: local://")
+            || normalized.starts_with("terminal session not found: local://")
+            || normalized.starts_with("error: terminal session not found: remote-session://")
+            || normalized.starts_with("terminal session not found: remote-session://")
+            || normalized.starts_with("error: terminal session not found: codex-runtime://")
+            || normalized.starts_with("terminal session not found: codex-runtime://")
+    })
 }
 
 fn remote_snapshot_directory_matches_session(
@@ -7033,6 +7579,9 @@ pub(crate) fn remote_resume_runtime_output_mismatches_saved_session(
     if snapshot.is_empty() {
         return false;
     }
+    if remote_resume_snapshot_is_external_active_guard(snapshot) {
+        return false;
+    }
     let saved_session_exists = match remote_saved_codex_session_exists(session_id) {
         Ok(value) => value,
         Err(_) => return false,
@@ -7048,6 +7597,9 @@ fn remote_resume_runtime_output_mismatches_managed_session(
     snapshot: &[u8],
 ) -> bool {
     if snapshot.is_empty() {
+        return false;
+    }
+    if remote_resume_snapshot_is_external_active_guard(snapshot) {
         return false;
     }
     if !remote_saved_session_can_reuse_existing_multiplexer(true, snapshot) {
@@ -7335,6 +7887,163 @@ fn refresh_remote_codex_terminal_identity_launch_command(
     changed
 }
 
+fn restored_remote_runtime_codex_session_id(
+    key: &str,
+    session: &ManagedSessionView,
+) -> Option<String> {
+    if let Some(session_id) = parse_remote_runtime_codex_session_key(key) {
+        return Some(session_id.to_string());
+    }
+    if let Some(session_id) = parse_remote_runtime_codex_session_key(&session.session_path) {
+        return Some(session_id.to_string());
+    }
+    session_metadata_value(session, "Runtime Session")
+        .and_then(|value| parse_remote_runtime_codex_session_key(&value).map(str::to_string))
+}
+
+fn refresh_restored_remote_runtime_codex_launch_command(
+    key: &str,
+    session: &mut ManagedSessionView,
+) -> bool {
+    if session.kind != SessionKind::Codex {
+        return false;
+    }
+    let Some(session_id) = restored_remote_runtime_codex_session_id(key, session) else {
+        return false;
+    };
+    let already_resume = session.launch_command.contains(" resume")
+        && session.launch_command.contains(session_id.as_str());
+    if !already_resume {
+        match remote_saved_codex_session_exists(&session_id) {
+            Ok(true) => {}
+            Ok(false) => return false,
+            Err(error) => {
+                if let Ok(home) = resolve_yggterm_home() {
+                    append_trace_event(
+                        &home,
+                        "server",
+                        "remote_runtime",
+                        "restored_codex_runtime_launch_repair_skipped",
+                        serde_json::json!({
+                            "key": key,
+                            "session_id": session_id,
+                            "reason": "saved_session_lookup_failed",
+                            "error": error.to_string(),
+                        }),
+                    );
+                }
+                return false;
+            }
+        }
+    }
+    let runtime_key = remote_runtime_codex_session_key(&session_id);
+    let cwd = session_metadata_value(session, "Cwd")
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    let existing_appearance =
+        terminal::infer_terminal_appearance_from_launch_command(&session.launch_command);
+    let launch_command = remote_persistent_resume_shell_command_with_terminal_appearance(
+        &session_id,
+        cwd.as_deref(),
+        existing_appearance,
+    );
+    let mut changed = false;
+
+    if session.id != session_id {
+        session.id = session_id.clone();
+        changed = true;
+    }
+    if session.session_path != runtime_key {
+        session.session_path = runtime_key.clone();
+        changed = true;
+    }
+    if session.launch_command != launch_command {
+        session.launch_command = launch_command.clone();
+        changed = true;
+    }
+    if session.remote_deploy_state != RemoteDeployState::NotRequired {
+        session.remote_deploy_state = RemoteDeployState::NotRequired;
+        changed = true;
+    }
+    if session.source != SessionSource::LiveLocal {
+        session.source = SessionSource::LiveLocal;
+        changed = true;
+    }
+
+    let before_len = session.metadata.len();
+    session
+        .metadata
+        .retain(|entry| entry.label != REMOTE_LAUNCH_ACTION_METADATA_LABEL);
+    if session.metadata.len() != before_len {
+        changed = true;
+    }
+
+    let before_metadata = session.metadata.clone();
+    upsert_session_metadata(
+        &mut session.metadata,
+        "Source",
+        "daemon-owned-remote-runtime".to_string(),
+    );
+    upsert_session_metadata(
+        &mut session.metadata,
+        "Restore",
+        format!("yggterm server remote resume-codex {session_id} --require-existing"),
+    );
+    upsert_session_metadata(
+        &mut session.metadata,
+        "Runtime Session",
+        runtime_key.clone(),
+    );
+    upsert_session_metadata(
+        &mut session.metadata,
+        "Runtime Ownership",
+        "yggterm daemon".to_string(),
+    );
+    upsert_session_metadata(
+        &mut session.metadata,
+        "Launch",
+        user_visible_launch_command(&launch_command),
+    );
+    if let Some(cwd) = cwd.as_deref() {
+        upsert_session_metadata(&mut session.metadata, "Cwd", cwd.to_string());
+    }
+    if session.metadata != before_metadata {
+        changed = true;
+    }
+
+    let terminal_lines = vec![
+        format!("$ {launch_command}"),
+        format!("Resume daemon-owned remote Codex session {session_id}"),
+        format!(
+            "Workspace: {}",
+            cwd.clone().unwrap_or_else(local_default_cwd)
+        ),
+        "Runtime owner: yggterm daemon".to_string(),
+        "Transport bridge: stdio attach to daemon PTY".to_string(),
+    ];
+    if session.terminal_lines != terminal_lines {
+        session.terminal_lines = terminal_lines;
+        changed = true;
+    }
+
+    if changed && let Ok(home) = resolve_yggterm_home() {
+        append_trace_event(
+            &home,
+            "server",
+            "remote_runtime",
+            "restored_codex_runtime_launch_repaired",
+            serde_json::json!({
+                "key": key,
+                "runtime_key": runtime_key,
+                "session_id": session_id,
+                "cwd": cwd,
+            }),
+        );
+    }
+
+    changed
+}
+
 fn remote_terminal_ssh_command(ssh_command: String) -> String {
     format!("{} exec {ssh_command}", remote_terminal_tty_settle_prefix())
 }
@@ -7355,7 +8064,7 @@ fn remote_terminal_tty_settle_prefix() -> &'static str {
     "__yggterm_initial_tty_size=$(stty size 2>/dev/null || true); \
      case \"$__yggterm_initial_tty_size\" in \"36 120\"|\"24 80\") \
      __yggterm_tty_wait=0; \
-     while [ \"$__yggterm_tty_wait\" -lt 24 ]; do \
+     while [ \"$__yggterm_tty_wait\" -lt 160 ]; do \
      __yggterm_current_tty_size=$(stty size 2>/dev/null || true); \
      [ -n \"$__yggterm_current_tty_size\" ] && \
      [ \"$__yggterm_current_tty_size\" != \"$__yggterm_initial_tty_size\" ] && break; \
@@ -7856,9 +8565,7 @@ fn apply_remote_scanned_session_preview(
         .map(|entry| entry.value.as_str())
         .is_some_and(|value| matches!(value, "head" | "full"))
         && (!session.preview.blocks.is_empty() || !session.rendered_sections.is_empty());
-    if !scanned.title_hint.trim().is_empty()
-        && !looks_like_generated_fallback_title(&scanned.title_hint)
-    {
+    if passive_title_hint_can_update(&session.title, &scanned.title_hint, false) {
         session.title = scanned.title_hint.clone();
     }
     let (primary_goals, preview_blocks, rendered_sections) =
@@ -8810,6 +9517,32 @@ def looks_like_generated_fallback_title(value):
     compact = (value or "").strip()
     lower = compact.lower()
     words = compact.split()
+    normalized_words = [re.sub(r"[^0-9a-zA-Z]", "", word).lower() for word in words]
+    normalized_words = [word for word in normalized_words if word]
+    low_signal_words = {
+        "the", "and", "for", "with", "this", "that", "from", "into",
+        "have", "will", "would", "should", "could", "about", "there",
+        "their", "what", "when", "where", "which", "your", "want",
+        "like", "just", "please", "sudo", "repo", "debian", "ubuntu",
+        "need", "needs", "make", "sure", "using", "through", "session",
+        "path", "paths", "source", "sources", "line", "lines", "verify",
+        "check", "box", "host", "machine", "flow", "official", "local",
+        "remote", "apt", "deb", "rpm", "via", "over", "under", "onto",
+        "you", "can", "may", "not", "asked", "again", "next", "also",
+        "continue", "now", "while", "those", "are", "generating",
+        "current", "status", "live", "but", "only", "typed", "first",
+        "old", "side", "wrote",
+    }
+    low_signal_count = sum(1 for word in normalized_words if word in low_signal_words)
+    if (
+        normalized_words
+        and (
+            normalized_words[0] in {"how", "why", "what", "when", "where", "who"}
+            or normalized_words[-1] in {"the", "a", "an", "to", "for", "of", "with", "into", "from", "and", "or"}
+            or (len(normalized_words) >= 3 and low_signal_count * 2 >= len(normalized_words))
+        )
+    ):
+        return True
     if re.fullmatch(r"Q[0-9a-fA-F]{6,7}", compact):
         return True
     if re.fullmatch(r"[0-9a-fA-F]{7,8}", compact):
@@ -8852,14 +9585,19 @@ def looks_like_generated_fallback_title(value):
 title = payload.get("title")
 if title:
     existing = conn.execute(
-        "SELECT title FROM session_titles WHERE session_id = ?",
+        "SELECT title, source FROM session_titles WHERE session_id = ?",
         (session_id,),
     ).fetchone()
     preserve_existing_title = (
-        looks_like_generated_fallback_title(title)
-        and existing is not None
+        existing is not None
         and existing[0]
-        and not looks_like_generated_fallback_title(existing[0])
+        and (
+            ((existing[1] or "").strip().lower() == "manual" and source.strip().lower() != "manual")
+            or (
+                looks_like_generated_fallback_title(title)
+                and not looks_like_generated_fallback_title(existing[0])
+            )
+        )
     )
     if not preserve_existing_title:
         conn.execute(
@@ -8940,6 +9678,30 @@ struct RemoteGeneratedCopyPayload {
 }
 
 const REMOTE_METADATA_MIRROR_DB_FILENAME: &str = "remote-session-cache.db";
+
+fn should_preserve_existing_remote_title(
+    incoming_title: &str,
+    incoming_source: &str,
+    existing_title: Option<&str>,
+    existing_source: Option<&str>,
+) -> bool {
+    let Some(existing_title) = existing_title
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return false;
+    };
+    let incoming_source = incoming_source.trim();
+    if existing_source
+        .map(str::trim)
+        .is_some_and(|source| source.eq_ignore_ascii_case("manual"))
+        && !incoming_source.eq_ignore_ascii_case("manual")
+    {
+        return true;
+    }
+    looks_like_generated_fallback_title(incoming_title)
+        && !looks_like_generated_fallback_title(existing_title)
+}
 
 fn open_remote_metadata_mirror_store() -> anyhow::Result<Connection> {
     let home = resolve_yggterm_home()?;
@@ -10349,11 +11111,20 @@ pub fn run_remote_resume_codex(
             span.finish(meta);
         }
     };
-    let _ = ensure_local_managed_cli(ManagedCliTool::Codex)?;
     let home = resolve_yggterm_home()?;
+    let saved_session_exists = remote_saved_codex_session_exists(session_id)?;
+    if remote_resume_requires_missing_saved_session_failure(require_existing, saved_session_exists)
+    {
+        anyhow::bail!(remote_resume_missing_saved_session_error(session_id));
+    }
+    if saved_session_exists {
+        wait_for_external_codex_resume_to_clear(&home, session_id);
+    }
+    let _ = ensure_local_managed_cli(ManagedCliTool::Codex)?;
     let initial_size = current_tty_size();
+    let terminal_appearance = terminal_identity_appearance_from_environment();
     if let Some((endpoint, runtime_key)) =
-        endpoint_with_live_remote_codex_session(&home, session_id)?
+        endpoint_with_live_remote_codex_session(&home, session_id, Some(&terminal_appearance))?
     {
         finish_span(serde_json::json!({
             "session_id": session_id,
@@ -10368,7 +11139,6 @@ pub fn run_remote_resume_codex(
     }
     let endpoint = default_endpoint(&home);
     ensure_local_daemon_running(&endpoint)?;
-    let terminal_appearance = terminal_identity_appearance_from_environment();
     let key = daemon_ensure_remote_runtime_codex_session(
         &endpoint,
         session_id,
@@ -10403,8 +11173,13 @@ pub fn run_remote_start_codex(session_id: &str, cwd: Option<&str>) -> anyhow::Re
     let home = resolve_yggterm_home()?;
     let runtime_key = remote_runtime_codex_session_key(session_id);
     let initial_size = current_tty_size();
+    let terminal_appearance = terminal_identity_appearance_from_environment();
     if let Some((endpoint, runtime_key)) =
-        endpoint_with_live_remote_runtime_key_for_bridge(&home, &runtime_key)?
+        endpoint_with_live_remote_runtime_key_for_bridge_with_terminal_appearance(
+            &home,
+            &runtime_key,
+            Some(&terminal_appearance),
+        )?
     {
         finish_span(serde_json::json!({
             "session_id": session_id,
@@ -10418,7 +11193,6 @@ pub fn run_remote_start_codex(session_id: &str, cwd: Option<&str>) -> anyhow::Re
     }
     let endpoint = default_endpoint(&home);
     ensure_local_daemon_running(&endpoint)?;
-    let terminal_appearance = terminal_identity_appearance_from_environment();
     let key = daemon::start_remote_runtime_codex_session(
         &endpoint,
         session_id,
@@ -10726,6 +11500,92 @@ fn endpoint_with_live_remote_runtime_key_for_bridge(
     }
 }
 
+fn normalize_terminal_appearance_for_bridge(value: Option<&str>) -> Option<&'static str> {
+    match value?.trim().to_ascii_lowercase().as_str() {
+        "dark" => Some("dark"),
+        "light" => Some("light"),
+        _ => None,
+    }
+}
+
+fn launch_command_matches_terminal_appearance(
+    launch_command: &str,
+    expected_appearance: Option<&str>,
+) -> bool {
+    let Some(expected) = normalize_terminal_appearance_for_bridge(expected_appearance) else {
+        return true;
+    };
+    terminal::infer_terminal_appearance_from_launch_command(launch_command) == Some(expected)
+}
+
+fn snapshot_session_matches_terminal_appearance(
+    session: &SnapshotSessionView,
+    expected_appearance: Option<&str>,
+) -> bool {
+    launch_command_matches_terminal_appearance(&session.launch_command, expected_appearance)
+}
+
+fn endpoint_runtime_matches_terminal_appearance(
+    home: &Path,
+    endpoint: &ServerEndpoint,
+    runtime_key: &str,
+    expected_appearance: Option<&str>,
+) -> bool {
+    let Some(expected) = normalize_terminal_appearance_for_bridge(expected_appearance) else {
+        return true;
+    };
+    let Ok((snapshot, _message)) = daemon::snapshot(endpoint) else {
+        return true;
+    };
+    let session = snapshot
+        .active_session
+        .iter()
+        .chain(snapshot.live_sessions.iter())
+        .find(|session| session.session_path == runtime_key);
+    let Some(session) = session else {
+        return true;
+    };
+    if snapshot_session_matches_terminal_appearance(session, Some(expected)) {
+        return true;
+    }
+    append_trace_event(
+        home,
+        "server",
+        "remote_runtime",
+        "runtime_bridge_appearance_mismatch",
+        json!({
+            "runtime_key": runtime_key,
+            "expected_appearance": expected,
+            "actual_appearance": terminal::infer_terminal_appearance_from_launch_command(&session.launch_command),
+            "owner_endpoint": format!("{endpoint:?}"),
+            "policy": "restart_daemon_runtime_before_bridge",
+        }),
+    );
+    false
+}
+
+fn endpoint_with_live_remote_runtime_key_for_bridge_with_terminal_appearance(
+    home: &Path,
+    runtime_key: &str,
+    terminal_appearance: Option<&str>,
+) -> anyhow::Result<Option<(ServerEndpoint, String)>> {
+    let Some((endpoint, runtime_key)) =
+        endpoint_with_live_remote_runtime_key_for_bridge(home, runtime_key)?
+    else {
+        return Ok(None);
+    };
+    if endpoint_runtime_matches_terminal_appearance(
+        home,
+        &endpoint,
+        &runtime_key,
+        terminal_appearance,
+    ) {
+        Ok(Some((endpoint, runtime_key)))
+    } else {
+        Ok(None)
+    }
+}
+
 fn snapshot_metadata_value(session: &SnapshotSessionView, label: &str) -> Option<String> {
     session
         .metadata
@@ -10746,9 +11606,16 @@ fn snapshot_codex_session_matches_id(session: &SnapshotSessionView, session_id: 
 fn endpoint_with_live_remote_codex_session(
     home: &Path,
     session_id: &str,
+    terminal_appearance: Option<&str>,
 ) -> anyhow::Result<Option<(ServerEndpoint, String)>> {
     let exact_key = remote_runtime_codex_session_key(session_id);
-    if let Some(endpoint) = endpoint_with_live_remote_runtime_key_for_bridge(home, &exact_key)? {
+    if let Some(endpoint) =
+        endpoint_with_live_remote_runtime_key_for_bridge_with_terminal_appearance(
+            home,
+            &exact_key,
+            terminal_appearance,
+        )?
+    {
         return Ok(Some(endpoint));
     }
     for (endpoint, runtime) in daemon::reachable_versioned_daemon_statuses(home) {
@@ -10764,6 +11631,23 @@ fn endpoint_with_live_remote_codex_session(
                 continue;
             }
             if remote_runtime_codex_session_id_from_terminal_key(&live.session_path).is_some() {
+                if !snapshot_session_matches_terminal_appearance(&live, terminal_appearance) {
+                    append_trace_event(
+                        home,
+                        "server",
+                        "remote_runtime",
+                        "runtime_bridge_appearance_mismatch",
+                        json!({
+                            "runtime_key": live.session_path,
+                            "session_id": session_id,
+                            "expected_appearance": normalize_terminal_appearance_for_bridge(terminal_appearance),
+                            "actual_appearance": terminal::infer_terminal_appearance_from_launch_command(&live.launch_command),
+                            "owner_endpoint": format!("{endpoint:?}"),
+                            "policy": "restart_daemon_runtime_before_bridge",
+                        }),
+                    );
+                    continue;
+                }
                 return Ok(Some((endpoint, live.session_path)));
             }
         }
@@ -12304,6 +13188,8 @@ pub struct ClientInstanceRecord {
     pub pid: u32,
     pub started_at_ms: u128,
     #[serde(default)]
+    pub linux_desktop_app_id: Option<String>,
+    #[serde(default)]
     pub process_start_ticks: Option<u64>,
     #[serde(default)]
     pub executable_path: Option<String>,
@@ -12663,21 +13549,56 @@ fn truthy_env_value(value: Option<&str>) -> bool {
         })
 }
 
+fn linux_desktop_identity_trace_paths(home: &Path) -> Vec<PathBuf> {
+    let current = event_trace_path(home);
+    vec![
+        current.with_file_name("event-trace.previous.jsonl"),
+        current,
+    ]
+}
+
+fn linux_desktop_app_id_from_trace_event(event: &Value) -> Option<Value> {
+    let name = event.get("name").and_then(Value::as_str)?;
+    if !matches!(
+        name,
+        "linux_desktop_app_id" | "linux_desktop_identity_applied"
+    ) {
+        return None;
+    }
+    let payload = event.get("payload").cloned().unwrap_or(Value::Null);
+    let app_id = payload.get("app_id").cloned().unwrap_or(Value::Null);
+    Some(json!({
+        "ts_ms": event.get("ts_ms").cloned().unwrap_or(Value::Null),
+        "pid": event.get("pid").cloned().unwrap_or(Value::Null),
+        "name": name,
+        "app_id": app_id,
+        "payload": payload,
+    }))
+}
+
 fn recent_linux_desktop_app_id_events(home: &Path, lines: usize) -> Vec<Value> {
-    tail_text_file_lines(&event_trace_path(home), lines)
-        .into_iter()
-        .filter_map(|line| serde_json::from_str::<Value>(&line).ok())
-        .filter(|event| event.get("name").and_then(Value::as_str) == Some("linux_desktop_app_id"))
-        .map(|event| {
-            let payload = event.get("payload").cloned().unwrap_or(Value::Null);
-            json!({
-                "ts_ms": event.get("ts_ms").cloned().unwrap_or(Value::Null),
-                "pid": event.get("pid").cloned().unwrap_or(Value::Null),
-                "app_id": payload.get("app_id").cloned().unwrap_or(Value::Null),
-                "payload": payload,
-            })
-        })
-        .collect()
+    let mut events = Vec::new();
+    for path in linux_desktop_identity_trace_paths(home) {
+        let Ok(text) = fs::read_to_string(&path) else {
+            continue;
+        };
+        events.extend(
+            text.lines()
+                .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                .filter_map(|event| linux_desktop_app_id_from_trace_event(&event)),
+        );
+    }
+    events.sort_by_key(|event| {
+        event
+            .get("ts_ms")
+            .and_then(Value::as_u64)
+            .unwrap_or_default()
+    });
+    let limit = lines.max(1);
+    if events.len() > limit {
+        events.drain(0..events.len() - limit);
+    }
+    events
 }
 
 #[cfg(target_os = "linux")]
@@ -12711,6 +13632,54 @@ fn desktop_field<'a>(entry: &'a Value, key: &str) -> Option<&'a str> {
         .and_then(Value::as_str)
 }
 
+fn desktop_identity_client_app_id_problems(
+    pid: u32,
+    latest_app_id: Option<&str>,
+    env: &BTreeMap<String, String>,
+    pinned_canonical: bool,
+) -> Vec<String> {
+    let explicit_suffix = env
+        .get("YGGTERM_DESKTOP_APP_ID_SUFFIX")
+        .is_some_and(|value| !value.trim().is_empty());
+    let remote_smoke = truthy_env_value(env.get("YGGTERM_REMOTE_SMOKE_TAG").map(String::as_str));
+    let mut problems = Vec::new();
+    if let Some(app_id) = latest_app_id
+        && app_id != YGGTERM_DESKTOP_APP_ID
+        && !explicit_suffix
+        && !remote_smoke
+    {
+        problems.push(format!(
+            "live client pid {pid} uses app id {app_id}; pinned KDE launchers expect {YGGTERM_DESKTOP_APP_ID}",
+        ));
+    }
+    if let Some(app_id) = latest_app_id
+        && app_id != YGGTERM_DESKTOP_APP_ID
+        && truthy_env_value(env.get("YGGTERM_ALLOW_MULTI_WINDOW").map(String::as_str))
+        && !remote_smoke
+        && !explicit_suffix
+    {
+        problems.push(format!(
+            "pid {pid} appears to be an update-handoff launch where YGGTERM_ALLOW_MULTI_WINDOW changed the desktop app id",
+        ));
+    }
+    if latest_app_id.is_none() && pinned_canonical && !explicit_suffix && !remote_smoke {
+        problems.push(format!(
+            "live client pid {pid} emitted no Linux desktop app id trace event; KDE pins the canonical {YGGTERM_DESKTOP_APP_ID} launcher, so taskbar stacking cannot be proved",
+        ));
+    }
+    problems
+}
+
+fn desktop_identity_latest_app_id_for_record(
+    record: &ClientInstanceRecord,
+    latest_app_id_by_pid: &BTreeMap<u32, String>,
+) -> Option<String> {
+    latest_app_id_by_pid
+        .get(&record.pid)
+        .cloned()
+        .or_else(|| record.linux_desktop_app_id.clone())
+}
+
 pub fn run_app_control_desktop_identity() -> anyhow::Result<()> {
     let home = resolve_yggterm_home()?;
     let endpoint = default_endpoint(&home);
@@ -12737,6 +13706,9 @@ pub fn run_app_control_desktop_identity() -> anyhow::Result<()> {
     }
 
     let pins = kde_pinned_yggterm_launchers();
+    let pinned_canonical = pins
+        .iter()
+        .any(|pin| pin.contains(&format!("{YGGTERM_DESKTOP_APP_ID}.desktop")));
     let mut problems = Vec::<String>::new();
     if desktop_field(&canonical_entry, "Icon") != Some(YGGTERM_DESKTOP_APP_ID) {
         problems.push(format!(
@@ -12753,32 +13725,14 @@ pub fn run_app_control_desktop_identity() -> anyhow::Result<()> {
         .iter()
         .map(|record| {
             let env = process_environment_snapshot(record.pid);
-            let latest_app_id = latest_app_id_by_pid.get(&record.pid).cloned();
-            let explicit_suffix = env.get("YGGTERM_DESKTOP_APP_ID_SUFFIX").is_some_and(|value| {
-                !value.trim().is_empty()
-            });
-            let remote_smoke = truthy_env_value(env.get("YGGTERM_REMOTE_SMOKE_TAG").map(String::as_str));
-            if let Some(app_id) = latest_app_id.as_deref()
-                && app_id != YGGTERM_DESKTOP_APP_ID
-                && !explicit_suffix
-                && !remote_smoke
-            {
-                problems.push(format!(
-                    "live client pid {} uses app id {app_id}; pinned KDE launchers expect {YGGTERM_DESKTOP_APP_ID}",
-                    record.pid
-                ));
-            }
-            if let Some(app_id) = latest_app_id.as_deref()
-                && app_id != YGGTERM_DESKTOP_APP_ID
-                && truthy_env_value(env.get("YGGTERM_ALLOW_MULTI_WINDOW").map(String::as_str))
-                && !remote_smoke
-                && !explicit_suffix
-            {
-                problems.push(format!(
-                    "pid {} appears to be an update-handoff launch where YGGTERM_ALLOW_MULTI_WINDOW changed the desktop app id",
-                    record.pid
-                ));
-            }
+            let latest_app_id =
+                desktop_identity_latest_app_id_for_record(record, &latest_app_id_by_pid);
+            problems.extend(desktop_identity_client_app_id_problems(
+                record.pid,
+                latest_app_id.as_deref(),
+                &env,
+                pinned_canonical,
+            ));
             json!({
                 "record": record,
                 "env": env,
@@ -12787,9 +13741,6 @@ pub fn run_app_control_desktop_identity() -> anyhow::Result<()> {
         })
         .collect::<Vec<_>>();
 
-    let pinned_canonical = pins
-        .iter()
-        .any(|pin| pin.contains(&format!("{YGGTERM_DESKTOP_APP_ID}.desktop")));
     if pinned_canonical && records.is_empty() {
         problems.push(
             "KDE pins the canonical Yggterm launcher, but no live app-control client is registered"
@@ -13073,6 +14024,26 @@ pub fn run_app_control_set_theme_editor_open(open: bool, timeout_ms: u64) -> any
 pub fn run_app_control_reset_theme_editor(timeout_ms: u64) -> anyhow::Result<()> {
     let home = resolve_yggterm_home()?;
     let response = request_app_control(&home, AppControlCommand::ResetThemeEditor, timeout_ms)?;
+    write_stdout_payload(&serde_json::to_string_pretty(&response)?)?;
+    Ok(())
+}
+
+pub fn run_app_control_set_theme_editor_values(
+    brightness: Option<f32>,
+    alpha: Option<f32>,
+    grain: Option<f32>,
+    timeout_ms: u64,
+) -> anyhow::Result<()> {
+    let home = resolve_yggterm_home()?;
+    let response = request_app_control(
+        &home,
+        AppControlCommand::SetThemeEditorValues {
+            brightness,
+            alpha,
+            grain,
+        },
+        timeout_ms,
+    )?;
     write_stdout_payload(&serde_json::to_string_pretty(&response)?)?;
     Ok(())
 }
@@ -13913,8 +14884,13 @@ fn parse_app_control_start_action(value: &str) -> anyhow::Result<AppControlStart
             Ok(AppControlStartAction::Terminal)
         }
         "ssh" | "connect" | "connect-ssh" | "connect_ssh" => Ok(AppControlStartAction::Ssh),
+        "folder" | "new-folder" | "new_folder" | "add-folder" | "add_folder" => {
+            Ok(AppControlStartAction::Folder)
+        }
         other => {
-            anyhow::bail!("unsupported app start action: {other}; use agent, terminal, or ssh")
+            anyhow::bail!(
+                "unsupported app start action: {other}; use agent, terminal, ssh, or folder"
+            )
         }
     }
 }
@@ -14231,10 +15207,6 @@ fn terminal_probe_i64_field(snapshot: &Value, key: &str) -> Option<i64> {
     })
 }
 
-fn terminal_probe_u64_field(snapshot: &Value, key: &str) -> u64 {
-    snapshot.get(key).and_then(Value::as_u64).unwrap_or(0)
-}
-
 fn terminal_probe_f64_field(snapshot: &Value, key: &str) -> Option<f64> {
     snapshot.get(key).and_then(|value| {
         value
@@ -14242,24 +15214,6 @@ fn terminal_probe_f64_field(snapshot: &Value, key: &str) -> Option<f64> {
             .or_else(|| value.as_i64().map(|number| number as f64))
             .or_else(|| value.as_u64().map(|number| number as f64))
     })
-}
-
-fn terminal_probe_snapshot_expects_scrollback(snapshot: &Value) -> bool {
-    if snapshot
-        .get("scrollback_expected")
-        .and_then(Value::as_bool)
-        .unwrap_or(false)
-    {
-        return true;
-    }
-    let rows = terminal_probe_u64_field(snapshot, "rows");
-    let raw_lines = terminal_probe_u64_field(snapshot, "last_raw_payload_line_count");
-    if rows > 0 && raw_lines > rows.saturating_add(4) {
-        return true;
-    }
-    terminal_probe_i64_field(snapshot, "base_y")
-        .map(|base_y| base_y > 0)
-        .unwrap_or(false)
 }
 
 fn terminal_scroll_probe_snapshot_can_move(snapshot: &Value, lines: i32) -> bool {
@@ -14270,9 +15224,7 @@ fn terminal_scroll_probe_snapshot_can_move(snapshot: &Value, lines: i32) -> bool
     let base_y = terminal_probe_i64_field(snapshot, "base_y");
     let scroll_top = terminal_probe_f64_field(snapshot, "viewport_scroll_top").unwrap_or(0.0);
     if lines < 0 {
-        return viewport_y.map(|value| value > 0).unwrap_or(false)
-            || scroll_top > 0.5
-            || terminal_probe_snapshot_expects_scrollback(snapshot);
+        return viewport_y.map(|value| value > 0).unwrap_or(false) || scroll_top > 0.5;
     }
     if let (Some(viewport_y), Some(base_y)) = (viewport_y, base_y) {
         return viewport_y < base_y;
@@ -14293,32 +15245,7 @@ fn terminal_scroll_probe_snapshot_moved(before: &Value, after: &Value) -> bool {
     {
         return true;
     }
-    let before_head = before
-        .get("text_head")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    let after_head = after
-        .get("text_head")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    if before_head != after_head {
-        return true;
-    }
-    let before_tail = before
-        .get("text_tail")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    let after_tail = after
-        .get("text_tail")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    if before_tail != after_tail {
-        return true;
-    }
-    terminal_probe_u64_field(after, "wheel_event_count")
-        > terminal_probe_u64_field(before, "wheel_event_count")
-        || terminal_probe_u64_field(after, "scroll_event_count")
-            > terminal_probe_u64_field(before, "scroll_event_count")
+    false
 }
 
 fn x11_keyboard_probe_requires_focused_retry(
@@ -15386,18 +16313,21 @@ pub fn run_remote_upsert_generated_copy(payload_json: &str) -> anyhow::Result<()
         .as_deref()
         .filter(|value| !value.trim().is_empty())
     {
-        let preserve_existing_title = looks_like_generated_fallback_title(title)
-            && conn
-                .query_row(
-                    "SELECT title FROM session_titles WHERE session_id = ?1",
-                    params![payload.session_id],
-                    |row| row.get::<_, String>(0),
-                )
-                .optional()?
-                .as_deref()
-                .is_some_and(|existing| {
-                    !existing.trim().is_empty() && !looks_like_generated_fallback_title(existing)
-                });
+        let existing_title = conn
+            .query_row(
+                "SELECT title, source FROM session_titles WHERE session_id = ?1",
+                params![payload.session_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+            )
+            .optional()?;
+        let preserve_existing_title = should_preserve_existing_remote_title(
+            title,
+            &payload.source,
+            existing_title.as_ref().map(|(title, _)| title.as_str()),
+            existing_title
+                .as_ref()
+                .and_then(|(_, source)| source.as_deref()),
+        );
         if !preserve_existing_title {
             conn.execute(
                 "INSERT INTO session_titles (session_id, title, cwd, source, model, updated_at)
@@ -17110,13 +18040,23 @@ fn persistent_agent_resume_command(
     cwd: Option<&str>,
     session_id: &str,
 ) -> String {
-    managed_cli_shell_command(
+    persistent_agent_resume_command_with_terminal_appearance(kind, cwd, session_id, None)
+}
+
+fn persistent_agent_resume_command_with_terminal_appearance(
+    kind: SessionKind,
+    cwd: Option<&str>,
+    session_id: &str,
+    terminal_appearance: Option<&str>,
+) -> String {
+    managed_cli_shell_command_with_terminal_appearance(
         kind,
         cwd,
         ManagedCliAction::Resume {
             session_id,
             persistent: true,
         },
+        terminal_appearance,
     )
     .unwrap_or_else(|_| legacy_agent_launch_command(kind, cwd, Some(session_id)))
 }
@@ -17551,7 +18491,8 @@ mod tests {
         choose_app_control_pid, clear_local_daemon_socket_link_escaping_home,
         clear_local_daemon_socket_link_for_version_mismatch, clear_session_preview_for_loading,
         clear_stale_local_daemon_socket_when_no_daemon, client_instances_dir, current_millis_u64,
-        dedupe_remote_scanned_sessions, describe_status_line, legacy_agent_launch_command,
+        dedupe_remote_scanned_sessions, describe_status_line,
+        launch_command_matches_terminal_appearance, legacy_agent_launch_command,
         legacy_remote_tmux_session_name, live_session_default_summary,
         load_remote_machine_sessions_from_mirror, local_daemon_connect_error_is_transient,
         local_remote_bootstrap_executable_from_current, looks_like_low_signal_generated_copy,
@@ -17562,7 +18503,8 @@ mod tests {
         remote_resume_requires_missing_saved_session_failure,
         remote_resume_runtime_output_mismatches_managed_session,
         remote_resume_runtime_output_requires_restart, remote_resume_shell_command,
-        remote_saved_codex_session_exists, remote_saved_session_can_reuse_existing_multiplexer,
+        remote_runtime_codex_session_key, remote_saved_codex_session_exists,
+        remote_saved_session_can_reuse_existing_multiplexer,
         remote_saved_session_screen_is_attachable, remote_scan_roots_with_parents,
         remote_scanned_session_path, remote_snapshot_looks_like_codex,
         remote_snapshot_looks_like_shell_prompt, remote_ssh_launch_command,
@@ -17578,8 +18520,8 @@ mod tests {
     #[cfg(unix)]
     use crate::process_start_ticks;
     use anyhow::Result;
-    use serde_json::json;
-    use std::collections::HashSet;
+    use serde_json::{Value, json};
+    use std::collections::{BTreeMap, HashSet};
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::process::{Command, Stdio};
@@ -17597,6 +18539,242 @@ mod tests {
                 None => std::env::remove_var(key),
             }
         }
+    }
+
+    #[test]
+    fn desktop_identity_scans_filtered_app_id_events_not_noisy_tail() {
+        let home = std::env::temp_dir().join(format!(
+            "yggterm-desktop-identity-trace-{}",
+            current_millis_u64()
+        ));
+        fs::create_dir_all(&home).expect("create temp home");
+        let trace_path = yggterm_core::event_trace_path(&home);
+        let mut text = String::new();
+        text.push_str(
+            &json!({
+                "ts_ms": 1_u64,
+                "pid": 42_u32,
+                "component": "ui",
+                "category": "startup",
+                "name": "linux_desktop_app_id",
+                "payload": { "app_id": super::YGGTERM_DESKTOP_APP_ID },
+            })
+            .to_string(),
+        );
+        text.push('\n');
+        for index in 0..2_500 {
+            text.push_str(
+                &json!({
+                    "ts_ms": 2_u64 + index,
+                    "pid": 99_u32,
+                    "component": "ui",
+                    "category": "render",
+                    "name": "terminal_mount",
+                    "payload": { "index": index },
+                })
+                .to_string(),
+            );
+            text.push('\n');
+        }
+        fs::write(&trace_path, text).expect("write temp trace");
+
+        let events = super::recent_linux_desktop_app_id_events(&home, 2_000);
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].get("pid").and_then(Value::as_u64), Some(42));
+        assert_eq!(
+            events[0].get("app_id").and_then(Value::as_str),
+            Some(super::YGGTERM_DESKTOP_APP_ID)
+        );
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn desktop_identity_scans_rotated_identity_applied_events() {
+        let home = std::env::temp_dir().join(format!(
+            "yggterm-desktop-identity-rotated-{}",
+            current_millis_u64()
+        ));
+        fs::create_dir_all(&home).expect("create temp home");
+        let current_path = yggterm_core::event_trace_path(&home);
+        let previous_path = current_path.with_file_name("event-trace.previous.jsonl");
+        fs::write(
+            &previous_path,
+            format!(
+                "{}\n",
+                json!({
+                    "ts_ms": 10_u64,
+                    "pid": 314_u32,
+                    "component": "ui",
+                    "category": "startup",
+                    "name": "linux_desktop_identity_applied",
+                    "payload": {
+                        "app_id": super::YGGTERM_DESKTOP_APP_ID,
+                        "after": {
+                            "gdk_program_class": super::YGGTERM_DESKTOP_APP_ID,
+                        },
+                    },
+                })
+            ),
+        )
+        .expect("write rotated trace");
+        fs::write(
+            &current_path,
+            format!(
+                "{}\n",
+                json!({
+                    "ts_ms": 11_u64,
+                    "pid": 314_u32,
+                    "component": "ui",
+                    "category": "render",
+                    "name": "terminal_mount",
+                    "payload": {},
+                })
+            ),
+        )
+        .expect("write current trace");
+
+        let events = super::recent_linux_desktop_app_id_events(&home, 2_000);
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0].get("name").and_then(Value::as_str),
+            Some("linux_desktop_identity_applied")
+        );
+        assert_eq!(
+            events[0].get("app_id").and_then(Value::as_str),
+            Some(super::YGGTERM_DESKTOP_APP_ID)
+        );
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn desktop_identity_flags_missing_app_id_trace_for_pinned_kde_client() {
+        let env = BTreeMap::new();
+
+        let problems = super::desktop_identity_client_app_id_problems(123, None, &env, true);
+
+        assert!(
+            problems
+                .iter()
+                .any(|problem| problem.contains("emitted no Linux desktop app id trace event"))
+        );
+
+        let mut explicit_suffix_env = BTreeMap::new();
+        explicit_suffix_env.insert(
+            "YGGTERM_DESKTOP_APP_ID_SUFFIX".to_string(),
+            "smoke".to_string(),
+        );
+        assert!(
+            super::desktop_identity_client_app_id_problems(123, None, &explicit_suffix_env, true)
+                .is_empty()
+        );
+
+        let mut remote_smoke_env = BTreeMap::new();
+        remote_smoke_env.insert("YGGTERM_REMOTE_SMOKE_TAG".to_string(), "1".to_string());
+        assert!(
+            super::desktop_identity_client_app_id_problems(123, None, &remote_smoke_env, true)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn desktop_identity_uses_client_record_app_id_when_trace_rotated_away() {
+        let record = ClientInstanceRecord {
+            pid: 123,
+            started_at_ms: 456,
+            linux_desktop_app_id: Some(super::YGGTERM_DESKTOP_APP_ID.to_string()),
+            process_start_ticks: None,
+            executable_path: None,
+            display: Some(":1".to_string()),
+            wayland_display: Some("wayland-0".to_string()),
+            xdg_session_id: Some("test-session".to_string()),
+            xdg_runtime_dir: None,
+            xauthority: None,
+        };
+        let trace_events = BTreeMap::<u32, String>::new();
+        let app_id = super::desktop_identity_latest_app_id_for_record(&record, &trace_events);
+        let env = BTreeMap::new();
+
+        assert_eq!(app_id.as_deref(), Some(super::YGGTERM_DESKTOP_APP_ID));
+        assert!(
+            super::desktop_identity_client_app_id_problems(123, app_id.as_deref(), &env, true)
+                .is_empty()
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn external_codex_resume_detection_blocks_non_yggterm_owner() {
+        let external = vec![
+            "node".to_string(),
+            "/usr/local/bin/codex".to_string(),
+            "-s".to_string(),
+            "danger-full-access".to_string(),
+            "resume".to_string(),
+            "019dfde8-d02a-7c23-a270-bab0539e7025".to_string(),
+        ];
+        assert!(super::codex_resume_args_match_session(
+            &external,
+            "019dfde8-d02a-7c23-a270-bab0539e7025"
+        ));
+        assert!(super::codex_resume_process_is_external_for_session(
+            &external,
+            &[],
+            "019dfde8-d02a-7c23-a270-bab0539e7025"
+        ));
+
+        let yggterm_ancestor = vec![
+            "/home/pi/.local/share/yggterm/direct/versions/current/yggterm-headless".to_string(),
+            "server".to_string(),
+            "daemon".to_string(),
+        ];
+        assert!(!super::codex_resume_process_is_external_for_session(
+            &external,
+            &[yggterm_ancestor],
+            "019dfde8-d02a-7c23-a270-bab0539e7025"
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn external_codex_resume_detection_ignores_yggterm_remote_bridge() {
+        let bridge = vec![
+            "/home/pi/.local/bin/yggterm".to_string(),
+            "server".to_string(),
+            "remote".to_string(),
+            "resume-codex".to_string(),
+            "019dfde8-d02a-7c23-a270-bab0539e7025".to_string(),
+            "/home/pi/gh/yggterm".to_string(),
+            "--require-existing".to_string(),
+        ];
+        assert!(!super::codex_resume_args_match_session(
+            &bridge,
+            "019dfde8-d02a-7c23-a270-bab0539e7025"
+        ));
+    }
+
+    #[test]
+    fn external_active_guard_message_is_not_a_failed_resume() {
+        let message = super::remote_resume_external_active_message(
+            "abc123",
+            &[super::ExternalCodexResumeProcess {
+                pid: 42,
+                argv0: "node".to_string(),
+            }],
+        );
+        assert!(super::remote_resume_snapshot_is_external_active_guard(
+            message.as_bytes()
+        ));
+        assert!(!remote_resume_runtime_output_requires_restart(
+            message.as_bytes()
+        ));
+        assert!(
+            !super::remote_resume_runtime_output_mismatches_saved_session(
+                "abc123",
+                message.as_bytes()
+            )
+        );
     }
 
     #[cfg(unix)]
@@ -19048,6 +20226,18 @@ mod tests {
     }
 
     #[test]
+    fn app_control_start_action_parses_folder_aliases() {
+        assert_eq!(
+            crate::parse_app_control_start_action("folder").unwrap(),
+            crate::AppControlStartAction::Folder
+        );
+        assert_eq!(
+            crate::parse_app_control_start_action("add-folder").unwrap(),
+            crate::AppControlStartAction::Folder
+        );
+    }
+
+    #[test]
     fn app_control_open_path_ready_rejects_session_view_contract_violations() {
         let state = json!({
             "session_view_contract_violations": [
@@ -19664,6 +20854,7 @@ mod tests {
         assert!(command.contains("exec ssh -tt -o LogLevel=ERROR -o ControlMaster=no "));
         assert!(command.contains("stty size"));
         assert!(command.contains("\"36 120\"|\"24 80\""));
+        assert!(command.contains("\"$__yggterm_tty_wait\" -lt 160"));
         assert!(
             command.contains("-tt -o LogLevel=ERROR -o ControlMaster=no -o ControlPath=none jojo ")
         );
@@ -19811,9 +21002,10 @@ mod tests {
 
     #[test]
     fn remote_persistent_resume_keeps_raw_input_but_restores_newline_output_processing() {
-        let command = super::remote_persistent_resume_shell_command(
+        let command = super::remote_persistent_resume_shell_command_with_terminal_appearance(
             "019dbdcf-9f11",
             Some("/home/pi/git/samplenotes"),
+            None,
         );
 
         assert!(
@@ -19837,6 +21029,16 @@ mod tests {
     fn remote_resume_runtime_output_requires_restart_for_codex_resume_instruction() {
         let exited = b"Token usage: total=1,064,406 input=1,023,193 output=41,213\nTo continue this session, run codex resume 019d0000-0000-7000-8000-000000000001\n";
         assert!(remote_resume_runtime_output_requires_restart(exited));
+    }
+
+    #[test]
+    fn remote_resume_runtime_output_requires_restart_for_internal_missing_runtime() {
+        let missing = b"\xe2\x80\xba Error: terminal session not found: codex-runtime://019e3648-a76f-7ed3-ace2-1ae56c58d800\n";
+        assert!(remote_resume_runtime_output_requires_restart(missing));
+
+        let prose =
+            b"The report mentions terminal session not found as a quoted incident, not output.\n";
+        assert!(!remote_resume_runtime_output_requires_restart(prose));
     }
 
     #[test]
@@ -20003,11 +21205,42 @@ mod tests {
             "wheel_event_count": 1,
             "scroll_event_count": 1,
         });
+        let event_only = json!({
+            "viewport_y": 124,
+            "base_y": 124,
+            "viewport_scroll_top": 2232.0,
+            "rows": 50,
+            "last_raw_payload_line_count": 197,
+            "text_head": "top changed by live output",
+            "text_tail": "bottom changed by live output",
+            "wheel_event_count": 1,
+            "scroll_event_count": 1,
+        });
+        let raw_lines_only = json!({
+            "viewport_y": 0,
+            "base_y": 0,
+            "viewport_scroll_top": 0.0,
+            "rows": 50,
+            "last_raw_payload_line_count": 197,
+            "scrollback_expected": true,
+            "text_head": "top",
+            "text_tail": "bottom",
+            "wheel_event_count": 0,
+            "scroll_event_count": 0,
+        });
 
         assert!(super::terminal_scroll_probe_snapshot_can_move(&before, -20));
         assert!(!super::terminal_scroll_probe_snapshot_can_move(&before, 20));
+        assert!(!super::terminal_scroll_probe_snapshot_can_move(
+            &raw_lines_only,
+            -20
+        ));
         assert!(!super::terminal_scroll_probe_snapshot_moved(
             &before, &unchanged
+        ));
+        assert!(!super::terminal_scroll_probe_snapshot_moved(
+            &before,
+            &event_only
         ));
         assert!(super::terminal_scroll_probe_snapshot_moved(&before, &moved));
     }
@@ -20149,6 +21382,64 @@ mod tests {
         let _ = fs::remove_dir_all(home);
 
         assert!(mismatches);
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_output_mismatch_detects_wrong_codex_runtime_buffer() -> Result<()> {
+        let home = std::env::temp_dir().join(format!(
+            "yggterm-runtime-codex-key-mismatch-{}-{}",
+            std::process::id(),
+            time::OffsetDateTime::now_utc().unix_timestamp_nanos()
+        ));
+        let sessions_dir = home.join("sessions").join("2026").join("05");
+        fs::create_dir_all(&sessions_dir)?;
+        fs::write(
+            sessions_dir.join("rollout-test.jsonl"),
+            concat!(
+                "{\"id\":\"abc123\",\"cwd\":\"/home/pi/gh/yggterm\"}\n",
+                "{\"timestamp\":\"2026-05-15T03:00:00Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"fix the yggterm terminal restore bug\"}]}}\n",
+                "{\"timestamp\":\"2026-05-15T03:00:01Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"I found the restored runtime was launching plain codex instead of resuming the saved session.\"}]}}\n"
+            ),
+        )?;
+        let _codex_home_guard = CODEX_HOME_TEST_LOCK.lock().expect("CODEX_HOME test lock");
+        let previous_codex_home = std::env::var_os("CODEX_HOME");
+        unsafe {
+            std::env::set_var("CODEX_HOME", &home);
+        }
+        let tree = SessionNode {
+            kind: SessionNodeKind::Group,
+            name: "sessions".to_string(),
+            title: None,
+            document_kind: None,
+            group_kind: None,
+            path: PathBuf::from("/"),
+            children: Vec::new(),
+            session_id: None,
+            cwd: None,
+        };
+        let server = YggtermServer::new(
+            &tree,
+            false,
+            GhosttyHostSupport::shadow("test".to_string(), false, false),
+            UiTheme::ZedLight,
+        );
+        let fresh_codex_surface = b">_ OpenAI Codex (v0.130.0)\nmodel: gpt-5.5 xhigh /model to change\ndirectory: ~/gh/yggterm\n\nTip: You can resume a previous session by running codex resume <ID>.\n\n> Write tests for @filename\n";
+
+        let mismatches = server.remote_resume_runtime_output_mismatches_path(
+            &remote_runtime_codex_session_key("abc123"),
+            fresh_codex_surface,
+        );
+        let missing_saved_session = server.remote_resume_runtime_output_mismatches_path(
+            &remote_runtime_codex_session_key("missing"),
+            fresh_codex_surface,
+        );
+
+        restore_env_var("CODEX_HOME", previous_codex_home);
+        let _ = fs::remove_dir_all(home);
+
+        assert!(mismatches);
+        assert!(!missing_saved_session);
         Ok(())
     }
 
@@ -20653,6 +21944,46 @@ terminal_window_id: None,
     }
 
     #[test]
+    fn focus_live_session_keeps_manual_live_session_order() {
+        let tree = SessionNode {
+            kind: SessionNodeKind::Group,
+            name: "root".to_string(),
+            title: None,
+            document_kind: None,
+            group_kind: None,
+            path: PathBuf::from("/"),
+            children: Vec::new(),
+            session_id: None,
+            cwd: None,
+        };
+        let mut server = YggtermServer::new(
+            &tree,
+            false,
+            GhosttyHostSupport::shadow("test".to_string(), false, false),
+            UiTheme::ZedLight,
+        );
+        let first = server.start_local_session(SessionKind::Shell, Some("/tmp/one"), Some("One"));
+        let second = server.start_local_session(SessionKind::Shell, Some("/tmp/two"), Some("Two"));
+        let third =
+            server.start_local_session(SessionKind::Shell, Some("/tmp/three"), Some("Three"));
+        let manual_order = vec![second.clone(), first.clone(), third.clone()];
+        assert!(server.replace_live_session_order(&manual_order));
+
+        server.focus_live_session(&first);
+
+        assert_eq!(server.active_session_path(), Some(first.as_str()));
+        assert_eq!(
+            server
+                .live_sessions()
+                .iter()
+                .map(|session| session.session_path.clone())
+                .collect::<Vec<_>>(),
+            manual_order,
+            "focusing a live session must not turn user drag order into recency order"
+        );
+    }
+
+    #[test]
     fn terminal_runtime_key_resolves_normalized_local_session_path() {
         let tree = SessionNode {
             kind: SessionNodeKind::Group,
@@ -21124,6 +22455,16 @@ terminal_window_id: None,
             GhosttyHostSupport::shadow("test".to_string(), false, false),
             UiTheme::ZedLight,
         );
+        server.remote_machines.push(RemoteMachineSnapshot {
+            machine_key: "dev".to_string(),
+            label: "dev".to_string(),
+            ssh_target: "dev".to_string(),
+            prefix: None,
+            remote_binary_expr: Some("$HOME/.yggterm/bin/yggterm".to_string()),
+            remote_deploy_state: RemoteDeployState::Ready,
+            health: RemoteMachineHealth::Healthy,
+            sessions: Vec::new(),
+        });
 
         let session_key =
             server.start_ssh_session("dev", None, Some("/home/pi"), Some("/home/pi shell"))?;
@@ -21144,6 +22485,59 @@ terminal_window_id: None,
         assert_eq!(server.ssh_targets()[0].label, "dev");
         assert_eq!(server.remote_machines().len(), 1);
         assert_eq!(server.remote_machines()[0].label, "dev");
+        Ok(())
+    }
+
+    #[test]
+    fn connect_ssh_custom_uses_verified_remote_binary_before_success() -> Result<()> {
+        let tree = SessionNode {
+            kind: SessionNodeKind::Group,
+            name: "root".to_string(),
+            title: None,
+            document_kind: None,
+            group_kind: None,
+            path: PathBuf::from("/"),
+            children: Vec::new(),
+            session_id: None,
+            cwd: None,
+        };
+        let mut server = YggtermServer::new(
+            &tree,
+            false,
+            GhosttyHostSupport::shadow("test".to_string(), false, false),
+            UiTheme::ZedLight,
+        );
+        server.remote_machines.push(RemoteMachineSnapshot {
+            machine_key: "practice".to_string(),
+            label: "practice".to_string(),
+            ssh_target: "practice".to_string(),
+            prefix: None,
+            remote_binary_expr: Some("$HOME/.yggterm/bin/yggterm".to_string()),
+            remote_deploy_state: RemoteDeployState::Ready,
+            health: RemoteMachineHealth::Healthy,
+            sessions: Vec::new(),
+        });
+
+        let (session_key, reused) = server.connect_ssh_custom("practice", None)?;
+
+        assert!(!reused);
+        let session = server.sessions.get(&session_key).expect("session");
+        assert_eq!(session.remote_deploy_state, RemoteDeployState::Ready);
+        assert!(
+            session
+                .launch_command
+                .contains("$HOME/.yggterm/bin/yggterm")
+        );
+        assert!(session.launch_command.contains("server"));
+        assert!(session.launch_command.contains("attach"));
+        assert_eq!(server.ssh_targets().len(), 1);
+        let machine = server
+            .remote_machines()
+            .iter()
+            .find(|machine| machine.machine_key == "practice")
+            .expect("remote machine");
+        assert_eq!(machine.health, RemoteMachineHealth::Healthy);
+        assert_eq!(machine.remote_deploy_state, RemoteDeployState::Ready);
         Ok(())
     }
 
@@ -21871,6 +23265,129 @@ terminal_window_id: None,
             session.preview.blocks[0].lines,
             vec!["Hydrated preview block"]
         );
+    }
+
+    #[test]
+    fn remote_scanned_preview_does_not_replace_existing_human_title() {
+        let mut session = build_session(
+            SessionKind::Codex,
+            "remote-session://dev/019d0000-0000-7000-8000-000000000001",
+            Some("019d0000-0000-7000-8000-000000000001"),
+            Some("/home/pi/git/samplenotes"),
+            Some("samplenotes"),
+            None,
+            TerminalBackend::Xterm,
+            UiTheme::ZedLight,
+            false,
+            StoredPreviewHydrationMode::Deferred,
+        );
+        let scanned = RemoteScannedSession {
+            session_path: "remote-session://dev/019d0000-0000-7000-8000-000000000001".to_string(),
+            session_id: "019d0000-0000-7000-8000-000000000001".to_string(),
+            cwd: "/home/pi/git/samplenotes".to_string(),
+            started_at: "May 13, 2026 10:00 PM UTC+0530".to_string(),
+            modified_epoch: 1,
+            event_count: 42,
+            user_message_count: 2,
+            assistant_message_count: 2,
+            title_hint: "While Those Are Generating Can".to_string(),
+            recent_context: "USER: Keep the manually named samplenotes session stable.".to_string(),
+            cached_precis: None,
+            cached_summary: None,
+            live_runtime: true,
+            storage_path: "/home/pi/.codex/sessions/2026/05/samplenotes.jsonl".to_string(),
+        };
+
+        apply_remote_scanned_session_preview(&mut session, &scanned, "dev", "dev");
+
+        assert_eq!(session.title, "samplenotes");
+    }
+
+    #[test]
+    fn remote_scanned_preview_can_replace_fallback_title() {
+        let mut session = build_session(
+            SessionKind::Codex,
+            "remote-session://dev/019d0000-0000-7000-8000-000000000001",
+            Some("019d0000-0000-7000-8000-000000000001"),
+            Some("/home/pi/git/samplenotes"),
+            Some("Remote Codex 019dbdcf"),
+            None,
+            TerminalBackend::Xterm,
+            UiTheme::ZedLight,
+            false,
+            StoredPreviewHydrationMode::Deferred,
+        );
+        let scanned = RemoteScannedSession {
+            session_path: "remote-session://dev/019d0000-0000-7000-8000-000000000001".to_string(),
+            session_id: "019d0000-0000-7000-8000-000000000001".to_string(),
+            cwd: "/home/pi/git/samplenotes".to_string(),
+            started_at: "May 13, 2026 10:00 PM UTC+0530".to_string(),
+            modified_epoch: 1,
+            event_count: 42,
+            user_message_count: 2,
+            assistant_message_count: 2,
+            title_hint: "Jyas Terminal Investigation".to_string(),
+            recent_context: "USER: Diagnose the samplenotes terminal restore path.".to_string(),
+            cached_precis: None,
+            cached_summary: None,
+            live_runtime: true,
+            storage_path: "/home/pi/.codex/sessions/2026/05/samplenotes.jsonl".to_string(),
+        };
+
+        apply_remote_scanned_session_preview(&mut session, &scanned, "dev", "dev");
+
+        assert_eq!(session.title, "Jyas Terminal Investigation");
+    }
+
+    #[test]
+    fn remote_generated_copy_preserves_manual_titles() {
+        assert!(super::should_preserve_existing_remote_title(
+            "Jyas Terminal Investigation",
+            "interface-llm",
+            Some("samplenotes"),
+            Some("manual"),
+        ));
+        assert!(!super::should_preserve_existing_remote_title(
+            "Jyas Terminal Investigation",
+            "manual",
+            Some("samplenotes"),
+            Some("manual"),
+        ));
+    }
+
+    #[test]
+    fn remote_generated_copy_preserves_human_title_from_low_signal_update() {
+        assert!(super::should_preserve_existing_remote_title(
+            "While Those Are Generating Can",
+            "interface-llm",
+            Some("JYAS PL9 Automation"),
+            Some("litellm"),
+        ));
+        assert!(super::should_preserve_existing_remote_title(
+            "Current Status Live Erome Service",
+            "interface-llm",
+            Some("Erome Systemd"),
+            Some("litellm"),
+        ));
+    }
+
+    #[test]
+    fn runtime_bridge_rejects_launch_command_with_wrong_terminal_appearance() {
+        let dark_launch = "export TERM_PROGRAM='vscode' && export YGGTERM_TERMINAL_APPEARANCE='dark' && export COLORFGBG='15;0' && codex resume abc";
+        let light_launch = "export TERM_PROGRAM='vscode' && export YGGTERM_TERMINAL_APPEARANCE='light' && export COLORFGBG='0;15' && codex resume abc";
+
+        assert!(launch_command_matches_terminal_appearance(
+            dark_launch,
+            Some("dark")
+        ));
+        assert!(!launch_command_matches_terminal_appearance(
+            light_launch,
+            Some("dark")
+        ));
+        assert!(launch_command_matches_terminal_appearance(
+            light_launch,
+            Some("light")
+        ));
     }
 
     #[test]
@@ -23288,6 +24805,14 @@ terminal_window_id: None,
 
         let live_sessions = server.live_sessions();
         assert_eq!(live_sessions.len(), 2);
+        assert_eq!(
+            live_sessions
+                .iter()
+                .map(|session| session.session_path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["local://first-shell", "local://second-shell"],
+            "persisted live-session rows must restore in the saved user order"
+        );
         assert!(
             live_sessions
                 .iter()
@@ -24124,6 +25649,90 @@ terminal_window_id: None,
     }
 
     #[test]
+    fn apply_snapshot_preserves_durable_ssh_machine_targets_missing_from_snapshot() {
+        let tree = SessionNode {
+            kind: SessionNodeKind::Group,
+            name: "sessions".to_string(),
+            title: None,
+            document_kind: None,
+            group_kind: None,
+            path: PathBuf::from("/"),
+            children: Vec::new(),
+            session_id: None,
+            cwd: None,
+        };
+        let mut server = YggtermServer::new(
+            &tree,
+            false,
+            GhosttyHostSupport::shadow("test".to_string(), false, false),
+            UiTheme::ZedLight,
+        );
+        let practice_target = SshConnectTarget {
+            label: "practice".to_string(),
+            kind: SessionKind::SshShell,
+            ssh_target: "practice".to_string(),
+            prefix: None,
+            cwd: None,
+        };
+        server.ssh_targets.push(practice_target.clone());
+        server.remote_machines.push(RemoteMachineSnapshot {
+            machine_key: "practice".to_string(),
+            label: "practice".to_string(),
+            ssh_target: "practice".to_string(),
+            prefix: None,
+            remote_binary_expr: Some("$HOME/.yggterm/bin/yggterm".to_string()),
+            remote_deploy_state: RemoteDeployState::Ready,
+            health: RemoteMachineHealth::Healthy,
+            sessions: Vec::new(),
+        });
+
+        server.apply_snapshot(ServerUiSnapshot {
+            active_session_path: None,
+            active_session: None,
+            active_view_mode: WorkspaceViewMode::Rendered,
+            remote_machines: vec![RemoteMachineSnapshot {
+                machine_key: "dev".to_string(),
+                label: "dev".to_string(),
+                ssh_target: "dev".to_string(),
+                prefix: None,
+                remote_binary_expr: Some("$HOME/.yggterm/bin/yggterm".to_string()),
+                remote_deploy_state: RemoteDeployState::Ready,
+                health: RemoteMachineHealth::Healthy,
+                sessions: Vec::new(),
+            }],
+            ssh_targets: vec![SshConnectTarget {
+                label: "dev".to_string(),
+                kind: SessionKind::SshShell,
+                ssh_target: "dev".to_string(),
+                prefix: None,
+                cwd: None,
+            }],
+            live_sessions: Vec::new(),
+        });
+
+        assert!(server.ssh_targets.iter().any(|target| {
+            target.ssh_target == "practice" && target.kind == SessionKind::SshShell
+        }));
+        let practice = server
+            .remote_machines
+            .iter()
+            .find(|machine| machine.machine_key == "practice")
+            .expect("practice machine target should survive stale snapshot apply");
+        assert_eq!(practice.ssh_target, "practice");
+        assert_eq!(practice.remote_deploy_state, RemoteDeployState::Ready);
+        assert_eq!(
+            practice.remote_binary_expr.as_deref(),
+            Some("$HOME/.yggterm/bin/yggterm")
+        );
+        assert!(
+            server
+                .remote_machines
+                .iter()
+                .any(|machine| { machine.machine_key == "dev" && machine.ssh_target == "dev" })
+        );
+    }
+
+    #[test]
     fn restore_persisted_state_defers_inactive_stored_transcript_hydration() -> Result<()> {
         let transcript_dir = std::env::temp_dir().join(format!(
             "yggterm-server-restore-deferred-{}-{}",
@@ -24675,6 +26284,172 @@ terminal_window_id: None,
         if let Err(payload) = result {
             std::panic::resume_unwind(payload);
         }
+    }
+
+    #[test]
+    fn restored_daemon_owned_codex_runtime_resumes_saved_session_identity() -> Result<()> {
+        let home = std::env::temp_dir().join(format!(
+            "yggterm-restored-runtime-resume-{}-{}",
+            std::process::id(),
+            time::OffsetDateTime::now_utc().unix_timestamp_nanos()
+        ));
+        let sessions_dir = home.join("sessions").join("2026").join("05");
+        fs::create_dir_all(&sessions_dir)?;
+        fs::write(
+            sessions_dir.join("rollout-test.jsonl"),
+            "{\"id\":\"abc123\",\"cwd\":\"/srv/app\"}\n",
+        )?;
+        let _codex_home_guard = CODEX_HOME_TEST_LOCK.lock().expect("CODEX_HOME test lock");
+        let previous_codex_home = std::env::var_os("CODEX_HOME");
+        unsafe {
+            std::env::set_var("CODEX_HOME", &home);
+        }
+
+        let tree = SessionNode {
+            kind: SessionNodeKind::Group,
+            name: "sessions".to_string(),
+            title: None,
+            document_kind: None,
+            group_kind: None,
+            path: PathBuf::from("/"),
+            children: Vec::new(),
+            session_id: None,
+            cwd: None,
+        };
+        let mut server = YggtermServer::new(
+            &tree,
+            false,
+            GhosttyHostSupport::shadow("test".to_string(), false, false),
+            UiTheme::ZedLight,
+        );
+        let runtime_key = remote_runtime_codex_session_key("abc123");
+
+        server.restore_live_session(PersistedLiveSession {
+            key: runtime_key.clone(),
+            id: "abc123".to_string(),
+            title: "Restored Remote Codex".to_string(),
+            kind: SessionKind::Codex,
+            keep_alive: true,
+            ssh_target: "localhost".to_string(),
+            prefix: None,
+            cwd: Some("/srv/app".to_string()),
+            remote_launch_action: Some("start-codex".to_string()),
+            storage_path: None,
+            restore_reason: None,
+        });
+
+        let session = server
+            .sessions
+            .get(&runtime_key)
+            .expect("restored daemon-owned codex runtime");
+        assert_eq!(session.session_path, runtime_key);
+        assert_eq!(session.source, SessionSource::LiveLocal);
+        assert_eq!(
+            session_metadata_value(session, REMOTE_LAUNCH_ACTION_METADATA_LABEL),
+            None,
+            "restored codex-runtime rows must not replay the fresh start action"
+        );
+        assert!(
+            session.launch_command.contains("resume -C \"$PWD\"")
+                && session.launch_command.contains("abc123"),
+            "{}",
+            session.launch_command
+        );
+        assert!(
+            !session.launch_command.ends_with("&& codex"),
+            "{}",
+            session.launch_command
+        );
+        assert!(
+            session_metadata_value(session, "Restore")
+                .expect("restore metadata")
+                .contains("resume-codex abc123 --require-existing")
+        );
+
+        server.request_terminal_launch_for_path(&runtime_key);
+        let (launch_command, cwd) = server.terminal_spec(&runtime_key).expect("terminal spec");
+        assert_eq!(cwd.as_deref(), Some("/srv/app"));
+        assert!(
+            launch_command.contains("resume -C \"$PWD\"") && launch_command.contains("abc123"),
+            "{launch_command}"
+        );
+        assert!(!launch_command.ends_with("&& codex"), "{launch_command}");
+
+        restore_env_var("CODEX_HOME", previous_codex_home);
+        let _ = fs::remove_dir_all(home);
+        Ok(())
+    }
+
+    #[test]
+    fn fresh_daemon_owned_codex_runtime_without_saved_session_keeps_fresh_launch() -> Result<()> {
+        let home = std::env::temp_dir().join(format!(
+            "yggterm-fresh-runtime-launch-{}-{}",
+            std::process::id(),
+            time::OffsetDateTime::now_utc().unix_timestamp_nanos()
+        ));
+        fs::create_dir_all(home.join("sessions"))?;
+        let _codex_home_guard = CODEX_HOME_TEST_LOCK.lock().expect("CODEX_HOME test lock");
+        let previous_codex_home = std::env::var_os("CODEX_HOME");
+        unsafe {
+            std::env::set_var("CODEX_HOME", &home);
+        }
+
+        let tree = SessionNode {
+            kind: SessionNodeKind::Group,
+            name: "sessions".to_string(),
+            title: None,
+            document_kind: None,
+            group_kind: None,
+            path: PathBuf::from("/"),
+            children: Vec::new(),
+            session_id: None,
+            cwd: None,
+        };
+        let mut server = YggtermServer::new(
+            &tree,
+            false,
+            GhosttyHostSupport::shadow("test".to_string(), false, false),
+            UiTheme::ZedLight,
+        );
+        let runtime_key = remote_runtime_codex_session_key("fresh123");
+
+        server.restore_live_session(PersistedLiveSession {
+            key: runtime_key.clone(),
+            id: "fresh123".to_string(),
+            title: "Fresh Remote Codex".to_string(),
+            kind: SessionKind::Codex,
+            keep_alive: true,
+            ssh_target: "localhost".to_string(),
+            prefix: None,
+            cwd: Some("/srv/app".to_string()),
+            remote_launch_action: Some("start-codex".to_string()),
+            storage_path: None,
+            restore_reason: None,
+        });
+
+        let session = server
+            .sessions
+            .get(&runtime_key)
+            .expect("restored fresh daemon-owned codex runtime");
+        assert_eq!(session.session_path, runtime_key);
+        assert_eq!(session.source, SessionSource::LiveLocal);
+        assert!(
+            session.launch_command.contains("codex") && !session.launch_command.contains(" resume"),
+            "{}",
+            session.launch_command
+        );
+
+        server.request_terminal_launch_for_path(&runtime_key);
+        let (launch_command, cwd) = server.terminal_spec(&runtime_key).expect("terminal spec");
+        assert_eq!(cwd.as_deref(), Some("/srv/app"));
+        assert!(
+            launch_command.contains("codex") && !launch_command.contains(" resume"),
+            "{launch_command}"
+        );
+
+        restore_env_var("CODEX_HOME", previous_codex_home);
+        let _ = fs::remove_dir_all(home);
+        Ok(())
     }
 
     #[test]
@@ -25306,6 +27081,55 @@ terminal_window_id: None,
     }
 
     #[test]
+    fn detach_live_session_view_preserves_keep_alive_runtime_metadata() {
+        let tree = SessionNode {
+            kind: SessionNodeKind::Group,
+            name: "sessions".to_string(),
+            title: None,
+            document_kind: None,
+            group_kind: None,
+            path: PathBuf::from("/"),
+            children: Vec::new(),
+            session_id: None,
+            cwd: None,
+        };
+        let mut server = YggtermServer::new(
+            &tree,
+            false,
+            GhosttyHostSupport::shadow("test".to_string(), false, false),
+            UiTheme::ZedLight,
+        );
+        let live_path =
+            server.start_local_session(SessionKind::Shell, Some("/tmp/kept"), Some("Kept"));
+        server
+            .set_live_session_keep_alive(&live_path, true)
+            .expect("mark keep alive");
+        server.active_session_path = Some(live_path.clone());
+        server.active_view_mode = WorkspaceViewMode::Terminal;
+
+        assert!(
+            server
+                .detach_live_session_view(&live_path)
+                .expect("detach kept live session")
+        );
+
+        assert_eq!(server.active_session_path(), None);
+        assert_eq!(server.active_view_mode(), WorkspaceViewMode::Rendered);
+        assert!(
+            server.sessions.contains_key(&live_path),
+            "ordinary close of a kept session must not remove its live metadata"
+        );
+        assert!(
+            server
+                .live_session_order
+                .iter()
+                .any(|path| path == &live_path),
+            "ordinary close of a kept session must keep the row in Live Sessions"
+        );
+        assert!(server.live_session_keep_alive(&live_path));
+    }
+
+    #[test]
     fn remove_live_session_clears_active_path_for_normalized_active_alias() {
         let tree = SessionNode {
             kind: SessionNodeKind::Group,
@@ -25493,6 +27317,7 @@ terminal_window_id: None,
         ClientInstanceRecord {
             pid,
             started_at_ms,
+            linux_desktop_app_id: Some(super::YGGTERM_DESKTOP_APP_ID.to_string()),
             process_start_ticks: None,
             executable_path: Some("/tmp/yggterm-test".to_string()),
             display: Some(display.to_string()),
@@ -25544,6 +27369,7 @@ terminal_window_id: None,
         let live_record = serde_json::to_vec(&ClientInstanceRecord {
             pid: std::process::id(),
             started_at_ms: 42,
+            linux_desktop_app_id: Some(super::YGGTERM_DESKTOP_APP_ID.to_string()),
             process_start_ticks: process_start_ticks(std::process::id()),
             executable_path: Some("/tmp/yggterm-test".to_string()),
             display: Some(":10.0".to_string()),
@@ -25582,6 +27408,7 @@ terminal_window_id: None,
         let live_record = serde_json::to_vec(&ClientInstanceRecord {
             pid: std::process::id(),
             started_at_ms: 42,
+            linux_desktop_app_id: Some(super::YGGTERM_DESKTOP_APP_ID.to_string()),
             process_start_ticks: process_start_ticks(std::process::id()),
             executable_path: Some("/tmp/yggterm-test".to_string()),
             display: Some(":10.0".to_string()),

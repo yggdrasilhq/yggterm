@@ -385,6 +385,7 @@ def blur_summary(state: dict) -> dict:
     dom = state.get("dom") or {}
     return {
         "live_blur_supported": shell.get("live_blur_supported"),
+        "css_backdrop_filter_enabled": shell.get("css_backdrop_filter_enabled"),
         "transparent_window": shell.get("transparent_window"),
         "profile_reason": shell.get("transparent_window_profile_reason"),
         "shell_frame_backdrop_filter": dom.get("shell_frame_backdrop_filter"),

@@ -57,11 +57,23 @@ This is the core determinism rule: Terminal tests should use fake PTY streams, s
 - Title, precis, and summary are display copy only. They are never identity and never decide which runtime receives input.
 - Live Sessions are daemon-owned runtimes. Closing one kills that runtime and removes it from the Live Sessions group. It must not imply stored transcript deletion unless the user requested a hard delete.
 - Fresh live terminals are runtime-only by default. They are restored across normal app close only after the user explicitly marks them `Keep Alive`; clearing keep-alive must remove them from persisted live-session state without killing the currently running terminal.
+- Keep Alive is not a shield against the row close action. Closing a live row means terminate/remove that selected runtime; closing the Yggterm window is the detach/preserve path for kept live sessions.
 - Remote live sessions are visible in `Live Sessions` and, when their cwd is known, are also projected under that remote cwd folder so folder-scoped work remains findable while the runtime is live. Keep Alive controls daemon retention/durability only; it must not decide whether a live remote session appears under its cwd. Local historical transcript rows still must not become duplicate stored-tree rows just because a runtime exists.
+- Remote cwd bookmarks created by `Add Folder` are local metadata rows with a synthetic remote-folder path, but they must render only inside the owning remote machine tree. They must not appear as local filesystem rows, and remote scans must not be required before the saved bookmark is visible.
+- The sidebar merge has two inputs for saved workspace metadata: the currently
+  visible local rows for local tree rendering, and the complete saved row model
+  for remote cwd bookmark projection. Remote `Add Folder` must never depend on
+  a hidden local `/__remote_folder__/...` implementation branch being expanded.
+- Remote cwd bookmark rename and launch are one contract. The synthetic storage
+  path is the durable cwd bookmark; renaming a newly added folder to a relative
+  path such as `git/samplers` moves the bookmark under the selected remote
+  cwd, and Startpage `New Codex Session` / `New Terminal` must launch with that
+  resolved remote cwd rather than the previous active session's cwd.
 - Expandable sidebar rows have a split hit-zone contract. Clicking the visible row name selects the row and opens that group's scoped Startpage without closing live runtimes; clicking the icon, disclosure/count control, machine/live-session affordance area, or trailing empty row surface toggles expansion. This applies uniformly to cwd folders, machine groups, and `Live Sessions`, with expansion state still keyed only by the row path.
 - Normal final-client close must notify the user, remove non-Keep-Alive live rows from durable restore state, send graceful runtime shutdown, and schedule force cleanup after one hour.
 - Update restart is different from Keep Alive. Before a direct-install restart, the daemon must persist every recoverable live runtime with a temporary update-restore marker only when current runtime truth still says that unkept runtime exists. That marker allows the next daemon to restore the session once, but it must not silently convert unkept terminals into durable Keep Alive sessions or serialize stale in-memory rows that no longer have a daemon runtime key. After a fresh remote scan reports that an unkept temporary remote runtime is not live, that row must leave `Live Sessions` instead of remaining as a degraded/loading recovery target.
-- A hot-update preserved-owner registry is a terminal I/O handoff map, not durable session truth. Current server live metadata must authorize every preserved runtime key before it appears in `server status`, app-control runtime truth, or sidebar rows. Closing a live session or clearing Keep Alive must remove that key from the preserved-owner map, and daemon load must prune unrepresented entries from `hot-update-terminal-owners.json` instead of carrying latent old runtimes forward.
+- A hot-update preserved-owner registry is a terminal I/O handoff map, not durable session truth. Persisted live-session state is the startup allow-list when it contains runtime keys; `hot-update-terminal-owners.json` is only a fallback when persisted live state is empty. Current server live metadata must authorize every preserved runtime key before it appears in `server status`, app-control runtime truth, or sidebar rows. During handoff, every represented `terminal_session_key` must be written or retargeted to the current outgoing handoff daemon endpoint; chained older sidecar entries must not become direct owner truth for the replacement daemon. Closing a live session or clearing Keep Alive must remove that key from the preserved-owner map. Daemon load must restore persisted live state before judging a registry version mismatch, prune only unrepresented entries from `hot-update-terminal-owners.json`, and retarget surviving entries to the current version instead of carrying latent old runtimes forward or wiping still-represented owners.
+- A temporary update-restored live session has the same survival priority as an explicit Keep Alive session until the handoff verifies or fails. Early saved-session mismatch text from a preserved owner may gate input or keep recovery visible, but it must not detach/remove the owner entry or spawn a duplicate remote resume while the temporary update-restore marker is present.
 - Startup reconciliation must prefer the active/default preserved-only sidecar daemon for retargeting over older orphaned PTY owners. An older same-patch-line daemon should be selected for hot-update handoff only when it actually owns terminal runtimes that the active sidecar does not already represent and those owned runtime keys are authorized by the current preserved-owner registry or persisted live-session state. A ghost-owned runtime for a closed session is not a session-survival reason.
 - Daemon cleanup is home-scoped. An app may reap same-home duplicate, legacy, or orphan daemons, but it must not signal a daemon from another `YGGTERM_HOME`, and it must not reap a legacy daemon that still has registered GUI clients in that daemon's exact endpoint scope or is the current hot-update PTY owner endpoint. App-control may scan legacy client-instance scopes for handoff discovery, but cleanup must not treat the replacement GUI as a client for every stale versioned daemon. During startup cleanup, the newest preserved-only sidecar whose terminal keys are exactly authorized by the current owner registry must remain available as the retarget bridge; older preserved-only sidecars with `owned_terminal_session_count == 0` must not be protected just because the same home has recoverable runtime activity elsewhere.
 - Multi-version daemon discovery is read-only observability, not an attach target. A current remote client may list stale versioned daemons for incident reports, but it must not bridge a live terminal through a daemon whose `server_version` differs from the current protocol version.
@@ -103,13 +115,31 @@ Titlebar search has the same proof requirement. When `shell.search_query` is non
 Update restart protection is observable through persisted daemon state. A normal persisted snapshot may contain only explicit Keep Alive live sessions. A pre-update persisted snapshot must contain all recoverable live sessions and must mark non-Keep-Alive sessions as temporary update restores. Remote scan reconciliation must also emit `server/remote_machine prune_temporary_stale_live_sessions` when it removes temporary update-restored remote rows whose scanned session no longer has `live_runtime=true`.
 
 Hot-update preserved-owner state is a survival bridge, not a second runtime
-truth. If the updated daemon directly owns the same terminal runtime keys as an
-older daemon, the older daemon must retire instead of writing a new
-`hot-update-terminal-owners.json` entry. Preserved/runtime-known keys are not
-adoption proof; the old owner must stay alive until the updated daemon owns the
-PTYs or the sessions are deliberately restarted. `server monitor --scenario
-server-list` should converge back to one current daemon only after that direct
-ownership condition is true.
+truth. If the updated daemon directly owns the same terminal runtime key as an
+older daemon, the older daemon must drop that duplicate key instead of writing a
+new `hot-update-terminal-owners.json` entry. If the old daemon owns a mix of
+duplicated and unique preserved PTYs, only the duplicated keys are retired; the
+unique PTYs stay alive. Preserved/runtime-known keys are not adoption proof; the
+old owner must stay alive until the updated daemon owns the PTYs or the sessions
+are deliberately restarted. `server monitor --scenario server-list` should
+converge back to no duplicate direct ownership after that direct ownership
+condition is true.
+
+During this preserved-owner interval, short current-screen reads are allowed as
+screen refreshes only. They must not replace a longer retained PTY snapshot as
+the scrollback source for a restored xterm surface. A healthy retained restore
+therefore has two layers of proof: server-list shows the runtime key routed
+through the preserved owner, and app-control `probe-scroll` shows non-zero
+`base_y` with actual viewport movement.
+
+The preserved-owner registry is endpoint-specific. If daemon A is the registered
+preserved owner for one runtime and daemon B is the registered preserved owner
+or current direct owner for another runtime, daemon A must not keep a duplicate
+copy of daemon B's runtime. The 23-smoke server-list gate treats the same runtime
+key appearing in multiple daemons' `owned_terminal_session_keys` as a
+release-blocking failure. Duplicate-owner pruning must never probe the current
+daemon or a legacy socket alias that resolves to the current daemon while it is
+already handling a request; probing self is a daemon-loop deadlock.
 
 Native paste is observable through terminal events and app-control paste commands. A browser `Ctrl+V`/`Cmd+V` must emit the native paste request instead of relying on xterm.js to guess clipboard contents.
 
@@ -131,11 +161,62 @@ Local startup restore has the same convergence requirement. If a local startup-r
 1. Model gate: server and shell unit tests cover the invariants above, live-close semantics, explicit keep-alive persistence, and the no-implicit-copy-generation policy.
 2. Local terminal gate: second-X11 typing smoke proves local shell input reaches an interactive terminal quickly without retry/disconnect toasts, and blank Enter does not leave a stale live-row spinner behind.
 3. KDE lifecycle gate: update/restart and app-owned smoke launch keep `plasmashell` stable, protect all live runtimes during the restart, leave no stale temp-home automation clients behind, and show `linux_daemon_sweep` skipping cross-home daemons.
-4. Remote session gate: switching between stored preview, live remote terminal, and retained live terminal keeps row, active path, and terminal text aligned.
+4. Remote session gate: switching between stored preview, live remote terminal, and retained live terminal uses `server app open <path> --view <terminal|preview>` or the matching app-control command, waits for settled state, and keeps row, active path, runtime truth, scrollback, and terminal text aligned. `terminal focus` is focus reclamation only; it must not be used as a session-switch proof.
 5. Clipboard gate: text and screenshot paste work in local, SSH, and Codex sessions through the native paste path, with the resulting staged image path visible in the receiving terminal.
 6. Notification gate: Codex-class completion and terminal notification/bell events create the expected in-app notification and sound when enabled.
 7. Cross-platform gate: Windows and macOS smoke runs prove install, launch, local terminal creation, close, paste, and update paths still work.
 8. Release gate: every field-test release includes the `.deb`, checksums, curated release notes, and proof paths for Linux/KDE, Windows, and macOS.
+
+## Panic Management Runbook
+
+`yggterm-headless server monitor` is the SSH-safe first response tool for live
+terminal incidents. Use it before guessing from screenshots or editing restore,
+rendering, or daemon lifecycle code.
+
+Use it when a terminal is hung, missing after restore, input-lagged, visually
+blank, slow to snapshot, or when GUI/daemon/install versions look mismatched:
+
+```bash
+yggterm-headless server monitor \
+  --scenario panic-report \
+  --expect-path "<session-path>" \
+  --jsonl-out /tmp/yggterm-incident.jsonl
+```
+
+For intermittent failures, collect repeated evidence:
+
+```bash
+yggterm-headless server monitor \
+  --scenario panic-report \
+  --expect-path "<session-path>" \
+  --iterations 30 \
+  --interval-ms 1000 \
+  --jsonl-out /tmp/yggterm-watch.jsonl
+```
+
+Triage from the report:
+
+- no reachable daemon or stale version: inspect server-list, sockets, and install
+  metadata before using `hot-restart --all`
+- expected session missing: run `wait-session --expect-path <session-path>`
+- slow status/snapshot: run `latency-check --all` and inspect trace/perf data
+- healthy daemon but blank or stale screen: use `server app state`,
+  `screenshot`, `probe-type`, `probe-scroll`, or `probe-select`
+- KDE pinning or duplicate app identity: run `server app desktop-identity`.
+  The report must prove the canonical `dev.yggterm.Yggterm.desktop` launcher,
+  matching `Icon` and `StartupWMClass`, a live app-control client, and a
+  canonical Linux desktop app id for that live PID. The live client-instance
+  record is durable identity proof; `linux_desktop_app_id` and
+  `linux_desktop_identity_applied` trace events are supporting startup proof and
+  may rotate during long smokes. A missing client-record app id is a
+  release-blocking regression on KDE because the shell may open under a second
+  taskbar icon even when the desktop file itself is correct.
+- managed Codex/tooling issue: use explicit foreground refresh paths, not
+  unattended background installs
+
+The monitor establishes facts. Keep incident commands read-only until evidence
+clearly points to daemon lifecycle recovery, session restore, or managed CLI
+refresh as the right next step.
 
 ## Pass Plan
 
