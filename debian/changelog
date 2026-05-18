@@ -1,3 +1,16 @@
+yggterm (2.6.65-1) unstable; urgency=medium
+
+  * Restore generic shell prompt replay for non-Codex remote terminals while
+    keeping Codex resume replay gated to Codex prompt surfaces.
+  * Force a bounded xterm-native repaint for retained replay paths that accept
+    already-visible daemon-backed text.
+  * Prefer xterm buffer text over DOM renderer chrome in app-control snapshots,
+    and ignore unfocused read-only probes for input-gated recovery.
+  * Cool long-running Codex inline status animation after the initial interactive
+    window so the active terminal does not keep the high WebKit repaint budget.
+
+ -- Avikalpa Kundu <avi@gour.top>  Mon, 18 May 2026 21:20:00 +0530
+
 yggterm (2.6.64-1) unstable; urgency=medium
 
   * Restart runtime-owned terminal rows when terminal reads find a missing or
