@@ -8449,14 +8449,18 @@ mod tests {
             "reading daemon response\n\nCaused by:\n    terminal session not found: codex-runtime://019e2ade"
         );
 
-        assert!(super::DaemonRuntime::preserved_owner_error_means_missing_runtime(
-            "codex-runtime://019e2ade",
-            &error
-        ));
-        assert!(!super::DaemonRuntime::preserved_owner_error_means_missing_runtime(
-            "codex-runtime://other",
-            &error
-        ));
+        assert!(
+            super::DaemonRuntime::preserved_owner_error_means_missing_runtime(
+                "codex-runtime://019e2ade",
+                &error
+            )
+        );
+        assert!(
+            !super::DaemonRuntime::preserved_owner_error_means_missing_runtime(
+                "codex-runtime://other",
+                &error
+            )
+        );
     }
 
     #[test]

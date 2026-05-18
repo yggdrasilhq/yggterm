@@ -7116,7 +7116,7 @@ fn remote_resume_snapshot_is_replayable_for_session(
             || terminal_chunk_is_codex_interactive_setup_prompt(trimmed)
             || terminal_chunk_has_codex_prompt_output(trimmed);
     }
-    false
+    true
 }
 
 fn remote_resume_screen_snapshot_is_replayable_for_blank_host(
@@ -24506,9 +24506,7 @@ async fn capture_dom_debug_snapshot_for(active_session_path: Option<&str>) -> Va
                 const bufferTextSample = readTerminalBufferSample(term);
                 const hostText = String(host.innerText || "");
                 const terminalText = lowPowerTuiOverlayText || bufferTextSample || hostText;
-                const terminalTextTail = hostText.trim()
-                    ? hostText.trim().slice(-8192)
-                    : terminalText.trim().slice(-8192);
+                const terminalTextTail = terminalText.trim().slice(-8192);
                 const hostRect = host.getBoundingClientRect();
                 const helpersRect = helpers ? helpers.getBoundingClientRect() : null;
                 const helperTextareaRect = helperTextarea ? helperTextarea.getBoundingClientRect() : null;
@@ -25020,6 +25018,7 @@ async fn capture_dom_debug_snapshot_for(active_session_path: Option<&str>) -> Va
                     xterm_session_snapshot_reason: mountedHost ? String(mountedHost.lastXtermSessionSnapshotReason || '') : '',
                     xterm_session_snapshot_at_ms: mountedHost ? Number(mountedHost.lastXtermSessionSnapshotAtMs || 0) : 0,
                     last_retained_replay_follow_debug: mountedHost && mountedHost.lastRetainedReplayFollowDebug ? mountedHost.lastRetainedReplayFollowDebug : null,
+                    last_retained_replay_paint_refresh_debug: mountedHost && mountedHost.lastRetainedReplayPaintRefreshDebug ? mountedHost.lastRetainedReplayPaintRefreshDebug : null,
                     scrollback_expected: mountedHost ? Boolean(mountedHost.scrollbackExpected) : false,
                     scrollback_locked: mountedHost ? Boolean(mountedHost.scrollbackLocked) : false,
                     scrollback_intent: mountedHost ? String(mountedHost.scrollbackIntent || 'PromptFollow') : 'PromptFollow',
@@ -26687,6 +26686,7 @@ async fn capture_dom_debug_snapshot_basic_for(active_session_path: Option<&str>)
                         xterm_session_snapshot_reason: mountedHost ? String(mountedHost.lastXtermSessionSnapshotReason || '') : '',
                         xterm_session_snapshot_at_ms: mountedHost ? Number(mountedHost.lastXtermSessionSnapshotAtMs || 0) : 0,
                         last_retained_replay_follow_debug: mountedHost && mountedHost.lastRetainedReplayFollowDebug ? mountedHost.lastRetainedReplayFollowDebug : null,
+                        last_retained_replay_paint_refresh_debug: mountedHost && mountedHost.lastRetainedReplayPaintRefreshDebug ? mountedHost.lastRetainedReplayPaintRefreshDebug : null,
                         scrollback_expected: mountedHost ? Boolean(mountedHost.scrollbackExpected) : false,
                         last_fit_guard: mountedHost && mountedHost.lastFitGuard ? mountedHost.lastFitGuard : null,
                         last_skipped_fit: mountedHost && mountedHost.lastSkippedFit ? mountedHost.lastSkippedFit : null,
@@ -28478,6 +28478,7 @@ async fn capture_dom_debug_snapshot_terminal_fallback_for(
                     xterm_session_snapshot_reason: mountedHost ? String(mountedHost.lastXtermSessionSnapshotReason || '') : '',
                     xterm_session_snapshot_at_ms: mountedHost ? Number(mountedHost.lastXtermSessionSnapshotAtMs || 0) : 0,
                     last_retained_replay_follow_debug: mountedHost && mountedHost.lastRetainedReplayFollowDebug ? mountedHost.lastRetainedReplayFollowDebug : null,
+                    last_retained_replay_paint_refresh_debug: mountedHost && mountedHost.lastRetainedReplayPaintRefreshDebug ? mountedHost.lastRetainedReplayPaintRefreshDebug : null,
                     scrollback_expected: mountedHost ? Boolean(mountedHost.scrollbackExpected) : false,
                     scrollback_locked: mountedHost ? Boolean(mountedHost.scrollbackLocked) : false,
                     scrollback_intent: mountedHost ? String(mountedHost.scrollbackIntent || 'PromptFollow') : 'PromptFollow',
@@ -29939,6 +29940,7 @@ async fn probe_terminal_viewport_scroll_for(session_path: &str, lines: i32) -> V
                         xterm_session_snapshot_reason: String(entry.lastXtermSessionSnapshotReason || ''),
                         xterm_session_snapshot_at_ms: Number(entry.lastXtermSessionSnapshotAtMs || 0),
                         last_retained_replay_follow_debug: entry.lastRetainedReplayFollowDebug || null,
+                        last_retained_replay_paint_refresh_debug: entry.lastRetainedReplayPaintRefreshDebug || null,
                         data_event_count: Number(entry.dataEventCount || 0),
                         read_nudge_count: Number(entry.readNudgeCount || 0),
                         last_read_nudge_at_ms: Number(entry.lastReadNudgeAtMs || 0),
@@ -49861,7 +49863,7 @@ fn terminal_active_animation_long_write_frame_ms() -> u64 {
         .ok()
         .and_then(|value| value.trim().parse::<u64>().ok())
         .map(|value| value.min(1_000))
-        .unwrap_or(400)
+        .unwrap_or(500)
 }
 fn terminal_active_animation_effective_write_frame_ms(animation_elapsed_ms: u64) -> u64 {
     let initial = terminal_active_animation_write_frame_ms().min(terminal_active_write_frame_ms());
@@ -51786,8 +51788,14 @@ fn terminal_eval_script_with_canvas_renderer(
         terminal_active_animation_sustained_write_frame_ms()
             .max(terminal_active_animation_write_frame_ms)
             .min(2_000);
+    let terminal_active_animation_long_write_frame_ms =
+        terminal_active_animation_long_write_frame_ms()
+            .max(terminal_active_animation_sustained_write_frame_ms)
+            .min(2_000);
     let terminal_inline_status_animation_sustained_after_ms =
         TERMINAL_INLINE_STATUS_ANIMATION_SUSTAINED_AFTER_MS;
+    let terminal_inline_status_animation_long_after_ms =
+        TERMINAL_INLINE_STATUS_ANIMATION_LONG_AFTER_MS;
     let font_family =
         serde_json::to_string(TERMINAL_FONT_FAMILY).expect("serialize terminal font family");
     let font_weight = serde_json::to_string(&terminal_font_weight(theme))
@@ -51855,9 +51863,17 @@ fn terminal_eval_script_with_canvas_renderer(
             terminalActiveAnimationWriteFrameMs,
             Number({terminal_active_animation_sustained_write_frame_ms} || 0)
         );
+        const terminalActiveAnimationLongWriteFrameMs = Math.max(
+            terminalActiveAnimationSustainedWriteFrameMs,
+            Number({terminal_active_animation_long_write_frame_ms} || 0)
+        );
         const terminalInlineStatusAnimationSustainedAfterMs = Math.max(
             0,
             Number({terminal_inline_status_animation_sustained_after_ms} || 0)
+        );
+        const terminalInlineStatusAnimationLongAfterMs = Math.max(
+            terminalInlineStatusAnimationSustainedAfterMs,
+            Number({terminal_inline_status_animation_long_after_ms} || 0)
         );
         let host = document.getElementById(hostId);
         sendTerminalEvent({{ kind: "debug", message: `bootstrap host=${{hostId}} present=${{!!host}}` }});
@@ -56463,6 +56479,7 @@ fn terminal_eval_script_with_canvas_renderer(
             retainedReplayUnsafeSkipPromptReady: false,
             lastRetainedReplayRejectedVisibleText: '',
             lastRetainedReplayFollowDebug: null,
+            lastRetainedReplayPaintRefreshDebug: null,
             lastRetainedReplayRecoveredFromSnapshot: false,
             lastRetainedReplaySnapshotAgeMs: null,
             lastRetainedReplaySnapshotError: '',
@@ -57038,6 +57055,12 @@ fn terminal_eval_script_with_canvas_renderer(
             const elapsedMs = recentInlineStatusAnimationStartedAtMs > 0
                 ? Math.max(0, Date.now() - recentInlineStatusAnimationStartedAtMs)
                 : 0;
+            if (elapsedMs >= terminalInlineStatusAnimationLongAfterMs) {{
+                return Math.max(
+                    Math.min(terminalActiveWriteFrameMs, terminalActiveAnimationWriteFrameMs),
+                    terminalActiveAnimationLongWriteFrameMs
+                );
+            }}
             return elapsedMs >= terminalInlineStatusAnimationSustainedAfterMs
                 ? Math.max(
                     Math.min(terminalActiveWriteFrameMs, terminalActiveAnimationWriteFrameMs),
@@ -58133,8 +58156,12 @@ fn terminal_eval_script_with_canvas_renderer(
         terminal_active_animation_write_frame_ms = terminal_active_animation_write_frame_ms,
         terminal_active_animation_sustained_write_frame_ms =
             terminal_active_animation_sustained_write_frame_ms,
+        terminal_active_animation_long_write_frame_ms =
+            terminal_active_animation_long_write_frame_ms,
         terminal_inline_status_animation_sustained_after_ms =
             terminal_inline_status_animation_sustained_after_ms,
+        terminal_inline_status_animation_long_after_ms =
+            terminal_inline_status_animation_long_after_ms,
         terminal_input_hot_suppress_ms = TERMINAL_INPUT_HOT_SUPPRESS_MS
     )
 }
@@ -58664,6 +58691,46 @@ fn terminal_replay_retained_data_script_for_session(
             }}
             return debug;
           }};
+          const refreshRetainedReplayPaint = (entry, reason) => {{
+            const debug = {{
+              reason: String(reason || 'retained_replay_paint_refresh'),
+              used_refresh_now: false,
+              used_refresh_raf: false,
+              used_refresh_120ms: false,
+              used_host_health_now: false,
+              used_host_health_raf: false,
+              used_host_health_120ms: false,
+            }};
+            const refreshOnce = (phase) => {{
+              try {{
+                if (!entry || !entry.term) {{
+                  debug[`missing_entry_${{phase}}`] = true;
+                  return;
+                }}
+                if (typeof entry.term.refresh === "function") {{
+                  entry.term.refresh(0, Math.max(0, Number(entry.term.rows || 1) - 1));
+                  debug[`used_refresh_${{phase}}`] = true;
+                }}
+                if (typeof entry.emitHostHealth === "function") {{
+                  entry.emitHostHealth(`${{reason || 'retained_replay_paint_refresh'}}:${{phase}}`);
+                  debug[`used_host_health_${{phase}}`] = true;
+                }}
+              }} catch (error) {{
+                debug[`error_${{phase}}`] = error && error.message ? String(error.message) : String(error);
+              }}
+              try {{
+                entry.lastRetainedReplayPaintRefreshDebug = debug;
+              }} catch (_error) {{}}
+            }};
+            refreshOnce('now');
+            try {{
+              window.requestAnimationFrame(() => refreshOnce('raf'));
+            }} catch (_error) {{}}
+            try {{
+              window.setTimeout(() => refreshOnce('120ms'), 120);
+            }} catch (_error) {{}}
+            return debug;
+          }};
           const sessionSnapshotForReplay = () => {{
             try {{
               const snapshots = window.__yggtermXtermSessionSnapshots || {{}};
@@ -58847,6 +58914,7 @@ fn terminal_replay_retained_data_script_for_session(
             if (entry.__yggtermLastRetainedReplayKey === replayKey) {{
               if (!collapsedScrollbackNeedsReplay && replayVisibleInEntry(entry)) {{
                 followPromptForEntry(entry, 'retained_replay_cached_visible');
+                refreshRetainedReplayPaint(entry, 'retained_replay_cached_visible');
                 if (Date.now() >= current.stableUntilMs && replayPromptReadyInEntry(entry)) {{
                   current.complete = true;
                 }} else {{
@@ -58857,6 +58925,7 @@ fn terminal_replay_retained_data_script_for_session(
             }}
             if (!authoritativeScreenReplay && !collapsedScrollbackNeedsReplay && replayVisibleInEntry(entry)) {{
               followPromptForEntry(entry, 'retained_replay_existing_visible');
+              refreshRetainedReplayPaint(entry, 'retained_replay_existing_visible');
               if (Date.now() >= current.stableUntilMs && replayPromptReadyInEntry(entry)) {{
                 current.complete = true;
               }} else {{
@@ -67305,6 +67374,33 @@ mod tests {
     }
 
     #[test]
+    fn retained_replay_existing_visible_forces_xterm_paint_refresh() {
+        let script = terminal_replay_retained_data_script_for_session(
+            "remote-session://dev/test",
+            "real output\n› prompt",
+            "daemon_terminal_read",
+        );
+
+        assert!(
+            script.contains("const refreshRetainedReplayPaint = (entry, reason) => {"),
+            "retained replay must have a narrow xterm repaint hook for DOM-visible but pixel-blank restores"
+        );
+        assert!(
+            script
+                .contains("refreshRetainedReplayPaint(entry, 'retained_replay_existing_visible');"),
+            "existing visible retained text must still force xterm to repaint once before the path settles"
+        );
+        assert!(
+            script.contains("refreshRetainedReplayPaint(entry, 'retained_replay_cached_visible');"),
+            "cached retained text must not skip the one-shot xterm repaint"
+        );
+        assert!(
+            script.contains("entry.lastRetainedReplayPaintRefreshDebug = debug;"),
+            "app-control must expose the retained replay paint refresh path"
+        );
+    }
+
+    #[test]
     fn terminal_eval_script_forces_xterm_viewport_without_dom_scroll_mediation() {
         let theme = terminal_theme(UiTheme::ZedLight, palette(UiTheme::ZedLight), 13.0, "");
         let script = terminal_eval_script("yggterm-terminal-test", &theme, true);
@@ -68211,6 +68307,9 @@ mod tests {
         assert!(script.contains("line-height: var(--yggterm-term-line-height)"));
         assert!(script.contains("letter-spacing: var(--yggterm-term-letter-spacing)"));
         assert!(script.contains("white-space: pre !important"));
+        assert!(script.contains("terminalActiveAnimationLongWriteFrameMs"));
+        assert!(script.contains("terminalInlineStatusAnimationLongAfterMs"));
+        assert!(script.contains("elapsedMs >= terminalInlineStatusAnimationLongAfterMs"));
         assert!(!script.contains(".xterm-rows .xterm-cursor {"));
         assert!(!script.contains("var(--yggterm-term-cursor-muted)"));
         assert!(
@@ -68850,6 +68949,13 @@ mod tests {
         assert!(source.contains("capture_dom_debug_snapshot_terminal_quick_fallback_for"));
         assert!(source.contains("APP_CONTROL_TERMINAL_QUICK_DOM_SNAPSHOT_TIMEOUT_MS"));
         assert!(source.contains("readVisibleBuffer"));
+        assert!(source.contains("const terminalTextTail = terminalText.trim().slice(-8192);"));
+        assert_eq!(
+            source
+                .matches("const terminalTextTail = hostText.trim()")
+                .count(),
+            1
+        );
         assert!(source.contains("matchingTitlebarSessionContainers"));
         assert!(source.contains("titlebar_title_text: String(titlebarTitle?.textContent"));
         assert!(
@@ -77536,6 +77642,67 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         assert_eq!(
             surface.get("input_enabled").and_then(Value::as_bool),
             Some(true)
+        );
+
+        let host = json!({
+            "child_count": 1,
+            "xterm_present": true,
+            "screen_present": true,
+            "viewport_present": true,
+            "rows_present": false,
+            "canvas_count": 1,
+            "text_sample": "normal terminal output",
+            "input_enabled": true,
+            "effective_input_focus": true,
+            "helper_textarea_focused": true,
+            "recent_frame_like_write_hot": true,
+            "recent_inline_status_animation_hot": true,
+            "terminal_input_hot": false,
+            "active_write_frame_budget": true,
+            "effective_terminal_write_frame_ms": 500.0,
+            "host_content_width": 883.0,
+            "host_content_height": 904.0,
+            "host_rect": { "left": 277.0, "top": 8.0, "width": 883.0, "height": 904.0, "bottom": 912.0 },
+            "screen_rect": { "left": 277.0, "top": 8.0, "width": 883.0, "height": 904.0 },
+            "viewport_rect": { "left": 277.0, "top": 8.0, "width": 883.0, "height": 904.0 },
+            "cursor_expected_rect": { "left": 293.0, "top": 854.0, "width": 8.0, "height": 18.0 },
+            "cursor_line_text": "› Use /skills to list available skills"
+        });
+        let surface = summarize_terminal_surface_for_app_control(&[host], false);
+        assert_eq!(surface.get("problem"), Some(&Value::Null));
+        assert_eq!(surface.get("geometry_problem"), Some(&Value::Null));
+        assert_eq!(surface.get("performance_problem"), Some(&Value::Null));
+
+        let host = json!({
+            "child_count": 1,
+            "xterm_present": true,
+            "screen_present": true,
+            "viewport_present": true,
+            "rows_present": false,
+            "canvas_count": 1,
+            "text_sample": "normal terminal output",
+            "input_enabled": true,
+            "effective_input_focus": true,
+            "helper_textarea_focused": true,
+            "recent_frame_like_write_hot": true,
+            "recent_inline_status_animation_hot": true,
+            "terminal_input_hot": true,
+            "active_write_frame_budget": true,
+            "effective_terminal_write_frame_ms": 500.0,
+            "host_content_width": 883.0,
+            "host_content_height": 904.0,
+            "host_rect": { "left": 277.0, "top": 8.0, "width": 883.0, "height": 904.0, "bottom": 912.0 },
+            "screen_rect": { "left": 277.0, "top": 8.0, "width": 883.0, "height": 904.0 },
+            "viewport_rect": { "left": 277.0, "top": 8.0, "width": 883.0, "height": 904.0 },
+            "cursor_expected_rect": { "left": 293.0, "top": 854.0, "width": 8.0, "height": 18.0 },
+            "cursor_line_text": "› Use /skills to list available skills"
+        });
+        let surface = summarize_terminal_surface_for_app_control(&[host], false);
+        assert_eq!(surface.get("problem"), Some(&Value::Null));
+        assert_eq!(surface.get("geometry_problem"), Some(&Value::Null));
+        assert_eq!(
+            surface.get("performance_problem").and_then(Value::as_str),
+            Some("active visible terminal write budget is too slow")
         );
 
         let host = json!({
