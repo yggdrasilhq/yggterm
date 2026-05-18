@@ -4,6 +4,21 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+## 2.6.65
+
+- Restore generic shell prompt replay for non-Codex remote terminals while
+  keeping Codex resume replay gated to Codex prompt surfaces, fixing the CI
+  regression that slipped into 2.6.64.
+- Force one bounded xterm-native repaint when retained replay accepts already
+  visible daemon-backed text, preventing a restore from settling with DOM/buffer
+  text present but a blank WebKit paint.
+- Keep app-control snapshots from becoming an alternate terminal source of
+  truth: terminal text tails now prefer the xterm buffer over DOM renderer
+  chrome, and unfocused read-only probes no longer trigger input-gated recovery.
+- Cool long-running Codex inline status animation to a slower xterm write cadence
+  after it has been visible for several seconds, reducing the active WebKit/GUI
+  fan budget without slowing fresh typing or terminal echo.
+
 ## 2.6.64
 
 - Recover active runtime-owned terminal rows when the current daemon has no

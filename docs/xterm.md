@@ -243,6 +243,17 @@ that chrome is allowed to visually cover the top edge without resizing the PTY.
 This diagnostic is only evidence; it must not draw terminal content or become a
 fallback renderer.
 
+In 2.6.65, jojo reproduced the same split on the DOM renderer during
+post-update retained replay: app-control reported daemon-backed xterm rows,
+prompt text, and clean input readiness, while the first WebKit screenshot still
+captured a blank dark terminal rectangle. The fix is not a shell overlay and
+not a second renderer. When retained replay accepts already-visible text instead
+of writing a new payload, the shell forces one bounded xterm-native refresh
+immediately, on the next animation frame, and once more after 120 ms. The
+refresh is observable as `last_retained_replay_paint_refresh_debug` and must
+remain a one-shot paint flush tied to retained replay, not a periodic recovery
+loop.
+
 ## Jojo Finding, 2026-05-17
 
 Wayland xterm canvas is no longer a default product renderer. A live 2.6.35
@@ -832,6 +843,13 @@ dimensions when available. It is a lab, not product code.
   lists the key. Remove that owner, recover through the current daemon/saved
   transcript path, and keep app-control input disabled until fresh PTY bytes
   make the xterm surface current again.
+- App-control text truth must prefer xterm buffer reads over DOM `innerText`.
+  xterm's DOM renderer inserts style and measurement nodes, so host-level DOM
+  text can contain renderer internals that are not PTY output. Likewise, a
+  read-only app-control snapshot taken while the document is unfocused must not
+  classify a prompt as input-gated just because the probe observed disabled
+  input; recovery should only react to gated input when the terminal or document
+  is actually focused.
 
 ## Next Fixes To Apply
 
