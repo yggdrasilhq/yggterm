@@ -306,7 +306,9 @@ def titlebar_matches_viewport(state: dict) -> bool:
         return False
     if active_summary and titlebar.get("menu_open") and summary_text != active_summary:
         return False
-    if active_summary and not _summary_matches_probe_text(active_summary, button_tooltip):
+    if active_summary and summary_text and not _summary_matches_probe_text(active_summary, summary_text):
+        return False
+    if active_summary and button_tooltip and not _summary_matches_probe_text(active_summary, button_tooltip):
         return False
     return True
 
@@ -318,6 +320,8 @@ def _summary_matches_probe_text(active_summary: str, probe_text: str) -> bool:
         return True
     if not probe:
         return False
+    if probe.lower() in {"session details", "close session details"}:
+        return True
     return active == probe or active.startswith(probe) or probe.startswith(active)
 
 

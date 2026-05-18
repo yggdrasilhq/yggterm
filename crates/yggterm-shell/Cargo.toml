@@ -9,8 +9,8 @@ license = "Apache-2.0"
 anyhow.workspace = true
 arboard = { version = "3.6.1", features = ["wayland-data-control"] }
 base64 = "0.22"
-dioxus = { version = "=0.7.6", features = ["desktop"] }
-dioxus-desktop = "=0.7.6"
+dioxus = { version = "=0.7.9", features = ["desktop"] }
+dioxus-desktop = "=0.7.9"
 include_dir = "0.7"
 keyboard-types = "0.7"
 libc = "0.2"
@@ -31,10 +31,17 @@ yggui-contract = { path = "../yggui-contract" }
 [target.'cfg(target_os = "linux")'.dependencies]
 cairo-rs = { version = "0.18.5", features = ["png"] }
 gdk = "0.18.2"
+gdkwayland-sys = "0.18.2"
+gdk_x11_sys = { package = "gdkx11-sys", version = "0.18.2" }
 gdk-pixbuf = "0.18.5"
 gtk = "0.18.2"
+wayland-backend = { version = "0.3.15", features = ["client_system"] }
+wayland-client = { version = "0.31.14", features = ["system"] }
+wayland-protocols = { version = "0.32.12", features = ["client", "staging"] }
+wayland-protocols-plasma = { version = "0.3.12", features = ["client"] }
 webkit2gtk = { version = "=2.0.2", features = ["v2_38"] }
 wry = "0.55.0"
+x11rb = "0.13.2"
 
 [target.'cfg(target_os = "windows")'.dependencies]
 webview2-com = "0.38"

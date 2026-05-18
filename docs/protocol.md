@@ -52,6 +52,10 @@ to lose the PTY.
   recovery presentation.
 - Terminal mode has exactly one terminal truth source: daemon-owned PTY bytes,
   plus retained daemon scrollback derived from those same bytes.
+- Retained daemon scrollback must be preserved separately from the current
+  screen. A cursor-safe current-screen replay may repair the visible grid, but
+  it must not replace a longer retained PTY history or reset xterm to an empty
+  scrollback buffer.
 - Preview mode may render transcript JSONL, generated copy, and metadata, but it
   must never seed or repair Terminal-mode xterm content.
 - Synthetic runtime keys are I/O keys only. They must not replace saved-session
@@ -66,15 +70,34 @@ to lose the PTY.
   runtime truth, the disagreement is a bug to investigate, not an alternate
   source of truth.
 
+The source-of-truth audit for these boundaries is
+`docs/architecture-audit-2026-05-16.md`. Runtime and hot-update changes must
+start from this ownership model. A probe may expose a mismatch, but only daemon
+runtime truth and the handoff state machine may decide ownership, adoption,
+retirement, or input readiness.
+
+The stable shell-side owner for startup stale-daemon selection and hot-update
+handoff priority is `crates/yggterm-shell/src/hot_update_policy.rs`. Launch
+orchestration may execute the selected action, but it must not keep a second
+copy of preserved-owner or stale-daemon selection rules.
+
 ## Session Close Definition
 
-Closing a live session is a runtime operation, not a mode switch. The daemon
-removes the selected PTY runtime and leaves saved transcript identity, cwd
-projection, title, summary, and summary timeline intact.
+Closing a live session is a runtime operation, not a mode switch. For ordinary
+row/session close, the daemon removes the selected PTY runtime and leaves saved
+transcript identity, cwd projection, title, summary, and summary timeline intact.
+This is true even when the row is marked Keep Alive: Keep Alive controls what
+happens when the Yggterm window closes, not what the user's close button means.
+The detach/preserve boundary is GUI close or update handoff, where kept
+terminals stay available without terminating their PTY runtime.
 
 Required close behavior:
 
 - Closing a background live session must not change the active viewport.
+- Closing a kept live session uses the same destructive runtime close semantics
+  as any other live-session close. It must terminate/remove that selected
+  runtime and clear preserved-owner entries for it. Closing the GUI is the
+  action that detaches/preserves kept sessions.
 - Closing the active live session must never leave the closed session selected
   in Web View, Terminal recovery, or a busy refresh loop.
 - The GUI owns active-close fallback because it owns viewport history. The
@@ -132,6 +155,14 @@ It must be classified as a rejected preserved-owner surface, keep input gated,
 and may perform the same one controlled force-remote restart after recovery has
 failed.
 
+Terminal geometry is part of hot-update readiness. The xterm grid size, daemon
+cached size, and kernel PTY size must converge before current remote Codex output
+is accepted as settled. A daemon resize no-op is valid only when the kernel PTY
+already reports the requested rows and columns. If the cache matches but the
+kernel PTY is still at a bootstrap size such as `36x120`, the daemon must repair
+the resize rather than letting Codex draw old-width line art into the restored
+session.
+
 ## Priority Order
 
 Hot update priority is strict:
@@ -150,6 +181,19 @@ Update completion is lower priority than session survival. An old daemon that
 owns a live PTY is not disposable. It is a preserved runtime owner until the new
 daemon has adopted the PTY, a compatibility route has been proven, or the user
 explicitly closes that session.
+
+The preserved-owner registry is evidence, not permission to kill. If cleanup
+finds a stale same-home daemon that directly reports an owned PTY runtime key
+missing from the registry, cleanup must preserve that daemon and classify the
+missing key as a handoff recovery incident. The only automatic retirement case
+for a directly-owned PTY is exact-key coverage by the current daemon.
+
+Startup restore must not eagerly launch or resume every remembered live
+terminal. Bulk remote prewarm is opt-in only because it can saturate the daemon
+control plane, block app-control truth, and turn a session-preserving update
+into a terminal storm. The active visible terminal may be restored on demand;
+background rows stay metadata/live-row truth until opened or otherwise
+explicitly requested.
 
 ## Preflight Protocol
 
@@ -183,6 +227,11 @@ reject it before ping/snapshot/app-control work and start or route through the
 canonical current daemon instead. JSON-producing CLIs must keep JSON on stdout;
 recovery warnings and lifecycle logs belong on stderr.
 
+Internal lifecycle, recovery, and stale-daemon messages must not be written into
+PTY application output. If such text reaches xterm, that is a transport-boundary
+incident. UI-side sanitizers may quarantine the symptom for safety, but they are
+not the fix and must not be treated as the normal protocol path.
+
 ## Handoff State Machine
 
 A direct-install update moves through these states:
@@ -202,12 +251,35 @@ A direct-install update moves through these states:
 7. `GUIReattached`: the GUI active session, sidebar rows, and terminal host all
    point at the same saved-session identity and runtime route.
 8. `Verified`: monitor, app-control state, screenshot, terminal probe, and
-   resource sample all pass.
+   resource sample all pass. Session-switch proof must use the settled
+   app-control open path (`server app open <path> --view terminal`) rather than
+   desktop pointer automation or `terminal focus`, which only reclaims input for
+   the already active terminal host.
 9. `RetireOldOwners`: only old daemons with no live PTYs and no required
    compatibility owner entries may be gracefully retired.
 
 Skipping `Verified` is not allowed for critical clients. Retiring old owners
 before `Verified` is a fatal update bug.
+
+Old-owner retirement must not use the session `Shutdown` request. `Shutdown`
+is allowed to stop terminals and remote Codex sessions, so it is reserved for
+user-requested or harness-owned teardown. Hot-update cleanup must use the
+daemon-retire path, which exits only the stale daemon process after proving that
+all runtime keys it reports are already owned by the current daemon. For older
+daemons that do not understand daemon-retire, a process-level fallback is valid
+only when the stale daemon reports zero owned runtime keys or every reported
+runtime key is covered by the current daemon. That fallback must be observable
+in monitor output and must never be used for the only reachable runtime owner.
+
+Duplicate-owner pruning must not use the user-facing `RemoveSession` request.
+`RemoveSession` is close-session semantics and may terminate a remote Codex
+session before dropping local metadata. When the current daemon already owns a
+runtime key that an older daemon also reports, the cleanup operation is
+local-only: send `DropTerminalRuntime` to the stale owner for that runtime key,
+then retire the stale daemon only after it reports zero owned PTYs. If the old
+daemon still owns another unique runtime key, it remains a preserved owner for
+that key only. It is not allowed to keep participating in hot update for keys
+already owned by the current daemon.
 
 ## Adoption And Compatibility
 
@@ -224,6 +296,102 @@ to the preserved owner, but it must be explicit and observable:
 Compatibility routing is a survival bridge, not a second source of truth. It
 must not create duplicate live rows, duplicate title records, duplicate summary
 records, or a second terminal content source.
+
+A preserved owner is valid only while it can actually answer terminal
+read/write/resize for the runtime key. If a preserved-owner request fails with
+`terminal session not found: <runtime-key>`, the current daemon must remove that
+owner even if the owner's status payload still lists the key. The next terminal
+read must fall back to current-daemon recovery: use the saved Codex transcript
+resume path when available, or expose a clear degraded state when it is not.
+Retained xterm text must not keep the surface marked writable after this
+failure.
+
+A current daemon terminal read has the same obligation. If the selected row is
+Terminal mode but the current daemon has no running runtime for that
+runtime-owned path, the daemon must recreate the runtime before returning
+terminal bytes. An exited runtime whose only output is internal attach noise
+such as `terminal session not found` is a failed bridge, not user-visible
+terminal content. It may trigger current-daemon recovery; it must not keep
+retained xterm text marked live or writable.
+
+Terminal retained replay during adoption has the same single-source rule. If a
+preserved owner can provide both retained PTY history and a current screen
+snapshot, the GUI must seed xterm with history-as-scrollback followed by the
+current screen. It may strip terminal control sequences from the history portion
+only to avoid replaying stale cursor addressing into old rows; the current
+screen portion remains daemon PTY-derived terminal content. A screen-only
+snapshot is an emergency visible-grid fallback, not proof that scrollback
+survived.
+
+A later short `terminal_read` from the same compatibility owner is a
+current-screen refresh, not a replacement scrollback source. It must not reset
+the xterm buffer seeded from retained history or collapse `base_y` back to
+zero. Conversely, a later retained-history replay must not overwrite a fresh
+interactive read. Retained history may stage scrollback, but the final
+input-enabled source for a remote interactive terminal must be a fresh PTY/read
+source such as `daemon_terminal_read` or `daemon_pty`, not
+`daemon_retained_history_screen_snapshot`. App-control proof for a retained
+adoption must show `base_y > 0`, a moving `probe-scroll`, no input-enabled
+retained-history final source, and no duplicate replay writers racing the same
+xterm mount.
+
+Retained-fault recovery follows the same rule. A non-prompt snapshot from a
+recovering remote runtime is diagnostic evidence only. It must not reset the
+xterm buffer, mark the open attempt ready, or enable input. The selected
+runtime's live PTY stream must prove the prompt-ready surface. App-control must
+also reject a focused or input-enabled terminal host whose `session_path` does
+not match the selected `active_session_path`; that is an identity split, not a
+healthy retained surface.
+
+Startup prewarm and focus are part of the same contract. Before either path is
+allowed to spawn a remote `resume-codex` command for an explicit Keep-Alive or
+temporary update-restored remote runtime, the new daemon must scan reachable
+same-home daemon owners for that runtime key. If an old owner still reports the
+runtime, the new daemon must record a preserved-owner route and use it. A
+missing handoff-cache entry is not permission to spawn a duplicate remote Codex
+process.
+
+When a daemon that already routes through older preserved owners prepares the
+next handoff, it must write only the PTY runtime keys it directly owns as
+handoff keys for itself. Reachable prior-owner entries remain attached to their
+actual owner endpoint unless the outgoing daemon has taken over that exact
+runtime. A handoff writer must never rewrite an older live PTY owner to itself
+merely because the current daemon represented the row through a preserved-owner
+route.
+
+Daemon startup must not clear `hot-update-terminal-owners.json` merely because
+the file was written for a previous patch. The daemon must first restore
+persisted live-session state, prune preserved-owner entries that are not
+represented by that restored live truth, and then retarget the surviving owner
+registry to the current version. A version mismatch in the handoff cache is not
+evidence that the PTY is disposable.
+
+If persisted live-session state has already been damaged or truncated during an
+incomplete update, the preserved-owner registry is still a session-survival
+signal. Before filtering runtime truth, the replacement daemon must query the
+registered preserved owner, recover any matching live-session rows from that
+owner's daemon snapshot, and only then decide whether the runtime is
+represented. A reachable owner reporting the runtime key outranks a missing row
+in the current daemon's local session tree; otherwise the GUI can demote a real
+live PTY into a saved-session preview and spawn the same nondeterministic
+"blank/new session" failure under a different patch version.
+
+If the registry itself was already truncated, startup may scan reachable
+same-home daemons for directly owned terminal keys, but it may recover only
+snapshot rows marked Keep-Alive or temporary update-restored. This scan is
+session survival, not ghost resurrection. Unkept rows without the update-restore
+marker must stay closed even if an old process still reports a terminal key.
+
+Preserved-owner `TerminalRead` is a hot-loop byte path. It must proxy PTY bytes
+directly to the owner and must not perform saved-session mismatch snapshots or
+semantic identity probes on every poll. Those checks belong to ensure/snapshot
+recovery paths where they are observable and bounded.
+
+Saved-session mismatch heuristics are not destructive authority during direct
+update. If a live row carries the temporary update-restore marker, a mismatch
+between early preserved-owner screen text and the saved Codex identity is
+recovery evidence only; it must not remove the preserved owner or spawn a fresh
+remote resume before the handoff has either verified or explicitly failed.
 
 ## Retryable Handoff Errors
 
@@ -252,6 +420,18 @@ If the active session is missing from the new daemon:
 - Keep the failed handoff visible as an incident state.
 - Preserve old daemon sockets and owner pids until the session is recovered or
   the user approves cleanup.
+- During startup reconciliation, persisted live-session state is the
+  authoritative allow-list for which old daemon-owned PTYs may be preserved.
+  `hot-update-terminal-owners.json` is a handoff cache and may be stale; it may
+  be used only when persisted live-session state has no runtime keys.
+- For an explicit Keep-Alive remote runtime that is still running, stale,
+  mismatched, prompt-only, blank-after-grace, or spec-mismatched early output is
+  not permission to restart the transport or spawn another resume command under
+  the same session label. Those conditions must keep the surface in recovery,
+  gate input, and remain observable. Restart is allowed only after the runtime
+  process is gone or after an explicit user/harness-owned force-restart action.
+  This applies equally to direct current-daemon runtimes and compatibility
+  routes through preserved old owners.
 
 If retained xterm text contains an update/bridge error:
 
