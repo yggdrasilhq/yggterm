@@ -366,8 +366,15 @@ fn persisted_live_session_from_managed(
     restore_reason: Option<String>,
     protect_for_update_restart: bool,
 ) -> Option<PersistedLiveSession> {
+    let has_promoted_codex_identity = session.kind == SessionKind::Codex
+        && session_metadata_value(session, "Codex Session")
+            .as_deref()
+            .is_some_and(|session_id| !session_id.trim().is_empty());
     let remote_launch_action = session_metadata_value(session, REMOTE_LAUNCH_ACTION_METADATA_LABEL)
-        .filter(|action| !(protect_for_update_restart && action.as_str() == "start-codex"));
+        .filter(|action| {
+            !(action.as_str() == "start-codex"
+                && (protect_for_update_restart || has_promoted_codex_identity))
+        });
     session
         .ssh_target
         .as_ref()
@@ -435,8 +442,8 @@ fn normalize_proc_fd_target_for_storage(path: &Path) -> Option<PathBuf> {
 #[cfg(target_os = "linux")]
 #[derive(Debug, Clone)]
 struct CodexSqliteStoragePaths {
-    logs_path: PathBuf,
-    state_path: PathBuf,
+    logs_paths: Vec<PathBuf>,
+    state_paths: Vec<PathBuf>,
 }
 
 #[cfg(target_os = "linux")]
@@ -476,10 +483,43 @@ fn codex_sqlite_paths_from_process_fds(pid: u32) -> Option<CodexSqliteStoragePat
     }
     logs_paths.sort();
     state_paths.sort();
+    if logs_paths.is_empty() {
+        return None;
+    }
     Some(CodexSqliteStoragePaths {
-        logs_path: logs_paths.into_iter().next()?,
-        state_path: state_paths.into_iter().next()?,
+        logs_paths,
+        state_paths,
     })
+}
+
+#[cfg(target_os = "linux")]
+fn codex_sqlite_state_path_candidates(
+    logs_paths: &[PathBuf],
+    explicit_state_paths: &[PathBuf],
+) -> Vec<PathBuf> {
+    let mut seen = HashSet::new();
+    let mut candidates = Vec::new();
+    for path in explicit_state_paths {
+        if seen.insert(path.clone()) {
+            candidates.push(path.clone());
+        }
+    }
+    for logs_path in logs_paths {
+        let Some(parent) = logs_path.parent() else {
+            continue;
+        };
+        let Ok(entries) = fs::read_dir(parent) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if proc_fd_path_is_codex_sqlite(&path, "state_") && seen.insert(path.clone()) {
+                candidates.push(path);
+            }
+        }
+    }
+    candidates.sort();
+    candidates
 }
 
 #[cfg(target_os = "linux")]
@@ -533,8 +573,27 @@ fn codex_thread_identity_from_state(
 #[cfg(target_os = "linux")]
 fn codex_sqlite_process_identity_from_pid(pid: u32) -> Option<CodexRuntimeProcessIdentity> {
     let paths = codex_sqlite_paths_from_process_fds(pid)?;
-    let thread_id = codex_thread_id_from_recent_logs(&paths.logs_path, pid)?;
-    codex_thread_identity_from_state(&paths.state_path, &thread_id)
+    codex_sqlite_process_identity_from_paths(&paths.logs_paths, &paths.state_paths, pid)
+}
+
+#[cfg(target_os = "linux")]
+fn codex_sqlite_process_identity_from_paths(
+    logs_paths: &[PathBuf],
+    state_paths: &[PathBuf],
+    pid: u32,
+) -> Option<CodexRuntimeProcessIdentity> {
+    let state_candidates = codex_sqlite_state_path_candidates(logs_paths, state_paths);
+    for logs_path in logs_paths {
+        let Some(thread_id) = codex_thread_id_from_recent_logs(logs_path, pid) else {
+            continue;
+        };
+        for state_path in &state_candidates {
+            if let Some(identity) = codex_thread_identity_from_state(state_path, &thread_id) {
+                return Some(identity);
+            }
+        }
+    }
+    None
 }
 
 #[cfg(target_os = "linux")]
@@ -1012,6 +1071,9 @@ pub(crate) fn overlay_codex_runtime_managed_identity(
         identity.session_id.clone(),
     );
     upsert_session_metadata(&mut session.metadata, "Runtime Session", runtime_key);
+    session
+        .metadata
+        .retain(|entry| entry.label != REMOTE_LAUNCH_ACTION_METADATA_LABEL);
     if !identity.cwd.trim().is_empty() {
         upsert_session_metadata(&mut session.metadata, "Cwd", identity.cwd.clone());
     }
@@ -1991,10 +2053,10 @@ impl YggtermServer {
             );
         }
         self.active_session_path = resolved_key.or_else(|| Some(path.to_string()));
-        self.request_terminal_launch_for_active();
         if self.active_session_supports_terminal() {
             self.active_view_mode = WorkspaceViewMode::Terminal;
         }
+        self.request_terminal_launch_for_active();
     }
 
     pub(crate) fn request_terminal_launch_for_path_preserving_active(&mut self, path: &str) {
@@ -4805,18 +4867,34 @@ impl YggtermServer {
         };
         self.upsert_ssh_target(&target);
         if let Some((machine_key, session_id, normalized_live_key)) = remote_scanned_key.as_ref() {
-            let starts_new_codex =
-                remote_launch_action.as_deref() == Some("start-codex") && !temporary_update_restore;
+            let has_saved_codex_identity = kind == SessionKind::Codex
+                && !id.trim().is_empty()
+                && storage_path
+                    .as_deref()
+                    .is_some_and(|path| !path.trim().is_empty());
+            let restored_codex_session_id = if has_saved_codex_identity {
+                id.clone()
+            } else {
+                session_id.clone()
+            };
+            let starts_new_codex = remote_launch_action.as_deref() == Some("start-codex")
+                && !temporary_update_restore
+                && !has_saved_codex_identity;
             let machine_ix = self
                 .remote_machines
                 .iter()
                 .position(|machine| machine.machine_key == *machine_key);
             if !starts_new_codex
                 && let Some(machine_ix) = machine_ix
-                && let Some(session_ix) = self.remote_machines[machine_ix]
-                    .sessions
-                    .iter()
-                    .position(|session| session.session_id == session_id.as_str())
+                && let Some(session_ix) =
+                    self.remote_machines[machine_ix]
+                        .sessions
+                        .iter()
+                        .position(|session| {
+                            session.session_id == session_id.as_str()
+                                || (has_saved_codex_identity
+                                    && session.session_id == restored_codex_session_id.as_str())
+                        })
             {
                 {
                     let scanned = &mut self.remote_machines[machine_ix].sessions[session_ix];
@@ -4840,6 +4918,34 @@ impl YggtermServer {
                 );
                 if !title.trim().is_empty() && !looks_like_generated_fallback_title(&title) {
                     session.title = title.clone();
+                }
+                if has_saved_codex_identity {
+                    session.id = restored_codex_session_id.clone();
+                    session.session_path = normalized_live_key.clone();
+                    upsert_session_metadata(
+                        &mut session.metadata,
+                        "Codex Session",
+                        restored_codex_session_id.clone(),
+                    );
+                    upsert_session_metadata(
+                        &mut session.metadata,
+                        "Runtime Session",
+                        normalized_live_key.clone(),
+                    );
+                    if let Some(storage_path) = storage_path.as_deref() {
+                        upsert_session_metadata(
+                            &mut session.metadata,
+                            "Storage",
+                            storage_path.to_string(),
+                        );
+                    }
+                    session
+                        .metadata
+                        .retain(|entry| entry.label != REMOTE_LAUNCH_ACTION_METADATA_LABEL);
+                    let _ = refresh_remote_codex_terminal_identity_launch_command(
+                        &mut session,
+                        &self.remote_machines,
+                    );
                 }
                 if keep_alive {
                     set_session_keep_alive_metadata(&mut session, true);
@@ -4891,7 +4997,7 @@ impl YggtermServer {
                 });
             self.insert_live_session_with_launch(
                 normalized_live_key,
-                session_id,
+                restored_codex_session_id.as_str(),
                 normalized_kind,
                 &target,
                 Some(resolved_title.clone()),
@@ -4915,7 +5021,7 @@ impl YggtermServer {
                     configure_remote_resume_live_session(
                         session,
                         normalized_live_key,
-                        session_id,
+                        restored_codex_session_id.as_str(),
                         &resolved_title,
                         &target,
                         &remote_binary,
@@ -4926,6 +5032,28 @@ impl YggtermServer {
                 }
                 if keep_alive {
                     set_session_keep_alive_metadata(session, true);
+                }
+                if has_saved_codex_identity {
+                    upsert_session_metadata(
+                        &mut session.metadata,
+                        "Codex Session",
+                        restored_codex_session_id.clone(),
+                    );
+                    upsert_session_metadata(
+                        &mut session.metadata,
+                        "Runtime Session",
+                        normalized_live_key.clone(),
+                    );
+                    if let Some(storage_path) = storage_path.as_deref() {
+                        upsert_session_metadata(
+                            &mut session.metadata,
+                            "Storage",
+                            storage_path.to_string(),
+                        );
+                    }
+                    session
+                        .metadata
+                        .retain(|entry| entry.label != REMOTE_LAUNCH_ACTION_METADATA_LABEL);
                 }
                 if temporary_update_restore {
                     upsert_session_metadata(
@@ -5124,6 +5252,20 @@ impl YggtermServer {
     }
 
     pub fn request_terminal_launch_for_active(&mut self) {
+        if self.active_view_mode != WorkspaceViewMode::Terminal {
+            if let Ok(home) = resolve_yggterm_home() {
+                append_trace_event(
+                    &home,
+                    "server",
+                    "session",
+                    "request_terminal_launch_for_active_skipped",
+                    serde_json::json!({
+                        "active_view_mode": format!("{:?}", self.active_view_mode),
+                    }),
+                );
+            }
+            return;
+        }
         let Some(raw_path) = self.active_session_path.clone() else {
             return;
         };
@@ -7891,6 +8033,12 @@ fn restored_remote_runtime_codex_session_id(
     key: &str,
     session: &ManagedSessionView,
 ) -> Option<String> {
+    if let Some(session_id) = session_metadata_value(session, "Codex Session")
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+    {
+        return Some(session_id);
+    }
     if let Some(session_id) = parse_remote_runtime_codex_session_key(key) {
         return Some(session_id.to_string());
     }
@@ -19044,6 +19192,101 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn codex_runtime_sqlite_identity_finds_sibling_state_without_state_fd() -> Result<()> {
+        use rusqlite::{Connection, params};
+
+        let root = std::env::temp_dir().join(format!(
+            "yggterm-codex-runtime-sqlite-logs-only-{}",
+            current_millis_u64()
+        ));
+        let codex_home = root.join(".codex");
+        fs::create_dir_all(&codex_home)?;
+        let logs_path = codex_home.join("logs_2.sqlite");
+        let state_path = codex_home.join("state_5.sqlite");
+        let rollout_path = codex_home
+            .join("sessions")
+            .join("2026")
+            .join("05")
+            .join("19")
+            .join("rollout-2026-05-19T00-00-00-logs-only-session.jsonl");
+        fs::create_dir_all(rollout_path.parent().expect("rollout parent"))?;
+        fs::write(&rollout_path, "")?;
+
+        {
+            let conn = Connection::open(&logs_path)?;
+            conn.execute(
+                "CREATE TABLE logs (
+                    id INTEGER PRIMARY KEY,
+                    thread_id TEXT,
+                    process_uuid TEXT
+                )",
+                [],
+            )?;
+        }
+        {
+            let conn = Connection::open(&state_path)?;
+            conn.execute(
+                "CREATE TABLE threads (
+                    id TEXT PRIMARY KEY,
+                    rollout_path TEXT NOT NULL,
+                    cwd TEXT NOT NULL
+                )",
+                [],
+            )?;
+            conn.execute(
+                "INSERT INTO threads (id, rollout_path, cwd) VALUES (?1, ?2, ?3)",
+                params![
+                    "logs-only-session",
+                    rollout_path.to_string_lossy().as_ref(),
+                    "/tmp/logs-only-project"
+                ],
+            )?;
+        }
+
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg("exec 3<\"$1\"; sleep 5")
+            .arg("sh")
+            .arg(&logs_path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn sqlite logs fd holder");
+
+        {
+            let conn = Connection::open(&logs_path)?;
+            conn.execute(
+                "INSERT INTO logs (thread_id, process_uuid) VALUES (?1, ?2)",
+                params!["logs-only-session", format!("pid:{}:test", child.id())],
+            )?;
+        }
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let identity = loop {
+            if let Some(identity) = super::codex_runtime_process_identity_from_root_pid(child.id())
+            {
+                break identity;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "Codex SQLite identity should infer sibling state_*.sqlite from logs fd"
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        };
+
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = fs::remove_dir_all(&root);
+
+        assert_eq!(identity.session_id, "logs-only-session");
+        assert_eq!(identity.cwd, "/tmp/logs-only-project");
+        assert_eq!(identity.storage_path, rollout_path);
+        Ok(())
+    }
+
     #[test]
     fn codex_runtime_snapshot_identity_uses_real_session_id_and_keeps_runtime_key() {
         let mut session = snapshot_session(
@@ -24472,6 +24715,60 @@ terminal_window_id: None,
     }
 
     #[test]
+    fn request_terminal_launch_for_active_skips_non_terminal_view() {
+        let tree = SessionNode {
+            kind: SessionNodeKind::Group,
+            name: "sessions".to_string(),
+            title: None,
+            document_kind: None,
+            group_kind: None,
+            path: PathBuf::from("/"),
+            children: Vec::new(),
+            session_id: None,
+            cwd: None,
+        };
+        let mut server = YggtermServer::new(
+            &tree,
+            false,
+            GhosttyHostSupport::shadow("test".to_string(), false, false),
+            UiTheme::ZedLight,
+        );
+        let target = SshConnectTarget {
+            label: "localhost".to_string(),
+            kind: SessionKind::Shell,
+            ssh_target: "localhost".to_string(),
+            prefix: None,
+            cwd: Some("/home/pi".to_string()),
+        };
+        server.insert_live_session_with_launch(
+            "local://closing-shell",
+            "closing-shell",
+            SessionKind::Shell,
+            &target,
+            Some("Closing Shell".to_string()),
+            false,
+        );
+        server.active_session_path = Some("local://closing-shell".to_string());
+        server.active_view_mode = WorkspaceViewMode::Rendered;
+        let before = server
+            .sessions
+            .get_mut("local://closing-shell")
+            .expect("live session");
+        before.status_line = "do not relaunch".to_string();
+        before.launch_command = "do-not-launch".to_string();
+
+        server.request_terminal_launch_for_active();
+
+        let after = server
+            .sessions
+            .get("local://closing-shell")
+            .expect("live session");
+        assert_eq!(server.active_view_mode(), WorkspaceViewMode::Rendered);
+        assert_eq!(after.status_line, "do not relaunch");
+        assert_eq!(after.launch_command, "do-not-launch");
+    }
+
+    #[test]
     fn restore_persisted_state_skips_unkept_recoverable_live_sessions_without_update_reason() {
         let tree = SessionNode {
             kind: SessionNodeKind::Group,
@@ -25239,6 +25536,114 @@ terminal_window_id: None,
                 .launch_command
                 .trim_end()
                 .ends_with("&& codex"),
+            "{}",
+            restored_live.launch_command
+        );
+    }
+
+    #[test]
+    fn keep_alive_remote_codex_identity_restores_real_session_not_fresh_start() {
+        let tree = SessionNode {
+            kind: SessionNodeKind::Group,
+            name: "sessions".to_string(),
+            title: None,
+            document_kind: None,
+            group_kind: None,
+            path: PathBuf::from("/"),
+            children: Vec::new(),
+            session_id: None,
+            cwd: None,
+        };
+        let synthetic_id = "54f06fff-d15d-4e79-8734-0ec9627632f2";
+        let real_id = "019e3fd6-87da-7803-a4e6-f95ad0f0e687";
+        let runtime_key = remote_scanned_session_path("dev", synthetic_id);
+        let storage_path = "/home/pi/.codex/sessions/2026/05/19/rollout-2026-05-19T16-14-44-019e3fd6-87da-7803-a4e6-f95ad0f0e687.jsonl";
+        let mut server = YggtermServer::new(
+            &tree,
+            false,
+            GhosttyHostSupport::shadow("test".to_string(), false, false),
+            UiTheme::ZedLight,
+        );
+        server.remote_machines = vec![remote_machine_with_scanned_session("dev", real_id, true)];
+        server.restore_live_session(PersistedLiveSession {
+            key: runtime_key.clone(),
+            id: synthetic_id.to_string(),
+            title: "Kaustav work".to_string(),
+            kind: SessionKind::Codex,
+            keep_alive: true,
+            ssh_target: "dev".to_string(),
+            prefix: None,
+            cwd: Some("/home/pi/git/samplenotes".to_string()),
+            remote_launch_action: Some("start-codex".to_string()),
+            storage_path: None,
+            restore_reason: None,
+        });
+        server.request_terminal_launch_for_path(&runtime_key);
+
+        assert!(server.apply_codex_runtime_identity_to_live_session(
+            &runtime_key,
+            &super::CodexRuntimeProcessIdentity {
+                storage_path: PathBuf::from(storage_path),
+                session_id: real_id.to_string(),
+                cwd: "/home/pi/git/samplenotes".to_string(),
+            },
+            None,
+        ));
+        let live = server
+            .sessions
+            .get(&runtime_key)
+            .expect("synthetic runtime key stays mounted");
+        assert_eq!(
+            session_metadata_value(live, REMOTE_LAUNCH_ACTION_METADATA_LABEL),
+            None,
+            "a promoted real Codex identity must not persist fresh-start metadata"
+        );
+
+        let persisted = server.persisted_state();
+        let persisted_live = persisted
+            .live_sessions
+            .iter()
+            .find(|live| live.key == runtime_key)
+            .expect("keep-alive live session persisted");
+        assert_eq!(persisted_live.id, real_id);
+        assert_eq!(persisted_live.storage_path.as_deref(), Some(storage_path));
+        assert_eq!(persisted_live.remote_launch_action, None);
+
+        let mut restored = YggtermServer::new(
+            &tree,
+            false,
+            GhosttyHostSupport::shadow("test".to_string(), false, false),
+            UiTheme::ZedLight,
+        );
+        restored.remote_machines = vec![remote_machine_with_scanned_session("dev", real_id, true)];
+        restored.restore_persisted_state_with_launch_policy(persisted, None, false);
+        let restored_live = restored
+            .sessions
+            .get(&runtime_key)
+            .expect("restored runtime live session");
+        assert_eq!(restored_live.session_path, runtime_key);
+        assert_eq!(restored_live.id, real_id);
+        assert_eq!(
+            session_metadata_value(restored_live, "Codex Session").as_deref(),
+            Some(real_id)
+        );
+        assert_eq!(
+            session_metadata_value(restored_live, "Storage").as_deref(),
+            Some(storage_path)
+        );
+        assert!(
+            restored_live.launch_command.contains("resume-codex")
+                || restored_live.launch_command.contains(" resume"),
+            "{}",
+            restored_live.launch_command
+        );
+        assert!(
+            restored_live.launch_command.contains(real_id),
+            "{}",
+            restored_live.launch_command
+        );
+        assert!(
+            !restored_live.launch_command.contains(" start-codex "),
             "{}",
             restored_live.launch_command
         );
