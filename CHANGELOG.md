@@ -4,6 +4,159 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+## 2.6.83
+
+- Harden hot-update session survival. Reachable old daemons that still report a
+  live PTY now recover missing rows as temporary update-restore sessions instead
+  of being treated as disposable stale state.
+- Fix daemon hot-restart handoff so the replacement daemon is spawned only after
+  the old daemon releases the current socket lock. This prevents live PTYs from
+  staying alive behind a missing `server-<version>.sock`.
+- Promote synthetic remote Codex runtime rows to the real Codex transcript id for
+  normal Keep Alive persistence, not only update-restart persistence. Restores now
+  resume the real saved session instead of replaying `start-codex` under the old
+  synthetic key.
+- Infer Codex SQLite `state_*.sqlite` files from the sibling `logs_*.sqlite` fd
+  when Codex no longer holds the state DB open, so runtime identity can still be
+  discovered from the live process tree.
+- Keep terminal mode rendered while the GUI is closing instead of briefly swapping
+  the viewport into Web View as part of the KDE close path.
+- Block automatic remote-runtime restarts for still-running temporary
+  update-restored sessions. Stale, blank, or spec-mismatched output now remains
+  a visible recovery incident until the runtime exits or a user/harness action
+  explicitly restarts it.
+- Remove the broad preserved-owner cleanup fallback that could call
+  `PrepareClientClose` on an old owner and kill unrelated running sessions.
+- Detect active remote Codex scroll-lock incidents where wheel input reaches an
+  xterm surface with `base_y=0`, and allow daemon-retained replay for reused
+  `start-codex` runtimes so stale fresh-start metadata cannot suppress
+  scrollback restoration.
+- Keep daemon-retained replay from being clobbered by the blank-surface
+  recovery watchdog. Once retained history has been staged into xterm, a late
+  empty DOM sample no longer resets the terminal and overwrites scrollback with
+  a short screen-only read.
+- Stop treating a prompt-ready daemon-retained history snapshot as unsafe just
+  because input is enabled. That false positive rearmed recovery and remounted
+  the live terminal back to a short `daemon_terminal_read`.
+- Tighten app-control terminal focus diagnostics so stale helper focus on a
+  retained offscreen host no longer masquerades as an active-session mismatch,
+  and pause hidden loading animations while the window is unfocused or
+  app-control-backgrounded.
+
+## 2.6.79
+
+- Fix a jojo fan-budget regression in the desktop render path. Retained
+  terminal canvases now receive a slim terminal-only snapshot instead of the
+  full workspace snapshot, avoiding repeated Dioxus equality checks across the
+  entire sidebar/session graph.
+- Remove render-time title/summary database opens from the active session copy
+  generation path while focus-time generation remains disabled. This stops the
+  idle GUI from repeatedly touching `~/.yggterm/session-titles.db`.
+- Add regression tests that block full `RenderSnapshot` terminal-canvas props
+  and active render-path `SessionStore` opens from returning.
+
+## 2.6.78
+
+- Fix the left sidebar clipping upward after live-session/tree changes. The
+  sidebar now has explicit stretch geometry, app-control exposes the scroller
+  bounds, and the autoscroll repair targets the sidebar scroller directly
+  instead of relying on generic `scrollIntoView`.
+- Tighten the xterm/sidebar smoke contract so selected live rows and the `Live
+  Sessions` group fail when they exist in app-control state but are clipped
+  outside the visible shell frame.
+
+## 2.6.77
+
+- Restore the focused xterm block cursor fill on Codex prompt rows. Cursor
+  blinking remains disabled for idle CPU, but the native block cursor now paints
+  with the terminal cursor theme color instead of inheriting the styled prompt
+  cell background and becoming invisible.
+
+## 2.6.76
+
+- Add a terminal-surface CSS backstop for xterm cursor blinking. Some retained
+  DOM renderer paths still attach the `xterm-cursor-blink` class even when the
+  xterm option is false; Yggterm now forces that cursor animation off without
+  drawing an overlay or changing PTY bytes.
+- Expose `xterm_cursor_blink` in app-control terminal host snapshots so cursor
+  option truth can be checked alongside the CSS animation census.
+
+## 2.6.75
+
+- Disable xterm.js cursor CSS blinking in the desktop shell. The cursor remains
+  a native xterm block cursor, but no longer keeps WebKit/GTK hot on idle
+  Wayland sessions.
+- Tighten the xterm smoke contract so cursor CSS animations are treated as an
+  idle/fan-budget regression rather than a harmless visual detail.
+
+## 2.6.74
+
+- Fix the Codex prompt cursor on dim placeholder text: `.xterm-dim` on a cursor
+  span is no longer treated as blink-off state, so the block cursor keeps
+  blinking while the prompt placeholder remains dim.
+- Tighten the cursor smoke contract to inspect the sampled cursor cell
+  background for styled prompt rows instead of using `.xterm-dim` as a blink
+  signal.
+
+## 2.6.73
+
+- Fix the xterm cursor blink-off contract: focused block cursors now let
+  xterm's native dim/off state go transparent instead of painting a terminal
+  background tile through styled Codex prompt rows.
+- Keep dim-row contrast normalization away from `.xterm-cursor` so terminal
+  text can be helped without taking over cursor rendering.
+
+## 2.6.72
+
+- Keep terminal input/cursor focus alive when the autohidden titlebar covers the
+  first xterm row; a visible prompt/cursor now wins over the covered-row sample.
+- Tighten the xterm smoke cursor check so a Codex prompt-row blink-off cursor
+  cannot collapse to the terminal background.
+
+## 2.6.71
+
+- Keep the active terminal cursor visible through restore/focus drift by using
+  xterm.js' native blinking block cursor and block inactive cursor instead of
+  the low-contrast inactive outline.
+
+## 2.6.70
+
+- Drop all retained xterm render state for a live terminal as soon as a close
+  starts, so a removed session cannot stay mounted as a zombie DOM surface.
+- Give live terminal close/remove requests the long daemon response budget,
+  preventing slow PTY teardown from succeeding underneath while the GUI reports
+  `Delete Failed`.
+- Expand daemon request warnings to include the full error chain for future
+  response-timeout and serialization incidents.
+
+## 2.6.69
+
+- Restore lossless xterm writes for synchronized Codex/TUI repaint bursts. The
+  write bridge may still pace large terminal frames, but it no longer deletes or
+  rewrites PTY bytes before xterm.js applies them.
+- Treat a blank active xterm surface as not launch-settled, and recover stale
+  local hot-open leases without requiring a manual switching pass.
+- Stop preview image rendering from probing session URI strings as filesystem
+  image paths during Dioxus renders.
+
+## 2.6.68
+
+- Collapse repeated synchronized Codex repaint bursts to the latest xterm frame
+  while preserving real scrollback/output, reducing WebKit/GUI CPU during active
+  Working/status animations.
+- Expose coalesced payload size in app-control snapshots and tighten the inline
+  animation smoke budget so oversized repaint bursts are caught.
+
+## 2.6.67
+
+- Repair blank DOM xterm surfaces where the PTY/xterm buffer still has live text
+  but WebKit has lost the `.xterm-rows` renderer layer, and make manual Redraw
+  Terminal attempt a bounded xterm-native renderer-surface recovery.
+- Tighten live-session close/delete preflight so a closing terminal cannot be
+  relaunched by stale open-attempt state before the daemon remove completes.
+- Add app-control and smoke coverage for missing DOM renderer text layers and
+  stale PromptFollow visual scroll locks.
+
 ## 2.6.66
 
 - Fix retained remote Codex prompt readiness so prompt-ready surfaces that pass
