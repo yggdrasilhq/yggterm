@@ -18,15 +18,57 @@ animation must come from PTY bytes, xterm.js cell attributes, theme mapping, or
 xterm.js-native APIs that remain part of the terminal surface. Any diagnostic
 shim must be opt-in, observable, and rejected by release smokes.
 
-Cursor blink/off and inactive states must preserve the xterm cell under the
-cursor. When xterm renders an outline, dim, or focused block-dim cursor element,
-Yggterm may copy the current xterm buffer/DOM cell background into a host CSS
-variable used by that native cursor element, but it must not infer a Codex
-prompt row from text or draw a separate cursor/prompt overlay. Restored xterm
-surfaces must refresh this sample after mount as well as after render/write
-events because a preserved session can become visible without a fresh xterm
-render callback. App-control exposes the sampled cursor cell background so a
-one-cell prompt-background hole is treated as a terminal surface regression.
+Cursor and inactive states must preserve xterm's native cursor shape. Yggterm
+uses xterm's native block cursor with CSS cursor blinking disabled in the
+desktop shell. A static visible native cursor is preferable to a shell overlay
+or PTY-byte rewrite, and it avoids WebKit/GTK idle CPU burn from a perpetual
+cursor animation on KDE/Wayland. The constructor requests `cursorBlink: false`;
+the terminal surface also applies an xterm-scoped CSS backstop that sets cursor
+animation to `none` because retained DOM renderer paths can keep cursor blink
+classes or option truth in surprising states after restore. If blinking is
+reintroduced, blink/off must be truly off: no shell-owned cell fill, no
+terminal-theme patch, and no prompt-background hole. Yggterm may sample the
+current xterm buffer/DOM cell background for observability and inactive-outline
+fallback, but it must not infer a Codex prompt row from text or draw a separate
+cursor/prompt overlay. Restored xterm surfaces must refresh this sample after
+mount as well as after render/write events because a preserved session can
+become visible without a fresh xterm render callback. App-control exposes the
+sampled cursor cell background and the xterm `cursorBlink` option as
+diagnostics; the release gate is no cursor-driven running CSS animation, no
+one-cell prompt-background hole, and no shell-owned cursor overlay.
+
+Focused block cursors must paint with xterm's cursor theme color even when the
+cursor span is attached to a dim Codex placeholder cell. The sampled cursor cell
+background is diagnostic/inactive-outline data; it must not become the focused
+block cursor fill, or the cursor disappears into styled prompt rows while still
+existing in DOM.
+
+Do not treat `.xterm-dim` on a cursor span as blink/off state. xterm may attach
+the cursor span to a dim prompt placeholder cell, so the cursor can legitimately
+carry `.xterm-dim` while it is visible. With cursor blinking disabled, a focused
+terminal may still expose an xterm-owned `xterm-cursor-blink` class on some DOM
+renderer paths, but app-control must show no cursor-driven running CSS
+animation. If blinking is re-enabled later, the only blink/off proof is the
+rendered cursor node becoming hidden through xterm's native opacity/animation
+state; the underlying sampled cursor cell background must still match the prompt
+cell, not the terminal viewport background.
+
+An auto-hidden titlebar covering the first xterm row is not proof that the
+terminal is unpainted. App-control may report the covered row, but if the prompt
+row or cursor cell is still topmost inside `.xterm-rows`, the surface remains
+paint-visible and must not lose input/focus. The cursor smoke also checks styled
+Codex prompt rows: the sampled cursor cell background for a `›` prompt row must
+preserve the prompt cell background and must not collapse to the terminal theme
+background.
+
+Foreground input belongs to the selected active terminal host only. Retained
+offscreen hosts may still have stale `.xterm-helper-textarea` focus after a
+switch, WebKit focus loss, or app restart; that stale helper focus is diagnostic
+noise unless the host is the active session host or still reports enabled/raw
+input. A different-session host with `input_enabled=true` or
+`raw_input_enabled=true` is an identity violation. A different-session retained
+host with disabled input and stale helper focus must release focus on the next
+Rust policy pass and must not keep the active viewport in recovery.
 
 This document owns terminal-rendering law. The cross-system source-of-truth
 audit lives in `docs/architecture-audit-2026-05-16.md`; if a terminal fix needs
@@ -41,6 +83,14 @@ were filtered, coalesced, dropped, replayed from the wrong source, or routed to
 the wrong runtime. If manual redraw fixes a surface, classify the incident as a
 renderer-settle or activation bug. If it does not, continue investigation at the
 PTY stream, runtime identity, geometry, or retained-replay boundary.
+
+One narrow renderer repair is allowed inside manual redraw: if app-control proves
+the xterm DOM renderer still has a screen node and buffered PTY text, but has lost
+both `.xterm-rows` and canvas layers, redraw may reattach xterm.js' own renderer
+row/selection containers and ask xterm to repaint. This is not a Yggterm overlay
+or alternate renderer; it is recovery of xterm's missing render surface, and must
+be observable through `renderer_surface_missing`, `renderer_surface_recovery_count`,
+and `active_terminal_surface.render_health.reason`.
 
 ## Interaction Contracts
 
@@ -160,6 +210,13 @@ Reattaching to a kept session after a GUI close must reuse the same PTY owner or
 stay in recovery; it must not spawn a fresh `codex resume` as a substitute for
 the lost owner.
 
+GUI close must not change Terminal mode into Web View as an intermediate
+rendering state. Closing may detach the xterm surface, hide the window, or hand
+the runtime to a preserved owner, but the rendered snapshot remains Terminal
+until the window is gone. A visible close path that briefly shows the active
+session as Web View is a shell state bug: it creates a second surface truth and
+can make users believe the terminal was replaced by transcript/preview content.
+
 In 2.6.22, the live jojo scroll incident tightened the retained-replay rule:
 cursor-addressed retained snapshots are dangerous as a visible screen seed, but
 replacing them with a current screen-only snapshot is also wrong because it
@@ -176,6 +233,20 @@ may have user input gated while a remote resume or retained replay is being
 validated, but its existing xterm scrollback must still respond to wheel and
 app-control `probe-scroll` actions when that host is the active terminal. Paste,
 keyboard input, and terminal writes remain readiness-gated.
+
+A reused `Remote Launch Action=start-codex` row is not proof that the runtime is
+fresh once the daemon reports existing runtime output or the shell has observed a
+ready viewport. In that state, daemon PTY retained bytes remain the terminal
+history truth and may be replayed after ready-settle even if the original launch
+action string still says `start-codex`. Fresh-start metadata must not suppress
+retained scrollback hydration for an already-running remote Codex session.
+
+An active remote Codex terminal that receives wheel input while xterm reports
+`base_y=0` is not a healthy prompt-follow state when the visible tail contains
+prior output. Classify it as retained scrollback loss: the viewport cannot move
+because the restored xterm buffer has no history. The recovery path is retained
+PTY replay followed by the current screen seed, not another screen-only ready
+classification.
 
 The same rule applies to retained-ready rehydrate modes. A preserved-owner
 `CollapsedScrollbackRecovery` must convert cursor-addressed retained history to
@@ -253,6 +324,13 @@ immediately, on the next animation frame, and once more after 120 ms. The
 refresh is observable as `last_retained_replay_paint_refresh_debug` and must
 remain a one-shot paint flush tied to retained replay, not a periodic recovery
 loop.
+
+In 2.6.66, jojo reproduced the harder DOM-renderer failure: xterm's buffer still
+contained the live Codex output, but WebKit had lost the DOM renderer's `.xterm-rows`
+layer entirely and no canvas layer existed. App-control now classifies that exact
+state as `dom_renderer_missing_text_layer_with_buffer_text`; manual redraw and
+host rebind attempt an xterm-native renderer-surface repair before accepting the
+surface as readable.
 
 ## Jojo Finding, 2026-05-17
 
@@ -802,6 +880,10 @@ dimensions when available. It is a lab, not product code.
 - Keep write batching lossless for control sequences. Bracketed paste markers,
   cursor movement, erase-line, alternate-screen transitions, and inline status
   rewrite batches must preserve ordering.
+- Synchronized repaint batching may drop superseded repaint frames when the gap
+  between frames is control-only. Preserve real scrollback/output before the
+  burst and keep the latest complete `?2026h`...`?2026l` frame; do not collapse
+  alternate-screen transitions or frames separated by visible text.
 - Scroll controls are shell controls, not terminal rendering. The YggUI scroll
   controller may appear when the user is intentionally far from prompt-follow,
   but it must only call xterm viewport APIs such as `scrollToLine` or

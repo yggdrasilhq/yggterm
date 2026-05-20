@@ -1,3 +1,152 @@
+yggterm (2.6.83-1) unstable; urgency=medium
+
+  * Release the daemon socket lock before spawning the hot-restart replacement,
+    preventing a missing current socket with live PTYs stranded behind the old
+    process.
+  * Persist promoted remote Codex runtimes by real transcript identity for normal
+    Keep Alive restores, not only update restarts.
+  * Infer Codex state SQLite files from sibling logs SQLite handles when the
+    live process no longer keeps state_*.sqlite open.
+  * Keep terminal mode visible while closing the GUI instead of briefly rendering
+    Web View during the KDE close path.
+  * Harden hot-update session survival by recovering reachable old-owner PTYs
+    as temporary update-restore rows before cleanup.
+  * Block automatic restart of still-running temporary update-restored remote
+    runtimes unless the process is gone or the user/harness explicitly restarts
+    it.
+  * Remove the broad preserved-owner PrepareClientClose fallback that could
+    kill unrelated running sessions on an old daemon.
+  * Preserve daemon-retained replay after scrollback recovery so a late blank
+    DOM sample cannot overwrite xterm history with a screen-only read.
+  * Allow input on prompt-ready daemon-retained history snapshots so the
+    recovery watchdog does not remount a healthy live terminal back to a short
+    screen read.
+  * Tighten app-control terminal focus diagnostics so stale helper focus on a
+    retained offscreen host no longer masquerades as an active-session mismatch,
+    and pause hidden loading animations while the window is unfocused or
+    app-control-backgrounded.
+
+ -- Avikalpa Kundu <avi@gour.top>  Tue, 19 May 2026 18:58:00 +0530
+
+yggterm (2.6.79-1) unstable; urgency=medium
+
+  * Keep retained terminal canvases on a slim terminal-only snapshot so Dioxus
+    no longer compares the full workspace/session graph in the idle render
+    path.
+  * Remove focus-time title/summary store opens from the active render path
+    while implicit generation remains disabled.
+  * Add regression checks for full RenderSnapshot terminal props and render-path
+    SessionStore access.
+
+ -- Avikalpa Kundu <avi@gour.top>  Tue, 19 May 2026 13:10:00 +0530
+
+yggterm (2.6.78-1) unstable; urgency=medium
+
+  * Keep the left sidebar stretched to the full workspace height and repair
+    selected-row autoscroll through the sidebar scroller instead of generic
+    scrollIntoView.
+  * Expose sidebar scroller geometry in app-control and fail smokes when live
+    sidebar rows are clipped outside the shell frame.
+
+ -- Avikalpa Kundu <avi@gour.top>  Tue, 19 May 2026 12:20:00 +0530
+
+yggterm (2.6.77-1) unstable; urgency=medium
+
+  * Restore the focused xterm block cursor fill on styled Codex prompt rows
+    while keeping cursor blinking disabled for idle CPU.
+
+ -- Avikalpa Kundu <avi@gour.top>  Tue, 19 May 2026 04:18:00 +0530
+
+yggterm (2.6.76-1) unstable; urgency=medium
+
+  * Force xterm cursor CSS animation off at the terminal-surface style layer,
+    covering retained DOM renderer paths that keep the blink class.
+  * Expose the xterm cursorBlink option in app-control snapshots.
+
+ -- Avikalpa Kundu <avi@gour.top>  Tue, 19 May 2026 03:59:00 +0530
+
+yggterm (2.6.75-1) unstable; urgency=medium
+
+  * Disable xterm cursor CSS blinking by default so an idle terminal cursor does
+    not keep WebKit/GTK busy on Wayland.
+  * Add smoke coverage that rejects cursor-driven CSS animations in terminal
+    app-control state.
+
+ -- Avikalpa Kundu <avi@gour.top>  Tue, 19 May 2026 03:44:09 +0530
+
+yggterm (2.6.74-1) unstable; urgency=medium
+
+  * Do not treat xterm-dim on native cursor spans as blink-off state; Codex
+    placeholder cells can be dim while the native block cursor is visible.
+  * Check styled prompt cursor-cell backgrounds directly in the xterm smoke
+    harness instead of inferring blink state from xterm-dim.
+
+ -- Avikalpa Kundu <avi@gour.top>  Tue, 19 May 2026 03:28:18 +0530
+
+yggterm (2.6.73-1) unstable; urgency=medium
+
+  * Let xterm's native focused block cursor blink-off state stay transparent
+    instead of painting a terminal-background tile through styled prompt rows.
+  * Keep dim-row contrast normalization away from native xterm cursor nodes.
+
+ -- Avikalpa Kundu <avi@gour.top>  Tue, 19 May 2026 03:18:00 +0530
+
+yggterm (2.6.72-1) unstable; urgency=medium
+
+  * Keep terminal input/cursor focus alive when the autohidden titlebar covers
+    the first xterm row.
+  * Add smoke coverage for Codex prompt-row cursor blink-off background.
+
+ -- Avikalpa Kundu <avi@gour.top>  Tue, 19 May 2026 02:50:56 +0530
+
+yggterm (2.6.71-1) unstable; urgency=medium
+
+  * Keep active terminal cursors visible during restore/focus drift by using
+    xterm.js' native blinking block cursor and block inactive cursor.
+
+ -- Avikalpa Kundu <avi@gour.top>  Tue, 19 May 2026 02:52:00 +0530
+
+yggterm (2.6.70-1) unstable; urgency=medium
+
+  * Drop retained xterm render state as soon as live terminal close starts.
+  * Give live terminal remove/close requests the long daemon response timeout
+    so slow PTY teardown cannot falsely report Delete Failed.
+  * Log full daemon request error chains for response timeout diagnostics.
+
+ -- Avikalpa Kundu <avi@gour.top>  Tue, 19 May 2026 02:33:00 +0530
+
+yggterm (2.6.69-1) unstable; urgency=medium
+
+  * Restore lossless xterm writes for synchronized Codex/TUI repaint bursts.
+    Frame budgeting may pace terminal bytes, but it no longer deletes or
+    rewrites PTY output before xterm.js applies it.
+  * Treat blank active xterm surfaces as not settled during app launch and
+    recover stale local hot-open leases without a manual switching pass.
+  * Avoid probing session URI strings as local preview image paths during
+    Dioxus renders.
+
+ -- Avikalpa Kundu <avi@gour.top>  Tue, 19 May 2026 01:21:04 +0530
+
+yggterm (2.6.68-1) unstable; urgency=medium
+
+  * Collapse repeated synchronized Codex repaint bursts to the latest xterm
+    frame while preserving real scrollback/output.
+  * Expose coalesced payload size in app-control snapshots and smoke-test the
+    oversized repaint budget.
+
+ -- Avikalpa Kundu <avi@gour.top>  Tue, 19 May 2026 00:35:06 +0530
+
+yggterm (2.6.67-1) unstable; urgency=medium
+
+  * Repair blank DOM xterm surfaces where live buffer text remains but the
+    renderer text layer is missing.
+  * Make Redraw Terminal attempt a bounded xterm-native renderer-surface
+    recovery and expose the recovery in app-control state.
+  * Clear live-session close/delete relaunch state before the daemon remove
+    reply arrives.
+
+ -- Avikalpa Kundu <avi@gour.top>  Tue, 19 May 2026 00:10:47 +0530
+
 yggterm (2.6.66-1) unstable; urgency=medium
 
   * Fix retained remote Codex prompt readiness so a surface that passes every

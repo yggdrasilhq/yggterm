@@ -59,6 +59,7 @@ pub(crate) fn retained_rehydrate_ready_history_retry_reason(reason: Option<&str>
             | Some("active terminal host exists but xterm surface is empty")
             | Some("active terminal host is still showing generic Codex idle chrome")
             | Some("active remote terminal lost expected scrollback after retained replay")
+            | Some("active remote terminal received scroll input but has no xterm scrollback")
             | Some("active remote Codex prompt surface has stale scrollback but no current prompt")
             | Some("active remote Codex prompt surface has no current input row")
     )
@@ -104,9 +105,8 @@ pub(crate) fn daemon_retained_snapshot_replay_should_start(
     terminal_ready_for_retained_replay: bool,
     retained_snapshot_already_staged: bool,
 ) -> bool {
-    let _ = codex_like_session;
+    let _ = (remote_starting_codex_session, codex_like_session);
     is_remote_resume_session
-        && !remote_starting_codex_session
         && host_is_active_session
         && active_host_selected
         && terminal_ready_for_retained_replay
@@ -319,6 +319,9 @@ mod tests {
         assert!(daemon_retained_snapshot_replay_should_start(
             true, false, true, true, true, true, false
         ));
+        assert!(daemon_retained_snapshot_replay_should_start(
+            true, true, true, true, true, true, false
+        ));
         assert!(!daemon_retained_snapshot_replay_should_start(
             false, false, false, true, true, true, false
         ));
@@ -327,9 +330,6 @@ mod tests {
         ));
         assert!(!daemon_retained_snapshot_replay_should_start(
             true, false, false, true, false, true, false
-        ));
-        assert!(!daemon_retained_snapshot_replay_should_start(
-            true, true, false, true, true, true, false
         ));
         assert!(!daemon_retained_snapshot_replay_should_start(
             true, false, false, true, true, false, false
