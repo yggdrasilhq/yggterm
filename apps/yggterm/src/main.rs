@@ -114,6 +114,84 @@ fn app_control_state_visible_for_pid(payload: &serde_json::Value, pid: u32) -> b
     client_pid == Some(pid as u64) || handled_by_pid == Some(pid as u64)
 }
 
+fn app_control_launch_terminal_surface_ready(data: &serde_json::Value) -> bool {
+    if data
+        .get("active_view_mode")
+        .and_then(serde_json::Value::as_str)
+        != Some("Terminal")
+    {
+        return true;
+    }
+    let Some(surface) = data.get("active_terminal_surface") else {
+        return false;
+    };
+    if surface
+        .get("problem")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|problem| !problem.trim().is_empty())
+    {
+        return false;
+    }
+    let active_session_path = data
+        .get("active_session_path")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let host = data
+        .get("terminal_hosts")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|hosts| {
+            hosts
+                .iter()
+                .find(|host| {
+                    !active_session_path.is_empty()
+                        && host.get("session_path").and_then(serde_json::Value::as_str)
+                            == Some(active_session_path)
+                })
+                .or_else(|| {
+                    hosts.iter().find(|host| {
+                        host.get("effective_input_focus")
+                            .and_then(serde_json::Value::as_bool)
+                            .unwrap_or(false)
+                    })
+                })
+                .or_else(|| hosts.first())
+        });
+    let Some(host) = host else {
+        return surface
+            .get("rendered")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+    };
+    let xterm_present = host
+        .get("xterm_present")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let viewport_present = host
+        .get("viewport_present")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let screen_present = host
+        .get("screen_present")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let rows_present = host
+        .get("rows_present")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let canvas_count = host
+        .get("canvas_count")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let child_count = host
+        .get("child_count")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    xterm_present
+        && viewport_present
+        && child_count > 0
+        && (screen_present || rows_present || canvas_count > 0)
+}
+
 fn app_control_state_settled_for_launch(payload: &serde_json::Value) -> bool {
     let Some(data) = payload.get("data") else {
         return false;
@@ -151,7 +229,7 @@ fn app_control_state_settled_for_launch(payload: &serde_json::Value) -> bool {
         .get("live_row_count")
         .and_then(serde_json::Value::as_u64)
         .unwrap_or(0);
-    active_runtime_present && live_row_count > 0
+    active_runtime_present && live_row_count > 0 && app_control_launch_terminal_surface_ready(data)
 }
 
 fn app_control_state_launch_summary(
@@ -175,6 +253,10 @@ fn app_control_state_launch_summary(
         "settled": app_control_state_settled_for_launch(payload),
         "active_session_path": data.get("active_session_path").cloned().unwrap_or(serde_json::Value::Null),
         "active_view_mode": data.get("active_view_mode").cloned().unwrap_or(serde_json::Value::Null),
+        "active_terminal_surface": data
+            .get("active_terminal_surface")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
         "session_view_contract_violations": data
             .get("session_view_contract_violations")
             .cloned()
@@ -3339,13 +3421,13 @@ mod tests {
     use super::superseded_client_termination_signal;
     use super::{
         BuiltinCliCommand, LinuxWindowProfileInput, SignalClientScope,
-        app_control_launch_state_timeout_ms, classify_builtin_cli_command,
-        compatible_signal_client_count, linux_window_profile_from_input,
-        main_should_retire_superseded_clients_before_shell, record_matches_executable,
-        should_retire_superseded_client, signal_client_instances_dir, signal_client_scope_matches,
-        signal_parse_process_start_ticks_from_stat, signal_process_start_ticks,
-        signal_shutdown_policy_allows_daemon_shutdown, superseded_client_close_command,
-        superseded_client_retirement_strategy_label,
+        app_control_launch_state_timeout_ms, app_control_state_settled_for_launch,
+        classify_builtin_cli_command, compatible_signal_client_count,
+        linux_window_profile_from_input, main_should_retire_superseded_clients_before_shell,
+        record_matches_executable, should_retire_superseded_client, signal_client_instances_dir,
+        signal_client_scope_matches, signal_parse_process_start_ticks_from_stat,
+        signal_process_start_ticks, signal_shutdown_policy_allows_daemon_shutdown,
+        superseded_client_close_command, superseded_client_retirement_strategy_label,
     };
     #[cfg(target_os = "linux")]
     use super::{
@@ -3408,6 +3490,68 @@ mod tests {
         assert_eq!(app_control_launch_state_timeout_ms(100), 250);
         assert_eq!(app_control_launch_state_timeout_ms(1_500), 1_500);
         assert_eq!(app_control_launch_state_timeout_ms(8_000), 4_000);
+    }
+
+    #[test]
+    fn app_launch_wait_rejects_blank_active_xterm_surface() {
+        let payload = serde_json::json!({
+            "data": {
+                "shell": { "needs_initial_server_sync": false },
+                "session_view_contract_violations": [],
+                "active_session_path": "local://701cb151-58a8-4fe3-8194-451d8daa8192",
+                "active_view_mode": "Terminal",
+                "runtime_truth": {
+                    "daemon_runtime_count": 1,
+                    "active_runtime_present": true,
+                    "live_row_count": 1
+                },
+                "active_terminal_surface": {
+                    "rendered": false,
+                    "problem": "active terminal host exists but xterm surface is empty"
+                },
+                "terminal_hosts": [{
+                    "session_path": "local://701cb151-58a8-4fe3-8194-451d8daa8192",
+                    "xterm_present": false,
+                    "screen_present": false,
+                    "viewport_present": false,
+                    "rows_present": false,
+                    "canvas_count": 0,
+                    "child_count": 0
+                }]
+            }
+        });
+        assert!(!app_control_state_settled_for_launch(&payload));
+    }
+
+    #[test]
+    fn app_launch_wait_accepts_mounted_active_xterm_surface() {
+        let payload = serde_json::json!({
+            "data": {
+                "shell": { "needs_initial_server_sync": false },
+                "session_view_contract_violations": [],
+                "active_session_path": "local://701cb151-58a8-4fe3-8194-451d8daa8192",
+                "active_view_mode": "Terminal",
+                "runtime_truth": {
+                    "daemon_runtime_count": 1,
+                    "active_runtime_present": true,
+                    "live_row_count": 1
+                },
+                "active_terminal_surface": {
+                    "rendered": true,
+                    "problem": null
+                },
+                "terminal_hosts": [{
+                    "session_path": "local://701cb151-58a8-4fe3-8194-451d8daa8192",
+                    "xterm_present": true,
+                    "screen_present": true,
+                    "viewport_present": true,
+                    "rows_present": true,
+                    "canvas_count": 0,
+                    "child_count": 4
+                }]
+            }
+        });
+        assert!(app_control_state_settled_for_launch(&payload));
     }
 
     #[test]
