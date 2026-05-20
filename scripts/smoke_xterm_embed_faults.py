@@ -5091,6 +5091,42 @@ def terminal_host_text(host: dict) -> str:
     return "\n".join(samples)
 
 
+def terminal_host_buffer_or_view_text(host: dict) -> str:
+    samples = [terminal_host_text(host)]
+    for key in ("buffer_text_sample", "screen_text_sample", "last_raw_payload_sample"):
+        value = str(host.get(key) or "").strip()
+        if value:
+            samples.append(value)
+    return "\n".join(sample for sample in samples if sample)
+
+
+def terminal_host_has_dom_renderer_missing_text_layer_with_buffer_text(host: dict) -> bool:
+    text = terminal_host_buffer_or_view_text(host)
+    if not any(ch.isalnum() for ch in text):
+        return False
+    if host.get("xterm_present") is not True or host.get("screen_present") is not True:
+        return False
+    if host.get("rows_present") is True:
+        return False
+    canvas_count = int(host.get("canvas_count") or 0)
+    visible_canvas_count = int(host.get("visible_canvas_layer_count") or 0)
+    if canvas_count > 0 or visible_canvas_count > 0:
+        return False
+    renderer_mode = str(host.get("xterm_renderer_mode") or "").strip().lower()
+    return renderer_mode in ("", "dom")
+
+
+def assert_no_dom_renderer_missing_text_layer_with_buffer_text(host: dict, context: str) -> None:
+    if terminal_host_has_dom_renderer_missing_text_layer_with_buffer_text(host):
+        raise AssertionError(
+            f"{context}: xterm DOM renderer has buffered terminal text but no renderable text layer: "
+            f"renderer_mode={host.get('xterm_renderer_mode')!r} rows_present={host.get('rows_present')!r} "
+            f"canvas_count={host.get('canvas_count')!r} visible_canvas_layer_count={host.get('visible_canvas_layer_count')!r} "
+            f"renderer_surface_missing={host.get('renderer_surface_missing')!r} "
+            f"text_tail={terminal_host_buffer_or_view_text(host)[-800:]!r}"
+        )
+
+
 def assert_no_attach_ready_protocol_markers(host: dict, context: str) -> None:
     text = terminal_host_text(host)
     if "__YGGTERM_ATTACH_READY__" in text:
@@ -5191,6 +5227,14 @@ def max_blank_rows_below_live_cursor(rows: int | float | None) -> int:
 def is_transparent_css_color(value: str | None) -> bool:
     text = str(value or "").strip().lower()
     return text in ("", "transparent", "rgba(0, 0, 0, 0)", "rgba(0,0,0,0)")
+
+
+def css_colors_close(left: str | None, right: str | None, *, tolerance: int = 4) -> bool:
+    left_rgb = parse_css_rgb(left)
+    right_rgb = parse_css_rgb(right)
+    if left_rgb is None or right_rgb is None:
+        return False
+    return pixel_delta(left_rgb, right_rgb) <= tolerance
 
 
 def is_effectively_hidden_css_opacity(value: str | None) -> bool:
@@ -14186,6 +14230,12 @@ def assert_render_health_watchdog_contract(pid: int) -> dict:
     render_health = surface.get("render_health") or {}
     if "healthy" not in render_health:
         raise AssertionError(f"active terminal surface does not expose render_health: {surface!r}")
+    if render_health.get("healthy") is False:
+        raise AssertionError(
+            f"active terminal surface reports unhealthy renderer state: render_health={render_health!r} surface={surface!r}"
+        )
+    host = active_host(state)
+    assert_no_dom_renderer_missing_text_layer_with_buffer_text(host, "render-health watchdog")
     return {
         "render_health": render_health,
         "problem": surface.get("problem"),
@@ -14773,6 +14823,7 @@ def assert_text_readability(state: dict) -> dict:
 
 def assert_renderer_contract(state: dict) -> dict:
     host = active_host(state)
+    assert_no_dom_renderer_missing_text_layer_with_buffer_text(host, "renderer contract")
     canvas_count = int(host.get("canvas_count") or 0)
     renderer_mode = str(host.get("xterm_renderer_mode") or "").strip().lower() or "unknown"
     canvas_opt_out = (ENV.get("YGGTERM_ENABLE_XTERM_CANVAS") or "").strip().lower() in (
@@ -15358,6 +15409,39 @@ def assert_sidebar_contract(pid: int, session: str) -> dict:
     dom_rows = ((state.get("dom") or {}).get("sidebar_visible_rows") or [])
     if not dom_rows:
         raise AssertionError("sidebar dom rows are missing from app state")
+    dom = state.get("dom") or {}
+    sidebar_scroll_top = float(dom.get("sidebar_scroll_top") or 0.0)
+    sidebar_scroll_height = float(dom.get("sidebar_scroll_height") or 0.0)
+    sidebar_scroll_client_height = float(dom.get("sidebar_scroll_client_height") or 0.0)
+    if (
+        sidebar_scroll_top > 1.0
+        and sidebar_scroll_height > 0.0
+        and sidebar_scroll_client_height > 0.0
+        and sidebar_scroll_height <= sidebar_scroll_client_height + 1.0
+    ):
+        raise AssertionError(
+            "sidebar scroller retained a non-zero scroll offset even though its rows fit: "
+            f"scroll_top={sidebar_scroll_top} scroll_height={sidebar_scroll_height} "
+            f"client_height={sidebar_scroll_client_height} state={state!r}"
+        )
+
+    def assert_sidebar_row_not_clipped(row: dict, context: str) -> None:
+        rect = sidebar_row_rect(row)
+        frame = dom_rect(state, "shell_frame_rect")
+        top_bound = float(frame.get("top") or 0.0) if rect_is_visible(frame) else 0.0
+        bottom_bound = rect_bottom(frame) if rect_is_visible(frame) else 0.0
+        top = float(rect.get("top") or 0.0)
+        bottom = rect_bottom(rect)
+        if top < top_bound - 1.0:
+            raise AssertionError(
+                f"{context} is clipped above the visible sidebar viewport: "
+                f"row={row!r} rect={rect!r} frame={frame!r} scroll_top={sidebar_scroll_top}"
+            )
+        if bottom_bound > 0.0 and bottom > bottom_bound + 1.0:
+            raise AssertionError(
+                f"{context} is clipped below the visible sidebar viewport: "
+                f"row={row!r} rect={rect!r} frame={frame!r} scroll_top={sidebar_scroll_top}"
+            )
 
     live_group_index = next(
         (
@@ -15374,6 +15458,7 @@ def assert_sidebar_contract(pid: int, session: str) -> dict:
                 f"Live Sessions should be the first visible sidebar group when present: "
                 f"index={live_group_index} rows={dom_rows!r}"
             )
+        assert_sidebar_row_not_clipped(dom_rows[live_group_index], "Live Sessions row")
         for row in dom_rows[live_group_index + 1 :]:
             if int(row.get("depth") or 0) <= 0:
                 break
@@ -15501,6 +15586,7 @@ def assert_sidebar_contract(pid: int, session: str) -> dict:
     )
     if selected_row is None:
         raise AssertionError(f"selected session is missing from sidebar dom rows: {session}")
+    assert_sidebar_row_not_clipped(selected_row, "selected active session row")
     if not bool(selected_row.get("selected")):
         raise AssertionError(
             f"active session row exists but is not the selected sidebar row: {selected_row!r}"
@@ -16606,6 +16692,7 @@ def assert_cursor_glyph_visibility(state: dict) -> dict:
     cursor_background = str(host.get("cursor_sample_background") or "")
     cursor_border_left = str(host.get("cursor_sample_border_left") or "")
     cursor_class_name = str(host.get("cursor_sample_class_name") or "")
+    cursor_cell_background = str(host.get("cursor_cell_background") or "")
     cursor_option_style = str(host.get("xterm_cursor_style") or "").strip().lower()
     cursor_option_width = host.get("xterm_cursor_width")
     renderer_mode = str(host.get("xterm_renderer_mode") or "").strip().lower()
@@ -16616,11 +16703,32 @@ def assert_cursor_glyph_visibility(state: dict) -> dict:
         or host.get("xterm_theme_background")
         or ""
     )
+    viewport_background = str(
+        host.get("viewport_background_color")
+        or host.get("effective_background_color")
+        or host.get("xterm_theme_background")
+        or ""
+    )
     node_rects = host.get("cursor_node_rects") or []
     active_node = node_rects[0] if isinstance(node_rects, list) and node_rects else {}
     visibility = str(active_node.get("visibility") or "").strip().lower()
     opacity = active_node.get("opacity")
+    if opacity is None:
+        opacity = host.get("cursor_sample_opacity")
     block_cursor = "xterm-cursor-block" in cursor_class_name
+    cursor_animation_samples = []
+    for sample in state.get("css_animation_samples") or []:
+        if not isinstance(sample, dict):
+            continue
+        sample_class_name = str(sample.get("class_name") or "")
+        sample_animation_name = str(sample.get("animation_name") or "")
+        if "xterm-cursor" in sample_class_name or "cursor" in sample_animation_name.lower():
+            cursor_animation_samples.append(sample)
+    if cursor_animation_samples:
+        raise AssertionError(
+            "terminal cursor is using a running CSS blink animation; this burns idle WebKit/GTK CPU: "
+            f"class={cursor_class_name!r} samples={cursor_animation_samples!r} host={host!r}"
+        )
     if cursor_option_style != "block":
         raise AssertionError(
             "terminal cursor style regressed away from the Ghostty-style block cursor: "
@@ -16682,6 +16790,68 @@ def assert_cursor_glyph_visibility(state: dict) -> dict:
             "cursor_expected_rect": cursor_rect,
             "css_cursor_sample_unavailable": True,
         }
+    prompt_row_backgrounds: list[str] = []
+    for sample in host.get("cursor_row_span_samples") or []:
+        if not isinstance(sample, dict):
+            continue
+        background = str(sample.get("background") or "").strip()
+        if is_transparent_css_color(background):
+            continue
+        if viewport_background and css_colors_close(background, viewport_background):
+            continue
+        if any(css_colors_close(background, existing) for existing in prompt_row_backgrounds):
+            continue
+        prompt_row_backgrounds.append(background)
+    blink_off_cursor = block_cursor and is_effectively_hidden_css_opacity(opacity)
+    if (
+        cursor_line_text.lstrip().startswith("›")
+        and prompt_row_backgrounds
+        and viewport_background
+        and cursor_cell_background
+        and css_colors_close(cursor_cell_background, viewport_background)
+        and not any(css_colors_close(cursor_cell_background, background) for background in prompt_row_backgrounds)
+    ):
+        raise AssertionError(
+            "block cursor cell background collapsed to the terminal background on a styled prompt row: "
+            f"cursor_cell_background={cursor_cell_background!r} viewport_background={viewport_background!r} "
+            f"prompt_backgrounds={prompt_row_backgrounds!r} host={host!r}"
+        )
+    if blink_off_cursor:
+        return {
+            "cursor_sample_text": cursor_text,
+            "cursor_buffer_cell_text": str(host.get("cursor_buffer_cell_text") or ""),
+            "cursor_buffer_prev_cell_text": str(host.get("cursor_buffer_prev_cell_text") or ""),
+            "cursor_sample_color": cursor_color,
+            "cursor_sample_background": cursor_background,
+            "cursor_cell_background": cursor_cell_background,
+            "contrast_background": row_background,
+            "prompt_row_backgrounds": prompt_row_backgrounds,
+            "cursor_sample_border_left": cursor_border_left,
+            "cursor_sample_class_name": cursor_class_name,
+            "xterm_cursor_style": cursor_option_style,
+            "xterm_cursor_width": cursor_option_width,
+            "xterm_renderer_mode": renderer_mode,
+            "xterm_theme_cursor": theme_cursor,
+            "xterm_theme_cursor_accent": theme_cursor_accent,
+            "xterm_theme_cursor_contrast": round(theme_cursor_contrast, 2)
+            if theme_cursor_contrast is not None
+            else None,
+            "cursor_glyph_visibility": visibility,
+            "cursor_glyph_opacity": opacity,
+            "cursor_blink_off": True,
+        }
+    if (
+        block_cursor
+        and renderer_mode != "canvas"
+        and not is_transparent_css_color(cursor_background)
+        and not css_colors_close(cursor_background, theme_cursor)
+    ):
+        raise AssertionError(
+            "focused block cursor fill does not match the xterm cursor theme color; "
+            "this usually means the cursor is visually disappearing into a styled prompt row: "
+            f"cursor_background={cursor_background!r} theme_cursor={theme_cursor!r} "
+            f"cursor_cell_background={cursor_cell_background!r} class={cursor_class_name!r} host={host!r}"
+        )
     contrast_background = (
         cursor_background if block_cursor and not is_transparent_css_color(cursor_background) else row_background
     )
@@ -16719,7 +16889,9 @@ def assert_cursor_glyph_visibility(state: dict) -> dict:
         "cursor_buffer_prev_cell_text": str(host.get("cursor_buffer_prev_cell_text") or ""),
         "cursor_sample_color": cursor_color,
         "cursor_sample_background": cursor_background,
+        "cursor_cell_background": cursor_cell_background,
         "contrast_background": contrast_background,
+        "prompt_row_backgrounds": prompt_row_backgrounds,
         "cursor_sample_border_left": cursor_border_left,
         "cursor_sample_class_name": cursor_class_name,
         "xterm_cursor_style": cursor_option_style,
@@ -16727,6 +16899,11 @@ def assert_cursor_glyph_visibility(state: dict) -> dict:
         "xterm_renderer_mode": renderer_mode,
         "xterm_theme_cursor": theme_cursor,
         "xterm_theme_cursor_accent": theme_cursor_accent,
+        "focused_block_cursor_fill_matches_theme": (
+            bool(block_cursor)
+            and not is_transparent_css_color(cursor_background)
+            and css_colors_close(cursor_background, theme_cursor)
+        ),
         "xterm_theme_cursor_contrast": round(theme_cursor_contrast, 2)
         if theme_cursor_contrast is not None
         else None,
@@ -18890,6 +19067,7 @@ def assert_inline_status_animation_budget(pid: int, out_dir: Path) -> dict:
                 "write_bridge_flush_count": host.get("write_bridge_flush_count"),
                 "write_command_count": host.get("write_command_count"),
                 "last_raw_payload_length": host.get("last_raw_payload_length"),
+                "last_coalesced_payload_length": host.get("last_coalesced_payload_length"),
                 "cursor_line_text": host.get("cursor_line_text")
                 or host.get("cursor_row_text"),
             }
@@ -18922,6 +19100,22 @@ def assert_inline_status_animation_budget(pid: int, out_dir: Path) -> dict:
             raise AssertionError(
                 "inline Working animation hot path used a slow write frame budget: "
                 f"slow_hot={slow_hot!r} samples={samples!r}"
+            )
+        lossy_repaints = [
+            sample
+            for sample in samples
+            if numeric(sample.get("last_raw_payload_length")) is not None
+            and numeric(sample.get("last_raw_payload_length")) > 65536.0
+            and (
+                numeric(sample.get("last_coalesced_payload_length")) is None
+                or numeric(sample.get("last_coalesced_payload_length"))
+                != numeric(sample.get("last_raw_payload_length"))
+            )
+        ]
+        if lossy_repaints:
+            raise AssertionError(
+                "terminal write bridge shortened a synchronized repaint burst before xterm saw it: "
+                f"lossy={lossy_repaints!r} samples={samples!r}"
             )
         flush_delta = (
             None

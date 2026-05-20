@@ -139,6 +139,23 @@ Required outcome:
 
 If any of these fail, the update is not hot. It is a failed handoff incident.
 
+The current daemon socket is part of session preservation. A daemon that still
+owns a PTY runtime must keep a reachable socket for that runtime, or it must be
+registered as a reachable preserved owner before a replacement daemon becomes
+the current route. A process that still has a PTY child but has removed its
+`server-<version>.sock` path is not preserving the session in a usable form.
+That state is a failed handoff: the GUI may show a retained row, but terminal
+read, write, resize, redraw, and restore cannot be trusted until a reachable
+owner is restored or the saved session is explicitly resumed.
+
+During daemon hot restart, the old daemon must close the listener, remove the
+old socket path, and release the socket bind lock before spawning the
+replacement process. Spawning while the old process still holds the lock creates
+the worst split-brain shape: the old process owns PTY children but has no socket,
+and the replacement exits with `bind_lock_busy`. Smoke tests must treat
+`socket path missing + bind lock busy + live PTY child` as a handoff failure,
+not as a preserved owner.
+
 A remote Codex surface that contains only the sparse prompt/footer, for example
 `› Write tests for @filename` plus the model/cwd line, is not hot-update ready.
 It may be real PTY output, but it is missing enough current xterm/Codex state
@@ -187,6 +204,11 @@ finds a stale same-home daemon that directly reports an owned PTY runtime key
 missing from the registry, cleanup must preserve that daemon and classify the
 missing key as a handoff recovery incident. The only automatic retirement case
 for a directly-owned PTY is exact-key coverage by the current daemon.
+If an old daemon can still answer status and its snapshot contains the runtime
+as a live row, that runtime is running even when the replacement daemon's local
+state was truncated. The replacement daemon must recover it as a temporary
+update-restore row and register the old daemon as owner before considering any
+cleanup.
 
 Startup restore must not eagerly launch or resume every remembered live
 terminal. Bulk remote prewarm is opt-in only because it can saturate the daemon
@@ -243,7 +265,9 @@ A direct-install update moves through these states:
 3. `HandoffPrepare`: all current live runtimes are marked protected for this
    handoff, including non-Keep-Alive sessions.
 4. `PreserveExistingRuntimeOwners`: old runtime-owner daemons keep PTYs alive.
-   They must not be killed by cleanup.
+   They must not be killed by cleanup, and each preserved owner must remain
+   reachable through a socket. A PTY-owning process with no reachable socket is
+   degraded state, not a preserved owner.
 5. `NewDaemonReady`: the new daemon is reachable and exposes protocol version,
    socket, pid, build id, and live-state load result.
 6. `AdoptOrAliasRuntimes`: each pre-update runtime is adopted by the new daemon
@@ -424,14 +448,15 @@ If the active session is missing from the new daemon:
   authoritative allow-list for which old daemon-owned PTYs may be preserved.
   `hot-update-terminal-owners.json` is a handoff cache and may be stale; it may
   be used only when persisted live-session state has no runtime keys.
-- For an explicit Keep-Alive remote runtime that is still running, stale,
-  mismatched, prompt-only, blank-after-grace, or spec-mismatched early output is
-  not permission to restart the transport or spawn another resume command under
-  the same session label. Those conditions must keep the surface in recovery,
-  gate input, and remain observable. Restart is allowed only after the runtime
-  process is gone or after an explicit user/harness-owned force-restart action.
-  This applies equally to direct current-daemon runtimes and compatibility
-  routes through preserved old owners.
+- For an explicit Keep-Alive or temporary update-restored remote runtime that
+  is still running, stale, mismatched, prompt-only, blank-after-grace, or
+  spec-mismatched early output is not permission to restart the transport or
+  spawn another resume command under the same session label. Those conditions
+  must keep the surface in recovery, gate input, and remain observable. Restart
+  is allowed only after the runtime process is gone or after an explicit
+  user/harness-owned force-restart action. This applies equally to direct
+  current-daemon runtimes and compatibility routes through preserved old
+  owners.
 
 If retained xterm text contains an update/bridge error:
 
