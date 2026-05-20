@@ -455,7 +455,7 @@ fn drain_unix_client_outcomes(
                     should_shutdown = true;
                 }
             }
-            Err(error) => warn!(error=%error, "daemon request failed"),
+            Err(error) => warn!(error=%format!("{error:#}"), "daemon request failed"),
         }
     }
     should_shutdown
@@ -593,7 +593,7 @@ fn remote_resume_saved_session_mismatch_requires_restart(
 fn terminal_reuse_needs_restart(
     still_running: bool,
     remote_resume_path: bool,
-    keep_alive_runtime: bool,
+    restart_protected_runtime: bool,
     stale_remote_attach: bool,
     blank_remote_attach: bool,
     remote_saved_session_mismatch_requires_restart: bool,
@@ -602,14 +602,14 @@ fn terminal_reuse_needs_restart(
     if !still_running {
         return (true, false);
     }
-    let restart_blocked_by_keep_alive = remote_resume_path && keep_alive_runtime;
+    let restart_blocked_by_protected_runtime = remote_resume_path && restart_protected_runtime;
     let restart_requested = stale_remote_attach
         || blank_remote_attach
         || remote_saved_session_mismatch_requires_restart
         || !spec_matches;
     (
-        restart_requested && !restart_blocked_by_keep_alive,
-        restart_requested && restart_blocked_by_keep_alive,
+        restart_requested && !restart_blocked_by_protected_runtime,
+        restart_requested && restart_blocked_by_protected_runtime,
     )
 }
 
@@ -2061,7 +2061,7 @@ impl DaemonRuntime {
                     &mut self.server,
                     &owner_snapshot,
                     &missing_keys,
-                    true,
+                    false,
                 );
             if restored_runtime_keys.is_empty() {
                 continue;
@@ -2180,7 +2180,7 @@ impl DaemonRuntime {
         );
     }
 
-    fn prune_unrepresented_preserved_owner_runtime_sessions(&self, reason: &'static str) {
+    fn prune_unrepresented_preserved_owner_runtime_sessions(&mut self, reason: &'static str) {
         let endpoint_groups = self.preserved_terminal_owners.endpoint_groups();
         if endpoint_groups.is_empty() {
             return;
@@ -2236,9 +2236,86 @@ impl DaemonRuntime {
             if stale_runtime_keys.is_empty() {
                 continue;
             }
+            let mut restored_running_runtime_keys = Vec::new();
+            let stale_runtime_key_set = stale_runtime_keys.iter().cloned().collect::<HashSet<_>>();
+            match snapshot(&owner_endpoint) {
+                Ok((owner_snapshot, _message)) => {
+                    restored_running_runtime_keys =
+                        restore_preserved_owner_live_sessions_from_snapshot_with_policy(
+                            &mut self.server,
+                            &owner_snapshot,
+                            &stale_runtime_key_set,
+                            false,
+                        );
+                    for runtime_key in &restored_running_runtime_keys {
+                        if let Err(error) = self.preserved_terminal_owners.upsert_runtime_owner(
+                            self.store.home_dir(),
+                            runtime_key,
+                            &owner_endpoint,
+                            &owner_status,
+                            Some(SERVER_PROTOCOL_VERSION.to_string()),
+                        ) {
+                            append_trace_event(
+                                self.store.home_dir(),
+                                "daemon",
+                                "hot_update",
+                                "preserved_owner_running_runtime_register_failed",
+                                serde_json::json!({
+                                    "reason": reason,
+                                    "runtime_key": runtime_key,
+                                    "owner_endpoint": owner_endpoint_label(&owner_endpoint),
+                                    "owner_server_version": owner_status.server_version,
+                                    "owner_server_pid": owner_status.server_pid,
+                                    "error": error.to_string(),
+                                }),
+                            );
+                        }
+                    }
+                    if !restored_running_runtime_keys.is_empty() {
+                        let _ = self.persist();
+                        let _ = self.preserved_terminal_owners.save(self.store.home_dir());
+                        append_trace_event(
+                            self.store.home_dir(),
+                            "daemon",
+                            "hot_update",
+                            "preserved_owner_running_runtimes_recovered_before_prune",
+                            serde_json::json!({
+                                "reason": reason,
+                                "owner_endpoint": owner_endpoint_label(&owner_endpoint),
+                                "owner_server_version": owner_status.server_version,
+                                "owner_server_pid": owner_status.server_pid,
+                                "restored_runtime_keys": &restored_running_runtime_keys,
+                            }),
+                        );
+                    }
+                }
+                Err(error) => {
+                    append_trace_event(
+                        self.store.home_dir(),
+                        "daemon",
+                        "hot_update",
+                        "preserved_owner_running_runtime_snapshot_failed",
+                        serde_json::json!({
+                            "reason": reason,
+                            "owner_endpoint": owner_endpoint_label(&owner_endpoint),
+                            "owner_server_version": owner_status.server_version,
+                            "owner_server_pid": owner_status.server_pid,
+                            "candidate_runtime_keys": &stale_runtime_keys,
+                            "error": error.to_string(),
+                        }),
+                    );
+                }
+            }
+            let restored_running_runtime_key_set = restored_running_runtime_keys
+                .iter()
+                .cloned()
+                .collect::<HashSet<_>>();
             let mut removed_runtime_keys = Vec::new();
             let mut errors = Vec::new();
-            for runtime_key in stale_runtime_keys {
+            for runtime_key in stale_runtime_keys
+                .into_iter()
+                .filter(|runtime_key| !restored_running_runtime_key_set.contains(runtime_key))
+            {
                 match drop_terminal_runtime(
                     &owner_endpoint,
                     &runtime_key,
@@ -2252,24 +2329,6 @@ impl DaemonRuntime {
                         }));
                     }
                 }
-            }
-            let registry_keys_are_all_keep_alive = owner_registry_keys
-                .iter()
-                .all(|key| self.server.live_session_keep_alive(key));
-            let mut fallback_prepare_client_close = None::<serde_json::Value>;
-            if !errors.is_empty() && registry_keys_are_all_keep_alive {
-                fallback_prepare_client_close = Some(match prepare_client_close(&owner_endpoint) {
-                    Ok(message) => serde_json::json!({
-                        "attempted": true,
-                        "ok": true,
-                        "message": message,
-                    }),
-                    Err(error) => serde_json::json!({
-                        "attempted": true,
-                        "ok": false,
-                        "error": error.to_string(),
-                    }),
-                });
             }
             let remaining_stale_runtime_keys = match status(&owner_endpoint) {
                 Ok(status_after) => {
@@ -2298,9 +2357,15 @@ impl DaemonRuntime {
                     "owner_endpoint": owner_endpoint_label(&owner_endpoint),
                     "owner_server_version": owner_status.server_version,
                     "owner_server_pid": owner_status.server_pid,
+                    "restored_running_runtime_keys": restored_running_runtime_key_set
+                        .into_iter()
+                        .collect::<Vec<_>>(),
                     "removed_runtime_keys": removed_runtime_keys,
                     "errors": errors,
-                    "fallback_prepare_client_close": fallback_prepare_client_close,
+                    "fallback_prepare_client_close": {
+                        "attempted": false,
+                        "reason": "broad_owner_close_can_kill_unrelated_running_sessions"
+                    },
                     "remaining_stale_runtime_keys": remaining_stale_runtime_keys,
                 }),
             );
@@ -2893,15 +2958,19 @@ impl DaemonRuntime {
                 self.terminals
                     .session_matches_spec(&runtime_path, &launch_command, cwd.as_deref());
             let keep_alive_runtime = self.server.live_session_keep_alive(path);
-            let (needs_restart, restart_blocked_by_keep_alive) = terminal_reuse_needs_restart(
-                still_running,
-                remote_resume_path,
-                keep_alive_runtime,
-                stale_remote_attach,
-                blank_remote_attach,
-                remote_saved_session_mismatch_requires_restart,
-                spec_matches,
-            );
+            let temporary_update_restore_runtime =
+                self.server.live_session_is_temporary_update_restore(path);
+            let restart_protected_runtime = keep_alive_runtime || temporary_update_restore_runtime;
+            let (needs_restart, restart_blocked_by_protected_runtime) =
+                terminal_reuse_needs_restart(
+                    still_running,
+                    remote_resume_path,
+                    restart_protected_runtime,
+                    stale_remote_attach,
+                    blank_remote_attach,
+                    remote_saved_session_mismatch_requires_restart,
+                    spec_matches,
+                );
             if let Ok(home) = crate::resolve_yggterm_home() {
                 append_trace_event(
                     &home,
@@ -2921,7 +2990,10 @@ impl DaemonRuntime {
                         "runtime_saved_session_mismatch": runtime_saved_session_mismatch,
                         "remote_saved_session_mismatch_requires_restart": remote_saved_session_mismatch_requires_restart,
                         "keep_alive_runtime": keep_alive_runtime,
-                        "restart_blocked_by_keep_alive": restart_blocked_by_keep_alive,
+                        "temporary_update_restore_runtime": temporary_update_restore_runtime,
+                        "restart_protected_runtime": restart_protected_runtime,
+                        "restart_blocked_by_keep_alive": restart_blocked_by_protected_runtime,
+                        "restart_blocked_by_protected_runtime": restart_blocked_by_protected_runtime,
                         "spec_matches": spec_matches,
                         "remote_resume_path": remote_resume_path,
                         "needs_restart": needs_restart,
@@ -6328,7 +6400,7 @@ pub fn run_daemon(endpoint: &ServerEndpoint, runtime: GhosttyHostSupport) -> Res
 
     #[cfg(unix)]
     if let ServerEndpoint::UnixSocket(path) = endpoint {
-        let Some(_daemon_socket_lock) = try_acquire_daemon_socket_lock(path, &home_dir)? else {
+        let Some(daemon_socket_lock) = try_acquire_daemon_socket_lock(path, &home_dir)? else {
             info!(
                 path = %path.display(),
                 "another yggterm daemon owns the socket bind lock"
@@ -6447,6 +6519,7 @@ pub fn run_daemon(endpoint: &ServerEndpoint, runtime: GhosttyHostSupport) -> Res
                     "failed to remove unix socket before hot restart"
                 );
             }
+            drop(daemon_socket_lock);
             if let Err(error) = spawn_hot_restart_daemon_process(&executable, endpoint) {
                 append_trace_event(
                     &home_dir,
@@ -6464,6 +6537,8 @@ pub fn run_daemon(endpoint: &ServerEndpoint, runtime: GhosttyHostSupport) -> Res
                     "failed to spawn hot restart daemon"
                 );
             }
+        } else {
+            drop(daemon_socket_lock);
         }
         return Ok(());
     }
@@ -6511,7 +6586,9 @@ pub fn run_daemon(endpoint: &ServerEndpoint, runtime: GhosttyHostSupport) -> Res
                                     break;
                                 }
                             }
-                            Err(error) => warn!(error=%error, "daemon request failed"),
+                            Err(error) => {
+                                warn!(error=%format!("{error:#}"), "daemon request failed")
+                            }
                         }
                     }
                     Err(error) if error.kind() == ErrorKind::WouldBlock => {
@@ -7840,6 +7917,7 @@ fn daemon_request_io_timeout_ms(request: &ServerRequest) -> u64 {
         | ServerRequest::OpenRemoteSession { .. }
         | ServerRequest::EnsureRemoteRuntimeCodexSession { .. }
         | ServerRequest::StartRemoteRuntimeCodexSession { .. }
+        | ServerRequest::RemoveSession { .. }
         | ServerRequest::TerminalRestart {
             force_remote: true, ..
         } => DAEMON_LONG_REQUEST_IO_TIMEOUT_MS,
@@ -8087,6 +8165,27 @@ mod tests {
         assert!(
             !unix_loop.contains("match handle_unix_stream(stream"),
             "unix accept loop must not let one partial client monopolize the daemon"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_hot_restart_releases_bind_lock_before_spawning_replacement() {
+        let source = include_str!("daemon.rs");
+        let unix_loop = source
+            .split("if let ServerEndpoint::UnixSocket(path) = endpoint {")
+            .nth(1)
+            .and_then(|suffix| suffix.split("if let ServerEndpoint::Tcp").next())
+            .expect("unix daemon accept loop should be present");
+        let drop_lock = unix_loop
+            .find("drop(daemon_socket_lock);")
+            .expect("hot restart must explicitly release the socket lock");
+        let spawn_restart = unix_loop
+            .find("spawn_hot_restart_daemon_process(&executable, endpoint)")
+            .expect("hot restart spawn should be present");
+        assert!(
+            drop_lock < spawn_restart,
+            "replacement daemon must spawn only after the old daemon releases the bind lock"
         );
     }
 
@@ -8795,6 +8894,12 @@ mod tests {
                 initial_rows: None,
             }),
             super::DAEMON_REQUEST_IO_TIMEOUT_MS
+        );
+        assert_eq!(
+            super::daemon_request_io_timeout_ms(&super::ServerRequest::RemoveSession {
+                path: "local://slow-close".to_string(),
+            }),
+            super::DAEMON_LONG_REQUEST_IO_TIMEOUT_MS
         );
     }
 
@@ -9580,6 +9685,67 @@ mod tests {
                 "remote-session://dev/closed-may-6".to_string(),
             ],
             "owner daemons must drop PTYs that are neither in the hot-update registry nor represented by current live-session truth"
+        );
+    }
+
+    #[test]
+    fn preserved_owner_runtime_scan_recovers_plain_running_rows_as_update_restore() {
+        let tree = daemon_test_tree();
+        let mut server = YggtermServer::new(
+            &tree,
+            false,
+            GhosttyHostSupport::shadow("test".to_string(), false, false),
+            UiTheme::ZedLight,
+        );
+        let running_path = remote_scanned_session_path("practice", "running-unkept");
+        let mut running = daemon_test_snapshot_session(&running_path, SessionSource::LiveSsh);
+        running.ssh_target = Some("practice".to_string());
+        running.metadata = vec![SnapshotMetadataEntry {
+            label: "Cwd".to_string(),
+            value: "/home/pi/git/samplers".to_string(),
+        }];
+        let owner_snapshot = ServerUiSnapshot {
+            active_session_path: Some(running_path.clone()),
+            active_session: Some(running.clone()),
+            active_view_mode: WorkspaceViewMode::Terminal,
+            remote_machines: Vec::new(),
+            ssh_targets: Vec::new(),
+            live_sessions: vec![running],
+        };
+        let runtime_keys = HashSet::from([running_path.clone()]);
+
+        let restored = super::restore_preserved_owner_live_sessions_from_snapshot_with_policy(
+            &mut server,
+            &owner_snapshot,
+            &runtime_keys,
+            false,
+        );
+
+        assert_eq!(restored, vec![running_path.clone()]);
+        assert!(server.represents_terminal_runtime_key(&running_path));
+        assert!(!server.live_session_keep_alive(&running_path));
+        assert!(
+            server.live_session_is_temporary_update_restore(&running_path),
+            "a running unkept owner row is protected as an update-restore incident, not silently promoted to Keep Alive"
+        );
+    }
+
+    #[test]
+    fn preserved_owner_prune_never_uses_broad_client_close_fallback() {
+        let source = include_str!("daemon.rs");
+        let prune_block = source
+            .split("fn prune_unrepresented_preserved_owner_runtime_sessions(")
+            .nth(1)
+            .and_then(|suffix| {
+                suffix
+                    .split("fn prune_duplicate_legacy_owned_runtime_sessions")
+                    .next()
+            })
+            .expect("preserved-owner prune implementation should be present");
+
+        assert!(
+            !prune_block.contains("prepare_client_close(&owner_endpoint)"),
+            "runtime pruning must target exact terminal keys; broad PrepareClientClose can kill unrelated running sessions on the old owner"
         );
     }
 
@@ -10899,17 +11065,17 @@ mod tests {
     }
 
     #[test]
-    fn keep_alive_remote_runtime_blocks_semantic_restart_while_still_running() {
+    fn protected_remote_runtime_blocks_semantic_restart_while_still_running() {
         let (needs_restart, blocked) =
             terminal_reuse_needs_restart(true, true, true, true, true, true, false);
 
         assert!(
             !needs_restart,
-            "a still-running keep-alive remote runtime must not be replaced because early output or launch spec looks stale"
+            "a still-running protected remote runtime must not be replaced because early output or launch spec looks stale"
         );
         assert!(
             blocked,
-            "the trace must expose that restart was requested but blocked by keep-alive"
+            "the trace must expose that restart was requested but blocked by session survival"
         );
     }
 
@@ -10923,14 +11089,14 @@ mod tests {
     }
 
     #[test]
-    fn keep_alive_remote_runtime_restarts_only_after_process_exit() {
+    fn protected_remote_runtime_restarts_only_after_process_exit() {
         let (needs_restart, blocked) =
             terminal_reuse_needs_restart(false, true, true, false, false, false, true);
 
         assert!(needs_restart);
         assert!(
             !blocked,
-            "keep-alive protects a live runtime; if the runtime is already gone, restart remains the recovery path"
+            "session survival protects a live runtime; if the runtime is already gone, restart remains the recovery path"
         );
     }
 
