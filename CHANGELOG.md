@@ -4,6 +4,35 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+## 2.7.25
+
+- Clear Web View's toolbar loading state when saved transcript/context fallback
+  is already readable and no preview request is in flight.
+
+## 2.7.24
+
+- Treat saved transcript/context fallback as real readable Web View content, so
+  background hydration cannot show the large remote-session loading/failure
+  gate over or under an already readable conversation.
+
+## 2.7.23
+
+- Allow live sessions to stay in Web View as read-only conversation surfaces
+  without closing, detaching, restarting, or hiding the daemon-owned PTY.
+- Tighten the xterm embed smoke so a live-session Web View request must settle
+  in rendered mode while the same daemon runtime remains present, and switching
+  back to Terminal must reattach to that runtime.
+- Update app-control viewport readiness so live-session Web View is not reported
+  as a terminal failure when the read-only conversation surface is mounted.
+- Stop treating readable `remote:scan` transcript content as a blocking loading
+  gate; Web View now renders scanned content immediately and auto-refreshes only
+  true empty/loading placeholders.
+
+## 2.7.22
+
+- Reserved during live Web View handoff testing; superseded by 2.7.23 before
+  publication.
+
 ## 2.7.21
 
 - Make Web View a provider-backed conversation surface. Codex and terminal

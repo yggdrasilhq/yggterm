@@ -114,6 +114,10 @@ daemon for both Codex sessions and generic SSH terminals.
   a composer and do not type through the terminal. Future chat apps can reuse the
   same Web View shell only after declaring an explicit API provider and send
   capability.
+- Switching a live session to Web View must not close, detach, restart, or hide
+  the daemon-owned runtime. The live runtime remains in `Live Sessions` and can
+  be restored by switching back to Terminal; Web View is only read-only
+  presentation over saved transcript/provider data.
 - Startpage saved-session cards are durable saved-session rows only. Live
   runtime projections, generic SSH terminals keyed by `live::...`, and fresh
   remote Codex starts without transcript `storage_path` stay out of saved UUID

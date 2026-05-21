@@ -1,3 +1,39 @@
+yggterm (2.7.25-1) unstable; urgency=medium
+
+  * Clear Web View's toolbar loading state when saved transcript/context
+    fallback is already readable and no preview request is in flight.
+
+ -- Avikalpa Kundu <avi@gour.top>  Thu, 21 May 2026 23:26:00 +0530
+
+yggterm (2.7.24-1) unstable; urgency=medium
+
+  * Treat saved transcript/context fallback as readable Web View content, so
+    background hydration cannot show the large remote-session loading/failure
+    gate while the conversation is already readable.
+
+ -- Avikalpa Kundu <avi@gour.top>  Thu, 21 May 2026 23:12:00 +0530
+
+yggterm (2.7.23-1) unstable; urgency=medium
+
+  * Allow live sessions to remain in read-only Web View without closing,
+    detaching, restarting, or hiding their daemon-owned PTY.
+  * Update the xterm embed smoke and app-control readiness probes so live
+    Web View settles as a rendered surface while preserving the runtime.
+  * Stop auto-refreshing readable remote scan previews in a loop; Web View now
+    shows available transcript content immediately and refreshes only true
+    loading/empty placeholders.
+
+ -- Avikalpa Kundu <avi@gour.top>  Thu, 21 May 2026 22:44:30 +0530
+
+yggterm (2.7.22-1) unstable; urgency=medium
+
+  * Allow live sessions to remain in read-only Web View without closing,
+    detaching, restarting, or hiding their daemon-owned PTY.
+  * Update the xterm embed smoke to prove Web View preserves the live runtime
+    and Terminal reattaches to the same session.
+
+ -- Avikalpa Kundu <avi@gour.top>  Thu, 21 May 2026 22:12:45 +0530
+
 yggterm (2.7.21-1) unstable; urgency=medium
 
   * Make Web View a provider-backed conversation surface.
