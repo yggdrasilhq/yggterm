@@ -72,9 +72,18 @@ provider must never mount a composer or route input to a PTY, and an interactive
 API provider must send through its provider API rather than by typing hidden
 shell text into xterm.
 
+Live runtime presence proves that Terminal mode is available; it does not force
+the active viewport to stay in Terminal mode. A user may switch a live session
+to Web View to read transcript/provider content while the daemon-owned PTY
+continues in the background. Switching back to Terminal reattaches to the same
+runtime key. Web View may not terminate, detach, restart, or otherwise mutate the
+runtime.
+
 The forbidden bridge is the important part:
 
 - Preview/transcript blocks must never seed, repair, or replace a Terminal-mode xterm buffer.
+- Live-session Web View may inspect saved transcript/provider data, but it must
+  leave the daemon runtime table and preserved-owner routing untouched.
 - Web View conversation providers must not infer write capability from session
   kind, row title, or terminal focus. Write capability is an explicit provider
   contract.
@@ -136,6 +145,11 @@ This is the core determinism rule: Terminal tests should use fake PTY streams, s
 - A retained terminal host may stay mounted only if its session identity still matches a live session or a deliberate recovery state.
 - Preview mode is read-only by default. Switching preview/terminal may not rewrite the session title, summary, identity, or runtime target.
 - Terminal mode and Preview mode must not repair each other. Preview can inspect the transcript of a runtime; Terminal can attach to a runtime. Neither surface is a fallback renderer for the other.
+- Saved transcript/context fallback is readable Preview content. Remote hydration
+  may show a small background status while that fallback is visible, but it must
+  not replace the reader with a blocking loading or failure gate unless there is
+  no readable Preview content at all. Once no preview request or failure retry is
+  pending, that readable fallback also clears the toolbar loading state.
 - Clipboard paste is an owned runtime operation. `Ctrl+V`/`Cmd+V` must route through the native clipboard reader so images can be staged locally or through the remote Yggterm helper, and text can still paste normally.
 - Terminal paste gestures must be single-owner. Once the active xterm host claims
   a paste event, browser default handling and xterm's browser paste path must be
