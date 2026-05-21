@@ -29,6 +29,7 @@ REMOTE_NO_SESSION_SETUP_CHECKS = {
     "live_sessions_tree_contract",
     "managed_cli_refresh_ttl",
     "maximize_roundtrip_layout",
+    "maximize_restart_persistence",
     "notification_health_initial",
     "right_panel_animation",
     "search_focus_overlay",

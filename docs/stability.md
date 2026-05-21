@@ -22,6 +22,26 @@ Everything else is supporting machinery. Sidebar rows, titles, summaries, keep-a
 
 The hot-update handoff contract is specified in `docs/protocol.md`. A version update that stalls, hides, replaces, or loses the active PTY is a release-blocking protocol violation, not a successful hot update.
 
+The remote careful-restore window is one minute. Before that deadline the shell
+may show a slow/restore notification and run normal attach recovery, but it must
+not decide that a running protected runtime is disposable. At the one-minute
+mark, a protected Keep Alive or temporary update-restored runtime gets a
+non-destructive restore request only: reattach, resize, refresh, and keep input
+gated until the same PTY is readable. Killing the process or spawning another
+`codex resume` under the same label is allowed only when daemon truth says the
+runtime is gone, or when a user/harness explicitly asks for a force restart.
+
+Switching a live session should feel local. If daemon truth already contains a
+live runtime and the retained xterm host is valid, row selection should display
+the cached terminal surface immediately while attach/readiness runs in the
+background. SSH latency is only part of the path when Yggterm has to create,
+recover, or reattach a missing remote runtime. A slow switch is therefore not
+"just SSH"; it usually means the shell entered one of these gates: daemon
+snapshot/status, remote ensure, retained replay validation, xterm remount,
+resize/geometry settle, input focus/readiness, or recovery after a stale
+preserved-owner handoff. `scripts/smoke_ui_latency.py` is the proof path for
+this contract.
+
 For terminal rendering bugs, the repair order is strict:
 
 1. Prove the selected session identity and daemon runtime key.
@@ -37,11 +57,27 @@ Yggterm has two major session surfaces, and they intentionally have different tr
 
 Terminal mode is a runtime attachment. It is analogous to opening Ghostty, SSHing to a machine, and attaching to a durable `screen`/`tmux` session. The user-visible xterm viewport must be fed by exactly one source: daemon-owned PTY bytes for the selected runtime, plus daemon-owned retained scrollback derived from those same bytes. If the runtime is unavailable, Terminal mode may show a runtime error. It may not fall back to preview text.
 
-Preview mode is session presentation. It is read-only inspection, shaped like a chat transcript or document view. It may render stored Codex JSONL, generated summaries, `USER`/`ASSISTANT` message blocks, timestamps, and other display copy. That data is useful for inspection, but it is not terminal output.
+Preview/Web View mode is session presentation. It is read-only inspection by
+default, shaped like a chat transcript or document view. It may render stored
+Codex JSONL, generated summaries, `USER`/`ASSISTANT` message blocks,
+timestamps, and other display copy. That data is useful for inspection, but it
+is not terminal output.
+
+The Web View UI is a modular conversation surface. Each mounted conversation
+declares a provider and capability set before rendering: transcript providers
+such as Codex and terminal scrollback are read-only, while future API-backed
+providers such as OpenWebUI or the SAMPLENOTES webapp may opt into `send` capability.
+Capability declarations do not change terminal truth. A read-only transcript
+provider must never mount a composer or route input to a PTY, and an interactive
+API provider must send through its provider API rather than by typing hidden
+shell text into xterm.
 
 The forbidden bridge is the important part:
 
 - Preview/transcript blocks must never seed, repair, or replace a Terminal-mode xterm buffer.
+- Web View conversation providers must not infer write capability from session
+  kind, row title, or terminal focus. Write capability is an explicit provider
+  contract.
 - Codex cards, `/status` panels, model banners, prompt examples, or weekly-limit strings are not correctness contracts.
 - The active shell's display copy must never outrank the daemon's current runtime stream for Terminal mode.
 - A retained xterm host is a cache keyed by runtime identity and stream epoch. When it is stale or blank, rebuild from daemon runtime bytes, not from presentation data.
@@ -59,6 +95,19 @@ This is the core determinism rule: Terminal tests should use fake PTY streams, s
 - Fresh live terminals are runtime-only by default. They are restored across normal app close only after the user explicitly marks them `Keep Alive`; clearing keep-alive must remove them from persisted live-session state without killing the currently running terminal.
 - Keep Alive is not a shield against the row close action. Closing a live row means terminate/remove that selected runtime; closing the Yggterm window is the detach/preserve path for kept live sessions.
 - Remote live sessions are visible in `Live Sessions` and, when their cwd is known, are also projected under that remote cwd folder so folder-scoped work remains findable while the runtime is live. Keep Alive controls daemon retention/durability only; it must not decide whether a live remote session appears under its cwd. Local historical transcript rows still must not become duplicate stored-tree rows just because a runtime exists.
+- Remote Codex saved-session truth requires a real transcript storage path. A fresh `start-codex` runtime that is still in onboarding, permission setup, or any other pre-transcript state is a live runtime only. Closing it removes the runtime; it must not create a phantom stored row that later fails with `no terminal spec for session`.
+- Codex onboarding, authentication, and setup menus are pre-transcript but
+  input-ready. Resume/loading gates must clear when the xterm buffer shows one
+  of those explicit menus; blocking input until a normal prompt appears turns a
+  correct fresh Codex start into a locked terminal. The classifier must also
+  accept xterm tails that start mid-menu after logo art, because viewport
+  sampling can expose `tGPT ... Device Code ... API key ... Press enter to
+  continue` instead of the full welcome header.
+- Startpage recent-work cards are durable saved-session truth only. Runtime
+  projections from `Live Sessions` and storage-less remote Codex rows may appear
+  in the sidebar tree, but they must not become Startpage session cards or UUID
+  fallbacks until a real saved-session identity exists.
+- When a live remote runtime is projected in both `Live Sessions` and its machine/cwd folder, dragging one visual row must not make the other visual row appear to drag. The duplicate projection is a read model over the same runtime, not two separate drag sources.
 - Remote cwd bookmarks created by `Add Folder` are local metadata rows with a synthetic remote-folder path, but they must render only inside the owning remote machine tree. They must not appear as local filesystem rows, and remote scans must not be required before the saved bookmark is visible.
 - The sidebar merge has two inputs for saved workspace metadata: the currently
   visible local rows for local tree rendering, and the complete saved row model
@@ -70,6 +119,11 @@ This is the core determinism rule: Terminal tests should use fake PTY streams, s
   cwd, and Startpage `New Codex Session` / `New Terminal` must launch with that
   resolved remote cwd rather than the previous active session's cwd.
 - Expandable sidebar rows have a split hit-zone contract. Clicking the visible row name selects the row and opens that group's scoped Startpage without closing live runtimes; clicking the icon, disclosure/count control, machine/live-session affordance area, or trailing empty row surface toggles expansion. This applies uniformly to cwd folders, machine groups, and `Live Sessions`, with expansion state still keyed only by the row path.
+- Sidebar scroll position is presentation state, not tree truth. When rows shrink
+  after launch, refresh, search, or machine expansion changes, the visible
+  scroller must clamp stale offsets back inside its current bounds. A tree whose
+  rows fit in the sidebar must have `sidebar_scroll_top == 0`; top rows becoming
+  clipped until another expansion forces a scrollbar is a layout regression.
 - Normal final-client close must notify the user, remove non-Keep-Alive live rows from durable restore state, send graceful runtime shutdown, and schedule force cleanup after one hour.
 - Update restart is different from Keep Alive. Before a direct-install restart, the daemon must persist every recoverable live runtime with a temporary update-restore marker only when current runtime truth still says that unkept runtime exists. That marker allows the next daemon to restore the session once, but it must not silently convert unkept terminals into durable Keep Alive sessions or serialize stale in-memory rows that no longer have a daemon runtime key. After a fresh remote scan reports that an unkept temporary remote runtime is not live, that row must leave `Live Sessions` instead of remaining as a degraded/loading recovery target.
 - A hot-update preserved-owner registry is a terminal I/O handoff map, not durable session truth. Persisted live-session state is the startup allow-list when it contains runtime keys; `hot-update-terminal-owners.json` is only a fallback when persisted live state is empty. Before filtering runtime truth, a replacement daemon must query reachable old owners: a directly owned runtime that still appears in the old owner's daemon snapshot is running and must be recovered as a temporary update-restore row instead of being killed as unrepresented. During handoff, every represented `terminal_session_key` must be written or retargeted to the current outgoing handoff daemon endpoint; chained older sidecar entries must not become direct owner truth for the replacement daemon. Closing a live session or clearing Keep Alive must remove that key from the preserved-owner map. Daemon load must restore persisted live state before judging a registry version mismatch, prune only unrepresented entries from `hot-update-terminal-owners.json`, and retarget surviving entries to the current version instead of carrying latent old runtimes forward or wiping still-represented owners.
@@ -83,7 +137,22 @@ This is the core determinism rule: Terminal tests should use fake PTY streams, s
 - Preview mode is read-only by default. Switching preview/terminal may not rewrite the session title, summary, identity, or runtime target.
 - Terminal mode and Preview mode must not repair each other. Preview can inspect the transcript of a runtime; Terminal can attach to a runtime. Neither surface is a fallback renderer for the other.
 - Clipboard paste is an owned runtime operation. `Ctrl+V`/`Cmd+V` must route through the native clipboard reader so images can be staged locally or through the remote Yggterm helper, and text can still paste normally.
+- Terminal paste gestures must be single-owner. Once the active xterm host claims
+  a paste event, browser default handling and xterm's browser paste path must be
+  stopped, and duplicate paste events from WebKit/portal/remote-desktop stacks
+  must be suppressed for that gesture. App-control and terminal telemetry expose
+  request and duplicate counters; neither surface may include clipboard text.
 - Terminal input, scroll, focus, and retained-host recovery are one controller. A terminal that only scrolls, only types, or loses scrollback while composing input is an invalid user-visible state.
+- An unfocused Yggterm window must cool the GUI terminal bridge even if a live
+  session remains the active row. Daemon PTY output can accumulate as runtime
+  truth; the GUI must not keep reading and repainting xterm frames at active
+  cadence until the window is focused again or a deliberate app-control attach
+  recovery is in flight.
+- Terminal selection copy must not use the browser Clipboard API. `Ctrl+Shift+C`
+  and `Ctrl+Shift+X` route xterm selection text through the Rust terminal event
+  bridge into a native clipboard owner thread; the WebKit renderer must stay out
+  of `navigator.clipboard.writeText` so Remmina/portal clipboard hangs cannot
+  freeze the shell.
 - Context menus and destructive runtime affordances must use theme primitives. Hard-coded light-mode menus or live-session close buttons are regressions.
 - Chrome/titlebar settings changes must be transactional and non-blocking. Persisting a toggle may not freeze the UI thread.
 - Codex-class sessions must expose semantic running/completed state, with notification and optional sound when work completes.
@@ -147,8 +216,15 @@ Native paste is observable through terminal events and app-control paste command
 
 Terminal typing proof is a viewport contract. Smokes that claim user-facing typing behavior should use `probe-type --mode keyboard --per-char` and require `visible_echo_observed=true` plus bounded `timings.visible_echo_ms`. In canvas renderer mode the proof must come from the xterm buffer/cursor sample, not `host.innerText`, because DOM rows are absent by design. `--per-char` dispatches character-level keyboard events without artificial per-character sleeps; if it reports slow echo, treat that as app/input-path latency rather than probe pacing. App-control direct PTY sends may prepare state, but interrupt bytes are split from following command bytes so prompt recovery cannot hide a dropped first character. For Codex-class live smoke tests, prefer a non-submitted marker echo plus clear-line proof over `/status` output; `/status` text is Codex UI and is not deterministic enough for CI.
 
-Latency is also a smoke-test contract. `scripts/smoke_ui_latency.py` measures state, rows, search, right-panel, and active terminal input latency against app-control budgets. Before typing, it rejects the blank-host failure class by requiring the active terminal to be rendered, interactive, out of `terminal_attach_in_flight`, backed by a mounted xterm viewport, and input-enabled. In read-only drawing mode it also records root-render churn, browser rebuild churn, combined GUI/WebKit CPU, and top per-thread CPU so a GUI reactive loop is caught even when xterm write/render counters are idle. App-control wakeups must be worker-aware: a request targeted at a different live GUI PID must not wake this client or schedule root renders. A degraded `dom.snapshot_mode == "terminal-fallback"` state is acceptable for live terminal proof only when the fallback is bounded within the state budget and still carries active terminal geometry, canvas counters, retained replay prompt-follow fields, and viewport-force diagnostics; sidebar claims must pair it with `server app rows`. Use `--clear-after` for live terminal probes so the smoke clears the prompt before and after short marker samples, preventing line wrapping from hiding an otherwise visible echo. Use it for live incident reports and CI-style regressions instead of relying on subjective typing feel alone.
+Latency is also a smoke-test contract. `scripts/smoke_ui_latency.py` measures state, rows, search, right-panel, and active terminal input latency against app-control budgets. Before typing, it rejects the blank-host failure class by requiring the active terminal to be rendered, interactive, out of `terminal_attach_in_flight`, backed by a mounted xterm viewport, and input-enabled. In read-only drawing mode it records root-render churn, browser rebuild churn, combined GUI/WebKit CPU, and top per-thread CPU so a GUI reactive loop is caught even when xterm write/render counters are idle. Read-only drawing proof may run while the desktop window is unfocused, such as after a Remmina restart; in that case it still requires the xterm viewport and drawing surface, but it must not fail only because the input gate is closed by window focus policy. App-control wakeups must be worker-aware: a request targeted at a different live GUI PID must not wake this client or schedule root renders. A degraded `dom.snapshot_mode == "terminal-fallback"` state is acceptable for live terminal proof only when the fallback is bounded within the state budget and still carries active terminal geometry, canvas counters, retained replay prompt-follow fields, and viewport-force diagnostics; sidebar claims must pair it with `server app rows`. Use `--clear-after` for live terminal probes so the smoke clears the prompt before and after short marker samples, preventing line wrapping from hiding an otherwise visible echo. Use it for live incident reports and CI-style regressions instead of relying on subjective typing feel alone.
 The default budgets are tuned for live SSH-driven app-control proof: 1200 ms for state/rows/search/panel command round trips, 500 ms for any individual terminal visible echo, and 450 ms for terminal visible-echo p95. Tighten those flags for local CI runs that do not include SSH/process-start overhead.
+
+Sidebar busy indicators are part of the idle/fan contract too. Live row and tree
+busy marks must not run infinite CSS animations on the stable channel; on
+Wayland-over-Remmina and similar remote desktops, even tiny WebKit animations can
+keep the compositor hot while the terminal is idle. App-control screenshots may
+show static busy marks, but `dom.css_running_animation_count` should decay to
+zero once modal/probe activity settles.
 
 Canvas renderer idle state is part of the same contract. App-control must expose `visible_canvas_layer_count`, `hidden_canvas_layer_count`, `software_canvas_layer_optimization_active`, and `software_canvas_cursor_overlay_*` without making the cheap/basic snapshot sample canvas pixels. A canvas-rendered idle terminal should hide inactive full-viewport selection/link/cursor layers and use the small Yggterm-owned cursor overlay, so read-only CPU smokes must fail when no active terminal host is mounted, when software layer optimization is inactive, or when more than two full-viewport canvas layers remain visible.
 
