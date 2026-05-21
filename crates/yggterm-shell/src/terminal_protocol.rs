@@ -95,6 +95,7 @@ pub(crate) enum TerminalJsEvent {
     Clipboard {
         action: String,
         chars: usize,
+        text: Option<String>,
     },
     ClipboardPasteRequest,
     ClipboardImageRequest,
@@ -164,6 +165,8 @@ enum TerminalJsEventWire {
     Clipboard {
         action: String,
         chars: usize,
+        #[serde(default)]
+        text: Option<String>,
     },
     ClipboardPasteRequest,
     ClipboardImageRequest,
@@ -235,9 +238,15 @@ impl From<TerminalJsEventWire> for TerminalJsEvent {
             TerminalJsEventWire::Input { data } => TerminalJsEvent::Input { data },
             TerminalJsEventWire::ReadNudge { reason } => TerminalJsEvent::ReadNudge { reason },
             TerminalJsEventWire::Resize { cols, rows } => TerminalJsEvent::Resize { cols, rows },
-            TerminalJsEventWire::Clipboard { action, chars } => {
-                TerminalJsEvent::Clipboard { action, chars }
-            }
+            TerminalJsEventWire::Clipboard {
+                action,
+                chars,
+                text,
+            } => TerminalJsEvent::Clipboard {
+                action,
+                chars,
+                text,
+            },
             TerminalJsEventWire::ClipboardPasteRequest => TerminalJsEvent::ClipboardPasteRequest,
             TerminalJsEventWire::ClipboardImageRequest => TerminalJsEvent::ClipboardImageRequest,
             TerminalJsEventWire::ContextMenu { client_x, client_y } => {
@@ -365,6 +374,40 @@ mod tests {
                 client_y,
             } if (client_x - 42.5).abs() < f64::EPSILON
                 && (client_y - 84.25).abs() < f64::EPSILON
+        ));
+    }
+
+    #[test]
+    fn clipboard_event_deserializes_selection_text_without_requiring_legacy_payloads() {
+        let event: TerminalJsEvent = serde_json::from_value(json!({
+            "kind": "clipboard",
+            "action": "copy",
+            "chars": 12,
+            "text": "hello world!",
+        }))
+        .expect("terminal clipboard payload should deserialize");
+        assert!(matches!(
+            event,
+            TerminalJsEvent::Clipboard {
+                action,
+                chars: 12,
+                text: Some(selection),
+            } if action == "copy" && selection == "hello world!"
+        ));
+
+        let legacy_event: TerminalJsEvent = serde_json::from_value(json!({
+            "kind": "clipboard",
+            "action": "copy",
+            "chars": 12,
+        }))
+        .expect("legacy terminal clipboard payload should still deserialize");
+        assert!(matches!(
+            legacy_event,
+            TerminalJsEvent::Clipboard {
+                action,
+                chars: 12,
+                text: None,
+            } if action == "copy"
         ));
     }
 

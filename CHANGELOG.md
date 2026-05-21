@@ -4,6 +4,191 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+## 2.7.21
+
+- Make Web View a provider-backed conversation surface. Codex and terminal
+  transcript providers remain read-only, and future OpenWebUI/JYAS-style API
+  chat providers must declare send capability explicitly before the UI can
+  expose chat input.
+- Add conversation-provider app-control attributes and contract tests so Web
+  View presentation cannot become terminal/xterm truth.
+
+## 2.7.20
+
+- Restore preserved-owner scrollback before declaring a remote session
+  interactive when a short live read wins the first paint race. A retained
+  history seed may now run once for collapsed-scrollback recovery while input
+  remains gated; it is still blocked after input is enabled or hot.
+- Keep xterm-owned session snapshots labeled as `xterm_session_snapshot`
+  observer cache instead of promoting them to `daemon_pty` truth.
+
+## 2.7.19
+
+- Treat versioned daemon socket aliases by their filesystem target, not their
+  path string. If a legacy socket such as `server-2-1-0.sock` points at the
+  current daemon, it can no longer masquerade as a preserved PTY owner; startup
+  retargets those registry entries to a reachable real owner when one reports
+  the runtime key.
+- Capture terminal right-click before xterm.js/WebKit can prepare the helper
+  textarea for native paste. Right-click now opens the Yggterm
+  terminal/session context menu without sending clipboard bytes to the PTY;
+  middle-click remains the primary-selection paste path.
+
+## 2.7.18
+
+- Treat live-connected remote xterm hosts as a hard stop for UI retained
+  rehydrate as well as delayed daemon retained replay. A retained snapshot may
+  seed an empty restore, but it is discarded once daemon PTY truth is live.
+
+## 2.7.17
+
+- Stop delayed retained replay from writing over a remote terminal after the
+  live xterm bridge has accepted input, preventing settled Codex sessions from
+  snapping back into old retained wall-text.
+- Keep terminal-open attempts from carrying a previous session's active xterm
+  host id into the newly selected session.
+- Tighten hot-update duplicate-owner handling: current daemon runtime I/O may
+  bypass a stale preserved-owner route, but the preserved-owner registry is
+  removed only after targeted local-only duplicate runtime pruning succeeds.
+
+## 2.7.16
+
+- Treat terminal paint as observer-only for geometry. Paint events no longer
+  resize daemon-owned PTYs, and unfocused ResizeObserver transients are skipped
+  once a terminal already has a usable grid so app-control/screenshot/layout
+  probes cannot bounce a live Codex TUI between stale terminal sizes.
+
+## 2.7.15
+
+- Reopen maximized windows as maximized by applying persisted window state at
+  native window construction and syncing window-manager close state before the
+  shell enters shutdown.
+- Disable the remote prompt-gap PTY resize nudge. Retained restore must settle
+  xterm viewport/render truth without resizing daemon-owned live PTYs behind
+  Codex/TUI sessions.
+- Stop visible-paint repair from refitting xterm or notifying the daemon PTY of
+  a new grid, and prefer rendered xterm cell metrics over stale fallback CSS
+  when explicit resize/refit paths compute terminal geometry.
+- Tighten app-control geometry diagnostics so stale prompt-follow debug records
+  cannot hide a cursor row that has drifted below the visible viewport.
+- Add a smoke check for maximized close/relaunch persistence.
+
+## 2.7.14
+
+- Stop retained replay from continuing prompt-follow or repaint work after
+  trusted live input promotes a terminal surface back to daemon-owned PTY
+  truth. This prevents idle Codex terminals from snapping back into stale
+  wall-text snapshots after typing stops.
+- Keep the active terminal on the active input frame budget while typing is
+  hot, even when Codex status animation bookkeeping is present.
+
+## 2.7.13
+
+- Repair prompt-follow terminal scroll truth when WebKit reports a DOM
+  viewport beyond xterm's own scrollback base. Yggterm now clamps and resyncs
+  that impossible DOM state instead of letting typing jump the active session
+  high into scrollback.
+- Reset retained-terminal recovery timing when a replacement xterm surface is
+  mounted, so stale first-output timestamps from discarded empty surfaces do
+  not make restore telemetry or watchdog decisions lie.
+- Persist the actual window maximized state on app-control and graceful close,
+  so a maximized Yggterm window reopens maximized after restart/handoff.
+- Ignore late close-path window resize/decorator events when persisting window
+  placement, preventing Linux detach cleanup from overwriting maximized state.
+
+## 2.7.9
+
+- Remove the stable theme alpha/transparency leak that kept the shell frame and
+  gradient on translucent CSS material. Stable Yggterm now exports opaque shell
+  chrome and single-layer opaque gradients, leaving blur/alpha/grain work on
+  the experimental branch and reducing compositor/WebKit repaint cost on jojo.
+
+## 2.7.8
+
+- Protect the daemon named in the hot-update preserved-owner registry from
+  Linux cleanup even when another daemon can describe the same runtime key.
+  Session survival now wins over stale-daemon cleanup, preventing keep-alive
+  Codex conversations from being killed and relaunched as interrupted sessions
+  during update/restart handoff.
+
+## 2.7.7
+
+- Stop stale xterm viewport telemetry from classifying a prompt-follow terminal
+  as cursor-clipped after a matched force-follow pass. The classifier now trusts
+  the prompt-follow force result when row fit is clean, preventing retained
+  terminal recovery from remounting a healthy viewport and burning CPU.
+
+## 2.7.6
+
+- Stop missing-saved-session remote Codex rows from auto-spawning doomed PTYs.
+  Yggterm now keeps the live row and launch error visible, but the daemon gates
+  restart/new-spawn paths once the saved transcript probe has failed so the GUI
+  does not enter a retry/repaint loop.
+
+## 2.7.5
+
+- Preserve live remote Codex rows when their saved transcript metadata is
+  missing. Running daemon PTY truth now wins over missing saved-session
+  metadata, so clicking a live row records a launch error instead of deleting
+  the row and spawning duplicate renamed copies.
+- Scope sidebar selection and drag state to the visual live row when the same
+  session also appears as a cwd projection. Cwd projections can still focus the
+  session, but only the canonical `Live Sessions` row reorders the live group.
+- Remember whether the app window was maximized and restore that state on the
+  next launch.
+
+## 2.7.4
+
+- Stop active terminal write flushes while the Yggterm window is unfocused or
+  app-control-backgrounded. This keeps daemon PTY truth intact while preventing
+  WebKit/xterm repaint work from burning CPU in the background.
+- Deduplicate terminal text paste gestures at the xterm bridge and expose
+  clipboard paste/copy telemetry counters without logging clipboard contents.
+
+## 2.7.3
+
+- Fix fresh remote Codex onboarding when xterm's visible tail starts mid-menu.
+  A truncated auth menu such as `tGPT ... Device Code ... API key ... Press
+  enter to continue` is still interactive PTY truth, so Yggterm now clears the
+  resume notification/input gate instead of repeatedly remounting the terminal.
+
+## 2.7.2
+
+- Let fresh remote Codex onboarding and sign-in menus accept input. These
+  surfaces are interactive PTY truth even before Codex has emitted a normal
+  prompt or transcript storage path, so Yggterm now clears the resume gate for
+  them instead of leaving the viewport locked behind a recovery notification.
+- Keep Startpage saved-session cards limited to durable saved sessions. Live
+  terminal/runtime projections still appear in `Live Sessions` and their
+  machine/cwd group, but a generic SSH terminal or pre-transcript Codex runtime
+  no longer looks like a saved UUID-backed session on the Startpage.
+
+## 2.7.1
+
+- Prevent fresh remote Codex onboarding sessions from becoming phantom saved
+  sessions. Remote Codex rows now enter machine/cwd saved-session truth only
+  after Codex exposes a real transcript storage path, and restore filters old
+  storage-less rows.
+- Keep drag feedback row-local when a live remote terminal appears in both
+  `Live Sessions` and its machine/cwd projection.
+
+## 2.7.0
+
+- Harden protected remote restores with a one-minute careful-restore boundary.
+  Keep Alive and temporary update-restored runtimes get one non-destructive
+  reattach/resize/refresh attempt after the timeout; Yggterm must not kill or
+  duplicate a still-running runtime unless daemon truth says it is gone or the
+  user/harness explicitly force-restarts it.
+- Move terminal selection copy off WebKit's browser Clipboard API. `Ctrl+Shift+C`
+  and `Ctrl+Shift+X` now bridge xterm selection text into a native clipboard
+  owner thread, keeping app-control and the shell responsive when Remmina or the
+  desktop clipboard stack stalls.
+- Repair stale sidebar scroll offsets after launch, refresh, search, or tree
+  shrink so top rows such as `Live Sessions` cannot remain clipped until another
+  expansion forces a scrollbar.
+- Update terminal and stability contracts for switch latency, protected restore,
+  terminal selection-copy proof, and sidebar scroll-bounds smoke coverage.
+
 ## 2.6.83
 
 - Harden hot-update session survival. Reachable old daemons that still report a
