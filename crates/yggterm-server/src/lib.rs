@@ -1630,22 +1630,11 @@ fn managed_session_supports_terminal_view(session: &ManagedSessionView) -> bool 
         ),
     }
 }
-fn managed_session_forces_terminal_view(session: &ManagedSessionView) -> bool {
-    session.kind != SessionKind::Document
-        && matches!(
-            session.source,
-            SessionSource::LiveLocal | SessionSource::LiveSsh
-        )
-        && managed_session_supports_terminal_view(session)
-}
 
 fn snapshot_active_view_mode_for_session(
     requested: WorkspaceViewMode,
     active_session: Option<&ManagedSessionView>,
 ) -> WorkspaceViewMode {
-    if active_session.is_some_and(managed_session_forces_terminal_view) {
-        return WorkspaceViewMode::Terminal;
-    }
     if requested != WorkspaceViewMode::Terminal {
         return requested;
     }
@@ -1803,15 +1792,6 @@ impl YggtermServer {
     }
 
     fn normalize_active_view_mode(&mut self) {
-        if let Some(path) = self.active_session_path.as_deref()
-            && self
-                .sessions
-                .get(path)
-                .is_some_and(managed_session_forces_terminal_view)
-        {
-            self.active_view_mode = WorkspaceViewMode::Terminal;
-            return;
-        }
         if self.active_view_mode != WorkspaceViewMode::Terminal {
             return;
         }
@@ -20138,18 +20118,18 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_active_view_mode_forces_live_runtime_to_terminal() {
+    fn snapshot_active_view_mode_allows_live_runtime_web_view() {
         let path = "local://live-codex";
         let live = managed_session_from_snapshot(snapshot_session(path, SessionSource::LiveLocal));
 
         assert_eq!(
             super::snapshot_active_view_mode_for_session(WorkspaceViewMode::Rendered, Some(&live)),
-            WorkspaceViewMode::Terminal
+            WorkspaceViewMode::Rendered
         );
     }
 
     #[test]
-    fn set_view_mode_cannot_put_live_local_runtime_in_rendered_mode() {
+    fn set_view_mode_allows_live_local_runtime_in_rendered_mode() {
         let tree = SessionNode {
             kind: SessionNodeKind::Group,
             name: "root".to_string(),
@@ -20172,10 +20152,10 @@ mod tests {
         server.set_view_mode(WorkspaceViewMode::Rendered);
 
         assert_eq!(server.active_session_path(), Some(path.as_str()));
-        assert_eq!(server.active_view_mode(), WorkspaceViewMode::Terminal);
+        assert_eq!(server.active_view_mode(), WorkspaceViewMode::Rendered);
         assert_eq!(
             server.snapshot().active_view_mode,
-            WorkspaceViewMode::Terminal
+            WorkspaceViewMode::Rendered
         );
     }
 

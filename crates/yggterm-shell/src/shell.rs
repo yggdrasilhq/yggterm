@@ -2396,12 +2396,24 @@ impl ShellState {
             should_surface_preview_failure(failure, now_ms).then(|| failure.message.clone())
         });
         let preview_failure_pending = preview_failure_entry.is_some() && preview_failure.is_none();
-        let preview_loading = preview_request_in_flight
-            || preview_failure_pending
-            || (preview_failure.is_none()
-                && active_session
-                    .as_ref()
-                    .is_some_and(preview_should_hide_stale_placeholder_content));
+        let preview_has_readable_fallback_context =
+            active_session.as_ref().is_some_and(|session| {
+                preview_has_readable_resume_context(
+                    session,
+                    active_title.as_deref(),
+                    active_summary.as_deref(),
+                    active_precis.as_deref(),
+                )
+            });
+        let preview_loading = preview_snapshot_loading_state(
+            preview_request_in_flight,
+            preview_failure_pending,
+            preview_failure.is_some(),
+            active_session
+                .as_ref()
+                .is_some_and(preview_should_hide_stale_placeholder_content),
+            preview_has_readable_fallback_context,
+        );
         let terminal_loading = !detach_terminal_before_close
             && self
                 .active_surface_requests
@@ -15064,6 +15076,60 @@ fn remote_preview_needs_refresh(session: &ManagedSessionView) -> bool {
                 .any(|section| section.title == "Recent Context")
             || preview_text_looks_like_loading_placeholder(&preview_summary_text(session)))
 }
+fn remote_preview_has_readable_scan_content(session: &ManagedSessionView) -> bool {
+    session.preview.blocks.iter().any(|block| {
+        block.timestamp == "remote:scan"
+            && block.lines.iter().any(|line| !line.trim().is_empty())
+            && !preview_text_looks_like_loading_placeholder(&block.lines.join("\n"))
+    }) || !session.rendered_sections.is_empty()
+}
+fn remote_preview_should_auto_sync(session: &ManagedSessionView) -> bool {
+    if !remote_preview_needs_refresh(session) {
+        return false;
+    }
+    let hydration = metadata_value(session, "Preview Hydration");
+    if !matches!(hydration.as_str(), "head" | "loading")
+        && remote_preview_has_readable_scan_content(session)
+    {
+        return false;
+    }
+    true
+}
+fn preview_should_show_blocking_failure_placeholder(
+    preview_failure_present: bool,
+    grouped_runs_empty: bool,
+    rendered_sections_empty: bool,
+    fallback_context_visible: bool,
+) -> bool {
+    preview_failure_present
+        && grouped_runs_empty
+        && rendered_sections_empty
+        && !fallback_context_visible
+}
+fn preview_should_show_blocking_loading_placeholder(
+    preview_loading: bool,
+    failure_placeholder_visible: bool,
+    grouped_runs_empty: bool,
+    rendered_sections_empty: bool,
+    fallback_context_visible: bool,
+) -> bool {
+    preview_loading
+        && !failure_placeholder_visible
+        && grouped_runs_empty
+        && rendered_sections_empty
+        && !fallback_context_visible
+}
+fn preview_snapshot_loading_state(
+    preview_request_in_flight: bool,
+    preview_failure_pending: bool,
+    preview_failure_present: bool,
+    stale_placeholder_content: bool,
+    readable_fallback_context: bool,
+) -> bool {
+    preview_request_in_flight
+        || preview_failure_pending
+        || (!preview_failure_present && stale_placeholder_content && !readable_fallback_context)
+}
 fn schedule_remote_preview_sync(
     shell: &mut ShellState,
     session_path: &str,
@@ -15437,7 +15503,7 @@ fn kick_active_remote_preview_sync(state: Signal<ShellState>, reason: &'static s
             return None;
         };
         if !session.session_path.starts_with("remote-session://")
-            || !remote_preview_needs_refresh(&session)
+            || !remote_preview_should_auto_sync(&session)
         {
             return None;
         }
@@ -34781,7 +34847,7 @@ fn app() -> Element {
     let mut last_startup_terminal_recovery_path = use_signal(|| None::<String>);
     let mut last_terminal_mount_key = use_signal(|| None::<String>);
     let mut last_linux_window_chrome_apply = use_signal(|| None::<LinuxWindowChromeApplySignature>);
-    let mut last_preview_refresh_marker = use_signal(|| None::<(String, u64, bool)>);
+    let mut last_preview_refresh_marker = use_signal(|| None::<(String, u64, bool, bool)>);
     let mut last_sidebar_autoscroll_path = use_signal(|| None::<String>);
     let mut last_sidebar_bounds_repair_key = use_signal(|| None::<String>);
     let mut last_tree_rename_focus_path = use_signal(|| None::<String>);
@@ -35783,8 +35849,18 @@ fn app() -> Element {
             return;
         }
         let needs_refresh = remote_preview_needs_refresh(&session);
-        let refresh_marker = (session.session_path.clone(), dirty_epoch, needs_refresh);
+        let should_auto_sync = remote_preview_should_auto_sync(&session);
+        let refresh_marker = (
+            session.session_path.clone(),
+            dirty_epoch,
+            needs_refresh,
+            should_auto_sync,
+        );
         if *last_preview_refresh_marker.read() == Some(refresh_marker.clone()) {
+            return;
+        }
+        if !should_auto_sync {
+            last_preview_refresh_marker.set(Some(refresh_marker));
             return;
         }
         let has_fetch_target =
@@ -40398,14 +40474,21 @@ fn MainSurface(
             let visible_terminal_resume_context_fallback = (!preview_context_available)
                 .then(|| terminal_resume_context_fallback.clone())
                 .flatten();
+            let fallback_context_visible = visible_terminal_resume_context_fallback.is_some();
             let effective_preview_layer_style = preview_layer_style.clone();
-            let show_failure_placeholder = preview_failure.is_some()
-                && grouped_runs.is_empty()
-                && rendered_sections.is_empty();
-            let show_loading_placeholder = !show_failure_placeholder
-                && snapshot.preview_loading
-                && grouped_runs.is_empty()
-                && rendered_sections.is_empty();
+            let show_failure_placeholder = preview_should_show_blocking_failure_placeholder(
+                preview_failure.is_some(),
+                grouped_runs.is_empty(),
+                rendered_sections.is_empty(),
+                fallback_context_visible,
+            );
+            let show_loading_placeholder = preview_should_show_blocking_loading_placeholder(
+                snapshot.preview_loading,
+                show_failure_placeholder,
+                grouped_runs.is_empty(),
+                rendered_sections.is_empty(),
+                fallback_context_visible,
+            );
             let terminal_canvas_snapshot =
                 TerminalCanvasSnapshot::from_render_snapshot(snapshot.as_ref());
             rsx! {
@@ -41676,6 +41759,24 @@ fn terminal_resume_context_fallback(
             (!trimmed.is_empty()).then_some(trimmed)
         })?;
     Some((title, summary))
+}
+fn preview_has_readable_resume_context(
+    session: &ManagedSessionView,
+    title: Option<&str>,
+    summary: Option<&str>,
+    precis: Option<&str>,
+) -> bool {
+    let has_title = title
+        .or_else(|| {
+            let session_title = session.title.trim();
+            (!session_title.is_empty()).then_some(session_title)
+        })
+        .is_some_and(|value| !value.trim().is_empty());
+    let has_detail = summary
+        .or(precis)
+        .is_some_and(|value| !value.trim().is_empty())
+        || !terminal_precis(session).trim().is_empty();
+    has_title && has_detail
 }
 fn terminal_session_still_active(shell: &ShellState, session_path: &str, host_id: &str) -> bool {
     shell.server.active_view_mode() == WorkspaceViewMode::Terminal
@@ -72167,6 +72268,42 @@ mod tests {
         assert!(should_surface_preview_failure(&repeated, 1_500));
     }
     #[test]
+    fn preview_loading_gate_does_not_cover_saved_fallback_context() {
+        assert!(!preview_should_show_blocking_loading_placeholder(
+            true, false, true, true, true,
+        ));
+        assert!(!preview_should_show_blocking_failure_placeholder(
+            true, true, true, true,
+        ));
+        assert!(preview_should_show_blocking_loading_placeholder(
+            true, false, true, true, false,
+        ));
+        assert!(preview_should_show_blocking_failure_placeholder(
+            true, true, true, false,
+        ));
+        assert!(!preview_should_show_blocking_loading_placeholder(
+            true, false, false, true, false,
+        ));
+        assert!(!preview_should_show_blocking_loading_placeholder(
+            true, false, true, false, false,
+        ));
+    }
+    #[test]
+    fn preview_saved_fallback_clears_stale_placeholder_loading_state() {
+        assert!(!preview_snapshot_loading_state(
+            false, false, false, true, true,
+        ));
+        assert!(preview_snapshot_loading_state(
+            true, false, false, true, true,
+        ));
+        assert!(preview_snapshot_loading_state(
+            false, true, false, true, true,
+        ));
+        assert!(preview_snapshot_loading_state(
+            false, false, false, true, false,
+        ));
+    }
+    #[test]
     fn workspace_rows_exclude_live_groups() {
         let live_group = BrowserRow {
             kind: BrowserRowKind::Group,
@@ -78380,6 +78517,7 @@ mod tests {
             stored_preview_hydrated: false,
         };
         assert!(remote_preview_needs_refresh(&session));
+        assert!(remote_preview_should_auto_sync(&session));
     }
     #[test]
     fn remote_preview_needs_refresh_for_placeholder_summary_text() {
@@ -78435,6 +78573,7 @@ mod tests {
             stored_preview_hydrated: false,
         };
         assert!(remote_preview_needs_refresh(&session));
+        assert!(remote_preview_should_auto_sync(&session));
     }
     #[test]
     fn preview_scan_hydration_remains_visible_while_refreshing() {
@@ -78493,6 +78632,7 @@ mod tests {
             stored_preview_hydrated: false,
         };
         assert!(remote_preview_needs_refresh(&session));
+        assert!(!remote_preview_should_auto_sync(&session));
         assert!(!preview_should_hide_stale_placeholder_content(&session));
     }
     #[test]
