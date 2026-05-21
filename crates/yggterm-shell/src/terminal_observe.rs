@@ -45,11 +45,6 @@ pub(crate) fn describe_viewport_snapshot(snapshot: &Value, dom: &Value) -> Value
         .and_then(Value::as_str)
         .unwrap_or("Unknown")
         .to_string();
-    let active_session_source = snapshot
-        .get("active_session_source")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .to_string();
     let active_title = snapshot
         .get("active_title")
         .and_then(Value::as_str)
@@ -351,21 +346,7 @@ pub(crate) fn describe_viewport_snapshot(snapshot: &Value, dom: &Value) -> Value
         let preview_has_content = preview_scroll_count > 0
             && ((preview_visible_block_count > 0 || !preview_rendered_sections.is_empty())
                 || (!preview_text_sample.is_empty() && !preview_placeholder));
-        let active_remote_live_preview = active_session_path.as_deref().is_some_and(|path| {
-            (path.starts_with("remote-session://") || path.starts_with("ssh://"))
-                && active_session_source.starts_with("Live")
-        });
-        if active_remote_live_preview {
-            (
-                false,
-                false,
-                Some("problem".to_string()),
-                Some(
-                    "active remote live session is showing Preview instead of the terminal surface"
-                        .to_string(),
-                ),
-            )
-        } else if preview_loading && !preview_has_content {
+        if preview_loading && !preview_has_content {
             (
                 false,
                 false,
@@ -6498,7 +6479,7 @@ Weekly limit:                21% left
     }
 
     #[test]
-    fn viewport_rejects_remote_live_preview_fallback() {
+    fn viewport_accepts_remote_live_web_view() {
         let snapshot = json!({
             "active_session_path": "remote-session://dev/live-codex",
             "active_session_source": "LiveSsh",
@@ -6541,17 +6522,14 @@ Weekly limit:                21% left
             "preview_scroll_count": 1
         });
         let viewport = describe_viewport_snapshot(&snapshot, &dom);
-        assert_eq!(viewport.get("ready").and_then(Value::as_bool), Some(false));
+        assert_eq!(viewport.get("ready").and_then(Value::as_bool), Some(true));
         assert_eq!(
             viewport
                 .get("terminal_settled_kind")
                 .and_then(Value::as_str),
-            Some("problem")
+            Some("preview")
         );
-        assert_eq!(
-            viewport.get("reason").and_then(Value::as_str),
-            Some("active remote live session is showing Preview instead of the terminal surface")
-        );
+        assert_eq!(viewport.get("reason").and_then(Value::as_str), None);
     }
 
     #[test]
