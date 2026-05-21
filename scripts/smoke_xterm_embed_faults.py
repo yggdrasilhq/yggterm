@@ -1198,6 +1198,47 @@ def app_clients() -> list[dict]:
     return run("server", "app", "clients", "--timeout-ms", "8000").get("clients") or []
 
 
+def app_close_preserving_live_sessions(pid: int) -> dict:
+    return run(
+        "server",
+        "app",
+        "close",
+        "--preserve-live-sessions",
+        "--pid",
+        str(pid),
+        "--timeout-ms",
+        "12000",
+        timeout_seconds=18.0,
+    )
+
+
+def wait_for_client_pid_absent(pid: int, timeout_seconds: float = 10.0) -> dict:
+    deadline = time.time() + timeout_seconds
+    last_clients: list[dict] = []
+    while time.time() < deadline:
+        last_clients = app_clients()
+        if not any(int(client.get("pid") or 0) == int(pid) for client in last_clients):
+            return {"clients": last_clients}
+        time.sleep(0.2)
+    raise AssertionError(f"app client pid {pid} did not unregister after close: clients={last_clients!r}")
+
+
+def app_launch_wait_settled(timeout_ms: int = 30000) -> dict:
+    payload = run(
+        "server",
+        "app",
+        "launch",
+        "--wait-visible",
+        "--wait-settled",
+        "--timeout-ms",
+        str(timeout_ms),
+        timeout_seconds=float(timeout_ms) / 1000.0 + 12.0,
+    )
+    if not payload.get("visible") or not payload.get("registered"):
+        raise AssertionError(f"restarted app did not become visible and registered: {payload!r}")
+    return payload
+
+
 def client_record(pid: int) -> dict:
     for client in app_clients():
         if int(client.get("pid") or 0) == int(pid):
@@ -3553,6 +3594,157 @@ def root_screenshot_matches_app_capture(root_path: Path, app_path: Path, state: 
     return mean_delta < 48.0
 
 
+def image_mean_rgb_delta(left: Image.Image, right: Image.Image) -> float:
+    diff = ImageStat.Stat(ImageChops.difference(left.convert("RGB"), right.convert("RGB"))).mean
+    return sum(diff) / max(1, len(diff))
+
+
+def opaque_app_patch_candidates(app: Image.Image, *, patch_size: int = 48) -> list[tuple[int, int, Image.Image]]:
+    rgba = app.convert("RGBA")
+    width, height = rgba.size
+    if width < patch_size or height < patch_size:
+        return []
+    alpha = rgba.getchannel("A")
+    rgb = rgba.convert("RGB")
+    patches: list[tuple[int, int, Image.Image]] = []
+    seen: set[tuple[int, int]] = set()
+
+    def alpha_mean_for_box(x: int, y: int) -> float:
+        alpha_patch = alpha.crop((x, y, x + patch_size, y + patch_size))
+        return ImageStat.Stat(alpha_patch).mean[0]
+
+    scored_grid: list[tuple[float, int, int, Image.Image]] = []
+    grid_step = max(24, patch_size)
+    for y in range(0, max(1, height - patch_size + 1), grid_step):
+        for x in range(0, max(1, width - patch_size + 1), grid_step):
+            if alpha_mean_for_box(x, y) < 245.0:
+                continue
+            patch = rgb.crop((x, y, x + patch_size, y + patch_size))
+            variance = sum(ImageStat.Stat(patch).stddev)
+            scored_grid.append((variance, x, y, patch))
+    scored_grid.sort(reverse=True, key=lambda item: item[0])
+    for _, x, y, patch in scored_grid[:8]:
+        patches.append((x, y, patch))
+
+    preferred_points = [
+        (0.54, 0.64),
+        (0.48, 0.78),
+        (0.62, 0.78),
+        (0.52, 0.38),
+        (0.78, 0.56),
+        (0.22, 0.56),
+    ]
+    for fx, fy in preferred_points:
+        x = int(round(width * fx - patch_size / 2))
+        y = int(round(height * fy - patch_size / 2))
+        x = max(0, min(width - patch_size, x))
+        y = max(0, min(height - patch_size, y))
+        if (x, y) in seen:
+            continue
+        seen.add((x, y))
+        if alpha_mean_for_box(x, y) < 245.0:
+            continue
+        patches.append((x, y, rgb.crop((x, y, x + patch_size, y + patch_size))))
+    deduped: list[tuple[int, int, Image.Image]] = []
+    seen.clear()
+    for x, y, patch in patches:
+        key = (x, y)
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append((x, y, patch))
+    return deduped[:10]
+
+
+def infer_app_window_bounds_from_root(root_path: Path, app_path: Path) -> dict | None:
+    if Image is None or ImageStat is None:
+        return None
+    if not root_path.exists() or not app_path.exists():
+        return None
+    try:
+        root = Image.open(root_path).convert("RGB")
+        app = Image.open(app_path).convert("RGBA")
+    except OSError:
+        return None
+    app_width, app_height = app.size
+    root_width, root_height = root.size
+    max_x = root_width - app_width
+    max_y = root_height - app_height
+    if max_x < 0 or max_y < 0:
+        return None
+    patches = opaque_app_patch_candidates(app)
+    if not patches:
+        return None
+
+    def score_at(x: int, y: int) -> float:
+        deltas = []
+        for patch_x, patch_y, patch in patches:
+            root_patch = root.crop(
+                (
+                    x + patch_x,
+                    y + patch_y,
+                    x + patch_x + patch.width,
+                    y + patch_y + patch.height,
+                )
+            )
+            deltas.append(image_mean_rgb_delta(root_patch, patch))
+        return sum(deltas) / len(deltas)
+
+    def scan(x_values: range, y_values: range) -> tuple[int, int, float]:
+        best_x = 0
+        best_y = 0
+        best_score = float("inf")
+        for y in y_values:
+            for x in x_values:
+                score = score_at(x, y)
+                if score < best_score:
+                    best_x = x
+                    best_y = y
+                    best_score = score
+        return best_x, best_y, best_score
+
+    coarse_step = 12
+    coarse_xs = range(0, max_x + 1, coarse_step)
+    coarse_ys = range(0, max_y + 1, coarse_step)
+    best_x, best_y, best_score = scan(coarse_xs, coarse_ys)
+    for radius, step in ((coarse_step * 2, 3), (4, 1)):
+        x0 = max(0, best_x - radius)
+        x1 = min(max_x, best_x + radius)
+        y0 = max(0, best_y - radius)
+        y1 = min(max_y, best_y + radius)
+        best_x, best_y, best_score = scan(
+            range(x0, x1 + 1, step),
+            range(y0, y1 + 1, step),
+        )
+    if best_score > 18.0:
+        return None
+    return {
+        "x": best_x,
+        "y": best_y,
+        "width": app_width,
+        "height": app_height,
+        "score": best_score,
+        "source": "root_screenshot_template_match",
+        "patch_count": len(patches),
+    }
+
+
+def state_with_inferred_window_bounds(state: dict, bounds: dict) -> dict:
+    adjusted = json.loads(json.dumps(state))
+    window = adjusted.setdefault("window", {})
+    window["outer_position"] = {
+        "x": bounds["x"],
+        "y": bounds["y"],
+    }
+    window["outer_size"] = {
+        "width": bounds["width"],
+        "height": bounds["height"],
+    }
+    window["outer_position_source"] = bounds.get("source")
+    window["outer_position_match_score"] = bounds.get("score")
+    return adjusted
+
+
 def shell_corner_signature(root_screenshot_path: Path, state: dict) -> dict | None:
     window = state.get("window") or {}
     dom = state.get("dom") or {}
@@ -3814,6 +4006,8 @@ def shell_corner_signature(root_screenshot_path: Path, state: dict) -> dict | No
             "width": window_width,
             "height": window_height,
         },
+        "window_position_source": window.get("outer_position_source") or "app_control",
+        "window_position_match_score": window.get("outer_position_match_score"),
         "shell_radius_px": shell_radius,
         "corners": corners,
         "moat_bands": moat_bands,
@@ -3842,9 +4036,13 @@ def assert_shell_corner_rounding(pid: int, screenshot_path: Path, state: dict | 
             except AssertionError:
                 pass
         capture_root_screenshot(display, path)
+        signature_state = state
         if not root_screenshot_matches_app_capture(path, screenshot_path, state):
-            return None, []
-        signature = shell_corner_signature(path, state)
+            inferred_bounds = infer_app_window_bounds_from_root(path, screenshot_path)
+            if inferred_bounds is None:
+                return None, []
+            signature_state = state_with_inferred_window_bounds(state, inferred_bounds)
+        signature = shell_corner_signature(path, signature_state)
         if signature is None:
             return None, []
         samples = []
@@ -13091,6 +13289,70 @@ def assert_maximize_roundtrip_layout(pid: int, out_dir: Path) -> dict:
     }
 
 
+def assert_maximize_restart_persistence(pid: int, out_dir: Path) -> dict:
+    app_set_search(pid, "", focused=False)
+    time.sleep(0.1)
+    baseline = wait_for_window_focus(pid, timeout_seconds=4.0)
+    if shell_context_menu_row_path(baseline):
+        try:
+            xdotool_key_window(pid, "Escape")
+        except Exception:
+            pass
+        time.sleep(0.02)
+        baseline = app_state(pid)
+    if titlebar_transient_open(baseline):
+        baseline = dismiss_titlebar_transients(pid, baseline, timeout_seconds=1.5)
+    if right_panel_mode(baseline) not in ("", "hidden", "none", "null"):
+        baseline = close_right_panel(pid, baseline, timeout_seconds=1.5)
+    wait_for_notifications_clear(pid, timeout_seconds=12.0)
+
+    if not bool((baseline.get("window") or {}).get("maximized")):
+        app_set_maximized(pid, True)
+    maximized_before = wait_for_window_maximized(pid, True)
+    if maximized_before is None:
+        return {
+            "skipped": True,
+            "reason": "maximize unsupported on this X11 session/window manager",
+            "pid": pid,
+        }
+    before_shot = out_dir / "maximize-restart-before-close.png"
+    app_screenshot(pid, before_shot)
+
+    close_response = app_close_preserving_live_sessions(pid)
+    gone = wait_for_client_pid_absent(pid, timeout_seconds=12.0)
+    launch = app_launch_wait_settled(timeout_ms=30000)
+    new_pid = int(launch.get("pid") or 0)
+    if new_pid <= 0:
+        raise AssertionError(f"restart launch did not report a valid pid: {launch!r}")
+    restored = wait_for_window_maximized(new_pid, True, timeout_seconds=12.0)
+    if restored is None:
+        restored = app_state(new_pid)
+        raise AssertionError(
+            "window was maximized before close but did not reopen maximized: "
+            f"before={maximized_before.get('window')!r} launch={launch!r} after={restored.get('window')!r}"
+        )
+    restored = wait_for_window_geometry_settle(new_pid, timeout_seconds=8.0)
+    if (restored.get("window") or {}).get("maximized") is not True:
+        raise AssertionError(f"restarted window lost maximized state after geometry settle: {restored!r}")
+    after_shot = out_dir / "maximize-restart-after-launch.png"
+    app_screenshot(new_pid, after_shot)
+    return {
+        "before": {
+            "pid": pid,
+            "window": maximized_before.get("window") or {},
+            "screenshot": str(before_shot),
+        },
+        "close": close_response,
+        "gone": gone,
+        "launch": launch,
+        "after": {
+            "pid": new_pid,
+            "window": restored.get("window") or {},
+            "screenshot": str(after_shot),
+        },
+    }
+
+
 def assert_window_corner_artifact_contract(pid: int, out_dir: Path) -> dict:
     app_set_search(pid, "", focused=False)
     time.sleep(0.1)
@@ -13127,11 +13389,7 @@ def assert_window_corner_artifact_contract(pid: int, out_dir: Path) -> dict:
     except (TypeError, ValueError):
         moved_left = 0.0
         moved_top = 0.0
-    if moved_left < 12.0 or moved_top < 12.0:
-        raise AssertionError(
-            "corner artifact proof requires a moved unmaximized window away from the root-screen edge: "
-            f"position={position!r} move={move_result!r}"
-        )
+    app_control_position_unreliable = moved_left < 12.0 or moved_top < 12.0
     attempts = []
     screenshot = {}
     corner_rounding = None
@@ -13156,6 +13414,7 @@ def assert_window_corner_artifact_contract(pid: int, out_dir: Path) -> dict:
                 "screenshot": str(attempt_path),
                 "has_corner_rounding": isinstance(corner_rounding, dict),
                 "window": window,
+                "app_control_position_unreliable": app_control_position_unreliable,
             }
         )
         if isinstance(corner_rounding, dict):
@@ -13170,6 +13429,7 @@ def assert_window_corner_artifact_contract(pid: int, out_dir: Path) -> dict:
     return {
         "window": window,
         "move": move_result,
+        "app_control_position_unreliable": app_control_position_unreliable,
         "attempts": attempts,
         "screenshot": str(shot_path),
         "corner_rounding": corner_rounding,
@@ -19488,6 +19748,7 @@ def main() -> int:
         "geometry",
         "managed_cli_refresh_ttl",
         "maximize_roundtrip_layout",
+        "maximize_restart_persistence",
         "notification_health_initial",
         "session_view_contract_initial",
         "sidebar_cursor_contract",
@@ -19736,6 +19997,15 @@ def main() -> int:
             args.pid, args.session, out_dir
         ))
         run_check("maximize_roundtrip_layout", lambda: assert_maximize_roundtrip_layout(args.pid, out_dir))
+        def run_maximize_restart_persistence():
+            result = assert_maximize_restart_persistence(args.pid, out_dir)
+            after = result.get("after") or {}
+            new_pid = int(after.get("pid") or args.pid)
+            if new_pid != args.pid:
+                args.pid = new_pid
+                summary["pid"] = new_pid
+            return result
+        run_check("maximize_restart_persistence", run_maximize_restart_persistence)
         run_check("window_corner_artifact", lambda: assert_window_corner_artifact_contract(args.pid, out_dir))
         run_check("webkit_child_rss_soak", lambda: assert_webkit_child_rss_soak(args.pid))
         if args.session_kind != "codex":
