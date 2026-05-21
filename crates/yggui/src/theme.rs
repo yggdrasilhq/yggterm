@@ -113,83 +113,52 @@ pub fn gradient_background_repeat_css(spec: &YgguiThemeSpec) -> String {
 fn repeated_gradient_background_property(
     spec: &YgguiThemeSpec,
     layer_value: &'static str,
-    grain_value: &'static str,
+    _grain_value: &'static str,
 ) -> String {
-    let spec = clamp_theme_spec(spec);
-    let base_layers = if spec.colors.is_empty() {
-        1
-    } else {
-        spec.colors.len().min(MAX_RENDER_THEME_STOPS) + 1
-    };
-    let mut values = vec![layer_value; base_layers];
-    if spec.grain > 0.01 {
-        values.push(grain_value);
-    }
-    values.join(", ")
+    let _ = clamp_theme_spec(spec);
+    layer_value.to_string()
 }
 
 fn gradient_css_with_alpha_scale(
     theme: UiTheme,
     spec: &YgguiThemeSpec,
-    alpha_scale: f32,
+    _alpha_scale: f32,
 ) -> String {
     let spec = clamp_theme_spec(spec);
-    let alpha_scale = alpha_scale.clamp(0.0, 1.0);
     if spec.colors.is_empty() {
-        let mut layers = vec![default_gradient(theme, alpha_scale)];
-        let grain = grain_layer(theme, spec.grain, alpha_scale);
-        if !grain.is_empty() {
-            layers.push(grain);
-        }
-        return layers.join(", ");
+        return default_gradient(theme);
     }
-    let mut layers = spec
+    let mut stops = spec
         .colors
         .iter()
         .take(MAX_RENDER_THEME_STOPS)
         .enumerate()
         .map(|(index, stop)| {
-            let rgba =
-                rendered_stop_rgba(theme, stop, spec.brightness, spec.alpha, index, alpha_scale);
-            format!(
-                "radial-gradient(circle at {:.0}% {:.0}%, {} 0%, transparent 46%)",
-                stop.x * 100.0,
-                stop.y * 100.0,
-                rgba
-            )
+            let rgb = rendered_stop_rgb(theme, stop, spec.brightness, index);
+            let position = ((index as f32 / MAX_RENDER_THEME_STOPS as f32) * 84.0).round();
+            format!("rgb({}, {}, {}) {:.0}%", rgb.0, rgb.1, rgb.2, position)
         })
         .collect::<Vec<_>>();
-    layers.push(default_backdrop(theme, &spec, alpha_scale));
-    let grain = grain_layer(theme, spec.grain, alpha_scale);
-    if !grain.is_empty() {
-        layers.push(grain);
-    }
-    layers.join(", ")
+    let base = themed_shell_rgb(theme, &spec);
+    stops.push(format!("rgb({}, {}, {}) 100%", base.0, base.1, base.2));
+    format!("linear-gradient(135deg, {})", stops.join(", "))
 }
 
 pub fn shell_tint(theme: UiTheme, spec: &YgguiThemeSpec) -> String {
     let spec = clamp_theme_spec(spec);
     let rgb = themed_shell_rgb(theme, &spec);
-    let alpha = spec.alpha;
-    format!("rgba({}, {}, {}, {:.3})", rgb.0, rgb.1, rgb.2, alpha)
+    format!("rgb({}, {}, {})", rgb.0, rgb.1, rgb.2)
 }
 
 pub fn chrome_material_tint(theme: UiTheme, spec: &YgguiThemeSpec) -> String {
     let spec = clamp_theme_spec(spec);
     let rgb = themed_shell_rgb(theme, &spec);
     let brightness_lift = theme_brightness_lift(spec.brightness);
-    let alpha_control = spec.alpha;
-    let alpha = match theme {
-        UiTheme::ZedLight => 0.86 + brightness_lift * 0.04,
-        UiTheme::ZedDark => 0.78 + brightness_lift * 0.06,
-    } * (0.86 + alpha_control * 0.14);
-    format!(
-        "rgba({}, {}, {}, {:.3})",
-        rgb.0,
-        rgb.1,
-        rgb.2,
-        alpha.clamp(0.74, 0.92)
-    )
+    let polished = match theme {
+        UiTheme::ZedLight => mix_rgb(rgb, (255, 255, 255), 0.08 + brightness_lift * 0.05),
+        UiTheme::ZedDark => mix_rgb(rgb, (18, 24, 31), 0.08 + brightness_lift * 0.04),
+    };
+    format!("rgb({}, {}, {})", polished.0, polished.1, polished.2)
 }
 
 pub fn preview_surface_css(theme: UiTheme, spec: &YgguiThemeSpec) -> String {
@@ -209,89 +178,23 @@ pub fn dominant_accent(spec: &YgguiThemeSpec, fallback: &'static str) -> String 
         })
 }
 
-fn default_gradient(theme: UiTheme, alpha_scale: f32) -> String {
-    let alpha_scale = alpha_scale.clamp(0.0, 1.0);
-    match theme {
-        UiTheme::ZedLight => format!(
-            "linear-gradient(180deg, rgba(236,243,248,{:.3}) 0%, rgba(240,245,249,{:.3}) 50%, rgba(232,238,244,{:.3}) 100%)",
-            0.86 * alpha_scale,
-            0.78 * alpha_scale,
-            0.86 * alpha_scale
-        ),
-        UiTheme::ZedDark => format!(
-            "linear-gradient(180deg, rgba(56,74,92,{:.3}) 0%, rgba(48,60,76,{:.3}) 50%, rgba(32,38,48,{:.3}) 100%)",
-            0.76 * alpha_scale,
-            0.70 * alpha_scale,
-            0.82 * alpha_scale
-        ),
-    }
-}
-
-fn default_backdrop(theme: UiTheme, spec: &YgguiThemeSpec, alpha_scale: f32) -> String {
-    let base = themed_shell_rgb(theme, spec);
-    let brightness_lift = theme_brightness_lift(spec.brightness);
-    let global_alpha = spec.alpha;
-    let alpha_scale = alpha_scale.clamp(0.0, 1.0);
-    let (top, middle, bottom, top_alpha, middle_alpha, bottom_alpha) = match theme {
-        UiTheme::ZedLight => (
-            mix_rgb(base, (255, 255, 255), 0.34),
-            mix_rgb(base, (243, 247, 250), 0.44),
-            mix_rgb(base, (232, 238, 244), 0.52),
-            0.66 + brightness_lift * 0.08,
-            0.60 + brightness_lift * 0.08,
-            0.72 + brightness_lift * 0.06,
-        ),
-        UiTheme::ZedDark => (
-            mix_rgb(base, (92, 110, 128), 0.20),
-            mix_rgb(base, (48, 56, 68), 0.18),
-            mix_rgb(base, (24, 28, 36), 0.26),
-            0.48 + brightness_lift * 0.08,
-            0.42 + brightness_lift * 0.07,
-            0.58 + brightness_lift * 0.06,
-        ),
-    };
-    format!(
-        "linear-gradient(180deg, rgba({}, {}, {}, {:.3}) 0%, rgba({}, {}, {}, {:.3}) 54%, rgba({}, {}, {}, {:.3}) 100%)",
-        top.0,
-        top.1,
-        top.2,
-        top_alpha * global_alpha * alpha_scale,
-        middle.0,
-        middle.1,
-        middle.2,
-        middle_alpha * global_alpha * alpha_scale,
-        bottom.0,
-        bottom.1,
-        bottom.2,
-        bottom_alpha * global_alpha * alpha_scale
-    )
-}
-
-fn grain_layer(theme: UiTheme, grain: f32, alpha_scale: f32) -> String {
-    if grain <= 0.01 {
-        return String::new();
-    }
-    let alpha = (0.020 + grain * 0.070) * alpha_scale.clamp(0.35, 1.0);
+fn default_gradient(theme: UiTheme) -> String {
     match theme {
         UiTheme::ZedLight => {
-            format!(
-                "radial-gradient(circle at 1px 1px, rgba(70,88,104,{alpha:.3}) 0.55px, transparent 0.75px)"
-            )
+            "linear-gradient(180deg, rgb(236, 243, 248) 0%, rgb(240, 245, 249) 50%, rgb(232, 238, 244) 100%)".to_string()
         }
-        UiTheme::ZedDark => format!(
-            "radial-gradient(circle at 1px 1px, rgba(255,255,255,{alpha:.3}) 0.55px, transparent 0.75px)"
-        ),
+        UiTheme::ZedDark => {
+            "linear-gradient(180deg, rgb(56, 74, 92) 0%, rgb(48, 60, 76) 50%, rgb(32, 38, 48) 100%)".to_string()
+        }
     }
 }
 
-fn rendered_stop_rgba(
+fn rendered_stop_rgb(
     theme: UiTheme,
     stop: &YgguiThemeColorStop,
     brightness: f32,
-    global_alpha: f32,
     index: usize,
-    alpha_scale: f32,
-) -> String {
+) -> (u8, u8, u8) {
     let color = normalize_hex_color(&stop.color).unwrap_or_else(|| FALLBACK_COLOR.to_string());
     let rgb = hex_to_rgb(&color).unwrap_or((124, 200, 255));
     let anchor = match theme {
@@ -310,14 +213,20 @@ fn rendered_stop_rgba(
         UiTheme::ZedLight => mix_rgb(softened, (255, 255, 255), 0.10 + brightness * 0.08),
         UiTheme::ZedDark => mix_rgb(softened, (230, 240, 248), 0.06 + brightness * 0.05),
     };
-    let layer_alpha = (stop.alpha * global_alpha * (0.30 + brightness * 0.28) + 0.08
-        - index as f32 * 0.04)
-        .clamp(0.12, 0.54)
-        * alpha_scale.clamp(0.0, 1.0);
-    format!(
-        "rgba({}, {}, {}, {:.3})",
-        polished.0, polished.1, polished.2, layer_alpha
-    )
+    let base = themed_shell_rgb(
+        theme,
+        &YgguiThemeSpec {
+            colors: vec![stop.clone()],
+            brightness,
+            alpha: STABLE_THEME_ALPHA,
+            grain: STABLE_THEME_GRAIN,
+        },
+    );
+    let index_lift = (index as f32 * 0.035).min(0.12);
+    match theme {
+        UiTheme::ZedLight => mix_rgb(polished, base, 0.18 + index_lift),
+        UiTheme::ZedDark => mix_rgb(polished, base, 0.24 + index_lift),
+    }
 }
 
 fn themed_shell_rgb(theme: UiTheme, spec: &YgguiThemeSpec) -> (u8, u8, u8) {
@@ -517,13 +426,7 @@ mod tests {
             spec = append_theme_stop(&spec, Some("#7cc8ff"));
         }
         let gradient = gradient_css(UiTheme::ZedDark, &spec);
-        assert_eq!(
-            gradient.matches("radial-gradient(circle at ").count()
-                - gradient
-                    .matches("radial-gradient(circle at 1px 1px")
-                    .count(),
-            MAX_RENDER_THEME_STOPS
-        );
+        assert_eq!(gradient.matches("rgb(").count(), MAX_RENDER_THEME_STOPS + 1);
     }
 
     #[test]
@@ -610,20 +513,13 @@ mod tests {
         let size = gradient_background_size_css(&spec);
         let repeat = gradient_background_repeat_css(&spec);
 
-        assert_eq!(size.split(',').count(), spec.colors.len() + 1);
-        assert_eq!(repeat.split(',').count(), spec.colors.len() + 1);
+        assert_eq!(size, "100% 100%");
+        assert_eq!(repeat, "no-repeat");
         assert!(!size.ends_with("4px 4px"));
-        assert!(repeat.split(',').all(|layer| layer.trim() == "no-repeat"));
-        assert_eq!(size.matches("100% 100%").count(), spec.colors.len() + 1);
-        assert_eq!(repeat.matches("no-repeat").count(), spec.colors.len() + 1);
 
         spec.grain = 0.0;
         assert!(!gradient_background_size_css(&spec).contains("4px 4px"));
-        assert!(
-            gradient_background_repeat_css(&spec)
-                .split(',')
-                .all(|part| part.trim() == "no-repeat")
-        );
+        assert_eq!(gradient_background_repeat_css(&spec), "no-repeat");
     }
 
     #[test]
@@ -643,7 +539,36 @@ mod tests {
         assert_eq!(low_gradient, high_gradient);
         assert_eq!(low_tint, high_tint);
         assert_eq!(low_material, high_material);
-        assert!(low_tint.contains("0.960"));
+        assert!(low_tint.starts_with("rgb("));
+        assert!(!low_tint.contains("rgba("));
+    }
+
+    #[test]
+    fn stable_theme_css_exports_opaque_single_layer_material() {
+        let mut spec = default_theme_editor_spec();
+        spec.alpha = 0.18;
+        spec.grain = 0.84;
+
+        let gradient = gradient_css(UiTheme::ZedLight, &spec);
+        let tint = shell_tint(UiTheme::ZedLight, &spec);
+        let material = chrome_material_tint(UiTheme::ZedLight, &spec);
+
+        for css in [&gradient, &tint, &material] {
+            assert!(
+                !css.contains("rgba("),
+                "stable theme CSS must not expose alpha channels: {css}"
+            );
+            assert!(
+                !css.contains("transparent"),
+                "stable theme CSS must not expose transparent layers: {css}"
+            );
+        }
+        assert!(
+            !gradient.contains("radial-gradient("),
+            "stable shell material must stay a single opaque layer: {gradient}"
+        );
+        assert_eq!(gradient_background_size_css(&spec), "100% 100%");
+        assert_eq!(gradient_background_repeat_css(&spec), "no-repeat");
     }
 
     #[test]
@@ -657,10 +582,8 @@ mod tests {
             normal.matches("radial-gradient(circle at").count(),
             blurred.matches("radial-gradient(circle at").count()
         );
-        assert!(
-            blurred.contains("rgba("),
-            "blur material should still export tinted layers"
-        );
+        assert!(!blurred.contains("rgba("));
+        assert!(!blurred.contains("transparent"));
     }
 
     #[test]
@@ -675,21 +598,15 @@ mod tests {
     }
 
     #[test]
-    fn chrome_material_tint_stays_readable_on_transparent_window_backends() {
+    fn chrome_material_tint_stays_opaque_on_transparent_window_backends() {
         let mut spec = default_theme_editor_spec();
         spec.alpha = 0.10;
         let light = chrome_material_tint(UiTheme::ZedLight, &spec);
         let dark = chrome_material_tint(UiTheme::ZedDark, &spec);
-        let alpha = |value: &str| {
-            value
-                .trim_end_matches(')')
-                .split(',')
-                .next_back()
-                .and_then(|part| part.trim().parse::<f32>().ok())
-                .unwrap()
-        };
 
-        assert!(alpha(&light) >= 0.80);
-        assert!(alpha(&dark) >= 0.74);
+        assert!(light.starts_with("rgb("));
+        assert!(dark.starts_with("rgb("));
+        assert!(!light.contains("rgba("));
+        assert!(!dark.contains("rgba("));
     }
 }

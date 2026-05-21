@@ -7,8 +7,21 @@ Yggterm sessions are durable handles for a terminal routine, not a second render
 - The daemon owns live PTY identity and I/O.
 - Codex transcript JSONL identity is the saved-session identity when it is available.
 - Synthetic runtime keys such as `codex-runtime://...` are terminal I/O keys only. They must not become user-facing saved-session identity.
-- Generic remote shell runtimes may use daemon keys such as `live::...`; the key remains the terminal runtime handle, but the UI must still classify it as one live SSH session and project it into Live Sessions plus the matching machine/cwd group when cwd is known.
-- Sidebar rows may appear in Live Sessions and in their cwd/machine group, but both views must resolve to the same session id and metadata record.
+- Generic local and remote shell runtimes may use daemon keys such as
+  `live::...`. These keys are terminal runtime handles only. Plain terminals
+  appear in `Live Sessions` while they are running and do not create cwd tree,
+  Startpage, title/summary, or saved-session rows. The cwd is launch
+  provenance, not workspace identity.
+- Durable sessions and app-grade surfaces may appear in `Live Sessions` and in
+  their cwd/machine group, but both views must resolve to the same session id
+  and metadata record.
+- A fresh remote Codex start is runtime-only until Codex exposes a real transcript storage path. If the user closes the onboarding surface before `Codex Session` and `Storage` metadata exist, the daemon must remove the live runtime and must not create a saved `remote-session://...` row.
+- Fresh remote Codex onboarding, sign-in, and setup menus are still interactive
+  PTY surfaces. The GUI must allow input and dismiss resume/loading gates when
+  xterm shows one of those menus, even though the runtime is not yet a durable
+  saved session and has no prompt-ready transcript identity. This includes
+  truncated visible tails of the same auth menu after Codex logo art; a partial
+  xterm sample must not turn the menu into stale non-prompt text.
 - The `Live Sessions` row order is user-owned once the user drags rows. The
   daemon persists that order and restore must replay it exactly. Focusing,
   switching, refreshing, or restart recovery must not silently convert the list
@@ -27,6 +40,12 @@ arrive out of order. It must reconcile them to the same saved-session identity
 before allowing rename, copy regeneration, keep-alive state, cwd placement, or
 terminal open to mutate durable state. If reconciliation fails, surface an
 incident state instead of promoting the first projection to truth.
+
+When the same durable live runtime is projected in both Live Sessions and a
+machine/cwd folder, drag/drop feedback is row-local. Dragging the Live Sessions
+copy may not also show a ghost drag on the cwd projection, even though both rows
+resolve to the same runtime path. Plain terminals have no cwd projection, so
+their row order is only the `Live Sessions` order.
 
 The shell-side heuristics that decide whether visible title copy is low-signal,
 whether passive copy generation may start, and how generic terminal labels are
@@ -90,6 +109,17 @@ daemon for both Codex sessions and generic SSH terminals.
 ## UI Contract
 
 - Startpage cards show the title, long UUID, cwd/host context, and the current summary/timeline preview.
+- Web View is a provider-backed conversation surface. Codex and terminal-backed
+  sessions render stored transcript/context blocks read-only; they do not expose
+  a composer and do not type through the terminal. Future chat apps can reuse the
+  same Web View shell only after declaring an explicit API provider and send
+  capability.
+- Startpage saved-session cards are durable saved-session rows only. Live
+  runtime projections, generic SSH terminals keyed by `live::...`, and fresh
+  remote Codex starts without transcript `storage_path` stay out of saved UUID
+  cards on the Startpage. Generic SSH/local terminals are visible only through
+  `Live Sessions`; durable remote Codex starts may project into machine/cwd
+  only after transcript identity is known.
 - A scoped Startpage's recent-work list is scoped by both machine and cwd. A
   local folder such as `/home/pi` may show only local stored/live sessions under
   that cwd; remote sessions on `dev`, `practice`, or any other machine require a
@@ -102,7 +132,11 @@ daemon for both Codex sessions and generic SSH terminals.
 - Summary edit/append uses a pencil action on the right side of the card and in the titlebar summary surface.
 - The titlebar summary surface presents a scrollable timeline; selecting a timeline entry shows that paragraph without changing terminal focus.
 - UUIDs are degraded fallback labels, not a normal steady state.
-- Startpage actions are for local/recent work and the currently scoped folder: new Codex session, local terminal, folder creation, rename, and summary edits. SSH connection belongs in the titlebar/right rail or context surfaces, not as a Startpage button.
+- Startpage actions are for local/recent work and the currently scoped folder:
+  new Codex session, New Terminal, folder creation, rename, and summary edits.
+  New Terminal starts a transient live PTY in that cwd; it does not create a
+  saved session card. SSH connection belongs in the titlebar/right rail or
+  context surfaces, not as a Startpage button.
 
 ## Non-Goals
 

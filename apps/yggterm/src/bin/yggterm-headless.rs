@@ -30,7 +30,7 @@ use yggterm_server::{
     run_app_control_restart_pending_update, run_app_control_scroll_preview,
     run_app_control_scroll_right_panel, run_app_control_send_terminal_input,
     run_app_control_set_clipboard_png_base64, run_app_control_set_clipboard_text,
-    run_app_control_set_fullscreen, run_app_control_set_main_zoom,
+    run_app_control_set_fullscreen, run_app_control_set_main_zoom, run_app_control_set_maximized,
     run_app_control_set_right_panel_mode, run_app_control_set_row_expanded,
     run_app_control_set_search, run_app_control_set_session_keep_alive,
     run_app_control_set_theme_editor_open, run_app_control_set_theme_editor_values,
@@ -174,6 +174,7 @@ fn print_server_app_help() {
   yggterm-headless server app screenshot [output] [--pid <pid>]
   yggterm-headless server app open <session-path> [--view <terminal|preview>] [--pid <pid>]
   yggterm-headless server app resize-window --width <px> --height <px> [--pid <pid>]
+  yggterm-headless server app maximize <on|off|toggle> [--pid <pid>]
   yggterm-headless server app session <remove|delete> <session-path> [--pid <pid>]
   yggterm-headless server app start-page [--pid <pid>]
   yggterm-headless server app update <check|restart>
@@ -1460,6 +1461,31 @@ fn main() -> Result<()> {
                 };
                 run_app_control_set_fullscreen(enabled, timeout_ms)
             }
+            "maximize" | "maximized" => {
+                let action = cli_positional_args(&args, 3)
+                    .into_iter()
+                    .next()
+                    .unwrap_or("toggle");
+                let current_state = yggterm_server::request_app_control(
+                    store.home_dir(),
+                    yggterm_server::AppControlCommand::DescribeState,
+                    timeout_ms,
+                )?;
+                let currently_maximized = current_state
+                    .data
+                    .as_ref()
+                    .and_then(|data| data.get("window"))
+                    .and_then(|window| window.get("maximized"))
+                    .and_then(|value| value.as_bool())
+                    .unwrap_or(false);
+                let enabled = match action {
+                    "on" | "true" | "1" => true,
+                    "off" | "false" | "0" => false,
+                    "toggle" => !currently_maximized,
+                    other => anyhow::bail!("unsupported maximize action: {other}"),
+                };
+                run_app_control_set_maximized(enabled, timeout_ms)
+            }
             "open" => {
                 let session_path = cli_positional_args(&args, 3)
                     .into_iter()
@@ -2021,6 +2047,14 @@ mod tests {
         assert!(source.contains("run_app_control_set_theme_editor_open"));
         assert!(source.contains("run_app_control_reset_theme_editor"));
         assert!(source.contains("run_app_control_set_theme_editor_values"));
+    }
+
+    #[test]
+    fn headless_app_control_exposes_maximize_command() {
+        let source = include_str!("yggterm-headless.rs");
+        assert!(source.contains("server app maximize <on|off|toggle>"));
+        assert!(source.contains("\"maximize\" | \"maximized\" =>"));
+        assert!(source.contains("run_app_control_set_maximized(enabled, timeout_ms)"));
     }
 
     #[test]

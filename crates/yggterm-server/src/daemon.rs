@@ -727,6 +727,33 @@ fn owner_endpoint_label(endpoint: &ServerEndpoint) -> String {
     PreservedOwnerEndpoint::from_endpoint(endpoint).label()
 }
 
+fn server_endpoints_same_target(left: &ServerEndpoint, right: &ServerEndpoint) -> bool {
+    match (left, right) {
+        #[cfg(unix)]
+        (ServerEndpoint::UnixSocket(left_path), ServerEndpoint::UnixSocket(right_path)) => {
+            if left_path == right_path {
+                return true;
+            }
+            let left_identity = fs::canonicalize(left_path).unwrap_or_else(|_| left_path.clone());
+            let right_identity =
+                fs::canonicalize(right_path).unwrap_or_else(|_| right_path.clone());
+            left_identity == right_identity
+        }
+        (
+            ServerEndpoint::Tcp {
+                host: left_host,
+                port: left_port,
+            },
+            ServerEndpoint::Tcp {
+                host: right_host,
+                port: right_port,
+            },
+        ) => left_host == right_host && left_port == right_port,
+        #[allow(unreachable_patterns)]
+        _ => false,
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct PreservedTerminalOwnerEntry {
     runtime_key: String,
@@ -900,6 +927,102 @@ impl PreservedTerminalOwnerRegistry {
             return Ok(false);
         }
         self.retarget_expected_server_version(home_dir, Some(SERVER_PROTOCOL_VERSION.to_string()))
+    }
+
+    fn retarget_current_alias_entries(
+        &mut self,
+        home_dir: &Path,
+        current_endpoint: &ServerEndpoint,
+        reachable_owner_statuses: &[(ServerEndpoint, ServerRuntimeStatus)],
+        current_pid: u32,
+        reason: &'static str,
+    ) -> Result<bool> {
+        if self.entries.is_empty() {
+            return Ok(false);
+        }
+        let before = self.entries.clone();
+        let mut retargeted = Vec::new();
+        let mut unresolved = Vec::new();
+        for entry in &mut self.entries {
+            let entry_endpoint = entry.endpoint.to_endpoint();
+            if !server_endpoints_same_target(&entry_endpoint, current_endpoint) {
+                continue;
+            }
+            let candidate = preserved_owner_candidate_for_runtime_key(
+                reachable_owner_statuses.to_vec(),
+                &entry.runtime_key,
+                current_pid,
+            );
+            let Some((owner_endpoint, owner_status)) = candidate else {
+                unresolved.push(serde_json::json!({
+                    "runtime_key": entry.runtime_key,
+                    "old_endpoint": owner_endpoint_label(&entry_endpoint),
+                    "old_owner_server_version": entry.owner_server_version,
+                    "old_owner_server_pid": entry.owner_server_pid,
+                }));
+                continue;
+            };
+            if server_endpoints_same_target(&owner_endpoint, current_endpoint) {
+                unresolved.push(serde_json::json!({
+                    "runtime_key": entry.runtime_key,
+                    "old_endpoint": owner_endpoint_label(&entry_endpoint),
+                    "candidate_endpoint": owner_endpoint_label(&owner_endpoint),
+                    "candidate_owner_server_version": owner_status.server_version,
+                    "candidate_owner_server_pid": owner_status.server_pid,
+                    "reason": "candidate_is_current_endpoint",
+                }));
+                continue;
+            }
+            retargeted.push(serde_json::json!({
+                "runtime_key": entry.runtime_key,
+                "old_endpoint": owner_endpoint_label(&entry_endpoint),
+                "new_endpoint": owner_endpoint_label(&owner_endpoint),
+                "old_owner_server_version": entry.owner_server_version,
+                "new_owner_server_version": owner_status.server_version,
+                "old_owner_server_pid": entry.owner_server_pid,
+                "new_owner_server_pid": owner_status.server_pid,
+            }));
+            entry.endpoint = PreservedOwnerEndpoint::from_endpoint(&owner_endpoint);
+            entry.owner_server_version = owner_status.server_version;
+            entry.owner_server_build_id = owner_status.server_build_id;
+            entry.owner_server_pid = owner_status.server_pid;
+            entry.created_at_ms = current_millis_u64();
+        }
+        if self.entries == before {
+            if !unresolved.is_empty() {
+                append_trace_event(
+                    home_dir,
+                    "daemon",
+                    "hot_update",
+                    "preserved_owner_current_alias_unresolved",
+                    serde_json::json!({
+                        "reason": reason,
+                        "current_endpoint": owner_endpoint_label(current_endpoint),
+                        "unresolved": unresolved,
+                    }),
+                );
+            }
+            return Ok(false);
+        }
+        self.entries
+            .sort_by(|left, right| left.runtime_key.cmp(&right.runtime_key));
+        self.entries
+            .dedup_by(|left, right| left.runtime_key == right.runtime_key);
+        self.save(home_dir)?;
+        append_trace_event(
+            home_dir,
+            "daemon",
+            "hot_update",
+            "preserved_owner_current_alias_retargeted",
+            serde_json::json!({
+                "reason": reason,
+                "current_endpoint": owner_endpoint_label(current_endpoint),
+                "retargeted": retargeted,
+                "unresolved": unresolved,
+                "remaining_runtime_keys": self.keys(),
+            }),
+        );
+        Ok(true)
     }
 
     fn keys(&self) -> Vec<String> {
@@ -1608,10 +1731,6 @@ impl DaemonRuntime {
             restored_live_sessions,
             restored_remote_machines,
         };
-        runtime.restore_missing_preserved_owner_live_sessions("runtime_load");
-        runtime
-            .recover_missing_preserved_owner_live_sessions_from_reachable_daemons("runtime_load");
-        runtime.prune_unrepresented_preserved_owners("runtime_load");
         let preserved_owner_registry_retargeted = runtime
             .preserved_terminal_owners
             .retarget_loaded_registry_for_current_version(runtime.store.home_dir())?;
@@ -1628,6 +1747,24 @@ impl DaemonRuntime {
                 }),
             );
         }
+        let current_endpoint = default_endpoint(runtime.store.home_dir());
+        let reachable_owner_statuses = reachable_versioned_daemon_statuses_excluding_endpoint(
+            runtime.store.home_dir(),
+            &current_endpoint,
+        );
+        let _ = runtime
+            .preserved_terminal_owners
+            .retarget_current_alias_entries(
+                runtime.store.home_dir(),
+                &current_endpoint,
+                &reachable_owner_statuses,
+                std::process::id(),
+                "runtime_load",
+            )?;
+        runtime.restore_missing_preserved_owner_live_sessions("runtime_load");
+        runtime
+            .recover_missing_preserved_owner_live_sessions_from_reachable_daemons("runtime_load");
+        runtime.prune_unrepresented_preserved_owners("runtime_load");
         runtime.prune_unrepresented_preserved_owner_runtime_sessions("runtime_load");
         perf.finish(serde_json::json!({
             "prefer_ghostty_backend": settings.prefer_ghostty_backend,
@@ -1827,7 +1964,7 @@ impl DaemonRuntime {
         }
         let entry = self.preserved_terminal_owners.owner_for_key(runtime_key)?;
         let endpoint = entry.endpoint.to_endpoint();
-        if endpoint == default_endpoint(self.store.home_dir()) {
+        if server_endpoints_same_target(&endpoint, &default_endpoint(self.store.home_dir())) {
             return None;
         }
         Some(endpoint)
@@ -1856,7 +1993,7 @@ impl DaemonRuntime {
             .preserved_terminal_owners
             .owner_for_key(runtime_key)
             .map(|entry| entry.endpoint.to_endpoint())
-            .filter(|endpoint| endpoint != &current_endpoint);
+            .filter(|endpoint| !server_endpoints_same_target(endpoint, &current_endpoint));
         if let Some(owner_endpoint) = owner_endpoint {
             match remove_session(&owner_endpoint, runtime_key) {
                 Ok((_snapshot, message)) => {
@@ -1899,7 +2036,7 @@ impl DaemonRuntime {
         }
         let current_endpoint = default_endpoint(self.store.home_dir());
         for (owner_endpoint, owner_registry_keys) in endpoint_groups {
-            if owner_endpoint == current_endpoint {
+            if server_endpoints_same_target(&owner_endpoint, &current_endpoint) {
                 continue;
             }
             let missing_keys = owner_registry_keys
@@ -2116,7 +2253,7 @@ impl DaemonRuntime {
         let mut status_cache = BTreeMap::<String, Option<ServerRuntimeStatus>>::new();
         for entry in &self.preserved_terminal_owners.entries {
             let owner_endpoint = entry.endpoint.to_endpoint();
-            if owner_endpoint == current_endpoint {
+            if server_endpoints_same_target(&owner_endpoint, &current_endpoint) {
                 continue;
             }
             let label = entry.endpoint.label();
@@ -2131,7 +2268,7 @@ impl DaemonRuntime {
         let current_endpoint = default_endpoint(self.store.home_dir());
         let mut owner_status_cache = BTreeMap::<String, Option<ServerRuntimeStatus>>::new();
         for (owner_endpoint, _runtime_keys) in self.preserved_terminal_owners.endpoint_groups() {
-            if owner_endpoint == current_endpoint {
+            if server_endpoints_same_target(&owner_endpoint, &current_endpoint) {
                 continue;
             }
             let label = owner_endpoint_label(&owner_endpoint);
@@ -2187,7 +2324,7 @@ impl DaemonRuntime {
         }
         let current_endpoint = default_endpoint(self.store.home_dir());
         for (owner_endpoint, owner_registry_keys) in endpoint_groups {
-            if owner_endpoint == current_endpoint {
+            if server_endpoints_same_target(&owner_endpoint, &current_endpoint) {
                 continue;
             }
             let owner_status = match status(&owner_endpoint) {
@@ -2372,7 +2509,7 @@ impl DaemonRuntime {
         }
     }
 
-    fn prune_duplicate_legacy_owned_runtime_sessions(&self, reason: &'static str) {
+    fn prune_duplicate_legacy_owned_runtime_sessions(&mut self, reason: &'static str) {
         let current_runtime_keys = self
             .terminals
             .session_keys()
@@ -2407,7 +2544,24 @@ impl DaemonRuntime {
                     &runtime_key,
                     Some("duplicate_legacy_owned_runtime_prune"),
                 ) {
-                    Ok(_message) => removed_runtime_keys.push(runtime_key),
+                    Ok(_message) => {
+                        let registry_points_to_owner = self
+                            .preserved_terminal_owners
+                            .owner_for_key(&runtime_key)
+                            .is_some_and(|entry| {
+                                server_endpoints_same_target(
+                                    &entry.endpoint.to_endpoint(),
+                                    &owner_endpoint,
+                                )
+                            });
+                        if registry_points_to_owner {
+                            self.remove_preserved_owner(
+                                &runtime_key,
+                                "duplicate_legacy_owned_runtime_pruned_current_owned",
+                            );
+                        }
+                        removed_runtime_keys.push(runtime_key);
+                    }
                     Err(error) => errors.push(serde_json::json!({
                         "runtime_key": runtime_key,
                         "error": error.to_string(),
@@ -2586,7 +2740,13 @@ impl DaemonRuntime {
         }
     }
 
-    fn preserved_owner_endpoint_for_request(&self, runtime_key: &str) -> Option<ServerEndpoint> {
+    fn preserved_owner_endpoint_for_request(
+        &mut self,
+        runtime_key: &str,
+    ) -> Option<ServerEndpoint> {
+        if self.terminals.has_session(runtime_key) {
+            return None;
+        }
         self.preserved_owner_for_runtime_key(runtime_key)
     }
 
@@ -3036,6 +3196,22 @@ impl DaemonRuntime {
                 return Ok(prepare_message);
             }
             if needs_restart {
+                if let Some(reason) = self.server.terminal_launch_blocked_reason(path) {
+                    if let Ok(home) = crate::resolve_yggterm_home() {
+                        append_trace_event(
+                            &home,
+                            "daemon",
+                            "terminal_ensure",
+                            "restart_blocked_by_launch_error",
+                            serde_json::json!({
+                                "path": path,
+                                "runtime_path": runtime_path,
+                                "reason": reason,
+                            }),
+                        );
+                    }
+                    bail!("{reason}");
+                }
                 let stop_command = self.server.terminal_stop_command(path);
                 if let Ok(home) = crate::resolve_yggterm_home() {
                     append_trace_event(
@@ -3077,6 +3253,22 @@ impl DaemonRuntime {
             }
             self.prune_duplicate_legacy_owned_runtime_sessions("terminal_ensure_restart");
             return Ok(prepare_message);
+        }
+        if let Some(reason) = self.server.terminal_launch_blocked_reason(path) {
+            if let Ok(home) = crate::resolve_yggterm_home() {
+                append_trace_event(
+                    &home,
+                    "daemon",
+                    "terminal_ensure",
+                    "ensure_session_blocked_by_launch_error",
+                    serde_json::json!({
+                        "path": path,
+                        "runtime_path": runtime_path,
+                        "reason": reason,
+                    }),
+                );
+            }
+            bail!("{reason}");
         }
         if let Ok(home) = crate::resolve_yggterm_home() {
             append_trace_event(
@@ -4313,6 +4505,7 @@ impl DaemonRuntime {
                     stop_command.as_deref(),
                     initial_size,
                 )?;
+                self.prune_duplicate_legacy_owned_runtime_sessions("terminal_restart");
                 self.persist()?;
                 if force_remote {
                     spawn_force_remote_restart_daemon_cleanup(
@@ -7078,10 +7271,14 @@ fn linux_daemon_runtime_activity_protected_for_cleanup(
     current_version_terminal_keys: &HashSet<String>,
     home_has_live_bridge_process: bool,
 ) -> bool {
+    let is_registered_preserved_owner = preserved_owner_pids.contains(&pid);
     let duplicate_current_runtime = runtime_status.is_some_and(|status| {
         linux_runtime_status_duplicates_current_version(status, current_version_terminal_keys)
     });
     if owner_registry_guard_active {
+        if is_registered_preserved_owner {
+            return true;
+        }
         if duplicate_current_runtime {
             return false;
         }
@@ -7099,9 +7296,6 @@ fn linux_daemon_runtime_activity_protected_for_cleanup(
             if status.owned_terminal_session_count > 0 {
                 return true;
             }
-        }
-        if preserved_owner_pids.contains(&pid) {
-            return true;
         }
         if clean_preserved_owner_available {
             return false;
@@ -9294,6 +9488,137 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn hot_update_owner_registry_is_not_pruned_by_key_presence_alone() {
+        let root = std::env::temp_dir().join(format!(
+            "yggterm-hot-update-current-owner-preserve-{}-{}",
+            std::process::id(),
+            super::current_millis_u64()
+        ));
+        let home = root.join(".yggterm");
+        fs::create_dir_all(&home).expect("create temp home");
+        let owner_endpoint = super::ServerEndpoint::UnixSocket(home.join("server-2-7-12.sock"));
+        let owner_status: ServerRuntimeStatus = serde_json::from_value(serde_json::json!({
+            "server_version": "2.7.12",
+            "server_build_id": 12,
+            "server_pid": 2712,
+            "host_kind": "local",
+            "host_detail": "test",
+            "embedded_surface_supported": true,
+            "bridge_enabled": true,
+            "owned_terminal_session_count": 2,
+            "owned_terminal_session_keys": [
+                "remote-session://jyas-webapp/current",
+                "remote-session://jyas-webapp/other"
+            ],
+            "terminal_session_count": 2,
+            "terminal_session_keys": [
+                "remote-session://jyas-webapp/current",
+                "remote-session://jyas-webapp/other"
+            ],
+        }))
+        .expect("status");
+        let registry = super::PreservedTerminalOwnerRegistry::write_handoff(
+            &home,
+            &owner_endpoint,
+            &owner_status,
+            Some("2.7.13".to_string()),
+            vec![
+                "remote-session://jyas-webapp/current".to_string(),
+                "remote-session://jyas-webapp/other".to_string(),
+            ],
+            Vec::new(),
+        )
+        .expect("write registry");
+
+        assert_eq!(
+            registry.keys(),
+            vec![
+                "remote-session://jyas-webapp/current".to_string(),
+                "remote-session://jyas-webapp/other".to_string()
+            ],
+            "a current daemon with the same key must not erase preserved-owner state until the duplicate owner is explicitly pruned"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hot_update_owner_registry_retargets_current_alias_to_reachable_owner() {
+        let root = std::env::temp_dir().join(format!(
+            "yggterm-hot-update-current-alias-retarget-{}-{}",
+            std::process::id(),
+            super::current_millis_u64()
+        ));
+        let home = root.join(".yggterm");
+        fs::create_dir_all(&home).expect("create temp home");
+        let current_endpoint = super::ServerEndpoint::UnixSocket(home.join("server-2-7-18.sock"));
+        let current_alias_path = home.join("server-2-1-0.sock");
+        if let super::ServerEndpoint::UnixSocket(path) = &current_endpoint {
+            fs::write(path, b"current").expect("write current endpoint placeholder");
+        }
+        std::os::unix::fs::symlink(
+            match &current_endpoint {
+                super::ServerEndpoint::UnixSocket(path) => path,
+                super::ServerEndpoint::Tcp { .. } => unreachable!(),
+            },
+            &current_alias_path,
+        )
+        .expect("create current alias");
+        let owner_endpoint = super::ServerEndpoint::UnixSocket(home.join("server-2-7-9.sock"));
+        let owner_status: ServerRuntimeStatus = serde_json::from_value(serde_json::json!({
+            "server_version": "2.7.9",
+            "server_build_id": 9,
+            "server_pid": 279,
+            "host_kind": "local",
+            "host_detail": "test",
+            "embedded_surface_supported": true,
+            "bridge_enabled": true,
+            "owned_terminal_session_count": 1,
+            "owned_terminal_session_keys": ["remote-session://dev/kept"],
+            "terminal_session_count": 1,
+            "terminal_session_keys": ["remote-session://dev/kept"],
+        }))
+        .expect("owner status");
+        let mut registry = super::PreservedTerminalOwnerRegistry {
+            schema_version: super::preserved_terminal_owner_schema_version(),
+            expected_server_version: Some("2.7.18".to_string()),
+            entries: vec![super::PreservedTerminalOwnerEntry {
+                runtime_key: "remote-session://dev/kept".to_string(),
+                endpoint: super::PreservedOwnerEndpoint::from_endpoint(
+                    &super::ServerEndpoint::UnixSocket(current_alias_path),
+                ),
+                owner_server_version: "2.7.16".to_string(),
+                owner_server_build_id: 16,
+                owner_server_pid: 2716,
+                created_at_ms: 1,
+            }],
+        };
+
+        let changed = registry
+            .retarget_current_alias_entries(
+                &home,
+                &current_endpoint,
+                &[(owner_endpoint.clone(), owner_status)],
+                218,
+                "test",
+            )
+            .expect("retarget current alias");
+
+        assert!(changed);
+        let entry = registry
+            .owner_for_key("remote-session://dev/kept")
+            .expect("retargeted entry");
+        assert!(super::server_endpoints_same_target(
+            &entry.endpoint.to_endpoint(),
+            &owner_endpoint
+        ));
+        assert_eq!(entry.owner_server_version, "2.7.9");
+        assert_eq!(entry.owner_server_pid, 279);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn runtime_load_retargets_preserved_owner_registry_without_dropping_keys() {
         let root = std::env::temp_dir().join(format!(
             "yggterm-runtime-load-owner-retarget-{}-{}",
@@ -10189,7 +10514,22 @@ mod tests {
             HashSet::from(["local://kept".to_string(), "local://closed".to_string()]);
         let preserved_owner_pids = HashSet::from([163]);
         let preserved_owner_runtime_keys = HashSet::from(["local://kept".to_string()]);
+        let exact_preserved_owner =
+            status_for_cleanup_test("2.1.170", 163, &["local://kept"], &[], &["local://kept"]);
 
+        assert!(
+            linux_daemon_runtime_activity_protected_for_cleanup(
+                163,
+                Some(&exact_preserved_owner),
+                &preserved_owner_pids,
+                &preserved_owner_runtime_keys,
+                true,
+                true,
+                &HashSet::new(),
+                true,
+            ),
+            "a clean preserved owner that directly owns the registry key must not be killed; the registry is the handoff route, not cleanup permission"
+        );
         assert!(
             linux_daemon_runtime_activity_protected_for_cleanup(
                 163,
@@ -10204,7 +10544,7 @@ mod tests {
             "the endpoint in the hot-update owner registry is still a session-survival root"
         );
         assert!(
-            !linux_daemon_runtime_activity_protected_for_cleanup(
+            linux_daemon_runtime_activity_protected_for_cleanup(
                 163,
                 Some(&actual_owner),
                 &preserved_owner_pids,
@@ -10214,7 +10554,7 @@ mod tests {
                 &current_version_terminal_keys,
                 true,
             ),
-            "a registry owner whose keys are already owned by the current daemon must retire"
+            "a registry owner remains the session-survival root even if another daemon reports the same runtime keys"
         );
         assert!(
             !linux_daemon_runtime_activity_protected_for_cleanup(
@@ -10514,6 +10854,33 @@ mod tests {
             super::versioned_server_status_probe_paths_excluding_endpoint(&sockets_dir, &excluded);
 
         assert_eq!(paths, vec![legacy]);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn server_endpoint_identity_treats_symlink_alias_as_same_target() {
+        let root = std::env::temp_dir().join(format!(
+            "yggterm-server-endpoint-identity-test-{}-{}",
+            std::process::id(),
+            super::current_millis()
+        ));
+        fs::create_dir_all(&root).expect("create temp dir");
+        let current = root.join("server-2-7-18.sock");
+        let alias = root.join("server-2-1-0.sock");
+        let other = root.join("server-2-7-9.sock");
+        fs::write(&current, b"current").expect("write current");
+        fs::write(&other, b"other").expect("write other");
+        std::os::unix::fs::symlink(&current, &alias).expect("create alias");
+
+        assert!(super::server_endpoints_same_target(
+            &super::ServerEndpoint::UnixSocket(alias),
+            &super::ServerEndpoint::UnixSocket(current)
+        ));
+        assert!(!super::server_endpoints_same_target(
+            &super::ServerEndpoint::UnixSocket(root.join("server-2-7-18.sock")),
+            &super::ServerEndpoint::UnixSocket(other)
+        ));
         let _ = fs::remove_dir_all(&root);
     }
 

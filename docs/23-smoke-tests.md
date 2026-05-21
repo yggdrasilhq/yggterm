@@ -115,6 +115,15 @@ that have previously hidden release-blocking defects:
   chrome must use the same background/gradient as the visible titlebar and must
   not resize the terminal grid or shift shell content. Stable builds must not
   report compositor blur, CSS backdrop blur, or a nonzero material blur budget.
+- restart the GUI once while unmaximized and prove the outer shell still has the
+  expected rounded compositor corners. On Wayland, do not trust toolkit
+  `outer_position` alone; the smoke must locate the app in the root screenshot
+  visually before sampling corner pixels.
+- restart the GUI once while maximized using the preserve-live-sessions close
+  path, then prove the relaunched GUI reports `window.maximized=true` and the
+  screenshot shows the maximized shell before any manual resize or switching
+  pass. The accepted harness check is
+  `scripts/smoke_xterm_embed_faults.py --only-check maximize_restart_persistence`.
 - open the theme editor, reset the theme, change brightness through
   app-control, verify the brightness slider/manual field is visible, verify
   alpha/grain remain pinned to stable defaults even if legacy values are set,
@@ -141,12 +150,21 @@ that have previously hidden release-blocking defects:
 - run the app-control terminal probes for typed echo, scroll, selection/context
   menu, and xterm row style truth; the screenshot, probe, and state JSON must
   agree
+- copy terminal selection with `Ctrl+Shift+C`, paste text into the active
+  terminal, and paste the same text through the app-control native paste path.
+  The receiving prompt must show one copy of the text per user gesture, and
+  app-control/telemetry must show one native paste request with any duplicate
+  browser paste events counted only as suppressed duplicates.
 - reject any state where app-control reports daemon-backed buffer text while
   the screenshot shows a blank terminal, or where canvas mode reports
   low-contrast foreground/background colors over a dark terminal surface
 - query `~/.yggterm/telemetry/terminal.sqlite3` for the run window; every opened
   terminal must have `terminal_open_attempt/begin` and either
   `terminal_open_attempt/ready` or a documented failure/recovery event
+- for retained or remote terminals, require the open-attempt timing fields to
+  split resume latency into mount, first bytes, first meaningful output, and
+  ready-gate phases; a slow pass without those phase timings is an
+  observability failure
 - after the first `terminal_open_attempt/ready` for a retained remote terminal,
   reject a burst of new retained-fault `begin` events in the settle window. A
   transient post-ready blank sample may appear as
@@ -169,6 +187,11 @@ that have previously hidden release-blocking defects:
   treated as drawable. If app-control screenshot capture is suspected to be a
   background/occlusion artifact, record an OS-level screenshot and classify that
   separately; do not turn a blank app-control capture into a pass silently.
+- reject observer-induced PTY geometry churn. After the first usable grid for a
+  live terminal, app-control state, screenshots, visible-paint probes, hidden
+  titlebar hover, and unfocused `ResizeObserver` samples must not produce
+  `terminal_resize_from_paint` or resize the daemon PTY to a stale grid and back
+  again. The accepted resize source is a focused explicit terminal resize path.
 
 ## Keep-Alive And Restore Pass
 
@@ -202,6 +225,10 @@ sessions. The release script must preserve the configured budget for each
 window, not just the cooldown window. The respawn burst budget may be higher
 than the settled budget, but the proof must show the load decays rather than
 turning into a render loop.
+The settled app-control snapshot must also report no stable-channel infinite
+busy animations: sidebar rows may show static busy marks, but
+`dom.css_running_animation_count` should return to zero after the respawn settle
+window unless an explicit modal or short probe animation is active.
 
 For each resource window, include enough samples to distinguish transient work
 from a leak or loop. The proof bundle should mark the causal boundary between
