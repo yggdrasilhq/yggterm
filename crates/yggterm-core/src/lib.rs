@@ -134,6 +134,7 @@ pub struct AppSettings {
     pub show_tree: bool,
     pub show_settings: bool,
     pub auto_hide_titlebar: bool,
+    pub window_maximized: bool,
     pub tree_width: f32,
     pub rendered_font_size: f32,
     pub terminal_font_size: f32,
@@ -162,6 +163,7 @@ impl Default for AppSettings {
             show_tree: true,
             show_settings: false,
             auto_hide_titlebar: false,
+            window_maximized: false,
             tree_width: 300.0,
             rendered_font_size: 10.0,
             terminal_font_size: 14.0,
@@ -778,6 +780,10 @@ fn parse_settings_value(value: &Value) -> Result<AppSettings> {
         settings.auto_hide_titlebar =
             serde_json::from_value(value.clone()).context("failed to parse auto_hide_titlebar")?;
     }
+    if let Some(value) = object.get("window_maximized") {
+        settings.window_maximized =
+            serde_json::from_value(value.clone()).context("failed to parse window_maximized")?;
+    }
     if let Some(value) = object.get("tree_width") {
         settings.tree_width =
             serde_json::from_value(value.clone()).context("failed to parse tree_width")?;
@@ -869,6 +875,7 @@ fn serialize_settings_value(settings: &AppSettings) -> Value {
         "show_tree": settings.show_tree,
         "show_settings": settings.show_settings,
         "auto_hide_titlebar": settings.auto_hide_titlebar,
+        "window_maximized": settings.window_maximized,
         "tree_width": settings.tree_width,
         "rendered_font_size": settings.rendered_font_size,
         "terminal_font_size": settings.terminal_font_size,
@@ -1758,6 +1765,25 @@ mod tests {
         settings.auto_hide_titlebar = true;
         assert_eq!(
             serialize_settings_value(&settings).get("auto_hide_titlebar"),
+            Some(&serde_json::json!(true))
+        );
+    }
+
+    #[test]
+    fn settings_parse_window_maximized() {
+        let parsed = parse_settings_value(&serde_json::json!({
+            "window_maximized": true
+        }))
+        .expect("settings should parse");
+        assert!(parsed.window_maximized);
+    }
+
+    #[test]
+    fn settings_serialize_window_maximized() {
+        let mut settings = AppSettings::default();
+        settings.window_maximized = true;
+        assert_eq!(
+            serialize_settings_value(&settings).get("window_maximized"),
             Some(&serde_json::json!(true))
         );
     }

@@ -1,3 +1,187 @@
+yggterm (2.7.21-1) unstable; urgency=medium
+
+  * Make Web View a provider-backed conversation surface.
+  * Keep Codex and terminal transcript providers read-only by default.
+  * Require explicit send capability for future API chat providers such as
+    OpenWebUI or SAMPLENOTES before exposing chat input.
+
+ -- Avikalpa Kundu <avi@gour.top>  Thu, 21 May 2026 21:19:19 +0530
+
+yggterm (2.7.20-1) unstable; urgency=medium
+
+  * Allow the first retained-history seed to restore preserved-owner
+    scrollback after a short live read paints the current screen, while keeping
+    the path blocked once input is enabled or hot.
+  * Keep xterm-owned session snapshots labeled as observer cache instead of
+    daemon PTY truth.
+
+ -- Avikalpa Kundu <avi@gour.top>  Thu, 21 May 2026 19:08:00 +0530
+
+yggterm (2.7.19-1) unstable; urgency=medium
+
+  * Treat hot-update owner socket aliases by canonical filesystem target.
+  * Retarget preserved-owner entries away from current-daemon compatibility
+    aliases when a reachable real PTY owner reports the runtime key.
+  * Capture terminal right-click before xterm.js/WebKit helper-textarea paste
+    handling so it opens the session context menu without pasting clipboard
+    bytes.
+
+ -- Avikalpa Kundu <avi@gour.top>  Thu, 21 May 2026 18:09:59 +0530
+
+yggterm (2.7.18-1) unstable; urgency=medium
+
+  * Stop UI retained rehydrate from reading or writing retained snapshots after
+    a remote xterm host has become live-connected to daemon PTY truth.
+
+ -- Avikalpa Kundu <avi@gour.top>  Thu, 21 May 2026 17:36:00 +0530
+
+yggterm (2.7.17-1) unstable; urgency=medium
+
+  * Stop delayed retained replay from overwriting live remote xterm sessions
+    after accepted input.
+  * Clear stale active xterm host identity when opening a newly selected
+    session.
+  * Keep preserved-owner registry state until targeted duplicate runtime
+    pruning succeeds, while routing current-daemon owned PTYs directly.
+
+ -- Avikalpa Kundu <avi@gour.top>  Thu, 21 May 2026 17:00:00 +0530
+
+yggterm (2.7.16-1) unstable; urgency=medium
+
+  * Keep terminal paint observer-only for daemon PTY geometry.
+  * Skip unfocused ResizeObserver transient grid changes after xterm has a
+    usable grid, preventing app-control/screenshot/layout probes from bouncing
+    a live Codex terminal between stale sizes.
+
+ -- Avikalpa Kundu <avi@gour.top>  Thu, 21 May 2026 13:56:00 +0530
+
+yggterm (2.7.15-1) unstable; urgency=medium
+
+  * Restore maximized windows at native window construction and persist
+    window-manager close state before shutdown.
+  * Disable the remote prompt-gap PTY resize nudge so retained restore no
+    longer resizes live Codex/TUI sessions as a visual repair.
+  * Keep visible-paint repair from refitting xterm or notifying the daemon PTY
+    of a new grid; explicit resize/refit now uses rendered xterm cell metrics.
+  * Tighten app-control geometry diagnostics for stale prompt-follow cursor
+    clipping.
+  * Add smoke coverage for maximized close/relaunch persistence.
+
+ -- Avikalpa Kundu <avi@gour.top>  Thu, 21 May 2026 13:03:00 +0530
+
+yggterm (2.7.14-1) unstable; urgency=medium
+
+  * Stop retained replay from repainting after trusted live input promotes a
+    terminal surface back to daemon-owned PTY truth.
+  * Keep active terminal input on the active frame budget while typing is hot,
+    even when Codex status animation bookkeeping is present.
+
+ -- Avikalpa Kundu <avi@gour.top>  Thu, 21 May 2026 12:04:00 +0530
+
+yggterm (2.7.13-1) unstable; urgency=medium
+
+  * Clamp impossible DOM visual scroll positions back to xterm scrollback base
+    so prompt-follow terminals do not jump high into scrollback on typing.
+  * Reset retained-terminal recovery timing when replacement xterm surfaces
+    mount, preventing stale empty-surface timestamps from driving restore
+    decisions.
+  * Persist actual maximized state during app-control and graceful close so
+    restart handoff reopens a maximized window as maximized.
+  * Ignore close-path resize/decorator events when persisting window placement,
+    preventing Linux detach cleanup from overwriting maximized state.
+
+ -- Avikalpa Kundu <avi@gour.top>  Thu, 21 May 2026 10:32:00 +0530
+
+yggterm (2.7.9-1) unstable; urgency=medium
+
+  * Remove stable theme alpha/transparency leakage so shell chrome paints
+    opaque material instead of compositor-blended gradients.
+
+ -- Avikalpa Kundu <avi@gour.top>  Thu, 21 May 2026 00:48:00 +0530
+
+yggterm (2.7.8-1) unstable; urgency=medium
+
+  * Protect hot-update preserved-owner daemons from Linux cleanup so
+    keep-alive Codex conversations are not killed during restart handoff.
+
+ -- Avikalpa Kundu <avi@gour.top>  Thu, 21 May 2026 00:16:00 +0530
+
+yggterm (2.7.7-1) unstable; urgency=medium
+
+  * Stop stale prompt-follow viewport telemetry from triggering cursor-clipped
+    retained-terminal recovery loops when xterm row fit is clean.
+
+ -- Avikalpa Kundu <avi@gour.top>  Wed, 20 May 2026 23:52:00 +0530
+
+yggterm (2.7.6-1) unstable; urgency=medium
+
+  * Gate missing-saved-session remote Codex rows so preserved launch errors do
+    not auto-spawn doomed PTYs or trigger GUI recovery repaint loops.
+
+ -- Avikalpa Kundu <avi@gour.top>  Wed, 20 May 2026 23:14:00 +0530
+
+yggterm (2.7.5-1) unstable; urgency=medium
+
+  * Preserve live remote Codex rows when saved transcript metadata is missing,
+    keeping daemon PTY truth ahead of saved-session metadata.
+  * Scope live-session selection and drag affordances to the canonical live row
+    instead of mirroring them onto cwd projections.
+  * Persist and restore the maximized window state.
+
+ -- Avikalpa Kundu <avi@gour.top>  Wed, 20 May 2026 22:42:51 +0530
+
+yggterm (2.7.4-1) unstable; urgency=medium
+
+  * Pause active terminal write flushes while the GUI window is unfocused or
+    app-control-backgrounded, preserving daemon PTY truth without keeping
+    WebKit/xterm hot in the background.
+  * Deduplicate xterm text paste gestures and expose bounded clipboard
+    telemetry counters without recording clipboard contents.
+
+ -- Avikalpa Kundu <avi@gour.top>  Wed, 20 May 2026 21:18:00 +0530
+
+yggterm (2.7.3-1) unstable; urgency=medium
+
+  * Recognize truncated fresh remote Codex auth menus as interactive terminal
+    surfaces so the resume notification does not lock an onboarding prompt.
+
+ -- Avikalpa Kundu <avi@gour.top>  Wed, 20 May 2026 16:54:00 +0530
+
+yggterm (2.7.2-1) unstable; urgency=medium
+
+  * Treat fresh remote Codex onboarding/sign-in menus as interactive PTY
+    surfaces so the resume/input gate does not lock the viewport while Codex is
+    waiting for an auth choice.
+  * Exclude live runtime projections and storage-less remote Codex rows from
+    Startpage saved-session cards; only durable saved sessions appear there.
+
+ -- Avikalpa Kundu <avi@gour.top>  Wed, 20 May 2026 16:18:54 +0530
+
+yggterm (2.7.1-1) unstable; urgency=medium
+
+  * Require real Codex transcript storage before promoting fresh remote Codex
+    onboarding sessions into saved remote machine/cwd rows, and drop legacy
+    storage-less phantom rows on restore.
+  * Keep live-session drag feedback scoped to the visual row being dragged so
+    cwd projections do not mirror a simultaneous ghost drag.
+
+ -- Avikalpa Kundu <avi@gour.top>  Wed, 20 May 2026 15:39:22 +0530
+
+yggterm (2.7.0-1) unstable; urgency=medium
+
+  * Add the one-minute careful-restore boundary for protected remote runtimes:
+    reattach/resize/refresh once, but do not kill or duplicate a still-running
+    Keep Alive or update-restored PTY without daemon/user proof.
+  * Route terminal selection copy through a native clipboard owner thread
+    instead of WebKit navigator.clipboard.writeText, preventing Remmina/portal
+    clipboard hangs from freezing the GUI.
+  * Clamp stale sidebar scroll offsets after tree shrink so top rows cannot
+    remain clipped when the visible rows fit without a scrollbar.
+  * Update terminal/stability proof contracts for protected restore,
+    selection-copy hangs, switch latency, and sidebar scroll-bounds checks.
+
+ -- Avikalpa Kundu <avi@gour.top>  Wed, 20 May 2026 13:58:00 +0530
+
 yggterm (2.6.83-1) unstable; urgency=medium
 
   * Release the daemon socket lock before spawning the hot-restart replacement,

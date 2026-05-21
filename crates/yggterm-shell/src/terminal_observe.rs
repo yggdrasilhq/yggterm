@@ -22,6 +22,9 @@ pub(crate) struct TerminalOpenAttempt {
     pub(crate) rearm_count: u32,
     pub(crate) ready_at_ms: Option<u64>,
     pub(crate) surface_mounted_at_ms: Option<u64>,
+    pub(crate) first_output_at_ms: Option<u64>,
+    pub(crate) first_protocol_only_output_at_ms: Option<u64>,
+    pub(crate) first_meaningful_output_at_ms: Option<u64>,
     pub(crate) latched_failure_at_ms: Option<u64>,
     pub(crate) latched_failure_reason: Option<String>,
     pub(crate) last_observed_ready: bool,
@@ -641,6 +644,54 @@ pub(crate) fn describe_terminal_open_attempt(attempt: &TerminalOpenAttempt) -> V
         "rearm_count": attempt.rearm_count,
         "ready_at_ms": attempt.ready_at_ms,
         "surface_mounted_at_ms": attempt.surface_mounted_at_ms,
+        "first_output_at_ms": attempt.first_output_at_ms,
+        "first_protocol_only_output_at_ms": attempt.first_protocol_only_output_at_ms,
+        "first_meaningful_output_at_ms": attempt.first_meaningful_output_at_ms,
+        "request_to_surface_mounted_ms": attempt
+            .surface_mounted_at_ms
+            .map(|value| value.saturating_sub(attempt.started_at_ms)),
+        "request_to_first_output_ms": attempt
+            .first_output_at_ms
+            .map(|value| value.saturating_sub(attempt.started_at_ms)),
+        "surface_mounted_to_first_output_ms": attempt.first_output_at_ms.and_then(|first_output| {
+            attempt
+                .surface_mounted_at_ms
+                .map(|mounted| first_output.saturating_sub(mounted))
+        }),
+        "request_to_first_protocol_only_output_ms": attempt
+            .first_protocol_only_output_at_ms
+            .map(|value| value.saturating_sub(attempt.started_at_ms)),
+        "request_to_first_meaningful_output_ms": attempt
+            .first_meaningful_output_at_ms
+            .map(|value| value.saturating_sub(attempt.started_at_ms)),
+        "surface_mounted_to_first_meaningful_output_ms": attempt
+            .first_meaningful_output_at_ms
+            .and_then(|first_meaningful| {
+                attempt
+                    .surface_mounted_at_ms
+                    .map(|mounted| first_meaningful.saturating_sub(mounted))
+            }),
+        "first_output_to_ready_ms": attempt.ready_at_ms.and_then(|ready| {
+            attempt
+                .first_output_at_ms
+                .map(|first_output| ready.saturating_sub(first_output))
+        }),
+        "first_meaningful_output_to_ready_ms": attempt.ready_at_ms.and_then(|ready| {
+            attempt
+                .first_meaningful_output_at_ms
+                .map(|first_meaningful| ready.saturating_sub(first_meaningful))
+        }),
+        "request_to_ready_ms": attempt
+            .ready_at_ms
+            .map(|value| value.saturating_sub(attempt.started_at_ms)),
+        "surface_mounted_to_ready_ms": attempt.ready_at_ms.and_then(|ready| {
+            attempt
+                .surface_mounted_at_ms
+                .map(|mounted| ready.saturating_sub(mounted))
+        }),
+        "request_to_failure_ms": attempt
+            .latched_failure_at_ms
+            .map(|value| value.saturating_sub(attempt.started_at_ms)),
         "latched_failure_at_ms": attempt.latched_failure_at_ms,
         "latched_failure_reason": attempt.latched_failure_reason,
         "last_observed_ready": attempt.last_observed_ready,
@@ -1032,6 +1083,7 @@ fn terminal_prompt_band_for_app_control(host: Option<&Value>) -> Value {
         "retained_replay_unsafe_skip_prompt_ready": host.get("retained_replay_unsafe_skip_prompt_ready").cloned().unwrap_or(Value::Bool(false)),
         "retained_replay_rejected_visible_text": host.get("retained_replay_rejected_visible_text").cloned().unwrap_or(Value::Null),
         "retained_replay_recovered_from_snapshot": host.get("retained_replay_recovered_from_snapshot").cloned().unwrap_or(Value::Bool(false)),
+        "retained_replay_superseded_by_daemon_pty": host.get("retained_replay_superseded_by_daemon_pty").cloned().unwrap_or(Value::Bool(false)),
         "retained_replay_snapshot_age_ms": host.get("retained_replay_snapshot_age_ms").cloned().unwrap_or(Value::Null),
         "retained_replay_snapshot_error": host.get("retained_replay_snapshot_error").cloned().unwrap_or(Value::Null),
         "last_retained_replay_follow_debug": host.get("last_retained_replay_follow_debug").cloned().unwrap_or(Value::Null),
@@ -1776,7 +1828,6 @@ fn terminal_host_problem_for_app_control(host: &Value) -> Option<&'static str> {
             | "daemon_retained_history_screen_snapshot"
             | "daemon_terminal_read"
             | "daemon_screen_snapshot"
-            | "xterm_session_snapshot"
     );
     let live_remote_daemon_pty_current_output_surface = session_path
         .starts_with("remote-session://")
@@ -2366,6 +2417,12 @@ fn terminal_host_geometry_problem_for_app_control(host: &Value) -> Option<&'stat
         .get("visual_viewport_y")
         .and_then(Value::as_f64)
         .filter(|value| *value >= 0.0);
+    let viewport_beyond_xterm_base = base_y.is_some_and(|base_y| {
+        [viewport_y, public_viewport_y, visual_viewport_y]
+            .into_iter()
+            .flatten()
+            .any(|viewport_y| viewport_y > base_y + 1.0)
+    });
     let scrollback_lock_is_stale_at_bottom = scrollback_locked
         && !user_scrollback_locked
         && base_y.is_some_and(|base_y| {
@@ -2378,6 +2435,35 @@ fn terminal_host_geometry_problem_for_app_control(host: &Value) -> Option<&'stat
         .get("fit_overflow_px")
         .and_then(Value::as_f64)
         .unwrap_or(0.0);
+    let prompt_follow_force_matched_bottom = {
+        let debug = host.get("last_viewport_force_debug");
+        let matched = debug
+            .and_then(|value| value.get("matched_target"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let target = debug
+            .and_then(|value| value.get("target_viewport_y"))
+            .and_then(Value::as_f64);
+        let after = debug
+            .and_then(|value| {
+                value
+                    .get("after_effective_viewport_y")
+                    .or_else(|| value.get("after_viewport_y"))
+            })
+            .and_then(Value::as_f64);
+        matched
+            && fit_overflow_px <= 0.05
+            && base_y.is_some_and(|base_y| target.is_some_and(|target| target + 0.5 >= base_y))
+            && target
+                .zip(after)
+                .is_some_and(|(target, after)| (target - after).abs() <= 1.0)
+            && base_y.is_some_and(|base_y| {
+                [viewport_y, public_viewport_y, visual_viewport_y]
+                    .into_iter()
+                    .flatten()
+                    .any(|viewport_y| viewport_y + 0.5 >= base_y)
+            })
+    };
     let cursor_expected_top = host
         .get("cursor_expected_rect")
         .and_then(|value| value.get("top"))
@@ -2440,6 +2526,9 @@ fn terminal_host_geometry_problem_for_app_control(host: &Value) -> Option<&'stat
     {
         return Some("active terminal host geometry does not match the xterm viewport height");
     }
+    if viewport_beyond_xterm_base {
+        return Some("active terminal viewport is beyond the xterm scrollback base");
+    }
     if scrollback_locked && !user_scrollback_locked && !scrollback_lock_is_stale_at_bottom {
         return Some("active terminal prompt-follow viewport is stuck in scrollback");
     }
@@ -2448,7 +2537,10 @@ fn terminal_host_geometry_problem_for_app_control(host: &Value) -> Option<&'stat
         && let Some(cursor_top) = cursor_expected_top
     {
         let cursor_bottom = cursor_top + cursor_expected_height;
-        if host_bottom >= 120.0 && cursor_bottom > host_bottom + 0.5 {
+        if host_bottom >= 120.0
+            && cursor_bottom > host_bottom + 0.5
+            && !prompt_follow_force_matched_bottom
+        {
             return Some("active terminal cursor row is clipped below the visible host");
         }
     }
@@ -2668,9 +2760,23 @@ pub(crate) fn terminal_chunk_is_codex_interactive_setup_prompt(data: &str) -> bo
         return false;
     }
     let codex_context = normalized.contains("openai codex")
+        || normalized.contains("welcome to codex")
         || normalized.contains("codex can read and edit files")
         || normalized.contains("codex can edit files outside this workspace")
         || normalized.contains("update model permissions");
+    let complete_authentication_menu = (normalized.contains("sign in with chatgpt")
+        || normalized.contains("sign in with device code")
+        || normalized.contains("provide your own api key"))
+        && (normalized.contains("usage-based billing")
+            || normalized.contains("paid plan")
+            || normalized.contains("press enter to continue"));
+    let truncated_authentication_menu = normalized.contains("sign in with device code")
+        && normalized.contains("provide your own api key")
+        && normalized.contains("press enter to continue")
+        && (normalized.contains("usage included with plus")
+            || normalized.contains("sign in from another device")
+            || normalized.contains("pay for what you use"));
+    let authentication_menu = complete_authentication_menu || truncated_authentication_menu;
     let permissions_menu = normalized.contains("update model permissions")
         || (normalized.contains("default (current)")
             && normalized.contains("auto-review")
@@ -2679,8 +2785,11 @@ pub(crate) fn terminal_chunk_is_codex_interactive_setup_prompt(data: &str) -> bo
             && normalized.contains("exercise caution when using"));
     let explicit_input = normalized.contains("press enter to confirm")
         || normalized.contains("enter to confirm")
+        || normalized.contains("press enter to continue")
         || normalized.contains("esc to go back");
-    codex_context && permissions_menu && explicit_input
+    (codex_context || truncated_authentication_menu)
+        && explicit_input
+        && (permissions_menu || authentication_menu)
 }
 
 fn terminal_chunk_is_codex_interrupted_input_surface(data: &str) -> bool {
@@ -3272,16 +3381,59 @@ fn terminal_chunk_printable_signal_count(data: &str) -> usize {
 #[cfg(test)]
 mod tests {
     use super::{
-        WorkspaceViewMode, describe_viewport_snapshot, summarize_terminal_surface_for_app_control,
-        terminal_bootstrap_activation_epoch, terminal_chunk_has_codex_prompt_output,
-        terminal_chunk_has_current_codex_input_row, terminal_chunk_has_meaningful_output,
-        terminal_chunk_is_codex_interactive_setup_prompt, terminal_chunk_is_codex_prompt_surface,
-        terminal_chunk_is_local_codex_scaffold, terminal_chunk_is_transport_error,
-        terminal_host_geometry_problem_for_app_control, terminal_host_problem_for_app_control,
+        TerminalOpenAttempt, TerminalOpenAttemptState, WorkspaceViewMode,
+        describe_terminal_open_attempt, describe_viewport_snapshot,
+        summarize_terminal_surface_for_app_control, terminal_bootstrap_activation_epoch,
+        terminal_chunk_has_codex_prompt_output, terminal_chunk_has_current_codex_input_row,
+        terminal_chunk_has_meaningful_output, terminal_chunk_is_codex_interactive_setup_prompt,
+        terminal_chunk_is_codex_prompt_surface, terminal_chunk_is_local_codex_scaffold,
+        terminal_chunk_is_transport_error, terminal_host_geometry_problem_for_app_control,
+        terminal_host_problem_for_app_control,
         terminal_observe_codex_prompt_tail_has_real_scrollback,
         terminal_observe_prompt_layout_is_acceptable, terminal_timing_for_app_control,
     };
     use serde_json::{Value, json};
+
+    #[test]
+    fn terminal_open_attempt_description_splits_resume_timing_phases() {
+        let attempt = TerminalOpenAttempt {
+            attempt_id: "attempt-1".to_string(),
+            session_path: "remote-session://dev/session".to_string(),
+            request_id: "request-1".to_string(),
+            open_request_id: 7,
+            source: "open_row".to_string(),
+            started_at_ms: 1_000,
+            state: TerminalOpenAttemptState::Ready,
+            observations: 3,
+            rearm_count: 1,
+            ready_at_ms: Some(1_900),
+            surface_mounted_at_ms: Some(1_100),
+            first_output_at_ms: Some(1_250),
+            first_protocol_only_output_at_ms: Some(1_200),
+            first_meaningful_output_at_ms: Some(1_600),
+            latched_failure_at_ms: None,
+            latched_failure_reason: None,
+            last_observed_ready: true,
+            last_observed_reason: Some("ready".to_string()),
+            last_surface_problem: None,
+            last_overlay_visible: false,
+            last_overlay_kind: None,
+            last_overlay_text: None,
+        };
+
+        let summary = describe_terminal_open_attempt(&attempt);
+        assert_eq!(summary["request_to_surface_mounted_ms"], 100);
+        assert_eq!(summary["request_to_first_protocol_only_output_ms"], 200);
+        assert_eq!(summary["surface_mounted_to_first_output_ms"], 150);
+        assert_eq!(summary["request_to_first_meaningful_output_ms"], 600);
+        assert_eq!(
+            summary["surface_mounted_to_first_meaningful_output_ms"],
+            500
+        );
+        assert_eq!(summary["first_output_to_ready_ms"], 650);
+        assert_eq!(summary["first_meaningful_output_to_ready_ms"], 300);
+        assert_eq!(summary["request_to_ready_ms"], 900);
+    }
 
     #[test]
     fn terminal_host_problem_accepts_prompt_ready_codex_footer_surface() {
@@ -3563,6 +3715,38 @@ Caused by:\n\
             "uto-reviewer subagent.\n  3. Full Access        Codex can edit files outside this workspace and access the internet without asking\n                        for approval. Exercise caution when using.\n\n  Press enter to confirm or esc to go back"
         ));
         assert_eq!(terminal_host_problem_for_app_control(&host), None);
+    }
+
+    #[test]
+    fn codex_onboarding_menu_is_interactive_setup_surface() {
+        let onboarding = "Welcome to Codex, OpenAI's command-line coding agent\n\n\
+  Sign in with ChatGPT to use Codex as part of your paid plan\n\
+or connect an API key for usage-based billing\n\n\
+› 1. Sign in with ChatGPT\n\
+  2. Sign in with Device Code\n\
+  3. Provide your own API key\n\n\
+Press enter to continue";
+
+        assert!(terminal_chunk_is_codex_interactive_setup_prompt(onboarding));
+    }
+
+    #[test]
+    fn codex_onboarding_tail_after_logo_truncation_is_interactive_setup_surface() {
+        let truncated_tail = "\
+tGPT
+     Usage included with Plus, Pro, Business, and Enterprise plans
+
+  2. Sign in with Device Code
+     Sign in from another device with a one-time code
+
+  3. Provide your own API key
+     Pay for what you use
+
+  Press enter to continue";
+
+        assert!(terminal_chunk_is_codex_interactive_setup_prompt(
+            truncated_tail
+        ));
     }
 
     #[test]
@@ -4702,6 +4886,123 @@ Best thing to improve in the meantime:
         });
 
         assert_eq!(terminal_host_geometry_problem_for_app_control(&host), None);
+    }
+
+    #[test]
+    fn app_control_terminal_surface_flags_viewport_beyond_xterm_base() {
+        let host = json!({
+            "session_path": "remote-session://dev/live",
+            "text_tail": "OpenAI Codex ready\n› Run /review",
+            "buffer_text_sample": "OpenAI Codex\n› Run /review",
+            "cursor_line_text": "› Run /review",
+            "xterm_present": true,
+            "screen_present": true,
+            "viewport_present": true,
+            "rows_present": true,
+            "canvas_count": 0,
+            "xterm_renderer_mode": "dom",
+            "scrollback_locked": false,
+            "scrollback_intent": "PromptFollow",
+            "base_y": 1000.0,
+            "viewport_y": 1286.0,
+            "public_viewport_y": 1000.0,
+            "visual_viewport_y": 1286.0,
+            "host_rect": {"left": 277.0, "top": 8.0, "width": 1343.0, "height": 1144.0, "bottom": 1152.0},
+            "host_content_width": 1343.0,
+            "host_content_height": 1144.0,
+            "screen_rect": {"left": 277.0, "top": 8.0, "width": 1336.0, "height": 1144.0},
+            "viewport_rect": {"left": 277.0, "top": 8.0, "width": 1343.0, "height": 1144.0},
+            "cursor_expected_rect": {"left": 293.0, "top": 1124.0, "width": 8.0, "height": 18.0},
+            "fit_required_height_px": 1134.0,
+            "fit_available_height_px": 1142.0,
+            "fit_overflow_px": 0.0,
+        });
+
+        assert_eq!(
+            terminal_host_geometry_problem_for_app_control(&host),
+            Some("active terminal viewport is beyond the xterm scrollback base")
+        );
+    }
+
+    #[test]
+    fn app_control_terminal_surface_ignores_stale_cursor_clip_after_matched_prompt_follow_force() {
+        let host = json!({
+            "session_path": "remote-session://samplenotes-webapp/live",
+            "text_tail": "OpenAI Codex ready\n› Improve documentation in @filename",
+            "buffer_text_sample": "OpenAI Codex\n› Improve documentation in @filename",
+            "cursor_line_text": "› Improve documentation in @filename",
+            "xterm_present": true,
+            "screen_present": true,
+            "viewport_present": true,
+            "rows_present": true,
+            "canvas_count": 0,
+            "xterm_renderer_mode": "dom",
+            "scrollback_locked": false,
+            "scrollback_intent": "PromptFollow",
+            "base_y": 882.0,
+            "viewport_y": 257.0,
+            "public_viewport_y": 257.0,
+            "visual_viewport_y": 882.0,
+            "host_rect": {"left": 277.0, "top": 257.0, "width": 883.0, "height": 900.0, "bottom": 1157.0},
+            "host_content_width": 883.0,
+            "host_content_height": 900.0,
+            "screen_rect": {"left": 277.0, "top": 257.0, "width": 883.0, "height": 900.0},
+            "viewport_rect": {"left": 277.0, "top": 257.0, "width": 883.0, "height": 900.0},
+            "cursor_expected_rect": {"left": 293.0, "top": 12374.0, "width": 8.0, "height": 18.0},
+            "fit_required_height_px": 900.0,
+            "fit_available_height_px": 900.0,
+            "fit_overflow_px": 0.0,
+            "last_viewport_force_debug": {
+                "matched_target": true,
+                "target_viewport_y": 882.0,
+                "after_effective_viewport_y": 882.0,
+                "after_viewport_y": 882.0
+            }
+        });
+
+        assert_eq!(terminal_host_geometry_problem_for_app_control(&host), None);
+    }
+
+    #[test]
+    fn app_control_terminal_surface_rejects_stale_prompt_follow_match_after_viewport_drift() {
+        let host = json!({
+            "session_path": "remote-session://dev/live",
+            "text_tail": "OpenAI Codex ready\n› Before the story",
+            "buffer_text_sample": "OpenAI Codex\n› Before the story",
+            "cursor_line_text": "› Before the story",
+            "xterm_present": true,
+            "screen_present": true,
+            "viewport_present": true,
+            "rows_present": true,
+            "canvas_count": 0,
+            "xterm_renderer_mode": "dom",
+            "scrollback_locked": false,
+            "scrollback_intent": "PromptFollow",
+            "base_y": 1000.0,
+            "viewport_y": 778.0,
+            "public_viewport_y": 778.0,
+            "visual_viewport_y": 778.0,
+            "host_rect": {"left": 277.0, "top": 8.0, "width": 1343.0, "height": 1144.0, "bottom": 1152.0},
+            "host_content_width": 1343.0,
+            "host_content_height": 1144.0,
+            "screen_rect": {"left": 277.0, "top": 8.0, "width": 1336.0, "height": 1144.0},
+            "viewport_rect": {"left": 277.0, "top": 8.0, "width": 1343.0, "height": 1144.0},
+            "cursor_expected_rect": {"left": 470.0, "top": 5120.0, "width": 8.0, "height": 18.0},
+            "fit_required_height_px": 1134.0,
+            "fit_available_height_px": 1142.0,
+            "fit_overflow_px": 0.0,
+            "last_viewport_force_debug": {
+                "matched_target": true,
+                "target_viewport_y": 1000.0,
+                "after_effective_viewport_y": 1000.0,
+                "after_viewport_y": 1000.0
+            }
+        });
+
+        assert_eq!(
+            terminal_host_geometry_problem_for_app_control(&host),
+            Some("active terminal cursor row is clipped below the visible host")
+        );
     }
 
     #[test]

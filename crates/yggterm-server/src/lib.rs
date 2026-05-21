@@ -1193,6 +1193,10 @@ fn remote_scanned_session_from_live_codex(
     if session.kind != SessionKind::Codex {
         return None;
     }
+    let storage_path = session_metadata_value(session, "Storage").unwrap_or_default();
+    if storage_path.trim().is_empty() {
+        return None;
+    }
     let session_id = session_metadata_value(session, "Codex Session")
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
@@ -1222,7 +1226,7 @@ fn remote_scanned_session_from_live_codex(
         cached_summary: summary_metadata_value(&session.preview.summary, "Summary")
             .or_else(|| session_metadata_value(session, "Summary")),
         live_runtime,
-        storage_path: session_metadata_value(session, "Storage").unwrap_or_default(),
+        storage_path,
     })
 }
 
@@ -1319,12 +1323,17 @@ fn clear_remote_machine_live_runtime_flags(
         .iter()
         .cloned()
         .map(|mut machine| {
+            machine.sessions.retain(remote_scanned_session_is_durable);
             for session in &mut machine.sessions {
                 session.live_runtime = false;
             }
             machine
         })
         .collect()
+}
+
+fn remote_scanned_session_is_durable(session: &RemoteScannedSession) -> bool {
+    !session.storage_path.trim().is_empty()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -2213,6 +2222,12 @@ impl YggtermServer {
                 .map(|entry| entry.value.clone());
             Some((session.launch_command.clone(), cwd))
         })
+    }
+
+    pub fn terminal_launch_blocked_reason(&self, path: &str) -> Option<String> {
+        let key = self.resolve_terminal_session_key(path)?;
+        let session = self.sessions.get(&key)?;
+        remote_saved_session_launch_blocked_reason(session)
     }
 
     pub fn recover_remote_scanned_terminal_for_restart(
@@ -3257,6 +3272,9 @@ impl YggtermServer {
                         .unwrap_or_default();
                 machine.sessions = if machine.sessions.is_empty() {
                     mirrored_sessions
+                        .into_iter()
+                        .filter(remote_scanned_session_is_durable)
+                        .collect()
                 } else {
                     if !mirrored_sessions.is_empty() {
                         machine.sessions = overlay_mirrored_remote_sessions(
@@ -3264,10 +3282,9 @@ impl YggtermServer {
                             &machine.sessions,
                         );
                     }
-                    let _ = machine
+                    machine.sessions = machine
                         .sessions
-                        .iter()
-                        .cloned()
+                        .into_iter()
                         .map(|mut session| {
                             if let Some((session_machine_key, session_id)) =
                                 parse_remote_scanned_session_path(&session.session_path)
@@ -3283,9 +3300,13 @@ impl YggtermServer {
                             }
                             session
                         })
+                        .filter(remote_scanned_session_is_durable)
                         .collect::<Vec<_>>();
                     if !machine.sessions.is_empty() {
                         overlay_mirrored_remote_sessions(&machine.machine_key, &machine.sessions)
+                            .into_iter()
+                            .filter(remote_scanned_session_is_durable)
+                            .collect()
                     } else {
                         machine.sessions.clone()
                     }
@@ -3313,7 +3334,10 @@ impl YggtermServer {
                 && let Ok(mirrored) = load_remote_machine_sessions_from_mirror(&machine.machine_key)
                 && !mirrored.is_empty()
             {
-                machine.sessions = mirrored;
+                machine.sessions = mirrored
+                    .into_iter()
+                    .filter(remote_scanned_session_is_durable)
+                    .collect();
                 machine.health = RemoteMachineHealth::Cached;
             }
         }
@@ -5392,21 +5416,23 @@ impl YggtermServer {
             }
         });
         if let Some((stale_path, ssh_target, session_id)) = missing_remote_live_session {
-            let _ = self.remove_live_session(&stale_path);
+            if let Some(session) = self.sessions.get_mut(&stale_path) {
+                preserve_missing_saved_remote_live_session(session, &session_id);
+            }
             if let Ok(home) = resolve_yggterm_home() {
                 append_trace_event(
                     &home,
                     "server",
                     "remote_runtime",
-                    "missing_saved_session_removed",
+                    "missing_saved_session_preserved_live_row",
                     serde_json::json!({
                         "session_path": stale_path,
                         "ssh_target": ssh_target,
                         "session_id": session_id,
+                        "policy": "live_runtime_truth_beats_transcript_metadata",
                     }),
                 );
             }
-            return;
         }
         if self
             .sessions
@@ -6341,6 +6367,36 @@ fn remote_resume_missing_saved_session_error(session_id: &str) -> String {
     format!(
         "yggterm: saved Codex session {session_id} is no longer available on this machine, so this row cannot be restored as a live terminal."
     )
+}
+
+fn preserve_missing_saved_remote_live_session(session: &mut ManagedSessionView, session_id: &str) {
+    session.last_launch_error = Some(remote_resume_missing_saved_session_error(session_id));
+    upsert_session_metadata(
+        &mut session.metadata,
+        "Saved Session",
+        "missing".to_string(),
+    );
+    upsert_session_metadata(
+        &mut session.metadata,
+        "Status",
+        "saved Codex transcript missing; preserving live PTY row".to_string(),
+    );
+}
+
+fn remote_saved_session_launch_blocked_reason(session: &ManagedSessionView) -> Option<String> {
+    if !live_session_uses_remote_runtime(session)
+        || !is_remote_scanned_live_session_path(&session.session_path)
+        || remote_live_session_starts_new_codex(session)
+        || session_metadata_value(session, "Saved Session").as_deref() != Some("missing")
+    {
+        return None;
+    }
+    session
+        .last_launch_error
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
 }
 
 fn remote_resume_requires_missing_saved_session_failure(
@@ -9895,7 +9951,10 @@ fn mirror_remote_machine_sessions(
     )?;
     let synced_at =
         OffsetDateTime::now_utc().format(&time::format_description::well_known::Rfc3339)?;
-    for session in sessions {
+    for session in sessions
+        .iter()
+        .filter(|session| remote_scanned_session_is_durable(session))
+    {
         tx.execute(
             "INSERT INTO remote_session_metadata (
                 machine_key, session_id, cwd, started_at, modified_epoch, event_count,
@@ -10016,6 +10075,9 @@ fn dedupe_remote_scanned_sessions(
 ) -> Vec<RemoteScannedSession> {
     let mut by_id = std::collections::BTreeMap::<String, RemoteScannedSession>::new();
     for session in sessions {
+        if !remote_scanned_session_is_durable(&session) {
+            continue;
+        }
         match by_id.entry(session.session_id.clone()) {
             std::collections::btree_map::Entry::Vacant(slot) => {
                 slot.insert(session);
@@ -19490,6 +19552,93 @@ mod tests {
         }
     }
 
+    #[test]
+    fn missing_saved_remote_live_session_marks_error_without_demoting_live_row() {
+        let session_id = "25886740-5fa9-436f-b482-f25bf5ef74cc";
+        let path = format!("remote-session://samplenotes-webapp/{session_id}");
+        let mut session =
+            managed_session_from_snapshot(snapshot_session(&path, SessionSource::LiveSsh));
+
+        super::preserve_missing_saved_remote_live_session(&mut session, session_id);
+
+        assert_eq!(session.source, SessionSource::LiveSsh);
+        assert_eq!(session.session_path, path);
+        assert_eq!(session.launch_phase, TerminalLaunchPhase::Running);
+        assert_eq!(
+            session_metadata_value(&session, "Saved Session"),
+            Some("missing".to_string())
+        );
+        assert!(
+            session_metadata_value(&session, "Status")
+                .as_deref()
+                .is_some_and(|status| status.contains("preserving live PTY row")),
+            "status metadata must explain why the row is kept"
+        );
+        assert!(
+            session
+                .last_launch_error
+                .as_deref()
+                .is_some_and(|error| error.contains(session_id)),
+            "the failed transcript check should be surfaced as a launch error, not a row deletion"
+        );
+    }
+
+    #[test]
+    fn missing_saved_remote_live_session_blocks_auto_spawn() {
+        let session_id = "25886740-5fa9-436f-b482-f25bf5ef74cc";
+        let path = format!("remote-session://samplenotes-webapp/{session_id}");
+        let mut session =
+            managed_session_from_snapshot(snapshot_session(&path, SessionSource::LiveSsh));
+        session.ssh_target = Some("samplenotes-webapp".to_string());
+        session.launch_command =
+            "ssh samplenotes-webapp yggterm server remote resume-codex --require-existing".to_string();
+        upsert_session_metadata(
+            &mut session.metadata,
+            "Remote Launch",
+            "yggterm".to_string(),
+        );
+
+        assert_eq!(
+            super::remote_saved_session_launch_blocked_reason(&session),
+            None,
+            "healthy live rows must remain spawnable before the missing transcript probe fails"
+        );
+
+        super::preserve_missing_saved_remote_live_session(&mut session, session_id);
+
+        let tree = SessionNode {
+            kind: SessionNodeKind::Group,
+            name: "root".to_string(),
+            title: None,
+            document_kind: None,
+            group_kind: None,
+            path: PathBuf::from("/"),
+            children: Vec::new(),
+            session_id: None,
+            cwd: None,
+        };
+        let mut server = YggtermServer::new(
+            &tree,
+            false,
+            GhosttyHostSupport::shadow("test".to_string(), false, false),
+            UiTheme::ZedLight,
+        );
+        server.sessions.insert(path.clone(), session);
+        server.live_session_order.push(path.clone());
+
+        let reason = server
+            .terminal_launch_blocked_reason(&path)
+            .expect("missing saved transcript should block automatic PTY spawn");
+        assert!(reason.contains(session_id));
+        assert_eq!(
+            server.terminal_spec(&path).map(|(command, _)| command),
+            Some(
+                "ssh samplenotes-webapp yggterm server remote resume-codex --require-existing".to_string()
+            ),
+            "the row still supports terminal view; only automatic spawn is blocked"
+        );
+    }
+
     fn snapshot_with_active(
         active_session_path: Option<String>,
         active_session: Option<SnapshotSessionView>,
@@ -25883,6 +26032,115 @@ terminal_window_id: None,
         assert_eq!(stored.title_hint, "muhurta");
         assert_eq!(stored.storage_path, storage_path);
         assert!(!stored.live_runtime);
+    }
+
+    #[test]
+    fn closing_unmaterialized_remote_start_codex_does_not_promote_to_scanned_tree() {
+        let tree = SessionNode {
+            kind: SessionNodeKind::Group,
+            name: "sessions".to_string(),
+            title: None,
+            document_kind: None,
+            group_kind: None,
+            path: PathBuf::from("/"),
+            children: Vec::new(),
+            session_id: None,
+            cwd: None,
+        };
+        let machine_key = "samplenotes-webapp";
+        let synthetic_id = "cdb00ffb-757d-4183-9dcd-825d9d18102e";
+        let runtime_key = remote_scanned_session_path(machine_key, synthetic_id);
+        let mut server = YggtermServer::new(
+            &tree,
+            false,
+            GhosttyHostSupport::shadow("test".to_string(), false, false),
+            UiTheme::ZedLight,
+        );
+        server.remote_machines = vec![RemoteMachineSnapshot {
+            machine_key: machine_key.to_string(),
+            label: machine_key.to_string(),
+            ssh_target: machine_key.to_string(),
+            prefix: None,
+            remote_binary_expr: Some("$HOME/.yggterm/bin/yggterm".to_string()),
+            remote_deploy_state: RemoteDeployState::Ready,
+            health: RemoteMachineHealth::Healthy,
+            sessions: Vec::new(),
+        }];
+        server.restore_live_session(PersistedLiveSession {
+            key: runtime_key.clone(),
+            id: synthetic_id.to_string(),
+            title: "samplenotes webapp".to_string(),
+            kind: SessionKind::Codex,
+            keep_alive: true,
+            ssh_target: machine_key.to_string(),
+            prefix: None,
+            cwd: Some("/home/pi".to_string()),
+            remote_launch_action: Some("start-codex".to_string()),
+            storage_path: None,
+            restore_reason: None,
+        });
+
+        assert!(
+            server
+                .remove_live_session(&runtime_key)
+                .expect("remove live")
+        );
+
+        assert!(server.live_sessions().is_empty());
+        assert!(
+            server.remote_machines[0].sessions.is_empty(),
+            "fresh remote Codex starts are not saved until Codex exposes a transcript path"
+        );
+        assert!(
+            server.persisted_state().remote_machines[0]
+                .sessions
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn restore_persisted_state_drops_remote_scanned_sessions_without_storage() {
+        let tree = SessionNode {
+            kind: SessionNodeKind::Group,
+            name: "sessions".to_string(),
+            title: None,
+            document_kind: None,
+            group_kind: None,
+            path: PathBuf::from("/"),
+            children: Vec::new(),
+            session_id: None,
+            cwd: None,
+        };
+        let machine_key = "samplenotes-webapp";
+        let phantom_id = "cdb00ffb-757d-4183-9dcd-825d9d18102e";
+        let phantom_path = remote_scanned_session_path(machine_key, phantom_id);
+        let mut machine = remote_machine_with_scanned_session(machine_key, phantom_id, false);
+        machine.sessions[0].storage_path.clear();
+        machine.sessions[0].title_hint = "samplenotes webapp".to_string();
+        let mut server = YggtermServer::new(
+            &tree,
+            false,
+            GhosttyHostSupport::shadow("test".to_string(), false, false),
+            UiTheme::ZedLight,
+        );
+
+        server.restore_persisted_state_with_launch_policy(
+            PersistedDaemonState {
+                active_session_path: Some(phantom_path.clone()),
+                active_view_mode: WorkspaceViewMode::Terminal,
+                ssh_targets: Vec::new(),
+                remote_machines: vec![machine],
+                stored_sessions: Vec::new(),
+                live_sessions: Vec::new(),
+            },
+            None,
+            false,
+        );
+
+        assert!(server.remote_machines[0].sessions.is_empty());
+        assert!(!server.sessions.contains_key(&phantom_path));
+        assert_ne!(server.active_session_path(), Some(phantom_path.as_str()));
+        assert_eq!(server.active_view_mode(), WorkspaceViewMode::Rendered);
     }
 
     #[test]

@@ -195,7 +195,11 @@ def wait_for_read_only_terminal_settle(
         next_result = run_json(args, "state_settle", app_args(args, "state"))
         next_state = data_from(next_result)
         next_session_path = args.session_path or active_session_from_state(next_state)
-        next_failures = collect_terminal_readiness_failures(next_state, next_session_path)
+        next_failures = collect_terminal_readiness_failures(
+            next_state,
+            next_session_path,
+            allow_unfocused_input_gate=args.read_only_drawing,
+        )
         attempts.append(
             {
                 "elapsed_ms": (time.perf_counter() - started) * 1000.0,
@@ -518,11 +522,20 @@ def terminal_drawing_probe(state: dict[str, Any], session_path: str) -> dict[str
     return probe
 
 
-def collect_terminal_readiness_failures(state: dict[str, Any], session_path: str) -> list[str]:
+def collect_terminal_readiness_failures(
+    state: dict[str, Any],
+    session_path: str,
+    *,
+    allow_unfocused_input_gate: bool = False,
+) -> list[str]:
     failures: list[str] = []
     viewport = active_terminal_viewport(state)
     shell = state.get("shell") if isinstance(state.get("shell"), dict) else {}
     runtime_truth = state.get("runtime_truth") if isinstance(state.get("runtime_truth"), dict) else {}
+    window = state.get("window") if isinstance(state.get("window"), dict) else {}
+    input_gate_may_be_closed = (
+        allow_unfocused_input_gate and window.get("focused") is False
+    )
     active_session = state.get("active_session_path") or viewport.get("active_session_path")
     if isinstance(active_session, str) and active_session and active_session != session_path:
         failures.append(
@@ -541,7 +554,7 @@ def collect_terminal_readiness_failures(state: dict[str, Any], session_path: str
         failures.append("active remote terminal has no daemon runtime")
     if viewport.get("ready") is not True:
         failures.append(f"terminal viewport not ready: {viewport.get('reason') or 'unknown reason'}")
-    if viewport.get("interactive") is not True:
+    if viewport.get("interactive") is not True and not input_gate_may_be_closed:
         failures.append("terminal viewport not interactive")
     surface = viewport.get("active_terminal_surface")
     if isinstance(surface, dict):
@@ -566,7 +579,10 @@ def collect_terminal_readiness_failures(state: dict[str, Any], session_path: str
                 "active terminal host belongs to a different session: "
                 f"{host_session!r} != {session_path!r}"
             )
-        for key in ("xterm_present", "viewport_present", "input_enabled"):
+        required_host_keys = ["xterm_present", "viewport_present"]
+        if not input_gate_may_be_closed:
+            required_host_keys.append("input_enabled")
+        for key in required_host_keys:
             if host.get(key) is not True:
                 failures.append(f"active terminal host {key}={host.get(key)!r}")
         if host.get("low_power_tui_overlay_active") is True or host.get("low_power_tui_overlay_present") is True:
@@ -1555,7 +1571,11 @@ def main() -> int:
     session_path = args.session_path or active_session_from_state(state_data)
     report["active_session_path"] = session_path
     report["measurements"]["initial_state_ms"] = state_result.elapsed_ms
-    readiness_failures = collect_terminal_readiness_failures(state_data, session_path)
+    readiness_failures = collect_terminal_readiness_failures(
+        state_data,
+        session_path,
+        allow_unfocused_input_gate=args.read_only_drawing,
+    )
     report["terminal_readiness_initial"] = {
         "ok": not readiness_failures,
         "failures": readiness_failures,
