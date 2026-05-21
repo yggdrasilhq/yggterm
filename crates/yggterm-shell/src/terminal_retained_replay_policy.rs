@@ -70,9 +70,14 @@ pub(crate) fn retained_ready_remote_host_rehydrate_mode(
     active_host_selected: bool,
     ready_attempt: bool,
     ready_history: bool,
+    terminal_live_host_connected: bool,
     surface_problem: Option<&str>,
 ) -> Option<RetainedRehydrateMode> {
-    if !retained_ready_remote_host || !active_host_selected || ready_attempt {
+    if !retained_ready_remote_host
+        || !active_host_selected
+        || ready_attempt
+        || terminal_live_host_connected
+    {
         return None;
     }
     if retained_rehydrate_ready_history_retry_reason(surface_problem) {
@@ -103,6 +108,7 @@ pub(crate) fn daemon_retained_snapshot_replay_should_start(
     host_is_active_session: bool,
     active_host_selected: bool,
     terminal_ready_for_retained_replay: bool,
+    terminal_live_host_connected: bool,
     retained_snapshot_already_staged: bool,
 ) -> bool {
     let _ = (remote_starting_codex_session, codex_like_session);
@@ -110,6 +116,7 @@ pub(crate) fn daemon_retained_snapshot_replay_should_start(
         && host_is_active_session
         && active_host_selected
         && terminal_ready_for_retained_replay
+        && !terminal_live_host_connected
         && !retained_snapshot_already_staged
 }
 
@@ -206,29 +213,34 @@ mod tests {
     #[test]
     fn retained_ready_remote_rehydrate_skips_ready_attempt() {
         assert_eq!(
-            retained_ready_remote_host_rehydrate_mode(true, true, true, false, None),
+            retained_ready_remote_host_rehydrate_mode(true, true, true, false, false, None),
             None
         );
         assert_eq!(
-            retained_ready_remote_host_rehydrate_mode(true, true, false, true, None),
+            retained_ready_remote_host_rehydrate_mode(true, true, false, true, false, None),
             None
         );
         assert_eq!(
-            retained_ready_remote_host_rehydrate_mode(true, true, false, false, None),
+            retained_ready_remote_host_rehydrate_mode(true, true, false, false, false, None),
             Some(RetainedRehydrateMode::InitialRead)
         );
         assert_eq!(
-            retained_ready_remote_host_rehydrate_mode(false, true, false, false, None),
+            retained_ready_remote_host_rehydrate_mode(false, true, false, false, false, None),
             None
         );
         assert_eq!(
-            retained_ready_remote_host_rehydrate_mode(true, false, false, false, None),
+            retained_ready_remote_host_rehydrate_mode(true, false, false, false, false, None),
+            None
+        );
+        assert_eq!(
+            retained_ready_remote_host_rehydrate_mode(true, true, false, false, true, None),
             None
         );
         assert_eq!(
             retained_ready_remote_host_rehydrate_mode(
                 true,
                 true,
+                false,
                 false,
                 false,
                 Some("active terminal host exists but xterm surface is empty"),
@@ -245,6 +257,7 @@ mod tests {
                 true,
                 false,
                 true,
+                false,
                 Some("active terminal host is only showing a plain shell prompt"),
             ),
             Some(RetainedRehydrateMode::CollapsedScrollbackRecovery)
@@ -255,6 +268,7 @@ mod tests {
                 true,
                 false,
                 true,
+                false,
                 Some("active remote Codex prompt surface has no current input row"),
             ),
             Some(RetainedRehydrateMode::CollapsedScrollbackRecovery)
@@ -265,6 +279,7 @@ mod tests {
                 true,
                 false,
                 true,
+                false,
                 Some("active remote terminal lost expected scrollback after retained replay"),
             ),
             Some(RetainedRehydrateMode::CollapsedScrollbackRecovery)
@@ -275,6 +290,7 @@ mod tests {
                 true,
                 false,
                 true,
+                false,
                 Some("active remote terminal is waiting for resume overlay"),
             ),
             None
@@ -314,28 +330,31 @@ mod tests {
     #[test]
     fn daemon_retained_snapshot_replay_starts_only_after_ready_active_remote_session() {
         assert!(daemon_retained_snapshot_replay_should_start(
-            true, false, false, true, true, true, false
+            true, false, false, true, true, true, false, false
         ));
         assert!(daemon_retained_snapshot_replay_should_start(
-            true, false, true, true, true, true, false
+            true, false, true, true, true, true, false, false
         ));
         assert!(daemon_retained_snapshot_replay_should_start(
-            true, true, true, true, true, true, false
+            true, true, true, true, true, true, false, false
         ));
         assert!(!daemon_retained_snapshot_replay_should_start(
-            false, false, false, true, true, true, false
+            false, false, false, true, true, true, false, false
         ));
         assert!(!daemon_retained_snapshot_replay_should_start(
-            true, false, false, false, true, true, false
+            true, false, false, false, true, true, false, false
         ));
         assert!(!daemon_retained_snapshot_replay_should_start(
-            true, false, false, true, false, true, false
+            true, false, false, true, false, true, false, false
         ));
         assert!(!daemon_retained_snapshot_replay_should_start(
-            true, false, false, true, true, false, false
+            true, false, false, true, true, false, false, false
         ));
         assert!(!daemon_retained_snapshot_replay_should_start(
-            true, false, false, true, true, true, true
+            true, false, false, true, true, true, true, false
+        ));
+        assert!(!daemon_retained_snapshot_replay_should_start(
+            true, false, false, true, true, true, false, true
         ));
         let key = daemon_retained_snapshot_replay_identity_key(
             "remote-session://dev/019dbdcf",

@@ -70,6 +70,18 @@ input. A different-session host with `input_enabled=true` or
 host with disabled input and stale helper focus must release focus on the next
 Rust policy pass and must not keep the active viewport in recovery.
 
+Codex onboarding and authentication menus are interactive xterm surfaces. A
+fresh remote Codex start may show `Welcome to Codex`, sign-in choices, or a
+permission/setup menu before any prompt-ready transcript identity or storage path
+exists. xterm-visible tails may start mid-menu after logo art or scrollback
+sampling, for example `tGPT ... Device Code ... API key ... Press enter to
+continue`; those tails are still the same interactive auth surface. That state
+is not a saved session yet, but it is still input-ready PTY truth. Resume gates,
+loading notifications, and recovery policy must clear for those explicit menus
+so the user can press the requested key. The fix belongs in the
+terminal-readiness classifier over xterm-visible PTY text; do not add a
+shell-owned prompt overlay or alternate input target.
+
 This document owns terminal-rendering law. The cross-system source-of-truth
 audit lives in `docs/architecture-audit-2026-05-16.md`; if a terminal fix needs
 different behavior than this file describes, update this file before changing
@@ -102,13 +114,37 @@ sends the resulting bytes through the normal terminal input path. The fallback
 path is xterm's core `triggerDataEvent`, then a direct terminal input event; none
 of these read from `navigator.clipboard`.
 
+Terminal selection copy is also not a browser-clipboard operation. `Ctrl+Shift+C`
+and `Ctrl+Shift+X` may read xterm's selected text, but the xterm embed must send
+that text to Rust over the terminal JS event bridge and return immediately. The
+renderer must not call `navigator.clipboard.writeText`; on remote desktops that
+can block inside WebKit/portal/Remmina clipboard synchronization and freeze the
+app. Rust owns a dedicated native clipboard owner thread for terminal selection
+copy, so a blocked desktop clipboard stack cannot stall the shell render loop or
+app-control response path.
+
+Text paste follows the same ownership rule. Browser paste events are captured
+only when the active xterm host owns terminal input, stopped before WebKit/xterm
+can also consume them, then converted into one native Rust clipboard read. The
+JS side keeps a short duplicate-event window because WebKit/portal/remote
+desktop stacks can surface more than one paste event for a single user gesture.
+That dedupe is observable through app-control fields such as
+`clipboard_paste_event_count`,
+`clipboard_paste_duplicate_suppressed_count`,
+`native_clipboard_paste_request_count`, and
+`native_clipboard_paste_request_deduped_count`; it must not log clipboard text.
+
 Right-click on a terminal is an xterm surface event that opens Yggterm's row
-context menu for that terminal session. The terminal host captures the native
-`contextmenu` event, prevents WebKit's browser menu, records the host-local
-counter/coordinates, and sends a `context_menu` terminal JS event through the
-same Rust bridge as input/resize/clipboard. The shell then opens the existing
-session context menu; it does not create a second menu implementation inside the
-terminal DOM.
+context menu for that terminal session. The terminal host captures secondary
+pointer events before xterm.js's helper-textarea right-click handler and also
+captures the native `contextmenu` event. It prevents WebKit's browser menu and
+native paste path, records the host-local counter/coordinates, and sends a
+`context_menu` terminal JS event through the same Rust bridge as
+input/resize/clipboard. The shell then opens the existing session context menu;
+it does not create a second menu implementation inside the terminal DOM. A
+right-click must not call `term.paste`, `triggerDataEvent`, native clipboard
+read, or direct terminal input. Middle-click remains the only primary-selection
+paste gesture.
 
 Active terminal write batching must stay below the threshold where typed input
 or Codex's `Working` animation feels stepped. Batching is only a flush-timing
@@ -128,12 +164,28 @@ or a broken prompt even though the PTY accepted the input. Deliver synchronized
 frames to xterm in PTY order and let xterm parse them.
 
 Layout-driven resize is not user scrollback. Titlebar auto-hide hover,
-fit-addon row changes, visible-paint refits, and resize-observer bursts arm a
-short prompt-follow layout guard. While the host is in `PromptFollow`, scroll
-events from those programmatic changes are suppressed as user-scroll evidence
-and the viewport is forced back to the active buffer bottom after the fit
-settles. If the user has explicitly entered `UserScrollback`, the same layout
-changes preserve that reading position instead of snapping to bottom.
+fit-addon row changes, and resize-observer bursts arm a short prompt-follow
+layout guard. While the host is in `PromptFollow`, scroll events from those
+programmatic changes are suppressed as user-scroll evidence and the viewport is
+forced back to the active buffer bottom after the fit settles. If the user has
+explicitly entered `UserScrollback`, the same layout changes preserve that
+reading position instead of snapping to bottom. Visible-paint repair is not a
+resize source: it may refresh or probe the mounted xterm surface, but it must
+not call fit logic or notify the daemon PTY of a new grid.
+
+Paint events are observers, not geometry authority. A paint probe may report the
+mounted xterm grid for diagnostics, but it must not call the daemon resize API.
+Once xterm has a usable grid, unfocused `ResizeObserver` transients must also be
+ignored until the window/document is focused again; app-control state,
+screenshots, hidden-titlebar hover, and compositor snapshotting are observers
+and must never bounce a live PTY between stale grid sizes.
+
+Prompt-gap recovery must not resize the daemon PTY as a repair tactic. If
+app-control sees a stale public viewport counter, a large blank gap, or a
+cursor-expected rectangle outside the host while xterm's visible DOM rows are
+still readable, the fix belongs in xterm viewport/render settle. Yggterm must
+not nudge the PTY row count down and back up to force Codex to repaint; that is
+a second geometry source of truth and can break a live TUI after input resumes.
 
 Regression coverage:
 
@@ -265,6 +317,48 @@ with `input_enabled=true` and
 `terminal_content_source=daemon_retained_history_screen_snapshot`, the shell has
 promoted a retained replay too far and must re-enter recovery instead of
 accepting user input.
+
+Trusted live input is also a retained-replay boundary. When the xterm host
+promotes a retained source to `daemon_pty`, any pending retained replay for that
+session must be marked superseded and stop retrying prompt-follow or repaint
+work. App-control exposes this as
+`retained_replay_superseded_by_daemon_pty=true`. A live daemon PTY may retain
+scrollback seeded from daemon history, but idle/focus repaint must not keep
+using retained replay as a second viewport controller.
+
+Accepted live input is the same hard boundary. Once the mounted xterm bridge has
+successfully written user input to the daemon for a remote resume session, the
+GUI must treat that host as live-connected and must not run any delayed daemon
+retained replay task for that session. A delayed retained replay may still log
+`daemon_retained_replay_skipped_live_connected`, but it must not write bytes,
+force prompt-follow, or replace the xterm buffer after the user has resumed
+typing.
+
+The UI retained-rehydrate path follows the same boundary. It may read from the
+daemon to seed an empty retained host while the surface is not live-connected,
+but it must check the live-connected flag again immediately before reading and
+again before writing to xterm. If a concurrent daemon read or accepted input has
+already promoted the host to `daemon_pty`, retained rehydrate must log
+`retained_rehydrate_skipped_live_connected` or
+`retained_rehydrate_result_discarded_live_connected` and return without
+mutating xterm.
+
+The narrow scrollback-recovery exception is preserved-owner
+`CollapsedScrollbackRecovery`: if a short live `daemon_terminal_read` painted
+the current screen first, but no retained history has been staged and input is
+still gated, the retained-history seed may still write daemon-derived history
+plus the current screen into xterm. This restores the xterm buffer before the
+session becomes interactive. It must not run after input is enabled or hot, and
+an xterm-owned session snapshot must remain `xterm_session_snapshot`, never
+`daemon_pty`.
+
+Remote resume readiness has two separate buffers. The replay buffer is allowed
+to clear after attach-ready so Yggterm does not duplicate bytes already written
+to xterm. That clear must not erase the readiness proof. A bounded
+observed-output sample from the same daemon PTY read may continue to prove
+visual reveal until input is enabled or recovery resets the mount. App-control
+may later report the same visible surface, but app-control must not be the only
+thing that can clear a stale `Restoring Remote Terminal` gate.
 
 Retained-fault recovery must not use a non-prompt screen snapshot as an xterm
 writer. That snapshot can be logged for telemetry, but the visible interactive

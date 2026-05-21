@@ -527,7 +527,7 @@ Image paste is a first-class terminal operation.
 - SSH sessions receive staged files through the remote Yggterm helper when available, with the resulting remote path inserted into the terminal.
 - Text paste and image paste share the same intentional paste path so `Ctrl+V`/`Cmd+V` behaves predictably across Linux, Windows, and macOS.
 - Linux-style primary selection is terminal-local and separate from the desktop clipboard. Selecting text in xterm.js records a primary selection, and middle-click pastes it through xterm.js terminal input so bracketed paste and PTY input semantics remain terminal-owned.
-- Terminal right-click opens the normal Yggterm terminal/session context menu through the xterm event bridge. It must suppress the browser/WebKit context menu on the terminal surface, but it must not create terminal-rendering overlays or a second menu implementation.
+- Terminal right-click opens the normal Yggterm terminal/session context menu through the xterm event bridge. It must suppress the browser/WebKit context menu and xterm helper-textarea paste path on the terminal surface, but it must not paste clipboard text, create terminal-rendering overlays, or create a second menu implementation.
 
 ### Terminal control
 
@@ -601,7 +601,7 @@ Sidebar iconography is semantic and greyscale by default.
 - Use a compact boxed SVG mark with `>_` text for Session and Codex session rows, including live Codex sessions and stored Codex transcripts. The box is the SVG outline; do not encode literal `[` or `]` characters into the mark.
 - Use a compact boxed SVG mark with `$_` text for Terminal rows, including local shells and SSH terminals. The box is the SVG outline; do not encode literal `[` or `]` characters into the mark.
 - Keep Paper/document icons as the current page mark until the Paper surface is developed further.
-- Busy state may temporarily replace the mark with the spinner, but idle rows must return to the correct boxed mark.
+- Busy state may temporarily replace the mark with a static spinner-shaped mark, but stable-channel sidebar rows must not run infinite CSS animations. Idle rows must return to the correct boxed mark.
 
 ### Header behavior
 

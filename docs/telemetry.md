@@ -78,12 +78,42 @@ Reason strings are intentionally stable. For example:
 The GUI records `terminal_open_attempt` transitions:
 
 - `begin`
+- `first_output`
+- `first_protocol_only_output`
+- `first_meaningful_output`
 - `ready`
 - `recovering`
 - `latched_failure`
 - `request_failed`
 - `session_failed`
 - `cleared`
+
+Each `terminal_open_attempt` event includes a `timing` object so slow resumes
+can be attributed to the exact phase instead of guessed from screenshots:
+
+- `elapsed_ms`: event time minus the open attempt start.
+- `request_to_surface_mounted_ms`: time until the xterm host first mounted.
+- `request_to_first_output_ms`: time until any daemon bytes reached the mounted
+  xterm bridge. Payloads record byte counts and booleans, not terminal text.
+- `surface_mounted_to_first_output_ms`: mounted-host wait before first bytes.
+- `request_to_first_protocol_only_output_ms`: time until the first
+  terminal-emulator protocol-only response or control exchange, when present.
+- `request_to_first_meaningful_output_ms`: time until the first output that the
+  resume gate considers session content rather than attach/control noise.
+- `surface_mounted_to_first_meaningful_output_ms`: mounted-host wait before
+  readable session content.
+- `first_output_to_ready_ms`: wait between first bytes and the ready verdict.
+- `first_meaningful_output_to_ready_ms`: wait between first meaningful content
+  and the ready verdict.
+- `request_to_ready_ms`: time until the terminal became readable/interactive.
+- `surface_mounted_to_ready_ms`: xterm mount-to-ready latency.
+- `request_to_failure_ms`: time until the first latched failure, when present.
+
+The `begin` event also records an open-context snapshot: active session path,
+active surface request, retained-terminal state, attach-in-flight flag,
+bootstrap owner/lease, mount epoch, and whether the session had an older ready
+attempt. This exists to catch the class where resume appears slow because a new
+open skipped behind a stale bootstrap lease.
 
 Severity mapping:
 
@@ -97,6 +127,27 @@ unhealthy, for example `canvas_blank_with_buffer_text` or
 `canvas_low_contrast_foreground_with_buffer_text`. These events are throttled by
 the host-health problem key so a single bad surface is logged once, while a
 later heal and relapse is still visible as a fresh incident.
+
+Clipboard telemetry uses the `terminal_io` category. Text copy and paste events
+record action, character count, byte count, method, and reason, never clipboard
+contents. The app-control terminal host snapshot exposes gesture counters for
+the browser side of the bridge:
+
+- `clipboard_paste_event_count`
+- `clipboard_paste_duplicate_suppressed_count`
+- `native_clipboard_paste_request_count`
+- `native_clipboard_paste_request_deduped_count`
+- `last_native_clipboard_paste_request_reason`
+- `terminal_secondary_button_suppress_count`
+
+Use those counters to diagnose double-paste or swallowed-paste reports before
+looking at raw desktop clipboard tools. A healthy text paste has exactly one
+native paste request for one claimed terminal paste gesture; duplicate browser
+events should increment only the suppressed counter.
+For terminal right-click, `terminal_secondary_button_suppress_count` must
+increase while `clipboard_paste_event_count`,
+`native_clipboard_paste_request_count`, and terminal data-event counters stay
+unchanged.
 
 The retained-recovery gate records
 `terminal_contract/retained_fault_recovery_suppressed_after_ready` when a
@@ -119,10 +170,59 @@ daemon endpoint is not ready before replaying a preserved PTY snapshot:
   retained-fault watchdog reached its remount deadline while the same session
   was still waiting for the current daemon endpoint. This should defer the
   watchdog and reschedule observation; it must not remount xterm.
+- `retained_replay_superseded_by_daemon_pty`: app-control field set on the
+  terminal host after trusted live input promotes a retained replay source back
+  to `daemon_pty`. Once this is true, retained replay is observer history only;
+  it must not continue prompt-follow retries or repaint a live daemon PTY.
+- `daemon_retained_replay_skipped_live_connected`: a delayed retained replay
+  worker reached its scheduled window after the mounted xterm host had already
+  accepted live input. This is the expected safe outcome; the worker must return
+  without writing retained bytes or forcing viewport policy.
+- `retained_rehydrate_skipped_live_connected`: the UI retained-rehydrate task
+  reached its read window after the mounted host was already live-connected, so
+  it returned without reading or writing retained bytes.
+- `retained_rehydrate_result_discarded_live_connected`: retained rehydrate read
+  a daemon snapshot, but a concurrent path promoted the host to `daemon_pty`
+  before the write. The payload was discarded and must not become visible
+  terminal truth.
+- `retained_rehydrate_read_after_live_connected_history_seed`: a
+  `CollapsedScrollbackRecovery` pass is intentionally reading retained daemon
+  history after a short live read painted the screen, because no retained
+  history has been staged and user input is still gated.
+- `retained_rehydrate_live_connected_history_seed_allowed`: the matching write
+  was allowed. App-control should then show retained-history scrollback before
+  any later input-enabled `daemon_pty` promotion.
+- `terminal_mount/terminal_attach_visual_reveal` or
+  `terminal_mount/terminal_attach_visual_reveal_from_read`: the product render
+  loop cleared the remote resume gate from daemon PTY/xterm truth. If the
+  matching `terminal_open_attempt/ready` event appears only after an
+  app-control `DescribeState`, the product loop is still missing a readiness
+  path.
+- `terminal_bootstrap_existing_lease_skip`: a terminal mount wanted to
+  bootstrap but found an existing attach lease. This is a warning because it can
+  be harmless for the same in-flight mount, but it is the primary evidence for
+  slow resume stalls when paired with a long `request_to_surface_mounted_ms`.
 
 These events are distinct from preserved-owner failures. A current endpoint
 readiness wait is a startup/handoff timing problem; an owner endpoint failure is
 a preserved PTY ownership problem.
+
+Hot-update owner cleanup records `hot_update/preserved_owner_removed` with
+reason `duplicate_legacy_owned_runtime_pruned_current_owned` when an old owner
+has accepted local-only `DropTerminalRuntime` for a key that the current daemon
+already owns. Absence of that event means the registry may still be survival
+evidence, even if current daemon read/write bypasses the preserved owner for the
+same key.
+
+Hot-update owner alias repair records
+`hot_update/preserved_owner_current_alias_retargeted` when a registry endpoint
+canonicalizes to the current daemon but a reachable real owner reports the same
+runtime key. The payload includes old/new endpoints, owner versions, owner pids,
+and remaining keys. If the alias points at the current daemon and no reachable
+owner reports that runtime key, the daemon records
+`hot_update/preserved_owner_current_alias_unresolved`; that event is diagnostic
+evidence only and must not make the current daemon proxy terminal I/O to itself
+through a stale preserved-owner route.
 
 For prompt-follow incidents, app-control also reports viewport provenance:
 `public_viewport_y` is xterm.js's public buffer counter, `visual_viewport_y` is

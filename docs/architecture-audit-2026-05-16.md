@@ -24,6 +24,7 @@ session truth, daemon truth, or theme truth.
 | --- | --- | --- | --- |
 | PTY lifecycle and byte stream | `yggterm-headless` daemon terminal runtime | app-control, telemetry, traces, screenshots | transcript preview, retained metadata, GUI state |
 | Terminal parsing and painting | xterm.js buffer, renderer, cell attributes, viewport | canvas pixels, xterm buffer probes, app-control host fields | shell DOM text overlays, prompt/cursor repair layers |
+| Web View conversation presentation | Provider-declared transcript/API model | conversation DOM attributes, app-control preview state, screenshots | terminal xterm buffer, row title, generated summaries alone |
 | Session identity | saved Codex transcript id when available, otherwise durable session id | sidebar rows, cwd projection, title DB, telemetry | synthetic runtime keys, row titles, generated summaries |
 | Live session retention | daemon runtime table plus preserved-owner registry | sidebar live rows, app-control runtime truth | keep-alive dot alone, retained xterm host alone |
 | Hot update | protocol state machine in `docs/protocol.md` | monitor, server-list, app-control, screenshots, resource samples | install-state alone, readable retained buffer, stale daemon status |
