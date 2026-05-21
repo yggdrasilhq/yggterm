@@ -14923,9 +14923,16 @@ def assert_web_view_terminal_toggle_no_crash(pid: int) -> dict:
             raise AssertionError(
                 f"web-view request changed active session: target={target_path!r} state={after_web_view!r}"
             )
-        if after_web_view.get("active_view_mode") != "Terminal":
+        if after_web_view.get("active_view_mode") != "Rendered":
             raise AssertionError(
-                f"live runtime accepted Web View mode instead of staying Terminal: {after_web_view!r}"
+                f"live runtime Web View request did not stay in rendered read-only mode: {after_web_view!r}"
+            )
+        runtime_truth = after_web_view.get("runtime_truth") or {}
+        runtime_keys = set(runtime_truth.get("daemon_runtime_keys") or [])
+        if target_path not in runtime_keys:
+            raise AssertionError(
+                f"live runtime Web View lost the daemon runtime: target={target_path!r} "
+                f"runtime_truth={runtime_truth!r}"
             )
         opened_terminal = app_open(pid, target_path, view="terminal")
         after_terminal = app_state(pid)
