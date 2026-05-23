@@ -1,13 +1,16 @@
 #![recursion_limit = "256"]
 
+#[cfg(feature = "desktop-shell")]
 pub mod chrome;
 pub mod drag_tree;
+pub mod otp;
 pub mod drag_visuals;
 pub mod motion;
 pub mod notifications;
 pub mod rails;
 pub mod theme;
 
+#[cfg(feature = "desktop-shell")]
 pub use chrome::{
     ChromeControlIcon, ChromePalette, HoveredChromeControl, TitlebarChrome, WindowControlsStrip,
     search_field_shell_style, search_input_style,
@@ -24,6 +27,11 @@ pub use motion::{
     standard_decelerate_transition, standard_transition, transition,
 };
 pub use notifications::{TOAST_CSS, ToastCard, ToastItem, ToastPalette, ToastTone, ToastViewport};
+pub use otp::{
+    YGGUI_OTP_CODE_LEN, YGGUI_OTP_CSS, YGGUI_OTP_INPUT_ID, OtpCodeEntry, android_clipboard_read_script,
+    apply_otp_input, complete_otp, install_otp_paste_bridge_script, normalize_otp_cell,
+    normalized_otp_cells, otp_active_index, otp_value,
+};
 pub use rails::{RailHeader, RailScrollBody, RailSectionTitle, SideRailShell};
 pub use theme::{
     MAX_THEME_STOPS, THEME_EDITOR_SWATCHES, append_theme_stop, chrome_material_tint,
