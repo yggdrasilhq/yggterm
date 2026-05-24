@@ -2900,6 +2900,9 @@ fn maybe_handoff_to_preferred_executable(
     args: &[String],
     install_context: &InstallContext,
 ) -> Result<()> {
+    if !should_handoff_to_preferred_executable(args) {
+        return Ok(());
+    }
     if std::env::var_os(ENV_YGGTERM_SKIP_ACTIVE_EXEC_HANDOFF).is_some() {
         return Ok(());
     }
@@ -2925,6 +2928,10 @@ fn maybe_handoff_to_preferred_executable(
         .status()
         .with_context(|| format!("failed to hand off launch to {}", preferred.display()))?;
     std::process::exit(status.code().unwrap_or(0));
+}
+
+fn should_handoff_to_preferred_executable(args: &[String]) -> bool {
+    args.is_empty()
 }
 
 fn signal_parse_client_pid(path: &std::path::Path) -> Option<u32> {
@@ -3424,10 +3431,11 @@ mod tests {
         app_control_launch_state_timeout_ms, app_control_state_settled_for_launch,
         classify_builtin_cli_command, compatible_signal_client_count,
         linux_window_profile_from_input, main_should_retire_superseded_clients_before_shell,
-        record_matches_executable, should_retire_superseded_client, signal_client_instances_dir,
-        signal_client_scope_matches, signal_parse_process_start_ticks_from_stat,
-        signal_process_start_ticks, signal_shutdown_policy_allows_daemon_shutdown,
-        superseded_client_close_command, superseded_client_retirement_strategy_label,
+        record_matches_executable, should_handoff_to_preferred_executable,
+        should_retire_superseded_client, signal_client_instances_dir, signal_client_scope_matches,
+        signal_parse_process_start_ticks_from_stat, signal_process_start_ticks,
+        signal_shutdown_policy_allows_daemon_shutdown, superseded_client_close_command,
+        superseded_client_retirement_strategy_label,
     };
     #[cfg(target_os = "linux")]
     use super::{
@@ -3995,6 +4003,25 @@ mod tests {
             &current
         ));
         assert!(!record_matches_executable(None, &current));
+    }
+
+    #[test]
+    fn preferred_executable_handoff_is_gui_entry_only() {
+        assert!(should_handoff_to_preferred_executable(&[]));
+        assert!(!should_handoff_to_preferred_executable(&[
+            "--version".to_string()
+        ]));
+        assert!(!should_handoff_to_preferred_executable(&[
+            "server".to_string(),
+            "app".to_string(),
+            "clients".to_string()
+        ]));
+        assert!(!should_handoff_to_preferred_executable(&[
+            "server".to_string(),
+            "app".to_string(),
+            "launch".to_string(),
+            "--wait-settled".to_string()
+        ]));
     }
 
     #[test]
