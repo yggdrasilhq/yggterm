@@ -89,6 +89,7 @@ use yggterm_core::{
     WorkspaceDocumentKind, YGGTERM_DESKTOP_APP_ID, append_trace_event, detect_install_context,
     event_trace_path, follow_trace_lines, generation_context_from_messages,
     looks_like_generated_fallback_title, looks_like_low_signal_generated_copy,
+    read_cc_session_identity_fields, read_cc_session_title,
     read_codex_session_identity_fields, read_codex_transcript_messages,
     read_codex_transcript_messages_limited, read_codex_transcript_messages_tail_limited,
     read_trace_tail, resolve_yggterm_home,
@@ -309,7 +310,7 @@ fn is_remote_scanned_live_session_path(path: &str) -> bool {
 fn local_live_session_kind_is_recoverable(kind: SessionKind) -> bool {
     matches!(
         kind,
-        SessionKind::Shell | SessionKind::Codex | SessionKind::CodexLiteLlm
+        SessionKind::Shell | SessionKind::Codex | SessionKind::CodexLiteLlm | SessionKind::ClaudeCode
     )
 }
 
@@ -1393,6 +1394,15 @@ pub enum RemoteMachineHealth {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LocalCcSession {
+    pub session_id: String,
+    pub cwd: String,
+    pub title_hint: String,
+    pub file_path: String,
+    pub modified_epoch: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RemoteScannedSession {
     pub session_path: String,
     pub session_id: String,
@@ -1764,6 +1774,7 @@ pub struct YggtermServer {
     ssh_targets: Vec<SshConnectTarget>,
     remote_machines: Vec<RemoteMachineSnapshot>,
     live_session_order: Vec<String>,
+    local_cc_sessions: Vec<LocalCcSession>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -1793,6 +1804,7 @@ impl YggtermServer {
         let backend = TerminalBackend::Xterm;
         sync_terminal_identity_env(theme);
 
+        let local_cc_sessions = scan_local_claude_code_sessions();
         let this = Self {
             sessions: BTreeMap::new(),
             active_session_path: None,
@@ -1803,6 +1815,7 @@ impl YggtermServer {
             ssh_targets: Vec::new(),
             remote_machines: Vec::new(),
             live_session_order: Vec::new(),
+            local_cc_sessions,
         };
 
         this
@@ -2860,6 +2873,14 @@ impl YggtermServer {
 
     pub fn remote_machines(&self) -> &[RemoteMachineSnapshot] {
         &self.remote_machines
+    }
+
+    pub fn local_cc_sessions(&self) -> &[LocalCcSession] {
+        &self.local_cc_sessions
+    }
+
+    pub fn refresh_local_cc_sessions(&mut self) {
+        self.local_cc_sessions = scan_local_claude_code_sessions();
     }
 
     pub fn live_sessions(&self) -> Vec<ManagedSessionView> {
@@ -11445,6 +11466,57 @@ pub fn scan_remote_machine_sessions_for_target(
     scan_remote_machine_sessions(target)
 }
 
+pub fn scan_local_claude_code_sessions() -> Vec<LocalCcSession> {
+    let projects_dir = match dirs::home_dir() {
+        Some(home) => home.join(".claude").join("projects"),
+        None => return Vec::new(),
+    };
+    let Ok(project_entries) = fs::read_dir(&projects_dir) else {
+        return Vec::new();
+    };
+    let mut sessions = Vec::new();
+    for project_entry in project_entries.flatten() {
+        let project_path = project_entry.path();
+        if !project_path.is_dir() {
+            continue;
+        }
+        let Ok(session_entries) = fs::read_dir(&project_path) else {
+            continue;
+        };
+        for session_entry in session_entries.flatten() {
+            let file_path = session_entry.path();
+            if file_path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+                continue;
+            }
+            let Some(file_path_str) = file_path.to_str().map(ToOwned::to_owned) else {
+                continue;
+            };
+            let Ok(Some((session_id, cwd))) = read_cc_session_identity_fields(&file_path) else {
+                continue;
+            };
+            let title_hint = read_cc_session_title(&file_path)
+                .ok()
+                .flatten()
+                .unwrap_or_else(|| short_session_id(&session_id));
+            let modified_epoch = fs::metadata(&file_path)
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            sessions.push(LocalCcSession {
+                session_id,
+                cwd,
+                title_hint,
+                file_path: file_path_str,
+                modified_epoch,
+            });
+        }
+    }
+    sessions.sort_by(|a, b| b.modified_epoch.cmp(&a.modified_epoch));
+    sessions
+}
+
 pub fn run_remote_stage_clipboard_png() -> anyhow::Result<()> {
     let home = resolve_yggterm_home()?;
     let clipboard_dir = home.join("clipboard");
@@ -18404,8 +18476,13 @@ fn legacy_agent_launch_command(
                 shell_single_quote(session_id)
             )
         }
-        // Claude Code does not have a session-resume concept; always launch fresh in cwd.
-        (SessionKind::ClaudeCode, _) => {
+        (SessionKind::ClaudeCode, Some(session_id)) => {
+            format!(
+                "{cwd_prefix}claude{claude_extra_args} --resume {}",
+                shell_single_quote(session_id)
+            )
+        }
+        (SessionKind::ClaudeCode, None) => {
             format!("{cwd_prefix}claude{claude_extra_args}")
         }
         (SessionKind::Codex, None) => format!("{cwd_prefix}codex{extra_args}"),
