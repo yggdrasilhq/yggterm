@@ -1276,8 +1276,15 @@ pub fn read_cc_session_title(path: &Path) -> Result<Option<String>> {
                 .join(" "),
             _ => continue,
         };
+        // Strip <local-command-caveat>...</local-command-caveat> block, then use
+        // whatever content follows it in the same message (if any).
+        let text = if let Some(after_close) = text.find("</local-command-caveat>") {
+            text[after_close + "</local-command-caveat>".len()..].to_string()
+        } else {
+            text
+        };
         let trimmed = text.trim();
-        if trimmed.is_empty() {
+        if trimmed.is_empty() || trimmed.starts_with("<local-command-caveat") {
             continue;
         }
         let title: String = trimmed.chars().take(80).collect();
