@@ -185,6 +185,7 @@ pub enum SessionSource {
 pub enum SessionKind {
     Codex,
     CodexLiteLlm,
+    ClaudeCode,
     Shell,
     SshShell,
     Document,
@@ -192,7 +193,16 @@ pub enum SessionKind {
 
 impl SessionKind {
     pub fn is_agent(self) -> bool {
-        matches!(self, SessionKind::Codex | SessionKind::CodexLiteLlm)
+        matches!(
+            self,
+            SessionKind::Codex | SessionKind::CodexLiteLlm | SessionKind::ClaudeCode
+        )
+    }
+
+    // Claude Code generates its own session titles and summaries through its
+    // conversation interface; skip LLM-based copy generation for these sessions.
+    pub fn self_generates_copy(self) -> bool {
+        matches!(self, SessionKind::ClaudeCode)
     }
 }
 
@@ -247,6 +257,14 @@ fn live_session_default_summary(kind: SessionKind, target: &SshConnectTarget) ->
                 "Codex LiteLLM session with daemon-owned PTY state so the conversation can survive sidebar navigation and GUI restarts.".to_string()
             }
         },
+        SessionKind::ClaudeCode => match cwd {
+            Some(cwd) => format!(
+                "Claude Code session rooted at {cwd}; the daemon owns the PTY so the conversation can survive sidebar navigation and GUI restarts."
+            ),
+            None => {
+                "Claude Code session with daemon-owned PTY state so the conversation can survive sidebar navigation and GUI restarts.".to_string()
+            }
+        },
         SessionKind::Document => "Document preview.".to_string(),
     }
 }
@@ -256,6 +274,7 @@ fn live_local_source_metadata_value(kind: SessionKind) -> &'static str {
         SessionKind::Shell => "local-shell",
         SessionKind::Codex => "local-codex",
         SessionKind::CodexLiteLlm => "local-codex-litellm",
+        SessionKind::ClaudeCode => "local-claude-code",
         SessionKind::SshShell => "live-ssh",
         SessionKind::Document => "document",
     }
@@ -263,7 +282,10 @@ fn live_local_source_metadata_value(kind: SessionKind) -> &'static str {
 
 fn live_local_target_metadata_value(kind: SessionKind, cwd: &str) -> String {
     match kind {
-        SessionKind::Shell | SessionKind::Codex | SessionKind::CodexLiteLlm => cwd.to_string(),
+        SessionKind::Shell
+        | SessionKind::Codex
+        | SessionKind::CodexLiteLlm
+        | SessionKind::ClaudeCode => cwd.to_string(),
         SessionKind::SshShell => "remote".to_string(),
         SessionKind::Document => "document".to_string(),
     }
@@ -274,6 +296,7 @@ fn live_local_prefix_metadata_value(kind: SessionKind) -> &'static str {
         SessionKind::Shell => "shell",
         SessionKind::Codex => "codex",
         SessionKind::CodexLiteLlm => "codex-litellm",
+        SessionKind::ClaudeCode => "claude",
         SessionKind::SshShell => "none",
         SessionKind::Document => "none",
     }
@@ -1599,6 +1622,7 @@ fn snapshot_session_supports_terminal_view(session: &SnapshotSessionView) -> boo
         SessionKind::Document => snapshot_document_has_terminal_recipe(session),
         SessionKind::Codex
         | SessionKind::CodexLiteLlm
+        | SessionKind::ClaudeCode
         | SessionKind::Shell
         | SessionKind::SshShell => matches!(
             session.source,
@@ -1623,6 +1647,7 @@ fn managed_session_supports_terminal_view(session: &ManagedSessionView) -> bool 
         SessionKind::Document => recipe_terminal_spec(session).is_some(),
         SessionKind::Codex
         | SessionKind::CodexLiteLlm
+        | SessionKind::ClaudeCode
         | SessionKind::Shell
         | SessionKind::SshShell => matches!(
             session.source,
@@ -1822,9 +1847,23 @@ impl YggtermServer {
     }
 
     pub fn refresh_session_preview_from_source(&mut self, path: &str) -> anyhow::Result<()> {
+        self.refresh_session_preview_from_source_with_remote_payload(path, false)
+    }
+
+    pub fn refresh_session_preview_from_source_with_remote_payload(
+        &mut self,
+        path: &str,
+        fetch_full_remote_payload: bool,
+    ) -> anyhow::Result<()> {
         if let Some((raw_machine_key, session_id)) = parse_remote_scanned_session_path(&path) {
             let machine_key = normalize_machine_key(raw_machine_key);
             self.refresh_remote_scanned_session_preview_from_cache(&machine_key, session_id);
+            if fetch_full_remote_payload || self.should_fetch_remote_preview_full_payload(path) {
+                self.refresh_remote_scanned_session_preview_from_remote_full(
+                    &machine_key,
+                    session_id,
+                )?;
+            }
             return Ok(());
         }
         let Some(session) = self.sessions.get(path).cloned() else {
@@ -1841,10 +1880,23 @@ impl YggtermServer {
                         &machine_key,
                         session_id,
                     );
+                    if fetch_full_remote_payload
+                        || self.should_fetch_remote_preview_full_payload(path)
+                    {
+                        self.refresh_remote_scanned_session_preview_from_remote_full(
+                            &machine_key,
+                            session_id,
+                        )?;
+                    }
                 }
             }
         }
         Ok(())
+    }
+
+    fn should_fetch_remote_preview_full_payload(&self, path: &str) -> bool {
+        self.active_view_mode == WorkspaceViewMode::Rendered
+            && self.active_session_path.as_deref() == Some(path)
     }
 
     pub fn sync_theme(&mut self, theme: UiTheme) {
@@ -2265,6 +2317,7 @@ impl YggtermServer {
         }
         match session.kind {
             SessionKind::Codex | SessionKind::CodexLiteLlm => Some("/quit\r".to_string()),
+            SessionKind::ClaudeCode => Some("/exit\r".to_string()),
             SessionKind::Shell | SessionKind::SshShell => Some("exit\r".to_string()),
             SessionKind::Document => None,
         }
@@ -4264,6 +4317,9 @@ impl YggtermServer {
                 );
             }
             if launch_terminal {
+                self.live_session_order
+                    .retain(|existing| existing != &session_path);
+                self.live_session_order.insert(0, session_path.clone());
                 self.focus_live_session(&session_path);
             } else {
                 self.active_session_path = Some(session_path.clone());
@@ -4451,9 +4507,10 @@ impl YggtermServer {
     ) -> String {
         let uuid = Uuid::new_v4().to_string();
         let key = match kind {
-            SessionKind::Codex | SessionKind::CodexLiteLlm | SessionKind::Shell => {
-                local_live_runtime_key(&uuid)
-            }
+            SessionKind::Codex
+            | SessionKind::CodexLiteLlm
+            | SessionKind::ClaudeCode
+            | SessionKind::Shell => local_live_runtime_key(&uuid),
             SessionKind::SshShell => format!("live::{uuid}"),
             SessionKind::Document => format!("document::{uuid}"),
         };
@@ -5929,6 +5986,64 @@ impl YggtermServer {
         if let Some(summary) = scanned.cached_summary.as_deref() {
             self.set_session_summary_hint(&path, summary);
         }
+    }
+
+    fn refresh_remote_scanned_session_preview_from_remote_full(
+        &mut self,
+        machine_key: &str,
+        session_id: &str,
+    ) -> anyhow::Result<bool> {
+        let machine_key = normalize_machine_key(machine_key);
+        let Some((machine, scanned)) = self
+            .remote_machines
+            .iter()
+            .find(|machine| machine.machine_key == machine_key)
+            .and_then(|machine| {
+                machine
+                    .sessions
+                    .iter()
+                    .find(|session| session.session_id == session_id)
+                    .map(|scanned| (machine.clone(), scanned.clone()))
+            })
+        else {
+            return Ok(false);
+        };
+        let storage_path = scanned.storage_path.trim();
+        if storage_path.is_empty() {
+            return Ok(false);
+        }
+        let target = SshConnectTarget {
+            label: machine.label.clone(),
+            kind: SessionKind::Codex,
+            ssh_target: machine.ssh_target.clone(),
+            prefix: machine.prefix.clone(),
+            cwd: Some(scanned.cwd.clone()),
+        };
+        let (payload, hydration) = fetch_remote_preview_tail_payload(
+            &target,
+            storage_path,
+            REMOTE_PREVIEW_TAIL_BLOCK_LIMIT,
+        )
+        .map(|payload| (payload, "tail"))
+        .or_else(|tail_error| {
+            warn!(
+                ssh_target = %target.ssh_target,
+                storage_path = %storage_path,
+                error = %tail_error,
+                "failed to fetch remote preview tail payload; falling back to head payload"
+            );
+            fetch_remote_preview_head_payload(&target, storage_path, 16)
+                .map(|payload| (payload, "head"))
+        })
+        .with_context(|| {
+            format!("fetching bounded remote preview for {machine_key}/{session_id}")
+        })?;
+        Ok(apply_remote_preview_payload_for_path_with_hydration(
+            self,
+            &remote_scanned_session_path(&machine_key, session_id),
+            payload,
+            hydration,
+        ))
     }
 
     fn connect_ssh_like_target(
@@ -8747,7 +8862,7 @@ fn apply_remote_scanned_session_preview(
         .iter()
         .find(|entry| entry.label == "Preview Hydration")
         .map(|entry| entry.value.as_str())
-        .is_some_and(|value| matches!(value, "head" | "full"))
+        .is_some_and(|value| matches!(value, "tail" | "head" | "full"))
         && (!session.preview.blocks.is_empty() || !session.rendered_sections.is_empty());
     if passive_title_hint_can_update(&session.title, &scanned.title_hint, false) {
         session.title = scanned.title_hint.clone();
@@ -8757,6 +8872,13 @@ fn apply_remote_scanned_session_preview(
     if !preserve_hydrated_preview {
         session.preview.blocks = preview_blocks;
         session.rendered_sections = rendered_sections;
+        if !session.preview.blocks.is_empty() || !session.rendered_sections.is_empty() {
+            upsert_session_metadata(
+                &mut session.metadata,
+                "Preview Hydration",
+                "scan".to_string(),
+            );
+        }
     }
     let messages = format!(
         "{} user · {} assistant",
@@ -9042,6 +9164,39 @@ fn apply_remote_preview_head_payload(
     );
 }
 
+fn apply_remote_preview_payload_for_path_with_hydration(
+    server: &mut YggtermServer,
+    session_path: &str,
+    payload: RemotePreviewPayload,
+    hydration: &str,
+) -> bool {
+    let mut applied = false;
+    let refreshed_title = payload.title_hint.clone();
+    let refreshed_precis = payload.cached_precis.clone();
+    let refreshed_summary = payload.cached_summary.clone();
+    if let Some(session) = server.sessions.get_mut(session_path) {
+        apply_remote_preview_payload(session, payload);
+        upsert_session_metadata(
+            &mut session.metadata,
+            "Preview Hydration",
+            hydration.to_string(),
+        );
+        applied = true;
+    }
+    if applied {
+        if let Some(title) = refreshed_title.as_deref() {
+            server.set_session_title_hint_passive(session_path, title);
+        }
+        if let Some(precis) = refreshed_precis.as_deref() {
+            server.set_session_precis_hint(session_path, precis);
+        }
+        if let Some(summary) = refreshed_summary.as_deref() {
+            server.set_session_summary_hint(session_path, summary);
+        }
+    }
+    applied
+}
+
 fn try_apply_remote_preview_head_payload(
     session: &mut ManagedSessionView,
     target: &SshConnectTarget,
@@ -9063,6 +9218,8 @@ fn try_apply_remote_preview_head_payload(
         }
     }
 }
+
+const REMOTE_PREVIEW_TAIL_BLOCK_LIMIT: usize = 48;
 
 fn apply_remote_preview_payload(session: &mut ManagedSessionView, payload: RemotePreviewPayload) {
     if let Some(title_hint) = payload
@@ -9209,6 +9366,28 @@ pub fn fetch_remote_preview_head_payload(
     )?;
     let payload: RemotePreviewPayload =
         serde_json::from_str(&output).context("invalid remote preview head payload")?;
+    Ok(payload)
+}
+
+pub fn fetch_remote_preview_tail_payload(
+    target: &SshConnectTarget,
+    storage_path: &str,
+    blocks: usize,
+) -> anyhow::Result<RemotePreviewPayload> {
+    let output = run_remote_yggterm_command(
+        &target.ssh_target,
+        target.prefix.as_deref(),
+        &[
+            "server",
+            "remote",
+            "preview-tail",
+            storage_path,
+            &blocks.to_string(),
+        ],
+        None,
+    )?;
+    let payload: RemotePreviewPayload =
+        serde_json::from_str(&output).context("invalid remote preview tail payload")?;
     Ok(payload)
 }
 
@@ -9421,6 +9600,29 @@ fn remote_preview_head_payload_for_path(
         .filter(|value| !value.trim().is_empty() && !looks_like_generated_fallback_title(value));
     let messages = read_codex_transcript_messages_limited(path, max_blocks)
         .with_context(|| format!("reading remote transcript head {}", path.display()))?;
+    Ok(Some(build_remote_preview_payload_from_messages(
+        &session_id,
+        &cwd,
+        path,
+        title_store,
+        title_hint,
+        messages,
+    )?))
+}
+
+fn remote_preview_tail_payload_for_path(
+    path: &std::path::Path,
+    title_store: &SessionTitleStore,
+    max_blocks: usize,
+) -> anyhow::Result<Option<RemotePreviewPayload>> {
+    let Some((session_id, cwd)) = read_codex_session_identity_fields(path)? else {
+        return Ok(None);
+    };
+    let title_hint = title_store
+        .get_title(&session_id)?
+        .filter(|value| !value.trim().is_empty() && !looks_like_generated_fallback_title(value));
+    let messages = read_codex_transcript_messages_tail_limited(path, max_blocks)
+        .with_context(|| format!("reading remote transcript tail {}", path.display()))?;
     Ok(Some(build_remote_preview_payload_from_messages(
         &session_id,
         &cwd,
@@ -16426,6 +16628,16 @@ pub fn run_remote_preview_head(path: &str, blocks: usize) -> anyhow::Result<()> 
     Ok(())
 }
 
+pub fn run_remote_preview_tail(path: &str, blocks: usize) -> anyhow::Result<()> {
+    let yggterm_home = resolve_yggterm_home()?;
+    let title_store = SessionTitleStore::open(&yggterm_home)?;
+    let payload =
+        remote_preview_tail_payload_for_path(std::path::Path::new(path), &title_store, blocks)?
+            .with_context(|| format!("no previewable codex session at {path}"))?;
+    write_stdout_line(&serde_json::to_string(&payload)?)?;
+    Ok(())
+}
+
 pub fn run_remote_generation_context(path: &str) -> anyhow::Result<()> {
     let context = generation_context_from_messages(
         &read_codex_transcript_messages(std::path::Path::new(path))
@@ -16914,7 +17126,13 @@ fn snapshot_live_session_view(session: &ManagedSessionView) -> SnapshotSessionVi
                     .preview
                     .blocks
                     .iter()
-                    .take(LIVE_SNAPSHOT_PREVIEW_BLOCK_LIMIT)
+                    .skip(
+                        session
+                            .preview
+                            .blocks
+                            .len()
+                            .saturating_sub(LIVE_SNAPSHOT_PREVIEW_BLOCK_LIMIT),
+                    )
                     .cloned()
                     .map(|mut block| {
                         if block.lines.len() > LIVE_SNAPSHOT_PREVIEW_BLOCK_LINE_LIMIT {
@@ -17468,6 +17686,14 @@ fn build_live_session(
                 "codex-litellm".to_string(),
                 RemoteDeployState::NotRequired,
             ),
+            SessionKind::ClaudeCode => (
+                agent_launch_command(SessionKind::ClaudeCode, Some(&default_cwd), None),
+                local_live_runtime_key(uuid),
+                "local-claude-code".to_string(),
+                default_cwd.clone(),
+                "claude".to_string(),
+                RemoteDeployState::NotRequired,
+            ),
             SessionKind::SshShell => (
                 remote_ssh_launch_command(
                     &target.ssh_target,
@@ -17500,6 +17726,9 @@ fn build_live_session(
         SessionKind::CodexLiteLlm => {
             "This Codex LiteLLM session uses the configured LiteLLM-friendly CLI path and stays attached to the daemon.".to_string()
         }
+        SessionKind::ClaudeCode => {
+            "This Claude Code session stays attached to the daemon and opens inline in the main terminal viewport.".to_string()
+        }
         SessionKind::SshShell => {
             "This session should land in the main viewport as an embedded xterm.js terminal.".to_string()
         }
@@ -17517,6 +17746,9 @@ fn build_live_session(
         }
         SessionKind::CodexLiteLlm => {
             "Codex LiteLLM is launched locally with a dedicated CODEX_HOME and will receive /quit on shutdown.".to_string()
+        }
+        SessionKind::ClaudeCode => {
+            "Claude Code is launched locally and will receive /exit when the daemon shuts down.".to_string()
         }
         SessionKind::Document => "No terminal runtime is required.".to_string(),
     };
@@ -18151,6 +18383,7 @@ fn legacy_agent_launch_command(
         .map(|prefix| format!("{prefix} && "))
         .unwrap_or_default();
     let extra_args = legacy_codex_extra_args();
+    let claude_extra_args = legacy_claude_code_extra_args();
     match (kind, session_id) {
         (SessionKind::Codex, Some(session_id)) => {
             if cwd_prefix.is_empty() {
@@ -18171,6 +18404,10 @@ fn legacy_agent_launch_command(
                 shell_single_quote(session_id)
             )
         }
+        // Claude Code does not have a session-resume concept; always launch fresh in cwd.
+        (SessionKind::ClaudeCode, _) => {
+            format!("{cwd_prefix}claude{claude_extra_args}")
+        }
         (SessionKind::Codex, None) => format!("{cwd_prefix}codex{extra_args}"),
         (SessionKind::CodexLiteLlm, None) => {
             format!("{cwd_prefix}CODEX_HOME=\"$HOME/.codex-litellm\" codex-litellm{extra_args}")
@@ -18184,6 +18421,15 @@ fn legacy_codex_extra_args() -> String {
         .and_then(|store| store.load_settings())
         .ok()
         .map(|settings| settings.codex_extra_args)
+        .unwrap_or_default();
+    shell_join_extra_args(&raw)
+}
+
+fn legacy_claude_code_extra_args() -> String {
+    let raw = SessionStore::open_or_init()
+        .and_then(|store| store.load_settings())
+        .ok()
+        .map(|settings| settings.claude_code_extra_args)
         .unwrap_or_default();
     shell_join_extra_args(&raw)
 }
@@ -18256,6 +18502,7 @@ fn stored_session_launch_command(kind: SessionKind, cwd: &str, session_id: &str)
         SessionKind::Codex | SessionKind::CodexLiteLlm => {
             agent_launch_command(kind, Some(cwd), Some(session_id))
         }
+        SessionKind::ClaudeCode => agent_launch_command(kind, Some(cwd), Some(session_id)),
         SessionKind::Document => "document web view".to_string(),
         SessionKind::Shell | SessionKind::SshShell => format!(
             "cd {} && codex resume {}",
@@ -18283,6 +18530,13 @@ fn local_session_target(kind: SessionKind, cwd: Option<&str>) -> SshConnectTarge
         },
         SessionKind::CodexLiteLlm => SshConnectTarget {
             label: "codex-litellm".to_string(),
+            kind,
+            ssh_target: "localhost".to_string(),
+            prefix: None,
+            cwd,
+        },
+        SessionKind::ClaudeCode => SshConnectTarget {
+            label: "claude-code".to_string(),
             kind,
             ssh_target: "localhost".to_string(),
             prefix: None,
@@ -18316,6 +18570,7 @@ fn session_kind_label(kind: SessionKind) -> &'static str {
     match kind {
         SessionKind::Codex => "codex",
         SessionKind::CodexLiteLlm => "codex-litellm",
+        SessionKind::ClaudeCode => "claude-code",
         SessionKind::Shell => "shell",
         SessionKind::SshShell => "ssh",
         SessionKind::Document => "document",
@@ -22429,6 +22684,94 @@ terminal_window_id: None,
     }
 
     #[test]
+    fn snapshot_live_session_preview_projection_keeps_latest_tail_blocks() {
+        let tree = SessionNode {
+            kind: SessionNodeKind::Group,
+            name: "root".to_string(),
+            title: None,
+            document_kind: None,
+            group_kind: None,
+            path: PathBuf::from("/"),
+            children: Vec::new(),
+            session_id: None,
+            cwd: None,
+        };
+        let mut server = YggtermServer::new(
+            &tree,
+            false,
+            GhosttyHostSupport::shadow("test".to_string(), false, false),
+            UiTheme::ZedLight,
+        );
+        let session_path = "remote-session://oc/tail-preview";
+        let mut session = build_session(
+            SessionKind::Codex,
+            session_path,
+            Some("tail-preview"),
+            Some("/home/pi"),
+            Some("Tail Preview"),
+            None,
+            TerminalBackend::Xterm,
+            UiTheme::ZedLight,
+            false,
+            StoredPreviewHydrationMode::Deferred,
+        );
+        session.source = SessionSource::LiveSsh;
+        session.preview.blocks = (0..5)
+            .map(|index| SessionPreviewBlock {
+                role: if index % 2 == 0 { "USER" } else { "ASSISTANT" },
+                timestamp: format!("2026-05-22T10:0{index}:00Z"),
+                tone: if index % 2 == 0 {
+                    PreviewTone::User
+                } else {
+                    PreviewTone::Assistant
+                },
+                folded: false,
+                lines: vec![format!("preview block {index}")],
+            })
+            .collect();
+        upsert_session_metadata(
+            &mut session.metadata,
+            "Preview Hydration",
+            "tail".to_string(),
+        );
+        server
+            .sessions
+            .insert(session_path.to_string(), session.clone());
+        server.live_session_order = vec![session_path.to_string()];
+        server.active_session_path = Some(session_path.to_string());
+        server.active_view_mode = WorkspaceViewMode::Rendered;
+
+        let snapshot = server.snapshot();
+        let active = snapshot.active_session.expect("active session");
+        assert_eq!(
+            active
+                .preview
+                .blocks
+                .iter()
+                .map(|block| block.lines.join("\n"))
+                .collect::<Vec<_>>(),
+            vec![
+                "preview block 0",
+                "preview block 1",
+                "preview block 2",
+                "preview block 3",
+                "preview block 4",
+            ],
+            "active Web View truth must retain the full hydrated preview"
+        );
+        let live = snapshot.live_sessions.first().expect("live session");
+        assert_eq!(
+            live.preview
+                .blocks
+                .iter()
+                .map(|block| block.lines.join("\n"))
+                .collect::<Vec<_>>(),
+            vec!["preview block 3", "preview block 4"],
+            "live-session sidebar projection must summarize the latest transcript tail, not stale head blocks"
+        );
+    }
+
+    #[test]
     fn snapshot_does_not_export_deleted_local_active_gap() {
         let tree = SessionNode {
             kind: SessionNodeKind::Group,
@@ -23636,6 +23979,110 @@ terminal_window_id: None,
         assert_eq!(
             session.preview.blocks[0].lines,
             vec!["Hydrated preview block"]
+        );
+    }
+
+    #[test]
+    fn remote_scanned_preview_does_not_clobber_tail_hydrated_preview_blocks() {
+        let mut session = build_session(
+            SessionKind::Codex,
+            "remote-session://jojo/tail123",
+            Some("tail123"),
+            Some("/home/pi"),
+            Some("Tail Hydrated Session"),
+            None,
+            TerminalBackend::Xterm,
+            UiTheme::ZedLight,
+            false,
+            StoredPreviewHydrationMode::Deferred,
+        );
+        session.preview.blocks = vec![SessionPreviewBlock {
+            role: "ASSISTANT",
+            timestamp: "May 22, 2026 02:10 PM UTC+0530".to_string(),
+            tone: PreviewTone::Assistant,
+            folded: false,
+            lines: vec!["Recent tail transcript block".to_string()],
+        }];
+        upsert_session_metadata(
+            &mut session.metadata,
+            "Preview Hydration",
+            "tail".to_string(),
+        );
+        let scanned = RemoteScannedSession {
+            session_path: "remote-session://jojo/tail123".to_string(),
+            session_id: "tail123".to_string(),
+            cwd: "/home/pi".to_string(),
+            started_at: "May 22, 2026 02:00 PM UTC+0530".to_string(),
+            modified_epoch: 1,
+            event_count: 2,
+            user_message_count: 1,
+            assistant_message_count: 1,
+            title_hint: "Tail Hydrated Session".to_string(),
+            recent_context: "ASSISTANT: Older scanned projection".to_string(),
+            cached_precis: None,
+            cached_summary: None,
+            live_runtime: false,
+            storage_path: "/tmp/tail123.jsonl".to_string(),
+        };
+
+        apply_remote_scanned_session_preview(&mut session, &scanned, "jojo", "jojo");
+
+        assert_eq!(session.preview.blocks.len(), 1);
+        assert_eq!(
+            session.preview.blocks[0].lines,
+            vec!["Recent tail transcript block"]
+        );
+        assert_eq!(
+            session_metadata_value(&session, "Preview Hydration").as_deref(),
+            Some("tail")
+        );
+    }
+
+    #[test]
+    fn remote_scanned_preview_marks_readable_scan_hydration() {
+        let mut session = build_session(
+            SessionKind::Codex,
+            "remote-session://jojo/abc123",
+            Some("abc123"),
+            Some("/home/pi"),
+            Some("Scanned Session"),
+            None,
+            TerminalBackend::Xterm,
+            UiTheme::ZedLight,
+            false,
+            StoredPreviewHydrationMode::Deferred,
+        );
+        let scanned = RemoteScannedSession {
+            session_path: "remote-session://jojo/abc123".to_string(),
+            session_id: "abc123".to_string(),
+            cwd: "/home/pi".to_string(),
+            started_at: "Mar 31, 2026 10:00 PM UTC+0530".to_string(),
+            modified_epoch: 1,
+            event_count: 2,
+            user_message_count: 1,
+            assistant_message_count: 1,
+            title_hint: "Scanned Session".to_string(),
+            recent_context: "USER: Open this in Web View.\nASSISTANT: I will render the scanned turns while full JSONL hydration runs.".to_string(),
+            cached_precis: None,
+            cached_summary: None,
+            live_runtime: true,
+            storage_path: "/home/pi/.codex/sessions/demo.jsonl".to_string(),
+        };
+
+        apply_remote_scanned_session_preview(&mut session, &scanned, "jojo", "jojo");
+
+        assert_eq!(
+            session_metadata_value(&session, "Preview Hydration").as_deref(),
+            Some("scan")
+        );
+        assert_eq!(session.preview.blocks.len(), 2);
+        assert_eq!(
+            session.preview.blocks[0].lines,
+            vec!["Open this in Web View.".to_string()]
+        );
+        assert_eq!(
+            session_metadata_value(&session, "Storage").as_deref(),
+            Some("/home/pi/.codex/sessions/demo.jsonl")
         );
     }
 
@@ -27560,6 +28007,49 @@ terminal_window_id: None,
 
         let result = server.refresh_session_preview_from_source("remote-session://dev/abc123");
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn remote_preview_full_fetch_is_active_rendered_only() {
+        let tree = SessionNode {
+            kind: SessionNodeKind::Group,
+            name: "sessions".to_string(),
+            title: None,
+            document_kind: None,
+            group_kind: None,
+            path: PathBuf::from("/"),
+            children: Vec::new(),
+            session_id: None,
+            cwd: None,
+        };
+        let mut server = YggtermServer::new(
+            &tree,
+            false,
+            GhosttyHostSupport::shadow("test".to_string(), false, false),
+            UiTheme::ZedLight,
+        );
+        let path = "remote-session://dev/abc123";
+        server.restore_live_session(PersistedLiveSession {
+            key: path.to_string(),
+            id: "abc123".to_string(),
+            title: "Remote session".to_string(),
+            kind: SessionKind::SshShell,
+            keep_alive: true,
+            ssh_target: "dev".to_string(),
+            prefix: None,
+            cwd: Some("/home/pi/gh".to_string()),
+            remote_launch_action: None,
+            storage_path: None,
+            restore_reason: None,
+        });
+
+        server.active_session_path = Some(path.to_string());
+        server.active_view_mode = WorkspaceViewMode::Terminal;
+        assert!(!server.should_fetch_remote_preview_full_payload(path));
+
+        server.active_view_mode = WorkspaceViewMode::Rendered;
+        assert!(server.should_fetch_remote_preview_full_payload(path));
+        assert!(!server.should_fetch_remote_preview_full_payload("remote-session://dev/other"));
     }
 
     #[test]

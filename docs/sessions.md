@@ -118,6 +118,36 @@ daemon for both Codex sessions and generic SSH terminals.
   the daemon-owned runtime. The live runtime remains in `Live Sessions` and can
   be restored by switching back to Terminal; Web View is only read-only
   presentation over saved transcript/provider data.
+- When the active Web View has a hydrated provider transcript window, that
+  active session payload is the authoritative Web View read model. `Live
+  Sessions` and machine/cwd rows are sidebar/runtime projections and may carry
+  only shallow preview blocks. Shell reconciliation must not replace the
+  hydrated active transcript with a shallow live-row projection just because
+  both rows share the same session path. For remote Codex sessions, interactive
+  hydration should use a bounded recent transcript window rather than shipping a
+  full multi-megabyte JSONL transcript through daemon snapshot IPC. Once that
+  recent-tail window is mounted, older head, scan, loading, or empty preview
+  projections are downgrades and must not clobber the active reader. Terminal
+  mode keeps the inverse rule: prefer the live runtime projection for xterm
+  attachment and PTY status.
+- If a live-session snapshot must truncate transcript preview blocks for
+  sidebar/runtime projection size, it must truncate from the head and keep the
+  latest tail. A shallow projection must not expose old transcript-head blocks
+  under `Preview Hydration=tail`; that creates a false observer that can replace
+  the active Web View conversation during restore.
+- Web View chat mode must lead with provider transcript turns. Generated goals,
+  summaries, and rendered context are secondary presentation sections and must
+  appear after the transcript turns so they never masquerade as the conversation
+  itself.
+- Live Codex Web View opens at the latest hydrated transcript turn. Older
+  transcript blocks remain provider data, but the first viewport after Terminal
+  -> Web View must not look like the start of an old unrelated conversation
+  when a recent-tail transcript window is present. Large transcript readers
+  must materialize the latest transcript window for the first frame, then may
+  also seed/pin the real scroll container through the mounted latest transcript
+  anchor. The global post-render scroll script is only a secondary nudge. A
+  shallow head projection or scroll position zero is not an acceptable first
+  frame for a hydrated tail.
 - Startpage saved-session cards are durable saved-session rows only. Live
   runtime projections, generic SSH terminals keyed by `live::...`, and fresh
   remote Codex starts without transcript `storage_path` stay out of saved UUID

@@ -1441,6 +1441,8 @@ pub enum ServerRequest {
     },
     RefreshPreview {
         path: String,
+        #[serde(default)]
+        full_remote_payload: bool,
     },
     UpdateSessionCopy {
         path: String,
@@ -1747,25 +1749,16 @@ impl DaemonRuntime {
                 }),
             );
         }
-        let current_endpoint = default_endpoint(runtime.store.home_dir());
-        let reachable_owner_statuses = reachable_versioned_daemon_statuses_excluding_endpoint(
+        append_trace_event(
             runtime.store.home_dir(),
-            &current_endpoint,
+            "daemon",
+            "hot_update",
+            "preserved_owner_deep_reconcile_deferred_on_load",
+            serde_json::json!({
+                "reason": "current daemon socket must bind before cross-daemon preserved-owner inspection",
+                "remaining_runtime_keys": runtime.preserved_terminal_owners.keys(),
+            }),
         );
-        let _ = runtime
-            .preserved_terminal_owners
-            .retarget_current_alias_entries(
-                runtime.store.home_dir(),
-                &current_endpoint,
-                &reachable_owner_statuses,
-                std::process::id(),
-                "runtime_load",
-            )?;
-        runtime.restore_missing_preserved_owner_live_sessions("runtime_load");
-        runtime
-            .recover_missing_preserved_owner_live_sessions_from_reachable_daemons("runtime_load");
-        runtime.prune_unrepresented_preserved_owners("runtime_load");
-        runtime.prune_unrepresented_preserved_owner_runtime_sessions("runtime_load");
         perf.finish(serde_json::json!({
             "prefer_ghostty_backend": settings.prefer_ghostty_backend,
             "theme": format!("{:?}", settings.theme),
@@ -3821,8 +3814,15 @@ impl DaemonRuntime {
                     message: Some(message),
                 }
             }
-            ServerRequest::RefreshPreview { path } => {
-                self.server.refresh_session_preview_from_source(&path)?;
+            ServerRequest::RefreshPreview {
+                path,
+                full_remote_payload,
+            } => {
+                self.server
+                    .refresh_session_preview_from_source_with_remote_payload(
+                        &path,
+                        full_remote_payload,
+                    )?;
                 self.persist()?;
                 self.snapshot_response(Some(format!("refreshed preview {path}")))
             }
@@ -4018,6 +4018,7 @@ impl DaemonRuntime {
                     match session_kind {
                         SessionKind::Codex => "codex",
                         SessionKind::CodexLiteLlm => "codex-litellm",
+                        SessionKind::ClaudeCode => "claude-code",
                         SessionKind::Shell => "shell",
                         SessionKind::SshShell => "ssh",
                         SessionKind::Document => "document",
@@ -5747,11 +5748,13 @@ pub fn refresh_managed_cli(
 pub fn refresh_preview(
     endpoint: &ServerEndpoint,
     path: &str,
+    full_remote_payload: bool,
 ) -> Result<(ServerUiSnapshot, Option<String>)> {
     expect_snapshot(send_request(
         endpoint,
         &ServerRequest::RefreshPreview {
             path: path.to_string(),
+            full_remote_payload,
         },
     )?)
 }
@@ -8109,6 +8112,7 @@ fn daemon_request_io_timeout_ms(request: &ServerRequest) -> u64 {
         ServerRequest::StartSshSession { .. }
         | ServerRequest::StartRemoteCodexSession { .. }
         | ServerRequest::OpenRemoteSession { .. }
+        | ServerRequest::RefreshPreview { .. }
         | ServerRequest::EnsureRemoteRuntimeCodexSession { .. }
         | ServerRequest::StartRemoteRuntimeCodexSession { .. }
         | ServerRequest::RemoveSession { .. }
@@ -8190,6 +8194,30 @@ mod tests {
         YggtermServer, remote_scanned_session_path,
     };
     use yggui_contract::UiTheme;
+
+    #[test]
+    fn refresh_preview_request_defaults_to_cache_only_and_can_request_full_payload() {
+        let decoded: super::ServerRequest =
+            serde_json::from_str(r#"{"kind":"refresh_preview","path":"remote-session://dev/a"}"#)
+                .expect("legacy refresh request should decode");
+        match decoded {
+            super::ServerRequest::RefreshPreview {
+                path,
+                full_remote_payload,
+            } => {
+                assert_eq!(path, "remote-session://dev/a");
+                assert!(!full_remote_payload);
+            }
+            other => panic!("unexpected request {other:?}"),
+        }
+
+        let encoded = serde_json::to_value(super::ServerRequest::RefreshPreview {
+            path: "remote-session://dev/a".to_string(),
+            full_remote_payload: true,
+        })
+        .expect("request should encode");
+        assert_eq!(encoded["full_remote_payload"], true);
+    }
 
     #[test]
     fn terminal_stream_responses_default_resize_fence_fields_for_hot_update() {
@@ -8513,6 +8541,41 @@ mod tests {
         assert!(
             !daemon_entrypoint.contains("cleanup_legacy_daemons("),
             "headless daemon entrypoint must not run blocking legacy cleanup before run_daemon"
+        );
+    }
+
+    #[test]
+    fn runtime_load_defers_preserved_owner_deep_reconcile_until_after_socket_bind() {
+        let source = include_str!("daemon.rs");
+        let load_body = source
+            .split("fn load(support: GhosttyHostSupport) -> Result<Self> {")
+            .nth(1)
+            .and_then(|body| body.split("fn preserved_terminal_owner_keys").next())
+            .expect("DaemonRuntime::load body should be present");
+        assert!(
+            !load_body.contains("restore_missing_preserved_owner_live_sessions("),
+            "runtime load must not inspect preserved-owner snapshots before binding the current socket"
+        );
+        assert!(
+            !load_body
+                .contains("recover_missing_preserved_owner_live_sessions_from_reachable_daemons("),
+            "runtime load must not scan old daemons before binding the current socket"
+        );
+        assert!(
+            !load_body.contains("prune_unrepresented_preserved_owners("),
+            "runtime load must not mutate stale owners before binding the current socket"
+        );
+        assert!(
+            !load_body.contains("reachable_versioned_daemon_statuses_excluding_endpoint("),
+            "runtime load must not inspect old daemon endpoints before binding the current socket"
+        );
+        assert!(
+            !load_body.contains("retarget_current_alias_entries("),
+            "runtime load must not retarget current-alias preserved owners before binding the current socket"
+        );
+        assert!(
+            load_body.contains("preserved_owner_deep_reconcile_deferred_on_load"),
+            "runtime load should leave trace evidence for deferred deep reconcile"
         );
     }
 
@@ -9076,6 +9139,13 @@ mod tests {
                 force_remote: true,
                 initial_cols: Some(110),
                 initial_rows: Some(50),
+            }),
+            super::DAEMON_LONG_REQUEST_IO_TIMEOUT_MS
+        );
+        assert_eq!(
+            super::daemon_request_io_timeout_ms(&super::ServerRequest::RefreshPreview {
+                path: "remote-session://dev/session".to_string(),
+                full_remote_payload: true,
             }),
             super::DAEMON_LONG_REQUEST_IO_TIMEOUT_MS
         );
