@@ -14525,7 +14525,8 @@ fn is_codex_litellm_storage_session_path(path: &str) -> bool {
 }
 
 fn is_claude_code_session_path(path: &str) -> bool {
-    path.contains("/.claude/projects/") && path.ends_with(".jsonl")
+    (path.contains("/.claude/projects/") && path.ends_with(".jsonl"))
+        || path.starts_with("remote-cc://")
 }
 
 fn row_session_kind(row: &BrowserRow) -> Option<SessionKind> {
@@ -19880,7 +19881,7 @@ fn inject_file_backed_cc_session_rows(
                 kind: BrowserRowKind::Session,
                 full_path: session.file_path.clone(),
                 label: session.title_hint.clone(),
-                detail_label: String::new(),
+                detail_label: session.context_hint.clone(),
                 document_kind: None,
                 group_kind: None,
                 session_title: Some(session.title_hint.clone()),
@@ -40320,6 +40321,8 @@ fn tree_icon_kind(row: &BrowserRow) -> &'static str {
                 || is_codex_storage_session_path(&row.full_path)
             {
                 "session"
+            } else if is_claude_code_session_path(&row.full_path) {
+                "claude-code"
             } else if row.full_path.starts_with("local://") {
                 "terminal"
             } else if row.full_path.starts_with("ssh://") {
@@ -40346,18 +40349,20 @@ fn tree_icon_kind(row: &BrowserRow) -> &'static str {
 fn tree_icon_glyph(row: &BrowserRow) -> Option<&'static str> {
     match row.kind {
         BrowserRowKind::Separator => Some("—"),
-        BrowserRowKind::Session => Some(
-            if row.full_path.starts_with("codex-litellm://")
+        BrowserRowKind::Session => {
+            if is_claude_code_session_path(&row.full_path) {
+                Some("*_")
+            } else if row.full_path.starts_with("codex-litellm://")
                 || is_codex_litellm_storage_session_path(&row.full_path)
                 || row.full_path.starts_with("codex://")
                 || is_codex_storage_session_path(&row.full_path)
                 || row.full_path.starts_with("remote-session://")
             {
-                ">_"
+                Some(">_")
             } else {
-                "$_"
-            },
-        ),
+                Some("$_")
+            }
+        }
         _ => None,
     }
 }
@@ -41131,26 +41136,31 @@ fn ClaudeCodeTreeIcon() -> Element {
             view_box: "0 0 19 15",
             fill: "none",
             xmlns: "http://www.w3.org/2000/svg",
-            circle {
-                cx: "9.5",
-                cy: "7.5",
-                r: "5.6",
-                stroke: "currentColor",
-                stroke_width: "1.15",
-            }
+            rect { x: "1.6", y: "1.7", width: "15.8", height: "11.6", rx: "2.2", stroke: "currentColor", stroke_width: "1.15" }
             text {
-                x: "9.5",
-                y: "10.5",
+                x: "7.0",
+                y: "10.2",
                 text_anchor: "middle",
                 fill: "currentColor",
-                style: "font-family:'JetBrains Mono', ui-monospace, monospace; font-size:6.5px; font-weight:800; letter-spacing:0;",
-                "cc"
+                style: "font-family:'JetBrains Mono', ui-monospace, monospace; font-size:10px; font-weight:800; letter-spacing:0;",
+                "*"
+            }
+            text {
+                x: "14.0",
+                y: "10.0",
+                text_anchor: "middle",
+                fill: "currentColor",
+                style: "font-family:'JetBrains Mono', ui-monospace, monospace; font-size:7px; font-weight:800; letter-spacing:0;",
+                "_"
             }
         }
     }
 }
 #[component]
 fn TreeIcon(row: BrowserRow) -> Element {
+    if row_session_kind(&row) == Some(SessionKind::ClaudeCode) {
+        return rsx! { ClaudeCodeTreeIcon {} };
+    }
     if let Some(glyph) = tree_icon_glyph(&row) {
         return rsx! {
             svg {
@@ -63614,17 +63624,33 @@ fn StartPage(snapshot: SharedSnapshot, state: Signal<ShellState>) -> Element {
                             } else {
                                 row.host_label.clone()
                             };
-                            let kind_tag: Option<(&'static str, &'static str, &'static str)> =
+                            let open_button_label: &'static str =
                                 match row_session_kind(&row) {
-                                    Some(SessionKind::ClaudeCode) => {
-                                        Some(("claude code", "rgba(217,119,6,0.22)", "#d97706"))
+                                    Some(SessionKind::ClaudeCode) => "Open in Claude",
+                                    Some(SessionKind::Codex | SessionKind::CodexLiteLlm) => {
+                                        "Open in Codex"
                                     }
-                                    Some(
-                                        SessionKind::Codex
-                                        | SessionKind::CodexLiteLlm,
-                                    ) => Some(("codex", "rgba(99,102,241,0.20)", "#6366f1")),
-                                    _ => None,
+                                    _ => "Open",
                                 };
+                            let open_button_style = match row_session_kind(&row) {
+                                Some(SessionKind::ClaudeCode) => format!(
+                                    "display:inline-flex; align-items:center; justify-content:center; \
+                                     min-height:28px; padding:0 10px; border:none; border-radius:7px; \
+                                     background:#d97706; color:white; font-size:12px; font-weight:800;"
+                                ),
+                                Some(SessionKind::Codex | SessionKind::CodexLiteLlm) => format!(
+                                    "display:inline-flex; align-items:center; justify-content:center; \
+                                     min-height:28px; padding:0 10px; border:none; border-radius:7px; \
+                                     background:{}; color:{}; font-size:12px; font-weight:800;",
+                                    palette.panel, palette.accent
+                                ),
+                                _ => format!(
+                                    "display:inline-flex; align-items:center; justify-content:center; \
+                                     min-height:28px; padding:0 10px; border:none; border-radius:7px; \
+                                     background:{}; color:{}; font-size:12px; font-weight:800;",
+                                    palette.panel, palette.accent
+                                ),
+                            };
                             let card_icon_button_style = format!(
                                 "display:inline-flex; align-items:center; justify-content:center; width:28px; height:28px; \
                                  border:none; border-radius:7px; background:{}; color:{}; box-shadow:inset 0 0 0 1px rgba(120,142,166,0.14); cursor:pointer;",
@@ -63681,15 +63707,6 @@ fn StartPage(snapshot: SharedSnapshot, state: Signal<ShellState>) -> Element {
                                                 },
                                                 PencilIcon { size: 12 }
                                             }
-                                            if let Some((tag_label, tag_bg, tag_color)) = kind_tag {
-                                                span {
-                                                    style: format!(
-                                                        "font-size:10px; font-weight:700; line-height:1; padding:2px 6px; border-radius:4px; \
-                                                         background:{tag_bg}; color:{tag_color}; flex:0 0 auto; letter-spacing:0.03em; text-transform:uppercase;"
-                                                    ),
-                                                    "{tag_label}"
-                                                }
-                                            }
                                             span {
                                                 style: format!("font-size:11px; line-height:1.3; color:{}; flex:0 0 auto;", palette.muted),
                                                 "{host}"
@@ -63721,13 +63738,9 @@ fn StartPage(snapshot: SharedSnapshot, state: Signal<ShellState>) -> Element {
                                         button {
                                             r#type: "button",
                                             "data-yggterm-start-action": "open-recent",
-                                            style: format!(
-                                                "display:inline-flex; align-items:center; justify-content:center; min-height:28px; padding:0 10px; \
-                                                 border:none; border-radius:7px; background:{}; color:{}; font-size:12px; font-weight:800;",
-                                                palette.panel, palette.accent
-                                            ),
+                                            style: "{open_button_style}",
                                             onclick: move |_| spawn_open_session_row(state, row_for_click.clone()),
-                                            "Open"
+                                            "{open_button_label}"
                                         }
                                         button {
                                             r#type: "button",
