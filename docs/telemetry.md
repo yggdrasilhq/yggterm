@@ -73,6 +73,14 @@ Reason strings are intentionally stable. For example:
 - `active remote terminal lost expected scrollback after retained replay`
 - `active remote terminal is showing stale retained text before prompt-ready surface`
 
+`active remote terminal lost expected scrollback after retained replay` is a
+blocking terminal-open reason only when the current prompt is not ready, an
+unsafe retained replay path is involved, or a scroll probe proves the viewport
+cannot move through expected history. For a readable prompt-ready restore, the
+same evidence remains available as observer data through `scrollback_expected`,
+`base_y`, `viewport_y`, retained replay source fields, and probe-scroll output;
+it must not hold user input behind a restore gate by itself.
+
 ## Initial Coverage
 
 The GUI records `terminal_open_attempt` transitions:
@@ -139,6 +147,8 @@ the browser side of the bridge:
 - `native_clipboard_paste_request_deduped_count`
 - `last_native_clipboard_paste_request_reason`
 - `terminal_secondary_button_suppress_count`
+- `focus_capture_pointer_events`
+- `focus_capture_hit_target_enabled`
 
 Use those counters to diagnose double-paste or swallowed-paste reports before
 looking at raw desktop clipboard tools. A healthy text paste has exactly one
@@ -148,6 +158,12 @@ For terminal right-click, `terminal_secondary_button_suppress_count` must
 increase while `clipboard_paste_event_count`,
 `native_clipboard_paste_request_count`, and terminal data-event counters stay
 unchanged.
+For terminal selection, the focus-capture overlay and context-menu backdrop are
+observer/shell chrome only. They must not become terminal hit targets. A healthy
+state reports `focus_capture_hit_target_enabled == false`, and `probe-select`
+must prove selection through xterm's pointer path with non-empty
+`term.getSelection()` plus selection-layer rectangles. DOM Range selection and
+buffer-only fallbacks are diagnostics, not selection truth.
 
 The retained-recovery gate records
 `terminal_contract/retained_fault_recovery_suppressed_after_ready` when a

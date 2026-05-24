@@ -42,6 +42,19 @@ resize/geometry settle, input focus/readiness, or recovery after a stale
 preserved-owner handoff. `scripts/smoke_ui_latency.py` is the proof path for
 this contract.
 
+Attach/recovery gates are foreground controller state. A retained live runtime
+may exist in the background, but an old `terminal_attach_in_flight` entry for a
+background row must not keep future switches or unrelated sessions behind a
+restore notification. Switching focus prunes background attach/bootstrap leases;
+the daemon runtime and retained-session identity remain untouched.
+
+Collapsed retained scrollback is a diagnostic unless it prevents the current
+prompt from being readable and input-ready. A remote terminal with a visible
+current prompt, mounted xterm surface, and enabled input should become
+interactive immediately. App-control must still expose `scrollback_expected`,
+`base_y`, and probe-scroll results so lost history can be debugged, and explicit
+wheel/scroll failures remain hard terminal problems.
+
 For terminal rendering bugs, the repair order is strict:
 
 1. Prove the selected session identity and daemon runtime key.
@@ -62,6 +75,54 @@ default, shaped like a chat transcript or document view. It may render stored
 Codex JSONL, generated summaries, `USER`/`ASSISTANT` message blocks,
 timestamps, and other display copy. That data is useful for inspection, but it
 is not terminal output.
+
+In chat layout, transcript turns come first. Generated goals, summaries,
+rendered context, and other secondary sections can enrich the reader, but they
+must sit below the actual transcript turns and must not be presented as the
+primary conversation.
+
+Readable remote scan previews are valid Web View presentation data. They should
+render immediately instead of being hidden behind a loading gate. If the live
+session metadata includes a saved transcript `Storage` path, the shell may fetch
+and hydrate a bounded recent JSONL transcript window in the background; that
+hydration updates Web View presentation only and must not seed, repair, restart,
+or otherwise mutate the Terminal-mode PTY runtime.
+
+Remote transcript hydration for the active Web View must stay bounded for
+interactive use. A large transcript can be tens of megabytes and must not be
+sent as a normal daemon snapshot just to make the reader usable. The active Web
+View should request a recent transcript window, keep any readable fallback
+visible while it arrives, and avoid loading toasts that block selection or
+reading. Legacy or Terminal-mode preview refresh remains cache-only so SSH fetch
+latency cannot enter restore or typing paths. Promoting a stored remote Web View
+back to Terminal must also promote the row into live-session order before
+focusing it.
+If a daemon snapshot contains both a hydrated `active_session` and a matching
+shallow `live_sessions` row, the shell must use the hydrated `active_session`
+for Preview/Web View and the live row for Terminal. Those rows are two read
+models over one identity, not two interchangeable sources of truth.
+For remote Codex Web View, a mounted recent-tail transcript window outranks
+older head, scan, loading, or empty projections. Refreshes may improve the
+reader with a fresher tail, but they must not downgrade a readable active Web
+View to the start of an old transcript or to generated context.
+
+Retained terminal switching should be visually quiet when the existing xterm
+surface has ready history or meaningful visible output. Restore notifications
+are observers for genuinely slow or failed recovery, not normal switching gates;
+they must not cover a readable retained terminal while final interactive-ready
+observation settles.
+The careful restore timeout is not fatal while the PTY stream is still making
+recent progress. Protocol-only terminal handshakes are not readiness proof, but
+they are evidence that the attach path is alive; a timeout in that window should
+stay in recovering/slow state and let the terminal bootstrap loop reach the next
+meaningful-output or hard-failure decision.
+
+KDE/Linux live-session retention keeps daemon PTYs and live rows as the durable
+truth, but it must not keep every previously visited xterm host mounted. Hidden
+terminal renderers are caches only. The stable default is active-host retention:
+the active terminal stays mounted, inactive live sessions remount from daemon
+PTY/retained history on switch, and resource telemetry should not grow linearly
+with the number of visited live sessions.
 
 The Web View UI is a modular conversation surface. Each mounted conversation
 declares a provider and capability set before rendering: transcript providers
@@ -136,6 +197,7 @@ This is the core determinism rule: Terminal tests should use fake PTY streams, s
 - Normal final-client close must notify the user, remove non-Keep-Alive live rows from durable restore state, send graceful runtime shutdown, and schedule force cleanup after one hour.
 - Update restart is different from Keep Alive. Before a direct-install restart, the daemon must persist every recoverable live runtime with a temporary update-restore marker only when current runtime truth still says that unkept runtime exists. That marker allows the next daemon to restore the session once, but it must not silently convert unkept terminals into durable Keep Alive sessions or serialize stale in-memory rows that no longer have a daemon runtime key. After a fresh remote scan reports that an unkept temporary remote runtime is not live, that row must leave `Live Sessions` instead of remaining as a degraded/loading recovery target.
 - A hot-update preserved-owner registry is a terminal I/O handoff map, not durable session truth. Persisted live-session state is the startup allow-list when it contains runtime keys; `hot-update-terminal-owners.json` is only a fallback when persisted live state is empty. Before filtering runtime truth, a replacement daemon must query reachable old owners: a directly owned runtime that still appears in the old owner's daemon snapshot is running and must be recovered as a temporary update-restore row instead of being killed as unrepresented. During handoff, every represented `terminal_session_key` must be written or retargeted to the current outgoing handoff daemon endpoint; chained older sidecar entries must not become direct owner truth for the replacement daemon. Closing a live session or clearing Keep Alive must remove that key from the preserved-owner map. Daemon load must restore persisted live state before judging a registry version mismatch, prune only unrepresented entries from `hot-update-terminal-owners.json`, and retarget surviving entries to the current version instead of carrying latent old runtimes forward or wiping still-represented owners.
+- Daemon boot has a stricter ordering than preserved-owner cleanup. The replacement daemon must bind and answer on its current endpoint before any deep cross-daemon snapshot, recovery, or prune work. A stale or busy old owner can delay reconciliation, but it must never leave the updated GUI waiting on a missing current socket.
 - A temporary update-restored live session has the same survival priority as an explicit Keep Alive session until the handoff verifies or fails. Early saved-session mismatch text from a preserved owner may gate input or keep recovery visible, but it must not detach/remove the owner entry or spawn a duplicate remote resume while the temporary update-restore marker is present.
 - Startup reconciliation must prefer the active/default preserved-only sidecar daemon for retargeting over older orphaned PTY owners. An older same-patch-line daemon should be selected for hot-update handoff only when it actually owns terminal runtimes that the active sidecar does not already represent and those owned runtime keys are authorized by the current preserved-owner registry or persisted live-session state. A ghost-owned runtime for a closed session is not a session-survival reason.
 - Daemon cleanup is home-scoped. An app may reap same-home duplicate, legacy, or orphan daemons, but it must not signal a daemon from another `YGGTERM_HOME`, and it must not reap a legacy daemon that still has registered GUI clients in that daemon's exact endpoint scope or is the current hot-update PTY owner endpoint. App-control may scan legacy client-instance scopes for handoff discovery, but cleanup must not treat the replacement GUI as a client for every stale versioned daemon. During startup cleanup, the newest preserved-only sidecar whose terminal keys are exactly authorized by the current owner registry must remain available as the retarget bridge; older preserved-only sidecars with `owned_terminal_session_count == 0` must not be protected just because the same home has recoverable runtime activity elsewhere.
@@ -254,6 +316,13 @@ Local startup restore has the same convergence requirement. If a local startup-r
 2. Local terminal gate: second-X11 typing smoke proves local shell input reaches an interactive terminal quickly without retry/disconnect toasts, and blank Enter does not leave a stale live-row spinner behind.
 3. KDE lifecycle gate: update/restart and app-owned smoke launch keep `plasmashell` stable, protect all live runtimes during the restart, leave no stale temp-home automation clients behind, and show `linux_daemon_sweep` skipping cross-home daemons.
 4. Remote session gate: switching between stored preview, live remote terminal, and retained live terminal uses `server app open <path> --view <terminal|preview>` or the matching app-control command, waits for settled state, and keeps row, active path, runtime truth, scrollback, and terminal text aligned. `terminal focus` is focus reclamation only; it must not be used as a session-switch proof.
+   For a live-profile restart, this gate must be run over every top-level
+   `Live Sessions` row, not only the active row. The failure signature from the
+   2026-05-22 jojo incident is explicitly banned: live rows visible, no daemon
+   runtime keys observed by app-control, `needs_initial_server_sync` still true
+   after settle, an empty xterm host in Terminal mode, and repeated
+   `startup_terminal_restore_recover` remounts. That state is a failed restore
+   loop, not a degraded but usable terminal.
 5. Clipboard gate: text and screenshot paste work in local, SSH, and Codex sessions through the native paste path, with the resulting staged image path visible in the receiving terminal.
 6. Notification gate: Codex-class completion and terminal notification/bell events create the expected in-app notification and sound when enabled.
 7. Cross-platform gate: Windows and macOS smoke runs prove install, launch, local terminal creation, close, paste, and update paths still work.

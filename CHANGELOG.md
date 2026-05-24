@@ -4,6 +4,167 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+## 2.7.48
+
+- Fix live-session snapshot projections so shallow Web View/sidebar previews
+  summarize the latest transcript tail instead of exporting stale head blocks
+  while claiming tail hydration.
+
+## 2.7.47
+
+- Fix remote Codex Web View opening on the wrong end of a hydrated transcript by
+  materializing the latest transcript window for the first chat frame instead of
+  depending on WebKit scroll timing.
+
+## 2.7.46
+
+- Fix remote Codex Web View latest-turn opening through a mounted latest
+  transcript anchor instead of relying only on a global post-render scroll
+  script.
+
+## 2.7.45
+
+- Fix remote Codex Web View latest-turn pinning for large transcripts by
+  seeding the virtual reader at the estimated transcript tail and repeatedly
+  pinning the DOM scroller until the reader settles on the latest hydrated
+  block.
+
+## 2.7.44
+
+- Open remote Codex Web View chat readers at the latest hydrated transcript
+  turn, so old transcript head blocks do not masquerade as the active
+  conversation after switching from Terminal to Web View.
+
+## 2.7.43
+
+- Keep Web View on the hydrated recent transcript tail during remote preview
+  refresh. Older head/scan projections from sidebar or daemon snapshots can no
+  longer replace the active reader after a successful recent-tail hydration.
+
+## 2.7.42
+
+- Keep Terminal mode interactive when app-control samples a top xterm row that
+  is intentionally clipped by the auto-hidden titlebar while the cursor/input
+  row remains visible. This fixes Web View -> Terminal live-session cycling
+  falsely gating readable daemon-owned PTYs as not paint-visible.
+
+## 2.7.41
+
+- Finish the daemon bind-before-reconcile fix by removing current-alias owner
+  retarget scans from runtime load. Updated daemons now bind their current
+  socket before any old-daemon inspection, so Web View and terminal restore do
+  not wait forever on a missing post-update endpoint.
+
+## 2.7.40
+
+- Make remote Codex Web View hydration bounded and recent by default, so large
+  transcripts render as chat blocks without pushing a 30 MB snapshot through
+  daemon IPC.
+- Add a `server remote preview-tail` helper and guard Web View refresh as a
+  single-flight request per session, preventing overlapping preview retries,
+  EAGAIN failures, and CPU-heavy loading gates.
+- Bind the replacement daemon's current socket before deep preserved-owner
+  reconciliation, so stale or busy old daemons cannot leave the updated GUI
+  waiting on a missing endpoint during Web View or terminal restore.
+
+## 2.7.38
+
+- Keep preferred-executable handoff scoped to GUI entry launches. Server and
+  app-control CLI commands now run from the executable the operator invoked, so
+  a stale direct-install state cannot silently route probes or relaunches
+  through an older GUI binary.
+
+## 2.7.37
+
+- Keep Web View on the fully hydrated active transcript when a matching live
+  row only has shallow preview blocks. Terminal mode still prefers the live
+  runtime projection for xterm attachment.
+- Defer the remote-terminal fatal resume timeout when recent PTY output shows
+  the attach path is still alive, avoiding false failure gates just before
+  meaningful output arrives.
+
+## 2.7.36
+
+- Expose focus-capture hit-target and xterm selection-layer diagnostics in the
+  basic app-control state snapshot, so selection regressions remain visible even
+  when the full DOM snapshot is not used.
+
+## 2.7.35
+
+- Restore xterm-owned text selection on active terminals by making the
+  focus-capture layer and context-menu backdrop non-hit-target observers.
+- Tighten the selection smoke probe so it must drive xterm pointer gestures and
+  observe real xterm selection-layer rectangles instead of passing through a
+  synthetic DOM range.
+- Let primary terminal clicks close a visible context menu without stealing the
+  click from xterm, reducing delayed right-click/selection recovery paths.
+
+## 2.7.34
+
+- Preserve explicit terminal scrollback intent during restore/switch settle, so
+  pending prompt-follow repairs cannot snap the viewport back after the user
+  scrolls.
+- Keep prompt-ready Codex surfaces interactive when a scroll probe/no-op finds
+  no xterm scrollback, and accept visible current input rows even when the
+  cursor-row sample is temporarily empty.
+
+## 2.7.33
+
+- Enforce KDE active-host terminal retention at the retention primitive, so
+  late ready/focus callbacks from inactive sessions cannot re-add hidden xterm
+  hosts after a switching sweep. This keeps daemon PTY restore durable while
+  preventing WebKit CPU from growing with every visited live session.
+
+## 2.7.32
+
+- Limit KDE live-terminal xterm retention to the active viewport by default.
+  Daemon PTYs and live rows remain preserved, but hidden full-size xterm hosts
+  are unmounted so a switching sweep cannot leave WebKit repainting many stale
+  terminal surfaces.
+
+## 2.7.31
+
+- Treat a clean retained prompt-follow xterm surface as visible even if a stale
+  remote-terminal resume notification still exists. The notification is pruned
+  as observer noise instead of holding the input gate closed.
+
+## 2.7.30
+
+- Suppress initial remote-terminal resume notices for retained sessions that
+  already have ready history or meaningful visible output. Healthy retained
+  switches stay visually quiet; slow/failure paths still surface notifications.
+
+## 2.7.29
+
+- Make remote Web View transcript hydration an explicit daemon IPC contract.
+  Web View sync now requests a full remote payload, while legacy and cache-only
+  refresh requests remain backward-compatible.
+
+## 2.7.28
+
+- Let the daemon perform the full remote transcript fetch only for the active
+  Web View surface. Terminal-mode refresh remains cache-only, and stored remote
+  sessions promoted back to Terminal are restored to the live-session order.
+
+## 2.7.27
+
+- Refresh the Web View full-hydration predicate so readable remote scan content
+  still upgrades to the full saved transcript through live-session Storage
+  metadata instead of staying at the initial scan excerpt.
+
+## 2.7.26
+
+- Render readable remote-scanned Web View conversations immediately, while
+  using live-session `Storage` metadata to hydrate the full saved transcript in
+  the background without touching the daemon-owned PTY.
+- Treat terminal attach-in-flight as foreground controller state only. Switching
+  away from a retained live session now prunes stale background attach gates
+  without dropping the retained runtime.
+- Stop blocking a readable, input-ready remote prompt behind a collapsed
+  scrollback recovery gate. Suspicious scrollback remains observable through
+  app-control/probes, and explicit scroll failures still fail, but prompt-ready
+  restore is allowed to become interactive immediately.
+
 ## 2.7.25
 
 - Clear Web View's toolbar loading state when saved transcript/context fallback

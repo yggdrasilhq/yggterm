@@ -1,3 +1,171 @@
+yggterm (2.7.48-1) unstable; urgency=medium
+
+  * Keep live-session snapshot preview projections on the latest transcript
+    tail, preventing stale head blocks from replacing Web View conversation
+    readers during live restore/switch handoff.
+
+ -- Avikalpa Kundu <avi@gour.top>  Fri, 22 May 2026 19:40:00 +0530
+
+yggterm (2.7.47-1) unstable; urgency=medium
+
+  * Materialize the latest remote Codex Web View transcript window as the first
+    chat frame so live readers do not open on stale transcript heads.
+
+ -- Avikalpa Kundu <avi@gour.top>  Fri, 22 May 2026 19:18:00 +0530
+
+yggterm (2.7.46-1) unstable; urgency=medium
+
+  * Scroll the mounted remote Codex Web View latest-turn anchor into view so
+    large conversations open on the hydrated tail after the DOM settles.
+
+ -- Avikalpa Kundu <avi@gour.top>  Fri, 22 May 2026 18:55:00 +0530
+
+yggterm (2.7.44-1) unstable; urgency=medium
+
+  * Pin remote Codex Web View chat readers to the latest hydrated transcript
+    turn when opened from live Terminal mode.
+
+ -- Avikalpa Kundu <avi@gour.top>  Fri, 22 May 2026 18:08:39 +0530
+
+yggterm (2.7.43-1) unstable; urgency=medium
+
+  * Preserve hydrated recent Web View transcript tails across remote preview
+    refreshes so older head/scan projections cannot replace the active reader.
+
+ -- Avikalpa Kundu <avi@gour.top>  Fri, 22 May 2026 17:35:00 +0530
+
+yggterm (2.7.42-1) unstable; urgency=medium
+
+  * Keep visible daemon-owned terminals interactive when app-control samples a
+    top xterm row clipped by the auto-hidden titlebar during restore/switch
+    readiness checks.
+
+ -- Avikalpa Kundu <avi@gour.top>  Fri, 22 May 2026 17:02:41 +0530
+
+yggterm (2.7.41-1) unstable; urgency=medium
+
+  * Bind the updated daemon endpoint before current-alias preserved-owner
+    retarget scans, preventing stale daemons from blocking post-update Web View
+    and terminal restore.
+
+ -- Avikalpa Kundu <avi@gour.top>  Fri, 22 May 2026 16:34:17 +0530
+
+yggterm (2.7.40-1) unstable; urgency=medium
+
+  * Hydrate remote Codex Web View with a bounded recent transcript window
+    instead of shipping full multi-megabyte transcript snapshots.
+  * Make remote preview refresh single-flight per session to avoid retry storms
+    and CPU-heavy loading gates.
+  * Bind the replacement daemon socket before deep preserved-owner
+    reconciliation so stale owners cannot block an updated GUI endpoint.
+
+ -- Avikalpa Kundu <avi@gour.top>  Fri, 22 May 2026 16:27:31 +0530
+
+yggterm (2.7.38-1) unstable; urgency=medium
+
+  * Keep preferred-executable handoff scoped to GUI launches so app-control and
+    server CLI commands cannot be routed through a stale direct-install binary.
+
+ -- Avikalpa Kundu <avi@gour.top>  Fri, 22 May 2026 15:23:41 +0530
+
+yggterm (2.7.37-1) unstable; urgency=medium
+
+  * Keep Web View on the fully hydrated active transcript instead of shallow
+    live-row preview projections.
+  * Defer fatal remote-terminal resume timeouts while recent PTY output shows
+    the attach path is still progressing.
+
+ -- Avikalpa Kundu <avi@gour.top>  Fri, 22 May 2026 15:02:11 +0530
+
+yggterm (2.7.36-1) unstable; urgency=medium
+
+  * Expose focus-capture hit-target and xterm selection-layer diagnostics in
+    the basic app-control state snapshot.
+
+ -- Avikalpa Kundu <avi@gour.top>  Fri, 22 May 2026 13:44:14 +0530
+
+yggterm (2.7.35-1) unstable; urgency=medium
+
+  * Restore xterm-owned terminal text selection by making shell observer layers
+    non-hit-targets.
+  * Require app-control selection probes to prove real xterm pointer selection
+    and visible selection-layer rectangles.
+  * Let primary terminal clicks dismiss context menus without stealing xterm
+    pointer gestures.
+
+ -- Avikalpa Kundu <avi@gour.top>  Fri, 22 May 2026 13:24:15 +0530
+
+yggterm (2.7.34-1) unstable; urgency=medium
+
+  * Preserve explicit user scrollback intent across prompt-follow settle jobs.
+  * Avoid gating prompt-ready Codex terminals after harmless no-scrollback
+    scrolls or empty cursor-row samples with a visible current input row.
+
+ -- Avikalpa Kundu <avi@gour.top>  Fri, 22 May 2026 12:08:00 +0530
+
+yggterm (2.7.33-1) unstable; urgency=medium
+
+  * Enforce active-host terminal retention immediately, so inactive terminal
+    callbacks cannot re-add hidden xterm hosts during switching sweeps.
+
+ -- Avikalpa Kundu <avi@gour.top>  Fri, 22 May 2026 11:18:00 +0530
+
+yggterm (2.7.32-1) unstable; urgency=medium
+
+  * Limit KDE live-terminal xterm retention to the active viewport by default
+    while preserving daemon-owned live PTYs.
+
+ -- Avikalpa Kundu <avi@gour.top>  Fri, 22 May 2026 10:52:00 +0530
+
+yggterm (2.7.31-1) unstable; urgency=medium
+
+  * Treat clean retained prompt-follow xterm surfaces as visible despite stale
+    remote-terminal resume notifications, so observer noise does not hold the
+    input gate closed.
+
+ -- Avikalpa Kundu <avi@gour.top>  Fri, 22 May 2026 10:14:00 +0530
+
+yggterm (2.7.30-1) unstable; urgency=medium
+
+  * Suppress initial remote-terminal resume notices for retained sessions that
+    already have ready history or meaningful visible output.
+
+ -- Avikalpa Kundu <avi@gour.top>  Fri, 22 May 2026 09:43:00 +0530
+
+yggterm (2.7.29-1) unstable; urgency=medium
+
+  * Make remote Web View full transcript hydration an explicit daemon IPC
+    request, with legacy cache-only preview refresh remaining compatible.
+
+ -- Avikalpa Kundu <avi@gour.top>  Fri, 22 May 2026 09:15:00 +0530
+
+yggterm (2.7.28-1) unstable; urgency=medium
+
+  * Fetch the full remote transcript only for the active Web View surface and
+    keep Terminal-mode refresh cache-only. Ensure stored remote previews
+    promoted back to Terminal rejoin the live-session order.
+
+ -- Avikalpa Kundu <avi@gour.top>  Fri, 22 May 2026 08:54:00 +0530
+
+yggterm (2.7.27-1) unstable; urgency=medium
+
+  * Refresh the Web View full-hydration predicate so readable remote scan
+    content still upgrades to the full saved transcript through live-session
+    Storage metadata instead of staying at the initial scan excerpt.
+
+ -- Avikalpa Kundu <avi@gour.top>  Fri, 22 May 2026 08:28:51 +0530
+
+yggterm (2.7.26-1) unstable; urgency=medium
+
+  * Render remote-scanned Web View conversations immediately and hydrate the
+    full saved transcript from live-session Storage metadata in the background.
+  * Prune stale background terminal attach gates without dropping retained live
+    runtimes.
+  * Allow readable prompt-ready restores to become interactive immediately even
+    when retained scrollback diagnostics remain suspicious.
+
+ -- Avikalpa Kundu <avi@gour.top>  Fri, 22 May 2026 08:06:16 +0530
+
 yggterm (2.7.25-1) unstable; urgency=medium
 
   * Clear Web View's toolbar loading state when saved transcript/context
