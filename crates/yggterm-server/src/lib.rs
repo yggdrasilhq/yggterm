@@ -89,7 +89,7 @@ use yggterm_core::{
     WorkspaceDocumentKind, YGGTERM_DESKTOP_APP_ID, append_trace_event, detect_install_context,
     event_trace_path, follow_trace_lines, generation_context_from_messages,
     looks_like_generated_fallback_title, looks_like_low_signal_generated_copy,
-    read_cc_session_identity_fields, read_cc_session_title,
+    read_cc_session_context, read_cc_session_identity_fields, read_cc_session_title,
     read_codex_session_identity_fields, read_codex_transcript_messages,
     read_codex_transcript_messages_limited, read_codex_transcript_messages_tail_limited,
     read_trace_tail, resolve_yggterm_home,
@@ -1398,6 +1398,7 @@ pub struct LocalCcSession {
     pub session_id: String,
     pub cwd: String,
     pub title_hint: String,
+    pub context_hint: String,
     pub file_path: String,
     pub modified_epoch: i64,
 }
@@ -4520,6 +4521,89 @@ impl YggtermServer {
         Some(session_path)
     }
 
+    fn open_remote_cc_session(
+        &mut self,
+        machine_key: &str,
+        ssh_target: &str,
+        prefix: Option<&str>,
+        label: &str,
+        session_id: &str,
+        cwd: &str,
+        title_hint: &str,
+    ) -> anyhow::Result<String> {
+        let session_path = remote_cc_session_path(machine_key, session_id);
+        let cwd_prefix = if cwd.trim().is_empty() {
+            String::new()
+        } else {
+            format!("cd {} && ", shell_single_quote(cwd))
+        };
+        let inner = format!(
+            "{}claude --resume {}",
+            cwd_prefix,
+            shell_single_quote(session_id)
+        );
+        let launch_command = remote_ssh_shell_command(ssh_target, prefix, &inner);
+        let resolved_title = if title_hint.trim().is_empty() {
+            short_session_id(session_id)
+        } else {
+            title_hint.to_string()
+        };
+        let backend = self.backend;
+        let theme = self.theme;
+        let ghostty_bridge_enabled = self.ghostty_host.bridge_enabled;
+        let target = SshConnectTarget {
+            label: label.to_string(),
+            kind: SessionKind::ClaudeCode,
+            ssh_target: ssh_target.to_string(),
+            prefix: prefix.map(ToOwned::to_owned),
+            cwd: if cwd.trim().is_empty() { None } else { Some(cwd.to_string()) },
+        };
+        if !self.sessions.contains_key(&session_path) {
+            let mut session = build_live_session(
+                session_id,
+                SessionKind::ClaudeCode,
+                &target,
+                backend,
+                theme,
+                ghostty_bridge_enabled,
+            );
+            session.session_path = session_path.clone();
+            session.title = resolved_title.clone();
+            upsert_session_metadata(&mut session.metadata, "Cwd", cwd.to_string());
+            upsert_session_metadata(&mut session.metadata, "Host", ssh_target.to_string());
+            self.sessions.insert(session_path.clone(), session);
+        }
+        if let Some(session) = self.sessions.get_mut(&session_path) {
+            session.id = session_id.to_string();
+            session.session_path = session_path.clone();
+            session.title = resolved_title;
+            session.kind = SessionKind::ClaudeCode;
+            session.source = SessionSource::LiveSsh;
+            session.host_label = label.to_string();
+            session.launch_phase = TerminalLaunchPhase::RemoteBootstrap;
+            session.ssh_target = Some(ssh_target.to_string());
+            session.ssh_prefix = prefix.map(ToOwned::to_owned);
+            session.launch_command = launch_command;
+            session.terminal_lines = vec![
+                format!("Queue remote Claude Code resume {session_id}"),
+                format!("Target host: {ssh_target}"),
+                format!("Workspace: {}", if cwd.trim().is_empty() { "<unknown>" } else { cwd }),
+            ];
+            upsert_session_metadata(&mut session.metadata, "UUID", session_id.to_string());
+            upsert_session_metadata(
+                &mut session.metadata,
+                "Restore",
+                format!("ssh {ssh_target} '{cwd_prefix}claude --resume {session_id}'"),
+            );
+        }
+        if !self.live_session_order.iter().any(|p| p == &session_path) {
+            self.live_session_order.insert(0, session_path.clone());
+        }
+        self.active_session_path = Some(session_path.clone());
+        self.active_view_mode = WorkspaceViewMode::Terminal;
+        Ok(session_path)
+    }
+
     pub fn start_local_session(
         &mut self,
         kind: SessionKind,
@@ -5391,6 +5475,38 @@ impl YggtermServer {
                 Some(WorkspaceViewMode::Terminal),
             );
             return;
+        }
+        if let Some((machine_key, session_id)) = parse_remote_cc_session_path(&path) {
+            let machine_info = self
+                .remote_machines
+                .iter()
+                .find(|m| m.machine_key == machine_key)
+                .and_then(|machine| {
+                    let scanned = machine
+                        .sessions
+                        .iter()
+                        .find(|s| s.session_id == session_id)?;
+                    Some((
+                        machine.ssh_target.clone(),
+                        machine.prefix.clone(),
+                        machine.label.clone(),
+                        session_id.to_string(),
+                        scanned.cwd.clone(),
+                        scanned.title_hint.clone(),
+                    ))
+                });
+            if let Some((ssh_target, prefix, label, session_id, cwd, title_hint)) = machine_info {
+                let _ = self.open_remote_cc_session(
+                    &machine_key.to_string(),
+                    &ssh_target,
+                    prefix.as_deref(),
+                    &label,
+                    &session_id,
+                    &cwd,
+                    &title_hint,
+                );
+                return;
+            }
         }
         let cached_live_ssh_launch = self.sessions.get(&path).and_then(|session| {
             if !live_session_uses_remote_runtime(session) {
@@ -11401,6 +11517,103 @@ print(path)
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
+const REMOTE_CC_SCAN_SCRIPT: &str = r#"
+import json, os, sys
+from pathlib import Path
+
+def scan_cc_session(jsonl_path):
+    session_id = None
+    cwd = None
+    ai_title = None
+    first_human_text = None
+    context_parts = []
+    try:
+        with open(jsonl_path, encoding='utf-8', errors='ignore') as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    r = json.loads(line)
+                except Exception:
+                    continue
+                t = r.get('type', '')
+                if t == 'permission-mode' and session_id is None:
+                    session_id = r.get('sessionId') or r.get('session_id')
+                elif t == 'file-history-snapshot' and cwd is None:
+                    cwd = r.get('cwd')
+                elif t == 'ai-title' and ai_title is None:
+                    ai_title = (r.get('aiTitle') or '').strip() or None
+                elif t == 'user':
+                    msg = r.get('message', {})
+                    if msg.get('role') == 'user':
+                        content = msg.get('content', '')
+                        if isinstance(content, str):
+                            text = content
+                        elif isinstance(content, list):
+                            text = ' '.join(p.get('text', '') for p in content if p.get('type') == 'text')
+                        else:
+                            continue
+                        tag = '</local-command-caveat>'
+                        pos = text.find(tag)
+                        if pos >= 0:
+                            text = text[pos + len(tag):]
+                        text = text.strip()
+                        if not text or text.startswith('<'):
+                            continue
+                        if first_human_text is None:
+                            first_human_text = text[:80]
+                        if len(context_parts) < 3:
+                            context_parts.append(text[:120])
+    except Exception:
+        return None
+    if not session_id or not cwd:
+        return None
+    try:
+        mtime = int(os.path.getmtime(str(jsonl_path)))
+    except Exception:
+        mtime = 0
+    return {
+        'session_id': session_id,
+        'cwd': cwd,
+        'title': ai_title or first_human_text or session_id[:8],
+        'context': ' · '.join(context_parts),
+        'mtime': mtime,
+    }
+
+projects_dir = Path(os.path.expanduser('~/.claude/projects'))
+if not projects_dir.exists():
+    sys.exit(0)
+for project_dir in projects_dir.iterdir():
+    if not project_dir.is_dir():
+        continue
+    for jsonl_path in project_dir.glob('*.jsonl'):
+        data = scan_cc_session(jsonl_path)
+        if data:
+            print(json.dumps(data, ensure_ascii=False))
+"#;
+
+#[derive(Debug, Serialize, Deserialize)]
+struct RemoteCcSummaryLine {
+    session_id: String,
+    cwd: String,
+    title: String,
+    #[serde(default)]
+    context: String,
+    #[serde(default)]
+    mtime: i64,
+}
+
+fn remote_cc_session_path(machine_key: &str, session_id: &str) -> String {
+    format!("remote-cc://{machine_key}/{session_id}")
+}
+
+fn parse_remote_cc_session_path(path: &str) -> Option<(&str, &str)> {
+    let rest = path.strip_prefix("remote-cc://")?;
+    let (machine_key, session_id) = rest.split_once('/')?;
+    Some((machine_key, session_id))
+}
+
 fn scan_remote_machine_sessions(
     target: &SshConnectTarget,
 ) -> anyhow::Result<Vec<RemoteScannedSession>> {
@@ -11457,6 +11670,42 @@ fn scan_remote_machine_sessions(
             storage_path: summary.rollout_path,
         });
     }
+    // Best-effort scan for Claude Code sessions on the remote machine.
+    if let Ok(cc_lines) = run_remote_python_lines(
+        &target.ssh_target,
+        target.prefix.as_deref(),
+        REMOTE_CC_SCAN_SCRIPT,
+        &[],
+    ) {
+        let existing_ids: std::collections::HashSet<String> =
+            sessions.iter().map(|s| s.session_id.clone()).collect();
+        let mut cc_sessions: Vec<RemoteScannedSession> = Vec::new();
+        for line in cc_lines {
+            let Ok(summary) = serde_json::from_str::<RemoteCcSummaryLine>(&line) else {
+                continue;
+            };
+            if existing_ids.contains(&summary.session_id) {
+                continue;
+            }
+            cc_sessions.push(RemoteScannedSession {
+                session_path: remote_cc_session_path(&machine_key, &summary.session_id),
+                session_id: summary.session_id,
+                cwd: summary.cwd,
+                started_at: String::new(),
+                modified_epoch: summary.mtime,
+                event_count: 0,
+                user_message_count: 0,
+                assistant_message_count: 0,
+                title_hint: summary.title,
+                recent_context: summary.context,
+                cached_precis: None,
+                cached_summary: None,
+                live_runtime: false,
+                storage_path: String::new(),
+            });
+        }
+        sessions.extend(cc_sessions);
+    }
     Ok(dedupe_remote_scanned_sessions(sessions))
 }
 
@@ -11498,6 +11747,7 @@ pub fn scan_local_claude_code_sessions() -> Vec<LocalCcSession> {
                 .ok()
                 .flatten()
                 .unwrap_or_else(|| short_session_id(&session_id));
+            let context_hint = read_cc_session_context(&file_path).unwrap_or_default();
             let modified_epoch = fs::metadata(&file_path)
                 .ok()
                 .and_then(|m| m.modified().ok())
@@ -11508,6 +11758,7 @@ pub fn scan_local_claude_code_sessions() -> Vec<LocalCcSession> {
                 session_id,
                 cwd,
                 title_hint,
+                context_hint,
                 file_path: file_path_str,
                 modified_epoch,
             });
