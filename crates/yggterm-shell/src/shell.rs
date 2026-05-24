@@ -19415,9 +19415,16 @@ fn merged_sidebar_rows_uncached(
     );
     let local_tree_ms = local_tree_started_at.elapsed().as_secs_f64() * 1000.0;
     let push_live_started_at = Instant::now();
+    // Exclude local-tree sessions (CC, new Codex-local) from "Live Sessions" group — they
+    // appear under their CWD folder via inject_local_live_session_rows instead.
+    let display_promoted_sessions = promoted_live_sessions
+        .iter()
+        .copied()
+        .filter(|s| !is_local_tree_live_session(s))
+        .collect::<Vec<_>>();
     push_live_session_rows(
         &mut rows,
-        &promoted_live_sessions,
+        &display_promoted_sessions,
         &remote_session_index,
         expanded_paths,
     );
@@ -19428,11 +19435,13 @@ fn merged_sidebar_rows_uncached(
     }
     let push_remote_ms = push_remote_started_at.elapsed().as_secs_f64() * 1000.0;
     let extend_stored_started_at = Instant::now();
-    let promoted_live_paths = promoted_live_sessions
+    // Only deduplicate paths from display-promoted sessions (not tree-injected ones) so that
+    // CC rows injected into stored_rows are not filtered out here.
+    let promoted_live_paths = display_promoted_sessions
         .iter()
         .map(|session| normalize_live_session_path(&session.session_path))
         .collect::<HashSet<_>>();
-    let promoted_storage_paths = promoted_live_sessions
+    let promoted_storage_paths = display_promoted_sessions
         .iter()
         .filter_map(|session| {
             let storage = metadata_value(session, "Storage");
@@ -19732,7 +19741,98 @@ fn inject_local_live_session_rows(
     if !has_group_rows {
         return synthetic_local_live_session_rows(sessions, remote_session_index);
     }
-    stored_rows.to_vec()
+    inject_cc_sessions_into_stored_rows(stored_rows, sessions, remote_session_index)
+}
+
+fn find_best_group_for_cwd_in_rows(rows: &[BrowserRow], cwd: &str) -> Option<(usize, usize)> {
+    let cwd = cwd.trim();
+    if cwd.is_empty() {
+        return rows
+            .iter()
+            .enumerate()
+            .find(|(_, r)| r.kind == BrowserRowKind::Group && r.full_path == "local")
+            .map(|(idx, r)| (idx, r.depth));
+    }
+    let path = std::path::Path::new(cwd);
+    let ancestors = path.ancestors().skip(1).filter_map(|p| {
+        let s = p.to_string_lossy().to_string();
+        if s.is_empty() || s == "/" { None } else { Some(s) }
+    });
+    let candidates = std::iter::once(cwd.to_string())
+        .chain(ancestors)
+        .chain(std::iter::once("local".to_string()));
+    for candidate in candidates {
+        if let Some(idx) = rows.iter().position(|r| {
+            r.kind == BrowserRowKind::Group && r.full_path == candidate
+        }) {
+            return Some((idx, rows[idx].depth));
+        }
+    }
+    None
+}
+
+fn find_child_insert_point(rows: &[BrowserRow], group_idx: usize, group_depth: usize) -> usize {
+    let mut idx = group_idx + 1;
+    while idx < rows.len() && rows[idx].depth > group_depth {
+        idx += 1;
+    }
+    idx
+}
+
+fn inject_cc_sessions_into_stored_rows(
+    stored_rows: &[BrowserRow],
+    sessions: &[&ManagedSessionView],
+    remote_session_index: &RemoteSessionIndex,
+) -> Vec<BrowserRow> {
+    let short_ids = unique_session_short_ids_for_pairs(
+        &sessions
+            .iter()
+            .map(|s| (s.session_path.clone(), s.id.clone()))
+            .collect::<Vec<_>>(),
+    );
+    let mut insertions: Vec<(usize, BrowserRow)> = Vec::new();
+    for session in sessions {
+        let cwd = metadata_value(session, "Cwd");
+        let Some((group_idx, group_depth)) =
+            find_best_group_for_cwd_in_rows(stored_rows, &cwd)
+        else {
+            continue;
+        };
+        let insert_idx = find_child_insert_point(stored_rows, group_idx, group_depth);
+        let label = live_session_label_with_index(remote_session_index, session, &short_ids);
+        let summary = live_session_summary_with_index(remote_session_index, session);
+        let keep_alive = live_session_keep_alive(session);
+        let detail_label = live_session_detail_label(summary, keep_alive);
+        let cwd_opt = if cwd.trim().is_empty() { None } else { Some(cwd) };
+        insertions.push((
+            insert_idx,
+            BrowserRow {
+                kind: BrowserRowKind::Session,
+                full_path: normalize_live_session_path(&session.session_path),
+                label: label.clone(),
+                detail_label,
+                document_kind: None,
+                group_kind: None,
+                session_title: Some(label),
+                depth: group_depth + 1,
+                host_label: session.host_label.clone(),
+                descendant_sessions: 1,
+                expanded: true,
+                session_id: Some(session.id.clone()),
+                session_cwd: cwd_opt,
+            },
+        ));
+    }
+    if insertions.is_empty() {
+        return stored_rows.to_vec();
+    }
+    // Insert from back to front so earlier indices are not shifted by later insertions.
+    insertions.sort_by(|a, b| b.0.cmp(&a.0));
+    let mut result = stored_rows.to_vec();
+    for (idx, row) in insertions {
+        result.insert(idx, row);
+    }
+    result
 }
 fn live_session_label_with_index(
     remote_session_index: &RemoteSessionIndex,
