@@ -63173,7 +63173,6 @@ fn start_page_recent_rows_from_browser_rows_with_modified_epochs(
     candidates
         .into_iter()
         .map(|(row, _, _, _)| row)
-        .take(6)
         .collect()
 }
 
@@ -63192,6 +63191,7 @@ fn start_page_live_projection_paths(snapshot: &RenderSnapshot) -> HashSet<String
 
 fn remote_scanned_session_is_start_page_durable(session: &RemoteScannedSession) -> bool {
     !session.storage_path.trim().is_empty()
+        || session.session_path.starts_with("remote-cc://")
 }
 
 fn start_page_browser_row_modified_epoch(row: &BrowserRow) -> i64 {
@@ -63641,8 +63641,7 @@ fn StartPage(snapshot: SharedSnapshot, state: Signal<ShellState>) -> Element {
                                 Some(SessionKind::Codex | SessionKind::CodexLiteLlm) => format!(
                                     "display:inline-flex; align-items:center; justify-content:center; \
                                      min-height:28px; padding:0 10px; border:none; border-radius:7px; \
-                                     background:{}; color:{}; font-size:12px; font-weight:800;",
-                                    palette.panel, palette.accent
+                                     background:#6366f1; color:white; font-size:12px; font-weight:800;"
                                 ),
                                 _ => format!(
                                     "display:inline-flex; align-items:center; justify-content:center; \
