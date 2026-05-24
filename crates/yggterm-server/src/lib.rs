@@ -4521,6 +4521,63 @@ impl YggtermServer {
         Some(session_path)
     }
 
+    fn open_local_cc_session(&mut self, storage_path: &str) -> Option<String> {
+        // If already running, focus the existing live session.
+        if let Some(existing_key) = self
+            .resolve_live_terminal_key_for_storage_path(storage_path)
+            .map(str::to_string)
+        {
+            self.live_session_order.retain(|p| p != &existing_key);
+            self.live_session_order.insert(0, existing_key.clone());
+            self.active_session_path = Some(existing_key.clone());
+            self.active_view_mode = WorkspaceViewMode::Terminal;
+            return Some(existing_key);
+        }
+        // The session_id is the JSONL file stem (strip .jsonl suffix).
+        let session_id = std::path::Path::new(storage_path)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("")
+            .to_string();
+        if session_id.is_empty() {
+            return None;
+        }
+        let (cwd, title) = self
+            .local_cc_sessions
+            .iter()
+            .find(|s| s.file_path == storage_path)
+            .map(|s| (s.cwd.clone(), s.title_hint.clone()))
+            .unwrap_or_else(|| (local_default_cwd(), short_session_id(&session_id)));
+        let mut live_key = local_live_runtime_key(&session_id);
+        if self.sessions.contains_key(&live_key) {
+            live_key = local_live_runtime_key(&Uuid::new_v4().to_string());
+        }
+        let target = local_session_target(SessionKind::ClaudeCode, Some(&cwd));
+        let mut session = build_live_session(
+            &session_id,
+            SessionKind::ClaudeCode,
+            &target,
+            self.backend,
+            self.theme,
+            self.ghostty_host.bridge_enabled,
+        );
+        // Override the generic launch command to resume this specific session.
+        session.launch_command =
+            stored_session_launch_command(SessionKind::ClaudeCode, &cwd, &session_id);
+        session.session_path = live_key.clone();
+        session.id = session_id.clone();
+        session.title = title;
+        session.source = SessionSource::LiveLocal;
+        upsert_session_metadata(&mut session.metadata, "Storage", storage_path.to_string());
+        upsert_session_metadata(&mut session.metadata, "UUID", session_id.clone());
+        self.sessions.insert(live_key.clone(), session);
+        self.live_session_order.retain(|p| p != &live_key);
+        self.live_session_order.insert(0, live_key.clone());
+        self.active_session_path = Some(live_key.clone());
+        self.active_view_mode = WorkspaceViewMode::Terminal;
+        Some(live_key)
+    }
+
     fn open_remote_cc_session(
         &mut self,
         machine_key: &str,
@@ -5507,6 +5564,11 @@ impl YggtermServer {
                 );
                 return;
             }
+        }
+        // Local Claude Code session — JSONL file under ~/.claude/projects/
+        if path.contains("/.claude/projects/") && path.ends_with(".jsonl") {
+            self.open_local_cc_session(&path);
+            return;
         }
         let cached_live_ssh_launch = self.sessions.get(&path).and_then(|session| {
             if !live_session_uses_remote_runtime(session) {
@@ -11522,6 +11584,8 @@ import json, os, sys
 from pathlib import Path
 
 def scan_cc_session(jsonl_path):
+    # Use the filename stem as the canonical session_id fallback (mirrors Rust behavior).
+    fallback_id = Path(jsonl_path).stem
     session_id = None
     cwd = None
     ai_title = None
@@ -11538,13 +11602,20 @@ def scan_cc_session(jsonl_path):
                 except Exception:
                     continue
                 t = r.get('type', '')
-                if t == 'permission-mode' and session_id is None:
-                    session_id = r.get('sessionId') or r.get('session_id')
-                elif t == 'file-history-snapshot' and cwd is None:
-                    cwd = r.get('cwd')
-                elif t == 'ai-title' and ai_title is None:
+                # sessionId can appear on any record; prefer permissionMode/permission-mode
+                # but fall through to any record that carries it.
+                if session_id is None:
+                    sid = r.get('sessionId') or r.get('session_id')
+                    if sid and sid.strip():
+                        session_id = sid.strip()
+                if t == 'ai-title' and ai_title is None:
                     ai_title = (r.get('aiTitle') or '').strip() or None
-                elif t == 'user':
+                if t == 'user':
+                    # cwd lives in user records alongside the message content
+                    if cwd is None:
+                        raw_cwd = r.get('cwd')
+                        if raw_cwd and raw_cwd.strip():
+                            cwd = raw_cwd.strip()
                     msg = r.get('message', {})
                     if msg.get('role') == 'user':
                         content = msg.get('content', '')
@@ -11565,18 +11636,25 @@ def scan_cc_session(jsonl_path):
                             first_human_text = text[:80]
                         if len(context_parts) < 3:
                             context_parts.append(text[:120])
+                # cwd fallback: any record that carries a top-level cwd field
+                if cwd is None and r.get('cwd') and r['cwd'].strip():
+                    cwd = r['cwd'].strip()
+                if cwd and ai_title is not None and first_human_text is not None:
+                    break
     except Exception:
         return None
-    if not session_id or not cwd:
+    # Use filename stem as session_id if no explicit sessionId was found in the file.
+    resolved_id = session_id or fallback_id
+    if not resolved_id or not cwd:
         return None
     try:
         mtime = int(os.path.getmtime(str(jsonl_path)))
     except Exception:
         mtime = 0
     return {
-        'session_id': session_id,
+        'session_id': resolved_id,
         'cwd': cwd,
-        'title': ai_title or first_human_text or session_id[:8],
+        'title': ai_title or first_human_text or resolved_id[:8],
         'context': ' · '.join(context_parts),
         'mtime': mtime,
     }
@@ -11617,22 +11695,27 @@ fn parse_remote_cc_session_path(path: &str) -> Option<(&str, &str)> {
 fn scan_remote_machine_sessions(
     target: &SshConnectTarget,
 ) -> anyhow::Result<Vec<RemoteScannedSession>> {
+    let machine_key = machine_key_from_ssh_target(&target.ssh_target);
     let python_args = [String::from("~/.codex")];
-    let lines = match run_remote_yggterm_command(
+
+    // Step 1: Codex/yggterm session scan. May fail if a scan is already in progress on
+    // the remote (lock busy). Capture the error rather than returning early so the CC
+    // scan below can still run independently.
+    let (yggterm_lines, deferred_error) = match run_remote_yggterm_command(
         &target.ssh_target,
         target.prefix.as_deref(),
         &["server", "remote", "scan", "~/.codex"],
         None,
     ) {
-        Ok(output) => output.lines().map(str::to_string).collect::<Vec<_>>(),
+        Ok(output) => (output.lines().map(str::to_string).collect::<Vec<_>>(), None),
         Err(error) => match run_remote_python_lines(
             &target.ssh_target,
             target.prefix.as_deref(),
             REMOTE_SCAN_SCRIPT,
             &python_args,
         ) {
-            Ok(lines) => lines,
-            Err(_python_error) if !should_fallback_to_python(&error) => return Err(error),
+            Ok(lines) => (lines, None),
+            Err(_python_error) if !should_fallback_to_python(&error) => (Vec::new(), Some(error)),
             Err(python_error) => {
                 return Err(python_error).with_context(|| {
                     format!("remote yggterm scan failed before python fallback: {error:#}")
@@ -11640,11 +11723,12 @@ fn scan_remote_machine_sessions(
             }
         },
     };
-    let machine_key = machine_key_from_ssh_target(&target.ssh_target);
+
     let mut sessions = Vec::new();
-    for line in lines {
-        let summary: RemoteSummaryLine =
-            serde_json::from_str(&line).context("invalid remote summary line")?;
+    for line in yggterm_lines {
+        let Ok(summary) = serde_json::from_str::<RemoteSummaryLine>(&line) else {
+            continue;
+        };
         let sanitized_recent_context = sanitize_recent_context_payload(&summary.recent_context);
         sessions.push(RemoteScannedSession {
             session_path: remote_scanned_session_path(&machine_key, &summary.id),
@@ -11670,7 +11754,11 @@ fn scan_remote_machine_sessions(
             storage_path: summary.rollout_path,
         });
     }
-    // Best-effort scan for Claude Code sessions on the remote machine.
+
+    // Step 2: Claude Code session scan — independent of step 1. Runs even when the
+    // yggterm scan failed (e.g. lock busy), because CC sessions live in ~/.claude/,
+    // not ~/.codex/, and don't require the remote scan lock.
+    let mut cc_found = false;
     if let Ok(cc_lines) = run_remote_python_lines(
         &target.ssh_target,
         target.prefix.as_deref(),
@@ -11704,8 +11792,17 @@ fn scan_remote_machine_sessions(
                 storage_path: String::new(),
             });
         }
+        cc_found = !cc_sessions.is_empty();
         sessions.extend(cc_sessions);
     }
+
+    // Only propagate the deferred yggterm error if we have nothing to show at all.
+    if sessions.is_empty() && !cc_found {
+        if let Some(err) = deferred_error {
+            return Err(err);
+        }
+    }
+
     Ok(dedupe_remote_scanned_sessions(sessions))
 }
 
