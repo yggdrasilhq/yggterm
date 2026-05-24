@@ -42,6 +42,12 @@ but should keep this base contract intact.
   after GUI restore, and after cleanup. The same runtime key must not appear in
   more than one daemon's `owned_terminal_session_keys`; preserved-owner entries
   are allowed only when exactly one daemon directly owns the PTY.
+- The current GUI must be able to observe runtime truth from the current daemon
+  before any row cycling starts. A restored GUI with visible top-level
+  `Live Sessions` rows but `runtime_truth.daemon_runtime_keys=[]`,
+  `daemon_update_state.state=unknown`, or
+  `shell.needs_initial_server_sync=true` after settle is a failed restore, even
+  if the sidebar labels look correct.
 - Reset/generate title-summary copy only for the app graph under test unless
   the release is explicitly validating local archive maintenance:
   `yggterm-headless server sessions regenerate-copy --skip-local --reset-summary-history`.
@@ -137,6 +143,19 @@ that have previously hidden release-blocking defects:
 - switch away from and back to at least one `htop` or `codex-session-tui`
   session after the background pipes cool; the TUI must still be readable and
   interactive
+- cycle every top-level row under `Live Sessions` through Terminal -> Web View
+  -> Terminal with `server app open <path> --view <terminal|preview>`.
+  Each step must settle within the app-control budget, keep
+  `active_session_path` on that row, clear `active_surface_requests`, keep
+  `session_view_contract_violations=[]`, and preserve daemon runtime truth.
+  Terminal mode must report `runtime_truth.active_runtime_present=true`, a
+  non-empty terminal surface, and enabled input. A terminal is not accepted if
+  it reports `ready=true`, `content_source=daemon_pty`, and no surface problem
+  while either the app-level terminal input, the active host input, or the raw
+  xterm input remains disabled. Web View mode must render a readable
+  conversation surface without detaching, restarting, hiding, or deleting the
+  live runtime. The repository harness for this is
+  `scripts/live_mode_cycle_check.py --all-live`.
 - close an active live session and a background live session; the active close
   must redirect to the previous valid viewport or startpage, and the background
   close must not steal focus
@@ -177,6 +196,11 @@ that have previously hidden release-blocking defects:
   readable. If the watchdog deadline fires during that wait, the only accepted
   event is `retained_fault_recovery_rearm_deferred_daemon_ready`; a
   `retained_fault_recovery_rearm` before daemon-ready is a failed smoke run.
+- reject repeated `terminal_mount/startup_terminal_restore_recover` remounts for
+  the same runtime while `runtime_truth.daemon_runtime_keys=[]` or
+  `runtime_truth.active_runtime_present=false`. That is not recovery, it is a
+  GUI retry loop over missing daemon truth and is a release-blocking fan/CPU
+  defect.
 - reject prompt-follow recovery if app-control shows the DOM viewport is already
   at the prompt while xterm's public `viewportY` is stale. In that case
   `viewport_y_source=dom_visual` is the accepted proof; a retained-fault remount
@@ -247,6 +271,10 @@ The gate passes only when:
 - titles, summaries, cwd placement, and long UUID metadata remain durable
 - no stale runtime or ghost session becomes live
 - app-control state, probes, screenshots, and resource logs agree
+- app-control `state`, `rows`, and `open` commands stay inside their latency
+  budgets during live-session cycling. A visible GUI whose app-control requests
+  time out while live rows are present is a release-blocking performance and
+  observability failure, not an inconclusive smoke result.
 - terminal telemetry contains no unhandled live-truth split for the run,
   including stored session without runtime ownership, healthy remote machine
   with no drawable terminal after terminal launch, or empty xterm surface that

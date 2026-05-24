@@ -539,6 +539,23 @@ def preview_semantic_issues_for_entries(entries: list[dict], rendered_sections: 
     return issues
 
 
+def preview_layout_issues(text_sample: str, entries: list[dict], rendered_sections: list[dict] | None = None) -> list[str]:
+    if not entries or not rendered_sections:
+        return []
+    sample = (text_sample or "").strip().lower()
+    if not sample:
+        return []
+    issues = []
+    for section in rendered_sections:
+        title = (section.get("title") or "").strip()
+        if title and sample.startswith(title.lower()):
+            issues.append(
+                f"preview starts with rendered section {title!r} before transcript entries"
+            )
+            break
+    return issues
+
+
 def load_server_state() -> dict:
     path = local_yggterm_path("server-state.json")
     if not path.exists():
@@ -826,6 +843,11 @@ def main() -> int:
                 screenshot_entries,
                 screenshot_rendered_sections,
             )
+            screenshot_layout_issues = preview_layout_issues(
+                text_sample,
+                screenshot_entries,
+                screenshot_rendered_sections,
+            )
             screenshot_expected_issues = preview_expected_turn_issues_for_entries(
                 screenshot_entries,
                 expected_turns,
@@ -858,6 +880,7 @@ def main() -> int:
                         dict.fromkeys(
                             semantic_issues
                             + screenshot_semantic_issues
+                            + screenshot_layout_issues
                             + screenshot_expected_issues
                         )
                     ),

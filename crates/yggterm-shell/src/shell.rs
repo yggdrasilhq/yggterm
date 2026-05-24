@@ -82,7 +82,10 @@ use dioxus::desktop::{
     use_window, use_wry_event_handler, window,
 };
 use dioxus::document;
-use dioxus::html::{InteractionElementOffset, input_data::MouseButton};
+use dioxus::html::{
+    InteractionElementOffset, ScrollBehavior, ScrollLogicalPosition, ScrollToOptions,
+    input_data::MouseButton,
+};
 use dioxus::prelude::*;
 use dioxus_core::{ScopeId, schedule_update, spawn_forever};
 use dioxus_desktop::UserWindowEvent as DesktopUserWindowEvent;
@@ -287,6 +290,7 @@ const REMOTE_PREVIEW_SYNC_DEBOUNCE_MS: u64 = 2_500;
 const REMOTE_TERMINAL_RESUME_SLOW_MS: u64 = 1_200;
 const REMOTE_TERMINAL_CAREFUL_RESTORE_AFTER_MS: u64 = 60_000;
 const REMOTE_TERMINAL_RESUME_FAIL_MS: u64 = REMOTE_TERMINAL_CAREFUL_RESTORE_AFTER_MS;
+const REMOTE_TERMINAL_RESUME_OUTPUT_PROGRESS_GRACE_MS: u64 = 30_000;
 const REMOTE_TERMINAL_RESUME_RECOVERY_STALL_MS: u64 = 3_000;
 const REMOTE_TERMINAL_BLANK_RUNTIME_OUTPUT_RECOVERY_MS: u64 = 1_100;
 const REMOTE_TERMINAL_START_CODEX_RECOVERY_STALL_MS: u64 = 18_000;
@@ -1124,7 +1128,39 @@ fn limit_live_terminal_retention_for_platform(
     has_wayland_display: bool,
     force_limit: bool,
 ) -> bool {
-    force_limit && is_kde_plasma && (has_x11_display || has_wayland_display)
+    is_kde_plasma && (has_x11_display || has_wayland_display || force_limit)
+}
+
+fn retain_terminal_session_path_for_policy(
+    retained_terminal_session_paths: &mut HashSet<String>,
+    terminal_mount_epochs: &mut HashMap<String, u64>,
+    session_path: &str,
+    limit_to_active_session: bool,
+    active_terminal_path: Option<&str>,
+) -> u64 {
+    if limit_to_active_session {
+        let Some(active_path) = active_terminal_path else {
+            retained_terminal_session_paths.clear();
+            terminal_mount_epochs.clear();
+            return 0;
+        };
+        if active_path != session_path {
+            let existing_epoch = terminal_mount_epochs
+                .get(session_path)
+                .copied()
+                .unwrap_or(0);
+            retained_terminal_session_paths.remove(session_path);
+            terminal_mount_epochs.remove(session_path);
+            return existing_epoch;
+        }
+        retained_terminal_session_paths.retain(|path| path == session_path);
+        terminal_mount_epochs.retain(|path, _| path == session_path);
+    }
+    retained_terminal_session_paths.insert(session_path.to_string());
+    let epoch = terminal_mount_epochs
+        .entry(session_path.to_string())
+        .or_insert(1);
+    *epoch
 }
 
 fn snapshot_terminal_line_tail(lines: &[String], limit: usize) -> Vec<String> {
@@ -1718,6 +1754,11 @@ fn conversation_provider_model_for_session(
             "codex-litellm-transcript",
             "Codex LiteLLM transcript",
             "Codex JSONL",
+        ),
+        SessionKind::ClaudeCode => ConversationProviderModel::read_only(
+            "claude-code-transcript",
+            "Claude Code transcript",
+            "Claude conversation",
         ),
         SessionKind::Shell | SessionKind::SshShell => ConversationProviderModel::read_only(
             "terminal-transcript",
@@ -2906,6 +2947,11 @@ impl ShellState {
             self.server_busy = false;
         }
     }
+    fn surface_request_is_current(&self, request_id: &str) -> bool {
+        self.active_surface_requests
+            .values()
+            .any(|request| request.request_id == request_id)
+    }
     fn defer_terminal_surface_request_end(&self, request_id: &str) -> bool {
         let Some(request) = self.active_surface_requests.get(&YggSurface::Terminal) else {
             return false;
@@ -3595,17 +3641,72 @@ impl ShellState {
             Some(json!({ "reason": reason })),
         );
     }
+    fn defer_remote_terminal_resume_timeout_after_recent_progress(
+        &mut self,
+        session_path: &str,
+        bootstrap_lease_identity: &str,
+    ) -> bool {
+        let Some(attempt_id) = self
+            .terminal_open_attempt_by_session
+            .get(session_path)
+            .cloned()
+        else {
+            return false;
+        };
+        let now_ms = current_millis();
+        let Some(attempt) = self.terminal_open_attempts.get_mut(&attempt_id) else {
+            return false;
+        };
+        if attempt.latched_failure_reason.is_some()
+            || matches!(attempt.state, TerminalOpenAttemptState::Ready)
+        {
+            return false;
+        }
+        let Some(first_output_at_ms) = attempt.first_output_at_ms else {
+            return false;
+        };
+        let output_elapsed_ms = now_ms.saturating_sub(first_output_at_ms);
+        if output_elapsed_ms > REMOTE_TERMINAL_RESUME_OUTPUT_PROGRESS_GRACE_MS {
+            return false;
+        }
+        if !matches!(attempt.state, TerminalOpenAttemptState::Recovering) {
+            attempt.state = TerminalOpenAttemptState::Recovering;
+        }
+        attempt.last_observed_reason =
+            Some("remote resume timeout deferred after recent PTY output progress".to_string());
+        let attempt_snapshot = attempt.clone();
+        self.record_terminal_open_attempt_event(
+            "timeout_deferred_after_output_progress",
+            &attempt_snapshot,
+            Some(json!({
+                "bootstrap_lease": bootstrap_lease_identity,
+                "first_output_at_ms": first_output_at_ms,
+                "first_protocol_only_output_at_ms": attempt_snapshot.first_protocol_only_output_at_ms,
+                "first_meaningful_output_at_ms": attempt_snapshot.first_meaningful_output_at_ms,
+                "output_elapsed_ms": output_elapsed_ms,
+                "progress_grace_ms": REMOTE_TERMINAL_RESUME_OUTPUT_PROGRESS_GRACE_MS,
+            })),
+        );
+        true
+    }
     fn fail_remote_terminal_resume_timeout(
         &mut self,
         session_path: &str,
         bootstrap_lease_identity: &str,
         reason: String,
-    ) {
+    ) -> bool {
+        if self.defer_remote_terminal_resume_timeout_after_recent_progress(
+            session_path,
+            bootstrap_lease_identity,
+        ) {
+            return false;
+        }
         release_terminal_bootstrap_lease_if_current(self, session_path, bootstrap_lease_identity);
         self.terminal_attach_in_flight.remove(session_path);
         self.terminal_resume_ready_paths.remove(session_path);
         self.fail_terminal_open_attempt_for_session(session_path, reason);
         self.maybe_finish_terminal_surface_request_for_session(session_path);
+        true
     }
     fn record_terminal_open_attempt_event(
         &mut self,
@@ -4202,13 +4303,24 @@ impl ShellState {
         self.browser.ensure_visible_path(session_path);
     }
     fn retain_terminal_session_path(&mut self, session_path: &str) -> u64 {
-        self.retained_terminal_session_paths
-            .insert(session_path.to_string());
-        let epoch = self
-            .terminal_mount_epochs
-            .entry(session_path.to_string())
-            .or_insert(1);
-        *epoch
+        let limit_to_active_session = linux_limit_live_terminal_retention();
+        let active_terminal_path = if limit_to_active_session
+            && self.server.active_view_mode() == WorkspaceViewMode::Terminal
+        {
+            self.server
+                .active_session_path()
+                .filter(|path| self.server.session_supports_terminal(path))
+                .map(str::to_string)
+        } else {
+            None
+        };
+        retain_terminal_session_path_for_policy(
+            &mut self.retained_terminal_session_paths,
+            &mut self.terminal_mount_epochs,
+            session_path,
+            limit_to_active_session,
+            active_terminal_path.as_deref(),
+        )
     }
     fn refresh_cached_hot_session_views(&mut self) {
         for session in self.server.live_session_views().iter() {
@@ -4463,6 +4575,19 @@ impl ShellState {
             .is_some_and(|attempt| {
                 attempt.ready_at_ms.is_some() && attempt.latched_failure_reason.is_none()
             })
+    }
+    fn terminal_session_has_meaningful_resume_output(&self, session_path: &str) -> bool {
+        self.latest_terminal_open_attempt_for_path(session_path)
+            .is_some_and(|attempt| {
+                attempt.first_meaningful_output_at_ms.is_some()
+                    && attempt.latched_failure_reason.is_none()
+                    && attempt.last_surface_problem.is_none()
+            })
+    }
+    fn terminal_session_should_suppress_initial_resume_notice(&self, session_path: &str) -> bool {
+        self.terminal_resume_ready_paths.contains(session_path)
+            || self.terminal_session_has_ready_history(session_path)
+            || self.terminal_session_has_meaningful_resume_output(session_path)
     }
     fn terminal_session_is_active_ready_focus_target(&self, session_path: &str) -> bool {
         self.server.active_view_mode() == WorkspaceViewMode::Terminal
@@ -4933,6 +5058,12 @@ impl ShellState {
         if self.terminal_session_has_ready_attempt(session_path) {
             return false;
         }
+        if self.terminal_session_has_meaningful_resume_output(session_path)
+            && !self.terminal_attach_in_flight.contains(session_path)
+            && !self.terminal_session_has_active_terminal_request(session_path)
+        {
+            return false;
+        }
         terminal_resume_notification_should_stay_visible_for_session(
             self.terminal_attach_in_flight.contains(session_path),
             self.terminal_session_has_visual_resume_reveal(session_path),
@@ -4966,19 +5097,39 @@ impl ShellState {
         self.clear_terminal_resume_notifications_except(keep_session_path.as_deref());
     }
     fn prune_terminal_attach_in_flight(&mut self) {
-        let mut keep_paths = self.retained_terminal_session_paths.clone();
-        if let Some(active_path) = self.server.active_session_path() {
-            keep_paths.insert(active_path.to_string());
-        }
+        let active_path = self.server.active_session_path().map(str::to_string);
+        let active_terminal_request_path = self
+            .active_surface_requests
+            .get(&YggSurface::Terminal)
+            .and_then(|request| {
+                active_request_session_target_path(request, self.server.active_session_path())
+            });
+        let retained_paths = self.retained_terminal_session_paths.clone();
         let ready_paths = self
             .terminal_attach_in_flight
             .iter()
             .filter(|session_path| self.terminal_session_has_ready_attempt(session_path))
             .cloned()
             .collect::<HashSet<_>>();
+        let mut removed_paths = Vec::new();
         self.terminal_attach_in_flight.retain(|session_path| {
-            keep_paths.contains(session_path) && !ready_paths.contains(session_path)
+            let foreground_attach = active_path.as_deref() == Some(session_path.as_str())
+                || active_terminal_request_path.as_deref() == Some(session_path.as_str());
+            let keep = foreground_attach
+                && retained_paths.contains(session_path)
+                && !ready_paths.contains(session_path);
+            if !keep {
+                removed_paths.push(session_path.clone());
+            }
+            keep
         });
+        for session_path in removed_paths {
+            self.terminal_bootstrap_owner_by_session
+                .remove(&session_path);
+            self.terminal_bootstrap_lease_by_session
+                .remove(&session_path);
+            self.maybe_finish_terminal_surface_request_for_session(&session_path);
+        }
     }
     fn prune_terminal_resume_ready_paths(&mut self) {
         let mut keep_paths = self.retained_terminal_session_paths.clone();
@@ -5585,6 +5736,11 @@ impl ShellState {
         self.persist_settings();
         self.last_action = "updated Codex extra args".to_string();
     }
+    fn update_claude_code_extra_args(&mut self, value: String) {
+        self.settings.claude_code_extra_args = value;
+        self.persist_settings();
+        self.last_action = "updated Claude Code extra args".to_string();
+    }
     fn update_notification_delivery(&mut self, mode: NotificationDeliveryMode) {
         apply_notification_delivery_mode(&mut self.settings, mode);
         self.persist_settings();
@@ -5817,18 +5973,15 @@ impl ShellState {
             let Some(current_active_path) = preferred_background_path else {
                 return snapshot;
             };
-            let preferred_session = snapshot
-                .live_sessions
-                .iter()
-                .find(|session| session.session_path == current_active_path)
-                .cloned()
-                .or_else(|| {
-                    snapshot
-                        .active_session
-                        .as_ref()
-                        .filter(|session| session.session_path == current_active_path)
-                        .cloned()
-                });
+            let preferred_session =
+                snapshot_session_for_surface(&snapshot, &current_active_path, *request_surface)
+                    .map(|candidate| {
+                        self.preview_candidate_preserving_current_tail(
+                            &current_active_path,
+                            candidate,
+                            *request_surface,
+                        )
+                    });
             snapshot.active_session_path = Some(current_active_path);
             if let Some(preferred_session) = preferred_session {
                 snapshot.active_session = Some(preferred_session);
@@ -5845,18 +5998,16 @@ impl ShellState {
         let Some(preferred_path) = preferred_path else {
             return snapshot;
         };
-        let preferred_session = snapshot
-            .live_sessions
-            .iter()
-            .find(|session| session.session_path == preferred_path)
-            .cloned()
-            .or_else(|| {
-                snapshot
-                    .active_session
-                    .as_ref()
-                    .filter(|session| session.session_path == preferred_path)
-                    .cloned()
-            });
+        let preferred_session =
+            snapshot_session_for_surface(&snapshot, &preferred_path, *request_surface).map(
+                |candidate| {
+                    self.preview_candidate_preserving_current_tail(
+                        &preferred_path,
+                        candidate,
+                        *request_surface,
+                    )
+                },
+            );
         snapshot.active_session_path = Some(preferred_path);
         if let Some(preferred_session) = preferred_session {
             snapshot.active_session = Some(preferred_session);
@@ -5867,6 +6018,27 @@ impl ShellState {
             _ => snapshot.active_view_mode,
         };
         snapshot
+    }
+    fn preview_candidate_preserving_current_tail(
+        &self,
+        session_path: &str,
+        candidate: SnapshotSessionView,
+        surface: YggSurface,
+    ) -> SnapshotSessionView {
+        if !matches!(surface, YggSurface::Preview | YggSurface::PreviewSync) {
+            return candidate;
+        }
+        let Some(current) = self
+            .server
+            .active_session()
+            .filter(|session| session.session_path == session_path)
+        else {
+            return candidate;
+        };
+        if snapshot_preview_is_downgrade_from_current(current, &candidate) {
+            return snapshot_session_view_for_ui(current.clone());
+        }
+        candidate
     }
     fn open_theme_editor(&mut self) {
         self.theme_editor_open = true;
@@ -6974,7 +7146,7 @@ impl ShellState {
             emit_system_notification(&title, &message);
         }
         if self.settings.notification_sound {
-            emit_notification_chime();
+            emit_notification_chime(tone);
         }
         if self.notifications.len() > 1000 {
             let overflow = self.notifications.len() - 1000;
@@ -12157,6 +12329,67 @@ fn remote_machine_refresh_message_keeps_client_cooldown(message: Option<&str>) -
         value.starts_with("queued refresh ") || value.starts_with("refresh already in progress ")
     })
 }
+fn snapshot_session_for_surface(
+    snapshot: &ServerUiSnapshot,
+    session_path: &str,
+    surface: YggSurface,
+) -> Option<SnapshotSessionView> {
+    let active_session = snapshot
+        .active_session
+        .as_ref()
+        .filter(|session| session.session_path == session_path)
+        .cloned();
+    let live_session = snapshot
+        .live_sessions
+        .iter()
+        .find(|session| session.session_path == session_path)
+        .cloned();
+    if matches!(surface, YggSurface::Preview | YggSurface::PreviewSync) {
+        active_session.or(live_session)
+    } else {
+        live_session.or(active_session)
+    }
+}
+fn snapshot_metadata_value(session: &SnapshotSessionView, label: &str) -> String {
+    session
+        .metadata
+        .iter()
+        .find(|entry| entry.label == label)
+        .map(|entry| entry.value.clone())
+        .unwrap_or_default()
+}
+fn preview_hydration_rank(value: &str) -> u8 {
+    match value {
+        "tail" => 4,
+        "full" => 3,
+        "head" => 2,
+        "scan" => 1,
+        _ => 0,
+    }
+}
+fn managed_session_has_preview_content(session: &ManagedSessionView) -> bool {
+    !session.preview.blocks.is_empty() || !session.rendered_sections.is_empty()
+}
+fn snapshot_session_has_preview_content(session: &SnapshotSessionView) -> bool {
+    !session.preview.blocks.is_empty() || !session.rendered_sections.is_empty()
+}
+fn managed_session_preview_rank(session: &ManagedSessionView) -> u8 {
+    preview_hydration_rank(&metadata_value(session, "Preview Hydration"))
+}
+fn snapshot_session_preview_rank(session: &SnapshotSessionView) -> u8 {
+    preview_hydration_rank(&snapshot_metadata_value(session, "Preview Hydration"))
+}
+fn snapshot_preview_is_downgrade_from_current(
+    current: &ManagedSessionView,
+    candidate: &SnapshotSessionView,
+) -> bool {
+    if !managed_session_has_preview_content(current) {
+        return false;
+    }
+    let current_rank = managed_session_preview_rank(current);
+    let candidate_rank = snapshot_session_preview_rank(candidate);
+    current_rank > candidate_rank || !snapshot_session_has_preview_content(candidate)
+}
 fn remote_machine_refresh_backoff_ms(failure_count: u8) -> u64 {
     let ix = failure_count.saturating_sub(1) as usize;
     REMOTE_MACHINE_REFRESH_BACKOFF_MS
@@ -14238,6 +14471,44 @@ fn spawn_start_terminal_session_for_row(
     }
 }
 
+fn spawn_start_claude_code_session_for_row(
+    mut state: Signal<ShellState>,
+    explicit_row: Option<BrowserRow>,
+) {
+    let launch_context = state.with_mut(|shell| {
+        shell.remember_current_viewport_for_history();
+        shell.show_start_page_when_no_live_sessions = false;
+        shell.clear_alt_overlay();
+        shell.close_titlebar_new_menu();
+        explicit_row
+            .as_ref()
+            .map(|row| agent_session_launch_context_for_row(shell, row, SessionKind::ClaudeCode))
+            .unwrap_or_else(|| current_agent_session_launch_context(shell, SessionKind::ClaudeCode))
+    });
+    let terminal_appearance =
+        state.with(|shell| shell.effective_terminal_identity_appearance().to_string());
+    match launch_context {
+        TerminalLaunchContext::Local { cwd, title_hint } => {
+            let terminal_appearance = terminal_appearance.clone();
+            spawn_server_snapshot_action(
+                state,
+                "starting claude code".to_string(),
+                move |endpoint| {
+                    start_local_session_at_with_terminal_appearance(
+                        &endpoint,
+                        SessionKind::ClaudeCode,
+                        cwd.as_deref(),
+                        title_hint.as_deref(),
+                        Some(&terminal_appearance),
+                    )
+                },
+            );
+        }
+        TerminalLaunchContext::Remote { .. } => {
+            // Claude Code is local-only; remote launch is not supported.
+        }
+    }
+}
 fn is_codex_storage_session_path(path: &str) -> bool {
     path.contains("/.codex/sessions/")
 }
@@ -14301,7 +14572,7 @@ fn session_kind_for_row(row: &BrowserRow) -> SessionKind {
 }
 fn session_kind_action_label(kind: SessionKind) -> &'static str {
     match kind {
-        SessionKind::Codex | SessionKind::CodexLiteLlm => "session",
+        SessionKind::Codex | SessionKind::CodexLiteLlm | SessionKind::ClaudeCode => "session",
         SessionKind::Shell => "terminal",
         SessionKind::SshShell => "ssh session",
         SessionKind::Document => "paper",
@@ -14369,6 +14640,9 @@ fn is_local_stored_session_path(path: &str) -> bool {
         && !path.starts_with("ssh://")
 }
 fn supports_generated_session_copy(session: &ManagedSessionView) -> bool {
+    if session.kind.self_generates_copy() {
+        return false;
+    }
     session.kind.is_agent()
         || session.kind == SessionKind::SshShell
         || is_local_live_session_path(&session.session_path)
@@ -14985,11 +15259,32 @@ fn target_can_fetch_remote_generation_context(target: &CopyGenerationTarget) -> 
             .as_deref()
             .is_some_and(|path| !path.trim().is_empty())
 }
+fn remote_preview_storage_path_from_metadata(session: &ManagedSessionView) -> Option<String> {
+    let storage_path = metadata_value(session, "Storage").trim().to_string();
+    (!storage_path.is_empty()).then_some(storage_path)
+}
+fn remote_preview_cwd_from_metadata(session: &ManagedSessionView) -> Option<String> {
+    let cwd = metadata_value(session, "Cwd").trim().to_string();
+    (!cwd.is_empty()).then_some(cwd)
+}
 fn remote_preview_fetch_target(
     server: &YggtermServer,
     session: &ManagedSessionView,
 ) -> Option<(SshConnectTarget, String)> {
-    remote_preview_fetch_target_for_path(server, &session.session_path)
+    remote_preview_fetch_target_for_path(server, &session.session_path).or_else(|| {
+        let storage_path = remote_preview_storage_path_from_metadata(session)?;
+        let machine = remote_machine_for_session_path(server, &session.session_path)?;
+        Some((
+            SshConnectTarget {
+                label: machine.label.clone(),
+                kind: SessionKind::Codex,
+                ssh_target: machine.ssh_target.clone(),
+                prefix: machine.prefix.clone(),
+                cwd: remote_preview_cwd_from_metadata(session),
+            },
+            storage_path,
+        ))
+    })
 }
 fn remote_preview_fetch_target_for_path(
     server: &YggtermServer,
@@ -15081,13 +15376,32 @@ fn remote_preview_has_readable_scan_content(session: &ManagedSessionView) -> boo
         block.timestamp == "remote:scan"
             && block.lines.iter().any(|line| !line.trim().is_empty())
             && !preview_text_looks_like_loading_placeholder(&block.lines.join("\n"))
-    }) || !session.rendered_sections.is_empty()
+    }) || session
+        .rendered_sections
+        .iter()
+        .any(rendered_section_has_readable_preview_content)
+}
+fn rendered_section_has_readable_preview_content(section: &SessionRenderedSection) -> bool {
+    if is_placeholder_rendered_section_title(&section.title) {
+        return false;
+    }
+    let joined = section.lines.join("\n");
+    !preview_text_looks_like_loading_placeholder(&joined)
+        && section.lines.iter().any(|line| {
+            let trimmed = line.trim();
+            !trimmed.is_empty() && !is_preview_scaffold_line(trimmed)
+        })
 }
 fn remote_preview_should_auto_sync(session: &ManagedSessionView) -> bool {
+    let hydration = metadata_value(session, "Preview Hydration");
+    if remote_preview_storage_path_from_metadata(session).is_some()
+        && !matches!(hydration.as_str(), "full" | "tail" | "loading")
+    {
+        return true;
+    }
     if !remote_preview_needs_refresh(session) {
         return false;
     }
-    let hydration = metadata_value(session, "Preview Hydration");
     if !matches!(hydration.as_str(), "head" | "loading")
         && remote_preview_has_readable_scan_content(session)
     {
@@ -15135,6 +15449,9 @@ fn schedule_remote_preview_sync(
     session_path: &str,
     debounce_ms: u64,
 ) -> bool {
+    if remote_preview_sync_in_flight_for_session(shell, session_path) {
+        return false;
+    }
     let now = current_millis();
     let next_allowed = shell
         .remote_preview_sync_after_ms
@@ -15148,6 +15465,14 @@ fn schedule_remote_preview_sync(
         .remote_preview_sync_after_ms
         .insert(session_path.to_string(), now.saturating_add(debounce_ms));
     true
+}
+fn remote_preview_sync_in_flight_for_session(shell: &ShellState, session_path: &str) -> bool {
+    shell
+        .active_surface_requests
+        .get(&YggSurface::PreviewSync)
+        .and_then(|request| active_request_session_target_path(request, Some(session_path)))
+        .as_deref()
+        == Some(session_path)
 }
 fn remote_preview_retry_backoff_ms(retry_count: u32) -> u64 {
     match retry_count {
@@ -15429,12 +15754,6 @@ fn spawn_remote_preview_payload_sync(
             false,
         );
     });
-    spawn_loading_notice(
-        state,
-        request_meta.clone(),
-        "Web View Still Refreshing",
-        "The remote web view is still syncing. Yggterm is keeping the current web view visible while newer content arrives.",
-    );
     spawn(async move {
         maybe_debug_request_delay().await;
         let path_for_task = session_path.clone();
@@ -15444,17 +15763,23 @@ fn spawn_remote_preview_payload_sync(
         let outcome = run_dedicated_interactive_request_io(
             "remote_preview_sync",
             trace_home.as_path(),
-            move || refresh_preview(&endpoint, &path_for_task),
+            move || refresh_preview(&endpoint, &path_for_task, true),
         )
         .await;
         let retry_session_path = session_path.clone();
         let _ = safe_shell_mut(state, "remote_preview_sync_finish", |shell| match outcome {
             Ok(result) => {
+                if !shell.surface_request_is_current(&request_id) {
+                    return;
+                }
                 shell.remote_preview_failures.remove(&session_path);
                 shell.record_preview_issue_telemetry(reason);
                 shell.apply_daemon_snapshot_result_for(&request_id, Ok(result));
             }
             Err(error) => {
+                if !shell.surface_request_is_current(&request_id) {
+                    return;
+                }
                 shell.finish_busy_request_for(&request_id);
                 warn!(path=%session_path, error=%error, "failed to refresh remote preview");
                 let now = current_millis();
@@ -16570,6 +16895,7 @@ fn sidebar_merge_cache_key(
             SessionKind::Shell => 3_u8,
             SessionKind::SshShell => 4_u8,
             SessionKind::Document => 5_u8,
+            SessionKind::ClaudeCode => 6_u8,
         }
         .hash(&mut hasher);
         session.host_label.hash(&mut hasher);
@@ -16952,6 +17278,9 @@ fn preview_should_hide_stale_placeholder_content(session: &ManagedSessionView) -
     if matches!(hydration.as_str(), "full" | "scan") {
         return false;
     }
+    if remote_preview_has_readable_scan_content(session) {
+        return false;
+    }
     let has_only_placeholder_blocks = !session.preview.blocks.is_empty()
         && session
             .preview
@@ -17084,6 +17413,138 @@ fn preview_virtual_window(
         scroll_height_px,
         overscan_px,
     }
+}
+fn preview_latest_materialized_window(
+    blocks: &[SessionPreviewBlock],
+    viewport_height_px: f64,
+    scroll_height_px: f64,
+) -> PreviewVirtualWindow {
+    let total_height_px = blocks
+        .iter()
+        .map(estimate_preview_block_height)
+        .sum::<f64>();
+    let start_index = blocks.len().saturating_sub(PREVIEW_BLOCK_WINDOW);
+    PreviewVirtualWindow {
+        start_index,
+        end_index: blocks.len(),
+        top_spacer_px: 0.0,
+        bottom_spacer_px: 0.0,
+        total_height_px,
+        scroll_top_px: 0.0,
+        viewport_height_px: viewport_height_px.max(PREVIEW_MIN_VIEWPORT_HEIGHT_PX),
+        scroll_height_px: scroll_height_px
+            .max(total_height_px)
+            .max(PREVIEW_MIN_VIEWPORT_HEIGHT_PX),
+        overscan_px: 0.0,
+    }
+}
+fn preview_should_pin_latest_on_open(
+    session: &ManagedSessionView,
+    view_mode: WorkspaceViewMode,
+    layout: PreviewLayoutMode,
+    search_active: bool,
+) -> bool {
+    if view_mode != WorkspaceViewMode::Rendered
+        || layout != PreviewLayoutMode::Chat
+        || search_active
+        || !session.session_path.starts_with("remote-session://")
+    {
+        return false;
+    }
+    matches!(
+        metadata_value(session, "Preview Hydration").as_str(),
+        "tail" | "full"
+    ) && !visible_preview_blocks(session).is_empty()
+}
+fn preview_latest_pin_request(session: &ManagedSessionView) -> (String, String) {
+    let visible = visible_preview_blocks(session);
+    let last_signature = visible
+        .last()
+        .map(|block| {
+            format!(
+                "{}:{}",
+                block.timestamp,
+                block.lines.last().map(String::as_str).unwrap_or("")
+            )
+        })
+        .unwrap_or_default();
+    let pin_key = format!(
+        "{}:{}:{}:{}",
+        session.session_path,
+        metadata_value(session, "Preview Hydration"),
+        visible.len(),
+        last_signature
+    );
+    (session.session_path.clone(), pin_key)
+}
+fn preview_latest_initial_scroll_top(session: &ManagedSessionView) -> f64 {
+    let total_height = visible_preview_blocks(session)
+        .iter()
+        .map(estimate_preview_block_height)
+        .sum::<f64>();
+    (total_height - PREVIEW_MIN_VIEWPORT_HEIGHT_PX).max(0.0)
+}
+fn preview_latest_anchor_scroll_options() -> ScrollToOptions {
+    ScrollToOptions {
+        behavior: ScrollBehavior::Instant,
+        vertical: ScrollLogicalPosition::End,
+        horizontal: ScrollLogicalPosition::Nearest,
+    }
+}
+fn preview_scroll_to_latest_script(session_path: &str) -> String {
+    let session_path_literal =
+        serde_json::to_string(session_path).unwrap_or_else(|_| "\"\"".to_string());
+    format!(
+        r#"(function() {{
+  const sessionPath = {session_path_literal};
+  let attempts = 0;
+  const maxAttempts = 80;
+  function visible(node) {{
+    if (!node) return false;
+    const rect = node.getBoundingClientRect();
+    const style = window.getComputedStyle(node);
+    return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
+  }}
+  function pickScroller() {{
+    const nodes = Array.from(document.querySelectorAll('[data-preview-scroll="1"]'));
+    return nodes.find((node) => node.getAttribute('data-preview-session-path') === sessionPath && visible(node))
+      || nodes.find((node) => node.getAttribute('data-preview-session-path') === sessionPath)
+      || null;
+  }}
+  function pickAnchor(scroller) {{
+    if (!scroller) return null;
+    const anchors = Array.from(scroller.querySelectorAll('[data-preview-latest-anchor="1"]'));
+    return anchors.find((node) => node.getAttribute('data-preview-session-path') === sessionPath)
+      || anchors[anchors.length - 1]
+      || null;
+  }}
+  function apply() {{
+    attempts += 1;
+    const scroller = pickScroller();
+    let target = 0;
+    if (scroller) {{
+      const maxScroll = Math.max(0, Number(scroller.scrollHeight || 0) - Number(scroller.clientHeight || 0));
+      const anchor = pickAnchor(scroller);
+      if (anchor && typeof anchor.offsetTop === 'number') {{
+        target = Math.max(0, Math.min(maxScroll, anchor.offsetTop - Number(scroller.clientHeight || 0) + Number(anchor.offsetHeight || 1)));
+      }} else {{
+        target = maxScroll;
+      }}
+      if (target > 0 || maxScroll > 0) {{
+        scroller.scrollTop = target;
+        if (typeof scroller.scrollTo === 'function') {{
+          scroller.scrollTo({{ top: target, left: 0, behavior: 'auto' }});
+        }}
+        scroller.dispatchEvent(new Event('scroll', {{ bubbles: true }}));
+      }}
+    }}
+    if (attempts < maxAttempts) {{
+      window.setTimeout(() => window.requestAnimationFrame(apply), 50);
+    }}
+  }}
+  window.requestAnimationFrame(apply);
+}})();"#
+    )
 }
 fn group_preview_runs(blocks: &[SessionPreviewBlock], start_index: usize) -> Vec<PreviewRun> {
     let key = preview_run_cache_key(blocks, start_index);
@@ -19394,6 +19855,10 @@ fn live_session_default_summary(session: &ManagedSessionView) -> Option<String> 
             Some(cwd) => format!("Local Codex LiteLLM terminal rooted at {cwd}."),
             None => "Local Codex LiteLLM terminal.".to_string(),
         }),
+        SessionKind::ClaudeCode => Some(match cwd {
+            Some(cwd) => format!("Local Claude Code session rooted at {cwd}."),
+            None => "Local Claude Code session.".to_string(),
+        }),
         SessionKind::Document => Some("Document preview.".to_string()),
     }
 }
@@ -19408,7 +19873,10 @@ fn live_session_label(
 }
 fn is_local_tree_live_session(session: &ManagedSessionView) -> bool {
     is_local_live_session_path(&session.session_path)
-        && matches!(session.kind, SessionKind::Codex | SessionKind::CodexLiteLlm)
+        && matches!(
+            session.kind,
+            SessionKind::Codex | SessionKind::CodexLiteLlm | SessionKind::ClaudeCode
+        )
 }
 fn is_live_local_stored_codex_terminal_session(session: &ManagedSessionView) -> bool {
     session.source == SessionSource::LiveLocal
@@ -22526,6 +22994,7 @@ fn group_session_title_hint(row: &BrowserRow, kind: SessionKind) -> String {
     let suffix = match kind {
         SessionKind::Codex => "codex",
         SessionKind::CodexLiteLlm => "codex-litellm",
+        SessionKind::ClaudeCode => "claude-code",
         SessionKind::Shell => "shell",
         SessionKind::SshShell => "ssh",
         SessionKind::Document => "document",
@@ -23907,7 +24376,14 @@ fn describe_app_rows_snapshot(state: &Signal<ShellState>) -> Value {
                 "child_count": row.descendant_sessions,
                 "busy": busy,
                 "busy_reason": busy_state.reason,
-                "icon_kind": if busy { Some("busy") } else { Some(tree_icon_kind(row)) },
+                "icon_kind": if busy { Some("busy") } else {
+                    let base = tree_icon_kind(row);
+                    if base == "terminal" && snapshot.live_sessions.iter().any(|s| s.session_path == row.full_path && s.kind == SessionKind::ClaudeCode) {
+                        Some("claude-code")
+                    } else {
+                        Some(base)
+                    }
+                },
                 "icon_text": if busy { None::<&str> } else { tree_icon_glyph(row) },
                 "live_member": live_member,
                 "live_keep_alive": live_keep_alive,
@@ -24855,28 +25331,33 @@ async fn capture_dom_debug_snapshot_for(active_session_path: Option<&str>) -> Va
                 const cursorRowStack = paintStackAtRect(cursorRowRect, host, rowsLayer);
                 const cursorSampleStack = paintStackAtRect(cursorSampleRect, host, rowsLayer);
                 const hostStack = paintStackAtRect(host ? host.getBoundingClientRect() : null, host, rowsLayer);
-                const stackTopIsYggtermChrome = (paintStack) => {
-                    const top = paintStack && Array.isArray(paintStack.stack) ? paintStack.stack[0] : null;
-                    if (!top || top.within_host || top.within_rows) {
-                        return false;
+                const stackContainsYggtermChromeBeforeTerminal = (paintStack) => {
+                    const stack = paintStack && Array.isArray(paintStack.stack) ? paintStack.stack : [];
+                    for (const entry of stack) {
+                        if (!entry || entry.within_host || entry.within_rows) {
+                            break;
+                        }
+                        const className = String(entry.class_name || '');
+                        const text = String(entry.text || '');
+                        const zIndex = String(entry.z_index || '');
+                        if (
+                            className.includes('yggterm-titlebar')
+                            || className.includes('yggterm-chrome')
+                            || text.includes('Web ViewTerminal')
+                            || text.includes('Search live sessions')
+                            || (zIndex === '211' && text.includes('▾'))
+                        ) {
+                            return true;
+                        }
                     }
-                    const className = String(top.class_name || '');
-                    const text = String(top.text || '');
-                    const zIndex = String(top.z_index || '');
-                    return (
-                        className.includes('yggterm-titlebar')
-                        || className.includes('yggterm-chrome')
-                        || text.includes('Web ViewTerminal')
-                        || text.includes('Search live sessions')
-                        || (zIndex === '211' && text.includes('▾'))
-                    );
+                    return false;
                 };
                 const rowPaintProblem = Boolean(rowText && rowSampleRect && !rowSampleStack.top_within_rows);
                 const cursorRowPaintProblem = Boolean(cursorRowText && cursorRowRect && !cursorRowStack.top_within_rows);
                 const cursorPaintProblem = Boolean(cursorText && cursorSampleRect && !cursorSampleStack.top_within_rows);
                 const rowSampleCoveredByShellChrome = Boolean(
                     rowPaintProblem
-                    && stackTopIsYggtermChrome(rowSampleStack)
+                    && stackContainsYggtermChromeBeforeTerminal(rowSampleStack)
                     && (cursorRowStack.top_within_rows || cursorSampleStack.top_within_rows)
                 );
                 let problem = '';
@@ -24906,6 +25387,8 @@ async fn capture_dom_debug_snapshot_for(active_session_path: Option<&str>) -> Va
                 const style = window.getComputedStyle(host);
                 const helpers = host.querySelector('.xterm-helpers');
                 const helperTextarea = host.querySelector('.xterm-helper-textarea');
+                const focusCapture = host.querySelector('.yggterm-term-focus-capture');
+                const focusCaptureStyle = focusCapture ? window.getComputedStyle(focusCapture) : null;
                 const screen = host.querySelector('.xterm-screen');
                 const viewport = host.querySelector('.xterm-viewport');
                 const canvasLayers = Array.from(host.querySelectorAll('canvas'));
@@ -25375,6 +25858,8 @@ async fn capture_dom_debug_snapshot_for(active_session_path: Option<&str>) -> Va
                     last_prompt_follow_layout_guard_reason: mountedHost ? String(mountedHost.lastPromptFollowLayoutGuardReason || '') : '',
                     xterm_root_user_select: resolvedUserSelect(xtermRootStyle, xtermRoot),
                     rows_user_select: resolvedUserSelect(rowsStyle, rowsLayer),
+                    focus_capture_pointer_events: focusCaptureStyle ? String(focusCaptureStyle.pointerEvents || '') : null,
+                    focus_capture_hit_target_enabled: focusCaptureStyle ? String(focusCaptureStyle.pointerEvents || '') !== 'none' : false,
                     selection_layer_count: host.querySelectorAll('.xterm-selection').length,
                     selection_layer_rect_count: selectionLayerRects.length,
                     dim_sample_text: dimSample ? String(dimSample.textContent || '') : null,
@@ -26748,26 +27233,31 @@ async fn capture_dom_debug_snapshot_basic_for(active_session_path: Option<&str>)
                 const rowSampleStack = basicPaintStackAtRect(rowSampleRect, host, rowsLayer);
                 const cursorRowStack = basicPaintStackAtRect(cursorRowRect, host, rowsLayer);
                 const cursorSampleStack = basicPaintStackAtRect(cursorSampleRect, host, rowsLayer);
-                const stackTopIsYggtermChrome = (paintStack) => {
-                    const top = paintStack && Array.isArray(paintStack.stack) ? paintStack.stack[0] : null;
-                    if (!top || top.within_host || top.within_rows) {
-                        return false;
+                const stackContainsYggtermChromeBeforeTerminal = (paintStack) => {
+                    const stack = paintStack && Array.isArray(paintStack.stack) ? paintStack.stack : [];
+                    for (const entry of stack) {
+                        if (!entry || entry.within_host || entry.within_rows) {
+                            break;
+                        }
+                        const className = String(entry.class_name || '');
+                        const text = String(entry.text || '');
+                        const zIndex = String(entry.z_index || '');
+                        if (
+                            className.includes('yggterm-titlebar')
+                            || className.includes('yggterm-chrome')
+                            || text.includes('Web ViewTerminal')
+                            || text.includes('Search live sessions')
+                            || (zIndex === '211' && text.includes('▾'))
+                        ) {
+                            return true;
+                        }
                     }
-                    const className = String(top.class_name || '');
-                    const text = String(top.text || '');
-                    const zIndex = String(top.z_index || '');
-                    return (
-                        className.includes('yggterm-titlebar')
-                        || className.includes('yggterm-chrome')
-                        || text.includes('Web ViewTerminal')
-                        || text.includes('Search live sessions')
-                        || (zIndex === '211' && text.includes('▾'))
-                    );
+                    return false;
                 };
                 const rowSampleCoveredByShellChrome = Boolean(
                     rowText
                     && !rowSampleStack.top_within_rows
-                    && stackTopIsYggtermChrome(rowSampleStack)
+                    && stackContainsYggtermChromeBeforeTerminal(rowSampleStack)
                     && (cursorRowStack.top_within_rows || cursorSampleStack.top_within_rows)
                 );
                 let problem = '';
@@ -26898,6 +27388,11 @@ async fn capture_dom_debug_snapshot_basic_for(active_session_path: Option<&str>)
                     const helpers = host.querySelector('.xterm-helpers');
                     const helpersStyle = helpers ? window.getComputedStyle(helpers) : null;
                     const helperTextareaStyle = helperTextarea ? window.getComputedStyle(helperTextarea) : null;
+                    const focusCapture = host.querySelector('.yggterm-term-focus-capture');
+                    const focusCaptureStyle = focusCapture ? window.getComputedStyle(focusCapture) : null;
+                    const selectionLayerRects = Array.from(host.querySelectorAll('.xterm-selection'))
+                        .flatMap((node) => Array.from(node.getClientRects ? node.getClientRects() : []))
+                        .filter((rect) => Number(rect.width || 0) > 0 && Number(rect.height || 0) > 0);
                     const screenRect = screen ? screen.getBoundingClientRect() : null;
                     const viewportRect = viewport ? viewport.getBoundingClientRect() : null;
                     const hostRect = host.getBoundingClientRect();
@@ -27125,6 +27620,8 @@ async fn capture_dom_debug_snapshot_basic_for(active_session_path: Option<&str>)
                         low_contrast_row_samples: [],
                         selection_text: selectionText,
                         selection_range_count: meaningfulSelection && selection ? Number(selection.rangeCount || 0) : 0,
+                        selection_layer_count: host.querySelectorAll('.xterm-selection').length,
+                        selection_layer_rect_count: selectionLayerRects.length,
                         helpers_present: Boolean(helpers),
                         helpers_rect: rectSummary(helpers),
                         helper_textarea_present: Boolean(helperTextarea),
@@ -27137,6 +27634,8 @@ async fn capture_dom_debug_snapshot_basic_for(active_session_path: Option<&str>)
                         helper_textarea_clip_path: helperTextareaStyle ? String(helperTextareaStyle.clipPath || '') : null,
                         helper_textarea_clip: helperTextareaStyle ? String(helperTextareaStyle.clip || '') : null,
                         helper_textarea_pointer_events: helperTextareaStyle ? String(helperTextareaStyle.pointerEvents || '') : null,
+                        focus_capture_pointer_events: focusCaptureStyle ? String(focusCaptureStyle.pointerEvents || '') : null,
+                        focus_capture_hit_target_enabled: focusCaptureStyle ? String(focusCaptureStyle.pointerEvents || '') !== 'none' : false,
                         cursor_sample_class_name: cursorSample ? String(cursorSample.className || '') : null,
                         cursor_sample_color: cursorSampleStyle ? String(cursorSampleStyle.color || '') : null,
                         cursor_sample_background: cursorSampleStyle ? String(cursorSampleStyle.backgroundColor || '') : null,
@@ -30700,6 +31199,7 @@ async fn probe_terminal_viewport_select_for(session_path: &str) -> Value {
     let script = format!(
         r#"
         (async () => {{
+            const settle = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
             try {{
                 const sessionPath = {session_path_literal};
                 const registry = window.__yggtermXtermHosts || {{}};
@@ -30724,6 +31224,104 @@ async fn probe_terminal_viewport_select_for(session_path: &str) -> Value {
                     }});
                     return;
                 }}
+                const term = entry.term;
+                const activeBuffer = term && term.buffer && term.buffer.active
+                    ? term.buffer.active
+                    : null;
+                const clearSelection = () => {{
+                    try {{
+                        if (term && typeof term.clearSelection === 'function') {{
+                            term.clearSelection();
+                        }}
+                    }} catch (_error) {{}}
+                    try {{
+                        const selection = window.getSelection ? window.getSelection() : null;
+                        if (selection) {{
+                            selection.removeAllRanges();
+                        }}
+                    }} catch (_error) {{}}
+                }};
+                const xtermSelectionText = () => {{
+                    try {{
+                        return term && typeof term.getSelection === 'function'
+                            ? String(term.getSelection() || '')
+                            : '';
+                    }} catch (_error) {{
+                        return '';
+                    }}
+                }};
+                const domSelectionText = () => {{
+                    try {{
+                        const selection = window.getSelection ? window.getSelection() : null;
+                        return selection ? String(selection.toString() || '') : '';
+                    }} catch (_error) {{
+                        return '';
+                    }}
+                }};
+                const selectionLayerRectCount = () => {{
+                    try {{
+                        return host.querySelectorAll('.xterm-selection div').length;
+                    }} catch (_error) {{
+                        return 0;
+                    }}
+                }};
+                const paintStackSummary = (x, y) => {{
+                    try {{
+                        const nodes = typeof document.elementsFromPoint === 'function'
+                            ? Array.from(document.elementsFromPoint(x, y) || [])
+                            : [document.elementFromPoint(x, y)].filter(Boolean);
+                        return nodes.slice(0, 6).map((node) => ({{
+                            tag: String(node && node.tagName || '').toLowerCase(),
+                            id: String(node && node.id || ''),
+                            class_name: typeof node.className === 'string' ? node.className : '',
+                            within_host: Boolean(node && host && (node === host || host.contains(node))),
+                            within_rows: Boolean(node && rowsLayer && (node === rowsLayer || rowsLayer.contains(node))),
+                            text: String(node && node.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 80),
+                        }}));
+                    }} catch (_error) {{
+                        return [];
+                    }}
+                }};
+                const dispatchMouse = (target, type, init) => {{
+                    try {{
+                        target.dispatchEvent(new MouseEvent(type, init));
+                    }} catch (_error) {{}}
+                }};
+                const dispatchPointer = (target, type, init) => {{
+                    if (typeof PointerEvent !== 'function') {{
+                        return;
+                    }}
+                    try {{
+                        target.dispatchEvent(new PointerEvent(type, {{
+                            ...init,
+                            pointerId: 1,
+                            pointerType: 'mouse',
+                            isPrimary: true,
+                        }}));
+                    }} catch (_error) {{}}
+                }};
+                const dispatchAt = (type, x, y, button, buttons, detail = 1) => {{
+                    const target = document.elementFromPoint(x, y) || rowsLayer || host;
+                    const init = {{
+                        bubbles: true,
+                        cancelable: true,
+                        composed: true,
+                        view: window,
+                        clientX: x,
+                        clientY: y,
+                        screenX: x,
+                        screenY: y,
+                        button,
+                        buttons,
+                        detail,
+                    }};
+                    if (type.startsWith('pointer')) {{
+                        dispatchPointer(target, type, init);
+                    }} else {{
+                        dispatchMouse(target, type, init);
+                    }}
+                    return target;
+                }};
                 const host = document.getElementById(entry.hostId);
                 const rowsLayer = host ? host.querySelector('.xterm-rows') : null;
                 if (!host) {{
@@ -30743,13 +31341,10 @@ async fn probe_terminal_viewport_select_for(session_path: &str) -> Value {
                         || window.getComputedStyle(host).backgroundColor
                         || ''
                     );
-                    const activeBuffer = entry.term && entry.term.buffer && entry.term.buffer.active
-                        ? entry.term.buffer.active
-                        : null;
                     const visibleLines = [];
                     if (activeBuffer && typeof activeBuffer.getLine === 'function') {{
                         const totalLines = Math.max(0, Number(activeBuffer.length || 0));
-                        const termRows = Math.max(1, Number(entry.term.rows || 0) || 24);
+                        const termRows = Math.max(1, Number(term && term.rows || 0) || 24);
                         const viewportY = Math.max(0, Number(activeBuffer.viewportY || 0));
                         const startRow = Math.min(totalLines, viewportY);
                         const endRow = Math.min(totalLines, startRow + termRows);
@@ -30782,24 +31377,19 @@ async fn probe_terminal_viewport_select_for(session_path: &str) -> Value {
                     }}
                     const meaningful = visibleLines.filter((line) => /[A-Za-z0-9]/.test(line) && line.trim().length >= 3);
                     const effectiveSelectedText = String(meaningful[0] || visibleLines[0] || '').trim();
-                    if (effectiveSelectedText) {{
-                        dioxus.send({{
-                            accepted: true,
-                            session_path: sessionPath,
-                            host_id: entry.hostId,
-                            selection_method: "buffer_fallback",
-                            selected_text: effectiveSelectedText.slice(0, 480),
-                            selected_text_length: effectiveSelectedText.length,
-                            selected_contrast: null,
-                            selected_excerpt: effectiveSelectedText.slice(0, 240),
-                            background_color: backgroundColor,
-                        }});
-                        return;
-                    }}
                     dioxus.send({{
                         accepted: false,
-                        reason: "terminal_rows_missing",
+                        reason: effectiveSelectedText
+                            ? "terminal_rows_missing_for_pointer_selection"
+                            : "terminal_rows_missing",
                         session_path: sessionPath,
+                        host_id: entry.hostId,
+                        selection_method: "buffer_fallback_unverified",
+                        selected_text: effectiveSelectedText.slice(0, 480),
+                        selected_text_length: effectiveSelectedText.length,
+                        selected_contrast: null,
+                        selected_excerpt: effectiveSelectedText.slice(0, 240),
+                        background_color: backgroundColor,
                     }});
                     return;
                 }}
@@ -30868,6 +31458,22 @@ async fn probe_terminal_viewport_select_for(session_path: &str) -> Value {
                     || window.getComputedStyle(host).backgroundColor
                     || ''
                 );
+                const rows = Array.from(rowsLayer.children || [])
+                    .filter((node) => String(node.tagName || '').toLowerCase() === 'div')
+                    .map((node) => {{
+                        const text = String(node.textContent || '').replace(/\s+/g, ' ').trim();
+                        const rect = node.getBoundingClientRect();
+                        return {{
+                            node,
+                            text,
+                            rect,
+                            width: rect.width,
+                            height: rect.height,
+                        }};
+                    }})
+                    .filter((entry) => entry.text && entry.width > 0 && entry.height > 0);
+                const meaningfulRows = rows.filter((entry) => /[A-Za-z0-9]/.test(entry.text) && entry.text.length >= 3);
+                const rowTarget = meaningfulRows[0] || rows[0] || null;
                 const spans = Array.from(rowsLayer.querySelectorAll('span'))
                     .map((span) => {{
                         const text = String(span.textContent || '').replace(/\s+/g, ' ').trim();
@@ -30890,34 +31496,102 @@ async fn probe_terminal_viewport_select_for(session_path: &str) -> Value {
                     .sort((a, b) => Number(a.contrast) - Number(b.contrast))[0]
                     || meaningfulSpans[0]
                     || spans[0]
-                    || Array.from(rowsLayer.querySelectorAll('div')).find((node) => String(node.textContent || '').trim())
-                    || rowsLayer;
-                const selection = window.getSelection ? window.getSelection() : null;
-                let rangeText = '';
-                if (selection) {{
-                    selection.removeAllRanges();
-                    const range = document.createRange();
-                    range.selectNodeContents(target.node || target);
-                    selection.addRange(range);
-                    rangeText = String(range.toString() || '');
+                    || null;
+                const selectedRow = rowTarget || (target && target.node ? {{
+                    node: target.node,
+                    text: String(target.text || ''),
+                    rect: target.node.getBoundingClientRect(),
+                }} : null);
+                if (!selectedRow) {{
+                    dioxus.send({{
+                        accepted: false,
+                        reason: "terminal_visible_text_missing",
+                        session_path: sessionPath,
+                        host_id: entry.hostId,
+                    }});
+                    return;
                 }}
-                await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
-                const selectedText = selection ? String(selection.toString() || '') : '';
-                const effectiveSelectedText = selectedText || rangeText || String(target.text || '');
-                if (selection) {{
+                const rowRect = selectedRow.rect && Number.isFinite(selectedRow.rect.left)
+                    ? selectedRow.rect
+                    : selectedRow.node.getBoundingClientRect();
+                const cellWidth = (() => {{
                     try {{
-                        selection.removeAllRanges();
+                        const dimensions = term && term._core && term._core._renderService
+                            ? term._core._renderService.dimensions
+                            : null;
+                        const width = dimensions && dimensions.css && dimensions.css.cell
+                            ? Number(dimensions.css.cell.width || 0)
+                            : 0;
+                        if (width > 0) {{
+                            return width;
+                        }}
                     }} catch (_error) {{}}
+                    const cols = Math.max(1, Number(term && term.cols || 1));
+                    const hostRect = host.getBoundingClientRect();
+                    return Math.max(4, Number(hostRect.width || rowRect.width || 80) / cols);
+                }})();
+                const selectChars = Math.max(3, Math.min(28, String(selectedRow.text || '').trim().length));
+                const startX = Number((rowRect.left + Math.max(2, Math.min(10, cellWidth * 0.75))).toFixed(2));
+                const endX = Number(Math.min(rowRect.right - 2, startX + (cellWidth * selectChars)).toFixed(2));
+                const y = Number((rowRect.top + Math.max(2, Math.min(rowRect.height - 2, rowRect.height / 2))).toFixed(2));
+                const contextMenuOpenBefore = Boolean(document.querySelector('[data-context-menu="1"]'));
+                const startStack = paintStackSummary(startX, y);
+                clearSelection();
+                dispatchAt('pointerdown', startX, y, 0, 1, 1);
+                dispatchAt('mousedown', startX, y, 0, 1, 1);
+                const steps = 8;
+                for (let index = 1; index <= steps; index += 1) {{
+                    const x = Number((startX + ((endX - startX) * (index / steps))).toFixed(2));
+                    dispatchAt('pointermove', x, y, 0, 1, 1);
+                    dispatchAt('mousemove', x, y, 0, 1, 1);
+                    await settle(12);
                 }}
+                dispatchAt('pointerup', endX, y, 0, 0, 1);
+                dispatchAt('mouseup', endX, y, 0, 0, 1);
+                await settle(180);
+                let selectedText = xtermSelectionText();
+                let rectCount = selectionLayerRectCount();
+                let method = selectedText.trim() ? "pointer_drag" : "";
+                if (!selectedText.trim()) {{
+                    clearSelection();
+                    dispatchAt('pointerdown', startX, y, 0, 1, 1);
+                    dispatchAt('mousedown', startX, y, 0, 1, 1);
+                    dispatchAt('pointerup', startX, y, 0, 0, 1);
+                    dispatchAt('mouseup', startX, y, 0, 0, 1);
+                    dispatchAt('click', startX, y, 0, 0, 1);
+                    await settle(24);
+                    dispatchAt('pointerdown', startX, y, 0, 1, 2);
+                    dispatchAt('mousedown', startX, y, 0, 1, 2);
+                    dispatchAt('pointerup', startX, y, 0, 0, 2);
+                    dispatchAt('mouseup', startX, y, 0, 0, 2);
+                    dispatchAt('click', startX, y, 0, 0, 2);
+                    dispatchAt('dblclick', startX, y, 0, 0, 2);
+                    await settle(180);
+                    selectedText = xtermSelectionText();
+                    rectCount = selectionLayerRectCount();
+                    method = selectedText.trim() ? "pointer_double_click" : "";
+                }}
+                const domSelectedText = domSelectionText();
+                const accepted = Boolean(selectedText.trim()) && rectCount > 0;
                 dioxus.send({{
-                    accepted: true,
+                    accepted,
+                    reason: accepted ? "" : "xterm_pointer_selection_not_observed",
                     session_path: sessionPath,
                     host_id: entry.hostId,
-                    selected_text: effectiveSelectedText.slice(0, 480),
-                    selected_text_length: effectiveSelectedText.length,
-                    selected_contrast: target.contrast != null ? Number(target.contrast) : null,
-                    selected_excerpt: String((target.text || effectiveSelectedText || '')).slice(0, 240),
+                    selection_method: method || "pointer_gesture_failed",
+                    selected_text: selectedText.slice(0, 480),
+                    selected_text_length: selectedText.length,
+                    dom_selection_text: domSelectedText.slice(0, 480),
+                    dom_selection_length: domSelectedText.length,
+                    selection_layer_rect_count: rectCount,
+                    selected_contrast: target && target.contrast != null ? Number(target.contrast) : null,
+                    selected_excerpt: String((selectedRow.text || selectedText || '')).slice(0, 240),
                     background_color: backgroundColor,
+                    context_menu_open_before: contextMenuOpenBefore,
+                    context_menu_open_after: Boolean(document.querySelector('[data-context-menu="1"]')),
+                    gesture_start: {{ x: startX, y }},
+                    gesture_end: {{ x: endX, y }},
+                    gesture_start_stack: startStack,
                 }});
             }} catch (error) {{
                 dioxus.send({{
@@ -33555,11 +34229,14 @@ async fn process_pending_app_control_requests(
                     "describe_state_runtime_status_end",
                     runtime_status_refresh.clone(),
                 );
+                trace_stage("describe_state_sync_input_policy_begin", json!({}));
+                sync_active_terminal_input_policy(state);
+                trace_stage("describe_state_sync_input_policy_end", json!({}));
                 trace_stage("describe_state_snapshot_begin", json!({}));
                 let mut snapshot = describe_app_state_snapshot(&state, &desktop);
                 trace_stage("describe_state_snapshot_end", json!({}));
                 trace_stage("describe_state_dom_begin", json!({}));
-                let dom =
+                let mut dom =
                     capture_dom_debug_snapshot_for_or_empty(active_session_path.as_deref()).await;
                 trace_stage(
                     "describe_state_dom_end",
@@ -33596,6 +34273,17 @@ async fn process_pending_app_control_requests(
                     &mut viewport,
                     terminal_open_attempt_before_observation.as_ref(),
                 );
+                let observed_session_path = viewport
+                    .get("active_session_path")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+                let ready_before_observation =
+                    observed_session_path.as_deref().is_some_and(|path| {
+                        state.with(|shell| {
+                            shell.terminal_resume_ready_paths.contains(path)
+                                || shell.terminal_session_has_ready_attempt(path)
+                        })
+                    });
                 trace_stage("describe_state_terminal_attempt_begin", json!({}));
                 let terminal_open_attempt = state.with_mut(|shell| {
                     shell.observe_terminal_open_attempt_from_viewport(&viewport);
@@ -33605,6 +34293,40 @@ async fn process_pending_app_control_requests(
                         .and_then(|path| shell.latest_terminal_open_attempt_snapshot_for_path(path))
                 });
                 trace_stage("describe_state_terminal_attempt_end", json!({}));
+                let ready_after_observation =
+                    observed_session_path.as_deref().is_some_and(|path| {
+                        state.with(|shell| {
+                            shell.terminal_resume_ready_paths.contains(path)
+                                || shell.terminal_session_has_ready_attempt(path)
+                        })
+                    });
+                if ready_after_observation && !ready_before_observation {
+                    trace_stage(
+                        "describe_state_ready_observation_sync_input_begin",
+                        json!({
+                            "session_path": observed_session_path,
+                        }),
+                    );
+                    sync_active_terminal_input_policy(state);
+                    sleep(Duration::from_millis(40)).await;
+                    snapshot = describe_app_state_snapshot(&state, &desktop);
+                    dom = capture_dom_debug_snapshot_for_or_empty(active_session_path.as_deref())
+                        .await;
+                    viewport = describe_viewport_snapshot(&snapshot, &dom);
+                    trace_stage(
+                        "describe_state_ready_observation_sync_input_end",
+                        json!({
+                            "surface_input_enabled": viewport
+                                .get("active_terminal_surface")
+                                .and_then(|surface| surface.get("input_enabled"))
+                                .and_then(Value::as_bool),
+                            "surface_raw_input_enabled": viewport
+                                .get("active_terminal_surface")
+                                .and_then(|surface| surface.get("raw_input_enabled"))
+                                .and_then(Value::as_bool),
+                        }),
+                    );
+                }
                 if let Some(map) = viewport.as_object_mut() {
                     map.insert(
                         "terminal_open_attempt".to_string(),
@@ -33642,6 +34364,8 @@ async fn process_pending_app_control_requests(
     );
     complete_app_control_request(&home, &inflight_path, &response)?;
     trace_stage("response_complete_end", json!({}));
+    let response_data_summary =
+        summarize_app_control_response_data_for_trace(response.data.as_ref());
     append_trace_event(
         &home,
         "ui",
@@ -33651,11 +34375,85 @@ async fn process_pending_app_control_requests(
             "request_id": response.request_id,
             "handled_by_pid": response.handled_by_pid,
             "output_path": response.output_path,
-            "data": response.data,
+            "data_summary": response_data_summary,
             "error": response.error,
         }),
     );
     Ok(true)
+}
+fn summarize_app_control_response_data_for_trace(data: Option<&Value>) -> Value {
+    let Some(data) = data else {
+        return Value::Null;
+    };
+    match data {
+        Value::Object(map) => {
+            let mut keys = map.keys().take(32).cloned().collect::<Vec<_>>();
+            keys.sort();
+            let viewport = map.get("viewport").and_then(Value::as_object);
+            let surface = viewport
+                .and_then(|viewport| viewport.get("active_terminal_surface"))
+                .and_then(Value::as_object);
+            let runtime_truth = map.get("runtime_truth").and_then(Value::as_object);
+            json!({
+                "kind": "object",
+                "key_count": map.len(),
+                "keys": keys,
+                "command": map.get("command").and_then(Value::as_str),
+                "queued": map.get("queued").and_then(Value::as_bool),
+                "session_path": map
+                    .get("session_path")
+                    .and_then(Value::as_str)
+                    .or_else(|| map.get("active_session_path").and_then(Value::as_str)),
+                "active_view_mode": map.get("active_view_mode").and_then(Value::as_str),
+                "ready": map.get("ready").and_then(Value::as_bool),
+                "viewport_ready": viewport
+                    .and_then(|viewport| viewport.get("ready"))
+                    .and_then(Value::as_bool),
+                "viewport_reason": viewport
+                    .and_then(|viewport| viewport.get("reason"))
+                    .and_then(Value::as_str),
+                "surface_problem": surface
+                    .and_then(|surface| surface.get("problem"))
+                    .and_then(Value::as_str),
+                "surface_input_enabled": surface
+                    .and_then(|surface| surface.get("input_enabled"))
+                    .and_then(Value::as_bool),
+                "surface_raw_input_enabled": surface
+                    .and_then(|surface| surface.get("raw_input_enabled"))
+                    .and_then(Value::as_bool),
+                "runtime_live_row_count": runtime_truth
+                    .and_then(|truth| truth.get("live_row_count"))
+                    .and_then(Value::as_u64),
+                "runtime_daemon_runtime_count": runtime_truth
+                    .and_then(|truth| truth.get("daemon_runtime_count"))
+                    .and_then(Value::as_u64),
+                "runtime_active_runtime_present": runtime_truth
+                    .and_then(|truth| truth.get("active_runtime_present"))
+                    .and_then(Value::as_bool),
+                "runtime_active_host_input_enabled": runtime_truth
+                    .and_then(|truth| truth.get("active_host_input_enabled"))
+                    .and_then(Value::as_bool),
+            })
+        }
+        Value::Array(values) => json!({
+            "kind": "array",
+            "len": values.len(),
+        }),
+        Value::String(value) => json!({
+            "kind": "string",
+            "len": value.len(),
+            "preview": value.chars().take(160).collect::<String>(),
+        }),
+        Value::Bool(value) => json!({
+            "kind": "bool",
+            "value": value,
+        }),
+        Value::Number(value) => json!({
+            "kind": "number",
+            "value": value,
+        }),
+        Value::Null => Value::Null,
+    }
 }
 fn parse_client_instance_pid(path: &Path) -> Option<u32> {
     let file_name = path.file_name()?.to_str()?;
@@ -35866,23 +36664,26 @@ fn app() -> Element {
         let has_fetch_target =
             remote_preview_fetch_target(&state.read().server, &session).is_some();
         if has_fetch_target {
-            state.with_mut(|shell| {
+            let scheduled = state.with_mut(|shell| {
                 shell.record_preview_issue_telemetry(if needs_refresh {
                     "preview_refresh_request_placeholder"
                 } else {
                     "preview_refresh_request_active"
-                })
+                });
+                schedule_remote_preview_sync(shell, &session.session_path, 0)
             });
             last_preview_refresh_marker.set(Some(refresh_marker));
-            spawn_remote_preview_payload_sync(
-                state,
-                session.session_path.clone(),
-                if needs_refresh {
-                    "preview_refresh_request_placeholder"
-                } else {
-                    "preview_refresh_request_active"
-                },
-            );
+            if scheduled {
+                spawn_remote_preview_payload_sync(
+                    state,
+                    session.session_path.clone(),
+                    if needs_refresh {
+                        "preview_refresh_request_placeholder"
+                    } else {
+                        "preview_refresh_request_active"
+                    },
+                );
+            }
         } else if needs_refresh {
             let scheduled = state.with_mut(|shell| {
                 shell.record_preview_issue_telemetry("preview_refresh_no_target");
@@ -36752,6 +37553,9 @@ fn app() -> Element {
                             on_toggle_new_menu: move |_| state.with_mut(|shell| shell.toggle_titlebar_new_menu()),
                             on_toggle_overflow_menu: move |_| state.with_mut(|shell| shell.toggle_titlebar_overflow_menu()),
                             on_close_overflow_menu: move |_| state.with_mut(|shell| shell.close_titlebar_overflow_menu()),
+                            on_start_claude_code: move |_| {
+                                spawn_start_claude_code_session_for_row(state, None);
+                            },
                             on_start_session: move |_| {
                             let launch_context = state.with_mut(|shell| {
                                 shell.close_titlebar_new_menu();
@@ -37176,6 +37980,7 @@ fn app() -> Element {
                             on_api_key_change: move |value: String| state.with_mut(|shell| shell.update_litellm_api_key(value)),
                             on_model_change: move |value: String| state.with_mut(|shell| shell.update_interface_llm_model(value)),
                             on_codex_extra_args_change: move |value: String| state.with_mut(|shell| shell.update_codex_extra_args(value)),
+                            on_claude_code_extra_args_change: move |value: String| state.with_mut(|shell| shell.update_claude_code_extra_args(value)),
                             on_focus_input: move |field_key: String| {
                                 focus_settings_field(state, &field_key);
                             },
@@ -37260,6 +38065,12 @@ fn app() -> Element {
                             let preferred_agent_kind = preferred_agent_kind;
                             move |_| {
                                 spawn_start_group_session(state, row.clone(), preferred_agent_kind)
+                            }
+                        },
+                        on_create_group_claude_code: {
+                            let row = context_row.clone();
+                            move |_| {
+                                spawn_start_group_session(state, row.clone(), SessionKind::ClaudeCode)
                             }
                         },
                         on_create_group: {
@@ -37504,6 +38315,7 @@ fn Titlebar(
     on_toggle_overflow_menu: EventHandler<()>,
     on_close_overflow_menu: EventHandler<()>,
     on_start_session: EventHandler<()>,
+    on_start_claude_code: EventHandler<()>,
     on_start_terminal: EventHandler<()>,
     on_create_paper: EventHandler<()>,
     on_refresh_summary: EventHandler<()>,
@@ -37837,6 +38649,13 @@ fn Titlebar(
                                                     }
                                                 }
                                                 "New Session"
+                                            }
+                                            button {
+                                                "data-titlebar-new-menu-action": "1",
+                                                class: "yggterm-menu-item",
+                                                style: titlebar_new_action_style(snapshot.palette),
+                                                onclick: move |_| on_start_claude_code.call(()),
+                                                "New Claude Code"
                                             }
                                             button {
                                                 "data-titlebar-new-menu-action": "1",
@@ -38841,7 +39660,20 @@ fn Sidebar(
                         let context_row = row.clone();
                         let delete_row = row.clone();
                         let visible_label = sidebar_row_visible_label(&row);
-                        let icon_kind = tree_icon_kind(&row).to_string();
+                        let icon_kind = {
+                            let base = tree_icon_kind(&row);
+                            if base == "terminal"
+                                && snapshot.live_sessions.iter().any(|s| {
+                                    s.session_path == row.full_path
+                                        && s.kind == SessionKind::ClaudeCode
+                                })
+                            {
+                                "claude-code"
+                            } else {
+                                base
+                            }
+                        }
+                        .to_string();
                         let busy_icon = sidebar_row_shows_busy_icon(&snapshot, &row);
                         let row_dragging = sidebar_row_dragging_for_projection(
                             snapshot.drag_paths.as_slice(),
@@ -39854,6 +40686,8 @@ fn SidebarRow(
                         },
                         if busy_icon {
                             BusyTreeIcon {}
+                        } else if icon_kind == "claude-code" {
+                            ClaudeCodeTreeIcon {}
                         } else {
                             TreeIcon { row: row.clone() }
                         }
@@ -40119,6 +40953,33 @@ fn DragGhost(snapshot: SharedSnapshot) -> Element {
     }
 }
 #[component]
+fn ClaudeCodeTreeIcon() -> Element {
+    rsx! {
+        svg {
+            width: "19",
+            height: "15",
+            view_box: "0 0 19 15",
+            fill: "none",
+            xmlns: "http://www.w3.org/2000/svg",
+            circle {
+                cx: "9.5",
+                cy: "7.5",
+                r: "5.6",
+                stroke: "currentColor",
+                stroke_width: "1.15",
+            }
+            text {
+                x: "9.5",
+                y: "10.5",
+                text_anchor: "middle",
+                fill: "currentColor",
+                style: "font-family:'JetBrains Mono', ui-monospace, monospace; font-size:6.5px; font-weight:800; letter-spacing:0;",
+                "cc"
+            }
+        }
+    }
+}
+#[component]
 fn TreeIcon(row: BrowserRow) -> Element {
     if let Some(glyph) = tree_icon_glyph(&row) {
         return rsx! {
@@ -40302,6 +41163,7 @@ fn MainSurface(
     let mut preview_scroll_client_height = use_signal(|| PREVIEW_MIN_VIEWPORT_HEIGHT_PX);
     let mut preview_scroll_height = use_signal(|| PREVIEW_MIN_VIEWPORT_HEIGHT_PX);
     let mut preview_reset_key = use_signal(String::new);
+    let mut preview_latest_pin_key = use_signal(String::new);
     let mut main_surface_trace_key = use_signal(String::new);
     let preview_reset_session_path = active_session_path.clone();
     let preview_reset_view_mode = snapshot.active_view_mode as u8;
@@ -40320,6 +41182,42 @@ fn MainSurface(
         preview_scroll_top.set(0.0);
         preview_scroll_client_height.set(PREVIEW_MIN_VIEWPORT_HEIGHT_PX);
         preview_scroll_height.set(PREVIEW_MIN_VIEWPORT_HEIGHT_PX);
+    });
+    let preview_latest_pin_request = snapshot
+        .active_session
+        .as_ref()
+        .filter(|session| {
+            preview_should_pin_latest_on_open(
+                session,
+                snapshot.active_view_mode,
+                snapshot.preview_layout,
+                snapshot.search_active,
+            )
+        })
+        .map(|session| {
+            let (session_path, pin_key) = preview_latest_pin_request(session);
+            (
+                session_path,
+                pin_key,
+                preview_latest_initial_scroll_top(session),
+            )
+        });
+    let preview_latest_anchor_key = preview_latest_pin_request
+        .as_ref()
+        .map(|(_, pin_key, _)| pin_key.clone())
+        .unwrap_or_default();
+    let preview_pin_latest_on_mount = preview_latest_pin_request.is_some();
+    use_effect(move || {
+        let Some((session_path, pin_key, initial_scroll_top)) = preview_latest_pin_request.clone()
+        else {
+            return;
+        };
+        if *preview_latest_pin_key.read() == pin_key {
+            return;
+        }
+        preview_scroll_top.set(initial_scroll_top);
+        preview_latest_pin_key.set(pin_key);
+        let _ = document::eval(&preview_scroll_to_latest_script(&session_path));
     });
     let render_trace_session_path = active_session_path.clone();
     let render_trace_surface_key = surface_key.clone();
@@ -40464,6 +41362,16 @@ fn MainSurface(
                 *preview_scroll_height.read(),
                 snapshot.search_active,
             );
+            let preview_window =
+                if preview_pin_latest_on_mount && visible_blocks.len() > PREVIEW_BLOCK_WINDOW {
+                    preview_latest_materialized_window(
+                        &visible_blocks,
+                        *preview_scroll_client_height.read(),
+                        *preview_scroll_height.read(),
+                    )
+                } else {
+                    preview_window
+                };
             let rendered_blocks =
                 visible_blocks[preview_window.start_index..preview_window.end_index].to_vec();
             let grouped_runs = group_preview_runs(&rendered_blocks, preview_window.start_index);
@@ -40573,6 +41481,8 @@ fn MainSurface(
                                         preview_window: preview_window.clone(),
                                         visible_block_count: visible_blocks.len(),
                                         grouped_runs: grouped_runs.clone(),
+                                        pin_latest_on_mount: preview_pin_latest_on_mount,
+                                        latest_anchor_key: preview_latest_anchor_key.clone(),
                                         palette: snapshot.palette,
                                         on_toggle_block: move |ix| on_toggle_preview_block.call(ix),
                                     }
@@ -40888,6 +41798,8 @@ fn ConversationWebView(
     preview_window: PreviewVirtualWindow,
     visible_block_count: usize,
     grouped_runs: Vec<PreviewRun>,
+    pin_latest_on_mount: bool,
+    latest_anchor_key: String,
     palette: Palette,
     on_toggle_block: EventHandler<usize>,
 ) -> Element {
@@ -40919,12 +41831,6 @@ fn ConversationWebView(
                 session: session.clone(),
                 provider: provider.clone(),
                 palette,
-            }
-            if !rendered_sections.is_empty() {
-                RenderedSectionsStrip {
-                    sections: rendered_sections.clone(),
-                    palette,
-                }
             }
             if let Some((fallback_title, fallback_summary)) = visible_terminal_resume_context_fallback.clone() {
                 TerminalResumeContextFallback {
@@ -40965,6 +41871,26 @@ fn ConversationWebView(
                 div {
                     "data-preview-spacer": "bottom",
                     style: format!("height:{}px; min-height:{}px;", preview_window.bottom_spacer_px.round(), preview_window.bottom_spacer_px.round()),
+                }
+            }
+            div {
+                key: "{latest_anchor_key}",
+                "data-preview-latest-anchor": "1",
+                "data-preview-session-path": "{session.session_path}",
+                style: "height:1px; min-height:1px; width:100%; pointer-events:none;",
+                onmounted: move |evt| async move {
+                    if !pin_latest_on_mount {
+                        return;
+                    }
+                    let _ = evt
+                        .scroll_to_with_options(preview_latest_anchor_scroll_options())
+                        .await;
+                },
+            }
+            if !rendered_sections.is_empty() {
+                RenderedSectionsStrip {
+                    sections: rendered_sections.clone(),
+                    palette,
                 }
             }
         }
@@ -43162,6 +44088,30 @@ fn TerminalCanvas(
                     && !timer_terminal_live_host_connected()
                     && still_waiting_for_resume
                 {
+                    let deferred_for_output_progress = safe_shell_mut(
+                        state,
+                        "terminal_resume_timeout_defer_output_progress",
+                        |shell| {
+                            shell.defer_remote_terminal_resume_timeout_after_recent_progress(
+                                &session_path,
+                                &timer_bootstrap_lease_identity,
+                            )
+                        },
+                    )
+                    .unwrap_or(false);
+                    if deferred_for_output_progress {
+                        append_trace_event(
+                            &timer_trace_home,
+                            "ui",
+                            "terminal_mount",
+                            "resume_timeout_deferred_after_output_progress",
+                            json!({
+                                "session_path": session_path,
+                                "bootstrap_identity": timer_bootstrap_lease_identity,
+                            }),
+                        );
+                        return;
+                    }
                     let failure_reason = format!(
                         "The live terminal on {} did not become interactive in time.",
                         session_host_label
@@ -44781,7 +45731,10 @@ fn TerminalCanvas(
                     shell.active_terminal_host_id = Some(host_id.clone());
                 }
             });
-            if is_remote_resume_session {
+            let suppress_initial_resume_notice = state.with(|shell| {
+                shell.terminal_session_should_suppress_initial_resume_notice(&session_path)
+            });
+            if is_remote_resume_session && !suppress_initial_resume_notice {
                 upsert_terminal_resume_notification(
                     state,
                     &session_path,
@@ -45028,8 +45981,10 @@ fn TerminalCanvas(
             let mut last_runtime_running = session_launch_phase_running;
             let mut pending_terminal_input_has_text = false;
             let mut input_echo_read_burst_remaining = 0_u8;
-            let codex_completion_notifications_enabled =
-                matches!(session_kind, SessionKind::Codex | SessionKind::CodexLiteLlm);
+            let codex_completion_notifications_enabled = matches!(
+                session_kind,
+                SessionKind::Codex | SessionKind::CodexLiteLlm | SessionKind::ClaudeCode
+            );
             let mut codex_busy_since_input = false;
             let mut codex_busy_started_at_ms = None::<u64>;
             let mut codex_completion_notified = false;
@@ -46959,6 +47914,15 @@ fn TerminalCanvas(
                                     }),
                                 );
                             }
+                            Ok(TerminalJsEvent::ContextMenuClose) => {
+                                let _ = safe_shell_mut(
+                                    state,
+                                    "terminal_context_menu_close",
+                                    |shell| {
+                                        shell.close_context_menu();
+                                    },
+                                );
+                            }
                             Ok(TerminalJsEvent::Clipboard {
                                 action,
                                 chars,
@@ -47812,10 +48776,15 @@ fn TerminalCanvas(
                                     saw_prompt_output,
                                     tail_prompt_only_output,
                                 ) {
+                                    let agent_label = if session_kind == SessionKind::ClaudeCode {
+                                        "Claude Code"
+                                    } else {
+                                        "Codex"
+                                    };
                                     safe_push_notification(
                                         state,
                                         NotificationTone::Success,
-                                        "Codex Session Ready",
+                                        format!("{agent_label} Session Ready"),
                                         format!("{title} is waiting for input."),
                                     );
                                     codex_completion_notified = true;
@@ -52732,28 +53701,107 @@ fn apply_notification_delivery_mode(settings: &mut AppSettings, mode: Notificati
         }
     }
 }
-fn emit_notification_chime() {
-    let _ = document::eval(
-        r#"
+fn emit_notification_chime(tone: NotificationTone) {
+    // Each tone gets a distinct sound shape so users can tell event types apart
+    // without looking at the screen.
+    let script = match tone {
+        // Success / completion: gentle two-note chord (fundamental + major third)
+        // ADSR: fast attack, short sustain, smooth exponential decay
+        NotificationTone::Success => r#"
         (() => {
           try {
             const ctx = new (window.AudioContext || window.webkitAudioContext)();
-            const osc = ctx.createOscillator();
-            const gain = ctx.createGain();
-            osc.type = "sine";
-            osc.frequency.value = 880;
-            gain.gain.value = 0.03;
-            osc.connect(gain);
-            gain.connect(ctx.destination);
-            osc.start();
-            setTimeout(() => {
-              try { osc.stop(); } catch (_error) {}
-              try { ctx.close(); } catch (_error) {}
-            }, 85);
+            const now = ctx.currentTime;
+            const master = ctx.createGain();
+            master.gain.setValueAtTime(0, now);
+            master.gain.linearRampToValueAtTime(0.055, now + 0.012);
+            master.gain.exponentialRampToValueAtTime(0.001, now + 0.42);
+            master.connect(ctx.destination);
+            [[523.25, 1.0], [659.25, 0.65]].forEach(([freq, amp]) => {
+              const osc = ctx.createOscillator();
+              const g = ctx.createGain();
+              osc.type = "sine";
+              osc.frequency.value = freq;
+              g.gain.value = amp;
+              osc.connect(g);
+              g.connect(master);
+              osc.start(now);
+              osc.stop(now + 0.46);
+            });
+            setTimeout(() => { try { ctx.close(); } catch (_e) {} }, 520);
           } catch (_error) {}
         })();
         "#,
-    );
+        // Info: single clean note, brief and unobtrusive
+        NotificationTone::Info => r#"
+        (() => {
+          try {
+            const ctx = new (window.AudioContext || window.webkitAudioContext)();
+            const now = ctx.currentTime;
+            const osc = ctx.createOscillator();
+            const gain = ctx.createGain();
+            osc.type = "sine";
+            osc.frequency.value = 698.46;
+            gain.gain.setValueAtTime(0, now);
+            gain.gain.linearRampToValueAtTime(0.04, now + 0.01);
+            gain.gain.exponentialRampToValueAtTime(0.001, now + 0.22);
+            osc.connect(gain);
+            gain.connect(ctx.destination);
+            osc.start(now);
+            osc.stop(now + 0.24);
+            setTimeout(() => { try { ctx.close(); } catch (_e) {} }, 300);
+          } catch (_error) {}
+        })();
+        "#,
+        // Warning: two quick rising pulses to signal attention needed
+        NotificationTone::Warning => r#"
+        (() => {
+          try {
+            const ctx = new (window.AudioContext || window.webkitAudioContext)();
+            const now = ctx.currentTime;
+            [0, 0.17].forEach(offset => {
+              const osc = ctx.createOscillator();
+              const gain = ctx.createGain();
+              osc.type = "sine";
+              osc.frequency.setValueAtTime(440, now + offset);
+              osc.frequency.linearRampToValueAtTime(660, now + offset + 0.10);
+              gain.gain.setValueAtTime(0, now + offset);
+              gain.gain.linearRampToValueAtTime(0.048, now + offset + 0.01);
+              gain.gain.exponentialRampToValueAtTime(0.001, now + offset + 0.13);
+              osc.connect(gain);
+              gain.connect(ctx.destination);
+              osc.start(now + offset);
+              osc.stop(now + offset + 0.15);
+            });
+            setTimeout(() => { try { ctx.close(); } catch (_e) {} }, 400);
+          } catch (_error) {}
+        })();
+        "#,
+        // Error: descending minor second interval — feels "wrong" intentionally
+        NotificationTone::Error => r#"
+        (() => {
+          try {
+            const ctx = new (window.AudioContext || window.webkitAudioContext)();
+            const now = ctx.currentTime;
+            [[0, 523.25], [0.18, 466.16]].forEach(([offset, freq]) => {
+              const osc = ctx.createOscillator();
+              const gain = ctx.createGain();
+              osc.type = "sine";
+              osc.frequency.value = freq;
+              gain.gain.setValueAtTime(0, now + offset);
+              gain.gain.linearRampToValueAtTime(0.052, now + offset + 0.012);
+              gain.gain.exponentialRampToValueAtTime(0.001, now + offset + 0.20);
+              osc.connect(gain);
+              gain.connect(ctx.destination);
+              osc.start(now + offset);
+              osc.stop(now + offset + 0.22);
+            });
+            setTimeout(() => { try { ctx.close(); } catch (_e) {} }, 450);
+          } catch (_error) {}
+        })();
+        "#,
+    };
+    let _ = document::eval(script);
 }
 fn emit_system_notification(title: &str, message: &str) {
     let _ = send_user_notification(title, message);
@@ -55374,10 +56422,11 @@ fn terminal_eval_script_with_canvas_renderer(
                     overlay.addEventListener('click', retainTerminalFocusAfterPointerRelease, true);
                     host.appendChild(overlay);
                 }}
-                overlay.style.pointerEvents =
-                    inputEnabled && hostOwnsActiveTerminalInput() && !host.classList.contains('yggterm-term-focused')
-                        ? 'auto'
-                        : 'none';
+                // The overlay is an observability/focus anchor only. It must never
+                // become the hit target for xterm gestures, because selection,
+                // double-click, and drag semantics belong to xterm.js.
+                overlay.style.pointerEvents = 'none';
+                overlay.setAttribute('data-yggterm-focus-capture-pointer-events', 'none');
                 overlay.style.cursor = inputEnabled ? 'text' : 'default';
                 return overlay;
             }} catch (_error) {{
@@ -55503,6 +56552,7 @@ fn terminal_eval_script_with_canvas_renderer(
         let promptFollowScheduleReason = '';
         let promptFollowScheduleAtMs = 0;
         let promptFollowScheduleSkipCount = 0;
+        let promptFollowScheduleCancelToken = 0;
         let lastPromptFollowScheduleSkipReason = '';
         let lastScrollbackSnapbackReason = '';
         let syncTerminalScrollController = (_reason = '') => {{}};
@@ -55796,6 +56846,11 @@ fn terminal_eval_script_with_canvas_renderer(
             scrollbackIntent = next;
             lastScrollbackIntentReason = nextReason;
             lastScrollbackIntentAtMs = Date.now();
+            if (scrollbackIntent === 'UserScrollback') {{
+                promptFollowScheduleCancelToken += 1;
+                promptFollowSchedulePending = false;
+                syncPromptFollowScheduleHostEntry();
+            }}
             syncHostScrollbackIntent();
             sendTerminalEvent({{
                 kind: "debug",
@@ -55874,15 +56929,22 @@ fn terminal_eval_script_with_canvas_renderer(
             promptFollowSchedulePending = true;
             promptFollowScheduleReason = scheduleReason;
             promptFollowScheduleAtMs = now;
+            const scheduleCancelToken = promptFollowScheduleCancelToken;
             syncPromptFollowScheduleHostEntry();
             const follow = (phase) => {{
                 try {{
+                    if (scheduleCancelToken !== promptFollowScheduleCancelToken) {{
+                        return;
+                    }}
                     if (scrollbackIntent !== 'UserScrollback') {{
                         scrollLiveCursorIntoView(true, `${{scheduleReason}}:${{phase}}`);
                     }}
                 }} catch (_error) {{}}
             }};
             const clearPending = () => {{
+                if (scheduleCancelToken !== promptFollowScheduleCancelToken) {{
+                    return;
+                }}
                 if (promptFollowScheduleReason === scheduleReason) {{
                     promptFollowSchedulePending = false;
                     syncPromptFollowScheduleHostEntry();
@@ -57684,8 +58746,20 @@ fn terminal_eval_script_with_canvas_renderer(
             handleWheel(event);
             return false;
         }});
-        const handleHostPointerFocus = (_event) => {{
+        const closeContextMenuForPrimaryTerminalPointer = (event) => {{
+            try {{
+                if (event && Number(event.button || 0) !== 0) {{
+                    return;
+                }}
+                if (!document.querySelector('[data-context-menu="1"]')) {{
+                    return;
+                }}
+                sendTerminalEvent({{ kind: "context_menu_close" }});
+            }} catch (_error) {{}}
+        }};
+        const handleHostPointerFocus = (event) => {{
             revealSoftwareCanvasLinkLayer('pointer_focus');
+            closeContextMenuForPrimaryTerminalPointer(event);
             releaseBlockingUiFocusForTerminalReclaim();
             refreshCursorContrastContract();
             // Reclaim stdin on pointerdown so settings/search focus cannot trap the
@@ -61307,7 +62381,10 @@ fn terminal_set_input_policy_script_for_active_session(
               if (!entry || !entry.term) {{
                 return;
               }}
-              if (typeof entry.forcePromptFollow === "function") {{
+              if (
+                typeof entry.forcePromptFollow === "function"
+                && String(entry.scrollbackIntent || 'PromptFollow') !== 'UserScrollback'
+              ) {{
                 entry.forcePromptFollow(reason);
               }}
               if (heavy && typeof entry.redrawTerminal === "function") {{
@@ -62165,6 +63242,7 @@ fn StartPage(snapshot: SharedSnapshot, state: Signal<ShellState>) -> Element {
     let recent_count = recent_rows.len();
     let selected_action_row = snapshot.selected_row.clone();
     let selected_agent_action_row = selected_action_row.clone();
+    let selected_claude_code_action_row = selected_action_row.clone();
     let selected_terminal_action_row = selected_action_row.clone();
     let can_create_folder_in_selected = selected_action_row
         .as_ref()
@@ -62229,6 +63307,24 @@ fn StartPage(snapshot: SharedSnapshot, state: Signal<ShellState>) -> Element {
                             );
                         },
                         "New Codex Session"
+                    }
+                    button {
+                        r#type: "button",
+                        "data-yggterm-start-action": "claude-code",
+                        style: "{quick_button_style}",
+                        onmousedown: |evt| {
+                            evt.prevent_default();
+                            evt.stop_propagation();
+                        },
+                        onclick: move |evt| {
+                            evt.prevent_default();
+                            evt.stop_propagation();
+                            spawn_start_claude_code_session_for_row(
+                                state,
+                                selected_claude_code_action_row.clone(),
+                            );
+                        },
+                        "New Claude Code Session"
                     }
                     button {
                         r#type: "button",
@@ -62489,6 +63585,7 @@ fn RightRail(
     on_api_key_change: EventHandler<String>,
     on_model_change: EventHandler<String>,
     on_codex_extra_args_change: EventHandler<String>,
+    on_claude_code_extra_args_change: EventHandler<String>,
     on_focus_input: EventHandler<String>,
     on_blur_input: EventHandler<()>,
     on_set_ui_theme: EventHandler<UiTheme>,
@@ -62540,6 +63637,7 @@ fn RightRail(
                     on_api_key_change,
                     on_model_change,
                     on_codex_extra_args_change,
+                    on_claude_code_extra_args_change,
                     on_focus_input,
                     on_blur_input,
                     on_set_ui_theme,
@@ -62612,6 +63710,7 @@ fn SettingsRailBody(
     on_api_key_change: EventHandler<String>,
     on_model_change: EventHandler<String>,
     on_codex_extra_args_change: EventHandler<String>,
+    on_claude_code_extra_args_change: EventHandler<String>,
     on_focus_input: EventHandler<String>,
     on_blur_input: EventHandler<()>,
     on_set_ui_theme: EventHandler<UiTheme>,
@@ -62728,6 +63827,22 @@ fn SettingsRailBody(
             div {
                 style: format!("font-size:11px; line-height:1.45; color:{}; margin-top:-6px;", snapshot.palette.muted),
                 "Optional advanced CLI flags appended to new and resumed Codex sessions. Example: -s danger-full-access"
+            }
+            SettingsField {
+                field_key: "claude-code-extra-args".to_string(),
+                label: "Claude Code Extra Args".to_string(),
+                value: snapshot.settings.claude_code_extra_args.clone(),
+                placeholder: "--dangerously-skip-permissions".to_string(),
+                secret: false,
+                autofocus: false,
+                palette: snapshot.palette,
+                on_focus_input: on_focus_input.clone(),
+                on_blur_input: on_blur_input.clone(),
+                on_change: on_claude_code_extra_args_change,
+            }
+            div {
+                style: format!("font-size:11px; line-height:1.45; color:{}; margin-top:-6px;", snapshot.palette.muted),
+                "Optional CLI flags appended to new Claude Code sessions. Example: --dangerously-skip-permissions"
             }
             ThemeSettingsSection {
                 palette: snapshot.palette,
@@ -63040,6 +64155,7 @@ fn ContextMenuOverlay(
     on_close: EventHandler<MouseEvent>,
     on_create_group: EventHandler<MouseEvent>,
     on_create_group_codex: EventHandler<MouseEvent>,
+    on_create_group_claude_code: EventHandler<MouseEvent>,
     on_create_group_shell: EventHandler<MouseEvent>,
     on_create_group_document: EventHandler<MouseEvent>,
     on_create_group_recipe: EventHandler<MouseEvent>,
@@ -63090,12 +64206,12 @@ fn ContextMenuOverlay(
     };
     rsx! {
         div {
-            style: "position:fixed; inset:0; z-index:90; background:transparent;",
+            style: "position:fixed; inset:0; z-index:90; background:transparent; pointer-events:none;",
             onclick: move |evt| on_close.call(evt),
             div {
                 "data-context-menu": "1",
                 "data-yggterm-menu-surface": "1",
-                style: context_menu_surface_style(palette, &placement_style, menu_blur),
+                style: format!("{} pointer-events:auto;", context_menu_surface_style(palette, &placement_style, menu_blur)),
                 onmousedown: |evt| evt.stop_propagation(),
                 onmouseup: |evt| evt.stop_propagation(),
                 onclick: |evt| evt.stop_propagation(),
@@ -63209,6 +64325,19 @@ fn ContextMenuOverlay(
                             on_create_group_codex.call(evt);
                         },
                         "New Codex Session"
+                    }
+                    button {
+                        "data-context-menu-action": "new-claude-code",
+                        class: "yggterm-menu-item",
+                        style: context_menu_action_style(palette, false),
+                        onmousedown: |evt| {
+                            evt.stop_propagation();
+                        },
+                        onclick: move |evt| {
+                            evt.stop_propagation();
+                            on_create_group_claude_code.call(evt);
+                        },
+                        "New Claude Code Session"
                     }
                     button {
                         "data-context-menu-action": "new-terminal",
@@ -68325,13 +69454,18 @@ mod tests {
         );
         assert!(script.contains("let programmaticFocusEnabled = Boolean(true);"));
         assert!(script.contains("programmaticFocusEnabled = nextProgrammaticFocusEnabled;"));
-        assert!(script.contains("const handleHostPointerFocus = (_event) => {"));
+        assert!(script.contains("const handleHostPointerFocus = (event) => {"));
+        assert!(script.contains("closeContextMenuForPrimaryTerminalPointer(event);"));
         assert!(script.contains("refreshCursorContrastContract();"));
         assert!(script.contains("setInputEnabled(true, false);"));
         assert!(script.contains("setInputEnabled(true, true, false);"));
         assert!(
             script.contains("native drag selection continues to work"),
             "pointerdown reclaim should explain why it avoids forcing helper focus before release"
+        );
+        assert!(
+            script.contains("overlay.style.pointerEvents = 'none';"),
+            "the focus-capture overlay must not intercept xterm drag selection"
         );
         assert!(
             !script.contains("const handleHostPointerFocus = (event) => {{\n            try {{\n                if (event && typeof event.preventDefault === 'function') {{"),
@@ -68438,6 +69572,12 @@ mod tests {
         );
         assert!(script.contains("if (isActive && activeSessionChanged) {"));
         assert!(script.contains("scheduleActivationRepaint(entry, \"active_session_switch\");"));
+        // Activation repaint must NOT unconditionally call forcePromptFollow.
+        // UserScrollback intent must be preserved across session switches.
+        assert!(
+            script.contains("String(entry.scrollbackIntent || 'PromptFollow') !== 'UserScrollback'"),
+            "activation repaint must guard forcePromptFollow to preserve UserScrollback"
+        );
     }
 
     #[test]
@@ -69240,19 +70380,19 @@ mod tests {
         );
     }
     #[test]
-    fn kde_live_terminal_retention_is_unlimited_by_default() {
-        assert!(!limit_live_terminal_retention_for_platform(
+    fn kde_live_terminal_retention_is_limited_by_default() {
+        assert!(limit_live_terminal_retention_for_platform(
             true, true, false, false
         ));
-        assert!(!limit_live_terminal_retention_for_platform(
+        assert!(limit_live_terminal_retention_for_platform(
             true, true, true, false
         ));
-        assert!(!limit_live_terminal_retention_for_platform(
+        assert!(limit_live_terminal_retention_for_platform(
             true, false, true, false
         ));
     }
     #[test]
-    fn kde_live_terminal_retention_can_be_limited_by_emergency_flag() {
+    fn kde_live_terminal_retention_force_flag_handles_headless_kde() {
         assert!(limit_live_terminal_retention_for_platform(
             true, true, false, true
         ));
@@ -69262,12 +70402,70 @@ mod tests {
         assert!(limit_live_terminal_retention_for_platform(
             true, false, true, true
         ));
-        assert!(!limit_live_terminal_retention_for_platform(
+        assert!(limit_live_terminal_retention_for_platform(
             true, false, false, true
         ));
         assert!(!limit_live_terminal_retention_for_platform(
             false, true, false, true
         ));
+    }
+    #[test]
+    fn active_limited_live_terminal_retention_rejects_late_inactive_callbacks() {
+        let active_path = "remote-session://dev/active";
+        let inactive_path = "remote-session://dev/inactive";
+        let mut retained_paths = HashSet::new();
+        retained_paths.insert(active_path.to_string());
+        let mut mount_epochs = HashMap::new();
+        mount_epochs.insert(active_path.to_string(), 4);
+        mount_epochs.insert(inactive_path.to_string(), 9);
+
+        let inactive_epoch = retain_terminal_session_path_for_policy(
+            &mut retained_paths,
+            &mut mount_epochs,
+            inactive_path,
+            true,
+            Some(active_path),
+        );
+
+        assert_eq!(inactive_epoch, 9);
+        assert!(retained_paths.contains(active_path));
+        assert!(!retained_paths.contains(inactive_path));
+        assert_eq!(mount_epochs.get(active_path).copied(), Some(4));
+        assert!(!mount_epochs.contains_key(inactive_path));
+
+        let active_epoch = retain_terminal_session_path_for_policy(
+            &mut retained_paths,
+            &mut mount_epochs,
+            active_path,
+            true,
+            Some(active_path),
+        );
+
+        assert_eq!(active_epoch, 4);
+        assert_eq!(retained_paths.len(), 1);
+        assert!(retained_paths.contains(active_path));
+        assert_eq!(mount_epochs.len(), 1);
+        assert_eq!(mount_epochs.get(active_path).copied(), Some(4));
+    }
+    #[test]
+    fn active_limited_live_terminal_retention_clears_without_active_terminal() {
+        let session_path = "remote-session://dev/inactive";
+        let mut retained_paths = HashSet::new();
+        retained_paths.insert(session_path.to_string());
+        let mut mount_epochs = HashMap::new();
+        mount_epochs.insert(session_path.to_string(), 2);
+
+        let epoch = retain_terminal_session_path_for_policy(
+            &mut retained_paths,
+            &mut mount_epochs,
+            session_path,
+            true,
+            None,
+        );
+
+        assert_eq!(epoch, 0);
+        assert!(retained_paths.is_empty());
+        assert!(mount_epochs.is_empty());
     }
     #[test]
     fn titlebar_wrapper_only_clips_overflow_while_collapsed() {
@@ -69567,6 +70765,10 @@ mod tests {
         assert!(
             script.contains("overlay.className = 'yggterm-term-focus-capture';"),
             "focus capture overlay should be attached inside the terminal host"
+        );
+        assert!(
+            script.contains("data-yggterm-focus-capture-pointer-events"),
+            "app-control should be able to prove the focus overlay is observer-only"
         );
     }
     #[test]
@@ -70097,15 +71299,19 @@ mod tests {
         assert!(source.contains("dom_paint_hit_test_problem: domPaintHitProbe.problem"));
         assert!(
             source.contains(
-                "rowPaintProblem\n                    && stackTopIsYggtermChrome(rowSampleStack)\n                    && (cursorRowStack.top_within_rows || cursorSampleStack.top_within_rows)"
+                "rowPaintProblem\n                    && stackContainsYggtermChromeBeforeTerminal(rowSampleStack)\n                    && (cursorRowStack.top_within_rows || cursorSampleStack.top_within_rows)"
             ),
             "a top row hidden by Yggterm titlebar chrome must not mark a visible prompt/cursor as unpainted"
         );
         assert!(
             source.contains(
-                "rowText\n                    && !rowSampleStack.top_within_rows\n                    && stackTopIsYggtermChrome(rowSampleStack)\n                    && (cursorRowStack.top_within_rows || cursorSampleStack.top_within_rows)"
+                "rowText\n                    && !rowSampleStack.top_within_rows\n                    && stackContainsYggtermChromeBeforeTerminal(rowSampleStack)\n                    && (cursorRowStack.top_within_rows || cursorSampleStack.top_within_rows)"
             ),
             "basic app-control snapshots need the same titlebar-covered-row allowance"
+        );
+        assert!(
+            source.contains("const stackContainsYggtermChromeBeforeTerminal = (paintStack) => {"),
+            "paint probes must scan parent chrome entries, not only the child node returned first by elementsFromPoint"
         );
         assert!(
             !source.contains(
@@ -70279,6 +71485,7 @@ mod tests {
         let theme = terminal_theme(UiTheme::ZedLight, palette(UiTheme::ZedLight), 13.0, "");
         let script = terminal_eval_script("yggterm-terminal-test", &theme, true);
         assert!(script.contains("let scrollbackIntent = 'PromptFollow';"));
+        assert!(script.contains("let promptFollowScheduleCancelToken = 0;"));
         assert!(script.contains("const setScrollbackIntent = (intent, reason) => {"));
         assert!(script.contains("const markTerminalInputHot = (reason = 'input') => {"));
         assert!(
@@ -70286,6 +71493,12 @@ mod tests {
         );
         assert!(script.contains("setScrollbackIntent('UserScrollback', 'wheel');"));
         assert!(script.contains("setScrollbackIntent('PromptFollow', 'wheel_reached_bottom');"));
+        assert!(script.contains("promptFollowScheduleCancelToken += 1;"));
+        assert!(script.contains("const scheduleCancelToken = promptFollowScheduleCancelToken;"));
+        assert!(
+            script.contains("if (scheduleCancelToken !== promptFollowScheduleCancelToken) {"),
+            "pending prompt-follow repairs must not snap back after explicit user scrollback"
+        );
         assert!(script.contains("entry.scrollbackIntent = scrollbackIntent;"));
         assert!(script.contains("scrollbackIntent,"));
         assert!(
@@ -71208,6 +72421,7 @@ mod tests {
         assert!(script.contains(
             "sendTerminalEvent({ kind: \"context_menu\", client_x: clientX, client_y: clientY });"
         ));
+        assert!(script.contains("sendTerminalEvent({ kind: \"context_menu_close\" });"));
         assert!(script.contains("terminalContextMenuOpenCount"));
         assert!(script.contains(
             "targetHost.addEventListener(\"contextmenu\", handleTerminalContextMenu, true);"
@@ -71235,6 +72449,39 @@ mod tests {
             "afterNativeClipboardPasteRequestCount === beforeNativeClipboardPasteRequestCount"
         ));
         assert!(probe.contains("terminal_right_click_paste_side_effect"));
+    }
+
+    #[test]
+    fn terminal_select_probe_uses_xterm_pointer_gesture_not_dom_range() {
+        let source = include_str!("shell.rs");
+        let probe = source
+            .split("async fn probe_terminal_viewport_select_for")
+            .nth(1)
+            .and_then(|suffix| {
+                suffix
+                    .split("async fn probe_terminal_primary_selection_paste_for")
+                    .next()
+            })
+            .expect("select probe implementation should be present");
+        assert!(
+            probe.contains("dispatchAt('pointerdown'"),
+            "selection probe must drive the same pointer path as a user drag"
+        );
+        assert!(probe.contains("xtermSelectionText()"));
+        assert!(probe.contains("selectionLayerRectCount()"));
+        assert!(probe.contains("xterm_pointer_selection_not_observed"));
+        assert!(
+            !probe.contains("document.createRange()"),
+            "DOM Range selection bypasses xterm.js and hid the guihost regression"
+        );
+        assert!(
+            !probe.contains("selection.addRange"),
+            "probe-select must not manufacture a browser selection"
+        );
+        assert!(
+            probe.contains("buffer_fallback_unverified"),
+            "buffer text without mounted rows is diagnostic only, not a selection pass"
+        );
     }
 
     #[test]
@@ -71518,6 +72765,23 @@ mod tests {
         assert!(source.contains("context_menu_backdrop_filter: contextMenuStyle"));
         assert!(source.contains("theme_editor_overlay_backdrop_filter: themeEditorOverlayStyle"));
         assert!(source.contains("theme_editor_shell_background: themeEditorShellStyle"));
+    }
+
+    #[test]
+    fn app_control_basic_dom_snapshot_reports_terminal_selection_hit_targets() {
+        let source = include_str!("shell.rs");
+        assert!(source.contains("snapshot_mode: 'basic'"));
+        assert!(
+            source.contains(
+                "const focusCapture = host.querySelector('.yggterm-term-focus-capture');"
+            )
+        );
+        assert!(source.contains("focus_capture_pointer_events: focusCaptureStyle"));
+        assert!(source.contains("focus_capture_hit_target_enabled: focusCaptureStyle"));
+        assert!(source.contains(
+            "const selectionLayerRects = Array.from(host.querySelectorAll('.xterm-selection'))"
+        ));
+        assert!(source.contains("selection_layer_rect_count: selectionLayerRects.length"));
     }
 
     #[test]
@@ -72249,6 +73513,178 @@ mod tests {
         assert_eq!(remote_preview_retry_backoff_ms(3), 30_000);
         assert_eq!(remote_preview_retry_backoff_ms(4), 60_000);
         assert_eq!(remote_preview_retry_backoff_ms(9), 60_000);
+    }
+    #[test]
+    fn remote_preview_sync_scheduler_is_single_flight_per_session() {
+        let session_path = "remote-session://dev/preview";
+        let mut shell = ShellState::new(test_shell_bootstrap_with_active_session(session_path));
+        shell.active_surface_requests.insert(
+            YggSurface::PreviewSync,
+            ActiveSurfaceRequest {
+                request_id: "preview-sync-1".to_string(),
+                operation: "remote_preview_sync".to_string(),
+                target: YggTarget::Preview {
+                    session_path: session_path.to_string(),
+                },
+            },
+        );
+
+        assert!(!schedule_remote_preview_sync(&mut shell, session_path, 0));
+
+        shell.active_surface_requests.clear();
+        assert!(schedule_remote_preview_sync(
+            &mut shell,
+            session_path,
+            1_000
+        ));
+        assert!(!schedule_remote_preview_sync(&mut shell, session_path, 0));
+    }
+    #[test]
+    fn remote_preview_tail_hydration_is_readable_without_immediate_resync() {
+        let mut session = test_live_shell_session("remote-session://dev/preview");
+        session.source = SessionSource::LiveSsh;
+        session.preview.blocks.push(SessionPreviewBlock {
+            role: "ASSISTANT",
+            timestamp: "2026-05-22".to_string(),
+            tone: PreviewTone::Assistant,
+            folded: false,
+            lines: vec!["Recent assistant response".to_string()],
+        });
+        session.metadata.push(SessionMetadataEntry {
+            label: "Storage",
+            value: "/home/user/.codex/sessions/example.jsonl".to_string(),
+        });
+        session.metadata.push(SessionMetadataEntry {
+            label: "Preview Hydration",
+            value: "tail".to_string(),
+        });
+
+        assert!(!remote_preview_needs_refresh(&session));
+        assert!(!remote_preview_should_auto_sync(&session));
+    }
+    #[test]
+    fn remote_preview_tail_hydration_pins_chat_reader_to_latest_on_open() {
+        let mut session = test_live_shell_session("remote-session://dev/preview");
+        session.source = SessionSource::LiveSsh;
+        session.preview.blocks.push(SessionPreviewBlock {
+            role: "USER",
+            timestamp: "2026-05-21".to_string(),
+            tone: PreviewTone::User,
+            folded: false,
+            lines: vec!["older transcript head".to_string()],
+        });
+        session.preview.blocks.push(SessionPreviewBlock {
+            role: "ASSISTANT",
+            timestamp: "2026-05-22".to_string(),
+            tone: PreviewTone::Assistant,
+            folded: false,
+            lines: vec!["latest transcript tail".to_string()],
+        });
+        session.metadata.push(SessionMetadataEntry {
+            label: "Preview Hydration",
+            value: "tail".to_string(),
+        });
+
+        assert!(preview_should_pin_latest_on_open(
+            &session,
+            WorkspaceViewMode::Rendered,
+            PreviewLayoutMode::Chat,
+            false,
+        ));
+
+        let (path, key) = preview_latest_pin_request(&session);
+        assert_eq!(path, "remote-session://dev/preview");
+        assert!(key.contains("tail"));
+        assert!(key.contains("latest transcript tail"));
+        assert!(preview_latest_initial_scroll_top(&session) >= 0.0);
+        for ix in 0..(PREVIEW_BLOCK_WINDOW + 3) {
+            session.preview.blocks.push(SessionPreviewBlock {
+                role: "ASSISTANT",
+                timestamp: format!("2026-05-22 tail {ix}"),
+                tone: PreviewTone::Assistant,
+                folded: false,
+                lines: vec![format!("latest transcript tail {ix}")],
+            });
+        }
+        let latest_window = preview_latest_materialized_window(
+            &visible_preview_blocks(&session),
+            PREVIEW_MIN_VIEWPORT_HEIGHT_PX,
+            PREVIEW_MIN_VIEWPORT_HEIGHT_PX,
+        );
+        assert_eq!(
+            latest_window.end_index,
+            visible_preview_blocks(&session).len()
+        );
+        assert_eq!(latest_window.top_spacer_px, 0.0);
+        assert_eq!(latest_window.bottom_spacer_px, 0.0);
+        assert!(latest_window.start_index > 0);
+        let mounted_anchor_scroll = preview_latest_anchor_scroll_options();
+        assert!(matches!(
+            mounted_anchor_scroll.behavior,
+            ScrollBehavior::Instant
+        ));
+        assert!(matches!(
+            mounted_anchor_scroll.vertical,
+            ScrollLogicalPosition::End
+        ));
+        assert!(matches!(
+            mounted_anchor_scroll.horizontal,
+            ScrollLogicalPosition::Nearest
+        ));
+
+        let script = preview_scroll_to_latest_script(&path);
+        assert!(script.contains("data-preview-scroll"));
+        assert!(script.contains("scrollTop = target"));
+        assert!(script.contains("maxAttempts = 80"));
+        assert!(script.contains("data-preview-latest-anchor"));
+        assert!(script.contains("remote-session://dev/preview"));
+    }
+    #[test]
+    fn preview_latest_pin_respects_non_chat_search_and_unhydrated_modes() {
+        let mut session = test_live_shell_session("remote-session://dev/preview");
+        session.source = SessionSource::LiveSsh;
+        session.preview.blocks.push(SessionPreviewBlock {
+            role: "ASSISTANT",
+            timestamp: "2026-05-22".to_string(),
+            tone: PreviewTone::Assistant,
+            folded: false,
+            lines: vec!["latest transcript tail".to_string()],
+        });
+        session.metadata.push(SessionMetadataEntry {
+            label: "Preview Hydration",
+            value: "tail".to_string(),
+        });
+        assert!(!preview_should_pin_latest_on_open(
+            &session,
+            WorkspaceViewMode::Terminal,
+            PreviewLayoutMode::Chat,
+            false,
+        ));
+        assert!(!preview_should_pin_latest_on_open(
+            &session,
+            WorkspaceViewMode::Rendered,
+            PreviewLayoutMode::Graph,
+            false,
+        ));
+        assert!(!preview_should_pin_latest_on_open(
+            &session,
+            WorkspaceViewMode::Rendered,
+            PreviewLayoutMode::Chat,
+            true,
+        ));
+        session
+            .metadata
+            .retain(|entry| entry.label != "Preview Hydration");
+        session.metadata.push(SessionMetadataEntry {
+            label: "Preview Hydration",
+            value: "head".to_string(),
+        });
+        assert!(!preview_should_pin_latest_on_open(
+            &session,
+            WorkspaceViewMode::Rendered,
+            PreviewLayoutMode::Chat,
+            false,
+        ));
     }
     #[test]
     fn preview_failure_surfaces_only_after_real_threshold() {
@@ -78636,6 +80072,167 @@ mod tests {
         assert!(!preview_should_hide_stale_placeholder_content(&session));
     }
     #[test]
+    fn readable_remote_scan_with_storage_stays_visible_and_full_syncs() {
+        let mut session = ManagedSessionView {
+            id: "abc".to_string(),
+            session_path: "remote-session://guihost/abc".to_string(),
+            title: "Scanned Session".to_string(),
+            kind: SessionKind::Codex,
+            host_label: "guihost".to_string(),
+            source: yggterm_server::SessionSource::LiveSsh,
+            backend: TerminalBackend::Xterm,
+            bridge_available: false,
+            launch_phase: yggterm_server::TerminalLaunchPhase::Running,
+            remote_deploy_state: yggterm_server::RemoteDeployState::Ready,
+            launch_command: "codex".to_string(),
+            status_line: "ready".to_string(),
+            terminal_lines: Vec::new(),
+            rendered_sections: Vec::new(),
+            preview: yggterm_server::SessionPreview {
+                summary: Vec::new(),
+                blocks: vec![
+                    yggterm_server::SessionPreviewBlock {
+                        role: "USER",
+                        timestamp: "remote:scan".to_string(),
+                        tone: yggterm_server::PreviewTone::User,
+                        folded: false,
+                        lines: vec!["Read the transcript in Web View.".to_string()],
+                    },
+                    yggterm_server::SessionPreviewBlock {
+                        role: "ASSISTANT",
+                        timestamp: "remote:scan".to_string(),
+                        tone: yggterm_server::PreviewTone::Assistant,
+                        folded: false,
+                        lines: vec!["I will hydrate the full JSONL in the background.".to_string()],
+                    },
+                ],
+            },
+            metadata: vec![SessionMetadataEntry {
+                label: "Storage",
+                value: "/home/user/.codex/sessions/demo.jsonl".to_string(),
+            }],
+            terminal_process_id: None,
+            terminal_foreground_active: None,
+            terminal_window_id: None,
+            terminal_host_token: None,
+            terminal_host_mode: GhosttyTerminalHostMode::Unsupported,
+            embedded_surface_id: None,
+            embedded_surface_detail: None,
+            last_launch_error: None,
+            last_window_error: None,
+            ssh_target: Some("guihost".to_string()),
+            ssh_prefix: None,
+            stored_preview_hydrated: false,
+        };
+
+        assert!(!preview_should_hide_stale_placeholder_content(&session));
+        assert_eq!(visible_preview_blocks(&session).len(), 2);
+        assert!(remote_preview_should_auto_sync(&session));
+
+        session.metadata.push(SessionMetadataEntry {
+            label: "Preview Hydration",
+            value: "scan".to_string(),
+        });
+        assert!(remote_preview_needs_refresh(&session));
+        assert!(remote_preview_should_auto_sync(&session));
+    }
+    #[test]
+    fn readable_remote_scan_without_storage_does_not_loop_auto_sync() {
+        let mut session = ManagedSessionView {
+            id: "abc".to_string(),
+            session_path: "remote-session://guihost/abc".to_string(),
+            title: "Scanned Session".to_string(),
+            kind: SessionKind::Codex,
+            host_label: "guihost".to_string(),
+            source: yggterm_server::SessionSource::LiveSsh,
+            backend: TerminalBackend::Xterm,
+            bridge_available: false,
+            launch_phase: yggterm_server::TerminalLaunchPhase::Running,
+            remote_deploy_state: yggterm_server::RemoteDeployState::Ready,
+            launch_command: "codex".to_string(),
+            status_line: "ready".to_string(),
+            terminal_lines: Vec::new(),
+            rendered_sections: Vec::new(),
+            preview: yggterm_server::SessionPreview {
+                summary: Vec::new(),
+                blocks: vec![yggterm_server::SessionPreviewBlock {
+                    role: "ASSISTANT",
+                    timestamp: "remote:scan".to_string(),
+                    tone: yggterm_server::PreviewTone::Assistant,
+                    folded: false,
+                    lines: vec!["Readable recent scan text.".to_string()],
+                }],
+            },
+            metadata: Vec::new(),
+            terminal_process_id: None,
+            terminal_foreground_active: None,
+            terminal_window_id: None,
+            terminal_host_token: None,
+            terminal_host_mode: GhosttyTerminalHostMode::Unsupported,
+            embedded_surface_id: None,
+            embedded_surface_detail: None,
+            last_launch_error: None,
+            last_window_error: None,
+            ssh_target: Some("guihost".to_string()),
+            ssh_prefix: None,
+            stored_preview_hydrated: false,
+        };
+
+        assert!(!preview_should_hide_stale_placeholder_content(&session));
+        assert_eq!(visible_preview_blocks(&session).len(), 1);
+        assert!(!remote_preview_should_auto_sync(&session));
+
+        session.metadata.push(SessionMetadataEntry {
+            label: "Preview Hydration",
+            value: "loading".to_string(),
+        });
+        assert!(remote_preview_should_auto_sync(&session));
+    }
+    #[test]
+    fn remote_placeholder_rendered_sections_without_scan_stay_hidden() {
+        let session = ManagedSessionView {
+            id: "abc".to_string(),
+            session_path: "remote-session://guihost/abc".to_string(),
+            title: "Loading Session".to_string(),
+            kind: SessionKind::Codex,
+            host_label: "guihost".to_string(),
+            source: yggterm_server::SessionSource::LiveSsh,
+            backend: TerminalBackend::Xterm,
+            bridge_available: false,
+            launch_phase: yggterm_server::TerminalLaunchPhase::Running,
+            remote_deploy_state: yggterm_server::RemoteDeployState::Ready,
+            launch_command: "codex".to_string(),
+            status_line: "ready".to_string(),
+            terminal_lines: Vec::new(),
+            rendered_sections: vec![yggterm_server::SessionRenderedSection {
+                title: "Server Notes",
+                lines: vec!["Launch command prepared".to_string()],
+            }],
+            preview: yggterm_server::SessionPreview {
+                summary: Vec::new(),
+                blocks: Vec::new(),
+            },
+            metadata: Vec::new(),
+            terminal_process_id: None,
+            terminal_foreground_active: None,
+            terminal_window_id: None,
+            terminal_host_token: None,
+            terminal_host_mode: GhosttyTerminalHostMode::Unsupported,
+            embedded_surface_id: None,
+            embedded_surface_detail: None,
+            last_launch_error: None,
+            last_window_error: None,
+            ssh_target: Some("guihost".to_string()),
+            ssh_prefix: None,
+            stored_preview_hydrated: false,
+        };
+
+        assert!(preview_should_hide_stale_placeholder_content(&session));
+        assert!(visible_preview_blocks(&session).is_empty());
+        assert!(preview_rendered_sections(&session).is_empty());
+        assert!(!remote_preview_has_readable_scan_content(&session));
+    }
+    #[test]
     fn terminal_chunk_has_meaningful_output_rejects_generic_codex_idle() {
         let data = "\
  >_ OpenAI Codex (v0.118.0)\n\
@@ -81159,6 +82756,95 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
     }
 
     #[test]
+    fn describe_viewport_snapshot_treats_retained_prompt_as_visible_despite_stale_resume_toast() {
+        let snapshot = json!({
+            "active_session_path": "remote-session://dev/retained-prompt",
+            "active_view_mode": "Terminal",
+            "active_title": "retained prompt",
+            "active_summary": "Saved context",
+            "shell": {
+                "terminal_attach_in_flight": [],
+                "notifications": [{
+                    "title": "Resuming Remote Terminal",
+                    "message": "Resuming the live terminal on dev.",
+                    "job_key": "terminal-resume:remote-session://dev/retained-prompt"
+                }]
+            },
+            "active_surface_requests": []
+        });
+        let dom = json!({
+            "titlebar_title_text": "retained prompt",
+            "titlebar_summary_text": "",
+            "titlebar_button_tooltip": "",
+            "titlebar_menu_open": false,
+            "preview_text_sample": "",
+            "preview_viewport_rect": null,
+            "preview_visible_block_ids": [],
+            "preview_font_family": "Inter",
+            "preview_visible_entries": [],
+            "preview_rendered_sections": [],
+            "preview_fallback_context_visible": false,
+            "preview_fallback_context_text": "",
+            "preview_timestamp_labels": [],
+            "preview_window": null,
+            "shell_text_sample": "",
+            "document_editor_count": 0,
+            "document_body_sample": "",
+            "terminal_hosts": [{
+                "session_path": "remote-session://dev/retained-prompt",
+                "child_count": 2,
+                "xterm_present": true,
+                "screen_present": true,
+                "viewport_present": true,
+                "rows_present": true,
+                "canvas_count": 0,
+                "input_enabled": false,
+                "helper_textarea_focused": false,
+                "terminal_content_source": "daemon_retained_history_screen_snapshot",
+                "retained_replay_prompt_follow_ready": true,
+                "mounted_entry_host_connected": true,
+                "render_event_count": 18,
+                "data_event_count": 1,
+                "text_sample": "• Done.\n\n› Find and fix a bug in @filename",
+                "text_tail": "• Done.\n\n› Find and fix a bug in @filename\n\ngpt-5.5 xhigh · ~/git/samplescripts",
+                "cursor_line_text": "› Find and fix a bug in @filename",
+                "resume_overlay_visible": false,
+                "resume_overlay_text": "",
+                "resume_overlay_excerpt": "",
+                "resume_overlay_kind": "hidden",
+                "resume_overlay_phase": "hidden",
+                "resume_overlay_effective_failed": false
+            }],
+            "terminal_resume_overlay": {
+                "visible": false,
+                "text_sample": "",
+                "excerpt": "",
+                "kind": "",
+                "phase": "hidden",
+                "effective_failed": false
+            },
+            "preview_visible_block_count": 0,
+            "preview_scroll_count": 0
+        });
+        let viewport = describe_viewport_snapshot(&snapshot, &dom);
+        assert_eq!(viewport.get("ready").and_then(Value::as_bool), Some(true));
+        assert_eq!(
+            viewport.get("interactive").and_then(Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            viewport
+                .get("terminal_settled_kind")
+                .and_then(Value::as_str),
+            Some("visible")
+        );
+        assert_eq!(
+            viewport.get("reason").and_then(Value::as_str),
+            Some("terminal rendered but focus is outside the terminal")
+        );
+    }
+
+    #[test]
     fn describe_viewport_snapshot_accepts_busy_daemon_pty_output_without_prompt_row() {
         let snapshot = json!({
             "active_session_path": "remote-session://dev/samplenotes",
@@ -82703,6 +84389,112 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
                 .contains_key(&YggSurface::Terminal)
         );
         assert!(!shell.server_busy);
+        let attempt = shell
+            .terminal_open_attempts
+            .get(&attempt_id)
+            .expect("attempt should exist");
+        assert!(matches!(attempt.state, TerminalOpenAttemptState::Failed));
+        assert_eq!(attempt.latched_failure_reason.as_deref(), Some("timed out"));
+    }
+
+    #[test]
+    fn remote_resume_timeout_defers_after_recent_protocol_only_output() {
+        let active_session_path = "remote-session://oc/recent-protocol-progress";
+        let bootstrap = test_shell_bootstrap_with_active_session(active_session_path);
+        let mut shell = ShellState::new(bootstrap);
+        shell.server_busy = true;
+        shell.server.set_view_mode(WorkspaceViewMode::Terminal);
+        shell
+            .terminal_attach_in_flight
+            .insert(active_session_path.to_string());
+        shell
+            .terminal_bootstrap_lease_by_session
+            .insert(active_session_path.to_string(), "lease-test".to_string());
+        let attempt_id =
+            shell.begin_terminal_open_attempt(active_session_path, "req-test", 1, "open_row");
+        shell.mark_terminal_open_attempt_first_output_for_session(
+            active_session_path,
+            "daemon_output",
+            12,
+            false,
+            true,
+        );
+
+        assert!(
+            !shell.fail_remote_terminal_resume_timeout(
+                active_session_path,
+                "lease-test",
+                "timed out".to_string()
+            ),
+            "recent PTY progress should keep restore in recovering state instead of latching a false fatal timeout"
+        );
+
+        assert!(
+            shell
+                .terminal_attach_in_flight
+                .contains(active_session_path)
+        );
+        assert!(
+            shell
+                .terminal_bootstrap_lease_by_session
+                .contains_key(active_session_path)
+        );
+        let attempt = shell
+            .terminal_open_attempts
+            .get(&attempt_id)
+            .expect("attempt should exist");
+        assert!(matches!(
+            attempt.state,
+            TerminalOpenAttemptState::Recovering
+        ));
+        assert_eq!(attempt.latched_failure_reason, None);
+    }
+
+    #[test]
+    fn remote_resume_timeout_latches_after_stale_protocol_only_output() {
+        let active_session_path = "remote-session://oc/stale-protocol-progress";
+        let bootstrap = test_shell_bootstrap_with_active_session(active_session_path);
+        let mut shell = ShellState::new(bootstrap);
+        shell.server_busy = true;
+        shell.server.set_view_mode(WorkspaceViewMode::Terminal);
+        shell
+            .terminal_attach_in_flight
+            .insert(active_session_path.to_string());
+        shell
+            .terminal_bootstrap_lease_by_session
+            .insert(active_session_path.to_string(), "lease-test".to_string());
+        let attempt_id =
+            shell.begin_terminal_open_attempt(active_session_path, "req-test", 1, "open_row");
+        shell.mark_terminal_open_attempt_first_output_for_session(
+            active_session_path,
+            "daemon_output",
+            12,
+            false,
+            true,
+        );
+        if let Some(attempt) = shell.terminal_open_attempts.get_mut(&attempt_id) {
+            let stale_output_at_ms = current_millis()
+                .saturating_sub(REMOTE_TERMINAL_RESUME_OUTPUT_PROGRESS_GRACE_MS + 1);
+            attempt.first_output_at_ms = Some(stale_output_at_ms);
+            attempt.first_protocol_only_output_at_ms = Some(stale_output_at_ms);
+        }
+
+        assert!(shell.fail_remote_terminal_resume_timeout(
+            active_session_path,
+            "lease-test",
+            "timed out".to_string()
+        ));
+
+        assert!(
+            !shell
+                .terminal_attach_in_flight
+                .contains(active_session_path)
+        );
+        assert!(
+            !shell
+                .terminal_bootstrap_lease_by_session
+                .contains_key(active_session_path)
+        );
         let attempt = shell
             .terminal_open_attempts
             .get(&attempt_id)
@@ -84640,6 +86432,23 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
                 None
             },
             ssh_prefix: None,
+        }
+    }
+
+    fn test_snapshot_preview_block(
+        tone: PreviewTone,
+        text: &str,
+    ) -> yggterm_server::SnapshotPreviewBlock {
+        yggterm_server::SnapshotPreviewBlock {
+            role: match tone {
+                PreviewTone::User => "user",
+                PreviewTone::Assistant => "assistant",
+            }
+            .to_string(),
+            timestamp: "2026-05-22T00:00:00Z".to_string(),
+            tone,
+            folded: false,
+            lines: vec![text.to_string()],
         }
     }
 
@@ -88165,6 +89974,64 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         assert!(!terminal_attach_blocks_background_work(&shell));
     }
     #[test]
+    fn prune_terminal_attach_in_flight_drops_background_retained_attach() {
+        let active_path = "remote-session://dev/active";
+        let background_path = "remote-session://dev/background";
+        let mut shell = ShellState::new(test_shell_bootstrap_with_active_session(active_path));
+        shell.server.set_view_mode(WorkspaceViewMode::Terminal);
+        shell.retain_terminal_session_path(active_path);
+        shell.retain_terminal_session_path(background_path);
+        shell
+            .terminal_attach_in_flight
+            .insert(background_path.to_string());
+        shell
+            .terminal_bootstrap_owner_by_session
+            .insert(background_path.to_string(), "owner:stale".to_string());
+        shell
+            .terminal_bootstrap_lease_by_session
+            .insert(background_path.to_string(), "lease:stale".to_string());
+
+        shell.prune_terminal_attach_in_flight();
+
+        assert!(
+            !shell.terminal_attach_in_flight.contains(background_path),
+            "a background attach must not survive only because the session is retained"
+        );
+        assert!(
+            !shell
+                .terminal_bootstrap_owner_by_session
+                .contains_key(background_path)
+        );
+        assert!(
+            !shell
+                .terminal_bootstrap_lease_by_session
+                .contains_key(background_path)
+        );
+        assert!(
+            shell
+                .retained_terminal_session_paths
+                .contains(background_path),
+            "dropping the stale attach gate must not drop the retained terminal itself"
+        );
+    }
+    #[test]
+    fn prune_terminal_attach_in_flight_keeps_active_retained_attach() {
+        let active_path = "remote-session://dev/active";
+        let mut shell = ShellState::new(test_shell_bootstrap_with_active_session(active_path));
+        shell.server.set_view_mode(WorkspaceViewMode::Terminal);
+        shell.retain_terminal_session_path(active_path);
+        shell
+            .terminal_attach_in_flight
+            .insert(active_path.to_string());
+
+        shell.prune_terminal_attach_in_flight();
+
+        assert!(
+            shell.terminal_attach_in_flight.contains(active_path),
+            "the foreground terminal may keep its attach gate until xterm/daemon truth settles"
+        );
+    }
+    #[test]
     fn snapshot_terminal_mount_epoch_defaults_to_zero_until_a_real_mount_exists() {
         let session_path = "local://test";
         let snapshot = RenderSnapshot {
@@ -88944,6 +90811,207 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
     }
 
     #[test]
+    fn preview_sync_reconcile_preserves_full_active_transcript_over_live_projection() {
+        let session_path = "remote-session://dev/full-preview";
+        let bootstrap = test_shell_bootstrap_with_active_session(session_path);
+        let mut shell = ShellState::new(bootstrap);
+        shell.server.set_view_mode(WorkspaceViewMode::Rendered);
+        shell.active_surface_requests.insert(
+            YggSurface::PreviewSync,
+            ActiveSurfaceRequest {
+                request_id: "preview-sync-test".to_string(),
+                operation: "remote_preview_sync".to_string(),
+                target: YggTarget::Preview {
+                    session_path: session_path.to_string(),
+                },
+            },
+        );
+
+        let mut full = test_snapshot_session_view(session_path);
+        full.kind = SessionKind::Codex;
+        full.preview.blocks = vec![
+            test_snapshot_preview_block(PreviewTone::User, "full transcript user turn"),
+            test_snapshot_preview_block(PreviewTone::Assistant, "full transcript assistant turn"),
+            test_snapshot_preview_block(PreviewTone::User, "full transcript follow-up"),
+        ];
+        full.metadata.push(yggterm_server::SnapshotMetadataEntry {
+            label: "Preview Hydration".to_string(),
+            value: "full".to_string(),
+        });
+        let mut live = full.clone();
+        live.preview.blocks = vec![test_snapshot_preview_block(
+            PreviewTone::Assistant,
+            "shallow live row projection",
+        )];
+        live.metadata
+            .retain(|entry| entry.label != "Preview Hydration");
+        live.metadata.push(yggterm_server::SnapshotMetadataEntry {
+            label: "Preview Hydration".to_string(),
+            value: "head".to_string(),
+        });
+
+        let reconciled = shell.reconcile_snapshot_for_request(
+            "preview-sync-test",
+            ServerUiSnapshot {
+                active_session_path: Some(session_path.to_string()),
+                active_session: Some(full),
+                active_view_mode: WorkspaceViewMode::Rendered,
+                remote_machines: Vec::new(),
+                ssh_targets: Vec::new(),
+                live_sessions: vec![live],
+            },
+        );
+
+        let active = reconciled
+            .active_session
+            .expect("preview sync should keep active session");
+        assert_eq!(
+            reconciled.active_session_path.as_deref(),
+            Some(session_path)
+        );
+        assert_eq!(reconciled.active_view_mode, WorkspaceViewMode::Rendered);
+        assert_eq!(active.preview.blocks.len(), 3);
+        assert_eq!(
+            active.preview.blocks[0].lines,
+            vec!["full transcript user turn".to_string()]
+        );
+        assert!(active.preview.blocks.iter().all(|block| {
+            !block
+                .lines
+                .iter()
+                .any(|line| line == "shallow live row projection")
+        }));
+    }
+
+    #[test]
+    fn preview_sync_reconcile_preserves_existing_tail_over_head_snapshot() {
+        let session_path = "remote-session://dev/tail-preview";
+        let bootstrap = test_shell_bootstrap_with_active_session(session_path);
+        let mut shell = ShellState::new(bootstrap);
+        let mut tail = test_snapshot_session_view(session_path);
+        tail.kind = SessionKind::Codex;
+        tail.preview.blocks = vec![
+            test_snapshot_preview_block(PreviewTone::User, "recent tail user turn"),
+            test_snapshot_preview_block(PreviewTone::Assistant, "recent tail assistant turn"),
+        ];
+        tail.metadata.push(yggterm_server::SnapshotMetadataEntry {
+            label: "Preview Hydration".to_string(),
+            value: "tail".to_string(),
+        });
+        shell.server.apply_snapshot(ServerUiSnapshot {
+            active_session_path: Some(session_path.to_string()),
+            active_session: Some(tail),
+            active_view_mode: WorkspaceViewMode::Rendered,
+            remote_machines: Vec::new(),
+            ssh_targets: Vec::new(),
+            live_sessions: Vec::new(),
+        });
+        shell.active_surface_requests.insert(
+            YggSurface::PreviewSync,
+            ActiveSurfaceRequest {
+                request_id: "preview-sync-tail-test".to_string(),
+                operation: "remote_preview_sync".to_string(),
+                target: YggTarget::Preview {
+                    session_path: session_path.to_string(),
+                },
+            },
+        );
+
+        let mut head = test_snapshot_session_view(session_path);
+        head.kind = SessionKind::Codex;
+        head.preview.blocks = vec![test_snapshot_preview_block(
+            PreviewTone::User,
+            "older transcript head",
+        )];
+        head.metadata
+            .retain(|entry| entry.label != "Preview Hydration");
+        head.metadata.push(yggterm_server::SnapshotMetadataEntry {
+            label: "Preview Hydration".to_string(),
+            value: "head".to_string(),
+        });
+
+        let reconciled = shell.reconcile_snapshot_for_request(
+            "preview-sync-tail-test",
+            ServerUiSnapshot {
+                active_session_path: Some(session_path.to_string()),
+                active_session: Some(head),
+                active_view_mode: WorkspaceViewMode::Rendered,
+                remote_machines: Vec::new(),
+                ssh_targets: Vec::new(),
+                live_sessions: Vec::new(),
+            },
+        );
+
+        let active = reconciled
+            .active_session
+            .expect("preview sync should keep active tail session");
+        assert_eq!(active.preview.blocks.len(), 2);
+        assert_eq!(
+            active.preview.blocks[0].lines,
+            vec!["recent tail user turn".to_string()]
+        );
+        assert!(active.preview.blocks.iter().all(|block| {
+            !block
+                .lines
+                .iter()
+                .any(|line| line == "older transcript head")
+        }));
+    }
+
+    #[test]
+    fn terminal_reconcile_prefers_live_runtime_projection_over_active_preview() {
+        let session_path = "remote-session://dev/live-runtime";
+        let bootstrap = test_shell_bootstrap_with_active_session(session_path);
+        let mut shell = ShellState::new(bootstrap);
+        shell.server.set_view_mode(WorkspaceViewMode::Terminal);
+        shell.active_surface_requests.insert(
+            YggSurface::Terminal,
+            ActiveSurfaceRequest {
+                request_id: "terminal-open-test".to_string(),
+                operation: "open_row".to_string(),
+                target: YggTarget::Terminal {
+                    session_path: session_path.to_string(),
+                },
+            },
+        );
+
+        let mut active = test_snapshot_session_view(session_path);
+        active.terminal_lines = vec!["stored preview projection".to_string()];
+        active.preview.blocks = vec![test_snapshot_preview_block(
+            PreviewTone::Assistant,
+            "full transcript stays web-view only",
+        )];
+        let mut live = active.clone();
+        live.terminal_lines = vec!["live runtime output".to_string()];
+        live.preview.blocks.clear();
+
+        let reconciled = shell.reconcile_snapshot_for_request(
+            "terminal-open-test",
+            ServerUiSnapshot {
+                active_session_path: Some(session_path.to_string()),
+                active_session: Some(active),
+                active_view_mode: WorkspaceViewMode::Terminal,
+                remote_machines: Vec::new(),
+                ssh_targets: Vec::new(),
+                live_sessions: vec![live],
+            },
+        );
+
+        let active = reconciled
+            .active_session
+            .expect("terminal open should keep active live runtime");
+        assert_eq!(
+            reconciled.active_session_path.as_deref(),
+            Some(session_path)
+        );
+        assert_eq!(reconciled.active_view_mode, WorkspaceViewMode::Terminal);
+        assert_eq!(
+            active.terminal_lines,
+            vec!["live runtime output".to_string()]
+        );
+    }
+
+    #[test]
     fn explicitly_opened_stored_session_can_render_preview_without_live_sessions() {
         let session_path = "remote-session://dev/opened-stored";
         let mut bootstrap = test_shell_bootstrap_with_active_session(session_path);
@@ -89026,6 +91094,83 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         );
         assert!(shell.terminal_session_has_ready_attempt(session_path));
     }
+
+    #[test]
+    fn retained_ready_history_suppresses_initial_resume_notice() {
+        let session_path = "remote-session://dev/ready-retained";
+        let notification_key = terminal_resume_notification_job_key(session_path);
+        let mut shell = ShellState::new(test_shell_bootstrap_with_active_session(session_path));
+        shell.server.set_view_mode(WorkspaceViewMode::Terminal);
+        shell.retain_terminal_session_path(session_path);
+        shell.begin_terminal_open_attempt(session_path, "req-test", 1, "retained_fault_recovery");
+        shell.mark_terminal_open_attempt_ready_for_session(session_path, "prior_ready");
+
+        assert!(shell.terminal_session_should_suppress_initial_resume_notice(session_path));
+        assert!(!shell.terminal_session_resume_notification_should_stay_visible(session_path));
+
+        shell.upsert_job_notification(
+            notification_key.clone(),
+            NotificationTone::Info,
+            "Resuming Remote Terminal",
+            "This stale notice should be pruned.",
+            None,
+            true,
+        );
+        shell.clear_terminal_resume_notifications_except(Some(session_path));
+
+        assert!(
+            shell
+                .notifications
+                .iter()
+                .all(|notification| notification.job_key.as_deref()
+                    != Some(notification_key.as_str()))
+        );
+    }
+
+    #[test]
+    fn blank_retained_session_keeps_initial_resume_notice_available() {
+        let session_path = "remote-session://dev/blank-retained";
+        let mut shell = ShellState::new(test_shell_bootstrap_with_active_session(session_path));
+        shell.server.set_view_mode(WorkspaceViewMode::Terminal);
+        shell.retain_terminal_session_path(session_path);
+
+        assert!(!shell.terminal_session_should_suppress_initial_resume_notice(session_path));
+    }
+
+    #[test]
+    fn meaningful_resume_output_without_attach_gate_hides_resume_notice() {
+        let session_path = "remote-session://dev/visible-before-ready";
+        let notification_key = terminal_resume_notification_job_key(session_path);
+        let mut shell = ShellState::new(test_shell_bootstrap_with_active_session(session_path));
+        shell.server.set_view_mode(WorkspaceViewMode::Terminal);
+        shell.begin_terminal_open_attempt(session_path, "req-test", 1, "retained_fault_recovery");
+        shell.mark_terminal_open_attempt_first_meaningful_output_for_session(
+            session_path,
+            "visible_text",
+            false,
+            true,
+        );
+        shell.upsert_job_notification(
+            notification_key.clone(),
+            NotificationTone::Info,
+            "Resuming Remote Terminal",
+            "This stale notice should be pruned.",
+            None,
+            true,
+        );
+
+        assert!(shell.terminal_session_should_suppress_initial_resume_notice(session_path));
+        assert!(!shell.terminal_session_resume_notification_should_stay_visible(session_path));
+        shell.clear_terminal_resume_notifications_except(Some(session_path));
+        assert!(
+            shell
+                .notifications
+                .iter()
+                .all(|notification| notification.job_key.as_deref()
+                    != Some(notification_key.as_str()))
+        );
+    }
+
     #[test]
     fn viewport_visible_daemon_pty_ready_observation_clears_stale_resume_gate() {
         let session_path = "remote-session://dev/samplenotes";
@@ -92914,6 +95059,70 @@ Updated at   Branch  Conversation\n\
             copy_generation_ix < defer_ix,
             "copy generation should be considered on every scheduler tick, even during the long startup background-refresh defer; its own gates keep it bounded"
         );
+    }
+    #[test]
+    fn app_control_request_end_trace_summarizes_state_without_terminal_buffers() {
+        let data = json!({
+            "active_session_path": "remote-session://dev/example",
+            "active_view_mode": "Terminal",
+            "ready": true,
+            "runtime_truth": {
+                "live_row_count": 14,
+                "daemon_runtime_count": 14,
+                "active_runtime_present": true,
+                "active_host_input_enabled": true,
+            },
+            "viewport": {
+                "ready": true,
+                "reason": null,
+                "active_terminal_surface": {
+                    "problem": null,
+                    "input_enabled": true,
+                    "raw_input_enabled": true,
+                    "content_source": "daemon_pty",
+                },
+                "active_terminal_hosts": [{
+                    "text_sample": "large terminal buffer that must stay out of request_end trace",
+                    "buffer_text_sample": "another large terminal buffer",
+                }],
+            },
+            "dom": {
+                "terminal_hosts": [{
+                    "text_sample": "large terminal buffer that must stay out of request_end trace",
+                }]
+            }
+        });
+
+        let summary = summarize_app_control_response_data_for_trace(Some(&data));
+        assert_eq!(
+            summary.get("session_path").and_then(Value::as_str),
+            Some("remote-session://dev/example")
+        );
+        assert_eq!(
+            summary
+                .get("runtime_active_host_input_enabled")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        let serialized = serde_json::to_string(&summary).expect("summary serializes");
+        assert!(!serialized.contains("large terminal buffer"));
+        assert!(!serialized.contains("active_terminal_hosts"));
+        assert!(!serialized.contains("terminal_hosts"));
+    }
+    #[test]
+    fn describe_state_reapplies_input_policy_after_ready_observation() {
+        let source = include_str!("shell.rs");
+        let observe_ix = source
+            .find("shell.observe_terminal_open_attempt_from_viewport(&viewport);")
+            .expect("describe_state should observe terminal readiness");
+        let after_observe = &source[observe_ix..];
+        let sync_ix = after_observe
+            .find("describe_state_ready_observation_sync_input_begin")
+            .expect("ready observation should trigger an immediate input-policy sync");
+        let recapture_ix = after_observe
+            .find("describe_state_ready_observation_sync_input_end")
+            .expect("describe_state should recapture after the input-policy sync");
+        assert!(sync_ix < recapture_ix);
     }
     #[test]
     fn passive_copy_failures_do_not_globally_suspend_scheduler() {

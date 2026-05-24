@@ -141,7 +141,11 @@ impl ManagedCliTool {
         match kind {
             SessionKind::Codex => Some(Self::Codex),
             SessionKind::CodexLiteLlm => Some(Self::CodexLiteLlm),
-            SessionKind::Shell | SessionKind::SshShell | SessionKind::Document => None,
+            // Claude Code is not a managed npm CLI; its binary is user-installed.
+            SessionKind::ClaudeCode
+            | SessionKind::Shell
+            | SessionKind::SshShell
+            | SessionKind::Document => None,
         }
     }
 
