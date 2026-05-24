@@ -147,7 +147,8 @@ use yggterm_server::{
     AppControlPointerCommand, AppControlPreviewLayout, AppControlResponse,
     AppControlRightPanelMode, AppControlStartAction, AppControlViewMode, GhosttyTerminalHostMode,
     ManagedSessionView, PersistedDaemonState, PreviewTone, ProbeTerminalViewportInputMode,
-    RemoteDeployState, RemoteMachineHealth, RemoteMachineSnapshot, RemoteScannedSession,
+    LocalCcSession, RemoteDeployState, RemoteMachineHealth, RemoteMachineSnapshot,
+    RemoteScannedSession,
     ServerEndpoint, ServerRuntimeStatus, ServerUiSnapshot, SessionKind, SessionMetadataEntry,
     SessionPreviewBlock, SessionRenderedSection, SessionSource, SnapshotSessionView,
     SshConnectTarget, TerminalBackend, TerminalLaunchPhase, WorkspaceViewMode,
@@ -2225,6 +2226,8 @@ impl ShellState {
         } else {
             self.browser.rows().to_vec()
         };
+        let stored_rows =
+            inject_file_backed_cc_session_rows(stored_rows, self.server.local_cc_sessions());
         let stored_projection_rows = self.browser.all_rows();
         let selected_path = if let Some(active) = self.server.active_session() {
             if active.source == yggterm_server::SessionSource::LiveSsh
@@ -5698,6 +5701,7 @@ impl ShellState {
             self.search_focused = false;
         }
         self.server.show_start_page();
+        self.server.refresh_local_cc_sessions();
         self.show_start_page_when_no_live_sessions = false;
         self.active_terminal_host_id = None;
         self.context_menu_row = None;
@@ -14517,6 +14521,10 @@ fn is_codex_litellm_storage_session_path(path: &str) -> bool {
     path.contains("/.codex-litellm/sessions/")
 }
 
+fn is_claude_code_session_path(path: &str) -> bool {
+    path.contains("/.claude/projects/") && path.ends_with(".jsonl")
+}
+
 fn row_session_kind(row: &BrowserRow) -> Option<SessionKind> {
     if row.kind != BrowserRowKind::Session {
         return None;
@@ -14530,6 +14538,8 @@ fn row_session_kind(row: &BrowserRow) -> Option<SessionKind> {
         || is_codex_storage_session_path(&row.full_path)
     {
         Some(SessionKind::Codex)
+    } else if is_claude_code_session_path(&row.full_path) {
+        Some(SessionKind::ClaudeCode)
     } else if row.full_path.starts_with("local://") {
         Some(SessionKind::Shell)
     } else if row.full_path.starts_with("ssh://")
@@ -19834,6 +19844,63 @@ fn inject_cc_sessions_into_stored_rows(
     }
     result
 }
+fn inject_file_backed_cc_session_rows(
+    stored_rows: Vec<BrowserRow>,
+    cc_sessions: &[LocalCcSession],
+) -> Vec<BrowserRow> {
+    if cc_sessions.is_empty() {
+        return stored_rows;
+    }
+    let has_group_rows = stored_rows.iter().any(|row| row.kind == BrowserRowKind::Group);
+    if !has_group_rows {
+        return stored_rows;
+    }
+    let live_paths: HashSet<String> = stored_rows
+        .iter()
+        .filter(|row| row.kind == BrowserRowKind::Session)
+        .filter_map(|row| row.session_id.clone())
+        .collect();
+    let mut insertions: Vec<(usize, BrowserRow)> = Vec::new();
+    for session in cc_sessions {
+        if live_paths.contains(&session.session_id) {
+            continue;
+        }
+        let Some((group_idx, group_depth)) =
+            find_best_group_for_cwd_in_rows(&stored_rows, &session.cwd)
+        else {
+            continue;
+        };
+        let insert_idx = find_child_insert_point(&stored_rows, group_idx, group_depth);
+        insertions.push((
+            insert_idx,
+            BrowserRow {
+                kind: BrowserRowKind::Session,
+                full_path: session.file_path.clone(),
+                label: session.title_hint.clone(),
+                detail_label: String::new(),
+                document_kind: None,
+                group_kind: None,
+                session_title: Some(session.title_hint.clone()),
+                depth: group_depth + 1,
+                host_label: "local".to_string(),
+                descendant_sessions: 1,
+                expanded: true,
+                session_id: Some(session.session_id.clone()),
+                session_cwd: Some(session.cwd.clone()),
+            },
+        ));
+    }
+    if insertions.is_empty() {
+        return stored_rows;
+    }
+    insertions.sort_by(|a, b| b.0.cmp(&a.0));
+    let mut result = stored_rows;
+    for (idx, row) in insertions {
+        result.insert(idx, row);
+    }
+    result
+}
+
 fn live_session_label_with_index(
     remote_session_index: &RemoteSessionIndex,
     session: &ManagedSessionView,

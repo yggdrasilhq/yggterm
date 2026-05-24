@@ -1203,6 +1203,94 @@ pub fn read_codex_session_identity_fields(path: &Path) -> Result<Option<(String,
     Ok(read_codex_session_identity(path)?.map(|identity| (identity.session_id, identity.cwd)))
 }
 
+pub fn read_cc_session_identity_fields(path: &Path) -> Result<Option<(String, String)>> {
+    let file = fs::File::open(path)
+        .with_context(|| format!("failed to read cc session {}", path.display()))?;
+    let reader = BufReader::new(file);
+    let fallback_id = path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| String::from("unknown-session"));
+    let mut session_id: Option<String> = None;
+    let mut cwd: Option<String> = None;
+    for line in reader.lines() {
+        let line = line.with_context(|| format!("failed to read line from {}", path.display()))?;
+        let Ok(value) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        if session_id.is_none() {
+            session_id = value
+                .get("sessionId")
+                .and_then(Value::as_str)
+                .filter(|s| !s.trim().is_empty())
+                .map(ToOwned::to_owned);
+        }
+        if cwd.is_none()
+            && value.get("type").and_then(Value::as_str) == Some("user")
+        {
+            cwd = value
+                .get("cwd")
+                .and_then(Value::as_str)
+                .filter(|s| !s.trim().is_empty())
+                .map(ToOwned::to_owned);
+        }
+        if session_id.is_some() && cwd.is_some() {
+            break;
+        }
+    }
+    let cwd = match cwd {
+        Some(c) => normalize_codex_cwd(c),
+        None => return Ok(None),
+    };
+    Ok(Some((session_id.unwrap_or(fallback_id), cwd)))
+}
+
+pub fn read_cc_session_title(path: &Path) -> Result<Option<String>> {
+    let file = fs::File::open(path)
+        .with_context(|| format!("failed to read cc session {}", path.display()))?;
+    let reader = BufReader::new(file);
+    for line in reader.lines() {
+        let line = line.with_context(|| format!("failed to read line from {}", path.display()))?;
+        let Ok(value) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        if value.get("type").and_then(Value::as_str) != Some("user") {
+            continue;
+        }
+        let content = value
+            .get("message")
+            .and_then(|m| m.get("content"));
+        let text = match content {
+            Some(Value::String(s)) => s.clone(),
+            Some(Value::Array(parts)) => parts
+                .iter()
+                .filter_map(|part| {
+                    if part.get("type").and_then(Value::as_str) == Some("text") {
+                        part.get("text").and_then(Value::as_str).map(ToOwned::to_owned)
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(" "),
+            _ => continue,
+        };
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let title: String = trimmed.chars().take(80).collect();
+        let title = if trimmed.len() > 80 {
+            format!("{title}…")
+        } else {
+            title
+        };
+        return Ok(Some(title));
+    }
+    Ok(None)
+}
+
 fn read_codex_session_identity(path: &Path) -> Result<Option<CodexSessionIdentity>> {
     let file = fs::File::open(path)
         .with_context(|| format!("failed to read codex session {}", path.display()))?;
