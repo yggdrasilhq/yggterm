@@ -45,6 +45,7 @@ pub(crate) fn terminal_kind_title_suffix(kind: SessionKind) -> &'static str {
     match kind {
         SessionKind::Codex => "Codex",
         SessionKind::CodexLiteLlm => "Codex LiteLLM",
+        SessionKind::ClaudeCode => "Claude Code",
         SessionKind::Shell => "Shell",
         SessionKind::SshShell => "SSH Terminal",
         SessionKind::Document => "Document",
@@ -79,6 +80,7 @@ pub(crate) fn humanized_terminal_title(
     Some(match kind {
         SessionKind::Codex => "Codex Session".to_string(),
         SessionKind::CodexLiteLlm => "Codex LiteLLM Session".to_string(),
+        SessionKind::ClaudeCode => "Claude Code Session".to_string(),
         SessionKind::Shell => "Local Terminal".to_string(),
         SessionKind::SshShell => "SSH Terminal".to_string(),
         SessionKind::Document => "Document".to_string(),

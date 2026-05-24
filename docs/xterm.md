@@ -114,6 +114,16 @@ sends the resulting bytes through the normal terminal input path. The fallback
 path is xterm's core `triggerDataEvent`, then a direct terminal input event; none
 of these read from `navigator.clipboard`.
 
+Primary selection itself must come from xterm.js pointer handling. The shell may
+reclaim terminal input focus on pointer down, but transparent focus helpers,
+context-menu backdrops, and app-control probes must never become the hit target
+for drag selection or double-click word selection. The focus-capture element is
+observer/focus scaffolding only and must keep `pointer-events: none`.
+`probe-select` is therefore a pointer-gesture probe: it dispatches a real drag
+or double-click against visible xterm rows, requires non-empty
+`term.getSelection()` plus xterm selection-layer rectangles, and treats DOM
+Range selection or buffer-only text as diagnostic data, not a pass.
+
 Terminal selection copy is also not a browser-clipboard operation. `Ctrl+Shift+C`
 and `Ctrl+Shift+X` may read xterm's selected text, but the xterm embed must send
 that text to Rust over the terminal JS event bridge and return immediately. The
@@ -145,6 +155,11 @@ it does not create a second menu implementation inside the terminal DOM. A
 right-click must not call `term.paste`, `triggerDataEvent`, native clipboard
 read, or direct terminal input. Middle-click remains the only primary-selection
 paste gesture.
+
+The context-menu backdrop is shell chrome, not a terminal gesture owner. It must
+not block primary pointer events that belong to xterm rows. When a primary
+terminal pointer begins while a context menu is visible, the xterm bridge asks
+the shell to close the menu and lets the same gesture continue to xterm.
 
 Active terminal write batching must stay below the threshold where typed input
 or Codex's `Working` animation feels stepped. Batching is only a flush-timing
@@ -191,6 +206,7 @@ Regression coverage:
 
 - `terminal_eval_script_supports_xterm_primary_selection_middle_paste`
 - `terminal_eval_script_bridges_xterm_right_click_context_menu`
+- `terminal_select_probe_uses_xterm_pointer_gesture_not_dom_range`
 - `terminal_eval_script_keeps_prompt_follow_during_layout_resize`
 - `scripts/smoke_xterm_embed_faults.py --only-check primary_selection_paste`
 - `scripts/smoke_xterm_embed_faults.py --only-check terminal_context_menu`
@@ -388,13 +404,17 @@ therefore computes an effective viewport from the DOM scroll position when the
 two disagree, and app-control exposes `public_viewport_y`,
 `visual_viewport_y`, `effective_viewport_y`, and `viewport_y_source` for proof.
 
-Retained xterm hosts must remain in WebKit's normal paint tree. Do not hide
-inactive retained terminals by moving them offscreen with transforms, and do not
-wrap active xterm DOM rows in strict paint containment. The accepted wrapper
-contract is light layout/style containment plus `opacity`, `visibility`, and
-`pointer-events` for inactive hosts. Strict/offscreen compositor isolation can
-produce the bad split where xterm row DOM, buffer text, and app-control state
-exist while the user-visible paint is blank or stale after a session switch.
+Mounted xterm hosts must remain in WebKit's normal paint tree. Do not hide the
+active terminal by moving it offscreen with transforms, and do not wrap active
+xterm DOM rows in strict paint containment. The accepted active wrapper contract
+is light layout/style containment plus normal visibility. Hidden retained hosts
+are renderer caches only, not session truth. On KDE/Linux the stable default is
+to keep only the active xterm host mounted and remount inactive live sessions
+from daemon PTY/retained history when selected, because many hidden full-size
+xterm DOM trees raise WebKit CPU and reintroduce stale-render ambiguity.
+Strict/offscreen compositor isolation can produce the bad split where xterm row
+DOM, buffer text, and app-control state exist while the user-visible paint is
+blank or stale after a session switch.
 
 App-control must expose DOM paint hit-tests for active terminal hosts. The
 snapshot samples the row and cursor rects with `document.elementsFromPoint` and
@@ -955,9 +975,18 @@ dimensions when available. It is a lab, not product code.
   Use `yggterm-headless server terminal restart <session> --force-remote` only
   when the session is known safe to replace.
 - Startup prewarm may use a cheaper no-snapshot path for background remote
-  sessions, but the restored active remote terminal must seed retained daemon
-  PTY scrollback. A prompt-only active restore with `scrollback_expected=true`
-  is not terminal-ready.
+  sessions, but the restored active remote terminal should seed retained daemon
+  PTY scrollback when that history is safe to replay. A prompt-ready active
+  restore with `scrollback_expected=true` and `base_y=0` is still a scrollback
+  diagnostic, but it must not block interactivity by itself. It becomes a hard
+  terminal problem when the current prompt is not readable/input-ready, when an
+  unsafe retained replay path is involved, or when a scroll probe proves the user
+  cannot move through expected xterm scrollback.
+- User scrollback is an explicit xterm intent. Pending prompt-follow repairs
+  from input-focus or resize settle must be cancelled when the user scrolls
+  away from the bottom; otherwise the terminal appears scroll-locked even though
+  xterm briefly moved. Returning to bottom may restore prompt-follow, but only
+  through xterm viewport state, not by force-redrawing terminal text.
 - A retained remote terminal with ready history may still require retained
   daemon replay when the current xterm buffer collapses. Ready history is not a
   replay suppressor after app-control reports a prompt-only, empty, stale, or
@@ -986,11 +1015,12 @@ dimensions when available. It is a lab, not product code.
 - Active-session switch repaint is a bounded xterm recovery action. It may clear
   texture atlas state and refresh the mounted xterm viewport after selection
   changes, but it must be keyed to activation and exposed to app-control.
-- Retained live terminals must keep their xterm bridge mounted while hidden.
-  Switching away may pause daemon reads to keep the background budget low, but
-  switching back must not recreate the xterm instance, call `reset`, or collapse
-  `base_y`/scrollback. Reactivation should re-enable input, refit, and repaint
-  the existing buffer.
+- Retained live terminals must keep daemon PTY/runtime truth while hidden. On
+  KDE/Linux, switching away may unmount the hidden xterm renderer to keep the
+  WebKit budget low. Switching back must remount from daemon PTY/retained
+  history without shell-owned placeholder text, prompt overlays, or session
+  identity substitution, and it must preserve `base_y`/scrollback when daemon
+  retained history exists.
 - A "switching pass" must never be required for correctness. If app-control or
   host health sees an active retained remote host with an empty xterm surface
   while the daemon runtime is present or has output, the shell must keep that
