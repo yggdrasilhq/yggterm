@@ -6226,9 +6226,12 @@ impl ShellState {
         self.refresh_tree_debug("close_context_menu");
     }
     fn all_sidebar_rows_for_selection(&self) -> Vec<BrowserRow> {
+        let cc_sessions = self.server.local_cc_sessions();
         let stored_rows = self.browser.search_rows();
+        let stored_rows_with_cc =
+            inject_file_backed_cc_session_rows(stored_rows.clone(), cc_sessions);
         let live_sessions = self.server.live_sessions();
-        let mut expanded_paths = stored_rows
+        let mut expanded_paths = stored_rows_with_cc
             .iter()
             .filter(|row| row.kind == BrowserRowKind::Group)
             .map(|row| row.full_path.clone())
@@ -6241,9 +6244,9 @@ impl ShellState {
         let mut previous_group_count = 0;
         for _ in 0..8 {
             let rows = sidebar_rows_for_selection(
-                &stored_rows,
+                &stored_rows_with_cc,
                 merged_sidebar_rows(
-                    &stored_rows,
+                    &stored_rows_with_cc,
                     self.server.remote_machines(),
                     self.server.ssh_targets(),
                     &live_sessions,
@@ -6263,9 +6266,9 @@ impl ShellState {
             expanded_paths.extend(group_paths);
         }
         sidebar_rows_for_selection(
-            &stored_rows,
+            &stored_rows_with_cc,
             merged_sidebar_rows(
-                &stored_rows,
+                &stored_rows_with_cc,
                 self.server.remote_machines(),
                 self.server.ssh_targets(),
                 &live_sessions,
@@ -63427,6 +63430,11 @@ fn StartPage(snapshot: SharedSnapshot, state: Signal<ShellState>) -> Element {
          font-size:12px; font-weight:700; box-shadow:inset 0 0 0 1px rgba(120,142,166,0.16);",
         palette.panel_alt, palette.text
     );
+    let claude_code_button_style =
+        "display:inline-flex; align-items:center; justify-content:center; gap:8px; min-height:34px; \
+         padding:0 13px; border:none; border-radius:8px; background:#d97706; color:white; \
+         font-size:12px; font-weight:800; box-shadow:0 8px 20px rgba(217,119,6,0.22);"
+        .to_string();
     let primary_button_style = format!(
         "display:inline-flex; align-items:center; justify-content:center; gap:8px; min-height:34px; \
          padding:0 13px; border:none; border-radius:8px; background:{}; color:white; \
@@ -63478,7 +63486,7 @@ fn StartPage(snapshot: SharedSnapshot, state: Signal<ShellState>) -> Element {
                     button {
                         r#type: "button",
                         "data-yggterm-start-action": "claude-code",
-                        style: "{quick_button_style}",
+                        style: "{claude_code_button_style}",
                         onmousedown: |evt| {
                             evt.prevent_default();
                             evt.stop_propagation();
@@ -63606,6 +63614,17 @@ fn StartPage(snapshot: SharedSnapshot, state: Signal<ShellState>) -> Element {
                             } else {
                                 row.host_label.clone()
                             };
+                            let kind_tag: Option<(&'static str, &'static str, &'static str)> =
+                                match row_session_kind(&row) {
+                                    Some(SessionKind::ClaudeCode) => {
+                                        Some(("claude code", "rgba(217,119,6,0.22)", "#d97706"))
+                                    }
+                                    Some(
+                                        SessionKind::Codex
+                                        | SessionKind::CodexLiteLlm,
+                                    ) => Some(("codex", "rgba(99,102,241,0.20)", "#6366f1")),
+                                    _ => None,
+                                };
                             let card_icon_button_style = format!(
                                 "display:inline-flex; align-items:center; justify-content:center; width:28px; height:28px; \
                                  border:none; border-radius:7px; background:{}; color:{}; box-shadow:inset 0 0 0 1px rgba(120,142,166,0.14); cursor:pointer;",
@@ -63661,6 +63680,15 @@ fn StartPage(snapshot: SharedSnapshot, state: Signal<ShellState>) -> Element {
                                                     queue_copy_edit_for_row(state, row_for_title_rename.clone(), CopyEditField::Title);
                                                 },
                                                 PencilIcon { size: 12 }
+                                            }
+                                            if let Some((tag_label, tag_bg, tag_color)) = kind_tag {
+                                                span {
+                                                    style: format!(
+                                                        "font-size:10px; font-weight:700; line-height:1; padding:2px 6px; border-radius:4px; \
+                                                         background:{tag_bg}; color:{tag_color}; flex:0 0 auto; letter-spacing:0.03em; text-transform:uppercase;"
+                                                    ),
+                                                    "{tag_label}"
+                                                }
                                             }
                                             span {
                                                 style: format!("font-size:11px; line-height:1.3; color:{}; flex:0 0 auto;", palette.muted),
