@@ -1250,24 +1250,89 @@ pub fn read_cc_session_title(path: &Path) -> Result<Option<String>> {
     let file = fs::File::open(path)
         .with_context(|| format!("failed to read cc session {}", path.display()))?;
     let reader = BufReader::new(file);
+    let mut first_human_text: Option<String> = None;
     for line in reader.lines() {
         let line = line.with_context(|| format!("failed to read line from {}", path.display()))?;
         let Ok(value) = serde_json::from_str::<Value>(&line) else {
             continue;
         };
+        // ai-title is the canonical title Claude Code generates — use it immediately.
+        if value.get("type").and_then(Value::as_str) == Some("ai-title") {
+            if let Some(title) = value.get("aiTitle").and_then(Value::as_str) {
+                let title = title.trim();
+                if !title.is_empty() {
+                    return Ok(Some(title.to_string()));
+                }
+            }
+        }
+        // Collect first real human text as fallback (skipping protocol XML).
+        if first_human_text.is_none()
+            && value.get("type").and_then(Value::as_str) == Some("user")
+            && value
+                .get("message")
+                .and_then(|m| m.get("role"))
+                .and_then(Value::as_str)
+                == Some("user")
+        {
+            let content = value.get("message").and_then(|m| m.get("content"));
+            let text = match content {
+                Some(Value::String(s)) => s.clone(),
+                Some(Value::Array(parts)) => parts
+                    .iter()
+                    .filter_map(|part| {
+                        if part.get("type").and_then(Value::as_str) == Some("text") {
+                            part.get("text").and_then(Value::as_str).map(ToOwned::to_owned)
+                        } else {
+                            None
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" "),
+                _ => continue,
+            };
+            // Strip protocol XML tags; use remainder if non-empty.
+            let text = if let Some(pos) = text.find("</local-command-caveat>") {
+                text[pos + "</local-command-caveat>".len()..].to_string()
+            } else {
+                text
+            };
+            let trimmed = text.trim();
+            if !trimmed.is_empty() && !trimmed.starts_with('<') {
+                let title: String = trimmed.chars().take(80).collect();
+                let title = if trimmed.chars().count() > 80 {
+                    format!("{title}…")
+                } else {
+                    title
+                };
+                first_human_text = Some(title);
+            }
+        }
+    }
+    Ok(first_human_text)
+}
+
+pub fn read_cc_session_context(path: &Path) -> Result<String> {
+    let file = fs::File::open(path)
+        .with_context(|| format!("failed to read cc session {}", path.display()))?;
+    let reader = BufReader::new(file);
+    let mut parts: Vec<String> = Vec::new();
+    for line in reader.lines() {
+        let Ok(line) = line else { continue };
+        let Ok(value) = serde_json::from_str::<Value>(&line) else { continue };
         if value.get("type").and_then(Value::as_str) != Some("user") {
             continue;
         }
-        let content = value
-            .get("message")
-            .and_then(|m| m.get("content"));
+        if value.get("message").and_then(|m| m.get("role")).and_then(Value::as_str) != Some("user") {
+            continue;
+        }
+        let content = value.get("message").and_then(|m| m.get("content"));
         let text = match content {
             Some(Value::String(s)) => s.clone(),
-            Some(Value::Array(parts)) => parts
+            Some(Value::Array(arr)) => arr
                 .iter()
-                .filter_map(|part| {
-                    if part.get("type").and_then(Value::as_str) == Some("text") {
-                        part.get("text").and_then(Value::as_str).map(ToOwned::to_owned)
+                .filter_map(|p| {
+                    if p.get("type").and_then(Value::as_str) == Some("text") {
+                        p.get("text").and_then(Value::as_str).map(ToOwned::to_owned)
                     } else {
                         None
                     }
@@ -1276,26 +1341,22 @@ pub fn read_cc_session_title(path: &Path) -> Result<Option<String>> {
                 .join(" "),
             _ => continue,
         };
-        // Strip <local-command-caveat>...</local-command-caveat> block, then use
-        // whatever content follows it in the same message (if any).
-        let text = if let Some(after_close) = text.find("</local-command-caveat>") {
-            text[after_close + "</local-command-caveat>".len()..].to_string()
+        let text = if let Some(pos) = text.find("</local-command-caveat>") {
+            text[pos + "</local-command-caveat>".len()..].to_string()
         } else {
             text
         };
         let trimmed = text.trim();
-        if trimmed.is_empty() || trimmed.starts_with("<local-command-caveat") {
+        if trimmed.is_empty() || trimmed.starts_with('<') {
             continue;
         }
-        let title: String = trimmed.chars().take(80).collect();
-        let title = if trimmed.len() > 80 {
-            format!("{title}…")
-        } else {
-            title
-        };
-        return Ok(Some(title));
+        let snippet: String = trimmed.chars().take(120).collect();
+        parts.push(snippet);
+        if parts.len() >= 3 {
+            break;
+        }
     }
-    Ok(None)
+    Ok(parts.join(" · "))
 }
 
 fn read_codex_session_identity(path: &Path) -> Result<Option<CodexSessionIdentity>> {
