@@ -1,4 +1,4 @@
-use crate::{SessionNode, SessionNodeKind, WorkspaceDocumentKind, WorkspaceGroupKind};
+use crate::{SessionKind, SessionNode, SessionNodeKind, WorkspaceDocumentKind, WorkspaceGroupKind};
 use dirs::home_dir;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -27,6 +27,13 @@ pub struct BrowserRow {
     pub expanded: bool,
     pub session_id: Option<String>,
     pub session_cwd: Option<String>,
+    /// Authoritative kind tag for sessions. When `Some`, callers should prefer
+    /// this over path-prefix heuristics — it is set by row builders that
+    /// originate from a `ManagedSessionView` (where `kind` is the SSOT). For
+    /// rows synthesized from file paths or stored metadata where kind cannot
+    /// be known without parsing, this stays `None` and callers fall back to
+    /// path-prefix dispatch. See [[spec-unify-local-remote]].
+    pub session_kind: Option<SessionKind>,
 }
 
 #[derive(Debug, Clone)]
@@ -426,6 +433,7 @@ fn flatten_rows(
             expanded,
             session_id: node.session_id.clone(),
             session_cwd: node.cwd.clone(),
+            session_kind: None,
         });
     }
 
