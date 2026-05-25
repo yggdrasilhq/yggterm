@@ -109,6 +109,9 @@ Build **Yggdrasil Terminal**: a Rust-first, cross-platform, remote-first termina
 - If code and docs disagree, stop and reconcile the interface doc before
   implementing. The canonical docs are `docs/protocol.md` for runtime/hot-update
   behavior, `docs/xterm.md` for terminal rendering and PTY bytes,
+  `docs/xterm-bugs.md` for the structured xterm.js bug registry (every
+  workaround site MUST have an `// XTERM-BUG: <id>` anchor and a matching
+  registry entry — see that file's template),
   `docs/sessions.md` for saved-session identity and copy, `docs/theme.md` for
   stable shell chrome, and `docs/telemetry.md` for observer-only telemetry.
 - For every reported regression, update the harness, smoke test, unit test, or CI gate to fail on the exact defect class before applying the runtime fix. Do not accept a fix based only on manual observation when a deterministic regression can be captured.
