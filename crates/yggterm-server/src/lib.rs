@@ -11657,6 +11657,7 @@ def scan_cc_session(jsonl_path):
         'title': ai_title or first_human_text or resolved_id[:8],
         'context': ' · '.join(context_parts),
         'mtime': mtime,
+        'path': str(jsonl_path),
     }
 
 projects_dir = Path(os.path.expanduser('~/.claude/projects'))
@@ -11680,6 +11681,8 @@ struct RemoteCcSummaryLine {
     context: String,
     #[serde(default)]
     mtime: i64,
+    #[serde(default)]
+    path: String,
 }
 
 fn remote_cc_session_path(machine_key: &str, session_id: &str) -> String {
@@ -11789,7 +11792,7 @@ fn scan_remote_machine_sessions(
                 cached_precis: None,
                 cached_summary: None,
                 live_runtime: false,
-                storage_path: String::new(),
+                storage_path: summary.path,
             });
         }
         cc_found = !cc_sessions.is_empty();
