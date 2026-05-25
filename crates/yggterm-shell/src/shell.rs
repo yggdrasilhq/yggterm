@@ -62232,6 +62232,17 @@ fn terminal_replay_retained_data_script_for_session(
               used_refresh: false,
             }};
             try {{
+              // XTERM-BUG: scrollback-lost-on-session-switch
+              // See docs/xterm-bugs.md#scrollback-lost-on-session-switch
+              // If the user is actively scrolled back, do NOT force prompt
+              // follow — retained replay paths (session switch, snapshot
+              // re-apply, daemon-to-replay handoff) MUST preserve the user's
+              // scroll position. Without this guard the entire scrollback
+              // collapses every time we re-mount.
+              if (entry && String(entry.scrollbackIntent || 'PromptFollow') === 'UserScrollback') {{
+                debug.skipped_user_scrollback = true;
+                return debug;
+              }}
               const buffer = entry && entry.term && entry.term.buffer && entry.term.buffer.active;
               if (!entry || !entry.term || !buffer) {{
                 debug.missing_entry = true;
