@@ -181,31 +181,7 @@ pub enum SessionSource {
     LiveSsh,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SessionKind {
-    Codex,
-    CodexLiteLlm,
-    ClaudeCode,
-    Shell,
-    SshShell,
-    Document,
-}
-
-impl SessionKind {
-    pub fn is_agent(self) -> bool {
-        matches!(
-            self,
-            SessionKind::Codex | SessionKind::CodexLiteLlm | SessionKind::ClaudeCode
-        )
-    }
-
-    // Claude Code generates its own session titles and summaries through its
-    // conversation interface; skip LLM-based copy generation for these sessions.
-    pub fn self_generates_copy(self) -> bool {
-        matches!(self, SessionKind::ClaudeCode)
-    }
-}
+pub use yggterm_core::SessionKind;
 
 fn live_session_default_title(kind: SessionKind, cwd: Option<&str>, fallback: &str) -> String {
     match kind {

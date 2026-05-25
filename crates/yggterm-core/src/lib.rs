@@ -2,6 +2,7 @@ mod browser;
 mod icon;
 mod install;
 mod perf;
+mod session_kind;
 mod telemetry;
 mod titles;
 mod trace;
@@ -39,6 +40,7 @@ pub use perf::{
     PERF_TELEMETRY_FILENAME, PERF_TELEMETRY_MAX_BYTES, PERF_TELEMETRY_ROTATED_FILENAME, PerfSpan,
     append_bounded_jsonl_record, append_perf_event, perf_telemetry_path,
 };
+pub use session_kind::SessionKind;
 pub use telemetry::{
     TERMINAL_TELEMETRY_DB_FILENAME, TERMINAL_TELEMETRY_DIRNAME, TerminalTelemetryEvent,
     append_terminal_telemetry_event, ensure_terminal_telemetry_schema,
