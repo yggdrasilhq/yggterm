@@ -13349,6 +13349,7 @@ fn synthesize_app_control_row(shell: &ShellState, session_path: &str) -> Option<
             expanded: false,
             session_id: Some(session.id.clone()),
             session_cwd: session_cwd_for_managed_session(&session),
+            session_kind: None,
         });
     }
     if let Some((machine_key, session_id)) = parse_remote_scanned_session_path(session_path)
@@ -13382,6 +13383,7 @@ fn synthesize_app_control_row(shell: &ShellState, session_path: &str) -> Option<
             expanded: false,
             session_id: Some(scanned.session_id.clone()),
             session_cwd: Some(scanned.cwd.clone()),
+            session_kind: None,
         });
     }
     let path = Path::new(session_path);
@@ -13411,6 +13413,7 @@ fn synthesize_app_control_row(shell: &ShellState, session_path: &str) -> Option<
         session_cwd: codex_identity
             .map(|(_, cwd)| cwd)
             .or_else(|| path.parent().map(|parent| parent.display().to_string())),
+            session_kind: None,
     })
 }
 fn session_cwd_for_managed_session(session: &ManagedSessionView) -> Option<String> {
@@ -14532,6 +14535,13 @@ fn is_claude_code_session_path(path: &str) -> bool {
 fn row_session_kind(row: &BrowserRow) -> Option<SessionKind> {
     if row.kind != BrowserRowKind::Session {
         return None;
+    }
+    // SSOT for kind: when the row was built from a ManagedSessionView, its
+    // `session_kind` is authoritative. The path-prefix dispatch below is the
+    // fallback for rows synthesized from file paths or stored metadata.
+    // See [[spec-unify-local-remote]].
+    if let Some(kind) = row.session_kind {
+        return Some(kind);
     }
     if row.full_path.starts_with("codex-litellm://")
         || is_codex_litellm_storage_session_path(&row.full_path)
@@ -18279,6 +18289,7 @@ fn spawn_active_session_copy_hydration(mut state: Signal<ShellState>, session: M
         expanded: false,
         session_id: Some(session.id.clone()),
         session_cwd: Some(metadata_value(&session, "Cwd")),
+        session_kind: None,
     });
     spawn(async move {
         let path_for_task = session_path.clone();
@@ -19341,6 +19352,7 @@ fn merged_sidebar_rows_uncached(
                 expanded: true,
                 session_id: None,
                 session_cwd: None,
+                session_kind: None,
             }];
         }
         return stored_rows;
@@ -19422,22 +19434,33 @@ fn merged_sidebar_rows_uncached(
         }
     }
     let resort_ms = resort_started_at.elapsed().as_secs_f64() * 1000.0;
+    // Per [[spec-active-sessions-dual-presence]]: active sessions appear in BOTH
+    // "Live Sessions" AND their cwd folder group. SSOT is the session object;
+    // display surfaces are dual.
+    //
+    // Local Codex/CC live sessions get injected under their cwd folder via
+    // inject_local_live_session_rows. Dedup against same-session_id file-backed
+    // stored rows is handled inside the injection.
+    let local_tree_live_sessions = promoted_live_sessions
+        .iter()
+        .copied()
+        .filter(|session| is_local_tree_live_session(session))
+        .collect::<Vec<_>>();
+    let local_tree_started_at = Instant::now();
+    let stored_rows = inject_local_live_session_rows(
+        &stored_rows,
+        &local_tree_live_sessions,
+        &remote_session_index,
+    );
+    let local_tree_ms = local_tree_started_at.elapsed().as_secs_f64() * 1000.0;
     let push_live_started_at = Instant::now();
-    // All promoted live sessions — including local Codex/CC — appear in Live Sessions.
-    // When a local CC session is live, its file-backed stored row is automatically excluded
-    // by the promoted_storage_paths dedup in the extend step below.
+    // All promoted live sessions — including local Codex/CC and remote
+    // sessions — appear in Live Sessions. Remote sessions ALSO remain in
+    // their machine group below (no retain dedup) per the dual-presence spec.
     let display_promoted_sessions = promoted_live_sessions
         .iter()
         .copied()
         .collect::<Vec<_>>();
-    // Build the set of live-promoted session paths. Any scanned session that is currently
-    // live-promoted must be removed from the machine group so it appears in exactly one place:
-    // the Live Sessions group (with real-time data). When the session ends it will reappear in
-    // the machine group on the next scan.
-    let promoted_live_paths: HashSet<String> = display_promoted_sessions
-        .iter()
-        .map(|s| s.session_path.clone())
-        .collect();
     push_live_session_rows(
         &mut rows,
         &display_promoted_sessions,
@@ -19446,21 +19469,25 @@ fn merged_sidebar_rows_uncached(
     );
     let push_live_ms = push_live_started_at.elapsed().as_secs_f64() * 1000.0;
     let push_remote_started_at = Instant::now();
-    for mut machine in machine_rows.into_values() {
-        // Remove scanned sessions that are currently live — they are rendered in Live Sessions above.
-        machine
-            .scanned_sessions
-            .retain(|s| !promoted_live_paths.contains(&s.session_path));
+    for machine in machine_rows.into_values() {
+        // Do NOT remove live sessions from machine.scanned_sessions — they
+        // belong in both "Live Sessions" AND their machine group per
+        // [[spec-active-sessions-dual-presence]].
         push_remote_machine_rows(&mut rows, &machine, expanded_paths);
     }
     let push_remote_ms = push_remote_started_at.elapsed().as_secs_f64() * 1000.0;
     let extend_stored_started_at = Instant::now();
-    // Only deduplicate paths from display-promoted sessions (not tree-injected ones) so that
-    // CC rows injected into stored_rows are not filtered out here.
-    let promoted_live_paths = display_promoted_sessions
-        .iter()
-        .map(|session| normalize_live_session_path(&session.session_path))
-        .collect::<HashSet<_>>();
+    // Per [[spec-active-sessions-dual-presence]]: live sessions appear in BOTH
+    // "Live Sessions" group AND their cwd folder group. So we do NOT filter
+    // stored rows by `promoted_live_paths`; that would yank the cwd-tree
+    // injection of a live local session (added by
+    // inject_local_live_session_rows above) right back out.
+    //
+    // We DO still filter by `promoted_storage_paths`: when a live session has
+    // a "Storage" metadata pointing at a JSONL file, the file-backed stored
+    // row would be a SECOND representation of the same logical session in the
+    // SAME (cwd-tree) view — which is the duplicate kind that's wrong. The
+    // injected live row covers that slot.
     let promoted_storage_paths = display_promoted_sessions
         .iter()
         .filter_map(|session| {
@@ -19472,10 +19499,8 @@ fn merged_sidebar_rows_uncached(
         if is_remote_workspace_virtual_row(row) {
             return None;
         }
-        let row_path = normalize_live_session_path(&row.full_path);
         if row.kind == BrowserRowKind::Session
-            && (promoted_live_paths.contains(&row_path)
-                || promoted_storage_paths.contains(&row.full_path))
+            && promoted_storage_paths.contains(&row.full_path)
         {
             None
         } else {
@@ -19494,6 +19519,7 @@ fn merged_sidebar_rows_uncached(
                 "merge_live_ms": merge_live_ms,
                 "promoted_retain_ms": promoted_retain_ms,
                 "resort_ms": resort_ms,
+                "local_tree_ms": local_tree_ms,
                 "push_live_ms": push_live_ms,
                 "push_remote_ms": push_remote_ms,
                 "extend_stored_ms": extend_stored_ms,
@@ -19631,6 +19657,7 @@ fn push_live_session_rows(
         expanded,
         session_id: None,
         session_cwd: None,
+        session_kind: None,
     });
     if !expanded {
         return;
@@ -19678,6 +19705,7 @@ fn push_live_session_rows(
             expanded: true,
             session_id: Some(session.id.clone()),
             session_cwd: (!cwd.trim().is_empty()).then_some(cwd),
+            session_kind: Some(session.kind),
         });
     }
 }
@@ -19741,6 +19769,7 @@ fn synthetic_local_live_session_rows(
                 expanded: true,
                 session_id: None,
                 session_cwd: (group_path != "local").then_some(group_path.clone()),
+                session_kind: None,
             });
         }
     }
@@ -19849,6 +19878,7 @@ fn inject_cc_sessions_into_stored_rows(
                 expanded: true,
                 session_id: Some(session.id.clone()),
                 session_cwd: cwd_opt,
+                session_kind: Some(session.kind),
             },
         ));
     }
@@ -19906,6 +19936,7 @@ fn inject_file_backed_cc_session_rows(
                 expanded: true,
                 session_id: Some(session.session_id.clone()),
                 session_cwd: Some(session.cwd.clone()),
+                session_kind: None,
             },
         ));
     }
@@ -20525,6 +20556,7 @@ fn push_remote_machine_rows(
         expanded: machine_expanded,
         session_id: None,
         session_cwd: None,
+        session_kind: None,
     });
     if !machine_expanded {
         return;
@@ -20571,6 +20603,7 @@ fn push_remote_machine_rows(
                 expanded: true,
                 session_id: Some(scanned.session_id.clone()),
                 session_cwd: Some(scanned.cwd.clone()),
+                session_kind: None,
             });
         }
     }
@@ -20863,6 +20896,7 @@ fn append_remote_folder_rows(
         expanded: is_expanded,
         session_id: None,
         session_cwd: Some(node.full_path.clone()),
+        session_kind: None,
     });
     if !is_expanded {
         return;
@@ -20897,6 +20931,7 @@ fn append_remote_folder_rows(
                 expanded: true,
                 session_id: Some(scanned.session_id.clone()),
                 session_cwd: Some(scanned.cwd.clone()),
+                session_kind: None,
             });
         }
     }
@@ -23260,6 +23295,7 @@ fn session_creation_context_row(row: &BrowserRow) -> BrowserRow {
         expanded: false,
         session_id: None,
         session_cwd: Some(cwd),
+        session_kind: None,
     }
 }
 fn resolve_creation_context_row(rows: &[BrowserRow], row: &BrowserRow) -> BrowserRow {
@@ -23897,6 +23933,9 @@ fn describe_app_state_snapshot(
             json!({
                 "session_path": session.session_path,
                 "title": session.title,
+                "kind": format!("{:?}", session.kind),
+                "host_label": session.host_label,
+                "cwd_metadata": metadata_value(session, "Cwd"),
                 "terminal_foreground_active": session.terminal_foreground_active,
                 "source": format!("{:?}", session.source),
                 "launch_phase": format!("{:?}", session.launch_phase),
@@ -40330,6 +40369,18 @@ fn tree_icon_kind(row: &BrowserRow) -> &'static str {
             }
         }
         BrowserRowKind::Session => {
+            // SSOT for icon dispatch: when `session_kind` is set (rows built
+            // from a ManagedSessionView), drive the icon from it. Path-prefix
+            // branches below are fallback for synthesized rows.
+            // See [[spec-unify-local-remote]].
+            if let Some(kind) = row.session_kind {
+                return match kind {
+                    SessionKind::Codex | SessionKind::CodexLiteLlm => "session",
+                    SessionKind::ClaudeCode => "claude-code",
+                    SessionKind::Shell | SessionKind::SshShell => "terminal",
+                    SessionKind::Document => "paper",
+                };
+            }
             if row.full_path.starts_with("codex-litellm://")
                 || is_codex_litellm_storage_session_path(&row.full_path)
                 || row.full_path.starts_with("codex://")
@@ -40365,6 +40416,15 @@ fn tree_icon_glyph(row: &BrowserRow) -> Option<&'static str> {
     match row.kind {
         BrowserRowKind::Separator => Some("—"),
         BrowserRowKind::Session => {
+            // SSOT for glyph: consult session_kind first. See [[spec-unify-local-remote]].
+            if let Some(kind) = row.session_kind {
+                return Some(match kind {
+                    SessionKind::ClaudeCode => "*_",
+                    SessionKind::Codex | SessionKind::CodexLiteLlm => ">_",
+                    SessionKind::Shell | SessionKind::SshShell => "$_",
+                    SessionKind::Document => "$_",
+                });
+            }
             if is_claude_code_session_path(&row.full_path) {
                 Some("*_")
             } else if row.full_path.starts_with("codex-litellm://")
@@ -45686,6 +45746,7 @@ fn TerminalCanvas(
         expanded: false,
         session_id: Some(session.id.clone()),
         session_cwd: session_cwd_for_managed_session(&session),
+        session_kind: None,
     };
     let retained_fault_recovery_watch_key =
         state.with(|shell| shell.retained_fault_recovery_watch_identity(&session_path));
@@ -51097,6 +51158,7 @@ fn TerminalCanvas(
         expanded: false,
         session_id: Some(session.id.clone()),
         session_cwd: session_cwd_for_managed_session(&session),
+        session_kind: None,
     };
     rsx! {
         div {
@@ -63405,6 +63467,7 @@ fn browser_row_for_remote_scanned_session(
         expanded: true,
         session_id: Some(session.session_id.clone()),
         session_cwd: Some(session.cwd.clone()),
+        session_kind: None,
     }
 }
 
@@ -73974,6 +74037,7 @@ mod tests {
             expanded: true,
             session_id: None,
             session_cwd: None,
+            session_kind: None,
         };
         let folder = BrowserRow {
             kind: BrowserRowKind::Group,
@@ -73989,6 +74053,7 @@ mod tests {
             expanded: true,
             session_id: None,
             session_cwd: None,
+            session_kind: None,
         };
         assert!(!is_workspace_row(&live_group));
         assert!(is_workspace_row(&folder));
@@ -74009,6 +74074,7 @@ mod tests {
             expanded: true,
             session_id: None,
             session_cwd: None,
+            session_kind: None,
         };
         let session = BrowserRow {
             kind: BrowserRowKind::Session,
@@ -74024,6 +74090,7 @@ mod tests {
             expanded: true,
             session_id: Some("test".to_string()),
             session_cwd: Some("/home/user".to_string()),
+            session_kind: None,
         };
         let local_root = BrowserRow {
             kind: BrowserRowKind::Group,
@@ -74039,6 +74106,7 @@ mod tests {
             expanded: true,
             session_id: None,
             session_cwd: None,
+            session_kind: None,
         };
         assert!(context_menu_allows_rename(&folder));
         assert!(context_menu_allows_rename(&session));
@@ -74060,6 +74128,7 @@ mod tests {
             expanded: false,
             session_id: None,
             session_cwd: None,
+            session_kind: None,
         };
         let folder = BrowserRow {
             kind: BrowserRowKind::Group,
@@ -74075,6 +74144,7 @@ mod tests {
             expanded: true,
             session_id: None,
             session_cwd: None,
+            session_kind: None,
         };
         assert_eq!(
             drag_drop_placement_from_pointer(&separator, 4.0),
@@ -74113,6 +74183,7 @@ mod tests {
             expanded: true,
             session_id: None,
             session_cwd: None,
+            session_kind: None,
         };
         assert!(!valid_drop_target(
             &["/home/user/gh/notes/folder-a".to_string()],
@@ -74143,6 +74214,7 @@ mod tests {
             expanded: false,
             session_id: Some("paper-b-id".to_string()),
             session_cwd: Some("/home/user/gh/notes".to_string()),
+            session_kind: None,
         };
         assert!(valid_drop_target(
             &["/home/user/gh/notes/paper-a".to_string()],
@@ -74328,6 +74400,7 @@ mod tests {
             expanded: false,
             session_id: Some("7be65605-e3c2-4607-89ed-0cc5ac87fc3c".to_string()),
             session_cwd: Some("/home/user".to_string()),
+            session_kind: None,
         };
         let drag_paths = vec![path.to_string()];
         let live_group_paths = HashSet::from([path.to_string()]);
@@ -74363,6 +74436,7 @@ mod tests {
             expanded: false,
             session_id: Some("7be65605-e3c2-4607-89ed-0cc5ac87fc3c".to_string()),
             session_cwd: Some("/home/user".to_string()),
+            session_kind: None,
         };
         let cwd_projection = BrowserRow {
             depth: 4,
@@ -74404,6 +74478,7 @@ mod tests {
             expanded: false,
             session_id: Some("fb3a6f66-3a09-4964-a889-a07928150ac2".to_string()),
             session_cwd: Some("/home/user/gh/codex-litellm".to_string()),
+            session_kind: None,
         };
         let cwd_projection = BrowserRow {
             depth: 4,
@@ -74465,6 +74540,7 @@ mod tests {
             expanded: false,
             session_id: Some("paper-a-id".to_string()),
             session_cwd: Some("/home/user/gh/notes".to_string()),
+            session_kind: None,
         };
         let destination = yggui::ordered_tree_child_path("/home/user/gh/notes", &item.full_path, 0);
         assert_eq!(destination, "/home/user/gh/notes/0000-paper-a");
@@ -74486,6 +74562,7 @@ mod tests {
                 expanded: false,
                 session_id: Some("paper-a-id".to_string()),
                 session_cwd: Some("/home/user/gh/notes".to_string()),
+                session_kind: None,
             },
             BrowserRow {
                 kind: BrowserRowKind::Document,
@@ -74501,6 +74578,7 @@ mod tests {
                 expanded: false,
                 session_id: Some("paper-b-id".to_string()),
                 session_cwd: Some("/home/user/gh/notes".to_string()),
+                session_kind: None,
             },
         ];
         let placement = resolve_workspace_drop_placement(
@@ -74533,6 +74611,7 @@ mod tests {
             expanded: false,
             session_id: Some("paper-a-id".to_string()),
             session_cwd: Some("/home/user/gh/notes".to_string()),
+            session_kind: None,
         }];
         let placement = resolve_workspace_drop_placement(
             &rows,
@@ -74741,6 +74820,7 @@ mod tests {
             expanded: false,
             session_id: Some("gg-id".to_string()),
             session_cwd: Some("/home/user/gh/notes".to_string()),
+            session_kind: None,
         };
         let separator = BrowserRow {
             kind: BrowserRowKind::Separator,
@@ -74756,6 +74836,7 @@ mod tests {
             expanded: false,
             session_id: None,
             session_cwd: None,
+            session_kind: None,
         };
         let rows = vec![
             BrowserRow {
@@ -74772,6 +74853,7 @@ mod tests {
                 expanded: false,
                 session_id: Some("paper-a-id".to_string()),
                 session_cwd: Some("/home/user/gh/notes".to_string()),
+                session_kind: None,
             },
             gg.clone(),
             separator.clone(),
@@ -74809,6 +74891,7 @@ mod tests {
             expanded: true,
             session_id: None,
             session_cwd: None,
+            session_kind: None,
         };
         let session = BrowserRow {
             kind: BrowserRowKind::Session,
@@ -74824,6 +74907,7 @@ mod tests {
             expanded: false,
             session_id: Some("local-shell".to_string()),
             session_cwd: Some("/home/user/gh/yggterm".to_string()),
+            session_kind: None,
         };
         let rows = vec![folder.clone(), session.clone()];
         assert!(is_tree_drag_source_row(&session));
@@ -74861,6 +74945,7 @@ mod tests {
             expanded: true,
             session_id: None,
             session_cwd: None,
+            session_kind: None,
         };
         let paper = BrowserRow {
             kind: BrowserRowKind::Document,
@@ -74876,6 +74961,7 @@ mod tests {
             expanded: false,
             session_id: None,
             session_cwd: None,
+            session_kind: None,
         };
         let resolved = resolve_creation_context_row(&[folder.clone(), paper.clone()], &paper);
         assert_eq!(resolved.full_path, folder.full_path);
@@ -74896,6 +74982,7 @@ mod tests {
             expanded: true,
             session_id: None,
             session_cwd: None,
+            session_kind: None,
         };
         let separator = BrowserRow {
             kind: BrowserRowKind::Separator,
@@ -74911,6 +74998,7 @@ mod tests {
             expanded: false,
             session_id: None,
             session_cwd: None,
+            session_kind: None,
         };
         let resolved =
             resolve_creation_context_row(&[folder.clone(), separator.clone()], &separator);
@@ -74933,6 +75021,7 @@ mod tests {
             expanded: false,
             session_id: Some("test-session".to_string()),
             session_cwd: Some("/home/user".to_string()),
+            session_kind: None,
         };
         let resolved = resolve_creation_context_row(&[session.clone()], &session);
         assert_eq!(resolved.kind, BrowserRowKind::Group);
@@ -74956,6 +75045,7 @@ mod tests {
             expanded: true,
             session_id: None,
             session_cwd: Some("/home/user".to_string()),
+            session_kind: None,
         };
         let path = new_group_virtual_path_for_row(&folder);
         assert!(path.starts_with("__remote_folder__/practice/home/user/folder-"));
@@ -74977,6 +75067,7 @@ mod tests {
             expanded: true,
             session_id: None,
             session_cwd: None,
+            session_kind: None,
         };
         let path = new_separator_virtual_path_for_row(&folder);
         assert!(path.starts_with("/home/user/gh/notes/!separator-"));
@@ -74997,6 +75088,7 @@ mod tests {
             expanded: false,
             session_id: Some("paper-id".to_string()),
             session_cwd: Some("/home/user/gh/notes".to_string()),
+            session_kind: None,
         };
         let path = new_separator_virtual_path_for_row(&document);
         assert!(path.starts_with("/home/user/gh/notes/untitled-1774153234~separator-"));
@@ -75356,6 +75448,7 @@ mod tests {
                 expanded: true,
                 session_id: None,
                 session_cwd: None,
+                session_kind: None,
             },
             BrowserRow {
                 kind: BrowserRowKind::Group,
@@ -75371,6 +75464,7 @@ mod tests {
                 expanded: true,
                 session_id: None,
                 session_cwd: Some("/home".to_string()),
+                session_kind: None,
             },
             BrowserRow {
                 kind: BrowserRowKind::Group,
@@ -75386,6 +75480,7 @@ mod tests {
                 expanded: true,
                 session_id: None,
                 session_cwd: Some("/home/user".to_string()),
+                session_kind: None,
             },
             BrowserRow {
                 kind: BrowserRowKind::Group,
@@ -75401,6 +75496,7 @@ mod tests {
                 expanded: false,
                 session_id: None,
                 session_cwd: Some(storage_root.to_string()),
+                session_kind: None,
             },
             BrowserRow {
                 kind: BrowserRowKind::Session,
@@ -75416,6 +75512,7 @@ mod tests {
                 expanded: true,
                 session_id: Some("session-1".to_string()),
                 session_cwd: Some("/home/user/.codex/sessions".to_string()),
+                session_kind: None,
             },
         ];
         let collapsed = merged_sidebar_rows(
@@ -75471,6 +75568,7 @@ mod tests {
             expanded: true,
             session_id: None,
             session_cwd: None,
+            session_kind: None,
         };
         let targets = vec![SshConnectTarget {
             label: "raspberry".to_string(),
@@ -75826,6 +75924,7 @@ mod tests {
                     expanded: true,
                     session_id: None,
                     session_cwd: None,
+                    session_kind: None,
                 },
                 BrowserRow {
                     kind: BrowserRowKind::Group,
@@ -75841,6 +75940,7 @@ mod tests {
                     expanded: true,
                     session_id: None,
                     session_cwd: Some("/home/user".to_string()),
+                    session_kind: None,
                 },
                 BrowserRow {
                     kind: BrowserRowKind::Group,
@@ -75856,6 +75956,7 @@ mod tests {
                     expanded: true,
                     session_id: None,
                     session_cwd: Some("/home/user/gh".to_string()),
+                    session_kind: None,
                 },
             ],
             &[],
@@ -75937,6 +76038,7 @@ mod tests {
                 expanded: true,
                 session_id: Some("stored-codex".to_string()),
                 session_cwd: Some("/home/user/.codex/sessions".to_string()),
+                session_kind: None,
             }],
             &[],
             &[],
@@ -76028,6 +76130,7 @@ mod tests {
                 expanded: true,
                 session_id: Some("litellm-session".to_string()),
                 session_cwd: Some("/home/user".to_string()),
+                session_kind: None,
             }],
             &[],
             &[],
@@ -77119,6 +77222,7 @@ mod tests {
             expanded: true,
             session_id: Some("ddf8f1ee-8e64-4201-ab3a-2b07424f9b77".to_string()),
             session_cwd: Some("/home/user".to_string()),
+            session_kind: None,
         }];
         enrich_sidebar_rows_with_live_titles(
             &mut rows,
@@ -77185,6 +77289,7 @@ mod tests {
             expanded: true,
             session_id: Some("live-local-home".to_string()),
             session_cwd: Some("/home/user".to_string()),
+            session_kind: None,
         }];
         enrich_sidebar_rows_with_live_titles(
             &mut rows,
@@ -77262,6 +77367,7 @@ mod tests {
             expanded: true,
             session_id: Some("live-local-home".to_string()),
             session_cwd: Some("/home/user".to_string()),
+            session_kind: None,
         }];
         enrich_sidebar_rows_with_live_titles(
             &mut rows,
@@ -77331,6 +77437,7 @@ mod tests {
             expanded: true,
             session_id: Some("019cf82b-196b-7152-b4d2-e053f7286318".to_string()),
             session_cwd: Some("/home/user/gh/yggterm".to_string()),
+            session_kind: None,
         }];
         enrich_sidebar_rows_with_live_titles(
             &mut rows,
@@ -77363,6 +77470,7 @@ mod tests {
             expanded: true,
             session_id: Some("019dfc16-7e12-73d0-b8dd-aa9e9c887f9a".to_string()),
             session_cwd: Some("/home/user/gh/yggterm".to_string()),
+            session_kind: None,
         }];
         let machines = vec![RemoteMachineSnapshot {
             machine_key: "dev".to_string(),
@@ -77526,6 +77634,7 @@ mod tests {
             expanded: true,
             session_id: Some("manual-title".to_string()),
             session_cwd: Some("/home/user".to_string()),
+            session_kind: None,
         }];
         enrich_sidebar_rows_with_live_titles(
             &mut rows,
@@ -77589,6 +77698,7 @@ mod tests {
             expanded: true,
             session_id: Some("live-local-title".to_string()),
             session_cwd: Some("/home/user".to_string()),
+            session_kind: None,
         }];
         enrich_sidebar_rows_with_live_titles(
             &mut rows,
@@ -77656,6 +77766,7 @@ mod tests {
             expanded: true,
             session_id: Some("019e0339-aed4-7993-a3fa-f3dad1388e3c".to_string()),
             session_cwd: Some("/home/user/git/samplenotes".to_string()),
+            session_kind: None,
         }];
         enrich_sidebar_rows_with_live_titles(
             &mut rows,
@@ -77720,6 +77831,7 @@ mod tests {
             expanded: true,
             session_id: Some("live-local-title".to_string()),
             session_cwd: Some("/home/user".to_string()),
+            session_kind: None,
         }];
         let mut title_overrides = BTreeMap::new();
         title_overrides.insert(
@@ -78040,6 +78152,7 @@ mod tests {
             expanded: false,
             session_id: None,
             session_cwd: Some("/__remote_folder__/practice/home/user/folder-abc".to_string()),
+            session_kind: None,
         };
         let expanded = HashSet::from([
             "__remote_machine__/practice".to_string(),
@@ -78106,6 +78219,7 @@ mod tests {
                 expanded: true,
                 session_id: None,
                 session_cwd: None,
+                session_kind: None,
             },
             BrowserRow {
                 kind: BrowserRowKind::Group,
@@ -78121,6 +78235,7 @@ mod tests {
                 expanded: true,
                 session_id: None,
                 session_cwd: None,
+                session_kind: None,
             },
         ];
         let projection_rows = vec![BrowserRow {
@@ -78137,6 +78252,7 @@ mod tests {
             expanded: false,
             session_id: None,
             session_cwd: Some("/__remote_folder__/practice/home/user/folder-abc".to_string()),
+            session_kind: None,
         }];
         let expanded = HashSet::from([
             "__remote_machine__/practice".to_string(),
@@ -78202,6 +78318,7 @@ mod tests {
             expanded: false,
             session_id: None,
             session_cwd: Some("/home/user/folder-abc".to_string()),
+            session_kind: None,
         }];
         let expanded = HashSet::from([
             "__remote_machine__/practice".to_string(),
@@ -78346,6 +78463,7 @@ mod tests {
             expanded: true,
             session_id: None,
             session_cwd: None,
+            session_kind: None,
         };
         match group_session_launch_context(&shell, &row, SessionKind::Shell) {
             TerminalLaunchContext::Remote {
@@ -78378,6 +78496,7 @@ mod tests {
             expanded: false,
             session_id: None,
             session_cwd: None,
+            session_kind: None,
         };
 
         assert_eq!(
@@ -78402,6 +78521,7 @@ mod tests {
             expanded: false,
             session_id: None,
             session_cwd: Some("/home/user/folder-abc".to_string()),
+            session_kind: None,
         };
 
         let (target_path, target_title) =
@@ -78446,6 +78566,7 @@ mod tests {
             expanded: false,
             session_id: None,
             session_cwd: None,
+            session_kind: None,
         };
 
         match terminal_launch_context_for_row(&shell, &row) {
@@ -78575,6 +78696,7 @@ mod tests {
                 expanded: true,
                 session_id: None,
                 session_cwd: None,
+                session_kind: None,
             },
             BrowserRow {
                 kind: BrowserRowKind::Group,
@@ -78590,6 +78712,7 @@ mod tests {
                 expanded: true,
                 session_id: None,
                 session_cwd: None,
+                session_kind: None,
             },
             BrowserRow {
                 kind: BrowserRowKind::Session,
@@ -78605,6 +78728,7 @@ mod tests {
                 expanded: true,
                 session_id: Some("019cf672-8d68-70a1-bd8b-68487c4fc63d".to_string()),
                 session_cwd: Some("/home/user/gh/excel-inspired".to_string()),
+                session_kind: None,
             },
             BrowserRow {
                 kind: BrowserRowKind::Session,
@@ -78620,6 +78744,7 @@ mod tests {
                 expanded: true,
                 session_id: Some("019caaaa-8d68-70a1-bd8b-68487c4fc63d".to_string()),
                 session_cwd: Some("/home/user/gh/yggterm".to_string()),
+                session_kind: None,
             },
         ];
         let filtered = filtered_sidebar_rows(&rows, "excel design");
@@ -78653,6 +78778,7 @@ mod tests {
                 expanded: true,
                 session_id: Some(format!("litellm-{ix}")),
                 session_cwd: Some("/home/user".to_string()),
+                session_kind: None,
             })
             .collect::<Vec<_>>();
         let rendered = sidebar_rows_for_render(&rows, "litellm");
@@ -78677,6 +78803,7 @@ mod tests {
             expanded: true,
             session_id: Some("019cf672-8d68-70a1-bd8b-68487c4fc63d".to_string()),
             session_cwd: Some("/home/user/gh/excel-inspired".to_string()),
+            session_kind: None,
         }];
         assert_eq!(search_sidebar_matches(&rows, "q4fc63d").len(), 1);
         assert_eq!(
@@ -78697,6 +78824,7 @@ mod tests {
             expanded: true,
             session_id: Some("vercel-run".to_string()),
             session_cwd: Some("/home/user/gh/vercel/app".to_string()),
+            session_kind: None,
         }];
         assert_eq!(search_sidebar_matches(&slash_rows, "vercel/").len(), 1);
         assert!(search_sidebar_matches(&rows, "timezone").is_empty());
@@ -78717,6 +78845,7 @@ mod tests {
             expanded: true,
             session_id: Some("version-proof".to_string()),
             session_cwd: Some("/home/user/gh/yggterm".to_string()),
+            session_kind: None,
         }];
         set_sidebar_search_context(
             &[RemoteMachineSnapshot {
@@ -78770,6 +78899,7 @@ mod tests {
                 expanded: true,
                 session_id: None,
                 session_cwd: None,
+                session_kind: None,
             },
             BrowserRow {
                 kind: BrowserRowKind::Group,
@@ -78785,6 +78915,7 @@ mod tests {
                 expanded: true,
                 session_id: None,
                 session_cwd: Some("/home/user/gh".to_string()),
+                session_kind: None,
             },
             BrowserRow {
                 kind: BrowserRowKind::Session,
@@ -78800,6 +78931,7 @@ mod tests {
                 expanded: true,
                 session_id: Some("1".to_string()),
                 session_cwd: Some("/home/user/gh/excel-inspired".to_string()),
+                session_kind: None,
             },
         ];
         let matches = search_sidebar_matches(&rows, "home/pi/gh");
@@ -78872,6 +79004,7 @@ mod tests {
             expanded: true,
             session_id: Some("test".to_string()),
             session_cwd: Some("/tmp".to_string()),
+            session_kind: None,
         }
     }
 
@@ -78890,6 +79023,7 @@ mod tests {
             expanded: true,
             session_id: None,
             session_cwd: Some("/tmp".to_string()),
+            session_kind: None,
         }
     }
 
@@ -78943,6 +79077,7 @@ mod tests {
             expanded: true,
             session_id: path.rsplit('/').next().map(ToOwned::to_owned),
             session_cwd: cwd.map(ToOwned::to_owned),
+            session_kind: None,
         }
     }
 
@@ -79505,6 +79640,7 @@ mod tests {
             expanded: true,
             session_id: None,
             session_cwd: Some("/notes".to_string()),
+            session_kind: None,
         };
 
         assert_eq!(
@@ -79638,6 +79774,7 @@ mod tests {
             expanded: true,
             session_id: Some("abc123".to_string()),
             session_cwd: Some("/home/user/gh/excel-inspired".to_string()),
+            session_kind: None,
         }];
         let live_sessions = vec![ManagedSessionView {
             id: "abc123".to_string(),
@@ -87400,6 +87537,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             expanded: true,
             session_id: Some("session".to_string()),
             session_cwd: Some("/home/user".to_string()),
+            session_kind: None,
         };
         let mut expanded_paths =
             HashSet::from(["local".to_string(), "/".to_string(), "/home/user".to_string()]);
@@ -87614,6 +87752,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             expanded: true,
             session_id: None,
             session_cwd: None,
+            session_kind: None,
         };
         shell.select_tree_row(&machine_row, TreeSelectionMode::Replace);
         let selected = shell.selected_copy_generation_rows(Some(&machine_row));
@@ -90575,6 +90714,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             expanded: true,
             session_id: None,
             session_cwd: Some("/home/user/gh/yggterm".to_string()),
+            session_kind: None,
         });
         snapshot.rows = vec![test_browser_session_row(
             "remote-session://dev/older-yggterm",
@@ -90662,6 +90802,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             expanded: true,
             session_id: None,
             session_cwd: Some("/home/user".to_string()),
+            session_kind: None,
         });
         let visible_rows = vec![snapshot.selected_row.clone().unwrap()];
         let all_rows = vec![
@@ -90754,6 +90895,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             expanded: true,
             session_id: None,
             session_cwd: Some("/home/user".to_string()),
+            session_kind: None,
         });
         snapshot.rows = vec![
             snapshot.selected_row.clone().unwrap(),
@@ -90845,6 +90987,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             expanded: true,
             session_id: None,
             session_cwd: Some("/home/user/gh/yggterm".to_string()),
+            session_kind: None,
         };
 
         shell.browser.ensure_expanded_paths(vec![
