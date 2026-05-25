@@ -160,6 +160,9 @@ All major bugs fixed. No remaining open items.
 - [x] **Bug 7**: Fixed duplicate rows (7 → 0). Two fixes: (1) `inject_cc_sessions_into_stored_rows` skips sessions already in stored_rows by session_id; (2) `display_promoted_sessions` excludes sessions already in machine scanned set. Total rows: 127 → 112. Fixed commit `3f9aecd`.
 - [x] **gstack skill**: Installed on pi, dev, and jojo. See below.
 - [x] **Verify after daemon restart**: Killed daemon, waited for GUI to restart it. CC rows: 20 before, 20 after. All `remote-cc://` paths correct. Bug 6 verified.
+- [x] **Bug 8 — Local Codex/CC sessions invisible in Live Sessions**: Fixed commit `c1b46cf`. Local sessions (kind=Codex/CC, path=`local://`) were filtered OUT of `display_promoted_sessions` by `!is_local_tree_live_session`, then injected into stored tree via `inject_local_live_session_rows`. New sessions with no stored row were invisible. Fix: removed both the filter and the inject call. `promoted_storage_paths` dedup (already in extend step) handles preventing file-backed CC row from appearing twice. Verified: relaunched Codex session appears at top of Live Sessions group.
+- [x] **Bug 9 — `remote-session://` classified as SshShell**: Fixed in commit `c1b46cf`. `row_session_kind` had `remote-session://` in the SshShell arm, causing remote Codex sessions to get wrong button style and icon. Moved to Codex arm.
+- [x] **Wayland clipboard fix (jojo)**: jojo runs pure Wayland — no X11 sockets. SSH restarts with `DISPLAY=:0` caused arboard to fail (tried X11 connection, no socket). Fix: always restart with `DISPLAY= WAYLAND_DISPLAY=wayland-0 XDG_RUNTIME_DIR=/run/user/1000`. Image paste notifications were showing "Paste Failed" with X11 connection error.
 
 ---
 
