@@ -32,8 +32,10 @@ xterm.js owns vs what the shell owns, cursor/prompt semantics, etc. — see
 | ID | Symptom | Status |
 |----|---------|--------|
 | [scrollback-lost-on-session-switch](#scrollback-lost-on-session-switch) | User-scrolled scrollback collapses to live cursor when switching sessions | PARTIALLY FIXED |
-| [scrollback-lost-on-gui-restart](#scrollback-lost-on-gui-restart) | Scroll position lost when GUI restarts (daemon survives) | OPEN, needs persistence |
+| [scrollback-lost-on-gui-restart](#scrollback-lost-on-gui-restart) | Scroll position lost when GUI restarts (daemon survives) | FIXED 2026-05-26 |
 | [resume-gate-too-restrictive](#resume-gate-too-restrictive) | Resuming a session that's mid-output (no prompt visible) takes 60-160s to clear "not ready" gate | FIXED 2026-05-25 |
+| [scroll-jump-on-input](#scroll-jump-on-input) | Typing in a session yanks viewport to a "particular spot" (flicker between spot and prompt); scroll-lock variant kicks user back when scrolling | OPEN, investigating |
+| [dom-leak-on-session-start](#dom-leak-on-session-start) | Portion of *prior* message context flashes briefly during session start/switch then goes away | OPEN, uninvestigated |
 | [slow-jitter](#slow-jitter) | Some sessions exhibit visible per-frame jitter under steady PTY output | OPEN, uninvestigated |
 | [blank-rendering-region](#blank-rendering-region) | Region inside an active session goes blank until forced redraw | OPEN, uninvestigated |
 
@@ -110,7 +112,7 @@ it changes by more than a small delta despite no user input.
 
 ## scrollback-lost-on-gui-restart
 
-**STATUS:** OPEN — needs a persistence layer.
+**STATUS:** FIXED 2026-05-26 — localStorage-based persistence verified live on jojo.
 
 ### Symptom
 User scrolls up in session A, agent deploys a GUI binary (kills GUI,
@@ -122,52 +124,54 @@ is at the bottom again. User loses their scrollback position.
 2. Scroll up so the live cursor is well off-screen.
 3. Restart the GUI process (daemon survives).
 4. After GUI re-launches, navigate to the original session.
-5. Observe: viewport is at the bottom; user's scroll position is gone.
+5. Before fix: viewport snapped to bottom; user's scroll position gone.
+6. After fix: viewport restored to ~same row distance from bottom.
 
 ### Root cause
-`scrollbackIntent` and `viewportY` are JS-side state inside
-`window.__yggtermXtermSessionSnapshots[sessionPath]`. This dictionary is
-in-process. When the GUI process dies, it's gone.
+`scrollbackIntent` and `viewportY` were JS-side state inside
+`window.__yggtermXtermSessionSnapshots[sessionPath]` — a process-local
+dictionary. When the GUI process dies, the dict is gone. The on-mount
+restore path needed an out-of-process store.
 
-The on-mount restore path (shell.rs ~57846) DOES support restoring
-`UserScrollback` intent + `viewportY` — but only when it has a snapshot to
-restore from, which the in-process dict doesn't provide after restart.
+### Fix
+WebKitGTK-backed localStorage **does persist** across GUI restarts (file
+at `~/.local/share/dev.yggterm.Yggterm/localstorage/dioxus_index.html_0.localstorage`).
+We piggyback on it:
 
-### Workaround / fix
-**Not yet implemented.** Two viable plans:
-
-1. **Daemon-side persistence.** Add `scrollback_intent` and
-   `scrollback_viewport_y` fields on the daemon's `ManagedSessionView`.
-   GUI debounces (~500ms) and sends `ScrollState { session_path, intent,
-   viewport_y }` to daemon. Daemon stores per session, includes in
-   `SnapshotSessionView` sent to GUI. GUI on terminal mount checks the
-   snapshot for prior scroll state and applies it via the existing
-   restore path. Survives GUI restart whenever daemon stays alive.
-   Survives daemon hot-restart because `persisted_state_for_update_restart`
-   serializes the full ManagedSessionView.
-
-2. **GUI-only file persistence.** GUI writes
-   `~/.yggterm/xterm-scrollback-state.json` on scroll change (debounced),
-   reads on startup. Simpler but doesn't survive a daemon-only restart.
-
-Plan 1 is the right one — it's the single source of truth path. Estimated
-~5-file change: ManagedSessionView field, IPC request type, daemon
-handler, snapshot field, GUI mount-time restore call.
+- **Save** on every `setScrollbackIntent` call, every `captureSessionXtermSnapshot`
+  call, and every `term.onScroll` event (throttled to 200ms when
+  `scrollbackLocked`). Saved value:
+  `{intent, viewportY, baseY, distanceFromBottom, locked, reason, savedAtMs}`.
+- **Restore** in `restoreXtermSessionSnapshotOnConstructed` when the
+  in-memory snapshot is absent: pre-arm `scrollbackIntent='UserScrollback'`
+  immediately so initial replay doesn't auto-scroll to bottom, then poll
+  at 1s/2s/3s/.../8s. Each poll waits for `baseY >= distanceFromBottom`
+  AND baseY-stable-for-600ms (replay finished), then `forceXtermViewportY(baseY - distanceFromBottom)`.
+- **Restore-window guard** suppresses save during the 8s deadline so
+  post-restart replay doesn't overwrite the user's saved position.
 
 ### Code locations
-- `crates/yggterm-shell/src/shell.rs:~56917` — snapshot construction
-  (where scrollbackIntent is captured into the in-memory snapshot)
-- `crates/yggterm-shell/src/shell.rs:~57846` — restore path (already
-  correctly applies `UserScrollback` + viewportY when present)
-- `crates/yggterm-server/src/lib.rs` — `ManagedSessionView` (add fields)
-- `crates/yggterm-server/src/lib.rs` — `SnapshotSessionView` (add fields)
+- `crates/yggterm-shell/src/shell.rs:~57110` — `setScrollbackIntent` calls `persistScrollStateToLocalStorage` (with restore-in-flight guard)
+- `crates/yggterm-shell/src/shell.rs:~57110` (just above) — `persistScrollStateToLocalStorage` / `loadScrollStateFromLocalStorage` helpers
+- `crates/yggterm-shell/src/shell.rs:~57790` — `restoreXtermSessionSnapshotOnConstructed` localStorage fallback path
+- `crates/yggterm-shell/src/shell.rs:~57790` (just above) — `tryApplyPendingPersistedScrollRestore` (stability gate)
+- `crates/yggterm-shell/src/shell.rs:~61220` — `term.onScroll` listener (throttled persist + opportunistic apply)
 
 ### Tests
-None yet.
+TODO. Test should assert presence of helper names and the
+`yggterm-scroll:` localStorage key prefix in the generated script.
 
 ### Telemetry
-Proposed: emit `xterm_scrollback_state_persisted` debounce events to
-trace, plus `xterm_scrollback_state_restored` on successful restore.
+`scrollback_intent` debug event already fires on every change. Restore
+emits `persisted_scroll_restored host=... target=... distance=... reason=...`
+debug event. Host-state fields: `persistedScrollRestorePending`,
+`persistedScrollRestoreApplied`, `persistedScrollRestoreTargetViewportY`.
+
+### Verification (2026-05-26, live on jojo)
+- Scroll up 40 lines in `remote-session://dev/019dbdcf-9f11-7932-afb2-0d7b7c35914b` → `viewport_y=960, base_y=1000`.
+- localStorage SQLite row written: `{viewportY: 960, baseY: 1000, distanceFromBottom: 40, ...}`.
+- SIGTERM GUI, relaunch. After ~6s settle: `viewport_y=960, base_y=1000, scrollback_intent=UserScrollback, scrollback_locked=true, last_viewport_force_reason=persisted_scroll_restore:poll_2000`.
+- Screenshot confirms user is reading scrollback (not at bottom prompt).
 
 ### Related memory
 `[[xterm-scrollback-bug]]`
@@ -252,6 +256,153 @@ on values > 5000.
 Reported live by user 2026-05-25: "Why is this session gated? This
 gating on resuming needs to take as less time as possible, but this
 getting stuck is also another xterm bug painpoint."
+
+---
+
+## scroll-jump-on-input
+
+**STATUS:** OPEN — reported live 2026-05-26 on jojo, multiple variants.
+
+### Symptom
+A class of related bugs where the viewport "jumps to a particular spot"
+unexpectedly. Variants reported by user:
+
+1. **Flicker-jump on type.** User is reading scrollback; pressing a key
+   causes the viewport to flicker very fast between "the particular spot"
+   and the prompt. Looks like two competing scroll handlers fighting per
+   keystroke.
+2. **Scroll-lock variant.** User tries to scroll down a little; after a
+   small delta the viewport is yanked back to the same "particular spot".
+3. **Random scrollback during session switch.** Switching to a session
+   sometimes lands on a stale viewport instead of bottom or last-known.
+
+### Reproduction
+Not yet captured deterministically. Reproduce path under investigation:
+mid-output session, scroll up partway, type any key, watch viewport.
+Live host `jojo`, active session
+`remote-session://dev/019dbdcf-9f11-7932-afb2-0d7b7c35914b`.
+
+### Root cause
+Unknown. Hypotheses:
+
+- **Two competing handlers per input.** `handleExternalReadNudge` at
+  shell.rs:~60054 fires `setScrollbackIntent('PromptFollow', 'external_input')`
+  + `scrollLiveCursorIntoView(true, 'external_input')` (force to bottom).
+  At the same time, the data event at shell.rs:~61490 fires
+  `setScrollbackIntent('PromptFollow', 'input')` +
+  `scrollLiveCursorIntoView(true, 'input')`. Both call
+  `forceXtermViewportY(baseY)`. If the first lands and the second
+  re-resolves baseY after a write, viewport flickers.
+- **Snapback to in-memory snapshot.** If snapshot capture ran while user
+  was at viewport=X, a later restore-from-snapshot path could pull viewport
+  back to X — the "particular spot" — every time it fires.
+- **Visual-mismatch-at-bottom.** `syncScrollbackLock` at shell.rs:~57318
+  detects `publicViewportY >= baseY && viewportY < baseY` and flips
+  `scrollbackLocked = false` even when user is genuinely scrolled-up.
+  This racing with `forceXtermViewportY` retries could cause the lock to
+  toggle false→true→false repeatedly, fighting the user.
+
+### Workaround / fix
+Not yet implemented. Next steps:
+
+1. Add per-frame telemetry: emit `xterm_scroll_jump` event whenever
+   `forceXtermViewportY` is called with reason involving 'input'/'external_input'
+   and the buffer's baseY changes within 200ms of the call. Capture
+   `(reason, before_viewport, after_viewport, baseY)` to identify the
+   competing caller.
+2. Add a "user is scrolled up" guard at the data-event input path so a
+   keystroke does not auto-scroll to bottom when user is still scrolled
+   up beyond N rows.
+3. Investigate whether `handleExternalReadNudge` and the data input both
+   need to force-follow, or if only one should.
+
+### Code locations
+- `crates/yggterm-shell/src/shell.rs:~60054` — `handleExternalReadNudge` (PromptFollow + cursor scroll)
+- `crates/yggterm-shell/src/shell.rs:~61490` — terminal input data event (PromptFollow + cursor scroll)
+- `crates/yggterm-shell/src/shell.rs:~57318` — `syncScrollbackLock` visual-mismatch path
+- `crates/yggterm-shell/src/shell.rs:~57647` — `forceXtermViewportY` definition
+
+### Tests
+None yet. Need a JSDOM-level test that drives a keystroke into a
+scrolled-up xterm and asserts viewport doesn't change.
+
+### Telemetry
+Proposed: `xterm_scroll_jump_after_input` debug event with `before_y`,
+`after_y`, `base_y`, `reason`, `dt_ms`.
+
+### Related
+Reported by user 2026-05-26: "when I type the xterm buffer jumps to a
+random selected particular spot... scroll lock which also this session
+has; which means if I try to scroll down I will get kicked into this
+spot after trying a little bit."
+
+---
+
+## dom-leak-on-session-start
+
+**STATUS:** OPEN — reported live 2026-05-26 on jojo.
+
+### Symptom
+When starting or switching to a session after a long time, during the
+startup window a portion of *prior* message context appears briefly in a
+weird way. After session restore + further input it goes away.
+
+Reads like stale DOM rows from a previous session's `.xterm-rows`
+children being left attached during the swap, or innerHTML from a
+previous snapshot being injected before the new buffer fully renders.
+
+### Reproduction
+Not yet captured deterministically. Conditions: session left idle for
+"long time", then switch to it. The xterm host DOM remains mounted; a
+swap or replay populates it; for a few frames the OLD rows are visible.
+
+### Root cause
+Unknown. Hypotheses:
+
+- **Retained-host DOM swap timing.** When we swap session-bound state
+  inside the same xterm host (`__yggtermXtermHosts[hostId]`), the new
+  session's `term.reset()/clear()` may run a frame after the new
+  innerHTML/buffer is mounted, leaving the old `.xterm-rows` rendered.
+- **Snapshot innerHTML reattach.** If `captureSessionXtermSnapshot`
+  stored an `innerHTML` blob and `restoreXtermSessionSnapshotOnConstructed`
+  injected it before `term.reset()`, the prior session's text would
+  paint for one frame.
+- **Inactive-host hidden but not cleared.** If we visually hide one
+  host and reveal another without clearing the hidden one's buffer,
+  the brief overlap (during fade/transition) shows the wrong content.
+
+### Workaround / fix
+Not yet implemented. Next steps:
+
+1. Add a "first paint" telemetry hook that captures the visible host's
+   first 3 frames as text samples and emits `xterm_first_paint host=... text_sample=...`.
+2. Compare those samples with the captured snapshot from the PRIOR
+   session; if they match prior, we have a leak.
+3. Audit `term.reset()` / `term.clear()` ordering vs first xterm.write
+   in `restoreXtermSessionSnapshotOnConstructed` (shell.rs:~57803-57815).
+4. Confirm whether retained-host swap clears `host.innerHTML` before
+   the new term is constructed.
+
+### Code locations
+- `crates/yggterm-shell/src/shell.rs:~57788` — `restoreXtermSessionSnapshotOnConstructed`
+- `crates/yggterm-shell/src/shell.rs:~57803` — `term.reset()/term.clear()` call sites
+- `crates/yggterm-shell/src/shell.rs:~55539` — `entry.sessionPath = host.getAttribute("data-terminal-session-path")` (host rebind)
+
+### Tests
+None yet. Hard to assert; will need a probe that captures the host
+innerText immediately on session switch and asserts it doesn't contain
+substrings from the previous session's last screen.
+
+### Telemetry
+Proposed: `xterm_first_paint_sample` capturing first 256 chars of
+`host.innerText` 0/16/64 ms after host-rebind, compared against the
+prior session's known last screen.
+
+### Related
+Reported by user 2026-05-26: "when I start or switch to a session after
+a long time and during startup I see a portion of my message context in
+a weird way randomly. Upon session restore and after geting it goes
+away."
 
 ---
 
