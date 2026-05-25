@@ -153,25 +153,71 @@ When running the CC scan manually from the user's shell (`ssh jojo 'ssh dev pyth
 
 ## What Still Needs to Be Done
 
-- [ ] **Bug 5**: Unify button colors — create `session_kind_primary_color(kind, palette)` function, use it for both top-bar and card buttons. Fix "Open in Codex" from `#6366f1` to `palette.accent`. Decide on CC color: amber `#d97706` or `palette.accent`. Apply consistently everywhere.
-- [ ] **Bug 6**: Fix `load_remote_machine_sessions_from_mirror` to preserve session path type (add `session_path` column to mirror DB). Without this, CC sessions appear correctly only until the daemon restarts; after restart they're loaded with wrong paths.
-- [ ] **Bug 7**: Fix 7 duplicate sidebar rows (live + stored).
+All major bugs fixed. No remaining open items.
+
+- [x] **Bug 5**: Unified button colors via `session_kind_primary_bg(kind, accent)` function in shell.rs. "Open in Codex" card now uses `palette.accent`. Fixed commit `3f9aecd`.
+- [x] **Bug 6**: Added `session_path` column to `remote_session_metadata` mirror DB. `mirror_remote_machine_sessions` stores full path. `load_remote_machine_sessions_from_mirror` reads it back with fallback. Verified: 20 CC rows survive daemon restart with `remote-cc://` paths. Fixed commit `3f9aecd`.
+- [x] **Bug 7**: Fixed duplicate rows (7 → 0). Two fixes: (1) `inject_cc_sessions_into_stored_rows` skips sessions already in stored_rows by session_id; (2) `display_promoted_sessions` excludes sessions already in machine scanned set. Total rows: 127 → 112. Fixed commit `3f9aecd`.
 - [x] **gstack skill**: Installed on pi, dev, and jojo. See below.
-- [ ] **Verify after daemon restart**: Restart the daemon fresh (without triggering a scan first) and confirm CC sessions still appear correctly (this tests Bug 6's impact).
+- [x] **Verify after daemon restart**: Killed daemon, waited for GUI to restart it. CC rows: 20 before, 20 after. All `remote-cc://` paths correct. Bug 6 verified.
 
 ---
 
-## Key Code Locations for Next Agent
+## Bug 5 — Button Color Fix Details (commit `3f9aecd`)
+**Status: FIXED**
 
-| Concept | File | Line |
-|---------|------|------|
+Added `fn session_kind_primary_bg<'a>(kind: SessionKind, accent: &'a str) -> &'a str` near `row_session_kind` (~line 14558 of shell.rs). Returns `#d97706` for CC, `accent` for Codex/CodexLiteLlm. Both top-bar buttons and card `open_button_style` now call this function. The hardcoded `#6366f1` (indigo) for card Codex buttons is gone — they now use `palette.accent` (same blue as top-bar "New Codex Session" button).
+
+---
+
+## Bug 6 — Mirror DB Path Type Fix Details (commit `3f9aecd`)
+**Status: FIXED**
+
+1. `open_remote_metadata_mirror_store` (lib.rs:10291): Added `session_path TEXT NOT NULL DEFAULT ''` to schema. Runs `ALTER TABLE ... ADD COLUMN session_path` after CREATE TABLE, swallowing "duplicate column name" for existing databases.
+2. `mirror_remote_machine_sessions` (lib.rs:10323): Stores `session.session_path` as param `?15` in INSERT.
+3. `load_remote_machine_sessions_from_mirror` (lib.rs:10367): Reads `session_path` at index 12. Uses it directly if non-empty, falls back to `remote_scanned_session_path()` otherwise (migration path for older DB rows).
+
+---
+
+## Bug 7 — Duplicate Row Fix Details (commit `3f9aecd`)
+**Status: FIXED**
+
+Two separate root causes:
+
+**Fix A** — Local CC session doubled with file-backed row (`inject_cc_sessions_into_stored_rows`, shell.rs ~line 19804):
+Added `stored_session_ids: HashSet<String>` from existing stored rows. Skips live CC sessions whose `session.id` is already in `stored_session_ids`.
+
+**Fix B** — Remote live Codex sessions doubled in Live Sessions + machine group (`merged_sidebar_rows_uncached`, shell.rs ~line 19431):
+After resort, build `machine_scanned_paths: HashSet<String>` of all session paths in any machine's `scanned_sessions`. Filter `display_promoted_sessions` to exclude sessions in `machine_scanned_paths`. This prevents sessions that are both live AND in the dev scan from appearing in both the "Live Sessions" group and the dev machine group.
+
+Result: Row count 127 → 112, duplicates 7 → 0. Verified live.
+
+---
+
+## gstack Installation (commit `3f9aecd`)
+**Status: DONE**
+
+[gstack](https://github.com/garrytan/gstack) by Garry Tan — Claude Code skill framework with 25+ slash commands.
+
+- **pi**: `git clone ssh://dev/home/pi/gh/gstack ~/.claude/skills/gstack && cd ~/.claude/skills/gstack && ./setup`
+- **dev**: `git clone ~/gh/gstack ~/.claude/skills/gstack && ./setup` (bun installed first)
+- **jojo**: `git clone https://github.com/garrytan/gstack.git ~/.claude/skills/gstack && ./setup` (bun installed first)
+
+Available skills: `/review`, `/ship`, `/qa`, `/investigate`, `/plan-eng-review`, `/plan-ceo-review`, `/retro`, `/office-hours`, `/autoplan`, and 16+ more. See `CLAUDE.md` for the full list.
+
+---
+
+## Key Code Locations
+
+| Concept | File | Approx Line |
+|---------|------|-------------|
+| `session_kind_primary_bg` (Bug 5 SSOT) | `crates/yggterm-shell/src/shell.rs` | 14558 |
+| Top-bar button styles | `crates/yggterm-shell/src/shell.rs` | 63443–63453 |
+| Card `open_button_style` | `crates/yggterm-shell/src/shell.rs` | 63635 |
+| `inject_cc_sessions_into_stored_rows` (Bug 7a) | `crates/yggterm-shell/src/shell.rs` | 19804 |
+| `display_promoted_sessions` filter (Bug 7b) | `crates/yggterm-shell/src/shell.rs` | 19442 |
+| `open_remote_metadata_mirror_store` (Bug 6 schema) | `crates/yggterm-server/src/lib.rs` | 10291 |
+| `mirror_remote_machine_sessions` (Bug 6 store) | `crates/yggterm-server/src/lib.rs` | 10323 |
+| `load_remote_machine_sessions_from_mirror` (Bug 6 load) | `crates/yggterm-server/src/lib.rs` | 10367 |
 | `remote_scanned_session_is_durable` | `crates/yggterm-server/src/lib.rs` | 1359 |
-| `dedupe_remote_scanned_sessions` | `crates/yggterm-server/src/lib.rs` | 10454 |
-| `run_remote_python_lines` (stdin fix) | `crates/yggterm-server/src/lib.rs` | 10555 |
-| `load_remote_machine_sessions_from_mirror` (Bug 6) | `crates/yggterm-server/src/lib.rs` | 10367 |
-| `mirror_remote_machine_sessions` | `crates/yggterm-server/src/lib.rs` | 10323 |
 | `REMOTE_CC_SCAN_SCRIPT` | `crates/yggterm-server/src/lib.rs` | 11582 |
-| `scan_remote_machine_sessions` | `crates/yggterm-server/src/lib.rs` | 11698 |
-| Top-bar button styles (Bug 5) | `crates/yggterm-shell/src/shell.rs` | 63437–63453 |
-| Card `open_button_style` (Bug 5) | `crates/yggterm-shell/src/shell.rs` | 63635–63652 |
-| `remote_scanned_session_is_start_page_durable` | `crates/yggterm-shell/src/shell.rs` | 63192 |
