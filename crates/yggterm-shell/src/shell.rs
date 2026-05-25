@@ -60190,6 +60190,33 @@ fn terminal_eval_script_with_canvas_renderer(
         restoreXtermSessionSnapshotOnConstructed();
         syncTerminalScrollController('constructed');
         scheduleCursorCellBackgroundRefresh('constructed');
+        // XTERM-BUG: dom-leak-on-session-start — capture host innerText at 0ms,
+        // 16ms, 64ms after mount so we can detect content from a prior session
+        // bleeding through during the swap. Each sample is the first 240 chars
+        // of host.innerText. Emitted as `xterm_first_paint_sample`.
+        const _captureFirstPaintSample = (label, delayMs) => {{
+            const fire = () => {{
+                try {{
+                    const sessionPath = host.getAttribute("data-terminal-session-path") || "";
+                    const text = String(host.innerText || '').replace(/\s+/g, ' ').trim().slice(0, 240);
+                    sendTerminalEvent({{
+                        kind: 'debug',
+                        message: `xterm_first_paint_sample host=${{hostId}} session=${{sessionPath}} label=${{label}} delay_ms=${{delayMs}} len=${{text.length}} text=${{JSON.stringify(text)}}`
+                    }});
+                    const entry = window.__yggtermXtermHosts && window.__yggtermXtermHosts[hostId]
+                        ? window.__yggtermXtermHosts[hostId] : null;
+                    if (entry) {{
+                        entry[`firstPaintSample_${{label}}`] = text;
+                        entry[`firstPaintSampleAtMs_${{label}}`] = Date.now();
+                    }}
+                }} catch (_e) {{}}
+            }};
+            if (delayMs <= 0) {{ fire(); }} else {{ window.setTimeout(fire, delayMs); }}
+        }};
+        _captureFirstPaintSample('t0', 0);
+        _captureFirstPaintSample('t16', 16);
+        _captureFirstPaintSample('t64', 64);
+        _captureFirstPaintSample('t256', 256);
         const handleExternalReadNudge = (event) => {{
             try {{
                 const detail = event && event.detail ? event.detail : {{}};
