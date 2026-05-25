@@ -33,7 +33,7 @@ xterm.js owns vs what the shell owns, cursor/prompt semantics, etc. — see
 |----|---------|--------|
 | [scrollback-lost-on-session-switch](#scrollback-lost-on-session-switch) | User-scrolled scrollback collapses to live cursor when switching sessions | PARTIALLY FIXED |
 | [scrollback-lost-on-gui-restart](#scrollback-lost-on-gui-restart) | Scroll position lost when GUI restarts (daemon survives) | OPEN, needs persistence |
-| [resume-gate-too-restrictive](#resume-gate-too-restrictive) | Resuming a session that's mid-output (no prompt visible) takes 60-160s to clear "not ready" gate | OPEN, needs design |
+| [resume-gate-too-restrictive](#resume-gate-too-restrictive) | Resuming a session that's mid-output (no prompt visible) takes 60-160s to clear "not ready" gate | FIXED 2026-05-25 |
 | [slow-jitter](#slow-jitter) | Some sessions exhibit visible per-frame jitter under steady PTY output | OPEN, uninvestigated |
 | [blank-rendering-region](#blank-rendering-region) | Region inside an active session goes blank until forced redraw | OPEN, uninvestigated |
 
@@ -176,7 +176,7 @@ trace, plus `xterm_scrollback_state_restored` on successful restore.
 
 ## resume-gate-too-restrictive
 
-**STATUS:** OPEN — fix needs careful design.
+**STATUS:** FIXED 2026-05-25 (commit `332072e`) — verified live, 740x faster.
 
 ### Symptom
 User opens (or resumes) a remote session that is in the middle of long
