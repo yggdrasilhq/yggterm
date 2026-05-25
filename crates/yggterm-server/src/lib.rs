@@ -10580,10 +10580,11 @@ fn run_remote_python_lines(
     let mut child = cmd
         .spawn()
         .with_context(|| format!("failed to start ssh python for {ssh_target}"))?;
-    if let Some(stdin) = child.stdin.as_mut() {
+    if let Some(mut stdin) = child.stdin.take() {
         stdin
             .write_all(script.as_bytes())
             .with_context(|| format!("failed to send script to {ssh_target}"))?;
+        // stdin is dropped here, closing the pipe so python3 sees EOF and can finish.
     }
     let output = wait_remote_command_with_timeout(
         child,
@@ -10632,10 +10633,11 @@ fn run_remote_python(
     let mut child = cmd
         .spawn()
         .with_context(|| format!("failed to start ssh python for {ssh_target}"))?;
-    if let Some(stdin) = child.stdin.as_mut() {
+    if let Some(mut stdin) = child.stdin.take() {
         stdin
             .write_all(script.as_bytes())
             .with_context(|| format!("failed to send script to {ssh_target}"))?;
+        // stdin is dropped here, closing the pipe so python3 sees EOF and can finish.
     }
     let output = child
         .wait_with_output()
@@ -11583,6 +11585,9 @@ const REMOTE_CC_SCAN_SCRIPT: &str = r#"
 import json, os, sys
 from pathlib import Path
 
+# Read at most 512 KB per file to avoid hanging on huge active sessions.
+MAX_BYTES_PER_FILE = 512 * 1024
+
 def scan_cc_session(jsonl_path):
     # Use the filename stem as the canonical session_id fallback (mirrors Rust behavior).
     fallback_id = Path(jsonl_path).stem
@@ -11593,7 +11598,11 @@ def scan_cc_session(jsonl_path):
     context_parts = []
     try:
         with open(jsonl_path, encoding='utf-8', errors='ignore') as f:
+            bytes_read = 0
             for line in f:
+                bytes_read += len(line.encode('utf-8', errors='ignore'))
+                if bytes_read > MAX_BYTES_PER_FILE:
+                    break
                 line = line.strip()
                 if not line:
                     continue
@@ -11639,21 +11648,22 @@ def scan_cc_session(jsonl_path):
                 # cwd fallback: any record that carries a top-level cwd field
                 if cwd is None and r.get('cwd') and r['cwd'].strip():
                     cwd = r['cwd'].strip()
-                if cwd and ai_title is not None and first_human_text is not None:
+                if ai_title is not None and first_human_text is not None and cwd is not None:
                     break
     except Exception:
         return None
     # Use filename stem as session_id if no explicit sessionId was found in the file.
     resolved_id = session_id or fallback_id
-    if not resolved_id or not cwd:
+    if not resolved_id:
         return None
+    # cwd may be empty for sessions that haven't set it; that is valid.
     try:
         mtime = int(os.path.getmtime(str(jsonl_path)))
     except Exception:
         mtime = 0
     return {
         'session_id': resolved_id,
-        'cwd': cwd,
+        'cwd': cwd or '',
         'title': ai_title or first_human_text or resolved_id[:8],
         'context': ' · '.join(context_parts),
         'mtime': mtime,
@@ -11762,41 +11772,81 @@ fn scan_remote_machine_sessions(
     // yggterm scan failed (e.g. lock busy), because CC sessions live in ~/.claude/,
     // not ~/.codex/, and don't require the remote scan lock.
     let mut cc_found = false;
-    if let Ok(cc_lines) = run_remote_python_lines(
+    match run_remote_python_lines(
         &target.ssh_target,
         target.prefix.as_deref(),
         REMOTE_CC_SCAN_SCRIPT,
         &[],
     ) {
-        let existing_ids: std::collections::HashSet<String> =
-            sessions.iter().map(|s| s.session_id.clone()).collect();
-        let mut cc_sessions: Vec<RemoteScannedSession> = Vec::new();
-        for line in cc_lines {
-            let Ok(summary) = serde_json::from_str::<RemoteCcSummaryLine>(&line) else {
-                continue;
-            };
-            if existing_ids.contains(&summary.session_id) {
-                continue;
+        Err(ref cc_err) => {
+            if let Ok(home) = resolve_yggterm_home() {
+                append_trace_event(
+                    &home,
+                    "server",
+                    "remote_machine",
+                    "cc_scan_failed",
+                    serde_json::json!({
+                        "ssh_target": target.ssh_target,
+                        "error": cc_err.to_string(),
+                    }),
+                );
             }
-            cc_sessions.push(RemoteScannedSession {
-                session_path: remote_cc_session_path(&machine_key, &summary.session_id),
-                session_id: summary.session_id,
-                cwd: summary.cwd,
-                started_at: String::new(),
-                modified_epoch: summary.mtime,
-                event_count: 0,
-                user_message_count: 0,
-                assistant_message_count: 0,
-                title_hint: summary.title,
-                recent_context: summary.context,
-                cached_precis: None,
-                cached_summary: None,
-                live_runtime: false,
-                storage_path: summary.path,
-            });
         }
-        cc_found = !cc_sessions.is_empty();
-        sessions.extend(cc_sessions);
+        Ok(cc_lines) => {
+            let existing_ids: std::collections::HashSet<String> =
+                sessions.iter().map(|s| s.session_id.clone()).collect();
+            let mut cc_sessions: Vec<RemoteScannedSession> = Vec::new();
+            let mut parse_errors = 0usize;
+            let mut id_collisions = 0usize;
+            for line in &cc_lines {
+                match serde_json::from_str::<RemoteCcSummaryLine>(line) {
+                    Err(_) => {
+                        parse_errors += 1;
+                        continue;
+                    }
+                    Ok(summary) => {
+                        if existing_ids.contains(&summary.session_id) {
+                            id_collisions += 1;
+                            continue;
+                        }
+                        cc_sessions.push(RemoteScannedSession {
+                            session_path: remote_cc_session_path(&machine_key, &summary.session_id),
+                            session_id: summary.session_id,
+                            cwd: summary.cwd,
+                            started_at: String::new(),
+                            modified_epoch: summary.mtime,
+                            event_count: 0,
+                            user_message_count: 0,
+                            assistant_message_count: 0,
+                            title_hint: summary.title,
+                            recent_context: summary.context,
+                            cached_precis: None,
+                            cached_summary: None,
+                            live_runtime: false,
+                            storage_path: summary.path,
+                        });
+                    }
+                }
+            }
+            if let Ok(home) = resolve_yggterm_home() {
+                append_trace_event(
+                    &home,
+                    "server",
+                    "remote_machine",
+                    "cc_scan_done",
+                    serde_json::json!({
+                        "ssh_target": target.ssh_target,
+                        "lines": cc_lines.len(),
+                        "parsed": cc_sessions.len(),
+                        "parse_errors": parse_errors,
+                        "id_collisions": id_collisions,
+                        "sample_storage_path": cc_sessions.first().map(|s| s.storage_path.clone()).unwrap_or_default(),
+                    }),
+                );
+            }
+            cc_found = !cc_sessions.is_empty();
+            sessions.extend(cc_sessions);
+        }
     }
 
     // Only propagate the deferred yggterm error if we have nothing to show at all.
