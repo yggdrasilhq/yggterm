@@ -85,6 +85,27 @@ Build **Yggdrasil Terminal**: a Rust-first, cross-platform, remote-first termina
   PTY-byte coalescing or trimming, post-hoc transport cleanup as a normal path,
   runtime-key identity substitution, alpha/blur/grain behavior in stable theme
   code, and stale-daemon mutation outside the hot-update protocol.
+- **Session display = dual presence.** An active session appears in BOTH the
+  "Live Sessions" group AND its cwd folder group (and on the start page,
+  ordered by recency). "Single source of truth" applies to the session OBJECT
+  (one `ManagedSessionView` per logical session), not to the display location.
+  Never silently filter a live session out of the cwd tree just because it
+  also appears in Live Sessions; if you find dedup code that does this, that
+  is a SPEC VIOLATION. Acceptable dedup is per-view (one row per logical
+  session within the same tree), not cross-view.
+- **SessionKind drives display, not path prefix.** Icon, glyph, label color,
+  button styling, and other display dispatch MUST consult `SessionKind`
+  (carried on `BrowserRow.session_kind` when the row was built from a
+  `ManagedSessionView`). Branches like `if path.starts_with("local://")
+  { "terminal" } else { "session" }` are SSOT violations — `local://` covers
+  both shells and Codex sessions, so the path alone cannot answer the
+  question. Path prefix is acceptable ONLY as a fallback for rows
+  synthesized from file paths where kind is genuinely unknown.
+- **Local and remote session display paths share code.** Do not introduce a
+  separate display path for local sessions vs remote sessions. Cosmetic
+  divergence (icon, label, button style) between a local Codex session and a
+  remote Codex session is itself a bug. When fixing session display, fix the
+  kind-driven code, not a locality-driven branch.
 - If code and docs disagree, stop and reconcile the interface doc before
   implementing. The canonical docs are `docs/protocol.md` for runtime/hot-update
   behavior, `docs/xterm.md` for terminal rendering and PTY bytes,
