@@ -10313,10 +10313,23 @@ fn open_remote_metadata_mirror_store() -> anyhow::Result<Connection> {
             cached_summary TEXT,
             storage_path TEXT NOT NULL,
             synced_at TEXT NOT NULL,
+            session_path TEXT NOT NULL DEFAULT '',
             PRIMARY KEY(machine_key, session_id)
         );",
     )
     .context("failed to initialize remote metadata mirror schema")?;
+    conn.execute(
+        "ALTER TABLE remote_session_metadata ADD COLUMN session_path TEXT NOT NULL DEFAULT ''",
+        [],
+    )
+    .or_else(|e| {
+        if e.to_string().contains("duplicate column name") {
+            Ok(0)
+        } else {
+            Err(e)
+        }
+    })
+    .context("failed to add session_path column to remote metadata mirror")?;
     Ok(conn)
 }
 
@@ -10340,8 +10353,8 @@ fn mirror_remote_machine_sessions(
             "INSERT INTO remote_session_metadata (
                 machine_key, session_id, cwd, started_at, modified_epoch, event_count,
                 user_message_count, assistant_message_count, title_hint, recent_context,
-                cached_precis, cached_summary, storage_path, synced_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                cached_precis, cached_summary, storage_path, synced_at, session_path
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
             params![
                 machine_key,
                 session.session_id,
@@ -10357,6 +10370,7 @@ fn mirror_remote_machine_sessions(
                 session.cached_summary,
                 session.storage_path,
                 synced_at,
+                session.session_path,
             ],
         )?;
     }
@@ -10371,15 +10385,21 @@ fn load_remote_machine_sessions_from_mirror(
     let mut stmt = conn.prepare(
         "SELECT session_id, cwd, started_at, modified_epoch, event_count, user_message_count,
                 assistant_message_count, title_hint, recent_context, cached_precis,
-                cached_summary, storage_path
+                cached_summary, storage_path, session_path
          FROM remote_session_metadata
          WHERE machine_key = ?1
          ORDER BY modified_epoch DESC, started_at DESC",
     )?;
     let rows = stmt.query_map(params![machine_key], |row| {
         let session_id: String = row.get(0)?;
+        let stored_path: String = row.get(12)?;
+        let session_path = if stored_path.is_empty() {
+            remote_scanned_session_path(machine_key, &session_id)
+        } else {
+            stored_path
+        };
         Ok(RemoteScannedSession {
-            session_path: remote_scanned_session_path(machine_key, &session_id),
+            session_path,
             session_id,
             cwd: row.get(1)?,
             started_at: row.get(2)?,

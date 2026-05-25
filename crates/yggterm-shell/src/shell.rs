@@ -14556,6 +14556,14 @@ fn row_session_kind(row: &BrowserRow) -> Option<SessionKind> {
     }
 }
 
+fn session_kind_primary_bg<'a>(kind: SessionKind, accent: &'a str) -> &'a str {
+    match kind {
+        SessionKind::ClaudeCode => "#d97706",
+        SessionKind::Codex | SessionKind::CodexLiteLlm => accent,
+        _ => accent,
+    }
+}
+
 fn is_hot_terminal_sidebar_path(path: &str) -> bool {
     path.starts_with("local://")
         || path.starts_with("ssh://")
@@ -19429,12 +19437,22 @@ fn merged_sidebar_rows_uncached(
     );
     let local_tree_ms = local_tree_started_at.elapsed().as_secs_f64() * 1000.0;
     let push_live_started_at = Instant::now();
+    // Build the set of session paths already represented in a machine group (via scanned sessions).
+    // A live session in this set should not also appear in the Live Sessions group — it is shown
+    // under its machine instead, enriched with live data by merge_remote_live_sessions.
+    let machine_scanned_paths: HashSet<String> = machine_rows
+        .values()
+        .flat_map(|machine| machine.scanned_sessions.iter())
+        .map(|session| session.session_path.clone())
+        .collect();
     // Exclude local-tree sessions (CC, new Codex-local) from "Live Sessions" group — they
     // appear under their CWD folder via inject_local_live_session_rows instead.
+    // Also exclude sessions already shown in a machine group to prevent duplicate rows.
     let display_promoted_sessions = promoted_live_sessions
         .iter()
         .copied()
         .filter(|s| !is_local_tree_live_session(s))
+        .filter(|s| !machine_scanned_paths.contains(&s.session_path))
         .collect::<Vec<_>>();
     push_live_session_rows(
         &mut rows,
@@ -19804,8 +19822,18 @@ fn inject_cc_sessions_into_stored_rows(
             .map(|s| (s.session_path.clone(), s.id.clone()))
             .collect::<Vec<_>>(),
     );
+    // Skip live CC sessions that already have a file-backed row in stored_rows (same session_id).
+    // Without this check, a running CC session appears twice: once from the file-backed row
+    // injected by inject_file_backed_cc_session_rows and again from this live injection.
+    let stored_session_ids: HashSet<String> = stored_rows
+        .iter()
+        .filter_map(|row| row.session_id.clone())
+        .collect();
     let mut insertions: Vec<(usize, BrowserRow)> = Vec::new();
     for session in sessions {
+        if stored_session_ids.contains(&session.id) {
+            continue;
+        }
         let cwd = metadata_value(session, "Cwd");
         let Some((group_idx, group_depth)) =
             find_best_group_for_cwd_in_rows(stored_rows, &cwd)
@@ -63440,16 +63468,17 @@ fn StartPage(snapshot: SharedSnapshot, state: Signal<ShellState>) -> Element {
          font-size:12px; font-weight:700; box-shadow:inset 0 0 0 1px rgba(120,142,166,0.16);",
         palette.panel_alt, palette.text
     );
-    let claude_code_button_style =
+    let claude_code_button_style = format!(
         "display:inline-flex; align-items:center; justify-content:center; gap:8px; min-height:34px; \
-         padding:0 13px; border:none; border-radius:8px; background:#d97706; color:white; \
-         font-size:12px; font-weight:800; box-shadow:0 8px 20px rgba(217,119,6,0.22);"
-        .to_string();
+         padding:0 13px; border:none; border-radius:8px; background:{}; color:white; \
+         font-size:12px; font-weight:800; box-shadow:0 8px 20px rgba(217,119,6,0.22);",
+        session_kind_primary_bg(SessionKind::ClaudeCode, &palette.accent)
+    );
     let primary_button_style = format!(
         "display:inline-flex; align-items:center; justify-content:center; gap:8px; min-height:34px; \
          padding:0 13px; border:none; border-radius:8px; background:{}; color:white; \
          font-size:12px; font-weight:800; box-shadow:0 8px 20px rgba(37,99,235,0.14);",
-        palette.accent
+        session_kind_primary_bg(SessionKind::Codex, &palette.accent)
     );
     rsx! {
         div {
@@ -63633,15 +63662,11 @@ fn StartPage(snapshot: SharedSnapshot, state: Signal<ShellState>) -> Element {
                                     _ => "Open",
                                 };
                             let open_button_style = match row_session_kind(&row) {
-                                Some(SessionKind::ClaudeCode) => format!(
+                                Some(kind @ (SessionKind::ClaudeCode | SessionKind::Codex | SessionKind::CodexLiteLlm)) => format!(
                                     "display:inline-flex; align-items:center; justify-content:center; \
                                      min-height:28px; padding:0 10px; border:none; border-radius:7px; \
-                                     background:#d97706; color:white; font-size:12px; font-weight:800;"
-                                ),
-                                Some(SessionKind::Codex | SessionKind::CodexLiteLlm) => format!(
-                                    "display:inline-flex; align-items:center; justify-content:center; \
-                                     min-height:28px; padding:0 10px; border:none; border-radius:7px; \
-                                     background:#6366f1; color:white; font-size:12px; font-weight:800;"
+                                     background:{}; color:white; font-size:12px; font-weight:800;",
+                                    session_kind_primary_bg(kind, &palette.accent)
                                 ),
                                 _ => format!(
                                     "display:inline-flex; align-items:center; justify-content:center; \
