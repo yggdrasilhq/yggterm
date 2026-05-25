@@ -56958,6 +56958,13 @@ fn terminal_eval_script_with_canvas_renderer(
                     entry.lastXtermSessionSnapshotBaseY = snapshot.baseY;
                     entry.lastXtermSessionSnapshotViewportY = snapshot.viewportY;
                 }}
+                // Skip persist while restore-from-localStorage is in flight.
+                const _restoreInFlight = Boolean(pendingPersistedScrollRestore)
+                    || (pendingPersistedScrollRestoreDeadlineMs > 0
+                        && Date.now() <= pendingPersistedScrollRestoreDeadlineMs);
+                if (!_restoreInFlight) {{
+                    persistScrollStateToLocalStorage(`snapshot:${{snapshot.reason || ''}}`);
+                }}
                 return snapshot;
             }} catch (_error) {{
                 return null;
@@ -57107,6 +57114,68 @@ fn terminal_eval_script_with_canvas_renderer(
                 entry.lastScrollbackSnapbackReason = lastScrollbackSnapbackReason;
             }} catch (_error) {{}}
         }};
+        // XTERM-BUG: scrollback-lost-on-gui-restart
+        // localStorage persists scroll position across GUI process restarts.
+        // In-memory __yggtermXtermSessionSnapshots covers within-session-switch;
+        // localStorage covers GUI-restart (PTY history is still on daemon).
+        // Key format: yggterm-scroll:<sessionPath>. Entries older than 24h are ignored on load.
+        const persistedScrollKey = () => {{
+            try {{
+                const sessionPath = currentHostSessionPath();
+                return sessionPath ? `yggterm-scroll:${{sessionPath}}` : '';
+            }} catch (_error) {{ return ''; }}
+        }};
+        const persistScrollStateToLocalStorage = (reason) => {{
+            try {{
+                if (typeof window === 'undefined' || !window.localStorage) {{ return; }}
+                const key = persistedScrollKey();
+                if (!key) {{ return; }}
+                const buffer = term && term.buffer && term.buffer.active ? term.buffer.active : null;
+                const viewportY = buffer ? Math.max(0, Number(buffer.viewportY || 0)) : 0;
+                const baseY = buffer ? Math.max(0, Number(buffer.baseY || 0)) : 0;
+                const payload = JSON.stringify({{
+                    intent: scrollbackIntent,
+                    viewportY,
+                    baseY,
+                    distanceFromBottom: Math.max(0, baseY - viewportY),
+                    locked: Boolean(scrollbackLocked),
+                    reason: String(reason || ''),
+                    savedAtMs: Date.now(),
+                }});
+                window.localStorage.setItem(key, payload);
+            }} catch (_error) {{}}
+        }};
+        const loadScrollStateFromLocalStorage = () => {{
+            try {{
+                if (typeof window === 'undefined' || !window.localStorage) {{ return null; }}
+                const key = persistedScrollKey();
+                if (!key) {{ return null; }}
+                const raw = window.localStorage.getItem(key);
+                if (!raw) {{ return null; }}
+                const state = JSON.parse(raw);
+                if (!state || typeof state !== 'object') {{ return null; }}
+                const savedAtMs = Number(state.savedAtMs || 0);
+                if (!Number.isFinite(savedAtMs) || savedAtMs <= 0) {{ return null; }}
+                const ageMs = Date.now() - savedAtMs;
+                // 24h expiry: stale scroll positions become misleading after a day.
+                if (ageMs < 0 || ageMs > 24 * 60 * 60 * 1000) {{
+                    try {{ window.localStorage.removeItem(key); }} catch (_e) {{}}
+                    return null;
+                }}
+                return {{
+                    intent: state.intent === 'UserScrollback' ? 'UserScrollback' : 'PromptFollow',
+                    viewportY: Math.max(0, Number(state.viewportY || 0)),
+                    baseY: Math.max(0, Number(state.baseY || 0)),
+                    distanceFromBottom: Math.max(0, Number(state.distanceFromBottom || 0)),
+                    locked: Boolean(state.locked),
+                    reason: String(state.reason || ''),
+                    ageMs,
+                }};
+            }} catch (_error) {{ return null; }}
+        }};
+        let pendingPersistedScrollRestore = null;
+        let pendingPersistedScrollRestoreDeadlineMs = 0;
+        let lastScrollPersistAtMs = 0;
         const setScrollbackIntent = (intent, reason) => {{
             const next = intent === 'UserScrollback' ? 'UserScrollback' : 'PromptFollow';
             const nextReason = String(reason || 'unknown');
@@ -57123,6 +57192,14 @@ fn terminal_eval_script_with_canvas_renderer(
                 syncPromptFollowScheduleHostEntry();
             }}
             syncHostScrollbackIntent();
+            // Skip persists while a pending restore is in flight (post-restart replay
+            // would otherwise overwrite the user's saved spot with intermediate state).
+            const restoreInFlight = Boolean(pendingPersistedScrollRestore)
+                || (pendingPersistedScrollRestoreDeadlineMs > 0
+                    && Date.now() <= pendingPersistedScrollRestoreDeadlineMs);
+            if (!restoreInFlight) {{
+                persistScrollStateToLocalStorage(`intent_change:${{nextReason}}`);
+            }}
             sendTerminalEvent({{
                 kind: "debug",
                 message: `scrollback_intent host=${{hostId}} intent=${{scrollbackIntent}} reason=${{lastScrollbackIntentReason}}`
@@ -57785,9 +57862,86 @@ fn terminal_eval_script_with_canvas_renderer(
                 return null;
             }}
         }};
+        // XTERM-BUG: scrollback-lost-on-gui-restart
+        // Apply a pending localStorage-restored scroll position once daemon-replayed
+        // scrollback has populated the buffer past distanceFromBottom rows AND baseY
+        // has been stable for at least 600ms (replay finished). Don't apply on first
+        // reach: more rows may still be arriving and we'd land at the wrong viewport.
+        const tryApplyPendingPersistedScrollRestore = (reason = '') => {{
+            try {{
+                if (!pendingPersistedScrollRestore) {{ return false; }}
+                const nowMs = Date.now();
+                const pastDeadline = nowMs > pendingPersistedScrollRestoreDeadlineMs;
+                const buffer = term && term.buffer && term.buffer.active ? term.buffer.active : null;
+                if (!buffer) {{
+                    if (pastDeadline) {{ pendingPersistedScrollRestore = null; }}
+                    return false;
+                }}
+                const baseY = Math.max(0, Number(buffer.baseY || 0));
+                const distance = Math.max(0, Number(pendingPersistedScrollRestore.distanceFromBottom || 0));
+                if (baseY < distance) {{
+                    if (pastDeadline) {{ pendingPersistedScrollRestore = null; }}
+                    return false;
+                }}
+                // Track baseY stability: only apply when baseY has held steady for 600ms.
+                const lastSeenBaseY = Number(pendingPersistedScrollRestore.lastSeenBaseY);
+                const lastSeenBaseYAtMs = Number(pendingPersistedScrollRestore.lastSeenBaseYAtMs || 0);
+                if (!Number.isFinite(lastSeenBaseY) || lastSeenBaseY !== baseY) {{
+                    pendingPersistedScrollRestore.lastSeenBaseY = baseY;
+                    pendingPersistedScrollRestore.lastSeenBaseYAtMs = nowMs;
+                    if (!pastDeadline) {{ return false; }}
+                }}
+                const stableForMs = nowMs - lastSeenBaseYAtMs;
+                if (!pastDeadline && stableForMs < 600) {{ return false; }}
+                const target = Math.max(0, baseY - distance);
+                forceXtermViewportY(target, `persisted_scroll_restore:${{reason}}`);
+                scrollbackLocked = Boolean(pendingPersistedScrollRestore.locked) || target < baseY;
+                const entry = window.__yggtermXtermHosts && window.__yggtermXtermHosts[hostId]
+                    ? window.__yggtermXtermHosts[hostId] : null;
+                if (entry) {{
+                    entry.scrollbackLocked = scrollbackLocked;
+                    entry.persistedScrollRestoreApplied = true;
+                    entry.persistedScrollRestoreAppliedAtMs = Date.now();
+                    entry.persistedScrollRestoreAppliedReason = String(reason || '');
+                    entry.persistedScrollRestoreTargetViewportY = target;
+                }}
+                sendTerminalEvent({{
+                    kind: 'debug',
+                    message: `persisted_scroll_restored host=${{hostId}} target=${{target}} distance=${{distance}} reason=${{reason}}`
+                }});
+                pendingPersistedScrollRestore = null;
+                return true;
+            }} catch (_error) {{
+                pendingPersistedScrollRestore = null;
+                return false;
+            }}
+        }};
         const restoreXtermSessionSnapshotOnConstructed = () => {{
             const snapshot = latestXtermSessionSnapshotForCurrentSession();
             if (!snapshot) {{
+                // XTERM-BUG: scrollback-lost-on-gui-restart — in-memory snapshot is
+                // gone (process restart). Try localStorage. We can't restore the
+                // *text* (daemon's retained-replay will do that) but we can restore
+                // the user's scroll position so they aren't yanked to the bottom.
+                const persisted = loadScrollStateFromLocalStorage();
+                // Restore whenever user was not at the bottom (locked) OR intent was UserScrollback.
+                if (persisted && (persisted.intent === 'UserScrollback' || persisted.locked || persisted.distanceFromBottom > 0)) {{
+                    pendingPersistedScrollRestore = persisted;
+                    pendingPersistedScrollRestoreDeadlineMs = Date.now() + 8000;
+                    setScrollbackIntent('UserScrollback', `persisted_scroll_state:age_ms_${{Math.round(persisted.ageMs)}}`);
+                    const entry = window.__yggtermXtermHosts && window.__yggtermXtermHosts[hostId]
+                        ? window.__yggtermXtermHosts[hostId] : null;
+                    if (entry) {{
+                        entry.persistedScrollRestorePending = true;
+                        entry.persistedScrollRestoreAgeMs = persisted.ageMs;
+                        entry.persistedScrollRestoreDistance = persisted.distanceFromBottom;
+                    }}
+                    // Poll attempts at 1s/2s/3s/4s/5s/6s/7s/8s — final fires at deadline
+                    // and applies regardless of stability gate.
+                    [1000, 2000, 3000, 4000, 5000, 6000, 7000, 8000].forEach((delayMs) => {{
+                        window.setTimeout(() => tryApplyPendingPersistedScrollRestore(`poll_${{delayMs}}`), delayMs);
+                    }});
+                }}
                 return false;
             }}
             const normalizedText = String(snapshot.text || '').replace(/\r?\n/g, "\r\n");
@@ -61098,10 +61252,28 @@ fn terminal_eval_script_with_canvas_renderer(
                 if (window.__yggtermXtermHosts && window.__yggtermXtermHosts[hostId]) {{
                     window.__yggtermXtermHosts[hostId].scrollEventCount = scrollEventCount;
                 }}
+                // XTERM-BUG: scrollback-lost-on-gui-restart — every scroll event
+                // is a chance to apply a pending persisted restore (replay added rows).
+                if (pendingPersistedScrollRestore) {{
+                    tryApplyPendingPersistedScrollRestore('scroll_event');
+                }}
                 syncScrollbackLock('scroll_event');
                 syncTerminalScrollController('scroll_event');
                 applySoftwareCanvasLayerOptimization('scroll_event');
                 syncXtermInputLineDecoration('scroll_event');
+                // XTERM-BUG: scrollback-lost-on-gui-restart — throttled persist
+                // so post-restart we can restore even when intent stays PromptFollow
+                // (probe-scroll / write-bridge-in-flight suppress intent change).
+                // Crucially: skip persists while a pending restore is active, so the
+                // post-restart replay storm doesn't overwrite the user's saved spot.
+                const nowMs = Date.now();
+                const restoreInFlight = Boolean(pendingPersistedScrollRestore)
+                    || (pendingPersistedScrollRestoreDeadlineMs > 0
+                        && nowMs <= pendingPersistedScrollRestoreDeadlineMs);
+                if (scrollbackLocked && !restoreInFlight && (nowMs - lastScrollPersistAtMs) >= 200) {{
+                    lastScrollPersistAtMs = nowMs;
+                    persistScrollStateToLocalStorage('scroll_event_throttled');
+                }}
                 emitHostHealth();
             }})
             : null;
@@ -61359,12 +61531,45 @@ fn terminal_eval_script_with_canvas_renderer(
                 return;
             }}
             markTerminalInputHot('data');
+            // XTERM-BUG: scrollback-lost-on-gui-restart — real keystrokes cancel any
+            // pending persisted-scroll restore so the restore doesn't pull viewport
+            // back from the prompt where user is typing.
+            if (pendingPersistedScrollRestore) {{
+                pendingPersistedScrollRestore = null;
+                pendingPersistedScrollRestoreDeadlineMs = 0;
+                const entry = window.__yggtermXtermHosts && window.__yggtermXtermHosts[hostId]
+                    ? window.__yggtermXtermHosts[hostId] : null;
+                if (entry) {{
+                    entry.persistedScrollRestorePending = false;
+                    entry.persistedScrollRestoreCancelledByInput = true;
+                }}
+            }}
+            // XTERM-BUG: scroll-jump-on-input — telemetry. Capture viewport-before so
+            // we can attribute jumps to the input path vs competing handlers.
+            const _scrollJumpBeforeY = (term && term.buffer && term.buffer.active)
+                ? Number(term.buffer.active.viewportY || 0) : -1;
+            const _scrollJumpBeforeBaseY = (term && term.buffer && term.buffer.active)
+                ? Number(term.buffer.active.baseY || 0) : -1;
             setScrollbackIntent('PromptFollow', 'input');
             scrollbackLocked = false;
             if (window.__yggtermXtermHosts && window.__yggtermXtermHosts[hostId]) {{
                 window.__yggtermXtermHosts[hostId].scrollbackLocked = scrollbackLocked;
             }}
             scrollLiveCursorIntoView(true, 'input');
+            // XTERM-BUG: scroll-jump-on-input — emit a scroll_jump_after_input event
+            // when viewport moved more than 1 row as a result of this keystroke.
+            try {{
+                const afterY = (term && term.buffer && term.buffer.active)
+                    ? Number(term.buffer.active.viewportY || 0) : -1;
+                const afterBaseY = (term && term.buffer && term.buffer.active)
+                    ? Number(term.buffer.active.baseY || 0) : -1;
+                if (_scrollJumpBeforeY >= 0 && afterY >= 0 && Math.abs(afterY - _scrollJumpBeforeY) > 1) {{
+                    sendTerminalEvent({{
+                        kind: 'debug',
+                        message: `scroll_jump_after_input host=${{hostId}} before=${{_scrollJumpBeforeY}} after=${{afterY}} base_before=${{_scrollJumpBeforeBaseY}} base_after=${{afterBaseY}}`
+                    }});
+                }}
+            }} catch (_e) {{}}
             queueTerminalInputData(data);
         }});
         window.__yggtermXtermCleanups[hostId] = () => {{
@@ -71667,7 +71872,8 @@ mod tests {
         );
         assert!(
             script.contains("setScrollbackIntent('PromptFollow', 'input');")
-                && script.contains("scrollLiveCursorIntoView(true, 'input');\n            queueTerminalInputData(data);"),
+                && script.contains("scrollLiveCursorIntoView(true, 'input');")
+                && script.contains("queueTerminalInputData(data);"),
             "real terminal input should reveal the prompt before forwarding bytes"
         );
     }
