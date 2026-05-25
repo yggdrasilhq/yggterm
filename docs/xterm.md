@@ -4,6 +4,12 @@ This document is the working contract for Yggterm's xterm.js path. Keep it in
 sync when terminal rendering, resize, PTY identity, app-control probes, or smoke
 tests change.
 
+> **For specific xterm.js bugs and the workarounds we've shipped, see
+> [`docs/xterm-bugs.md`](xterm-bugs.md).** That file is the structured
+> registry: one section per bug, cross-linked to inline `// XTERM-BUG:`
+> anchors in code. Add a new entry there before closing any xterm-related
+> regression.
+
 ## Core Contract
 
 Yggterm terminal content has one primary truth:
