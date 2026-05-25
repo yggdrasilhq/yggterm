@@ -163,6 +163,15 @@ All major bugs fixed. No remaining open items.
 - [x] **Bug 8 — Local Codex/CC sessions invisible in Live Sessions**: Fixed commit `c1b46cf`. Local sessions (kind=Codex/CC, path=`local://`) were filtered OUT of `display_promoted_sessions` by `!is_local_tree_live_session`, then injected into stored tree via `inject_local_live_session_rows`. New sessions with no stored row were invisible. Fix: removed both the filter and the inject call. `promoted_storage_paths` dedup (already in extend step) handles preventing file-backed CC row from appearing twice. Verified: relaunched Codex session appears at top of Live Sessions group.
 - [x] **Bug 9 — `remote-session://` classified as SshShell**: Fixed in commit `c1b46cf`. `row_session_kind` had `remote-session://` in the SshShell arm, causing remote Codex sessions to get wrong button style and icon. Moved to Codex arm.
 - [x] **Wayland clipboard fix (jojo)**: jojo runs pure Wayland — no X11 sockets. SSH restarts with `DISPLAY=:0` caused arboard to fail (tried X11 connection, no socket). Fix: always restart with `DISPLAY= WAYLAND_DISPLAY=wayland-0 XDG_RUNTIME_DIR=/run/user/1000`. Image paste notifications were showing "Paste Failed" with X11 connection error.
+- [x] **Spec 1 + Spec 2 fix**: Active sessions now appear in BOTH Live Sessions group AND cwd tree group. Local Codex sessions show the correct "session" icon (was "terminal"/shell). Done via:
+  - Moved `SessionKind` enum to `yggterm-core` (re-exported from `yggterm-server`).
+  - Added `session_kind: Option<SessionKind>` to `BrowserRow`; populated by `push_live_session_rows` and `inject_cc_sessions_into_stored_rows` from `ManagedSessionView.kind`.
+  - `tree_icon_kind`, `tree_icon_glyph`, `row_session_kind` now consult `session_kind` first; path-prefix dispatch is fallback for synthesized rows.
+  - Restored the `inject_local_live_session_rows` call inside `merged_sidebar_rows_uncached` (was removed in commit `c1b46cf` under the old "show in exactly one place" interpretation of SSOT).
+  - Removed `promoted_live_paths` filter from the extend step — it was yanking the cwd-tree-injected live row right back out (path-equality dedup that violates dual presence).
+  - Removed `machine.scanned_sessions.retain(!promoted_live_paths)` so remote live sessions also appear in both Live Sessions AND their machine group.
+  - Verified live on jojo: `local://a7c4fa98` Codex session appears at row 1 (Live Sessions, `icon=session`) AND row 79 (`/home/pi` folder group, `icon=session`).
+  - AGENTS.md updated with the dual-presence rule, SessionKind-drives-display rule, and unify-local-remote rule.
 
 ---
 
