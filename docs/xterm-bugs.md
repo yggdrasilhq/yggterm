@@ -31,7 +31,8 @@ xterm.js owns vs what the shell owns, cursor/prompt semantics, etc. — see
 
 | ID | Symptom | Status |
 |----|---------|--------|
-| [scrollback-lost-on-session-switch](#scrollback-lost-on-session-switch) | User-scrolled scrollback collapses to live cursor when switching sessions | FIXED, guard in place |
+| [scrollback-lost-on-session-switch](#scrollback-lost-on-session-switch) | User-scrolled scrollback collapses to live cursor when switching sessions | PARTIALLY FIXED |
+| [scrollback-lost-on-gui-restart](#scrollback-lost-on-gui-restart) | Scroll position lost when GUI restarts (daemon survives) | OPEN, needs persistence |
 | [slow-jitter](#slow-jitter) | Some sessions exhibit visible per-frame jitter under steady PTY output | OPEN, uninvestigated |
 | [blank-rendering-region](#blank-rendering-region) | Region inside an active session goes blank until forced redraw | OPEN, uninvestigated |
 
@@ -39,49 +40,133 @@ xterm.js owns vs what the shell owns, cursor/prompt semantics, etc. — see
 
 ## scrollback-lost-on-session-switch
 
-**STATUS:** FIXED — guard in `repaintActiveEntry` prevents regression.
+**STATUS:** PARTIALLY FIXED — within-session-life session switch is now
+guarded; scroll position is still lost across GUI restart (see
+[scrollback-lost-on-gui-restart](#scrollback-lost-on-gui-restart)).
 
 ### Symptom
 User scrolls up through scrollback in session A, switches to session B,
-switches back to A. The scrollback position has been reset to the live
-cursor (bottom of buffer); previously-visible scrollback rows are gone from
-the viewport even though they're still in the buffer.
+switches back to A. The scrollback position resets to the live cursor;
+previously-visible scrollback rows are gone from the viewport.
 
 ### Reproduction
 1. Long-running session with rich scrollback (>100 rows above viewport).
 2. Scroll up so the live cursor is well off-screen.
 3. Click another session in the sidebar.
 4. Click back to the original session.
-5. Observe: viewport snaps back to live cursor; user's scroll position lost.
+5. Before fix: viewport snaps back to live cursor; user's scroll position lost.
 
 ### Root cause
-Session-switch repaint was calling `forcePromptFollow` unconditionally,
-which scrolls the live cursor into view as a side effect. The intent of
-the call was to ensure the prompt was visible *for sessions where the user
-was already at the bottom*, but with no guard it also reset scroll position
-for users who were actively reading scrollback.
+Two distinct paths reset the viewport:
+
+1. **`repaintActiveEntry`** — activation repaint after session switch.
+   Was calling `forcePromptFollow` unconditionally. Already guarded by
+   `scrollbackIntent !== 'UserScrollback'` check (committed pre-2026-05-25).
+
+2. **`followPromptForEntry`** — retained-replay path. Called from
+   ~7 sites (`retained_replay_xterm_session_snapshot`,
+   `retained_replay_cached_visible`, `retained_replay_existing_visible`,
+   `retained_replay_existing_scrollback`, `retained_replay_write`,
+   etc.). Was UNGUARDED until 2026-05-25 — every retained replay (which
+   fires on session switch when xterm needs to re-mount/re-apply
+   snapshot) yanked the viewport to the bottom. **This was the actual
+   biting bug** (commit 36dfe61 only fixed path 1, path 2 was still
+   resetting scroll).
 
 ### Workaround / fix
-`repaintActiveEntry` only calls `forcePromptFollow` when a user-scroll
-guard reports false (i.e., the user is not currently in scrollback). The
-`forcePromptFollow` JS-side helper is at `entry.forcePromptFollow(reason)`.
+Both code paths now early-return when
+`entry.scrollbackIntent === 'UserScrollback'`. Specifically:
+
+- `repaintActiveEntry` guards inline (shell.rs ~62660).
+- `followPromptForEntry` guards at function entry, so ALL ~7 retained-replay
+  callers inherit the guard (shell.rs ~62236).
 
 ### Code locations
-- `crates/yggterm-shell/src/shell.rs:69857` — the inline regression comment
-  ("Activation repaint must NOT unconditionally call forcePromptFollow")
-- `crates/yggterm-shell/src/shell.rs:69861` — the assertion that documents
-  the contract for tests
-- `crates/yggterm-shell/src/shell.rs:59817` — `forcePromptFollow` JS
-  definition (`(reason = 'prompt_follow') => scrollLiveCursorIntoView(true, reason)`)
+- `crates/yggterm-shell/src/shell.rs:~62236` — `followPromptForEntry`
+  guard (`XTERM-BUG:` anchor)
+- `crates/yggterm-shell/src/shell.rs:~62660` — `repaintActiveEntry`
+  guard (`XTERM-BUG:` anchor)
+- `crates/yggterm-shell/src/shell.rs:~59831` — `forcePromptFollow` JS
+  definition
+- `crates/yggterm-shell/src/shell.rs:~57111` — `setScrollbackIntent`
+  (sets `UserScrollback` when user wheels/PageUps)
 
 ### Tests
-Test asserts that activation repaint emits the guard before any
-`forcePromptFollow` call (see assertion at shell.rs:69861).
+The test assertion at ~69861 covers `repaintActiveEntry`. A new assertion
+for `followPromptForEntry`'s guard is needed (TODO: assert
+"if (entry && String(entry.scrollbackIntent || 'PromptFollow') === 'UserScrollback')"
+appears inside the followPromptForEntry definition).
 
 ### Telemetry
 None yet. A `xterm_scrollback_lost_on_switch` event could be added by
 sampling the buffer's `yDisp` before and after repaint and emitting when
 it changes by more than a small delta despite no user input.
+
+### Related memory
+`[[xterm-scrollback-bug]]`
+
+---
+
+## scrollback-lost-on-gui-restart
+
+**STATUS:** OPEN — needs a persistence layer.
+
+### Symptom
+User scrolls up in session A, agent deploys a GUI binary (kills GUI,
+relaunches; daemon stays alive), user reopens session A — scroll position
+is at the bottom again. User loses their scrollback position.
+
+### Reproduction
+1. Long-running session with rich scrollback.
+2. Scroll up so the live cursor is well off-screen.
+3. Restart the GUI process (daemon survives).
+4. After GUI re-launches, navigate to the original session.
+5. Observe: viewport is at the bottom; user's scroll position is gone.
+
+### Root cause
+`scrollbackIntent` and `viewportY` are JS-side state inside
+`window.__yggtermXtermSessionSnapshots[sessionPath]`. This dictionary is
+in-process. When the GUI process dies, it's gone.
+
+The on-mount restore path (shell.rs ~57846) DOES support restoring
+`UserScrollback` intent + `viewportY` — but only when it has a snapshot to
+restore from, which the in-process dict doesn't provide after restart.
+
+### Workaround / fix
+**Not yet implemented.** Two viable plans:
+
+1. **Daemon-side persistence.** Add `scrollback_intent` and
+   `scrollback_viewport_y` fields on the daemon's `ManagedSessionView`.
+   GUI debounces (~500ms) and sends `ScrollState { session_path, intent,
+   viewport_y }` to daemon. Daemon stores per session, includes in
+   `SnapshotSessionView` sent to GUI. GUI on terminal mount checks the
+   snapshot for prior scroll state and applies it via the existing
+   restore path. Survives GUI restart whenever daemon stays alive.
+   Survives daemon hot-restart because `persisted_state_for_update_restart`
+   serializes the full ManagedSessionView.
+
+2. **GUI-only file persistence.** GUI writes
+   `~/.yggterm/xterm-scrollback-state.json` on scroll change (debounced),
+   reads on startup. Simpler but doesn't survive a daemon-only restart.
+
+Plan 1 is the right one — it's the single source of truth path. Estimated
+~5-file change: ManagedSessionView field, IPC request type, daemon
+handler, snapshot field, GUI mount-time restore call.
+
+### Code locations
+- `crates/yggterm-shell/src/shell.rs:~56917` — snapshot construction
+  (where scrollbackIntent is captured into the in-memory snapshot)
+- `crates/yggterm-shell/src/shell.rs:~57846` — restore path (already
+  correctly applies `UserScrollback` + viewportY when present)
+- `crates/yggterm-server/src/lib.rs` — `ManagedSessionView` (add fields)
+- `crates/yggterm-server/src/lib.rs` — `SnapshotSessionView` (add fields)
+
+### Tests
+None yet.
+
+### Telemetry
+Proposed: emit `xterm_scrollback_state_persisted` debounce events to
+trace, plus `xterm_scrollback_state_restored` on successful restore.
 
 ### Related memory
 `[[xterm-scrollback-bug]]`
