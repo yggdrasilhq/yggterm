@@ -19307,6 +19307,20 @@ fn sidebar_rows_for_selection(
     }
     visible_rows
 }
+/// Build the merged sidebar row list from stored rows + live sessions + remote
+/// machines + SSH targets. This is the single function that owns sidebar shape.
+///
+/// **Contracts (see [`AGENTS.md`](../../../AGENTS.md) "Session display"):**
+/// - Active sessions appear in BOTH "Live Sessions" group AND their cwd folder
+///   group (dual presence). Never silently filter a live session out of the
+///   cwd tree just because it also appears in Live Sessions.
+/// - Local Codex/CC live sessions are injected into the cwd tree by
+///   `inject_local_live_session_rows`.
+/// - Remote live sessions stay in `machine.scanned_sessions`; no
+///   live-vs-scanned dedup at this layer.
+/// - Same-session dedup within a single tree view is done by
+///   `inject_cc_sessions_into_stored_rows` (by session_id) and by the
+///   `promoted_storage_paths` filter in the extend step (by storage path).
 fn merged_sidebar_rows_uncached(
     stored_rows: &[BrowserRow],
     stored_projection_rows: &[BrowserRow],
@@ -62638,6 +62652,11 @@ fn terminal_set_input_policy_script_for_active_session(
               if (!entry || !entry.term) {{
                 return;
               }}
+              // XTERM-BUG: scrollback-lost-on-session-switch
+              // See docs/xterm-bugs.md#scrollback-lost-on-session-switch
+              // forcePromptFollow scrolls live cursor into view. We MUST NOT
+              // call it when the user is actively scrolled back, otherwise a
+              // session switch yanks them out of their scroll position.
               if (
                 typeof entry.forcePromptFollow === "function"
                 && String(entry.scrollbackIntent || 'PromptFollow') !== 'UserScrollback'
@@ -69854,6 +69873,8 @@ mod tests {
         );
         assert!(script.contains("if (isActive && activeSessionChanged) {"));
         assert!(script.contains("scheduleActivationRepaint(entry, \"active_session_switch\");"));
+        // XTERM-BUG: scrollback-lost-on-session-switch
+        // See docs/xterm-bugs.md#scrollback-lost-on-session-switch
         // Activation repaint must NOT unconditionally call forcePromptFollow.
         // UserScrollback intent must be preserved across session switches.
         assert!(
