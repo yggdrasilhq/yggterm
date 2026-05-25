@@ -14539,6 +14539,7 @@ fn row_session_kind(row: &BrowserRow) -> Option<SessionKind> {
         Some(SessionKind::CodexLiteLlm)
     } else if row.full_path.starts_with("codex://")
         || row.full_path.starts_with("codex-runtime://")
+        || row.full_path.starts_with("remote-session://")
         || is_codex_storage_session_path(&row.full_path)
     {
         Some(SessionKind::Codex)
@@ -14547,7 +14548,6 @@ fn row_session_kind(row: &BrowserRow) -> Option<SessionKind> {
     } else if row.full_path.starts_with("local://") {
         Some(SessionKind::Shell)
     } else if row.full_path.starts_with("ssh://")
-        || row.full_path.starts_with("remote-session://")
         || row.full_path.starts_with("live::")
     {
         Some(SessionKind::SshShell)
@@ -19314,10 +19314,6 @@ fn merged_sidebar_rows_uncached(
     let total_started_at = Instant::now();
     let remote_session_index = build_remote_session_index(remote_machines);
     let remote_index_ms = total_started_at.elapsed().as_secs_f64() * 1000.0;
-    let local_tree_live_sessions = live_sessions
-        .iter()
-        .filter(|session| is_local_tree_live_session(session))
-        .collect::<Vec<_>>();
     let promoted_live_sessions = live_sessions
         .iter()
         .filter(|session| is_promoted_live_session(session))
@@ -19328,7 +19324,6 @@ fn merged_sidebar_rows_uncached(
     if ssh_targets.is_empty()
         && remote_machines.is_empty()
         && promoted_live_sessions.is_empty()
-        && local_tree_live_sessions.is_empty()
         && !has_remote_workspace_folders
     {
         if stored_rows.is_empty() {
@@ -19350,9 +19345,7 @@ fn merged_sidebar_rows_uncached(
         }
         return stored_rows;
     }
-    let mut rows = Vec::with_capacity(
-        stored_rows.len() + local_tree_live_sessions.len() + remote_machines.len() * 6 + 8,
-    );
+    let mut rows = Vec::with_capacity(stored_rows.len() + remote_machines.len() * 6 + 8);
     let machine_rows_init_started_at = Instant::now();
     let mut machine_rows = BTreeMap::<String, SidebarRemoteMachine>::new();
     for target in ssh_targets {
@@ -19429,31 +19422,22 @@ fn merged_sidebar_rows_uncached(
         }
     }
     let resort_ms = resort_started_at.elapsed().as_secs_f64() * 1000.0;
-    let local_tree_started_at = Instant::now();
-    let stored_rows = inject_local_live_session_rows(
-        &stored_rows,
-        &local_tree_live_sessions,
-        &remote_session_index,
-    );
-    let local_tree_ms = local_tree_started_at.elapsed().as_secs_f64() * 1000.0;
     let push_live_started_at = Instant::now();
-    // Build the set of session paths already represented in a machine group (via scanned sessions).
-    // A live session in this set should not also appear in the Live Sessions group — it is shown
-    // under its machine instead, enriched with live data by merge_remote_live_sessions.
-    let machine_scanned_paths: HashSet<String> = machine_rows
-        .values()
-        .flat_map(|machine| machine.scanned_sessions.iter())
-        .map(|session| session.session_path.clone())
-        .collect();
-    // Exclude local-tree sessions (CC, new Codex-local) from "Live Sessions" group — they
-    // appear under their CWD folder via inject_local_live_session_rows instead.
-    // Also exclude sessions already shown in a machine group to prevent duplicate rows.
+    // All promoted live sessions — including local Codex/CC — appear in Live Sessions.
+    // When a local CC session is live, its file-backed stored row is automatically excluded
+    // by the promoted_storage_paths dedup in the extend step below.
     let display_promoted_sessions = promoted_live_sessions
         .iter()
         .copied()
-        .filter(|s| !is_local_tree_live_session(s))
-        .filter(|s| !machine_scanned_paths.contains(&s.session_path))
         .collect::<Vec<_>>();
+    // Build the set of live-promoted session paths. Any scanned session that is currently
+    // live-promoted must be removed from the machine group so it appears in exactly one place:
+    // the Live Sessions group (with real-time data). When the session ends it will reappear in
+    // the machine group on the next scan.
+    let promoted_live_paths: HashSet<String> = display_promoted_sessions
+        .iter()
+        .map(|s| s.session_path.clone())
+        .collect();
     push_live_session_rows(
         &mut rows,
         &display_promoted_sessions,
@@ -19462,7 +19446,11 @@ fn merged_sidebar_rows_uncached(
     );
     let push_live_ms = push_live_started_at.elapsed().as_secs_f64() * 1000.0;
     let push_remote_started_at = Instant::now();
-    for machine in machine_rows.into_values() {
+    for mut machine in machine_rows.into_values() {
+        // Remove scanned sessions that are currently live — they are rendered in Live Sessions above.
+        machine
+            .scanned_sessions
+            .retain(|s| !promoted_live_paths.contains(&s.session_path));
         push_remote_machine_rows(&mut rows, &machine, expanded_paths);
     }
     let push_remote_ms = push_remote_started_at.elapsed().as_secs_f64() * 1000.0;
@@ -19508,7 +19496,6 @@ fn merged_sidebar_rows_uncached(
                 "resort_ms": resort_ms,
                 "push_live_ms": push_live_ms,
                 "push_remote_ms": push_remote_ms,
-                "local_tree_ms": local_tree_ms,
                 "extend_stored_ms": extend_stored_ms,
                 "total_ms": total_started_at.elapsed().as_secs_f64() * 1000.0,
                 "stored_row_count": stored_rows.len(),
