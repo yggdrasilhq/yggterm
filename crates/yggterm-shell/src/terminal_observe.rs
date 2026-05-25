@@ -2197,6 +2197,20 @@ fn terminal_host_problem_for_app_control(host: &Value) -> Option<&'static str> {
             "active remote terminal accepted input without a following daemon stream echo",
         );
     }
+    // XTERM-BUG: resume-gate-too-restrictive
+    // See docs/xterm-bugs.md#resume-gate-too-restrictive
+    //
+    // The "no prompt-ready surface" gate must NOT fire when the visible
+    // surface is showing meaningful PTY output. A session in the middle of
+    // a long-running command (pytest run, Codex agent reply, etc.) won't
+    // have a prompt visible, but it's a healthy live session — gating it
+    // costs 60–160s of spurious recovery loops before the user can use it.
+    //
+    // The remaining conditions still catch the real fault case: input
+    // enabled, daemon PTY connected, surface non-empty, NOT in a prompt
+    // pattern, NOT in a recognized non-prompt activity (transport error,
+    // loading, transcript browser, idle chrome), AND no meaningful PTY
+    // output to justify the prompt-less view.
     if session_path.starts_with("remote-session://")
         && input_enabled
         && mounted_entry_host_connected
@@ -2211,6 +2225,8 @@ fn terminal_host_problem_for_app_control(host: &Value) -> Option<&'static str> {
         && !terminal_chunk_is_generic_codex_idle(cursor_line_text)
         && (terminal_content_source == "daemon_pty" || retained_replay_from_pty)
         && (xterm_present || screen_present || rows_present || canvas_count > 0)
+        && !terminal_chunk_has_meaningful_output(visible_text)
+        && !sample_has_meaningful_output
     {
         return Some("active remote terminal is input-enabled without a prompt-ready surface");
     }
@@ -2289,6 +2305,12 @@ fn terminal_host_problem_for_app_control(host: &Value) -> Option<&'static str> {
         && !prompt_ready_surface
         && !transcript_browser_ready_surface
         && !live_remote_daemon_pty_current_output_surface
+        // XTERM-BUG: resume-gate-too-restrictive
+        // See docs/xterm-bugs.md#resume-gate-too-restrictive
+        // Same exemption as the earlier site: a session with meaningful
+        // PTY output is a healthy live session even without a prompt visible.
+        && !terminal_chunk_has_meaningful_output(visible_text)
+        && !sample_has_meaningful_output
     {
         return Some("active remote terminal is input-enabled without a prompt-ready surface");
     }
