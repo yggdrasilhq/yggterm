@@ -72115,6 +72115,38 @@ mod tests {
         );
     }
 
+    /// Per docs/xterm-bugs.md scrollback-lost-on-gui-restart entry:
+    /// the localStorage-backed scroll persistence shipped in commit
+    /// 5a6e19f relies on three named helpers + a `yggterm-scroll:` key
+    /// prefix. If any of these disappear during a future refactor, the
+    /// GUI-restart scroll-position survival regresses silently. Closes
+    /// the TODO at docs/xterm-bugs.md:165.
+    #[test]
+    fn terminal_eval_script_persists_scroll_state_to_localstorage() {
+        let theme = terminal_theme(UiTheme::ZedLight, palette(UiTheme::ZedLight), 13.0, "");
+        let script = terminal_eval_script("yggterm-terminal-test", &theme, true);
+        // The three helpers that own the localStorage round-trip.
+        assert!(
+            script.contains("const persistScrollStateToLocalStorage = (reason) => {"),
+            "persistScrollStateToLocalStorage helper must remain for scroll position survival across GUI restart"
+        );
+        assert!(
+            script.contains("const loadScrollStateFromLocalStorage = () => {"),
+            "loadScrollStateFromLocalStorage helper must remain to restore on terminal construction"
+        );
+        assert!(
+            script.contains("const tryApplyPendingPersistedScrollRestore = (reason = '') => {"),
+            "tryApplyPendingPersistedScrollRestore must remain to apply restore once baseY stabilizes after replay"
+        );
+        // The key prefix is the persistence handshake — never change it
+        // without a migration story.
+        assert!(
+            script.contains("`yggterm-scroll:${{sessionPath}}`")
+                || script.contains("`yggterm-scroll:${sessionPath}`"),
+            "localStorage key prefix must remain `yggterm-scroll:` so reloads find prior entries"
+        );
+    }
+
     /// Per docs/xterm-bugs.md scrollback-lost-on-session-switch entry:
     /// the `followPromptForEntry` retained-replay path was the actual
     /// biting bug (commit 28542e9 fixed it; 36dfe61 only patched the
