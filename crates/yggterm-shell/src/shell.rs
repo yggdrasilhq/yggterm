@@ -72115,6 +72115,35 @@ mod tests {
         );
     }
 
+    /// Per docs/xterm-bugs.md scrollback-lost-on-session-switch entry:
+    /// the `followPromptForEntry` retained-replay path was the actual
+    /// biting bug (commit 28542e9 fixed it; 36dfe61 only patched the
+    /// sibling `repaintActiveEntry` path). The guard MUST be at the
+    /// function entry so all ~7 retained-replay callers inherit it.
+    /// Closes the TODO at docs/xterm-bugs.md:100.
+    #[test]
+    fn retained_replay_script_followPromptForEntry_guards_user_scrollback() {
+        let script = terminal_replay_retained_data_script_for_session(
+            "remote-session://dev/test",
+            "hello\r\nworld\r\n",
+            "daemon_retained_snapshot",
+        );
+        // Function definition exists.
+        assert!(
+            script.contains("const followPromptForEntry = (entry, reason) => {"),
+            "followPromptForEntry must be defined for retained-replay paths"
+        );
+        // Guard literal sits inside the function body — same string the
+        // registry doc points at for grep-anchoring.
+        assert!(
+            script.contains(
+                "if (entry && String(entry.scrollbackIntent || 'PromptFollow') === 'UserScrollback')"
+            ),
+            "followPromptForEntry must early-return when scrollbackIntent is UserScrollback, \
+             so all 7 retained-replay callers preserve the user's scroll position"
+        );
+    }
+
     #[test]
     fn terminal_eval_script_batches_user_input_without_gating_protocol_replies() {
         let theme = terminal_theme(UiTheme::ZedLight, palette(UiTheme::ZedLight), 13.0, "");
