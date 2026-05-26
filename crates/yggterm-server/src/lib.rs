@@ -286,7 +286,10 @@ fn is_remote_scanned_live_session_path(path: &str) -> bool {
 fn local_live_session_kind_is_recoverable(kind: SessionKind) -> bool {
     matches!(
         kind,
-        SessionKind::Shell | SessionKind::Codex | SessionKind::CodexLiteLlm | SessionKind::ClaudeCode
+        SessionKind::Shell
+            | SessionKind::Codex
+            | SessionKind::CodexLiteLlm
+            | SessionKind::ClaudeCode
     )
 }
 
@@ -4589,7 +4592,11 @@ impl YggtermServer {
             kind: SessionKind::ClaudeCode,
             ssh_target: ssh_target.to_string(),
             prefix: prefix.map(ToOwned::to_owned),
-            cwd: if cwd.trim().is_empty() { None } else { Some(cwd.to_string()) },
+            cwd: if cwd.trim().is_empty() {
+                None
+            } else {
+                Some(cwd.to_string())
+            },
         };
         if !self.sessions.contains_key(&session_path) {
             let mut session = build_live_session(
@@ -4620,7 +4627,14 @@ impl YggtermServer {
             session.terminal_lines = vec![
                 format!("Queue remote Claude Code resume {session_id}"),
                 format!("Target host: {ssh_target}"),
-                format!("Workspace: {}", if cwd.trim().is_empty() { "<unknown>" } else { cwd }),
+                format!(
+                    "Workspace: {}",
+                    if cwd.trim().is_empty() {
+                        "<unknown>"
+                    } else {
+                        cwd
+                    }
+                ),
             ];
             upsert_session_metadata(&mut session.metadata, "UUID", session_id.to_string());
             upsert_session_metadata(
@@ -19099,12 +19113,11 @@ mod tests {
         remote_scanned_session_path, remote_snapshot_looks_like_codex,
         remote_snapshot_looks_like_shell_prompt, remote_ssh_launch_command,
         remote_summary_for_path, remote_tmux_session_name, sanitize_recent_context_payload,
-        session_metadata_value,
-        should_fallback_to_python, should_remove_local_daemon_socket_for_spawn_state,
-        stored_session_launch_command, strip_remote_payload_noise,
-        synthesize_remote_scanned_session_view, try_acquire_remote_scan_lock,
-        upsert_session_metadata, validate_server_ui_snapshot, wait_remote_command_with_timeout,
-        windows_local_interactive_shell_launch_command,
+        session_metadata_value, should_fallback_to_python,
+        should_remove_local_daemon_socket_for_spawn_state, stored_session_launch_command,
+        strip_remote_payload_noise, synthesize_remote_scanned_session_view,
+        try_acquire_remote_scan_lock, upsert_session_metadata, validate_server_ui_snapshot,
+        wait_remote_command_with_timeout, windows_local_interactive_shell_launch_command,
     };
     use crate::SessionRenderedSection;
     #[cfg(unix)]
