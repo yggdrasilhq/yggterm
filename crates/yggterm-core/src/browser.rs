@@ -409,6 +409,14 @@ fn flatten_rows(
     let expanded = is_leaf || !filter.is_empty() || expanded_paths.contains(&full_path);
 
     if include_root {
+        // Per [[spec-cwd-tree-agent-cli-unified]]: agent-CLI session leaves
+        // carry their `SessionKind` and optional `detail` through to the
+        // `BrowserRow`. When `node.detail` is `None`, fall back to the
+        // default `short_id · cwd` form computed by `detail_label_for_row`.
+        let detail_label = node
+            .detail
+            .clone()
+            .unwrap_or_else(|| detail_label_for_row(node, &full_path, is_leaf));
         rows.push(BrowserRow {
             kind: if is_leaf {
                 match node.kind {
@@ -422,7 +430,7 @@ fn flatten_rows(
                 BrowserRowKind::Group
             },
             label: format_row_label(node, short_ids, &full_path, is_leaf),
-            detail_label: detail_label_for_row(node, &full_path, is_leaf),
+            detail_label,
             session_title: if is_leaf { node.title.clone() } else { None },
             document_kind: node.document_kind,
             group_kind: node.group_kind,
@@ -433,7 +441,7 @@ fn flatten_rows(
             expanded,
             session_id: node.session_id.clone(),
             session_cwd: node.cwd.clone(),
-            session_kind: None,
+            session_kind: node.session_kind,
         });
     }
 
@@ -689,7 +697,7 @@ fn session_id_suffix(id: &str, width: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::{BrowserRowKind, SessionBrowserState, unique_session_short_ids_for_pairs};
-    use crate::{SessionNode, SessionNodeKind, WorkspaceGroupKind};
+    use crate::{SessionKind, SessionNode, SessionNodeKind, WorkspaceGroupKind};
     use std::path::PathBuf;
 
     #[test]
@@ -716,6 +724,157 @@ mod tests {
         assert_eq!(ids.get("b").map(String::as_str), Some("duplicate-id"));
     }
 
+    /// Regression: per [[spec-cwd-tree-agent-cli-unified]] every agent-CLI
+    /// session leaf must carry its `SessionKind` through to `BrowserRow.session_kind`.
+    /// Caught the case where the prior `inject_file_backed_cc_session_rows`
+    /// path set `session_kind: None`, forcing display dispatch to fall back
+    /// to path-prefix heuristics — a Spec 2 violation.
+    #[test]
+    fn flatten_rows_carries_session_kind_through_to_browser_row() {
+        let cc_leaf = SessionNode {
+            kind: SessionNodeKind::CodexSession,
+            name: "cc-leaf".to_string(),
+            path: PathBuf::from("/home/pi/.claude/projects/-home-pi/abc.jsonl"),
+            session_id: Some("cc-id".to_string()),
+            cwd: Some("/home/pi".to_string()),
+            session_kind: Some(SessionKind::ClaudeCode),
+            detail: Some("first user message".to_string()),
+            ..Default::default()
+        };
+        let codex_leaf = SessionNode {
+            kind: SessionNodeKind::CodexSession,
+            name: "codex-leaf".to_string(),
+            path: PathBuf::from("/home/pi/.codex/sessions/2026/05/26/x.jsonl"),
+            session_id: Some("codex-id".to_string()),
+            cwd: Some("/home/pi".to_string()),
+            session_kind: Some(SessionKind::Codex),
+            ..Default::default()
+        };
+        let home_pi = SessionNode {
+            kind: SessionNodeKind::Group,
+            name: "/home/pi".to_string(),
+            title: Some("/home/pi".to_string()),
+            group_kind: Some(WorkspaceGroupKind::Folder),
+            path: PathBuf::from("/home/pi"),
+            children: vec![codex_leaf, cc_leaf],
+            ..Default::default()
+        };
+        let root = SessionNode {
+            kind: SessionNodeKind::Group,
+            name: "local".to_string(),
+            title: Some("local".to_string()),
+            group_kind: Some(WorkspaceGroupKind::Folder),
+            path: PathBuf::from("local"),
+            children: vec![home_pi],
+            ..Default::default()
+        };
+        let browser = SessionBrowserState::new(root);
+        let rows = browser.all_rows();
+        let cc_row = rows
+            .iter()
+            .find(|r| r.session_id.as_deref() == Some("cc-id"))
+            .expect("cc-id row must be present");
+        let codex_row = rows
+            .iter()
+            .find(|r| r.session_id.as_deref() == Some("codex-id"))
+            .expect("codex-id row must be present");
+        assert_eq!(
+            cc_row.session_kind,
+            Some(SessionKind::ClaudeCode),
+            "CC leaf must carry its SessionKind into BrowserRow"
+        );
+        assert_eq!(
+            codex_row.session_kind,
+            Some(SessionKind::Codex),
+            "Codex leaf must carry its SessionKind into BrowserRow"
+        );
+        assert_eq!(
+            cc_row.detail_label, "first user message",
+            "CC leaf's `detail` must propagate into BrowserRow.detail_label"
+        );
+    }
+
+    /// Regression: per [[spec-cwd-tree-agent-cli-unified]] CC and Codex
+    /// sessions must respect expand/collapse uniformly. Caught the case
+    /// where post-hoc CC injection bypassed expand state and rendered CC
+    /// rows at child depth while their parent group was collapsed
+    /// (visually orphaned bug reported 2026-05-26). The real tree shape is
+    /// `local -> / -> /home/pi -> sessions`, so the test mirrors that;
+    /// only `local` and `/` are auto-expanded at level 1, leaving
+    /// `/home/pi` collapsed by default.
+    #[test]
+    fn collapsed_parent_hides_agent_sessions_uniformly() {
+        let cc_leaf = SessionNode {
+            kind: SessionNodeKind::CodexSession,
+            name: "cc".to_string(),
+            path: PathBuf::from("/home/pi/.claude/projects/-home-pi/x.jsonl"),
+            session_id: Some("cc-id".to_string()),
+            cwd: Some("/home/pi".to_string()),
+            session_kind: Some(SessionKind::ClaudeCode),
+            ..Default::default()
+        };
+        let codex_leaf = SessionNode {
+            kind: SessionNodeKind::CodexSession,
+            name: "codex".to_string(),
+            path: PathBuf::from("/home/pi/.codex/sessions/x.jsonl"),
+            session_id: Some("codex-id".to_string()),
+            cwd: Some("/home/pi".to_string()),
+            session_kind: Some(SessionKind::Codex),
+            ..Default::default()
+        };
+        let home_pi = SessionNode {
+            kind: SessionNodeKind::Group,
+            name: "/home/pi".to_string(),
+            title: Some("/home/pi".to_string()),
+            group_kind: Some(WorkspaceGroupKind::Folder),
+            path: PathBuf::from("/home/pi"),
+            children: vec![codex_leaf, cc_leaf],
+            ..Default::default()
+        };
+        let slash = SessionNode {
+            kind: SessionNodeKind::Group,
+            name: "/".to_string(),
+            title: Some("/".to_string()),
+            group_kind: Some(WorkspaceGroupKind::Folder),
+            path: PathBuf::from("/"),
+            children: vec![home_pi],
+            ..Default::default()
+        };
+        let root = SessionNode {
+            kind: SessionNodeKind::Group,
+            name: "local".to_string(),
+            title: Some("local".to_string()),
+            group_kind: Some(WorkspaceGroupKind::Folder),
+            path: PathBuf::from("local"),
+            children: vec![slash],
+            ..Default::default()
+        };
+        let mut browser = SessionBrowserState::new(root);
+        // Default expansion is level-1 only (local + /). /home/pi is level-2
+        // so it stays collapsed. Both agent-CLI children MUST be hidden.
+        let rows = browser.rows();
+        assert!(
+            !rows.iter().any(|r| r.session_id.as_deref() == Some("cc-id")),
+            "CC session must be hidden when its parent group is collapsed"
+        );
+        assert!(
+            !rows.iter().any(|r| r.session_id.as_deref() == Some("codex-id")),
+            "Codex session must be hidden when its parent group is collapsed"
+        );
+
+        // Now expand /home/pi explicitly. Both kinds must appear together.
+        browser.ensure_expanded_paths(["/home/pi".to_string()]);
+        let rows = browser.rows();
+        assert!(
+            rows.iter().any(|r| r.session_id.as_deref() == Some("cc-id")),
+            "CC session must appear when its parent group is expanded"
+        );
+        assert!(
+            rows.iter().any(|r| r.session_id.as_deref() == Some("codex-id")),
+            "Codex session must appear when its parent group is expanded"
+        );
+    }
+
     #[test]
     fn root_group_stays_visible_when_sidebar_is_otherwise_empty() {
         let root = SessionNode {
@@ -728,6 +887,7 @@ mod tests {
             children: Vec::new(),
             session_id: None,
             cwd: None,
+            ..Default::default()
         };
         let browser = SessionBrowserState::new(root);
         let rows = browser.rows();
@@ -756,9 +916,11 @@ mod tests {
                 children: Vec::new(),
                 session_id: None,
                 cwd: None,
+                ..Default::default()
             }],
             session_id: None,
             cwd: None,
+            ..Default::default()
         };
         let mut browser = SessionBrowserState::new(root);
         browser.restore_ui_state(
@@ -824,12 +986,17 @@ mod tests {
                             children: Vec::new(),
                             session_id: None,
                             cwd: None,
+                            ..Default::default()
                         }],
+                        ..Default::default()
                     }],
+                    ..Default::default()
                 }],
+                ..Default::default()
             }],
             session_id: None,
             cwd: None,
+            ..Default::default()
         };
         let mut browser = SessionBrowserState::new(root);
         browser.restore_ui_state(&[], Some(selected));
@@ -887,12 +1054,17 @@ mod tests {
                             children: Vec::new(),
                             session_id: None,
                             cwd: None,
+                            ..Default::default()
                         }],
+                        ..Default::default()
                     }],
+                    ..Default::default()
                 }],
+                ..Default::default()
             }],
             session_id: None,
             cwd: None,
+            ..Default::default()
         };
         let browser = SessionBrowserState::new(root);
         let all_rows = browser.all_rows();
@@ -960,13 +1132,19 @@ mod tests {
                                 children: Vec::new(),
                                 session_id: Some("session-1".to_string()),
                                 cwd: Some("/home/pi".to_string()),
+                                ..Default::default()
                             }],
+                            ..Default::default()
                         }],
+                        ..Default::default()
                     }],
+                    ..Default::default()
                 }],
+                ..Default::default()
             }],
             session_id: None,
             cwd: None,
+            ..Default::default()
         };
         let mut browser = SessionBrowserState::new(root);
         browser.restore_ui_state_preserving_expanded_paths(
@@ -1037,13 +1215,19 @@ mod tests {
                                 children: Vec::new(),
                                 session_id: Some("session-1".to_string()),
                                 cwd: Some("/home/pi".to_string()),
+                                ..Default::default()
                             }],
+                            ..Default::default()
                         }],
+                        ..Default::default()
                     }],
+                    ..Default::default()
                 }],
+                ..Default::default()
             }],
             session_id: None,
             cwd: None,
+            ..Default::default()
         };
         let mut browser = SessionBrowserState::new(root);
         browser.restore_ui_state(&[], Some(selected));
