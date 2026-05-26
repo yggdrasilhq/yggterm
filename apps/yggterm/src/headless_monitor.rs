@@ -122,6 +122,10 @@ struct Config {
     expected_build_id: Option<u64>,
     reason: Option<String>,
     background: bool,
+    /// Force the hot-restart even when the daemon would otherwise defer
+    /// for session_survival_required. Used by dev/agent deploys that share
+    /// a version string. See [[bug-class-auto-hot-restart-version-gated]].
+    force: bool,
 }
 
 pub fn run(args: Vec<String>) -> Result<()> {
@@ -160,6 +164,7 @@ fn parse_args(args: Vec<String>) -> Result<Config> {
     let mut expected_build_id = None::<u64>;
     let mut reason = None::<String>;
     let mut background = false;
+    let mut force = false;
 
     let mut ix = 0usize;
     while ix < args.len() {
@@ -336,6 +341,14 @@ fn parse_args(args: Vec<String>) -> Result<Config> {
             "--foreground" => {
                 background = false;
             }
+            "--force" => {
+                // For `--scenario hot-restart`: bypass the same-version
+                // refusal and the session-survival deferral so the swap
+                // proceeds even when version_string matches the running
+                // daemon (dev/agent deploy case). See
+                // [[bug-class-auto-hot-restart-version-gated]].
+                force = true;
+            }
             other => bail!("unknown argument: {other}"),
         }
         ix += 1;
@@ -363,6 +376,7 @@ fn parse_args(args: Vec<String>) -> Result<Config> {
         expected_build_id,
         reason,
         background,
+        force,
     })
 }
 
@@ -1172,6 +1186,7 @@ fn run_scenario(
                         cfg.reason
                             .as_deref()
                             .or(Some("yggterm-headless monitor hot restart")),
+                        cfg.force,
                     );
                     match hot_result {
                         Ok(HotRestartResult::Restarting { message }) => {
