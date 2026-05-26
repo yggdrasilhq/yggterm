@@ -59467,6 +59467,41 @@ fn terminal_eval_script_with_canvas_renderer(
                 return false;
             }}
         }};
+        // XTERM-BUG: clipboard-double-paste — telemetry to attribute the
+        // bug class. Every entry into a paste path emits an
+        // xterm_paste_event; if two events arrive within 300 ms with
+        // different `source` or `triggered_by`, that's our signature of a
+        // double-fire (selection + clipboard, or two clipboard pastes).
+        let lastPasteEventAtMs = 0;
+        let lastPasteEventSource = '';
+        let lastPasteEventTrigger = '';
+        const recordPasteEvent = (source, triggered_by, payload_length, extra) => {{
+            try {{
+                const now = Date.now();
+                const dt = lastPasteEventAtMs ? now - lastPasteEventAtMs : -1;
+                const extraJson = extra ? JSON.stringify(extra) : '';
+                sendTerminalEvent({{
+                    kind: 'debug',
+                    message: `xterm_paste_event host=${{hostId}} source=${{source}} trigger=${{triggered_by}} length=${{payload_length}} dt_ms=${{dt}}${{extraJson ? ' extra=' + extraJson : ''}}`
+                }});
+                if (dt >= 0 && dt < 300 && (lastPasteEventSource !== source || lastPasteEventTrigger !== triggered_by)) {{
+                    sendTerminalEvent({{
+                        kind: 'debug',
+                        message: `xterm_paste_double_fire host=${{hostId}} prev_source=${{lastPasteEventSource}} prev_trigger=${{lastPasteEventTrigger}} curr_source=${{source}} curr_trigger=${{triggered_by}} dt_ms=${{dt}} length=${{payload_length}}`
+                    }});
+                    const entry = window.__yggtermXtermHosts && window.__yggtermXtermHosts[hostId]
+                        ? window.__yggtermXtermHosts[hostId] : null;
+                    if (entry) {{
+                        entry.pasteDoubleFireCount = Number(entry.pasteDoubleFireCount || 0) + 1;
+                        entry.lastPasteDoubleFireAtMs = now;
+                        entry.lastPasteDoubleFireSummary = `${{lastPasteEventSource}}:${{lastPasteEventTrigger}} -> ${{source}}:${{triggered_by}} dt=${{dt}}`;
+                    }}
+                }}
+                lastPasteEventAtMs = now;
+                lastPasteEventSource = source;
+                lastPasteEventTrigger = triggered_by;
+            }} catch (_error) {{}}
+        }};
         const primarySelectionTextForPaste = () => {{
             try {{
                 recordPrimarySelectionFromXterm('middle_click_refresh');
@@ -59521,6 +59556,10 @@ fn terminal_eval_script_with_canvas_renderer(
                     entry.lastPrimarySelectionPasteMethod = 'pending';
                     entry.scrollbackLocked = false;
                 }}
+                // XTERM-BUG: clipboard-double-paste — record yggterm-side
+                // primary paste. If xterm.js or WebKit also fires a paste
+                // within 300 ms, the double-fire detector flags it.
+                recordPasteEvent('primary', 'middle_click_yggterm', text.length, null);
                 focusTerminal();
                 try {{
                     if (term && typeof term.paste === 'function') {{
@@ -61515,6 +61554,22 @@ fn terminal_eval_script_with_canvas_renderer(
             }}, minHostHealthIntervalMs);
         }};
         term.onData((data) => {{
+            // XTERM-BUG: clipboard-double-paste — any multi-char onData
+            // burst that didn't originate from a known yggterm paste path
+            // is recorded as `unknown` source. If it lands within 300 ms
+            // of a known yggterm paste, the double-fire detector flags it
+            // (that's the smoking-gun for xterm.js/WebKit re-pasting on
+            // top of our paste). Single-char data = typing, not paste.
+            try {{
+                if (typeof data === 'string' && data.length >= 4) {{
+                    const dt = lastPasteEventAtMs ? Date.now() - lastPasteEventAtMs : -1;
+                    // If we just emitted a paste event from our own path,
+                    // skip the onData echo (term.paste internally feeds onData).
+                    if (!(dt >= 0 && dt < 60 && lastPasteEventTrigger === 'middle_click_yggterm')) {{
+                        recordPasteEvent('unknown', 'on_data_burst', data.length, null);
+                    }}
+                }}
+            }} catch (_e) {{}}
             if (terminalDataIsSuppressedProtocolResponse(data)) {{
                 if (terminalProtocolResponseFallbackAllowed(data)) {{
                     recordSuppressedTerminalProtocolResponse('onData-fallback', data);
