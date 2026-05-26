@@ -147,8 +147,7 @@ use yggterm_server::{
     AppControlPointerCommand, AppControlPreviewLayout, AppControlResponse,
     AppControlRightPanelMode, AppControlStartAction, AppControlViewMode, GhosttyTerminalHostMode,
     ManagedSessionView, PersistedDaemonState, PreviewTone, ProbeTerminalViewportInputMode,
-    RemoteDeployState, RemoteMachineHealth, RemoteMachineSnapshot,
-    RemoteScannedSession,
+    RemoteDeployState, RemoteMachineHealth, RemoteMachineSnapshot, RemoteScannedSession,
     ServerEndpoint, ServerRuntimeStatus, ServerUiSnapshot, SessionKind, SessionMetadataEntry,
     SessionPreviewBlock, SessionRenderedSection, SessionSource, SnapshotSessionView,
     SshConnectTarget, TerminalBackend, TerminalLaunchPhase, WorkspaceViewMode,
@@ -13416,7 +13415,7 @@ fn synthesize_app_control_row(shell: &ShellState, session_path: &str) -> Option<
         session_cwd: codex_identity
             .map(|(_, cwd)| cwd)
             .or_else(|| path.parent().map(|parent| parent.display().to_string())),
-            session_kind: None,
+        session_kind: None,
     })
 }
 fn session_cwd_for_managed_session(session: &ManagedSessionView) -> Option<String> {
@@ -14560,9 +14559,7 @@ fn row_session_kind(row: &BrowserRow) -> Option<SessionKind> {
         Some(SessionKind::ClaudeCode)
     } else if row.full_path.starts_with("local://") {
         Some(SessionKind::Shell)
-    } else if row.full_path.starts_with("ssh://")
-        || row.full_path.starts_with("live::")
-    {
+    } else if row.full_path.starts_with("ssh://") || row.full_path.starts_with("live::") {
         Some(SessionKind::SshShell)
     } else {
         None
@@ -19474,10 +19471,7 @@ fn merged_sidebar_rows_uncached(
     // All promoted live sessions — including local Codex/CC and remote
     // sessions — appear in Live Sessions. Remote sessions ALSO remain in
     // their machine group below (no retain dedup) per the dual-presence spec.
-    let display_promoted_sessions = promoted_live_sessions
-        .iter()
-        .copied()
-        .collect::<Vec<_>>();
+    let display_promoted_sessions = promoted_live_sessions.iter().copied().collect::<Vec<_>>();
     push_live_session_rows(
         &mut rows,
         &display_promoted_sessions,
@@ -19516,9 +19510,7 @@ fn merged_sidebar_rows_uncached(
         if is_remote_workspace_virtual_row(row) {
             return None;
         }
-        if row.kind == BrowserRowKind::Session
-            && promoted_storage_paths.contains(&row.full_path)
-        {
+        if row.kind == BrowserRowKind::Session && promoted_storage_paths.contains(&row.full_path) {
             None
         } else {
             Some(row.clone())
@@ -19821,15 +19813,20 @@ fn find_best_group_for_cwd_in_rows(rows: &[BrowserRow], cwd: &str) -> Option<(us
     let path = std::path::Path::new(cwd);
     let ancestors = path.ancestors().skip(1).filter_map(|p| {
         let s = p.to_string_lossy().to_string();
-        if s.is_empty() || s == "/" { None } else { Some(s) }
+        if s.is_empty() || s == "/" {
+            None
+        } else {
+            Some(s)
+        }
     });
     let candidates = std::iter::once(cwd.to_string())
         .chain(ancestors)
         .chain(std::iter::once("local".to_string()));
     for candidate in candidates {
-        if let Some(idx) = rows.iter().position(|r| {
-            r.kind == BrowserRowKind::Group && r.full_path == candidate
-        }) {
+        if let Some(idx) = rows
+            .iter()
+            .position(|r| r.kind == BrowserRowKind::Group && r.full_path == candidate)
+        {
             return Some((idx, rows[idx].depth));
         }
     }
@@ -19868,8 +19865,7 @@ fn inject_cc_sessions_into_stored_rows(
             continue;
         }
         let cwd = metadata_value(session, "Cwd");
-        let Some((group_idx, group_depth)) =
-            find_best_group_for_cwd_in_rows(stored_rows, &cwd)
+        let Some((group_idx, group_depth)) = find_best_group_for_cwd_in_rows(stored_rows, &cwd)
         else {
             continue;
         };
@@ -19878,7 +19874,11 @@ fn inject_cc_sessions_into_stored_rows(
         let summary = live_session_summary_with_index(remote_session_index, session);
         let keep_alive = live_session_keep_alive(session);
         let detail_label = live_session_detail_label(summary, keep_alive);
-        let cwd_opt = if cwd.trim().is_empty() { None } else { Some(cwd) };
+        let cwd_opt = if cwd.trim().is_empty() {
+            None
+        } else {
+            Some(cwd)
+        };
         insertions.push((
             insert_idx,
             BrowserRow {
@@ -53935,7 +53935,8 @@ fn emit_notification_chime(tone: NotificationTone) {
     let script = match tone {
         // Success / completion: gentle two-note chord (fundamental + major third)
         // ADSR: fast attack, short sustain, smooth exponential decay
-        NotificationTone::Success => r#"
+        NotificationTone::Success => {
+            r#"
         (() => {
           try {
             const ctx = new (window.AudioContext || window.webkitAudioContext)();
@@ -53959,9 +53960,11 @@ fn emit_notification_chime(tone: NotificationTone) {
             setTimeout(() => { try { ctx.close(); } catch (_e) {} }, 520);
           } catch (_error) {}
         })();
-        "#,
+        "#
+        }
         // Info: single clean note, brief and unobtrusive
-        NotificationTone::Info => r#"
+        NotificationTone::Info => {
+            r#"
         (() => {
           try {
             const ctx = new (window.AudioContext || window.webkitAudioContext)();
@@ -53980,9 +53983,11 @@ fn emit_notification_chime(tone: NotificationTone) {
             setTimeout(() => { try { ctx.close(); } catch (_e) {} }, 300);
           } catch (_error) {}
         })();
-        "#,
+        "#
+        }
         // Warning: two quick rising pulses to signal attention needed
-        NotificationTone::Warning => r#"
+        NotificationTone::Warning => {
+            r#"
         (() => {
           try {
             const ctx = new (window.AudioContext || window.webkitAudioContext)();
@@ -54004,9 +54009,11 @@ fn emit_notification_chime(tone: NotificationTone) {
             setTimeout(() => { try { ctx.close(); } catch (_e) {} }, 400);
           } catch (_error) {}
         })();
-        "#,
+        "#
+        }
         // Error: descending minor second interval — feels "wrong" intentionally
-        NotificationTone::Error => r#"
+        NotificationTone::Error => {
+            r#"
         (() => {
           try {
             const ctx = new (window.AudioContext || window.webkitAudioContext)();
@@ -54027,7 +54034,8 @@ fn emit_notification_chime(tone: NotificationTone) {
             setTimeout(() => { try { ctx.close(); } catch (_e) {} }, 450);
           } catch (_error) {}
         })();
-        "#,
+        "#
+        }
     };
     let _ = document::eval(script);
 }
@@ -63587,10 +63595,7 @@ fn start_page_recent_rows_from_browser_rows_with_modified_epochs(
             .then_with(|| right.2.cmp(&left.2))
             .then_with(|| left.3.cmp(&right.3))
     });
-    candidates
-        .into_iter()
-        .map(|(row, _, _, _)| row)
-        .collect()
+    candidates.into_iter().map(|(row, _, _, _)| row).collect()
 }
 
 fn start_page_live_projection_paths(snapshot: &RenderSnapshot) -> HashSet<String> {
@@ -63607,8 +63612,7 @@ fn start_page_live_projection_paths(snapshot: &RenderSnapshot) -> HashSet<String
 }
 
 fn remote_scanned_session_is_start_page_durable(session: &RemoteScannedSession) -> bool {
-    !session.storage_path.trim().is_empty()
-        || session.session_path.starts_with("remote-cc://")
+    !session.storage_path.trim().is_empty() || session.session_path.starts_with("remote-cc://")
 }
 
 fn start_page_browser_row_modified_epoch(row: &BrowserRow) -> i64 {
@@ -70162,7 +70166,8 @@ mod tests {
         // Activation repaint must NOT unconditionally call forcePromptFollow.
         // UserScrollback intent must be preserved across session switches.
         assert!(
-            script.contains("String(entry.scrollbackIntent || 'PromptFollow') !== 'UserScrollback'"),
+            script
+                .contains("String(entry.scrollbackIntent || 'PromptFollow') !== 'UserScrollback'"),
             "activation repaint must guard forcePromptFollow to preserve UserScrollback"
         );
     }
@@ -71264,7 +71269,9 @@ mod tests {
         // gets the .yggterm-term-focused class iff focused — but the literal
         // string changed.
         assert!(
-            script.contains("inputEnabled && hostOwnsActiveTerminalInput() && !focused ? 'auto' : 'none';"),
+            script.contains(
+                "inputEnabled && hostOwnsActiveTerminalInput() && !focused ? 'auto' : 'none';"
+            ),
             "transparent focus-capture hit layer must only intercept the active terminal, not parked retained hosts"
         );
         assert!(
