@@ -63465,18 +63465,14 @@ fn start_page_recent_rows_from_browser_rows_with_modified_epochs(
         }
     };
 
-    // Per [[spec-active-sessions-dual-presence]]: live sessions belong in the
-    // start page recent list too (in addition to the Live Sessions group and
-    // cwd tree). Push them first with i64::MAX as modified_epoch so they sort
-    // to the top by recency.
-    for live_session in &snapshot.live_sessions {
-        let live_row = browser_row_for_live_session(live_session);
-        if !start_page_recent_scope_allows_browser_row(&scope, &live_row) {
-            continue;
-        }
-        push_candidate(live_row, i64::MAX, String::new());
-    }
-
+    // SPEC: start page is a LAUNCHING PAD for sessions you want to open or
+    // resume. Live sessions are already running — they're surfaced in the
+    // "Live Sessions" sidebar group and the cwd tree (see
+    // [[spec-active-sessions-dual-presence]] for the canonical two-place
+    // claim; the start page is explicitly NOT a third presence).
+    // The `live_projection_paths` filter at the browser_rows loop below
+    // strips any browser_row whose path matches a live session, so we
+    // don't double-count via that path either.
     for machine in &snapshot.remote_machines {
         let remote_short_ids = unique_session_short_ids_for_pairs(
             &machine
@@ -63716,27 +63712,6 @@ fn start_page_recent_scope_allows_browser_row(
     true
 }
 
-fn browser_row_for_live_session(session: &ManagedSessionView) -> BrowserRow {
-    // Per [[spec-active-sessions-dual-presence]]: live sessions surface in the
-    // start page recent list as well as the Live Sessions group.
-    BrowserRow {
-        kind: BrowserRowKind::Session,
-        full_path: session.session_path.clone(),
-        label: session.title.clone(),
-        detail_label: String::new(),
-        document_kind: None,
-        group_kind: None,
-        session_title: Some(session.title.clone()),
-        depth: 0,
-        host_label: session.host_label.clone(),
-        descendant_sessions: 0,
-        expanded: false,
-        session_id: Some(session.id.clone()),
-        session_cwd: Some(metadata_value(session, "Cwd")),
-        session_kind: Some(session.kind),
-    }
-}
-
 fn browser_row_for_remote_scanned_session(
     machine: &RemoteMachineSnapshot,
     session: &RemoteScannedSession,
@@ -63800,13 +63775,6 @@ fn StartPage(snapshot: SharedSnapshot, state: Signal<ShellState>) -> Element {
     let can_create_folder_in_selected = selected_action_row
         .as_ref()
         .is_some_and(|row| row.full_path == "local" || is_workspace_row(row));
-    let can_rename_selected = selected_action_row
-        .as_ref()
-        .is_some_and(context_menu_allows_rename);
-    let selected_session_edit_row = selected_action_row
-        .as_ref()
-        .filter(|row| row.kind == BrowserRowKind::Session)
-        .cloned();
     let quick_button_style = format!(
         "display:inline-flex; align-items:center; justify-content:center; gap:8px; min-height:34px; \
          padding:0 13px; border:none; border-radius:8px; background:{}; color:{}; \
@@ -63922,43 +63890,13 @@ fn StartPage(snapshot: SharedSnapshot, state: Signal<ShellState>) -> Element {
                             }
                         }
                     }
-                    if can_rename_selected {
-                        if let Some(row) = selected_action_row.clone() {
-                            button {
-                                r#type: "button",
-                                "data-yggterm-start-action": "rename",
-                                style: "{quick_button_style}",
-                                onmousedown: |evt| {
-                                    evt.prevent_default();
-                                    evt.stop_propagation();
-                                },
-                                onclick: move |evt| {
-                                    evt.prevent_default();
-                                    evt.stop_propagation();
-                                    state.with_mut(|shell| shell.begin_tree_rename(&row));
-                                    sync_active_terminal_input_policy(state);
-                                },
-                                "Rename"
-                            }
-                        }
-                    }
-                    if let Some(row) = selected_session_edit_row.clone() {
-                        button {
-                            r#type: "button",
-                            "data-yggterm-start-action": "edit-summary",
-                            style: "{quick_button_style}",
-                            onmousedown: |evt| {
-                                evt.prevent_default();
-                                evt.stop_propagation();
-                            },
-                            onclick: move |evt| {
-                                evt.prevent_default();
-                                evt.stop_propagation();
-                                queue_copy_edit_for_row(state, row.clone(), CopyEditField::Summary);
-                            },
-                            "Edit Summary"
-                        }
-                    }
+                    // Rename + Edit Summary intentionally NOT in this header. Both
+                    // operate on snapshot.selected_row (sidebar selection) — a target
+                    // that's invisible from the start page perspective. Per-card
+                    // pencils at ~line 64063 (rename title) and ~line 64114 (edit
+                    // summary) provide the same actions with clear contextual scope.
+                    // Header buttons here only host actions that DON'T have a per-row
+                    // equivalent (New Codex/Claude/Terminal/Folder).
                 }
                 div {
                     style: "display:flex; flex-direction:column; gap:10px; min-width:0;",
@@ -91166,11 +91104,12 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
     }
 
     #[test]
-    fn start_page_recent_rows_includes_live_terminals_without_duplicating_browser_row() {
-        // Per [[spec-active-sessions-dual-presence]] live sessions appear in
-        // recent rows alongside durable scanned sessions. The browser_row
-        // representation of the same live session MUST be filtered out so the
-        // entry only appears once (live-session candidate wins).
+    fn start_page_recent_rows_excludes_live_terminal_projections() {
+        // SPEC: live sessions do NOT appear in start page recents. They are
+        // dual-present in Live Sessions group + cwd tree only. The start page
+        // is a launching pad for sessions to open/resume; live ones are
+        // already running and accessible from the sidebar Live Sessions group.
+        // See [[spec-active-sessions-dual-presence]] (out-of-scope: start page).
         let mut shell = ShellState::new(test_shell_bootstrap_with_active_session("local://seed"));
         let live_terminal_path = "live::remote-shell";
         let mut live_terminal = test_live_shell_session(live_terminal_path);
@@ -91235,16 +91174,10 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             .map(|row| row.full_path)
             .collect::<Vec<_>>();
 
-        // live::remote-shell appears once (from the live_sessions loop), the
-        // browser_row for the same path is filtered by live_projection_paths,
-        // and the durable scanned session follows.
-        assert_eq!(
-            paths,
-            [
-                "live::remote-shell",
-                "remote-session://samplenotes-webapp/durable",
-            ]
-        );
+        // The browser_row representation of live::remote-shell is stripped by
+        // the live_projection_paths filter, and no separate live-session
+        // candidate is pushed. Only the durable scanned session remains.
+        assert_eq!(paths, ["remote-session://samplenotes-webapp/durable"]);
     }
 
     #[test]
@@ -91344,14 +91277,14 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             .into_iter()
             .map(|row| row.full_path)
             .collect::<Vec<_>>();
-        // Per [[spec-active-sessions-dual-presence]] the live session must appear
-        // in start page recents too. Live sessions sort first ("currently running"
-        // is most recent), followed by scanned remote sessions in modified_epoch
-        // desc order.
+        // SPEC: live sessions are NOT in the start page recents — they're
+        // dual-present in Live Sessions group + cwd tree only. The folder
+        // selection scopes recents to durable sessions in this folder.
+        // active_path's live session is verified above by the live_sessions
+        // assert; it must not also appear here.
         assert_eq!(
             recent_paths,
             vec![
-                active_path.to_string(),
                 "remote-session://dev/newest-yggterm".to_string(),
                 "remote-session://dev/older-yggterm".to_string(),
             ]
