@@ -6977,88 +6977,12 @@ fn tmux_has_session(session_name: &str) -> anyhow::Result<bool> {
         .success())
 }
 
-fn tmux_spawn_codex_session(session_name: &str, command: &str) -> anyhow::Result<()> {
-    let status = Command::new("tmux")
-        .args([
-            "new-session",
-            "-d",
-            "-s",
-            session_name,
-            "sh",
-            "-lc",
-            command,
-        ])
-        .status()
-        .with_context(|| format!("creating tmux session {session_name}"))?;
-    if status.success() {
-        Ok(())
-    } else {
-        anyhow::bail!("tmux failed to create session {session_name}: {status}");
-    }
-}
-
-fn tmux_attach_session(session_name: &str) -> anyhow::Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        let error = Command::new("tmux")
-            .args(["attach-session", "-t", session_name])
-            .exec();
-        Err(anyhow::anyhow!(
-            "failed to exec tmux attach-session for {session_name}: {error}"
-        ))
-    }
-
-    #[cfg(not(unix))]
-    {
-        let status = Command::new("tmux")
-            .args(["attach-session", "-t", session_name])
-            .status()
-            .with_context(|| format!("attaching tmux session {session_name}"))?;
-        if status.success() {
-            Ok(())
-        } else {
-            anyhow::bail!("tmux attach-session failed for {session_name}: {status}");
-        }
-    }
-}
-
-fn tmux_snapshot_bytes(session_name: &str) -> anyhow::Result<Vec<u8>> {
-    let output = Command::new("tmux")
-        .args([
-            "capture-pane",
-            "-p",
-            "-e",
-            "-J",
-            "-S",
-            "-",
-            "-t",
-            session_name,
-        ])
-        .output()
-        .with_context(|| format!("capturing tmux pane for {session_name}"))?;
-    if !output.status.success() {
-        anyhow::bail!(
-            "tmux capture-pane failed for {session_name}: {}",
-            output.status
-        );
-    }
-    Ok(sanitize_terminal_snapshot(&output.stdout))
-}
-
-fn tmux_visible_snapshot_bytes(session_name: &str) -> anyhow::Result<Vec<u8>> {
-    let output = Command::new("tmux")
-        .args(["capture-pane", "-p", "-e", "-J", "-t", session_name])
-        .output()
-        .with_context(|| format!("capturing visible tmux pane for {session_name}"))?;
-    if !output.status.success() {
-        anyhow::bail!(
-            "tmux visible capture failed for {session_name}: {}",
-            output.status
-        );
-    }
-    Ok(sanitize_terminal_snapshot(&output.stdout))
-}
+// Deleted 2026-05-26: tmux_spawn_codex_session, tmux_attach_session,
+// tmux_snapshot_bytes, tmux_visible_snapshot_bytes — legacy multiplexer
+// adapters from before yggterm-headless became the remote runtime. The
+// surviving tmux helpers (tmux_available, tmux_has_session, tmux_send_keys,
+// tmux_kill_session) are still used by the remote-session shutdown path
+// in lib.rs:~13906.
 
 fn tmux_send_keys(session_name: &str, text: &str) -> anyhow::Result<()> {
     let status = Command::new("tmux")
@@ -7111,95 +7035,11 @@ fn screen_has_session(session_name: &str) -> anyhow::Result<bool> {
     Ok(screen_session_ref(session_name)?.is_some())
 }
 
-fn screen_spawn_codex_session(session_name: &str, command: &str) -> anyhow::Result<()> {
-    let status = Command::new("screen")
-        .args(["-DmS", session_name, "sh", "-lc", command])
-        .status()
-        .with_context(|| format!("creating screen session {session_name}"))?;
-    if status.success() {
-        Ok(())
-    } else {
-        anyhow::bail!("screen failed to create session {session_name}: {status}");
-    }
-}
-
-fn screen_attach_shell_command(target: &str) -> String {
-    let quoted_target = shell_single_quote(target);
-    format!(
-        r#"(export TERM='xterm-256color' COLORTERM='truecolor'; \
-         attach_once() {{ \
-             screen -D -r {target}; \
-         }}; \
-         for retry_delay in 0 0.06 0.14 0.28; do \
-             if [ "$retry_delay" != 0 ]; then sleep "$retry_delay"; fi; \
-             attach_once && exit 0; \
-         done; \
-         exec screen -D -r {target})"#,
-        target = quoted_target,
-    )
-}
-
-fn screen_resume_or_spawn_shell_command(
-    session_name: &str,
-    legacy_session_name: Option<&str>,
-    spawn_command: &str,
-) -> String {
-    let quoted_session = shell_single_quote(session_name);
-    let quoted_spawn = shell_single_quote(spawn_command);
-    let legacy_attach = legacy_session_name
-        .filter(|candidate| *candidate != session_name)
-        .map(shell_single_quote)
-        .map(|quoted_legacy| format!("attach_once {quoted_legacy} && exit 0;"))
-        .unwrap_or_default();
-    format!(
-        r#"(export TERM='xterm-256color' COLORTERM='truecolor'; \
-         attach_once() {{ \
-             target="$1"; \
-             [ -n "$target" ] || return 1; \
-             screen -D -r "$target"; \
-         }}; \
-         for retry_delay in 0 0.06 0.14 0.28; do \
-             if [ "$retry_delay" != 0 ]; then sleep "$retry_delay"; fi; \
-             attach_once {session} && exit 0; \
-             {legacy_attach} \
-         done; \
-         screen -DmS {session} sh -lc {spawn}; \
-         for retry_delay in 0 0.06 0.14 0.28; do \
-             if [ "$retry_delay" != 0 ]; then sleep "$retry_delay"; fi; \
-             attach_once {session} && exit 0; \
-         done; \
-         exec screen -D -r {session})"#,
-        session = quoted_session,
-        legacy_attach = legacy_attach,
-        spawn = quoted_spawn,
-    )
-}
-
-fn screen_attach_session(session_name: &str) -> anyhow::Result<()> {
-    let target = screen_session_ref(session_name)?.unwrap_or_else(|| session_name.to_string());
-    let attach_command = screen_attach_shell_command(&target);
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        let error = Command::new("sh").args(["-lc", &attach_command]).exec();
-        Err(anyhow::anyhow!(
-            "failed to exec screen attach for {target}: {error}"
-        ))
-    }
-
-    #[cfg(not(unix))]
-    {
-        let status = Command::new("sh")
-            .args(["-lc", &attach_command])
-            .status()
-            .with_context(|| format!("attaching screen session {target}"))?;
-        if status.success() {
-            Ok(())
-        } else {
-            anyhow::bail!("screen attach failed for {target}: {status}");
-        }
-    }
-}
+// Deleted 2026-05-26: screen_spawn_codex_session, screen_attach_shell_command,
+// screen_resume_or_spawn_shell_command, screen_attach_session — legacy
+// multiplexer adapters. The surviving screen helpers (screen_available,
+// screen_session_ref, screen_has_session, screen_send_keys, screen_kill_session)
+// are still used by the remote-session shutdown path in lib.rs:~13906.
 
 fn screen_send_keys(session_name: &str, text: &str) -> anyhow::Result<()> {
     let target = screen_session_ref(session_name)?.unwrap_or_else(|| session_name.to_string());
@@ -7230,108 +7070,10 @@ fn screen_kill_session(session_name: &str) -> anyhow::Result<()> {
     }
 }
 
-fn sanitize_terminal_snapshot(bytes: &[u8]) -> Vec<u8> {
-    bytes
-        .iter()
-        .copied()
-        .filter(|byte| matches!(byte, b'\n' | b'\r' | b'\t') || (0x20..=0x7e).contains(byte))
-        .collect()
-}
-
-fn screen_snapshot_bytes_with_history(
-    session_name: &str,
-    include_history: bool,
-) -> anyhow::Result<Vec<u8>> {
-    let Some(target) = screen_session_ref(session_name)? else {
-        return Ok(Vec::new());
-    };
-    let path = std::env::temp_dir().join(format!(
-        "yggterm-screen-{}-{}.txt",
-        current_millis_u64(),
-        Uuid::new_v4().simple()
-    ));
-    let mut command = Command::new("screen");
-    command.args(["-S", &target, "-X", "hardcopy"]);
-    if include_history {
-        command.arg("-h");
-    }
-    let status = command
-        .arg(&path)
-        .status()
-        .with_context(|| format!("capturing screen hardcopy for {target}"))?;
-    if !status.success() {
-        anyhow::bail!("screen hardcopy failed for {target}: {status}");
-    }
-    let mut bytes = None;
-    let mut last_error = None;
-    for _ in 0..40 {
-        match fs::read(&path) {
-            Ok(read) => {
-                bytes = Some(read);
-                break;
-            }
-            Err(error) => {
-                last_error = Some(error.to_string());
-                std::thread::sleep(Duration::from_millis(50));
-            }
-        }
-    }
-    let _ = fs::remove_file(&path);
-    let bytes = bytes.with_context(|| {
-        format!(
-            "reading {}{}",
-            path.display(),
-            last_error
-                .as_deref()
-                .map(|error| format!(" after retry: {error}"))
-                .unwrap_or_default()
-        )
-    })?;
-    Ok(sanitize_terminal_snapshot(&bytes))
-}
-
-fn screen_snapshot_bytes(session_name: &str) -> anyhow::Result<Vec<u8>> {
-    screen_snapshot_bytes_with_history(session_name, true)
-}
-
-fn screen_visible_snapshot_bytes(session_name: &str) -> anyhow::Result<Vec<u8>> {
-    screen_snapshot_bytes_with_history(session_name, false)
-}
-
-fn terminal_snapshot_emission_bytes(bytes: &[u8]) -> Vec<u8> {
-    let mut normalized = Vec::with_capacity(bytes.len());
-    let mut previous_was_cr = false;
-    for byte in bytes {
-        match *byte {
-            b'\n' if !previous_was_cr => {
-                normalized.push(b'\r');
-                normalized.push(b'\n');
-                previous_was_cr = false;
-            }
-            value => {
-                normalized.push(value);
-                previous_was_cr = value == b'\r';
-            }
-        }
-    }
-    normalized
-}
-
-fn emit_terminal_snapshot(bytes: &[u8]) -> anyhow::Result<()> {
-    if bytes.is_empty() {
-        return Ok(());
-    }
-    let normalized = terminal_snapshot_emission_bytes(bytes);
-    let mut stdout = std::io::stdout();
-    stdout
-        .write_all(b"\x1b[2J\x1b[H")
-        .context("clearing terminal before snapshot emit")?;
-    stdout
-        .write_all(&normalized)
-        .context("writing terminal snapshot")?;
-    stdout.flush().context("flushing terminal snapshot")?;
-    Ok(())
-}
+// Deleted 2026-05-26: sanitize_terminal_snapshot, screen_snapshot_bytes_with_history,
+// screen_snapshot_bytes, screen_visible_snapshot_bytes, terminal_snapshot_emission_bytes,
+// emit_terminal_snapshot — used only by the legacy remote_multiplexer_* path
+// that yggterm-headless replaced.
 
 fn remote_snapshot_non_empty_lines(bytes: &[u8]) -> Vec<String> {
     let text = String::from_utf8_lossy(bytes);
@@ -8083,83 +7825,11 @@ fn remote_resume_runtime_output_mismatches_managed_session(
     !remote_snapshot_matches_saved_session_fragments(&fragments, snapshot, false)
 }
 
-fn emit_remote_multiplexer_snapshot_with_retry(
-    multiplexer: RemoteMultiplexer,
-    session_name: &str,
-    wait_budget: Duration,
-) -> anyhow::Result<bool> {
-    let deadline = Instant::now() + wait_budget;
-    loop {
-        let bytes = remote_multiplexer_visible_snapshot_bytes(multiplexer, session_name)?;
-        if !bytes.is_empty() {
-            emit_terminal_snapshot(&bytes)?;
-            return Ok(true);
-        }
-        if Instant::now() >= deadline {
-            return Ok(false);
-        }
-        std::thread::sleep(Duration::from_millis(40));
-    }
-}
-
-fn wait_for_remote_resume_snapshot(
-    multiplexer: RemoteMultiplexer,
-    session_name: &str,
-    session_id: &str,
-    saved_session_exists: bool,
-    wait_budget: Duration,
-) -> anyhow::Result<Option<Vec<u8>>> {
-    let deadline = Instant::now() + wait_budget;
-    loop {
-        let visible_snapshot =
-            remote_multiplexer_visible_snapshot_bytes(multiplexer, session_name)?;
-        let full_snapshot = if saved_session_exists && !visible_snapshot.is_empty() {
-            remote_multiplexer_snapshot_bytes(multiplexer, session_name).unwrap_or_default()
-        } else {
-            Vec::new()
-        };
-        if remote_saved_session_screen_is_attachable(
-            session_id,
-            saved_session_exists,
-            &visible_snapshot,
-            &full_snapshot,
-        ) {
-            let prefer_full_snapshot = saved_session_exists
-                && !full_snapshot.is_empty()
-                && remote_snapshot_matches_saved_session_strict(session_id, &full_snapshot)
-                    .unwrap_or(false);
-            return Ok(Some(if prefer_full_snapshot {
-                full_snapshot
-            } else {
-                visible_snapshot
-            }));
-        }
-        if Instant::now() >= deadline {
-            return Ok(None);
-        }
-        std::thread::sleep(Duration::from_millis(45));
-    }
-}
-
-fn remote_multiplexer_snapshot_bytes(
-    multiplexer: RemoteMultiplexer,
-    session_name: &str,
-) -> anyhow::Result<Vec<u8>> {
-    match multiplexer {
-        RemoteMultiplexer::Tmux => tmux_snapshot_bytes(session_name),
-        RemoteMultiplexer::Screen => screen_snapshot_bytes(session_name),
-    }
-}
-
-fn remote_multiplexer_visible_snapshot_bytes(
-    multiplexer: RemoteMultiplexer,
-    session_name: &str,
-) -> anyhow::Result<Vec<u8>> {
-    match multiplexer {
-        RemoteMultiplexer::Tmux => tmux_visible_snapshot_bytes(session_name),
-        RemoteMultiplexer::Screen => screen_visible_snapshot_bytes(session_name),
-    }
-}
+// Deleted 2026-05-26: emit_remote_multiplexer_snapshot_with_retry,
+// wait_for_remote_resume_snapshot, remote_multiplexer_snapshot_bytes,
+// remote_multiplexer_visible_snapshot_bytes — the remote-multiplexer
+// snapshot path that yggterm-headless replaced. See block deletions in
+// lib.rs:~7038 (tmux), ~7050 (screen), ~7073 (sanitize/emit) above.
 
 fn remote_ssh_launch_command(
     ssh_target: &str,
@@ -19429,7 +19099,7 @@ mod tests {
         remote_scanned_session_path, remote_snapshot_looks_like_codex,
         remote_snapshot_looks_like_shell_prompt, remote_ssh_launch_command,
         remote_summary_for_path, remote_tmux_session_name, sanitize_recent_context_payload,
-        screen_attach_shell_command, screen_resume_or_spawn_shell_command, session_metadata_value,
+        session_metadata_value,
         should_fallback_to_python, should_remove_local_daemon_socket_for_spawn_state,
         stored_session_launch_command, strip_remote_payload_noise,
         synthesize_remote_scanned_session_view, try_acquire_remote_scan_lock,
@@ -22128,14 +21798,6 @@ mod tests {
     }
 
     #[test]
-    fn terminal_snapshot_emission_normalizes_bare_lf_for_pty_output() {
-        assert_eq!(
-            super::terminal_snapshot_emission_bytes(b"one\ntwo\r\nthree\n"),
-            b"one\r\ntwo\r\nthree\r\n"
-        );
-    }
-
-    #[test]
     fn remote_resume_runtime_output_requires_restart_for_codex_resume_instruction() {
         let exited = b"Token usage: total=1,064,406 input=1,023,193 output=41,213\nTo continue this session, run codex resume 019d0000-0000-7000-8000-000000000001\n";
         assert!(remote_resume_runtime_output_requires_restart(exited));
@@ -22691,32 +22353,9 @@ terminal_window_id: None,
         assert_eq!(legacy_a, legacy_b);
     }
 
-    #[test]
-    fn screen_attach_shell_command_replays_exact_session_without_injecting_ctrl_l() {
-        let command = screen_attach_shell_command("4046775.yggterm-abc123");
-        assert!(command.contains("export TERM='xterm-256color' COLORTERM='truecolor'"));
-        assert!(command.contains("screen -D -r '4046775.yggterm-abc123'"));
-        assert!(command.contains("attach_once()"));
-        assert!(command.contains("for retry_delay in 0 0.06 0.14 0.28"));
-        assert!(!command.contains("screen -S '4046775.yggterm-abc123' -X stuff"));
-        assert!(!command.contains("redisplay"));
-        assert!(!command.contains("screen -D -RR"));
-    }
-
-    #[test]
-    fn screen_resume_or_spawn_shell_command_avoids_screen_ls_on_hot_path() {
-        let command = screen_resume_or_spawn_shell_command(
-            "yggterm-abc123",
-            Some("123456.yggterm-legacy"),
-            "exec codex resume -C /home/pi abc123",
-        );
-        assert!(command.contains("attach_once 'yggterm-abc123'"));
-        assert!(command.contains("attach_once '123456.yggterm-legacy'"));
-        assert!(command.contains(
-            "screen -DmS 'yggterm-abc123' sh -lc 'exec codex resume -C /home/pi abc123'"
-        ));
-        assert!(!command.contains("screen -ls"));
-    }
+    // Deleted 2026-05-26: screen_attach_shell_command_replays_exact_session_without_injecting_ctrl_l
+    // and screen_resume_or_spawn_shell_command_avoids_screen_ls_on_hot_path —
+    // tested legacy multiplexer adapters deleted in the same commit.
 
     #[test]
     fn reopening_remote_scanned_session_refreshes_stale_launch_command() -> Result<()> {
