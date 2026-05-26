@@ -162,8 +162,11 @@ We piggyback on it:
 - `crates/yggterm-shell/src/shell.rs:~61220` — `term.onScroll` listener (throttled persist + opportunistic apply)
 
 ### Tests
-TODO. Test should assert presence of helper names and the
-`yggterm-scroll:` localStorage key prefix in the generated script.
+`terminal_eval_script_persists_scroll_state_to_localstorage` in
+yggterm-shell asserts the three helper names (`persistScrollStateToLocalStorage`,
+`loadScrollStateFromLocalStorage`, `tryApplyPendingPersistedScrollRestore`)
+and the `yggterm-scroll:` localStorage key prefix all appear in the
+generated terminal-eval script. Fails if any are removed.
 
 ### Telemetry
 `scrollback_intent` debug event already fires on every change. Restore
