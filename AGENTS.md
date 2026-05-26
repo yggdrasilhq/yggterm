@@ -76,6 +76,18 @@ Build **Yggdrasil Terminal**: a Rust-first, cross-platform, remote-first termina
   observers involved. Daemon PTY/runtime truth, xterm render truth, session
   identity, metadata, app-control, telemetry, screenshots, and smoke tests are
   not interchangeable.
+- **Spec interpretation rule: every spec MUST enumerate what it does NOT cover.**
+  When you cite a spec to justify code, (1) quote the exact spec language,
+  (2) state the literal claim, (3) state at least one *adjacent* claim that
+  the spec does NOT make. A spec that reads "X stays in A and B. Also, C is
+  ordered by recency" is TWO separate claims (X∈{A,B}; C has a sort rule);
+  it is NOT "X stays in {A, B, C}". When in doubt, treat the spec as
+  *narrower* than your reading; expansions require user confirmation, not
+  agent inference. Memories that paraphrase a spec MUST link to the original
+  spec text (AGENTS.md or user message) and MUST include an "Out of scope"
+  section listing the related claims they deliberately do not make. Any code
+  comment of the form `// Per [[spec-X]]: do Y` must survive the test
+  "would the user agree Y is in [[spec-X]]'s scope, not Y-adjacent?"
 - Never promote an observer into product truth. App-control, telemetry,
   screenshots, logs, generated summaries, and smoke results can prove or
   disprove behavior, but they must not drive terminal rendering, input routing,
@@ -86,13 +98,20 @@ Build **Yggdrasil Terminal**: a Rust-first, cross-platform, remote-first termina
   runtime-key identity substitution, alpha/blur/grain behavior in stable theme
   code, and stale-daemon mutation outside the hot-update protocol.
 - **Session display = dual presence.** An active session appears in BOTH the
-  "Live Sessions" group AND its cwd folder group (and on the start page,
-  ordered by recency). "Single source of truth" applies to the session OBJECT
-  (one `ManagedSessionView` per logical session), not to the display location.
-  Never silently filter a live session out of the cwd tree just because it
-  also appears in Live Sessions; if you find dedup code that does this, that
-  is a SPEC VIOLATION. Acceptable dedup is per-view (one row per logical
-  session within the same tree), not cross-view.
+  "Live Sessions" group AND its cwd folder group. "Single source of truth"
+  applies to the session OBJECT (one `ManagedSessionView` per logical session),
+  not to the display location. Never silently filter a live session out of
+  the cwd tree just because it also appears in Live Sessions; if you find
+  dedup code that does this, that is a SPEC VIOLATION. Acceptable dedup is
+  per-view (one row per logical session within the same tree), not cross-view.
+  **Out of scope: the start page.** The start page is a *launching pad* for
+  sessions to open/resume; live sessions are already running and are
+  accessible from the Live Sessions sidebar group — they are NOT a third
+  presence target. The `start_page_recent_rows` candidate loop must not push
+  `snapshot.live_sessions`. The `live_projection_paths` filter that strips
+  browser_row duplicates of live sessions from start page recents is the
+  correct behavior, not a bug. The start-page-ordered-by-recency rule is
+  about sort order on the durable recents list, NOT about content membership.
 - **SessionKind drives display, not path prefix.** Icon, glyph, label color,
   button styling, and other display dispatch MUST consult `SessionKind`
   (carried on `BrowserRow.session_kind` when the row was built from a
