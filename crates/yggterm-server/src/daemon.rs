@@ -8588,8 +8588,13 @@ mod tests {
             .and_then(|suffix| suffix.split("ServerRequest::SyncExternalWindow").next())
             .expect("terminal restart branch should be present");
 
+        // After the restart_session_with_size refactor, the TerminalRestart
+        // branch uses restart_session_with_size(...) not restart_session(...).
+        // Accept either to keep the original intent (the handler must call
+        // ONE of the restart helpers before cleanup).
         assert!(
-            branch.contains("self.terminals.restart_session("),
+            branch.contains("self.terminals.restart_session(")
+                || branch.contains("self.terminals.restart_session_with_size("),
             "terminal restart should still restart the requested runtime before cleanup"
         );
         assert!(
@@ -8634,6 +8639,7 @@ mod tests {
             children: Vec::new(),
             session_id: None,
             cwd: None,
+            ..Default::default()
         }
     }
 
