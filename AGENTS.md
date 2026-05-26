@@ -43,6 +43,28 @@ Build **Yggdrasil Terminal**: a Rust-first, cross-platform, remote-first termina
 - Yggterm should feel remote-first: multiple machines, SSH-heavy workflows, and restoring many live terminal contexts is a core use case.
 - Treat richer surfaces such as `paper`, `cellulose`, and Excalidraw integration as app-grade surfaces that can live in separate repos while still embedding into Yggterm.
 
+## Terminal multiplexer positioning (vs tmux / screen / abduco)
+
+Yggterm's daemon-owned PTY model IS a terminal multiplexer. Product positioning: **Yggterm must match tmux's baseline capabilities AND exceed them in modern affordances.** This is first-class customer value, not a nice-to-have. A user choosing yggterm should never have to fall back to tmux for "I need my history when I reconnect" or similar baseline expectations.
+
+**Baseline parity (REQUIRED for credibility against tmux):**
+- Session survives client disconnect — GUI close/restart never kills a running session. ✓ shipped
+- Reattach from any client — any GUI sees the live daemon. ✓ shipped
+- Window/pane resize handshake — daemon reflows cell grid on client resize. ✓ shipped
+- **Real terminal history across restart** — daemon maintains a per-session headless VT parser with a scrollback ring (default 10k+ rows), so GUI restart restores full terminal history regardless of whether the inner app is a TUI (Codex, vim, htop) or plain shell. This matches tmux's `history-limit` semantics. ❌ NOT YET SHIPPED — currently the daemon retains only a small raw-byte ring (~146 KB) which collapses to ~one screen for TUI sessions. Implementing this is a parity gate, not an enhancement.
+- Per-session `history-limit` config — tunable scrollback retention exposed in settings.
+
+**Where yggterm must EXCEED tmux (these are why a customer picks yggterm):**
+- Native xterm.js render fidelity: 24-bit color, glyph anti-aliasing, hyperlinks, image protocols (Sixel, Kitty), web-grade font rendering. tmux is constrained to whatever terminal emulator the user happens to be in.
+- Cross-machine session graph: one GUI sees local + remote daemons as a unified session tree. tmux requires manual ssh nesting and per-machine state.
+- Cursor + scroll position preserved across GUI restart — not just history, also the user's reading position. ✓ shipped (commit 5a6e19f).
+- Agent-CLI awareness: Codex / Claude Code transcript stitching, generated summaries, session titles, kind-driven icons. tmux is application-agnostic by design and loses this.
+- First-class observability: app-control state, screenshots, probes for every visible region. tmux exposes only `capture-pane`.
+- Persistent session metadata: cwd, machine, working folder, agent kind, generated title — carried across restart and visible in the cwd tree. tmux drops this.
+- Unified cwd tree across agent CLIs ([[spec-cwd-tree-agent-cli-unified]]) — sessions from any CLI (Codex, Claude Code, future ones) live in one tree organized by cwd, with kind-driven icon/label/style. tmux has no concept of this.
+
+When choosing whether to ship a feature, ask: "does this advance baseline parity or the exceed-tmux line?" If neither, it's noise.
+
 ## Design philosophy
 
 - `DESIGN.md` at the repository root is the source of truth for UI language, interaction taste, visual polish, naming, and reusable styling preferences. Consult it before making UI wording or styling changes.
