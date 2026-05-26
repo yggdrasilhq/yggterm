@@ -63465,6 +63465,18 @@ fn start_page_recent_rows_from_browser_rows_with_modified_epochs(
         }
     };
 
+    // Per [[spec-active-sessions-dual-presence]]: live sessions belong in the
+    // start page recent list too (in addition to the Live Sessions group and
+    // cwd tree). Push them first with i64::MAX as modified_epoch so they sort
+    // to the top by recency.
+    for live_session in &snapshot.live_sessions {
+        let live_row = browser_row_for_live_session(live_session);
+        if !start_page_recent_scope_allows_browser_row(&scope, &live_row) {
+            continue;
+        }
+        push_candidate(live_row, i64::MAX, String::new());
+    }
+
     for machine in &snapshot.remote_machines {
         let remote_short_ids = unique_session_short_ids_for_pairs(
             &machine
@@ -63702,6 +63714,27 @@ fn start_page_recent_scope_allows_browser_row(
         }
     }
     true
+}
+
+fn browser_row_for_live_session(session: &ManagedSessionView) -> BrowserRow {
+    // Per [[spec-active-sessions-dual-presence]]: live sessions surface in the
+    // start page recent list as well as the Live Sessions group.
+    BrowserRow {
+        kind: BrowserRowKind::Session,
+        full_path: session.session_path.clone(),
+        label: session.title.clone(),
+        detail_label: String::new(),
+        document_kind: None,
+        group_kind: None,
+        session_title: Some(session.title.clone()),
+        depth: 0,
+        host_label: session.host_label.clone(),
+        descendant_sessions: 0,
+        expanded: false,
+        session_id: Some(session.id.clone()),
+        session_cwd: Some(metadata_value(session, "Cwd")),
+        session_kind: Some(session.kind),
+    }
 }
 
 fn browser_row_for_remote_scanned_session(
@@ -71217,8 +71250,13 @@ mod tests {
             script.contains("function releaseBlockingUiFocusForTerminalReclaim()"),
             "runtime bridge should explicitly release focused search/settings inputs when the user clicks back into the terminal"
         );
+        // The hit layer condition was rewritten to use a local `focused` bool
+        // derived from helper-textarea === document.activeElement (set immediately
+        // above this site by syncFocusClass). Semantics are unchanged — host
+        // gets the .yggterm-term-focused class iff focused — but the literal
+        // string changed.
         assert!(
-            script.contains("inputEnabled && hostOwnsActiveTerminalInput() && !host.classList.contains('yggterm-term-focused')"),
+            script.contains("inputEnabled && hostOwnsActiveTerminalInput() && !focused ? 'auto' : 'none';"),
             "transparent focus-capture hit layer must only intercept the active terminal, not parked retained hosts"
         );
         assert!(
@@ -73427,7 +73465,14 @@ mod tests {
         );
         assert!(TREE_LOADING_DOT_CSS.contains("animation: none !important"));
         assert!(source.contains("class: \"yggterm-tree-spinner\""));
-        assert!(!source.contains("animation:yggterm-tree-spinner"));
+        // Build the search needle at runtime so this test's own source text
+        // doesn't contain the literal needle and self-trigger the check.
+        let spinner_animation_needle = format!("animation:{}", "yggterm-tree-spinner");
+        let spinner_animation_line_count = source
+            .lines()
+            .filter(|line| line.contains(&spinner_animation_needle))
+            .count();
+        assert_eq!(spinner_animation_line_count, 0);
         assert!(TREE_SPINNER_CSS.contains("animation: none !important"));
         assert!(
             source.contains(
@@ -75166,7 +75211,10 @@ mod tests {
             document_kind: None,
             group_kind: None,
             session_title: Some("local-shell".to_string()),
-            depth: 2,
+            // Hot-terminal sessions only count as drag sources at depth<=1; see
+            // is_tree_drag_source_row. Use depth=1 so the test exercises the
+            // drag/drop path that protects against implicit recipe creation.
+            depth: 1,
             host_label: String::new(),
             descendant_sessions: 0,
             expanded: false,
@@ -91118,7 +91166,11 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
     }
 
     #[test]
-    fn start_page_recent_rows_excludes_live_terminal_projections() {
+    fn start_page_recent_rows_includes_live_terminals_without_duplicating_browser_row() {
+        // Per [[spec-active-sessions-dual-presence]] live sessions appear in
+        // recent rows alongside durable scanned sessions. The browser_row
+        // representation of the same live session MUST be filtered out so the
+        // entry only appears once (live-session candidate wins).
         let mut shell = ShellState::new(test_shell_bootstrap_with_active_session("local://seed"));
         let live_terminal_path = "live::remote-shell";
         let mut live_terminal = test_live_shell_session(live_terminal_path);
@@ -91183,7 +91235,16 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             .map(|row| row.full_path)
             .collect::<Vec<_>>();
 
-        assert_eq!(paths, ["remote-session://samplenotes-webapp/durable"]);
+        // live::remote-shell appears once (from the live_sessions loop), the
+        // browser_row for the same path is filtered by live_projection_paths,
+        // and the durable scanned session follows.
+        assert_eq!(
+            paths,
+            [
+                "live::remote-shell",
+                "remote-session://samplenotes-webapp/durable",
+            ]
+        );
     }
 
     #[test]
@@ -91283,12 +91344,16 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             .into_iter()
             .map(|row| row.full_path)
             .collect::<Vec<_>>();
+        // Per [[spec-active-sessions-dual-presence]] the live session must appear
+        // in start page recents too. Live sessions sort first ("currently running"
+        // is most recent), followed by scanned remote sessions in modified_epoch
+        // desc order.
         assert_eq!(
             recent_paths,
             vec![
+                active_path.to_string(),
                 "remote-session://dev/newest-yggterm".to_string(),
                 "remote-session://dev/older-yggterm".to_string(),
-                active_path.to_string(),
             ]
         );
     }
