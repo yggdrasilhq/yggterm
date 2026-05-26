@@ -36,6 +36,7 @@ xterm.js owns vs what the shell owns, cursor/prompt semantics, etc. — see
 | [resume-gate-too-restrictive](#resume-gate-too-restrictive) | Resuming a session that's mid-output (no prompt visible) takes 60-160s to clear "not ready" gate | FIXED 2026-05-25 |
 | [scroll-jump-on-input](#scroll-jump-on-input) | Typing in a session yanks viewport to a "particular spot" (flicker between spot and prompt); scroll-lock variant kicks user back when scrolling | OPEN, investigating |
 | [dom-leak-on-session-start](#dom-leak-on-session-start) | Portion of *prior* message context flashes briefly during session start/switch then goes away | OPEN, uninvestigated |
+| [clipboard-double-paste](#clipboard-double-paste) | Class: text select + middle-click pastes selection THEN clipboard (double); Ctrl+Shift+V double paste; selection-vs-clipboard ordering bugs | OPEN, investigating |
 | [slow-jitter](#slow-jitter) | Some sessions exhibit visible per-frame jitter under steady PTY output | OPEN, uninvestigated |
 | [blank-rendering-region](#blank-rendering-region) | Region inside an active session goes blank until forced redraw | OPEN, uninvestigated |
 
@@ -403,6 +404,97 @@ Reported by user 2026-05-26: "when I start or switch to a session after
 a long time and during startup I see a portion of my message context in
 a weird way randomly. Upon session restore and after geting it goes
 away."
+
+---
+
+## clipboard-double-paste
+
+**STATUS:** OPEN — long-standing class with multiple variants. Currently
+investigating; telemetry hooks to be added per the plan below.
+
+### Symptom — class with multiple variants
+Yggterm's clipboard plumbing has a recurring failure mode where a single
+user intent (paste once) results in **two paste operations**, with content
+from different sources concatenated or interleaved.
+
+Variants reported by the user (collected over time):
+
+1. **Selection + middle-click double-paste (current variation, 2026-05-26).**
+   User selects text in the terminal (PRIMARY selection set) and middle-clicks
+   to paste. Result: the SELECTED text gets pasted first, immediately
+   followed by the CLIPBOARD contents. Expected: only PRIMARY should paste
+   on middle-click; CLIPBOARD should be untouched.
+
+2. **`Ctrl+Shift+V` double-paste (past variation).** User presses
+   `Ctrl+Shift+V`. Result: clipboard contents paste twice. Expected: one paste.
+
+3. **Selection-vs-clipboard ordering** (suspected related): paths that
+   should consult only one of PRIMARY/CLIPBOARD end up consulting both,
+   merging or re-emitting content.
+
+### Reproduction (current variation, on jojo 2026-05-26)
+1. Open any session with text content.
+2. Select a non-empty range with the mouse (sets PRIMARY).
+3. Middle-click anywhere in the prompt area.
+4. Observe: the selected text appears at the prompt, followed by whatever
+   was in the clipboard. Should be just the selected text.
+
+### Root cause
+Unknown — to be confirmed. Hypotheses:
+
+- **Two listeners both consume the same event.** xterm.js has built-in
+  middle-click → PRIMARY paste, AND Yggterm-side has its own pointer
+  handlers (e.g. `recordPrimarySelectionFromXterm`, primary-selection
+  listeners) that may also call a paste path. If both fire on the same
+  middle-click, you get two pastes (one from each handler).
+- **`yggterm-shell`'s `primary_selection_paste` handler dispatches via
+  both the dioxus side and the xterm side.** If both think they own the
+  event, both `term.paste(...)` calls fire.
+- **`Ctrl+Shift+V` variant**: similar — keymap binding fires `term.paste`
+  AND a Yggterm-side IPC paste request, both completing.
+- **PRIMARY/CLIPBOARD confusion**: the middle-click handler might call
+  `read_clipboard()` instead of (or in addition to) `read_primary()`,
+  emitting clipboard content where only primary was wanted.
+
+### Workaround / fix (planned)
+1. **Add telemetry** to attribute future repros: emit
+   `xterm_paste_event { source: primary|clipboard, triggered_by:
+   middle_click|ctrl_shift_v|context_menu|js_term_paste|external_input,
+   payload_length, dt_since_previous_ms }` on every paste-path entry.
+   When `dt_since_previous_ms < 300` and source differs, log as
+   `xterm_paste_double_fire` — that's the diagnostic signature.
+2. **Single owner for middle-click**: pick exactly one path
+   (xterm.js built-in OR Yggterm primary-selection-paste) and disable
+   the other for middle-click.
+3. **Single owner for `Ctrl+Shift+V`**: same — pick one.
+4. **Selection vs clipboard separation**: a middle-click handler MUST
+   only read PRIMARY; a `Ctrl+Shift+V` handler MUST only read CLIPBOARD.
+   Any code path that reads both for one trigger is a bug.
+
+### Code locations (suspected — to be confirmed by repro + telemetry)
+- `crates/yggterm-shell/src/shell.rs:~59311` —
+  `primarySelectionSessionPath` and `primary_selection_paste` related code
+- `crates/yggterm-shell/src/shell.rs:~59367` — `setScrollbackIntent('PromptFollow', 'primary_selection_paste')`
+- `crates/yggterm-shell/src/shell.rs` — search for `term.paste(`,
+  `read_primary`, `read_clipboard`, `ClipboardOwnerKind`, `paste_primary`
+  to find all paste entry points.
+
+### Tests
+None yet. Need a JSDOM-level test that simulates middle-click on a
+selected terminal range and asserts exactly ONE paste fires with PRIMARY
+content (no clipboard concatenation).
+
+### Telemetry
+Proposed (not yet shipped): `xterm_paste_event` and `xterm_paste_double_fire`
+debug events as described above. Will be added in the same change that
+adds telemetry hooks at every paste entry point.
+
+### Related
+Reported live by user 2026-05-26: "text select copy paste or ctrl+shift+c/v
+copy paste. This is a great bug class and has many variations that I have
+faced, asked to fixed over the time. Currently text select and middle
+click paste pastes the selected text first and then the clipboard next.
+In the past, I have seen double clipboard paste on ctrl+shift+v etc."
 
 ---
 
