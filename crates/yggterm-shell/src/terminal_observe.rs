@@ -5570,7 +5570,11 @@ Best thing to improve in the meantime:
     }
 
     #[test]
-    fn terminal_host_problem_rejects_input_enabled_remote_tail_without_prompt() {
+    fn terminal_host_problem_accepts_input_enabled_remote_tail_with_meaningful_output() {
+        // XTERM-BUG: resume-gate-too-restrictive (commit 332072e). Sessions with
+        // meaningful PTY output in `text_sample` are valid running sessions
+        // even when input is enabled and no prompt is visible — the gate must
+        // not reject them as "not ready". This used to assert Some(reason).
         let host = json!({
             "session_path": "remote-session://dev/stale-codex",
             "text_sample": "The final 2.1.59 artifacts are built. Before replacing the live jojo install, I’m taking one more runtime/install snapshot.",
@@ -5594,10 +5598,7 @@ Best thing to improve in the meantime:
             "helpers_rect": {"width": 840.0, "height": 830.0},
             "helper_textarea_rect": {"left": -10000.0, "top": 68.0, "width": 1.0, "height": 1.0}
         });
-        assert_eq!(
-            terminal_host_problem_for_app_control(&host),
-            Some("active remote terminal is input-enabled without a prompt-ready surface")
-        );
+        assert_eq!(terminal_host_problem_for_app_control(&host), None);
     }
 
     #[test]
@@ -5639,7 +5640,11 @@ Best thing to improve in the meantime:
     }
 
     #[test]
-    fn terminal_host_problem_rejects_input_enabled_daemon_pty_output_without_prompt() {
+    fn terminal_host_problem_accepts_input_enabled_daemon_pty_output_without_prompt() {
+        // XTERM-BUG: resume-gate-too-restrictive (commit 332072e). An empty
+        // cursor_line_text with meaningful PTY output in `text_sample` is a
+        // legitimate "mid-output" running session; the gate must not reject it.
+        // This used to assert Some(reason).
         let host = json!({
             "session_path": "remote-session://dev/current-output",
             "text_sample": "Status as of 2026-05-13 11:26 IST:\n\nThe batch is no longer running and the validation coverage is stale.",
@@ -5673,14 +5678,15 @@ Best thing to improve in the meantime:
             "helpers_rect": {"width": 840.0, "height": 830.0},
             "helper_textarea_rect": {"left": -10000.0, "top": 68.0, "width": 1.0, "height": 1.0}
         });
-        assert_eq!(
-            terminal_host_problem_for_app_control(&host),
-            Some("active remote terminal is input-enabled without a prompt-ready surface")
-        );
+        assert_eq!(terminal_host_problem_for_app_control(&host), None);
     }
 
     #[test]
-    fn terminal_host_problem_rejects_daemon_pty_retained_scrollback_with_non_prompt_cursor() {
+    fn terminal_host_problem_accepts_daemon_pty_retained_scrollback_with_non_prompt_cursor() {
+        // XTERM-BUG: resume-gate-too-restrictive (commit 332072e). Retained
+        // daemon-PTY scrollback (93k chars / 1000 rows) with a non-prompt
+        // cursor line is a real running session; the gate must not reject
+        // it. This used to assert Some(reason).
         let host = json!({
             "session_path": "remote-session://dev/stale-codex",
             "text_sample": "- Active chart: SAMPLENOTES_BENCH_0099\n  - Log rows: 742\n  - Physical PDFs in output dir: 2510",
@@ -5717,10 +5723,7 @@ Best thing to improve in the meantime:
             "helpers_rect": {"width": 840.0, "height": 830.0},
             "helper_textarea_rect": {"left": -10000.0, "top": 68.0, "width": 1.0, "height": 1.0}
         });
-        assert_eq!(
-            terminal_host_problem_for_app_control(&host),
-            Some("active remote terminal is input-enabled without a prompt-ready surface")
-        );
+        assert_eq!(terminal_host_problem_for_app_control(&host), None);
     }
 
     #[test]
@@ -5917,7 +5920,11 @@ Best thing to improve in the meantime:
     }
 
     #[test]
-    fn terminal_host_problem_rejects_input_enabled_codex_status_surface_without_prompt() {
+    fn terminal_host_problem_accepts_input_enabled_codex_status_surface_with_meaningful_output() {
+        // XTERM-BUG: resume-gate-too-restrictive (commit 332072e). A Codex
+        // /status banner is a meaningful PTY surface for a live session even
+        // though no prompt char is on the cursor line. The gate must not
+        // reject it. This used to assert Some(reason).
         let status = "\
 >_ OpenAI Codex (v0.128.0)
 
@@ -5952,10 +5959,7 @@ Weekly limit:                97% left
             "helpers_rect": {"width": 840.0, "height": 830.0},
             "helper_textarea_rect": {"left": -10000.0, "top": 68.0, "width": 1.0, "height": 1.0}
         });
-        assert_eq!(
-            terminal_host_problem_for_app_control(&host),
-            Some("active remote terminal is input-enabled without a prompt-ready surface")
-        );
+        assert_eq!(terminal_host_problem_for_app_control(&host), None);
     }
 
     #[test]
