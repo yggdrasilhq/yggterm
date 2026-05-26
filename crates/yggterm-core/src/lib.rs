@@ -74,7 +74,7 @@ pub const DEFAULT_CODEX_HOME_DIRNAME: &str = ".codex";
 pub const SESSIONS_DIRNAME: &str = "sessions";
 pub const SETTINGS_FILENAME: &str = "settings.json";
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SessionNode {
     pub kind: SessionNodeKind,
     pub name: String,
@@ -85,12 +85,32 @@ pub struct SessionNode {
     pub children: Vec<SessionNode>,
     pub session_id: Option<String>,
     pub cwd: Option<String>,
+    /// Authoritative `SessionKind` for agent-CLI session leaves. Carried
+    /// from the source scanner (Codex, Claude Code, future CLIs) into the
+    /// derived `BrowserRow.session_kind`. `None` for groups, documents, and
+    /// historical tree paths where kind cannot be derived from the path
+    /// alone. See [[spec-cwd-tree-agent-cli-unified]].
+    #[serde(default)]
+    pub session_kind: Option<SessionKind>,
+    /// Optional detail string for session leaves (e.g. CC's first-user-message
+    /// context hint). When `None`, callers compute a default from `cwd` and
+    /// `session_id`. Carried into `BrowserRow.detail_label` by the tree
+    /// flattener. See [[spec-cwd-tree-agent-cli-unified]].
+    #[serde(default)]
+    pub detail: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum SessionNodeKind {
+    #[default]
     Group,
+    /// Leaf node representing a saved agent-CLI session (Codex, Claude Code,
+    /// or future agent CLIs). The actual SessionKind is carried on
+    /// `SessionNode.session_kind`. Variant name retained for serde compat
+    /// with previously-persisted snapshots; new code should treat this as
+    /// "agent session" regardless of which CLI wrote the file.
+    #[serde(alias = "agent_session")]
     CodexSession,
     Document,
 }
@@ -251,8 +271,10 @@ impl SessionStore {
     }
 
     pub fn load_codex_tree(&self, settings: &AppSettings) -> Result<SessionNode> {
-        let codex_root = resolve_codex_sessions_root()?;
-        build_codex_browser_tree(&self.home, &codex_root, settings)
+        // Preserved name for API compat; internally now builds the unified
+        // local cwd tree from all agent-CLI scanners (Codex, Claude Code,
+        // future). See [[spec-cwd-tree-agent-cli-unified]].
+        build_local_cwd_tree(&self.home, settings)
     }
 
     pub fn list_documents(&self) -> Result<Vec<WorkspaceDocumentSummary>> {
@@ -603,7 +625,7 @@ impl SessionStore {
         let codex_root = resolve_codex_sessions_root()?;
         let resolver = SessionTitleResolver::new(&self.home)?;
         let mut sessions = if codex_root.exists() {
-            scan_codex_sessions(&codex_root, Some(&resolver))?
+            scan_local_codex_sessions(&codex_root, Some(&resolver))?
         } else {
             Vec::new()
         };
@@ -989,28 +1011,18 @@ fn walk_directory_tree(path: &Path, include_codex_files: bool) -> Result<Session
             children.push(SessionNode {
                 kind: SessionNodeKind::CodexSession,
                 name: codex_leaf_label(&entry_path),
-                title: None,
-                document_kind: None,
-                group_kind: None,
                 path: entry_path,
-                children: Vec::new(),
-                session_id: None,
-                cwd: None,
+                ..Default::default()
             });
         }
     }
     children.sort_by(|a, b| a.name.cmp(&b.name));
 
     Ok(SessionNode {
-        kind: SessionNodeKind::Group,
         name,
-        title: None,
-        document_kind: None,
-        group_kind: None,
         path: path.to_path_buf(),
         children,
-        session_id: None,
-        cwd: None,
+        ..Default::default()
     })
 }
 
@@ -1064,13 +1076,22 @@ fn join_session_label(left: &str, right: &str) -> String {
     }
 }
 
+/// Unified summary of a saved agent-CLI session that the local cwd tree
+/// builder consumes. One per session file, regardless of which CLI wrote it.
+/// Per [[spec-cwd-tree-agent-cli-unified]]: adding a new agent CLI means
+/// writing a `scan_local_<cli>_sessions() -> Vec<LocalAgentSessionSummary>`
+/// scanner — never adding a parallel injection pass into the row list.
 #[derive(Debug, Clone)]
-struct CodexSessionSummary {
-    file_path: PathBuf,
-    session_id: String,
-    cwd: String,
-    generated_title: Option<String>,
-    modified_epoch_ms: u128,
+pub struct LocalAgentSessionSummary {
+    pub kind: SessionKind,
+    pub file_path: PathBuf,
+    pub session_id: String,
+    pub cwd: String,
+    pub title: Option<String>,
+    /// Optional detail line (e.g. CC's first-user-message context hint).
+    /// `None` means the tree flattener computes a default from cwd + id.
+    pub detail: Option<String>,
+    pub modified_epoch_ms: u128,
 }
 
 #[derive(Debug, Clone)]
@@ -1080,9 +1101,9 @@ struct CodexSessionIdentity {
 }
 
 #[derive(Debug, Clone)]
-struct CodexProjectBucket {
+struct LocalAgentProjectBucket {
     cwd: String,
-    sessions: Vec<CodexSessionSummary>,
+    sessions: Vec<LocalAgentSessionSummary>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1092,23 +1113,29 @@ struct CodexBrowserTreeNode {
     explicit_title: Option<String>,
     document: Option<WorkspaceDocumentSummary>,
     group_kind: Option<WorkspaceGroupKind>,
-    project: Option<CodexProjectBucket>,
+    project: Option<LocalAgentProjectBucket>,
     children: BTreeMap<String, CodexBrowserTreeNode>,
 }
 
-fn build_codex_browser_tree(
-    home: &Path,
-    codex_root: &Path,
-    _settings: &AppSettings,
-) -> Result<SessionNode> {
+/// Build the unified local cwd tree from all known agent-CLI session
+/// scanners. Per [[spec-cwd-tree-agent-cli-unified]] every CLI's sessions
+/// flow through the same tree-building pipeline; there is no per-CLI
+/// injection pass. To add a new CLI: write a `scan_local_<cli>_sessions()`
+/// that returns `Vec<LocalAgentSessionSummary>` and call it here.
+fn build_local_cwd_tree(home: &Path, _settings: &AppSettings) -> Result<SessionNode> {
     let title_resolver = SessionTitleResolver::new(home).ok();
-    let sessions = if codex_root.exists() {
-        scan_codex_sessions(codex_root, title_resolver.as_ref())?
-    } else {
-        Vec::new()
-    };
 
-    let mut projects = BTreeMap::<String, Vec<CodexSessionSummary>>::new();
+    let mut sessions: Vec<LocalAgentSessionSummary> = Vec::new();
+    let codex_root = resolve_codex_sessions_root()?;
+    if codex_root.exists() {
+        sessions.extend(scan_local_codex_sessions(
+            &codex_root,
+            title_resolver.as_ref(),
+        )?);
+    }
+    sessions.extend(scan_local_claude_code_sessions());
+
+    let mut projects = BTreeMap::<String, Vec<LocalAgentSessionSummary>>::new();
     for session in sessions {
         projects
             .entry(session.cwd.clone())
@@ -1123,7 +1150,7 @@ fn build_codex_browser_tree(
                 .cmp(&a.modified_epoch_ms)
                 .then_with(|| a.session_id.cmp(&b.session_id))
         });
-        buckets.push(CodexProjectBucket {
+        buckets.push(LocalAgentProjectBucket {
             cwd,
             sessions: project_sessions,
         });
@@ -1157,10 +1184,12 @@ fn build_codex_browser_tree(
     Ok(codex_browser_tree_to_session_node(&root))
 }
 
-fn scan_codex_sessions(
+/// Scan local Codex session JSONL files and return unified summaries
+/// ready for the cwd tree builder. Per [[spec-cwd-tree-agent-cli-unified]].
+pub fn scan_local_codex_sessions(
     root: &Path,
     title_resolver: Option<&SessionTitleResolver>,
-) -> Result<Vec<CodexSessionSummary>> {
+) -> Result<Vec<LocalAgentSessionSummary>> {
     let mut sessions = Vec::new();
     for entry in
         fs::read_dir(root).with_context(|| format!("failed to read dir {}", root.display()))?
@@ -1169,9 +1198,9 @@ fn scan_codex_sessions(
         let path = entry.path();
         let file_type = entry.file_type()?;
         if file_type.is_dir() {
-            sessions.extend(scan_codex_sessions(&path, title_resolver)?);
+            sessions.extend(scan_local_codex_sessions(&path, title_resolver)?);
         } else if is_codex_session_file(&path) {
-            if let Some(summary) = read_codex_session_summary(&path, title_resolver)? {
+            if let Some(summary) = read_local_codex_session_summary(&path, title_resolver)? {
                 sessions.push(summary);
             }
         }
@@ -1179,22 +1208,80 @@ fn scan_codex_sessions(
     Ok(sessions)
 }
 
-fn read_codex_session_summary(
+/// Scan local Claude Code session JSONL files (~/.claude/projects) and
+/// return them as `LocalAgentSessionSummary` records. Mirrors
+/// `scan_local_codex_sessions` so both flow through the same tree builder.
+/// Per [[spec-cwd-tree-agent-cli-unified]] this replaces the prior
+/// post-hoc `inject_file_backed_cc_session_rows` injection path.
+pub fn scan_local_claude_code_sessions() -> Vec<LocalAgentSessionSummary> {
+    let Some(home) = dirs::home_dir() else {
+        return Vec::new();
+    };
+    let projects_dir = home.join(".claude").join("projects");
+    let Ok(project_entries) = fs::read_dir(&projects_dir) else {
+        return Vec::new();
+    };
+    let mut sessions = Vec::new();
+    for project_entry in project_entries.flatten() {
+        let project_path = project_entry.path();
+        if !project_path.is_dir() {
+            continue;
+        }
+        let Ok(session_entries) = fs::read_dir(&project_path) else {
+            continue;
+        };
+        for session_entry in session_entries.flatten() {
+            let file_path = session_entry.path();
+            if file_path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+                continue;
+            }
+            let Ok(Some((session_id, cwd))) = read_cc_session_identity_fields(&file_path) else {
+                continue;
+            };
+            let title = read_cc_session_title(&file_path).ok().flatten();
+            let detail = read_cc_session_context(&file_path)
+                .ok()
+                .filter(|s| !s.trim().is_empty());
+            let modified_epoch_ms = fs::metadata(&file_path)
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_millis())
+                .unwrap_or_default();
+            sessions.push(LocalAgentSessionSummary {
+                kind: SessionKind::ClaudeCode,
+                file_path,
+                session_id,
+                cwd,
+                title,
+                detail,
+                modified_epoch_ms,
+            });
+        }
+    }
+    sessions
+}
+
+fn read_local_codex_session_summary(
     path: &Path,
     title_resolver: Option<&SessionTitleResolver>,
-) -> Result<Option<CodexSessionSummary>> {
+) -> Result<Option<LocalAgentSessionSummary>> {
     let Some(identity) = read_codex_session_identity(path)? else {
         return Ok(None);
     };
 
-    Ok(Some(CodexSessionSummary {
+    Ok(Some(LocalAgentSessionSummary {
+        kind: SessionKind::Codex,
         file_path: path.to_path_buf(),
-        generated_title: title_resolver.and_then(|resolver| {
+        title: title_resolver.and_then(|resolver| {
             resolver
                 .resolve_for_session(&identity.session_id)
                 .ok()
                 .flatten()
         }),
+        // Codex doesn't carry a first-user-message context the way CC does;
+        // the flattener will compute the default `short_id · cwd` detail.
+        detail: None,
         session_id: identity.session_id,
         cwd: identity.cwd,
         modified_epoch_ms: fs::metadata(path)
@@ -1493,7 +1580,7 @@ fn normalize_codex_cwd(raw: String) -> String {
     }
 }
 
-fn insert_codex_browser_project(root: &mut CodexBrowserTreeNode, project: &CodexProjectBucket) {
+fn insert_codex_browser_project(root: &mut CodexBrowserTreeNode, project: &LocalAgentProjectBucket) {
     let segments = browser_tree_segments(&project.cwd);
     insert_codex_browser_path(root, &segments, project.clone());
 }
@@ -1501,7 +1588,7 @@ fn insert_codex_browser_project(root: &mut CodexBrowserTreeNode, project: &Codex
 fn insert_codex_browser_path(
     node: &mut CodexBrowserTreeNode,
     segments: &[String],
-    project: CodexProjectBucket,
+    project: LocalAgentProjectBucket,
 ) {
     if segments.is_empty() {
         node.project = Some(project);
@@ -1665,11 +1752,10 @@ fn codex_browser_tree_to_session_node(node: &CodexBrowserTreeNode) -> SessionNod
             name: document.title.clone(),
             title: Some(document.title.clone()),
             document_kind: Some(document.kind),
-            group_kind: None,
             path: PathBuf::from(document.virtual_path.clone()),
-            children: Vec::new(),
             session_id: Some(document.id.clone()),
             cwd: Some(document.virtual_path.clone()),
+            ..Default::default()
         };
     }
 
@@ -1684,16 +1770,20 @@ fn codex_browser_tree_to_session_node(node: &CodexBrowserTreeNode) -> SessionNod
     children.extend(nested_children);
 
     if let Some(project) = &node.project {
+        // Per [[spec-cwd-tree-agent-cli-unified]]: every agent CLI session
+        // becomes a leaf here, carrying its authoritative SessionKind and
+        // optional detail. Display dispatch (icon/glyph/label/style) reads
+        // from `session_kind` — never from path prefix.
         children.extend(project.sessions.iter().map(|session| SessionNode {
             kind: SessionNodeKind::CodexSession,
             name: short_session_id(&session.session_id),
-            title: session.generated_title.clone(),
-            document_kind: None,
-            group_kind: None,
+            title: session.title.clone(),
             path: session.file_path.clone(),
-            children: Vec::new(),
             session_id: Some(session.session_id.clone()),
             cwd: Some(project.cwd.clone()),
+            session_kind: Some(session.kind),
+            detail: session.detail.clone(),
+            ..Default::default()
         }));
     }
 
@@ -1701,12 +1791,11 @@ fn codex_browser_tree_to_session_node(node: &CodexBrowserTreeNode) -> SessionNod
         kind: SessionNodeKind::Group,
         name: node.name.clone(),
         title: node.explicit_title.clone(),
-        document_kind: None,
         group_kind: node.group_kind,
         path: PathBuf::from(node.full_path.clone()),
         children,
-        session_id: None,
         cwd: node.project.as_ref().map(|project| project.cwd.clone()),
+        ..Default::default()
     }
 }
 
@@ -1798,6 +1887,7 @@ mod tests {
             children: Vec::new(),
             session_id: None,
             cwd: None,
+            ..Default::default()
         };
         let document = SessionNode {
             kind: SessionNodeKind::Document,
@@ -1809,6 +1899,7 @@ mod tests {
             children: Vec::new(),
             session_id: Some("paper-id".to_string()),
             cwd: Some("/workspace/paper".to_string()),
+            ..Default::default()
         };
         let separator = SessionNode {
             kind: SessionNodeKind::Group,
@@ -1820,6 +1911,7 @@ mod tests {
             children: Vec::new(),
             session_id: None,
             cwd: None,
+            ..Default::default()
         };
 
         let mut nodes = vec![separator, document, folder];
@@ -1863,15 +1955,19 @@ mod tests {
                         children: Vec::new(),
                         session_id: Some("session-1".to_string()),
                         cwd: Some("/workspace/machine-a/nested".to_string()),
+                        ..Default::default()
                     }],
                     session_id: None,
                     cwd: None,
+                    ..Default::default()
                 }],
                 session_id: None,
                 cwd: None,
+                ..Default::default()
             }],
             session_id: None,
             cwd: None,
+            ..Default::default()
         };
 
         let mut browser = SessionBrowserState::new(root);
@@ -1914,13 +2010,15 @@ mod tests {
         );
         insert_codex_browser_project(
             &mut root,
-            &CodexProjectBucket {
+            &LocalAgentProjectBucket {
                 cwd: "/home/pi".to_string(),
-                sessions: vec![CodexSessionSummary {
+                sessions: vec![LocalAgentSessionSummary {
+                    kind: SessionKind::Codex,
                     file_path: PathBuf::from("/home/pi/.codex/sessions/example.jsonl"),
                     session_id: "stored-session-id".to_string(),
                     cwd: "/home/pi".to_string(),
-                    generated_title: Some("Stored Codex".to_string()),
+                    title: Some("Stored Codex".to_string()),
+                    detail: None,
                     modified_epoch_ms: 0,
                 }],
             },

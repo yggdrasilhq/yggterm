@@ -147,6 +147,18 @@ When choosing whether to ship a feature, ask: "does this advance baseline parity
   divergence (icon, label, button style) between a local Codex session and a
   remote Codex session is itself a bug. When fixing session display, fix the
   kind-driven code, not a locality-driven branch.
+- **Local cwd tree is agent-CLI-agnostic.** Per
+  [[spec-cwd-tree-agent-cli-unified]] every saved agent-CLI session
+  (Codex, Claude Code, future) flows through ONE pipeline:
+  `yggterm_core::scan_local_<cli>_sessions()` returns
+  `LocalAgentSessionSummary` records → `build_local_cwd_tree` groups them
+  by cwd → `SessionNode { session_kind, detail, ... }` → flattener carries
+  `session_kind` into `BrowserRow.session_kind`. NO post-hoc injection
+  passes. Adding a new agent CLI is ONE scanner + one call site in
+  `build_local_cwd_tree` + display-dispatch updates for the new
+  `SessionKind` variant — never a parallel `inject_<cli>_rows()` path.
+  The prior `inject_file_backed_cc_session_rows` bypassed expand/collapse
+  state, causing the orphaned-row bug reported 2026-05-26.
 - If code and docs disagree, stop and reconcile the interface doc before
   implementing. The canonical docs are `docs/protocol.md` for runtime/hot-update
   behavior, `docs/xterm.md` for terminal rendering and PTY bytes,
