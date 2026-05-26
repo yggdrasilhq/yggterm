@@ -55763,8 +55763,14 @@ fn terminal_eval_script_with_canvas_renderer(
                 #${{hostId}} .xterm-viewport {{
                     height: 100% !important;
                     overflow-x: hidden !important;
-                    scrollbar-width: none !important;
-                    -ms-overflow-style: none !important;
+                    /* Sleek thin scrollbar — auto-shown by the browser when
+                       content overflows. Complements the D-pad scroll
+                       controller for fast drag-scroll in long sessions. */
+                    scrollbar-width: thin !important;
+                    scrollbar-color: rgba(120, 142, 166, 0.36) transparent !important;
+                }}
+                #${{hostId}} .xterm-viewport:hover {{
+                    scrollbar-color: rgba(120, 142, 166, 0.55) transparent !important;
                 }}
                 #${{hostId}} .xterm-rows {{
                     height: 100% !important;
@@ -55854,10 +55860,33 @@ fn terminal_eval_script_with_canvas_renderer(
                     color: inherit !important;
                     -webkit-text-fill-color: currentColor !important;
                 }}
+                /* WebKit / Chromium thin sleek scrollbar to match Firefox.
+                   Auto-hides when at rest; subtle thumb on hover. */
                 #${{hostId}} .xterm-viewport::-webkit-scrollbar {{
-                    width: 0 !important;
+                    width: 8px !important;
                     height: 0 !important;
-                    display: none !important;
+                    background: transparent !important;
+                }}
+                #${{hostId}} .xterm-viewport::-webkit-scrollbar-track {{
+                    background: transparent !important;
+                }}
+                #${{hostId}} .xterm-viewport::-webkit-scrollbar-thumb {{
+                    background: rgba(120, 142, 166, 0.32) !important;
+                    border-radius: 4px !important;
+                    border: 2px solid transparent !important;
+                    background-clip: padding-box !important;
+                    min-height: 24px !important;
+                }}
+                #${{hostId}} .xterm-viewport:hover::-webkit-scrollbar-thumb {{
+                    background: rgba(120, 142, 166, 0.55) !important;
+                    background-clip: padding-box !important;
+                }}
+                #${{hostId}} .xterm-viewport::-webkit-scrollbar-thumb:hover {{
+                    background: rgba(120, 142, 166, 0.78) !important;
+                    background-clip: padding-box !important;
+                }}
+                #${{hostId}} .xterm-viewport::-webkit-scrollbar-corner {{
+                    background: transparent !important;
                 }}
             `;
             document.head.appendChild(runtimeStyle);
