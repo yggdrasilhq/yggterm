@@ -1423,14 +1423,24 @@ mod tests {
     }
 
     #[test]
-    fn best_effort_copy_handles_short_substantive_question_context() {
-        let context = ["RECENT SUBSTANTIVE TURNS:", "USER: Who are you?"].join("\n");
+    fn best_effort_copy_handles_short_substantive_user_context() {
+        // Renamed from `..._short_substantive_question_context` 2026-05-26.
+        // The original used a "Who are you?" turn which is now filtered as
+        // low-signal by `looks_like_low_signal_generated_copy`'s question-
+        // fragment heuristic (correctly — bare question turns are noise in
+        // production, not substantive titles). A short non-question user
+        // turn still passes; that's what this asserts.
+        let context = [
+            "RECENT SUBSTANTIVE TURNS:",
+            "USER: Investigate the JYAS extraction workflow.",
+        ]
+        .join("\n");
         let title = best_effort_title_from_context(&context).expect("title");
         let precis = best_effort_precis_from_context(&context).expect("precis");
         let summary = best_effort_summary_from_context(&context).expect("summary");
-        assert_eq!(title, "Who Are You");
-        assert!(precis.contains("Who are you"));
-        assert!(summary.contains("Who are you"));
+        assert_eq!(title, "Investigate Jyas Extraction Workflow");
+        assert!(precis.contains("JYAS extraction workflow") || precis.contains("Investigate"));
+        assert!(summary.contains("JYAS") || summary.contains("Investigate"));
     }
 
     #[test]
