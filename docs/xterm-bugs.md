@@ -34,7 +34,7 @@ xterm.js owns vs what the shell owns, cursor/prompt semantics, etc. — see
 | [scrollback-lost-on-session-switch](#scrollback-lost-on-session-switch) | User-scrolled scrollback collapses to live cursor when switching sessions | PARTIALLY FIXED |
 | [scrollback-lost-on-gui-restart](#scrollback-lost-on-gui-restart) | Scroll position lost when GUI restarts (daemon survives) | FIXED 2026-05-26 |
 | [resume-gate-too-restrictive](#resume-gate-too-restrictive) | Resuming a session that's mid-output (no prompt visible) takes 60-160s to clear "not ready" gate | FIXED 2026-05-25 |
-| [scroll-jump-on-input](#scroll-jump-on-input) | Typing in a session yanks viewport to a "particular spot" (flicker between spot and prompt); scroll-lock variant kicks user back when scrolling | OPEN, investigating |
+| [scroll-jump-on-input](#scroll-jump-on-input) | Typing in a session yanks viewport to a "particular spot" (flicker between spot and prompt); scroll-lock variant kicks user back when scrolling | PARTIALLY FIXED 2026-05-26 — input-snap skipped when user is reading scrollback |
 | [dom-leak-on-session-start](#dom-leak-on-session-start) | Portion of *prior* message context flashes briefly during session start/switch then goes away | OPEN, uninvestigated |
 | [clipboard-double-paste](#clipboard-double-paste) | Class: text select + middle-click pastes selection THEN clipboard (double); Ctrl+Shift+V double paste; selection-vs-clipboard ordering bugs | OPEN, investigating |
 | [slow-jitter](#slow-jitter) | Some sessions exhibit visible per-frame jitter under steady PTY output | OPEN, uninvestigated |
@@ -262,7 +262,33 @@ getting stuck is also another xterm bug painpoint."
 
 ## scroll-jump-on-input
 
-**STATUS:** OPEN — reported live 2026-05-26 on jojo, multiple variants.
+**STATUS:** PARTIALLY FIXED 2026-05-26 (commit 6c757b1) — the "snap to
+bottom on input while reading scrollback" variant is fixed; flicker and
+scroll-lock variants still need real-repro telemetry to attribute.
+
+### Fix (variant 1: snap-to-bottom on input while scrolled up)
+In the `term.onData` handler in shell.rs (the JS code generated for each
+xterm host), before firing `setScrollbackIntent('PromptFollow', 'input')`
+and `scrollLiveCursorIntoView(true, 'input')`, check:
+
+```js
+const _scrollJumpUserIsReadingScrollback =
+    scrollbackIntent === 'UserScrollback'
+    && (baseY - viewportY) > 5;
+if (!_scrollJumpUserIsReadingScrollback) {
+    // existing snap-to-bottom logic
+} else {
+    // keystroke still goes to PTY via queueTerminalInputData; viewport stays.
+    sendTerminalEvent({ kind: 'debug', message: `input_snap_skipped ...` });
+}
+```
+
+5-row threshold: at small distances the user probably wants the prompt
+visible while typing; at larger distances they're intentionally reading.
+
+Records `inputSnapSkippedCount`, `lastInputSnapSkippedAtMs`,
+`lastInputSnapSkippedDistanceRows` on the host entry for app-control
+visibility.
 
 ### Symptom
 A class of related bugs where the viewport "jumps to a particular spot"
