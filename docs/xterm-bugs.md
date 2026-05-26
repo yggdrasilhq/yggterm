@@ -96,10 +96,13 @@ Both code paths now early-return when
   (sets `UserScrollback` when user wheels/PageUps)
 
 ### Tests
-The test assertion at ~69861 covers `repaintActiveEntry`. A new assertion
-for `followPromptForEntry`'s guard is needed (TODO: assert
-"if (entry && String(entry.scrollbackIntent || 'PromptFollow') === 'UserScrollback')"
-appears inside the followPromptForEntry definition).
+Both paths now have regression coverage:
+- `repaintActiveEntry` guard is asserted at shell.rs ~69861.
+- `followPromptForEntry` guard is asserted by
+  `retained_replay_script_followPromptForEntry_guards_user_scrollback`
+  (added 2026-05-26). Fails if either the function definition or the
+  `String(entry.scrollbackIntent || 'PromptFollow') === 'UserScrollback'`
+  early-return guard is removed.
 
 ### Telemetry
 None yet. A `xterm_scrollback_lost_on_switch` event could be added by
