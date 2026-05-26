@@ -1320,9 +1320,7 @@ pub fn read_cc_session_identity_fields(path: &Path) -> Result<Option<(String, St
                 .filter(|s| !s.trim().is_empty())
                 .map(ToOwned::to_owned);
         }
-        if cwd.is_none()
-            && value.get("type").and_then(Value::as_str) == Some("user")
-        {
+        if cwd.is_none() && value.get("type").and_then(Value::as_str) == Some("user") {
             cwd = value
                 .get("cwd")
                 .and_then(Value::as_str)
@@ -1375,7 +1373,9 @@ pub fn read_cc_session_title(path: &Path) -> Result<Option<String>> {
                     .iter()
                     .filter_map(|part| {
                         if part.get("type").and_then(Value::as_str) == Some("text") {
-                            part.get("text").and_then(Value::as_str).map(ToOwned::to_owned)
+                            part.get("text")
+                                .and_then(Value::as_str)
+                                .map(ToOwned::to_owned)
                         } else {
                             None
                         }
@@ -1412,11 +1412,18 @@ pub fn read_cc_session_context(path: &Path) -> Result<String> {
     let mut parts: Vec<String> = Vec::new();
     for line in reader.lines() {
         let Ok(line) = line else { continue };
-        let Ok(value) = serde_json::from_str::<Value>(&line) else { continue };
+        let Ok(value) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
         if value.get("type").and_then(Value::as_str) != Some("user") {
             continue;
         }
-        if value.get("message").and_then(|m| m.get("role")).and_then(Value::as_str) != Some("user") {
+        if value
+            .get("message")
+            .and_then(|m| m.get("role"))
+            .and_then(Value::as_str)
+            != Some("user")
+        {
             continue;
         }
         let content = value.get("message").and_then(|m| m.get("content"));
@@ -1580,7 +1587,10 @@ fn normalize_codex_cwd(raw: String) -> String {
     }
 }
 
-fn insert_codex_browser_project(root: &mut CodexBrowserTreeNode, project: &LocalAgentProjectBucket) {
+fn insert_codex_browser_project(
+    root: &mut CodexBrowserTreeNode,
+    project: &LocalAgentProjectBucket,
+) {
     let segments = browser_tree_segments(&project.cwd);
     insert_codex_browser_path(root, &segments, project.clone());
 }

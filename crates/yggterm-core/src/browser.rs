@@ -854,11 +854,15 @@ mod tests {
         // so it stays collapsed. Both agent-CLI children MUST be hidden.
         let rows = browser.rows();
         assert!(
-            !rows.iter().any(|r| r.session_id.as_deref() == Some("cc-id")),
+            !rows
+                .iter()
+                .any(|r| r.session_id.as_deref() == Some("cc-id")),
             "CC session must be hidden when its parent group is collapsed"
         );
         assert!(
-            !rows.iter().any(|r| r.session_id.as_deref() == Some("codex-id")),
+            !rows
+                .iter()
+                .any(|r| r.session_id.as_deref() == Some("codex-id")),
             "Codex session must be hidden when its parent group is collapsed"
         );
 
@@ -866,11 +870,13 @@ mod tests {
         browser.ensure_expanded_paths(["/home/pi".to_string()]);
         let rows = browser.rows();
         assert!(
-            rows.iter().any(|r| r.session_id.as_deref() == Some("cc-id")),
+            rows.iter()
+                .any(|r| r.session_id.as_deref() == Some("cc-id")),
             "CC session must appear when its parent group is expanded"
         );
         assert!(
-            rows.iter().any(|r| r.session_id.as_deref() == Some("codex-id")),
+            rows.iter()
+                .any(|r| r.session_id.as_deref() == Some("codex-id")),
             "Codex session must appear when its parent group is expanded"
         );
     }
