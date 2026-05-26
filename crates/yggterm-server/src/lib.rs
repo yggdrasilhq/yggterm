@@ -12213,6 +12213,7 @@ fn hot_update_stale_remote_runtime_owner_for_bridge(
         Some(daemon::SERVER_PROTOCOL_VERSION),
         Some(current_local_build_id()),
         Some("remote runtime bridge hot update"),
+        false,
     );
     match result {
         Ok(HotRestartResult::Restarting { message }) => {
