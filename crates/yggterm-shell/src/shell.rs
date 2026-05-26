@@ -54940,7 +54940,11 @@ fn terminal_eval_script_with_canvas_renderer(
             letterSpacing: 0,
             minimumContrastRatio: {minimum_contrast_ratio},
             rightClickSelectsWord: false,
-            scrollback: 1000,
+            // Per [[spec-tmux-parity-and-beyond]]: xterm.js scrollback matches the
+            // daemon's `DAEMON_VT_SCROLLBACK_ROWS` so the GUI can render the full
+            // retained history when the daemon replays it on attach. 10 000 rows
+            // is the practical sweet spot for shells.
+            scrollback: 10000,
             theme: {{
                 background: {background},
                 foreground: {foreground},
