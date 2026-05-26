@@ -1390,6 +1390,13 @@ pub enum ServerRequest {
         expected_version: Option<String>,
         expected_build_id: Option<u64>,
         reason: Option<String>,
+        /// When `true`, the daemon bypasses the same-version refusal check
+        /// and proceeds with the handoff even when the target version
+        /// equals the current `SERVER_PROTOCOL_VERSION`. Used by dev/agent
+        /// deploys where the build_id changed but the version_string didn't.
+        /// See [[bug-class-auto-hot-restart-version-gated]].
+        #[serde(default)]
+        force: bool,
     },
     RetireDaemon {
         reason: Option<String>,
@@ -3411,6 +3418,7 @@ impl DaemonRuntime {
                 expected_version,
                 expected_build_id,
                 reason,
+                force,
             } => {
                 let runtime_status = self.status();
                 let owned_terminal_session_keys = self.terminals.session_keys();
@@ -3469,12 +3477,13 @@ impl DaemonRuntime {
                             )),
                         });
                     }
-                    if expected_version
-                        .as_deref()
-                        .is_none_or(|version| version == SERVER_PROTOCOL_VERSION)
+                    if !force
+                        && expected_version
+                            .as_deref()
+                            .is_none_or(|version| version == SERVER_PROTOCOL_VERSION)
                     {
                         return Ok(ServerResponse::Error {
-                            message: "hot update handoff requires a different target daemon version when live terminal runtimes are present".to_string(),
+                            message: "hot update handoff requires a different target daemon version when live terminal runtimes are present (pass --force to override for dev/agent deploys)".to_string(),
                         });
                     }
                     let daemon_executable = canonical_hot_restart_executable(&daemon_executable)?;
@@ -6260,6 +6269,7 @@ pub fn hot_restart(
         expected_version,
         expected_build_id,
         reason,
+        false,
     )?
     .message())
 }
@@ -6270,6 +6280,7 @@ pub fn hot_restart_detailed(
     expected_version: Option<&str>,
     expected_build_id: Option<u64>,
     reason: Option<&str>,
+    force: bool,
 ) -> Result<HotRestartResult> {
     let daemon_executable = daemon_executable
         .canonicalize()
@@ -6281,6 +6292,7 @@ pub fn hot_restart_detailed(
             expected_version: expected_version.map(ToOwned::to_owned),
             expected_build_id,
             reason: reason.map(ToOwned::to_owned),
+            force,
         },
     )? {
         ServerResponse::Ack { message } => Ok(HotRestartResult::Restarting { message }),
@@ -9344,6 +9356,7 @@ mod tests {
             expected_version: Some("2.1.61".to_string()),
             expected_build_id: None,
             reason: Some("test".to_string()),
+            force: false,
         };
 
         let outcome = super::daemon_request_outcome_for_response(
