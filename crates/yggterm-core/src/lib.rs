@@ -841,6 +841,10 @@ fn parse_settings_value(value: &Value) -> Result<AppSettings> {
         settings.codex_extra_args =
             serde_json::from_value(value.clone()).context("failed to parse codex_extra_args")?;
     }
+    if let Some(value) = object.get("claude_code_extra_args") {
+        settings.claude_code_extra_args = serde_json::from_value(value.clone())
+            .context("failed to parse claude_code_extra_args")?;
+    }
     if let Some(value) = object.get("default_agent_profile") {
         settings.default_agent_profile = serde_json::from_value(value.clone())
             .context("failed to parse default_agent_profile")?;
@@ -891,6 +895,7 @@ fn serialize_settings_value(settings: &AppSettings) -> Value {
         "litellm_api_key": settings.litellm_api_key,
         "interface_llm_model": settings.interface_llm_model,
         "codex_extra_args": settings.codex_extra_args,
+        "claude_code_extra_args": settings.claude_code_extra_args,
         "default_agent_profile": settings.default_agent_profile,
         "in_app_notifications": settings.in_app_notifications,
         "system_notifications": settings.system_notifications,
@@ -1735,6 +1740,51 @@ fn short_session_id(session_id: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression test for the class of bug where a new `AppSettings` field
+    /// is declared but its read/write through `serialize_settings_value` /
+    /// `parse_settings_value` is forgotten. Symptom: the field appears in
+    /// the UI, the user sets it, but it silently drops on every restart.
+    /// Was caught live for `claude_code_extra_args` (2026-05-26); this test
+    /// guards against the same fault on every other field by mutating each
+    /// to a distinct non-default value and asserting full round-trip.
+    #[test]
+    fn app_settings_round_trip_through_serialize_then_parse_preserves_all_fields() {
+        let mut original = AppSettings::default();
+        // Mutate every field to a distinct, non-default value. If a new
+        // field is added to AppSettings and not handled in serialize/parse,
+        // this test will surface the divergence as soon as the field is
+        // mutated here.
+        original.theme = UiTheme::ZedDark;
+        original.show_tree = false;
+        original.show_settings = true;
+        original.auto_hide_titlebar = true;
+        original.window_maximized = true;
+        original.tree_width = 411.5;
+        original.rendered_font_size = 11.5;
+        original.terminal_font_size = 17.0;
+        original.terminal_light_theme_name = "Solarized Light".to_string();
+        original.terminal_dark_theme_name = "Monokai".to_string();
+        original.ui_font_size = 15.5;
+        original.prefer_ghostty_backend = false;
+        original.litellm_endpoint = "https://litellm.example.test".to_string();
+        original.litellm_api_key = "sk-test-1234".to_string();
+        original.interface_llm_model = "gpt-test-5".to_string();
+        original.codex_extra_args = "-s danger-full-access".to_string();
+        original.claude_code_extra_args = "--dangerously-skip-permissions".to_string();
+        original.in_app_notifications = false;
+        original.system_notifications = true;
+        original.notification_sound = true;
+        original.terminal_telemetry_enabled = false;
+        original.selected_browser_path = Some("__remote_machine__/dev".to_string());
+        original.expanded_browser_paths =
+            vec!["__remote_machine__/dev".to_string(), "/home/pi".to_string()];
+
+        let json = serialize_settings_value(&original);
+        let round_tripped = parse_settings_value(&json).expect("parse settings");
+
+        assert_eq!(round_tripped, original);
+    }
 
     #[test]
     fn browser_child_sort_respects_raw_virtual_path_order() {
