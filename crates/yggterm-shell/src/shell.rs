@@ -61622,12 +61622,37 @@ fn terminal_eval_script_with_canvas_renderer(
                 ? Number(term.buffer.active.viewportY || 0) : -1;
             const _scrollJumpBeforeBaseY = (term && term.buffer && term.buffer.active)
                 ? Number(term.buffer.active.baseY || 0) : -1;
-            setScrollbackIntent('PromptFollow', 'input');
-            scrollbackLocked = false;
-            if (window.__yggtermXtermHosts && window.__yggtermXtermHosts[hostId]) {{
-                window.__yggtermXtermHosts[hostId].scrollbackLocked = scrollbackLocked;
+            // XTERM-BUG: scroll-jump-on-input — when user is actively scrolled up
+            // (UserScrollback intent AND visibly off-bottom by > 5 rows), a
+            // keystroke must NOT yank the viewport to baseY. The keystroke still
+            // goes to the PTY; the viewport stays where the user is reading.
+            // This is the actual production fix that complements the
+            // pre-existing telemetry.
+            const _scrollJumpUserIsReadingScrollback =
+                scrollbackIntent === 'UserScrollback'
+                && _scrollJumpBeforeY >= 0
+                && _scrollJumpBeforeBaseY >= 0
+                && (_scrollJumpBeforeBaseY - _scrollJumpBeforeY) > 5;
+            if (!_scrollJumpUserIsReadingScrollback) {{
+                setScrollbackIntent('PromptFollow', 'input');
+                scrollbackLocked = false;
+                if (window.__yggtermXtermHosts && window.__yggtermXtermHosts[hostId]) {{
+                    window.__yggtermXtermHosts[hostId].scrollbackLocked = scrollbackLocked;
+                }}
+                scrollLiveCursorIntoView(true, 'input');
+            }} else {{
+                // Record that we deliberately skipped the snap so probes can verify.
+                if (window.__yggtermXtermHosts && window.__yggtermXtermHosts[hostId]) {{
+                    const entry = window.__yggtermXtermHosts[hostId];
+                    entry.inputSnapSkippedCount = Number(entry.inputSnapSkippedCount || 0) + 1;
+                    entry.lastInputSnapSkippedAtMs = Date.now();
+                    entry.lastInputSnapSkippedDistanceRows = _scrollJumpBeforeBaseY - _scrollJumpBeforeY;
+                }}
+                sendTerminalEvent({{
+                    kind: 'debug',
+                    message: `input_snap_skipped host=${{hostId}} distance_rows=${{_scrollJumpBeforeBaseY - _scrollJumpBeforeY}} viewport_y=${{_scrollJumpBeforeY}} base_y=${{_scrollJumpBeforeBaseY}}`
+                }});
             }}
-            scrollLiveCursorIntoView(true, 'input');
             // XTERM-BUG: scroll-jump-on-input — emit a scroll_jump_after_input event
             // when viewport moved more than 1 row as a result of this keystroke.
             try {{
