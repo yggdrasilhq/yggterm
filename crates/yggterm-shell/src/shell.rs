@@ -147,7 +147,7 @@ use yggterm_server::{
     AppControlPointerCommand, AppControlPreviewLayout, AppControlResponse,
     AppControlRightPanelMode, AppControlStartAction, AppControlViewMode, GhosttyTerminalHostMode,
     ManagedSessionView, PersistedDaemonState, PreviewTone, ProbeTerminalViewportInputMode,
-    LocalCcSession, RemoteDeployState, RemoteMachineHealth, RemoteMachineSnapshot,
+    RemoteDeployState, RemoteMachineHealth, RemoteMachineSnapshot,
     RemoteScannedSession,
     ServerEndpoint, ServerRuntimeStatus, ServerUiSnapshot, SessionKind, SessionMetadataEntry,
     SessionPreviewBlock, SessionRenderedSection, SessionSource, SnapshotSessionView,
@@ -2226,8 +2226,12 @@ impl ShellState {
         } else {
             self.browser.rows().to_vec()
         };
-        let stored_rows =
-            inject_file_backed_cc_session_rows(stored_rows, self.server.local_cc_sessions());
+        // Per [[spec-cwd-tree-agent-cli-unified]]: file-backed CC sessions
+        // are now native leaves in the tree (via build_local_cwd_tree). The
+        // prior inject_file_backed_cc_session_rows post-hoc injection has
+        // been deleted — it bypassed expand/collapse state, causing CC rows
+        // to render orphaned at child depth while their parent group was
+        // collapsed (live bug reported 2026-05-26).
         let stored_projection_rows = self.browser.all_rows();
         let selected_path = if let Some(active) = self.server.active_session() {
             if active.source == yggterm_server::SessionSource::LiveSsh
@@ -6226,12 +6230,11 @@ impl ShellState {
         self.refresh_tree_debug("close_context_menu");
     }
     fn all_sidebar_rows_for_selection(&self) -> Vec<BrowserRow> {
-        let cc_sessions = self.server.local_cc_sessions();
+        // Per [[spec-cwd-tree-agent-cli-unified]]: CC sessions now live
+        // natively in the tree. No post-hoc injection needed.
         let stored_rows = self.browser.search_rows();
-        let stored_rows_with_cc =
-            inject_file_backed_cc_session_rows(stored_rows.clone(), cc_sessions);
         let live_sessions = self.server.live_sessions();
-        let mut expanded_paths = stored_rows_with_cc
+        let mut expanded_paths = stored_rows
             .iter()
             .filter(|row| row.kind == BrowserRowKind::Group)
             .map(|row| row.full_path.clone())
@@ -6244,9 +6247,9 @@ impl ShellState {
         let mut previous_group_count = 0;
         for _ in 0..8 {
             let rows = sidebar_rows_for_selection(
-                &stored_rows_with_cc,
+                &stored_rows,
                 merged_sidebar_rows(
-                    &stored_rows_with_cc,
+                    &stored_rows,
                     self.server.remote_machines(),
                     self.server.ssh_targets(),
                     &live_sessions,
@@ -6266,9 +6269,9 @@ impl ShellState {
             expanded_paths.extend(group_paths);
         }
         sidebar_rows_for_selection(
-            &stored_rows_with_cc,
+            &stored_rows,
             merged_sidebar_rows(
-                &stored_rows_with_cc,
+                &stored_rows,
                 self.server.remote_machines(),
                 self.server.ssh_targets(),
                 &live_sessions,
@@ -19907,63 +19910,17 @@ fn inject_cc_sessions_into_stored_rows(
     }
     result
 }
-fn inject_file_backed_cc_session_rows(
-    stored_rows: Vec<BrowserRow>,
-    cc_sessions: &[LocalCcSession],
-) -> Vec<BrowserRow> {
-    if cc_sessions.is_empty() {
-        return stored_rows;
-    }
-    let has_group_rows = stored_rows.iter().any(|row| row.kind == BrowserRowKind::Group);
-    if !has_group_rows {
-        return stored_rows;
-    }
-    let live_paths: HashSet<String> = stored_rows
-        .iter()
-        .filter(|row| row.kind == BrowserRowKind::Session)
-        .filter_map(|row| row.session_id.clone())
-        .collect();
-    let mut insertions: Vec<(usize, BrowserRow)> = Vec::new();
-    for session in cc_sessions {
-        if live_paths.contains(&session.session_id) {
-            continue;
-        }
-        let Some((group_idx, group_depth)) =
-            find_best_group_for_cwd_in_rows(&stored_rows, &session.cwd)
-        else {
-            continue;
-        };
-        let insert_idx = find_child_insert_point(&stored_rows, group_idx, group_depth);
-        insertions.push((
-            insert_idx,
-            BrowserRow {
-                kind: BrowserRowKind::Session,
-                full_path: session.file_path.clone(),
-                label: session.title_hint.clone(),
-                detail_label: session.context_hint.clone(),
-                document_kind: None,
-                group_kind: None,
-                session_title: Some(session.title_hint.clone()),
-                depth: group_depth + 1,
-                host_label: "local".to_string(),
-                descendant_sessions: 1,
-                expanded: true,
-                session_id: Some(session.session_id.clone()),
-                session_cwd: Some(session.cwd.clone()),
-                session_kind: None,
-            },
-        ));
-    }
-    if insertions.is_empty() {
-        return stored_rows;
-    }
-    insertions.sort_by(|a, b| b.0.cmp(&a.0));
-    let mut result = stored_rows;
-    for (idx, row) in insertions {
-        result.insert(idx, row);
-    }
-    result
-}
+// inject_file_backed_cc_session_rows was deleted 2026-05-26.
+// Per [[spec-cwd-tree-agent-cli-unified]]: file-backed CC sessions are now
+// native leaves in the local cwd tree (built via
+// yggterm_core::build_local_cwd_tree which calls
+// yggterm_core::scan_local_claude_code_sessions alongside
+// yggterm_core::scan_local_codex_sessions). The prior post-hoc injection
+// bypassed expand/collapse state, causing CC rows to render at child depth
+// even when their parent group was collapsed — visually orphaned.
+// LIVE (running) CC sessions still need separate injection — see
+// `inject_cc_sessions_into_stored_rows` below — because they come from
+// `ManagedSessionView` in-memory state, not from a JSONL file scan.
 
 fn live_session_label_with_index(
     remote_session_index: &RemoteSessionIndex,
@@ -74606,9 +74563,11 @@ mod tests {
                 children: Vec::new(),
                 session_id: Some("duplicate".to_string()),
                 cwd: Some("/home/user/gh/yggterm".to_string()),
+                ..Default::default()
             }],
             session_id: None,
             cwd: None,
+            ..Default::default()
         };
         let live_session = test_live_shell_session(path);
         let mut shell = ShellState::new(test_shell_bootstrap_with_browser_tree(browser_tree));
@@ -77299,9 +77258,11 @@ mod tests {
                 children: Vec::new(),
                 session_id: Some("live-shell-session".to_string()),
                 cwd: Some("/home/user".to_string()),
+                ..Default::default()
             }],
             session_id: None,
             cwd: None,
+            ..Default::default()
         };
         let shell = ShellState::new(test_shell_bootstrap_with_browser_tree(browser_tree));
         let session = ManagedSessionView {
@@ -84047,6 +84008,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             children: Vec::new(),
             session_id: Some("test-session".to_string()),
             cwd: Some("/home/user".to_string()),
+            ..Default::default()
         };
         let root = SessionNode {
             kind: SessionNodeKind::Group,
@@ -84058,6 +84020,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             children: vec![active_tree],
             session_id: None,
             cwd: None,
+            ..Default::default()
         };
         let bootstrap = ShellBootstrap {
             tree: root.clone(),
@@ -87172,6 +87135,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             children: Vec::new(),
             session_id: Some("test-session".to_string()),
             cwd: Some("/home/user".to_string()),
+            ..Default::default()
         };
         let root = SessionNode {
             kind: SessionNodeKind::Group,
@@ -87183,6 +87147,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             children: vec![active_tree],
             session_id: None,
             cwd: None,
+            ..Default::default()
         };
         ShellBootstrap {
             tree: root.clone(),
@@ -87655,6 +87620,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
                         children: Vec::new(),
                         session_id: Some("alpha-session".to_string()),
                         cwd: Some("/home/user/gh/codex-litellm".to_string()),
+                        ..Default::default()
                     },
                     SessionNode {
                         kind: SessionNodeKind::CodexSession,
@@ -87666,13 +87632,16 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
                         children: Vec::new(),
                         session_id: Some("beta-session".to_string()),
                         cwd: Some("/home/user/gh/codex-litellm".to_string()),
+                        ..Default::default()
                     },
                 ],
                 session_id: None,
                 cwd: Some("/home/user/gh/codex-litellm".to_string()),
+                ..Default::default()
             }],
             session_id: None,
             cwd: None,
+            ..Default::default()
         }
     }
     #[test]
@@ -87737,6 +87706,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
                     children: Vec::new(),
                     session_id: None,
                     cwd: Some(first.to_string()),
+                    ..Default::default()
                 },
                 SessionNode {
                     kind: SessionNodeKind::Group,
@@ -87748,10 +87718,12 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
                     children: Vec::new(),
                     session_id: None,
                     cwd: Some(second.to_string()),
+                    ..Default::default()
                 },
             ],
             session_id: None,
             cwd: None,
+            ..Default::default()
         };
         let mut shell = ShellState::new(test_shell_bootstrap_with_browser_tree(tree));
         let second_row = shell
@@ -87840,12 +87812,15 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
                     children: Vec::new(),
                     session_id: Some("child-note".to_string()),
                     cwd: Some(child.to_string()),
+                    ..Default::default()
                 }],
                 session_id: None,
                 cwd: Some(parent.to_string()),
+                ..Default::default()
             }],
             session_id: None,
             cwd: None,
+            ..Default::default()
         };
         let mut shell = ShellState::new(test_shell_bootstrap_with_browser_tree(tree));
         let parent_row = shell
@@ -87932,6 +87907,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             children: Vec::new(),
             session_id: None,
             cwd: None,
+            ..Default::default()
         }));
         shell.server.apply_snapshot(ServerUiSnapshot {
             active_session_path: None,
@@ -88287,15 +88263,19 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
                         children: Vec::new(),
                         session_id: None,
                         cwd: Some("/home/user/gh".to_string()),
+                        ..Default::default()
                     }],
                     session_id: None,
                     cwd: Some("/home/user".to_string()),
+                    ..Default::default()
                 }],
                 session_id: None,
                 cwd: None,
+                ..Default::default()
             }],
             session_id: None,
             cwd: None,
+            ..Default::default()
         });
         shell.browser.ensure_expanded_paths(vec![
             "local".to_string(),
@@ -88401,12 +88381,15 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
                     children: Vec::new(),
                     session_id: Some("recipe-id".to_string()),
                     cwd: Some(recipe_path.to_string()),
+                    ..Default::default()
                 }],
                 session_id: None,
                 cwd: Some("/home/user".to_string()),
+                ..Default::default()
             }],
             session_id: None,
             cwd: None,
+            ..Default::default()
         }));
         let live_session = test_live_shell_session(active_session_path);
         shell.server.apply_snapshot(ServerUiSnapshot {
@@ -88473,6 +88456,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
                         children: Vec::new(),
                         session_id: None,
                         cwd: Some(rename_path.to_string()),
+                        ..Default::default()
                     },
                     SessionNode {
                         kind: SessionNodeKind::Group,
@@ -88484,13 +88468,16 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
                         children: Vec::new(),
                         session_id: None,
                         cwd: Some("/home/user/git".to_string()),
+                        ..Default::default()
                     },
                 ],
                 session_id: None,
                 cwd: Some("/home/user".to_string()),
+                ..Default::default()
             }],
             session_id: None,
             cwd: None,
+            ..Default::default()
         }));
         let live_session = test_live_shell_session(active_session_path);
         shell.server.apply_snapshot(ServerUiSnapshot {
@@ -88560,6 +88547,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
                     children: Vec::new(),
                     session_id: None,
                     cwd: None,
+                    ..Default::default()
                 },
                 SessionNode {
                     kind: SessionNodeKind::CodexSession,
@@ -88571,10 +88559,12 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
                     children: Vec::new(),
                     session_id: Some("stored-session".to_string()),
                     cwd: Some("/home/user".to_string()),
+                    ..Default::default()
                 },
             ],
             session_id: None,
             cwd: None,
+            ..Default::default()
         });
         let active_session = ManagedSessionView {
             id: "stored-session".to_string(),

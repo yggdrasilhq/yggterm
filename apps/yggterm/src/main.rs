@@ -3302,6 +3302,7 @@ fn placeholder_session_tree(path: std::path::PathBuf, theme: UiTheme) -> Session
         children: Vec::new(),
         session_id: None,
         cwd: None,
+        ..Default::default()
     }
 }
 
