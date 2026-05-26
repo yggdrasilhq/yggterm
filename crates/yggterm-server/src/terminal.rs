@@ -19,7 +19,17 @@ use yggterm_core::{append_trace_event, resolve_yggterm_home};
 const DEFAULT_COLS: u16 = 120;
 const DEFAULT_ROWS: u16 = 36;
 const MAX_CHUNKS: usize = 512;
-pub const MAX_BUFFER_BYTES: usize = 2 * 1024 * 1024;
+// Per [[spec-tmux-parity-and-beyond]]: raw-byte retention is the
+// substrate for GUI-restart history replay. Was 2 MB pre-2026-05-26;
+// bumped to 16 MB so plain-shell sessions retain ~50–100x more history
+// (real lines, not redraws). TUI sessions still primarily benefit from
+// the daemon-side vt100 scrollback ring (see TerminalScreenState).
+pub const MAX_BUFFER_BYTES: usize = 16 * 1024 * 1024;
+/// Per-session daemon-side scrollback ring depth (rows) tracked by the
+/// vt100 parser. Mirrors xterm.js's scrollback config in shell.rs.
+/// Per [[spec-tmux-parity-and-beyond]] — this is the tmux `history-limit`
+/// equivalent. 10 000 rows is the practical sweet spot for shells.
+pub const DAEMON_VT_SCROLLBACK_ROWS: usize = 10_000;
 pub const IDLE_TRIM_MAX_CHUNKS: usize = 64;
 pub const IDLE_TRIM_MAX_BYTES: usize = 128 * 1024;
 const INITIAL_ATTACH_MAX_CHUNKS: usize = 192;
@@ -855,7 +865,11 @@ struct TerminalScreenState {
 impl TerminalScreenState {
     fn new(rows: u16, cols: u16) -> Self {
         Self {
-            parser: Vt100Parser::new(rows, cols, 0),
+            // Per [[spec-tmux-parity-and-beyond]] the daemon's vt100 parser
+            // tracks DAEMON_VT_SCROLLBACK_ROWS of scrolled-off rows so the
+            // GUI can restore real terminal history after restart (matching
+            // tmux's `history-limit` semantics).
+            parser: Vt100Parser::new(rows, cols, DAEMON_VT_SCROLLBACK_ROWS),
             formatted: String::new(),
         }
     }
@@ -2533,21 +2547,26 @@ PY"#,
 
     #[test]
     fn trim_chunk_buffer_enforces_byte_budget() {
+        // Sized so total > MAX_BUFFER_BYTES (135%) — three chunks each at
+        // 45% of the budget. After dropping the oldest, total drops to 90%
+        // (under budget), so exactly two chunks remain. Mirrors the original
+        // pre-bump ratio (900 KB chunks vs old 2 MB budget).
+        let chunk_size = (MAX_BUFFER_BYTES * 45) / 100;
         let mut chunks = VecDeque::from([
             TerminalChunk {
                 seq: 1,
-                data: "a".repeat(900_000),
+                data: "a".repeat(chunk_size),
             },
             TerminalChunk {
                 seq: 2,
-                data: "b".repeat(900_000),
+                data: "b".repeat(chunk_size),
             },
             TerminalChunk {
                 seq: 3,
-                data: "c".repeat(900_000),
+                data: "c".repeat(chunk_size),
             },
         ]);
-        let mut retained = 2_700_000usize;
+        let mut retained = chunk_size * 3;
         trim_chunk_buffer(&mut chunks, &mut retained, MAX_CHUNKS, MAX_BUFFER_BYTES);
         assert!(retained <= MAX_BUFFER_BYTES);
         assert_eq!(chunks.len(), 2);

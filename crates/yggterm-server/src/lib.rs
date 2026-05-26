@@ -20325,6 +20325,7 @@ mod tests {
             children: Vec::new(),
             session_id: None,
             cwd: None,
+            ..Default::default()
         };
         let mut server = YggtermServer::new(
             &tree,
@@ -20654,6 +20655,7 @@ mod tests {
             children: Vec::new(),
             session_id: None,
             cwd: None,
+            ..Default::default()
         };
         let mut server = YggtermServer::new(
             &tree,
@@ -20869,6 +20871,7 @@ mod tests {
             children: Vec::new(),
             session_id: None,
             cwd: None,
+            ..Default::default()
         };
         let mut server = YggtermServer::new(
             &tree,
@@ -20926,6 +20929,7 @@ mod tests {
             children: Vec::new(),
             session_id: None,
             cwd: None,
+            ..Default::default()
         };
         let mut server = YggtermServer::new(
             &tree,
@@ -21665,9 +21669,11 @@ mod tests {
                 children: Vec::new(),
                 session_id: Some("old".to_string()),
                 cwd: Some("/home/pi".to_string()),
+                ..Default::default()
             }],
             session_id: None,
             cwd: None,
+            ..Default::default()
         };
         let server = YggtermServer::new(
             &tree,
@@ -21692,6 +21698,7 @@ mod tests {
                 children: Vec::new(),
                 session_id: None,
                 cwd: None,
+                ..Default::default()
             },
             false,
             GhosttyHostSupport::shadow("test".to_string(), false, false),
@@ -21783,6 +21790,7 @@ mod tests {
                 children: Vec::new(),
                 session_id: None,
                 cwd: None,
+                ..Default::default()
             },
             false,
             GhosttyHostSupport::shadow("test".to_string(), false, false),
@@ -22518,6 +22526,7 @@ mod tests {
             children: Vec::new(),
             session_id: None,
             cwd: None,
+            ..Default::default()
         };
         let server = YggtermServer::new(
             &tree,
@@ -22730,6 +22739,7 @@ terminal_window_id: None,
             children: Vec::new(),
             session_id: None,
             cwd: None,
+            ..Default::default()
         };
         let mut server = YggtermServer::new(
             &tree,
@@ -23012,6 +23022,7 @@ terminal_window_id: None,
             children: Vec::new(),
             session_id: None,
             cwd: None,
+            ..Default::default()
         };
         let mut server = YggtermServer::new(
             &tree,
@@ -23056,6 +23067,7 @@ terminal_window_id: None,
             children: Vec::new(),
             session_id: None,
             cwd: None,
+            ..Default::default()
         };
         let mut server = YggtermServer::new(
             &tree,
@@ -23096,6 +23108,7 @@ terminal_window_id: None,
             children: Vec::new(),
             session_id: None,
             cwd: None,
+            ..Default::default()
         };
         let mut server = YggtermServer::new(
             &tree,
@@ -23130,6 +23143,7 @@ terminal_window_id: None,
             children: Vec::new(),
             session_id: None,
             cwd: None,
+            ..Default::default()
         };
         let mut server = YggtermServer::new(
             &tree,
@@ -23169,6 +23183,7 @@ terminal_window_id: None,
             children: Vec::new(),
             session_id: None,
             cwd: None,
+            ..Default::default()
         };
         let mut server = YggtermServer::new(
             &tree,
@@ -23257,6 +23272,7 @@ terminal_window_id: None,
             children: Vec::new(),
             session_id: None,
             cwd: None,
+            ..Default::default()
         };
         let mut server = YggtermServer::new(
             &tree,
@@ -23302,6 +23318,7 @@ terminal_window_id: None,
             children: Vec::new(),
             session_id: None,
             cwd: None,
+            ..Default::default()
         };
         let mut server = YggtermServer::new(
             &tree,
@@ -23367,6 +23384,7 @@ terminal_window_id: None,
             children: Vec::new(),
             session_id: None,
             cwd: None,
+            ..Default::default()
         };
         let mut server = YggtermServer::new(
             &tree,
@@ -23437,6 +23455,7 @@ terminal_window_id: None,
             children: Vec::new(),
             session_id: None,
             cwd: None,
+            ..Default::default()
         };
         let mut server = YggtermServer::new(
             &tree,
@@ -23485,6 +23504,7 @@ terminal_window_id: None,
             children: Vec::new(),
             session_id: None,
             cwd: None,
+            ..Default::default()
         };
         let mut server = YggtermServer::new(
             &tree,
@@ -23535,6 +23555,7 @@ terminal_window_id: None,
             children: Vec::new(),
             session_id: None,
             cwd: None,
+            ..Default::default()
         };
         let mut server = YggtermServer::new(
             &tree,
@@ -23577,6 +23598,7 @@ terminal_window_id: None,
             children: Vec::new(),
             session_id: None,
             cwd: None,
+            ..Default::default()
         };
         let mut server = YggtermServer::new(
             &tree,
@@ -23637,6 +23659,7 @@ terminal_window_id: None,
             children: Vec::new(),
             session_id: None,
             cwd: None,
+            ..Default::default()
         };
         let mut server = YggtermServer::new(
             &tree,
@@ -23689,6 +23712,7 @@ terminal_window_id: None,
             children: Vec::new(),
             session_id: None,
             cwd: None,
+            ..Default::default()
         };
         let mut server = YggtermServer::new(
             &tree,
@@ -23766,6 +23790,7 @@ terminal_window_id: None,
             children: Vec::new(),
             session_id: None,
             cwd: None,
+            ..Default::default()
         };
         let mut server = YggtermServer::new(
             &tree,
@@ -23823,6 +23848,7 @@ terminal_window_id: None,
             children: Vec::new(),
             session_id: None,
             cwd: None,
+            ..Default::default()
         };
         let mut server = YggtermServer::new(
             &tree,
@@ -23856,6 +23882,7 @@ terminal_window_id: None,
             children: Vec::new(),
             session_id: None,
             cwd: None,
+            ..Default::default()
         };
         let mut server = YggtermServer::new(
             &tree,
@@ -24038,6 +24065,7 @@ terminal_window_id: None,
             children: Vec::new(),
             session_id: None,
             cwd: None,
+            ..Default::default()
         };
         let mut server = YggtermServer::new(
             &tree,
@@ -24120,6 +24148,7 @@ terminal_window_id: None,
             children: Vec::new(),
             session_id: None,
             cwd: None,
+            ..Default::default()
         };
         let mut server = YggtermServer::new(
             &tree,
@@ -24176,6 +24205,7 @@ terminal_window_id: None,
             children: Vec::new(),
             session_id: None,
             cwd: None,
+            ..Default::default()
         };
         let mut server = YggtermServer::new(
             &tree,
@@ -24226,6 +24256,7 @@ terminal_window_id: None,
             children: Vec::new(),
             session_id: None,
             cwd: None,
+            ..Default::default()
         };
         let mut server = YggtermServer::new(
             &tree,
@@ -24263,6 +24294,7 @@ terminal_window_id: None,
             children: Vec::new(),
             session_id: None,
             cwd: None,
+            ..Default::default()
         };
         let mut server = YggtermServer::new(
             &tree,
@@ -24338,6 +24370,7 @@ terminal_window_id: None,
             children: Vec::new(),
             session_id: None,
             cwd: None,
+            ..Default::default()
         };
         let mut server = YggtermServer::new(
             &tree,
@@ -24848,6 +24881,7 @@ terminal_window_id: None,
             children: Vec::new(),
             session_id: None,
             cwd: None,
+            ..Default::default()
         };
         let mut server = YggtermServer::new(
             &tree,
@@ -24898,6 +24932,7 @@ terminal_window_id: None,
             children: Vec::new(),
             session_id: None,
             cwd: None,
+            ..Default::default()
         };
         let mut server = YggtermServer::new(
             &tree,
@@ -24970,6 +25005,7 @@ terminal_window_id: None,
             children: Vec::new(),
             session_id: None,
             cwd: None,
+            ..Default::default()
         };
         let mut server = YggtermServer::new(
             &tree,
@@ -25039,6 +25075,7 @@ terminal_window_id: None,
             children: Vec::new(),
             session_id: None,
             cwd: None,
+            ..Default::default()
         };
         let mut server = YggtermServer::new(
             &tree,
@@ -25101,6 +25138,7 @@ terminal_window_id: None,
             children: Vec::new(),
             session_id: None,
             cwd: None,
+            ..Default::default()
         };
         let mut server = YggtermServer::new(
             &tree,
@@ -25185,6 +25223,7 @@ terminal_window_id: None,
             children: Vec::new(),
             session_id: None,
             cwd: None,
+            ..Default::default()
         };
         let mut server = YggtermServer::new(
             &tree,
@@ -25258,6 +25297,7 @@ terminal_window_id: None,
             children: Vec::new(),
             session_id: None,
             cwd: None,
+            ..Default::default()
         };
         let mut server = YggtermServer::new(
             &tree,
@@ -25369,6 +25409,7 @@ terminal_window_id: None,
             children: Vec::new(),
             session_id: None,
             cwd: None,
+            ..Default::default()
         };
         let mut server = YggtermServer::new(
             &tree,
@@ -25416,6 +25457,7 @@ terminal_window_id: None,
             children: Vec::new(),
             session_id: None,
             cwd: None,
+            ..Default::default()
         };
         let mut server = YggtermServer::new(
             &tree,
@@ -25475,6 +25517,7 @@ terminal_window_id: None,
             children: Vec::new(),
             session_id: None,
             cwd: None,
+            ..Default::default()
         };
         let mut server = YggtermServer::new(
             &tree,
@@ -25546,6 +25589,7 @@ terminal_window_id: None,
             children: Vec::new(),
             session_id: None,
             cwd: None,
+            ..Default::default()
         };
         let mut server = YggtermServer::new(
             &tree,
@@ -25601,6 +25645,7 @@ terminal_window_id: None,
             children: Vec::new(),
             session_id: None,
             cwd: None,
+            ..Default::default()
         };
         let mut server = YggtermServer::new(
             &tree,
@@ -25662,6 +25707,7 @@ terminal_window_id: None,
             children: Vec::new(),
             session_id: None,
             cwd: None,
+            ..Default::default()
         };
         let mut server = YggtermServer::new(
             &tree,
@@ -25728,6 +25774,7 @@ terminal_window_id: None,
             children: Vec::new(),
             session_id: None,
             cwd: None,
+            ..Default::default()
         };
         let mut server = YggtermServer::new(
             &tree,
@@ -25776,6 +25823,7 @@ terminal_window_id: None,
             children: Vec::new(),
             session_id: None,
             cwd: None,
+            ..Default::default()
         };
         let mut server = YggtermServer::new(
             &tree,
@@ -25830,6 +25878,7 @@ terminal_window_id: None,
             children: Vec::new(),
             session_id: None,
             cwd: None,
+            ..Default::default()
         };
         let mut server = YggtermServer::new(
             &tree,
@@ -25877,6 +25926,7 @@ terminal_window_id: None,
             children: Vec::new(),
             session_id: None,
             cwd: None,
+            ..Default::default()
         };
         let mut server = YggtermServer::new(
             &tree,
@@ -25931,6 +25981,7 @@ terminal_window_id: None,
             children: Vec::new(),
             session_id: None,
             cwd: None,
+            ..Default::default()
         };
         let mut server = YggtermServer::new(
             &tree,
@@ -26009,6 +26060,7 @@ terminal_window_id: None,
             children: Vec::new(),
             session_id: None,
             cwd: None,
+            ..Default::default()
         };
         let mut server = YggtermServer::new(
             &tree,
@@ -26104,6 +26156,7 @@ terminal_window_id: None,
             children: Vec::new(),
             session_id: None,
             cwd: None,
+            ..Default::default()
         };
         let mut server = YggtermServer::new(
             &tree,
@@ -26189,6 +26242,7 @@ terminal_window_id: None,
             children: Vec::new(),
             session_id: None,
             cwd: None,
+            ..Default::default()
         };
         let mut server = YggtermServer::new(
             &tree,
@@ -26332,6 +26386,7 @@ terminal_window_id: None,
             children: Vec::new(),
             session_id: None,
             cwd: None,
+            ..Default::default()
         };
         let mut server = YggtermServer::new(
             &tree,
@@ -26405,6 +26460,7 @@ terminal_window_id: None,
             children: Vec::new(),
             session_id: None,
             cwd: None,
+            ..Default::default()
         };
         let mut server = YggtermServer::new(
             &tree,
@@ -26457,6 +26513,7 @@ terminal_window_id: None,
             children: Vec::new(),
             session_id: None,
             cwd: None,
+            ..Default::default()
         };
         let mut server = YggtermServer::new(
             &tree,
@@ -26504,6 +26561,7 @@ terminal_window_id: None,
             children: Vec::new(),
             session_id: None,
             cwd: None,
+            ..Default::default()
         };
         let runtime_key = "codex-runtime://synthetic-runtime";
         let storage_path =
@@ -26603,6 +26661,7 @@ terminal_window_id: None,
             children: Vec::new(),
             session_id: None,
             cwd: None,
+            ..Default::default()
         };
         let synthetic_id = "54f06fff-d15d-4e79-8734-0ec9627632f2";
         let real_id = "019e3fd6-87da-7803-a4e6-f95ad0f0e687";
@@ -26728,6 +26787,7 @@ terminal_window_id: None,
             children: Vec::new(),
             session_id: None,
             cwd: None,
+            ..Default::default()
         };
         let runtime_key = remote_scanned_session_path("dev", synthetic_id);
         let mut server = YggtermServer::new(
@@ -26793,6 +26853,7 @@ terminal_window_id: None,
             children: Vec::new(),
             session_id: None,
             cwd: None,
+            ..Default::default()
         };
         let synthetic_id = "0dce9c47-2495-4243-a658-d5162507f92e";
         let real_id = "019e0339-aed4-7993-a3fa-f3dad1388e3c";
@@ -26835,6 +26896,7 @@ terminal_window_id: None,
             children: Vec::new(),
             session_id: None,
             cwd: None,
+            ..Default::default()
         };
         let synthetic_id = "0dce9c47-2495-4243-a658-d5162507f92e";
         let real_id = "019e0339-aed4-7993-a3fa-f3dad1388e3c";
@@ -26870,6 +26932,7 @@ terminal_window_id: None,
             children: Vec::new(),
             session_id: None,
             cwd: None,
+            ..Default::default()
         };
         let synthetic_id = "0dce9c47-2495-4243-a658-d5162507f92e";
         let real_id = "019e0339-aed4-7993-a3fa-f3dad1388e3c";
@@ -26947,6 +27010,7 @@ terminal_window_id: None,
             children: Vec::new(),
             session_id: None,
             cwd: None,
+            ..Default::default()
         };
         let machine_key = "jyas-webapp";
         let synthetic_id = "cdb00ffb-757d-4183-9dcd-825d9d18102e";
@@ -27011,6 +27075,7 @@ terminal_window_id: None,
             children: Vec::new(),
             session_id: None,
             cwd: None,
+            ..Default::default()
         };
         let machine_key = "jyas-webapp";
         let phantom_id = "cdb00ffb-757d-4183-9dcd-825d9d18102e";
@@ -27056,6 +27121,7 @@ terminal_window_id: None,
             children: Vec::new(),
             session_id: None,
             cwd: None,
+            ..Default::default()
         };
         let runtime_key = "local://synthetic-runtime";
         let storage_path =
@@ -27148,6 +27214,7 @@ terminal_window_id: None,
             children: Vec::new(),
             session_id: None,
             cwd: None,
+            ..Default::default()
         };
         let mut server = YggtermServer::new(
             &tree,
@@ -27224,6 +27291,7 @@ terminal_window_id: None,
             children: Vec::new(),
             session_id: None,
             cwd: None,
+            ..Default::default()
         };
         let mut server = YggtermServer::new(
             &tree,
@@ -27324,6 +27392,7 @@ terminal_window_id: None,
             children: Vec::new(),
             session_id: None,
             cwd: None,
+            ..Default::default()
         };
         let mut server = YggtermServer::new(
             &tree,
@@ -27406,6 +27475,7 @@ terminal_window_id: None,
             children: Vec::new(),
             session_id: None,
             cwd: None,
+            ..Default::default()
         };
         let mut server = YggtermServer::new(
             &tree,
@@ -27492,6 +27562,7 @@ terminal_window_id: None,
             children: Vec::new(),
             session_id: None,
             cwd: None,
+            ..Default::default()
         };
         let mut server = YggtermServer::new(
             &tree,
@@ -27544,6 +27615,7 @@ terminal_window_id: None,
             children: Vec::new(),
             session_id: None,
             cwd: None,
+            ..Default::default()
         };
         let mut server = YggtermServer::new(
             &tree,
@@ -27617,6 +27689,7 @@ terminal_window_id: None,
             children: Vec::new(),
             session_id: None,
             cwd: None,
+            ..Default::default()
         };
         let mut server = YggtermServer::new(
             &tree,
@@ -27695,6 +27768,7 @@ terminal_window_id: None,
                 children: Vec::new(),
                 session_id: None,
                 cwd: None,
+                ..Default::default()
             };
             let mut server = YggtermServer::new(
                 &tree,
@@ -27769,6 +27843,7 @@ terminal_window_id: None,
                 children: Vec::new(),
                 session_id: None,
                 cwd: None,
+                ..Default::default()
             };
             let mut server = YggtermServer::new(
                 &tree,
@@ -27879,6 +27954,7 @@ terminal_window_id: None,
             children: Vec::new(),
             session_id: None,
             cwd: None,
+            ..Default::default()
         };
         let mut server = YggtermServer::new(
             &tree,
@@ -27968,6 +28044,7 @@ terminal_window_id: None,
             children: Vec::new(),
             session_id: None,
             cwd: None,
+            ..Default::default()
         };
         let mut server = YggtermServer::new(
             &tree,
@@ -28028,6 +28105,7 @@ terminal_window_id: None,
             children: Vec::new(),
             session_id: None,
             cwd: None,
+            ..Default::default()
         };
         let mut server = YggtermServer::new(
             &tree,
@@ -28066,6 +28144,7 @@ terminal_window_id: None,
             children: Vec::new(),
             session_id: None,
             cwd: None,
+            ..Default::default()
         };
         let mut server = YggtermServer::new(
             &tree,
@@ -28148,6 +28227,7 @@ terminal_window_id: None,
             children: Vec::new(),
             session_id: None,
             cwd: None,
+            ..Default::default()
         };
         let mut server = YggtermServer::new(
             &tree,
@@ -28227,6 +28307,7 @@ terminal_window_id: None,
             children: Vec::new(),
             session_id: None,
             cwd: None,
+            ..Default::default()
         };
         let mut server = YggtermServer::new(
             &tree,
@@ -28276,6 +28357,7 @@ terminal_window_id: None,
             children: Vec::new(),
             session_id: None,
             cwd: None,
+            ..Default::default()
         };
         let mut server = YggtermServer::new(
             &tree,
@@ -28378,6 +28460,7 @@ terminal_window_id: None,
             children: Vec::new(),
             session_id: None,
             cwd: None,
+            ..Default::default()
         };
         let mut server = YggtermServer::new(
             &tree,
@@ -28458,6 +28541,7 @@ terminal_window_id: None,
             children: Vec::new(),
             session_id: None,
             cwd: None,
+            ..Default::default()
         };
         let mut server = YggtermServer::new(
             &tree,
@@ -28495,6 +28579,7 @@ terminal_window_id: None,
             children: Vec::new(),
             session_id: None,
             cwd: None,
+            ..Default::default()
         };
         let mut server = YggtermServer::new(
             &tree,
@@ -28538,6 +28623,7 @@ terminal_window_id: None,
             children: Vec::new(),
             session_id: None,
             cwd: None,
+            ..Default::default()
         };
         let mut server = YggtermServer::new(
             &tree,
@@ -28594,6 +28680,7 @@ terminal_window_id: None,
             children: Vec::new(),
             session_id: None,
             cwd: None,
+            ..Default::default()
         };
         let mut server = YggtermServer::new(
             &tree,
@@ -28648,9 +28735,11 @@ terminal_window_id: None,
                 children: Vec::new(),
                 session_id: Some("saved".to_string()),
                 cwd: Some("/home/pi".to_string()),
+                ..Default::default()
             }],
             session_id: None,
             cwd: None,
+            ..Default::default()
         };
         let mut server = YggtermServer::new(
             &tree,
@@ -28699,6 +28788,7 @@ terminal_window_id: None,
             children: Vec::new(),
             session_id: None,
             cwd: None,
+            ..Default::default()
         };
         let mut server = YggtermServer::new(
             &tree,
@@ -28748,6 +28838,7 @@ terminal_window_id: None,
             children: Vec::new(),
             session_id: None,
             cwd: None,
+            ..Default::default()
         };
         let mut server = YggtermServer::new(
             &tree,
