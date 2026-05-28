@@ -55945,25 +55945,34 @@ fn terminal_eval_script_with_canvas_renderer(
                     background: rgba(120, 142, 166, 0.36) !important;
                     border-radius: 4px !important;
                     background-clip: padding-box !important;
-                    /* min-height bumped from 24 → 36px so the user has a
-                       larger hit target when clicking-to-drag. Width
-                       still locked at 8px (see ::-webkit-scrollbar above)
-                       so the visual footprint stays sleek; only the
-                       vertical extent of the thumb increases. */
+                    /* 36px min-height for a comfortable click target.
+                       8px scrollbar slot stays fixed across states; the
+                       transparent border below trims the VISIBLE thumb
+                       width on hover/active per user preference: full
+                       8px at rest, slimmer when actively engaged. */
                     min-height: 36px !important;
-                    transition: background-color 120ms ease !important;
+                    border: 0 solid transparent !important;
+                    transition: background-color 120ms ease,
+                                border-width 120ms ease !important;
                 }}
                 #${{hostId}} .xterm-viewport:hover::-webkit-scrollbar-thumb {{
                     background: rgba(140, 162, 186, 0.78) !important;
                     background-clip: padding-box !important;
+                    /* 1px transparent border on each side → 6px visible
+                       width when the viewport is hovered. */
+                    border: 1px solid transparent !important;
                 }}
                 #${{hostId}} .xterm-viewport::-webkit-scrollbar-thumb:hover {{
-                    background: rgba(150, 172, 196, 0.92) !important;
+                    background: rgba(150, 172, 196, 0.78) !important;
                     background-clip: padding-box !important;
+                    border: 1px solid transparent !important;
                 }}
                 #${{hostId}} .xterm-viewport::-webkit-scrollbar-thumb:active {{
-                    background: rgba(170, 188, 210, 1.0) !important;
+                    background: rgba(170, 188, 210, 0.85) !important;
                     background-clip: padding-box !important;
+                    /* 2px transparent border each side → 4px visible
+                       width while actively dragging — slimmest state. */
+                    border: 2px solid transparent !important;
                 }}
                 #${{hostId}} .xterm-viewport::-webkit-scrollbar-corner {{
                     background: transparent !important;
@@ -57550,6 +57559,35 @@ fn terminal_eval_script_with_canvas_renderer(
                 viewport.style.overflowX = 'hidden';
                 viewport.style.removeProperty('scrollbar-width');
                 viewport.style.removeProperty('-ms-overflow-style');
+                // XTERM-BUG: scrollbar-drag-triggers-text-selection
+                // Without this guard, mousedown on the scrollbar slot
+                // bubbles up to xterm.js's selection handler — the
+                // browser-native scrollbar drag works, but on release
+                // xterm finalizes a phantom text selection in the rows
+                // beneath the click. Detect mousedown landing in the
+                // right-edge scrollbar slot (where x is between
+                // clientWidth and offsetWidth) and stopPropagation so
+                // xterm never sees it. Idempotent re-attach via the
+                // sentinel attribute so repeat stretchXtermRoot calls
+                // don't stack listeners.
+                if (!viewport.getAttribute('data-yggterm-scrollbar-guard')) {{
+                    viewport.setAttribute('data-yggterm-scrollbar-guard', '1');
+                    viewport.addEventListener('mousedown', (event) => {{
+                        try {{
+                            const rect = viewport.getBoundingClientRect();
+                            const scrollbarWidth =
+                                Math.max(0, viewport.offsetWidth - viewport.clientWidth);
+                            const localX = event.clientX - rect.left;
+                            if (
+                                scrollbarWidth > 0
+                                && localX >= viewport.clientWidth
+                                && localX <= viewport.clientWidth + scrollbarWidth
+                            ) {{
+                                event.stopPropagation();
+                            }}
+                        }} catch (_error) {{}}
+                    }}, true);
+                }}
             }}
             if (rowsLayer) {{
                 rowsLayer.style.width = '100%';
