@@ -39,6 +39,8 @@ xterm.js owns vs what the shell owns, cursor/prompt semantics, etc. — see
 | [clipboard-double-paste](#clipboard-double-paste) | Class: text select + middle-click pastes selection THEN clipboard (double); Ctrl+Shift+V double paste; selection-vs-clipboard ordering bugs | OPEN, investigating |
 | [slow-jitter](#slow-jitter) | Some sessions exhibit visible per-frame jitter under steady PTY output | OPEN, uninvestigated |
 | [blank-rendering-region](#blank-rendering-region) | Region inside an active session goes blank until forced redraw | OPEN, uninvestigated |
+| [scrollbar-not-draggable](#scrollbar-not-draggable) | Sleek thin scrollbar visible but cannot be dragged | FIXED 2026-05-28 |
+| [content-scooped-on-session-switch](#content-scooped-on-session-switch) | Switching sessions: middle rows disappear, top + bottom remaining text presented as continuous | OPEN, telemetry added |
 
 ---
 
@@ -601,6 +603,130 @@ None yet.
 Proposed: `xterm_blank_region` event emitted when an app-control probe
 detects DOM `.xterm-rows` children with no rendered glyphs while the
 buffer reports non-empty content at those row indices.
+
+---
+
+## scrollbar-not-draggable
+
+**STATUS:** FIXED 2026-05-28
+
+### Symptom
+The sleek thin scrollbar (added for fast drag-scroll in long sessions)
+appears visually but cannot actually be dragged with the mouse — clicks
+on the scrollbar track have no effect.
+
+### Reproduction
+1. Build a session with enough output to need scrollback (>2 screens).
+2. Try to click-and-drag the scrollbar thumb on the right edge of the
+   terminal viewport. Before fix: nothing happens.
+
+### Root cause
+`stretchXtermRoot()` in `terminal_eval_script` deliberately HID the
+scrollbar by:
+1. Sizing the `.xterm-viewport` to `calc(100% + gutter)` width.
+2. Pulling it left with `marginRight: -gutter`, so the scrollbar slot
+   ends up outside the host's `overflow: hidden` clip region.
+3. Setting `scrollbar-width: none` inline, overriding our `thin` CSS.
+
+This was correct when the D-pad was the only intended scroll control. It
+became a bug once we added the sleek scrollbar CSS — the CSS was being
+clobbered by the JS and the scrollbar was clipped off-screen even when
+the CSS happened to win.
+
+### Workaround / fix
+Removed the gutter compensation in `stretchXtermRoot()`: viewport, screen,
+and helpers all stay at natural `100%` width and `marginRight: 0px`.
+Inline `scrollbar-width: none` and `-ms-overflow-style` are explicitly
+cleared so CSS `scrollbar-width: thin` wins. The scrollbar now lives
+inside the host's clip region and is draggable normally.
+
+### Code locations
+- `crates/yggterm-shell/src/shell.rs` — `stretchXtermRoot()`, the
+  scrollbar CSS block (~line 55811–55938).
+
+### Tests
+`terminal_eval_script_scrollbar_is_draggable_not_pushed_off_screen` in
+`crates/yggterm-shell/src/shell.rs` asserts the JS no longer sets
+`scrollbar-width: none` inline, no longer pushes the viewport off-screen
+via negative margin, and clears any stale inline `scrollbar-width` so the
+CSS thin scrollbar is authoritative.
+
+### Telemetry
+None — fix is structural.
+
+### Related memory
+`[[spec-xterm-bug-registry]]`
+
+---
+
+## content-scooped-on-session-switch
+
+**STATUS:** OPEN, telemetry added 2026-05-28
+
+### Symptom
+While switching between sessions, content from the middle of the terminal
+appears "scooped out" — rows go missing in the middle and the remaining
+top and bottom text is presented as one continuous block, hiding the gap.
+Effectively the user sees: top-of-buffer + (silent missing rows) +
+bottom-of-buffer, joined without any indicator that rows were lost.
+
+### Reproduction
+1. Have two sessions A and B with substantial scrollback in each (eg.
+   long codex output or shell history).
+2. While focused on session A, switch to session B and back.
+3. Sometimes the visible scrollback of session A shows continuous text
+   that is actually composed of two non-adjacent regions of the original
+   buffer joined together; the middle section is missing.
+
+Not yet captured deterministically on a clean install — needs the new
+`xterm_resize` telemetry below to confirm whether it correlates with a
+host resize during switch.
+
+### Root cause (hypothesis)
+Most likely candidate is xterm.js wrapped-line reflow on resize: when
+the host is briefly hidden (display switched away) the cached host
+dimensions can differ slightly from real ones. On switch back,
+`fitTerminalToHost` calls `term.resize(cols, rows)`. If `cols` changed,
+xterm.js re-wraps every line in the buffer — wrapped logical lines
+collapse into shorter row counts at the new width, which can drop rows
+from the middle of buffered scrollback even if the visible text is
+preserved at the edges.
+
+Other hypotheses to investigate as telemetry comes in:
+- `repaintActiveEntry` `heavy: true` path triggering an erase-in-display.
+- `restoreXtermSessionSnapshotOnConstructed` racing with
+  `terminal_replay_retained_data_script_for_session` and writing
+  partial overlapping content.
+- Localised buffer reflow when the cursor cell is on a wrapped line and
+  `term.resize` truncates.
+
+### Workaround / fix
+Not yet shipped. Investigation gated on telemetry.
+
+### Code locations
+- `crates/yggterm-shell/src/shell.rs:emitResize` — telemetry instrumented
+  here.
+- `crates/yggterm-shell/src/shell.rs:fitTerminalToHost` — calls
+  `term.resize`, which is the suspected reflow trigger.
+- `crates/yggterm-shell/src/shell.rs:repaintActiveEntry` — heavy redraw
+  on session switch, possible secondary contributor.
+
+### Tests
+None yet — repro is still uncaptured.
+
+### Telemetry
+`xterm_resize` event extended with:
+- `prev_cols`, `prev_rows` (dimensions before fit)
+- `buffer_length_before`, `buffer_length_after`, `buffer_length_delta`
+- `base_y_before`, `base_y_after`
+- `viewport_y_before`, `viewport_y_after`
+- `suspect_content_scoop` (true when |delta| >= 4 AND cols changed)
+
+When `suspect_content_scoop` fires, an `xterm_content_scoop_suspect`
+debug line is also emitted with all of the above inline for easy grep.
+
+### Related memory
+`[[spec-xterm-bug-registry]]`, `[[spec-tmux-parity-and-beyond]]`
 
 ---
 
