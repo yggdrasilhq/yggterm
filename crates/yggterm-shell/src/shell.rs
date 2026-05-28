@@ -690,6 +690,10 @@ struct ShellState {
     retained_rehydrate_daemon_ready_wait_started_by_session: HashMap<String, u64>,
     last_retained_rehydrate_daemon_ready_rearm_deferral_key: Option<String>,
     xterm_gate_metrics: GateMetrics,
+    // Sessions where retained_fault_recovery has been latched off because the
+    // daemon no longer owns the PTY. Per [[spec-xterm-gating-ux]]: an
+    // unsatisfiable gate must STOP polling, not flicker forever.
+    retained_fault_recovery_lost_pty_sessions: HashSet<String>,
     remote_preview_sync_after_ms: HashMap<String, u64>,
     remote_preview_failures: HashMap<String, PreviewSyncFailure>,
     remote_preview_dirty_epoch: HashMap<String, u64>,
@@ -2020,6 +2024,7 @@ impl ShellState {
             retained_rehydrate_daemon_ready_wait_started_by_session: HashMap::new(),
             last_retained_rehydrate_daemon_ready_rearm_deferral_key: None,
             xterm_gate_metrics: GateMetrics::default(),
+            retained_fault_recovery_lost_pty_sessions: HashSet::new(),
             remote_preview_sync_after_ms: HashMap::new(),
             remote_preview_failures: HashMap::new(),
             remote_preview_dirty_epoch: HashMap::new(),
@@ -3083,6 +3088,15 @@ impl ShellState {
                 .is_some_and(|host_id| !terminal_host_id_belongs_to_session(session_path, host_id))
         {
             self.active_terminal_host_id = None;
+        }
+        // Per [[spec-xterm-gating-ux]]: the lost-PTY latch is released by a
+        // POSITIVE signal — the daemon actually owns the PTY now — not by
+        // every non-RFR attempt creation. Clicking a session row also kicks
+        // off auto-polled `hot_open_row` retries from the GUI, and clearing on
+        // those would let the loop re-arm immediately. Honor only explicit
+        // user-driven row opens AND only when daemon ownership has come back.
+        if source == "open_row" && self.daemon_owns_session_runtime(session_path) {
+            self.clear_retained_fault_recovery_lost_pty_latch(session_path);
         }
         let begin_context = self.terminal_open_context_payload(session_path);
         let attempt_id = format!("terminal-open-{}-{open_request_id}", current_millis());
@@ -4675,6 +4689,75 @@ impl ShellState {
         }
         Some((attempt.attempt_id.clone(), ready_elapsed_ms))
     }
+    /// Per [[spec-xterm-gating-ux]]: a gate is unsatisfiable if the resource
+    /// behind it is GONE. `owned_terminal_session_keys` is the daemon's
+    /// manifest of PTYs it actually OWNS right now. A session sitting in
+    /// `preserved_terminal_owner_keys` without being owned is a leftover
+    /// pointing at a previous-daemon PID that may or may not still exist —
+    /// the live-guihost failure mode where 13 of 15 sessions were stuck because
+    /// the previous owner daemon died. Treat ownership as the source of
+    /// truth; preserved-only state is not enough to keep retrying.
+    fn daemon_owns_session_runtime(&self, session_path: &str) -> bool {
+        let Some(runtime_status) = self.latest_runtime_status.as_ref() else {
+            // Without a runtime status snapshot we can't prove the PTY is
+            // gone — fall through to the existing recovery flow.
+            return true;
+        };
+        let runtime_key = self.server.terminal_runtime_key_for_path(session_path);
+        runtime_status
+            .owned_terminal_session_keys
+            .iter()
+            .any(|key| key == &runtime_key)
+    }
+    /// Returns true if the GUI has spawned enough retained_fault_recovery
+    /// attempts for this session that further attempts are clearly futile.
+    /// Used as the precondition before latching — never latch on the first
+    /// fault detection, because the daemon may simply not have caught up yet.
+    /// We count distinct RFR attempts (not just Failed-state ones) because
+    /// the recovery state machine often replaces a stuck attempt before it
+    /// transitions to Failed, so a strict "must reach Failed" check never
+    /// fires in the runaway-loop case the spec is targeting.
+    fn retained_fault_recovery_has_prior_failure(&self, session_path: &str) -> bool {
+        const FUTILE_ATTEMPT_THRESHOLD: usize = 3;
+        let rfr_attempts = self
+            .terminal_open_attempts
+            .values()
+            .filter(|attempt| {
+                attempt.session_path == session_path
+                    && attempt.source == "retained_fault_recovery"
+            })
+            .count();
+        rfr_attempts >= FUTILE_ATTEMPT_THRESHOLD
+    }
+    fn latch_retained_fault_recovery_lost_pty(&mut self, session_path: &str, reason: &str) {
+        if !self
+            .retained_fault_recovery_lost_pty_sessions
+            .insert(session_path.to_string())
+        {
+            // Already latched — don't re-emit telemetry per poll.
+            return;
+        }
+        // Stop the toast loop: replace the "Restoring..." progress toast with
+        // a one-shot info-tone "Session lost" so the user sees a stable
+        // state instead of flicker.
+        let job_key = terminal_resume_notification_job_key(session_path);
+        self.clear_job_notification(&job_key);
+        self.record_terminal_contract_telemetry(
+            "retained_fault_recovery_lost_pty_latched",
+            "warn",
+            session_path,
+            reason,
+            json!({
+                "active_session_path": self.server.active_session_path(),
+                "runtime_key": self.server.terminal_runtime_key_for_path(session_path),
+            }),
+        );
+    }
+    /// Cleared on user-initiated open so a future fault gets a fresh shot.
+    fn clear_retained_fault_recovery_lost_pty_latch(&mut self, session_path: &str) {
+        self.retained_fault_recovery_lost_pty_sessions
+            .remove(session_path);
+    }
     fn invalidate_retained_remote_non_prompt_surface(
         &mut self,
         session_path: &str,
@@ -4729,6 +4812,25 @@ impl ShellState {
                         )
                 });
         if recovery_already_in_flight {
+            return false;
+        }
+        // Per [[spec-xterm-gating-ux]]: stop the recovery loop when the gate
+        // is unsatisfiable. If we've already failed once AND the daemon does
+        // not have a PTY for this session, latch — no point creating a new
+        // attempt that will fail identically.
+        if self
+            .retained_fault_recovery_lost_pty_sessions
+            .contains(session_path)
+        {
+            return false;
+        }
+        if self.retained_fault_recovery_has_prior_failure(session_path)
+            && !self.daemon_owns_session_runtime(session_path)
+        {
+            let reason = fault_reason.unwrap_or(
+                "retained fault recovery latched: daemon does not own this session's PTY",
+            );
+            self.latch_retained_fault_recovery_lost_pty(session_path, reason);
             return false;
         }
         let retained_before_fault = self.retained_terminal_session_paths.contains(session_path);
@@ -5096,6 +5198,16 @@ impl ShellState {
     }
     fn terminal_session_resume_notification_should_stay_visible(&self, session_path: &str) -> bool {
         if self.terminal_session_has_ready_attempt(session_path) {
+            return false;
+        }
+        // Per [[spec-xterm-gating-ux]]: when retained_fault_recovery is latched
+        // because the PTY is gone, the user-facing toast must NOT keep
+        // re-asserting itself on poll ticks. The latch is the authoritative
+        // "this session is not coming back without user action" signal.
+        if self
+            .retained_fault_recovery_lost_pty_sessions
+            .contains(session_path)
+        {
             return false;
         }
         if self.terminal_session_has_meaningful_resume_output(session_path)
@@ -13609,6 +13721,15 @@ fn server_endpoint_label(endpoint: &ServerEndpoint) -> String {
 }
 fn retained_rehydrate_daemon_ready_wait_should_record(elapsed_ms: u64) -> bool {
     elapsed_ms >= RETAINED_REHYDRATE_DAEMON_READY_TELEMETRY_MS
+}
+fn retained_fault_recovery_lost_pty_sessions_sorted(shell: &ShellState) -> Vec<String> {
+    let mut latched: Vec<String> = shell
+        .retained_fault_recovery_lost_pty_sessions
+        .iter()
+        .cloned()
+        .collect();
+    latched.sort();
+    latched
 }
 fn set_app_control_row_expanded(shell: &mut ShellState, row: &BrowserRow, expanded: bool) {
     if row.kind != BrowserRowKind::Group {
@@ -24052,6 +24173,11 @@ fn describe_app_state_snapshot(
             // should emit a structured trace so we can MEASURE time-in-gate per
             // session." The probe owns aggregate p50/p95/max per gate kind.
             "xterm_gate_metrics": shell.xterm_gate_metrics.to_app_state_json(),
+            // Sessions where retained_fault_recovery has been latched off
+            // because the daemon no longer has their PTY. Useful for the user
+            // and for smoke tests to assert the loop actually stops.
+            "retained_fault_recovery_lost_pty_sessions":
+                retained_fault_recovery_lost_pty_sessions_sorted(&shell),
         },
         "browser": {
             "selected_path": selected_path.clone(),
@@ -86290,6 +86416,150 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             !shell
                 .terminal_bootstrap_lease_by_session
                 .contains_key(active_session_path)
+        );
+    }
+
+    #[test]
+    fn lost_pty_latch_stops_recovery_loop_when_daemon_has_no_session() {
+        // Per [[spec-xterm-gating-ux]]: when the daemon's terminal_session_keys
+        // does NOT contain this session, retained_fault_recovery has nothing to
+        // rehydrate from. The second + subsequent fault detections must return
+        // false (no new attempts) and clear the resume toast so the user sees a
+        // stable state, not a 1Hz flicker.
+        let active_session_path = "remote-session://dev/lost-pty";
+        let bootstrap = test_shell_bootstrap_with_active_session(active_session_path);
+        let mut shell = ShellState::new(bootstrap);
+        shell.server_busy = false;
+        shell.server.set_view_mode(WorkspaceViewMode::Terminal);
+        shell.retain_terminal_session_path(active_session_path);
+        // Daemon reports zero live sessions — the PTY for this path is gone.
+        shell.latest_runtime_status = Some(runtime_status_for_test("2.7.72", 0, 12345));
+        // Seed 3 prior RFR attempts (the FUTILE_ATTEMPT_THRESHOLD) so the
+        // latch condition is met. These are how the live recovery loop
+        // actually appears in trace — fast-cycling Pending → Recovering
+        // attempts replaced before they reach Failed.
+        for i in 0..3 {
+            shell.begin_terminal_open_attempt(
+                active_session_path,
+                &format!("req-prior-{i}"),
+                u64::try_from(i).unwrap_or(0) + 1,
+                "retained_fault_recovery",
+            );
+        }
+        shell.terminal_attach_in_flight.remove(active_session_path);
+        // Prime a stuck toast so we can verify it gets cleared.
+        let job_key = terminal_resume_notification_job_key(active_session_path);
+        shell.upsert_job_notification(
+            job_key.clone(),
+            NotificationTone::Info,
+            "Restoring Remote Terminal",
+            "stuck",
+            None,
+            false,
+        );
+        assert!(
+            shell
+                .notifications
+                .iter()
+                .any(|n| n.job_key.as_deref() == Some(job_key.as_str())),
+            "test setup: toast should be present before latch"
+        );
+
+        let invalidated =
+            shell.invalidate_retained_remote_non_prompt_surface(active_session_path, Some("blank"));
+        assert!(
+            !invalidated,
+            "second fault for a session with no daemon PTY must NOT create a new attempt"
+        );
+        assert!(
+            shell
+                .retained_fault_recovery_lost_pty_sessions
+                .contains(active_session_path),
+            "session should be latched after the lost-PTY detection"
+        );
+        assert!(
+            !shell
+                .notifications
+                .iter()
+                .any(|n| n.job_key.as_deref() == Some(job_key.as_str())),
+            "stuck toast must be cleared on latch so the flicker stops"
+        );
+
+        // Re-arming again is a no-op: still latched, still no new attempt.
+        let reinvalidated =
+            shell.invalidate_retained_remote_non_prompt_surface(active_session_path, Some("blank"));
+        assert!(!reinvalidated);
+    }
+
+    #[test]
+    fn lost_pty_latch_released_only_when_daemon_owns_pty_again() {
+        // Per [[spec-xterm-gating-ux]]: the latch must be released by a
+        // POSITIVE signal (daemon owns the PTY) rather than by every non-RFR
+        // attempt — auto-poll re-bootstrap paths use `hot_open_row` source
+        // and clearing on those re-opens the loop.
+        let active_session_path = "remote-session://dev/lost-pty-retry";
+        let bootstrap = test_shell_bootstrap_with_active_session(active_session_path);
+        let mut shell = ShellState::new(bootstrap);
+        shell.latest_runtime_status = Some(runtime_status_for_test("2.7.73", 0, 12345));
+        shell
+            .retained_fault_recovery_lost_pty_sessions
+            .insert(active_session_path.to_string());
+
+        // Auto-poll source must NOT clear the latch.
+        shell.begin_terminal_open_attempt(active_session_path, "req-hot", 1, "hot_open_row");
+        assert!(
+            shell
+                .retained_fault_recovery_lost_pty_sessions
+                .contains(active_session_path),
+            "hot_open_row (auto-poll) must NOT clear the latch"
+        );
+
+        // Auto-driven RFR attempts must NOT clear the latch either.
+        shell.begin_terminal_open_attempt(
+            active_session_path,
+            "req-auto",
+            2,
+            "retained_fault_recovery",
+        );
+        assert!(
+            shell
+                .retained_fault_recovery_lost_pty_sessions
+                .contains(active_session_path),
+            "retained_fault_recovery (auto) must NOT clear the latch"
+        );
+
+        // User clicks the row while the daemon STILL does not own the PTY.
+        // We honor the explicit click but only release the latch when ownership
+        // has actually returned — otherwise we'd loop again on stale state.
+        shell.begin_terminal_open_attempt(active_session_path, "req-click", 3, "open_row");
+        assert!(
+            shell
+                .retained_fault_recovery_lost_pty_sessions
+                .contains(active_session_path),
+            "open_row without daemon ownership must NOT clear the latch"
+        );
+
+        // Daemon now owns the runtime key — a user click is the signal to retry.
+        shell.latest_runtime_status = Some(serde_json::from_value(json!({
+            "server_version": "2.7.73",
+            "server_build_id": 0,
+            "server_pid": 12345,
+            "host_kind": "local",
+            "host_detail": "test",
+            "embedded_surface_supported": true,
+            "bridge_enabled": true,
+            "terminal_session_count": 1,
+            "terminal_session_keys": [shell.server.terminal_runtime_key_for_path(active_session_path)],
+            "owned_terminal_session_count": 1,
+            "owned_terminal_session_keys": [shell.server.terminal_runtime_key_for_path(active_session_path)],
+            "managed_session_count": 0,
+        })).expect("runtime status"));
+        shell.begin_terminal_open_attempt(active_session_path, "req-click2", 4, "open_row");
+        assert!(
+            !shell
+                .retained_fault_recovery_lost_pty_sessions
+                .contains(active_session_path),
+            "open_row after daemon regained ownership MUST clear the latch"
         );
     }
 
