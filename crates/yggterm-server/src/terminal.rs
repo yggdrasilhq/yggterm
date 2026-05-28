@@ -2024,10 +2024,36 @@ fn initial_attach_should_replay_screen_snapshot(
     if !terminal_snapshot_looks_like_full_screen_surface(snapshot_data) {
         return false;
     }
+    // Per per [[project-purpose]] wrapper-vs-manual parity: this gate used
+    // to check `terminal_chunk_has_scrollback_text` PER CHUNK (>= 40 non-
+    // empty lines in a SINGLE chunk). Codex emits many small chunks, so
+    // every chunk failed the per-chunk test → the snapshot replaced the
+    // historical chunks → user lost scrollback. The equivalent manual
+    // `ssh -t <machine> codex resume <UUID>` typed into a local shell
+    // skipped this gate entirely (local:// keys don't match the third
+    // condition below) and served raw chunks, giving full scrollback in
+    // xterm.js naturally. To restore parity, evaluate scrollback content
+    // across the COMBINED retained chunks. When the union has enough
+    // non-empty lines to count as a scrollback-worthy session, prefer the
+    // raw chunks over the viewport-only snapshot so the GUI sees the
+    // same byte stream the manual case sees.
     if retained_initial
         .iter()
         .any(|chunk| terminal_chunk_has_scrollback_text(&chunk.data))
     {
+        return false;
+    }
+    let combined_non_empty_lines = retained_initial
+        .iter()
+        .map(|chunk| {
+            let stripped = strip_terminal_control_sequences(&chunk.data);
+            stripped
+                .lines()
+                .filter(|line| !line.trim().is_empty())
+                .count()
+        })
+        .sum::<usize>();
+    if combined_non_empty_lines >= usize::from(DEFAULT_ROWS).saturating_add(4) {
         return false;
     }
     key.starts_with("live::")
