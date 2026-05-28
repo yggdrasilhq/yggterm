@@ -55945,7 +55945,12 @@ fn terminal_eval_script_with_canvas_renderer(
                     background: rgba(120, 142, 166, 0.36) !important;
                     border-radius: 4px !important;
                     background-clip: padding-box !important;
-                    min-height: 24px !important;
+                    /* min-height bumped from 24 → 36px so the user has a
+                       larger hit target when clicking-to-drag. Width
+                       still locked at 8px (see ::-webkit-scrollbar above)
+                       so the visual footprint stays sleek; only the
+                       vertical extent of the thumb increases. */
+                    min-height: 36px !important;
                     transition: background-color 120ms ease !important;
                 }}
                 #${{hostId}} .xterm-viewport:hover::-webkit-scrollbar-thumb {{
