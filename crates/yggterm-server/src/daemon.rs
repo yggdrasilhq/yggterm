@@ -6522,6 +6522,49 @@ fn spawn_force_remote_restart_daemon_cleanup(store: &SessionStore, owner_registr
 #[cfg(not(target_os = "linux"))]
 fn spawn_force_remote_restart_daemon_cleanup(_store: &SessionStore, _owner_registry_empty: bool) {}
 
+/// Per [[bug-class-old-daemon-never-retires]]: poll `/proc/self/exe` every
+/// 60s. Linux appends the literal " (deleted)" suffix to the link target
+/// when the file on disk has been replaced (the running process holds the
+/// old inode open; the path now resolves to a fresher binary). When we
+/// detect this, send self a Shutdown RPC so the main accept loop exits
+/// cleanly — the next client connection spawns a fresh daemon from the
+/// new on-disk binary. Without this, old daemons sit holding preserved-
+/// owner sessions and never voluntarily retire for newer code.
+#[cfg(target_os = "linux")]
+fn spawn_disk_binary_version_poll(endpoint: ServerEndpoint, home_dir: PathBuf) {
+    std::thread::spawn(move || {
+        const POLL_INTERVAL_MS: u64 = 60_000;
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(POLL_INTERVAL_MS));
+            let link = match fs::read_link("/proc/self/exe") {
+                Ok(l) => l,
+                Err(_) => continue,
+            };
+            let link_str = link.to_string_lossy();
+            if !link_str.ends_with(" (deleted)") {
+                continue;
+            }
+            append_trace_event(
+                &home_dir,
+                "daemon",
+                "lifecycle",
+                "disk_binary_replaced_self_retire",
+                serde_json::json!({
+                    "exe_link": link_str.to_string(),
+                    "current_version": SERVER_PROTOCOL_VERSION,
+                    "current_pid": std::process::id(),
+                }),
+            );
+            // Best-effort self-shutdown. If the call fails (e.g. socket
+            // already torn down), the thread just exits and the daemon
+            // continues; the next poll cycle would retry, but the
+            // process should already be on its way out.
+            let _ = shutdown(&endpoint);
+            break;
+        }
+    });
+}
+
 fn spawn_active_terminal_prewarm(
     runtime: Arc<Mutex<DaemonRuntime>>,
     last_activity_ms: Arc<AtomicU64>,
@@ -6783,6 +6826,16 @@ pub fn run_daemon(endpoint: &ServerEndpoint, runtime: GhosttyHostSupport) -> Res
         if let Ok(current_exe) = std::env::current_exe() {
             spawn_legacy_linux_daemon_cleanup(endpoint.clone(), current_exe, home_dir.clone());
         }
+        // Per [[bug-class-old-daemon-never-retires]]: auto-poll the on-disk
+        // binary every 60s. When the running daemon's executable has been
+        // replaced (Linux marks /proc/self/exe with the literal "(deleted)"
+        // suffix once the inode is unlinked), the on-disk binary is a
+        // newer version. Send self a Shutdown RPC so the main loop exits
+        // cleanly. The next client connection spawns a fresh daemon from
+        // the new disk binary. Without this poll, old daemons accumulate
+        // for days until the user runs `server retire-stale-daemons`.
+        #[cfg(target_os = "linux")]
+        spawn_disk_binary_version_poll(endpoint.clone(), home_dir.clone());
         let (client_outcome_tx, client_outcome_rx) =
             std::sync::mpsc::channel::<Result<DaemonRequestOutcome>>();
         let mut restart_after_exit = None::<PathBuf>;
