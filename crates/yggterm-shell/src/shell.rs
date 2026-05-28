@@ -71,6 +71,7 @@ use crate::theme_contract::{
 };
 use crate::ui_telemetry::{append_ui_telemetry_event, ui_telemetry_should_record};
 use crate::window_icon;
+use crate::xterm_gate_metrics::{GateKind, GateMetrics};
 use anyhow::{Context, Result, anyhow};
 use arboard::{Clipboard as NativeClipboard, ImageData as NativeClipboardImageData};
 #[cfg(target_os = "linux")]
@@ -688,6 +689,7 @@ struct ShellState {
     last_retained_fault_invalidation_suppression_key: Option<String>,
     retained_rehydrate_daemon_ready_wait_started_by_session: HashMap<String, u64>,
     last_retained_rehydrate_daemon_ready_rearm_deferral_key: Option<String>,
+    xterm_gate_metrics: GateMetrics,
     remote_preview_sync_after_ms: HashMap<String, u64>,
     remote_preview_failures: HashMap<String, PreviewSyncFailure>,
     remote_preview_dirty_epoch: HashMap<String, u64>,
@@ -2017,6 +2019,7 @@ impl ShellState {
             last_retained_fault_invalidation_suppression_key: None,
             retained_rehydrate_daemon_ready_wait_started_by_session: HashMap::new(),
             last_retained_rehydrate_daemon_ready_rearm_deferral_key: None,
+            xterm_gate_metrics: GateMetrics::default(),
             remote_preview_sync_after_ms: HashMap::new(),
             remote_preview_failures: HashMap::new(),
             remote_preview_dirty_epoch: HashMap::new(),
@@ -3966,7 +3969,18 @@ impl ShellState {
             .retained_rehydrate_daemon_ready_wait_started_by_session
             .remove(session_path)?;
         self.last_retained_rehydrate_daemon_ready_rearm_deferral_key = None;
-        Some(current_millis().saturating_sub(started_at_ms))
+        let now_ms = current_millis();
+        let elapsed_ms = now_ms.saturating_sub(started_at_ms);
+        // Per [[spec-xterm-gating-ux]]: every gate-clear records into the
+        // bounded per-kind ring so app-state can surface p50/p95/max. Every
+        // clear is sampled — not just slow ones — so the percentile reflects
+        // the steady-state experience, not just the tail.
+        self.xterm_gate_metrics.record_clear(
+            GateKind::RetainedRehydrateDaemonReadyWait,
+            elapsed_ms,
+            now_ms,
+        );
+        Some(elapsed_ms)
     }
     fn retained_rehydrate_daemon_ready_wait_elapsed_ms(
         &self,
@@ -24034,6 +24048,10 @@ fn describe_app_state_snapshot(
         "terminal_telemetry": {
             "enabled": shell.settings.terminal_telemetry_enabled,
             "db_path": terminal_telemetry_db_path,
+            // Per [[spec-xterm-gating-ux]] "every gate-arm and gate-clear event
+            // should emit a structured trace so we can MEASURE time-in-gate per
+            // session." The probe owns aggregate p50/p95/max per gate kind.
+            "xterm_gate_metrics": shell.xterm_gate_metrics.to_app_state_json(),
         },
         "browser": {
             "selected_path": selected_path.clone(),
@@ -86562,6 +86580,29 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         assert!(retained_rehydrate_daemon_ready_wait_should_record(
             RETAINED_REHYDRATE_DAEMON_READY_TELEMETRY_MS + 1
         ));
+    }
+
+    #[test]
+    fn finish_daemon_ready_wait_pushes_sample_into_gate_metrics() {
+        // Per [[spec-xterm-gating-ux]]: every gate-clear — fast or slow — feeds
+        // the histogram so p50 reflects steady-state, not just the tail.
+        let active_session_path = "remote-session://oc/blank";
+        let bootstrap = test_shell_bootstrap_with_active_session(active_session_path);
+        let mut shell = ShellState::new(bootstrap);
+        let armed_at = current_millis().saturating_sub(120);
+        shell.begin_retained_rehydrate_daemon_ready_wait(active_session_path, armed_at);
+        let elapsed_ms = shell
+            .finish_retained_rehydrate_daemon_ready_wait(active_session_path)
+            .expect("finish should report elapsed when armed");
+        assert!(elapsed_ms >= 120, "elapsed should reflect armed_at");
+        let snapshot = shell.xterm_gate_metrics.to_app_state_json();
+        let entries = snapshot.as_array().expect("snapshot is array");
+        assert_eq!(entries.len(), 1, "exactly one gate kind sampled");
+        let entry = &entries[0];
+        assert_eq!(entry["gate_kind"], "retained_rehydrate_daemon_ready_wait");
+        assert_eq!(entry["sample_count"], 1);
+        let recorded_p50 = entry["p50_ms"].as_u64().expect("p50 present");
+        assert!(recorded_p50 >= 120, "p50 reflects the recorded elapsed");
     }
 
     #[cfg(unix)]
