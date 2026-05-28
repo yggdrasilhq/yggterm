@@ -24,7 +24,8 @@ pub use codex_cli::{
     ManagedCliTool, ManagedCliToolStatus, TerminalIdentityColorProfile, managed_cli_refresh_ttl_ms,
 };
 pub use daemon::{
-    HotRestartResult, ServerEndpoint, ServerRequest, ServerResponse, ServerRuntimeStatus,
+    HotRestartResult, SERVER_PROTOCOL_VERSION, ServerEndpoint, ServerRequest, ServerResponse,
+    ServerRuntimeStatus,
     TerminalStreamChunk, cleanup_legacy_daemons, connect_ssh, connect_ssh_custom, default_endpoint,
     ensure_remote_runtime_codex_session as daemon_ensure_remote_runtime_codex_session, focus_live,
     focus_live_with_view, hot_restart, hot_restart_detailed, open_remote_session,
@@ -32,7 +33,8 @@ pub use daemon::{
     prepare_client_close, prepare_update_restart, raise_external_window,
     reachable_versioned_daemon_statuses, refresh_managed_cli, refresh_preview,
     refresh_remote_machine, remove_session, remove_ssh_target, reorder_live_sessions,
-    request_terminal_launch, request_terminal_launch_for_path, retire_daemon, run_daemon,
+    request_terminal_launch, request_terminal_launch_for_path, retire_daemon,
+    retire_stale_daemons, RetireStaleDaemonOutcome, RetireStaleDaemonsReport, run_daemon,
     set_all_preview_blocks_folded, set_session_keep_alive, set_view_mode, shutdown, snapshot,
     start_command_session, start_command_session_with_terminal_appearance, start_local_session,
     start_local_session_at, start_local_session_at_with_terminal_appearance,
