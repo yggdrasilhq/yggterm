@@ -1433,18 +1433,34 @@ pub(crate) fn managed_cli_shell_command_with_terminal_appearance(
             persistent,
         } => {
             let prefix = if persistent { "exec " } else { "" };
+            // Per [[spec-agent-cli-wrapper-render-parity]] +
+            // [[spec-tmux-parity-and-beyond]]: codex defaults to alt-screen
+            // TUI mode which preserves ZERO scrollback (TUI takes over its
+            // own buffer; on exit main buffer is restored to pre-codex
+            // state). When yggterm provides the cwd via `-C "$PWD"`, codex
+            // skips its interactive cwd picker too, so even the picker
+            // pages that normally land in the main buffer are gone. Result:
+            // user's `codex resume` via the yggterm wrapper had no
+            // scrollback. Fix: pass `--no-alt-screen` for codex inline
+            // mode, which per codex docs "preserves terminal scrollback
+            // history." The conversation prints turn-by-turn into the
+            // main buffer where xterm.js scrollback captures it.
+            let codex_inline = matches!(kind, SessionKind::Codex | SessionKind::CodexLiteLlm);
+            let alt_screen_flag = if codex_inline { " --no-alt-screen" } else { "" };
             if matches!(kind, SessionKind::Codex) && has_cwd {
                 format!(
-                    "{prefix}{}{} resume -C \"$PWD\" {}",
+                    "{prefix}{}{}{} resume -C \"$PWD\" {}",
                     tool.binary_name(),
                     extra_args,
+                    alt_screen_flag,
                     shell_single_quote(session_id)
                 )
             } else {
                 format!(
-                    "{prefix}{}{} resume {}",
+                    "{prefix}{}{}{} resume {}",
                     tool.binary_name(),
                     extra_args,
+                    alt_screen_flag,
                     shell_single_quote(session_id)
                 )
             }
