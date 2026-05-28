@@ -2,6 +2,27 @@
 
 Read `AGENTS.md` in full before starting any task. It is the authoritative engineering contract for this project.
 
+## Why yggterm exists (read before every session)
+
+yggterm replaces the chaotic pre-existing workflow of VSCode terminals + tmux + ssh + `codex resume` / `claude -r` across multiple machines, where the user loses track of sessions across machines and has to redo the ssh+cd+resume mechanics every time the editor restarts.
+
+**Core value proposition:** when the user clicks an agent session in the cwd tree (Codex, Claude Code, future first-class agent CLIs), yggterm performs the equivalent of `ssh <machine> "cd <cwd> && codex resume <UUID>"` (or `claude -r <UUID>`) and hands off the terminal. The user just types. **This handoff is the product.**
+
+**First-class vs second-class:**
+- First-class: agent CLI sessions (Codex, Claude Code, future). Organized by cwd in the tree. Persist by default (the agent CLI itself persists via JSONL; yggterm's job is to faithfully invoke `codex resume` / `claude -r`).
+- Second-class: plain shell terminals. Connect to the yggterm-server tmux-like layer. Survive GUI death IF marked keep-alive; otherwise die with the GUI.
+
+**Yggterm does NOT:**
+- Parse codex/CC JSONL into the terminal viewport. Terminal-view delegates rendering to the CLI itself.
+- Reinvent the agent CLI rendering.
+- Add CLI flags beyond the minimum needed for handoff (cwd, UUID, terminal-appearance env).
+
+**The wrapper-vs-manual parity rule:** if a session opened via yggterm renders differently from the equivalent `ssh -t <machine> codex resume <UUID>` typed into a shell, that is a yggterm bug. The fix is in yggterm's wrapper/handoff/preservation path, NOT in adding flags to the codex command that the manual case doesn't use. Diagnose by running the manual command in a clean shell first and comparing.
+
+The web view (separate surface) is where JSONL gets pretty-formatted into a chat UI — that path is in active development. Don't confuse the two.
+
+Full mission statement: `[[project-purpose]]` in `~/.claude/projects/-home-pi-gh-yggterm/memory/project-purpose.md`.
+
 ## Core working rules
 
 ### Single source of truth — no exceptions
