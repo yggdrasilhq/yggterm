@@ -6329,6 +6329,127 @@ pub fn retire_daemon(endpoint: &ServerEndpoint, reason: Option<&str>) -> Result<
     )?)
 }
 
+#[derive(Debug, Default, serde::Serialize)]
+pub struct RetireStaleDaemonsReport {
+    pub current_version: String,
+    pub considered: Vec<RetireStaleDaemonOutcome>,
+    pub retired_count: usize,
+    pub skipped_count: usize,
+    pub unreachable_count: usize,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct RetireStaleDaemonOutcome {
+    pub socket: String,
+    pub status: String,
+    pub server_version: Option<String>,
+    pub server_pid: Option<u32>,
+    pub message: Option<String>,
+}
+
+/// Per [[bug-class-old-daemon-never-retires]]: yggterm-headless processes
+/// from older deploys keep running because the idle-shutdown gate is too
+/// conservative (it counts preserved-owner sessions as live work) and there
+/// is no disk-binary-version poll. This helper walks every
+/// `server-*.sock` in `home_dir`, probes the version of the daemon behind
+/// it, and sends `RetireDaemon` to any whose version differs from
+/// `current_version`. Sockets that are unreachable are removed; the current
+/// daemon's own socket is skipped.
+#[cfg(unix)]
+pub fn retire_stale_daemons(
+    home_dir: &Path,
+    current_version: &str,
+) -> Result<RetireStaleDaemonsReport> {
+    let mut report = RetireStaleDaemonsReport {
+        current_version: current_version.to_string(),
+        ..RetireStaleDaemonsReport::default()
+    };
+    let current_endpoint_path = match default_endpoint(home_dir) {
+        ServerEndpoint::UnixSocket(path) => Some(path),
+        #[allow(unreachable_patterns)]
+        _ => None,
+    };
+    let entries = match fs::read_dir(home_dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(report),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("reading daemon socket dir {}", home_dir.display()));
+        }
+    };
+    let mut socket_paths: Vec<PathBuf> = entries
+        .filter_map(|entry| entry.ok().map(|e| e.path()))
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .map(|n| n.starts_with("server-") && n.ends_with(".sock"))
+                .unwrap_or(false)
+        })
+        .collect();
+    socket_paths.sort();
+    let mut seen_inode = HashSet::<PathBuf>::new();
+    for path in socket_paths {
+        let canonical = fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+        if !seen_inode.insert(canonical.clone()) {
+            continue;
+        }
+        if current_endpoint_path
+            .as_ref()
+            .map(|cur| fs::canonicalize(cur).unwrap_or_else(|_| cur.clone()) == canonical)
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        let endpoint = ServerEndpoint::UnixSocket(path.clone());
+        let outcome = match status(&endpoint) {
+            Ok(s) => {
+                if s.server_version == current_version {
+                    report.skipped_count += 1;
+                    RetireStaleDaemonOutcome {
+                        socket: path.display().to_string(),
+                        status: "skipped_same_version".to_string(),
+                        server_version: Some(s.server_version),
+                        server_pid: Some(s.server_pid),
+                        message: None,
+                    }
+                } else {
+                    match retire_daemon(&endpoint, Some("retire_stale_daemons_cli")) {
+                        Ok(message) => {
+                            report.retired_count += 1;
+                            RetireStaleDaemonOutcome {
+                                socket: path.display().to_string(),
+                                status: "retired".to_string(),
+                                server_version: Some(s.server_version),
+                                server_pid: Some(s.server_pid),
+                                message,
+                            }
+                        }
+                        Err(error) => RetireStaleDaemonOutcome {
+                            socket: path.display().to_string(),
+                            status: "retire_failed".to_string(),
+                            server_version: Some(s.server_version),
+                            server_pid: Some(s.server_pid),
+                            message: Some(error.to_string()),
+                        },
+                    }
+                }
+            }
+            Err(_) => {
+                report.unreachable_count += 1;
+                RetireStaleDaemonOutcome {
+                    socket: path.display().to_string(),
+                    status: "unreachable".to_string(),
+                    server_version: None,
+                    server_pid: None,
+                    message: None,
+                }
+            }
+        };
+        report.considered.push(outcome);
+    }
+    Ok(report)
+}
+
 pub fn cleanup_legacy_daemons(endpoint: &ServerEndpoint, current_exe: &Path) -> Result<()> {
     #[cfg(unix)]
     cleanup_legacy_unix_daemons(endpoint)?;
