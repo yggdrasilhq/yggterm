@@ -4,6 +4,41 @@
 
 Build **Yggdrasil Terminal**: a Rust-first, cross-platform, remote-first terminal workspace with a Dioxus desktop shell shaped like Zed, a daemon-owned PTY core, and an embedded xterm.js terminal surface.
 
+### The product yggterm replaces
+
+The user's pre-yggterm workflow: VSCode terminal panes → tmux inside them (for persistence) → ssh to N different machines → `codex resume` / `claude -r` on each. When VSCode dies, manually reattach to tmux, re-find sessions, re-orient across machines. **yggterm exists to make this workflow disappear.**
+
+### Core value proposition (do not violate)
+
+When the user clicks an agent session in the cwd tree, yggterm performs the equivalent of:
+
+```
+ssh <machine> "cd <cwd> && codex resume <UUID>"      # or: claude -r <UUID>
+```
+
+…and hands off the terminal. The user just types. **This handoff IS the product.** Anything that breaks rendering parity between this handoff and the equivalent manual command typed into a shell is a regression of the core promise.
+
+### First-class vs second-class session kinds
+
+| Class | Kinds | Persistence | Tree placement |
+|---|---|---|---|
+| First-class | Codex, Claude Code, future agent CLIs (per [[spec-cwd-tree-agent-cli-unified]]) | The agent CLI itself persists via its JSONL. yggterm's job is to faithfully invoke `<cli> resume <UUID>` so the conversation continues. | Organized by cwd in the tree |
+| Second-class | Plain shell terminals (`Shell`, `SshShell`) | Survive GUI death IFF marked keep-alive. Otherwise die with the GUI. Persistence is provided by the yggterm-server (the tmux-like layer). | Listed in Live Sessions when keep-alive; transient otherwise |
+
+### What yggterm does NOT do (don't propose these)
+
+- **Does not parse codex/CC JSONL into the terminal viewport.** The terminal view delegates rendering to the CLI itself. Reading JSONL is the web view's job (separate surface, currently buggy, will improve).
+- **Does not reinvent the agent CLI's rendering.** Codex's TUI is codex's choice. CC's render is CC's choice.
+- **Does not add CLI flags beyond the minimum needed for handoff** (cwd, UUID, terminal-appearance env). If a fix adds a flag the manual case doesn't use, question it — the manual case PROVED the CLI works without it.
+
+### The wrapper-vs-manual parity rule
+
+> If `app open <agent-session>` renders differently from `ssh -t <machine> codex resume <UUID>` typed into a shell, that is a yggterm bug, NOT a CLI bug. The fix is in yggterm's wrapper / handoff / preservation path.
+
+Diagnose by running the manual command in a clean shell FIRST and comparing rows/cursor/scrollback. If manual works, the wrapper is at fault — don't add flags that change the CLI's behavior; instead find what the wrapper does differently in env, stty, PTY setup, ownership, or preservation.
+
+Full mission rationale: see `~/.claude/projects/-home-pi-gh-yggterm/memory/project-purpose.md` (link `[[project-purpose]]`).
+
 ## Local repository relationships
 
 - `../ghostty` contains legacy Ghostty integration code in Zig.
