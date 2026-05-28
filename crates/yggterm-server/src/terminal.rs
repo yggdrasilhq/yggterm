@@ -887,6 +887,74 @@ impl TerminalScreenState {
     fn refresh_formatted(&mut self) {
         self.formatted = String::from_utf8_lossy(&self.parser.screen().state_formatted()).into();
     }
+
+    /// Walk the vt100 scrollback ring (rows that have scrolled off the
+    /// visible viewport) oldest-to-newest and return them as plain-text
+    /// rows. Uses `set_scrollback(k)` round-trips because vt100's public
+    /// API caps `visible_rows()` at viewport size — to enumerate the full
+    /// ring we step the scrollback offset down from the actual count to 1
+    /// and grab the topmost visible row each step.
+    ///
+    /// Per [[spec-tmux-parity-and-beyond]] — this is what closes the
+    /// tmux-parity gap: the daemon retains real scrollback across GUI
+    /// restart, and on attach we prepend this history before the
+    /// formatted viewport so the user sees their real terminal history,
+    /// not just the last frame.
+    fn vt_scrollback_plain_rows(&mut self) -> Vec<String> {
+        let screen = self.parser.screen_mut();
+        let saved_offset = screen.scrollback();
+        screen.set_scrollback(usize::MAX);
+        let total = screen.scrollback();
+        if total == 0 {
+            screen.set_scrollback(saved_offset);
+            return Vec::new();
+        }
+        let (_, cols) = screen.size();
+        let mut rows = Vec::with_capacity(total);
+        for k in (1..=total).rev() {
+            screen.set_scrollback(k);
+            if let Some(text) = screen.rows(0, cols).next() {
+                rows.push(text.trim_end().to_string());
+            }
+        }
+        screen.set_scrollback(saved_offset);
+        rows
+    }
+
+    /// Build a single replay payload combining the scrollback history
+    /// (as plain text rows) with the formatted viewport state. The
+    /// payload is shaped so xterm.js on the GUI side renders history
+    /// into its scrollback and then repaints the current viewport via
+    /// the formatted-state escape sequence. Returns `None` when the
+    /// session has neither scrollback nor visible viewport content.
+    fn history_and_screen_replay(&mut self) -> Option<String> {
+        let history = self.vt_scrollback_plain_rows();
+        let history: Vec<String> = history
+            .into_iter()
+            .filter(|line| !line.is_empty())
+            .collect();
+        let formatted = self.formatted.trim_matches('\0').to_string();
+        let formatted_has_visible = formatted
+            .chars()
+            .any(|ch| !ch.is_control() && !ch.is_whitespace());
+        if history.is_empty() && !formatted_has_visible {
+            return None;
+        }
+        let mut payload = String::with_capacity(history.iter().map(|l| l.len() + 2).sum::<usize>() + formatted.len() + 8);
+        for line in &history {
+            payload.push_str(line);
+            payload.push_str("\r\n");
+        }
+        // \x1b[2J\x1b[H clears the visible viewport (not scrollback) and
+        // homes the cursor; matches what the GUI-side
+        // `terminal_retained_history_screen_replay_payload` writes between
+        // history and screen.
+        if !history.is_empty() {
+            payload.push_str("\x1b[2J\x1b[H");
+        }
+        payload.push_str(&formatted);
+        Some(payload)
+    }
 }
 
 fn spawn_terminal_writer_thread(
@@ -1401,17 +1469,20 @@ impl PtySessionRuntime {
     }
 
     fn screen_snapshot_chunk(&self, next_cursor: u64) -> Option<TerminalChunk> {
-        let screen_state = self
+        let mut screen_state = self
             .screen_state
             .lock()
             .expect("pty screen state lock poisoned");
-        let formatted = screen_state.formatted.trim_matches('\0').to_string();
-        if !terminal_chunk_has_visible_text(&formatted) {
+        // Per [[spec-tmux-parity-and-beyond]]: emit history+viewport, not
+        // just viewport. Without this the GUI shows only the last frame
+        // after restart and loses everything that scrolled off.
+        let payload = screen_state.history_and_screen_replay()?;
+        if !terminal_chunk_has_visible_text(&payload) {
             return None;
         }
         Some(TerminalChunk {
             seq: next_cursor.saturating_add(1),
-            data: formatted,
+            data: payload,
         })
     }
 
@@ -2271,6 +2342,74 @@ mod tests {
     use std::io;
     use std::sync::mpsc;
     use std::time::Instant;
+
+    #[test]
+    fn vt_scrollback_returns_empty_when_no_lines_have_scrolled_off() {
+        let mut state = TerminalScreenState::new(24, 80);
+        state.process(b"line one\r\nline two\r\n");
+        assert!(state.vt_scrollback_plain_rows().is_empty());
+    }
+
+    fn parse_history_line_number(text: &str) -> Option<u32> {
+        text.trim().strip_prefix("line ")?.parse::<u32>().ok()
+    }
+
+    #[test]
+    fn vt_scrollback_returns_scrolled_off_rows_oldest_first() {
+        let rows: u16 = 5;
+        let mut state = TerminalScreenState::new(rows, 80);
+        for i in 1..=12 {
+            state.process(format!("line {i}\r\n").as_bytes());
+        }
+        let history = state.vt_scrollback_plain_rows();
+        assert!(
+            history.len() >= 6,
+            "expected at least 6 scrolled-off rows, got {}",
+            history.len()
+        );
+        assert_eq!(history.first().map(|s| s.as_str()), Some("line 1"));
+        let history_nums: Vec<u32> = history
+            .iter()
+            .filter_map(|line| parse_history_line_number(line))
+            .collect();
+        assert!(
+            history_nums.windows(2).all(|w| w[0] < w[1]),
+            "history must be strictly increasing (oldest-first), got {:?}",
+            history_nums
+        );
+        let max_history = *history_nums.last().unwrap_or(&0);
+        assert!(
+            max_history <= 12,
+            "history should not contain lines beyond what was written"
+        );
+    }
+
+    #[test]
+    fn history_and_screen_replay_returns_none_when_terminal_is_empty() {
+        let mut state = TerminalScreenState::new(24, 80);
+        assert!(state.history_and_screen_replay().is_none());
+    }
+
+    #[test]
+    fn history_and_screen_replay_prepends_scrollback_before_clear_and_viewport() {
+        let mut state = TerminalScreenState::new(4, 40);
+        for i in 1..=10 {
+            state.process(format!("hist-{i}\r\n").as_bytes());
+        }
+        let replay = state.history_and_screen_replay().expect("payload");
+        assert!(replay.contains("hist-1"), "oldest scrollback row must be present");
+        assert!(replay.contains("hist-3"), "intermediate scrollback row must be present");
+        let clear_idx = replay
+            .find("\x1b[2J\x1b[H")
+            .expect("clear-visible escape between history and viewport must be present");
+        let hist3_idx = replay
+            .find("hist-3")
+            .expect("history must precede clear-visible escape");
+        assert!(
+            hist3_idx < clear_idx,
+            "history rows must appear before the clear-screen-and-home escape"
+        );
+    }
 
     #[test]
     fn terminal_utf8_decoder_preserves_box_drawing_across_read_boundaries() {
