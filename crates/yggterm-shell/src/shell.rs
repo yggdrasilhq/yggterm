@@ -1865,6 +1865,21 @@ enum MachineHealth {
     Cached,
     Offline,
 }
+
+// ============================================================================
+// SECTION: `impl ShellState`
+// ----------------------------------------------------------------------------
+// The state machine for the entire desktop shell — sidebar, terminal hosts,
+// active session, settings, hot-update state, app-control surfaces, render
+// snapshots. Methods are grouped roughly by:
+//   * snapshot/render pipeline (~1869..2400)
+//   * session selection + tree manipulation (~2400..5500)
+//   * settings + persistence (~5700..7100)
+//   * app-control + telemetry (~7100..14000)
+//   * terminal lifecycle + retained replay (~14000..32000)
+// The block runs to ~line 35525 where `launch_shell` (the binary entry) begins.
+// See AGENTS.md for the source-of-truth contract behind each subsystem.
+// ============================================================================
 impl ShellState {
     fn new(bootstrap: ShellBootstrap) -> Self {
         let initial_search_query = std::env::var("YGGTERM_SEARCH_QUERY").unwrap_or_default();
@@ -35522,6 +35537,16 @@ fn ghostty_dock_request(
         retry_budget: 16,
     })
 }
+// ============================================================================
+// SECTION: `pub fn launch_shell` — binary entry point
+// ----------------------------------------------------------------------------
+// Receives the bootstrap from apps/yggterm/src/main.rs (settings loaded,
+// daemon endpoint resolved, browser tree built) and starts the Dioxus
+// desktop event loop. Anything after this fn through ~line 54604 is
+// either part of launch_shell's setup chain or top-level helpers for the
+// render path (Dioxus components, palette/theme rendering, side-rail
+// state, sidebar projection, start-page rendering).
+// ============================================================================
 pub fn launch_shell(mut bootstrap: ShellBootstrap) -> Result<()> {
     let trace_home = perf_home_dir(&bootstrap.settings_path);
     let linux_window_transparent = bootstrap.linux_window_transparent;
@@ -54601,6 +54626,21 @@ fn terminal_input_override_for_right_panel_mode(right_panel_mode: RightPanelMode
     let _ = right_panel_mode;
     false
 }
+// ============================================================================
+// SECTION: `terminal_eval_script` — the embedded xterm.js bootstrap script
+// ----------------------------------------------------------------------------
+// Generates ~30 000 lines of JavaScript that runs INSIDE the Dioxus WebView
+// per terminal host. This is where most xterm.js integration bugs are
+// fixed (scrollback intent, write bridge, scroll lock, paste paths, focus,
+// retained replay, snapshot capture/restore, software canvas overlays).
+// Search anchors:
+//   * `setScrollbackIntent`, `forceXtermViewportY`, `scrollLiveCursorIntoView`
+//   * `term.onData(`, `handlePrimarySelectionMiddleClick`
+//   * `restoreXtermSessionSnapshotOnConstructed`, `captureSessionXtermSnapshot`
+//   * `persistScrollStateToLocalStorage`, `loadScrollStateFromLocalStorage`
+// Every fix in this script should leave a `// XTERM-BUG: <id>` anchor that
+// points at the matching entry in docs/xterm-bugs.md.
+// ============================================================================
 fn terminal_eval_script(
     host_id: &str,
     theme: &TerminalTheme,
@@ -57413,21 +57453,22 @@ fn terminal_eval_script_with_canvas_renderer(
             }} catch (_error) {{}}
         }};
         const stretchXtermRoot = () => {{
+            // XTERM-BUG: scrollbar-not-draggable
+            // Per docs/xterm-bugs.md — earlier versions hid the scrollbar by
+            // expanding viewport/screen width with `calc(100% + gutter)` and a
+            // negative right margin, then setting `scrollbar-width: none`
+            // inline. That pushed the scrollbar off the right edge of the
+            // host (which has overflow:hidden) and clipped it. With the sleek
+            // scrollbar CSS we want the scrollbar visible AND draggable, so
+            // viewport/screen now stay at natural 100% width and the inline
+            // scrollbar-width override is dropped; CSS `scrollbar-width: thin`
+            // is the SSOT.
             const xtermRoot = host.querySelector('.xterm');
             const helpers = host.querySelector('.xterm-helpers');
             const helperTextarea = host.querySelector('.xterm-helper-textarea');
             const screen = host.querySelector('.xterm-screen');
             const viewport = host.querySelector('.xterm-viewport');
             const rowsLayer = host.querySelector('.xterm-rows');
-            const viewportScrollbarGutter = viewport
-                ? Math.max(0, Math.round((viewport.offsetWidth || 0) - (viewport.clientWidth || 0)))
-                : 0;
-            const compensatedWidth = viewportScrollbarGutter > 0
-                ? `calc(100% + ${{viewportScrollbarGutter}}px)`
-                : '100%';
-            const compensatedMarginRight = viewportScrollbarGutter > 0
-                ? `-${{viewportScrollbarGutter}}px`
-                : '0px';
             host.style.boxSizing = 'border-box';
             host.style.position = 'relative';
             host.style.overflow = 'hidden';
@@ -57445,7 +57486,7 @@ fn terminal_eval_script_with_canvas_renderer(
             if (helpers) {{
                 helpers.style.position = 'absolute';
                 helpers.style.inset = '0';
-                helpers.style.width = compensatedWidth;
+                helpers.style.width = '100%';
                 helpers.style.overflow = 'hidden';
                 helpers.style.pointerEvents = 'none';
             }}
@@ -57462,18 +57503,18 @@ fn terminal_eval_script_with_canvas_renderer(
             }}
             syncFocusClass();
             if (screen) {{
-                screen.style.width = compensatedWidth;
+                screen.style.width = '100%';
                 screen.style.height = '100%';
                 screen.style.position = 'relative';
                 screen.style.overflow = 'hidden';
             }}
             if (viewport) {{
-                viewport.style.width = compensatedWidth;
+                viewport.style.width = '100%';
                 viewport.style.height = '100%';
-                viewport.style.marginRight = compensatedMarginRight;
+                viewport.style.marginRight = '0px';
                 viewport.style.overflowX = 'hidden';
-                viewport.style.scrollbarWidth = 'none';
-                viewport.style.msOverflowStyle = 'none';
+                viewport.style.removeProperty('scrollbar-width');
+                viewport.style.removeProperty('-ms-overflow-style');
             }}
             if (rowsLayer) {{
                 rowsLayer.style.width = '100%';
@@ -59972,6 +60013,17 @@ fn terminal_eval_script_with_canvas_renderer(
             rebindCurrentHost('emit_resize', true);
             try {{
                 const resizeShouldFollowPrompt = scrollbackIntent !== 'UserScrollback';
+                // XTERM-BUG: content-scooped-on-session-switch
+                // Capture buffer state before/after resize so we can detect
+                // wrapped-line collapse (line count drop, baseY shift) when
+                // the host width changes during session switch. See
+                // docs/xterm-bugs.md#content-scooped-on-session-switch.
+                const _bufferBefore = (term && term.buffer && term.buffer.active) ? term.buffer.active : null;
+                const _bufferLengthBefore = _bufferBefore ? Number(_bufferBefore.length || 0) : -1;
+                const _baseYBefore = _bufferBefore ? Number(_bufferBefore.baseY || 0) : -1;
+                const _viewportYBefore = _bufferBefore ? Number(_bufferBefore.viewportY || 0) : -1;
+                const _colsBefore = Number(term.cols || 0);
+                const _rowsBefore = Number(term.rows || 0);
                 const fitChanged = fitTerminalToHost('resize');
                 const rowFitGuardApplied = applyTerminalRowFitGuard('resize');
                 const resizeKey = `${{term.cols}}x${{term.rows}}`;
@@ -59981,12 +60033,36 @@ fn terminal_eval_script_with_canvas_renderer(
                     requestRenderProbe('resize');
                     scheduleSettledResizePaint();
                     if (resizeChanged) {{
+                        const _bufferAfter = (term && term.buffer && term.buffer.active) ? term.buffer.active : null;
+                        const _bufferLengthAfter = _bufferAfter ? Number(_bufferAfter.length || 0) : -1;
+                        const _baseYAfter = _bufferAfter ? Number(_bufferAfter.baseY || 0) : -1;
+                        const _viewportYAfter = _bufferAfter ? Number(_bufferAfter.viewportY || 0) : -1;
+                        const _lineCountDelta = _bufferLengthBefore >= 0 && _bufferLengthAfter >= 0
+                            ? _bufferLengthAfter - _bufferLengthBefore
+                            : 0;
+                        const _suspectScoop = Math.abs(_lineCountDelta) >= 4 && _colsBefore !== Number(term.cols || 0);
                         emitPerf("xterm_resize", {{
                             reason: "resize",
                             cols: term.cols,
                             rows: term.rows,
+                            prev_cols: _colsBefore,
+                            prev_rows: _rowsBefore,
+                            buffer_length_before: _bufferLengthBefore,
+                            buffer_length_after: _bufferLengthAfter,
+                            buffer_length_delta: _lineCountDelta,
+                            base_y_before: _baseYBefore,
+                            base_y_after: _baseYAfter,
+                            viewport_y_before: _viewportYBefore,
+                            viewport_y_after: _viewportYAfter,
                             row_fit_guard_applied: Boolean(rowFitGuardApplied),
+                            suspect_content_scoop: Boolean(_suspectScoop),
                         }});
+                        if (_suspectScoop) {{
+                            sendTerminalEvent({{
+                                kind: "debug",
+                                message: `xterm_content_scoop_suspect host=${{hostId}} cols=${{_colsBefore}}->${{term.cols}} rows=${{_rowsBefore}}->${{term.rows}} buffer_lines=${{_bufferLengthBefore}}->${{_bufferLengthAfter}} delta=${{_lineCountDelta}} baseY=${{_baseYBefore}}->${{_baseYAfter}}`
+                            }});
+                        }}
                         scheduleResizeNotification();
                     }}
                 }}
@@ -62255,6 +62331,17 @@ fn terminal_set_input_enabled_script_for_session(
         focus = if focus { "true" } else { "false" },
     )
 }
+// ============================================================================
+// SECTION: retained-replay JS scripts (per-attach, per-redraw)
+// ----------------------------------------------------------------------------
+// Smaller JS snippets generated on demand to write retained bytes into a
+// live xterm host, drive cursor positioning, and trigger refresh. Key
+// generators below: `terminal_replay_retained_data_script_for_session`,
+// nudge/redraw helpers, and post-replay sanity probes. This is where the
+// `followPromptForEntry` guard lives (XTERM-BUG: scrollback-lost-on-
+// session-switch) — see retained_replay_script_followPromptForEntry_guards_
+// user_scrollback test in the test module.
+// ============================================================================
 fn terminal_replay_retained_data_script_for_session(
     session_path: &str,
     data: &str,
@@ -68952,6 +69039,16 @@ fn interface_font_family() -> &'static str {
 fn interface_font_family() -> &'static str {
     "system-ui, sans-serif"
 }
+// ============================================================================
+// SECTION: tests
+// ----------------------------------------------------------------------------
+// All unit tests for the shell module. Many are "self-tests" that include
+// the source via `include_str!` to assert the presence of literal strings
+// in generated JS scripts — that's how we lock in the xterm.js script
+// shape across refactors. Search for `XTERM-BUG` or `Per docs/xterm-bugs.md`
+// in this section to find regression coverage that maps back to the bug
+// registry.
+// ============================================================================
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -71235,6 +71332,35 @@ mod tests {
         assert!(shell.sidebar_resize_drag.is_none());
         assert_eq!(shell.sidebar_width, 420.0);
         assert_eq!(shell.settings.tree_width, 420.0);
+    }
+    #[test]
+    fn terminal_eval_script_scrollbar_is_draggable_not_pushed_off_screen() {
+        let theme = terminal_theme(UiTheme::ZedLight, palette(UiTheme::ZedLight), 13.0, "");
+        let script = terminal_eval_script("yggterm-terminal-test", &theme, true);
+        assert!(
+            !script.contains("viewport.style.scrollbarWidth = 'none';"),
+            "stretchXtermRoot must NOT inline-set scrollbar-width:none; CSS owns scrollbar styling (XTERM-BUG: scrollbar-not-draggable)"
+        );
+        assert!(
+            script.contains("viewport.style.removeProperty('scrollbar-width');"),
+            "stretchXtermRoot must clear any stale inline scrollbar-width so CSS thin scrollbar wins"
+        );
+        assert!(
+            !script.contains("viewport.style.marginRight = compensatedMarginRight;"),
+            "stretchXtermRoot must NOT push the viewport scrollbar off-screen via negative margin"
+        );
+        assert!(
+            script.contains("viewport.style.marginRight = '0px';"),
+            "stretchXtermRoot must keep the viewport scrollbar inside the host bounds"
+        );
+        assert!(
+            script.contains("scrollbar-width: thin !important;"),
+            "CSS must declare scrollbar-width: thin so the sleek scrollbar renders"
+        );
+        assert!(
+            script.contains(".xterm-viewport::-webkit-scrollbar-thumb"),
+            "CSS must provide a WebKit scrollbar thumb so dragging is visually possible on Chromium/WebKit"
+        );
     }
     #[test]
     fn terminal_eval_script_declares_sync_focus_before_stretch_root_uses_it() {
