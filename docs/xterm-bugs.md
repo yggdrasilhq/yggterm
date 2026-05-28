@@ -41,7 +41,7 @@ xterm.js owns vs what the shell owns, cursor/prompt semantics, etc. — see
 | [blank-rendering-region](#blank-rendering-region) | Region inside an active session goes blank until forced redraw | OPEN, uninvestigated |
 | [scrollbar-not-draggable](#scrollbar-not-draggable) | Sleek thin scrollbar visible but cannot be dragged | FIXED 2026-05-28 |
 | [content-scooped-on-session-switch](#content-scooped-on-session-switch) | Switching sessions: middle rows disappear, top + bottom remaining text presented as continuous | OPEN, telemetry added |
-| [keepalive-restart-viewport-only](#keepalive-restart-viewport-only) | After GUI restart, keep-alive sessions show only viewport's worth of content; daemon had retained more in vt100 ring but didn't serve it | FIXED 2026-05-28 |
+| [keepalive-restart-viewport-only](#keepalive-restart-viewport-only) | After GUI restart, keep-alive sessions show only viewport's worth of content; daemon had retained more in vt100 ring but didn't serve it | REOPENED 2026-05-28 — helper landed but two gaps (daemon-handoff resets ring; GUI uses daemon_pty path) keep it user-broken |
 
 ---
 
@@ -733,7 +733,15 @@ debug line is also emitted with all of the above inline for easy grep.
 
 ## keepalive-restart-viewport-only
 
-**STATUS:** FIXED 2026-05-28
+**STATUS:** REOPENED 2026-05-28 (was claimed FIXED; live verification on jojo showed `base_y: 0` in xterm.js, scrollbar empty, user couldn't scroll). Two distinct gaps below.
+
+**Gap 1 — daemon handoff loses vt100 ring.** `TerminalScreenState::new` creates a fresh `Vt100Parser`. When the daemon hot-restarts (or retires + spawns new), the new daemon's parser starts empty. All previously accumulated scrolled-off rows are gone. Fix path: re-feed retained raw PTY chunks through the new parser on session restore, OR serialize/deserialize the parser snapshot across handoffs.
+
+**Gap 2 — GUI uses daemon_pty path, not snapshot path.** For active sessions, `terminal_content_source` resolves to `daemon_pty` (raw stream), so `screen_snapshot_chunk` (where `history_and_screen_replay` was wired in) is never invoked on initial attach. Even with a populated vt100 ring, the GUI never asks the daemon to serve it. Fix path: when initial attach finds vt100 has accumulated scrollback (>= rows_len worth), prefer the snapshot chunk over raw replay.
+
+Original section retained below for the helper implementation details.
+
+### Original FIXED claim (helper landed but inert)
 
 ### Symptom
 After the user closes and reopens the GUI (or hot-restarts it), every
