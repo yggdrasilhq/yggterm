@@ -6911,13 +6911,20 @@ fn remote_persistent_resume_shell_command_with_terminal_appearance(
     cwd: Option<&str>,
     terminal_appearance: Option<&str>,
 ) -> String {
-    let base = persistent_agent_resume_command_with_terminal_appearance(
+    // Per [[spec-agent-cli-wrapper-render-parity]]: render the same as a
+    // clean `codex resume <UUID>`. A previous version of this wrapper
+    // prefixed `stty raw -echo opost onlcr` here, which pre-empted
+    // codex's own terminal-mode init and caused codex to render only a
+    // partial UI (status bar visible, conversation truncated, cursor
+    // landing on the status bar instead of the input prompt row).
+    // Codex sets raw mode itself when it enters TUI; we no longer
+    // pre-set anything and let codex own the terminal state.
+    persistent_agent_resume_command_with_terminal_appearance(
         SessionKind::Codex,
         cwd,
         session_id,
         terminal_appearance,
-    );
-    format!("stty raw -echo opost onlcr </dev/tty >/dev/tty 2>/dev/null || true; {base}")
+    )
 }
 
 fn resolve_remote_codex_home() -> std::path::PathBuf {
