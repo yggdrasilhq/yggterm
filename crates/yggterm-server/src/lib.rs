@@ -5572,6 +5572,13 @@ impl YggtermServer {
                 self.cached_remote_launch_for_target(&ssh_target, ssh_prefix.as_deref()),
             ))
         });
+        // Per [[bug-class-deploy-state-gate-on-version-mismatch]]: capture the
+        // error from resolve_remote_yggterm_binary into resolved_live_ssh_launch_error
+        // so we can plumb it onto session.last_launch_error and surface it in
+        // status_line. Pre-fix, this error was logged to trace and swallowed —
+        // the session sat at remote_deploy_state=Planned forever with an empty
+        // viewport and no user-visible hint about the version mismatch.
+        let mut resolved_live_ssh_launch_error: Option<(String, String)> = None;
         let resolved_live_ssh_launch = self.sessions.get(&path).and_then(|session| {
             if !live_session_uses_remote_runtime(session) {
                 return None;
@@ -5589,6 +5596,7 @@ impl YggtermServer {
                     Some((ssh_target, ssh_prefix, remote_binary, remote_deploy_state))
                 }
                 Err(error) => {
+                    let error_str = error.to_string();
                     if let Ok(home) = resolve_yggterm_home() {
                         append_trace_event(
                             &home,
@@ -5598,10 +5606,11 @@ impl YggtermServer {
                             serde_json::json!({
                                 "session_path": session.session_path,
                                 "ssh_target": ssh_target,
-                                "error": error.to_string(),
+                                "error": error_str.clone(),
                             }),
                         );
                     }
+                    resolved_live_ssh_launch_error = Some((ssh_target.clone(), error_str));
                     None
                 }
             }
@@ -5937,6 +5946,18 @@ impl YggtermServer {
                     RemoteDeployState::NotRequired
                 };
                 session.launch_phase = TerminalLaunchPhase::Running;
+                // Per [[bug-class-deploy-state-gate-on-version-mismatch]]: if
+                // the remote-binary resolve failed for this session's ssh
+                // target AND the deploy state ended up Planned (the silent
+                // gate), surface the error on the session so callers and the
+                // status_line have actionable info.
+                if matches!(session.remote_deploy_state, RemoteDeployState::Planned)
+                    && let Some(ref session_ssh_target) = session.ssh_target
+                    && let Some((ref err_target, ref err_msg)) = resolved_live_ssh_launch_error
+                    && err_target == session_ssh_target
+                {
+                    session.last_launch_error = Some(err_msg.clone());
+                }
                 session.terminal_lines = build_live_terminal_lines(session);
                 upsert_session_metadata(
                     &mut session.metadata,
@@ -5947,13 +5968,14 @@ impl YggtermServer {
                         "running".to_string()
                     },
                 );
-                session.status_line = describe_status_line(
+                session.status_line = describe_status_line_with_error(
                     session.backend,
                     self.theme,
                     session.source,
                     session.launch_phase,
                     session.remote_deploy_state,
                     session.bridge_available,
+                    session.last_launch_error.as_deref(),
                 );
             }
         }
@@ -18374,6 +18396,31 @@ fn describe_status_line(
     remote_deploy_state: RemoteDeployState,
     bridge_available: bool,
 ) -> String {
+    describe_status_line_with_error(
+        backend,
+        theme,
+        source,
+        launch_phase,
+        remote_deploy_state,
+        bridge_available,
+        None,
+    )
+}
+
+// Per [[bug-class-deploy-state-gate-on-version-mismatch]]: when a remote
+// session is gated at `Planned` because resolve_remote_yggterm_binary
+// failed (typically a protocol/version mismatch between local daemon and
+// the remote binary), surface the error inline in the status line so the
+// user has something actionable instead of an empty viewport.
+fn describe_status_line_with_error(
+    backend: TerminalBackend,
+    theme: UiTheme,
+    source: SessionSource,
+    launch_phase: TerminalLaunchPhase,
+    remote_deploy_state: RemoteDeployState,
+    bridge_available: bool,
+    last_launch_error: Option<&str>,
+) -> String {
     let backend_label = match backend {
         TerminalBackend::Xterm => "xterm.js",
         TerminalBackend::Ghostty => "Ghostty",
@@ -18384,12 +18431,29 @@ fn describe_status_line(
         UiTheme::ZedLight => "light",
     };
     let daemon_runtime_available = bridge_available || matches!(backend, TerminalBackend::Xterm);
-    let launch_status = describe_launch_phase(
+    let mut launch_status = describe_launch_phase(
         source,
         launch_phase,
         remote_deploy_state,
         daemon_runtime_available,
     );
+    if matches!(
+        (source, remote_deploy_state),
+        (SessionSource::LiveSsh, RemoteDeployState::Planned)
+    ) && let Some(error) = last_launch_error
+    {
+        let trimmed = error.trim();
+        if !trimmed.is_empty() {
+            let single_line = trimmed
+                .lines()
+                .next()
+                .unwrap_or(trimmed)
+                .chars()
+                .take(240)
+                .collect::<String>();
+            launch_status = format!("remote bootstrap blocked: {single_line}");
+        }
+    }
     format!("{backend_label} · {appearance} scheme requested · {launch_status}")
 }
 
@@ -19095,7 +19159,7 @@ mod tests {
         choose_app_control_pid, clear_local_daemon_socket_link_escaping_home,
         clear_local_daemon_socket_link_for_version_mismatch, clear_session_preview_for_loading,
         clear_stale_local_daemon_socket_when_no_daemon, client_instances_dir, current_millis_u64,
-        dedupe_remote_scanned_sessions, describe_status_line,
+        dedupe_remote_scanned_sessions, describe_status_line, describe_status_line_with_error,
         launch_command_matches_terminal_appearance, legacy_agent_launch_command,
         legacy_remote_tmux_session_name, live_session_default_summary,
         load_remote_machine_sessions_from_mirror, local_daemon_connect_error_is_transient,
@@ -21290,6 +21354,64 @@ mod tests {
 
         assert!(status.contains("daemon ready"));
         assert!(!status.contains("runtime degraded"));
+    }
+
+    #[test]
+    fn live_ssh_status_line_surfaces_resolve_error_when_planned() {
+        let status = describe_status_line_with_error(
+            TerminalBackend::Xterm,
+            UiTheme::ZedDark,
+            SessionSource::LiveSsh,
+            TerminalLaunchPhase::RemoteBootstrap,
+            RemoteDeployState::Planned,
+            true,
+            Some(
+                "remote yggterm protocol mismatch for dev: expected 2026-05-26@1779951538, got 2026-05-26@1779800000",
+            ),
+        );
+        assert!(
+            status.contains("remote bootstrap blocked"),
+            "expected blocked sentinel in {status:?}"
+        );
+        assert!(
+            status.contains("protocol mismatch"),
+            "expected protocol error inline in {status:?}"
+        );
+        assert!(
+            !status.contains("remote bootstrap planned"),
+            "blocked status must replace the silent 'planned' phrasing"
+        );
+    }
+
+    #[test]
+    fn live_ssh_status_line_keeps_planned_phrase_when_no_error_captured() {
+        let status = describe_status_line_with_error(
+            TerminalBackend::Xterm,
+            UiTheme::ZedDark,
+            SessionSource::LiveSsh,
+            TerminalLaunchPhase::RemoteBootstrap,
+            RemoteDeployState::Planned,
+            true,
+            None,
+        );
+        assert!(status.contains("remote bootstrap planned"));
+        assert!(!status.contains("blocked"));
+    }
+
+    #[test]
+    fn ready_state_ignores_launch_error_to_avoid_stale_warnings() {
+        let status = describe_status_line_with_error(
+            TerminalBackend::Xterm,
+            UiTheme::ZedLight,
+            SessionSource::LiveSsh,
+            TerminalLaunchPhase::Running,
+            RemoteDeployState::Ready,
+            true,
+            Some("stale resolve error from a previous probe"),
+        );
+        assert!(status.contains("remote terminal attached"));
+        assert!(!status.contains("blocked"));
+        assert!(!status.contains("stale resolve error"));
     }
 
     #[test]
