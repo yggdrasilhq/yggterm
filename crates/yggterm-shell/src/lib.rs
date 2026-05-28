@@ -13,6 +13,7 @@ mod terminal_write_policy;
 mod theme_contract;
 mod ui_telemetry;
 mod window_icon;
+mod xterm_gate_metrics;
 
 pub use shell::{
     PendingUpdateRestart, ShellBootstrap, initial_server_sync, launch_shell, start_daemon_watchdog,
