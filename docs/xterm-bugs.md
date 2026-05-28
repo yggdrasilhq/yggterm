@@ -41,6 +41,7 @@ xterm.js owns vs what the shell owns, cursor/prompt semantics, etc. — see
 | [blank-rendering-region](#blank-rendering-region) | Region inside an active session goes blank until forced redraw | OPEN, uninvestigated |
 | [scrollbar-not-draggable](#scrollbar-not-draggable) | Sleek thin scrollbar visible but cannot be dragged | FIXED 2026-05-28 |
 | [content-scooped-on-session-switch](#content-scooped-on-session-switch) | Switching sessions: middle rows disappear, top + bottom remaining text presented as continuous | OPEN, telemetry added |
+| [keepalive-restart-viewport-only](#keepalive-restart-viewport-only) | After GUI restart, keep-alive sessions show only viewport's worth of content; daemon had retained more in vt100 ring but didn't serve it | FIXED 2026-05-28 |
 
 ---
 
@@ -727,6 +728,72 @@ debug line is also emitted with all of the above inline for easy grep.
 
 ### Related memory
 `[[spec-xterm-bug-registry]]`, `[[spec-tmux-parity-and-beyond]]`
+
+---
+
+## keepalive-restart-viewport-only
+
+**STATUS:** FIXED 2026-05-28
+
+### Symptom
+After the user closes and reopens the GUI (or hot-restarts it), every
+keep-alive session shows only the last viewport's worth of content. The
+scrollback is empty. tmux/screen with the equivalent history-limit
+preserve full scrollback across `tmux attach` cycles — yggterm did not.
+
+### Reproduction
+1. Run a long-output session (codex working on a hard task; long `make`;
+   `ls -R /` etc) until well over a viewport of output has scrolled.
+2. Close yggterm GUI.
+3. Reopen yggterm GUI.
+4. Before fix: scrollback is gone, only the bottom viewport remains.
+
+### Root cause
+The daemon owned a 10 000-row vt100 scrollback ring per session (sized
+in `DAEMON_VT_SCROLLBACK_ROWS`), but the replay path
+(`screen_snapshot_chunk` in `crates/yggterm-server/src/terminal.rs`)
+emitted only `screen.state_formatted()`, which the vt100 crate caps at
+the visible viewport (its `visible_rows()` always tops out at
+`rows_len`). For TUI sessions (codex, ssh attaches) the daemon's
+`read()` path also prefers the screen snapshot over raw chunks, so the
+GUI received viewport-only content with no chance to reconstruct
+history.
+
+### Workaround / fix
+Added `TerminalScreenState::vt_scrollback_plain_rows` and
+`::history_and_screen_replay` that walk the vt100 scrollback ring
+oldest-to-newest (by stepping `set_scrollback(k)` and grabbing the
+topmost row each step — necessary because vt100 doesn't expose the
+scrollback iterator publicly), then build a payload of
+`{plain history rows joined with \r\n}\x1b[2J\x1b[H{state_formatted}`.
+`screen_snapshot_chunk` now serves this composite payload. The GUI
+writes it through xterm.js as one chunk: plain history flows into the
+xterm scrollback buffer, `\x1b[2J\x1b[H` clears only the visible
+viewport (NOT scrollback), then the formatted state repaints the live
+viewport with cursor + attrs.
+
+This closes the [[spec-tmux-parity-and-beyond]] history-limit parity
+gate.
+
+### Code locations
+- `crates/yggterm-server/src/terminal.rs:vt_scrollback_plain_rows`
+- `crates/yggterm-server/src/terminal.rs:history_and_screen_replay`
+- `crates/yggterm-server/src/terminal.rs:screen_snapshot_chunk` (uses
+  the new helper)
+
+### Tests
+- `vt_scrollback_returns_empty_when_no_lines_have_scrolled_off`
+- `vt_scrollback_returns_scrolled_off_rows_oldest_first`
+- `history_and_screen_replay_returns_none_when_terminal_is_empty`
+- `history_and_screen_replay_prepends_scrollback_before_clear_and_viewport`
+
+### Telemetry
+Existing `terminal_retained_bytes` counters apply. Future telemetry
+could add a `scrollback_rows_served` per attach so we can watch for
+silent regressions when this path degrades.
+
+### Related memory
+`[[spec-tmux-parity-and-beyond]]`, `[[xterm-scrollback-bug]]`
 
 ---
 
