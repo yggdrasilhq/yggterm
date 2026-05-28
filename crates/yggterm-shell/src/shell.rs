@@ -55807,6 +55807,15 @@ fn terminal_eval_script_with_canvas_renderer(
                 #${{hostId}} .xterm-screen {{
                     overflow: hidden !important;
                     height: 100% !important;
+                    /* XTERM-BUG: scrollbar-not-draggable
+                       The screen layer stacks above .xterm-viewport in
+                       the xterm.js DOM. If it's full-width it covers
+                       the right-edge scrollbar slot and intercepts
+                       mouse clicks before they reach the native
+                       scrollbar. Reserve the scrollbar width on the
+                       right so the scrollbar is hit-testable. Matches
+                       the ::-webkit-scrollbar width: 8px rule below. */
+                    width: calc(100% - 8px) !important;
                 }}
                 #${{hostId}} .xterm-viewport {{
                     height: 100% !important;
@@ -57502,8 +57511,11 @@ fn terminal_eval_script_with_canvas_renderer(
                 }}, true);
             }}
             syncFocusClass();
+            // XTERM-BUG: scrollbar-not-draggable — leave the screen narrower
+            // than the host by the scrollbar width so the right-edge
+            // scrollbar slot is hit-testable by the native browser drag.
             if (screen) {{
-                screen.style.width = '100%';
+                screen.style.width = 'calc(100% - 8px)';
                 screen.style.height = '100%';
                 screen.style.position = 'relative';
                 screen.style.overflow = 'hidden';

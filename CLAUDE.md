@@ -26,6 +26,10 @@ The live desktop host is defined in `.agents/config/live-host`. The yggterm bina
 
 yggui app-control exists precisely so the agent can perform the whole build → deploy → restart → test → screenshot loop without the user touching anything. When a change requires the GUI to relaunch to take effect, use yggui (kill the GUI process, relaunch via `yggterm-headless server app launch`, screenshot, probe state). Do NOT wait for the user to manually restart — that defeats the agent-first design. If the existing yggui surface is missing a probe or affordance you need to test something, extend yggui rather than hand the task back. Only stop for the user when an action is truly destructive or genuinely ambiguous.
 
+### When the user reports issues, fix them — don't pre-emptively pause to ask
+
+The user's workflow: they report issues; the agent fixes ALL of them and reports back with **causes + fixes** (not diagnoses awaiting permission). Don't ask "should I keep going?", don't ask "do you want me to pause?", don't enumerate trade-offs without taking action. The default is: keep working through the entire reported list, drive each fix end-to-end via yggui, and only stop when (a) every issue is fixed and live-verified, or (b) you've hit a genuinely destructive or ambiguous decision that needs user input. "Wait should I do this" is not the right reflex — the right reflex is "I'm doing this, here's why, here's the result."
+
 ### Never claim "shipped" or "fixed" without live proof
 
 A fix is not shipped until you have observed the fixed behavior on the live host through yggui: screenshot of the visible change, state-snapshot showing the corrected field, telemetry trace showing the new code path firing, or a probe that exercises the affordance. Compiled binaries on disk, passing unit tests, and a successful `scp` are necessary but not sufficient — a stale daemon, deferred hot-restart, cached webview, or version-mismatch gate can keep the running system on the OLD behavior. Before saying "this is fixed" or "shipped":
