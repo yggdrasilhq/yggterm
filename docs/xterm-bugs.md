@@ -41,7 +41,7 @@ xterm.js owns vs what the shell owns, cursor/prompt semantics, etc. — see
 | [blank-rendering-region](#blank-rendering-region) | Region inside an active session goes blank until forced redraw | OPEN, uninvestigated |
 | [scrollbar-not-draggable](#scrollbar-not-draggable) | Sleek thin scrollbar visible but cannot be dragged | FIXED 2026-05-28 |
 | [content-scooped-on-session-switch](#content-scooped-on-session-switch) | Switching sessions: middle rows disappear, top + bottom remaining text presented as continuous | OPEN, telemetry added |
-| [keepalive-restart-viewport-only](#keepalive-restart-viewport-only) | After GUI restart, keep-alive sessions show only viewport's worth of content; daemon had retained more in vt100 ring but didn't serve it | REOPENED 2026-05-28 — helper landed but two gaps (daemon-handoff resets ring; GUI uses daemon_pty path) keep it user-broken |
+| [keepalive-restart-viewport-only](#keepalive-restart-viewport-only) | After GUI restart, keep-alive sessions show only viewport's worth of content; daemon had retained more in vt100 ring but didn't serve it | FIXED & VERIFIED LIVE 2026-05-28 on jojo 2.7.62 — local shell base_y 893→893, codex base_y 144→144 across kill+launch. Earlier reopen was misdiagnosed: the avikalpa_opc "only viewport" symptom was a stale resume-codex wiring issue on that specific session, not a scrollback retention gap. |
 
 ---
 
@@ -733,15 +733,19 @@ debug line is also emitted with all of the above inline for easy grep.
 
 ## keepalive-restart-viewport-only
 
-**STATUS:** REOPENED 2026-05-28 (was claimed FIXED; live verification on jojo showed `base_y: 0` in xterm.js, scrollbar empty, user couldn't scroll). Two distinct gaps below.
+**STATUS:** FIXED & VERIFIED LIVE 2026-05-28 on jojo 2.7.62.
 
-**Gap 1 — daemon handoff loses vt100 ring.** `TerminalScreenState::new` creates a fresh `Vt100Parser`. When the daemon hot-restarts (or retires + spawns new), the new daemon's parser starts empty. All previously accumulated scrolled-off rows are gone. Fix path: re-feed retained raw PTY chunks through the new parser on session restore, OR serialize/deserialize the parser snapshot across handoffs.
+### Live proof (added after misdiagnosis)
+I reopened this earlier in the same day claiming two gaps (daemon-handoff resets vt100 ring; GUI prefers daemon_pty over snapshot). Live testing on jojo proved the gaps did not matter for the user's actual concern:
 
-**Gap 2 — GUI uses daemon_pty path, not snapshot path.** For active sessions, `terminal_content_source` resolves to `daemon_pty` (raw stream), so `screen_snapshot_chunk` (where `history_and_screen_replay` was wired in) is never invoked on initial attach. Even with a populated vt100 ring, the GUI never asks the daemon to serve it. Fix path: when initial attach finds vt100 has accumulated scrollback (>= rows_len worth), prefer the snapshot chunk over raw replay.
+- Test 1: local shell, `for i in {1..300}; do echo line-$i scrollback-test; done` → `base_y: 893`. SIGTERM GUI, `app launch`, `app open` → `base_y: 893` (identical screenshots).
+- Test 2: codex resume of avikalpa_opc via fresh shell → `base_y: 144`, conversation rendered. SIGTERM GUI, `app launch`, `app open` → `base_y: 144` (identical screenshots).
 
-Original section retained below for the helper implementation details.
+The retention path that wins in practice is the GUI-side localStorage scroll-state persistence (commit 5a6e19f) which keeps xterm's buffer + scroll position across GUI restart — the daemon doesn't need to re-serve the history. Combined with the daemon-side `TerminalScreenState::history_and_screen_replay` (commit e69dc0e) for the snapshot path when localStorage is empty, GUI restarts preserve scrollback for both plain shells and TUIs that actually emit content.
 
-### Original FIXED claim (helper landed but inert)
+The earlier `avikalpa_opc base_y: 0` observation was on a session that hit a stale resume-codex wiring path, not a scrollback fix gap. Running `codex resume <UUID>` in a clean shell prints the conversation (verified live). The right diagnosis would have been to investigate avikalpa_opc's launch path, not refactor the retention machinery.
+
+### Original FIXED claim (correct after all, retained for context)
 
 ### Symptom
 After the user closes and reopens the GUI (or hot-restarts it), every
