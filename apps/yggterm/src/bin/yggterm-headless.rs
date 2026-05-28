@@ -1971,6 +1971,20 @@ fn main() -> Result<()> {
         }
         return Ok(());
     }
+    if args.as_slice() == ["server", "retire-stale-daemons"] {
+        // Per [[bug-class-old-daemon-never-retires]]: yggterm-headless processes
+        // from older deploys keep running because they own preserved sessions
+        // (which blocks idle shutdown) and never check for newer binaries on
+        // disk. This CLI scans every server-*.sock in YGGTERM_HOME and sends
+        // RetireDaemon to each one whose version differs from the current
+        // SERVER_PROTOCOL_VERSION.
+        let report = yggterm_server::retire_stale_daemons(
+            store.home_dir(),
+            yggterm_server::SERVER_PROTOCOL_VERSION,
+        )?;
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(());
+    }
     if args.as_slice() == ["server", "ping"] {
         ensure_local_server_ready_for_cli(&store)?;
         let endpoint = default_endpoint(store.home_dir());
