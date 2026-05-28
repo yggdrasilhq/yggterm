@@ -3990,11 +3990,16 @@ impl ShellState {
         let attempt_id = self
             .latest_terminal_open_attempt_for_path(session_path)
             .map(|attempt| attempt.attempt_id.clone());
+        // Per [[spec-xterm-gating-ux]]: do NOT re-emit per-grace-period
+        // (~1s). Dedup at the (session, attempt) level so the gate fires
+        // its "deferred" telemetry ONCE per attempt, not on every poll
+        // tick. The wait_elapsed_ms bucket was creating a new key each
+        // grace-period, producing a 1-Hz flicker if the gate was open
+        // long enough for the user to see it.
         let deferral_key = format!(
-            "{}:{}:{}",
+            "{}:{}",
             session_path,
             attempt_id.as_deref().unwrap_or("no-attempt"),
-            wait_elapsed_ms / RETAINED_REHYDRATE_DAEMON_READY_WATCH_GRACE_MS.max(1)
         );
         if self
             .last_retained_rehydrate_daemon_ready_rearm_deferral_key
@@ -55820,14 +55825,18 @@ fn terminal_eval_script_with_canvas_renderer(
                 #${{hostId}} .xterm-viewport {{
                     height: 100% !important;
                     overflow-x: hidden !important;
-                    /* Sleek thin scrollbar — auto-shown by the browser when
-                       content overflows. Complements the D-pad scroll
-                       controller for fast drag-scroll in long sessions. */
+                    /* Sleek thin scrollbar — fixed width at rest and
+                       on drag, so clicking the thumb does NOT cause
+                       the browser to widen and shift it 2-3px left
+                       (a UX wart of WebKit's default :active scrollbar
+                       behavior). Thumb is the only thing that changes
+                       on hover (color), not width. The screen layer
+                       reserves an 8px right gutter to match. */
                     scrollbar-width: thin !important;
                     scrollbar-color: rgba(120, 142, 166, 0.36) transparent !important;
                 }}
                 #${{hostId}} .xterm-viewport:hover {{
-                    scrollbar-color: rgba(120, 142, 166, 0.55) transparent !important;
+                    scrollbar-color: rgba(140, 162, 186, 0.78) transparent !important;
                 }}
                 #${{hostId}} .xterm-rows {{
                     height: 100% !important;
@@ -55918,7 +55927,12 @@ fn terminal_eval_script_with_canvas_renderer(
                     -webkit-text-fill-color: currentColor !important;
                 }}
                 /* WebKit / Chromium thin sleek scrollbar to match Firefox.
-                   Auto-hides when at rest; subtle thumb on hover. */
+                   Width is fixed at 8px across rest/hover/active so that
+                   clicking the thumb doesn't trigger WebKit's default
+                   "fatter scrollbar while dragging" behavior — which
+                   produced a 2-3px leftward shift and a chunky drag
+                   highlight on rest-to-active transition. Color is the
+                   only thing that changes; transition keeps it smooth. */
                 #${{hostId}} .xterm-viewport::-webkit-scrollbar {{
                     width: 8px !important;
                     height: 0 !important;
@@ -55928,18 +55942,22 @@ fn terminal_eval_script_with_canvas_renderer(
                     background: transparent !important;
                 }}
                 #${{hostId}} .xterm-viewport::-webkit-scrollbar-thumb {{
-                    background: rgba(120, 142, 166, 0.32) !important;
+                    background: rgba(120, 142, 166, 0.36) !important;
                     border-radius: 4px !important;
-                    border: 2px solid transparent !important;
                     background-clip: padding-box !important;
                     min-height: 24px !important;
+                    transition: background-color 120ms ease !important;
                 }}
                 #${{hostId}} .xterm-viewport:hover::-webkit-scrollbar-thumb {{
-                    background: rgba(120, 142, 166, 0.55) !important;
+                    background: rgba(140, 162, 186, 0.78) !important;
                     background-clip: padding-box !important;
                 }}
                 #${{hostId}} .xterm-viewport::-webkit-scrollbar-thumb:hover {{
-                    background: rgba(120, 142, 166, 0.78) !important;
+                    background: rgba(150, 172, 196, 0.92) !important;
+                    background-clip: padding-box !important;
+                }}
+                #${{hostId}} .xterm-viewport::-webkit-scrollbar-thumb:active {{
+                    background: rgba(170, 188, 210, 1.0) !important;
                     background-clip: padding-box !important;
                 }}
                 #${{hostId}} .xterm-viewport::-webkit-scrollbar-corner {{
