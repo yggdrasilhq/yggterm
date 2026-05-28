@@ -26,6 +26,15 @@ The live desktop host is defined in `.agents/config/live-host`. The yggterm bina
 
 yggui app-control exists precisely so the agent can perform the whole build → deploy → restart → test → screenshot loop without the user touching anything. When a change requires the GUI to relaunch to take effect, use yggui (kill the GUI process, relaunch via `yggterm-headless server app launch`, screenshot, probe state). Do NOT wait for the user to manually restart — that defeats the agent-first design. If the existing yggui surface is missing a probe or affordance you need to test something, extend yggui rather than hand the task back. Only stop for the user when an action is truly destructive or genuinely ambiguous.
 
+### Never claim "shipped" or "fixed" without live proof
+
+A fix is not shipped until you have observed the fixed behavior on the live host through yggui: screenshot of the visible change, state-snapshot showing the corrected field, telemetry trace showing the new code path firing, or a probe that exercises the affordance. Compiled binaries on disk, passing unit tests, and a successful `scp` are necessary but not sufficient — a stale daemon, deferred hot-restart, cached webview, or version-mismatch gate can keep the running system on the OLD behavior. Before saying "this is fixed" or "shipped":
+
+1. Check the running version of every component that touches the fix (daemon, GUI, remote binary as relevant). `yggterm-headless server status` for the daemon; `pgrep` for the GUI; `ssh <target> ~/.yggterm/bin/yggterm --version` for the remote.
+2. Confirm that the running version is the one that contains your fix. If not, drive the restart loop yourself per the previous rule until it is.
+3. Exercise the fix on the live host (yggui probe, screenshot, state snapshot) and quote the evidence in the user-facing report.
+4. If you cannot exercise it (no repro path available), say so explicitly — "code is on disk, daemon still at version N which lacks the fix, will activate on next swap" — instead of "shipped." The user reads "shipped" as "I can use it now," and a false shipped claim is worse than a documented gap.
+
 ### Check all affected surfaces together
 
 If a change affects how sessions appear, check both the CWD tree sidebar and the start page. If it affects remote sessions, check both local and remote paths. If it changes an icon, check both the sidebar row and the start page card. Fixing one surface while leaving another inconsistent is a spec violation.
