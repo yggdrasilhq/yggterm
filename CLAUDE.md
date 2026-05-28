@@ -26,6 +26,20 @@ The live desktop host is defined in `.agents/config/live-host`. The yggterm bina
 
 yggui app-control exists precisely so the agent can perform the whole build → deploy → restart → test → screenshot loop without the user touching anything. When a change requires the GUI to relaunch to take effect, use yggui (kill the GUI process, relaunch via `yggterm-headless server app launch`, screenshot, probe state). Do NOT wait for the user to manually restart — that defeats the agent-first design. If the existing yggui surface is missing a probe or affordance you need to test something, extend yggui rather than hand the task back. Only stop for the user when an action is truly destructive or genuinely ambiguous.
 
+### When diagnosing an issue, use `/investigate` — never free-list "issues" from raw telemetry
+
+When the user reports a bug, an anomaly, "something is off," or asks "what issues do you see," reach for `gstack /investigate` first (skill is installed at `~/.claude/skills/gstack/investigate`). Its discipline: investigate → analyze → hypothesize → implement, with the Iron Law *"no fixes without root cause."* Each named issue must have:
+
+1. A specific observed symptom (what the user sees, NOT what a telemetry field says)
+2. A hypothesis with evidence supporting it
+3. A falsification attempt (probe that would disprove it — e.g. send a keystroke, take a screenshot, query a different field) before naming it as an issue
+
+**Do not list "issues" by free-associating from suspicious-looking fields.** Telemetry fields have semantics that may not match their names: `input_enabled: False` does not necessarily mean "user can't type," it might track which input mode owns focus or be a transient between mounts. If you haven't read the code that sets a field OR falsified your interpretation against a live probe, do NOT cite it as a user-visible issue.
+
+**Cross-validate every claim against the screenshot.** If the user is actively using the session right now, by construction it can't be "unusable" — anything you claim is broken must be visible to a human looking at the screen.
+
+**Prefer ONE high-confidence issue named correctly over five low-confidence guesses.** Padding the list to look thorough is its own kind of dishonesty — it makes the user wonder if you understand anything at all.
+
 ### When the user reports issues, fix them — don't pre-emptively pause to ask
 
 The user's workflow: they report issues; the agent fixes ALL of them and reports back with **causes + fixes** (not diagnoses awaiting permission). Don't ask "should I keep going?", don't ask "do you want me to pause?", don't enumerate trade-offs without taking action. The default is: keep working through the entire reported list, drive each fix end-to-end via yggui, and only stop when (a) every issue is fixed and live-verified, or (b) you've hit a genuinely destructive or ambiguous decision that needs user input. "Wait should I do this" is not the right reflex — the right reflex is "I'm doing this, here's why, here's the result."
