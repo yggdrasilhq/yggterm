@@ -1,9 +1,10 @@
 use crate::{
     ManagedCliTool, run_remote_ensure_managed_cli, run_remote_generation_context,
-    run_remote_preview, run_remote_preview_head, run_remote_preview_tail,
-    run_remote_protocol_version, run_remote_refresh_managed_cli, run_remote_resume_codex,
-    run_remote_saved_codex_session_exists, run_remote_scan, run_remote_stage_clipboard_png,
-    run_remote_start_codex, run_remote_terminate_codex, run_remote_upsert_generated_copy,
+    run_remote_local_codex_identities, run_remote_preview, run_remote_preview_head,
+    run_remote_preview_tail, run_remote_protocol_version, run_remote_refresh_managed_cli,
+    run_remote_resume_codex, run_remote_saved_codex_session_exists, run_remote_scan,
+    run_remote_stage_clipboard_png, run_remote_start_codex, run_remote_terminate_codex,
+    run_remote_upsert_generated_copy,
 };
 use anyhow::{Result, bail};
 
@@ -32,6 +33,11 @@ pub enum RemoteServerCommand {
     Scan {
         codex_home: Option<String>,
     },
+    /// Enumerate Codex/Claude Code processes running on the remote machine and
+    /// emit their real CLI session ids. Used by the local daemon to rebind
+    /// live remote-Codex rows that still carry a synthesized UUIDv4 id
+    /// (`[[finding-uuidv4-codex-session-drift]]` Stage 2).
+    LocalCodexIdentities,
     PreviewHead {
         session_id: String,
         blocks: usize,
@@ -100,6 +106,7 @@ fn parse_remote_server_command(args: &[String]) -> Result<Option<RemoteServerCom
         "scan" => RemoteServerCommand::Scan {
             codex_home: args.get(3).cloned(),
         },
+        "local-codex-identities" if args.len() == 3 => RemoteServerCommand::LocalCodexIdentities,
         "preview-head" if args.len() >= 4 => RemoteServerCommand::PreviewHead {
             session_id: args[3].clone(),
             blocks: args
@@ -151,6 +158,7 @@ fn run_remote_server_command(command: RemoteServerCommand) -> Result<()> {
         }
         RemoteServerCommand::EnsureManagedCli { tool } => run_remote_ensure_managed_cli(tool),
         RemoteServerCommand::Scan { codex_home } => run_remote_scan(codex_home.as_deref()),
+        RemoteServerCommand::LocalCodexIdentities => run_remote_local_codex_identities(),
         RemoteServerCommand::PreviewHead { session_id, blocks } => {
             run_remote_preview_head(&session_id, blocks)
         }
@@ -260,6 +268,34 @@ mod tests {
             RemoteServerCommand::EnsureManagedCli {
                 tool: ManagedCliTool::CodexLiteLlm,
             }
+        );
+    }
+
+    #[test]
+    fn parse_local_codex_identities_command() {
+        let args = vec![
+            "server".to_string(),
+            "remote".to_string(),
+            "local-codex-identities".to_string(),
+        ];
+        let command = parse_remote_server_command(&args)
+            .expect("parse command")
+            .expect("remote command");
+        assert_eq!(command, RemoteServerCommand::LocalCodexIdentities);
+    }
+
+    #[test]
+    fn parse_local_codex_identities_rejects_extra_args() {
+        let args = vec![
+            "server".to_string(),
+            "remote".to_string(),
+            "local-codex-identities".to_string(),
+            "unexpected".to_string(),
+        ];
+        assert!(
+            parse_remote_server_command(&args)
+                .expect("parse command")
+                .is_none()
         );
     }
 
