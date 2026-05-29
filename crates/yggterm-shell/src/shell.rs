@@ -3126,11 +3126,15 @@ impl ShellState {
                 current_millis().saturating_add(RETAINED_FAULT_RECOVERY_LATCH_GRACE_MS),
             );
         }
-        // Arm the RetainedFaultRecoveryLoop gate on the FIRST RFR attempt
-        // for this session. Subsequent RFR attempts within the same loop
-        // share the original arm timestamp — we measure end-to-end user
-        // gated time, not per-attempt latency.
-        if source == "retained_fault_recovery" {
+        // Arm the RetainedFaultRecoveryLoop gate. A non-RFR open is the
+        // start of a fresh user-felt loop, so when the next RFR attempt
+        // comes in we want to measure from THIS open, not from some prior
+        // session's first attempt hours ago. Strategy: reset the arm on
+        // any non-RFR open; arm on the first RFR attempt after that.
+        if source != "retained_fault_recovery" {
+            self.retained_fault_recovery_loop_armed_at_ms
+                .remove(session_path);
+        } else {
             self.retained_fault_recovery_loop_armed_at_ms
                 .entry(session_path.to_string())
                 .or_insert_with(current_millis);
