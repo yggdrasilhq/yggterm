@@ -417,6 +417,10 @@ fn passive_title_hint_can_update(current_title: &str, title_hint: &str, was_miss
         )
 }
 
+fn is_local_claude_code_storage_session_path(path: &str) -> bool {
+    path.contains("/.claude/projects/") && path.ends_with(".jsonl")
+}
+
 fn is_local_codex_storage_session_path(path: &str) -> bool {
     path.contains("/.codex/sessions/") || path.contains("/.codex-litellm/sessions/")
 }
@@ -432,6 +436,25 @@ fn normalize_proc_fd_target_path(path: &Path) -> Option<PathBuf> {
     }
     let normalized = PathBuf::from(trimmed);
     (normalized.extension().and_then(|ext| ext.to_str()) == Some("jsonl")).then_some(normalized)
+}
+
+/// Per AGENTS.md "saved-session identity should use the real Codex session id
+/// from the open transcript when available." Same applies to Claude Code:
+/// when a `claude` process is running with `~/.claude/projects/<encoded-cwd>/
+/// <session-id>.jsonl` open, the basename IS the real Claude Code session
+/// identity. Walking the process tree FDs lets us discover that ID and rebind
+/// the live-session row away from the synthetic UUIDv4 that
+/// `start_local_session` allocated.
+fn normalize_proc_fd_target_path_for_claude_code(path: &Path) -> Option<PathBuf> {
+    let raw = path.to_string_lossy();
+    let trimmed = raw
+        .strip_suffix(" (deleted)")
+        .unwrap_or(raw.as_ref())
+        .trim();
+    if !is_local_claude_code_storage_session_path(trimmed) {
+        return None;
+    }
+    Some(PathBuf::from(trimmed))
 }
 
 #[cfg(target_os = "linux")]
@@ -961,11 +984,67 @@ fn codex_storage_path_from_process_fds(pid: u32) -> Option<PathBuf> {
     candidates.into_iter().next()
 }
 
+fn claude_code_storage_path_from_process_fds(pid: u32) -> Option<PathBuf> {
+    let Ok(entries) = fs::read_dir(format!("/proc/{pid}/fd")) else {
+        return None;
+    };
+    let mut candidates = entries
+        .flatten()
+        .filter_map(|entry| fs::read_link(entry.path()).ok())
+        .filter_map(|target| normalize_proc_fd_target_path_for_claude_code(&target))
+        .collect::<Vec<_>>();
+    candidates.sort();
+    candidates.into_iter().next()
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CodexRuntimeProcessIdentity {
     pub storage_path: PathBuf,
     pub session_id: String,
     pub cwd: String,
+}
+
+/// Mirrors `CodexRuntimeProcessIdentity` for Claude Code. AGENTS.md spec
+/// "saved-session identity should use the real Codex session id from the
+/// open transcript when available" — same principle for Claude Code:
+/// the basename of the open `~/.claude/projects/<encoded-cwd>/<id>.jsonl`
+/// IS the real Claude Code session id.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ClaudeCodeRuntimeProcessIdentity {
+    pub storage_path: PathBuf,
+    pub session_id: String,
+    pub cwd: String,
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn claude_code_runtime_process_identity_from_root_pid(
+    root_pid: u32,
+) -> Option<ClaudeCodeRuntimeProcessIdentity> {
+    let mut queue = VecDeque::from([root_pid]);
+    let mut seen = HashSet::new();
+    while let Some(pid) = queue.pop_front() {
+        if !seen.insert(pid) {
+            continue;
+        }
+        if let Some(storage_path) = claude_code_storage_path_from_process_fds(pid)
+            && let Ok(Some((session_id, cwd))) = read_cc_session_identity_fields(&storage_path)
+        {
+            return Some(ClaudeCodeRuntimeProcessIdentity {
+                storage_path,
+                session_id,
+                cwd,
+            });
+        }
+        queue.extend(linux_proc_child_pids(pid));
+    }
+    None
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn claude_code_runtime_process_identity_from_root_pid(
+    _root_pid: u32,
+) -> Option<ClaudeCodeRuntimeProcessIdentity> {
+    None
 }
 
 #[cfg(target_os = "linux")]
@@ -1048,6 +1127,36 @@ pub(crate) fn overlay_codex_runtime_snapshot_identity(
             .filter(|value| !value.trim().is_empty() && !looks_like_generated_fallback_title(value))
             .unwrap_or_else(|| short_session_id(&identity.session_id));
         session.title = title;
+    }
+}
+
+pub(crate) fn overlay_claude_code_runtime_managed_identity(
+    session: &mut ManagedSessionView,
+    identity: &ClaudeCodeRuntimeProcessIdentity,
+) {
+    if session.kind != SessionKind::ClaudeCode {
+        return;
+    }
+    let runtime_key = session.session_path.clone();
+    let title_was_generated = session.title.trim().is_empty()
+        || looks_like_generated_fallback_title(&session.title);
+    session.id = identity.session_id.clone();
+    upsert_session_metadata(
+        &mut session.metadata,
+        "Storage",
+        identity.storage_path.display().to_string(),
+    );
+    upsert_session_metadata(
+        &mut session.metadata,
+        "Claude Code Session",
+        identity.session_id.clone(),
+    );
+    upsert_session_metadata(&mut session.metadata, "Runtime Session", runtime_key);
+    if !identity.cwd.trim().is_empty() {
+        upsert_session_metadata(&mut session.metadata, "Cwd", identity.cwd.clone());
+    }
+    if title_was_generated {
+        session.title = short_session_id(&identity.session_id);
     }
 }
 
@@ -2932,6 +3041,51 @@ impl YggtermServer {
                     .map(|_| key.clone())
             })
             .collect()
+    }
+
+    pub(crate) fn live_claude_code_session_keys_for_runtime_identity(&self) -> Vec<String> {
+        self.live_session_order
+            .iter()
+            .filter_map(|key| {
+                self.sessions
+                    .get(key)
+                    .filter(|session| {
+                        session.kind == SessionKind::ClaudeCode
+                            && managed_session_is_live_runtime_session(key, session)
+                    })
+                    .map(|_| key.clone())
+            })
+            .collect()
+    }
+
+    /// Mirrors `apply_codex_runtime_identity_to_live_session` for Claude Code.
+    /// Closes the same UUIDv4-vs-real-session-id drift the codex rebind
+    /// addresses, applied to local CC sessions whose `~/.claude/projects/...`
+    /// JSONL was discovered by walking the live PTY's process tree.
+    pub(crate) fn apply_claude_code_runtime_identity_to_live_session(
+        &mut self,
+        key_or_path: &str,
+        identity: &ClaudeCodeRuntimeProcessIdentity,
+    ) -> bool {
+        let Some(key) = self
+            .resolve_session_storage_key(key_or_path)
+            .map(str::to_string)
+        else {
+            return false;
+        };
+        let Some(session) = self.sessions.get_mut(&key) else {
+            return false;
+        };
+        if session.kind != SessionKind::ClaudeCode
+            || !matches!(
+                session.source,
+                SessionSource::LiveLocal | SessionSource::LiveSsh
+            )
+        {
+            return false;
+        }
+        overlay_claude_code_runtime_managed_identity(session, identity);
+        true
     }
 
     pub(crate) fn apply_codex_runtime_identity_to_live_session(
