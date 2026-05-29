@@ -26,6 +26,19 @@ pub(crate) enum GateKind {
     /// lost-PTY latch (`latch_retained_fault_recovery_lost_pty`). Measures
     /// "how long was the user stuck looking at a recovering surface."
     RetainedFaultRecoveryLoop,
+    /// HOT-tier switch latency per [[spec-xterm-gating-ux]] 3-tier model:
+    /// arms when the user clicks a session whose daemon already owns the PTY
+    /// (i.e. `owned_terminal_session_keys` contains the runtime key), clears
+    /// on `mark_terminal_open_attempt_ready_for_session`. p50 here is the
+    /// number the user reads to see how close we are to VSCode-tab feel.
+    /// Distinct from RetainedFaultRecoveryLoop, which mixes hot and cold.
+    HotSessionSwitch,
+    /// COLD-tier switch latency — same lifecycle as HotSessionSwitch but
+    /// for opens where the daemon does NOT own the PTY at click time. This
+    /// is the path that runs SSH+codex resume from scratch and is the slow
+    /// case. Separating the histograms makes the gain from HOT pre-warming
+    /// observable instead of buried in a mixed average.
+    ColdSessionSwitch,
 }
 
 impl GateKind {
@@ -33,6 +46,8 @@ impl GateKind {
         match self {
             GateKind::RetainedRehydrateDaemonReadyWait => "retained_rehydrate_daemon_ready_wait",
             GateKind::RetainedFaultRecoveryLoop => "retained_fault_recovery_loop",
+            GateKind::HotSessionSwitch => "hot_session_switch",
+            GateKind::ColdSessionSwitch => "cold_session_switch",
         }
     }
 }
