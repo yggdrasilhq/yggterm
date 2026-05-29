@@ -3537,6 +3537,7 @@ impl ShellState {
         let mut clear_resume_notification_for = None::<String>;
         let mut deferred_event = None::<(&'static str, TerminalOpenAttempt, Value)>;
         let mut should_return_early = false;
+        let mut fire_dead_session_toast_for = None::<String>;
         let ready = viewport
             .get("ready")
             .and_then(Value::as_bool)
@@ -3641,6 +3642,20 @@ impl ShellState {
             };
             attempt.observations = attempt.observations.saturating_add(1);
             attempt.last_observed_ready = ready;
+            // Edge-trigger the dead-session clarifier toast the first time the
+            // surface reports the saved Codex session is gone from the remote
+            // machine. Firing here is deterministic and independent of the
+            // 1.2s slow / 60s fail timers, which the fast-fail case races past
+            // (issue #16). A fresh remount registers a new attempt with an
+            // empty last_surface_problem, so re-entering a dead session
+            // re-fires exactly once per attempt — no per-poll flicker.
+            let was_codex_dead = surface_problem_is_codex_session_gone(
+                attempt.last_surface_problem.as_deref(),
+            );
+            let now_codex_dead = surface_problem_is_codex_session_gone(surface_problem.as_deref());
+            if now_codex_dead && !was_codex_dead {
+                fire_dead_session_toast_for = Some(attempt.session_path.clone());
+            }
             attempt.last_observed_reason = reason.clone();
             attempt.last_surface_problem = surface_problem.clone();
             attempt.last_overlay_visible = overlay_visible;
@@ -3766,9 +3781,37 @@ impl ShellState {
             self.terminal_attach_in_flight.remove(&session_path);
             self.maybe_finish_terminal_surface_request_for_session(&session_path);
         }
+        if let Some(session_path) = fire_dead_session_toast_for {
+            self.emit_codex_session_gone_toast(&session_path);
+        }
         if should_return_early {
             return;
         }
+    }
+    /// Surface the actionable "Session No Longer On Remote" clarifier toast for
+    /// a saved Codex session the remote machine has removed. Single owner of the
+    /// dead-session toast content so the synchronous detection path and the
+    /// slow/fail timer fallbacks all render identical copy (issue #16).
+    fn emit_codex_session_gone_toast(&mut self, session_path: &str) {
+        let host_label = self
+            .server
+            .live_sessions()
+            .iter()
+            .find(|session| session.session_path == session_path)
+            .map(|session| session.host_label.clone())
+            .filter(|label| !label.trim().is_empty())
+            .unwrap_or_else(|| "the remote machine".to_string());
+        let job_key = terminal_resume_notification_job_key(session_path);
+        self.upsert_job_notification(
+            job_key,
+            NotificationTone::Info,
+            "Session No Longer On Remote",
+            format!(
+                "The saved Codex session on {host_label} has been removed from that machine. Right-click the row in the sidebar → Delete Item to clear it.",
+            ),
+            None,
+            false,
+        );
     }
     fn fail_terminal_open_attempt_for_request(&mut self, request_id: &str, reason: String) {
         let Some(attempt) = self
@@ -3830,9 +3873,8 @@ impl ShellState {
         let problem = attempt
             .last_surface_problem
             .as_deref()
-            .or(attempt.last_observed_reason.as_deref())
-            .unwrap_or("");
-        problem.contains("Codex session no longer on remote machine")
+            .or(attempt.last_observed_reason.as_deref());
+        surface_problem_is_codex_session_gone(problem)
     }
     fn defer_remote_terminal_resume_timeout_after_recent_progress(
         &mut self,
@@ -5483,6 +5525,15 @@ impl ShellState {
     fn terminal_session_resume_notification_should_stay_visible(&self, session_path: &str) -> bool {
         if self.terminal_session_has_ready_attempt(session_path) {
             return false;
+        }
+        // A saved Codex session that the remote machine has removed is a
+        // terminal, actionable state: the "Session No Longer On Remote" toast
+        // must stay visible so the user sees how to clear the dead row. The
+        // wrapper's error text otherwise counts as "meaningful resume output"
+        // below and silently suppresses the clarifier — the fast-fail gap that
+        // made all three timer/transport-error sites no-op (issue #16).
+        if self.terminal_session_codex_no_longer_on_remote(session_path) {
+            return true;
         }
         // Per [[spec-xterm-gating-ux]]: when retained_fault_recovery is latched
         // because the PTY is gone, the user-facing toast must NOT keep
@@ -7802,6 +7853,13 @@ fn safe_finish_job_notification(
 }
 fn terminal_resume_notification_job_key(session_path: &str) -> String {
     format!("terminal-resume:{session_path}")
+}
+/// Single owner of the "saved Codex session removed from the remote machine"
+/// surface-problem marker (emitted by terminal_observe). Both the synchronous
+/// edge-triggered toast in the viewport observer and `terminal_session_codex_no_longer_on_remote`
+/// classify against this so the detection can never drift between callsites.
+fn surface_problem_is_codex_session_gone(surface_problem: Option<&str>) -> bool {
+    surface_problem.is_some_and(|problem| problem.contains("Codex session no longer on remote machine"))
 }
 fn terminal_resume_notification_session_path(job_key: &str) -> Option<&str> {
     job_key.strip_prefix("terminal-resume:")
@@ -85217,6 +85275,107 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         assert_eq!(attempt.observations, 1);
         assert!(attempt.last_observed_ready);
         assert!(attempt.last_observed_reason.is_none());
+    }
+    #[test]
+    fn codex_session_gone_surface_fires_clarifier_toast_synchronously() {
+        // Issue #16: when the wrapper reports the saved Codex session is gone
+        // from the remote machine, the actionable "Session No Longer On Remote"
+        // toast must surface on the first observation — not depend on the 1.2s
+        // slow / 60s fail timers that the fast-fail case races past.
+        let active_session_path = "remote-session://dev/dead-codex";
+        let bootstrap = test_shell_bootstrap_with_active_session(active_session_path);
+        let mut shell = ShellState::new(bootstrap);
+        shell.settings.in_app_notifications = true;
+        shell.server_busy = false;
+        shell.server.set_view_mode(WorkspaceViewMode::Terminal);
+        shell.begin_terminal_open_attempt(active_session_path, "request:test", 1, "open_row");
+
+        let dead_viewport = json!({
+            "active_session_path": active_session_path,
+            "active_view_mode": "Terminal",
+            "ready": false,
+            "interactive": false,
+            "terminal_settled_kind": null,
+            "reason": null,
+            "terminal_resume_overlay": {
+                "visible": false,
+                "phase": "hidden",
+                "kind": "",
+                "text_sample": "",
+            },
+            "active_terminal_surface": {
+                "problem": "active terminal host shows: saved Codex session no longer on remote machine",
+            },
+        });
+        shell.observe_terminal_open_attempt_from_viewport(&dead_viewport);
+
+        let dead_toasts = shell
+            .notifications
+            .iter()
+            .filter(|toast| toast.title == "Session No Longer On Remote")
+            .count();
+        assert_eq!(
+            dead_toasts, 1,
+            "dead-session clarifier toast should fire on first observation"
+        );
+        assert!(
+            shell.terminal_session_codex_no_longer_on_remote(active_session_path),
+            "attempt should be classified as gone-from-remote"
+        );
+        assert!(
+            shell.terminal_session_resume_notification_should_stay_visible(active_session_path),
+            "dead-session toast must not be suppressed as a settled resume surface"
+        );
+
+        // Re-observing the same dead surface must not duplicate the toast
+        // (edge-triggered once per attempt; no per-poll flicker).
+        shell.observe_terminal_open_attempt_from_viewport(&dead_viewport);
+        let dead_toasts_after = shell
+            .notifications
+            .iter()
+            .filter(|toast| toast.title == "Session No Longer On Remote")
+            .count();
+        assert_eq!(
+            dead_toasts_after, 1,
+            "repeated dead-session observations must not stack toasts"
+        );
+    }
+    #[test]
+    fn healthy_recovering_surface_does_not_fire_dead_session_toast() {
+        let active_session_path = "remote-session://dev/recovering-codex";
+        let bootstrap = test_shell_bootstrap_with_active_session(active_session_path);
+        let mut shell = ShellState::new(bootstrap);
+        shell.settings.in_app_notifications = true;
+        shell.server_busy = false;
+        shell.server.set_view_mode(WorkspaceViewMode::Terminal);
+        shell.begin_terminal_open_attempt(active_session_path, "request:test", 1, "open_row");
+
+        shell.observe_terminal_open_attempt_from_viewport(&json!({
+            "active_session_path": active_session_path,
+            "active_view_mode": "Terminal",
+            "ready": false,
+            "interactive": false,
+            "terminal_settled_kind": null,
+            "reason": null,
+            "terminal_resume_overlay": {
+                "visible": true,
+                "phase": "recovering",
+                "kind": "chip",
+                "text_sample": "",
+            },
+            "active_terminal_surface": {
+                "problem": "active terminal host is still showing resume placeholder content",
+            },
+        }));
+
+        assert!(
+            !shell
+                .notifications
+                .iter()
+                .any(|toast| toast.title == "Session No Longer On Remote"),
+            "a slow-but-healthy resume must not surface the dead-session clarifier"
+        );
+        assert!(!shell.terminal_session_codex_no_longer_on_remote(active_session_path));
     }
     #[test]
     fn ready_terminal_attempt_coerces_dom_timeout_viewport_to_degraded_visible() {
