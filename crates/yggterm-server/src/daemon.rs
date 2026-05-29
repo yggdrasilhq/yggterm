@@ -11,9 +11,9 @@ use crate::{
     claude_code_runtime_process_identity_from_root_pid,
     codex_runtime_process_identity_from_root_pid, current_millis, fetch_remote_generation_context,
     local_headless_companion_executable_from_current, overlay_codex_runtime_snapshot_identity,
-    persist_remote_generated_copy, remote_resume_runtime_output_requires_restart,
-    request_remote_codex_session_shutdown, spawn_hot_restart_daemon_process,
-    terminate_remote_codex_session,
+    persist_remote_generated_copy, poll_remote_local_codex_identities,
+    remote_resume_runtime_output_requires_restart, request_remote_codex_session_shutdown,
+    spawn_hot_restart_daemon_process, terminate_remote_codex_session,
 };
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -60,6 +60,15 @@ const REMOTE_START_CODEX_ATTACH_STARTUP_GRACE_MS: u64 = 18_000;
 const CLIENT_CLOSE_FORCE_SHUTDOWN_AFTER_SECS: u64 = 60 * 60;
 const EXPLICIT_REMOTE_SESSION_CLOSE_FORCE_AFTER_SECS: u64 = 2;
 const ENV_YGGTERM_ENABLE_BACKGROUND_COPY_CHORE: &str = "YGGTERM_ENABLE_BACKGROUND_COPY_CHORE";
+// Remote-Codex identity poll (`[[finding-uuidv4-codex-session-drift]]` Stage 2).
+const REMOTE_CODEX_IDENTITY_POLL_MS: u64 = 8_000;
+const REMOTE_CODEX_IDENTITY_POLL_MAX_IDLE_MS: u64 = 60_000;
+// A remote-Codex row that never matches a running process (codex already
+// exited, cwd mismatch) is abandoned after this many SSH polls so the daemon
+// does not SSH a machine forever for an un-rebindable row.
+const REMOTE_CODEX_IDENTITY_POLL_MAX_ATTEMPTS: u32 = 12;
+const ENV_YGGTERM_DISABLE_REMOTE_CODEX_IDENTITY_POLL: &str =
+    "YGGTERM_DISABLE_REMOTE_CODEX_IDENTITY_POLL";
 
 fn spawn_explicit_remote_session_shutdown(
     home: &Path,
@@ -5210,6 +5219,164 @@ fn run_background_copy_chore(runtime: &Arc<Mutex<DaemonRuntime>>) -> Result<usiz
     Ok(updates.len())
 }
 
+fn remote_codex_identity_poll_enabled() -> bool {
+    // Default ON; an explicit truthy disable env opts out.
+    !daemon_background_copy_chore_enabled_from_env(
+        std::env::var(ENV_YGGTERM_DISABLE_REMOTE_CODEX_IDENTITY_POLL)
+            .ok()
+            .as_deref(),
+    )
+}
+
+fn normalize_cwd_for_identity_match(cwd: &str) -> String {
+    let trimmed = cwd.trim().trim_end_matches('/');
+    if trimmed.is_empty() {
+        "/".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+/// Matches the Codex processes running on one machine to the live remote-Codex
+/// rows that need rebinding, pairing by normalized cwd. Pure (no IO) so the
+/// matching policy is unit-testable. A running identity is paired only when its
+/// real session id differs from the row's synthesized id and has not already
+/// been claimed by an earlier row at the same cwd, so two rows in the same cwd
+/// never collapse onto one transcript.
+fn match_codex_identities_to_targets(
+    group: &[crate::RemoteCodexIdentityPollTarget],
+    identities: &[crate::LocalAgentCliIdentity],
+) -> Vec<(String, CodexRuntimeProcessIdentity)> {
+    let mut by_cwd: HashMap<String, Vec<&crate::LocalAgentCliIdentity>> = HashMap::new();
+    for identity in identities.iter().filter(|identity| identity.kind == "codex") {
+        by_cwd
+            .entry(normalize_cwd_for_identity_match(&identity.cwd))
+            .or_default()
+            .push(identity);
+    }
+    let mut claimed: HashSet<String> = HashSet::new();
+    let mut rebinds = Vec::new();
+    for target in group {
+        let Some(candidates) = by_cwd.get(&normalize_cwd_for_identity_match(&target.cwd)) else {
+            continue;
+        };
+        let Some(identity) = candidates.iter().find(|identity| {
+            identity.session_id != target.current_id && !claimed.contains(&identity.session_id)
+        }) else {
+            continue;
+        };
+        claimed.insert(identity.session_id.clone());
+        rebinds.push((
+            target.key.clone(),
+            CodexRuntimeProcessIdentity {
+                storage_path: PathBuf::from(&identity.storage_path),
+                session_id: identity.session_id.clone(),
+                cwd: identity.cwd.clone(),
+            },
+        ));
+    }
+    rebinds
+}
+
+/// One tick of the remote-Codex identity poll
+/// (`[[finding-uuidv4-codex-session-drift]]` Stage 2). For each live remote
+/// Codex row still carrying a synthesized UUIDv4 id, SSH-queries the owning
+/// machine for its running Codex processes, matches by cwd, and rebinds the row
+/// to the real CLI session id through the same SSOT path the local rebind uses
+/// (`apply_codex_runtime_identity_to_live_session`). Self-limiting: a row drops
+/// out as soon as it is rebound, and `attempts` abandons rows that never match.
+/// Returns the number of rows rebound this tick.
+fn run_remote_codex_identity_poll_chore(
+    runtime: &Arc<Mutex<DaemonRuntime>>,
+    attempts: &mut HashMap<String, u32>,
+) -> Result<usize> {
+    let (targets, yggterm_home) = {
+        let runtime = lock_daemon_runtime(runtime, "remote_codex_identity_poll_read");
+        (
+            runtime
+                .server
+                .live_remote_codex_sessions_needing_identity_poll(),
+            resolve_yggterm_home().ok(),
+        )
+    };
+
+    // Forget attempt counters for rows that no longer need polling.
+    let live_keys: HashSet<String> = targets.iter().map(|target| target.key.clone()).collect();
+    attempts.retain(|key, _| live_keys.contains(key));
+
+    // Skip rows that have exhausted their attempt budget (un-rebindable).
+    let targets: Vec<crate::RemoteCodexIdentityPollTarget> = targets
+        .into_iter()
+        .filter(|target| {
+            attempts.get(&target.key).copied().unwrap_or(0)
+                < REMOTE_CODEX_IDENTITY_POLL_MAX_ATTEMPTS
+        })
+        .collect();
+    if targets.is_empty() {
+        return Ok(0);
+    }
+
+    // Query each machine once.
+    let mut machines: HashMap<(String, Option<String>), Vec<crate::RemoteCodexIdentityPollTarget>> =
+        HashMap::new();
+    for target in targets {
+        machines
+            .entry((target.ssh_target.clone(), target.ssh_prefix.clone()))
+            .or_default()
+            .push(target);
+    }
+
+    let mut rebinds: Vec<(String, CodexRuntimeProcessIdentity)> = Vec::new();
+    for ((ssh_target, ssh_prefix), group) in &machines {
+        // Count the attempt for every row we are about to poll, regardless of outcome.
+        for target in group {
+            *attempts.entry(target.key.clone()).or_insert(0) += 1;
+        }
+        let identities =
+            match poll_remote_local_codex_identities(ssh_target, ssh_prefix.as_deref()) {
+                Ok(identities) => identities,
+                Err(error) => {
+                    warn!(ssh_target = %ssh_target, error = %error, "remote codex identity poll failed");
+                    continue;
+                }
+            };
+        rebinds.extend(match_codex_identities_to_targets(group, &identities));
+    }
+
+    if rebinds.is_empty() {
+        return Ok(0);
+    }
+
+    let mut applied = 0usize;
+    let mut runtime = lock_daemon_runtime(runtime, "remote_codex_identity_poll_apply");
+    for (key, identity) in &rebinds {
+        if runtime.server.apply_codex_runtime_identity_to_live_session(
+            key,
+            identity,
+            yggterm_home.as_deref(),
+        ) {
+            applied += 1;
+            attempts.remove(key);
+            append_trace_event(
+                runtime.store.home_dir(),
+                "daemon",
+                "persistence",
+                "remote_codex_runtime_identity_refreshed",
+                serde_json::json!({
+                    "session_path": key,
+                    "codex_session_id": identity.session_id,
+                    "storage_path": identity.storage_path.display().to_string(),
+                    "cwd": identity.cwd,
+                }),
+            );
+        }
+    }
+    if applied > 0 {
+        runtime.persist()?;
+    }
+    Ok(applied)
+}
+
 fn daemon_background_copy_chore_enabled_from_env(value: Option<&str>) -> bool {
     value.is_some_and(|value| {
         matches!(
@@ -6772,6 +6939,42 @@ pub fn run_daemon(endpoint: &ServerEndpoint, runtime: GhosttyHostSupport) -> Res
             "disabled",
             serde_json::json!({
                 "env": ENV_YGGTERM_ENABLE_BACKGROUND_COPY_CHORE,
+            }),
+        );
+    }
+    if remote_codex_identity_poll_enabled() {
+        let runtime = runtime.clone();
+        let last_activity_ms = last_activity_ms.clone();
+        std::thread::spawn(move || {
+            let mut attempts: HashMap<String, u32> = HashMap::new();
+            let mut sleep_ms = REMOTE_CODEX_IDENTITY_POLL_MS;
+            loop {
+                std::thread::sleep(std::time::Duration::from_millis(sleep_ms));
+                match run_remote_codex_identity_poll_chore(&runtime, &mut attempts) {
+                    Ok(rebinds) if rebinds > 0 => {
+                        mark_daemon_activity(&last_activity_ms);
+                        sleep_ms = REMOTE_CODEX_IDENTITY_POLL_MS;
+                    }
+                    Ok(_) => {
+                        sleep_ms = (sleep_ms.saturating_mul(2))
+                            .min(REMOTE_CODEX_IDENTITY_POLL_MAX_IDLE_MS);
+                    }
+                    Err(error) => {
+                        sleep_ms = (sleep_ms.saturating_mul(2))
+                            .min(REMOTE_CODEX_IDENTITY_POLL_MAX_IDLE_MS);
+                        warn!(error = %error, "daemon remote codex identity poll chore failed");
+                    }
+                }
+            }
+        });
+    } else {
+        append_trace_event(
+            &home_dir,
+            "daemon",
+            "remote_codex_identity_poll",
+            "disabled",
+            serde_json::json!({
+                "env": ENV_YGGTERM_DISABLE_REMOTE_CODEX_IDENTITY_POLL,
             }),
         );
     }
@@ -8401,6 +8604,112 @@ mod tests {
     use super::orphan_daemon_reap_applies_to_home;
     use super::terminal_launch_command_for_path;
     use super::write_persisted_state;
+    use super::{match_codex_identities_to_targets, normalize_cwd_for_identity_match};
+    use crate::{LocalAgentCliIdentity, RemoteCodexIdentityPollTarget};
+
+    fn poll_target(key: &str, cwd: &str, current_id: &str) -> RemoteCodexIdentityPollTarget {
+        RemoteCodexIdentityPollTarget {
+            key: key.to_string(),
+            ssh_target: "jojo".to_string(),
+            ssh_prefix: None,
+            cwd: cwd.to_string(),
+            current_id: current_id.to_string(),
+        }
+    }
+
+    fn codex_identity(session_id: &str, cwd: &str) -> LocalAgentCliIdentity {
+        LocalAgentCliIdentity {
+            kind: "codex".to_string(),
+            session_id: session_id.to_string(),
+            cwd: cwd.to_string(),
+            storage_path: format!("/home/pi/.codex/sessions/{session_id}.jsonl"),
+        }
+    }
+
+    #[test]
+    fn match_codex_identities_rebinds_uuidv4_row_to_running_transcript() {
+        let synth = "11111111-2222-4333-8444-555555555555";
+        let real = "019ce5d8-c94c-7b62-ae19-3818ae400b65";
+        let targets = vec![poll_target("codex-runtime://abc", "/home/pi", synth)];
+        let identities = vec![codex_identity(real, "/home/pi")];
+        let rebinds = match_codex_identities_to_targets(&targets, &identities);
+        assert_eq!(rebinds.len(), 1);
+        assert_eq!(rebinds[0].0, "codex-runtime://abc");
+        assert_eq!(rebinds[0].1.session_id, real);
+    }
+
+    #[test]
+    fn match_codex_identities_ignores_trailing_slash_cwd_difference() {
+        let targets = vec![poll_target(
+            "k",
+            "/home/pi/proj/",
+            "11111111-2222-4333-8444-555555555555",
+        )];
+        let identities = vec![codex_identity("019aaaaa-bbbb-cccc-dddd-eeeeeeeeeeee", "/home/pi/proj")];
+        assert_eq!(match_codex_identities_to_targets(&targets, &identities).len(), 1);
+    }
+
+    #[test]
+    fn match_codex_identities_skips_when_id_already_matches() {
+        let id = "019ce5d8-c94c-7b62-ae19-3818ae400b65";
+        // Row already carries the real id — nothing to rebind.
+        let targets = vec![poll_target("k", "/home/pi", id)];
+        let identities = vec![codex_identity(id, "/home/pi")];
+        assert!(match_codex_identities_to_targets(&targets, &identities).is_empty());
+    }
+
+    #[test]
+    fn match_codex_identities_does_not_collapse_two_rows_onto_one_transcript() {
+        // Two synthesized rows at the same cwd, two running transcripts: each
+        // row must claim a distinct transcript, never the same one twice.
+        let targets = vec![
+            poll_target("k1", "/home/pi", "11111111-1111-4111-8111-111111111111"),
+            poll_target("k2", "/home/pi", "22222222-2222-4222-8222-222222222222"),
+        ];
+        let identities = vec![
+            codex_identity("019aaaaaaaaa-aaaa-aaaa-aaaaaaaaaaaa", "/home/pi"),
+            codex_identity("019bbbbbbbbb-bbbb-bbbb-bbbbbbbbbbbb", "/home/pi"),
+        ];
+        let rebinds = match_codex_identities_to_targets(&targets, &identities);
+        assert_eq!(rebinds.len(), 2);
+        let bound: HashSet<String> = rebinds.iter().map(|(_, id)| id.session_id.clone()).collect();
+        assert_eq!(bound.len(), 2, "two rows must bind to two distinct transcripts");
+    }
+
+    #[test]
+    fn match_codex_identities_skips_when_cwd_has_no_running_codex() {
+        let targets = vec![poll_target(
+            "k",
+            "/home/pi/other",
+            "11111111-2222-4333-8444-555555555555",
+        )];
+        let identities = vec![codex_identity("019aaaaaaaaa-aaaa-aaaa-aaaaaaaaaaaa", "/home/pi")];
+        assert!(match_codex_identities_to_targets(&targets, &identities).is_empty());
+    }
+
+    #[test]
+    fn match_codex_identities_ignores_claude_code_kind() {
+        let targets = vec![poll_target(
+            "k",
+            "/home/pi",
+            "11111111-2222-4333-8444-555555555555",
+        )];
+        let identities = vec![LocalAgentCliIdentity {
+            kind: "claude_code".to_string(),
+            session_id: "019aaaaaaaaa-aaaa-aaaa-aaaaaaaaaaaa".to_string(),
+            cwd: "/home/pi".to_string(),
+            storage_path: "/home/pi/.claude/projects/x/y.jsonl".to_string(),
+        }];
+        assert!(match_codex_identities_to_targets(&targets, &identities).is_empty());
+    }
+
+    #[test]
+    fn normalize_cwd_match_handles_root_and_trailing_slashes() {
+        assert_eq!(normalize_cwd_for_identity_match("/home/pi/"), "/home/pi");
+        assert_eq!(normalize_cwd_for_identity_match("  /home/pi  "), "/home/pi");
+        assert_eq!(normalize_cwd_for_identity_match("/"), "/");
+        assert_eq!(normalize_cwd_for_identity_match(""), "/");
+    }
     use super::{
         REMOTE_ATTACH_STARTUP_GRACE_MS, REMOTE_START_CODEX_ATTACH_STARTUP_GRACE_MS,
         remote_resume_saved_session_mismatch_requires_restart, remote_resume_stale_attach,
