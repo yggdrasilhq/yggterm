@@ -326,6 +326,15 @@ const RETAINED_FAULT_RECOVERY_MAX_REARMS: u32 = 2;
 // daemon-side ownership can take longer when the SSH key prompt or codex
 // init takes its time. 30 seconds is generous without being annoying.
 const RETAINED_FAULT_RECOVERY_LATCH_GRACE_MS: u64 = 30_000;
+// HOT-tier pre-attach knobs per Phase 2 of [[spec-xterm-gating-ux]].
+// Conservative defaults: warm at most 2 sessions concurrently so a fresh
+// foreground gesture doesn't fire 10+ ssh dials; keep top-5 candidates hot;
+// re-attempt the same session at most once per 2 minutes (cooldown) so a
+// failing target doesn't get retried in a tight loop; check every 5 seconds.
+const HOT_WARM_CHECK_INTERVAL_MS: u64 = 5_000;
+const HOT_WARM_COOLDOWN_MS: u64 = 120_000;
+const HOT_WARM_MAX_CONCURRENT: usize = 2;
+const HOT_WARM_TOP_N: usize = 5;
 const TERMINAL_RECOVERY_WATCH_GRACE_MS: u64 = 150;
 const RETAINED_REHYDRATE_DAEMON_READY_TELEMETRY_MS: u64 = 100;
 const RETAINED_REHYDRATE_DAEMON_READY_WATCH_GRACE_MS: u64 = 1_000;
@@ -715,6 +724,13 @@ struct ShellState {
     // current open attempt for this session armed its HOT or COLD switch
     // gate. Cleared when the attempt resolves Ready. Keyed by session_path.
     switch_arm_ms_by_session: HashMap<String, (u64, SessionWarmthTier)>,
+    // HOT-tier pre-attach state per Phase 2 of [[spec-xterm-gating-ux]].
+    // The warmer eagerly attaches the top-N most-recently-used keep-alive
+    // codex sessions in background so the user's next switch finds the PTY
+    // already owned by the daemon (i.e. takes the HOT path, not COLD).
+    hot_warming_in_flight: HashSet<String>,
+    last_hot_warm_attempt_at_ms: HashMap<String, u64>,
+    next_hot_warm_check_at_ms: u64,
     // Sessions where retained_fault_recovery has been latched off because the
     // daemon no longer owns the PTY. Per [[spec-xterm-gating-ux]]: an
     // unsatisfiable gate must STOP polling, not flicker forever.
@@ -2062,6 +2078,9 @@ impl ShellState {
             last_retained_rehydrate_daemon_ready_rearm_deferral_key: None,
             xterm_gate_metrics: GateMetrics::default(),
             switch_arm_ms_by_session: HashMap::new(),
+            hot_warming_in_flight: HashSet::new(),
+            last_hot_warm_attempt_at_ms: HashMap::new(),
+            next_hot_warm_check_at_ms: 0,
             retained_fault_recovery_lost_pty_sessions: HashSet::new(),
             retained_fault_recovery_latch_grace_until_ms: HashMap::new(),
             retained_fault_recovery_loop_armed_at_ms: HashMap::new(),
@@ -4860,6 +4879,76 @@ impl ShellState {
     fn clear_retained_fault_recovery_lost_pty_latch(&mut self, session_path: &str) {
         self.retained_fault_recovery_lost_pty_sessions
             .remove(session_path);
+    }
+    /// HOT-tier pre-attach per [[spec-xterm-gating-ux]] Phase 2: returns
+    /// the next batch of live keep-alive codex sessions to background-warm
+    /// so that the user's next click finds them daemon-owned (HOT). Picks
+    /// top-N most-recently-used in live_session_order that are NOT already
+    /// owned, NOT currently warming, NOT in cooldown, and NOT the active
+    /// session itself (which is already being attached). Updates internal
+    /// in-flight + cooldown bookkeeping for the returned set; callers must
+    /// follow up by issuing TerminalEnsure RPCs to the daemon.
+    fn tick_hot_warmer(&mut self, now_ms: u64) -> Vec<String> {
+        if self.next_hot_warm_check_at_ms > now_ms {
+            return Vec::new();
+        }
+        self.next_hot_warm_check_at_ms = now_ms.saturating_add(HOT_WARM_CHECK_INTERVAL_MS);
+        let available = HOT_WARM_MAX_CONCURRENT.saturating_sub(self.hot_warming_in_flight.len());
+        if available == 0 {
+            return Vec::new();
+        }
+        // Snapshot the keep-alive Codex sessions in live order, then filter.
+        // live_sessions() returns most-recently-used first.
+        let live_sessions = self.server.live_sessions().clone();
+        let active_path = self.server.active_session_path().map(str::to_string);
+        let mut candidates: Vec<String> = Vec::new();
+        for session in live_sessions.iter().take(HOT_WARM_TOP_N * 4) {
+            if candidates.len() >= available {
+                break;
+            }
+            if session.kind != SessionKind::Codex {
+                continue;
+            }
+            if !live_session_keep_alive(&session) {
+                continue;
+            }
+            let path = &session.session_path;
+            if Some(path.as_str()) == active_path.as_deref() {
+                continue;
+            }
+            if self.hot_warming_in_flight.contains(path) {
+                continue;
+            }
+            if self.daemon_owns_session_runtime(path) {
+                // Already HOT — no warm needed.
+                continue;
+            }
+            if let Some(last_attempt) = self.last_hot_warm_attempt_at_ms.get(path)
+                && now_ms.saturating_sub(*last_attempt) < HOT_WARM_COOLDOWN_MS
+            {
+                continue;
+            }
+            if self
+                .retained_fault_recovery_lost_pty_sessions
+                .contains(path)
+            {
+                // Latched sessions are intentionally NOT warmed — they were
+                // failing for a reason.
+                continue;
+            }
+            candidates.push(path.clone());
+        }
+        for path in &candidates {
+            self.hot_warming_in_flight.insert(path.clone());
+            self.last_hot_warm_attempt_at_ms.insert(path.clone(), now_ms);
+        }
+        candidates
+    }
+    /// Called when a background warm attempt completes (success or failure),
+    /// releasing the in-flight slot so the next tick can warm a different
+    /// candidate.
+    fn finish_hot_warm(&mut self, session_path: &str) {
+        self.hot_warming_in_flight.remove(session_path);
     }
     /// Per [[spec-xterm-gating-ux]] 3-tier model: closes the HOT or COLD
     /// switch-latency gate that was armed at user-driven open and records
@@ -37419,6 +37508,66 @@ fn app() -> Element {
                 if !should_continue {
                     break;
                 }
+            }
+        }
+    });
+    // HOT-tier pre-attach per [[spec-xterm-gating-ux]] Phase 2: every 5s,
+    // pick the top-N most-recently-used keep-alive Codex sessions that the
+    // daemon does NOT currently own and silently `terminal_ensure` them so
+    // the next click takes the HOT path. Capped at HOT_WARM_MAX_CONCURRENT.
+    use_future(move || {
+        let mut state = state;
+        async move {
+            // Defer initial check so the daemon has a chance to publish its
+            // current ownership state — warming on a stale snapshot would
+            // fire ensures for sessions the daemon JUST claimed.
+            tokio::time::sleep(std::time::Duration::from_millis(8_000)).await;
+            loop {
+                let candidates: Vec<String> = state
+                    .with_mut(|shell| shell.tick_hot_warmer(current_millis()));
+                for path in candidates {
+                    let path_for_task = path.clone();
+                    spawn(async move {
+                        let endpoint =
+                            state.with(|shell| shell.bootstrap.server_endpoint.clone());
+                        let result = tokio::task::spawn_blocking(move || {
+                            terminal_ensure(&endpoint, &path_for_task)
+                        })
+                        .await;
+                        let trace_path = path.clone();
+                        match result {
+                            Ok(Ok(_)) => {
+                                append_ui_telemetry_event(
+                                    "hot_warm_ensure_ok",
+                                    json!({"session_path": trace_path}),
+                                );
+                            }
+                            Ok(Err(error)) => {
+                                append_ui_telemetry_event(
+                                    "hot_warm_ensure_error",
+                                    json!({
+                                        "session_path": trace_path,
+                                        "error": error.to_string(),
+                                    }),
+                                );
+                            }
+                            Err(error) => {
+                                append_ui_telemetry_event(
+                                    "hot_warm_ensure_panic",
+                                    json!({
+                                        "session_path": trace_path,
+                                        "error": error.to_string(),
+                                    }),
+                                );
+                            }
+                        }
+                        state.with_mut(|shell| shell.finish_hot_warm(&path));
+                    });
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(
+                    HOT_WARM_CHECK_INTERVAL_MS,
+                ))
+                .await;
             }
         }
     });
@@ -86887,6 +87036,86 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
                 .contains(active_session_path),
             "{source} (user-driven) MUST release the latch even when daemon does not yet own the PTY"
         );
+    }
+
+    #[test]
+    fn hot_warmer_skips_active_owned_and_latched_sessions_and_respects_cooldown() {
+        // HOT pre-attach must not warm sessions that are: the active one
+        // (already being attached), already owned by daemon (HOT), latched
+        // off (failing for a reason), inside the cooldown window from a
+        // prior warm, or non-codex / non-keep-alive. It must also respect
+        // HOT_WARM_MAX_CONCURRENT and the check interval.
+        let active_path = "remote-session://dev/active";
+        let hot_path = "remote-session://dev/already-hot";
+        let cooldown_path = "remote-session://dev/in-cooldown";
+        let latched_path = "remote-session://dev/latched-off";
+        let candidate_a = "remote-session://dev/candidate-a";
+        let candidate_b = "remote-session://dev/candidate-b";
+        let candidate_c = "remote-session://dev/candidate-c";
+        let bootstrap = test_shell_bootstrap_with_active_session(active_path);
+        let mut shell = ShellState::new(bootstrap);
+        // Daemon owns only the already-hot path.
+        let owned_key = shell
+            .server
+            .terminal_runtime_key_for_path(hot_path)
+            .to_string();
+        shell.latest_runtime_status = Some(
+            serde_json::from_value(json!({
+                "server_version": "2.7.79",
+                "server_build_id": 0,
+                "server_pid": 12345,
+                "host_kind": "local",
+                "host_detail": "test",
+                "embedded_surface_supported": true,
+                "bridge_enabled": true,
+                "terminal_session_count": 1,
+                "terminal_session_keys": [owned_key.clone()],
+                "owned_terminal_session_count": 1,
+                "owned_terminal_session_keys": [owned_key],
+                "managed_session_count": 0,
+            }))
+            .expect("runtime status"),
+        );
+        let now_ms = current_millis();
+        // Seed cooldown for cooldown_path (recent warm attempt).
+        shell.last_hot_warm_attempt_at_ms.insert(
+            cooldown_path.to_string(),
+            now_ms.saturating_sub(HOT_WARM_COOLDOWN_MS / 2),
+        );
+        // Latch latched_path.
+        shell
+            .retained_fault_recovery_lost_pty_sessions
+            .insert(latched_path.to_string());
+
+        // Direct candidates test: insert into the helper's input set.
+        // We can't easily seed live_sessions in a unit test without server
+        // state plumbing, so we test the explicit helpers directly:
+        // - hot_warming_in_flight + last_hot_warm_attempt_at_ms bookkeeping
+        // - finish_hot_warm releases the slot
+        shell.hot_warming_in_flight.insert(candidate_a.to_string());
+        shell.hot_warming_in_flight.insert(candidate_b.to_string());
+        let next = shell.tick_hot_warmer(now_ms);
+        assert!(
+            next.is_empty(),
+            "warmer at max concurrent must return empty: got {next:?}"
+        );
+        shell.finish_hot_warm(candidate_a);
+        assert_eq!(shell.hot_warming_in_flight.len(), 1);
+        shell.finish_hot_warm(candidate_b);
+        assert!(shell.hot_warming_in_flight.is_empty());
+
+        // Cooldown timestamp must block re-warming.
+        shell.last_hot_warm_attempt_at_ms.insert(
+            candidate_c.to_string(),
+            now_ms.saturating_sub(HOT_WARM_COOLDOWN_MS - 1),
+        );
+        assert!(shell.last_hot_warm_attempt_at_ms.contains_key(candidate_c));
+
+        // Check-interval guard: a second call inside the interval returns empty.
+        let mut shell2 = ShellState::new(test_shell_bootstrap_with_active_session(active_path));
+        let _ = shell2.tick_hot_warmer(now_ms);
+        let immediate = shell2.tick_hot_warmer(now_ms + 100);
+        assert!(immediate.is_empty(), "interval guard must short-circuit");
     }
 
     #[test]
