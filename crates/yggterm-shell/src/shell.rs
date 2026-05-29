@@ -3478,6 +3478,26 @@ impl ShellState {
             return;
         }
         attempt.first_meaningful_output_at_ms = Some(current_millis());
+        // HOT-tier fast-ready per [[spec-xterm-gating-ux]] Phase 2a: when the
+        // session was armed as HOT (daemon owned the PTY at click time) AND
+        // the first meaningful output has arrived, the snapshot/settle path
+        // is no longer load-bearing — the content is real PTY output, the
+        // daemon is connected, we can declare ready immediately and shave
+        // the ~636ms first_output→ready settle window the live data showed.
+        // Cold sessions still take the full path because their first output
+        // may be SSH banner noise that doesn't reflect codex state.
+        let attempt_was_hot = self
+            .switch_arm_ms_by_session
+            .get(session_path)
+            .is_some_and(|(_, tier)| matches!(tier, SessionWarmthTier::Hot));
+        let fast_ready_eligible = attempt_was_hot
+            && prompt_like
+            && attempt.ready_at_ms.is_none()
+            && matches!(
+                attempt.state,
+                TerminalOpenAttemptState::Pending
+                    | TerminalOpenAttemptState::Recovering
+            );
         let attempt_snapshot = attempt.clone();
         self.record_terminal_open_attempt_event(
             "first_meaningful_output",
@@ -3486,8 +3506,15 @@ impl ShellState {
                 "reason": reason,
                 "prompt_like": prompt_like,
                 "marker": marker,
+                "fast_ready_eligible": fast_ready_eligible,
             })),
         );
+        if fast_ready_eligible {
+            self.mark_terminal_open_attempt_ready_for_session(
+                session_path,
+                "hot_fast_ready_on_first_meaningful_output",
+            );
+        }
     }
     fn observe_terminal_open_attempt_from_viewport(&mut self, viewport: &Value) {
         let active_session_path = viewport
@@ -87086,6 +87113,78 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
                 .retained_fault_recovery_lost_pty_sessions
                 .contains(active_session_path),
             "{source} (user-driven) MUST release the latch even when daemon does not yet own the PTY"
+        );
+    }
+
+    #[test]
+    fn hot_fast_ready_fires_on_first_meaningful_output_when_session_armed_hot() {
+        // Per [[spec-xterm-gating-ux]] Phase 2a: when the session was armed
+        // as HOT (daemon owned the PTY at click time) AND the first
+        // meaningful output arrives, we skip the ~636ms settle window and
+        // fire mark_ready immediately. Cold sessions still take the full
+        // path because their first bytes may be SSH banner noise.
+        let session_path = "remote-session://dev/hot-fast";
+        let bootstrap = test_shell_bootstrap_with_active_session(session_path);
+        let mut shell = ShellState::new(bootstrap);
+        // Arm as HOT.
+        let attempt_id =
+            shell.begin_terminal_open_attempt(session_path, "req-hot", 1, "open_row");
+        // Force the (session, tier) entry without depending on daemon snapshot.
+        shell
+            .switch_arm_ms_by_session
+            .insert(session_path.to_string(), (current_millis(), SessionWarmthTier::Hot));
+        // Surface mounted so the attempt is in a meaningful in-flight state.
+        if let Some(attempt) = shell.terminal_open_attempts.get_mut(&attempt_id) {
+            attempt.state = TerminalOpenAttemptState::Recovering;
+            attempt.surface_mounted_at_ms = Some(current_millis());
+        }
+
+        shell.mark_terminal_open_attempt_first_meaningful_output_for_session(
+            session_path,
+            "test_prompt_arrival",
+            /* prompt_like = */ true,
+            /* marker = */ false,
+        );
+
+        let attempt = shell
+            .terminal_open_attempts
+            .get(&attempt_id)
+            .expect("attempt still present");
+        assert!(
+            attempt.ready_at_ms.is_some(),
+            "HOT + prompt_like + meaningful_output must fast-ready"
+        );
+        assert!(matches!(attempt.state, TerminalOpenAttemptState::Ready));
+    }
+
+    #[test]
+    fn cold_session_does_not_fast_ready_on_first_meaningful_output() {
+        // Cold sessions (daemon does not own PTY) must NOT use the
+        // fast-ready path — early bytes may be SSH banner noise that
+        // doesn't reflect a settled codex prompt.
+        let session_path = "remote-session://dev/cold-noisy";
+        let bootstrap = test_shell_bootstrap_with_active_session(session_path);
+        let mut shell = ShellState::new(bootstrap);
+        let attempt_id =
+            shell.begin_terminal_open_attempt(session_path, "req-cold", 1, "open_row");
+        shell.switch_arm_ms_by_session.insert(
+            session_path.to_string(),
+            (current_millis(), SessionWarmthTier::Cold),
+        );
+        if let Some(attempt) = shell.terminal_open_attempts.get_mut(&attempt_id) {
+            attempt.state = TerminalOpenAttemptState::Recovering;
+            attempt.surface_mounted_at_ms = Some(current_millis());
+        }
+        shell.mark_terminal_open_attempt_first_meaningful_output_for_session(
+            session_path,
+            "test_cold_first_output",
+            true,
+            false,
+        );
+        let attempt = shell.terminal_open_attempts.get(&attempt_id).unwrap();
+        assert!(
+            attempt.ready_at_ms.is_none(),
+            "COLD session must NOT fast-ready"
         );
     }
 
