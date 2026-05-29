@@ -2036,6 +2036,11 @@ fn terminal_host_problem_for_app_control(host: &Value) -> Option<&'static str> {
             || terminal_chunk_has_current_codex_input_row(visible_text))
         && (xterm_present || screen_present || rows_present || canvas_count > 0);
     if !cursor_line_text.is_empty() && terminal_chunk_is_transport_error(cursor_line_text) {
+        if terminal_chunk_is_codex_session_not_on_remote(cursor_line_text) {
+            return Some(
+                "active terminal host shows: saved Codex session no longer on remote machine",
+            );
+        }
         return Some("active terminal host is showing transport/error output");
     }
     let blank_but_mounted_surface = text_sample.is_empty()
@@ -2061,6 +2066,11 @@ fn terminal_host_problem_for_app_control(host: &Value) -> Option<&'static str> {
         return None;
     }
     if terminal_chunk_is_transport_error(visible_text) {
+        if terminal_chunk_is_codex_session_not_on_remote(visible_text) {
+            return Some(
+                "active terminal host shows: saved Codex session no longer on remote machine",
+            );
+        }
         return Some("active terminal host is showing transport/error output");
     }
     if terminal_chunk_is_loading_placeholder(visible_text) {
@@ -3309,6 +3319,23 @@ pub(crate) fn terminal_chunk_is_low_signal_terminal_noise(data: &str) -> bool {
     })
 }
 
+/// Per [[spec-xterm-gating-ux]] / dead-session UX: distinguishes the
+/// "saved Codex session UUID is no longer available on this machine"
+/// failure (from `crates/yggterm-server/src/lib.rs` wrapper) from generic
+/// transport errors. This is recoverable only by Remove-from-sidebar, not by
+/// a retry — so the toast text should differ.
+pub(crate) fn terminal_chunk_is_codex_session_not_on_remote(data: &str) -> bool {
+    let stripped = strip_terminal_control_sequences(data);
+    let lower: String = stripped
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_ascii_lowercase)
+        .collect::<Vec<_>>()
+        .join(" ");
+    lower.contains("saved codex session")
+        && lower.contains("no longer available on this machine")
+}
 pub(crate) fn terminal_chunk_is_transport_error(data: &str) -> bool {
     let stripped = strip_terminal_control_sequences(data);
     let all_lines = stripped
