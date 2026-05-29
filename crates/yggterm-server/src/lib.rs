@@ -3058,6 +3058,45 @@ impl YggtermServer {
             .collect()
     }
 
+    /// Live remote-Codex sessions that still carry a synthesized UUIDv4 id and
+    /// therefore need a real CLI session id discovered over SSH
+    /// (`[[finding-uuidv4-codex-session-drift]]` Stage 2). The local PTY-tree
+    /// walk used for local Codex/CC sessions cannot reach a remote machine, so
+    /// these are the rows the remote identity poll targets. A session drops out
+    /// of this list as soon as its id has been rebound to a real id, which makes
+    /// the poll self-limiting.
+    pub(crate) fn live_remote_codex_sessions_needing_identity_poll(
+        &self,
+    ) -> Vec<RemoteCodexIdentityPollTarget> {
+        self.live_session_order
+            .iter()
+            .filter_map(|key| {
+                let session = self.sessions.get(key)?;
+                if session.kind != SessionKind::Codex
+                    || !managed_session_is_live_runtime_session(key, session)
+                {
+                    return None;
+                }
+                let ssh_target = session
+                    .ssh_target
+                    .as_deref()
+                    .filter(|target| !is_loopback_ssh_target(target))?;
+                if !looks_like_synthesized_uuidv4_session_id(&session.id) {
+                    return None;
+                }
+                let cwd = session_metadata_value(session, "Cwd")
+                    .filter(|value| !value.trim().is_empty())?;
+                Some(RemoteCodexIdentityPollTarget {
+                    key: key.clone(),
+                    ssh_target: ssh_target.to_string(),
+                    ssh_prefix: session.ssh_prefix.clone(),
+                    cwd,
+                    current_id: session.id.clone(),
+                })
+            })
+            .collect()
+    }
+
     /// Mirrors `apply_codex_runtime_identity_to_live_session` for Claude Code.
     /// Closes the same UUIDv4-vs-real-session-id drift the codex rebind
     /// addresses, applied to local CC sessions whose `~/.claude/projects/...`
@@ -6779,6 +6818,76 @@ fn normalize_remote_terminal_write_data(data: &str) -> String {
 
 fn parse_remote_runtime_codex_session_key(path: &str) -> Option<&str> {
     path.strip_prefix("codex-runtime://")
+}
+
+/// A live remote-Codex row that needs its real CLI session id discovered over
+/// SSH. Produced by [`YggtermServer::live_remote_codex_sessions_needing_identity_poll`]
+/// and consumed by the daemon's remote identity-poll chore.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RemoteCodexIdentityPollTarget {
+    /// Session storage key (the `codex-runtime://<synth-id>` I/O key).
+    pub key: String,
+    pub ssh_target: String,
+    pub ssh_prefix: Option<String>,
+    pub cwd: String,
+    /// The synthesized UUIDv4 id currently bound to the row.
+    pub current_id: String,
+}
+
+/// True when `session_id` is a random UUIDv4 (8-4-4-4-12 hex) rather than a real
+/// Codex ULID. Codex ULIDs are UUIDv7-style and begin with `019`; yggterm's
+/// synthesized live-session ids are `Uuid::new_v4()`. Mirrors the
+/// `is_uuidv4` heuristic in `scripts/migrate_uuidv4_codex_live_sessions.py`.
+fn looks_like_synthesized_uuidv4_session_id(session_id: &str) -> bool {
+    if session_id.starts_with("019") {
+        return false;
+    }
+    let parts: Vec<&str> = session_id.split('-').collect();
+    if parts.len() != 5 {
+        return false;
+    }
+    if parts.iter().map(|part| part.len()).collect::<Vec<_>>() != [8, 4, 4, 4, 12] {
+        return false;
+    }
+    parts
+        .iter()
+        .all(|part| part.chars().all(|ch| ch.is_ascii_hexdigit()))
+}
+
+#[cfg(test)]
+mod synthesized_session_id_tests {
+    use super::looks_like_synthesized_uuidv4_session_id;
+
+    #[test]
+    fn random_uuidv4_is_synthesized() {
+        assert!(looks_like_synthesized_uuidv4_session_id(
+            "11111111-2222-4333-8444-555555555555"
+        ));
+        assert!(looks_like_synthesized_uuidv4_session_id(
+            "a1b2c3d4-e5f6-4789-abcd-ef0123456789"
+        ));
+    }
+
+    #[test]
+    fn codex_ulid_is_not_synthesized() {
+        // Codex ULIDs are UUIDv7-style and begin with 019.
+        assert!(!looks_like_synthesized_uuidv4_session_id(
+            "019ce5d8-c94c-7b62-ae19-3818ae400b65"
+        ));
+    }
+
+    #[test]
+    fn non_uuid_shapes_are_not_synthesized() {
+        assert!(!looks_like_synthesized_uuidv4_session_id("not-a-uuid"));
+        assert!(!looks_like_synthesized_uuidv4_session_id(""));
+        assert!(!looks_like_synthesized_uuidv4_session_id(
+            "11111111-2222-4333-8444-55555555555g"
+        ));
+        // Right shape but non-hex character.
+        assert!(!looks_like_synthesized_uuidv4_session_id(
+            "zzzzzzzz-2222-4333-8444-555555555555"
+        ));
+    }
 }
 
 fn remote_runtime_codex_session_id_from_terminal_key(path: &str) -> Option<&str> {
@@ -11728,6 +11837,35 @@ pub fn scan_remote_machine_sessions_for_target(
     target: &SshConnectTarget,
 ) -> anyhow::Result<Vec<RemoteScannedSession>> {
     scan_remote_machine_sessions(target)
+}
+
+/// SSH-invokes `yggterm server remote local-codex-identities` on a remote
+/// machine and parses the emitted [`LocalAgentCliIdentity`] JSON lines. Used by
+/// the daemon's remote-Codex identity-poll chore
+/// (`[[finding-uuidv4-codex-session-drift]]` Stage 2). Lines that fail to parse
+/// are skipped rather than aborting the whole poll, so a partially-upgraded
+/// remote binary degrades gracefully.
+pub(crate) fn poll_remote_local_codex_identities(
+    ssh_target: &str,
+    ssh_prefix: Option<&str>,
+) -> anyhow::Result<Vec<LocalAgentCliIdentity>> {
+    let output = run_remote_yggterm_command(
+        ssh_target,
+        ssh_prefix,
+        &["server", "remote", "local-codex-identities"],
+        None,
+    )?;
+    let mut identities = Vec::new();
+    for line in output.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if let Ok(identity) = serde_json::from_str::<LocalAgentCliIdentity>(trimmed) {
+            identities.push(identity);
+        }
+    }
+    Ok(identities)
 }
 
 pub fn scan_local_claude_code_sessions() -> Vec<LocalCcSession> {
@@ -16881,6 +17019,90 @@ pub fn run_remote_scan(codex_home: Option<&str>) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+/// One running agent-CLI process discovered on THIS machine, identified by the
+/// real session id of its open transcript. Emitted as a JSON line by
+/// `run_remote_local_codex_identities`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct LocalAgentCliIdentity {
+    /// "codex" or "claude_code".
+    pub kind: String,
+    /// Real CLI session id (the transcript basename), e.g. a Codex ULID.
+    pub session_id: String,
+    /// Working directory the CLI reported in its transcript.
+    pub cwd: String,
+    /// Absolute path of the open transcript on this machine.
+    pub storage_path: String,
+}
+
+/// Enumerates Codex / Claude Code processes currently running on THIS machine
+/// and prints one [`LocalAgentCliIdentity`] JSON object per line.
+///
+/// Stage 2 of the UUIDv4-codex-session-drift fix
+/// (`[[finding-uuidv4-codex-session-drift]]`): the local daemon cannot walk a
+/// remote machine's process tree, so it SSH-invokes this command and rebinds
+/// live remote-Codex rows whose synthesized UUIDv4 id never matched the real
+/// CLI session id. Mirrors the local
+/// `codex_runtime_process_identity_from_root_pid` discovery, but enumerated
+/// across every PID rather than descending from one PTY root.
+#[cfg(target_os = "linux")]
+pub fn run_remote_local_codex_identities() -> anyhow::Result<()> {
+    for identity in enumerate_local_agent_cli_identities() {
+        write_stdout_line_strict(&serde_json::to_string(&identity)?)?;
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn run_remote_local_codex_identities() -> anyhow::Result<()> {
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn enumerate_local_agent_cli_identities() -> Vec<LocalAgentCliIdentity> {
+    let mut identities = Vec::new();
+    let mut seen: HashSet<(String, String)> = HashSet::new();
+    let Ok(entries) = fs::read_dir("/proc") else {
+        return identities;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(pid_str) = name.to_str() else {
+            continue;
+        };
+        if !pid_str.chars().all(|ch| ch.is_ascii_digit()) {
+            continue;
+        }
+        let Ok(pid) = pid_str.parse::<u32>() else {
+            continue;
+        };
+        if let Some(storage_path) = codex_storage_path_from_process_fds(pid)
+            && let Ok(Some((session_id, cwd))) = read_codex_session_identity_fields(&storage_path)
+            && seen.insert(("codex".to_string(), session_id.clone()))
+        {
+            identities.push(LocalAgentCliIdentity {
+                kind: "codex".to_string(),
+                session_id,
+                cwd,
+                storage_path: storage_path.display().to_string(),
+            });
+        }
+        if let Some(storage_path) = claude_code_storage_path_from_process_fds(pid)
+            && let Ok(Some((session_id, cwd))) = read_cc_session_identity_fields(&storage_path)
+            && seen.insert(("claude_code".to_string(), session_id.clone()))
+        {
+            identities.push(LocalAgentCliIdentity {
+                kind: "claude_code".to_string(),
+                session_id,
+                cwd,
+                storage_path: storage_path.display().to_string(),
+            });
+        }
+    }
+    // Deterministic order so the SSH output (and any tests) are stable.
+    identities.sort_by(|a, b| (&a.kind, &a.session_id).cmp(&(&b.kind, &b.session_id)));
+    identities
 }
 
 fn live_remote_runtime_codex_session_ids(yggterm_home: &Path) -> HashSet<String> {
