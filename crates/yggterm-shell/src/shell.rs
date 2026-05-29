@@ -32,9 +32,10 @@ use crate::terminal_observe::{
     terminal_chunk_is_codex_resume_instruction, terminal_chunk_is_generic_codex_idle,
     terminal_chunk_is_loading_placeholder, terminal_chunk_is_local_codex_scaffold,
     terminal_chunk_is_low_signal_terminal_noise, terminal_chunk_is_saved_transcript_prefill,
-    terminal_chunk_is_transcript_browser, terminal_chunk_is_transport_error,
-    terminal_line_is_internal_transport_error, terminal_open_attempt_failure_reason_from_viewport,
-    terminal_open_attempt_state_label, terminal_tail_excerpt,
+    terminal_chunk_is_codex_session_not_on_remote, terminal_chunk_is_transcript_browser,
+    terminal_chunk_is_transport_error, terminal_line_is_internal_transport_error,
+    terminal_open_attempt_failure_reason_from_viewport, terminal_open_attempt_state_label,
+    terminal_tail_excerpt,
 };
 #[cfg(test)]
 use crate::terminal_observe::{
@@ -3719,6 +3720,25 @@ impl ShellState {
             &attempt_snapshot,
             Some(json!({ "reason": reason })),
         );
+    }
+    /// Returns true when the most recent open attempt for this session
+    /// observed the "saved Codex session no longer on remote machine" surface
+    /// problem (see terminal_observe::terminal_chunk_is_codex_session_not_on_remote).
+    /// Used to swap a confusing "Needs Attention" toast for a clearer one
+    /// that tells the user how to remove the dead row.
+    fn terminal_session_codex_no_longer_on_remote(&self, session_path: &str) -> bool {
+        let Some(attempt_id) = self.terminal_open_attempt_by_session.get(session_path) else {
+            return false;
+        };
+        let Some(attempt) = self.terminal_open_attempts.get(attempt_id) else {
+            return false;
+        };
+        let problem = attempt
+            .last_surface_problem
+            .as_deref()
+            .or(attempt.last_observed_reason.as_deref())
+            .unwrap_or("");
+        problem.contains("Codex session no longer on remote machine")
     }
     fn defer_remote_terminal_resume_timeout_after_recent_progress(
         &mut self,
@@ -44519,16 +44539,35 @@ fn TerminalCanvas(
                     && still_waiting_for_resume
                 {
                     timer_resume_overlay_slow.set(true);
-                    upsert_terminal_resume_notification(
+                    // If the wrapper has already reported the session is gone
+                    // from the remote machine, don't show the misleading
+                    // "Restoring Remote Terminal" toast — it'll never restore.
+                    let session_no_longer_on_remote = safe_shell_read(
                         state,
-                        &session_path,
-                        NotificationTone::Info,
-                        "Restoring Remote Terminal",
-                        format!(
-                            "Restoring the live terminal on {}. The viewport will switch in once the session is truly interactive.",
-                            session_host_label
-                        ),
-                    );
+                        "terminal_resume_slow_classify_failure",
+                        |shell| shell.terminal_session_codex_no_longer_on_remote(&session_path),
+                    )
+                    .unwrap_or(false);
+                    let (tone, title, message) = if session_no_longer_on_remote {
+                        (
+                            NotificationTone::Info,
+                            "Session No Longer On Remote",
+                            format!(
+                                "The saved Codex session on {} has been removed from that machine. Right-click the row in the sidebar → Delete Item to clear it.",
+                                session_host_label
+                            ),
+                        )
+                    } else {
+                        (
+                            NotificationTone::Info,
+                            "Restoring Remote Terminal",
+                            format!(
+                                "Restoring the live terminal on {}. The viewport will switch in once the session is truly interactive.",
+                                session_host_label
+                            ),
+                        )
+                    };
+                    upsert_terminal_resume_notification(state, &session_path, tone, title, message);
                 }
             });
         }
@@ -44583,16 +44622,43 @@ fn TerminalCanvas(
                         );
                         return;
                     }
-                    let failure_reason = format!(
-                        "The live terminal on {} did not become interactive in time.",
-                        session_host_label
-                    );
+                    // If the wrapper has already told us the saved Codex
+                    // session is gone from the remote machine, surface a
+                    // clearer toast with the actionable next step rather
+                    // than the generic "Needs Attention" message.
+                    let session_no_longer_on_remote = safe_shell_read(
+                        state,
+                        "terminal_resume_timeout_classify_failure",
+                        |shell| shell.terminal_session_codex_no_longer_on_remote(&session_path),
+                    )
+                    .unwrap_or(false);
+                    let (toast_title, failure_reason) = if session_no_longer_on_remote {
+                        (
+                            "Session No Longer On Remote",
+                            format!(
+                                "The saved Codex session on {} has been removed from that machine. Right-click the row in the sidebar → Delete Item to clear it.",
+                                session_host_label
+                            ),
+                        )
+                    } else {
+                        (
+                            "Remote Terminal Needs Attention",
+                            format!(
+                                "The live terminal on {} did not become interactive in time.",
+                                session_host_label
+                            ),
+                        )
+                    };
                     timer_resume_overlay_timed_out.set(true);
                     upsert_terminal_resume_notification(
                         state,
                         &session_path,
-                        NotificationTone::Error,
-                        "Remote Terminal Needs Attention",
+                        if session_no_longer_on_remote {
+                            NotificationTone::Info
+                        } else {
+                            NotificationTone::Error
+                        },
+                        toast_title,
                         failure_reason.clone(),
                     );
                     let _ =
@@ -49466,15 +49532,37 @@ fn TerminalCanvas(
                                         enabled: false,
                                         focus: false,
                                     });
+                                    // Swap to the dead-session clarifier when the
+                                    // wrapper has reported the saved Codex session
+                                    // is gone from the remote machine.
+                                    let session_no_longer_on_remote = batched_output
+                                        .as_deref()
+                                        .is_some_and(terminal_chunk_is_codex_session_not_on_remote);
+                                    let (tone, title, message) = if session_no_longer_on_remote {
+                                        (
+                                            NotificationTone::Info,
+                                            "Session No Longer On Remote",
+                                            format!(
+                                                "The saved Codex session on {} has been removed from that machine. Right-click the row in the sidebar → Delete Item to clear it.",
+                                                session_host_label
+                                            ),
+                                        )
+                                    } else {
+                                        (
+                                            NotificationTone::Error,
+                                            "Remote Terminal Disconnected",
+                                            format!(
+                                                "The live terminal on {} reported a transport error during restore.",
+                                                session_host_label
+                                            ),
+                                        )
+                                    };
                                     upsert_terminal_resume_notification(
                                         state,
                                         &session_path,
-                                        NotificationTone::Error,
-                                        "Remote Terminal Disconnected",
-                                        format!(
-                                            "The live terminal on {} reported a transport error during restore.",
-                                            session_host_label
-                                        ),
+                                        tone,
+                                        title,
+                                        message,
                                     );
                                     let _ = safe_shell_mut(state, "terminal_attach_transport_error", |shell| {
                                         shell.terminal_attach_in_flight.remove(&session_path);
@@ -82959,6 +83047,32 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         assert_eq!(
             surface.get("problem").and_then(Value::as_str),
             Some("active terminal host is showing transport/error output")
+        );
+    }
+
+    #[test]
+    fn app_control_terminal_surface_flags_codex_session_gone_distinctly() {
+        // Per the dead-session UX work: this specific wrapper error
+        // (from yggterm-server when a saved Codex UUID's rollout JSONL is
+        // missing on the remote machine) must surface its own problem string
+        // so the resume-timeout toast can swap from the confusing generic
+        // "Needs Attention" to a clear "Session No Longer On Remote" with
+        // the right next-step instruction.
+        let host = json!({
+            "child_count": 1,
+            "xterm_present": true,
+            "screen_present": true,
+            "viewport_present": true,
+            "rows_present": true,
+            "canvas_count": 1,
+            "text_sample": "Error: yggterm: saved Codex session a2db554c-5d54-4c9b-8234-ae58d15fd6e6 is no longer available on this machine, so this row cannot be restored as a live terminal."
+        });
+        let surface = summarize_terminal_surface_for_app_control(&[host], false);
+        assert_eq!(
+            surface.get("problem").and_then(Value::as_str),
+            Some(
+                "active terminal host shows: saved Codex session no longer on remote machine"
+            )
         );
     }
 
