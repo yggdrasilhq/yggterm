@@ -2693,6 +2693,7 @@ impl ShellState {
         );
     }
     fn set_window_focused(&mut self, focused: bool) {
+        let was_focused = self.window_focused;
         self.window_focused = focused;
         if !focused {
             self.terminal_input_override_active = false;
@@ -2703,6 +2704,14 @@ impl ShellState {
                 > APP_CONTROL_BACKGROUND_FOCUS_REARM_GRACE_MS
         {
             self.clear_app_control_backgrounded();
+        }
+        // Per [[spec-xterm-gating-ux]] hot/cold philosophy: the activation
+        // gesture is itself the prefetch signal. Drop the warmer's next-tick
+        // gate so the foreground gain immediately schedules a warm pass on
+        // the next loop iteration (within ~5s) instead of waiting out the
+        // background-mode debounce.
+        if focused && !was_focused {
+            self.next_hot_warm_check_at_ms = 0;
         }
     }
     fn mark_app_control_backgrounded(&mut self) {
@@ -4888,7 +4897,19 @@ impl ShellState {
     /// session itself (which is already being attached). Updates internal
     /// in-flight + cooldown bookkeeping for the returned set; callers must
     /// follow up by issuing TerminalEnsure RPCs to the daemon.
+    ///
+    /// Per the spec's hot/cold philosophy: when the yggterm client window
+    /// is in background, the user isn't paying attention to switch
+    /// latency — we should NOT burn SSH/CPU/network keeping sessions
+    /// HOT. Returning empty here lets sessions naturally cool (the
+    /// daemon's idle-shutdown will release them after its own timeout),
+    /// then the next foreground gesture triggers re-warming on the very
+    /// next 5s tick. Same gating applies to `app_control_backgrounded`
+    /// which is the explicit headless-mode background signal.
     fn tick_hot_warmer(&mut self, now_ms: u64) -> Vec<String> {
+        if !self.window_focused || self.app_control_backgrounded {
+            return Vec::new();
+        }
         if self.next_hot_warm_check_at_ms > now_ms {
             return Vec::new();
         }
@@ -87035,6 +87056,46 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
                 .retained_fault_recovery_lost_pty_sessions
                 .contains(active_session_path),
             "{source} (user-driven) MUST release the latch even when daemon does not yet own the PTY"
+        );
+    }
+
+    #[test]
+    fn hot_warmer_short_circuits_when_window_backgrounded() {
+        // Per [[spec-xterm-gating-ux]] hot/cold philosophy: when the client
+        // window loses focus the warmer must stop spending SSH/CPU/network
+        // cycles. When focus returns, the next tick fires immediately
+        // (no full interval wait) because the foreground gesture is the
+        // prefetch signal.
+        let bootstrap = test_shell_bootstrap_with_active_session("remote-session://dev/active");
+        let mut shell = ShellState::new(bootstrap);
+        let now = current_millis();
+        // Background the window.
+        shell.set_window_focused(false);
+        let result = shell.tick_hot_warmer(now);
+        assert!(result.is_empty(), "no warming while window backgrounded");
+        assert_eq!(
+            shell.next_hot_warm_check_at_ms, 0,
+            "background tick must NOT consume the interval slot"
+        );
+
+        // Also: app_control_backgrounded explicitly set should gate.
+        shell.set_window_focused(true);
+        shell.mark_app_control_backgrounded();
+        let result = shell.tick_hot_warmer(now);
+        assert!(
+            result.is_empty(),
+            "app_control_backgrounded must also gate warming"
+        );
+
+        // Foreground gesture clears the next-check gate so warming can
+        // fire on the next loop iteration without waiting out the interval.
+        shell.next_hot_warm_check_at_ms = now.saturating_add(HOT_WARM_CHECK_INTERVAL_MS);
+        shell.app_control_backgrounded = false;
+        shell.window_focused = false;
+        shell.set_window_focused(true);
+        assert_eq!(
+            shell.next_hot_warm_check_at_ms, 0,
+            "foreground gain must reset the interval gate"
         );
     }
 
