@@ -14702,6 +14702,25 @@ fn spawn_start_group_session(mut state: Signal<ShellState>, row: BrowserRow, kin
             cwd,
             title_hint,
         } => {
+            // Claude Code is local-only today (see
+            // [[finding-uuidv4-codex-session-drift]] for context: remote CC
+            // would also inherit the synthetic-UUID drift bug). Surface a
+            // clear toast instead of silently falling through to SSH shell,
+            // which used to leave the user staring at a shell terminal
+            // they didn't ask for.
+            if matches!(kind, SessionKind::ClaudeCode) {
+                state.with_mut(|shell| {
+                    shell.push_notification(
+                        NotificationTone::Info,
+                        "Claude Code is local-only",
+                        format!(
+                            "Claude Code can't start in a remote folder ({}). Right-click a LOCAL folder, or pick 'New Codex Session' / 'New Shell' instead.",
+                            ssh_target
+                        ),
+                    );
+                });
+                return;
+            }
             let terminal_appearance = terminal_appearance.clone();
             spawn_server_snapshot_action(state, pending, move |endpoint| {
                 if matches!(kind, SessionKind::Codex | SessionKind::CodexLiteLlm) {
@@ -14954,8 +14973,19 @@ fn spawn_start_claude_code_session_for_row(
                 },
             );
         }
-        TerminalLaunchContext::Remote { .. } => {
-            // Claude Code is local-only; remote launch is not supported.
+        TerminalLaunchContext::Remote { ssh_target, .. } => {
+            // Surface the same instruction as the cwd-tree path so the user
+            // isn't left wondering why the button did nothing.
+            state.with_mut(|shell| {
+                shell.push_notification(
+                    NotificationTone::Info,
+                    "Claude Code is local-only",
+                    format!(
+                        "Claude Code can't start in a remote folder ({}). Pick a LOCAL folder or use Codex/Shell for remote.",
+                        ssh_target
+                    ),
+                );
+            });
         }
     }
 }
