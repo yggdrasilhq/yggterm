@@ -73,6 +73,19 @@ use crate::theme_contract::{
 use crate::ui_telemetry::{append_ui_telemetry_event, ui_telemetry_should_record};
 use crate::window_icon;
 use crate::xterm_gate_metrics::{GateKind, GateMetrics};
+
+/// Per [[spec-xterm-gating-ux]] 3-tier model. The session is in one of
+/// these warmth tiers at the moment the user clicks it; the tier determines
+/// which switch-latency histogram receives the duration sample.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(crate) enum SessionWarmthTier {
+    /// Daemon already owns the PTY at click time. Snapshot is in memory; we
+    /// just need to attach, replay, and paint. Target: <100ms perceptual.
+    Hot,
+    /// Daemon does NOT own the PTY at click time. SSH dial + codex resume
+    /// has to spin up before we get any content. Today's slow path.
+    Cold,
+}
 use anyhow::{Context, Result, anyhow};
 use arboard::{Clipboard as NativeClipboard, ImageData as NativeClipboardImageData};
 #[cfg(target_os = "linux")]
@@ -698,6 +711,10 @@ struct ShellState {
     retained_rehydrate_daemon_ready_wait_started_by_session: HashMap<String, u64>,
     last_retained_rehydrate_daemon_ready_rearm_deferral_key: Option<String>,
     xterm_gate_metrics: GateMetrics,
+    // Per [[spec-xterm-gating-ux]] 3-tier model: timestamp at which the
+    // current open attempt for this session armed its HOT or COLD switch
+    // gate. Cleared when the attempt resolves Ready. Keyed by session_path.
+    switch_arm_ms_by_session: HashMap<String, (u64, SessionWarmthTier)>,
     // Sessions where retained_fault_recovery has been latched off because the
     // daemon no longer owns the PTY. Per [[spec-xterm-gating-ux]]: an
     // unsatisfiable gate must STOP polling, not flicker forever.
@@ -2044,6 +2061,7 @@ impl ShellState {
             retained_rehydrate_daemon_ready_wait_started_by_session: HashMap::new(),
             last_retained_rehydrate_daemon_ready_rearm_deferral_key: None,
             xterm_gate_metrics: GateMetrics::default(),
+            switch_arm_ms_by_session: HashMap::new(),
             retained_fault_recovery_lost_pty_sessions: HashSet::new(),
             retained_fault_recovery_latch_grace_until_ms: HashMap::new(),
             retained_fault_recovery_loop_armed_at_ms: HashMap::new(),
@@ -3139,6 +3157,19 @@ impl ShellState {
                 .entry(session_path.to_string())
                 .or_insert_with(current_millis);
         }
+        // Per [[spec-xterm-gating-ux]] 3-tier model: tag a user-driven open
+        // with the HOT/COLD tier so the switch-latency histograms can be
+        // measured separately. RFR and startup_restore are NOT user-driven
+        // switches, so they don't arm this gate.
+        if source != "retained_fault_recovery" && source != "startup_restore" {
+            let tier = if self.daemon_owns_session_runtime(session_path) {
+                SessionWarmthTier::Hot
+            } else {
+                SessionWarmthTier::Cold
+            };
+            self.switch_arm_ms_by_session
+                .insert(session_path.to_string(), (current_millis(), tier));
+        }
         let begin_context = self.terminal_open_context_payload(session_path);
         let attempt_id = format!("terminal-open-{}-{open_request_id}", current_millis());
         let attempt = TerminalOpenAttempt {
@@ -3299,6 +3330,10 @@ impl ShellState {
         // histogram so we can compare "time-to-ready" (success path) against
         // "time-to-latch" (lost-PTY path).
         self.finish_retained_fault_recovery_loop(session_path, "ready");
+        // Per [[spec-xterm-gating-ux]] 3-tier model: finish the HOT/COLD
+        // switch-latency histogram for this open. Cleared only on first
+        // ready transition so we don't double-count.
+        self.finish_session_switch_gate(session_path);
         if let Some(attempt) = ready_snapshot {
             self.record_terminal_open_attempt_event(
                 "ready",
@@ -4825,6 +4860,23 @@ impl ShellState {
     fn clear_retained_fault_recovery_lost_pty_latch(&mut self, session_path: &str) {
         self.retained_fault_recovery_lost_pty_sessions
             .remove(session_path);
+    }
+    /// Per [[spec-xterm-gating-ux]] 3-tier model: closes the HOT or COLD
+    /// switch-latency gate that was armed at user-driven open and records
+    /// the duration into the appropriate histogram. Idempotent — only the
+    /// first call for a given armed open records a sample (subsequent calls
+    /// during the same attempt's ready-transitions are no-ops).
+    fn finish_session_switch_gate(&mut self, session_path: &str) -> Option<u64> {
+        let (armed_at_ms, tier) = self.switch_arm_ms_by_session.remove(session_path)?;
+        let now_ms = current_millis();
+        let elapsed_ms = now_ms.saturating_sub(armed_at_ms);
+        let kind = match tier {
+            SessionWarmthTier::Hot => GateKind::HotSessionSwitch,
+            SessionWarmthTier::Cold => GateKind::ColdSessionSwitch,
+        };
+        self.xterm_gate_metrics
+            .record_clear(kind, elapsed_ms, now_ms);
+        Some(elapsed_ms)
     }
     /// Records the duration of an in-progress retained_fault_recovery loop
     /// into the [[spec-xterm-gating-ux]] gate-metrics histogram. Reason is
@@ -13825,6 +13877,32 @@ fn retained_fault_recovery_lost_pty_sessions_sorted(shell: &ShellState) -> Vec<S
         .collect();
     latched.sort();
     latched
+}
+/// Returns the set of live session paths whose runtime keys are currently
+/// owned by the daemon. Per [[spec-xterm-gating-ux]] 3-tier model these are
+/// the HOT-tier candidates. Today this drives only the metric labeling; in
+/// a follow-up commit it will drive pre-fetch policy.
+fn hot_session_paths_sorted(shell: &ShellState) -> Vec<String> {
+    let Some(runtime_status) = shell.latest_runtime_status.as_ref() else {
+        return Vec::new();
+    };
+    let mut hot: Vec<String> = shell
+        .server
+        .live_session_views()
+        .iter()
+        .filter_map(|session| {
+            let runtime_key = shell
+                .server
+                .terminal_runtime_key_for_path(&session.session_path);
+            runtime_status
+                .owned_terminal_session_keys
+                .iter()
+                .any(|key| key == &runtime_key)
+                .then(|| session.session_path.clone())
+        })
+        .collect();
+    hot.sort();
+    hot
 }
 fn set_app_control_row_expanded(shell: &mut ShellState, row: &BrowserRow, expanded: bool) {
     if row.kind != BrowserRowKind::Group {
@@ -24273,6 +24351,13 @@ fn describe_app_state_snapshot(
             // and for smoke tests to assert the loop actually stops.
             "retained_fault_recovery_lost_pty_sessions":
                 retained_fault_recovery_lost_pty_sessions_sorted(&shell),
+            // Per [[spec-xterm-gating-ux]] 3-tier model: sessions whose
+            // runtime keys are currently owned by the daemon. A click on
+            // any of these takes the HOT switch path. The list is the
+            // material for future pre-warming work; for now it just lets
+            // the user (and smoke tests) see how many sessions are HOT-
+            // eligible right now.
+            "hot_session_paths": hot_session_paths_sorted(&shell),
         },
         "browser": {
             "selected_path": selected_path.clone(),
@@ -86802,6 +86887,80 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
                 .contains(active_session_path),
             "{source} (user-driven) MUST release the latch even when daemon does not yet own the PTY"
         );
+    }
+
+    #[test]
+    fn user_click_arms_hot_or_cold_switch_gate_based_on_daemon_ownership() {
+        // Per [[spec-xterm-gating-ux]] 3-tier model: clicking a session
+        // whose runtime key is in daemon.owned_terminal_session_keys arms
+        // the HOT switch histogram; otherwise the COLD histogram.
+        let hot_path = "remote-session://dev/owned";
+        let cold_path = "remote-session://dev/not-owned";
+        let bootstrap = test_shell_bootstrap_with_active_session(hot_path);
+        let mut shell = ShellState::new(bootstrap);
+        // Construct a runtime status where the daemon owns ONLY the hot path.
+        let owned_runtime_key = shell.server.terminal_runtime_key_for_path(hot_path);
+        shell.latest_runtime_status = Some(
+            serde_json::from_value(json!({
+                "server_version": "2.7.78",
+                "server_build_id": 0,
+                "server_pid": 12345,
+                "host_kind": "local",
+                "host_detail": "test",
+                "embedded_surface_supported": true,
+                "bridge_enabled": true,
+                "terminal_session_count": 1,
+                "terminal_session_keys": [owned_runtime_key.clone()],
+                "owned_terminal_session_count": 1,
+                "owned_terminal_session_keys": [owned_runtime_key],
+                "managed_session_count": 0,
+            }))
+            .expect("runtime status"),
+        );
+
+        // Hot click: arms HOT, clears HOT on first ready.
+        shell.begin_terminal_open_attempt(hot_path, "req-hot", 1, "open_row");
+        assert!(
+            shell.switch_arm_ms_by_session.contains_key(hot_path),
+            "hot click must arm the switch gate"
+        );
+        shell.mark_terminal_open_attempt_ready_for_session(hot_path, "ready");
+        assert!(
+            !shell.switch_arm_ms_by_session.contains_key(hot_path),
+            "ready transition must clear the switch arm"
+        );
+
+        // Cold click: arms COLD, clears COLD on first ready.
+        shell.begin_terminal_open_attempt(cold_path, "req-cold", 2, "hot_open_row");
+        assert!(shell.switch_arm_ms_by_session.contains_key(cold_path));
+        shell.mark_terminal_open_attempt_ready_for_session(cold_path, "ready");
+        assert!(!shell.switch_arm_ms_by_session.contains_key(cold_path));
+
+        let snapshot = shell.xterm_gate_metrics.to_app_state_json();
+        let entries = snapshot.as_array().unwrap();
+        let hot_entry = entries
+            .iter()
+            .find(|e| e["gate_kind"] == "hot_session_switch")
+            .expect("hot_session_switch histogram present");
+        let cold_entry = entries
+            .iter()
+            .find(|e| e["gate_kind"] == "cold_session_switch")
+            .expect("cold_session_switch histogram present");
+        assert_eq!(hot_entry["sample_count"], 1);
+        assert_eq!(cold_entry["sample_count"], 1);
+    }
+
+    #[test]
+    fn auto_driven_attempts_do_not_arm_switch_gate() {
+        // RFR / startup_restore are not user-driven switches; they must not
+        // pollute the switch-latency histograms.
+        let path = "remote-session://dev/auto";
+        let bootstrap = test_shell_bootstrap_with_active_session(path);
+        let mut shell = ShellState::new(bootstrap);
+        shell.begin_terminal_open_attempt(path, "req-rfr", 1, "retained_fault_recovery");
+        assert!(!shell.switch_arm_ms_by_session.contains_key(path));
+        shell.begin_terminal_open_attempt(path, "req-startup", 2, "startup_restore");
+        assert!(!shell.switch_arm_ms_by_session.contains_key(path));
     }
 
     #[test]
