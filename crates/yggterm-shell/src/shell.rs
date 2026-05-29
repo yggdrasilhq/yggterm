@@ -38661,6 +38661,7 @@ fn app() -> Element {
                             let row = row.clone();
                             move |_| {
                                 let path = row.full_path.clone();
+                                let label = row.label.clone();
                                 state.with_mut(|shell| shell.close_context_menu());
                                 spawn(async move {
                                     let result = redraw_terminal_viewport_for(&path).await;
@@ -38668,20 +38669,54 @@ fn app() -> Element {
                                         .get("accepted")
                                         .and_then(Value::as_bool)
                                         .unwrap_or(false);
-                                    if !accepted {
-                                        let reason = result
-                                            .get("reason")
-                                            .and_then(Value::as_str)
-                                            .unwrap_or("terminal host did not accept redraw")
-                                            .to_string();
+                                    if accepted {
+                                        // Successful redraw used to silently
+                                        // succeed. Surface a short toast so the
+                                        // user has feedback that the action ran
+                                        // — otherwise "nothing happens" is the
+                                        // user-perceived response when the
+                                        // viewport content didn't actually
+                                        // need changing.
                                         state.with_mut(|shell| {
                                             shell.push_notification(
-                                                NotificationTone::Error,
-                                                "Redraw Failed",
-                                                reason,
+                                                NotificationTone::Info,
+                                                "Redraw Terminal",
+                                                format!("Repainted {label}."),
                                             );
                                         });
+                                        return;
                                     }
+                                    let reason = result
+                                        .get("reason")
+                                        .and_then(Value::as_str)
+                                        .unwrap_or("terminal host did not accept redraw");
+                                    // The most common failure path is
+                                    // `terminal_host_missing` — the user
+                                    // right-clicked a row whose xterm host
+                                    // isn't currently mounted (i.e. not the
+                                    // active viewport). Swap to a clearer
+                                    // instruction rather than the raw debug
+                                    // string.
+                                    let (title, message) = if reason == "terminal_host_missing" {
+                                        (
+                                            "Open Session Before Redrawing",
+                                            format!(
+                                                "{label} isn't the active viewport. Click the row to focus the session, then right-click → Redraw Terminal."
+                                            ),
+                                        )
+                                    } else {
+                                        (
+                                            "Redraw Failed",
+                                            format!("{label}: {reason}"),
+                                        )
+                                    };
+                                    state.with_mut(|shell| {
+                                        shell.push_notification(
+                                            NotificationTone::Error,
+                                            title,
+                                            message,
+                                        );
+                                    });
                                 });
                             }
                         },
