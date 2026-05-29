@@ -8,6 +8,7 @@ use crate::{
     SessionKind, SessionSource, SnapshotSessionView, SshConnectTarget, TerminalManager,
     WorkspaceViewMode, YggtermServer, active_client_instance_records,
     active_client_instance_records_for_endpoint_scope,
+    claude_code_runtime_process_identity_from_root_pid,
     codex_runtime_process_identity_from_root_pid, current_millis, fetch_remote_generation_context,
     local_headless_companion_executable_from_current, overlay_codex_runtime_snapshot_identity,
     persist_remote_generated_copy, remote_resume_runtime_output_requires_restart,
@@ -1932,6 +1933,45 @@ impl DaemonRuntime {
         refreshed
     }
 
+    /// Mirrors `refresh_live_codex_runtime_identities_for_persistence` for
+    /// Claude Code. Walks each live ClaudeCode session's PTY process tree
+    /// to find the open `~/.claude/projects/.../<session-id>.jsonl` and
+    /// applies the discovered identity to the live row. Closes the same
+    /// UUIDv4-vs-real-id drift that the codex rebind handles.
+    fn refresh_live_claude_code_runtime_identities_for_persistence(&mut self) -> usize {
+        let keys = self.server.live_claude_code_session_keys_for_runtime_identity();
+        let mut refreshed = 0usize;
+        for key in keys {
+            let runtime_path = self.server.terminal_runtime_key_for_path(&key);
+            let Some(pid) = self.terminals.session_process_id(&runtime_path) else {
+                continue;
+            };
+            let Some(identity) = claude_code_runtime_process_identity_from_root_pid(pid) else {
+                continue;
+            };
+            if self
+                .server
+                .apply_claude_code_runtime_identity_to_live_session(&key, &identity)
+            {
+                refreshed += 1;
+                append_trace_event(
+                    self.store.home_dir(),
+                    "daemon",
+                    "persistence",
+                    "claude_code_runtime_identity_refreshed",
+                    serde_json::json!({
+                        "session_path": key,
+                        "runtime_path": runtime_path,
+                        "pid": pid,
+                        "claude_code_session_id": identity.session_id,
+                        "storage_path": identity.storage_path.display().to_string(),
+                    }),
+                );
+            }
+        }
+        refreshed
+    }
+
     fn snapshot_response(&self, message: Option<String>) -> ServerResponse {
         let mut snapshot = self.server.snapshot();
         let runtime_keys = self
@@ -3319,11 +3359,13 @@ impl DaemonRuntime {
 
     fn persist(&mut self) -> Result<()> {
         self.refresh_live_codex_runtime_identities_for_persistence();
+        self.refresh_live_claude_code_runtime_identities_for_persistence();
         write_persisted_state(&self.state_path, &self.server.persisted_state())
     }
 
     fn persisted_state_for_update_restart(&mut self) -> PersistedDaemonState {
         self.refresh_live_codex_runtime_identities_for_persistence();
+        self.refresh_live_claude_code_runtime_identities_for_persistence();
         self.server.persisted_state_for_update_restart()
     }
 
