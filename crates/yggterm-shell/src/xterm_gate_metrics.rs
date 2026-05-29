@@ -20,12 +20,19 @@ pub(crate) enum GateKind {
     /// rehydrate. Lifecycle: `begin_retained_rehydrate_daemon_ready_wait` /
     /// `finish_retained_rehydrate_daemon_ready_wait` (shell.rs).
     RetainedRehydrateDaemonReadyWait,
+    /// User-visible gate spanning a retained_fault_recovery loop for one
+    /// session: arms on the first RFR attempt, clears on either a successful
+    /// mount (`mark_terminal_open_attempt_ready_for_session`) or the
+    /// lost-PTY latch (`latch_retained_fault_recovery_lost_pty`). Measures
+    /// "how long was the user stuck looking at a recovering surface."
+    RetainedFaultRecoveryLoop,
 }
 
 impl GateKind {
     fn as_str(self) -> &'static str {
         match self {
             GateKind::RetainedRehydrateDaemonReadyWait => "retained_rehydrate_daemon_ready_wait",
+            GateKind::RetainedFaultRecoveryLoop => "retained_fault_recovery_loop",
         }
     }
 }
