@@ -180,6 +180,7 @@ use yggterm_server::{
     shutdown as daemon_shutdown, snapshot as daemon_snapshot, snapshot_session_view_for_ui,
     stage_remote_clipboard_png, start_command_session_with_terminal_appearance,
     start_local_session_at_with_terminal_appearance,
+    start_remote_claude_session_at_with_terminal_appearance,
     start_remote_codex_session_at_with_terminal_appearance,
     start_ssh_session_at_with_terminal_appearance, status, take_next_app_control_request,
     terminal_ensure, terminal_read, terminal_resize, terminal_restart_with_size,
@@ -14875,28 +14876,22 @@ fn spawn_start_group_session(mut state: Signal<ShellState>, row: BrowserRow, kin
             cwd,
             title_hint,
         } => {
-            // Claude Code is local-only today (see
-            // [[finding-uuidv4-codex-session-drift]] for context: remote CC
-            // would also inherit the synthetic-UUID drift bug). Surface a
-            // clear toast instead of silently falling through to SSH shell,
-            // which used to leave the user staring at a shell terminal
-            // they didn't ask for.
-            if matches!(kind, SessionKind::ClaudeCode) {
-                state.with_mut(|shell| {
-                    shell.push_notification(
-                        NotificationTone::Info,
-                        "Claude Code is local-only",
-                        format!(
-                            "Claude Code can't start in a remote folder ({}). Right-click a LOCAL folder, or pick 'New Codex Session' / 'New Shell' instead.",
-                            ssh_target
-                        ),
-                    );
-                });
-                return;
-            }
+            // Remote Claude Code now launches over a direct SSH PTY with a
+            // caller-assigned id (`claude --session-id <uuid>`), so the row id
+            // is the authoritative CLI session id — no UUIDv4 drift, no rebind
+            // poll (unlike Codex / local CC). See [[finding-uuidv4-codex-session-drift]].
             let terminal_appearance = terminal_appearance.clone();
             spawn_server_snapshot_action(state, pending, move |endpoint| {
-                if matches!(kind, SessionKind::Codex | SessionKind::CodexLiteLlm) {
+                if matches!(kind, SessionKind::ClaudeCode) {
+                    start_remote_claude_session_at_with_terminal_appearance(
+                        &endpoint,
+                        &ssh_target,
+                        prefix.as_deref(),
+                        cwd.as_deref(),
+                        title_hint.as_deref(),
+                        Some(&terminal_appearance),
+                    )
+                } else if matches!(kind, SessionKind::Codex | SessionKind::CodexLiteLlm) {
                     start_remote_codex_session_at_with_terminal_appearance(
                         &endpoint,
                         &ssh_target,
@@ -15146,19 +15141,30 @@ fn spawn_start_claude_code_session_for_row(
                 },
             );
         }
-        TerminalLaunchContext::Remote { ssh_target, .. } => {
-            // Surface the same instruction as the cwd-tree path so the user
-            // isn't left wondering why the button did nothing.
-            state.with_mut(|shell| {
-                shell.push_notification(
-                    NotificationTone::Info,
-                    "Claude Code is local-only",
-                    format!(
-                        "Claude Code can't start in a remote folder ({}). Pick a LOCAL folder or use Codex/Shell for remote.",
-                        ssh_target
-                    ),
-                );
-            });
+        TerminalLaunchContext::Remote {
+            ssh_target,
+            prefix,
+            cwd,
+            title_hint,
+        } => {
+            // Remote Claude Code launches over a direct SSH PTY with a
+            // caller-assigned id; the row id is the real CLI session id. See
+            // [[finding-uuidv4-codex-session-drift]].
+            let terminal_appearance = terminal_appearance.clone();
+            spawn_server_snapshot_action(
+                state,
+                "starting remote claude code".to_string(),
+                move |endpoint| {
+                    start_remote_claude_session_at_with_terminal_appearance(
+                        &endpoint,
+                        &ssh_target,
+                        prefix.as_deref(),
+                        cwd.as_deref(),
+                        title_hint.as_deref(),
+                        Some(&terminal_appearance),
+                    )
+                },
+            );
         }
     }
 }
@@ -34088,6 +34094,15 @@ async fn process_pending_app_control_requests(
                             ensure_daemon_running(&endpoint)?;
                             if requested_kind_for_task == SessionKind::Codex {
                                 start_remote_codex_session_at_with_terminal_appearance(
+                                    &endpoint,
+                                    &machine.ssh_target,
+                                    machine.prefix.as_deref(),
+                                    cwd_for_task.as_deref(),
+                                    title_hint_for_task.as_deref(),
+                                    Some(&terminal_appearance_for_task),
+                                )
+                            } else if requested_kind_for_task == SessionKind::ClaudeCode {
+                                start_remote_claude_session_at_with_terminal_appearance(
                                     &endpoint,
                                     &machine.ssh_target,
                                     machine.prefix.as_deref(),
