@@ -8278,6 +8278,37 @@ fn remote_resume_runtime_output_mismatches_managed_session(
 // snapshot path that yggterm-headless replaced. See block deletions in
 // lib.rs:~7038 (tmux), ~7050 (screen), ~7073 (sanitize/emit) above.
 
+/// Wrap a composed remote command so sshd executes it under a *login* shell,
+/// reproducing the PATH a user gets from an interactive `ssh <host>` (which
+/// sources `~/.profile` / `~/.bash_profile`). Without this, `ssh host 'cmd'`
+/// runs as a non-login, non-interactive shell whose PATH typically omits
+/// `~/.local/bin`, so a stale root-owned `/usr/local/bin/<cli>` shadows the
+/// user's auto-updating `~/.local/bin/<cli>`. The wrapper-vs-manual parity rule
+/// (see CLAUDE.md / [[spec-agent-cli-wrapper-render-parity]]) requires the
+/// handoff to resolve the exact same binary the user resolves by hand.
+///
+/// We hardcode `bash -lc` (deterministic — the supported fleet's login shell is
+/// bash and the `~/.local/bin` prepend lives in `~/.profile`, which bash login
+/// shells source) rather than `$SHELL -lc`, to avoid env-dependent behavior
+/// (no-non-determinism rule). The inner command sets TERM/COLORTERM/etc. AFTER
+/// the profile runs, so terminal-identity exports still win.
+fn login_shell_wrap(remote: &str) -> String {
+    format!("exec bash -lc {}", shell_single_quote(remote))
+}
+
+/// Single owner of remote-ssh command assembly: login-shell-wrap the composed
+/// `remote` payload (PATH parity) and format the `ssh -tt` invocation. Every
+/// remote launch builder funnels through here so the login-shell behavior is
+/// defined in exactly one place.
+fn assemble_remote_ssh_command(ssh_target: &str, remote: &str) -> String {
+    remote_terminal_ssh_command(format!(
+        "ssh -tt -o LogLevel=ERROR {} {} {}",
+        ssh_control_options(),
+        ssh_target,
+        shell_single_quote(&login_shell_wrap(remote))
+    ))
+}
+
 fn remote_ssh_launch_command(
     ssh_target: &str,
     prefix: Option<&str>,
@@ -8299,12 +8330,7 @@ fn remote_ssh_launch_command(
         Some(prefix) => format!("{prefix} && {inner}"),
         None => inner,
     };
-    remote_terminal_ssh_command(format!(
-        "ssh -tt -o LogLevel=ERROR {} {} {}",
-        ssh_control_options(),
-        ssh_target,
-        shell_single_quote(&remote)
-    ))
+    assemble_remote_ssh_command(ssh_target, &remote)
 }
 
 fn remote_ssh_shell_command(ssh_target: &str, prefix: Option<&str>, inner: &str) -> String {
@@ -8318,12 +8344,7 @@ fn remote_ssh_shell_command(ssh_target: &str, prefix: Option<&str>, inner: &str)
         Some(prefix) => format!("{prefix} && {inner}"),
         None => inner,
     };
-    remote_terminal_ssh_command(format!(
-        "ssh -tt -o LogLevel=ERROR {} {} {}",
-        ssh_control_options(),
-        ssh_target,
-        shell_single_quote(&remote)
-    ))
+    assemble_remote_ssh_command(ssh_target, &remote)
 }
 
 fn remote_direct_attach_launch_command(
@@ -8356,12 +8377,7 @@ fn remote_direct_attach_launch_command(
         Some(prefix) => format!("{prefix} && {inner}"),
         None => inner,
     };
-    remote_terminal_ssh_command(format!(
-        "ssh -tt -o LogLevel=ERROR {} {} {}",
-        ssh_control_options(),
-        ssh_target,
-        shell_single_quote(&remote)
-    ))
+    assemble_remote_ssh_command(ssh_target, &remote)
 }
 
 fn refresh_remote_codex_terminal_identity_launch_command(
@@ -22302,11 +22318,35 @@ mod tests {
         assert!(!command.contains("ControlPath=/tmp/yggterm-ssh-%C"));
         assert!(command.contains("tmux new-session -A -s yggterm &&"));
         assert!(command.contains("$HOME/.yggterm/bin/yggterm"));
-        assert!(command.contains("'resume-codex'"));
+        assert!(command.contains("resume-codex"));
         assert!(command.contains("'/srv/app'"));
         assert!(!command.contains("export YGGTERM_HOME"));
         assert!(command.contains("ControlMaster"));
         assert!(command.contains("ControlPath"));
+    }
+
+    #[test]
+    fn remote_launch_commands_run_under_login_shell_for_path_parity() {
+        // Wrapper-vs-manual parity: the handoff must resolve the same CLI the
+        // user gets from an interactive `ssh <host>` (login PATH incl.
+        // ~/.local/bin), not the non-login PATH that shadows it with a stale
+        // root-owned /usr/local/bin copy. Every remote launch builder funnels
+        // through assemble_remote_ssh_command -> login_shell_wrap.
+        let codex = remote_ssh_launch_command(
+            "jojo",
+            None,
+            "$HOME/.yggterm/bin/yggterm",
+            &["server", "remote", "resume-codex", "abc123", "/srv/app"],
+        );
+        assert!(
+            codex.contains("exec bash -lc "),
+            "codex remote launch must run under a login shell: {codex}"
+        );
+        let cc = super::remote_ssh_shell_command("jojo", None, "claude --session-id abc123");
+        assert!(
+            cc.contains("exec bash -lc "),
+            "CC remote launch must run under a login shell: {cc}"
+        );
     }
 
     #[test]
@@ -22352,7 +22392,7 @@ mod tests {
         assert!(command.contains("export TERM='"));
         assert!(command.contains("&& exec $HOME/.yggterm/bin/yggterm"));
         assert!(command.contains("$HOME/.yggterm/bin/yggterm"));
-        assert!(command.contains("'resume-codex'"));
+        assert!(command.contains("resume-codex"));
         assert!(command.contains("'/srv/app'"));
         assert!(command.contains("'--require-existing'"));
     }
@@ -23881,7 +23921,7 @@ terminal_window_id: None,
         assert_eq!(server.active_view_mode(), WorkspaceViewMode::Terminal);
         assert!(server.live_session_order.contains(&session_path));
         assert!(server.terminal_spec(&session_path).is_some());
-        assert!(session.launch_command.contains("'resume-codex'"));
+        assert!(session.launch_command.contains("resume-codex"));
         assert!(session.launch_command.contains("'abc123'"));
         Ok(())
     }
@@ -28031,7 +28071,7 @@ terminal_window_id: None,
             "{}",
             session.launch_command
         );
-        assert!(!session.launch_command.contains("'resume-codex'"));
+        assert!(!session.launch_command.contains("resume-codex"));
         assert!(!session.launch_command.contains("'attach'"));
         assert!(server.session_starts_new_remote_codex(&key));
 
@@ -28583,7 +28623,7 @@ terminal_window_id: None,
             "{}",
             session.launch_command
         );
-        assert!(!session.launch_command.contains("'resume-codex'"));
+        assert!(!session.launch_command.contains("resume-codex"));
         assert!(!session.launch_command.contains("--require-existing"));
         assert!(server.session_starts_new_remote_codex("remote-session://dev/fresh-codex"));
     }
@@ -28647,7 +28687,7 @@ terminal_window_id: None,
             None
         );
         assert!(
-            session.launch_command.contains("'resume-codex'"),
+            session.launch_command.contains("resume-codex"),
             "{}",
             session.launch_command
         );
