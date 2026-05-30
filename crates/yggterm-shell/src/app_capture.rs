@@ -464,14 +464,29 @@ async fn platform_capture_visible_app_surface(
     // our window and take a compositor screenshot of the active window. See
     // [[finding-app-screenshot-unfaithful-on-wayland]].
     if target == ScreenshotTarget::App && is_wayland {
+        // Best-effort raise, then capture ONLY if our own window actually became
+        // focused. spectacle grabs the ACTIVE window, so without this gate a
+        // failed raise (e.g. the user is actively using another app, which
+        // strengthens KDE focus-stealing prevention) would capture THAT window
+        // — an unacceptable privacy leak. desktop.is_focused() is authoritative
+        // for "is yggterm the active window". If not focused, fall through to
+        // the WebKit snapshot, which can only ever render yggterm's own DOM.
         let _ = focus_app_window(desktop);
-        thread::sleep(Duration::from_millis(150));
-        match capture_linux_wayland_window_screenshot(output_path) {
-            Ok(()) => {
-                return Ok(SurfaceCapture::new(output_path, "linux_wayland_spectacle")
-                    .with_attempts(attempts));
+        thread::sleep(Duration::from_millis(180));
+        if desktop.is_focused() {
+            match capture_linux_wayland_window_screenshot(output_path) {
+                Ok(()) => {
+                    return Ok(SurfaceCapture::new(output_path, "linux_wayland_spectacle")
+                        .with_attempts(attempts));
+                }
+                Err(error) => attempts.push(format!("linux_wayland_spectacle: {error:#}")),
             }
-            Err(error) => attempts.push(format!("linux_wayland_spectacle: {error:#}")),
+        } else {
+            attempts.push(
+                "linux_wayland_spectacle: skipped — yggterm window is not focused, \
+                 refusing to capture another window"
+                    .to_string(),
+            );
         }
     }
     // X11 session: faithful window grab (xwd + convert).
