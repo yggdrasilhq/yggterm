@@ -924,6 +924,9 @@ const KDE_CLOSE_TERMINAL_DETACH_MS: u64 = 180;
 const KDE_CLOSE_FINAL_HIDE_MS: u64 = 60;
 const CLOSE_FORCE_EXIT_WATCHDOG_MS: u64 = 2_500;
 const SIDEBAR_RENAME_AUTOSCROLL_SUPPRESS_MS: u64 = 4_000;
+/// Minimum spacing between terminal-driven attention pings (BEL / OSC 9 / 777)
+/// per session, so a chatty TUI can't spam toasts/OS notifications.
+const TERMINAL_NOTIFY_PING_MIN_INTERVAL_MS: u64 = 2_500;
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum RightPanelMode {
     Hidden,
@@ -47061,6 +47064,9 @@ fn TerminalCanvas(
             let mut codex_busy_since_input = false;
             let mut codex_busy_started_at_ms = None::<u64>;
             let mut codex_completion_notified = false;
+            // Rate-limit terminal-driven attention pings (BEL / OSC 9 / OSC 777)
+            // so a chatty TUI can't spam toasts/OS notifications.
+            let mut last_terminal_notify_ping_ms = 0_u64;
             let mut inline_status_animation_hot_until_ms = 0_u64;
             let mut inline_status_animation_started_at_ms = 0_u64;
             let mut last_forward_protocol_only_trace_ms = 0_u64;
@@ -47296,6 +47302,65 @@ fn TerminalCanvas(
                                     placeholder_rendered = true;
                                 } else if is_remote_resume_session {
                                     set_signal_if_changed(terminal_resume_surface_staged, false);
+                                }
+                            }
+                            Ok(TerminalJsEvent::Notify { source, title: notify_title, body }) => {
+                                // A CLI in the PTY (Claude Code / Codex) pinged for
+                                // attention: BEL, OSC 9, or OSC 777. Always surface the
+                                // in-app toast (which also plays the chime when sound is
+                                // enabled); raise an OS desktop notification only when the
+                                // user is NOT already watching this session (window
+                                // unfocused OR this session is not the active terminal).
+                                let now_ms = current_millis();
+                                if now_ms.saturating_sub(last_terminal_notify_ping_ms)
+                                    >= TERMINAL_NOTIFY_PING_MIN_INTERVAL_MS
+                                {
+                                    last_terminal_notify_ping_ms = now_ms;
+                                    let (window_focused_now, session_visible_now) =
+                                        state.with(|shell| {
+                                            (
+                                                shell.window_focused,
+                                                terminal_active_visible_for_session(
+                                                    shell,
+                                                    &session_path,
+                                                ),
+                                            )
+                                        });
+                                    let watching = window_focused_now && session_visible_now;
+                                    let heading = notify_title
+                                        .as_deref()
+                                        .map(str::trim)
+                                        .filter(|value| !value.is_empty())
+                                        .map(ToOwned::to_owned)
+                                        .unwrap_or_else(|| title.clone());
+                                    let detail = body
+                                        .as_deref()
+                                        .map(str::trim)
+                                        .filter(|value| !value.is_empty())
+                                        .map(ToOwned::to_owned)
+                                        .unwrap_or_else(|| {
+                                            format!("{} needs your attention", title)
+                                        });
+                                    append_trace_event(
+                                        &trace_home,
+                                        "ui",
+                                        "terminal_notify",
+                                        &source,
+                                        json!({
+                                            "session_path": session_path.clone(),
+                                            "watching": watching,
+                                            "os_notified": !watching,
+                                        }),
+                                    );
+                                    safe_push_notification(
+                                        state,
+                                        NotificationTone::Info,
+                                        heading.clone(),
+                                        detail.clone(),
+                                    );
+                                    if !watching {
+                                        let _ = send_user_notification(&heading, &detail);
+                                    }
                                 }
                             }
                             Ok(TerminalJsEvent::Paint {
@@ -54798,114 +54863,53 @@ fn apply_notification_delivery_mode(settings: &mut AppSettings, mode: Notificati
     }
 }
 fn emit_notification_chime(tone: NotificationTone) {
-    // Each tone gets a distinct sound shape so users can tell event types apart
-    // without looking at the screen.
-    let script = match tone {
-        // Success / completion: gentle two-note chord (fundamental + major third)
-        // ADSR: fast attack, short sustain, smooth exponential decay
+    // Airplane cabin "bong": a high note falling to a low note, sine timbre with
+    // a soft attack and a long mellow exponential tail — "soothing + alertful"
+    // (user choice 2026-05-30). Single ding-dong for info/attention, double for
+    // completion. Each note is [startSeconds, frequencyHz, peakGain]; tones
+    // differ by interval and repetition so they're still distinguishable by ear.
+    let notes: &str = match tone {
+        // Completion: double ding-dong (boarding-complete feel)
         NotificationTone::Success => {
-            r#"
-        (() => {
-          try {
+            "[[0.0,587.33,0.075],[0.18,440.0,0.075],[0.62,587.33,0.07],[0.80,440.0,0.07]]"
+        }
+        // Info / attention ping: single ding-dong
+        NotificationTone::Info => "[[0.0,587.33,0.07],[0.18,440.0,0.07]]",
+        // Warning: single ding-dong, brighter and a touch louder
+        NotificationTone::Warning => "[[0.0,659.25,0.08],[0.16,523.25,0.08]]",
+        // Error: single low descending bong, somber
+        NotificationTone::Error => "[[0.0,440.0,0.075],[0.20,329.63,0.075]]",
+    };
+    let script = format!(
+        r#"
+        (() => {{
+          try {{
             const ctx = new (window.AudioContext || window.webkitAudioContext)();
             const now = ctx.currentTime;
-            const master = ctx.createGain();
-            master.gain.setValueAtTime(0, now);
-            master.gain.linearRampToValueAtTime(0.055, now + 0.012);
-            master.gain.exponentialRampToValueAtTime(0.001, now + 0.42);
-            master.connect(ctx.destination);
-            [[523.25, 1.0], [659.25, 0.65]].forEach(([freq, amp]) => {
+            const notes = {notes};
+            let endAt = now;
+            notes.forEach(([t, freq, peak]) => {{
               const osc = ctx.createOscillator();
               const g = ctx.createGain();
               osc.type = "sine";
               osc.frequency.value = freq;
-              g.gain.value = amp;
+              const start = now + t;
+              g.gain.setValueAtTime(0, start);
+              g.gain.linearRampToValueAtTime(peak, start + 0.025);
+              g.gain.exponentialRampToValueAtTime(0.0008, start + 1.15);
               osc.connect(g);
-              g.connect(master);
-              osc.start(now);
-              osc.stop(now + 0.46);
-            });
-            setTimeout(() => { try { ctx.close(); } catch (_e) {} }, 520);
-          } catch (_error) {}
-        })();
+              g.connect(ctx.destination);
+              osc.start(start);
+              const stop = start + 1.2;
+              osc.stop(stop);
+              if (stop > endAt) endAt = stop;
+            }});
+            setTimeout(() => {{ try {{ ctx.close(); }} catch (_e) {{}} }}, Math.ceil((endAt - now) * 1000) + 80);
+          }} catch (_error) {{}}
+        }})();
         "#
-        }
-        // Info: single clean note, brief and unobtrusive
-        NotificationTone::Info => {
-            r#"
-        (() => {
-          try {
-            const ctx = new (window.AudioContext || window.webkitAudioContext)();
-            const now = ctx.currentTime;
-            const osc = ctx.createOscillator();
-            const gain = ctx.createGain();
-            osc.type = "sine";
-            osc.frequency.value = 698.46;
-            gain.gain.setValueAtTime(0, now);
-            gain.gain.linearRampToValueAtTime(0.04, now + 0.01);
-            gain.gain.exponentialRampToValueAtTime(0.001, now + 0.22);
-            osc.connect(gain);
-            gain.connect(ctx.destination);
-            osc.start(now);
-            osc.stop(now + 0.24);
-            setTimeout(() => { try { ctx.close(); } catch (_e) {} }, 300);
-          } catch (_error) {}
-        })();
-        "#
-        }
-        // Warning: two quick rising pulses to signal attention needed
-        NotificationTone::Warning => {
-            r#"
-        (() => {
-          try {
-            const ctx = new (window.AudioContext || window.webkitAudioContext)();
-            const now = ctx.currentTime;
-            [0, 0.17].forEach(offset => {
-              const osc = ctx.createOscillator();
-              const gain = ctx.createGain();
-              osc.type = "sine";
-              osc.frequency.setValueAtTime(440, now + offset);
-              osc.frequency.linearRampToValueAtTime(660, now + offset + 0.10);
-              gain.gain.setValueAtTime(0, now + offset);
-              gain.gain.linearRampToValueAtTime(0.048, now + offset + 0.01);
-              gain.gain.exponentialRampToValueAtTime(0.001, now + offset + 0.13);
-              osc.connect(gain);
-              gain.connect(ctx.destination);
-              osc.start(now + offset);
-              osc.stop(now + offset + 0.15);
-            });
-            setTimeout(() => { try { ctx.close(); } catch (_e) {} }, 400);
-          } catch (_error) {}
-        })();
-        "#
-        }
-        // Error: descending minor second interval — feels "wrong" intentionally
-        NotificationTone::Error => {
-            r#"
-        (() => {
-          try {
-            const ctx = new (window.AudioContext || window.webkitAudioContext)();
-            const now = ctx.currentTime;
-            [[0, 523.25], [0.18, 466.16]].forEach(([offset, freq]) => {
-              const osc = ctx.createOscillator();
-              const gain = ctx.createGain();
-              osc.type = "sine";
-              osc.frequency.value = freq;
-              gain.gain.setValueAtTime(0, now + offset);
-              gain.gain.linearRampToValueAtTime(0.052, now + offset + 0.012);
-              gain.gain.exponentialRampToValueAtTime(0.001, now + offset + 0.20);
-              osc.connect(gain);
-              gain.connect(ctx.destination);
-              osc.start(now + offset);
-              osc.stop(now + offset + 0.22);
-            });
-            setTimeout(() => { try { ctx.close(); } catch (_e) {} }, 450);
-          } catch (_error) {}
-        })();
-        "#
-        }
-    };
-    let _ = document::eval(script);
+    );
+    let _ = document::eval(&script);
 }
 fn emit_system_notification(title: &str, message: &str) {
     let _ = send_user_notification(title, message);
@@ -55972,6 +55976,39 @@ fn terminal_eval_script_with_canvas_renderer(
         const suppressedOsc4Disposable = registerTerminalProtocolResponseSuppressor(4);
         const suppressedOsc10Disposable = registerTerminalProtocolResponseSuppressor(10);
         const suppressedOsc11Disposable = registerTerminalProtocolResponseSuppressor(11);
+        // CC/Codex attention "ping": forward the terminal BEL and notification
+        // OSCs (9 = iTerm, 777 = desktop-notify) to yggterm's notification
+        // system. Notification OSCs are CONSUMED (return true) so they never
+        // print as viewport junk; the BEL is observe-only.
+        try {{
+            if (typeof term.onBell === 'function') {{
+                term.onBell(() => {{ sendTerminalEvent({{ kind: "notify", source: "bell" }}); }});
+            }}
+        }} catch (_bellError) {{}}
+        const registerTerminalNotifyOsc = (oscCode, source) => {{
+            try {{
+                if (!term || !term.parser || typeof term.parser.registerOscHandler !== 'function') {{
+                    return null;
+                }}
+                return term.parser.registerOscHandler(oscCode, (data) => {{
+                    let title = null;
+                    let body = (typeof data === 'string') ? data : null;
+                    if (oscCode === 777 && typeof data === 'string') {{
+                        const parts = data.split(';');
+                        if (parts[0] === 'notify') {{
+                            title = parts[1] || null;
+                            body = parts.slice(2).join(';') || null;
+                        }}
+                    }}
+                    sendTerminalEvent({{ kind: "notify", source: source, title: title, body: body }});
+                    return true;
+                }});
+            }} catch (_oscError) {{
+                return null;
+            }}
+        }};
+        const notifyOsc9Disposable = registerTerminalNotifyOsc(9, "osc9");
+        const notifyOsc777Disposable = registerTerminalNotifyOsc(777, "osc777");
         try {{
             if (canvasRendererEnabled && window.CanvasAddon && window.CanvasAddon.CanvasAddon) {{
                 const canvasAddon = new window.CanvasAddon.CanvasAddon();
