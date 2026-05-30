@@ -335,6 +335,12 @@ const HOT_WARM_CHECK_INTERVAL_MS: u64 = 5_000;
 const HOT_WARM_COOLDOWN_MS: u64 = 120_000;
 const HOT_WARM_MAX_CONCURRENT: usize = 2;
 const HOT_WARM_TOP_N: usize = 5;
+// HOT-tier Phase 3 of [[spec-xterm-gating-ux]]: total number of terminal hosts
+// kept mounted+warm under the limit-to-active retention policy (the active host
+// plus the N-1 most-recently-used neighbors). Bounded so a KDE/Plasma session,
+// where retention is otherwise limited to one host, pays only a small fixed
+// cost for VSCode-tab-style instant switching among recent sessions.
+const HOT_PREMOUNT_RETAINED_CAP: usize = 4;
 const TERMINAL_RECOVERY_WATCH_GRACE_MS: u64 = 150;
 const RETAINED_REHYDRATE_DAEMON_READY_TELEMETRY_MS: u64 = 100;
 const RETAINED_REHYDRATE_DAEMON_READY_WATCH_GRACE_MS: u64 = 1_000;
@@ -731,6 +737,12 @@ struct ShellState {
     hot_warming_in_flight: HashSet<String>,
     last_hot_warm_attempt_at_ms: HashMap<String, u64>,
     next_hot_warm_check_at_ms: u64,
+    // HOT-tier Phase 3 of [[spec-xterm-gating-ux]]: most-recently-activated
+    // terminal session paths (front = most recent). Drives the bounded
+    // pre-mount keep-set so the top-N hosts stay mounted+warm and switching
+    // between them is a visibility flip (the switch handler reuses the live
+    // host with no mount-epoch bump) rather than a full unmount+replay.
+    terminal_activation_mru: Vec<String>,
     // Sessions where retained_fault_recovery has been latched off because the
     // daemon no longer owns the PTY. Per [[spec-xterm-gating-ux]]: an
     // unsatisfiable gate must STOP polling, not flicker forever.
@@ -1196,14 +1208,27 @@ fn retain_terminal_session_path_for_policy(
     session_path: &str,
     limit_to_active_session: bool,
     active_terminal_path: Option<&str>,
+    premount_keep_paths: &HashSet<String>,
 ) -> u64 {
+    // A session is kept mounted if it is the one being retained now, the active
+    // terminal, or in the bounded HOT-tier Phase 3 pre-mount keep-set. Anything
+    // else is evicted under the limit-to-active policy.
+    let should_keep = |path: &str| {
+        path == session_path
+            || active_terminal_path == Some(path)
+            || premount_keep_paths.contains(path)
+    };
     if limit_to_active_session {
         let Some(active_path) = active_terminal_path else {
+            // No active terminal host (e.g. a non-terminal view is active):
+            // preserve the original behavior of releasing all retained hosts.
+            // The pre-mount win is for terminal->terminal switches, where the
+            // active path is always present.
             retained_terminal_session_paths.clear();
             terminal_mount_epochs.clear();
             return 0;
         };
-        if active_path != session_path {
+        if active_path != session_path && !premount_keep_paths.contains(session_path) {
             let existing_epoch = terminal_mount_epochs
                 .get(session_path)
                 .copied()
@@ -1212,14 +1237,18 @@ fn retain_terminal_session_path_for_policy(
             terminal_mount_epochs.remove(session_path);
             return existing_epoch;
         }
-        retained_terminal_session_paths.retain(|path| path == session_path);
-        terminal_mount_epochs.retain(|path, _| path == session_path);
+        retained_terminal_session_paths.retain(|path| should_keep(path));
+        terminal_mount_epochs.retain(|path, _| should_keep(path));
     }
     retained_terminal_session_paths.insert(session_path.to_string());
     let epoch = terminal_mount_epochs
         .entry(session_path.to_string())
         .or_insert(1);
     *epoch
+}
+
+fn hot_premount_enabled() -> bool {
+    !env_flag_truthy("YGGTERM_DISABLE_HOT_PREMOUNT")
 }
 
 fn snapshot_terminal_line_tail(lines: &[String], limit: usize) -> Vec<String> {
@@ -2081,6 +2110,7 @@ impl ShellState {
             hot_warming_in_flight: HashSet::new(),
             last_hot_warm_attempt_at_ms: HashMap::new(),
             next_hot_warm_check_at_ms: 0,
+            terminal_activation_mru: Vec::new(),
             retained_fault_recovery_lost_pty_sessions: HashSet::new(),
             retained_fault_recovery_latch_grace_until_ms: HashMap::new(),
             retained_fault_recovery_loop_armed_at_ms: HashMap::new(),
@@ -4565,13 +4595,71 @@ impl ShellState {
         } else {
             None
         };
+        // HOT-tier Phase 3: record this activation at the front of the MRU and
+        // compute the bounded pre-mount keep-set. Under the limit-to-active
+        // policy this keeps the top-N recently-used hosts mounted+warm so
+        // switching among them reuses the live host (no remount). Disabled by
+        // YGGTERM_DISABLE_HOT_PREMOUNT.
+        let premount_paths = if limit_to_active_session && hot_premount_enabled() {
+            self.note_terminal_activation_mru(session_path);
+            self.compute_hot_premount_keep_set(active_terminal_path.as_deref())
+        } else {
+            HashSet::new()
+        };
         retain_terminal_session_path_for_policy(
             &mut self.retained_terminal_session_paths,
             &mut self.terminal_mount_epochs,
             session_path,
             limit_to_active_session,
             active_terminal_path.as_deref(),
+            &premount_paths,
         )
+    }
+    /// Move `session_path` to the front of the activation MRU (most-recent
+    /// first), de-duplicating and trimming so the list never grows unbounded.
+    fn note_terminal_activation_mru(&mut self, session_path: &str) {
+        self.terminal_activation_mru
+            .retain(|path| path != session_path);
+        self.terminal_activation_mru
+            .insert(0, session_path.to_string());
+        // Keep a little headroom past the cap so an evicted-then-revisited
+        // session is still ranked by recency, but bound total growth.
+        let max_tracked = HOT_PREMOUNT_RETAINED_CAP.saturating_mul(4).max(8);
+        self.terminal_activation_mru.truncate(max_tracked);
+    }
+    /// The bounded set of session paths to keep mounted under limit-to-active
+    /// retention: the active path plus the most-recently-used mountable
+    /// neighbors, capped at `HOT_PREMOUNT_RETAINED_CAP`. Only sessions that can
+    /// actually render a terminal host are kept, so dead/non-terminal rows are
+    /// never pinned into the retained set.
+    fn compute_hot_premount_keep_set(&self, active_terminal_path: Option<&str>) -> HashSet<String> {
+        let mut keep = HashSet::new();
+        if let Some(active) = active_terminal_path {
+            keep.insert(active.to_string());
+        }
+        for path in &self.terminal_activation_mru {
+            if keep.len() >= HOT_PREMOUNT_RETAINED_CAP {
+                break;
+            }
+            if keep.contains(path) {
+                continue;
+            }
+            if self.terminal_session_is_premount_mountable(path) {
+                keep.insert(path.clone());
+            }
+        }
+        keep
+    }
+    /// Whether a session can host a live terminal surface right now — the same
+    /// mountability test the retained-render path uses. Gates which MRU entries
+    /// are eligible to stay pre-mounted.
+    fn terminal_session_is_premount_mountable(&self, session_path: &str) -> bool {
+        self.server.session_supports_terminal(session_path)
+            || self.cached_hot_session_views.contains_key(session_path)
+            || self.server.live_sessions().iter().any(|session| {
+                session.session_path == session_path
+                    && is_live_local_stored_codex_terminal_session(session)
+            })
     }
     fn refresh_cached_hot_session_views(&mut self) {
         for session in self.server.live_session_views().iter() {
@@ -71899,6 +71987,7 @@ mod tests {
             inactive_path,
             true,
             Some(active_path),
+            &HashSet::new(),
         );
 
         assert_eq!(inactive_epoch, 9);
@@ -71913,6 +72002,7 @@ mod tests {
             active_path,
             true,
             Some(active_path),
+            &HashSet::new(),
         );
 
         assert_eq!(active_epoch, 4);
@@ -71935,11 +72025,104 @@ mod tests {
             session_path,
             true,
             None,
+            &HashSet::new(),
         );
 
         assert_eq!(epoch, 0);
         assert!(retained_paths.is_empty());
         assert!(mount_epochs.is_empty());
+    }
+    #[test]
+    fn premount_keep_set_keeps_recent_neighbor_mounted_on_switch() {
+        // HOT-tier Phase 3: switching to `a` must keep recently-used `b`
+        // mounted (it's in the keep-set) while evicting `c` (not in the set),
+        // so a later switch back to `b` reuses its live host instead of
+        // remounting.
+        let a = "remote-session://dev/a";
+        let b = "remote-session://dev/b";
+        let c = "remote-session://dev/c";
+        let mut retained: HashSet<String> =
+            [a, b, c].iter().map(|s| s.to_string()).collect();
+        let mut epochs: HashMap<String, u64> =
+            [(a, 1u64), (b, 2), (c, 3)].iter().map(|(p, e)| (p.to_string(), *e)).collect();
+        let keep: HashSet<String> = [a, b].iter().map(|s| s.to_string()).collect();
+
+        let epoch = retain_terminal_session_path_for_policy(
+            &mut retained, &mut epochs, a, true, Some(a), &keep,
+        );
+
+        assert_eq!(epoch, 1);
+        assert!(retained.contains(a));
+        assert!(retained.contains(b), "keep-set neighbor stays mounted");
+        assert!(!retained.contains(c), "non-keep-set session is evicted");
+        assert!(epochs.contains_key(b));
+        assert!(!epochs.contains_key(c));
+    }
+    #[test]
+    fn premount_keep_set_does_not_evict_inactive_member_on_stray_callback() {
+        // A late retain() for an inactive but kept session must not drop it.
+        let a = "remote-session://dev/a";
+        let b = "remote-session://dev/b";
+        let mut retained: HashSet<String> = [a, b].iter().map(|s| s.to_string()).collect();
+        let mut epochs: HashMap<String, u64> =
+            [(a, 1u64), (b, 5)].iter().map(|(p, e)| (p.to_string(), *e)).collect();
+        let keep: HashSet<String> = [a, b].iter().map(|s| s.to_string()).collect();
+
+        let epoch = retain_terminal_session_path_for_policy(
+            &mut retained, &mut epochs, b, true, Some(a), &keep,
+        );
+
+        assert_eq!(epoch, 5, "kept session preserves its existing mount epoch");
+        assert!(retained.contains(a));
+        assert!(retained.contains(b), "inactive keep-set member is preserved");
+    }
+    #[test]
+    fn premount_empty_keep_set_preserves_legacy_active_only_eviction() {
+        // With no keep-set (pre-mount disabled), the policy must behave exactly
+        // as before: only the active session survives.
+        let a = "remote-session://dev/a";
+        let b = "remote-session://dev/b";
+        let mut retained: HashSet<String> = [a, b].iter().map(|s| s.to_string()).collect();
+        let mut epochs: HashMap<String, u64> =
+            [(a, 1u64), (b, 2)].iter().map(|(p, e)| (p.to_string(), *e)).collect();
+
+        retain_terminal_session_path_for_policy(
+            &mut retained, &mut epochs, a, true, Some(a), &HashSet::new(),
+        );
+
+        assert_eq!(retained.len(), 1);
+        assert!(retained.contains(a));
+        assert!(!retained.contains(b));
+    }
+    #[test]
+    fn hot_premount_keep_set_is_bounded_and_recency_ordered() {
+        // ShellState-level: the MRU keeps most-recent first and the keep-set is
+        // capped at HOT_PREMOUNT_RETAINED_CAP.
+        let active = "remote-session://dev/active";
+        let mut shell = ShellState::new(test_shell_bootstrap_with_active_session(active));
+        // Seed cached hot views so the paths are "premount-mountable".
+        for i in 0..(HOT_PREMOUNT_RETAINED_CAP + 3) {
+            let path = format!("remote-session://dev/s{i}");
+            let mut view = shell
+                .server
+                .live_session_views()
+                .first()
+                .map(|s| (**s).clone())
+                .unwrap_or_else(|| panic!("seed session view"));
+            view.session_path = path.clone();
+            shell.cached_hot_session_views.insert(path.clone(), view);
+            shell.note_terminal_activation_mru(&path);
+        }
+        // Most-recently noted path is at the front.
+        let newest = format!("remote-session://dev/s{}", HOT_PREMOUNT_RETAINED_CAP + 2);
+        assert_eq!(shell.terminal_activation_mru.first(), Some(&newest));
+        let keep = shell.compute_hot_premount_keep_set(Some(active));
+        assert!(keep.contains(active), "active path always kept");
+        assert!(
+            keep.len() <= HOT_PREMOUNT_RETAINED_CAP,
+            "keep-set respects the cap: {}",
+            keep.len()
+        );
     }
     #[test]
     fn titlebar_wrapper_only_clips_overflow_while_collapsed() {
