@@ -111,6 +111,16 @@ pub(crate) enum TerminalJsEvent {
     Debug {
         message: String,
     },
+    /// A terminal-driven attention signal: the BEL (`term.onBell`) or a
+    /// notification OSC (9 / 777) emitted by the CLI running in the PTY — e.g.
+    /// Claude Code / Codex pinging when a task finishes or needs input. Routed
+    /// to the in-app toast + sound always, and an OS desktop notification only
+    /// when the user is not already watching this session.
+    Notify {
+        source: String,
+        title: Option<String>,
+        body: Option<String>,
+    },
     Perf {
         name: String,
         payload: Value,
@@ -184,6 +194,13 @@ enum TerminalJsEventWire {
     },
     Debug {
         message: String,
+    },
+    Notify {
+        source: String,
+        #[serde(default)]
+        title: Option<String>,
+        #[serde(default)]
+        body: Option<String>,
     },
     Perf {
         name: String,
@@ -259,6 +276,15 @@ impl From<TerminalJsEventWire> for TerminalJsEvent {
                 TerminalJsEvent::ClipboardError { action, message }
             }
             TerminalJsEventWire::Debug { message } => TerminalJsEvent::Debug { message },
+            TerminalJsEventWire::Notify {
+                source,
+                title,
+                body,
+            } => TerminalJsEvent::Notify {
+                source,
+                title,
+                body,
+            },
             TerminalJsEventWire::Perf { name, payload } => TerminalJsEvent::Perf { name, payload },
         }
     }
