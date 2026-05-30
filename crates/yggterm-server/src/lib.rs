@@ -38,8 +38,9 @@ pub use daemon::{
     set_all_preview_blocks_folded, set_session_keep_alive, set_view_mode, shutdown, snapshot,
     start_command_session, start_command_session_with_terminal_appearance, start_local_session,
     start_local_session_at, start_local_session_at_with_terminal_appearance,
-    start_remote_codex_session_at, start_remote_codex_session_at_with_terminal_appearance,
-    start_remote_runtime_codex_session, start_ssh_session_at,
+    start_remote_claude_session_at_with_terminal_appearance, start_remote_codex_session_at,
+    start_remote_codex_session_at_with_terminal_appearance, start_remote_runtime_codex_session,
+    start_ssh_session_at,
     start_ssh_session_at_with_terminal_appearance, status, switch_agent_session_mode,
     sync_external_window, sync_terminal_identity, sync_terminal_identity_with_profile, sync_theme,
     terminal_ensure, terminal_read, terminal_resize, terminal_restart, terminal_restart_with_size,
@@ -3945,6 +3946,144 @@ impl YggtermServer {
         self.active_view_mode = WorkspaceViewMode::Terminal;
         self.request_terminal_launch_for_active();
         Ok(key)
+    }
+
+    /// Start a NEW remote Claude Code session over a direct SSH PTY. Mirrors
+    /// `open_remote_cc_session` (which RESUMES an existing transcript) but
+    /// assigns the session id up front and launches `claude --session-id <uuid>`.
+    /// Claude Code adopts the caller-provided id as its real transcript id
+    /// (verified: a fresh `--session-id` writes `~/.claude/projects/.../<id>.jsonl`),
+    /// so the yggterm row id IS the authoritative CLI session id — no UUIDv4
+    /// drift and no rebind poll, unlike Codex / local Claude Code. See
+    /// [[finding-uuidv4-codex-session-drift]]. This is the lightweight direct-SSH
+    /// model (not the daemon-runtime bridge Codex uses), consistent with how
+    /// remote Claude Code resume already works.
+    pub fn start_remote_claude_session(
+        &mut self,
+        target: &str,
+        prefix: Option<&str>,
+        cwd: Option<&str>,
+        title_hint: Option<&str>,
+    ) -> anyhow::Result<String> {
+        let ssh_target = canonicalize_ssh_target_alias(target);
+        if ssh_target.is_empty() {
+            anyhow::bail!("enter an SSH target such as dev, pi@raspberry, or user@ip");
+        }
+        let prefix = prefix
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned);
+        let requested_cwd = cwd
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned);
+        let cwd =
+            normalize_remote_attach_cwd(&ssh_target, prefix.as_deref(), requested_cwd.as_deref());
+        let machine_key = machine_key_from_ssh_target(&ssh_target);
+        let target_label = self
+            .ssh_targets
+            .iter()
+            .find(|existing| existing.ssh_target == ssh_target && existing.prefix == prefix)
+            .map(|existing| existing.label.trim().to_string())
+            .filter(|label| !label.is_empty())
+            .unwrap_or_else(|| {
+                ssh_machine_label(&SshConnectTarget {
+                    label: String::new(),
+                    kind: SessionKind::SshShell,
+                    ssh_target: ssh_target.clone(),
+                    prefix: prefix.clone(),
+                    cwd: cwd.clone(),
+                })
+            });
+        // Register the machine/target stub (kind-agnostic) so the row is anchored
+        // to a known remote machine, exactly as the Codex start path does.
+        let registry_target = SshConnectTarget {
+            label: target_label.clone(),
+            kind: SessionKind::SshShell,
+            ssh_target: ssh_target.clone(),
+            prefix: prefix.clone(),
+            cwd: cwd.clone(),
+        };
+        self.upsert_ssh_target(&registry_target);
+        self.ensure_remote_machine_stub(&registry_target);
+
+        let cc_target = SshConnectTarget {
+            label: target_label.clone(),
+            kind: SessionKind::ClaudeCode,
+            ssh_target: ssh_target.clone(),
+            prefix: prefix.clone(),
+            cwd: cwd.clone(),
+        };
+        let uuid = Uuid::new_v4().to_string();
+        let session_path = remote_cc_session_path(&machine_key, &uuid);
+        let cwd_display = cwd.clone().unwrap_or_default();
+        let cwd_prefix = if cwd_display.trim().is_empty() {
+            String::new()
+        } else {
+            format!("cd {} && ", shell_single_quote(&cwd_display))
+        };
+        let inner = format!("{}claude --session-id {}", cwd_prefix, shell_single_quote(&uuid));
+        let launch_command = remote_ssh_shell_command(&ssh_target, prefix.as_deref(), &inner);
+        let title = title_hint
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| {
+                live_session_default_title(
+                    SessionKind::ClaudeCode,
+                    cwd.as_deref(),
+                    &ssh_machine_label(&cc_target),
+                )
+            });
+
+        let mut session = build_live_session(
+            &uuid,
+            SessionKind::ClaudeCode,
+            &cc_target,
+            self.backend,
+            self.theme,
+            self.ghostty_host.bridge_enabled,
+        );
+        session.session_path = session_path.clone();
+        session.id = uuid.clone();
+        session.title = title.clone();
+        session.source = SessionSource::LiveSsh;
+        session.host_label = target_label;
+        session.launch_phase = TerminalLaunchPhase::RemoteBootstrap;
+        session.ssh_target = Some(ssh_target.clone());
+        session.ssh_prefix = prefix.clone();
+        session.launch_command = launch_command;
+        session.terminal_lines = vec![
+            format!("Queue new remote Claude Code session {uuid}"),
+            format!("Target host: {ssh_target}"),
+            format!(
+                "Workspace: {}",
+                if cwd_display.trim().is_empty() {
+                    "<unknown>".to_string()
+                } else {
+                    cwd_display.clone()
+                }
+            ),
+        ];
+        if let Some(cwd) = cwd.as_deref() {
+            upsert_session_metadata(&mut session.metadata, "Cwd", cwd.to_string());
+        }
+        upsert_session_metadata(&mut session.metadata, "Host", ssh_target.clone());
+        upsert_session_metadata(&mut session.metadata, "UUID", uuid.clone());
+        upsert_session_metadata(&mut session.metadata, "Claude Code Session", uuid.clone());
+        upsert_session_metadata(
+            &mut session.metadata,
+            "Restore",
+            format!("ssh {ssh_target} '{cwd_prefix}claude --resume {uuid}'"),
+        );
+
+        self.sessions.insert(session_path.clone(), session);
+        self.live_session_order
+            .retain(|existing| existing != &session_path);
+        self.live_session_order.insert(0, session_path.clone());
+        self.active_session_path = Some(session_path.clone());
+        self.active_view_mode = WorkspaceViewMode::Terminal;
+        Ok(session_path)
     }
 
     pub(crate) fn is_loopback_remote_target(target: &SshConnectTarget) -> bool {
@@ -15829,8 +15968,9 @@ fn parse_app_control_session_kind(kind: &str) -> anyhow::Result<SessionKind> {
         "shell" | "terminal" | "plain" => Ok(SessionKind::Shell),
         "codex" => Ok(SessionKind::Codex),
         "codex-litellm" | "litellm" => Ok(SessionKind::CodexLiteLlm),
+        "claude" | "claude-code" | "claudecode" => Ok(SessionKind::ClaudeCode),
         other => anyhow::bail!(
-            "unsupported app-control terminal kind {other:?}; expected shell, codex, or codex-litellm"
+            "unsupported app-control terminal kind {other:?}; expected shell, codex, codex-litellm, or claude"
         ),
     }
 }
@@ -27905,6 +28045,79 @@ terminal_window_id: None,
             persisted_session.remote_launch_action.as_deref(),
             None,
             "update restart persistence must not replay a fresh Codex launch"
+        );
+    }
+
+    #[test]
+    fn start_remote_claude_session_assigns_authoritative_session_id() {
+        let tree = SessionNode {
+            kind: SessionNodeKind::Group,
+            name: "sessions".to_string(),
+            title: None,
+            document_kind: None,
+            group_kind: None,
+            path: PathBuf::from("/"),
+            children: Vec::new(),
+            session_id: None,
+            cwd: None,
+            ..Default::default()
+        };
+        let mut server = YggtermServer::new(
+            &tree,
+            false,
+            GhosttyHostSupport::shadow("test".to_string(), false, false),
+            UiTheme::ZedLight,
+        );
+        server.remote_machines.push(RemoteMachineSnapshot {
+            machine_key: "dev".to_string(),
+            label: "dev".to_string(),
+            ssh_target: "dev".to_string(),
+            prefix: None,
+            remote_binary_expr: Some("$HOME/.yggterm/bin/yggterm".to_string()),
+            remote_deploy_state: RemoteDeployState::Ready,
+            health: RemoteMachineHealth::Healthy,
+            sessions: Vec::new(),
+        });
+
+        let key = server
+            .start_remote_claude_session("dev", None, Some("/home/pi/gh/yggterm"), Some("CC"))
+            .expect("start remote claude");
+
+        let session = server.sessions.get(&key).expect("remote claude session");
+        assert_eq!(session.kind, SessionKind::ClaudeCode);
+        assert_eq!(session.source, SessionSource::LiveSsh);
+        assert_eq!(session.ssh_target.as_deref(), Some("dev"));
+        // The row id IS the launched --session-id, so there is no UUIDv4 drift
+        // and no rebind poll is needed (unlike Codex / local Claude Code).
+        assert!(
+            !session.id.trim().is_empty(),
+            "claude session must carry an id"
+        );
+        assert!(
+            session.launch_command.contains("claude --session-id"),
+            "{}",
+            session.launch_command
+        );
+        // The launched id (shell-quoted) must be the row id — that is what makes
+        // it authoritative with no drift.
+        assert!(
+            session.launch_command.contains(&session.id),
+            "launch command must pin the row id as the claude session id: {}",
+            session.launch_command
+        );
+        assert!(
+            !session.launch_command.contains("--resume"),
+            "a fresh session starts, it does not resume: {}",
+            session.launch_command
+        );
+        assert!(
+            session.launch_command.contains("/home/pi/gh/yggterm"),
+            "{}",
+            session.launch_command
+        );
+        assert_eq!(
+            session_metadata_value(session, "Claude Code Session").as_deref(),
+            Some(session.id.as_str()),
         );
     }
 
