@@ -188,6 +188,120 @@ pub fn capture_linux_x11_window_screenshot(pid: u32, output_path: &Path) -> Resu
     Ok(())
 }
 
+/// Capture the currently-active window on a Wayland session (e.g. KDE Plasma)
+/// via Spectacle. WebKitGTK's `get_snapshot` cannot capture xterm.js's
+/// hardware-accelerated `<canvas>`, and X11 grabs (xwd/import) don't see
+/// Wayland windows — so on Wayland the only faithful path is a compositor
+/// screenshot. The caller MUST raise/focus the app window first so the
+/// active-window capture targets it. See
+/// [[finding-app-screenshot-unfaithful-on-wayland]].
+#[cfg(target_os = "linux")]
+pub fn capture_linux_wayland_window_screenshot(output_path: &Path) -> Result<()> {
+    let status = Command::new("spectacle")
+        .args([
+            "--background",
+            "--nonotify",
+            "--activewindow",
+            "--output",
+            output_path.to_string_lossy().as_ref(),
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .context("running spectacle for Wayland window screenshot")?;
+    if !status.success() {
+        bail!("spectacle exited with status {status}");
+    }
+    let metadata =
+        std::fs::metadata(output_path).context("spectacle produced no screenshot file")?;
+    if metadata.len() == 0 {
+        let _ = std::fs::remove_file(output_path);
+        bail!("spectacle produced an empty screenshot file");
+    }
+    Ok(())
+}
+
+/// Force-activate (raise + focus) a window on KDE Plasma Wayland by caption /
+/// resource-class substring. KDE Wayland's focus-stealing prevention ignores a
+/// background app's own gtk `present()`, so a backgrounded window can't bring
+/// itself to the front — but a KWin script runs INSIDE the compositor and can.
+/// Needed before a spectacle active-window capture so the screenshot targets us
+/// rather than whatever the user currently has focused. Best-effort; errors are
+/// non-fatal (caller falls back to plain present()).
+#[cfg(target_os = "linux")]
+pub fn force_activate_kde_wayland_window(match_substr: &str) -> Result<()> {
+    use std::io::Write;
+    let needle = match_substr.to_lowercase();
+    let script = format!(
+        "const wins = (typeof workspace.windowList === 'function') ? workspace.windowList() : workspace.clientList();\n\
+         for (const w of wins) {{\n\
+           const cls = (w.resourceClass ? w.resourceClass.toString() : '').toLowerCase();\n\
+           const cap = (w.caption ? w.caption.toString() : '').toLowerCase();\n\
+           if (cls.indexOf('{needle}') >= 0 || cap.indexOf('{needle}') >= 0) {{\n\
+             if ('activeWindow' in workspace) {{ workspace.activeWindow = w; }} else {{ workspace.activeClient = w; }}\n\
+             break;\n\
+           }}\n\
+         }}\n"
+    );
+    let script_path =
+        std::env::temp_dir().join(format!("yggterm-kwin-activate-{}.js", std::process::id()));
+    std::fs::File::create(&script_path)
+        .and_then(|mut file| file.write_all(script.as_bytes()))
+        .context("writing KWin activation script")?;
+    let load = Command::new("gdbus")
+        .args([
+            "call",
+            "--session",
+            "--dest",
+            "org.kde.KWin",
+            "--object-path",
+            "/Scripting",
+            "--method",
+            "org.kde.kwin.Scripting.loadScript",
+            &script_path.to_string_lossy(),
+            "yggterm-activate",
+        ])
+        .output()
+        .context("loading KWin activation script via gdbus")?;
+    let _ = std::fs::remove_file(&script_path);
+    if !load.status.success() {
+        bail!(
+            "KWin loadScript failed: {}",
+            String::from_utf8_lossy(&load.stderr)
+        );
+    }
+    let script_id: String = String::from_utf8_lossy(&load.stdout)
+        .chars()
+        .filter(|c| c.is_ascii_digit())
+        .collect();
+    if script_id.is_empty() {
+        bail!(
+            "KWin loadScript returned no script id: {}",
+            String::from_utf8_lossy(&load.stdout)
+        );
+    }
+    let object_path = format!("/Scripting/Script{script_id}");
+    let run = |method: &str| {
+        let _ = Command::new("gdbus")
+            .args([
+                "call",
+                "--session",
+                "--dest",
+                "org.kde.KWin",
+                "--object-path",
+                &object_path,
+                "--method",
+                method,
+            ])
+            .output();
+    };
+    run("org.kde.kwin.Script.run");
+    std::thread::sleep(std::time::Duration::from_millis(250));
+    run("org.kde.kwin.Script.stop");
+    Ok(())
+}
+
 #[cfg(target_os = "linux")]
 #[derive(Debug, Clone)]
 pub struct LinuxX11FocusResult {
