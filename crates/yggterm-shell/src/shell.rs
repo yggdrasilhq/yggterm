@@ -54300,7 +54300,27 @@ fn local_terminal_attach_ready_output(
         || terminal_chunk_has_codex_prompt_output(host_health_cursor_line_text)
         || terminal_chunk_has_codex_prompt_output(host_health_text_tail)
 }
-const TERMINAL_FONT_FAMILY: &str = "'JetBrains Mono', 'DejaVu Sans Mono', 'Fira Code', monospace";
+const TERMINAL_FONT_FAMILY: &str =
+    "'JetBrains Mono', 'DejaVu Sans Mono', 'Fira Code', 'Symbols Nerd Font Mono', monospace";
+
+/// Bundled Nerd Font (symbols-only, subset to the Nerd Font BMP ranges, woff2,
+/// ~500KB) embedded as a base64 data URI so powerline (U+E0xx) and icon
+/// (U+F0xx) glyphs render deterministically without relying on a system-
+/// installed Nerd Font. Standard Unicode (✓, box-drawing, arrows, bullets)
+/// already renders via the text fonts above — this ONLY adds Nerd/powerline
+/// coverage, the one gap found empirically. See
+/// [[spec-terminal-notifications-richness]].
+const SYMBOLS_NERD_FONT_B64: &str = include_str!("../assets/symbols-nerd-mono.woff2.b64");
+
+/// JSON-quoted `<style>` text content for the bundled Nerd Font `@font-face`,
+/// built once (the base64 payload is large, so don't rebuild it per render).
+static NERD_FONT_FACE_STYLE_JS: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    let face = format!(
+        "@font-face{{font-family:'Symbols Nerd Font Mono';font-style:normal;font-weight:normal;font-display:swap;src:url(data:font/woff2;base64,{}) format('woff2');}}",
+        SYMBOLS_NERD_FONT_B64.trim()
+    );
+    serde_json::to_string(&face).expect("serialize nerd font-face css")
+});
 fn terminal_hex_channel(value: &str) -> Option<u8> {
     u8::from_str_radix(value, 16).ok()
 }
@@ -54507,6 +54527,7 @@ fn terminal_moz_font_smoothing(theme: &TerminalTheme) -> &'static str {
 }
 fn xterm_assets_bootstrap_script() -> String {
     let css = serde_json::to_string(XTERM_CSS).expect("serialize xterm css");
+    let nerd = NERD_FONT_FACE_STYLE_JS.as_str();
     let xterm = serde_json::to_string(XTERM_JS).expect("serialize xterm js");
     let fit = serde_json::to_string(XTERM_FIT_JS).expect("serialize xterm fit addon");
     let canvas = serde_json::to_string(XTERM_CANVAS_JS).expect("serialize xterm canvas addon");
@@ -54520,6 +54541,19 @@ fn xterm_assets_bootstrap_script() -> String {
             style.id = styleId;
             style.textContent = {css};
             document.head.appendChild(style);
+          }}
+          // Bundled Nerd Font @font-face so powerline/icon glyphs render without
+          // a system-installed Nerd Font. Proactively load it so the xterm
+          // canvas glyph atlas can use it on first paint.
+          const nerdStyleId = "yggterm-nerd-font-face";
+          if (!document.getElementById(nerdStyleId)) {{
+            const nerdStyle = document.createElement("style");
+            nerdStyle.id = nerdStyleId;
+            nerdStyle.textContent = {nerd};
+            document.head.appendChild(nerdStyle);
+            if (document.fonts && typeof document.fonts.load === "function") {{
+              try {{ document.fonts.load("16px 'Symbols Nerd Font Mono'"); }} catch (_e) {{}}
+            }}
           }}
           const injectScript = (id, source) => {{
             if (document.getElementById(id)) {{
