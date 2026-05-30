@@ -28,6 +28,33 @@ Yggterm sessions are durable handles for a terminal routine, not a second render
   back into recency order. New live runtimes may enter at the top until the user
   moves them.
 
+### Runtime-identity rebind
+
+When yggterm launches a new Codex or Claude Code session it synthesizes a
+`Uuid::new_v4()` live-session id before the CLI assigns its own real session id
+to the transcript. Left alone, the two never reconcile and a restart tries to
+`resume` an id the CLI never created. The daemon closes this drift by rebinding
+the synthesized id to the real CLI session id discovered from the running
+process, through one source of truth
+(`apply_codex_runtime_identity_to_live_session` /
+`apply_claude_code_runtime_identity_to_live_session`). The synthetic
+`codex-runtime://...` key stays the terminal I/O key; only the saved-session
+identity and metadata are rewritten.
+
+Identity is discovered per locality:
+
+- **Local Codex / Claude Code** — the daemon walks the live PTY's process tree
+  and reads the open `~/.codex/sessions/.../<id>.jsonl` (or
+  `~/.claude/projects/<cwd>/<id>.jsonl`). Runs inside `persist()`.
+- **Remote Codex** — the daemon cannot walk a remote process tree, so it
+  SSH-invokes `yggterm server remote local-codex-identities` on the owning
+  machine (which enumerates that machine's running Codex/Claude Code processes
+  and emits their real session ids), then matches each live remote-Codex row to
+  a running transcript by cwd. This runs on a background chore, never on the
+  synchronous request path, and is self-limiting: a row stops being polled as
+  soon as it is rebound, and an un-matchable row is abandoned after a bounded
+  number of attempts. Disable with `YGGTERM_DISABLE_REMOTE_CODEX_IDENTITY_POLL`.
+
 The cross-system ownership table is in
 `docs/architecture-audit-2026-05-16.md`. Session code must not infer saved
 identity from whichever projection appears first. A live row, cwd row,
