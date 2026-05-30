@@ -43,7 +43,10 @@ use yggterm_platform::capture_windows_hwnd_screenshot;
 #[cfg(target_os = "windows")]
 use yggterm_platform::capture_windows_window_screenshot;
 #[cfg(target_os = "linux")]
-use yggterm_platform::{capture_linux_x11_window_screenshot, focus_linux_x11_window};
+use yggterm_platform::{
+    capture_linux_wayland_window_screenshot, capture_linux_x11_window_screenshot,
+    focus_linux_x11_window, force_activate_kde_wayland_window,
+};
 #[cfg(target_os = "macos")]
 use yggterm_platform::{
     capture_macos_screen_rect_screencapture, capture_macos_window_cg_screenshot,
@@ -67,7 +70,6 @@ impl SurfaceCapture {
         }
     }
 
-    #[cfg(target_os = "windows")]
     fn with_attempts(mut self, backend_attempts: Vec<String>) -> Self {
         self.backend_attempts = backend_attempts;
         self
@@ -139,6 +141,18 @@ pub fn focus_app_window(desktop: &DesktopContext) -> Result<Value> {
             gtk_window.present();
             if let Some(gdk_window) = gtk_window.window() {
                 gdk_window.raise();
+            }
+            // KDE Plasma Wayland ignores a background app's own present()/raise()
+            // (focus-stealing prevention), so force activation via a KWin script
+            // — otherwise a spectacle active-window capture targets whatever the
+            // user has focused instead of us. See
+            // [[finding-app-screenshot-unfaithful-on-wayland]].
+            if std::env::var_os("WAYLAND_DISPLAY").is_some()
+                && std::env::var("XDG_CURRENT_DESKTOP")
+                    .map(|desktop_name| desktop_name.to_uppercase().contains("KDE"))
+                    .unwrap_or(false)
+            {
+                let _ = force_activate_kde_wayland_window("yggterm");
             }
             match focus_linux_x11_window(std::process::id()) {
                 Ok(result) => {
@@ -440,13 +454,40 @@ async fn platform_capture_visible_app_surface(
     target: ScreenshotTarget,
     dom_snapshot: Option<&Value>,
 ) -> Result<SurfaceCapture> {
-    if target == ScreenshotTarget::App
-        && std::env::var_os("DISPLAY").is_some()
-        && std::env::var_os("WAYLAND_DISPLAY").is_none()
-        && capture_linux_x11_window_screenshot(std::process::id(), output_path).is_ok()
-    {
-        return Ok(SurfaceCapture::new(output_path, "linux_x11_window"));
+    let mut attempts: Vec<String> = Vec::new();
+    let is_wayland = std::env::var_os("WAYLAND_DISPLAY").is_some()
+        || std::env::var("XDG_SESSION_TYPE")
+            .map(|value| value.eq_ignore_ascii_case("wayland"))
+            .unwrap_or(false);
+    // Wayland (e.g. KDE Plasma): WebKitGTK get_snapshot can't capture the
+    // accelerated xterm <canvas>, and X11 grabs don't see Wayland windows. Raise
+    // our window and take a compositor screenshot of the active window. See
+    // [[finding-app-screenshot-unfaithful-on-wayland]].
+    if target == ScreenshotTarget::App && is_wayland {
+        let _ = focus_app_window(desktop);
+        thread::sleep(Duration::from_millis(150));
+        match capture_linux_wayland_window_screenshot(output_path) {
+            Ok(()) => {
+                return Ok(SurfaceCapture::new(output_path, "linux_wayland_spectacle")
+                    .with_attempts(attempts));
+            }
+            Err(error) => attempts.push(format!("linux_wayland_spectacle: {error:#}")),
+        }
     }
+    // X11 session: faithful window grab (xwd + convert).
+    if target == ScreenshotTarget::App && std::env::var_os("DISPLAY").is_some() && !is_wayland {
+        match capture_linux_x11_window_screenshot(std::process::id(), output_path) {
+            Ok(()) => {
+                return Ok(
+                    SurfaceCapture::new(output_path, "linux_x11_window").with_attempts(attempts)
+                );
+            }
+            Err(error) => attempts.push(format!("linux_x11_window: {error:#}")),
+        }
+    }
+    // Last resort: WebKitGTK snapshot. WARNING: does NOT faithfully capture the
+    // accelerated terminal <canvas> — `attempts` records why the faithful paths
+    // above were unavailable so the degradation is never silent.
     let gtk_webview = desktop.webview.webview();
     let surface = gtk_webview
         .snapshot_future(SnapshotRegion::Visible, SnapshotOptions::NONE)
@@ -459,17 +500,15 @@ async fn platform_capture_visible_app_surface(
             surface
                 .write_to_png(&mut output)
                 .with_context(|| format!("writing screenshot png {}", output_path.display()))?;
-            Ok(SurfaceCapture::new(output_path, "linux_webkit_snapshot"))
+            Ok(SurfaceCapture::new(output_path, "linux_webkit_snapshot").with_attempts(attempts))
         }
         ScreenshotTarget::PreviewViewport => {
             let rect = preview_viewport_capture_rect(
                 dom_snapshot.context("preview viewport capture requires a DOM snapshot")?,
             )?;
             crop_visible_surface_to_rect(&surface, rect, output_path)?;
-            Ok(SurfaceCapture::new(
-                output_path,
-                "linux_preview_viewport_crop",
-            ))
+            Ok(SurfaceCapture::new(output_path, "linux_preview_viewport_crop")
+                .with_attempts(attempts))
         }
     }
 }
