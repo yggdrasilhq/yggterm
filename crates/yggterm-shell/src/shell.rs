@@ -15226,6 +15226,12 @@ fn is_hot_terminal_sidebar_path(path: &str) -> bool {
         || path.starts_with("ssh://")
         || path.starts_with("live::")
         || path.starts_with("remote-session://")
+        // Live remote Claude Code sessions (open_remote_cc_session /
+        // start_remote_claude_session) must promote into the Live region just
+        // like remote Codex, so they get dual presence (Live + cwd tree), the
+        // keep-alive context menu, and a stable start-page entry. Local CC uses
+        // local:// above; the `.jsonl` storage path stays a stored cwd-tree row.
+        || path.starts_with("remote-cc://")
         || path.starts_with("codex://")
         || path.starts_with("codex-runtime://")
         || path.starts_with("codex-litellm://")
@@ -39019,6 +39025,23 @@ fn app() -> Element {
                             let row = context_row.clone();
                             move |_| spawn_start_group_session(state, row.clone(), SessionKind::Shell)
                         },
+                        // The "… Here" actions on a live-session row use the RAW
+                        // selected row (not the resolved creation context), so
+                        // agent_session_launch_context_for_row opens in THAT
+                        // session's own cwd — local or remote.
+                        on_open_terminal_here: {
+                            let row = row.clone();
+                            move |_| spawn_start_group_session(state, row.clone(), SessionKind::Shell)
+                        },
+                        on_new_codex_here: {
+                            let row = row.clone();
+                            let preferred_agent_kind = preferred_agent_kind;
+                            move |_| spawn_start_group_session(state, row.clone(), preferred_agent_kind)
+                        },
+                        on_new_claude_here: {
+                            let row = row.clone();
+                            move |_| spawn_start_group_session(state, row.clone(), SessionKind::ClaudeCode)
+                        },
                         on_create_group_document: {
                             let row = context_row.clone();
                             move |_| queue_new_document_for_row(state, row.clone())
@@ -61802,9 +61825,27 @@ fn terminal_eval_script_with_canvas_renderer(
                 entry.recentInlineStatusAnimationHot = recentInlineStatusAnimationHot();
             }} catch (_error) {{}}
         }};
+        let yggtermWasActiveHost = false;
+        try {{ yggtermWasActiveHost = host.getAttribute('data-active-session-host') === 'true'; }} catch (_error) {{}}
+        // HOT-tier Phase 3 reuses a hidden xterm host on switch (visibility flip,
+        // no remount). The codex input-line decoration (the prompt-line
+        // background band) can be left stale until the first keystroke. When
+        // this host becomes active, rebuild ONLY that decoration overlay — do
+        // NOT fit()/clearTextureAtlas()/refresh() the whole canvas, which blanks
+        // a reused WebGL host until new PTY data arrives.
+        const handleActiveHostRepaintOnSwitch = () => {{
+            let isActive = false;
+            try {{ isActive = host.getAttribute('data-active-session-host') === 'true'; }} catch (_error) {{}}
+            if (isActive && !yggtermWasActiveHost) {{
+                try {{ disposeXtermInputLineDecoration('reactivated'); }} catch (_error) {{}}
+                try {{ syncXtermInputLineDecoration('reactivated'); }} catch (_error) {{}}
+            }}
+            yggtermWasActiveHost = isActive;
+        }};
         try {{
             const budgetObserver = new MutationObserver(() => {{
                 syncTerminalWriteFrameBudgetHostEntry();
+                handleActiveHostRepaintOnSwitch();
             }});
             budgetObserver.observe(host, {{
                 attributes: true,
@@ -65736,6 +65777,9 @@ fn ContextMenuOverlay(
     on_set_keep_alive: EventHandler<bool>,
     on_redraw_terminal: EventHandler<MouseEvent>,
     on_delete_item: EventHandler<MouseEvent>,
+    on_open_terminal_here: EventHandler<MouseEvent>,
+    on_new_codex_here: EventHandler<MouseEvent>,
+    on_new_claude_here: EventHandler<MouseEvent>,
 ) -> Element {
     let placement = context_menu_placement(position, window_size, (224.0, 420.0));
     let placement_style = context_menu_position_style(placement);
@@ -65976,6 +66020,52 @@ fn ContextMenuOverlay(
                             } else {
                                 "Keep Alive"
                             }
+                        }
+                        div {
+                            style: format!("height:1px; margin:6px 4px; background:{}; opacity:0.7;", palette.border),
+                        }
+                        // Open a sibling session in THIS session's cwd, without
+                        // hunting through the cwd tree. The handlers resolve the
+                        // selected live row's cwd (local or remote) via
+                        // agent_session_launch_context_for_row.
+                        button {
+                            "data-context-menu-action": "open-terminal-here",
+                            class: "yggterm-menu-item",
+                            style: context_menu_action_style(palette, false),
+                            onmousedown: |evt| {
+                                evt.stop_propagation();
+                            },
+                            onclick: move |evt| {
+                                evt.stop_propagation();
+                                on_open_terminal_here.call(evt);
+                            },
+                            "Open Terminal Here"
+                        }
+                        button {
+                            "data-context-menu-action": "new-codex-here",
+                            class: "yggterm-menu-item",
+                            style: context_menu_action_style(palette, false),
+                            onmousedown: |evt| {
+                                evt.stop_propagation();
+                            },
+                            onclick: move |evt| {
+                                evt.stop_propagation();
+                                on_new_codex_here.call(evt);
+                            },
+                            "New Codex Session Here"
+                        }
+                        button {
+                            "data-context-menu-action": "new-claude-here",
+                            class: "yggterm-menu-item",
+                            style: context_menu_action_style(palette, false),
+                            onmousedown: |evt| {
+                                evt.stop_propagation();
+                            },
+                            onclick: move |evt| {
+                                evt.stop_propagation();
+                                on_new_claude_here.call(evt);
+                            },
+                            "New Claude Code Session Here"
                         }
                     }
                     button {
