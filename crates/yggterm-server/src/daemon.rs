@@ -1442,6 +1442,14 @@ pub enum ServerRequest {
         #[serde(default)]
         terminal_appearance: Option<String>,
     },
+    StartRemoteClaudeSession {
+        target: String,
+        prefix: Option<String>,
+        cwd: Option<String>,
+        title_hint: Option<String>,
+        #[serde(default)]
+        terminal_appearance: Option<String>,
+    },
     OpenRemoteSession {
         machine_key: String,
         session_id: String,
@@ -3815,6 +3823,26 @@ impl DaemonRuntime {
                 self.persist()?;
                 self.snapshot_response(Some(format!("started {key}")))
             }
+            ServerRequest::StartRemoteClaudeSession {
+                target,
+                prefix,
+                cwd,
+                title_hint,
+                terminal_appearance,
+            } => {
+                sync_terminal_identity_for_request(terminal_appearance.as_deref(), None);
+                let key = self.server.start_remote_claude_session(
+                    &target,
+                    prefix.as_deref(),
+                    cwd.as_deref(),
+                    title_hint.as_deref(),
+                )?;
+                if self.server.active_session_supports_terminal() {
+                    self.ensure_terminal_for_active()?;
+                }
+                self.persist()?;
+                self.snapshot_response(Some(format!("started {key}")))
+            }
             ServerRequest::OpenRemoteSession {
                 machine_key,
                 session_id,
@@ -5491,6 +5519,7 @@ fn server_request_name(request: &ServerRequest) -> &'static str {
         ServerRequest::ConnectSshCustom { .. } => "connect_ssh_custom",
         ServerRequest::StartSshSession { .. } => "start_ssh_session",
         ServerRequest::StartRemoteCodexSession { .. } => "start_remote_codex_session",
+        ServerRequest::StartRemoteClaudeSession { .. } => "start_remote_claude_session",
         ServerRequest::OpenRemoteSession { .. } => "open_remote_session",
         ServerRequest::RefreshRemoteMachine { .. } => "refresh_remote_machine",
         ServerRequest::RefreshManagedCli { .. } => "refresh_managed_cli",
@@ -5928,6 +5957,26 @@ pub fn start_remote_codex_session_at_with_terminal_appearance(
     expect_snapshot(send_request(
         endpoint,
         &ServerRequest::StartRemoteCodexSession {
+            target: target.to_string(),
+            prefix: prefix.map(ToOwned::to_owned),
+            cwd: cwd.map(ToOwned::to_owned),
+            title_hint: title_hint.map(ToOwned::to_owned),
+            terminal_appearance: terminal_appearance.map(ToOwned::to_owned),
+        },
+    )?)
+}
+
+pub fn start_remote_claude_session_at_with_terminal_appearance(
+    endpoint: &ServerEndpoint,
+    target: &str,
+    prefix: Option<&str>,
+    cwd: Option<&str>,
+    title_hint: Option<&str>,
+    terminal_appearance: Option<&str>,
+) -> Result<(ServerUiSnapshot, Option<String>)> {
+    expect_snapshot(send_request(
+        endpoint,
+        &ServerRequest::StartRemoteClaudeSession {
             target: target.to_string(),
             prefix: prefix.map(ToOwned::to_owned),
             cwd: cwd.map(ToOwned::to_owned),
@@ -8542,6 +8591,7 @@ fn daemon_request_io_timeout_ms(request: &ServerRequest) -> u64 {
     match request {
         ServerRequest::StartSshSession { .. }
         | ServerRequest::StartRemoteCodexSession { .. }
+        | ServerRequest::StartRemoteClaudeSession { .. }
         | ServerRequest::OpenRemoteSession { .. }
         | ServerRequest::RefreshPreview { .. }
         | ServerRequest::EnsureRemoteRuntimeCodexSession { .. }
