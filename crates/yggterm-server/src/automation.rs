@@ -13,11 +13,50 @@
 //! automation id + run window, so recomputing it yields the same value — it is
 //! never re-rolled per scheduler tick.
 
+use std::path::{Path, PathBuf};
+
 use serde::{Deserialize, Serialize};
 
 use crate::SessionKind;
 
 const DAY_MS: u64 = 24 * 60 * 60 * 1000;
+
+/// Filename for the automations store, under the daemon home dir
+/// (`~/.yggterm/`). Kept separate from `server-state.json` — automations are a
+/// distinct concern from per-session runtime state.
+pub const AUTOMATIONS_FILE: &str = "automations.json";
+
+/// Path to the automations store for a daemon home dir.
+pub fn automations_path(home_dir: &Path) -> PathBuf {
+    home_dir.join(AUTOMATIONS_FILE)
+}
+
+/// Load automations from `~/.yggterm/automations.json`. A missing file is an
+/// empty set (first run); a corrupt file is logged-as-empty by the caller's
+/// choice — here it returns the parse error so the caller can decide.
+pub fn load_automations(home_dir: &Path) -> std::io::Result<Vec<Automation>> {
+    let path = automations_path(home_dir);
+    match std::fs::read(&path) {
+        Ok(bytes) => serde_json::from_slice(&bytes)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(error) => Err(error),
+    }
+}
+
+/// Persist automations to `~/.yggterm/automations.json` atomically
+/// (write-temp-then-rename) so a crash mid-write can't corrupt the store.
+pub fn save_automations(home_dir: &Path, automations: &[Automation]) -> std::io::Result<()> {
+    let path = automations_path(home_dir);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let json = serde_json::to_vec_pretty(automations)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, &json)?;
+    std::fs::rename(&tmp, &path)
+}
 
 /// How often an automation fires. Monthly is approximated as 30 days
 /// (exact-calendar-month support is a future refinement; determinism is the
@@ -188,6 +227,21 @@ mod tests {
         assert!(automation_is_due(&a, 5_000));
         a.enabled = false;
         assert!(!automation_is_due(&a, 10_000), "disabled never fires");
+    }
+
+    #[test]
+    fn save_then_load_roundtrips_and_missing_file_is_empty() {
+        let dir = std::env::temp_dir().join(format!("ygg-auto-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        // Missing file => empty set (first run).
+        assert!(load_automations(&dir).unwrap().is_empty());
+        let mut a = sample(5, AutomationCadence::Monthly);
+        a.linked_session_id = Some("019e-cafe".to_string());
+        a.next_run_at_ms = compute_next_run_at_ms(&a, a.created_at_ms);
+        save_automations(&dir, std::slice::from_ref(&a)).unwrap();
+        let loaded = load_automations(&dir).unwrap();
+        assert_eq!(loaded, vec![a]);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
