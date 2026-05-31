@@ -1,5 +1,6 @@
 mod app_control;
 mod attach;
+mod automation;
 mod codex_cli;
 mod daemon;
 mod host;
@@ -20,6 +21,7 @@ pub use app_control::{
     enqueue_screenshot_request, take_next_app_control_request, wait_for_app_control_response,
 };
 pub use attach::{AttachMetadata, run_attach};
+pub use automation::{Automation, AutomationCadence, automation_is_due, compute_next_run_at_ms};
 pub use codex_cli::{
     ManagedCliTool, ManagedCliToolStatus, TerminalIdentityColorProfile, managed_cli_refresh_ttl_ms,
 };
