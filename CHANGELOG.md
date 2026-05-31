@@ -4,6 +4,25 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+## 2.8.1
+
+- Fix resumed Claude Code (`remote-cc`) sessions rendering blank / losing their
+  prompt on mount and session-switch: the retained-replay readiness layer was
+  Codex-only and never recognized Claude's prompt surface. Added a Claude
+  prompt-surface recognizer so the retained snapshot replays correctly.
+- Reduce xterm.js input/render latency toward native-terminal feel: cut the
+  active write-frame budget from 160 ms to 16 ms, tightened the focused-session
+  PTY read cadence (60 ms → 16 ms) and the post-keystroke echo poll (45 ms →
+  8 ms).
+- Enable the GPU canvas renderer by default on Wayland (the DOM renderer is
+  xterm.js's slowest backend; the X11 idle-CPU regression that gated it off does
+  not reproduce on Wayland). Fixed the render-health heuristic that falsely
+  reported low contrast for canvas-rendered surfaces.
+- Stop a false "needs your attention" notification when a foreground shell rings
+  the terminal BEL in response to the user's own keystroke (e.g. bash readline
+  tab-tab with no completion). Background/explicit OSC notifications are
+  unaffected.
+
 ## 2.7.48
 
 - Fix live-session snapshot projections so shallow Web View/sidebar previews

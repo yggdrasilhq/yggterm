@@ -25,7 +25,8 @@ use crate::terminal_observe::{
     TerminalOpenAttempt, TerminalOpenAttemptState, describe_terminal_open_attempt,
     describe_viewport_snapshot, preview_text_looks_like_loading_placeholder,
     strip_terminal_control_sequences, terminal_bootstrap_activation_epoch,
-    terminal_bootstrap_should_wait_for_mount_epoch_sync, terminal_chunk_has_codex_prompt_output,
+    terminal_bootstrap_should_wait_for_mount_epoch_sync, terminal_chunk_is_claude_prompt_surface,
+    terminal_chunk_has_codex_prompt_output,
     terminal_chunk_has_generic_codex_idle_footer, terminal_chunk_has_meaningful_output,
     terminal_chunk_has_prompt_output, terminal_chunk_has_visible_output,
     terminal_chunk_is_codex_interactive_setup_prompt, terminal_chunk_is_codex_prompt_surface,
@@ -351,7 +352,13 @@ const TERMINAL_LOCAL_ENSURE_MAX_ATTEMPTS: u64 = 3;
 const RECENT_DAEMON_START_GRACE_MS: u64 = 3_000;
 const TERMINAL_REMOTE_RESUME_READ_POLL_MS: u64 = 45;
 const TERMINAL_LOCAL_INITIAL_READ_POLL_MS: u64 = 120;
-const TERMINAL_ACTIVE_OUTPUT_READ_POLL_MS: u64 = 60;
+// Read cadence for the focused/active session's PTY output. Aligned to one
+// display frame (~16ms / 60fps) to match the xterm write-frame budget — at the
+// old 60ms (~16fps) output sat up to 60ms before it was even read, adding
+// visible latency on top of the frame flush. Only the focused session uses this
+// fast cadence (unfocused sessions use TERMINAL_UNFOCUSED_OUTPUT_READ_POLL_MS),
+// so the extra reads cost is one session's worth.
+const TERMINAL_ACTIVE_OUTPUT_READ_POLL_MS: u64 = 16;
 const TERMINAL_UNFOCUSED_OUTPUT_READ_POLL_MS: u64 = 16_000;
 const TERMINAL_UNFOCUSED_TUI_DROP_READ_POLL_MS: u64 = 15_000;
 const TERMINAL_REMOTE_IDLE_READ_POLL_MAX_MS: u64 = 220;
@@ -359,7 +366,11 @@ const TERMINAL_LOCAL_IDLE_READ_POLL_MAX_MS: u64 = 3_000;
 const TERMINAL_UNFOCUSED_LOCAL_IDLE_READ_POLL_MAX_MS: u64 = 8_000;
 const TERMINAL_IDLE_READ_BACKOFF_STEP_MS: u64 = 500;
 const TERMINAL_UNFOCUSED_IDLE_READ_BACKOFF_STEP_MS: u64 = 800;
-const TERMINAL_INPUT_ECHO_READ_POLL_MS: u64 = 45;
+// After the user types, poll the PTY almost immediately for the echo so
+// keystrokes feel instant (the "typing drag" in agent prompt regions came from
+// waiting up to 45ms per echo read before the frame flush). Used for a short
+// burst of reads after input (TERMINAL_INPUT_ECHO_READ_BURST_READS).
+const TERMINAL_INPUT_ECHO_READ_POLL_MS: u64 = 8;
 const TERMINAL_INPUT_ECHO_READ_DELAY_MS: u64 = 0;
 const TERMINAL_INPUT_ECHO_READ_BURST_READS: u8 = 8;
 const TERMINAL_APP_CONTROL_MULTILINE_READ_BURST_READS: u8 = 96;
@@ -8182,7 +8193,8 @@ fn terminal_surface_has_prompt_ready_text(text: &str) -> bool {
         && !terminal_chunk_is_codex_resume_instruction(trimmed)
         && (terminal_chunk_has_prompt_output(trimmed)
             || terminal_chunk_has_codex_prompt_output(trimmed)
-            || terminal_chunk_is_codex_interactive_setup_prompt(trimmed))
+            || terminal_chunk_is_codex_interactive_setup_prompt(trimmed)
+            || terminal_chunk_is_claude_prompt_surface(trimmed))
 }
 fn terminal_chunk_is_codex_interrupted_input_surface(text: &str) -> bool {
     let mut tail_lines = text
@@ -8292,6 +8304,7 @@ fn remote_resume_blank_host_snapshot_is_replayable(snapshot: &str) -> bool {
     let prompt_ready_snapshot = terminal_chunk_is_codex_prompt_surface(trimmed)
         || terminal_chunk_is_codex_interactive_setup_prompt(trimmed)
         || terminal_chunk_has_codex_prompt_output(trimmed)
+        || terminal_chunk_is_claude_prompt_surface(trimmed)
         || (terminal_chunk_has_prompt_output(trimmed)
             && !terminal_chunk_is_generic_codex_idle(trimmed)
             && !terminal_chunk_tail_is_generic_codex_idle(trimmed));
@@ -47348,6 +47361,24 @@ fn TerminalCanvas(
                                             )
                                         });
                                     let watching = window_focused_now && session_visible_now;
+                                    // A raw BEL while the user is actively watching this
+                                    // session is almost always a response to their own
+                                    // keystroke (bash readline rings BEL on no/ambiguous
+                                    // tab-completion, end-of-history, etc.) — NOT an
+                                    // unsolicited attention request. Suppress it so plain
+                                    // shells don't misfire "needs your attention". Genuine
+                                    // attention bells (session in background / window
+                                    // unfocused) still notify, and explicit OSC 9 / OSC 777
+                                    // notifies are never suppressed here.
+                                    if source == "bell" && watching {
+                                        append_trace_event(
+                                            &trace_home,
+                                            "ui",
+                                            "terminal_notify",
+                                            "bell_suppressed_while_watching",
+                                            json!({ "session_path": session_path.clone() }),
+                                        );
+                                    } else {
                                     let heading = notify_title
                                         .as_deref()
                                         .map(str::trim)
@@ -47381,6 +47412,7 @@ fn TerminalCanvas(
                                     );
                                     if !watching {
                                         let _ = send_user_notification(&heading, &detail);
+                                    }
                                     }
                                 }
                             }
@@ -53450,8 +53482,14 @@ fn terminal_xterm_canvas_renderer_enabled_from_env(
             .unwrap_or_default()
             .split(',')
             .any(|part| part.trim() == "x11");
+        // X11 WebKitGTK burns idle CPU with the canvas renderer; keep DOM there.
         if gdk_backend_x11 || (!wayland_display_present && display_present) {
             return false;
+        }
+        // Wayland: GPU canvas renderer (see main.rs renderer policy and
+        // docs/xterm-bugs.md#xterm-pipeline-latency).
+        if wayland_display_present {
+            return true;
         }
     }
     false
@@ -53464,11 +53502,20 @@ fn terminal_write_frame_ms() -> u64 {
         .unwrap_or(4000)
 }
 fn terminal_active_write_frame_ms() -> u64 {
+    // Latency: this is the flush cadence for the focused/active session's write
+    // bridge AND the cadence the alt-screen/cursor-hidden "frame mode" latch
+    // coalesces at. At the old 160ms (~6fps) an entire Claude/Codex TUI session
+    // was pinned to ~6fps interactive feel because the latch stays on for the
+    // whole life of an alt-screen / cursor-hidden app. One display frame (~16ms,
+    // 60fps) keeps the protective coalescing that shields the Rust->webview eval
+    // bridge from per-frame floods while removing the perceptible lag. See
+    // memory finding-xterm-latency-dom-renderer-write-framing. Tunable via
+    // YGGTERM_TERMINAL_ACTIVE_WRITE_FRAME_MS.
     std::env::var(TERMINAL_ACTIVE_WRITE_FRAME_MS_ENV)
         .ok()
         .and_then(|value| value.trim().parse::<u64>().ok())
         .map(|value| value.min(2000))
-        .unwrap_or(160)
+        .unwrap_or(16)
 }
 fn terminal_active_animation_write_frame_ms() -> u64 {
     std::env::var(TERMINAL_ACTIVE_ANIMATION_WRITE_FRAME_MS_ENV)
@@ -74006,6 +74053,7 @@ mod tests {
 
     #[test]
     fn xterm_canvas_renderer_is_gated_off_on_x11_idle_cpu_path() {
+        // Explicit env override always wins.
         assert!(!terminal_xterm_canvas_renderer_enabled_from_env(
             Some("0"),
             Some("wayland"),
@@ -74018,6 +74066,7 @@ mod tests {
             true,
             true
         ));
+        // X11 keeps the DOM renderer (idle-CPU regression).
         assert!(!terminal_xterm_canvas_renderer_enabled_from_env(
             None,
             Some("x11"),
@@ -74027,11 +74076,15 @@ mod tests {
         assert!(!terminal_xterm_canvas_renderer_enabled_from_env(
             None, None, false, true
         ));
-        assert!(!terminal_xterm_canvas_renderer_enabled_from_env(
+        // Wayland enables the GPU canvas renderer by default.
+        assert!(terminal_xterm_canvas_renderer_enabled_from_env(
             None,
             Some("wayland"),
             true,
             true
+        ));
+        assert!(terminal_xterm_canvas_renderer_enabled_from_env(
+            None, None, true, false
         ));
         let theme = terminal_theme(UiTheme::ZedLight, palette(UiTheme::ZedLight), 13.0, "");
         let script =
@@ -96907,7 +96960,7 @@ Shared connection to 192.0.2.14 closed.\r\n";
             "backgrounded disposable remote-owner output after attach should drain without using active rendering cadence"
         );
         assert_eq!(
-            terminal_inline_status_animation_read_poll_ms(40),
+            terminal_inline_status_animation_read_poll_ms(8),
             TERMINAL_ACTIVE_OUTPUT_READ_POLL_MS,
             "visible Codex inline status animation must not poll below the active output cadence even if an env override requests an overheated frame rate"
         );
