@@ -21,7 +21,10 @@ pub use app_control::{
     enqueue_screenshot_request, take_next_app_control_request, wait_for_app_control_response,
 };
 pub use attach::{AttachMetadata, run_attach};
-pub use automation::{Automation, AutomationCadence, automation_is_due, compute_next_run_at_ms};
+pub use automation::{
+    AUTOMATIONS_FILE, Automation, AutomationCadence, automation_is_due, automations_path,
+    compute_next_run_at_ms, load_automations, save_automations,
+};
 pub use codex_cli::{
     ManagedCliTool, ManagedCliToolStatus, TerminalIdentityColorProfile, managed_cli_refresh_ttl_ms,
 };
@@ -1869,6 +1872,11 @@ pub struct YggtermServer {
     remote_machines: Vec<RemoteMachineSnapshot>,
     live_session_order: Vec<String>,
     local_cc_sessions: Vec<LocalCcSession>,
+    /// Automation schedule definitions (persisted separately in
+    /// `~/.yggterm/automations.json`). A session is "automated" — and thus
+    /// shown in the Automated Sessions group instead of Live — iff some
+    /// automation's `linked_session_id` matches its id. See `automation.rs`.
+    automations: Vec<Automation>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -1910,9 +1918,68 @@ impl YggtermServer {
             remote_machines: Vec::new(),
             live_session_order: Vec::new(),
             local_cc_sessions,
+            automations: Vec::new(),
         };
 
         this
+    }
+
+    // ---- Automations (see automation.rs / docs/automations.md) ----
+
+    /// All automation definitions, in stable insertion order.
+    pub fn automations(&self) -> &[Automation] {
+        &self.automations
+    }
+
+    /// Replace the whole automation set (used when loading from disk).
+    pub fn set_automations(&mut self, automations: Vec<Automation>) {
+        self.automations = automations;
+    }
+
+    /// Insert or replace an automation by id. Returns the prior value if it
+    /// replaced one.
+    pub fn upsert_automation(&mut self, automation: Automation) -> Option<Automation> {
+        if let Some(slot) = self
+            .automations
+            .iter_mut()
+            .find(|existing| existing.id == automation.id)
+        {
+            Some(std::mem::replace(slot, automation))
+        } else {
+            self.automations.push(automation);
+            None
+        }
+    }
+
+    /// Remove an automation by id. Returns it if present. Does NOT touch the
+    /// linked session — un-automating leaves the session running; it simply
+    /// stops being grouped under Automated (E2: it reappears in Live).
+    pub fn remove_automation(&mut self, automation_id: &str) -> Option<Automation> {
+        let index = self
+            .automations
+            .iter()
+            .position(|existing| existing.id == automation_id)?;
+        Some(self.automations.remove(index))
+    }
+
+    pub fn automation(&self, automation_id: &str) -> Option<&Automation> {
+        self.automations
+            .iter()
+            .find(|existing| existing.id == automation_id)
+    }
+
+    /// The automation that owns this session, if any — the SSOT for placing the
+    /// session in the Automated Sessions group (derived, never a duplicated
+    /// flag on the session).
+    pub fn automation_for_session(&self, session_id: &str) -> Option<&Automation> {
+        self.automations
+            .iter()
+            .find(|automation| automation.linked_session_id.as_deref() == Some(session_id))
+    }
+
+    /// Whether a session is currently automated (shown under Automated Sessions).
+    pub fn session_is_automated(&self, session_id: &str) -> bool {
+        self.automation_for_session(session_id).is_some()
     }
 
     pub fn backend(&self) -> TerminalBackend {
