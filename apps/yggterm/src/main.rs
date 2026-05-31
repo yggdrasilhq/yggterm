@@ -2105,13 +2105,20 @@ fn linux_terminal_renderer_policy_from_input(
             reason: "xterm_canvas_disabled_for_x11",
         };
     }
+    if input.wayland_display_present {
+        // Wayland: enable the GPU canvas renderer (the DOM renderer is xterm.js's
+        // slowest backend). The X11 idle-CPU regression does not reproduce on
+        // Wayland, and the canvas-renderer false positive in the render-health
+        // heuristic (canvas_low_contrast_foreground_with_buffer_text) is fixed
+        // by trusting canvas ink. See docs/xterm-bugs.md#xterm-pipeline-latency.
+        return LinuxTerminalRendererPolicy {
+            set_canvas_env: Some("1"),
+            reason: "xterm_canvas_enabled_for_wayland",
+        };
+    }
     LinuxTerminalRendererPolicy {
         set_canvas_env: Some("0"),
-        reason: if input.wayland_display_present {
-            "xterm_canvas_disabled_by_default_for_wayland"
-        } else {
-            "xterm_canvas_disabled_by_default"
-        },
+        reason: "xterm_canvas_disabled_by_default",
     }
 }
 
@@ -3754,17 +3761,17 @@ mod tests {
     fn linux_terminal_renderer_policy_keeps_canvas_opt_in() {
         use super::{LinuxTerminalRendererPolicyInput, linux_terminal_renderer_policy_from_input};
 
+        // Wayland enables the GPU canvas renderer by default (the X11 idle-CPU
+        // regression does not reproduce on Wayland; the render-health false
+        // positive is fixed by trusting canvas ink).
         let wayland = linux_terminal_renderer_policy_from_input(LinuxTerminalRendererPolicyInput {
             explicit_canvas_env: false,
             gdk_backend_x11: false,
             wayland_display_present: true,
             display_present: true,
         });
-        assert_eq!(wayland.set_canvas_env, Some("0"));
-        assert_eq!(
-            wayland.reason,
-            "xterm_canvas_disabled_by_default_for_wayland"
-        );
+        assert_eq!(wayland.set_canvas_env, Some("1"));
+        assert_eq!(wayland.reason, "xterm_canvas_enabled_for_wayland");
 
         let x11 = linux_terminal_renderer_policy_from_input(LinuxTerminalRendererPolicyInput {
             explicit_canvas_env: false,
