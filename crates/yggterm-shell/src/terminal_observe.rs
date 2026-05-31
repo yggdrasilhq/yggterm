@@ -1253,25 +1253,14 @@ fn terminal_host_render_health_for_app_control(host: &Value) -> Option<Value> {
             "alpha_sum": alpha_sum,
         }));
     }
-    if has_buffer_text
-        && canvas_count > 0
-        && let Some((foreground, background, contrast_ratio)) =
-            terminal_host_canvas_low_contrast_style(host)
-    {
-        return Some(json!({
-            "healthy": false,
-            "status": "unhealthy",
-            "reason": "canvas_low_contrast_foreground_with_buffer_text",
-            "recovery_scheduled": recovery_scheduled,
-            "recovery_count": recovery_count,
-            "sampled_pixels": sampled_pixels,
-            "nontransparent_pixels": nontransparent_pixels,
-            "alpha_sum": alpha_sum,
-            "foreground_color": foreground,
-            "background_color": background,
-            "contrast_ratio": contrast_ratio,
-        }));
-    }
+    // NOTE: the DOM-style low-contrast check (terminal_host_canvas_low_contrast_style)
+    // is intentionally NOT applied here. It reads DOM-derived foreground/background
+    // colors, but when the canvas renderer owns the glyphs the `.xterm-rows` are
+    // unstyled (computed `color` resolves to black) — so on Wayland (canvas
+    // renderer) every healthy session falsely reported
+    // `canvas_low_contrast_foreground_with_buffer_text` and got stuck `ready:false`.
+    // Genuine canvas paint failures are still caught by `canvas_blank_with_buffer_text`
+    // (real canvas-ink sampling) above. See docs/xterm-bugs.md#xterm-pipeline-latency.
     if terminal_host_dom_rows_transparent_with_buffer_text(host) {
         return Some(json!({
             "healthy": false,
@@ -1410,78 +1399,6 @@ fn terminal_host_dom_rows_transparent_with_buffer_text(host: &Value) -> bool {
         }
     }
     false
-}
-
-fn terminal_host_canvas_low_contrast_style(host: &Value) -> Option<(String, String, f32)> {
-    let foreground = host
-        .get("foreground_color")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .trim();
-    let background = host
-        .get("effective_background_color")
-        .or_else(|| host.get("background_color"))
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .trim();
-    let fg = parse_css_rgb_color(foreground)?;
-    let bg = parse_css_rgb_color(background)?;
-    let contrast_ratio = terminal_rgb_contrast_ratio(fg, bg);
-    let background_luminance = terminal_rgb_relative_luminance(bg);
-    if background_luminance < 0.22 && contrast_ratio < 2.4 {
-        Some((
-            foreground.to_string(),
-            background.to_string(),
-            (contrast_ratio * 100.0).round() / 100.0,
-        ))
-    } else {
-        None
-    }
-}
-
-fn parse_css_rgb_color(value: &str) -> Option<(u8, u8, u8)> {
-    let normalized = value.trim().to_ascii_lowercase();
-    let inner = normalized
-        .strip_prefix("rgb(")
-        .and_then(|value| value.strip_suffix(')'))
-        .or_else(|| {
-            normalized
-                .strip_prefix("rgba(")
-                .and_then(|value| value.strip_suffix(')'))
-        })?;
-    let mut parts = inner.split(',').map(str::trim);
-    let red = parse_css_rgb_channel(parts.next()?)?;
-    let green = parse_css_rgb_channel(parts.next()?)?;
-    let blue = parse_css_rgb_channel(parts.next()?)?;
-    Some((red, green, blue))
-}
-
-fn parse_css_rgb_channel(value: &str) -> Option<u8> {
-    let value = value.strip_suffix('%').unwrap_or(value).trim();
-    value
-        .parse::<f32>()
-        .ok()
-        .map(|channel| channel.round().clamp(0.0, 255.0) as u8)
-}
-
-fn terminal_rgb_contrast_ratio(left: (u8, u8, u8), right: (u8, u8, u8)) -> f32 {
-    let left_lum = terminal_rgb_relative_luminance(left);
-    let right_lum = terminal_rgb_relative_luminance(right);
-    let lighter = left_lum.max(right_lum);
-    let darker = left_lum.min(right_lum);
-    (lighter + 0.05) / (darker + 0.05)
-}
-
-fn terminal_rgb_relative_luminance((red, green, blue): (u8, u8, u8)) -> f32 {
-    fn channel(value: u8) -> f32 {
-        let normalized = f32::from(value) / 255.0;
-        if normalized <= 0.04045 {
-            normalized / 12.92
-        } else {
-            ((normalized + 0.055) / 1.055).powf(2.4)
-        }
-    }
-    0.2126 * channel(red) + 0.7152 * channel(green) + 0.0722 * channel(blue)
 }
 
 fn terminal_css_color_is_transparent(value: &str) -> bool {
@@ -2985,6 +2902,44 @@ pub(crate) fn terminal_chunk_has_prompt_output(data: &str) -> bool {
         })
 }
 
+/// Recognize a Claude Code prompt/ready surface.
+///
+/// The remote retained-replay readiness gate was historically Codex-only
+/// (`terminal_chunk_is_codex_prompt_surface`, `…_has_codex_prompt_output`,
+/// `…_is_codex_interactive_setup_prompt`), so a resumed Claude Code session's
+/// retained snapshot was judged "non-prompt / not replayable" and the viewport
+/// blanked on mount/remount. Claude Code is a first-class `SessionKind` but its
+/// prompt shape was never taught to this layer. See
+/// docs/xterm-bugs.md#remote-cc-replay-codex-only and memory
+/// finding-remote-cc-retained-replay-codex-only.
+///
+/// Markers are kept Claude-specific (low false-positive against shell/Codex
+/// surfaces): the idle input-box footer "? for shortcuts", or a selection
+/// prompt that pairs Claude's `❯` caret with a permission affordance
+/// ("Do you want", "Yes, allow", "Tab to", "esc to", or an explicit
+/// yes/no option set).
+pub(crate) fn terminal_chunk_is_claude_prompt_surface(data: &str) -> bool {
+    let stripped = strip_terminal_control_sequences(data);
+    let trimmed = stripped.trim();
+    if trimmed.is_empty()
+        || terminal_chunk_is_transport_error(&stripped)
+        || terminal_chunk_is_loading_placeholder(&stripped)
+        || terminal_chunk_is_transcript_browser(&stripped)
+    {
+        return false;
+    }
+    let normalized = stripped.to_ascii_lowercase();
+    let idle_footer = normalized.contains("? for shortcuts");
+    let has_selection_caret = stripped.contains('❯');
+    let permission_prompt = has_selection_caret
+        && (normalized.contains("do you want")
+            || normalized.contains("yes, allow")
+            || normalized.contains("tab to ")
+            || normalized.contains("esc to ")
+            || (normalized.contains("yes") && normalized.contains("no")));
+    idle_footer || permission_prompt
+}
+
 pub(crate) fn terminal_chunk_has_current_codex_input_row(data: &str) -> bool {
     let stripped = strip_terminal_control_sequences(data);
     let lines = stripped
@@ -3541,7 +3496,8 @@ mod tests {
         describe_terminal_open_attempt, describe_viewport_snapshot,
         summarize_terminal_surface_for_app_control, terminal_bootstrap_activation_epoch,
         terminal_chunk_has_codex_prompt_output, terminal_chunk_has_current_codex_input_row,
-        terminal_chunk_has_meaningful_output, terminal_chunk_is_codex_interactive_setup_prompt,
+        terminal_chunk_has_meaningful_output, terminal_chunk_is_claude_prompt_surface,
+        terminal_chunk_is_codex_interactive_setup_prompt,
         terminal_chunk_is_codex_prompt_surface, terminal_chunk_is_local_codex_scaffold,
         terminal_chunk_is_transport_error, terminal_host_geometry_problem_for_app_control,
         terminal_host_problem_for_app_control,
@@ -4787,6 +4743,34 @@ Best thing to improve in the meantime:
     }
 
     #[test]
+    fn terminal_chunk_is_claude_prompt_surface_recognizes_claude_surfaces() {
+        // Permission/selection prompt (the live remote-cc blank-viewport repro).
+        assert!(terminal_chunk_is_claude_prompt_surface(
+            "\
+●
+
+ ❯ 1. Yes
+   2. Yes, allow reading from src/ during this session
+   3. No
+
+               · Tab to amend"
+        ));
+        // Idle input box footer.
+        assert!(terminal_chunk_is_claude_prompt_surface(
+            "\
+╭───────────────────────────────────────────╮
+│ > Try \"edit <filepath>\"                     │
+╰───────────────────────────────────────────╯
+  ? for shortcuts"
+        ));
+        // Must NOT match a plain shell surface or empty/loading content.
+        assert!(!terminal_chunk_is_claude_prompt_surface("user@host:~/gh/yggterm$ "));
+        assert!(!terminal_chunk_is_claude_prompt_surface(""));
+        // A bare caret without any Claude affordance is not enough.
+        assert!(!terminal_chunk_is_claude_prompt_surface("❯ "));
+    }
+
+    #[test]
     fn terminal_chunk_has_codex_prompt_output_accepts_codex_prompt_line() {
         assert!(terminal_chunk_has_codex_prompt_output(
             "› Explain this codebase"
@@ -5233,7 +5217,13 @@ Best thing to improve in the meantime:
     }
 
     #[test]
-    fn app_control_terminal_surface_flags_low_contrast_canvas_with_buffer_text() {
+    fn app_control_terminal_surface_does_not_flag_canvas_low_contrast_from_dom_color() {
+        // With the canvas renderer the DOM `.xterm-rows` are unstyled, so the
+        // computed `foreground_color` resolves to black even though the canvas
+        // paints readable glyphs. The old DOM-style low-contrast heuristic
+        // falsely flagged every healthy Wayland (canvas) session here and stuck
+        // it at `ready:false`. That check is removed; genuine canvas paint
+        // failures are caught by the canvas-ink (`canvas_blank...`) check.
         let host = json!({
             "session_path": "remote-session://practice/codex",
             "text_tail": "OpenAI Codex ready",
@@ -5248,23 +5238,50 @@ Best thing to improve in the meantime:
             "effective_background_color": "rgb(38, 42, 51)"
         });
         let summary = summarize_terminal_surface_for_app_control(&[host], false);
+        assert_ne!(
+            summary
+                .get("render_health")
+                .and_then(|health| health.get("reason"))
+                .and_then(Value::as_str),
+            Some("canvas_low_contrast_foreground_with_buffer_text"),
+            "DOM-color low-contrast must not flag a canvas-rendered surface"
+        );
+        assert_ne!(
+            summary.get("problem").and_then(Value::as_str),
+            Some("canvas_low_contrast_foreground_with_buffer_text")
+        );
+    }
+
+    #[test]
+    fn app_control_terminal_surface_trusts_canvas_with_healthy_ink_over_dom_contrast() {
+        // Same low DOM-style contrast as the flagged case, but the canvas
+        // layers report healthy ink — the glyphs are visibly painted on the
+        // canvas, so the DOM-style contrast heuristic must NOT fire (this is
+        // the Wayland canvas-renderer false positive that blocked enabling it).
+        let host = json!({
+            "session_path": "remote-session://practice/codex",
+            "text_tail": "OpenAI Codex ready",
+            "buffer_text_sample": "OpenAI Codex\n› Find and fix a bug in @filename",
+            "cursor_line_text": "› Find and fix a bug in @filename",
+            "xterm_present": true,
+            "screen_present": true,
+            "rows_present": false,
+            "canvas_count": 4,
+            "foreground_color": "rgb(0, 0, 0)",
+            "background_color": "rgb(38, 42, 51)",
+            "effective_background_color": "rgb(38, 42, 51)",
+            "canvas_layers": [
+                {"ink_sample": {"sampled_pixels": 4096, "nontransparent_pixels": 1200, "alpha_sum": 250000}}
+            ]
+        });
+        let summary = summarize_terminal_surface_for_app_control(&[host], false);
         assert_eq!(
             summary
                 .get("render_health")
                 .and_then(|health| health.get("healthy"))
                 .and_then(Value::as_bool),
-            Some(false)
-        );
-        assert_eq!(
-            summary
-                .get("render_health")
-                .and_then(|health| health.get("reason"))
-                .and_then(Value::as_str),
-            Some("canvas_low_contrast_foreground_with_buffer_text")
-        );
-        assert_eq!(
-            summary.get("problem").and_then(Value::as_str),
-            Some("canvas_low_contrast_foreground_with_buffer_text")
+            Some(true),
+            "canvas with healthy ink must not be flagged low-contrast from DOM style"
         );
     }
 
