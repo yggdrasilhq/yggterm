@@ -66,11 +66,19 @@ Automations are scheduled invocations of the **yggui app control** surface: open
 
 ## Open design questions (resolve during implementation)
 
-- Persistence of `Automation` definitions: a new section in `~/.yggterm/server-state.json` (SSOT, alongside sessions) vs a separate file.
-- Scheduler granularity & catch-up: if the daemon was down when `next_run_at` passed, run-on-next-start vs skip.
-- "Random ± days" jitter: deterministic seed per automation so `next_run_at` is stable/inspectable (no-non-determinism rule — the jitter must be computed, not re-rolled each tick).
-- Concurrency: if a prior automated session is still running when the timer fires (E1-style), transfer/attach rather than spawn a duplicate.
-- Whether `agent_kind` should be the general `SessionKind` (future first-class CLIs) rather than a Codex/CC binary.
+- ~~Persistence: server-state.json vs separate file~~ → **RESOLVED: separate `~/.yggterm/automations.json`** (atomic write-temp-rename). Chosen for clean separation + to avoid churn across 52 `PersistedLiveSession` / 23 `PersistedDaemonState` literal sites.
+- ~~Deterministic jitter~~ → **RESOLVED**: `compute_next_run_at_ms` seeds jitter from `(id, run-window)`; computed once into `next_run_at_ms`, never re-rolled per tick.
+- ~~`agent_kind` general?~~ → **RESOLVED**: it IS `SessionKind` (future first-class CLIs, not a Codex/CC binary).
+- ~~Automated-flag on session~~ → **RESOLVED: DERIVED** — `automation_for_session(id)` (an automation's `linked_session_id == session.id`). No duplicated flag on the session; the link on the automation is SSOT. E1/E2 = link add/remove.
+- Still open (scheduler increment): daemon-down catch-up = run-on-next-start (planned); concurrency when a prior automated session still runs = transfer/attach, never duplicate (E1).
+
+## Implementation status (experimental/automations)
+
+- ✅ **Increment 1 — scheduling foundation** (`b072d63`): `automation.rs` — `Automation`, `AutomationCadence`, deterministic `compute_next_run_at_ms` + `automation_is_due`. 6 tests.
+- ✅ **Increment 2 — persistence + server CRUD + derived grouping** (`577f8bd`): `automations.json` load/save; `YggtermServer.automations` + CRUD; `automation_for_session` / `session_is_automated`. 7 tests.
+- ⬜ **Increment 3 — daemon scheduler chore**: load automations at startup; periodic chore fires due automations → opens/re-prompts the linked keep-alive session via the app-control session-open + `terminal send` path; updates `last_run_at`/`next_run_at` + saves. E1 transfer-not-duplicate.
+- ⬜ **Increment 4 — UI**: Automated Sessions sidebar group (filtered by `session_is_automated`) + start-page "Automations" entries ("Launch [Codex/CC] on [cadence] at [time]") + New Automation create flow + E2 un-automate action.
+- ⬜ **Increment 5 — live verify** on jojo.
 
 ## Build / verify
 
