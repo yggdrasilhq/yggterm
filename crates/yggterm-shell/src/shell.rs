@@ -320,6 +320,15 @@ const REMOTE_TERMINAL_ATTACH_CONNECTED_GRACE_MS: u64 = 280;
 const STARTUP_TERMINAL_RESTORE_RECOVERY_MS: u64 = 5_000;
 const RETAINED_EMPTY_SURFACE_RECOVERY_REARM_MS: u64 = 900;
 const RETAINED_FAULT_READY_SETTLE_GRACE_MS: u64 = 1_500;
+// HOT switch-back: when a retained host that previously reached ready (and
+// whose daemon still owns the PTY) momentarily reports "xterm surface is
+// empty" right after being revealed on a session switch, that is a transient
+// repaint gap, NOT a fault — the activation repaint paints it within a frame
+// or two. Suppress the fault-recovery watchdog for this grace window so the
+// host is REVEALED (same epoch, scrollback intact) instead of cold-remounted.
+// Only if it is STILL empty after the grace do we treat it as a genuine fault
+// and recover. See memory [[followups-switch-hotness-update-friction]].
+const RETAINED_REVEAL_EMPTY_GRACE_MS: u64 = 1_200;
 const RETAINED_FAULT_RECOVERY_MAX_REARMS: u32 = 2;
 // Per [[feedback-cycle-all-keepalive-after-gate-work]]: after a user click,
 // keep the latch off for this long so the resume flow has runway to actually
@@ -771,6 +780,19 @@ struct ShellState {
     // the GUI first tries to recover a session, until either success or
     // lost-PTY latch.
     retained_fault_recovery_loop_armed_at_ms: HashMap<String, u64>,
+    // Per-session deadline through which the fault-recovery watchdog treats a
+    // benign "xterm surface is empty" on a revealed retained host (one that
+    // already reached ready and whose daemon still owns the PTY) as a transient
+    // reveal repaint gap rather than a fault. Set when the session is activated
+    // on a switch; cleared when its render state is dropped. Lets a switch-back
+    // REVEAL the existing host (scrollback intact, no remount) instead of cold
+    // recovery. See [[followups-switch-hotness-update-friction]].
+    terminal_reveal_grace_until_ms: HashMap<String, u64>,
+    // Sticky set of sessions whose host reached ready at least once in its
+    // current life (survives attempt churn; cleared on render-state drop).
+    // Drives hot-reveal recognition when the latest attempt is a cold-recovery
+    // one. See [[followups-switch-hotness-update-friction]].
+    terminal_sessions_reached_ready: HashSet<String>,
     remote_preview_sync_after_ms: HashMap<String, u64>,
     remote_preview_failures: HashMap<String, PreviewSyncFailure>,
     remote_preview_dirty_epoch: HashMap<String, u64>,
@@ -2129,6 +2151,8 @@ impl ShellState {
             retained_fault_recovery_lost_pty_sessions: HashSet::new(),
             retained_fault_recovery_latch_grace_until_ms: HashMap::new(),
             retained_fault_recovery_loop_armed_at_ms: HashMap::new(),
+            terminal_reveal_grace_until_ms: HashMap::new(),
+            terminal_sessions_reached_ready: HashSet::new(),
             remote_preview_sync_after_ms: HashMap::new(),
             remote_preview_failures: HashMap::new(),
             remote_preview_dirty_epoch: HashMap::new(),
@@ -3343,6 +3367,8 @@ impl ShellState {
         self.terminal_busy_hint_until_ms.remove(session_path);
         self.retained_rehydrate_daemon_ready_wait_started_by_session
             .remove(session_path);
+        self.terminal_reveal_grace_until_ms.remove(session_path);
+        self.terminal_sessions_reached_ready.remove(session_path);
         if self
             .active_terminal_host_id
             .as_deref()
@@ -3382,6 +3408,14 @@ impl ShellState {
             return;
         };
         let now_ms = current_millis();
+        // Sticky "this host reached ready at least once in its current life".
+        // Unlike `terminal_session_has_ready_history` (which only inspects the
+        // LATEST attempt, and is thus false once a cold recovery attempt
+        // supersedes the original), this survives attempt churn so the
+        // hot-reveal / reveal-grace logic still recognizes a host that WAS hot.
+        // Cleared in drop_terminal_render_state_for_session.
+        self.terminal_sessions_reached_ready
+            .insert(session_path.to_string());
         let mut ready_snapshot = None;
         if let Some(attempt) = self.terminal_open_attempts.get_mut(&attempt_id) {
             let first_ready = attempt.ready_at_ms.is_none();
@@ -4813,6 +4847,22 @@ impl ShellState {
                 )
             })
     }
+    /// Sticky "this host was hot (reached ready) at least once and isn't a dead
+    /// shell". Combines the per-life sticky set with the latest-attempt history
+    /// so hot-reveal recognition survives a cold-recovery attempt superseding
+    /// the original ready attempt.
+    fn terminal_session_was_ever_ready(&self, session_path: &str) -> bool {
+        self.terminal_sessions_reached_ready.contains(session_path)
+            || self.terminal_session_has_ready_history(session_path)
+    }
+    /// True while a freshly-revealed retained host is inside its reveal grace
+    /// window (opened on switch activation). See `terminal_reveal_grace_until_ms`.
+    fn terminal_session_in_reveal_grace(&self, session_path: &str) -> bool {
+        self.terminal_reveal_grace_until_ms
+            .get(session_path)
+            .copied()
+            .is_some_and(|until_ms| current_millis() < until_ms)
+    }
     fn terminal_session_is_retained_live(&self, session_path: &str) -> bool {
         let retained = self.retained_terminal_session_paths.contains(session_path);
         let active_remote_terminal_session = self.server.active_view_mode()
@@ -4827,9 +4877,18 @@ impl ShellState {
                         attempt.last_observed_reason.as_deref(),
                     )
             });
+        // During a reveal grace, a "recovering" attempt is the spurious one a
+        // prior switch left behind (or one the watchdog raced in on the benign
+        // empty-surface signal). If the host previously reached ready and the
+        // daemon still owns the PTY, treat the switch-back as a REVEAL and let
+        // the host be reused, rather than honoring that stale recovery.
+        let reveal_eligible = self.terminal_session_in_reveal_grace(session_path)
+            && self.terminal_session_was_ever_ready(session_path)
+            && self.daemon_owns_session_runtime(session_path)
+            && !self.terminal_attach_in_flight.contains(session_path);
         let active_remote_recovering_runtime = active_remote_terminal_session
             && self.active_remote_terminal_session_pending_runtime_launch(session_path);
-        if non_prompt_recovering_attempt || active_remote_recovering_runtime {
+        if (non_prompt_recovering_attempt && !reveal_eligible) || active_remote_recovering_runtime {
             return false;
         }
         let bootstrap_in_progress = self
@@ -4853,7 +4912,7 @@ impl ShellState {
         // through to recovery). See memory
         // [[followups-switch-hotness-update-friction]].
         let hot_reveal_reusable = has_host_epoch
-            && self.terminal_session_has_ready_history(session_path)
+            && self.terminal_session_was_ever_ready(session_path)
             && !self.terminal_attach_in_flight.contains(session_path)
             && self.daemon_owns_session_runtime(session_path);
         retained
@@ -5234,6 +5293,38 @@ impl ShellState {
                         "settle_grace_ms": RETAINED_FAULT_READY_SETTLE_GRACE_MS,
                         "terminal_resume_ready": true,
                         "terminal_attach_in_flight": false,
+                    }),
+                );
+            }
+            return false;
+        }
+        // HOT switch-back reveal grace: a host that previously reached ready and
+        // whose daemon still owns the PTY, reporting the benign empty-surface
+        // signal within its reveal grace, is a transient repaint gap on reveal —
+        // NOT a fault. Defer recovery so the existing host is revealed (scrollback
+        // intact) instead of cold-remounted; the activation repaint fills it. If
+        // it is STILL faulting after the grace expires, recovery proceeds
+        // normally on the next tick. Genuine non-empty faults (transport errors,
+        // identity mismatch, etc.) are unaffected — only the empty-surface reason
+        // is graced. See [[followups-switch-hotness-update-friction]].
+        let benign_reveal_empty_fault = fault_reason
+            == Some("active terminal host exists but xterm surface is empty")
+            && self.terminal_session_in_reveal_grace(session_path)
+            && self.terminal_session_was_ever_ready(session_path)
+            && self.daemon_owns_session_runtime(session_path);
+        if benign_reveal_empty_fault {
+            let suppression_key = format!("{session_path}:reveal_grace");
+            if self.last_retained_fault_invalidation_suppression_key.as_deref()
+                != Some(suppression_key.as_str())
+            {
+                self.last_retained_fault_invalidation_suppression_key = Some(suppression_key);
+                self.record_terminal_contract_telemetry(
+                    "retained_fault_recovery_suppressed_during_reveal",
+                    "info",
+                    session_path,
+                    "reveal grace: benign empty surface on revealed retained host",
+                    json!({
+                        "reveal_grace_ms": RETAINED_REVEAL_EMPTY_GRACE_MS,
                     }),
                 );
             }
@@ -37304,6 +37395,20 @@ fn app() -> Element {
         }
         last_terminal_mount_key.set(Some(mount_key.clone()));
         let (mount_epoch, reused_live_host) = state.with_mut(|shell| {
+            // Open the reveal grace window BEFORE deciding reuse. A switch-back
+            // to a host that previously reached ready is a REVEAL, not a fault:
+            // the grace makes both the reuse predicate ignore a stale spurious
+            // "recovering" attempt from a prior switch AND the fault-recovery
+            // watchdog defer on the transient empty-surface repaint gap, so the
+            // existing host (scrollback intact) is reused instead of cold
+            // remounted. Gated on ready_history so fresh/never-ready sessions
+            // are unaffected; genuine faults still recover after the grace.
+            if shell.terminal_session_was_ever_ready(&active_session_path) {
+                shell.terminal_reveal_grace_until_ms.insert(
+                    active_session_path.clone(),
+                    current_millis().saturating_add(RETAINED_REVEAL_EMPTY_GRACE_MS),
+                );
+            }
             let reused_live_host = shell.terminal_session_is_retained_live(&active_session_path);
             let mount_epoch = if reused_live_host {
                 shell.retain_terminal_session_path(&active_session_path)
@@ -85767,6 +85872,51 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         assert!(
             !shell.terminal_session_is_retained_live(active_session_path),
             "a retained host whose daemon PTY is gone must NOT be reused; it must recover"
+        );
+    }
+    #[test]
+    fn reveal_grace_lets_switch_back_reuse_host_despite_stale_recovering_attempt() {
+        // The watchdog race left a stale `Recovering` attempt with an
+        // invalidating reason. Without a reveal grace that forces a cold
+        // remount; with one (opened on switch activation) the host is reused.
+        let active_session_path = "remote-session://dev/reveal-grace";
+        let bootstrap = test_shell_bootstrap_with_active_session(active_session_path);
+        let mut shell = ShellState::new(bootstrap);
+        shell.server_busy = false;
+        shell.server.set_view_mode(WorkspaceViewMode::Terminal);
+        shell.retain_terminal_session_path(active_session_path);
+        shell.bump_terminal_mount_epoch_for_session(active_session_path);
+        let attempt_id =
+            shell.begin_terminal_open_attempt(active_session_path, "request:rg", 1, "test");
+        shell.mark_terminal_open_attempt_ready_for_session(active_session_path, "test_ready");
+        shell.terminal_resume_ready_paths.remove(active_session_path);
+        // Stale spurious recovering attempt from a prior switch's watchdog race.
+        if let Some(attempt) = shell.terminal_open_attempts.get_mut(&attempt_id) {
+            attempt.state = TerminalOpenAttemptState::Recovering;
+            attempt.last_observed_reason =
+                Some("active terminal host exists but xterm surface is empty".to_string());
+        }
+        // No grace yet -> the stale recovering attempt forces a cold remount.
+        assert!(
+            !shell.terminal_session_is_retained_live(active_session_path),
+            "without a reveal grace a stale recovering attempt must block reuse"
+        );
+        // Opening the reveal grace (as the activation effect does on switch)
+        // lets the host be reused, and the watchdog defers the benign fault.
+        shell.terminal_reveal_grace_until_ms.insert(
+            active_session_path.to_string(),
+            current_millis().saturating_add(RETAINED_REVEAL_EMPTY_GRACE_MS),
+        );
+        assert!(
+            shell.terminal_session_is_retained_live(active_session_path),
+            "within the reveal grace the host must be reused (HOT switch-back)"
+        );
+        assert!(
+            !shell.invalidate_retained_remote_non_prompt_surface(
+                active_session_path,
+                Some("active terminal host exists but xterm surface is empty"),
+            ),
+            "the watchdog must defer the benign empty-surface fault during the reveal grace"
         );
     }
     #[test]
