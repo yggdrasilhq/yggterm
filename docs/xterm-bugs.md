@@ -39,6 +39,8 @@ xterm.js owns vs what the shell owns, cursor/prompt semantics, etc. — see
 | [clipboard-double-paste](#clipboard-double-paste) | Class: text select + middle-click pastes selection THEN clipboard (double); Ctrl+Shift+V double paste; selection-vs-clipboard ordering bugs | OPEN, investigating |
 | [slow-jitter](#slow-jitter) | Some sessions exhibit visible per-frame jitter under steady PTY output | OPEN, uninvestigated |
 | [blank-rendering-region](#blank-rendering-region) | Region inside an active session goes blank until forced redraw | OPEN, uninvestigated |
+| [remote-cc-replay-codex-only](#remote-cc-replay-codex-only) | Resumed Claude Code (remote-cc) viewport renders without its prompt box / blanks on mount+remount because the retained-replay readiness gate only recognizes Codex prompts | FIX PENDING LIVE VERIFY 2026-05-31 |
+| [xterm-pipeline-latency](#xterm-pipeline-latency) | Interactive feel ~6fps vs ghostty/VSCode: DOM renderer forced + 160ms write-frame latch over xterm's own scheduler | FRAME BUDGET SHIPPED+VERIFIED 2026-05-31 (160→16ms); canvas renderer deferred (readiness heuristic) |
 | [scrollbar-not-draggable](#scrollbar-not-draggable) | Sleek thin scrollbar visible but cannot be dragged | FIXED 2026-05-28 |
 | [content-scooped-on-session-switch](#content-scooped-on-session-switch) | Switching sessions: middle rows disappear, top + bottom remaining text presented as continuous | OPEN, telemetry added |
 | [keepalive-restart-viewport-only](#keepalive-restart-viewport-only) | After GUI restart, keep-alive sessions show only viewport's worth of content; daemon had retained more in vt100 ring but didn't serve it | FIXED & VERIFIED LIVE 2026-05-28 on jojo 2.7.62 — local shell base_y 893→893, codex base_y 144→144 across kill+launch. Earlier reopen was misdiagnosed: the avikalpa_opc "only viewport" symptom was a stale resume-codex wiring issue on that specific session, not a scrollback retention gap. |
@@ -806,6 +808,150 @@ silent regressions when this path degrades.
 
 ### Related memory
 `[[spec-tmux-parity-and-beyond]]`, `[[xterm-scrollback-bug]]`
+
+---
+
+## remote-cc-replay-codex-only
+
+**STATUS:** FIX PENDING LIVE VERIFY 2026-05-31 — recognizer + readiness
+wiring landed on branch `fix/remote-cc-replay-and-xterm-latency`; unit
+tests pass; dev/jojo live verification still owed before "fixed".
+
+### Symptom
+A resumed Claude Code session (`remote-cc://…`) renders with its prompt
+box border / question / option numbers MISSING — only the assistant `●`
+bullet and bare option text survive. Forcing a repaint (session
+re-open → xterm host remount) collapses the viewport further to just `●`,
+fully blank. The full prompt still lives on the daemon/PTY side, so this
+is reconstruction loss, not Claude output, and not `blank-rendering-region`
+(the xterm BUFFER itself is missing the rows).
+
+### Reproduction
+1. Resume a Claude Code session on a remote (live-confirmed on jojo
+   2.7.86, `remote-cc://dev/654669a2…`, sitting at a tool-permission
+   prompt).
+2. Observe the prompt box is not fully reconstructed.
+3. `yggterm server app open <same remote-cc path>` to remount the host.
+4. Before fix: buffer dump (`app state` →
+   `active_terminal_hosts[].buffer_text_sample`) collapses to `●`,
+   `data_event_count: 0`; screenshot shows a blank viewport.
+
+### Root cause
+The remote retained-replay / resume-surface readiness layer in
+`crates/yggterm-shell/src/shell.rs` is **Codex-shaped**. Every "is this a
+replayable prompt surface?" gate
+(`remote_resume_blank_host_snapshot_is_replayable`,
+`remote_resume_snapshot_is_replayable_for_session`,
+`terminal_surface_has_prompt_ready_text`,
+`retained_remote_surface_has_non_prompt_text`) decides via
+`terminal_chunk_is_codex_prompt_surface` (requires the "OpenAI Codex"
+header), `terminal_chunk_has_codex_prompt_output` (requires Codex's `›`
+marker), or `terminal_chunk_has_prompt_output` (a ≤2-line bare shell
+prompt). A Claude permission prompt (box-drawn, `❯` caret, numbered
+options, "Tab to amend") matches NONE, so the snapshot is judged
+"non-prompt / not replayable" and the blank host stays blank.
+`codex_like_session` (shell.rs ~44888) excludes `SessionKind::ClaudeCode`.
+There was no Claude-prompt recognizer anywhere — `SessionKind::ClaudeCode`
+was made first-class for launch/icons/routing but this readiness layer was
+never taught Claude's prompt shape (an SSOT / holistic-spec gap). Present
+in `main` too — it is NOT fixed by the 2.7.86→2.8.0 bump.
+
+### Workaround / fix
+- New recognizer `terminal_chunk_is_claude_prompt_surface`
+  (`crates/yggterm-shell/src/terminal_observe.rs`) keyed on Claude-specific
+  markers ("? for shortcuts" idle footer; `❯` caret + a permission
+  affordance) — low false-positive against shell/Codex surfaces.
+- OR'd into `terminal_surface_has_prompt_ready_text` and the
+  `prompt_ready_snapshot` test inside
+  `remote_resume_blank_host_snapshot_is_replayable` (shell.rs).
+- LIVE-RECOVERY for a stuck session: resize the GUI window (SIGWINCH →
+  Claude full repaint via the LIVE write path, which works) — the bug is
+  replay-only.
+
+### Code locations
+- `crates/yggterm-shell/src/terminal_observe.rs` —
+  `terminal_chunk_is_claude_prompt_surface` (definition + test).
+- `crates/yggterm-shell/src/shell.rs` —
+  `terminal_surface_has_prompt_ready_text`,
+  `remote_resume_blank_host_snapshot_is_replayable` (wiring).
+
+### Open follow-ups
+- GUI-side replay JS (`terminal_replay_retained_data_script_for_session`)
+  still uses Codex's `›`/`promptNeedle` for some idempotency checks
+  (`replayVisibleInEntry`); confirm during dev verify that Claude replay
+  promotes through `promptViewportReadyInEntry` (geometry-only, non-codex
+  path) and add a Claude needle if not.
+- Consider generalizing `codex_like_session` → an agent-CLI-agnostic
+  `agent_like_session` per SSOT instead of accreting per-CLI recognizers.
+
+### Tests
+`terminal_observe::tests::terminal_chunk_is_claude_prompt_surface_recognizes_claude_surfaces`.
+
+### Related memory
+`[[finding-remote-cc-retained-replay-codex-only]]`,
+`[[spec-cwd-tree-agent-cli-unified]]`,
+`[[spec-agent-cli-wrapper-render-parity]]`, `[[content-scooped-on-session-switch]]`
+
+---
+
+## xterm-pipeline-latency
+
+**STATUS:** MITIGATED (frame budget) — SHIPPED & VERIFIED LIVE on jojo
+2026-05-31: active write-frame default 160ms→16ms; live state shows
+`terminal_active_write_frame_ms: 16` on remote-cc and codex sessions.
+GPU canvas renderer on Wayland was TRIED and DEFERRED (see below).
+Relates to `slow-jitter`.
+
+### Symptom
+Interactive typing/output in the xterm.js viewport feels markedly laggier
+than ghostty or VSCode's xterm.js — lower effective FPS, perceptible echo
+delay, especially inside agent-CLI (Claude/Codex) sessions.
+
+### Root cause
+Two stacked costs in `crates/yggterm-shell/src/shell.rs`:
+1. **DOM renderer forced on.** `terminal_xterm_canvas_renderer_enabled_from_env`
+   falls through to `false` in every Linux branch (canvas/WebGL addon is
+   bundled but gated off due to a past X11 idle-CPU regression — test
+   `xterm_canvas_renderer_is_gated_off_on_x11_idle_cpu_path`). The DOM
+   renderer is xterm.js's slowest backend. Live: `canvas_count: 0`.
+   VSCode uses WebGL; ghostty is native GPU.
+2. **A coarse write-framing layer over xterm's own scheduler.**
+   `TerminalWriteBridge` (`terminal_write_bridge.rs`) staged PTY output and
+   flushed at `terminal_active_write_frame_ms` = **160ms (~6fps)** when
+   focused/active, and the batching LATCHES on for the entire life of any
+   alt-screen / cursor-hidden TUI. xterm.js already coalesces writes to the
+   display refresh (~60fps), so this second layer only added latency.
+
+### Workaround / fix
+- `terminal_active_write_frame_ms` default 160ms → 16ms (one display
+  frame). Keeps the protective coalescing that shields the Rust→webview
+  `document::eval` bridge from per-frame floods while removing the
+  perceptible per-session lag. Tunable via
+  `YGGTERM_TERMINAL_ACTIVE_WRITE_FRAME_MS`.
+- GPU canvas renderer on Wayland: TRIED 2026-05-31, DEFERRED. It activated
+  (`canvas_count: 4`, idle CPU ~1.3% vs 0.0% DOM — X11 idle-CPU fear did NOT
+  reproduce on Wayland), but tripped the `canvas_low_contrast_foreground_with_buffer_text`
+  render-health heuristic (terminal_observe.rs) and left sessions
+  `ready: False` because yggterm's readiness/screenshot/contrast heuristics
+  read DOM `.xterm-rows`, which the canvas renderer does not populate.
+  Re-enabling is blocked on making those heuristics canvas-aware (trust
+  buffer-text + canvas-ink totals when the canvas renderer is active) and
+  confirming whether the low-contrast sample is a false positive. Still
+  reachable via `YGGTERM_ENABLE_XTERM_CANVAS=1` for that work.
+
+### Code locations
+- `crates/yggterm-shell/src/shell.rs` — `terminal_active_write_frame_ms`,
+  `terminal_xterm_canvas_renderer_enabled_from_env`.
+- `crates/yggterm-shell/src/terminal_write_bridge.rs` — frame latch.
+
+### Tests
+Existing relational frame-budget tests
+(`terminal_output_read_poll_slows_unfocused_streams_after_resume`, etc.)
+remain green with the new default.
+
+### Related memory
+`[[finding-xterm-latency-dom-renderer-write-framing]]`,
+`[[spec-tmux-parity-and-beyond]]`, `[[spec-xterm-gating-ux]]`
 
 ---
 
