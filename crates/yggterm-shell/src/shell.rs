@@ -4839,11 +4839,29 @@ impl ShellState {
                 .terminal_bootstrap_owner_by_session
                 .contains_key(session_path);
         let has_host_epoch = self.terminal_session_host_id(session_path).is_some();
+        // HOT reveal on switch-back: a retained host that previously reached
+        // ready and whose daemon PTY still exists can be revealed/reused
+        // (same epoch, no remount) instead of cold-remounted. While a host is
+        // HIDDEN its transient `resume_ready`/ready-attempt flags clear (or the
+        // attempt gains a spurious "xterm surface is empty" problem), which used
+        // to make the two clauses below false on every switch-back -> a cold
+        // remount + retained_fault_recovery that re-pulled scrollback. Unlike
+        // those flags, `ready_history` is STICKY (set once the host reached
+        // ready, survives hide) and only true when the host is not
+        // latched-failed; gating on `daemon_owns_session_runtime` ensures we
+        // never reveal a host whose PTY is actually gone (that still falls
+        // through to recovery). See memory
+        // [[followups-switch-hotness-update-friction]].
+        let hot_reveal_reusable = has_host_epoch
+            && self.terminal_session_has_ready_history(session_path)
+            && !self.terminal_attach_in_flight.contains(session_path)
+            && self.daemon_owns_session_runtime(session_path);
         retained
             && (((self.terminal_resume_ready_paths.contains(session_path)
                 || self.terminal_session_has_ready_attempt(session_path))
                 && !self.terminal_attach_in_flight.contains(session_path))
-                || (!active_remote_terminal_session && bootstrap_in_progress && has_host_epoch))
+                || (!active_remote_terminal_session && bootstrap_in_progress && has_host_epoch)
+                || hot_reveal_reusable)
     }
     fn rearm_unready_remote_terminal_bootstrap_for_open(&mut self, session_path: &str) -> bool {
         if !self.terminal_session_uses_remote_runtime(session_path) {
@@ -23881,10 +23899,20 @@ fn group_session_launch_context(
             title_hint,
         };
     }
-    TerminalLaunchContext::Local {
-        cwd: group_session_cwd(row),
-        title_hint,
-    }
+    // Single source of truth for the launch cwd: prefer the row's own
+    // `session_cwd` (the real filesystem directory) for BOTH local and remote,
+    // exactly as the remote branch above does. A local LIVE-SESSION row has a
+    // `full_path` of `local://<uuid>` — a session URI, not a directory — so the
+    // old `group_session_cwd(row)` (which returns `full_path` for non-group
+    // rows) handed `local://<uuid>` to the local launcher and errored. Folder /
+    // group rows have no `session_cwd`, so they still fall back to
+    // `group_session_cwd`. See [[spec-unify-local-remote]].
+    let cwd = row
+        .session_cwd
+        .clone()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| group_session_cwd(row));
+    TerminalLaunchContext::Local { cwd, title_hint }
 }
 fn document_parent_base(row: &BrowserRow) -> Option<String> {
     let normalize_legacy_parent = |path: String| {
@@ -80218,6 +80246,40 @@ mod tests {
         }
     }
     #[test]
+    fn local_live_session_new_terminal_here_uses_session_cwd_not_uri() {
+        // Regression: "new terminal here" on a LOCAL live-session row used to
+        // pass the row's `local://<uuid>` full_path as the launch cwd (via
+        // group_session_cwd) instead of its real `session_cwd`, erroring on
+        // launch. Remote rows already preferred session_cwd; both must agree.
+        let shell = ShellState::new(test_shell_bootstrap_with_active_session("local://test"));
+        let row = BrowserRow {
+            kind: BrowserRowKind::Session,
+            full_path: "local://bb880637-2a72-466b-a77e-45a45e16bba1".to_string(),
+            label: "local shell".to_string(),
+            detail_label: String::new(),
+            document_kind: None,
+            group_kind: None,
+            session_title: None,
+            depth: 1,
+            host_label: "local".to_string(),
+            descendant_sessions: 0,
+            expanded: false,
+            session_id: None,
+            session_cwd: Some("/home/user".to_string()),
+            session_kind: Some(SessionKind::Shell),
+        };
+        match group_session_launch_context(&shell, &row, SessionKind::Shell) {
+            TerminalLaunchContext::Local { cwd, .. } => {
+                assert_eq!(
+                    cwd.as_deref(),
+                    Some("/home/user"),
+                    "local new-terminal-here must launch in the session's real cwd, not its local:// URI"
+                );
+            }
+            other => panic!("expected local launch context, got {other:?}"),
+        }
+    }
+    #[test]
     fn remote_folder_helpers_accept_stored_leading_slash_paths() {
         let row = BrowserRow {
             kind: BrowserRowKind::Group,
@@ -85661,6 +85723,51 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             .terminal_resume_ready_paths
             .insert(active_session_path.to_string());
         assert!(shell.terminal_session_is_retained_live(active_session_path));
+    }
+    #[test]
+    fn retained_host_with_ready_history_is_hot_reusable_on_switch_back() {
+        // Regression for the "every session switch feels cold" bug
+        // ([[followups-switch-hotness-update-friction]]): a retained host that
+        // previously reached ready must stay HOT-reusable on switch-back even
+        // after its transient ready flags clear and the open attempt picks up a
+        // spurious "xterm surface is empty" problem while it was hidden — as
+        // long as the daemon still owns the PTY.
+        let active_session_path = "remote-session://dev/hot-switch";
+        let bootstrap = test_shell_bootstrap_with_active_session(active_session_path);
+        let mut shell = ShellState::new(bootstrap);
+        shell.server_busy = false;
+        shell.server.set_view_mode(WorkspaceViewMode::Terminal);
+        shell.retain_terminal_session_path(active_session_path);
+        shell.bump_terminal_mount_epoch_for_session(active_session_path);
+        let attempt_id =
+            shell.begin_terminal_open_attempt(active_session_path, "request:hot", 1, "test");
+        shell.mark_terminal_open_attempt_ready_for_session(active_session_path, "test_ready");
+        // Simulate the hidden-host state: not in resume-ready set, and the
+        // attempt now carries an empty-surface problem so has_ready_attempt is
+        // false. ready_history (ready_at_ms) is sticky and remains.
+        shell.terminal_resume_ready_paths.remove(active_session_path);
+        if let Some(attempt) = shell.terminal_open_attempts.get_mut(&attempt_id) {
+            attempt.observations = 1;
+            attempt.last_observed_ready = false;
+            attempt.last_surface_problem =
+                Some("active terminal host exists but xterm surface is empty".to_string());
+        }
+        assert!(
+            !shell.terminal_session_has_ready_attempt(active_session_path),
+            "precondition: the transient ready-attempt signal is cleared while hidden"
+        );
+        // latest_runtime_status is None here -> daemon_owns_session_runtime
+        // falls back to true, so the host is reusable (HOT reveal, no remount).
+        assert!(
+            shell.terminal_session_is_retained_live(active_session_path),
+            "a retained host that reached ready must be reused on switch-back, not cold-remounted"
+        );
+        // Safety: if the daemon no longer owns the PTY, fall through to recovery.
+        shell.latest_runtime_status = Some(runtime_status_for_test("2.8.1", 0, 12345));
+        assert!(
+            !shell.terminal_session_is_retained_live(active_session_path),
+            "a retained host whose daemon PTY is gone must NOT be reused; it must recover"
+        );
     }
     #[test]
     fn ready_terminal_attempt_ignores_degraded_dom_timeout_observation() {
