@@ -40909,7 +40909,13 @@ fn terminal_chunk_looks_idle_for_sidebar_icon(sample: &str) -> bool {
             && (terminal_chunk_has_prompt_output(prompt_summary_prefix)
                 || terminal_chunk_has_codex_prompt_output(prompt_summary_prefix)))
 }
-fn terminal_chunk_has_codex_working_status_for_sidebar_icon(sample: &str) -> bool {
+/// Detects an agent CLI actively processing a turn, for the sidebar working
+/// indicator. CLI-agnostic: Codex renders `Working (Ns • esc to interrupt)`,
+/// Claude Code renders `✻ <gerund>… (Ns · esc to interrupt)` — the shared,
+/// unambiguous "I'm busy, press esc to stop" signal is `esc to interrupt`,
+/// which neither CLI shows when idle. Codex-only background-task indicators
+/// (`/stop to close`, `background terminal running`) are kept as a fallback.
+fn terminal_chunk_has_agent_working_status_for_sidebar_icon(sample: &str) -> bool {
     sample.lines().rev().take(10).any(|line| {
         let line = line.trim();
         if line.is_empty() {
@@ -40917,11 +40923,16 @@ fn terminal_chunk_has_codex_working_status_for_sidebar_icon(sample: &str) -> boo
         }
         let lower = line.to_ascii_lowercase();
         if lower.contains("worked for ") {
+            // Codex completion summary ("Worked for Ns"), not active work.
             return false;
         }
+        // Universal active-processing signal shown by both Codex and Claude Code.
+        if lower.contains("esc to interrupt") {
+            return true;
+        }
+        // Codex-only background-task indicators (no "esc to interrupt" line).
         lower.contains("working (")
-            && (lower.contains("esc to interrupt")
-                || lower.contains("/stop to close")
+            && (lower.contains("/stop to close")
                 || lower.contains("background terminal running"))
     })
 }
@@ -41083,12 +41094,14 @@ fn sidebar_row_busy_state(snapshot: &RenderSnapshot, row: &BrowserRow) -> Sideba
         .any(|line| !line.trim().is_empty())
         && !terminal_lines_are_bootstrap_scaffold(&session.terminal_lines);
     let is_idle = terminal_chunk_looks_idle_for_sidebar_icon(&sidebar_sample);
-    let has_codex_working_status =
-        terminal_chunk_has_codex_working_status_for_sidebar_icon(&sidebar_sample);
-    if matches!(session.kind, SessionKind::Codex | SessionKind::CodexLiteLlm)
-        && has_codex_working_status
+    let has_agent_working_status =
+        terminal_chunk_has_agent_working_status_for_sidebar_icon(&sidebar_sample);
+    if matches!(
+        session.kind,
+        SessionKind::Codex | SessionKind::CodexLiteLlm | SessionKind::ClaudeCode
+    ) && has_agent_working_status
     {
-        return SidebarBusyState::busy("codex_working_status");
+        return SidebarBusyState::busy("agent_working_status");
     }
     let is_active_live_session = snapshot.active_session_path.as_deref()
         == Some(session.session_path.as_str())
@@ -44873,6 +44886,14 @@ fn TerminalCanvas(
     let session_host_label = session.host_label.clone();
     let session_kind = session.kind;
     let codex_like_session = matches!(session_kind, SessionKind::Codex | SessionKind::CodexLiteLlm);
+    // First-class agent CLIs that drive the sidebar "working" indicator (Codex
+    // AND Claude Code). Deliberately broader than `codex_like_session`, which
+    // gates codex-specific resize/replay handoff handling and must NOT include
+    // Claude Code.
+    let agent_cli_session = matches!(
+        session_kind,
+        SessionKind::Codex | SessionKind::CodexLiteLlm | SessionKind::ClaudeCode
+    );
     let terminal_session_kind = format!("{:?}", session.kind);
     let mount_identity = format!("{session_path}:{mount_epoch}");
     let mut terminal_resume_overlay_excerpt = use_signal(|| initial_resume_overlay_excerpt.clone());
@@ -47800,7 +47821,7 @@ fn TerminalCanvas(
                                     );
                                 }
                                 if terminal_host_health_should_mark_sidebar_busy(
-                                    codex_like_session,
+                                    agent_cli_session,
                                     frame_like_hot,
                                     host_surface_text,
                                 ) {
@@ -52190,7 +52211,7 @@ fn terminal_host_health_should_mark_sidebar_busy(
     host_surface_text: &str,
 ) -> bool {
     codex_like_session
-        && (terminal_chunk_has_codex_working_status_for_sidebar_icon(host_surface_text)
+        && (terminal_chunk_has_agent_working_status_for_sidebar_icon(host_surface_text)
             || frame_like_hot)
 }
 
@@ -90927,6 +90948,49 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
                     == normalize_live_session_path(session_path)
             })
             .expect("live session row");
+        assert!(sidebar_row_shows_busy_icon(&snapshot, row));
+    }
+    #[test]
+    fn sidebar_busy_icon_marks_active_claude_code_working_status() {
+        // Claude Code renders a different working line than Codex (animated
+        // spinner + gerund + token count), but shares the "esc to interrupt"
+        // signal. The generalized detector must light the sidebar indicator.
+        let session_path = "remote-cc://dev/working";
+        let mut shell = ShellState::new(test_shell_bootstrap_with_active_session(session_path));
+        let mut live_session = test_live_shell_session(session_path);
+        live_session.id = "working".to_string();
+        live_session.title = "yggterm claude-code".to_string();
+        live_session.kind = SessionKind::ClaudeCode;
+        live_session.host_label = "dev".to_string();
+        live_session.source = SessionSource::LiveSsh;
+        live_session.terminal_foreground_active = Some(false);
+        live_session.terminal_lines = vec![
+            "› Try \"how does the auth flow work?\"".to_string(),
+            "✻ Forging… (12s · ↑ 2.1k tokens · esc to interrupt)".to_string(),
+        ];
+        shell.server.apply_snapshot(ServerUiSnapshot {
+            active_session_path: Some(session_path.to_string()),
+            active_session: Some(snapshot_session_view_for_ui(live_session.clone())),
+            active_view_mode: WorkspaceViewMode::Terminal,
+            remote_machines: Vec::new(),
+            ssh_targets: Vec::new(),
+            live_sessions: vec![snapshot_session_view_for_ui(live_session)],
+        });
+        shell.needs_initial_server_sync = false;
+        shell.browser.select_path(session_path.to_string());
+        shell.selected_tree_paths.clear();
+        shell.selected_tree_paths.insert(session_path.to_string());
+        shell.selection_anchor = Some(session_path.to_string());
+
+        let snapshot = shell.snapshot();
+        let row = snapshot
+            .rows
+            .iter()
+            .find(|row| {
+                normalize_live_session_path(&row.full_path)
+                    == normalize_live_session_path(session_path)
+            })
+            .expect("live claude-code session row");
         assert!(sidebar_row_shows_busy_icon(&snapshot, row));
     }
     #[test]
