@@ -582,6 +582,10 @@ impl TerminalManager {
         self.sessions.get(key).map(|session| session.age_ms())
     }
 
+    pub fn session_idle_for_ms(&self, key: &str) -> Option<u64> {
+        self.sessions.get(key).map(|session| session.idle_for_ms())
+    }
+
     pub fn session_process_id(&self, key: &str) -> Option<u32> {
         self.sessions
             .get(key)
@@ -1449,6 +1453,15 @@ impl PtySessionRuntime {
 
     fn age_ms(&self) -> u64 {
         now_millis().saturating_sub(self.started_at_ms)
+    }
+
+    /// Milliseconds since this session last produced PTY output. The reader
+    /// loop stamps `last_activity_ms` on every chunk, so this is the most
+    /// reliable daemon-side "how recently was this session active" signal —
+    /// used by the hot-update idle gate to avoid interrupting agents that are
+    /// mid-turn or just finished. See [[finding-hot-update-interrupts-remote-sessions]].
+    fn idle_for_ms(&self) -> u64 {
+        now_millis().saturating_sub(self.last_activity_ms.load(Ordering::SeqCst))
     }
 
     fn snapshot(&self) -> String {

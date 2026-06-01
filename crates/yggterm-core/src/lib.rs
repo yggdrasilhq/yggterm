@@ -928,6 +928,40 @@ fn serialize_settings_value(settings: &AppSettings) -> Value {
     })
 }
 
+/// Single source of truth for "is an agent CLI actively working right now",
+/// derived purely from the live screen text. CLI-agnostic: Codex renders
+/// `Working (Ns • esc to interrupt)`, Claude Code renders
+/// `✻ <gerund>… (Ns · esc to interrupt)` — the shared, unambiguous "I'm busy,
+/// press esc to stop" signal is `esc to interrupt`, which neither CLI shows
+/// when idle. Codex-only background-task indicators (`/stop to close`,
+/// `background terminal running`) are kept as a fallback.
+///
+/// Both the sidebar working-indicator (GUI) and the hot-update idle gate
+/// (daemon) MUST use this one function so the displayed "working" state and
+/// the "is it safe to hot-update" decision can never silently diverge.
+/// See [[finding-hot-update-interrupts-remote-sessions]].
+pub fn screen_text_shows_agent_working(sample: &str) -> bool {
+    sample.lines().rev().take(10).any(|line| {
+        let line = line.trim();
+        if line.is_empty() {
+            return false;
+        }
+        let lower = line.to_ascii_lowercase();
+        if lower.contains("worked for ") {
+            // Codex completion summary ("Worked for Ns"), not active work.
+            return false;
+        }
+        // Universal active-processing signal shown by both Codex and Claude Code.
+        if lower.contains("esc to interrupt") {
+            return true;
+        }
+        // Codex-only background-task indicators (no "esc to interrupt" line).
+        lower.contains("working (")
+            && (lower.contains("/stop to close")
+                || lower.contains("background terminal running"))
+    })
+}
+
 pub fn resolve_yggterm_home() -> Result<PathBuf> {
     if let Some(value) = std::env::var_os(ENV_YGGTERM_HOME) {
         let p = PathBuf::from(value);
@@ -1913,6 +1947,39 @@ fn short_session_id(session_id: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn agent_working_detects_esc_to_interrupt_for_both_clis() {
+        // Codex
+        assert!(screen_text_shows_agent_working(
+            "some output\nWorking (12s • esc to interrupt)"
+        ));
+        // Claude Code
+        assert!(screen_text_shows_agent_working(
+            "✻ Pondering… (5s · esc to interrupt)"
+        ));
+        // Codex background task without an esc-to-interrupt line
+        assert!(screen_text_shows_agent_working(
+            "Working (background terminal running)"
+        ));
+    }
+
+    #[test]
+    fn agent_working_is_false_when_idle_or_completed() {
+        // Completion summary must not read as active work.
+        assert!(!screen_text_shows_agent_working(
+            "• Worked for 42s\n› "
+        ));
+        // Plain idle shell prompt.
+        assert!(!screen_text_shows_agent_working("user@host:~$ "));
+        assert!(!screen_text_shows_agent_working(""));
+        // "esc to interrupt" buried far above the visible tail is ignored.
+        let mut buf = String::from("Working (1s • esc to interrupt)\n");
+        for _ in 0..20 {
+            buf.push_str("idle line\n");
+        }
+        assert!(!screen_text_shows_agent_working(&buf));
+    }
 
     #[test]
     fn cc_title_prefers_latest_custom_title_over_ai_title() {
