@@ -22184,9 +22184,31 @@ fn queue_tree_rename(mut state: Signal<ShellState>, row: BrowserRow, label: Stri
     });
     sync_active_terminal_input_policy(state);
     let settings = state.read().settings.clone();
+    // Resolve the SSH target for a remote Claude Code session up front (from the
+    // live session view), so the blocking task can write the rename's
+    // `custom-title` into the CC JSONL on the machine that owns it. See memory
+    // finding-cc-title-storage-custom-title.
+    let remote_cc_rename: Option<(String, Option<String>, String)> = {
+        let is_cc = row.session_kind == Some(SessionKind::ClaudeCode)
+            || is_claude_code_session_path(&row.full_path);
+        if is_cc && row.full_path.starts_with("remote-cc://") {
+            let session_id = row.session_id.clone();
+            state.read().server.live_sessions().iter().find_map(|session| {
+                if session.session_path != row.full_path {
+                    return None;
+                }
+                let ssh_target = session.ssh_target.clone()?;
+                let id = session_id.clone()?;
+                Some((ssh_target, session.ssh_prefix.clone(), id))
+            })
+        } else {
+            None
+        }
+    };
     spawn(async move {
         let row_for_task = row.clone();
         let trimmed_for_task = trimmed.clone();
+        let remote_cc_rename_for_task = remote_cc_rename.clone();
         let outcome = task::spawn_blocking(move || -> Result<(SessionNode, String)> {
             let store = SessionStore::open_or_init()?;
             let mut selected_path = row_for_task.full_path.clone();
@@ -22245,23 +22267,37 @@ fn queue_tree_rename(mut state: Signal<ShellState>, row: BrowserRow, label: Stri
                     let is_claude_code = row_for_task.session_kind
                         == Some(SessionKind::ClaudeCode)
                         || is_claude_code_session_path(&row_for_task.full_path);
-                    let cc_jsonl_written = is_claude_code
-                        && row_for_task
-                            .session_id
-                            .as_deref()
-                            .and_then(|session_id| {
-                                yggterm_core::local_cc_session_jsonl_path(session_id)
-                                    .map(|jsonl| (session_id, jsonl))
-                            })
-                            .map(|(session_id, jsonl)| {
-                                yggterm_core::append_cc_session_custom_title(
-                                    &jsonl,
-                                    session_id,
-                                    &trimmed_for_task,
-                                )
-                            })
-                            .transpose()?
-                            .is_some();
+                    let cc_jsonl_written = if let Some((ssh_target, prefix, session_id)) =
+                        remote_cc_rename_for_task.as_ref()
+                    {
+                        // Remote CC: append the custom-title on the owning machine
+                        // over SSH (mirrors CC's own /rename there).
+                        yggterm_server::rename_remote_cc_session(
+                            ssh_target,
+                            prefix.as_deref(),
+                            session_id,
+                            &trimmed_for_task,
+                        )?;
+                        true
+                    } else {
+                        is_claude_code
+                            && row_for_task
+                                .session_id
+                                .as_deref()
+                                .and_then(|session_id| {
+                                    yggterm_core::local_cc_session_jsonl_path(session_id)
+                                        .map(|jsonl| (session_id, jsonl))
+                                })
+                                .map(|(session_id, jsonl)| {
+                                    yggterm_core::append_cc_session_custom_title(
+                                        &jsonl,
+                                        session_id,
+                                        &trimmed_for_task,
+                                    )
+                                })
+                                .transpose()?
+                                .is_some()
+                    };
                     if !cc_jsonl_written {
                         if let Some(session_id) = row_for_task.session_id.as_deref() {
                             store.save_manual_title_for_session_id(
