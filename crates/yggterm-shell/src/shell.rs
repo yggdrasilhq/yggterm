@@ -41263,25 +41263,10 @@ fn terminal_chunk_looks_idle_for_sidebar_icon(sample: &str) -> bool {
 /// which neither CLI shows when idle. Codex-only background-task indicators
 /// (`/stop to close`, `background terminal running`) are kept as a fallback.
 fn terminal_chunk_has_agent_working_status_for_sidebar_icon(sample: &str) -> bool {
-    sample.lines().rev().take(10).any(|line| {
-        let line = line.trim();
-        if line.is_empty() {
-            return false;
-        }
-        let lower = line.to_ascii_lowercase();
-        if lower.contains("worked for ") {
-            // Codex completion summary ("Worked for Ns"), not active work.
-            return false;
-        }
-        // Universal active-processing signal shown by both Codex and Claude Code.
-        if lower.contains("esc to interrupt") {
-            return true;
-        }
-        // Codex-only background-task indicators (no "esc to interrupt" line).
-        lower.contains("working (")
-            && (lower.contains("/stop to close")
-                || lower.contains("background terminal running"))
-    })
+    // SSOT: the detection heuristic lives in yggterm-core so the sidebar
+    // working-indicator and the daemon hot-update idle gate share one
+    // definition of "agent is working" and cannot diverge.
+    yggterm_core::screen_text_shows_agent_working(sample)
 }
 fn terminal_lines_are_bootstrap_scaffold(lines: &[String]) -> bool {
     let visible = lines
