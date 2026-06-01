@@ -26,7 +26,7 @@ use yggterm_server::{
     run_app_control_probe_terminal_viewport_input, run_app_control_probe_terminal_viewport_scroll,
     run_app_control_probe_terminal_viewport_select, run_app_control_reclaim_terminal_focus,
     run_app_control_redraw_terminal, run_app_control_remove_session,
-    run_app_control_rename_session,
+    run_app_control_rename_session, run_app_control_restart_session,
     run_app_control_reset_theme_editor, run_app_control_resize_window,
     run_app_control_restart_pending_update, run_app_control_scroll_preview,
     run_app_control_scroll_right_panel, run_app_control_send_terminal_input,
@@ -1968,6 +1968,12 @@ fn main() -> Result<()> {
                             anyhow::anyhow!("missing title for server app session rename")
                         })?;
                         run_app_control_rename_session(session_path, title, timeout_ms)
+                    }
+                    "restart" => {
+                        let session_path = cli_positional_args(&args, 4).into_iter().next().ok_or_else(|| {
+                            anyhow::anyhow!("missing session path for server app session restart")
+                        })?;
+                        run_app_control_restart_session(session_path, timeout_ms)
                     }
                     other => anyhow::bail!("unsupported app session action: {other}"),
                 }
