@@ -4,6 +4,19 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+## 2.8.4
+
+- Claude Code sessions now show the working/busy indicator in the sidebar
+  while the agent is processing a turn (previously only Codex/shell sessions
+  did — CC's live status was never sampled).
+- Fix new Codex sessions failing to cold-attach after their first turn: the
+  stored resume command kept the placeholder session id instead of the real
+  one once known, so a cold resume could fail until the session was reopened.
+- Rename a session straight from automation via
+  `yggterm server app session rename <path> <title>` (drives the same rename
+  pipeline as the sidebar).
+- Right-click a live session → "Restart Session" to force a manual restart.
+
 ## 2.8.3
 
 - Claude Code session titles are now integrated both ways. yggterm reads CC's
