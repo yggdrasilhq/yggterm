@@ -14017,6 +14017,39 @@ fn refresh_remote_managed_cli(
         .with_context(|| format!("parsing remote managed cli refresh report for {ssh_target}"))
 }
 
+/// SSH-invoked on the remote machine: append a Claude Code `custom-title`
+/// (user rename) to the session's JSONL there, using the same core helper the
+/// local rename path uses. The write-back half of yggterm's CC rename
+/// integration. See memory finding-cc-title-storage-custom-title.
+/// Client/daemon side: SSH-invoke `cc-rename` on the remote machine so a
+/// yggterm rename of a `remote-cc://` session writes the `custom-title` into
+/// the CC JSONL on the machine that owns it. Reuses the SSOT remote-yggterm
+/// invoker (binary resolution + quoting). See memory
+/// finding-cc-title-storage-custom-title.
+pub fn rename_remote_cc_session(
+    ssh_target: &str,
+    exec_prefix: Option<&str>,
+    session_id: &str,
+    title: &str,
+) -> anyhow::Result<()> {
+    run_remote_yggterm_command(
+        ssh_target,
+        exec_prefix,
+        &["server", "remote", "cc-rename", session_id, title],
+        None,
+    )?;
+    Ok(())
+}
+
+pub fn run_remote_cc_rename(session_id: &str, title: &str) -> anyhow::Result<()> {
+    let Some(path) = yggterm_core::local_cc_session_jsonl_path(session_id) else {
+        anyhow::bail!("claude code session not found on this machine: {session_id}");
+    };
+    yggterm_core::append_cc_session_custom_title(&path, session_id, title)?;
+    println!("renamed {session_id}");
+    Ok(())
+}
+
 pub fn run_remote_terminate_codex(session_id: &str) -> anyhow::Result<()> {
     if let Ok(home) = resolve_yggterm_home() {
         let current_endpoint = default_endpoint(&home);
