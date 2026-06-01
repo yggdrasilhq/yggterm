@@ -35,7 +35,7 @@ use yggterm_server::{
     run_app_control_probe_terminal_primary_selection_paste,
     run_app_control_probe_terminal_viewport_input, run_app_control_probe_terminal_viewport_scroll,
     run_app_control_probe_terminal_viewport_select, run_app_control_reclaim_terminal_focus,
-    run_app_control_redraw_terminal, run_app_control_remove_session,
+    run_app_control_redraw_terminal, run_app_control_remove_session, run_app_control_rename_session,
     run_app_control_reset_theme_editor, run_app_control_resize_window,
     run_app_control_restart_pending_update, run_app_control_scroll_preview,
     run_app_control_scroll_right_panel, run_app_control_send_terminal_input,
@@ -670,6 +670,7 @@ fn print_server_app_help() {
   yggterm server app screenshot [output] [--pid <pid>]
   yggterm server app open <session-path> [--view <terminal|preview>] [--pid <pid>]
   yggterm server app session <remove|delete> <session-path> [--pid <pid>]
+  yggterm server app session rename <session-path> <title> [--pid <pid>]
   yggterm server app start-page [--pid <pid>]
   yggterm server app terminal <new|send|focus|probe-type|probe-scroll|probe-select|probe-context-menu> ...
   yggterm server app terminal send <session> (--data <data>|--stdin)"
@@ -1799,6 +1800,18 @@ fn main() -> Result<()> {
                             .next()
                             .context("missing session path for server app session remove")?;
                         run_app_control_remove_session(session_path, timeout_ms)
+                    }
+                    "rename" => {
+                        let positionals = cli_positional_args(&args, 4);
+                        let session_path = positionals
+                            .first()
+                            .copied()
+                            .context("missing session path for server app session rename")?;
+                        let title = positionals
+                            .get(1)
+                            .copied()
+                            .context("missing title for server app session rename")?;
+                        run_app_control_rename_session(session_path, title, timeout_ms)
                     }
                     other => anyhow::bail!("unsupported app session action: {other}"),
                 }
