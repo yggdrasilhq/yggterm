@@ -11723,6 +11723,7 @@ def scan_cc_session(jsonl_path):
     session_id = None
     cwd = None
     ai_title = None
+    custom_title = None
     first_human_text = None
     context_parts = []
     try:
@@ -11748,6 +11749,12 @@ def scan_cc_session(jsonl_path):
                         session_id = sid.strip()
                 if t == 'ai-title' and ai_title is None:
                     ai_title = (r.get('aiTitle') or '').strip() or None
+                # custom-title is the user rename (/rename or picker Ctrl+R); it
+                # wins over ai-title and is latest-wins (a re-rename appends again).
+                if t == 'custom-title':
+                    ct = (r.get('customTitle') or '').strip()
+                    if ct:
+                        custom_title = ct
                 if t == 'user':
                     # cwd lives in user records alongside the message content
                     if cwd is None:
@@ -11777,8 +11784,9 @@ def scan_cc_session(jsonl_path):
                 # cwd fallback: any record that carries a top-level cwd field
                 if cwd is None and r.get('cwd') and r['cwd'].strip():
                     cwd = r['cwd'].strip()
-                if ai_title is not None and first_human_text is not None and cwd is not None:
-                    break
+                # NOTE: do NOT early-break once ai-title/human/cwd are known — a
+                # `custom-title` (user rename) is appended later in the log and
+                # must win. Scanning continues to the MAX_BYTES cap.
     except Exception:
         return None
     # Use filename stem as session_id if no explicit sessionId was found in the file.
@@ -11793,7 +11801,7 @@ def scan_cc_session(jsonl_path):
     return {
         'session_id': resolved_id,
         'cwd': cwd or '',
-        'title': ai_title or first_human_text or resolved_id[:8],
+        'title': custom_title or ai_title or first_human_text or resolved_id[:8],
         'context': ' · '.join(context_parts),
         'mtime': mtime,
         'path': str(jsonl_path),
