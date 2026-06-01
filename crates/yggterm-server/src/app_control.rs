@@ -317,6 +317,11 @@ pub enum AppControlCommand {
         session_path: String,
         title: String,
     },
+    /// Force-restart a live session through the same path as the context-menu
+    /// "Restart Session" action, so the agent can drive + verify restarts.
+    RestartSession {
+        session_path: String,
+    },
     SetSessionKeepAlive {
         session_path: String,
         keep_alive: bool,
@@ -386,6 +391,7 @@ impl AppControlCommand {
             Self::ProbeTerminalContextMenu { .. } => "probe_terminal_context_menu",
             Self::RemoveSession { .. } => "remove_session",
             Self::RenameSession { .. } => "rename_session",
+            Self::RestartSession { .. } => "restart_session",
             Self::SetSessionKeepAlive { .. } => "set_session_keep_alive",
             Self::SetRowExpanded { .. } => "set_row_expanded",
             Self::SetTreeSelection { .. } => "set_tree_selection",
