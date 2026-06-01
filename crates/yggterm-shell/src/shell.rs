@@ -22191,18 +22191,37 @@ fn queue_tree_rename(mut state: Signal<ShellState>, row: BrowserRow, label: Stri
     let remote_cc_rename: Option<(String, Option<String>, String)> = {
         let is_cc = row.session_kind == Some(SessionKind::ClaudeCode)
             || is_claude_code_session_path(&row.full_path);
-        if is_cc && row.full_path.starts_with("remote-cc://") {
-            let session_id = row.session_id.clone();
-            state.read().server.live_sessions().iter().find_map(|session| {
-                if session.session_path != row.full_path {
-                    return None;
-                }
-                let ssh_target = session.ssh_target.clone()?;
-                let id = session_id.clone()?;
-                Some((ssh_target, session.ssh_prefix.clone(), id))
-            })
-        } else {
-            None
+        match row
+            .full_path
+            .trim_start_matches('/')
+            .strip_prefix("remote-cc://")
+            .filter(|_| is_cc)
+        {
+            Some(rest) => {
+                // remote-cc://<machine>/<session-id>: parse machine + id from the
+                // path (the live-session view does not surface ssh_target), then
+                // resolve the machine's ssh target/prefix from remote_machines.
+                let (machine_key, path_session_id) = rest
+                    .split_once('/')
+                    .map(|(m, id)| (m.to_string(), id.to_string()))
+                    .unwrap_or_else(|| (rest.to_string(), String::new()));
+                let session_id = row
+                    .session_id
+                    .clone()
+                    .filter(|id| !id.trim().is_empty())
+                    .unwrap_or(path_session_id);
+                let shell = state.read();
+                shell
+                    .server
+                    .remote_machines()
+                    .iter()
+                    .find(|machine| machine.machine_key == machine_key)
+                    .filter(|_| !session_id.trim().is_empty())
+                    .map(|machine| {
+                        (machine.ssh_target.clone(), machine.prefix.clone(), session_id.clone())
+                    })
+            }
+            None => None,
         }
     };
     spawn(async move {
@@ -34874,6 +34893,38 @@ async fn process_pending_app_control_requests(
                     .and_then(Value::as_str)
                     .map(ToOwned::to_owned),
                 data: Some(result),
+            }
+        }
+        AppControlCommand::RenameSession {
+            session_path,
+            title,
+        } => {
+            let trimmed = title.trim().to_string();
+            let row = state.with(|shell| resolve_app_control_row(shell, &session_path));
+            let (accepted, reason) = match (&row, trimmed.is_empty()) {
+                (Some(row), false) => {
+                    state.with_mut(|shell| shell.begin_tree_rename(row));
+                    queue_tree_rename(state, row.clone(), trimmed.clone());
+                    (true, None)
+                }
+                (Some(_), true) => (false, Some("empty title".to_string())),
+                (None, _) => (
+                    false,
+                    Some(format!("no session row for {session_path}")),
+                ),
+            };
+            AppControlResponse {
+                request_id: request.request_id.clone(),
+                handled_by_pid: std::process::id(),
+                completed_at_ms: current_millis() as u128,
+                output_path: None,
+                error: reason.clone(),
+                data: Some(json!({
+                    "accepted": accepted,
+                    "session_path": session_path,
+                    "title": trimmed,
+                    "reason": reason,
+                })),
             }
         }
         AppControlCommand::RemoveSession { session_path } => {
