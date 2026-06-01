@@ -4,6 +4,19 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+## 2.8.5
+
+- Hot updates now wait for agent CLI sessions to be idle before swapping the
+  daemon, so an update never lands on top of a Codex/Claude Code turn in
+  progress (and avoids throwing away a still-warm prompt cache). A session
+  blocks the update while it shows `esc to interrupt` or produced output within
+  the idle window (default 5 min, set `YGGTERM_HOT_UPDATE_IDLE_THRESHOLD_MS`;
+  override entirely with `YGGTERM_HOT_UPDATE_IGNORE_IDLE_GATE=1`).
+- Fix hot-update handoffs being reported as failed/deferred when they actually
+  succeeded: with many live sessions the daemon took longer than the 10s client
+  timeout to prepare the handoff, so the success response was missed and the
+  update looked like a no-op. The handoff now uses the long request budget.
+
 ## 2.8.4
 
 - Claude Code sessions now show the working/busy indicator in the sidebar
