@@ -1862,11 +1862,18 @@ impl DaemonRuntime {
             .session_foreground_process_active(&runtime_path);
         if matches!(
             session.kind,
-            SessionKind::Shell | SessionKind::Codex | SessionKind::CodexLiteLlm
+            SessionKind::Shell
+                | SessionKind::Codex
+                | SessionKind::CodexLiteLlm
+                | SessionKind::ClaudeCode
         ) && let Some(screen_text) = self.terminals.session_screen_snapshot(&runtime_path)
             && let Some((status_line, terminal_lines)) =
                 terminal_sidebar_snapshot_from_screen(&screen_text)
         {
+            // ClaudeCode must be included: the sidebar working-indicator detects
+            // CC's "esc to interrupt" status, but it can only do so if CC's live
+            // screen text is refreshed here. Omitting it left CC sessions stuck
+            // showing idle. See memory finding-hot-update-interrupts-remote-sessions (#21).
             session.status_line = status_line;
             session.terminal_lines = terminal_lines;
         }
