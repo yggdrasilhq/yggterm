@@ -444,6 +444,32 @@ fn hot_update_target_regression(
     (requested_version < existing_version).then(|| (existing.to_string(), requested.to_string()))
 }
 
+/// Default idle window an agent CLI session must be quiet for before a
+/// hot-update is allowed to proceed. Tuned around the Anthropic prompt-cache
+/// window: a `claude --resume` within a few minutes of the last turn still
+/// re-hits the cache, so deferring updates while a session was recently active
+/// (or is mid-turn) preserves that cache and avoids interrupting work. The user
+/// can shorten/lengthen via `YGGTERM_HOT_UPDATE_IDLE_THRESHOLD_MS`.
+/// See [[finding-hot-update-interrupts-remote-sessions]].
+const HOT_UPDATE_IDLE_THRESHOLD_MS_DEFAULT: u64 = 300_000;
+
+fn hot_update_idle_threshold_ms() -> u64 {
+    std::env::var("YGGTERM_HOT_UPDATE_IDLE_THRESHOLD_MS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(HOT_UPDATE_IDLE_THRESHOLD_MS_DEFAULT)
+}
+
+/// `true` when the operator has explicitly opted out of the idle gate (e.g. an
+/// agent/dev deploy that must land now). Cache preservation is the default
+/// priority, so this is an explicit override rather than something `--force`
+/// implies (`--force` only bypasses the same-version target check).
+fn hot_update_idle_gate_overridden() -> bool {
+    std::env::var("YGGTERM_HOT_UPDATE_IGNORE_IDLE_GATE")
+        .ok()
+        .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "yes" | "on"))
+}
+
 #[cfg(unix)]
 fn server_socket_path_lexists(path: &Path) -> bool {
     fs::symlink_metadata(path).is_ok()
@@ -1852,6 +1878,36 @@ impl DaemonRuntime {
             session_terminal_bytes: payload_stats.terminal_bytes,
             session_payload_total_bytes: payload_stats.total_bytes,
         }
+    }
+
+    /// Idle gate for hot-update (#19): returns `Some(reason)` when a hot-update
+    /// should be DEFERRED to preserve agent CLI work / prompt cache, else `None`.
+    /// Blocks when any owned session is currently working (`esc to interrupt`
+    /// via the shared [`yggterm_core::screen_text_shows_agent_working`] SSOT) or
+    /// produced output more recently than the idle threshold. Fail-safe:
+    /// unknown/unreadable sessions do not block (the session-survival defer
+    /// still protects them). Overridable via `YGGTERM_HOT_UPDATE_IGNORE_IDLE_GATE`.
+    fn hot_update_idle_gate_block_reason(&self, owned_runtime_keys: &[String]) -> Option<String> {
+        if hot_update_idle_gate_overridden() {
+            return None;
+        }
+        let threshold_ms = hot_update_idle_threshold_ms();
+        for key in owned_runtime_keys {
+            let runtime_path = self.terminal_runtime_key_for_path(key);
+            if let Some(screen) = self.terminals.session_screen_snapshot(&runtime_path)
+                && yggterm_core::screen_text_shows_agent_working(&screen)
+            {
+                return Some(format!("session {key} is actively working (esc to interrupt)"));
+            }
+            if let Some(idle_ms) = self.terminals.session_idle_for_ms(&runtime_path)
+                && idle_ms < threshold_ms
+            {
+                return Some(format!(
+                    "session {key} was active {idle_ms}ms ago (< {threshold_ms}ms idle threshold)"
+                ));
+            }
+        }
+        None
     }
 
     fn overlay_terminal_runtime_snapshot_session(&self, session: &mut SnapshotSessionView) {
@@ -3550,6 +3606,36 @@ impl DaemonRuntime {
                     {
                         return Ok(ServerResponse::Error {
                             message: "hot update handoff requires a different target daemon version when live terminal runtimes are present (pass --force to override for dev/agent deploys)".to_string(),
+                        });
+                    }
+                    // #19 idle gate: cache preservation > update. Defer the
+                    // hot-update while any owned agent session is mid-turn or
+                    // was active inside the idle window so we never churn the
+                    // daemon (and eventually retire it) on top of live work.
+                    // Overridable via YGGTERM_HOT_UPDATE_IGNORE_IDLE_GATE.
+                    if let Some(reason) =
+                        self.hot_update_idle_gate_block_reason(&owned_terminal_session_keys)
+                    {
+                        append_trace_event(
+                            self.store.home_dir(),
+                            "daemon",
+                            "hot_update",
+                            "hot_update_deferred_idle_gate",
+                            serde_json::json!({
+                                "expected_version": expected_version,
+                                "reason": &reason,
+                                "idle_threshold_ms": hot_update_idle_threshold_ms(),
+                                "owned_terminal_session_count": owned_terminal_session_keys.len(),
+                                "owned_terminal_session_keys": &owned_terminal_session_keys,
+                                "server_version": SERVER_PROTOCOL_VERSION,
+                                "server_pid": std::process::id(),
+                                "update_priority": "defer_update_preserve_cache",
+                            }),
+                        );
+                        return Ok(ServerResponse::Error {
+                            message: format!(
+                                "hot update deferred to preserve agent work/cache: {reason} (set YGGTERM_HOT_UPDATE_IGNORE_IDLE_GATE=1 to override)"
+                            ),
                         });
                     }
                     let daemon_executable = canonical_hot_restart_executable(&daemon_executable)?;
@@ -8606,7 +8692,17 @@ fn daemon_request_io_timeout_ms(request: &ServerRequest) -> u64 {
         | ServerRequest::RemoveSession { .. }
         | ServerRequest::TerminalRestart {
             force_remote: true, ..
-        } => DAEMON_LONG_REQUEST_IO_TIMEOUT_MS,
+        }
+        // Hot-update handoff writes persisted state for every managed session,
+        // writes the preserved-owner registry, and spawns the successor daemon
+        // before returning `HotUpdateHandoff`. With many managed sessions this
+        // routinely exceeds the 10s default, so the client read timed out at
+        // ~10s and surfaced a false "reading daemon response" failure even
+        // though the handoff actually completed (new daemon bound, registry
+        // written, sessions preserved). Give it the long budget so the success
+        // response is read instead of false-negatived. See
+        // [[finding-hot-update-interrupts-remote-sessions]].
+        | ServerRequest::HotRestart { .. } => DAEMON_LONG_REQUEST_IO_TIMEOUT_MS,
         _ => DAEMON_REQUEST_IO_TIMEOUT_MS,
     }
 }
