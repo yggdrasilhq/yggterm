@@ -1093,6 +1093,24 @@ fn upsert_snapshot_metadata(metadata: &mut Vec<SnapshotMetadataEntry>, label: &s
     }
 }
 
+/// #16: cold attach resumes via the STORED `launch_command`, which embeds the
+/// session id (e.g. `... resume-codex <id> ...`). At spawn that id is the
+/// synthesized UUIDv4; a runtime-identity rebind later learns the real CLI id.
+/// Re-point the stored launch_command at the real id so a cold attach resumes
+/// the actual transcript instead of the dead UUIDv4 (which failed until a
+/// close+reopen rebuilt the command). No-op when the id isn't embedded (e.g.
+/// a bare `codex` / `claude` start command). See
+/// finding-codex-cold-attach-stale-launch-command.
+fn repoint_stored_launch_command_session_id(session: &mut ManagedSessionView, new_id: &str) {
+    let previous_id = session.id.clone();
+    if !previous_id.trim().is_empty()
+        && previous_id != new_id
+        && session.launch_command.contains(&previous_id)
+    {
+        session.launch_command = session.launch_command.replace(&previous_id, new_id);
+    }
+}
+
 pub(crate) fn overlay_codex_runtime_snapshot_identity(
     session: &mut SnapshotSessionView,
     identity: &CodexRuntimeProcessIdentity,
@@ -1141,6 +1159,7 @@ pub(crate) fn overlay_claude_code_runtime_managed_identity(
     let runtime_key = session.session_path.clone();
     let title_was_generated = session.title.trim().is_empty()
         || looks_like_generated_fallback_title(&session.title);
+    repoint_stored_launch_command_session_id(session, &identity.session_id);
     session.id = identity.session_id.clone();
     upsert_session_metadata(
         &mut session.metadata,
@@ -1174,6 +1193,7 @@ pub(crate) fn overlay_codex_runtime_managed_identity(
         || looks_like_generated_fallback_title(&session.title)
         || parse_remote_runtime_codex_session_key(&runtime_key)
             .is_some_and(|runtime_id| session.title.contains(runtime_id));
+    repoint_stored_launch_command_session_id(session, &identity.session_id);
     session.id = identity.session_id.clone();
     upsert_session_metadata(
         &mut session.metadata,
