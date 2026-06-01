@@ -310,6 +310,13 @@ pub enum AppControlCommand {
     RemoveSession {
         session_path: String,
     },
+    /// Rename a session through the real tree-rename pipeline (sidebar title).
+    /// Lets the agent drive + verify renames (e.g. Claude Code custom-title
+    /// write-back) without a human gesture.
+    RenameSession {
+        session_path: String,
+        title: String,
+    },
     SetSessionKeepAlive {
         session_path: String,
         keep_alive: bool,
@@ -378,6 +385,7 @@ impl AppControlCommand {
             }
             Self::ProbeTerminalContextMenu { .. } => "probe_terminal_context_menu",
             Self::RemoveSession { .. } => "remove_session",
+            Self::RenameSession { .. } => "rename_session",
             Self::SetSessionKeepAlive { .. } => "set_session_keep_alive",
             Self::SetRowExpanded { .. } => "set_row_expanded",
             Self::SetTreeSelection { .. } => "set_tree_selection",
