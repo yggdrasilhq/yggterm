@@ -39485,6 +39485,68 @@ fn app() -> Element {
                                 });
                             }
                         },
+                        on_restart_session: {
+                            let row = row.clone();
+                            move |_| {
+                                let path = row.full_path.clone();
+                                let label = row.label.clone();
+                                state.with_mut(|shell| shell.close_context_menu());
+                                // Manual restart override. terminal_force_remote_restart_async
+                                // re-resumes a remote session's runtime (the user's
+                                // keep-alive agent sessions are remote). Local-session
+                                // restart isn't wired through this primitive yet.
+                                let is_remote = path.starts_with("remote-cc://")
+                                    || path.starts_with("remote-session://");
+                                if !is_remote {
+                                    state.with_mut(|shell| {
+                                        shell.push_notification(
+                                            NotificationTone::Info,
+                                            "Restart Session",
+                                            format!(
+                                                "{label}: manual restart is currently available for remote sessions."
+                                            ),
+                                        );
+                                    });
+                                    return;
+                                }
+                                let (endpoint, appearance) = state.with(|shell| {
+                                    (
+                                        shell.bootstrap.server_endpoint.clone(),
+                                        shell.effective_terminal_identity_appearance().to_string(),
+                                    )
+                                });
+                                let trace_home =
+                                    resolve_yggterm_home().unwrap_or_else(|_| PathBuf::from("."));
+                                state.with_mut(|shell| {
+                                    shell.push_notification(
+                                        NotificationTone::Warning,
+                                        "Restart Session",
+                                        format!("Restarting {label}…"),
+                                    );
+                                });
+                                spawn(async move {
+                                    if let Err(error) = terminal_force_remote_restart_async(
+                                        endpoint,
+                                        path.clone(),
+                                        Some(appearance),
+                                        None,
+                                        &trace_home,
+                                        "manual_restart_session",
+                                        0,
+                                    )
+                                    .await
+                                    {
+                                        state.with_mut(|shell| {
+                                            shell.push_notification(
+                                                NotificationTone::Error,
+                                                "Restart Failed",
+                                                format!("{label}: {error}"),
+                                            );
+                                        });
+                                    }
+                                });
+                            }
+                        },
                         on_delete_item: {
                             let row = row.clone();
                             move |_| {
@@ -66164,6 +66226,7 @@ fn ContextMenuOverlay(
     on_close_live_sessions: EventHandler<MouseEvent>,
     on_set_keep_alive: EventHandler<bool>,
     on_redraw_terminal: EventHandler<MouseEvent>,
+    on_restart_session: EventHandler<MouseEvent>,
     on_delete_item: EventHandler<MouseEvent>,
     on_open_terminal_here: EventHandler<MouseEvent>,
     on_new_codex_here: EventHandler<MouseEvent>,
@@ -66391,6 +66454,19 @@ fn ContextMenuOverlay(
                                 on_redraw_terminal.call(evt);
                             },
                             "Redraw Terminal"
+                        }
+                        button {
+                            "data-context-menu-action": "restart-session",
+                            class: "yggterm-menu-item",
+                            style: context_menu_action_style(palette, false),
+                            onmousedown: |evt| {
+                                evt.stop_propagation();
+                            },
+                            onclick: move |evt| {
+                                evt.stop_propagation();
+                                on_restart_session.call(evt);
+                            },
+                            "Restart Session"
                         }
                         button {
                             "data-context-menu-action": if keep_alive_active { "stop-keep-alive" } else { "keep-alive" },
