@@ -4,6 +4,17 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+## 2.8.2
+
+- Fix "new terminal here" on a local live session erroring out: the local
+  launch path used the row's `local://<uuid>` identifier as the working
+  directory instead of its real cwd (the remote path was already correct).
+  Both paths now resolve the cwd the same way.
+- Session switching is smoother: switching back to a recently-used session no
+  longer triggers a repeated cold remount loop. The previously-rendered host
+  is revealed instead of rebuilt, preserving its scrollback. (A brief one-time
+  refresh can still occur on the first switch back; further work tracked.)
+
 ## 2.8.1
 
 - Fix resumed Claude Code (`remote-cc`) sessions rendering blank / losing their
