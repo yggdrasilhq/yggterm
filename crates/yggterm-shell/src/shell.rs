@@ -22235,23 +22235,52 @@ fn queue_tree_rename(mut state: Signal<ShellState>, row: BrowserRow, label: Stri
                         .session_cwd
                         .clone()
                         .unwrap_or_else(|| row_for_task.full_path.clone());
-                    if let Some(session_id) = row_for_task.session_id.as_deref() {
-                        store.save_manual_title_for_session_id(
-                            session_id,
-                            &cwd,
-                            &trimmed_for_task,
-                        )?;
-                    } else if store
-                        .save_manual_title_for_session_path(
-                            &row_for_task.full_path,
-                            &trimmed_for_task,
-                        )?
-                        .is_none()
-                    {
-                        return Err(anyhow!(
-                            "session rename needs a stable session identity: {}",
-                            row_for_task.full_path
-                        ));
+                    // Claude Code: a rename is a `custom-title` written into CC's
+                    // own JSONL (identical to CC's `/rename` / picker Ctrl+R), so
+                    // CC's storage stays the single source of truth and the rename
+                    // is bidirectional — CC shows yggterm's rename and vice versa.
+                    // See memory finding-cc-title-storage-custom-title. Local CC
+                    // JSONL is written directly here; remote-cc is handled by the
+                    // daemon over SSH (below, outside this blocking store task).
+                    let is_claude_code = row_for_task.session_kind
+                        == Some(SessionKind::ClaudeCode)
+                        || is_claude_code_session_path(&row_for_task.full_path);
+                    let cc_jsonl_written = is_claude_code
+                        && row_for_task
+                            .session_id
+                            .as_deref()
+                            .and_then(|session_id| {
+                                yggterm_core::local_cc_session_jsonl_path(session_id)
+                                    .map(|jsonl| (session_id, jsonl))
+                            })
+                            .map(|(session_id, jsonl)| {
+                                yggterm_core::append_cc_session_custom_title(
+                                    &jsonl,
+                                    session_id,
+                                    &trimmed_for_task,
+                                )
+                            })
+                            .transpose()?
+                            .is_some();
+                    if !cc_jsonl_written {
+                        if let Some(session_id) = row_for_task.session_id.as_deref() {
+                            store.save_manual_title_for_session_id(
+                                session_id,
+                                &cwd,
+                                &trimmed_for_task,
+                            )?;
+                        } else if store
+                            .save_manual_title_for_session_path(
+                                &row_for_task.full_path,
+                                &trimmed_for_task,
+                            )?
+                            .is_none()
+                        {
+                            return Err(anyhow!(
+                                "session rename needs a stable session identity: {}",
+                                row_for_task.full_path
+                            ));
+                        }
                     }
                 }
             }
