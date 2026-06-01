@@ -15,7 +15,7 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::fs;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use time::OffsetDateTime;
 use titles::{SessionTitleResolver, settings_ready as litellm_settings_ready};
@@ -1297,6 +1297,63 @@ pub fn read_codex_session_identity_fields(path: &Path) -> Result<Option<(String,
     Ok(read_codex_session_identity(path)?.map(|identity| (identity.session_id, identity.cwd)))
 }
 
+/// Resolve the on-disk JSONL path for a local Claude Code session by its id.
+/// CC names each session file `<session-id>.jsonl` under
+/// `~/.claude/projects/<encoded-cwd>/`, so a glob on the id avoids reproducing
+/// CC's cwd-encoding. Returns the first match (ids are UUIDs → unique).
+pub fn local_cc_session_jsonl_path(session_id: &str) -> Option<PathBuf> {
+    let home = dirs::home_dir()?;
+    let projects_dir = home.join(".claude").join("projects");
+    let file_name = format!("{session_id}.jsonl");
+    for project_entry in fs::read_dir(&projects_dir).ok()?.flatten() {
+        let candidate = project_entry.path().join(&file_name);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+/// Append a Claude Code user-rename to a session's JSONL — byte-compatible with
+/// what CC itself writes for `/rename` (a `custom-title` record, which CC
+/// displays over its auto `ai-title`, plus the parallel `agent-name` record).
+/// This makes a yggterm rename indistinguishable from a CC rename and keeps
+/// CC's JSONL the single source of truth. See memory
+/// finding-cc-title-storage-custom-title.
+pub fn append_cc_session_custom_title(
+    jsonl_path: &Path,
+    session_id: &str,
+    title: &str,
+) -> Result<()> {
+    let title = title.trim();
+    if title.is_empty() {
+        anyhow::bail!("refusing to write an empty Claude Code title");
+    }
+    let custom_title = serde_json::json!({
+        "type": "custom-title",
+        "customTitle": title,
+        "sessionId": session_id,
+    });
+    let agent_name = serde_json::json!({
+        "type": "agent-name",
+        "agentName": title,
+        "sessionId": session_id,
+    });
+    let mut payload = String::new();
+    payload.push_str(&serde_json::to_string(&custom_title)?);
+    payload.push('\n');
+    payload.push_str(&serde_json::to_string(&agent_name)?);
+    payload.push('\n');
+    let mut file = fs::OpenOptions::new()
+        .create(false)
+        .append(true)
+        .open(jsonl_path)
+        .with_context(|| format!("failed to open cc session for rename {}", jsonl_path.display()))?;
+    file.write_all(payload.as_bytes())
+        .with_context(|| format!("failed to append cc rename to {}", jsonl_path.display()))?;
+    Ok(())
+}
+
 pub fn read_cc_session_identity_fields(path: &Path) -> Result<Option<(String, String)>> {
     let file = fs::File::open(path)
         .with_context(|| format!("failed to read cc session {}", path.display()))?;
@@ -1342,18 +1399,35 @@ pub fn read_cc_session_title(path: &Path) -> Result<Option<String>> {
     let file = fs::File::open(path)
         .with_context(|| format!("failed to read cc session {}", path.display()))?;
     let reader = BufReader::new(file);
+    // Claude Code title precedence (verified against CC 2.1.x JSONL, see memory
+    // finding-cc-title-storage-custom-title): a user rename (`/rename` or the
+    // resume-picker Ctrl+R) appends a `custom-title` record, which CC itself
+    // displays OVER its auto-generated `ai-title`. Both are append-only and
+    // latest-wins. So scan the whole file and prefer the latest `custom-title`,
+    // then the latest `ai-title`, then the first human prompt. (We can't early-
+    // return on `ai-title` — a later `custom-title` must win, and the caller
+    // reads the whole file for context immediately after anyway.)
+    let mut custom_title: Option<String> = None;
+    let mut ai_title: Option<String> = None;
     let mut first_human_text: Option<String> = None;
     for line in reader.lines() {
         let line = line.with_context(|| format!("failed to read line from {}", path.display()))?;
         let Ok(value) = serde_json::from_str::<Value>(&line) else {
             continue;
         };
-        // ai-title is the canonical title Claude Code generates — use it immediately.
+        if value.get("type").and_then(Value::as_str) == Some("custom-title") {
+            if let Some(title) = value.get("customTitle").and_then(Value::as_str) {
+                let title = title.trim();
+                if !title.is_empty() {
+                    custom_title = Some(title.to_string());
+                }
+            }
+        }
         if value.get("type").and_then(Value::as_str) == Some("ai-title") {
             if let Some(title) = value.get("aiTitle").and_then(Value::as_str) {
                 let title = title.trim();
                 if !title.is_empty() {
-                    return Ok(Some(title.to_string()));
+                    ai_title = Some(title.to_string());
                 }
             }
         }
@@ -1402,7 +1476,7 @@ pub fn read_cc_session_title(path: &Path) -> Result<Option<String>> {
             }
         }
     }
-    Ok(first_human_text)
+    Ok(custom_title.or(ai_title).or(first_human_text))
 }
 
 pub fn read_cc_session_context(path: &Path) -> Result<String> {
@@ -1839,6 +1913,63 @@ fn short_session_id(session_id: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cc_title_prefers_latest_custom_title_over_ai_title() {
+        let dir = std::env::temp_dir().join(format!("ygg-cc-title-{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        let path = dir.join("sess.jsonl");
+        // AI title (re-emitted), then a user rename (custom-title), then a
+        // re-rename — latest custom-title must win.
+        fs::write(
+            &path,
+            concat!(
+                r#"{"type":"ai-title","aiTitle":"Auto Generated","sessionId":"s1"}"#,
+                "\n",
+                r#"{"type":"user","message":{"role":"user","content":"hello there"}}"#,
+                "\n",
+                r#"{"type":"ai-title","aiTitle":"Auto Generated","sessionId":"s1"}"#,
+                "\n",
+                r#"{"type":"custom-title","customTitle":"User Renamed","sessionId":"s1"}"#,
+                "\n",
+                r#"{"type":"custom-title","customTitle":"User Renamed Again","sessionId":"s1"}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            read_cc_session_title(&path).unwrap().as_deref(),
+            Some("User Renamed Again")
+        );
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn append_cc_custom_title_round_trips_through_reader() {
+        let dir = std::env::temp_dir().join(format!("ygg-cc-rt-{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        let path = dir.join("rt.jsonl");
+        // Start with only an AI title (what yggterm would show before rename).
+        fs::write(
+            &path,
+            "{\"type\":\"ai-title\",\"aiTitle\":\"Before\",\"sessionId\":\"abc\"}\n",
+        )
+        .unwrap();
+        assert_eq!(read_cc_session_title(&path).unwrap().as_deref(), Some("Before"));
+        // A yggterm rename writes a custom-title; the reader must now return it.
+        append_cc_session_custom_title(&path, "abc", "Renamed By Yggterm").unwrap();
+        assert_eq!(
+            read_cc_session_title(&path).unwrap().as_deref(),
+            Some("Renamed By Yggterm")
+        );
+        // And the file must carry both the custom-title and the parallel
+        // agent-name record that CC's own /rename writes.
+        let body = fs::read_to_string(&path).unwrap();
+        assert!(body.contains(r#""type":"custom-title""#));
+        assert!(body.contains(r#""type":"agent-name""#));
+        assert!(body.contains("Renamed By Yggterm"));
+        let _ = fs::remove_file(&path);
+    }
 
     /// Regression test for the class of bug where a new `AppSettings` field
     /// is declared but its read/write through `serialize_settings_value` /
