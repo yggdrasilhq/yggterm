@@ -39078,6 +39078,11 @@ fn app() -> Element {
                                 );
                             }
                         },
+                        on_press_highlight_row: move |(row, mode): (BrowserRow, TreeSelectionMode)| {
+                            // #14: instant highlight on press (no session open/switch).
+                            state.with_mut(|shell| shell.select_tree_row(&row, mode));
+                            claim_sidebar_focus_by_path(Some(&row.full_path));
+                        },
                         on_set_row_expanded: move |(row, expanded): (BrowserRow, bool)| {
                             state.with_mut(|shell| {
                                 set_app_control_row_expanded(shell, &row, expanded);
@@ -40741,6 +40746,7 @@ fn Sidebar(
     on_select_all_rows: EventHandler<()>,
     on_start_sidebar_resize: EventHandler<f64>,
     on_select_row: EventHandler<(BrowserRow, TreeSelectionMode)>,
+    on_press_highlight_row: EventHandler<(BrowserRow, TreeSelectionMode)>,
     on_set_row_expanded: EventHandler<(BrowserRow, bool)>,
     on_delete_selected_items: EventHandler<bool>,
     on_delete_row: EventHandler<BrowserRow>,
@@ -41003,6 +41009,7 @@ fn Sidebar(
                     for (row, live_group_member) in visible_rows.into_iter() {
                     {
                         let select_row = row.clone();
+                        let press_highlight_row = row.clone();
                         let context_row = row.clone();
                         let delete_row = row.clone();
                         let visible_label = sidebar_row_visible_label(&row);
@@ -41067,6 +41074,9 @@ fn Sidebar(
                                 palette: snapshot.palette,
                                 on_select: move |mode: TreeSelectionMode| {
                                     on_select_row.call((select_row.clone(), mode));
+                                },
+                                on_press_highlight: move |mode: TreeSelectionMode| {
+                                    on_press_highlight_row.call((press_highlight_row.clone(), mode));
                                 },
                                 on_set_expanded: {
                                     let row = row.clone();
@@ -41667,6 +41677,11 @@ fn SidebarRow(
     show_live_close: bool,
     palette: Palette,
     on_select: EventHandler<TreeSelectionMode>,
+    // Fired on mouse-DOWN to paint the selection highlight immediately (instant
+    // feedback) without opening/switching the session — the open still happens
+    // on mouse-up via `on_select`. Eliminates the perceived "selection latency"
+    // where the highlight only appeared on release. #14.
+    on_press_highlight: EventHandler<TreeSelectionMode>,
     on_set_expanded: EventHandler<bool>,
     on_open_context_menu: EventHandler<(f64, f64)>,
     on_delete_row: EventHandler<MouseEvent>,
@@ -41878,6 +41893,7 @@ fn SidebarRow(
     let row_for_enter = row.clone();
     let row_for_move = row.clone();
     let row_for_root_mouseup = row.clone();
+    let row_for_press_highlight = row.clone();
     let row_for_icon_mousedown = row.clone();
     let row_for_icon_mouseup = row.clone();
     let row_for_label_mouseup = row.clone();
@@ -41931,13 +41947,26 @@ fn SidebarRow(
             draggable: false,
             onmousedown: move |evt| {
                 claim_sidebar_focus_by_path(Some(&focus_path));
-                if draggable
-                    && evt.trigger_button() == Some(MouseButton::Primary)
+                if evt.trigger_button() == Some(MouseButton::Primary)
                     && !evt.modifiers().contains(Modifiers::SHIFT)
                     && !evt.modifiers().contains(Modifiers::CONTROL)
                     && !evt.modifiers().contains(Modifiers::META)
                 {
-                    on_start_drag.call(evt);
+                    // #14: paint the highlight on press for instant feedback,
+                    // but only for rows whose primary click selects (not groups
+                    // that toggle-expand) and only when not already selected (so
+                    // a press that begins a multi-row drag keeps the selection).
+                    if !selected
+                        && sidebar_row_primary_click_action(
+                            &row_for_press_highlight,
+                            SidebarRowPrimaryClickZone::ToggleSurface,
+                        ) == SidebarRowPrimaryClickAction::Select
+                    {
+                        on_press_highlight.call(TreeSelectionMode::Replace);
+                    }
+                    if draggable {
+                        on_start_drag.call(evt);
+                    }
                 }
             },
             ondoubleclick: move |evt| on_begin_rename.call(evt),
