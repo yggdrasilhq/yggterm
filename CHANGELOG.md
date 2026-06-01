@@ -6,6 +6,10 @@ This file tracks user-visible changes in `yggterm`.
 
 ## 2.8.5
 
+- Sidebar rows now highlight the moment you press the mouse, instead of waiting
+  for the release — clicking a session (especially the active/top Live Session)
+  feels instant. The session still opens on release, and starting a multi-row
+  drag keeps the existing selection.
 - Hot updates now wait for agent CLI sessions to be idle before swapping the
   daemon, so an update never lands on top of a Codex/Claude Code turn in
   progress (and avoids throwing away a still-warm prompt cache). A session
