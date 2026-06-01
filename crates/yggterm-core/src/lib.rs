@@ -33,8 +33,8 @@ pub use install::{
     ReleaseUpdateInstallProgress, ReleaseUpdateInstallStage, UpdatePolicy, YGGTERM_DESKTOP_APP_ID,
     check_for_update, current_asset_label, current_version, detect_install_context,
     direct_install_root, install_mode_summary, install_release_update,
-    install_release_update_with_progress, refresh_desktop_integration, update_command_hint,
-    write_direct_install_state,
+    install_release_update_with_progress, promote_direct_install_active_version,
+    refresh_desktop_integration, update_command_hint, write_direct_install_state,
 };
 pub use perf::{
     PERF_TELEMETRY_FILENAME, PERF_TELEMETRY_MAX_BYTES, PERF_TELEMETRY_ROTATED_FILENAME, PerfSpan,
