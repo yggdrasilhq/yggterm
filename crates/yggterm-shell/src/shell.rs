@@ -34927,6 +34927,39 @@ async fn process_pending_app_control_requests(
                 })),
             }
         }
+        AppControlCommand::RestartSession { session_path } => {
+            // Same daemon force-restart as the context-menu "Restart Session".
+            let (endpoint, appearance) = state.with(|shell| {
+                (
+                    shell.bootstrap.server_endpoint.clone(),
+                    shell.effective_terminal_identity_appearance().to_string(),
+                )
+            });
+            let trace_home = resolve_yggterm_home().unwrap_or_else(|_| PathBuf::from("."));
+            let result = terminal_force_remote_restart_async(
+                endpoint,
+                session_path.clone(),
+                Some(appearance),
+                None,
+                &trace_home,
+                "app_control_restart_session",
+                0,
+            )
+            .await;
+            let error = result.as_ref().err().map(|error| error.to_string());
+            AppControlResponse {
+                request_id: request.request_id.clone(),
+                handled_by_pid: std::process::id(),
+                completed_at_ms: current_millis() as u128,
+                output_path: None,
+                error: error.clone(),
+                data: Some(json!({
+                    "accepted": error.is_none(),
+                    "session_path": session_path,
+                    "reason": error,
+                })),
+            }
+        }
         AppControlCommand::RemoveSession { session_path } => {
             let endpoint = state.read().bootstrap.server_endpoint.clone();
             let (pending, close_redirect_target) = state.with_mut(|shell| {
@@ -39491,24 +39524,14 @@ fn app() -> Element {
                                 let path = row.full_path.clone();
                                 let label = row.label.clone();
                                 state.with_mut(|shell| shell.close_context_menu());
-                                // Manual restart override. terminal_force_remote_restart_async
-                                // re-resumes a remote session's runtime (the user's
-                                // keep-alive agent sessions are remote). Local-session
-                                // restart isn't wired through this primitive yet.
-                                let is_remote = path.starts_with("remote-cc://")
-                                    || path.starts_with("remote-session://");
-                                if !is_remote {
-                                    state.with_mut(|shell| {
-                                        shell.push_notification(
-                                            NotificationTone::Info,
-                                            "Restart Session",
-                                            format!(
-                                                "{label}: manual restart is currently available for remote sessions."
-                                            ),
-                                        );
-                                    });
-                                    return;
-                                }
+                                // Manual restart override for ANY live session.
+                                // terminal_force_remote_restart_async issues the
+                                // daemon TerminalRestart (force_remote=true): for a
+                                // remote agent it terminates the remote runtime and
+                                // re-resumes; for a local session the remote-terminate
+                                // is a no-op and the daemon re-launches the PTY. (An
+                                // earlier version no-op'd for local sessions with just
+                                // a toast — that's the bug this fixes.)
                                 let (endpoint, appearance) = state.with(|shell| {
                                     (
                                         shell.bootstrap.server_endpoint.clone(),
