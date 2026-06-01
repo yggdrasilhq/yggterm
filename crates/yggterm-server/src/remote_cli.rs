@@ -1,6 +1,7 @@
 use crate::{
     ManagedCliTool, run_remote_ensure_managed_cli, run_remote_generation_context,
-    run_remote_local_codex_identities, run_remote_preview, run_remote_preview_head,
+    run_remote_cc_rename, run_remote_local_codex_identities, run_remote_preview,
+    run_remote_preview_head,
     run_remote_preview_tail, run_remote_protocol_version, run_remote_refresh_managed_cli,
     run_remote_resume_codex, run_remote_saved_codex_session_exists, run_remote_scan,
     run_remote_stage_clipboard_png, run_remote_start_codex, run_remote_terminate_codex,
@@ -38,6 +39,13 @@ pub enum RemoteServerCommand {
     /// live remote-Codex rows that still carry a synthesized UUIDv4 id
     /// (`[[finding-uuidv4-codex-session-drift]]` Stage 2).
     LocalCodexIdentities,
+    /// Append a Claude Code `custom-title` (user rename) to a session's JSONL
+    /// on this (remote) machine — the SSH-invoked half of yggterm's CC rename
+    /// write-back. See memory finding-cc-title-storage-custom-title.
+    CcRename {
+        session_id: String,
+        title: String,
+    },
     PreviewHead {
         session_id: String,
         blocks: usize,
@@ -107,6 +115,10 @@ fn parse_remote_server_command(args: &[String]) -> Result<Option<RemoteServerCom
             codex_home: args.get(3).cloned(),
         },
         "local-codex-identities" if args.len() == 3 => RemoteServerCommand::LocalCodexIdentities,
+        "cc-rename" if args.len() == 5 => RemoteServerCommand::CcRename {
+            session_id: args[3].clone(),
+            title: args[4].clone(),
+        },
         "preview-head" if args.len() >= 4 => RemoteServerCommand::PreviewHead {
             session_id: args[3].clone(),
             blocks: args
@@ -159,6 +171,9 @@ fn run_remote_server_command(command: RemoteServerCommand) -> Result<()> {
         RemoteServerCommand::EnsureManagedCli { tool } => run_remote_ensure_managed_cli(tool),
         RemoteServerCommand::Scan { codex_home } => run_remote_scan(codex_home.as_deref()),
         RemoteServerCommand::LocalCodexIdentities => run_remote_local_codex_identities(),
+        RemoteServerCommand::CcRename { session_id, title } => {
+            run_remote_cc_rename(&session_id, &title)
+        }
         RemoteServerCommand::PreviewHead { session_id, blocks } => {
             run_remote_preview_head(&session_id, blocks)
         }
@@ -209,6 +224,27 @@ mod tests {
                 session_id: "019ad8".to_string(),
                 cwd: Some("/home/pi".to_string()),
                 require_existing: true,
+            }
+        );
+    }
+
+    #[test]
+    fn parse_cc_rename_command() {
+        let args = vec![
+            "server".to_string(),
+            "remote".to_string(),
+            "cc-rename".to_string(),
+            "654669a2-f2d4-4d40-a19c-ad1d4ba3d833".to_string(),
+            "My Renamed Session".to_string(),
+        ];
+        let command = parse_remote_server_command(&args)
+            .expect("parse command")
+            .expect("remote command");
+        assert_eq!(
+            command,
+            RemoteServerCommand::CcRename {
+                session_id: "654669a2-f2d4-4d40-a19c-ad1d4ba3d833".to_string(),
+                title: "My Renamed Session".to_string(),
             }
         );
     }
