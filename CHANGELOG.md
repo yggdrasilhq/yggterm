@@ -4,6 +4,15 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+## 2.8.3
+
+- Claude Code session titles are now integrated both ways. yggterm reads CC's
+  own title (a `/rename` or resume-picker Ctrl+R inside Claude Code shows up in
+  the sidebar), and renaming a session in yggterm writes that title back into
+  Claude Code's session log — so the two stay in sync. Works for local and
+  remote CC sessions. (Remote requires the updated yggterm binary on the remote
+  machine.)
+
 ## 2.8.2
 
 - Fix "new terminal here" on a local live session erroring out: the local
