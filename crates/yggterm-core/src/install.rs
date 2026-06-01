@@ -400,6 +400,55 @@ pub fn write_direct_install_state(
     Ok(())
 }
 
+/// Promote a managed Direct install's `active_version`/`active_executable` to a
+/// hot-update target before the successor daemon is spawned.
+///
+/// Why this exists: under a managed Direct install every launched binary
+/// re-execs to `install-state.active_version`'s executable
+/// (`maybe_handoff_to_preferred_headless_executable`). During a hot-update
+/// handoff the old daemon spawns the *target* binary, but without flipping
+/// install-state first that spawned binary re-execs straight back to the OLD
+/// active version — so it binds the old version socket, defers to the live old
+/// daemon, and the update never lands (and the registry/version mismatch can
+/// then trip the downgrade guard). Flipping install-state to the target first
+/// makes the spawned binary stay on the target version, bind its own socket,
+/// and adopt the preserved owners. See [[finding-hot-update-interrupts-remote-sessions]].
+///
+/// Returns `Ok(true)` when a managed Direct install was found (and is now
+/// pointing at `target_version`), `Ok(false)` when not under a managed install
+/// (raw/dev binaries — nothing to flip). `target_executable` is the GUI
+/// executable for the target version (the companion of the target headless
+/// binary).
+pub fn promote_direct_install_active_version(
+    target_version: &str,
+    target_executable: &Path,
+) -> Result<bool> {
+    let found = if let Some(root) = std::env::var_os(ENV_YGGTERM_DIRECT_INSTALL_ROOT)
+        .map(PathBuf::from)
+        .filter(|root| root.join(INSTALL_STATE_FILENAME).is_file())
+    {
+        load_direct_install_state(&root)?.map(|state| (root, state))
+    } else {
+        find_direct_install_state(target_executable)?
+    };
+    let Some((root, state)) = found else {
+        return Ok(false);
+    };
+    if state.active_version == target_version
+        && state.active_executable == target_executable
+    {
+        return Ok(true);
+    }
+    write_direct_install_state(
+        &root,
+        &state.repo,
+        &state.asset_label,
+        target_version,
+        target_executable,
+    )?;
+    Ok(true)
+}
+
 pub fn prune_direct_install_versions(root: &Path, keep_version: &str) -> Result<Vec<PathBuf>> {
     if keep_version.trim().is_empty() {
         anyhow::bail!("refusing to prune direct install versions without an active version");
@@ -1501,6 +1550,56 @@ mod tests {
         assert!(!contents.contains("2.4.56/yggterm"));
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn promote_direct_install_active_version_flips_state_to_target() {
+        let root = std::env::temp_dir().join(format!(
+            "yggterm-promote-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let next_dir = root.join("versions").join("2.8.5");
+        let next_exe = next_dir.join("yggterm");
+        fs::create_dir_all(&next_dir).expect("create version dir");
+        fs::write(&next_exe, b"next").expect("write next exe");
+        write_direct_install_state(
+            &root,
+            "yggdrasilhq/yggterm",
+            "linux-x86_64",
+            "2.8.4",
+            &root.join("versions").join("2.8.4").join("yggterm"),
+        )
+        .expect("seed install state");
+
+        // Ancestor-path resolution (no env dependency): the target executable
+        // sits under the managed root, so promote finds and flips it.
+        let promoted = promote_direct_install_active_version("2.8.5", &next_exe)
+            .expect("promote should succeed");
+        assert!(promoted, "managed install should be detected");
+        let loaded = load_direct_install_state(&root)
+            .expect("reload")
+            .expect("direct state");
+        assert_eq!(loaded.active_version, "2.8.5");
+        assert_eq!(loaded.active_executable, next_exe);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn promote_direct_install_active_version_is_noop_without_managed_install() {
+        // An executable with no install-state in any ancestor is not managed.
+        let bare = std::env::temp_dir().join(format!(
+            "yggterm-unmanaged-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&bare).expect("mkdir");
+        let exe = bare.join("yggterm");
+        // Only meaningful when the env override is not pointing at a real install.
+        if std::env::var_os(ENV_YGGTERM_DIRECT_INSTALL_ROOT).is_none() {
+            let promoted = promote_direct_install_active_version("2.8.5", &exe)
+                .expect("promote should not error");
+            assert!(!promoted, "unmanaged install should report false");
+        }
+        let _ = fs::remove_dir_all(bare);
     }
 
     #[test]

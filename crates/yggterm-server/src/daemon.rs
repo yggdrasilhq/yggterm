@@ -3639,6 +3639,45 @@ impl DaemonRuntime {
                         });
                     }
                     let daemon_executable = canonical_hot_restart_executable(&daemon_executable)?;
+                    // Under a managed Direct install, every launched binary
+                    // re-execs to install-state.active_version. Flip install-state
+                    // to the handoff TARGET before spawning so the successor stays
+                    // on the target version, binds its own version socket, and
+                    // adopts the preserved owners — instead of re-exec'ing back to
+                    // the old active version and deferring to the live old daemon.
+                    // Best-effort: raw/dev installs return false (nothing to flip).
+                    // See [[finding-hot-update-interrupts-remote-sessions]].
+                    if let Some(target_version) = expected_version.as_deref() {
+                        let target_gui_executable = daemon_executable.with_file_name(
+                            companion_gui_executable_file_name(&daemon_executable),
+                        );
+                        match yggterm_core::promote_direct_install_active_version(
+                            target_version,
+                            &target_gui_executable,
+                        ) {
+                            Ok(managed) => append_trace_event(
+                                self.store.home_dir(),
+                                "daemon",
+                                "hot_update",
+                                "hot_update_install_state_promoted",
+                                serde_json::json!({
+                                    "target_version": target_version,
+                                    "target_gui_executable": target_gui_executable.display().to_string(),
+                                    "managed_direct_install": managed,
+                                }),
+                            ),
+                            Err(error) => append_trace_event(
+                                self.store.home_dir(),
+                                "daemon",
+                                "hot_update",
+                                "hot_update_install_state_promote_failed",
+                                serde_json::json!({
+                                    "target_version": target_version,
+                                    "error": error.to_string(),
+                                }),
+                            ),
+                        }
+                    }
                     let state = self
                         .server
                         .persisted_state_for_update_restart_with_runtime_keys(
@@ -8353,6 +8392,22 @@ fn write_persisted_state(path: &Path, state: &PersistedDaemonState) -> Result<()
         })
         .with_context(|| format!("writing daemon state {}", path.display()))?;
     Ok(())
+}
+
+/// The GUI executable file name that sits beside a headless binary
+/// (`yggterm-headless` → `yggterm`, preserving a `.exe` suffix on Windows).
+/// Used to point a managed install's `active_executable` (which is the GUI
+/// executable) at the hot-update target version.
+fn companion_gui_executable_file_name(headless: &Path) -> String {
+    let name = headless
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("yggterm-headless");
+    if name.ends_with(".exe") {
+        "yggterm.exe".to_string()
+    } else {
+        "yggterm".to_string()
+    }
 }
 
 fn canonical_hot_restart_executable(raw_path: &str) -> Result<PathBuf> {

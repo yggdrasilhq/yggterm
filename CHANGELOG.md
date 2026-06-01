@@ -4,7 +4,16 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
-## 2.8.5
+## 2.8.6
+
+- Session-preserving hot-update handoffs now work on managed (Direct) installs.
+  Previously a handoff spawned the new-version daemon but it re-exec'd back to
+  the *old* active version, so it bound the old socket and deferred to the live
+  old daemon — the update silently didn't land. The handoff now promotes the
+  managed install's active version to the update target before spawning, so the
+  successor stays on the target version, binds its own socket, and adopts the
+  preserved sessions. (The normal "check for updates" flow already did this; the
+  gap was in direct/agent-triggered handoffs.)
 
 - Sidebar rows now highlight the moment you press the mouse, instead of waiting
   for the release — clicking a session (especially the active/top Live Session)
