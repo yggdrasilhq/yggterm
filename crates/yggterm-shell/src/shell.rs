@@ -61368,6 +61368,30 @@ fn terminal_eval_script_with_canvas_renderer(
             if (!pasteEventBelongsToTerminal(event)) {{
                 return;
             }}
+            // XTERM-BUG: middle-click double/triple paste. On Linux, WebKit's
+            // NATIVE middle-click primary paste fires a 'paste' event in
+            // addition to our explicit primary paste
+            // (handlePrimarySelectionMiddleClick). Handling it here would read
+            // the system CLIPBOARD and paste a SECOND content on top of the
+            // primary (repro point 8: pasted selected region AND clipboard
+            // region), and the 3 capture-phase listeners can echo it again
+            // (3x). If a primary middle-click just happened, this paste event
+            // is that native echo — swallow it so a middle-click yields exactly
+            // ONE (primary) paste. Ctrl+Shift+V (no middle-click) is unaffected.
+            // See [[finding-terminal-selection-paste-bugs]].
+            try {{
+                if (lastPrimarySelectionMiddleClickAtMs > 0
+                    && Date.now() - lastPrimarySelectionMiddleClickAtMs < 700) {{
+                    stopTerminalClipboardEvent(event);
+                    const echoEntry = window.__yggtermXtermHosts && window.__yggtermXtermHosts[hostId]
+                        ? window.__yggtermXtermHosts[hostId] : null;
+                    if (echoEntry) {{
+                        echoEntry.middleClickClipboardEchoSuppressedCount =
+                            Number(echoEntry.middleClickClipboardEchoSuppressedCount || 0) + 1;
+                    }}
+                    return;
+                }}
+            }} catch (_mcEchoError) {{}}
             try {{
                 if (event.__yggtermHandledPaste) {{
                     stopTerminalClipboardEvent(event);
@@ -61381,6 +61405,20 @@ fn terminal_eval_script_with_canvas_renderer(
                     requestNativeClipboardImagePaste();
                 }} else {{
                     requestNativeClipboardPaste('paste_event');
+                }}
+                // A clipboard paste is input destined for the prompt — un-pin
+                // and follow to the prompt (consistent with middle-click and the
+                // snap-on-submit decision). Without this, Ctrl+Shift+V while the
+                // viewport is pinned (e.g. after a selection) pasted but left the
+                // viewport scrolled up (repro point 5). See
+                // [[audit-viewport-scroll-control-flow]].
+                if (!pasteClaim.hasImage) {{
+                    try {{
+                        markTerminalInputHot('clipboard_paste');
+                        setScrollbackIntent('PromptFollow', 'clipboard_paste');
+                        scrollbackLocked = false;
+                        scrollLiveCursorIntoView(true, 'clipboard_paste');
+                    }} catch (_clipFollowError) {{}}
                 }}
                 window.setTimeout(() => {{
                     if (inputEnabled) {{
@@ -62872,6 +62910,21 @@ fn terminal_eval_script_with_canvas_renderer(
         const selectionDisposable = typeof term.onSelectionChange === 'function'
             ? term.onSelectionChange(() => {{
                 recordPrimarySelectionFromXterm('selection_change');
+                // SCROLL MODE = SELECTING/PINNED: the moment the user has a
+                // non-empty selection, pin the viewport (UserScrollback) so
+                // streaming agent output does NOT auto-follow and yank the
+                // viewport out from under the drag. The pin persists after the
+                // selection clears (the user is reading) until they scroll back
+                // to the bottom or type at the prompt (which snaps to follow).
+                // This guards the follow DECISION via the existing intent state,
+                // NOT the low-level viewport mover (guarding the mover broke DOM
+                // sync). See [[audit-viewport-scroll-control-flow]].
+                try {{
+                    if (term && typeof term.hasSelection === 'function' && term.hasSelection()
+                        && scrollbackIntent !== 'UserScrollback') {{
+                        setScrollbackIntent('UserScrollback', 'selection_active');
+                    }}
+                }} catch (_selectionIntentError) {{}}
                 applySoftwareCanvasLayerOptimization('selection_change');
                 emitHostHealthThrottled();
             }})
