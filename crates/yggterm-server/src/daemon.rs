@@ -3016,6 +3016,35 @@ impl DaemonRuntime {
         self.ensure_terminal_for_path_with_initial_size_and_seed(path, None, seed_remote_snapshot)
     }
 
+    /// Instant local prefill from the daemon's OWN retained PTY screen for a
+    /// remote session. Used when the remote multiplexer hardcopy comes back empty
+    /// (`empty_multiplexer_snapshot_no_prefill`) — without it the surface paints
+    /// blank/unstyled until the live PTY repaints ("shadow session"). The daemon
+    /// has been streaming the PTY, so its screen snapshot is the current,
+    /// non-empty content and paints instantly. Wrapped with clear-screen +
+    /// home-cursor to match the remote-seed prefill framing. Returns None when the
+    /// daemon holds no non-blank screen (e.g. a genuinely fresh session), so the
+    /// caller still falls back to the stored-session seed.
+    fn daemon_screen_seed_prefill(&self, runtime_path: &str, path: &str) -> Option<String> {
+        let screen = self.terminals.session_screen_snapshot(runtime_path)?;
+        if screen.trim().is_empty() {
+            return None;
+        }
+        if let Ok(home) = crate::resolve_yggterm_home() {
+            append_trace_event(
+                &home,
+                "daemon",
+                "terminal_ensure",
+                "remote_resume_seed_daemon_screen_prefill",
+                serde_json::json!({
+                    "path": path,
+                    "bytes": screen.len(),
+                }),
+            );
+        }
+        Some(format!("\x1b[2J\x1b[H{screen}"))
+    }
+
     fn ensure_terminal_for_path_with_initial_size_and_seed(
         &mut self,
         path: &str,
@@ -3140,7 +3169,9 @@ impl DaemonRuntime {
                         }
                         Some(prefill)
                     }
-                    Ok(None) => self.server.remote_resume_seed_fallback_for_path(path),
+                    Ok(None) => self
+                        .daemon_screen_seed_prefill(&runtime_path, path)
+                        .or_else(|| self.server.remote_resume_seed_fallback_for_path(path)),
                     Err(error) => {
                         if let Ok(home) = crate::resolve_yggterm_home() {
                             append_trace_event(
@@ -3154,7 +3185,8 @@ impl DaemonRuntime {
                                 }),
                             );
                         }
-                        self.server.remote_resume_seed_fallback_for_path(path)
+                        self.daemon_screen_seed_prefill(&runtime_path, path)
+                            .or_else(|| self.server.remote_resume_seed_fallback_for_path(path))
                     }
                 }
             } else {
