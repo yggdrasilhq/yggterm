@@ -5589,6 +5589,59 @@ fn mark_daemon_activity(last_activity_ms: &AtomicU64) {
     last_activity_ms.store(current_millis_u64(), Ordering::Relaxed);
 }
 
+/// Parse a dotted version string ("2.8.6") into a comparable triple. A missing
+/// patch component is treated as 0.
+fn parse_daemon_version_triple(version: &str) -> Option<(u64, u64, u64)> {
+    let mut parts = version.split('.');
+    let major = parts.next()?.trim().parse::<u64>().ok()?;
+    let minor = parts.next()?.trim().parse::<u64>().ok()?;
+    let patch = parts.next().unwrap_or("0").trim().parse::<u64>().ok()?;
+    Some((major, minor, patch))
+}
+
+/// Per [[bug-class-old-daemon-never-retires]]: in the managed-versions install
+/// model every daemon binary lives at its own path, so the `(deleted)` exe poll
+/// never fires and stale daemons never retire. Detect supersession structurally:
+/// a strictly-newer daemon is reachable on another versioned socket. Only sockets
+/// whose parsed version is HIGHER than ours are probed (so a busy machine with
+/// many dead lower-version socket files stays cheap), and the probe confirms the
+/// peer actually reports a newer version before we treat ourselves as superseded.
+#[cfg(unix)]
+fn daemon_is_superseded(home_dir: &Path) -> bool {
+    let Some(my_version) = parse_daemon_version_triple(SERVER_PROTOCOL_VERSION) else {
+        return false;
+    };
+    let own_socket = match default_endpoint(home_dir) {
+        ServerEndpoint::UnixSocket(path) => fs::canonicalize(&path).ok(),
+        #[allow(unreachable_patterns)]
+        _ => None,
+    };
+    let Ok(entries) = fs::read_dir(home_dir) else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(socket_version) = parse_versioned_server_socket_name(&path) else {
+            continue;
+        };
+        if socket_version <= my_version {
+            continue;
+        }
+        if let Some(own) = own_socket.as_ref()
+            && fs::canonicalize(&path).ok().as_ref() == Some(own)
+        {
+            continue;
+        }
+        if let Ok(status) = status(&ServerEndpoint::UnixSocket(path))
+            && parse_daemon_version_triple(&status.server_version)
+                .is_some_and(|peer| peer > my_version)
+        {
+            return true;
+        }
+    }
+    false
+}
+
 fn daemon_should_idle_shutdown(
     home_dir: &Path,
     endpoint: &ServerEndpoint,
@@ -5596,6 +5649,9 @@ fn daemon_should_idle_shutdown(
     idle_shutdown_ms: u64,
     terminal_session_count: usize,
 ) -> bool {
+    // Never retire a daemon that still owns live sessions (including preserved
+    // hot-update PTYs, which are counted here) — there is no fd-handoff, so a
+    // shutdown would interrupt them.
     if terminal_session_count > 0 {
         return false;
     }
@@ -5603,13 +5659,30 @@ fn daemon_should_idle_shutdown(
     if idle_for_ms < idle_shutdown_ms {
         return false;
     }
-    match active_client_instance_records(home_dir, endpoint) {
+    let clients_empty = match active_client_instance_records(home_dir, endpoint) {
         Ok(records) => records.is_empty(),
         Err(error) => {
             warn!(error=%error, "failed to read active client instances during daemon idle check");
-            false
+            return false;
+        }
+    };
+    if clients_empty {
+        return true;
+    }
+    // Clients exist, but a client only ever connects to the socket matching its
+    // own version. If a strictly-newer daemon is alive, those client records
+    // belong to IT, not to us — and we own zero sessions — so this stale daemon
+    // is safe to retire even though client records exist. This is what lets a
+    // superseded daemon drain and exit in the managed-versions install model,
+    // where the `(deleted)` exe poll never triggers. Per
+    // [[bug-class-old-daemon-never-retires]].
+    #[cfg(unix)]
+    {
+        if daemon_is_superseded(home_dir) {
+            return true;
         }
     }
+    false
 }
 
 #[cfg(unix)]
@@ -6801,6 +6874,23 @@ pub fn retire_stale_daemons(
                         server_version: Some(s.server_version),
                         server_pid: Some(s.server_pid),
                         message: None,
+                    }
+                } else if s.terminal_session_count > 0 {
+                    // SESSION-SAFE: never retire a daemon that still owns live
+                    // sessions (incl. preserved hot-update PTYs) — there is no
+                    // fd-handoff, so retiring it would interrupt those sessions.
+                    // It will retire itself once it drains to zero (idle gate +
+                    // supersession check). Per [[bug-class-old-daemon-never-retires]].
+                    report.skipped_count += 1;
+                    RetireStaleDaemonOutcome {
+                        socket: path.display().to_string(),
+                        status: "skipped_owns_live_sessions".to_string(),
+                        server_version: Some(s.server_version),
+                        server_pid: Some(s.server_pid),
+                        message: Some(format!(
+                            "owns {} live session(s); left running",
+                            s.terminal_session_count
+                        )),
                     }
                 } else {
                     match retire_daemon(&endpoint, Some("retire_stale_daemons_cli")) {
@@ -8787,13 +8877,29 @@ mod tests {
     use super::{
         RemoteMachineRefreshQueueStatus, SERVER_PROTOCOL_VERSION,
         apply_terminal_runtime_truth_to_snapshot, daemon_background_copy_chore_enabled_from_env,
-        mark_remote_machine_refresh_queued, preserved_owner_candidate_for_runtime_key,
+        mark_remote_machine_refresh_queued, parse_daemon_version_triple,
+        preserved_owner_candidate_for_runtime_key,
         preserved_owner_saved_session_mismatch_should_detach,
         remove_session_should_detach_keep_alive_runtime, terminal_reuse_needs_restart,
         terminal_sidebar_snapshot_from_screen,
     };
     use crate::TerminalManager;
     use std::collections::{BTreeMap, HashMap, HashSet};
+
+    #[test]
+    fn daemon_version_triple_parses_and_orders() {
+        assert_eq!(parse_daemon_version_triple("2.8.9"), Some((2, 8, 9)));
+        assert_eq!(parse_daemon_version_triple("2.8"), Some((2, 8, 0)));
+        assert_eq!(parse_daemon_version_triple("10.0.1"), Some((10, 0, 1)));
+        assert_eq!(parse_daemon_version_triple("garbage"), None);
+        // Supersession ordering the idle-shutdown gate relies on.
+        assert!(parse_daemon_version_triple("2.8.9") > parse_daemon_version_triple("2.8.8"));
+        assert!(parse_daemon_version_triple("2.9.0") > parse_daemon_version_triple("2.8.99"));
+        assert!(parse_daemon_version_triple("2.8.6") < parse_daemon_version_triple("2.8.8"));
+        // The current daemon version must itself be parseable, or supersession
+        // detection silently no-ops.
+        assert!(parse_daemon_version_triple(SERVER_PROTOCOL_VERSION).is_some());
+    }
     use std::fs;
     use std::io::Write;
     use std::path::{Path, PathBuf};
