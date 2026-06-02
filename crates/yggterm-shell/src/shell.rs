@@ -60960,6 +60960,10 @@ fn terminal_eval_script_with_canvas_renderer(
             }} catch (_error) {{}}
         }};
         let lastPrimarySelectionMiddleClickAtMs = 0;
+        // One-shot deadline: handleClipboardPaste suppresses exactly ONE native
+        // clipboard 'paste' echo before this time (set on a middle-click), then
+        // clears it — so a later Ctrl+Shift+V is never swallowed.
+        let pendingMiddleClickEchoUntilMs = 0;
         const primarySelectionSessionPath = () => host.getAttribute("data-terminal-session-path") || "";
         const syncPrimarySelectionHostEntry = (text, reason = '') => {{
             try {{
@@ -61065,9 +61069,25 @@ fn terminal_eval_script_with_canvas_renderer(
                     event.stopPropagation();
                 }}
                 const now = Date.now();
+                // A middle-click fires BOTH 'mousedown' and 'auxclick' (~200ms
+                // apart — longer than any time-dedupe), so pasting on both
+                // double-pasted (trace: two source=primary events per click).
+                // Paste — and arm the native-echo suppressor — on the DOWN edge
+                // ONLY; the release event (auxclick/click) just preventDefaults
+                // the native paste and returns (no paste, no re-arm — re-arming
+                // would swallow a later Ctrl+Shift+V).
+                // See [[finding-terminal-selection-paste-bugs]].
+                const isDownEdge = event.type === 'mousedown' || event.type === 'pointerdown';
+                if (!isDownEdge) {{
+                    return;
+                }}
                 if (now - lastPrimarySelectionMiddleClickAtMs < 120) {{
                     return;
                 }}
+                // Arm a ONE-SHOT suppressor for WebKit's native middle-click
+                // clipboard 'paste' echo that fires ~200ms later (handleClipboard
+                // Paste consumes exactly one paste event before this deadline).
+                pendingMiddleClickEchoUntilMs = now + 600;
                 lastPrimarySelectionMiddleClickAtMs = now;
                 if (!inputEnabled || !hostOwnsActiveTerminalInput()) {{
                     return;
@@ -61368,20 +61388,18 @@ fn terminal_eval_script_with_canvas_renderer(
             if (!pasteEventBelongsToTerminal(event)) {{
                 return;
             }}
-            // XTERM-BUG: middle-click double/triple paste. On Linux, WebKit's
-            // NATIVE middle-click primary paste fires a 'paste' event in
-            // addition to our explicit primary paste
-            // (handlePrimarySelectionMiddleClick). Handling it here would read
-            // the system CLIPBOARD and paste a SECOND content on top of the
-            // primary (repro point 8: pasted selected region AND clipboard
-            // region), and the 3 capture-phase listeners can echo it again
-            // (3x). If a primary middle-click just happened, this paste event
-            // is that native echo — swallow it so a middle-click yields exactly
-            // ONE (primary) paste. Ctrl+Shift+V (no middle-click) is unaffected.
+            // XTERM-BUG: middle-click double paste. On Linux, WebKit's NATIVE
+            // middle-click primary paste fires a 'paste' event in addition to
+            // our explicit primary paste (handlePrimarySelectionMiddleClick);
+            // handling it here would read the system CLIPBOARD and paste a
+            // SECOND content (repro point 8). Consume exactly ONE such echo
+            // after a middle-click (one-shot deadline), then clear it — so a
+            // later Ctrl+Shift+V is NEVER swallowed (an earlier 700ms time-
+            // window guard broke Ctrl+Shift+V during rapid testing).
             // See [[finding-terminal-selection-paste-bugs]].
             try {{
-                if (lastPrimarySelectionMiddleClickAtMs > 0
-                    && Date.now() - lastPrimarySelectionMiddleClickAtMs < 700) {{
+                if (pendingMiddleClickEchoUntilMs > 0 && Date.now() < pendingMiddleClickEchoUntilMs) {{
+                    pendingMiddleClickEchoUntilMs = 0;
                     stopTerminalClipboardEvent(event);
                     const echoEntry = window.__yggtermXtermHosts && window.__yggtermXtermHosts[hostId]
                         ? window.__yggtermXtermHosts[hostId] : null;
