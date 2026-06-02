@@ -60118,16 +60118,30 @@ fn terminal_eval_script_with_canvas_renderer(
             if (settledResizeFollowupTimer !== null) {{
                 window.clearTimeout(settledResizeFollowupTimer);
             }}
+            // XTERM-BUG: switch-flicker. The two 5-phase follow cascades that
+            // used to run here (settled_resize_paint + settled_resize_followup,
+            // each now/raf/32/140/320ms) raced the reflow on a reveal/resize and
+            // landed at a shifting target -> flicker + "random" scroll position.
+            // Collapse to a SINGLE intent-guarded settled follow per timer:
+            // follow only while FOLLOWING (never override UserScrollback) and
+            // never while a selection is active. See [[audit-viewport-scroll-control-flow]].
+            const settledResizeSingleFollow = (reason) => {{
+                try {{
+                    if (scrollbackIntent === 'UserScrollback') {{ return; }}
+                    if (term && typeof term.hasSelection === 'function' && term.hasSelection()) {{ return; }}
+                    scrollLiveCursorIntoView(true, reason);
+                }} catch (_settledFollowError) {{}}
+            }};
             settledResizePaintTimer = window.setTimeout(() => {{
                 settledResizePaintTimer = null;
                 requestVisiblePaint(false);
-                schedulePromptFollowAfterLayout('settled_resize_paint');
+                settledResizeSingleFollow('settled_resize_paint');
             }}, 140);
             settledResizeFollowupTimer = window.setTimeout(() => {{
                 settledResizeFollowupTimer = null;
                 emitResize();
                 requestVisiblePaint(true);
-                schedulePromptFollowAfterLayout('settled_resize_followup');
+                settledResizeSingleFollow('settled_resize_followup');
                 emitHostHealth();
             }}, 260);
         }};
