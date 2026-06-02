@@ -5155,9 +5155,19 @@ impl ShellState {
             return true;
         };
         let runtime_key = self.server.terminal_runtime_key_for_path(session_path);
+        // The daemon "owns" a runtime for reveal purposes if it holds the PTY
+        // directly (owned) OR proxies it through a live preserved-owner (an
+        // older daemon that survived a hot-update swap). After a daemon swap,
+        // re-resumed sessions land in preserved_terminal_owner_keys, not owned;
+        // checking only `owned` made hot_reveal_reusable false for those, so
+        // every switch-back cold-REMOUNTED (epoch churn / ~30s recovery / DOM
+        // leak on big sessions like samplenotes) instead of revealing. Both lists
+        // reflect a LIVE PTY, so either qualifies for a same-epoch reveal.
+        // See [[finding-hot-switch-latency-remount]] / [[bug-class-old-daemon-never-retires]].
         runtime_status
             .owned_terminal_session_keys
             .iter()
+            .chain(runtime_status.preserved_terminal_owner_keys.iter())
             .any(|key| key == &runtime_key)
     }
     /// Returns true if the GUI has spawned enough retained_fault_recovery
