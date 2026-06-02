@@ -4,6 +4,17 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+## 2.8.7
+
+- Switching between recent live sessions is now tab-instant. Previously each
+  switch tore down and rebuilt the terminal surface (a ~1–2s cold remount with
+  a re-init + scrollback re-pull); now a switch back to a recently-used session
+  reveals the already-mounted host (no remount). Root cause: the switch's own
+  in-flight attach marker made the reveal path think the host wasn't reusable,
+  and a hidden terminal momentarily reading "empty" tripped a fault-recovery
+  remount. The working set of recent sessions is kept hot (default 8, tunable
+  via `YGGTERM_HOT_PREMOUNT_CAP`).
+
 ## 2.8.6
 
 - Session-preserving hot-update handoffs now work on managed (Direct) installs.

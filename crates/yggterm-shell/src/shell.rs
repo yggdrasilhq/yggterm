@@ -348,10 +348,24 @@ const HOT_WARM_MAX_CONCURRENT: usize = 2;
 const HOT_WARM_TOP_N: usize = 5;
 // HOT-tier Phase 3 of [[spec-xterm-gating-ux]]: total number of terminal hosts
 // kept mounted+warm under the limit-to-active retention policy (the active host
-// plus the N-1 most-recently-used neighbors). Bounded so a KDE/Plasma session,
-// where retention is otherwise limited to one host, pays only a small fixed
-// cost for VSCode-tab-style instant switching among recent sessions.
-const HOT_PREMOUNT_RETAINED_CAP: usize = 4;
+// plus the N-1 most-recently-used neighbors). Each kept host keeps a STABLE
+// mount epoch, so a switch among them is a CSS reveal (~1 frame) instead of a
+// cold remount (the ~1s xterm.js re-init that dominated hot-switch latency —
+// see [[finding-hot-switch-latency-remount]]). Raised from 4 to 8 so a typical
+// working set of recent sessions all switch tab-instant; tunable via
+// YGGTERM_HOT_PREMOUNT_CAP for users with more live sessions and headroom. The
+// cost is N hidden xterm hosts in the webview (unfocused hosts poll their PTY
+// only every 16s, so the steady-state cost is mostly DOM/memory, not CPU).
+const HOT_PREMOUNT_RETAINED_CAP_DEFAULT: usize = 8;
+const HOT_PREMOUNT_RETAINED_CAP_MAX: usize = 64;
+
+fn hot_premount_retained_cap() -> usize {
+    std::env::var("YGGTERM_HOT_PREMOUNT_CAP")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .map(|cap| cap.clamp(1, HOT_PREMOUNT_RETAINED_CAP_MAX))
+        .unwrap_or(HOT_PREMOUNT_RETAINED_CAP_DEFAULT)
+}
 const TERMINAL_RECOVERY_WATCH_GRACE_MS: u64 = 150;
 const RETAINED_REHYDRATE_DAEMON_READY_TELEMETRY_MS: u64 = 100;
 const RETAINED_REHYDRATE_DAEMON_READY_WATCH_GRACE_MS: u64 = 1_000;
@@ -4673,7 +4687,7 @@ impl ShellState {
             .insert(0, session_path.to_string());
         // Keep a little headroom past the cap so an evicted-then-revisited
         // session is still ranked by recency, but bound total growth.
-        let max_tracked = HOT_PREMOUNT_RETAINED_CAP.saturating_mul(4).max(8);
+        let max_tracked = hot_premount_retained_cap().saturating_mul(4).max(8);
         self.terminal_activation_mru.truncate(max_tracked);
     }
     /// The bounded set of session paths to keep mounted under limit-to-active
@@ -4687,7 +4701,7 @@ impl ShellState {
             keep.insert(active.to_string());
         }
         for path in &self.terminal_activation_mru {
-            if keep.len() >= HOT_PREMOUNT_RETAINED_CAP {
+            if keep.len() >= hot_premount_retained_cap() {
                 break;
             }
             if keep.contains(path) {
@@ -4802,6 +4816,34 @@ impl ShellState {
         PASSIVE_COPY_SUSPENDED.store(suspended, Ordering::Relaxed);
     }
     fn bump_terminal_mount_epoch_for_session(&mut self, session_path: &str) -> u64 {
+        // DIAGNOSTIC (hot-switch latency #milestone): every remount goes through
+        // an epoch bump. Log the hot-reveal sub-conditions so we can see WHY the
+        // switch-back didn't take the reveal path. See
+        // [[finding-hot-switch-latency-remount]]. Cheap + one event per bump.
+        if std::env::var("YGGTERM_TRACE_HOT_REVEAL").is_ok()
+            && let Ok(home) = resolve_yggterm_home()
+        {
+            let had_host_epoch = self.terminal_mount_epochs.contains_key(session_path);
+            append_trace_event(
+                &home,
+                "ui",
+                "hot_reveal_diag",
+                "mount_epoch_bump",
+                json!({
+                    "session_path": session_path,
+                    "prev_epoch": self.terminal_mount_epochs.get(session_path).copied(),
+                    "had_host_epoch": had_host_epoch,
+                    "was_ever_ready": self.terminal_session_was_ever_ready(session_path),
+                    "reached_ready_set": self.terminal_sessions_reached_ready.contains(session_path),
+                    "daemon_owns_runtime": self.daemon_owns_session_runtime(session_path),
+                    "attach_in_flight": self.terminal_attach_in_flight.contains(session_path),
+                    "in_reveal_grace": self.terminal_session_in_reveal_grace(session_path),
+                    "retained": self.retained_terminal_session_paths.contains(session_path),
+                    "empty_surface": self.latest_terminal_open_attempt_has_empty_surface(session_path),
+                    "is_retained_live": self.terminal_session_is_retained_live(session_path),
+                }),
+            );
+        }
         let epoch = self
             .terminal_mount_epochs
             .entry(session_path.to_string())
@@ -4863,6 +4905,18 @@ impl ShellState {
             .copied()
             .is_some_and(|until_ms| current_millis() < until_ms)
     }
+    /// A host that reached ready, still holds its mount epoch, and whose daemon
+    /// still owns the PTY can be REVEALED on switch-back (reuse the live host,
+    /// no remount) — independent of a stale `attach_in_flight` marker left by a
+    /// prior open. This is the single predicate both the render's reveal
+    /// recognition (`hot_reveal_reusable`) and the open-path re-arm use, so they
+    /// can never disagree about whether a switch is a reveal or a remount.
+    /// See [[finding-hot-switch-latency-remount]].
+    fn terminal_session_host_reusable_for_reveal(&self, session_path: &str) -> bool {
+        self.terminal_session_host_id(session_path).is_some()
+            && self.terminal_session_was_ever_ready(session_path)
+            && self.daemon_owns_session_runtime(session_path)
+    }
     fn terminal_session_is_retained_live(&self, session_path: &str) -> bool {
         let retained = self.retained_terminal_session_paths.contains(session_path);
         let active_remote_terminal_session = self.server.active_view_mode()
@@ -4911,10 +4965,17 @@ impl ShellState {
         // never reveal a host whose PTY is actually gone (that still falls
         // through to recovery). See memory
         // [[followups-switch-hotness-update-friction]].
-        let hot_reveal_reusable = has_host_epoch
-            && self.terminal_session_was_ever_ready(session_path)
-            && !self.terminal_attach_in_flight.contains(session_path)
-            && self.daemon_owns_session_runtime(session_path);
+        // A host that reached ready, still has its mount epoch, and whose
+        // daemon still owns the PTY is REUSABLE on switch-back — reveal it.
+        // We deliberately do NOT require `!attach_in_flight` here: an open/
+        // switch sets `attach_in_flight` for the target, and a prior attach's
+        // flag lingers across hide (it is retained because the session is in
+        // the keep-set), so requiring its absence made every switch-back read
+        // as "not reusable" -> cold remount (the ~1s js-init that dominated
+        // hot-switch latency). `daemon_owns_session_runtime` already guarantees
+        // the PTY is live, so a stale in-flight marker must not block the
+        // reveal. See [[finding-hot-switch-latency-remount]] (#milestone).
+        let hot_reveal_reusable = self.terminal_session_host_reusable_for_reveal(session_path);
         retained
             && (((self.terminal_resume_ready_paths.contains(session_path)
                 || self.terminal_session_has_ready_attempt(session_path))
@@ -4935,6 +4996,19 @@ impl ShellState {
             || self
                 .terminal_bootstrap_lease_by_session
                 .contains_key(session_path);
+        // Reuse a retained, daemon-owned, previously-ready host on switch-back
+        // instead of remounting it. `is_retained_live` now recognizes such a
+        // host even while a stale `attach_in_flight` marker lingers; drop that
+        // stale marker so the reveal path engages cleanly (no epoch bump, no
+        // ~1s remount). See [[finding-hot-switch-latency-remount]] (#milestone).
+        if self.terminal_session_host_reusable_for_reveal(session_path) {
+            // Reusable retained host: drop any stale in-flight attach marker so
+            // the reveal path engages cleanly, and DON'T remount (no epoch bump).
+            if has_pending_attach_state {
+                self.terminal_attach_in_flight.remove(session_path);
+            }
+            return false;
+        }
         if (self.terminal_session_is_retained_live(session_path) && !has_pending_attach_state)
             || (!has_pending_attach_state
                 && !active_remote_recovering_runtime
@@ -5520,6 +5594,17 @@ impl ShellState {
         true
     }
     fn recover_startup_terminal_restore(&mut self, active_session_path: &str, now_ms: u64) -> bool {
+        // A reusable retained host being revealed on switch-back can momentarily
+        // read "empty surface" — a hidden xterm repaint gap, not a fault. While
+        // it is inside the reveal grace, tearing it down + bumping the epoch
+        // would force a ~1s cold remount (the hot-switch latency we're killing).
+        // Let the activation repaint fill it instead. See
+        // [[finding-hot-switch-latency-remount]] (#milestone).
+        if self.terminal_session_host_reusable_for_reveal(active_session_path)
+            && self.terminal_session_in_reveal_grace(active_session_path)
+        {
+            return false;
+        }
         if !self.startup_terminal_restore_should_recover(active_session_path, now_ms) {
             return false;
         }
@@ -72707,7 +72792,7 @@ mod tests {
         let active = "remote-session://dev/active";
         let mut shell = ShellState::new(test_shell_bootstrap_with_active_session(active));
         // Seed cached hot views so the paths are "premount-mountable".
-        for i in 0..(HOT_PREMOUNT_RETAINED_CAP + 3) {
+        for i in 0..(hot_premount_retained_cap() + 3) {
             let path = format!("remote-session://dev/s{i}");
             let mut view = shell
                 .server
@@ -72720,12 +72805,12 @@ mod tests {
             shell.note_terminal_activation_mru(&path);
         }
         // Most-recently noted path is at the front.
-        let newest = format!("remote-session://dev/s{}", HOT_PREMOUNT_RETAINED_CAP + 2);
+        let newest = format!("remote-session://dev/s{}", hot_premount_retained_cap() + 2);
         assert_eq!(shell.terminal_activation_mru.first(), Some(&newest));
         let keep = shell.compute_hot_premount_keep_set(Some(active));
         assert!(keep.contains(active), "active path always kept");
         assert!(
-            keep.len() <= HOT_PREMOUNT_RETAINED_CAP,
+            keep.len() <= hot_premount_retained_cap(),
             "keep-set respects the cap: {}",
             keep.len()
         );
