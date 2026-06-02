@@ -4,6 +4,33 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+## 2.8.9
+
+- Returning to a session after a GUI restart no longer flickers between a saved
+  scroll position and the live bottom. A stale scroll-restore was fighting the
+  prompt-follow on every click and keystroke; the restore is now abandoned the
+  moment you engage the prompt (type, paste, or scroll to the bottom) or live
+  output arrives, so the view snaps to the bottom and stays. A session you return
+  to passively still restores its scroll position.
+- Fixed a leak that made the app gradually laggier: switching or restarting
+  sessions left orphaned terminal instances behind (the cleanup was keyed to a
+  mount id that changed on every remount), so they piled up and slowed selection,
+  paste, and switching. Superseded instances for a session are now disposed on
+  remount; the working set stays bounded.
+- Switching to a remote session no longer briefly shows a blank/unstyled surface
+  before the real content appears. When the remote snapshot used to seed the
+  surface comes back empty, the surface is now prefilled instantly from the
+  daemon's own screen buffer instead of painting blank until the live stream
+  repaints.
+- Reduced switch flicker: a session reveal/resize now performs a single settled
+  scroll-to-prompt instead of several racing passes.
+- Old background daemons from previous versions now retire themselves once a
+  newer daemon is running and they own no sessions, instead of lingering
+  indefinitely. The manual `retire-stale-daemons` command is now session-safe
+  too (it skips any daemon still holding live sessions).
+- The terminal now records which render pathway it uses (GPU canvas vs. DOM) and
+  why, per platform, so the chosen renderer is verifiable from telemetry.
+
 ## 2.8.8
 
 - Selecting text no longer makes the terminal viewport jump. While you have a
