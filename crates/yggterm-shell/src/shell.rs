@@ -32251,6 +32251,27 @@ async fn probe_terminal_viewport_scroll_for(session_path: &str, lines: i32) -> V
                         last_viewport_force_reason: String(entry.lastViewportForceReason || ''),
                         last_viewport_force_at_ms: Number(entry.lastViewportForceAtMs || 0),
                         viewport_force_log: Array.isArray(entry.viewportForceLog) ? entry.viewportForceLog.slice(-64) : [],
+                        dom_census: (() => {{
+                            try {{
+                                const hosts = Array.from(document.querySelectorAll('[id^="yggterm-terminal-"]'));
+                                const byPath = {{}};
+                                for (const h of hosts) {{
+                                    const p = h.getAttribute('data-terminal-session-path') || h.id;
+                                    byPath[p] = (byPath[p] || 0) + 1;
+                                }}
+                                const stacked = Object.entries(byPath).filter(([, n]) => n > 1).length;
+                                const registry = window.__yggtermXtermHosts || {{}};
+                                return {{
+                                    terminal_host_elements: hosts.length,
+                                    xterm_screens: document.querySelectorAll('.xterm-screen').length,
+                                    xterm_viewports: document.querySelectorAll('.xterm-viewport').length,
+                                    canvases: document.querySelectorAll('canvas').length,
+                                    registry_entries: Object.keys(registry).length,
+                                    paths_with_stacked_hosts: stacked,
+                                    total_dom_nodes: document.getElementsByTagName('*').length,
+                                }};
+                            }} catch (_e) {{ return null; }}
+                        }})(),
                         scrollback_expected: Boolean(entry.scrollbackExpected),
                         scrollback_locked: Boolean(entry.scrollbackLocked),
                         scrollback_intent: String(entry.scrollbackIntent || 'PromptFollow'),
@@ -56289,6 +56310,35 @@ fn terminal_eval_script_with_canvas_renderer(
                 window.__yggtermXtermCleanups[hostId]();
             }} catch (_error) {{}}
         }}
+        // REGISTRY-LEAK FIX: reap superseded-epoch hosts for THIS session path.
+        // hostId embeds the mount epoch (`-m<N>`); on restart/switch the epoch bumps
+        // to a NEW hostId, abandoning the prior epoch's entry. Its cleanup is keyed by
+        // the OLD hostId and is only invoked when that exact hostId re-inits — which
+        // never happens after an epoch bump. So the xterm.js Terminal + registry entry
+        // leak, and every global pass over `__yggtermXtermHosts` (selection/paste/
+        // switch) slows as the registry grows unbounded (measured 5->20+ on guihost). On
+        // (re)mount of a path, dispose any OTHER registry entry for the SAME path whose
+        // DOM host element is gone — that entry is a dead prior epoch. Other paths'
+        // warm-retained entries are untouched. See [[finding-hot-switch-latency-remount]].
+        try {{
+            const mountSessionPath = host.getAttribute("data-terminal-session-path") || "";
+            const reg = window.__yggtermXtermHosts || {{}};
+            const cleanups = window.__yggtermXtermCleanups || {{}};
+            if (mountSessionPath) {{
+                for (const staleKey of Object.keys(reg)) {{
+                    if (staleKey === hostId) {{ continue; }}
+                    const other = reg[staleKey];
+                    if (!other || other.sessionPath !== mountSessionPath) {{ continue; }}
+                    const staleDom = document.getElementById(staleKey);
+                    if (staleDom && staleDom.isConnected) {{ continue; }}
+                    try {{
+                        if (typeof cleanups[staleKey] === 'function') {{ cleanups[staleKey](); }}
+                    }} catch (_staleCleanupError) {{}}
+                    try {{ delete reg[staleKey]; }} catch (_e1) {{}}
+                    try {{ delete cleanups[staleKey]; }} catch (_e2) {{}}
+                }}
+            }}
+        }} catch (_reapError) {{}}
         const hostMetrics = () => {{
             const rect = host.getBoundingClientRect();
             const computed = window.getComputedStyle(host);
