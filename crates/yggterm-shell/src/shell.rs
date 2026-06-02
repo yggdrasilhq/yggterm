@@ -59259,26 +59259,6 @@ fn terminal_eval_script_with_canvas_renderer(
                     debug.reason = debug.reason || 'missing_active_buffer';
                     return debug;
                 }}
-                // XTERM-BUG: selection-jump — never move the viewport while the
-                // user has an active text selection. Incoming PTY output (agent
-                // sessions stream constantly) drove auto prompt-follow, which
-                // force-scrolled to the bottom mid-drag and made drag-selection
-                // jump around / go haywire. User-driven wheel scrolls are exempt;
-                // the prompt-follow resumes naturally once the selection clears.
-                if (String(reason || '') !== 'wheel'
-                    && term && typeof term.hasSelection === 'function' && term.hasSelection()) {{
-                    debug.skipped_for_active_selection = true;
-                    try {{
-                        const guardEntry = window.__yggtermXtermHosts && window.__yggtermXtermHosts[hostId]
-                            ? window.__yggtermXtermHosts[hostId] : null;
-                        if (guardEntry) {{
-                            guardEntry.viewportMoveSkippedForSelectionCount =
-                                Number(guardEntry.viewportMoveSkippedForSelectionCount || 0) + 1;
-                            guardEntry.lastViewportMoveSkippedForSelectionReason = String(reason || '');
-                        }}
-                    }} catch (_guardError) {{}}
-                    return debug;
-                }}
                 const baseY = Math.max(0, Number(active.baseY || 0));
                 const beforeViewportY = Math.max(0, Number(active.viewportY || 0));
                 const beforeEffectiveViewportY = effectiveXtermViewportY(active, debug);
