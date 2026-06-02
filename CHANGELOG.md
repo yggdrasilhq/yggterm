@@ -4,6 +4,17 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+## 2.8.8
+
+- Selecting text no longer makes the terminal viewport jump. While you have a
+  selection, streaming output stops auto-scrolling to the bottom, so a drag
+  selection stays put; typing at the prompt resumes following.
+- Middle-click paste now pastes exactly once (it was double/triple-pasting):
+  the click fired our paste on both mouse-down and release, plus a duplicate of
+  the system clipboard. Now it pastes the selection once on mouse-down.
+- Ctrl+Shift+V is reliable again (it could be swallowed right after a
+  middle-click) and now scrolls to the prompt when you paste.
+
 ## 2.8.7
 
 - Switching between recent live sessions is now tab-instant. Previously each
