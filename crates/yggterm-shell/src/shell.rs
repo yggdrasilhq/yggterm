@@ -32250,6 +32250,7 @@ async fn probe_terminal_viewport_scroll_for(session_path: &str, lines: i32) -> V
                         last_viewport_force_debug: entry.lastViewportForceDebug || null,
                         last_viewport_force_reason: String(entry.lastViewportForceReason || ''),
                         last_viewport_force_at_ms: Number(entry.lastViewportForceAtMs || 0),
+                        viewport_force_log: Array.isArray(entry.viewportForceLog) ? entry.viewportForceLog.slice(-64) : [],
                         scrollback_expected: Boolean(entry.scrollbackExpected),
                         scrollback_locked: Boolean(entry.scrollbackLocked),
                         scrollback_intent: String(entry.scrollbackIntent || 'PromptFollow'),
@@ -59363,6 +59364,27 @@ fn terminal_eval_script_with_canvas_renderer(
                     entry.lastViewportForceDebug = debug;
                     entry.lastViewportForceReason = String(reason || '');
                     entry.lastViewportForceAtMs = Date.now();
+                    // Always-on capped ring buffer of recent viewport moves so a
+                    // single keystroke's flicker sequence (which setter moved the
+                    // viewport, to where, with what intent) can be dumped via the
+                    // `terminal probe-viewport-trace` app-control probe. Cheap: one
+                    // small object push, capped at 64. See [[audit-viewport-scroll-control-flow]].
+                    if (!Array.isArray(entry.viewportForceLog)) {{ entry.viewportForceLog = []; }}
+                    entry.viewportForceLog.push({{
+                        at: Date.now(),
+                        reason: String(debug.reason || ''),
+                        req: Number(debug.requested_target_viewport_y || 0),
+                        target: Number(debug.target_viewport_y || 0),
+                        beforeEff: Number(debug.before_effective_viewport_y || 0),
+                        afterEff: Number(debug.after_effective_viewport_y || 0),
+                        base: Number(debug.after_base_y || 0),
+                        noop: Boolean(debug.noop_matched_target),
+                        intent: String(scrollbackIntent || ''),
+                        locked: Boolean(scrollbackLocked),
+                    }});
+                    if (entry.viewportForceLog.length > 64) {{
+                        entry.viewportForceLog.splice(0, entry.viewportForceLog.length - 64);
+                    }}
                 }}
             }} catch (_error) {{}}
             return debug;
@@ -59402,6 +59424,28 @@ fn terminal_eval_script_with_canvas_renderer(
         const tryApplyPendingPersistedScrollRestore = (reason = '') => {{
             try {{
                 if (!pendingPersistedScrollRestore) {{ return false; }}
+                // SCROLL-OWNERSHIP: abandon a stale scroll-restore the instant
+                // follow-mode is engaged. A restored session is armed in
+                // 'UserScrollback'; it only flips to 'PromptFollow' when the user
+                // genuinely engages the prompt (keystroke/paste/scroll-to-bottom)
+                // or live output is injected. In any of those cases the user wants
+                // the live bottom, NOT a saved scrollback offset — re-applying the
+                // offset here was the post-restart flicker (restore vs prompt-follow
+                // fighting on every click/keystroke for the 8s poll window). A truly
+                // passive restored session stays in 'UserScrollback', so this still
+                // restores the scroll position for the case it was designed for.
+                // See [[audit-viewport-scroll-control-flow]].
+                if (scrollbackIntent !== 'UserScrollback') {{
+                    pendingPersistedScrollRestore = null;
+                    const abandonEntry = window.__yggtermXtermHosts && window.__yggtermXtermHosts[hostId]
+                        ? window.__yggtermXtermHosts[hostId] : null;
+                    if (abandonEntry) {{
+                        abandonEntry.persistedScrollRestorePending = false;
+                        abandonEntry.persistedScrollRestoreAbandonedReason = `follow_engaged:${{reason}}`;
+                        abandonEntry.persistedScrollRestoreAbandonedAtMs = Date.now();
+                    }}
+                    return false;
+                }}
                 const nowMs = Date.now();
                 const pastDeadline = nowMs > pendingPersistedScrollRestoreDeadlineMs;
                 const buffer = term && term.buffer && term.buffer.active ? term.buffer.active : null;
