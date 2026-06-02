@@ -27167,6 +27167,7 @@ async fn capture_dom_debug_snapshot_for(active_session_path: Option<&str>) -> Va
                     })(),
                     xterm_cursor_hidden_toggle_count: mountedHost ? Number(mountedHost.cursorHiddenToggleCount || 0) : 0,
                     xterm_canvas_renderer_requested: Boolean(window.__yggtermXtermCanvasRendererEnabled),
+                    xterm_renderer_policy_reason: String(window.__yggtermXtermRendererPolicyReason || ''),
                     xterm_renderer_mode: host.querySelectorAll('canvas').length > 0 ? 'canvas' : 'dom',
                     xterm_mouse_tracking_mode: xtermModes ? String(xtermModes.mouseTrackingMode || '') : null,
                     xterm_last_visual_transition_reason: mountedHost ? String(mountedHost.lastVisualTransitionReason || '') : '',
@@ -29027,6 +29028,7 @@ async fn capture_dom_debug_snapshot_basic_for(active_session_path: Option<&str>)
                         last_fit_guard: mountedHost && mountedHost.lastFitGuard ? mountedHost.lastFitGuard : null,
                         last_skipped_fit: mountedHost && mountedHost.lastSkippedFit ? mountedHost.lastSkippedFit : null,
                         xterm_canvas_renderer_requested: Boolean(window.__yggtermXtermCanvasRendererEnabled),
+                    xterm_renderer_policy_reason: String(window.__yggtermXtermRendererPolicyReason || ''),
                         xterm_renderer_mode: canvasCount > 0 ? 'canvas' : 'dom',
                         helper_textarea_focused: Boolean(helperTextarea && helperTextarea === activeElement),
                         host_has_active_element: Boolean(activeElement && host.contains(activeElement)),
@@ -30069,6 +30071,7 @@ async fn capture_dom_debug_snapshot_terminal_quick_fallback_for(
                         hidden_canvas_layer_count: 0,
                         xterm_renderer_mode: canvasCount > 0 ? 'canvas' : 'dom',
                         xterm_canvas_renderer_requested: Boolean(window.__yggtermXtermCanvasRendererEnabled),
+                    xterm_renderer_policy_reason: String(window.__yggtermXtermRendererPolicyReason || ''),
                         cursor_node_count: nativeCursor ? 1 : 0,
                         cursor_sample_rect: cursorSampleRect,
                         cursor_expected_rect: cursorExpectedRect,
@@ -30737,6 +30740,7 @@ async fn capture_dom_debug_snapshot_terminal_fallback_for(
                     xterm_cursor_hidden: xtermCursorHidden,
                     xterm_cursor_hidden_toggle_count: mountedHost ? Number(mountedHost.cursorHiddenToggleCount || 0) : 0,
                     xterm_canvas_renderer_requested: Boolean(window.__yggtermXtermCanvasRendererEnabled),
+                    xterm_renderer_policy_reason: String(window.__yggtermXtermRendererPolicyReason || ''),
                     xterm_renderer_mode: canvasLayers.length > 0 ? 'canvas' : 'dom',
                     helpers_present: Boolean(helpers),
                     helpers_rect: rectSummary(helpers),
@@ -53959,6 +53963,69 @@ fn terminal_xterm_canvas_renderer_enabled_from_env(
     }
     false
 }
+/// Human-readable reason for the xterm renderer policy decision, so telemetry can
+/// show WHY a given pathway (canvas vs DOM) was chosen on each platform. Mirrors
+/// `terminal_xterm_canvas_renderer_enabled_from_env` exactly. NOTE: xterm.js has
+/// three render tiers — DOM (slowest), canvas (the @xterm/addon-canvas we bundle),
+/// and WebGL (fastest, NOT bundled). We deliberately top out at canvas on
+/// WebKitGTK: WebGL contexts are lossy under WebKitGTK/Wayland compositing and a
+/// lost context blanks the terminal, so canvas is the best *reliable* tier here.
+/// This reason string + the `renderer_decision` trace exist to measure that claim.
+fn terminal_xterm_renderer_policy_reason() -> String {
+    // main.rs (configure_linux_terminal_renderer_policy) resolves the platform
+    // policy and exports the authoritative reason as YGGTERM_XTERM_CANVAS_POLICY
+    // (e.g. "xterm_canvas_enabled_for_wayland" / "xterm_canvas_disabled_for_x11")
+    // and SETS YGGTERM_ENABLE_XTERM_CANVAS before the webview starts. By the time
+    // the shell reads the canvas flag it looks "explicit", so prefer the upstream
+    // policy reason when present — that is the real per-platform decision and makes
+    // the renderer_decision trace self-explanatory.
+    if let Ok(policy) = std::env::var("YGGTERM_XTERM_CANVAS_POLICY") {
+        let trimmed = policy.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+    }
+    terminal_xterm_renderer_policy_reason_from_env(
+        std::env::var(XTERM_CANVAS_RENDERER_ENV).ok().as_deref(),
+        std::env::var("GDK_BACKEND").ok().as_deref(),
+        std::env::var_os("WAYLAND_DISPLAY").is_some(),
+        std::env::var_os("DISPLAY").is_some(),
+    )
+    .to_string()
+}
+fn terminal_xterm_renderer_policy_reason_from_env(
+    explicit_value: Option<&str>,
+    gdk_backend: Option<&str>,
+    wayland_display_present: bool,
+    display_present: bool,
+) -> &'static str {
+    if let Some(value) = explicit_value {
+        return if env_value_truthy(value) {
+            "explicit_env_canvas"
+        } else {
+            "explicit_env_dom"
+        };
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let gdk_backend_x11 = gdk_backend
+            .unwrap_or_default()
+            .split(',')
+            .any(|part| part.trim() == "x11");
+        if gdk_backend_x11 || (!wayland_display_present && display_present) {
+            return "linux_x11_dom_idle_cpu_guard";
+        }
+        if wayland_display_present {
+            return "linux_wayland_canvas_gpu";
+        }
+        return "linux_headless_dom";
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (gdk_backend, wayland_display_present, display_present);
+        "non_linux_dom"
+    }
+}
 fn terminal_write_frame_ms() -> u64 {
     std::env::var(TERMINAL_WRITE_FRAME_MS_ENV)
         .ok()
@@ -56065,6 +56132,7 @@ fn terminal_eval_script(
         theme,
         initial_input_enabled,
         terminal_xterm_canvas_renderer_enabled(),
+        &terminal_xterm_renderer_policy_reason(),
     )
 }
 fn terminal_eval_script_with_canvas_renderer(
@@ -56072,6 +56140,7 @@ fn terminal_eval_script_with_canvas_renderer(
     theme: &TerminalTheme,
     initial_input_enabled: bool,
     canvas_renderer_enabled: bool,
+    renderer_policy_reason: &str,
 ) -> String {
     let css = serde_json::to_string(XTERM_CSS).expect("serialize xterm css");
     let xterm = serde_json::to_string(XTERM_JS).expect("serialize xterm js");
@@ -56112,6 +56181,8 @@ fn terminal_eval_script_with_canvas_renderer(
         serde_json::to_string(&initial_input_enabled).expect("serialize initial input enabled");
     let canvas_renderer_enabled =
         serde_json::to_string(&canvas_renderer_enabled).expect("serialize canvas renderer flag");
+    let renderer_policy_reason =
+        serde_json::to_string(renderer_policy_reason).expect("serialize renderer policy reason");
     let terminal_write_frame_ms = terminal_write_frame_ms();
     let terminal_active_write_frame_ms = terminal_active_write_frame_ms();
     let terminal_active_animation_write_frame_ms =
@@ -56465,6 +56536,8 @@ fn terminal_eval_script_with_canvas_renderer(
         // while isolating compositor-specific WebKit behavior.
         const canvasRendererEnabled = {canvas_renderer_enabled};
         window.__yggtermXtermCanvasRendererEnabled = Boolean(canvasRendererEnabled);
+        const rendererPolicyReason = {renderer_policy_reason};
+        window.__yggtermXtermRendererPolicyReason = String(rendererPolicyReason || '');
         let preferredCanvasRenderer = false;
         const fitAddon = new window.FitAddon.FitAddon();
         term.loadAddon(fitAddon);
@@ -56605,18 +56678,38 @@ fn terminal_eval_script_with_canvas_renderer(
         }};
         const notifyOsc9Disposable = registerTerminalNotifyOsc(9, "osc9");
         const notifyOsc777Disposable = registerTerminalNotifyOsc(777, "osc777");
+        let canvasAddonAvailable = Boolean(window.CanvasAddon && window.CanvasAddon.CanvasAddon);
+        let rendererDecisionError = '';
         try {{
-            if (canvasRendererEnabled && window.CanvasAddon && window.CanvasAddon.CanvasAddon) {{
+            if (canvasRendererEnabled && canvasAddonAvailable) {{
                 const canvasAddon = new window.CanvasAddon.CanvasAddon();
                 term.loadAddon(canvasAddon);
                 preferredCanvasRenderer = true;
             }}
         }} catch (error) {{
+            rendererDecisionError = error && error.message ? error.message : String(error);
             sendTerminalEvent({{
                 kind: "debug",
-                message: `canvas_addon_failed host=${{hostId}} error=${{error && error.message ? error.message : String(error)}}`
+                message: `canvas_addon_failed host=${{hostId}} error=${{rendererDecisionError}}`
             }});
         }}
+        // RENDERER TELEMETRY: emit the definitive render-pathway decision so we can
+        // confirm, per platform, which xterm.js tier is actually in use and WHY.
+        // `requested` = policy enabled canvas; `loaded` = the canvas addon attached;
+        // a verify pass after first paint records the ACTUAL renderer (canvas leaves
+        // <canvas> elements, DOM does not). Tiers: dom (slowest) < canvas (bundled) <
+        // webgl (fastest, not bundled — see terminal_xterm_renderer_policy_reason).
+        const emitRendererDecision = (phase) => {{
+            try {{
+                const canvasCount = host.querySelectorAll('canvas').length;
+                sendTerminalEvent({{
+                    kind: "debug",
+                    message: `renderer_decision host=${{hostId}} phase=${{phase}} reason=${{rendererPolicyReason}} requested=${{canvasRendererEnabled ? 1 : 0}} addon_available=${{canvasAddonAvailable ? 1 : 0}} canvas_loaded=${{preferredCanvasRenderer ? 1 : 0}} actual=${{canvasCount > 0 ? 'canvas' : 'dom'}} canvas_elements=${{canvasCount}}${{rendererDecisionError ? ' error=' + rendererDecisionError : ''}}`
+                }});
+            }} catch (_rendererDecisionTraceError) {{}}
+        }};
+        emitRendererDecision('init');
+        try {{ window.requestAnimationFrame(() => window.requestAnimationFrame(() => emitRendererDecision('after_paint'))); }} catch (_rafError) {{}}
         const terminalHostContentMetrics = () => {{
             try {{
                 const rect = host.getBoundingClientRect();
@@ -74688,6 +74781,35 @@ mod tests {
     }
 
     #[test]
+    fn xterm_renderer_policy_reason_matches_enable_decision() {
+        // The reason string must stay in lockstep with the enable decision, since
+        // it is the telemetry that explains which render pathway was chosen.
+        assert_eq!(
+            terminal_xterm_renderer_policy_reason_from_env(Some("0"), Some("wayland"), true, true),
+            "explicit_env_dom"
+        );
+        assert_eq!(
+            terminal_xterm_renderer_policy_reason_from_env(Some("1"), Some("x11"), true, true),
+            "explicit_env_canvas"
+        );
+        #[cfg(target_os = "linux")]
+        {
+            assert_eq!(
+                terminal_xterm_renderer_policy_reason_from_env(None, Some("x11"), true, true),
+                "linux_x11_dom_idle_cpu_guard"
+            );
+            assert_eq!(
+                terminal_xterm_renderer_policy_reason_from_env(None, None, false, true),
+                "linux_x11_dom_idle_cpu_guard"
+            );
+            assert_eq!(
+                terminal_xterm_renderer_policy_reason_from_env(None, Some("wayland"), true, false),
+                "linux_wayland_canvas_gpu"
+            );
+        }
+    }
+
+    #[test]
     fn xterm_canvas_renderer_is_gated_off_on_x11_idle_cpu_path() {
         // Explicit env override always wins.
         assert!(!terminal_xterm_canvas_renderer_enabled_from_env(
@@ -74724,7 +74846,7 @@ mod tests {
         ));
         let theme = terminal_theme(UiTheme::ZedLight, palette(UiTheme::ZedLight), 13.0, "");
         let script =
-            terminal_eval_script_with_canvas_renderer("yggterm-terminal-test", &theme, true, false);
+            terminal_eval_script_with_canvas_renderer("yggterm-terminal-test", &theme, true, false, "test_reason");
         assert!(script.contains("const canvasRendererEnabled = false;"));
         assert!(script.contains("if (canvasRendererEnabled && window.CanvasAddon"));
     }
@@ -74754,9 +74876,9 @@ mod tests {
     fn terminal_eval_script_runtime_gates_canvas_renderer() {
         let theme = terminal_theme(UiTheme::ZedLight, palette(UiTheme::ZedLight), 13.0, "");
         let disabled =
-            terminal_eval_script_with_canvas_renderer("yggterm-terminal-test", &theme, true, false);
+            terminal_eval_script_with_canvas_renderer("yggterm-terminal-test", &theme, true, false, "test_reason");
         let enabled =
-            terminal_eval_script_with_canvas_renderer("yggterm-terminal-test", &theme, true, true);
+            terminal_eval_script_with_canvas_renderer("yggterm-terminal-test", &theme, true, true, "test_reason");
         assert!(disabled.contains("const canvasRendererEnabled = false;"));
         assert!(enabled.contains("const canvasRendererEnabled = true;"));
         assert!(enabled.contains(
@@ -74768,7 +74890,7 @@ mod tests {
     fn terminal_eval_script_trims_idle_canvas_overlay_layers() {
         let theme = terminal_theme(UiTheme::ZedLight, palette(UiTheme::ZedLight), 13.0, "");
         let script =
-            terminal_eval_script_with_canvas_renderer("yggterm-terminal-test", &theme, true, true);
+            terminal_eval_script_with_canvas_renderer("yggterm-terminal-test", &theme, true, true, "test_reason");
         assert!(script.contains("const softwareCanvasLayerOptimizationAllowed = () => Boolean("));
         assert!(script.contains("className.includes('xterm-selection-layer')"));
         assert!(script.contains("className.includes('xterm-link-layer')"));
@@ -74790,7 +74912,7 @@ mod tests {
     fn terminal_eval_script_keeps_codex_prompt_and_cursor_xterm_owned() {
         let theme = terminal_theme(UiTheme::ZedDark, palette(UiTheme::ZedDark), 13.0, "");
         let script =
-            terminal_eval_script_with_canvas_renderer("yggterm-terminal-test", &theme, true, true);
+            terminal_eval_script_with_canvas_renderer("yggterm-terminal-test", &theme, true, true, "test_reason");
         assert!(!script.contains(".yggterm-canvas-input-line-overlay"));
         assert!(!script.contains(".yggterm-canvas-cursor-overlay"));
         assert!(!script.contains("overlay.className = 'yggterm-canvas-input-line-overlay'"));
@@ -74816,7 +74938,7 @@ mod tests {
     fn terminal_eval_script_can_opt_into_canvas_renderer() {
         let theme = terminal_theme(UiTheme::ZedLight, palette(UiTheme::ZedLight), 13.0, "");
         let script =
-            terminal_eval_script_with_canvas_renderer("yggterm-terminal-test", &theme, true, true);
+            terminal_eval_script_with_canvas_renderer("yggterm-terminal-test", &theme, true, true, "test_reason");
         assert!(script.contains("const canvasRendererEnabled = true;"));
     }
 
