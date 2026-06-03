@@ -11,17 +11,19 @@ is not the active embedded terminal surface for Yggterm.
 
 Per the decentralized host-resident daemon architecture (see `AGENTS.md` →
 "Terminal multiplexer positioning"), the persistence layer for **plain shell
-terminals** is — by design — the host's own `yggterm-headless` daemon. The daemon
-runs on the machine where the shell lives (local or each SSH host), owns the
-shell PTY, retains its scrollback, and keeps it alive across GUI/client
-disconnect and SSH death. A GUI client reaches it over SSH (SSH is the auth
-layer); metadata lives in that host's `~/.yggterm`.
+terminals** is — by design — the host's own **yggterm server** (daemon). It runs
+on the machine where the shell lives (local or each SSH host), owns the shell
+PTY, retains its scrollback, and keeps it alive across client disconnect and SSH
+death. A client (GUI `yggterm` or headless `yggterm-headless`) reaches it over SSH
+(SSH is the auth layer); metadata lives in that host's `~/.yggterm`. (Nomenclature:
+`yggterm` = GUI client, `yggterm-headless` = headless client for agents, "yggterm
+server" = the session-holding daemon.)
 
 **Current reality (stopgap, to be removed):** shell terminals are launched via
 `yggterm attach <uuid>` → `crates/yggterm-server/src/attach.rs::exec_tmux`, which
 execs into `tmux new-session` when tmux is available. This was a shortcut to get
-shell persistence (especially remote, across SSH drops) before the host daemon
-owned shell PTYs end-to-end. It is **harmful and not a design choice**:
+shell persistence (especially remote, across SSH drops) before the host yggterm
+server owned shell PTYs end-to-end. It is **harmful and not a design choice**:
 
 - tmux owns the scrollback (copy-mode), so xterm.js sees only the current screen
   → "no scrollback buffer" for shell sessions.
@@ -29,13 +31,14 @@ owned shell PTYs end-to-end. It is **harmful and not a design choice**:
 - tmux's screen model fights xterm.js scroll/selection.
 - It is pure redundancy for *local* shells, where the daemon already owns the PTY.
 
-**Target end state:** the host `yggterm-headless` owns shell PTYs directly — no
+**Target end state:** the host **yggterm server** owns shell PTYs directly — no
 tmux process, no tmux status bar, no tmux-owned scrollback. Remote-shell
-survival across SSH death comes from the daemon running ON THE REMOTE HOST (which
-yggterm already self-installs there, see `[[spec-cli-binary-auto-provisioning]]`),
-not from tmux. Until that path is fully wired, do not deepen the tmux dependency;
-prefer removing it (local first) and, where remote persistence still needs a
-host-side holder, route it through the host daemon rather than tmux.
+survival across SSH death comes from the yggterm server running ON THE REMOTE HOST
+(which yggterm already self-installs there, see
+`[[spec-cli-binary-auto-provisioning]]`), not from tmux. Until that path is fully
+wired, do not deepen the tmux dependency; prefer removing it (local first) and,
+where remote persistence still needs a host-side holder, route it through the host
+yggterm server rather than tmux.
 
 ## Ghostty Status
 
