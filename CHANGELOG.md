@@ -4,6 +4,15 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+## 2.8.15
+
+- Reverted 2.8.14's middle-output re-sync again. Under active work it fired during
+  the session's recovery churn and made things worse: it cleared and only partially
+  replayed scrollback (normal-buffer sessions lost most of their history) and
+  amplified the re-seed loop that blanks/scroll-locks full-screen TUIs. The
+  data-loss (clipped middle) is reopened; it can't ship until it coexists with a
+  fix for recovery firing on actively-streaming sessions.
+
 ## 2.8.14
 
 - Re-fixed the silent middle-output loss from 2.8.12, this time without breaking
