@@ -329,6 +329,16 @@ const RETAINED_FAULT_READY_SETTLE_GRACE_MS: u64 = 1_500;
 // Only if it is STILL empty after the grace do we treat it as a genuine fault
 // and recover. See memory [[followups-switch-hotness-update-friction]].
 const RETAINED_REVEAL_EMPTY_GRACE_MS: u64 = 1_200;
+// A full-screen TUI (codex/agent) constantly clears+redraws (`\x1b[2J\x1b[H`).
+// The host-health poll can sample the buffer in the gap AFTER the clear and
+// BEFORE the redraw paints — cursor home, every row blank (diag observed
+// cursor_line_len=0, text_tail_len=0, blank_rows_below_cursor=62/63). That is a
+// TRANSIENT, not a broken surface, but it used to trip empty-surface recovery →
+// shadow flash → multi-second re-gate, both on cold attach AND mid-session during
+// scroll/selection. Require the empty condition to PERSIST across this settle
+// window (codex's redraw fills well within a frame; a genuine empty surface
+// stays empty) before recovering. See [[finding-hot-switch-latency-remount]].
+const RETAINED_EMPTY_SURFACE_SETTLE_MS: u64 = 800;
 const RETAINED_FAULT_RECOVERY_MAX_REARMS: u32 = 2;
 // Per [[feedback-cycle-all-keepalive-after-gate-work]]: after a user click,
 // keep the latch off for this long so the resume flow has runway to actually
@@ -47542,6 +47552,11 @@ fn TerminalCanvas(
             let mut post_attach_read_recovery_attempts = 0_u64;
             let mut blank_retry_poison_recovery_attempts = 0_u64;
             let mut retained_empty_surface_recovery_attempts = 0_u64;
+            // First poll at which the empty-surface condition was observed in the
+            // current continuous run; reset whenever the surface is non-empty.
+            // Recovery only fires once this has persisted RETAINED_EMPTY_SURFACE_SETTLE_MS,
+            // so codex's transient post-clear blank never triggers it.
+            let mut retained_empty_surface_first_seen_ms = None::<u64>;
             let mut non_prompt_retained_recovery_attempts = 0_u64;
             let mut non_prompt_snapshot_replay_attempts = 0_u64;
             let mut blank_host_snapshot_replay_attempts = 0_u64;
@@ -48451,18 +48466,50 @@ fn TerminalCanvas(
                                 .unwrap_or((false, false, false, false));
                                 let poisoned_by_retry =
                                     attach_in_flight_from_shell || resume_notification_visible;
-                                if retained_ready_remote_empty_surface_should_recover(
-                                    is_remote_resume_session,
-                                    ready_attempt_from_shell,
-                                    terminal_retained_snapshot_staged(),
-                                    terminal_paint_seen,
-                                    terminal_geometry_ready,
-                                    has_transport_error,
-                                    &cursor_line_text,
-                                    &text_tail,
-                                    rows,
-                                    blank_rows_below_cursor,
-                                ) && retained_empty_surface_recovery_attempts < 1 {
+                                let retained_empty_surface_now =
+                                    retained_ready_remote_empty_surface_should_recover(
+                                        is_remote_resume_session,
+                                        ready_attempt_from_shell,
+                                        terminal_retained_snapshot_staged(),
+                                        terminal_paint_seen,
+                                        terminal_geometry_ready,
+                                        has_transport_error,
+                                        &cursor_line_text,
+                                        &text_tail,
+                                        rows,
+                                        blank_rows_below_cursor,
+                                    );
+                                if !retained_empty_surface_now {
+                                    // Surface has content (codex finished its redraw) — reset the
+                                    // settle timer so a transient post-clear blank never accrues.
+                                    retained_empty_surface_first_seen_ms = None;
+                                }
+                                let retained_empty_surface_settled = retained_empty_surface_now && {
+                                    let now_ms = current_millis();
+                                    let first_seen =
+                                        *retained_empty_surface_first_seen_ms.get_or_insert(now_ms);
+                                    let persisted_ms = now_ms.saturating_sub(first_seen);
+                                    if persisted_ms < RETAINED_EMPTY_SURFACE_SETTLE_MS {
+                                        append_trace_event(
+                                            &trace_home,
+                                            "ui",
+                                            "terminal_mount",
+                                            "retained_empty_surface_settle_wait",
+                                            json!({
+                                                "session_path": session_path.clone(),
+                                                "persisted_ms": persisted_ms,
+                                                "rows": rows,
+                                                "blank_rows_below_cursor": blank_rows_below_cursor,
+                                            }),
+                                        );
+                                        false
+                                    } else {
+                                        true
+                                    }
+                                };
+                                if retained_empty_surface_settled
+                                    && retained_empty_surface_recovery_attempts < 1
+                                {
                                     let invalidated = safe_shell_mut(
                                         state,
                                         "terminal_attach_retry_after_retained_empty_surface",
