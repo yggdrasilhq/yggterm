@@ -4,6 +4,18 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+## 2.8.11
+
+- Fixed a "shadow" flash + multi-second re-gate that could hit a session both on
+  cold attach and mid-session (e.g. scrolling up to select text would blank the
+  surface and gate before you could paste). A full-screen TUI clears and redraws
+  constantly, and the surface-health check could sample the buffer in the gap
+  between the clear and the repaint — one blank frame — and mistake it for a
+  broken empty surface, triggering recovery. The check now requires the surface
+  to stay empty across a short settle window before recovering, so the TUI's
+  normal redraw transient no longer trips it while a genuinely broken surface
+  still self-heals.
+
 ## 2.8.10
 
 - Reverted the 2.8.9 "empty-seed daemon-screen prefill." It wrote a clear-screen
