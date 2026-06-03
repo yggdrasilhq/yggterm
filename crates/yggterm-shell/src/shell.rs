@@ -48490,6 +48490,19 @@ fn TerminalCanvas(
                                                 "attempt": retained_empty_surface_recovery_attempts,
                                                 "rows": rows,
                                                 "blank_rows_below_cursor": blank_rows_below_cursor,
+                                                // DIAG (cold-attach empty-surface false-positive): capture
+                                                // the exact surface values at trip time. If the cursor line
+                                                // and tail are empty here while the immediately-preceding
+                                                // trace shows a fresh seed/replay (clear-screen `\x1b[2J`
+                                                // then content), the "empty" is a transient mid-seed sample,
+                                                // not a real empty surface — confirming the settle-grace fix.
+                                                "diag_cursor_line_len": cursor_line_text.trim().len(),
+                                                "diag_cursor_line_sample": cursor_line_text.chars().take(60).collect::<String>(),
+                                                "diag_text_tail_len": text_tail.trim().len(),
+                                                "diag_text_tail_sample": text_tail.chars().rev().take(60).collect::<String>().chars().rev().collect::<String>(),
+                                                "diag_paint_seen": terminal_paint_seen,
+                                                "diag_geometry_ready": terminal_geometry_ready,
+                                                "diag_retained_snapshot_staged": terminal_retained_snapshot_staged(),
                                             }),
                                         );
                                         set_signal_if_changed(terminal_overlay_dismissed, false);
