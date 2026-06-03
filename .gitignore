@@ -6,3 +6,18 @@ run.log
 *.swo
 .DS_Store
 __pycache__/
+
+# Local proof/debug artifacts — screenshots & state dumps at repo root.
+# These can contain private session data (paths, titles, UUIDs); never commit them.
+# (Prevents an accidental `git add -A` from sweeping them in.)
+/.*.png
+/.*.json
+.todos/
+/artifacts/demos/unreleased/
+
+# Per-machine local config, not part of the repo
+.codex
+.claude/
+.agents/config/
+event-trace.jsonl
+target/
