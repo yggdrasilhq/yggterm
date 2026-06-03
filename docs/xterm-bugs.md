@@ -44,6 +44,9 @@ xterm.js owns vs what the shell owns, cursor/prompt semantics, etc. — see
 | [scrollbar-not-draggable](#scrollbar-not-draggable) | Sleek thin scrollbar visible but cannot be dragged | FIXED 2026-05-28 |
 | [content-scooped-on-session-switch](#content-scooped-on-session-switch) | Switching sessions: middle rows disappear, top + bottom remaining text presented as continuous | OPEN, telemetry added |
 | [keepalive-restart-viewport-only](#keepalive-restart-viewport-only) | After GUI restart, keep-alive sessions show only viewport's worth of content; daemon had retained more in vt100 ring but didn't serve it | FIXED & VERIFIED LIVE 2026-05-28 on jojo 2.7.62 — local shell base_y 893→893, codex base_y 144→144 across kill+launch. Earlier reopen was misdiagnosed: the avikalpa_opc "only viewport" symptom was a stale resume-codex wiring issue on that specific session, not a scrollback retention gap. |
+| [surface-recovery-false-positive-on-transient](#surface-recovery-false-positive-on-transient) | "Shadow" blank flash + multi-second re-gate, and (worse) input-disable → re-resume → exhaust → session yanked closed, all triggered by a TUI's normal clear+redraw transient misread as a broken/empty/non-prompt surface | FIXED 2026-06-03 (settle-gates) — empty-surface 2.8.11, non-prompt 4-point fix |
+| [persisted-scroll-restore-fights-follow](#persisted-scroll-restore-fights-follow) | After GUI restart, every click/keystroke flickers between a saved scroll offset and the live bottom | FIXED 2026-06-02 |
+| [xterm-host-registry-leak](#xterm-host-registry-leak) | Switching/restarting sessions accumulates orphaned xterm.js instances (cleanup keyed to mount epoch that changes on remount) → growing latency on selection/paste/switch | FIXED 2026-06-02 |
 
 ---
 
@@ -952,6 +955,135 @@ remain green with the new default.
 ### Related memory
 `[[finding-xterm-latency-dom-renderer-write-framing]]`,
 `[[spec-tmux-parity-and-beyond]]`, `[[spec-xterm-gating-ux]]`
+
+---
+
+## surface-recovery-false-positive-on-transient
+
+STATUS: FIXED 2026-06-03 (settle-gates). Supersedes the "shadow session" reports
+under [blank-rendering-region](#blank-rendering-region) and much of
+[dom-leak-on-session-start](#dom-leak-on-session-start) on the cold/switch path.
+
+### Symptom
+On cold attach AND mid-session (e.g. scroll-up to select text), a remote session
+would: flash a blank "shadow" surface, gate for ~2–3s while it "recovered", and
+in the worst case **disable keyboard input**, **re-resume the session (interrupting
+codex)**, churn rehydrate/DOM cycles, and finally — on recovery-budget exhaustion —
+**mark the session Failed and yank it closed**.
+
+### Root cause
+A full-screen TUI (codex/agent) clears+redraws constantly (`\x1b[2J\x1b[H`). The
+host-health poll could sample the buffer in the one-frame gap *after the clear and
+before the repaint*: cursor home, every row blank (diagnostic captured
+`cursor_line_len=0, text_tail_len=0, blank_rows_below_cursor=62/63`). Two recovery
+predicates were **point-in-time checks with no persistence guard**, so a single
+transient sample escalated:
+- `retained_ready_remote_empty_surface_should_recover` → empty-surface recovery
+  (re-seed churn → shadow flash + re-gate).
+- `retained_remote_surface_should_wait_for_prompt_ready` → non-prompt-surface
+  recovery, which is far more destructive: disables input → snapshot replay →
+  `resume_recovery` (RE-RESUME, interrupts codex) → on exhaustion marks the
+  attempt Failed and tears the session down.
+
+### Workaround (fix)
+Require the bad condition to **persist across a settle window** before recovering;
+the TUI's redraw fills within a frame and resets the timer, so transients never
+trigger recovery, while a genuinely broken surface persists and still self-heals.
+- Empty-surface: `RETAINED_EMPTY_SURFACE_SETTLE_MS = 800ms`.
+- Non-prompt-surface: `RETAINED_NON_PROMPT_SETTLE_MS = 1500ms` (longer — the
+  escalation is destructive), PLUS: never re-resume a connected live session on a
+  transient, and on budget exhaustion **never fail/close a session whose daemon
+  still owns the PTY** (accept the surface as-is, keep it alive + input enabled;
+  only a provably-dead runtime is failed).
+
+### Code locations
+- `crates/yggterm-shell/src/shell.rs`: `RETAINED_EMPTY_SURFACE_SETTLE_MS`,
+  `RETAINED_NON_PROMPT_SETTLE_MS`; the host-health poll settle gates
+  (`retained_empty_surface_settle_wait` / `retained_non_prompt_surface_settle_wait`);
+  `rearm_stale_retained_fault_recovery` (keep-alive-on-exhaustion branch gated on
+  `daemon_owns_session_runtime`).
+
+### Telemetry
+`retained_empty_surface_settle_wait`, `retained_non_prompt_surface_settle_wait`
+(deferred), vs `retained_empty_surface_recovery_begin` /
+`retained_non_prompt_surface_recovery_begin` (fired). The diag fields
+`diag_cursor_line_len` / `diag_text_tail_len` / `blank_rows_below_cursor` on
+`retained_empty_surface_recovery_begin` were what pinned the transient.
+
+### Tests
+`retained_fault_recovery_exhausts_remount_budget_instead_of_spinning` (updated to
+the keep-alive-on-exhaustion spec) + the empty-surface/non-prompt suite.
+
+### Related memory
+`[[finding-hot-switch-latency-remount]]`, `[[audit-viewport-scroll-control-flow]]`
+
+---
+
+## persisted-scroll-restore-fights-follow
+
+STATUS: FIXED 2026-06-02.
+
+### Symptom
+After a GUI restart, returning to a session dropped the viewport at a "random"
+saved scroll offset, then every click/keystroke flickered between that offset and
+the live bottom for ~8s.
+
+### Root cause
+On GUI restart a session arms `pendingPersistedScrollRestore` (saved offset from
+localStorage) and polls up to 8s to apply it. During that window the prompt-follow
+cascade forced the viewport to the bottom while the pending restore re-applied the
+offset — no coordination, so they fought on every interaction.
+
+### Workaround (fix)
+In `tryApplyPendingPersistedScrollRestore`, abandon the pending restore the moment
+`scrollbackIntent !== 'UserScrollback'` (the user engaged the prompt — typed,
+pasted, scrolled to bottom — or live output arrived). A passive restored session
+stays in `UserScrollback`, so position-restore still works for the case it was
+designed for.
+
+### Code locations
+`crates/yggterm-shell/src/shell.rs::tryApplyPendingPersistedScrollRestore`.
+
+### Related memory
+`[[audit-viewport-scroll-control-flow]]`
+
+NOTE: a *separate*, still-OPEN viewport bug remains — left-click jumping the
+viewport to a random scrollback position + scroll-down-goes-up — which is the
+"no single owner of viewport position" issue tracked in
+`[[audit-viewport-scroll-control-flow]]` (needs the consolidated
+FOLLOWING/PINNED/SELECTING controller). It is NOT fixed by this entry.
+
+---
+
+## xterm-host-registry-leak
+
+STATUS: FIXED 2026-06-02.
+
+### Symptom
+The app got gradually laggier with use — selection, paste, and session switching
+slowed over time. Restarting/switching sessions was the trigger.
+
+### Root cause
+A host's cleanup is registered in `__yggtermXtermCleanups[hostId]` and only runs
+when that EXACT hostId re-initializes. But hostId embeds the mount epoch (`-m<N>`);
+every restart/switch bumps the epoch → a new hostId → the prior epoch's entry is
+abandoned, its cleanup never runs, and its xterm.js Terminal (buffer + renderer +
+listeners) leaks. The registry grew unbounded (measured 5→20+). Every global pass
+over the registry (selection/paste/switch) then got slower.
+
+### Workaround (fix)
+On (re)mount of a session path, reap any OTHER registry entry for the SAME path
+whose DOM host element is gone (a dead prior epoch) — dispose its Terminal and
+delete its registry+cleanup entries. Other paths' warm-retained entries are
+untouched. A `dom_census` field was added to the `terminal probe-scroll` snapshot
+to measure this class.
+
+### Code locations
+`crates/yggterm-shell/src/shell.rs` host-init reaper (near the
+`__yggtermXtermCleanups` re-init), `dom_census` in the probe-scroll snapshot.
+
+### Related memory
+`[[finding-hot-switch-latency-remount]]`
 
 ---
 
