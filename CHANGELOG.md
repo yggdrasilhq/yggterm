@@ -4,6 +4,22 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+## 2.8.14
+
+- Re-fixed the silent middle-output loss from 2.8.12, this time without breaking
+  full-screen TUIs. When the server's output ring trims below a connected client's
+  read position, it re-syncs the client from its scrollback ring — but now it's
+  buffer-aware: a session in the alternate screen (codex and other full-screen
+  TUIs) gets a screen-only re-sync (no scrollback replayed into the TUI, which was
+  the 2.8.13 revert's cause), while a normal-buffer session gets its scrollback
+  cleared and replayed cleanly. Unit-tested both paths.
+
+## 2.8.13
+
+- Reverted 2.8.12's middle-output re-sync: it replayed scrollback into full-screen
+  TUIs (codex) on switch-back, corrupting the render and gating the session
+  indefinitely. (Re-fixed correctly in 2.8.14.)
+
 ## 2.8.12
 
 - Fixed silent loss of output in the middle of a session ("TUI content clipped,
