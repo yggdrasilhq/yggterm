@@ -103,7 +103,7 @@ Foreground input belongs to the selected active terminal host only. Retained
 offscreen hosts may still have stale `.xterm-helper-textarea` focus after a
 switch, WebKit focus loss, or app restart; that stale helper focus is diagnostic
 noise unless the host is the active session host or still reports enabled/raw
-input. A different-session host with `input_enabled=true` or
+input. A different-session host with `host_stdin_enabled=true` or
 `raw_input_enabled=true` is an identity violation. A different-session retained
 host with disabled input and stale helper focus must release focus on the next
 Rust policy pass and must not keep the active viewport in recovery.
@@ -367,7 +367,7 @@ staged daemon retained history into xterm for a mount, the separate daemon
 retained replay worker must not run again and overwrite the fresh
 `daemon_terminal_read` screen. A retained-history replay is a scrollback seed,
 not an input-ready terminal truth. If app-control ever reports a remote surface
-with `input_enabled=true` and
+with `foreground_input_ready=true` and
 `terminal_content_source=daemon_retained_history_screen_snapshot`, the shell has
 promoted a retained replay too far and must re-enter recovery instead of
 accepting user input.
@@ -504,7 +504,7 @@ terminal surface. State-only buffer text is not enough terminal proof.
 The live 2.4.0 jojo viewport could become visually blank across the upper xterm
 canvas after switching between live sessions while remaining functional at the
 prompt. App-control showed the daemon and xterm buffer still had history,
-`input_enabled=true`, and no geometry problem; a manual app-control
+`foreground_input_ready=true`, and no geometry problem; a manual app-control
 `terminal redraw <session>` restored the missing rows through xterm.js native
 refresh. This is a stale renderer/canvas texture problem after active host
 switch, not session loss and not a reason to draw shell-owned terminal text.
@@ -663,9 +663,9 @@ only; live output during a probe is not scroll movement.
 
 In 2.6.16, remote daemon PTY output without a current prompt row became
 readable-only. A mounted xterm that contains meaningful daemon output can be a
-valid evidence surface while `input_enabled=false`, but it must not be reported
+valid evidence surface while `host_stdin_enabled=false`, but it must not be reported
 as user-input-ready unless the current prompt/input row is visible. App-control
-must reject `input_enabled=true` on a remote daemon PTY surface whose cursor row
+must reject `host_stdin_enabled=true` on a remote daemon PTY surface whose cursor row
 is empty or non-prompt text, even if retained replay came from daemon PTY bytes.
 
 In 2.2.7, forced remote restarts also terminate plain remote bridge processes

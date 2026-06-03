@@ -55,7 +55,7 @@ When the user reports a bug, an anomaly, "something is off," or asks "what issue
 2. A hypothesis with evidence supporting it
 3. A falsification attempt (probe that would disprove it — e.g. send a keystroke, take a screenshot, query a different field) before naming it as an issue
 
-**Do not list "issues" by free-associating from suspicious-looking fields.** Telemetry fields have semantics that may not match their names: `input_enabled: False` does not necessarily mean "user can't type," it might track which input mode owns focus or be a transient between mounts. If you haven't read the code that sets a field OR falsified your interpretation against a live probe, do NOT cite it as a user-visible issue.
+**Do not list "issues" by free-associating from suspicious-looking fields.** Telemetry fields have semantics that may not match their names. War story: a field named `input_enabled` did NOT mean "user can type" — it meant "this host currently holds input focus/stdin," so it read `False` on a perfectly usable session whenever the window wasn't focused. That misread drove a whole false "the session is broken" investigation (2026-06-03). The flag was since renamed to `host_stdin_enabled` (per-host) / `foreground_input_ready` (summary aggregate) precisely so it can't be misread — see docs/xterm-bugs.md#surface-recovery-false-positive-on-transient. If you haven't read the code that sets a field OR falsified your interpretation against a live probe, do NOT cite it as a user-visible issue.
 
 **Cross-validate every claim against the screenshot.** If the user is actively using the session right now, by construction it can't be "unusable" — anything you claim is broken must be visible to a human looking at the screen.
 
