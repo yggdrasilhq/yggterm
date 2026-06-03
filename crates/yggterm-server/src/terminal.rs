@@ -1503,32 +1503,12 @@ impl PtySessionRuntime {
         let retained_chunks = self.chunks.lock().expect("pty chunk lock poisoned");
         let next_cursor = self.seq.load(Ordering::SeqCst);
         let effective_cursor = if cursor > next_cursor { 0 } else { cursor };
-        // CHUNK-RING GAP (docs/xterm-bugs.md#chunk-ring-trim-drops-mid-stream):
-        // the raw chunk ring is trimmed (16MB live cap / 128KB idle-trim) oldest-
-        // first. If it was trimmed BELOW a connected client's cursor, the chunks
-        // between `effective_cursor` and the oldest survivor were evicted. Returning
-        // only the survivors (`seq > cursor`) would SILENTLY drop those middle
-        // chunks → corrupted/missing content in the client. Instead, re-sync the
-        // client from the vt100 scrollback ring (10k rows — it retains what the
-        // small raw ring lost): `\x1b[3J` clears the client's stale scrollback, then
-        // the history+screen replay rebuilds it cleanly. Only fires on a real gap.
-        if effective_cursor != 0
-            && retained_chunks
-                .front()
-                .is_some_and(|oldest| oldest.seq > effective_cursor.saturating_add(1))
-            && let Some(mut snapshot_chunk) = self.screen_snapshot_chunk(next_cursor)
-        {
-            snapshot_chunk.data = format!("\x1b[3J{}", snapshot_chunk.data);
-            return TerminalReadResult {
-                cursor: next_cursor,
-                chunks: vec![snapshot_chunk],
-                running: self.is_running(),
-                runtime_output_seen: self.has_runtime_output(),
-                eof_without_output: false,
-                post_resize_output_seen: self.post_resize_output_seen(),
-                last_resize_seq: self.last_resize_seq(),
-            };
-        }
+        // NOTE: the chunk-ring-gap resync (docs/xterm-bugs.md#chunk-ring-trim-drops-
+        // mid-stream) was reverted — replaying history+screen on a gap corrupted
+        // ALTERNATE-SCREEN TUIs (codex) on switch-back (normal-buffer history written
+        // into the alt screen) → broken render → indefinite non-prompt gate. The gap
+        // fix needs to be alt-screen-aware (replay screen-only when in the alternate
+        // buffer; vt100::Screen::alternate_screen() can gate it) before it ships.
         let prefer_initial_screen_snapshot =
             terminal_key_prefers_initial_screen_snapshot(&self.key, &self.launch_command);
         let mut chunks = if effective_cursor == 0 {
