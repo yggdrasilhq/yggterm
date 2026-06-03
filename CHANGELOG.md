@@ -4,6 +4,16 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+## 2.8.12
+
+- Fixed silent loss of output in the middle of a session ("TUI content clipped,
+  chunks in the middle missing"). The server keeps a bounded raw-output ring that
+  trims oldest-first; if it trimmed below a connected client's read position
+  (after switching away, idling, or reconnecting), the evicted chunks were
+  silently skipped and the client rendered a stream that began mid-way →
+  corrupted/missing content. The server now detects that gap and re-syncs the
+  client from its full scrollback ring instead of handing back a partial tail.
+
 ## 2.8.11
 
 - Fixed a "shadow" flash + multi-second re-gate that could hit a session both on
