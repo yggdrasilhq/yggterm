@@ -339,6 +339,16 @@ const RETAINED_REVEAL_EMPTY_GRACE_MS: u64 = 1_200;
 // window (codex's redraw fills well within a frame; a genuine empty surface
 // stays empty) before recovering. See [[finding-hot-switch-latency-remount]].
 const RETAINED_EMPTY_SURFACE_SETTLE_MS: u64 = 800;
+// Like the empty-surface transient above, a cold/mid-redraw surface can fail
+// codex-PROMPT recognition for a frame (the prompt hasn't repainted yet). The
+// non-prompt-surface path is far more aggressive than the empty-surface one — it
+// DISABLES INPUT, then escalates to a resume-recovery that RE-RESUMES the session
+// (interrupting codex) and, on exhaustion, tears the session down. So it must not
+// fire on a transient: require the non-prompt condition to PERSIST for this window
+// before disabling input / escalating. Longer than the empty-surface window
+// because the escalation is destructive. See [[finding-hot-switch-latency-remount]]
+// and [[audit-viewport-scroll-control-flow]].
+const RETAINED_NON_PROMPT_SETTLE_MS: u64 = 1_500;
 const RETAINED_FAULT_RECOVERY_MAX_REARMS: u32 = 2;
 // Per [[feedback-cycle-all-keepalive-after-gate-work]]: after a user click,
 // keep the latch off for this long so the resume flow has runway to actually
@@ -5770,15 +5780,10 @@ impl ShellState {
                 return false;
             }
             if attempt.rearm_count >= RETAINED_FAULT_RECOVERY_MAX_REARMS {
+                // Exhausted: decide Failed-vs-keep-alive AFTER this borrow ends,
+                // based on whether the daemon still owns the live PTY (a &self call
+                // not allowed during this &mut borrow).
                 exhausted_budget = true;
-                attempt.state = TerminalOpenAttemptState::Failed;
-                attempt.latched_failure_at_ms = Some(now_ms);
-                attempt.latched_failure_reason =
-                    Some("retained fault recovery exhausted remount budget".to_string());
-                if attempt.last_surface_problem.is_none() {
-                    attempt.last_surface_problem =
-                        Some("retained fault recovery exhausted remount budget".to_string());
-                }
             } else {
                 attempt.rearm_count = attempt.rearm_count.saturating_add(1);
                 should_rearm = true;
@@ -5813,7 +5818,36 @@ impl ShellState {
                 .remove(active_session_path);
             self.terminal_bootstrap_lease_by_session
                 .remove(active_session_path);
-            self.terminal_resume_ready_paths.remove(active_session_path);
+            if self.daemon_owns_session_runtime(active_session_path) {
+                // NEVER fail/close a LIVE session: the daemon still owns the PTY,
+                // so the terminal content is real even though codex-prompt
+                // recognition kept missing. Accept the surface as-is and keep the
+                // session alive + usable (a keystroke or slash repaints) instead of
+                // marking it Failed (which yanks/closes it). Auto-closing a working
+                // session is the worst outcome. See [[finding-hot-switch-latency-remount]].
+                self.mark_terminal_open_attempt_ready_for_session(
+                    active_session_path,
+                    "retained_fault_recovery_exhausted_keep_alive",
+                );
+            } else {
+                // No live runtime — a genuine failure. Mark it failed as before.
+                if let Some(attempt_id) = self
+                    .terminal_open_attempt_by_session
+                    .get(active_session_path)
+                    .cloned()
+                    && let Some(attempt) = self.terminal_open_attempts.get_mut(&attempt_id)
+                {
+                    attempt.state = TerminalOpenAttemptState::Failed;
+                    attempt.latched_failure_at_ms = Some(now_ms);
+                    attempt.latched_failure_reason =
+                        Some("retained fault recovery exhausted remount budget".to_string());
+                    if attempt.last_surface_problem.is_none() {
+                        attempt.last_surface_problem =
+                            Some("retained fault recovery exhausted remount budget".to_string());
+                    }
+                }
+                self.terminal_resume_ready_paths.remove(active_session_path);
+            }
             return true;
         }
         if let Some(attempt_id) = self
@@ -47557,6 +47591,10 @@ fn TerminalCanvas(
             // Recovery only fires once this has persisted RETAINED_EMPTY_SURFACE_SETTLE_MS,
             // so codex's transient post-clear blank never triggers it.
             let mut retained_empty_surface_first_seen_ms = None::<u64>;
+            // Same persistence gate for the (destructive) non-prompt-surface path:
+            // reset whenever the surface looks prompt-ready; only escalate once the
+            // non-prompt condition has held for RETAINED_NON_PROMPT_SETTLE_MS.
+            let mut retained_non_prompt_first_seen_ms = None::<u64>;
             let mut non_prompt_retained_recovery_attempts = 0_u64;
             let mut non_prompt_snapshot_replay_attempts = 0_u64;
             let mut blank_host_snapshot_replay_attempts = 0_u64;
@@ -48935,18 +48973,54 @@ fn TerminalCanvas(
                                     maybe_spawn_missing_managed_cli_refreshes(state);
                                     continue;
                                 }
-                                if retained_remote_surface_should_wait_for_prompt_ready(
-                                    is_remote_resume_session,
-                                    poisoned_by_retry,
-                                    ready_attempt_from_shell,
-                                    traced_attach_ready,
-                                    terminal_live_host_connected(),
-                                    terminal_paint_seen,
-                                    terminal_geometry_ready,
-                                    has_transport_error,
-                                    &cursor_line_text,
-                                    &text_tail,
-                                ) {
+                                let retained_non_prompt_now =
+                                    retained_remote_surface_should_wait_for_prompt_ready(
+                                        is_remote_resume_session,
+                                        poisoned_by_retry,
+                                        ready_attempt_from_shell,
+                                        traced_attach_ready,
+                                        terminal_live_host_connected(),
+                                        terminal_paint_seen,
+                                        terminal_geometry_ready,
+                                        has_transport_error,
+                                        &cursor_line_text,
+                                        &text_tail,
+                                    );
+                                if !retained_non_prompt_now {
+                                    retained_non_prompt_first_seen_ms = None;
+                                }
+                                // SETTLE GATE: only enter the destructive non-prompt
+                                // path (disable input -> replay -> re-resume) once the
+                                // non-prompt condition has PERSISTED. A cold/mid-redraw
+                                // surface that fails prompt recognition for a frame
+                                // resets the timer when codex repaints, so it never
+                                // disables input or re-resumes on a transient. A
+                                // genuinely-stuck non-prompt surface persists past the
+                                // window and still recovers.
+                                let retained_non_prompt_settled = retained_non_prompt_now && {
+                                    let now_ms = current_millis();
+                                    let first_seen = *retained_non_prompt_first_seen_ms
+                                        .get_or_insert(now_ms);
+                                    let persisted_ms = now_ms.saturating_sub(first_seen);
+                                    if persisted_ms < RETAINED_NON_PROMPT_SETTLE_MS {
+                                        append_trace_event(
+                                            &trace_home,
+                                            "ui",
+                                            "terminal_mount",
+                                            "retained_non_prompt_surface_settle_wait",
+                                            json!({
+                                                "session_path": session_path.clone(),
+                                                "persisted_ms": persisted_ms,
+                                                "rows": rows,
+                                                "blank_rows_below_cursor": blank_rows_below_cursor,
+                                            }),
+                                        );
+                                        false
+                                    } else {
+                                        true
+                                    }
+                                };
+                                if retained_non_prompt_settled {
                                     append_trace_event(
                                         &trace_home,
                                         "ui",
@@ -88467,10 +88541,19 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             .terminal_open_attempts
             .get(&attempt_id)
             .expect("attempt should remain observable");
-        assert!(matches!(attempt.state, TerminalOpenAttemptState::Failed));
-        assert_eq!(
-            attempt.latched_failure_reason.as_deref(),
-            Some("retained fault recovery exhausted remount budget")
+        // New spec: exhausting the remount budget must stop the spin (markers
+        // cleared, returns true) WITHOUT failing/closing a session whose PTY may
+        // still be live. Here there is no runtime-status snapshot, so daemon
+        // ownership can't be disproven — the session is accepted as-is and kept
+        // alive (NOT Failed), so the user keeps a usable terminal they can repaint
+        // rather than having it yanked closed.
+        assert!(
+            !matches!(attempt.state, TerminalOpenAttemptState::Failed),
+            "a live/unprovable session must not be failed-closed on budget exhaustion"
+        );
+        assert!(
+            shell.terminal_session_was_ever_ready(active_session_path),
+            "exhaustion of a live session accepts the surface as ready (kept alive)"
         );
         assert!(
             !shell
