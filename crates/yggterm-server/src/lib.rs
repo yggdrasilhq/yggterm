@@ -16168,7 +16168,7 @@ struct X11TerminalProbeContext {
 fn terminal_host_probe_snapshot(host: &Value) -> Value {
     json!({
         "session_path": host.get("session_path").and_then(Value::as_str).unwrap_or_default(),
-        "input_enabled": host.get("input_enabled").and_then(Value::as_bool),
+        "host_stdin_enabled": host.get("host_stdin_enabled").and_then(Value::as_bool),
         "helper_textarea_focused": host.get("helper_textarea_has_focus").and_then(Value::as_bool)
             .or_else(|| host.get("helper_textarea_focused").and_then(Value::as_bool)),
         "host_has_active_element": host.get("host_has_active_element").and_then(Value::as_bool),
@@ -16207,8 +16207,8 @@ fn terminal_host_probe_snapshot(host: &Value) -> Value {
 }
 
 fn terminal_probe_focus_ready(snapshot: &Value) -> bool {
-    let input_enabled = snapshot
-        .get("input_enabled")
+    let host_stdin_enabled = snapshot
+        .get("host_stdin_enabled")
         .and_then(Value::as_bool)
         .unwrap_or(false);
     let helper_focused = snapshot
@@ -16219,7 +16219,7 @@ fn terminal_probe_focus_ready(snapshot: &Value) -> bool {
         .get("host_has_active_element")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    input_enabled && (helper_focused || host_has_active_element)
+    host_stdin_enabled && (helper_focused || host_has_active_element)
 }
 
 fn terminal_probe_snapshot_timeout_ms(timeout_ms: u64) -> u64 {

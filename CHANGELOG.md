@@ -4,6 +4,14 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+- Renamed the misleading app-control `input_enabled` field (it meant "this host holds
+  input focus/stdin," not "the user can type," and caused a false "session broken"
+  investigation). It is now two accurately-named fields: per-host
+  `terminal_hosts[].host_stdin_enabled` and the summary aggregate
+  `active_terminal_surface.foreground_input_ready`; the snapshot reason
+  `input_disabled` is now `focus_released`. `raw_input_enabled`/`effective_input_focus`
+  are unchanged. Consumers of `server app state` / probe JSON should use the new keys.
+
 - App-control surface health no longer raises a false "empty/plain-shell surface"
   problem (and the spurious fault-recovery it drives) when the yggterm window is not
   focused. A buffer read taken with the window unfocused (e.g. during an app-control

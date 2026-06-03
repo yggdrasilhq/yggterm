@@ -287,7 +287,7 @@ pub(crate) fn describe_viewport_snapshot(snapshot: &Value, dom: &Value) -> Value
         .and_then(Value::as_str)
         .map(str::to_string);
     let terminal_input_enabled = active_terminal_surface
-        .get("input_enabled")
+        .get("foreground_input_ready")
         .and_then(Value::as_bool)
         .unwrap_or(false);
     let clean_daemon_pty_surface_visible =
@@ -878,7 +878,7 @@ pub(crate) fn summarize_terminal_surface_for_app_control(
         .iter()
         .min_by_key(|host| terminal_host_active_rank_for_app_control(host));
     let raw_input_enabled = hosts.iter().any(|host| {
-        host.get("input_enabled")
+        host.get("host_stdin_enabled")
             .and_then(Value::as_bool)
             .unwrap_or(false)
     });
@@ -891,7 +891,7 @@ pub(crate) fn summarize_terminal_surface_for_app_control(
         host.get("effective_input_focus")
             .and_then(Value::as_bool)
             .unwrap_or_else(|| {
-                host.get("input_enabled")
+                host.get("host_stdin_enabled")
                     .and_then(Value::as_bool)
                     .unwrap_or(false)
                     && host
@@ -924,7 +924,7 @@ pub(crate) fn summarize_terminal_surface_for_app_control(
             .or(render_health_problem.clone())
             .or(live_problem.clone())
     };
-    let input_enabled = raw_input_enabled && raw_effective_input_focus && problem.is_none();
+    let foreground_input_ready = raw_input_enabled && raw_effective_input_focus && problem.is_none();
     let effective_input_focus = raw_effective_input_focus && problem.is_none();
     json!({
         "rendered": rendered,
@@ -934,7 +934,7 @@ pub(crate) fn summarize_terminal_surface_for_app_control(
         "performance_problem": performance_problem,
         "render_health": render_health,
         "overlay_context_visible": overlay_context_visible,
-        "input_enabled": input_enabled,
+        "foreground_input_ready": foreground_input_ready,
         "raw_input_enabled": raw_input_enabled,
         "effective_input_focus": effective_input_focus,
         "raw_effective_input_focus": raw_effective_input_focus,
@@ -955,7 +955,7 @@ fn terminal_host_active_rank_for_app_control(host: &Value) -> u8 {
         return 0;
     }
     if host
-        .get("input_enabled")
+        .get("host_stdin_enabled")
         .and_then(Value::as_bool)
         .unwrap_or(false)
     {
@@ -968,15 +968,15 @@ fn terminal_host_active_rank_for_app_control(host: &Value) -> u8 {
 }
 
 fn terminal_host_claims_foreground_input_for_app_control(host: &Value) -> bool {
-    let input_enabled = host
-        .get("input_enabled")
+    let host_stdin_enabled = host
+        .get("host_stdin_enabled")
         .and_then(Value::as_bool)
         .unwrap_or(false);
     let raw_input_enabled = host
         .get("raw_input_enabled")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    if input_enabled || raw_input_enabled {
+    if host_stdin_enabled || raw_input_enabled {
         return true;
     }
     terminal_host_has_effective_focus_for_app_control(host)
@@ -1504,14 +1504,14 @@ fn terminal_host_problem_for_app_control(host: &Value) -> Option<&'static str> {
         .and_then(Value::as_str)
         .map(str::trim)
         .unwrap_or("");
-    let input_enabled = host
-        .get("input_enabled")
+    let host_stdin_enabled = host
+        .get("host_stdin_enabled")
         .and_then(Value::as_bool)
         .unwrap_or(false);
     let raw_input_enabled = host
         .get("raw_input_enabled")
         .and_then(Value::as_bool)
-        .unwrap_or(input_enabled);
+        .unwrap_or(host_stdin_enabled);
     let helper_textarea_focused = host
         .get("helper_textarea_focused")
         .and_then(Value::as_bool)
@@ -1794,7 +1794,7 @@ fn terminal_host_problem_for_app_control(host: &Value) -> Option<&'static str> {
         && (terminal_chunk_has_codex_prompt_output(visible_text) || sample_has_codex_prompt_output)
         && mounted_entry_host_connected
         && remote_codex_prompt_has_real_output
-        && (input_enabled || helper_textarea_focused || cursor_sample_visible)
+        && (host_stdin_enabled || helper_textarea_focused || cursor_sample_visible)
         && (xterm_present || screen_present || rows_present || canvas_count > 0)
         && !terminal_chunk_is_transport_error(visible_text)
         && !terminal_chunk_is_loading_placeholder(visible_text)
@@ -1829,7 +1829,7 @@ fn terminal_host_problem_for_app_control(host: &Value) -> Option<&'static str> {
     let live_remote_daemon_pty_current_output_surface = session_path
         .starts_with("remote-session://")
         && terminal_content_source == "daemon_pty"
-        && !input_enabled
+        && !host_stdin_enabled
         && mounted_entry_host_connected
         && remote_codex_prompt_has_real_output
         && (terminal_chunk_has_meaningful_output(visible_text) || sample_has_meaningful_output)
@@ -1894,13 +1894,13 @@ fn terminal_host_problem_for_app_control(host: &Value) -> Option<&'static str> {
     let live_remote_codex_interrupted_input_surface = session_path.starts_with("remote-session://")
         && codex_interrupted_input_surface
         && mounted_entry_host_connected
-        && input_enabled
+        && host_stdin_enabled
         && (helper_textarea_focused || cursor_sample_visible)
         && (xterm_present || screen_present || rows_present || canvas_count > 0);
     let local_codex_welcome_with_active_cursor_surface = session_path.starts_with("local://")
         && terminal_chunk_is_generic_codex_idle(visible_text)
         && mounted_entry_host_connected
-        && input_enabled
+        && host_stdin_enabled
         && (helper_textarea_focused || host_has_active_element || cursor_sample_visible)
         && (xterm_present || screen_present || rows_present || canvas_count > 0)
         && (last_raw_payload_length > 0 || write_command_count > 0);
@@ -1918,7 +1918,7 @@ fn terminal_host_problem_for_app_control(host: &Value) -> Option<&'static str> {
     };
     let accepted_input_without_following_stream_echo = session_path
         .starts_with("remote-session://")
-        && input_enabled
+        && host_stdin_enabled
         && helper_textarea_focused
         && mounted_entry_host_connected
         && user_data_event_count > 0
@@ -1959,7 +1959,7 @@ fn terminal_host_problem_for_app_control(host: &Value) -> Option<&'static str> {
     let prompt_ready_surface = live_remote_codex_interrupted_input_surface
         || local_codex_welcome_with_active_cursor_surface
         || (prompt_visible
-            && (input_enabled
+            && (host_stdin_enabled
                 || helper_textarea_focused
                 || cursor_sample_visible
                 || local_prompt_surface
@@ -1987,7 +1987,7 @@ fn terminal_host_problem_for_app_control(host: &Value) -> Option<&'static str> {
         && !terminal_chunk_is_transcript_browser(visible_text);
     let transcript_browser_ready_surface = false;
     let remote_prompt_input_gated_after_user_input = session_path.starts_with("remote-session://")
-        && !input_enabled
+        && !host_stdin_enabled
         && !raw_input_enabled
         && (document_focused || helper_textarea_focused || host_has_active_element)
         && mounted_entry_host_connected
@@ -2013,7 +2013,7 @@ fn terminal_host_problem_for_app_control(host: &Value) -> Option<&'static str> {
             || !cursor_line_text.is_empty()
             || blank_rows_below_cursor > 0
             || !xterm_buffer_kind.is_empty()
-            || input_enabled
+            || host_stdin_enabled
             || helper_textarea_focused
             || xterm_cursor_hidden);
     if visible_text.is_empty() {
@@ -2040,7 +2040,7 @@ fn terminal_host_problem_for_app_control(host: &Value) -> Option<&'static str> {
         return Some("active terminal host is still showing resume placeholder content");
     }
     if session_path.starts_with("remote-session://")
-        && input_enabled
+        && host_stdin_enabled
         && terminal_content_source == "daemon_retained_history_screen_snapshot"
         && !prompt_ready_surface
     {
@@ -2067,7 +2067,7 @@ fn terminal_host_problem_for_app_control(host: &Value) -> Option<&'static str> {
         return Some("active terminal host is still showing generic Codex idle footer");
     }
     if session_path.starts_with("remote-session://")
-        && input_enabled
+        && host_stdin_enabled
         && retained_replay_from_pty
         && (base_y > 0
             || scrollback_expected
@@ -2103,7 +2103,7 @@ fn terminal_host_problem_for_app_control(host: &Value) -> Option<&'static str> {
         return Some("active remote Codex prompt surface has no current input row");
     }
     if session_path.starts_with("remote-session://")
-        && input_enabled
+        && host_stdin_enabled
         && mounted_entry_host_connected
         && retained_replay_from_pty
         && xterm_buffer_kind != "alternate"
@@ -2126,7 +2126,7 @@ fn terminal_host_problem_for_app_control(host: &Value) -> Option<&'static str> {
         return Some("active remote Codex prompt surface has no current input row");
     }
     if session_path.starts_with("remote-session://")
-        && input_enabled
+        && host_stdin_enabled
         && mounted_entry_host_connected
         && retained_replay_from_pty
         && cursor_line_text.is_empty()
@@ -2185,7 +2185,7 @@ fn terminal_host_problem_for_app_control(host: &Value) -> Option<&'static str> {
     // loading, transcript browser, idle chrome), AND no meaningful PTY
     // output to justify the prompt-less view.
     if session_path.starts_with("remote-session://")
-        && input_enabled
+        && host_stdin_enabled
         && mounted_entry_host_connected
         && !prompt_ready_surface
         && !cursor_line_text.is_empty()
@@ -2220,7 +2220,7 @@ fn terminal_host_problem_for_app_control(host: &Value) -> Option<&'static str> {
         return Some("active remote terminal is showing non-PTY server snapshot content");
     }
     if session_path.starts_with("remote-session://")
-        && !input_enabled
+        && !host_stdin_enabled
         && mounted_entry_host_connected
         && (xterm_present || screen_present || rows_present || canvas_count > 0)
         && (last_raw_payload_length > 0 || write_command_count > 0)
@@ -2233,7 +2233,7 @@ fn terminal_host_problem_for_app_control(host: &Value) -> Option<&'static str> {
         );
     }
     if session_path.starts_with("remote-session://")
-        && input_enabled
+        && host_stdin_enabled
         && scrollback_expected
         && !prompt_ready_retained_unsafe_skip
         && (!prompt_ready_surface || retained_replay_unsafe_skip_prompt_ready)
@@ -2245,7 +2245,7 @@ fn terminal_host_problem_for_app_control(host: &Value) -> Option<&'static str> {
         return Some("active remote terminal lost expected scrollback after retained replay");
     }
     if session_path.starts_with("remote-session://")
-        && input_enabled
+        && host_stdin_enabled
         && mounted_entry_host_connected
         && retained_replay_from_pty
         && wheel_event_count > 0
@@ -2261,7 +2261,7 @@ fn terminal_host_problem_for_app_control(host: &Value) -> Option<&'static str> {
         return Some("active remote terminal received scroll input but has no xterm scrollback");
     }
     if session_path.starts_with("remote-session://")
-        && input_enabled
+        && host_stdin_enabled
         && last_raw_payload_line_count > rows.saturating_add(4)
         && !prompt_ready_retained_unsafe_skip
         && (!prompt_ready_surface || retained_replay_unsafe_skip_prompt_ready)
@@ -2273,7 +2273,7 @@ fn terminal_host_problem_for_app_control(host: &Value) -> Option<&'static str> {
         return Some("active remote terminal accepted multi-row replay without scrollback");
     }
     if session_path.starts_with("remote-session://")
-        && input_enabled
+        && host_stdin_enabled
         && (helper_textarea_focused || host_has_active_element)
         && !prompt_ready_surface
         && !transcript_browser_ready_surface
@@ -2443,8 +2443,8 @@ fn terminal_host_geometry_problem_for_app_control(host: &Value) -> Option<&'stat
         .get("helper_textarea_present")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    let input_enabled = host
-        .get("input_enabled")
+    let host_stdin_enabled = host
+        .get("host_stdin_enabled")
         .and_then(Value::as_bool)
         .unwrap_or(false);
     let helper_textarea_opacity = host
@@ -2662,7 +2662,7 @@ fn terminal_host_geometry_problem_for_app_control(host: &Value) -> Option<&'stat
     {
         return Some("active terminal host helper layer is taller than the visible host");
     }
-    if helper_textarea_present && input_enabled {
+    if helper_textarea_present && host_stdin_enabled {
         let tiny_helper = helper_textarea_width >= 1.0
             && helper_textarea_width <= 2.0
             && helper_textarea_height >= 1.0
@@ -2696,8 +2696,8 @@ fn terminal_host_geometry_problem_for_app_control(host: &Value) -> Option<&'stat
 }
 
 fn terminal_host_performance_problem_for_app_control(host: &Value) -> Option<&'static str> {
-    let input_enabled = host
-        .get("input_enabled")
+    let host_stdin_enabled = host
+        .get("host_stdin_enabled")
         .and_then(Value::as_bool)
         .unwrap_or(false);
     let terminal_has_effective_input_focus = host
@@ -2716,10 +2716,10 @@ fn terminal_host_performance_problem_for_app_control(host: &Value) -> Option<&'s
                 .get("document_focused")
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
-            input_enabled
+            host_stdin_enabled
                 && (helper_textarea_focused || host_has_active_element || document_focused)
         });
-    let active_visible_terminal = input_enabled
+    let active_visible_terminal = host_stdin_enabled
         && terminal_has_effective_input_focus
         && host
             .get("viewport_present")
@@ -3600,7 +3600,7 @@ mod tests {
 
   gpt-5.4 high fast · 100% left · ~/git",
             "cursor_line_text": "› Explain this codebase",
-            "input_enabled": true,
+            "host_stdin_enabled": true,
             "helper_textarea_focused": true,
             "host_rect": {"left": 0.0, "top": 0.0, "width": 840.0, "height": 830.0},
             "host_content_width": 840.0,
@@ -3630,7 +3630,7 @@ mod tests {
             "child_count": 0,
             "mounted_entry_host_connected": false,
             "render_event_count": 0,
-            "input_enabled": false,
+            "host_stdin_enabled": false,
             "helper_textarea_focused": false,
         });
 
@@ -3673,7 +3673,7 @@ mod tests {
             "mounted_entry_host_connected": true,
             "render_event_count": 3,
             "data_event_count": 1,
-            "input_enabled": false,
+            "host_stdin_enabled": false,
             "helper_textarea_focused": false,
             "dom_paint_hit_test_problem": "xterm row sample is not topmost at its visible text point",
         });
@@ -3713,7 +3713,7 @@ mod tests {
             "mounted_entry_host_connected": true,
             "render_event_count": 3,
             "data_event_count": 1,
-            "input_enabled": true,
+            "host_stdin_enabled": true,
             "effective_input_focus": true,
             "helper_textarea_focused": true,
             "dom_paint_hit_test_problem": "xterm row sample is not topmost at its visible text point",
@@ -3755,7 +3755,7 @@ mod tests {
         let surface = summarize_terminal_surface_for_app_control(&[host], false);
         assert_eq!(surface.get("problem").and_then(Value::as_str), None);
         assert_eq!(
-            surface.get("input_enabled").and_then(Value::as_bool),
+            surface.get("foreground_input_ready").and_then(Value::as_bool),
             Some(true)
         );
     }
@@ -3838,7 +3838,7 @@ Caused by:\n\
         let host = json!({
             "text_sample": "pi@dev:/home/pi$ codex\n╭────────────────────────────────────────────╮\n│ >_ OpenAI Codex (v0.120.0)                 │\n│                                            │\n│ model:     gpt-5.4 high   /model to change │\n│ directory: /home/pi                        │\n╰────────────────────────────────────────────╯\n\n  Tip: New Use /fast to enable our fastest inference at 2X plan usage.\n\n\n› Implement {feature}\n\n  gpt-5.4 high · /home/pi",
             "cursor_line_text": "› Implement {feature}",
-            "input_enabled": true,
+            "host_stdin_enabled": true,
             "helper_textarea_focused": true,
             "host_rect": {"left": 0.0, "top": 0.0, "width": 840.0, "height": 830.0},
             "host_content_width": 840.0,
@@ -3858,7 +3858,7 @@ Caused by:\n\
             "text_sample": "╭─────────────────────────────────────────────╮\n│ >_ OpenAI Codex (v0.128.0)                  │\n│                                             │\n│ model:     gpt-5.5 xhigh   /model to change │\n│ directory: ~/gh/yggterm                     │",
             "text_tail": "╭─────────────────────────────────────────────╮\n│ >_ OpenAI Codex (v0.128.0)                  │\n│                                             │\n│ model:     gpt-5.5 xhigh   /model to change │\n│ directory: ~/gh/yggterm                     │",
             "cursor_line_text": "│ directory: ~/gh/yggterm                     │",
-            "input_enabled": true,
+            "host_stdin_enabled": true,
             "helper_textarea_focused": true,
             "xterm_present": true,
             "screen_present": true,
@@ -3890,7 +3890,7 @@ Caused by:\n\
             "text_tail": text,
             "buffer_text_sample": text,
             "cursor_line_text": "",
-            "input_enabled": true,
+            "host_stdin_enabled": true,
             "helper_textarea_focused": true,
             "host_has_active_element": true,
             "xterm_present": true,
@@ -3919,7 +3919,7 @@ Caused by:\n\
             "text_sample": "╭─────────────────────────────────────────────╮\n│ >_ OpenAI Codex (v0.128.0)                  │\n│                                             │\n│ model:     gpt-5.5 xhigh   /model to change │\n│ directory: ~/gh/yggterm                     │",
             "text_tail": "╭─────────────────────────────────────────────╮\n│ >_ OpenAI Codex (v0.128.0)                  │\n│                                             │\n│ model:     gpt-5.5 xhigh   /model to change │\n│ directory: ~/gh/yggterm                     │\n╰─────────────────────────────────────────────╯\n\n  Tip: You can run any shell command from Codex using ! (e.g. !ls)\n\n\n  Update Model Permissions\n\n› 1. Default (current)  Codex can read and edit files in the current workspace, and run commands. Approval\n                        is required to access the internet or edit other files.\n  2. Auto-review        Same workspace-write permissions as Default, but eligible `on-request` approvals\n                        are routed through the auto-reviewer subagent.\n  3. Full Access        Codex can edit files outside this workspace and access the internet without asking\n                        for approval. Exercise caution when using.\n\n  Press enter to confirm or esc to go back",
             "cursor_line_text": "",
-            "input_enabled": true,
+            "host_stdin_enabled": true,
             "helper_textarea_focused": true,
             "xterm_present": true,
             "screen_present": true,
@@ -3983,7 +3983,7 @@ tGPT
         let host = json!({
             "text_sample": "pi@jojo:~$ codex\n╭───────────────────────────────────────────╮\n│ >_ OpenAI Codex (v0.124.0)                │\n│                                           │\n│ model:     gpt-5.4 low   /model to change │\n│ directory: ~                              │\n╰───────────────────────────────────────────╯\n\n› Summarize recent commits\n\n  gpt-5.4 low · ~",
             "cursor_row_text": "› Summarize recent commits",
-            "input_enabled": true,
+            "host_stdin_enabled": true,
             "helper_textarea_focused": true,
             "cursor_sample_rect": {"left": 325.0, "top": 256.0, "width": 8.0, "height": 18.0},
             "host_rect": {"left": 0.0, "top": 0.0, "width": 840.0, "height": 830.0},
@@ -4018,7 +4018,7 @@ tGPT
             "text_tail": "",
             "buffer_text_sample": "",
             "cursor_line_text": "",
-            "input_enabled": false,
+            "host_stdin_enabled": false,
             "raw_input_enabled": false,
             "helper_textarea_focused": false,
             "host_has_active_element": false,
@@ -4067,7 +4067,7 @@ tGPT
             "text_tail": text_tail,
             "buffer_text_sample": text_tail,
             "cursor_line_text": "› Explain this codebase",
-            "input_enabled": true,
+            "host_stdin_enabled": true,
             "helper_textarea_focused": true,
             "xterm_present": true,
             "screen_present": true,
@@ -4101,7 +4101,7 @@ tGPT
             "text_tail": text_tail,
             "buffer_text_sample": text_tail,
             "cursor_line_text": "› Summarize recent commits",
-            "input_enabled": true,
+            "host_stdin_enabled": true,
             "helper_textarea_focused": true,
             "xterm_present": true,
             "screen_present": true,
@@ -4137,7 +4137,7 @@ tGPT
             "text_tail": text_tail,
             "buffer_text_sample": text_tail,
             "cursor_line_text": "› Write tests for @filename",
-            "input_enabled": true,
+            "host_stdin_enabled": true,
             "helper_textarea_focused": true,
             "xterm_present": true,
             "screen_present": true,
@@ -4177,7 +4177,7 @@ tGPT
             "text_tail": text_tail,
             "buffer_text_sample": text_tail,
             "cursor_line_text": "› Use /skills to list available skills",
-            "input_enabled": true,
+            "host_stdin_enabled": true,
             "helper_textarea_focused": true,
             "xterm_present": true,
             "screen_present": true,
@@ -4217,7 +4217,7 @@ tGPT
             "text_tail": text_tail,
             "buffer_text_sample": text_tail,
             "cursor_line_text": "› Use /skills to list available skills",
-            "input_enabled": true,
+            "host_stdin_enabled": true,
             "helper_textarea_focused": true,
             "xterm_present": true,
             "screen_present": true,
@@ -4269,7 +4269,7 @@ Best thing to improve in the meantime:
             "text_tail": text_tail,
             "buffer_text_sample": text_tail,
             "cursor_line_text": "› Improve documentation in @filename",
-            "input_enabled": false,
+            "host_stdin_enabled": false,
             "helper_textarea_focused": false,
             "xterm_present": true,
             "screen_present": true,
@@ -4318,7 +4318,7 @@ Best thing to improve in the meantime:
             "text_tail": text_tail,
             "buffer_text_sample": text_tail,
             "cursor_line_text": "",
-            "input_enabled": false,
+            "host_stdin_enabled": false,
             "helper_textarea_focused": false,
             "xterm_present": true,
             "screen_present": true,
@@ -4358,7 +4358,7 @@ Best thing to improve in the meantime:
             "cursor_line_text": "",
             "cursor_y": 44,
             "cursor_expected_rect": {"left": 1005.0, "top": 800.0, "width": 8.0, "height": 18.0},
-            "input_enabled": true,
+            "host_stdin_enabled": true,
             "helper_textarea_focused": true,
             "xterm_present": true,
             "screen_present": true,
@@ -4404,7 +4404,7 @@ Best thing to improve in the meantime:
             "cursor_line_text": "",
             "cursor_y": 44,
             "cursor_expected_rect": {"left": 1005.0, "top": 800.0, "width": 8.0, "height": 18.0},
-            "input_enabled": true,
+            "host_stdin_enabled": true,
             "helper_textarea_focused": true,
             "xterm_present": true,
             "screen_present": true,
@@ -4449,7 +4449,7 @@ Best thing to improve in the meantime:
             "text_tail": text_tail,
             "buffer_text_sample": text_tail,
             "cursor_line_text": "",
-            "input_enabled": false,
+            "host_stdin_enabled": false,
             "helper_textarea_focused": false,
             "xterm_present": true,
             "screen_present": true,
@@ -4493,7 +4493,7 @@ Best thing to improve in the meantime:
             "text_tail": text_tail,
             "buffer_text_sample": text_tail,
             "cursor_line_text": "› Write tests for @filename",
-            "input_enabled": false,
+            "host_stdin_enabled": false,
             "raw_input_enabled": false,
             "helper_textarea_focused": false,
             "document_focused": true,
@@ -4551,7 +4551,7 @@ Best thing to improve in the meantime:
             "text_tail": text_tail,
             "buffer_text_sample": text_tail,
             "cursor_line_text": "› Implement {feature}",
-            "input_enabled": false,
+            "host_stdin_enabled": false,
             "raw_input_enabled": false,
             "helper_textarea_focused": false,
             "host_has_active_element": false,
@@ -4599,7 +4599,7 @@ Best thing to improve in the meantime:
             "text_tail": text_tail,
             "buffer_text_sample": text_tail,
             "cursor_line_text": " this session, run codex resume 019d0000-0000-7000-8000-000000000001",
-            "input_enabled": true,
+            "host_stdin_enabled": true,
             "helper_textarea_focused": true,
             "xterm_present": true,
             "screen_present": true,
@@ -4644,7 +4644,7 @@ Best thing to improve in the meantime:
             "text_tail": text_tail,
             "buffer_text_sample": text_tail,
             "cursor_line_text": "› Find and fix a bug in @filename",
-            "input_enabled": true,
+            "host_stdin_enabled": true,
             "helper_textarea_focused": true,
             "xterm_present": true,
             "screen_present": true,
@@ -4687,7 +4687,7 @@ Best thing to improve in the meantime:
             "text_tail": text_tail,
             "buffer_text_sample": text_tail,
             "cursor_line_text": "› Copy pasting the code from email or typing it does not auto switch the input boxes like other prompts",
-            "input_enabled": true,
+            "host_stdin_enabled": true,
             "helper_textarea_focused": true,
             "xterm_present": true,
             "screen_present": true,
@@ -4739,7 +4739,7 @@ Best thing to improve in the meantime:
             "text_tail": text_tail,
             "buffer_text_sample": text_tail,
             "cursor_line_text": "› Find and fix a bug in @filename",
-            "input_enabled": true,
+            "host_stdin_enabled": true,
             "helper_textarea_focused": true,
             "xterm_present": true,
             "screen_present": true,
@@ -4816,7 +4816,7 @@ Best thing to improve in the meantime:
             "text_tail": text_tail,
             "buffer_text_sample": text_tail,
             "cursor_line_text": "› Run /review on my current changes",
-            "input_enabled": true,
+            "host_stdin_enabled": true,
             "helper_textarea_focused": true,
             "host_has_active_element": true,
             "xterm_present": true,
@@ -4950,7 +4950,7 @@ Best thing to improve in the meantime:
                 "text_sample": prompt,
                 "text_tail": prompt,
                 "cursor_line_text": "  PaddleOCR in ssh practice in ~/gh/paddleocr and validate it.",
-                "input_enabled": true,
+                "host_stdin_enabled": true,
                 "helper_textarea_focused": true,
                 "mounted_entry_host_connected": true,
                 "xterm_present": true,
@@ -5016,7 +5016,7 @@ Best thing to improve in the meantime:
                 "text_tail": tail,
                 "buffer_text_sample": header,
                 "cursor_line_text": cursor_line,
-                "input_enabled": true,
+                "host_stdin_enabled": true,
                 "helper_textarea_focused": true,
                 "host_has_active_element": true,
                 "mounted_entry_host_connected": true,
@@ -5052,7 +5052,7 @@ Best thing to improve in the meantime:
 
   gpt-5.4 high fast · 100% left · ~/git",
             "cursor_line_text": "› Explain this codebase",
-            "input_enabled": false,
+            "host_stdin_enabled": false,
             "helper_textarea_focused": false,
             "cursor_node_count": 0,
             "cursor_sample_rect": {"left": 302.0, "top": 214.0, "width": 8.0, "height": 17.0},
@@ -5073,7 +5073,7 @@ Best thing to improve in the meantime:
             "session_path": "local://fresh-shell",
             "text_sample": "pi@jojo:~$",
             "cursor_line_text": "pi@jojo:~$",
-            "input_enabled": false,
+            "host_stdin_enabled": false,
             "helper_textarea_focused": false,
             "cursor_node_count": 0,
             "xterm_present": true,
@@ -5446,7 +5446,7 @@ Best thing to improve in the meantime:
             "screen_present": true,
             "viewport_present": true,
             "canvas_count": 2,
-            "input_enabled": true,
+            "host_stdin_enabled": true,
             "helper_textarea_focused": true,
             "host_has_active_element": true,
             "terminal_input_hot": true,
@@ -5468,7 +5468,7 @@ Best thing to improve in the meantime:
         });
         let summary = summarize_terminal_surface_for_app_control(&[host], false);
         assert_eq!(
-            summary.get("input_enabled").and_then(Value::as_bool),
+            summary.get("foreground_input_ready").and_then(Value::as_bool),
             Some(true)
         );
         assert_eq!(
@@ -5511,7 +5511,7 @@ Best thing to improve in the meantime:
             "screen_present": true,
             "canvas_count": 2,
             "render_event_count": 1,
-            "input_enabled": true,
+            "host_stdin_enabled": true,
             "helper_textarea_focused": true,
             "terminal_content_source": "empty"
         });
@@ -5525,7 +5525,7 @@ Best thing to improve in the meantime:
             Some(true)
         );
         assert_eq!(
-            summary.get("input_enabled").and_then(Value::as_bool),
+            summary.get("foreground_input_ready").and_then(Value::as_bool),
             Some(false)
         );
     }
@@ -5549,7 +5549,7 @@ Best thing to improve in the meantime:
             "write_command_count": 1,
             "terminal_content_source": "daemon_pty",
             "mounted_entry_host_connected": true,
-            "input_enabled": true,
+            "host_stdin_enabled": true,
             "helper_textarea_focused": false,
             "host_has_active_element": false,
             "xterm_buffer_kind": "normal",
@@ -5572,7 +5572,7 @@ Best thing to improve in the meantime:
             Some(true)
         );
         assert_eq!(
-            summary.get("input_enabled").and_then(Value::as_bool),
+            summary.get("foreground_input_ready").and_then(Value::as_bool),
             Some(false),
             "raw protocol bridge may stay open, but user input is not ready without prompt focus"
         );
@@ -5584,7 +5584,7 @@ Best thing to improve in the meantime:
             "session_path": "remote-session://dev/fresh-shell",
             "text_sample": "pi@dev:~$",
             "cursor_line_text": "pi@dev:~$",
-            "input_enabled": false,
+            "host_stdin_enabled": false,
             "helper_textarea_focused": false,
             "cursor_node_count": 0,
             "xterm_present": true,
@@ -5615,7 +5615,7 @@ Best thing to improve in the meantime:
             "session_path": "live::practice-shell",
             "text_sample": "pi@practice:~$",
             "cursor_line_text": "pi@practice:~$ ",
-            "input_enabled": false,
+            "host_stdin_enabled": false,
             "helper_textarea_focused": false,
             "host_has_active_element": false,
             "cursor_node_count": 0,
@@ -5647,7 +5647,7 @@ Best thing to improve in the meantime:
             "session_path": "live::practice-shell",
             "text_sample": "normal terminal output",
             "cursor_line_text": "pi@practice:~$ ",
-            "input_enabled": true,
+            "host_stdin_enabled": true,
             "effective_input_focus": false,
             "helper_textarea_focused": false,
             "host_has_active_element": false,
@@ -5683,7 +5683,7 @@ Best thing to improve in the meantime:
             "session_path": "live::practice-shell",
             "text_sample": "normal terminal output",
             "cursor_line_text": "pi@practice:~$ ",
-            "input_enabled": true,
+            "host_stdin_enabled": true,
             "effective_input_focus": true,
             "helper_textarea_focused": true,
             "host_has_active_element": true,
@@ -5715,7 +5715,7 @@ Best thing to improve in the meantime:
         assert_eq!(summary.get("problem"), Some(&Value::Null));
         assert_eq!(summary.get("geometry_problem"), Some(&Value::Null));
         assert_eq!(
-            summary.get("input_enabled").and_then(Value::as_bool),
+            summary.get("foreground_input_ready").and_then(Value::as_bool),
             Some(true)
         );
     }
@@ -5731,7 +5731,7 @@ Best thing to improve in the meantime:
             "text_sample": "The final 2.1.59 artifacts are built. Before replacing the live jojo install, I’m taking one more runtime/install snapshot.",
             "text_tail": "The final 2.1.59 artifacts are built. Before replacing the live jojo install, I’m taking one more runtime/install snapshot.",
             "cursor_line_text": "stale scan processes.",
-            "input_enabled": true,
+            "host_stdin_enabled": true,
             "helper_textarea_focused": true,
             "cursor_node_count": 1,
             "xterm_present": true,
@@ -5759,7 +5759,7 @@ Best thing to improve in the meantime:
             "text_sample": "Status as of 2026-05-13 11:26 IST:\n\nThe batch is no longer running and the validation coverage is stale.",
             "text_tail": "The official full validation coverage is stale from 2026-05-06 20:40 IST, still showing 48/1000 ready charts. So v3 readiness remains blocked until we restart or repair the batch.",
             "cursor_line_text": "",
-            "input_enabled": false,
+            "host_stdin_enabled": false,
             "helper_textarea_focused": false,
             "cursor_node_count": 1,
             "xterm_present": true,
@@ -5801,7 +5801,7 @@ Best thing to improve in the meantime:
             "text_sample": "Status as of 2026-05-13 11:26 IST:\n\nThe batch is no longer running and the validation coverage is stale.",
             "text_tail": "The official full validation coverage is stale from 2026-05-06 20:40 IST, still showing 48/1000 ready charts. So v3 readiness remains blocked until we restart or repair the batch.",
             "cursor_line_text": "",
-            "input_enabled": true,
+            "host_stdin_enabled": true,
             "helper_textarea_focused": true,
             "cursor_node_count": 1,
             "xterm_present": true,
@@ -5843,7 +5843,7 @@ Best thing to improve in the meantime:
             "text_sample": "- Active chart: SAMPLENOTES_BENCH_0099\n  - Log rows: 742\n  - Physical PDFs in output dir: 2510",
             "text_tail": "- Active chart: SAMPLENOTES_BENCH_0099\n  - Log rows: 742\n  - Physical PDFs in output dir: 2510\n\nThe current actionable improvement is not astrology logic yet.",
             "cursor_line_text": "  - Physical PDFs in output",
-            "input_enabled": true,
+            "host_stdin_enabled": true,
             "helper_textarea_focused": true,
             "host_has_active_element": true,
             "cursor_node_count": 1,
@@ -5885,7 +5885,7 @@ Best thing to improve in the meantime:
             "text_tail": "- Active chart: SAMPLENOTES_BENCH_0099\n  - Log rows: 742\n  - Physical PDFs in output dir: 2510\n\nThe immediate engineering priority is still the harness: no fixture corpus, no rigorous parity measurement.",
             "buffer_text_sample": "- Active chart: SAMPLENOTES_BENCH_0099\n  - Log rows: 742\n  - Physical PDFs in output dir: 2510",
             "cursor_line_text": "",
-            "input_enabled": true,
+            "host_stdin_enabled": true,
             "helper_textarea_focused": true,
             "host_has_active_element": true,
             "cursor_node_count": 0,
@@ -5929,7 +5929,7 @@ Best thing to improve in the meantime:
             "text_tail": "- Active chart: SAMPLENOTES_BENCH_0099\n  - Log rows: 742\n\nThe immediate engineering priority is still the harness: no fixture corpus, no rigorous parity measurement.\n \n \n› I’ll use the SAMPLENOTES v3 research workflow here and check the live PL9 batch before recommending parallel work. I’m going to distinguish runner health from v3 parity work so we do not confuse fixture generation progress with solved logic.git/samplenotes\n\nThe batch is still alive and the repaired open path is working, but the main friction has shifted: VP2+ generation is failing on some charts after the chart opens correctly.",
             "buffer_text_sample": "- Active chart: SAMPLENOTES_BENCH_0099\n  - Log rows: 742",
             "cursor_line_text": "",
-            "input_enabled": true,
+            "host_stdin_enabled": true,
             "helper_textarea_focused": true,
             "host_has_active_element": true,
             "cursor_node_count": 0,
@@ -5973,7 +5973,7 @@ Best thing to improve in the meantime:
             "text_sample": "• I found a concrete rename root cause.\n\n■ Conversation interrupted - tell the model what to do differently. Something went wrong? Hit `/feedback` to",
             "text_tail": "• I found a concrete rename root cause.\n\n■ Conversation interrupted - tell the model what to do differently. Something went wrong? Hit `/feedback` to",
             "cursor_line_text": "■ Conversation interrupted - tell the model what to do differently. Something went wrong? Hit `/feedback` to",
-            "input_enabled": true,
+            "host_stdin_enabled": true,
             "helper_textarea_focused": true,
             "cursor_node_count": 1,
             "xterm_present": true,
@@ -6003,7 +6003,7 @@ Best thing to improve in the meantime:
             "text_tail": stale_tail,
             "buffer_text_sample": stale_tail,
             "cursor_line_text": "workflow can still add any matrix artifacts afterward.",
-            "input_enabled": false,
+            "host_stdin_enabled": false,
             "helper_textarea_focused": false,
             "cursor_node_count": 0,
             "xterm_present": true,
@@ -6043,7 +6043,7 @@ Best thing to improve in the meantime:
             "cursor_line_text": "› Improve documentation in @filename",
             "terminal_content_source": "server_prompt_snapshot",
             "retained_replay_source": "server_prompt_snapshot",
-            "input_enabled": true,
+            "host_stdin_enabled": true,
             "helper_textarea_focused": true,
             "cursor_node_count": 1,
             "xterm_present": true,
@@ -6092,7 +6092,7 @@ Weekly limit:                97% left
             "text_sample": status,
             "text_tail": status,
             "cursor_line_text": "Weekly limit:                97% left",
-            "input_enabled": true,
+            "host_stdin_enabled": true,
             "helper_textarea_focused": true,
             "cursor_node_count": 1,
             "xterm_present": true,
@@ -6138,7 +6138,7 @@ Weekly limit:                21% left
             "text_tail": tail,
             "buffer_text_sample": "• I found a concrete rename root cause.",
             "cursor_line_text": "",
-            "input_enabled": true,
+            "host_stdin_enabled": true,
             "helper_textarea_focused": true,
             "cursor_node_count": 0,
             "xterm_present": true,
@@ -6171,7 +6171,7 @@ Weekly limit:                21% left
             "text_sample": "›",
             "text_tail": "›",
             "cursor_line_text": "›",
-            "input_enabled": true,
+            "host_stdin_enabled": true,
             "helper_textarea_focused": true,
             "cursor_node_count": 0,
             "xterm_present": true,
@@ -6203,7 +6203,7 @@ Weekly limit:                21% left
             "text_sample": "› Write tests for @filename",
             "text_tail": "› Write tests for @filename",
             "cursor_line_text": "› Write tests for @filename",
-            "input_enabled": true,
+            "host_stdin_enabled": true,
             "helper_textarea_focused": true,
             "cursor_node_count": 0,
             "xterm_present": true,
@@ -6236,7 +6236,7 @@ Weekly limit:                21% left
             "text_sample": "Previous retained output without a current prompt row",
             "text_tail": "Previous retained output without a current prompt row",
             "cursor_line_text": "",
-            "input_enabled": true,
+            "host_stdin_enabled": true,
             "helper_textarea_focused": true,
             "cursor_node_count": 0,
             "xterm_present": true,
@@ -6273,7 +6273,7 @@ Weekly limit:                21% left
             "text_tail": "• I generated the SAMPLENOTES evidence pack.\n\nBest timing:\n- 23 Nov 2026 - 10 Jan 2027\n- 5 Aug 2027 - 4 Oct 2028\n\n› Improve documentation in @filename\n\ngpt-5.5 medium · ~/git/samplenotes",
             "buffer_text_sample": "• I generated the SAMPLENOTES evidence pack.",
             "cursor_line_text": "› Improve documentation in @filename",
-            "input_enabled": true,
+            "host_stdin_enabled": true,
             "helper_textarea_focused": true,
             "cursor_node_count": 1,
             "xterm_present": true,
@@ -6313,7 +6313,7 @@ Weekly limit:                21% left
             "text_tail": "• I generated the SAMPLENOTES evidence pack.\n\nBest timing:\n- 23 Nov 2026 - 10 Jan 2027\n- 5 Aug 2027 - 4 Oct 2028\n\n› Improve documentation in @filename\n\ngpt-5.5 medium · ~/git/samplenotes",
             "buffer_text_sample": "• I generated the SAMPLENOTES evidence pack.",
             "cursor_line_text": "› Improve documentation in @filename",
-            "input_enabled": true,
+            "host_stdin_enabled": true,
             "helper_textarea_focused": true,
             "cursor_node_count": 0,
             "xterm_present": true,
@@ -6373,7 +6373,7 @@ Weekly limit:                21% left
             "text_tail": text_tail,
             "buffer_text_sample": text_tail,
             "cursor_line_text": "",
-            "input_enabled": true,
+            "host_stdin_enabled": true,
             "helper_textarea_focused": true,
             "xterm_present": true,
             "screen_present": true,
@@ -6412,7 +6412,7 @@ Weekly limit:                21% left
             "text_sample": "• Previous output\n\n› Run /review on my current changes\n \n  gpt-5.5 medium · ~/git/samplenotes",
             "text_tail": "• Previous output\n\n› Run /review on my current changes\n \n  gpt-5.5 medium · ~/git/samplenotes",
             "cursor_line_text": "› Run /review on my current changes",
-            "input_enabled": true,
+            "host_stdin_enabled": true,
             "helper_textarea_focused": true,
             "cursor_node_count": 0,
             "xterm_present": true,
@@ -6453,7 +6453,7 @@ Weekly limit:                21% left
             "text_sample": "Previous output\n\n› e s\n \n  gpt-5.5 xhigh · ~/git/samplenotes",
             "text_tail": "Previous output\n\n› e s\n \n  gpt-5.5 xhigh · ~/git/samplenotes",
             "cursor_line_text": "› e s",
-            "input_enabled": true,
+            "host_stdin_enabled": true,
             "effective_input_focus": true,
             "helper_textarea_focused": true,
             "host_has_active_element": true,
@@ -6486,7 +6486,7 @@ Weekly limit:                21% left
         let surface = summarize_terminal_surface_for_app_control(&[host], false);
         assert_eq!(surface.get("problem").and_then(Value::as_str), None);
         assert_eq!(
-            surface.get("input_enabled").and_then(Value::as_bool),
+            surface.get("foreground_input_ready").and_then(Value::as_bool),
             Some(true)
         );
     }
@@ -6498,7 +6498,7 @@ Weekly limit:                21% left
             "text_sample": "Previous output\nCodex was working here",
             "text_tail": "Previous output\nCodex was working here",
             "cursor_line_text": "",
-            "input_enabled": true,
+            "host_stdin_enabled": true,
             "helper_textarea_focused": true,
             "cursor_node_count": 0,
             "xterm_present": true,
@@ -6535,7 +6535,7 @@ Weekly limit:                21% left
             Some("active remote terminal is input-enabled on retained history replay")
         );
         assert_eq!(
-            surface.get("input_enabled").and_then(Value::as_bool),
+            surface.get("foreground_input_ready").and_then(Value::as_bool),
             Some(false)
         );
         assert_eq!(
@@ -6551,7 +6551,7 @@ Weekly limit:                21% left
             "text_sample": "Current PTY output\n\n› Summarize recent commits",
             "text_tail": "Current PTY output\n\n› Summarize recent commits",
             "cursor_line_text": "› Summarize recent commits",
-            "input_enabled": false,
+            "host_stdin_enabled": false,
             "helper_textarea_focused": false,
             "cursor_node_count": 1,
             "xterm_present": true,
@@ -6586,7 +6586,7 @@ Weekly limit:                21% left
             Some("active terminal host is transparent while mounted")
         );
         assert_eq!(
-            surface.get("input_enabled").and_then(Value::as_bool),
+            surface.get("foreground_input_ready").and_then(Value::as_bool),
             Some(false)
         );
     }
@@ -6597,7 +6597,7 @@ Weekly limit:                21% left
             "session_path": "remote-session://dev/live-codex",
             "text_sample": "/ T R A N S C R I P T /\n• Published v2.1.50: https://github.com/yggdrasilhq/yggterm/releases/tag/v2.1.50\n\n──────────────────── 87% ─\n ↑/↓ to scroll   pgup/pgdn to page   home/end to jump\n q to quit   esc/← to edit prev   → to edit next   enter to edit message",
             "cursor_line_text": " q to quit   esc/← to edit prev   → to edit next   enter to edit message",
-            "input_enabled": true,
+            "host_stdin_enabled": true,
             "helper_textarea_focused": true,
             "cursor_node_count": 0,
             "xterm_present": true,
@@ -6630,7 +6630,7 @@ Weekly limit:                21% left
             "text_tail": "• Published v2.1.50: https://github.com/yggdrasilhq/yggterm/releases/tag/v2.1.50\n\n──────────────────────────────────── 87% ─\n ↑/↓ to scroll   pgup/pgdn to page   home/end to jump\n q to quit   esc/← to edit prev   → to edit next   enter to edit message",
             "buffer_text_sample": "/ T R A N S C R I P T / / / / / / / / / / /\n  x86_64/arm64, and Debian artifacts. I’m checking the final release asset list.",
             "cursor_line_text": "",
-            "input_enabled": true,
+            "host_stdin_enabled": true,
             "helper_textarea_focused": true,
             "cursor_node_count": 0,
             "xterm_present": true,
@@ -6663,7 +6663,7 @@ Weekly limit:                21% left
             "text_tail": "USER:\nPlease fix yggterm.\n\nASSISTANT:\nI am checking the daemon state.",
             "buffer_text_sample": "USER:\nPlease fix yggterm.",
             "cursor_line_text": "",
-            "input_enabled": true,
+            "host_stdin_enabled": true,
             "helper_textarea_focused": true,
             "cursor_node_count": 0,
             "xterm_present": true,
@@ -6725,7 +6725,7 @@ Weekly limit:                21% left
                 "viewport_present": true,
                 "rows_present": false,
                 "canvas_count": 4,
-                "input_enabled": true,
+                "host_stdin_enabled": true,
                 "helper_textarea_focused": true,
                 "xterm_cursor_hidden": true,
                 "text_sample": "/ T R A N S C R I P T /\n• Published v2.1.50",
@@ -6810,7 +6810,7 @@ Weekly limit:                21% left
                 "viewport_present": true,
                 "rows_present": false,
                 "canvas_count": 4,
-                "input_enabled": true,
+                "host_stdin_enabled": true,
                 "raw_input_enabled": true,
                 "helper_textarea_focused": true,
                 "host_has_active_element": true,
@@ -6899,7 +6899,7 @@ Weekly limit:                21% left
                     "viewport_present": true,
                     "rows_present": true,
                     "canvas_count": 4,
-                    "input_enabled": true,
+                    "host_stdin_enabled": true,
                     "raw_input_enabled": true,
                     "effective_input_focus": true,
                     "helper_textarea_focused": true,
@@ -6935,7 +6935,7 @@ Weekly limit:                21% left
                     "viewport_present": true,
                     "rows_present": true,
                     "canvas_count": 4,
-                    "input_enabled": false,
+                    "host_stdin_enabled": false,
                     "raw_input_enabled": false,
                     "effective_input_focus": false,
                     "helper_textarea_focused": true,
@@ -7041,7 +7041,7 @@ Weekly limit:                21% left
         let host = json!({
             "text_sample": "",
             "cursor_line_text": "",
-            "input_enabled": false,
+            "host_stdin_enabled": false,
             "helper_textarea_focused": false,
             "xterm_present": true,
             "screen_present": true,
@@ -7071,7 +7071,7 @@ Weekly limit:                21% left
         let host = json!({
             "text_sample": "",
             "cursor_line_text": "",
-            "input_enabled": true,
+            "host_stdin_enabled": true,
             "helper_textarea_focused": true,
             "xterm_present": true,
             "screen_present": true,
@@ -7101,7 +7101,7 @@ Weekly limit:                21% left
         let host = json!({
             "text_sample": "",
             "cursor_line_text": "pi@jojo:~$",
-            "input_enabled": true,
+            "host_stdin_enabled": true,
             "helper_textarea_focused": true,
             "xterm_present": true,
             "screen_present": true,
@@ -7128,7 +7128,7 @@ Weekly limit:                21% left
         let host = json!({
             "text_sample": "pi@dev:~$",
             "cursor_line_text": "pi@dev:~$",
-            "input_enabled": true,
+            "host_stdin_enabled": true,
             "helper_textarea_focused": true,
             "helper_textarea_present": true,
             "helper_textarea_opacity": "0",
@@ -7164,7 +7164,7 @@ Weekly limit:                21% left
         let host = json!({
             "text_sample": "pi@dev:~$",
             "cursor_line_text": "pi@dev:~$",
-            "input_enabled": true,
+            "host_stdin_enabled": true,
             "helper_textarea_focused": true,
             "helper_textarea_present": true,
             "helper_textarea_opacity": "0",
@@ -7205,7 +7205,7 @@ Weekly limit:                21% left
         let host = json!({
             "text_sample": "pi@dev:~$",
             "cursor_line_text": "pi@dev:~$",
-            "input_enabled": true,
+            "host_stdin_enabled": true,
             "helper_textarea_focused": true,
             "helper_textarea_present": true,
             "helper_textarea_opacity": "1",
