@@ -25327,7 +25327,7 @@ fn enrich_runtime_truth_with_viewport(snapshot: &mut Value, viewport: &Value) {
         .cloned()
         .unwrap_or_default();
     let active_host_raw_input_enabled = active_hosts.iter().any(|host| {
-        host.get("input_enabled")
+        host.get("host_stdin_enabled")
             .and_then(Value::as_bool)
             .unwrap_or(false)
     });
@@ -25335,7 +25335,7 @@ fn enrich_runtime_truth_with_viewport(snapshot: &mut Value, viewport: &Value) {
         host.get("effective_input_focus")
             .and_then(Value::as_bool)
             .unwrap_or_else(|| {
-                host.get("input_enabled")
+                host.get("host_stdin_enabled")
                     .and_then(Value::as_bool)
                     .unwrap_or(false)
                     && host
@@ -25502,7 +25502,7 @@ fn coerce_degraded_viewport_from_ready_terminal_attempt(
         json!({
             "session_path": active_path,
             "rendered": true,
-            "input_enabled": false,
+            "host_stdin_enabled": false,
             "raw_input_enabled": false,
             "effective_input_focus": false,
             "raw_effective_input_focus": false,
@@ -27254,7 +27254,7 @@ async fn capture_dom_debug_snapshot_for(active_session_path: Option<&str>) -> Va
                             && activeElement === helperTextarea
                             && host.contains(activeElement)
                     ),
-                    input_enabled: mountedHost ? Boolean(mountedHost.inputEnabled) : null,
+                    host_stdin_enabled: mountedHost ? Boolean(mountedHost.inputEnabled) : null,
                     rust_input_gate_open: mountedHost ? Boolean(mountedHost.rustInputGateOpen) : false,
                     programmatic_focus_enabled: mountedHost ? Boolean(mountedHost.programmaticFocusEnabled) : null,
                     input_policy_apply_count: mountedHost ? Number(mountedHost.inputPolicyApplyCount || 0) : 0,
@@ -28928,7 +28928,7 @@ async fn capture_dom_debug_snapshot_basic_for(active_session_path: Option<&str>)
                         inactive_tui_last_tail: mountedHost ? String(mountedHost.inactiveTuiLastTail || '') : '',
                         unfocused_tui_frame_drop_count: mountedHost ? Number(mountedHost.unfocusedTuiFrameDropCount || 0) : 0,
                         unfocused_tui_last_tail: mountedHost ? String(mountedHost.unfocusedTuiLastTail || '') : '',
-                        input_enabled: mountedHost ? Boolean(mountedHost.inputEnabled) : false,
+                        host_stdin_enabled: mountedHost ? Boolean(mountedHost.inputEnabled) : false,
                         rust_input_gate_open: mountedHost ? Boolean(mountedHost.rustInputGateOpen) : false,
                         programmatic_focus_enabled: mountedHost ? Boolean(mountedHost.programmaticFocusEnabled) : false,
                         input_policy_apply_count: mountedHost ? Number(mountedHost.inputPolicyApplyCount || 0) : 0,
@@ -30105,7 +30105,7 @@ async fn capture_dom_debug_snapshot_terminal_quick_fallback_for(
                         helper_textarea_pointer_events: helperTextareaStyle ? String(helperTextareaStyle.pointerEvents || '') : null,
                         helper_textarea_focused: helperTextareaFocused,
                         host_has_active_element: hostHasActiveElement,
-                        input_enabled: inputEnabled,
+                        host_stdin_enabled: inputEnabled,
                         raw_input_enabled: inputEnabled,
                         effective_input_focus: effectiveInputFocus,
                         raw_effective_input_focus: effectiveInputFocus,
@@ -30808,7 +30808,7 @@ async fn capture_dom_debug_snapshot_terminal_fallback_for(
                             && helperTextarea === activeElement
                             && host.contains(activeElement)
                     ),
-                    input_enabled: mountedHost ? Boolean(mountedHost.inputEnabled) : false,
+                    host_stdin_enabled: mountedHost ? Boolean(mountedHost.inputEnabled) : false,
                     raw_input_enabled: mountedHost ? Boolean(mountedHost.inputEnabled) : false,
                     rust_input_gate_open: mountedHost ? Boolean(mountedHost.rustInputGateOpen) : false,
                     programmatic_focus_enabled: mountedHost ? Boolean(mountedHost.programmaticFocusEnabled) : false,
@@ -31590,7 +31590,7 @@ fn terminal_probe_input_script(
                                 && host
                                 && host.contains(document.activeElement)
                         ),
-                        input_enabled: Boolean(entry.inputEnabled),
+                        host_stdin_enabled: Boolean(entry.inputEnabled),
                         text_tail: buffer.text_tail,
                         visible_text: buffer.visible_text,
                         cursor_line_text: buffer.cursor_line_text,
@@ -32055,7 +32055,7 @@ fn terminal_probe_input_script(
                     ? (textNewlyVisible(after) || cursorAdvancedForWhitespace(after))
                     : counterChangeAtMs !== null;
                 const hasTransportError = terminalChunkIsTransportError(String(after.text_tail || ''));
-                const inputReady = Boolean(after.input_enabled && after.effective_input_focus);
+                const inputReady = Boolean(after.host_stdin_enabled && after.effective_input_focus);
                 const accepted = !hasTransportError
                     && inputReady
                     && (!text || visibleEchoObserved || (pressEnter && counterChangeAtMs !== null));
@@ -32278,7 +32278,7 @@ async fn probe_terminal_viewport_scroll_for(session_path: &str, lines: i32) -> V
 	                        fit_available_height_px: Number(fitAvailableHeight.toFixed(2)),
 	                        fit_overflow_px: Number(Math.max(0, fitRequiredHeight - fitAvailableHeight).toFixed(2)),
 	                        viewport_scroll_top: viewportElement ? Number(viewportElement.scrollTop || 0) : null,
-                        input_enabled: Boolean(entry.inputEnabled),
+                        host_stdin_enabled: Boolean(entry.inputEnabled),
                         helper_textarea_focused: Boolean(helperTextarea && document.activeElement === helperTextarea),
                         host_has_active_element: Boolean(host && host.contains(document.activeElement)),
                         effective_input_focus: Boolean(
@@ -35639,9 +35639,9 @@ async fn process_pending_app_control_requests(
                     trace_stage(
                         "describe_state_ready_observation_sync_input_end",
                         json!({
-                            "surface_input_enabled": viewport
+                            "surface_foreground_input_ready": viewport
                                 .get("active_terminal_surface")
-                                .and_then(|surface| surface.get("input_enabled"))
+                                .and_then(|surface| surface.get("foreground_input_ready"))
                                 .and_then(Value::as_bool),
                             "surface_raw_input_enabled": viewport
                                 .get("active_terminal_surface")
@@ -35738,8 +35738,8 @@ fn summarize_app_control_response_data_for_trace(data: Option<&Value>) -> Value 
                 "surface_problem": surface
                     .and_then(|surface| surface.get("problem"))
                     .and_then(Value::as_str),
-                "surface_input_enabled": surface
-                    .and_then(|surface| surface.get("input_enabled"))
+                "surface_foreground_input_ready": surface
+                    .and_then(|surface| surface.get("foreground_input_ready"))
                     .and_then(Value::as_bool),
                 "surface_raw_input_enabled": surface
                     .and_then(|surface| surface.get("raw_input_enabled"))
@@ -60901,7 +60901,7 @@ fn terminal_eval_script_with_canvas_renderer(
             syncInputPolicyHostEntry();
             if (!inputEnabled) {{
                 try {{
-                    captureSessionXtermSnapshot('input_disabled');
+                    captureSessionXtermSnapshot('focus_released');
                 }} catch (_error) {{}}
                 host.classList.remove('yggterm-term-focused');
                 try {{
@@ -60920,8 +60920,8 @@ fn terminal_eval_script_with_canvas_renderer(
                         host.blur();
                     }}
                 }} catch (_error) {{}}
-                applySoftwareCanvasLayerOptimization('input_disabled');
-                disposeXtermInputLineDecoration('input_disabled');
+                applySoftwareCanvasLayerOptimization('focus_released');
+                disposeXtermInputLineDecoration('focus_released');
                 syncInputPolicyHostEntry();
                 return;
             }}
@@ -60954,7 +60954,7 @@ fn terminal_eval_script_with_canvas_renderer(
                 syncFocusClass();
                 scheduleInputDriftRecovery();
             }}
-            syncXtermInputLineDecoration('input_enabled');
+            syncXtermInputLineDecoration('host_stdin_enabled');
             syncInputPolicyHostEntry();
             try {{
                 if (typeof syncTerminalWriteFrameBudgetHostEntry === 'function') {{
@@ -64523,7 +64523,7 @@ fn terminal_replay_retained_data_script_for_session(
               entry.lastRetainedReplayRejectedVisibleText = String(reason || 'retained_replay_blocked_by_live_input');
               entry.lastRetainedReplayFollowDebug = {{
                 reason: String(reason || 'retained_replay_blocked_by_live_input'),
-                input_enabled: inputEnabledNow,
+                host_stdin_enabled: inputEnabledNow,
                 input_hot: inputHotNow,
               }};
               try {{
@@ -73758,7 +73758,7 @@ mod tests {
             "window.__yggtermXtermSessionSnapshots = window.__yggtermXtermSessionSnapshots || {};"
         ));
         assert!(script.contains("window.__yggtermXtermSessionSnapshots[sessionPath] = snapshot;"));
-        assert!(script.contains("captureSessionXtermSnapshot('input_disabled');"));
+        assert!(script.contains("captureSessionXtermSnapshot('focus_released');"));
         assert!(script.contains("captureSessionXtermSnapshot('cleanup');"));
         assert!(script.contains("entry.lastXtermSessionSnapshotLineCount = snapshot.lineCount;"));
         assert!(script.contains(
@@ -75554,7 +75554,7 @@ mod tests {
             false,
         );
         assert!(script.contains(
-            "const inputReady = Boolean(after.input_enabled && after.effective_input_focus);"
+            "const inputReady = Boolean(after.host_stdin_enabled && after.effective_input_focus);"
         ));
         assert!(script.contains("&& inputReady"));
         assert!(script.contains("\"terminal_input_not_focused\""));
@@ -84857,7 +84857,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             "active_terminal_hosts": [
                 {
                     "session_path": "local://blank-codex",
-                    "input_enabled": true
+                    "host_stdin_enabled": true
                 }
             ]
         });
@@ -84890,7 +84890,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             "active_terminal_hosts": [
                 {
                     "session_path": "local://focused-codex",
-                    "input_enabled": true,
+                    "host_stdin_enabled": true,
                     "helper_textarea_focused": true,
                     "host_has_active_element": true
                 }
@@ -84916,7 +84916,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             "rows_present": true,
             "canvas_count": 1,
             "text_sample": "OpenAI Codex\n› Use /skills to list available skills",
-            "input_enabled": true,
+            "host_stdin_enabled": true,
             "helper_textarea_focused": true,
             "host_has_active_element": true
         });
@@ -85086,7 +85086,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             "rows_present": false,
             "canvas_count": 1,
             "text_sample": "normal terminal output",
-            "input_enabled": true,
+            "host_stdin_enabled": true,
             "scrollback_locked": false,
             "host_content_width": 883.0,
             "host_content_height": 904.0,
@@ -85112,7 +85112,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             "rows_present": false,
             "canvas_count": 1,
             "text_sample": "normal terminal output",
-            "input_enabled": true,
+            "host_stdin_enabled": true,
             "scrollback_locked": false,
             "host_content_width": 883.0,
             "host_content_height": 899.96,
@@ -85136,7 +85136,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             "rows_present": false,
             "canvas_count": 1,
             "text_sample": "normal terminal output",
-            "input_enabled": true,
+            "host_stdin_enabled": true,
             "scrollback_locked": false,
             "host_content_width": 883.0,
             "host_content_height": 899.75,
@@ -85165,7 +85165,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             "rows_present": false,
             "canvas_count": 1,
             "text_sample": "normal terminal output",
-            "input_enabled": true,
+            "host_stdin_enabled": true,
             "effective_input_focus": true,
             "scrollback_locked": true,
             "scrollback_intent": "UserScrollback",
@@ -85191,7 +85191,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             "rows_present": false,
             "canvas_count": 1,
             "text_sample": "normal terminal output",
-            "input_enabled": true,
+            "host_stdin_enabled": true,
             "effective_input_focus": true,
             "scrollback_locked": true,
             "scrollback_intent": "PromptFollow",
@@ -85219,7 +85219,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             "rows_present": false,
             "canvas_count": 1,
             "text_sample": "normal terminal output",
-            "input_enabled": true,
+            "host_stdin_enabled": true,
             "effective_input_focus": true,
             "scrollback_locked": true,
             "scrollback_intent": "PromptFollow",
@@ -85237,7 +85237,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         assert_eq!(surface.get("problem"), Some(&Value::Null));
         assert_eq!(surface.get("geometry_problem"), Some(&Value::Null));
         assert_eq!(
-            surface.get("input_enabled").and_then(Value::as_bool),
+            surface.get("foreground_input_ready").and_then(Value::as_bool),
             Some(true)
         );
     }
@@ -85251,7 +85251,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             "rows_present": false,
             "canvas_count": 1,
             "text_sample": "normal terminal output",
-            "input_enabled": true,
+            "host_stdin_enabled": true,
             "effective_input_focus": true,
             "helper_textarea_focused": true,
             "recent_frame_like_write_hot": true,
@@ -85273,7 +85273,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             Some("active visible terminal is using the background write budget")
         );
         assert_eq!(
-            surface.get("input_enabled").and_then(Value::as_bool),
+            surface.get("foreground_input_ready").and_then(Value::as_bool),
             Some(true)
         );
 
@@ -85285,7 +85285,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             "rows_present": false,
             "canvas_count": 1,
             "text_sample": "normal terminal output",
-            "input_enabled": true,
+            "host_stdin_enabled": true,
             "effective_input_focus": true,
             "helper_textarea_focused": true,
             "recent_frame_like_write_hot": true,
@@ -85307,7 +85307,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             Some("active visible terminal write budget is too slow")
         );
         assert_eq!(
-            surface.get("input_enabled").and_then(Value::as_bool),
+            surface.get("foreground_input_ready").and_then(Value::as_bool),
             Some(true)
         );
 
@@ -85319,7 +85319,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             "rows_present": false,
             "canvas_count": 1,
             "text_sample": "normal terminal output",
-            "input_enabled": true,
+            "host_stdin_enabled": true,
             "effective_input_focus": true,
             "helper_textarea_focused": true,
             "recent_frame_like_write_hot": true,
@@ -85348,7 +85348,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             "rows_present": false,
             "canvas_count": 1,
             "text_sample": "normal terminal output",
-            "input_enabled": true,
+            "host_stdin_enabled": true,
             "effective_input_focus": true,
             "helper_textarea_focused": true,
             "recent_frame_like_write_hot": true,
@@ -85380,7 +85380,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             "rows_present": false,
             "canvas_count": 1,
             "text_sample": "normal terminal output",
-            "input_enabled": true,
+            "host_stdin_enabled": true,
             "effective_input_focus": true,
             "helper_textarea_focused": true,
             "recent_frame_like_write_hot": true,
@@ -85413,7 +85413,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             "helper_textarea_clip_path": "none",
             "helper_textarea_clip": "auto",
             "helper_textarea_pointer_events": "auto",
-            "input_enabled": true,
+            "host_stdin_enabled": true,
             "screen_present": true,
             "viewport_present": true,
             "rows_present": true,
@@ -85673,7 +85673,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
                 "rows_present": true,
                 "canvas_count": 0,
                 "text_sample": "Saved context still visible",
-                "input_enabled": false,
+                "host_stdin_enabled": false,
                 "resume_overlay_visible": false,
                 "resume_overlay_text": "",
                 "resume_overlay_excerpt": "",
@@ -85752,7 +85752,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
                 "viewport_present": true,
                 "rows_present": false,
                 "canvas_count": 4,
-                "input_enabled": false,
+                "host_stdin_enabled": false,
                 "terminal_content_source": "daemon_pty",
                 "cursor_sample_rect": {
                     "left": 277,
@@ -85843,7 +85843,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
                 "viewport_present": true,
                 "rows_present": true,
                 "canvas_count": 0,
-                "input_enabled": false,
+                "host_stdin_enabled": false,
                 "helper_textarea_focused": false,
                 "terminal_content_source": "daemon_retained_history_screen_snapshot",
                 "retained_replay_prompt_follow_ready": true,
@@ -85933,7 +85933,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
                 "rows_present": false,
                 "canvas_count": 4,
                 "mounted_entry_host_connected": true,
-                "input_enabled": false,
+                "host_stdin_enabled": false,
                 "terminal_content_source": "daemon_pty",
                 "last_raw_payload_length": 7648,
                 "last_raw_payload_line_count": 6,
@@ -86027,7 +86027,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
                 "viewport_present": true,
                 "rows_present": false,
                 "canvas_count": 4,
-                "input_enabled": false,
+                "host_stdin_enabled": false,
                 "mounted_entry_host_connected": true,
                 "rows": 52,
                 "cols": 177,
@@ -86127,7 +86127,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
                 "viewport_present": true,
                 "rows_present": true,
                 "canvas_count": 1,
-                "input_enabled": true,
+                "host_stdin_enabled": true,
                 "effective_input_focus": true,
                 "text_sample": "Done. Added these in the ThinkBook x layer:\n- x+q -> play/pause\n› git commit/push\n• Committed and pushed.",
                 "resume_overlay_visible": false,
@@ -86205,7 +86205,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
                 "viewport_present": true,
                 "rows_present": true,
                 "canvas_count": 1,
-                "input_enabled": false,
+                "host_stdin_enabled": false,
                 "cursor_line_text": "› /status",
                 "cursor_node_count": 1,
                 "cursor_sample_rect": {
@@ -86273,7 +86273,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
                 "viewport_present": true,
                 "rows_present": true,
                 "canvas_count": 0,
-                "input_enabled": true,
+                "host_stdin_enabled": true,
                 "effective_input_focus": true,
                 "text_sample": "pi@***:~$",
                 "resume_overlay_visible": false,
@@ -98941,7 +98941,7 @@ Updated at   Branch  Conversation\n\
                 "reason": null,
                 "active_terminal_surface": {
                     "problem": null,
-                    "input_enabled": true,
+                    "host_stdin_enabled": true,
                     "raw_input_enabled": true,
                     "content_source": "daemon_pty",
                 },
