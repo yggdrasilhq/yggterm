@@ -1015,6 +1015,49 @@ trigger recovery, while a genuinely broken surface persists and still self-heals
 `retained_fault_recovery_exhausts_remount_budget_instead_of_spinning` (updated to
 the keep-alive-on-exhaustion spec) + the empty-surface/non-prompt suite.
 
+### Second cause (2026-06-03): low-confidence read of a non-foreground host
+The settle-gates fix the *transient* (clear+redraw frame-gap) cause. A second,
+independent cause is a **buffer read taken while the host is not the foreground
+input owner**. When a session is not the focused host, `set_input_enabled(false)`
+captures the xterm snapshot on blur (`captureSessionXtermSnapshot('input_disabled')`,
+reason renamed conceptually to "focus released") and `term.buffer.active`/
+`translateToString` can read back **empty or a single sparse row** even though the
+canvas is painting live content the user sees and uses. The app-control surface
+detector then classified that sparse read as a definite problem — observed live as
+`active terminal host exists but xterm surface is empty` (and, on partial reads,
+`...only showing a plain shell prompt`), driving empty-surface fault-recovery on a
+perfectly healthy session. This is the *false-positive illusion*: the instrument,
+not the session, was broken. **A field name made it worse twice** — `input_enabled`
+reads as "user can type" but actually means "this host currently holds input
+focus/stdin"; both the probe and the detector conflated focus-ownership with health.
+
+Fix: a **couldn't-observe guard** in `terminal_host_problem_for_app_control`
+(`crates/yggterm-shell/src/terminal_observe.rs`) — abstain (return `None`) when ALL of:
+- the read is low-confidence — the host does **not** hold input focus and the
+  window is **not** focused (`!raw_input_enabled && !helper_textarea_focused &&
+  !host_has_active_element && !document_focused`); a snapshot captured on blur reads
+  back empty/sparse/placeholder even while the canvas paints live;
+- a **live daemon paint frame is present** for this surface
+  (`!last_raw_payload_sample.is_empty()` with `canvas_count > 0 || render_event_count
+  > 0`) — the decisive "healthy, just-not-cleanly-readable" signal. A genuinely
+  stuck/stale surface (codex never reached a prompt, retained prose, gated tail)
+  has buffered/retained text but **no** current live paint frame and is still flagged;
+- it is **not** a transport/error string (those are unambiguous and surface regardless
+  of focus).
+
+Genuine geometry/transparency/paint faults are checked before this guard and still
+surface; the guard strictly *reduces* spurious recovery. When the user actually
+focuses the window (`document_focused`), the read is trusted again and real problems
+re-surface. Test: `terminal_host_problem_abstains_on_sparse_read_of_unfocused_rendered_daemon_fed_surface`
+(asserts both directions: abstains unfocused, still diagnoses when focused).
+
+Still open: the client buffer read should be made reliable for non-foreground hosts
+(or tagged with a confidence the detector honors), and the misleading `input_enabled`
+flag is being renamed to a focus-ownership name (`app state`/probe JSON keys + the JS
+`inputEnabled` var). Drive sessions with `server app terminal send` (direct PTY write),
+not `probe-type` (a JS-keypress diagnostic whose `visible_echo_missing` does not mean
+input is unsendable).
+
 ### Related memory
 `[[finding-hot-switch-latency-remount]]`, `[[audit-viewport-scroll-control-flow]]`
 
