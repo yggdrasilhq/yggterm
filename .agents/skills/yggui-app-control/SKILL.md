@@ -64,7 +64,22 @@ ssh "$LIVE_HOST" "~/.local/bin/yggterm server app terminal probe-type --mode xte
 The user may explicitly **grant** specific live sessions for the agent to drive and
 monitor as a production end-user test (e.g. "I give you access to my erome systemd
 and samplenotes sessions"). Only drive sessions the user has explicitly granted in the
-current conversation. Pattern:
+current conversation.
+
+**Use `terminal send`, NOT `terminal probe-type`, to drive a session.** They are
+different tools:
+- **`server app terminal send <S> --data 'X'`** (or `--stdin`) is the DRIVER. It writes
+  the bytes straight to the daemon → remote PTY (`AppControlCommand::SendTerminalInput`
+  → `terminal_write_app_control_input_async`). Returns `{accepted:true, bytes:N}` when
+  the bytes were written. This is what reaches codex/CC's stdin.
+- **`server app terminal probe-type <S> --data 'X'`** is a DIAGNOSTIC ONLY. It simulates
+  a keypress *inside the webview* (xterm `triggerDataEvent` / DOM KeyboardEvents) and
+  reports whether the input gate + echo accepted it. It does NOT reliably reach the
+  remote PTY — the JS-simulated `onData` queues locally but the synthetic dispatch
+  doesn't drive the real transport the way a hardware keypress does. **A
+  `visible_echo_missing` from probe-type does NOT mean input can't be sent** — it means
+  the JS simulation didn't echo. Don't conclude "input is broken" from probe-type; use
+  `send` to actually drive, then read state to confirm.
 
 ```bash
 LIVE_HOST=$(cat .agents/config/live-host)
@@ -72,31 +87,45 @@ S="remote-session://dev/<uuid>"   # a granted session
 # 1) focus first — input is gated on focus; a cold-attached session is often
 #    input_enabled=false until focused (focusing re-enables it).
 ssh "$LIVE_HOST" "~/.local/bin/yggterm server app terminal focus '$S'"
-# 2) type a prompt
-ssh "$LIVE_HOST" "~/.local/bin/yggterm server app terminal probe-type '$S' --data 'continue' --enter"
+# 2) drive a prompt (Enter is part of the data — append \r, or codex won't submit)
+ssh "$LIVE_HOST" "~/.local/bin/yggterm server app terminal send '$S' --data \$'continue\r'"
 ```
 
-**PRECONDITION — codex/CC must be at its interactive composer.** probe-type input only
-lands when the agent CLI is at its live input prompt. Check the probe-type result:
-`visible_echo: true` ⇒ it landed; **`reason: visible_echo_missing`** ⇒ it did NOT —
-the CLI is showing normal-buffer content (a transcript / finished output), not the
-composer, so nothing you send registers. Don't keep sending into a non-composer; ask
-the user to bring the CLI to its idle prompt, or capture-and-confirm first.
-
-### Arrow keys / menu navigation (no extra flags needed)
-probe-type `--data` is sent as **raw PTY bytes** (via the xterm core trigger), so send
-escape sequences directly using bash `$'...'` quoting. Down-arrow is `\x1b[B` (normal
-cursor mode) or `\x1bOB` (application cursor mode — check
+### Arrow keys / menu navigation
+`send --data` is raw PTY bytes, so send escape sequences directly with bash `$'...'`.
+Down-arrow is `\x1b[B` (normal cursor mode) or `\x1bOB` (application cursor mode — check
 `app state` → `xterm_application_cursor_keys_mode`):
 
 ```bash
 # codex "full access" via /permissions: open menu, Down twice, Enter
-ssh "$LIVE_HOST" "~/.local/bin/yggterm server app terminal probe-type '$S' --data '/permissions' --enter"
-ssh "$LIVE_HOST" "~/.local/bin/yggterm server app terminal probe-type '$S' --data \$'\x1b[B\x1b[B\r'"
+ssh "$LIVE_HOST" "~/.local/bin/yggterm server app terminal send '$S' --data \$'/permissions\r'"
+ssh "$LIVE_HOST" "~/.local/bin/yggterm server app terminal send '$S' --data \$'\x1b[B\x1b[B\r'"
 ```
-**Verify the menu opened with a screenshot BEFORE sending Enter** — sending arrows+Enter
-blind into a non-menu risks selecting the wrong permission level. (Codex full-access
-selector = Down ×2 from the top, per the user.)
+**Confirm the menu opened BEFORE sending arrows+Enter** — blind arrow+Enter into a
+non-menu risks selecting the wrong permission level. (Codex full-access selector =
+Down ×2 from the top, per the user.) BUT see the observability caveat below: on
+KDE/Wayland the screenshot and per-call buffer reads can be stale/inconsistent for a
+retained remote session, so "confirm visually" may not be reliable — when in doubt,
+don't navigate a destructive menu blind.
+
+### Forcing a repaint
+`server app terminal redraw <S>` forces a client repaint/re-read (the programmatic
+equivalent of the user pressing `<Esc>` to un-stick a "muffled"/half-painted remote
+TUI). Use it after `send` if the viewport looks stale.
+
+### Observability caveat (KDE/Wayland, retained remote sessions) — IMPORTANT
+For a remote session that is in a retained/hot-but-not-live-attached state, the
+observability surface is currently UNRELIABLE and the readings contradict each other:
+- `server app screenshot` can return a STALE frame (Wayland snapshot fallback) that
+  doesn't reflect the latest paint.
+- `probe-scroll` `visible_text` reads **inconsistently call-to-call** — sometimes the
+  live composer text, sometimes empty (`xterm_session_snapshot_reason: input_disabled`).
+- `redraw`'s own embedded snapshot may show live content while the next probe-scroll
+  shows empty.
+This inconsistency is itself a tracked bug (see the convergent root cause:
+client viewport not reliably live-attached/repainting for retained remote sessions —
+the same root as the user-visible "muffled rendering until I press Esc"). Until it's
+fixed, cross-check at least two surfaces and treat a single read as low-confidence.
 
 ### Rapid-frame capture of loading artifacting
 Loading/switch artifacting is transient and inconsistent — hard to describe in words.
