@@ -24,6 +24,38 @@ animation must come from PTY bytes, xterm.js cell attributes, theme mapping, or
 xterm.js-native APIs that remain part of the terminal surface. Any diagnostic
 shim must be opt-in, observable, and rejected by release smokes.
 
+### Normal vs alternate screen buffer — where scrollback lives (read before reasoning about scroll)
+
+A terminal has two screen buffers, and **scrollback only exists in one of them**.
+This is dynamic per-session state, NOT a property of the session kind — the same
+codex (or Claude Code, or shell) session moves between the two as the inner app
+runs. Never reason about a session as "the normal-buffer one" or "the alt-screen
+one"; check its current mode.
+
+- **Normal (primary) buffer:** output accumulates; lines that scroll off the top
+  go into **scrollback**. `base_y > 0` = rows of history above the viewport;
+  `xterm_buffer_kind: normal`. A plain shell, or codex/CC showing scrollable
+  output / a transcript, is here. There is a real scroll position.
+- **Alternate buffer:** a full-screen TUI (`vim`, `htop`, `less`, and codex/CC's
+  interactive UI) sends `\x1b[?1049h` to switch in and `\x1b[?1049l` to switch
+  out. It is exactly the visible rows with **no scrollback** — the app repaints in
+  place and manages its own scrolling (hence codex's own Ctrl+T transcript view).
+  `base_y = 0`, `xterm_buffer_kind: alternate`. There is no scroll position.
+
+Consequences that have repeatedly bitten this codebase:
+- **Re-sync/replay must be buffer-aware.** Replaying normal-buffer scrollback
+  history into the alternate buffer corrupts the TUI (the 2.8.12 → 2.8.13 revert).
+  Gate on `vt100::Screen::alternate_screen()` (daemon) — screen-only replay in the
+  alt buffer, history+screen only in the normal buffer. See
+  `[[finding-hot-switch-latency-remount]]` and
+  docs/xterm-bugs.md#chunk-ring-trim-drops-mid-stream.
+- **Scroll/reveal artifacts only apply to the normal buffer.** Reveal `scrollTop`
+  flicker, scroll-jump, etc. need a scroll position, so they only manifest when a
+  session is in the normal buffer at that instant; alt-screen sessions are immune.
+- The recovery/recognition bugs (prompt detection on a fixed canvas) tend to hit
+  alt-screen sessions; the scroll bugs tend to hit normal-buffer sessions — same
+  switch, different failure mode, because they're literally different buffers.
+
 Cursor and inactive states must preserve xterm's native cursor shape. Yggterm
 uses xterm's native block cursor with CSS cursor blinking disabled in the
 desktop shell. A static visible native cursor is preferable to a shell overlay
