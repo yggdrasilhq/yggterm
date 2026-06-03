@@ -4,6 +4,15 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+## 2.8.10
+
+- Reverted the 2.8.9 "empty-seed daemon-screen prefill." It wrote a clear-screen
+  before repainting from the daemon buffer, which on a hot session *reveal* (where
+  the surface already has content) blanked the surface for a frame — a visible
+  "shadow" flash that then tripped empty-surface recovery and a multi-second
+  re-gate. Reverting restores instant hot-session reveals. The cold-attach blank
+  it originally targeted is being addressed a different way (without a clear).
+
 ## 2.8.9
 
 - Returning to a session after a GUI restart no longer flickers between a saved
