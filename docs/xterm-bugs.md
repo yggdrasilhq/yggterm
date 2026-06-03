@@ -1027,9 +1027,11 @@ detector then classified that sparse read as a definite problem — observed liv
 `active terminal host exists but xterm surface is empty` (and, on partial reads,
 `...only showing a plain shell prompt`), driving empty-surface fault-recovery on a
 perfectly healthy session. This is the *false-positive illusion*: the instrument,
-not the session, was broken. **A field name made it worse twice** — `input_enabled`
-reads as "user can type" but actually means "this host currently holds input
-focus/stdin"; both the probe and the detector conflated focus-ownership with health.
+not the session, was broken. **A field name made it worse twice** — the old
+`input_enabled` read as "user can type" but actually meant "this host currently holds
+input focus/stdin"; both the probe and the detector conflated focus-ownership with
+health. That flag has since been **renamed** (see "Rename" below) so it can't be
+misread again.
 
 Fix: a **couldn't-observe guard** in `terminal_host_problem_for_app_control`
 (`crates/yggterm-shell/src/terminal_observe.rs`) — abstain (return `None`) when ALL of:
@@ -1051,10 +1053,21 @@ focuses the window (`document_focused`), the read is trusted again and real prob
 re-surface. Test: `terminal_host_problem_abstains_on_sparse_read_of_unfocused_rendered_daemon_fed_surface`
 (asserts both directions: abstains unfocused, still diagnoses when focused).
 
+**Rename (done):** the misleading `input_enabled` was split into two accurately-named
+app-control fields and a clearer snapshot reason:
+- per-host `terminal_hosts[].input_enabled` → **`host_stdin_enabled`** ("this host is
+  the active input target / xterm stdin is enabled"; mirrors `term.disableStdin`);
+- summary `active_terminal_surface.input_enabled` (the aggregate
+  `raw_input_enabled && effective_input_focus && problem.is_none()`) →
+  **`foreground_input_ready`** ("the foreground surface holds focus and is healthy");
+- `xterm_session_snapshot_reason: "input_disabled"` → **`"focus_released"`** (captured
+  on blur).
+`raw_input_enabled` / `effective_input_focus` keep their (already-accurate) names. The
+internal JS variable `inputEnabled` is intentionally NOT renamed (no compile check on
+the generated string template; the *emitted key* is what was surfaced and confusing).
+
 Still open: the client buffer read should be made reliable for non-foreground hosts
-(or tagged with a confidence the detector honors), and the misleading `input_enabled`
-flag is being renamed to a focus-ownership name (`app state`/probe JSON keys + the JS
-`inputEnabled` var). Drive sessions with `server app terminal send` (direct PTY write),
+(or tagged with a confidence the detector honors). Drive sessions with `server app terminal send` (direct PTY write),
 not `probe-type` (a JS-keypress diagnostic whose `visible_echo_missing` does not mean
 input is unsendable).
 
