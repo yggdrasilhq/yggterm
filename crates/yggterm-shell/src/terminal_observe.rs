@@ -1733,6 +1733,52 @@ fn terminal_host_problem_for_app_control(host: &Value) -> Option<&'static str> {
     {
         return Some("active terminal DOM rows are present but not paint-visible");
     }
+    // COULDN'T-OBSERVE GUARD — do NOT invent a problem from the absence of a
+    // readable client text snapshot.
+    //
+    // A buffer read taken while this host is NOT the foreground input owner is
+    // low-confidence: the canvas can be painting live content the user sees and
+    // uses, while `term.buffer.active` reads back empty or as a single sparse
+    // row (the snapshot is captured on blur via the "focus_released" path).
+    // Classifying that sparse read as a definite problem ("active terminal host
+    // is only showing a plain shell prompt", "...has no current input row",
+    // "...accepted input without a following daemon stream echo", ...) is a
+    // false positive — and it also drives spurious fault-recovery on a healthy
+    // session. When the surface is demonstrably rendered AND the daemon is
+    // actively feeding it bytes, but this host does not hold input focus AND the
+    // readable client text is too sparse to classify, report no problem rather
+    // than diagnosing from non-evidence. Genuine geometry / transparency / paint
+    // faults are already handled above this guard and still surface.
+    // "Reliable read" = this host owns input, OR the window/document is focused
+    // (the user is looking at it and its buffer is painted live + current). A read
+    // taken with NONE of these is low-confidence — captured on blur, it reads back
+    // empty/sparse/placeholder even while the canvas paints live.
+    let host_holds_input_focus = raw_input_enabled
+        || helper_textarea_focused
+        || host_has_active_element
+        || document_focused;
+    // The decisive "this is a live, healthy surface I just can't read cleanly"
+    // signal is a non-empty `last_raw_payload_sample`: the daemon delivered a
+    // real paint frame for THIS surface very recently. A genuinely stuck/stale
+    // surface (codex never reached a prompt, retained prose, gated tail) shows
+    // buffered/retained text with NO current live paint frame — those keep being
+    // flagged. Combined with "this host is not the foreground input owner" (the
+    // text snapshot was captured on blur and reads back empty/sparse/placeholder
+    // even while the canvas paints live), this is exactly the false-positive
+    // illusion (2026-06-03): the instrument, not the session, was broken.
+    let surface_has_live_daemon_paint =
+        (canvas_count > 0 || render_event_count > 0) && !last_raw_payload_sample.is_empty();
+    // A transport/error string is unambiguous and worth surfacing regardless of
+    // focus; everything else (which prompt/state the surface is "supposed" to be
+    // in) is an interactive-state judgment that needs a reliable foreground read.
+    let any_transport_error = terminal_chunk_is_transport_error(visible_text)
+        || terminal_chunk_is_transport_error(last_raw_payload_sample)
+        || visible_text_samples
+            .iter()
+            .any(|sample| terminal_chunk_is_transport_error(sample));
+    if !host_holds_input_focus && surface_has_live_daemon_paint && !any_transport_error {
+        return None;
+    }
     let codex_interactive_setup_prompt =
         terminal_chunk_is_codex_interactive_setup_prompt(visible_text);
     let codex_prompt_surface =
@@ -3949,6 +3995,67 @@ tGPT
             "helper_textarea_rect": {"left": 0.0, "top": 0.0, "width": 1.0, "height": 1.0}
         });
         assert_eq!(terminal_host_problem_for_app_control(&host), None);
+    }
+
+    #[test]
+    fn terminal_host_problem_abstains_on_sparse_read_of_unfocused_rendered_daemon_fed_surface() {
+        // Regression: the live false-positive illusion (2026-06-03). A healthy,
+        // actively-used remote Codex session that is NOT the foreground input
+        // owner read back with an empty/sparse client text buffer (the snapshot
+        // was captured on blur, "focus_released"), while the canvas was painting
+        // live and the daemon was still feeding bytes. The detector classified
+        // that sparse read as "active terminal host is only showing a plain
+        // shell prompt" — a false positive on a session the user was scrolling
+        // and typing in. With the couldn't-observe guard it must abstain (None).
+        //
+        // Codex composer paint frame as raw daemon bytes (cursor-addressed redraw
+        // with the composer-box background) — proof the daemon is feeding a live
+        // surface even though the client text read came back empty.
+        let raw_payload = "\\x1b[?2026h\\x1b[25;2H\\x1b[0m\\x1b[49m\\x1b[K\\x1b[26;2H\\x1b[0m\\x1b[48;2;64;67;75m\\x1b[K\\x1b[?2026l";
+        let host = json!({
+            "session_path": "remote-session://dev/unfocused-codex",
+            "text_sample": "",
+            "text_tail": "",
+            "buffer_text_sample": "",
+            "cursor_line_text": "",
+            "input_enabled": false,
+            "raw_input_enabled": false,
+            "helper_textarea_focused": false,
+            "host_has_active_element": false,
+            "xterm_present": true,
+            "screen_present": true,
+            "rows_present": true,
+            "canvas_count": 4,
+            "render_event_count": 124,
+            "data_event_count": 29,
+            "write_command_count": 30,
+            "last_raw_payload_sample": raw_payload,
+            "xterm_buffer_kind": "normal",
+            "xterm_cursor_hidden": false,
+            "mounted_entry_host_connected": true,
+            "blank_rows_below_cursor": 35,
+            "base_y": 1940,
+            "rows": 36,
+            "host_rect": {"left": 277.0, "top": 8.0, "width": 1343.0, "height": 1144.0},
+            "host_content_width": 1343.0,
+            "host_content_height": 1144.0,
+            "screen_rect": {"width": 1343.0, "height": 1144.0},
+            "viewport_rect": {"width": 1343.0, "height": 1144.0},
+            "helpers_rect": {"width": 1343.0, "height": 1144.0},
+            "helper_textarea_rect": {"left": -10000.0, "top": 68.0, "width": 1.0, "height": 1.0}
+        });
+        assert_eq!(terminal_host_problem_for_app_control(&host), None);
+
+        // Discriminator: the SAME sparse read, but with the window focused
+        // (document_focused = the user is looking at it, so the read is reliable
+        // and a live paint frame doesn't excuse an unreadable surface), must NOT
+        // abstain — a genuinely empty focused surface is still a problem.
+        let mut focused = host.clone();
+        focused["document_focused"] = json!(true);
+        assert!(
+            terminal_host_problem_for_app_control(&focused).is_some(),
+            "a focused window's empty surface must still be diagnosable"
+        );
     }
 
     #[test]
