@@ -959,6 +959,43 @@ impl TerminalScreenState {
         payload.push_str(&formatted);
         Some(payload)
     }
+
+    /// True when the inner app is in the alternate screen buffer (a full-screen
+    /// TUI like codex/vim/htop sent `\x1b[?1049h`). The alt buffer has no
+    /// scrollback of its own.
+    fn in_alternate_screen(&self) -> bool {
+        self.parser.screen().alternate_screen()
+    }
+
+    /// Replay ONLY the current screen (no scrollback history). Used to re-sync the
+    /// alternate-screen buffer, where prepending normal-buffer history would
+    /// corrupt the full-screen TUI.
+    fn screen_only_replay(&self) -> Option<String> {
+        let formatted = self.formatted.trim_matches('\0');
+        let has_visible = formatted
+            .chars()
+            .any(|ch| !ch.is_control() && !ch.is_whitespace());
+        if !has_visible {
+            return None;
+        }
+        Some(format!("\x1b[2J\x1b[H{formatted}"))
+    }
+
+    /// Build the re-sync payload used when the raw chunk ring was trimmed below a
+    /// connected client's cursor (docs/xterm-bugs.md#chunk-ring-trim-drops-mid-stream).
+    /// MUST be alternate-screen-aware: in the alt buffer, replay screen-only — never
+    /// the normal-buffer scrollback history (that was the 2.8.12 regression that
+    /// corrupted codex TUIs on switch). In the normal buffer, clear the client's
+    /// stale scrollback (`\x1b[3J`) then replay history+screen so the recovered
+    /// scrollback is clean.
+    fn gap_resync_payload(&mut self) -> Option<String> {
+        if self.in_alternate_screen() {
+            self.screen_only_replay()
+        } else {
+            self.history_and_screen_replay()
+                .map(|payload| format!("\x1b[3J{payload}"))
+        }
+    }
 }
 
 fn spawn_terminal_writer_thread(
@@ -1499,16 +1536,51 @@ impl PtySessionRuntime {
         })
     }
 
+    /// Re-sync chunk for the chunk-ring-gap case. Alternate-screen-aware: see
+    /// `TerminalScreenState::gap_resync_payload`.
+    fn gap_resync_chunk(&self, next_cursor: u64) -> Option<TerminalChunk> {
+        let mut screen_state = self
+            .screen_state
+            .lock()
+            .expect("pty screen state lock poisoned");
+        let payload = screen_state.gap_resync_payload()?;
+        if !terminal_chunk_has_visible_text(&payload) {
+            return None;
+        }
+        Some(TerminalChunk {
+            seq: next_cursor.saturating_add(1),
+            data: payload,
+        })
+    }
+
     fn read(&self, cursor: u64) -> TerminalReadResult {
         let retained_chunks = self.chunks.lock().expect("pty chunk lock poisoned");
         let next_cursor = self.seq.load(Ordering::SeqCst);
         let effective_cursor = if cursor > next_cursor { 0 } else { cursor };
-        // NOTE: the chunk-ring-gap resync (docs/xterm-bugs.md#chunk-ring-trim-drops-
-        // mid-stream) was reverted — replaying history+screen on a gap corrupted
-        // ALTERNATE-SCREEN TUIs (codex) on switch-back (normal-buffer history written
-        // into the alt screen) → broken render → indefinite non-prompt gate. The gap
-        // fix needs to be alt-screen-aware (replay screen-only when in the alternate
-        // buffer; vt100::Screen::alternate_screen() can gate it) before it ships.
+        // CHUNK-RING GAP (docs/xterm-bugs.md#chunk-ring-trim-drops-mid-stream):
+        // the raw chunk ring is trimmed oldest-first (16MB live / 128KB idle-trim).
+        // If it was trimmed BELOW a connected client's cursor, the chunks between
+        // `effective_cursor` and the oldest survivor were evicted; returning only the
+        // survivors (`seq > cursor`) would SILENTLY drop that middle content. Re-sync
+        // from the vt100 ring instead — ALT-SCREEN-AWARE: `gap_resync_chunk` replays
+        // screen-only in the alternate buffer (never normal-buffer history, which
+        // corrupted codex TUIs in 2.8.12) and history+screen in the normal buffer.
+        if effective_cursor != 0
+            && retained_chunks
+                .front()
+                .is_some_and(|oldest| oldest.seq > effective_cursor.saturating_add(1))
+            && let Some(snapshot_chunk) = self.gap_resync_chunk(next_cursor)
+        {
+            return TerminalReadResult {
+                cursor: next_cursor,
+                chunks: vec![snapshot_chunk],
+                running: self.is_running(),
+                runtime_output_seen: self.has_runtime_output(),
+                eof_without_output: false,
+                post_resize_output_seen: self.post_resize_output_seen(),
+                last_resize_seq: self.last_resize_seq(),
+            };
+        }
         let prefer_initial_screen_snapshot =
             terminal_key_prefers_initial_screen_snapshot(&self.key, &self.launch_command);
         let mut chunks = if effective_cursor == 0 {
@@ -2433,6 +2505,54 @@ mod tests {
     fn history_and_screen_replay_returns_none_when_terminal_is_empty() {
         let mut state = TerminalScreenState::new(24, 80);
         assert!(state.history_and_screen_replay().is_none());
+    }
+
+    #[test]
+    fn gap_resync_in_normal_buffer_clears_scrollback_and_replays_history() {
+        let mut state = TerminalScreenState::new(4, 40);
+        for i in 1..=10 {
+            state.process(format!("hist-{i}\r\n").as_bytes());
+        }
+        assert!(!state.in_alternate_screen());
+        let payload = state.gap_resync_payload().expect("normal-buffer resync payload");
+        assert!(
+            payload.starts_with("\x1b[3J"),
+            "normal-buffer gap resync must clear the client's stale scrollback first"
+        );
+        assert!(
+            payload.contains("hist-1"),
+            "normal-buffer gap resync must replay scrolled-off history"
+        );
+    }
+
+    #[test]
+    fn gap_resync_in_alternate_screen_is_screen_only_no_history() {
+        let mut state = TerminalScreenState::new(4, 40);
+        // Accumulate normal-buffer history first (this is what corrupted codex
+        // TUIs in 2.8.12 when replayed into the alt buffer).
+        for i in 1..=10 {
+            state.process(format!("hist-{i}\r\n").as_bytes());
+        }
+        // Enter the alternate screen (full-screen TUI) and draw.
+        state.process(b"\x1b[?1049h");
+        state.process(b"ALTSCREENMARKER");
+        assert!(
+            state.in_alternate_screen(),
+            "\\x1b[?1049h must put the parser in the alternate screen"
+        );
+        let payload = state
+            .gap_resync_payload()
+            .expect("alt-screen resync payload");
+        // The regression: alt-screen resync must NOT clear/replay normal-buffer
+        // scrollback. No \x1b[3J prefix and none of the normal-buffer history rows.
+        assert!(
+            !payload.starts_with("\x1b[3J"),
+            "alt-screen gap resync must not clear normal-buffer scrollback"
+        );
+        assert!(
+            !payload.contains("hist-1") && !payload.contains("hist-10"),
+            "alt-screen gap resync must not replay normal-buffer history into the alt buffer"
+        );
     }
 
     #[test]
