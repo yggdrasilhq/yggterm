@@ -84,13 +84,19 @@ Yggterm's daemon-owned PTY model IS a terminal multiplexer. Product positioning:
 
 ### Decentralized host-resident daemon architecture (the core model — do not violate)
 
-This is the architecture that makes yggterm a real tmux replacement, and it is the lens for every persistence/remote decision:
+This is the architecture that makes yggterm a real tmux replacement, and it is the lens for every persistence/remote decision.
 
-- **`yggterm-headless` runs ON EVERY host** — the local machine AND each SSH host. The daemon that owns a session's PTY runs *on the machine where that session lives*, and holds it alive there, exactly as a tmux server would. A remote session is held alive by the remote host's yggterm daemon, not by anything on the GUI machine.
-- **SSH is the transport AND the auth layer.** A GUI client reaches a remote host's daemon over SSH; having SSH access to the host *is* the authorization to see and attach its sessions. There is no separate yggterm auth.
-- **Metadata is decentralized — stored on each machine.** Each host's `~/.yggterm` holds its own sessions, retained scrollback, and session metadata. There is no central server; the cwd tree is a union the GUI composes by talking to each host's daemon.
-- **Many GUI clients, one daemon.** Any GUI client with SSH access to a host can attach the same live daemons/sessions concurrently. Sessions are owned by the host daemon, not by a client.
-- **Therefore tmux must NOT be a dependency.** The host-resident yggterm daemon IS the multiplexer that keeps shell terminals alive across client disconnect and SSH death — that is precisely tmux's job, done by yggterm with full xterm.js scrollback and yggterm's own UX. Any current use of tmux/screen to keep a shell alive (see `docs/terminal-backends.md`) is a **stopgap** for the remote-shell-PTY path not yet being fully wired through the host daemon, not a design choice. The target end state: shell terminals are owned by the host's `yggterm-headless` directly — no tmux process, no tmux status bar, no tmux-owned scrollback. The objection "the local daemon can't keep a remote shell alive across an SSH drop" is NOT a justification for tmux — it is the reason the daemon must run on the *remote* host.
+**Nomenclature (use these terms precisely):**
+- **yggterm** — the GUI client (the desktop app the user sees).
+- **yggterm-headless** — the headless *client*, made for agents (the app-control surface agents drive). It is a CLIENT, not the session-holder.
+- **yggterm server** — the daemon(s) that *hold* sessions alive (codex, Claude Code, plain shell, other TUIs). This is the tmux-equivalent. (The `yggterm-headless` binary can launch a server via `server daemon`, but the session-holding *role* is "yggterm server".)
+
+The model:
+- **The yggterm server (daemon) runs ON EVERY host** — the local machine AND each SSH host. The server that owns a session's PTY runs *on the machine where that session lives*, and holds it alive there, exactly as a tmux server would. A remote session is held alive by the remote host's yggterm server, not by anything on the GUI machine.
+- **SSH is the transport AND the auth layer.** A client reaches a remote host's yggterm server over SSH; having SSH access to the host *is* the authorization to see and attach its sessions. There is no separate yggterm auth.
+- **Metadata is decentralized — stored on each machine.** Each host's `~/.yggterm` holds its own sessions, retained scrollback, and session metadata. There is no central server; the cwd tree is a union the client composes by talking to each host's yggterm server.
+- **Many clients, one server.** Any client (GUI or headless) with SSH access to a host can attach the same live servers/sessions concurrently. Sessions are owned by the host's yggterm server, not by a client.
+- **Therefore tmux must NOT be a dependency.** The host-resident yggterm server IS the multiplexer that keeps shell terminals alive across client disconnect and SSH death — that is precisely tmux's job, done by yggterm with full xterm.js scrollback and yggterm's own UX. Any current use of tmux/screen to keep a shell alive (see `docs/terminal-backends.md`) is a **stopgap** for the remote-shell-PTY path not yet being fully wired through the host yggterm server, not a design choice. The target end state: shell terminals are owned by the host's yggterm server directly — no tmux process, no tmux status bar, no tmux-owned scrollback. The objection "the local server can't keep a remote shell alive across an SSH drop" is NOT a justification for tmux — it is the reason the server must run on the *remote* host.
 
 **Baseline parity (REQUIRED for credibility against tmux):**
 - Session survives client disconnect — GUI close/restart never kills a running session. ✓ shipped

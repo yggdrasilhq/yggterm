@@ -47,6 +47,7 @@ xterm.js owns vs what the shell owns, cursor/prompt semantics, etc. — see
 | [surface-recovery-false-positive-on-transient](#surface-recovery-false-positive-on-transient) | "Shadow" blank flash + multi-second re-gate, and (worse) input-disable → re-resume → exhaust → session yanked closed, all triggered by a TUI's normal clear+redraw transient misread as a broken/empty/non-prompt surface | FIXED 2026-06-03 (settle-gates) — empty-surface 2.8.11, non-prompt 4-point fix |
 | [persisted-scroll-restore-fights-follow](#persisted-scroll-restore-fights-follow) | After GUI restart, every click/keystroke flickers between a saved scroll offset and the live bottom | FIXED 2026-06-02 |
 | [xterm-host-registry-leak](#xterm-host-registry-leak) | Switching/restarting sessions accumulates orphaned xterm.js instances (cleanup keyed to mount epoch that changes on remount) → growing latency on selection/paste/switch | FIXED 2026-06-02 |
+| [chunk-ring-trim-drops-mid-stream](#chunk-ring-trim-drops-mid-stream) | Middle chunks of TUI output silently missing: yggterm-server chunk ring trims oldest while a client's read-cursor is behind the trim, and read(cursor) returns only surviving chunks with no gap signal | OPEN — audit 2026-06-03, server-side protocol fix needed |
 
 ---
 
@@ -1084,6 +1085,61 @@ to measure this class.
 
 ### Related memory
 `[[finding-hot-switch-latency-remount]]`
+
+---
+
+## chunk-ring-trim-drops-mid-stream
+
+STATUS: OPEN — found by the xterm.js ← yggterm-server pipeline audit (2026-06-03).
+This is a **yggterm-server (daemon) protocol** bug, not an xterm.js bug, but it
+manifests as the user-visible symptom "TUI content clipped / chunks in the middle
+absent" so it is registered here.
+
+### Symptom
+While working a remote session (codex/agent or shell), chunks of output in the
+MIDDLE are silently absent — confirmed via codex's Ctrl+T transcript. Often paired
+with the viewport jumping up during output (a separate scroll-controller issue,
+see `[[audit-viewport-scroll-control-flow]]`).
+
+### Data path being audited
+codex/CC/shell (remote host) → **yggterm server** reads PTY into a per-session
+chunk ring (each chunk has a monotonic `seq`) → SSH → client (`yggterm` GUI or
+`yggterm-headless`) read-bridge → xterm.js. (Nomenclature: yggterm = GUI client,
+yggterm-headless = headless client for agents, yggterm server = the session-holding
+daemon.)
+
+### Root cause
+`terminal.rs::PtySessionRuntime::read(cursor)` for an incremental read does:
+`chunks.iter().filter(|c| c.seq > cursor).collect()`. The chunk ring is trimmed
+(oldest evicted) by `trim_chunk_buffer` under the live cap (`MAX_BUFFER_BYTES` =
+16 MB) and, more aggressively, by idle-trim (`IDLE_TRIM_MAX_BYTES` = 128 KB). If
+the ring is trimmed while a client's `cursor` is BEHIND the new oldest `seq`
+(e.g. the client switched away / disconnected, the session idle-trimmed, then the
+client resumes from its stale cursor), the evicted chunks between `cursor` and the
+oldest survivor are **silently dropped** — `read` returns only the surviving tail
+and `TerminalReadResult` has **no gap/reset field** to signal it. The client
+applies a tail that begins mid-stream → xterm state diverges → missing/garbled
+middle rows. Ruled out as NOT the cause this round: GUI transport
+(`transport_leak_dropped_write_count = 0`), frame coalescing
+(`coalesce_high_volume_terminal_frames` is a no-op). Note: a full-screen TUI in
+the alternate buffer (`base_y = 0`) legitimately has no scrollback — that part is
+by design, not this bug.
+
+### Proposed fix (server-side)
+Detect a stale cursor: on `read`, if `cursor` is below the oldest retained `seq`
+(a gap), return a RESET signal (new `TerminalReadResult` flag) so the client
+re-reads from `cursor = 0` / a fresh screen snapshot instead of applying a partial
+tail. Longer term this folds into the real-scrollback-retention work
+(`[[spec-tmux-parity-and-beyond]]`) so the ring/idle-trim no longer evicts live
+content a connected client still needs.
+
+### Code locations
+`crates/yggterm-server/src/terminal.rs`: `PtySessionRuntime::read` (the
+`filter(seq > cursor)` branch), `trim_chunk_buffer`, `MAX_BUFFER_BYTES`,
+`IDLE_TRIM_MAX_BYTES`, `TerminalReadResult` (needs a gap/reset field).
+
+### Related memory
+`[[spec-tmux-parity-and-beyond]]`, `[[finding-hot-switch-latency-remount]]`
 
 ---
 
