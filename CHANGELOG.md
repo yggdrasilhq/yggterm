@@ -4,6 +4,16 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+- App-control surface health no longer raises a false "empty/plain-shell surface"
+  problem (and the spurious fault-recovery it drives) when the yggterm window is not
+  focused. A buffer read taken with the window unfocused (e.g. during an app-control
+  query, or while another app is foreground) is captured on blur and can read back
+  empty/sparse even though the canvas is painting live content; the detector now
+  abstains on such low-confidence reads when a live daemon paint frame is present and
+  it isn't a transport error. Genuinely stuck/stale surfaces (no live paint frame)
+  and focused-window surfaces are still diagnosed. See docs/xterm-bugs.md
+  (surface-recovery-false-positive-on-transient → "second cause").
+
 ## 2.8.15
 
 - Reverted 2.8.14's middle-output re-sync again. Under active work it fired during
