@@ -59,6 +59,59 @@ LIVE_HOST=$(cat .agents/config/live-host)
 ssh "$LIVE_HOST" "~/.local/bin/yggterm server app terminal probe-type --mode xterm --data '__PROBE__'"
 ```
 
+## Driving + monitoring user-granted sessions (end-user testing)
+
+The user may explicitly **grant** specific live sessions for the agent to drive and
+monitor as a production end-user test (e.g. "I give you access to my erome systemd
+and samplenotes sessions"). Only drive sessions the user has explicitly granted in the
+current conversation. Pattern:
+
+```bash
+LIVE_HOST=$(cat .agents/config/live-host)
+S="remote-session://dev/<uuid>"   # a granted session
+# 1) focus first — input is gated on focus; a cold-attached session is often
+#    input_enabled=false until focused (focusing re-enables it).
+ssh "$LIVE_HOST" "~/.local/bin/yggterm server app terminal focus '$S'"
+# 2) type a prompt
+ssh "$LIVE_HOST" "~/.local/bin/yggterm server app terminal probe-type '$S' --data 'continue' --enter"
+```
+
+**PRECONDITION — codex/CC must be at its interactive composer.** probe-type input only
+lands when the agent CLI is at its live input prompt. Check the probe-type result:
+`visible_echo: true` ⇒ it landed; **`reason: visible_echo_missing`** ⇒ it did NOT —
+the CLI is showing normal-buffer content (a transcript / finished output), not the
+composer, so nothing you send registers. Don't keep sending into a non-composer; ask
+the user to bring the CLI to its idle prompt, or capture-and-confirm first.
+
+### Arrow keys / menu navigation (no extra flags needed)
+probe-type `--data` is sent as **raw PTY bytes** (via the xterm core trigger), so send
+escape sequences directly using bash `$'...'` quoting. Down-arrow is `\x1b[B` (normal
+cursor mode) or `\x1bOB` (application cursor mode — check
+`app state` → `xterm_application_cursor_keys_mode`):
+
+```bash
+# codex "full access" via /permissions: open menu, Down twice, Enter
+ssh "$LIVE_HOST" "~/.local/bin/yggterm server app terminal probe-type '$S' --data '/permissions' --enter"
+ssh "$LIVE_HOST" "~/.local/bin/yggterm server app terminal probe-type '$S' --data \$'\x1b[B\x1b[B\r'"
+```
+**Verify the menu opened with a screenshot BEFORE sending Enter** — sending arrows+Enter
+blind into a non-menu risks selecting the wrong permission level. (Codex full-access
+selector = Down ×2 from the top, per the user.)
+
+### Rapid-frame capture of loading artifacting
+Loading/switch artifacting is transient and inconsistent — hard to describe in words.
+Capture a burst of frames right after sending a prompt:
+
+```bash
+# ~10 frames, ~1s apart, then pull a strategic subset to inspect
+ssh "$LIVE_HOST" 'for i in $(seq 1 10); do ~/.local/bin/yggterm server app screenshot /tmp/load-$i.png >/dev/null 2>&1; sleep 0.6; done'
+for i in 1 3 5 7 9; do scp -q "$LIVE_HOST:/tmp/load-$i.png" /tmp/load-$i.png; done
+```
+Then Read the frames and compare adjacent ones for the artifact (squished width, blank
+flash, scroll jump, broken prompt region). Cross-check with `probe-scroll`'s
+`dom_census` + buffer state — screenshots can be fuzzy/stale; the xterm buffer text and
+counters are the ground truth.
+
 ## Panel Navigation
 
 ```bash
