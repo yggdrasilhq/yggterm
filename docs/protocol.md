@@ -606,7 +606,7 @@ The terminal proof bar is:
 - Active session path matches selected terminal.
 - `expected_path.listed == true` and `expected_path.terminal_keyed == true` for
   a reachable owner route.
-- `input_enabled=true` only after runtime truth is current.
+- `foreground_input_ready=true` only after runtime truth is current.
 - `problem=null`.
 - `geometry_problem=null`.
 - `terminal_content_source=daemon_pty`.

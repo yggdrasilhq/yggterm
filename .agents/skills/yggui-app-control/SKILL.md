@@ -85,7 +85,7 @@ different tools:
 LIVE_HOST=$(cat .agents/config/live-host)
 S="remote-session://dev/<uuid>"   # a granted session
 # 1) focus first — input is gated on focus; a cold-attached session is often
-#    input_enabled=false until focused (focusing re-enables it).
+#    host_stdin_enabled=false until focused (focusing re-enables it).
 ssh "$LIVE_HOST" "~/.local/bin/yggterm server app terminal focus '$S'"
 # 2) drive a prompt (Enter is part of the data — append \r, or codex won't submit)
 ssh "$LIVE_HOST" "~/.local/bin/yggterm server app terminal send '$S' --data \$'continue\r'"
@@ -119,7 +119,7 @@ observability surface is currently UNRELIABLE and the readings contradict each o
 - `server app screenshot` can return a STALE frame (Wayland snapshot fallback) that
   doesn't reflect the latest paint.
 - `probe-scroll` `visible_text` reads **inconsistently call-to-call** — sometimes the
-  live composer text, sometimes empty (`xterm_session_snapshot_reason: input_disabled`).
+  live composer text, sometimes empty (`xterm_session_snapshot_reason: focus_released`).
 - `redraw`'s own embedded snapshot may show live content while the next probe-scroll
   shows empty.
 This inconsistency is itself a tracked bug (see the convergent root cause:
