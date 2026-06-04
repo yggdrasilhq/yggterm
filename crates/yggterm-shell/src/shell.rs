@@ -58895,6 +58895,47 @@ fn terminal_eval_script_with_canvas_renderer(
                     return null;
                 }}
                 window.__yggtermXtermSessionSnapshots = window.__yggtermXtermSessionSnapshots || {{}};
+                // XTERM-BUG: blank-viewport-client-snapshot-poison
+                // Do NOT let a collapsed/near-blank frame overwrite a good cached
+                // snapshot. A blank codex/TUI frame still has >=1 nonblank cell
+                // (composer border / "›"), so the nonblankLineCount<=0 guard above
+                // is not enough: a 1-nonblank-line frame would be cached and then
+                // restored on hot-reveal, showing blank and self-perpetuating
+                // (blank begets blank). Track each session's historical nonblank
+                // max; if a new frame collapses to <=1 nonblank line for a session
+                // that previously had real content (max>=6), keep the prior good
+                // snapshot instead. The daemon authoritative replay (the source of
+                // truth) reconciles the displayed content; this only stops the
+                // client cache from latching a poison frame. A legitimately cleared
+                // session (daemon also blank) is corrected by daemon reconciliation.
+                window.__yggtermXtermSessionNonblankMax = window.__yggtermXtermSessionNonblankMax || {{}};
+                const priorNonblankMax = Math.max(
+                    0,
+                    Number(window.__yggtermXtermSessionNonblankMax[sessionPath] || 0)
+                );
+                const collapsedPoisonFrame = nonblankLineCount <= 1 && priorNonblankMax >= 6;
+                if (collapsedPoisonFrame) {{
+                    const priorSnapshot = window.__yggtermXtermSessionSnapshots[sessionPath] || null;
+                    const priorEntry = window.__yggtermXtermHosts && window.__yggtermXtermHosts[hostId]
+                        ? window.__yggtermXtermHosts[hostId]
+                        : null;
+                    if (priorEntry) {{
+                        priorEntry.lastXtermSessionSnapshotCollapsedSkipReason =
+                            `collapsed_poison_frame:nonblank_${{nonblankLineCount}}_prior_max_${{priorNonblankMax}}`;
+                        priorEntry.lastXtermSessionSnapshotCollapsedSkipAtMs = Date.now();
+                    }}
+                    sendTerminalEvent({{
+                        kind: 'debug',
+                        message: `xterm_session_snapshot_collapsed_skip host=${{hostId}} nonblank=${{nonblankLineCount}} prior_max=${{priorNonblankMax}} reason=${{String(reason || '')}}`
+                    }});
+                    // Return the retained good snapshot (if any) so callers still
+                    // observe a non-poison frame; do not overwrite the cache.
+                    return priorSnapshot;
+                }}
+                window.__yggtermXtermSessionNonblankMax[sessionPath] = Math.max(
+                    priorNonblankMax,
+                    nonblankLineCount
+                );
                 const snapshot = {{
                     sessionPath,
                     hostId,
@@ -58925,6 +58966,9 @@ fn terminal_eval_script_with_canvas_renderer(
                         .forEach(([key]) => {{
                             try {{
                                 delete window.__yggtermXtermSessionSnapshots[key];
+                                if (window.__yggtermXtermSessionNonblankMax) {{
+                                    delete window.__yggtermXtermSessionNonblankMax[key];
+                                }}
                             }} catch (_error) {{}}
                         }});
                 }}
@@ -59870,6 +59914,20 @@ fn terminal_eval_script_with_canvas_renderer(
             }} catch (_error) {{}}
             return debug;
         }};
+        // XTERM-BUG: blank-viewport-client-snapshot-poison
+        // A cached frame that collapsed to <=1 nonblank line for a session that
+        // previously held real content (tracked nonblank max >= 6) is almost
+        // certainly a poison/blank frame. Treat it as unusable so restore/replay
+        // falls through to the daemon authoritative content (source of truth).
+        const xtermSessionSnapshotIsCollapsedPoison = (sessionPath, nonblankLineCount) => {{
+            try {{
+                const maxMap = window.__yggtermXtermSessionNonblankMax || {{}};
+                const priorMax = Math.max(0, Number(maxMap[sessionPath] || 0));
+                return Number(nonblankLineCount) <= 1 && priorMax >= 6;
+            }} catch (_error) {{
+                return false;
+            }}
+        }};
         const latestXtermSessionSnapshotForCurrentSession = () => {{
             try {{
                 const sessionPath = currentHostSessionPath();
@@ -59890,6 +59948,15 @@ fn terminal_eval_script_with_canvas_renderer(
                 );
                 const nonblankLineCount = Number(snapshot.nonblankLineCount || 0);
                 if (!text.trim() || lineCount <= 0 || nonblankLineCount <= 0) {{
+                    return null;
+                }}
+                // XTERM-BUG: blank-viewport-client-snapshot-poison (restore guard)
+                // Reject a sparse snapshot for a session that previously had real
+                // content. Returning null here means the client-snapshot restore is
+                // skipped, the surface stays empty, and the EXISTING, well-tested
+                // empty-surface fault-recovery re-replays from the daemon (source of
+                // truth). Defense-in-depth paired with the capture-side poison guard.
+                if (xtermSessionSnapshotIsCollapsedPoison(sessionPath, nonblankLineCount)) {{
                     return null;
                 }}
                 return {{ ...snapshot, ageMs, lineCount, nonblankLineCount }};
@@ -64871,6 +64938,20 @@ fn terminal_replay_retained_data_script_for_session(
             }} catch (_error) {{}}
             return debug;
           }};
+          // XTERM-BUG: blank-viewport-client-snapshot-poison (replay-script copy)
+          // Mirror of the bootstrap-script guard (separate eval scope). A frame
+          // collapsed to <=1 nonblank line for a session whose tracked nonblank
+          // max is >=6 is a poison frame; reject it so the daemon authoritative
+          // replay wins.
+          const xtermSessionSnapshotIsCollapsedPoison = (sessionPath, nonblankLineCount) => {{
+            try {{
+              const maxMap = window.__yggtermXtermSessionNonblankMax || {{}};
+              const priorMax = Math.max(0, Number(maxMap[sessionPath] || 0));
+              return Number(nonblankLineCount) <= 1 && priorMax >= 6;
+            }} catch (_error) {{
+              return false;
+            }}
+          }};
           const sessionSnapshotForReplay = () => {{
             try {{
               const snapshots = window.__yggtermXtermSessionSnapshots || {{}};
@@ -64893,6 +64974,13 @@ fn terminal_replay_retained_data_script_for_session(
                 return null;
               }}
               if (visibleTextHasInternalTransportLeak(text)) {{
+                return null;
+              }}
+              // XTERM-BUG: blank-viewport-client-snapshot-poison (replay guard)
+              // Same defense as the construct-time restore: never replay a sparse
+              // snapshot for a session that previously had real content; fall
+              // through to the daemon authoritative replay instead.
+              if (xtermSessionSnapshotIsCollapsedPoison(sessionPath, nonblankLineCount)) {{
                 return null;
               }}
               return {{
@@ -73968,6 +74056,49 @@ mod tests {
         assert!(script.contains(
             "entry.lastXtermSessionSnapshotNonblankLineCount = snapshot.nonblankLineCount;"
         ));
+    }
+
+    #[test]
+    fn terminal_eval_script_guards_against_blank_viewport_snapshot_poison() {
+        // Regression lock for the blank-viewport-client-snapshot-poison fix
+        // (see finding-blank-viewport-client-snapshot-poison). The capture path
+        // must track a per-session nonblank max and refuse to overwrite a good
+        // cached frame with a collapsed (<=1 nonblank line) one; the restore and
+        // replay paths must reject such a collapsed frame so the daemon
+        // authoritative content wins.
+        let theme = terminal_theme(UiTheme::ZedLight, palette(UiTheme::ZedLight), 13.0, "");
+        let script = terminal_eval_script("yggterm-terminal-test", &theme, true);
+        // Capture-side: nonblank-max tracking + collapsed-frame skip.
+        assert!(script.contains(
+            "window.__yggtermXtermSessionNonblankMax = window.__yggtermXtermSessionNonblankMax || {};"
+        ));
+        assert!(script.contains("const collapsedPoisonFrame = nonblankLineCount <= 1 && priorNonblankMax >= 6;"));
+        assert!(
+            script.contains("window.__yggtermXtermSessionNonblankMax[sessionPath] = Math.max("),
+            "capture must record the per-session nonblank max"
+        );
+        // Restore-side guard helper (bootstrap script copy).
+        assert!(script.contains(
+            "const xtermSessionSnapshotIsCollapsedPoison = (sessionPath, nonblankLineCount) => {"
+        ));
+        assert!(script.contains("return Number(nonblankLineCount) <= 1 && priorMax >= 6;"));
+        assert!(script.contains("if (xtermSessionSnapshotIsCollapsedPoison(sessionPath, nonblankLineCount)) {"));
+    }
+
+    #[test]
+    fn retained_replay_script_guards_against_blank_viewport_snapshot_poison() {
+        // The separate retained-replay eval scope carries its own copy of the
+        // collapsed-poison guard so sessionSnapshotForReplay cannot replay a
+        // poison frame over the daemon authoritative content.
+        let script = terminal_replay_retained_data_script_for_session(
+            "remote-session://dev/abc",
+            "data",
+            "daemon_retained_history_screen_snapshot",
+        );
+        assert!(script.contains(
+            "const xtermSessionSnapshotIsCollapsedPoison = (sessionPath, nonblankLineCount) => {"
+        ));
+        assert!(script.contains("if (xtermSessionSnapshotIsCollapsedPoison(sessionPath, nonblankLineCount)) {"));
     }
 
     #[test]
