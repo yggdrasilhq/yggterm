@@ -47,7 +47,7 @@ xterm.js owns vs what the shell owns, cursor/prompt semantics, etc. — see
 | [surface-recovery-false-positive-on-transient](#surface-recovery-false-positive-on-transient) | "Shadow" blank flash + multi-second re-gate, and (worse) input-disable → re-resume → exhaust → session yanked closed, all triggered by a TUI's normal clear+redraw transient misread as a broken/empty/non-prompt surface | FIXED 2026-06-03 (settle-gates) — empty-surface 2.8.11, non-prompt 4-point fix |
 | [persisted-scroll-restore-fights-follow](#persisted-scroll-restore-fights-follow) | After GUI restart, every click/keystroke flickers between a saved scroll offset and the live bottom | FIXED 2026-06-02 |
 | [xterm-host-registry-leak](#xterm-host-registry-leak) | Switching/restarting sessions accumulates orphaned xterm.js instances (cleanup keyed to mount epoch that changes on remount) → growing latency on selection/paste/switch | FIXED 2026-06-02 |
-| [chunk-ring-trim-drops-mid-stream](#chunk-ring-trim-drops-mid-stream) | Middle chunks of TUI output silently missing: yggterm-server chunk ring trims oldest while a client's read-cursor is behind the trim, and read(cursor) returns only surviving chunks with no gap signal | OPEN — audit 2026-06-03, server-side protocol fix needed |
+| [chunk-ring-trim-drops-mid-stream](#chunk-ring-trim-drops-mid-stream) | Middle chunks of TUI output silently missing: yggterm-server chunk ring trims oldest while a client's read-cursor is behind the trim, and read(cursor) returns only surviving chunks with no gap signal | LAYER 1 DONE 2026-06-04 (read() detects + signals `resync_required`, no longer silent; tested) — LAYER 2 pending (propagate to client + re-attach, live-risky) |
 
 ---
 
@@ -1181,18 +1181,40 @@ middle rows. Ruled out as NOT the cause this round: GUI transport
 the alternate buffer (`base_y = 0`) legitimately has no scrollback — that part is
 by design, not this bug.
 
-### Proposed fix (server-side)
-Detect a stale cursor: on `read`, if `cursor` is below the oldest retained `seq`
-(a gap), return a RESET signal (new `TerminalReadResult` flag) so the client
-re-reads from `cursor = 0` / a fresh screen snapshot instead of applying a partial
-tail. Longer term this folds into the real-scrollback-retention work
-(`[[spec-tmux-parity-and-beyond]]`) so the ring/idle-trim no longer evicts live
+### Fix — layer 1 DONE (2026-06-04): detect + signal at the source of truth
+Why signal-and-re-attach instead of the 2.8.12/14 in-band replay: those re-sent
+history+screen inside `read()` and corrupted alternate-screen TUIs (normal-buffer
+history written into the alt screen) and cleared normal-buffer scrollback (`\x1b[3J`),
+and fired during recovery churn — the TRAP (see
+`[[incident-gap-fix-cascade-2026-06-03]]`). Detecting the gap and letting the client
+recover via its EXISTING re-attach path (which is already alt-screen-correct and reads
+the full vt100 scrollback, `DAEMON_VT_SCROLLBACK_ROWS` = 10 000) avoids all three.
+
+`PtySessionRuntime::read(cursor)` now computes
+`resync_required = effective_cursor > 0 && oldest_retained.seq > effective_cursor + 1`
+and returns it on `TerminalReadResult`. So the gap is no longer SILENT at the source.
+Covered by `tests/pipeline_integration.rs::read_from_cursor_never_silently_drops_trimmed_middle_chunks`
+(drives the ring past `MAX_CHUNKS` with a client behind the trim; asserts contiguous
+OR `resync_required`). No runtime behavior change yet — the flag is not consumed
+downstream (see layer 2).
+
+### Fix — layer 2 PENDING: propagate + client re-attach (the live-risky part)
+`resync_required` must be threaded through the socket/SSH protocol → the flattened
+tuple in `terminal_read_with_local_daemon_recovery` (lib.rs ~13498) and the bridge
+stream handler (lib.rs ~13587, which currently drops it) → the GUI read-bridge
+(`shell.rs`), where it triggers a clean re-attach (read from cursor 0 / fresh screen
+snapshot) instead of appending the discontiguous tail. This is multi-layer and must be
+live-verified against the real repro (a BACKGROUNDED session streaming past the ring
+cap, then switch-back) before shipping. Longer term this folds into real-scrollback
+retention (`[[spec-tmux-parity-and-beyond]]`) so the ring/idle-trim never evicts live
 content a connected client still needs.
 
 ### Code locations
-`crates/yggterm-server/src/terminal.rs`: `PtySessionRuntime::read` (the
-`filter(seq > cursor)` branch), `trim_chunk_buffer`, `MAX_BUFFER_BYTES`,
-`IDLE_TRIM_MAX_BYTES`, `TerminalReadResult` (needs a gap/reset field).
+`crates/yggterm-server/src/terminal.rs`: `PtySessionRuntime::read` (gap detection +
+`resync_required`), `trim_chunk_buffer`, `MAX_BUFFER_BYTES`, `IDLE_TRIM_MAX_BYTES`,
+`TerminalReadResult.resync_required`. Layer 2: `lib.rs`
+`terminal_read_with_local_daemon_recovery` + the bridge stream loop; `shell.rs`
+read-bridge.
 
 ### Related memory
 `[[spec-tmux-parity-and-beyond]]`, `[[finding-hot-switch-latency-remount]]`
