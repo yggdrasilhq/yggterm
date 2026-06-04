@@ -369,6 +369,38 @@ fn codex_inline_committed_lines_reach_daemon_scrollback() {
 }
 
 #[test]
+fn codex_reveal_serves_scrollback_history_to_client() {
+    // DECISIVE localization for the codex scroll-lock: does the daemon's REVEAL
+    // (read(cursor=0), the path a client uses on mount/switch-back) actually SERVE
+    // the captured scrollback history to the client, or only the current screen?
+    // Use a codex-runtime:// key so the real codex reveal path
+    // (prefer_initial_screen_snapshot / history_and_screen_replay) is exercised.
+    // If the reveal payload contains the committed scrolled-off lines, the daemon
+    // side is correct and the scroll-lock is a CLIENT-side xterm load bug
+    // (fixable GUI-only, no daemon restart). If not, the reveal selection is the bug.
+    let mut mgr = TerminalManager::new();
+    let key = "codex-runtime://test-reveal";
+    mgr.ensure_session(
+        key,
+        &launch("--scenario codex-inline --rows 80 --screen-rows 24 --repaints 8 --hold-ms 4000"),
+        None,
+    )
+    .expect("ensure_session");
+    wait_for_output(&mgr, key);
+    let reveal = read_from_zero(&mgr, key);
+    assert!(
+        reveal.contains("CODEX_MSG_0000"),
+        "the daemon REVEAL (read(0)) must serve the oldest committed scrolled-off \
+         line to the client — if absent, the reveal drops scrollback; tail {:?}",
+        &reveal[reveal.len().saturating_sub(200)..]
+    );
+    assert!(
+        reveal.contains("CODEX_MSG_0079"),
+        "the reveal must also include the most recent committed line"
+    );
+}
+
+#[test]
 fn clear_storm_does_not_corrupt_final_frame() {
     let mut mgr = TerminalManager::new();
     let key = "test://clear-storm";
