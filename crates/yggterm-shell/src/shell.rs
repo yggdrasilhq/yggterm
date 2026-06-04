@@ -46483,6 +46483,7 @@ fn TerminalCanvas(
                         _eof,
                         _post_resize_output_seen,
                         _last_resize_seq,
+                        _resync_required,
                     )| {
                         (
                             chunks
@@ -50146,7 +50147,30 @@ fn TerminalCanvas(
                                 runtime_eof_without_output,
                                 post_resize_output_seen,
                                 last_resize_seq,
+                                resync_required,
                             )) => {
+                                // Layer 2 (carry + observe): the daemon flagged that
+                                // the chunk ring trimmed below our cursor, so these
+                                // chunks skip a contiguous middle
+                                // (docs/xterm-bugs.md#chunk-ring-trim-drops-mid-stream).
+                                // For now we only TRACE it — the re-attach action
+                                // (read from cursor 0 to recover the gap from the vt100
+                                // scrollback) lands in a follow-up, gated on live
+                                // verification against a backgrounded-stream repro.
+                                if resync_required {
+                                    append_trace_event(
+                                        &trace_home,
+                                        "ui",
+                                        "terminal_mount",
+                                        "terminal_stream_resync_required",
+                                        json!({
+                                            "session_path": runtime_session_path,
+                                            "cursor": cursor,
+                                            "next_cursor": next_cursor,
+                                            "chunks": chunks.len(),
+                                        }),
+                                    );
+                                }
                                 let cursor_rewound =
                                     terminal_read_cursor_rewound(cursor, next_cursor);
                                 if cursor_rewound {
@@ -54503,6 +54527,11 @@ async fn terminal_read_async(
     bool,
     bool,
     u64,
+    // resync_required — the live chunk ring trimmed below `cursor`; the client must
+    // re-attach to recover the gap (docs/xterm-bugs.md#chunk-ring-trim-drops-mid-stream
+    // layer 2). Carried through to the read-bridge; the re-attach action lands in a
+    // follow-up.
+    bool,
 )> {
     run_dedicated_terminal_io("terminal_read", trace_home, move || {
         terminal_read(&endpoint, &session_path, cursor)

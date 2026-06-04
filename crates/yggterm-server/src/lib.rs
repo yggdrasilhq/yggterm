@@ -13499,7 +13499,7 @@ fn terminal_read_with_local_daemon_recovery(
     endpoint: &ServerEndpoint,
     path: &str,
     cursor: u64,
-) -> anyhow::Result<(u64, Vec<TerminalStreamChunk>, bool, bool, bool, bool, u64)> {
+) -> anyhow::Result<(u64, Vec<TerminalStreamChunk>, bool, bool, bool, bool, u64, bool)> {
     let mut last_error = None::<anyhow::Error>;
     for attempt in 0..=5_u64 {
         match terminal_read(endpoint, path, cursor) {
@@ -13592,6 +13592,13 @@ fn bridge_remote_runtime_session_stdio(
             eof_without_output,
             _post_resize_output_seen,
             _last_resize_seq,
+            // Carried end-to-end (docs/xterm-bugs.md#chunk-ring-trim-drops-mid-stream
+            // layer 2). Consumed in a follow-up: when set, the bridge/GUI must
+            // re-attach (read from cursor 0) to recover the trimmed middle from the
+            // vt100 scrollback instead of streaming the discontiguous tail. Bound
+            // with a leading underscore until that re-attach lands so this plumbing
+            // is a pure no-op carry.
+            _resync_required,
         ) = terminal_read_with_local_daemon_recovery(endpoint, path, cursor)?;
         let chunks_have_visible_text = chunks
             .iter()
