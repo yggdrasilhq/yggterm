@@ -84,10 +84,19 @@ different tools:
 ```bash
 LIVE_HOST=$(cat .agents/config/live-host)
 S="remote-session://dev/<uuid>"   # a granted session
-# 1) focus first — input is gated on focus; a cold-attached session is often
-#    host_stdin_enabled=false until focused (focusing re-enables it).
+# PREFERRED for prompt insertion: `terminal submit` is readiness-gated — it WAITS
+# until the session is at an idle interactive codex prompt, then sends; it refuses
+# (writes nothing) if the session never becomes ready within --ready-timeout-ms.
+# This is the SAFE insertion path. A raw `send` of "...\r" into a session that is
+# mid-task, at a menu, or showing a pending update prompt fires Enter into the wrong
+# thing (observed live: `/permissions\r` confirmed a pending codex self-update).
+ssh "$LIVE_HOST" "~/.local/bin/yggterm server app terminal submit '$S' --data 'What is the status now?' --ready-timeout-ms 30000"
+# -> {submitted:true, waited_ms} OR {submitted:false, reason:"...did not reach an idle interactive prompt..."}
+
+# Raw `send` (NO readiness gate) — only when you KNOW the session is at its composer
+# (you just confirmed it, or you're answering a menu you can see). Enter is part of
+# the data — append \r, or codex won't submit.
 ssh "$LIVE_HOST" "~/.local/bin/yggterm server app terminal focus '$S'"
-# 2) drive a prompt (Enter is part of the data — append \r, or codex won't submit)
 ssh "$LIVE_HOST" "~/.local/bin/yggterm server app terminal send '$S' --data \$'continue\r'"
 ```
 
