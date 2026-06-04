@@ -30,7 +30,8 @@ use crate::terminal_observe::{
     terminal_chunk_has_generic_codex_idle_footer, terminal_chunk_has_meaningful_output,
     terminal_chunk_has_prompt_output, terminal_chunk_has_visible_output,
     terminal_chunk_is_codex_interactive_setup_prompt, terminal_chunk_is_codex_prompt_surface,
-    terminal_chunk_is_codex_resume_instruction, terminal_chunk_is_generic_codex_idle,
+    terminal_chunk_is_codex_resume_instruction, terminal_chunk_has_current_codex_input_row,
+    terminal_chunk_is_generic_codex_idle,
     terminal_chunk_is_loading_placeholder, terminal_chunk_is_local_codex_scaffold,
     terminal_chunk_is_low_signal_terminal_noise, terminal_chunk_is_saved_transcript_prefill,
     terminal_chunk_is_codex_session_not_on_remote, terminal_chunk_is_transcript_browser,
@@ -34699,6 +34700,124 @@ async fn process_pending_app_control_requests(
                     })),
                     error: Some(error.to_string()),
                 },
+            }
+        }
+        AppControlCommand::SubmitTerminalPrompt {
+            session_path,
+            data,
+            timeout_ms,
+        } => {
+            // Readiness-gated prompt insertion (the robust agent/automation path):
+            // poll the session's daemon screen until it shows a CURRENT codex input
+            // row (idle interactive prompt), then send. If it never becomes ready
+            // within the timeout, send NOTHING and report not-ready so the caller
+            // retries later or skips — never fire a prompt into a menu/busy/update
+            // surface. Readiness policy = terminal_chunk_has_current_codex_input_row
+            // (the same recognizer the surface-health uses), kept as SSOT here.
+            let (endpoint, runtime_session_path, trace_home) = state.with(|shell| {
+                (
+                    shell.bootstrap.server_endpoint.clone(),
+                    app_control_terminal_input_write_path(shell, &session_path),
+                    perf_home_dir(&shell.bootstrap.settings_path),
+                )
+            });
+            let timeout = Duration::from_millis(if timeout_ms == 0 { 30_000 } else { timeout_ms });
+            let started = Instant::now();
+            let mut last_screen = String::new();
+            let mut ready = false;
+            while started.elapsed() < timeout {
+                match terminal_snapshot_async(
+                    endpoint.clone(),
+                    session_path.clone(),
+                    trace_home.as_path(),
+                )
+                .await
+                {
+                    Ok((screen, _running, _rt, _pr, _rs)) => {
+                        last_screen = screen;
+                        if terminal_chunk_has_current_codex_input_row(&last_screen) {
+                            ready = true;
+                            break;
+                        }
+                    }
+                    Err(_error) => {}
+                }
+                sleep(Duration::from_millis(150)).await;
+            }
+            let waited_ms = started.elapsed().as_millis() as u64;
+            if !ready {
+                AppControlResponse {
+                    request_id: request.request_id.clone(),
+                    handled_by_pid: std::process::id(),
+                    completed_at_ms: current_millis() as u128,
+                    output_path: None,
+                    data: Some(json!({
+                        "submitted": false,
+                        "session_path": session_path,
+                        "reason": "session did not reach an idle interactive prompt within the timeout",
+                        "waited_ms": waited_ms,
+                    })),
+                    error: None,
+                }
+            } else {
+                let read_nudge_reason = app_control_terminal_input_read_nudge_reason(&data);
+                match terminal_write_app_control_input_async(
+                    endpoint,
+                    runtime_session_path,
+                    session_path.clone(),
+                    data.clone(),
+                    read_nudge_reason,
+                    trace_home.as_path(),
+                )
+                .await
+                {
+                    Ok(write_report) => {
+                        let _ = safe_shell_mut(
+                            state,
+                            "app_control_submit_terminal_prompt_schedule_live_snapshot_refresh",
+                            |shell| {
+                                schedule_live_session_snapshot_after_terminal_input(
+                                    shell,
+                                    &session_path,
+                                    false,
+                                );
+                            },
+                        );
+                        let read_nudge = dispatch_terminal_external_input_read_nudge(
+                            &session_path,
+                            read_nudge_reason,
+                        )
+                        .await;
+                        AppControlResponse {
+                            request_id: request.request_id.clone(),
+                            handled_by_pid: std::process::id(),
+                            completed_at_ms: current_millis() as u128,
+                            output_path: None,
+                            data: Some(json!({
+                                "submitted": true,
+                                "session_path": session_path,
+                                "bytes": data.len(),
+                                "waited_ms": waited_ms,
+                                "read_nudge": read_nudge,
+                                "write": write_report.to_json(),
+                            })),
+                            error: None,
+                        }
+                    }
+                    Err(error) => AppControlResponse {
+                        request_id: request.request_id.clone(),
+                        handled_by_pid: std::process::id(),
+                        completed_at_ms: current_millis() as u128,
+                        output_path: None,
+                        data: Some(json!({
+                            "submitted": false,
+                            "session_path": session_path,
+                            "reason": "write failed after readiness",
+                            "waited_ms": waited_ms,
+                        })),
+                        error: Some(error.to_string()),
+                    },
+                }
             }
         }
         AppControlCommand::ReclaimTerminalFocus { session_path } => {
