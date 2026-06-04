@@ -161,7 +161,17 @@ jobs:
 
   publish-release:
     name: Publish GitHub release assets
-    if: startsWith(github.ref, 'refs/tags/v')
+    # Publish whatever platform artifacts DID build. The Windows/macOS cross-package
+    # legs have been failing (see scripts/package-platform-release.sh), which — with a
+    # plain `needs:` — skipped this job entirely and forced a manual `gh release create`
+    # every release. Gate on `always()` so the release still publishes the Linux assets
+    # as long as the Linux deb leg succeeded (a proxy for "the Linux build is good");
+    # the download step below only collects artifacts that exist, so missing
+    # Windows/macOS artifacts simply aren't attached.
+    if: >-
+      always()
+      && startsWith(github.ref, 'refs/tags/v')
+      && needs.package-linux-deb.result == 'success'
     needs:
       - proof-bundles
       - package
