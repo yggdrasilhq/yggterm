@@ -57254,17 +57254,17 @@ fn terminal_eval_script_with_canvas_renderer(
             if (!changesGrid) {{
                 return true;
             }}
-            let documentFocused = true;
-            try {{
-                documentFocused = typeof document.hasFocus === 'function'
-                    ? Boolean(document.hasFocus())
-                    : true;
-            }} catch (_error) {{
-                documentFocused = true;
-            }}
-            const windowFocused = host.getAttribute('data-terminal-window-focused') === 'true'
-                && host.getAttribute('data-terminal-app-control-backgrounded') !== 'true';
-            if (windowFocused && documentFocused) {{
+            // A visible, usable host must be allowed to re-fit its grid even when the
+            // OS reports the window as unfocused. On KDE/Wayland document.hasFocus()
+            // returns false for a perfectly visible FOREGROUND window, and the old
+            // focus gate (windowFocused && documentFocused) then froze the grid at a
+            // stale width — the "squished viewport" (codex TUI wrapping at ~10% of the
+            // host width). hostLooksUsable() already excludes hidden / off-screen /
+            // too-small hosts, and the explicit app-control-backgrounded flag covers
+            // deliberate backgrounding, so visibility is the correct gate — not focus.
+            const appControlBackgrounded =
+                host.getAttribute('data-terminal-app-control-backgrounded') === 'true';
+            if (!appControlBackgrounded && hostLooksUsable()) {{
                 return true;
             }}
             recordSkippedFit(reasonText, proposed, cause);
@@ -74945,8 +74945,16 @@ mod tests {
                 && script.contains("fitTerminalToHost('resize');")
                 && script.contains("const resizeMutationAllowed = (reason, proposed, cause = 'unfocused_resize_observer') => {")
                 && script.contains("lastResizeKey === '' || reasonText !== 'resize'")
-                && script.contains("recordSkippedFit(reasonText, proposed, cause);"),
-            "the shell bridge should explicitly fit xterm to the live host instead of leaving the canvas at the bootstrap 80x24 size"
+                && script.contains("recordSkippedFit(reasonText, proposed, cause);")
+                // A visible, usable host must re-fit its grid regardless of OS focus:
+                // KDE/Wayland reports document.hasFocus()==false for a visible
+                // foreground window, and the old focus gate froze the grid at a stale
+                // width (squished viewport). Lock the visibility-based gate so the
+                // focus regression cannot return.
+                && script
+                    .contains("if (!appControlBackgrounded && hostLooksUsable()) {")
+                && !script.contains("if (windowFocused && documentFocused) {"),
+            "the shell bridge should explicitly fit xterm to the live host instead of leaving the canvas at the bootstrap 80x24 size, gating grid resizes on host visibility (not OS focus, which Wayland reports wrong)"
         );
         assert!(
             script.contains("pendingVisiblePaintRecovery: false,")
