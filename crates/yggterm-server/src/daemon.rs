@@ -11721,6 +11721,12 @@ mod tests {
         let client_instances = sockets_dir.join("client-instances");
         fs::create_dir_all(&client_instances).expect("create client instances dir");
         let current = sockets_dir.join("server-2-1-5.sock");
+        // default_endpoint relocates the socket out of `sockets_dir` when the
+        // path would exceed SUN_LEN (e.g. a deep $TMPDIR), so create the resolved
+        // parent before writing — a no-op when the socket stays in sockets_dir.
+        if let Some(parent) = current.parent() {
+            fs::create_dir_all(parent).expect("create current socket parent");
+        }
         fs::write(&current, b"").expect("write current socket placeholder");
         fs::create_dir_all(client_instances.join("unix--home-pi--yggterm-server-2-1-4-sock"))
             .expect("create old instance dir");
@@ -11745,6 +11751,12 @@ mod tests {
         else {
             panic!("unix test requires unix socket endpoint");
         };
+        // default_endpoint relocates the socket out of `sockets_dir` when the
+        // path would exceed SUN_LEN (e.g. a deep $TMPDIR), so create the resolved
+        // parent before writing — a no-op when the socket stays in sockets_dir.
+        if let Some(parent) = current.parent() {
+            fs::create_dir_all(parent).expect("create current socket parent");
+        }
         fs::write(&current, b"").expect("write current socket placeholder");
         std::os::unix::fs::symlink(&current, sockets_dir.join("server-2-1-102.sock"))
             .expect("create 2.1.102 alias");
@@ -11772,6 +11784,12 @@ mod tests {
             panic!("unix test requires unix socket endpoint");
         };
         let legacy = sockets_dir.join("server-2-6-2.sock");
+        // default_endpoint relocates the socket out of `sockets_dir` when the
+        // path would exceed SUN_LEN (e.g. a deep $TMPDIR), so create the resolved
+        // parent before writing — a no-op when the socket stays in sockets_dir.
+        if let Some(parent) = current.parent() {
+            fs::create_dir_all(parent).expect("create current socket parent");
+        }
         fs::write(&current, b"").expect("write current socket placeholder");
         fs::write(&legacy, b"").expect("write legacy socket placeholder");
         std::os::unix::fs::symlink(&current, sockets_dir.join("server-2-1-102.sock"))
