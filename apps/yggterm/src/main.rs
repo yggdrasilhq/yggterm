@@ -51,8 +51,8 @@ use yggterm_server::{
     run_app_control_start_action, run_app_control_trigger_update_check, run_attach, run_daemon,
     ScreenshotPostProcess, run_screenrecord_capture, run_screenshot_capture,
     run_screenshot_capture_with_post_process, run_trace_bundle, run_trace_follow, run_trace_tail,
-    shutdown, snapshot, start_local_session, status, terminal_restart, terminal_write,
-    try_run_remote_server_command,
+    shutdown, snapshot, start_local_session, status, terminal_restart, terminal_retained_snapshot,
+    terminal_snapshot, terminal_write, try_run_remote_server_command,
 };
 use yggterm_shell::{
     ShellBootstrap, launch_shell, start_daemon_watchdog, terminal_identity_appearance_for_settings,
@@ -681,6 +681,7 @@ fn print_server_help() {
   yggterm server snapshot
   yggterm server shutdown
   yggterm server terminal write <session> (--data <data>|--stdin)
+  yggterm server terminal screen <session> [--retained] [--raw]
   yggterm server terminal restart <session> [--terminal-appearance <dark|light>] [--force-remote]
   yggterm server sessions regenerate-copy [--budget <n>] [--force] [--reset-summary-history] [--json]
   yggterm server smoke
@@ -906,6 +907,48 @@ fn main() -> Result<()> {
                 "bytes": data.len(),
             }))?
         );
+        return Ok(());
+    }
+    // Dump the daemon's vt100 screen for a session — the ground truth BEFORE
+    // xterm.js renders it. Compare against the GUI's xterm buffer (app terminal
+    // probe-scroll) to tell whether a blank/garbled viewport is a real session
+    // problem or an xterm.js render/replay bug. `--retained` uses the full
+    // scrollback snapshot; default is the current live screen.
+    if args.len() >= 4 && args[0] == "server" && args[1] == "terminal" && args[2] == "screen" {
+        // Read-only diagnostic: talk to whatever daemon currently holds the socket,
+        // regardless of version. Do NOT call ensure_local_server_ready_for_cli — its
+        // "is current" version gate would reject an older running daemon and try to
+        // spawn a competing one (which fails while the socket is held), so a screen
+        // dump must connect directly like `server status` / `server snapshot` do.
+        let endpoint = default_endpoint(store.home_dir());
+        let retained = args.iter().any(|arg| arg == "--retained");
+        let raw = args.iter().any(|arg| arg == "--raw");
+        let (text, running, runtime_output_seen, post_resize_output_seen, last_resize_seq) =
+            if retained {
+                terminal_retained_snapshot(&endpoint, &args[3])?
+            } else {
+                terminal_snapshot(&endpoint, &args[3])?
+            };
+        if raw {
+            print!("{text}");
+        } else {
+            let nonblank = text.lines().filter(|line| !line.trim().is_empty()).count();
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "session_path": args[3],
+                    "source": if retained { "retained_snapshot" } else { "live_screen" },
+                    "running": running,
+                    "runtime_output_seen": runtime_output_seen,
+                    "post_resize_output_seen": post_resize_output_seen,
+                    "last_resize_seq": last_resize_seq,
+                    "line_count": text.lines().count(),
+                    "nonblank_line_count": nonblank,
+                    "char_count": text.chars().count(),
+                    "text": text,
+                }))?
+            );
+        }
         return Ok(());
     }
     if args.len() >= 4 && args[0] == "server" && args[1] == "terminal" && args[2] == "restart" {
