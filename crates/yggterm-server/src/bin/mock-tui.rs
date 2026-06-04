@@ -113,6 +113,26 @@ fn main() {
                  gpt-mock \u{00b7} ~/mock"
             );
         }
+        // INTERACTIVE: echo each stdin line back as `ECHO: <line>`. Exercises the
+        // full agent-session-control drive loop (write -> PTY -> program -> read):
+        // a test sends a prompt and asserts the program received + responded.
+        "echo" => {
+            let _ = write!(w, "MOCK_ECHO_READY\r\n");
+            let _ = w.flush();
+            run_echo(&mut w);
+            hold(&args);
+            return;
+        }
+        // INTERACTIVE: a 3-option selector (Default / Auto-review / Full Access),
+        // navigated with up/down arrows and committed with Enter — the shape of
+        // codex's `/permissions` menu. On Enter it prints `SELECTED: <option>` so a
+        // test (or the live permission flow) can assert the right item was chosen
+        // via arrow-key driving. Exercises escape-sequence input delivery.
+        "menu" => {
+            run_permission_menu(&mut w, &args);
+            hold(&args);
+            return;
+        }
         // Plain shell-ish prompt (normal buffer, minimal output).
         _ => {
             let _ = write!(w, "$ MOCK_TUI_PROMPT\r\n$ ");
@@ -132,6 +152,85 @@ fn main() {
     });
 
     hold(&args);
+}
+
+/// Read stdin line-by-line and echo each back as `ECHO: <line>`. A bare CR or LF
+/// commits a line. Runs until stdin closes or the hold window elapses (the caller
+/// holds the PTY open afterward).
+fn run_echo(w: &mut impl Write) {
+    let mut stdin = io::stdin();
+    let mut buf = [0u8; 1024];
+    let mut line: Vec<u8> = Vec::new();
+    while let Ok(n) = stdin.read(&mut buf) {
+        if n == 0 {
+            break;
+        }
+        for &byte in &buf[..n] {
+            if byte == b'\r' || byte == b'\n' {
+                let text = String::from_utf8_lossy(&line);
+                let _ = write!(w, "ECHO: {text}\r\n");
+                let _ = w.flush();
+                line.clear();
+            } else {
+                line.push(byte);
+            }
+        }
+    }
+}
+
+/// Render a 3-option permission selector and drive it from stdin arrow keys +
+/// Enter, mirroring codex's `/permissions` menu so the live "Full Access" flow has
+/// a deterministic stand-in. `--start <0..2>` seeds the highlighted option.
+fn run_permission_menu(w: &mut impl Write, args: &[String]) {
+    let options = ["Default", "Auto-review", "Full Access"];
+    let mut selected: usize = arg_value(args, "--start")
+        .and_then(|s| s.parse().ok())
+        .filter(|i| *i < options.len())
+        .unwrap_or(0);
+    let render = |w: &mut dyn Write, selected: usize| {
+        let _ = write!(w, "\x1b[2J\x1b[HUpdate Model Permissions\r\n");
+        for (ix, opt) in options.iter().enumerate() {
+            let marker = if ix == selected { ">" } else { " " };
+            let _ = write!(w, "{marker} {opt}\r\n");
+        }
+        let _ = write!(w, "Press enter to confirm or esc to go back\r\n");
+        let _ = w.flush();
+    };
+    render(w, selected);
+    let mut stdin = io::stdin();
+    let mut buf = [0u8; 1024];
+    let mut pending: Vec<u8> = Vec::new();
+    while let Ok(n) = stdin.read(&mut buf) {
+        if n == 0 {
+            break;
+        }
+        pending.extend_from_slice(&buf[..n]);
+        // Consume recognized sequences greedily: ESC[A (up), ESC[B (down), CR/LF.
+        loop {
+            if pending.is_empty() {
+                break;
+            }
+            if pending[0] == b'\r' || pending[0] == b'\n' {
+                pending.remove(0);
+                let _ = write!(w, "SELECTED: {}\r\n", options[selected]);
+                let _ = w.flush();
+            } else if pending.starts_with(b"\x1b[A") {
+                pending.drain(..3);
+                selected = selected.saturating_sub(1);
+                render(w, selected);
+            } else if pending.starts_with(b"\x1b[B") {
+                pending.drain(..3);
+                selected = (selected + 1).min(options.len() - 1);
+                render(w, selected);
+            } else if pending[0] == 0x1b && pending.len() < 3 {
+                // Possibly a partial escape sequence — wait for more bytes.
+                break;
+            } else {
+                // Unrecognized byte; drop it so we don't spin.
+                pending.remove(0);
+            }
+        }
+    }
 }
 
 fn hold(args: &[String]) {
