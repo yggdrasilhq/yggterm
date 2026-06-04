@@ -34799,11 +34799,27 @@ async fn process_pending_app_control_requests(
                 }
             } else {
                 let read_nudge_reason = app_control_terminal_input_read_nudge_reason(&data);
+                // Type the text first, then submit with a DISTINCT Enter — codex treats
+                // a \r concatenated with the text in one write as a pasted newline
+                // (composer content), not a submit (verified live 2026-06-04).
+                let text = data.trim_end_matches(['\r', '\n']).to_string();
+                if !text.is_empty() {
+                    let _ = terminal_write_app_control_input_async(
+                        endpoint.clone(),
+                        runtime_session_path.clone(),
+                        session_path.clone(),
+                        text,
+                        "submit_text",
+                        trace_home.as_path(),
+                    )
+                    .await;
+                    sleep(Duration::from_millis(80)).await;
+                }
                 match terminal_write_app_control_input_async(
-                    endpoint,
-                    runtime_session_path,
+                    endpoint.clone(),
+                    runtime_session_path.clone(),
                     session_path.clone(),
-                    data.clone(),
+                    "\r".to_string(),
                     read_nudge_reason,
                     trace_home.as_path(),
                 )
