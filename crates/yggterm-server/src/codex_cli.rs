@@ -778,6 +778,18 @@ pub(crate) fn sync_terminal_identity_env(theme: UiTheme) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    // These tests mutate process-global environment variables (NO_COLOR,
+    // YGGTERM_*_APPEARANCE, COLORFGBG). cargo runs tests in parallel by default,
+    // so without serialization they race and intermittently read each other's
+    // env state. Acquire this lock at the top of every env-mutating test. Poison
+    // is tolerated (into_inner) so one panicking test doesn't cascade-fail the rest.
+    static ENV_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn env_test_guard() -> std::sync::MutexGuard<'static, ()> {
+        ENV_TEST_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
 
     #[test]
     fn terminal_identity_shell_exports_unset_no_color() {
@@ -787,6 +799,7 @@ mod tests {
 
     #[test]
     fn sync_terminal_identity_env_removes_no_color() {
+        let _env = env_test_guard();
         let previous = env::var_os("NO_COLOR");
         unsafe {
             env::set_var("NO_COLOR", "1");
@@ -801,6 +814,7 @@ mod tests {
 
     #[test]
     fn sync_terminal_identity_env_preserves_explicit_terminal_appearance() {
+        let _env = env_test_guard();
         let previous_terminal = env::var_os(ENV_YGGTERM_TERMINAL_APPEARANCE);
         let previous_shell = env::var_os("YGGTERM_APPEARANCE");
         let previous_colorfgbg = env::var_os("COLORFGBG");
@@ -834,6 +848,7 @@ mod tests {
 
     #[test]
     fn terminal_identity_prefers_terminal_appearance_over_shell_appearance() {
+        let _env = env_test_guard();
         let previous_terminal = env::var_os(ENV_YGGTERM_TERMINAL_APPEARANCE);
         let previous_shell = env::var_os("YGGTERM_APPEARANCE");
         unsafe {
@@ -869,6 +884,7 @@ mod tests {
 
     #[test]
     fn terminal_identity_falls_back_to_colorfgbg_when_yggterm_vars_missing() {
+        let _env = env_test_guard();
         let previous_terminal = env::var_os(ENV_YGGTERM_TERMINAL_APPEARANCE);
         let previous_shell = env::var_os("YGGTERM_APPEARANCE");
         let previous_colorfgbg = env::var_os("COLORFGBG");
