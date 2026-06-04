@@ -279,6 +279,15 @@ pub enum AppControlCommand {
     RedrawTerminal {
         session_path: String,
     },
+    /// Drive the terminal viewport scroll position directly (not synthetic wheel
+    /// events), so an agent can scroll/navigate scrollback via app control and
+    /// verify movement. `to` is "top", "bottom", or a signed line delta
+    /// ("-10" up, "20" down). Sets UserScrollback intent for a delta/top so the
+    /// position sticks; "bottom" returns to follow.
+    ScrollTerminalViewport {
+        session_path: String,
+        to: String,
+    },
     PasteTerminalClipboard {
         session_path: String,
     },
@@ -391,6 +400,7 @@ impl AppControlCommand {
             Self::SubmitTerminalPrompt { .. } => "submit_terminal_prompt",
             Self::ReclaimTerminalFocus { .. } => "reclaim_terminal_focus",
             Self::RedrawTerminal { .. } => "redraw_terminal",
+            Self::ScrollTerminalViewport { .. } => "scroll_terminal_viewport",
             Self::PasteTerminalClipboard { .. } => "paste_terminal_clipboard",
             Self::PasteTerminalClipboardImage { .. } => "paste_terminal_clipboard_image",
             Self::ProbeTerminalViewportInput { .. } => "probe_terminal_viewport_input",
