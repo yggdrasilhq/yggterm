@@ -38,6 +38,70 @@ fn read_from_zero(mgr: &TerminalManager, key: &str) -> String {
         .collect::<String>()
 }
 
+/// Poll `read(0)` until the accumulated output contains `needle` (or time out).
+fn wait_for_text(mgr: &TerminalManager, key: &str, needle: &str, timeout: Duration) -> String {
+    let deadline = Instant::now() + timeout;
+    let mut data = String::new();
+    while Instant::now() < deadline {
+        data = read_from_zero(mgr, key);
+        if data.contains(needle) {
+            return data;
+        }
+        std::thread::sleep(Duration::from_millis(40));
+    }
+    data
+}
+
+// ---- Agent session control (programmatic prompt insertion) --------------------
+// These exercise the feature behind yggterm's automation (timers + programmatic
+// prompt insertion): an agent writes input to a session and the program receives
+// it and responds. The seam is the same `TerminalManager::write` -> PTY -> program
+// -> `read` round-trip the live `server app terminal send` uses.
+
+#[test]
+fn agent_inserted_prompt_reaches_the_program_and_produces_output() {
+    let mut mgr = TerminalManager::new();
+    let key = "test://drive-echo";
+    mgr.ensure_session(key, &launch("--scenario echo --hold-ms 8000"), None)
+        .expect("ensure_session");
+    // Wait for the program to be ready to read input.
+    assert!(
+        !wait_for_text(&mgr, key, "MOCK_ECHO_READY", Duration::from_secs(5)).is_empty(),
+        "echo program should announce readiness"
+    );
+    // Insert a prompt exactly as the automation / `terminal send` path does.
+    mgr.write(key, "What is the status now?\r")
+        .expect("write prompt");
+    let data = wait_for_text(&mgr, key, "ECHO: What is the status now?", Duration::from_secs(5));
+    assert!(
+        data.contains("ECHO: What is the status now?"),
+        "the inserted prompt must reach the program and round-trip back; got tail {:?}",
+        &data[data.len().saturating_sub(200)..]
+    );
+}
+
+#[test]
+fn agent_arrow_key_navigation_selects_full_access_in_a_permission_menu() {
+    let mut mgr = TerminalManager::new();
+    let key = "test://drive-menu";
+    // The 3-option selector starts on "Default" (index 0), like codex /permissions.
+    mgr.ensure_session(key, &launch("--scenario menu --hold-ms 8000"), None)
+        .expect("ensure_session");
+    assert!(
+        wait_for_text(&mgr, key, "Update Model Permissions", Duration::from_secs(5))
+            .contains("Full Access"),
+        "menu should render all options"
+    );
+    // Drive: Down, Down, Enter -> select "Full Access" (the live /permissions flow).
+    mgr.write(key, "\x1b[B\x1b[B\r").expect("write arrows + enter");
+    let data = wait_for_text(&mgr, key, "SELECTED:", Duration::from_secs(5));
+    assert!(
+        data.contains("SELECTED: Full Access"),
+        "Down x2 + Enter must commit Full Access; got tail {:?}",
+        &data[data.len().saturating_sub(200)..]
+    );
+}
+
 #[test]
 fn alt_screen_session_delivers_screen_content() {
     let mut mgr = TerminalManager::new();
