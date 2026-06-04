@@ -263,6 +263,16 @@ pub enum AppControlCommand {
         session_path: String,
         data: String,
     },
+    /// Readiness-gated prompt insertion: wait until the session is at an idle
+    /// interactive prompt (up to `timeout_ms`), then send `data`. If it never
+    /// becomes ready, send NOTHING and report it. The robust path for agent /
+    /// automation prompt insertion — see TerminalManager::submit_prompt.
+    SubmitTerminalPrompt {
+        session_path: String,
+        data: String,
+        #[serde(default)]
+        timeout_ms: u64,
+    },
     ReclaimTerminalFocus {
         session_path: String,
     },
@@ -378,6 +388,7 @@ impl AppControlCommand {
             Self::StartAction { .. } => "start_action",
             Self::CreateTerminal { .. } => "create_terminal",
             Self::SendTerminalInput { .. } => "send_terminal_input",
+            Self::SubmitTerminalPrompt { .. } => "submit_terminal_prompt",
             Self::ReclaimTerminalFocus { .. } => "reclaim_terminal_focus",
             Self::RedrawTerminal { .. } => "redraw_terminal",
             Self::PasteTerminalClipboard { .. } => "paste_terminal_clipboard",
