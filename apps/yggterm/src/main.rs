@@ -38,9 +38,9 @@ use yggterm_server::{
     run_app_control_redraw_terminal, run_app_control_remove_session, run_app_control_rename_session,
     run_app_control_restart_session,
     run_app_control_reset_theme_editor, run_app_control_resize_window,
-    run_app_control_restart_pending_update, run_app_control_scroll_preview,
-    run_app_control_scroll_right_panel, run_app_control_scroll_terminal_viewport,
-    run_app_control_send_terminal_input,
+    run_app_control_read_terminal_buffer, run_app_control_restart_pending_update,
+    run_app_control_scroll_preview, run_app_control_scroll_right_panel,
+    run_app_control_scroll_terminal_viewport, run_app_control_send_terminal_input,
     run_app_control_submit_terminal_prompt,
     run_app_control_set_clipboard_png_base64, run_app_control_set_clipboard_text,
     run_app_control_set_fullscreen, run_app_control_set_main_zoom, run_app_control_set_maximized,
@@ -709,6 +709,7 @@ fn print_server_app_help() {
   yggterm server app start-page [--pid <pid>]
   yggterm server app terminal <new|send|focus|scroll|probe-type|probe-scroll|probe-select|probe-context-menu> ...
   yggterm server app terminal scroll <session> --to <top|bottom|±N>
+  yggterm server app terminal read-buffer <session> [--mode screen|full]
   yggterm server app terminal send <session> (--data <data>|--stdin)"
     );
 }
@@ -1926,6 +1927,14 @@ fn main() -> Result<()> {
                         let to = cli_flag_value(&args, "--to")
                             .context("missing --to (top|bottom|±N lines) for server app terminal scroll")?;
                         run_app_control_scroll_terminal_viewport(session_path, to, timeout_ms)
+                    }
+                    "read-buffer" => {
+                        let session_path = cli_positional_args(&args, 4)
+                            .into_iter()
+                            .next()
+                            .context("missing session path for server app terminal read-buffer")?;
+                        let mode = cli_flag_value(&args, "--mode").unwrap_or("screen");
+                        run_app_control_read_terminal_buffer(session_path, mode, timeout_ms)
                     }
                     "probe-select" => {
                         let session_path = cli_positional_args(&args, 4)
