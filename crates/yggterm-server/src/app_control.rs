@@ -288,6 +288,18 @@ pub enum AppControlCommand {
         session_path: String,
         to: String,
     },
+    /// Read the xterm.js buffer text via the buffer API (term.buffer.active
+    /// getLine/translateToString) — focus-independent, unlike DOM innerText
+    /// which goes empty on an unfocused Wayland window. This is "endpoint B"
+    /// (after xterm.js) for the before/after-xterm buffer-integrity comparison
+    /// against `server terminal screen` (endpoint A, the daemon vt100 screen).
+    /// `mode` = "screen" (visible rows only) or "full" (whole buffer incl
+    /// scrollback).
+    ReadTerminalBuffer {
+        session_path: String,
+        #[serde(default)]
+        mode: String,
+    },
     PasteTerminalClipboard {
         session_path: String,
     },
@@ -401,6 +413,7 @@ impl AppControlCommand {
             Self::ReclaimTerminalFocus { .. } => "reclaim_terminal_focus",
             Self::RedrawTerminal { .. } => "redraw_terminal",
             Self::ScrollTerminalViewport { .. } => "scroll_terminal_viewport",
+            Self::ReadTerminalBuffer { .. } => "read_terminal_buffer",
             Self::PasteTerminalClipboard { .. } => "paste_terminal_clipboard",
             Self::PasteTerminalClipboardImage { .. } => "paste_terminal_clipboard_image",
             Self::ProbeTerminalViewportInput { .. } => "probe_terminal_viewport_input",
