@@ -30,6 +30,7 @@ use yggterm_server::{
     run_app_control_reset_theme_editor, run_app_control_resize_window,
     run_app_control_restart_pending_update, run_app_control_scroll_preview,
     run_app_control_scroll_right_panel, run_app_control_send_terminal_input,
+    run_app_control_submit_terminal_prompt,
     run_app_control_set_clipboard_png_base64, run_app_control_set_clipboard_text,
     run_app_control_set_fullscreen, run_app_control_set_main_zoom, run_app_control_set_maximized,
     run_app_control_set_right_panel_mode, run_app_control_set_row_expanded,
@@ -1740,6 +1741,57 @@ fn main() -> Result<()> {
                                 .to_string()
                         };
                         run_app_control_send_terminal_input(session_path, &data, timeout_ms)
+                    }
+                    "submit" => {
+                        // Readiness-gated prompt insertion: waits for the session to
+                        // reach an idle interactive prompt, then sends; refuses if it
+                        // never becomes ready. `--ready-timeout-ms` bounds the wait.
+                        let session_path = cli_positional_args(&args, 4)
+                            .into_iter()
+                            .next()
+                            .ok_or_else(|| {
+                                anyhow::anyhow!(
+                                    "missing session path for server app terminal submit"
+                                )
+                            })?;
+                        let data = if args.iter().any(|arg| arg == "--stdin") {
+                            let mut value = String::new();
+                            std::io::stdin()
+                                .read_to_string(&mut value)
+                                .context("reading app terminal submit stdin")?;
+                            value
+                        } else {
+                            args.windows(2)
+                                .find_map(|window| {
+                                    if window[0] == "--data" {
+                                        Some(window[1].as_str())
+                                    } else {
+                                        None
+                                    }
+                                })
+                                .ok_or_else(|| {
+                                    anyhow::anyhow!(
+                                        "missing --data or --stdin for server app terminal submit"
+                                    )
+                                })?
+                                .to_string()
+                        };
+                        let ready_timeout_ms = args
+                            .windows(2)
+                            .find_map(|window| {
+                                if window[0] == "--ready-timeout-ms" {
+                                    window[1].parse::<u64>().ok()
+                                } else {
+                                    None
+                                }
+                            })
+                            .unwrap_or(30_000);
+                        run_app_control_submit_terminal_prompt(
+                            session_path,
+                            &data,
+                            ready_timeout_ms,
+                            timeout_ms,
+                        )
                     }
                     "focus" => {
                         let session_path = cli_positional_args(&args, 4)

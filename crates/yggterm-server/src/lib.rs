@@ -16077,6 +16077,30 @@ pub fn run_app_control_send_terminal_input(
     Ok(())
 }
 
+pub fn run_app_control_submit_terminal_prompt(
+    session_path: &str,
+    data: &str,
+    ready_timeout_ms: u64,
+    timeout_ms: u64,
+) -> anyhow::Result<()> {
+    let home = resolve_yggterm_home()?;
+    // The app-control request waits up to `ready_timeout_ms` for the session to
+    // reach an idle prompt before sending; give the IPC round-trip headroom beyond
+    // that so the client doesn't time out while the GUI is still polling readiness.
+    let request_timeout_ms = timeout_ms.max(ready_timeout_ms.saturating_add(10_000));
+    let response = request_app_control(
+        &home,
+        AppControlCommand::SubmitTerminalPrompt {
+            session_path: session_path.to_string(),
+            data: data.to_string(),
+            timeout_ms: ready_timeout_ms,
+        },
+        request_timeout_ms,
+    )?;
+    write_stdout_payload(&serde_json::to_string_pretty(&response)?)?;
+    Ok(())
+}
+
 pub fn run_app_control_reclaim_terminal_focus(
     session_path: &str,
     timeout_ms: u64,
