@@ -34723,26 +34723,64 @@ async fn process_pending_app_control_requests(
             });
             let timeout = Duration::from_millis(if timeout_ms == 0 { 30_000 } else { timeout_ms });
             let started = Instant::now();
-            let mut last_screen = String::new();
-            let mut ready = false;
+            // A displayed prompt does NOT mean codex is reading input — a just-resumed
+            // codex draws its composer before its input loop is live and silently drops
+            // keystrokes (root cause, see finding-fresh-restarted-codex-no-input). So:
+            // PHASE 1 — wait for the composer to be DISPLAYED (avoid probing a menu /
+            // mid-output surface); PHASE 2 — ECHO-VERIFY codex is actually CONSUMING
+            // input by writing a probe and confirming it echoes, then clear it (Ctrl+U)
+            // and submit. The real prompt is written ONLY after the echo is confirmed.
+            const ECHO_PROBE: &str = "yggterm_ready_probe";
+            const CLEAR_LINE: &str = "\u{15}"; // Ctrl+U
+            let probe_write = |payload: &str| {
+                terminal_write_app_control_input_async(
+                    endpoint.clone(),
+                    runtime_session_path.clone(),
+                    session_path.clone(),
+                    payload.to_string(),
+                    "submit_probe",
+                    trace_home.as_path(),
+                )
+            };
+            let mut prompt_shown = false;
             while started.elapsed() < timeout {
-                match terminal_snapshot_async(
+                if let Ok((screen, ..)) = terminal_snapshot_async(
                     endpoint.clone(),
                     session_path.clone(),
                     trace_home.as_path(),
                 )
                 .await
+                    && terminal_chunk_has_current_codex_input_row(&screen)
                 {
-                    Ok((screen, _running, _rt, _pr, _rs)) => {
-                        last_screen = screen;
-                        if terminal_chunk_has_current_codex_input_row(&last_screen) {
-                            ready = true;
-                            break;
-                        }
-                    }
-                    Err(_error) => {}
+                    prompt_shown = true;
+                    break;
                 }
                 sleep(Duration::from_millis(150)).await;
+            }
+            let mut ready = false;
+            if prompt_shown {
+                while started.elapsed() < timeout {
+                    let _ = probe_write(ECHO_PROBE).await;
+                    sleep(Duration::from_millis(180)).await;
+                    let echoed = matches!(
+                        terminal_snapshot_async(
+                            endpoint.clone(),
+                            session_path.clone(),
+                            trace_home.as_path(),
+                        )
+                        .await,
+                        Ok((ref screen, ..)) if screen.contains(ECHO_PROBE)
+                    );
+                    // Clear the probe whether it echoed (consumed) or was buffered while
+                    // codex wasn't reading yet — keeps the composer clean either way.
+                    let _ = probe_write(CLEAR_LINE).await;
+                    if echoed {
+                        sleep(Duration::from_millis(60)).await;
+                        ready = true;
+                        break;
+                    }
+                    sleep(Duration::from_millis(120)).await;
+                }
             }
             let waited_ms = started.elapsed().as_millis() as u64;
             if !ready {
@@ -34754,7 +34792,7 @@ async fn process_pending_app_control_requests(
                     data: Some(json!({
                         "submitted": false,
                         "session_path": session_path,
-                        "reason": "session did not reach an idle interactive prompt within the timeout",
+                        "reason": "session never echo-confirmed it was consuming input within the timeout (prompt may be displayed but codex not yet reading)",
                         "waited_ms": waited_ms,
                     })),
                     error: None,
