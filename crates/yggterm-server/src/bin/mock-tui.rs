@@ -152,6 +152,20 @@ fn main() {
             hold(&args);
             return;
         }
+        // INTERACTIVE: a codex-style composer with char-by-char echo, Ctrl+U clear,
+        // and Enter submit — PLUS a `--ready-after-ms` window during which input is
+        // IGNORED (drained, not echoed). Models the real bug root cause: codex draws
+        // its prompt before its input loop is live, so a probe written too early is
+        // silently dropped. Lets echo-verified readiness be tested: a probe only
+        // echoes once the composer is actually reading.
+        "composer" => {
+            let ready_after: u64 = arg_value(&args, "--ready-after-ms")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0);
+            run_composer(&mut w, ready_after);
+            hold(&args);
+            return;
+        }
         // Plain shell-ish prompt (normal buffer, minimal output).
         _ => {
             let _ = write!(w, "$ MOCK_TUI_PROMPT\r\n$ ");
@@ -192,6 +206,72 @@ fn run_echo(w: &mut impl Write) {
                 line.clear();
             } else {
                 line.push(byte);
+            }
+        }
+    }
+}
+
+/// A codex-style composer with char echo + Ctrl+U clear + Enter submit. For the
+/// first `ready_after_ms` it IGNORES all input (drains it) — modeling codex drawing
+/// its prompt before its input loop is live. After that window it echoes the live
+/// buffer as `> <buffer>` on every keystroke, clears on Ctrl+U (0x15), and on CR/LF
+/// emits `SUBMITTED: <buffer>` then clears. This is the deterministic stand-in for
+/// echo-verified readiness: a probe only shows up once the composer is truly reading.
+fn run_composer(w: &mut impl Write, ready_after_ms: u64) {
+    use std::time::Instant;
+    // Model codex: put the tty in raw / no-echo mode so the LINE DISCIPLINE does not
+    // auto-echo input. Only the program's OWN echo (below, once it's reading) shows a
+    // keystroke — which is the whole point of echo-verified readiness. Without this
+    // the cooked-mode tty echoes the probe even while we're ignoring input, defeating
+    // the test (and misrepresenting how codex's raw-mode TUI behaves).
+    unsafe {
+        let mut termios: libc::termios = std::mem::zeroed();
+        if libc::tcgetattr(0, &mut termios) == 0 {
+            termios.c_lflag &= !(libc::ECHO | libc::ICANON | libc::ISIG | libc::IEXTEN);
+            termios.c_iflag &= !(libc::ICRNL | libc::IXON);
+            let _ = libc::tcsetattr(0, libc::TCSANOW, &termios);
+        }
+    }
+    let started = Instant::now();
+    let _ = write!(w, "\u{203a} \r\n  gpt-mock \u{00b7} ~/mock\r\n");
+    let _ = w.flush();
+    let mut stdin = io::stdin();
+    let mut buf = [0u8; 1024];
+    let mut composed: Vec<u8> = Vec::new();
+    let render = |w: &mut dyn Write, composed: &[u8]| {
+        let text = String::from_utf8_lossy(composed);
+        let _ = write!(w, "\x1b[2J\x1b[H\u{203a} {text}\r\n  gpt-mock \u{00b7} ~/mock\r\n");
+        let _ = w.flush();
+    };
+    while let Ok(n) = stdin.read(&mut buf) {
+        if n == 0 {
+            break;
+        }
+        // Not-reading window: drain input without acting on it.
+        if started.elapsed() < Duration::from_millis(ready_after_ms) {
+            continue;
+        }
+        for &byte in &buf[..n] {
+            match byte {
+                b'\r' | b'\n' => {
+                    let text = String::from_utf8_lossy(&composed).to_string();
+                    let _ = write!(w, "\x1b[2J\x1b[HSUBMITTED: {text}\r\n\u{203a} \r\n  gpt-mock \u{00b7} ~/mock\r\n");
+                    let _ = w.flush();
+                    composed.clear();
+                }
+                0x15 => {
+                    composed.clear();
+                    render(w, &composed);
+                }
+                0x7f | 0x08 => {
+                    composed.pop();
+                    render(w, &composed);
+                }
+                b if b >= 0x20 => {
+                    composed.push(b);
+                    render(w, &composed);
+                }
+                _ => {}
             }
         }
     }

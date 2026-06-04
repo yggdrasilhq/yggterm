@@ -699,6 +699,58 @@ impl TerminalManager {
         }
     }
 
+    /// ECHO-VERIFIED prompt insertion — the robust readiness check. A displayed
+    /// prompt does NOT mean the program is reading input: a just-resumed codex draws
+    /// its composer seconds-to-minutes before its input loop is live, so a prompt
+    /// written then is silently dropped (root-caused 2026-06-04, see
+    /// [[finding-fresh-restarted-codex-no-input]]). Instead of trusting "prompt
+    /// shown", PROVE the program is consuming input: write a distinctive probe and
+    /// confirm it ECHOES into the surface; only then clear it (Ctrl+U) and submit the
+    /// real prompt. If the probe never echoes within `timeout`, the real prompt is
+    /// NEVER written. Self-healing across retries: a Ctrl+U after each probe prevents
+    /// buffered probes from accumulating once the program starts reading.
+    pub fn submit_prompt_echo_verified(
+        &self,
+        key: &str,
+        data: &str,
+        timeout: Duration,
+    ) -> Result<PromptSubmitOutcome> {
+        // Distinctive enough not to collide with real surface text; cleared via Ctrl+U.
+        const PROBE: &str = "yggterm_ready_probe";
+        const CLEAR_LINE: &str = "\u{15}"; // Ctrl+U — clears the composer line
+        const PROBE_SETTLE: Duration = Duration::from_millis(180);
+        const RETRY_INTERVAL: Duration = Duration::from_millis(120);
+        if self.session_screen_snapshot(key).is_none() {
+            return Ok(PromptSubmitOutcome::NoSession);
+        }
+        let start = Instant::now();
+        loop {
+            self.write(key, PROBE)?;
+            thread::sleep(PROBE_SETTLE);
+            let echoed = self
+                .session_screen_snapshot(key)
+                .is_some_and(|screen| screen.contains(PROBE));
+            if echoed {
+                // The program is consuming input. Clear the probe, then submit.
+                self.write(key, CLEAR_LINE)?;
+                thread::sleep(Duration::from_millis(60));
+                self.write(key, data)?;
+                return Ok(PromptSubmitOutcome::Submitted {
+                    waited_ms: start.elapsed().as_millis() as u64,
+                });
+            }
+            // Not consuming yet: clear any buffered probe so it can't pile up, then
+            // wait and retry (or give up at the deadline, leaving the surface clean).
+            let _ = self.write(key, CLEAR_LINE);
+            if start.elapsed() >= timeout {
+                return Ok(PromptSubmitOutcome::NotReady {
+                    waited_ms: start.elapsed().as_millis() as u64,
+                });
+            }
+            thread::sleep(RETRY_INTERVAL);
+        }
+    }
+
     pub fn resize(&self, key: &str, cols: u16, rows: u16) -> Result<()> {
         let session = self
             .sessions
