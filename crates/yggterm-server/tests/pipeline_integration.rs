@@ -81,6 +81,63 @@ fn agent_inserted_prompt_reaches_the_program_and_produces_output() {
 }
 
 #[test]
+fn submit_prompt_waits_for_readiness_then_delivers() {
+    use yggterm_server::PromptSubmitOutcome;
+    let mut mgr = TerminalManager::new();
+    let key = "test://submit-ready";
+    // Busy for ~1.5s, then shows a ready `>` input row, then echoes.
+    mgr.ensure_session(
+        key,
+        &launch("--scenario delayed-prompt --ready-after-ms 1500 --hold-ms 9000"),
+        None,
+    )
+    .expect("ensure_session");
+    // Readiness policy (injected): the codex-style input row marker, absent while busy.
+    let is_ready = |screen: &str| screen.contains('\u{203a}');
+    let outcome = mgr
+        .submit_prompt(key, "status?\r", is_ready, Duration::from_secs(6))
+        .expect("submit_prompt");
+    match outcome {
+        PromptSubmitOutcome::Submitted { waited_ms } => assert!(
+            waited_ms >= 1000,
+            "submit must WAIT through the busy phase before delivering, waited {waited_ms}ms"
+        ),
+        other => panic!("expected Submitted after readiness, got {other:?}"),
+    }
+    // The prompt, delivered only once ready, must round-trip through the echo.
+    let data = wait_for_text(&mgr, key, "ECHO: status?", Duration::from_secs(5));
+    assert!(
+        data.contains("ECHO: status?"),
+        "the readiness-gated prompt must reach the program once it is ready; tail {:?}",
+        &data[data.len().saturating_sub(160)..]
+    );
+}
+
+#[test]
+fn submit_prompt_refuses_and_writes_nothing_when_never_ready() {
+    use yggterm_server::PromptSubmitOutcome;
+    let mut mgr = TerminalManager::new();
+    let key = "test://submit-never";
+    // An alt-screen surface that never shows a `>` input row — never "ready".
+    mgr.ensure_session(key, &launch("--scenario alt-screen --hold-ms 8000"), None)
+        .expect("ensure_session");
+    wait_for_output(&mgr, key);
+    let is_ready = |screen: &str| screen.contains('\u{203a}');
+    let outcome = mgr
+        .submit_prompt(key, "should-not-appear\r", is_ready, Duration::from_millis(800))
+        .expect("submit_prompt");
+    assert!(
+        matches!(outcome, PromptSubmitOutcome::NotReady { .. }),
+        "a never-ready session must be refused, got {outcome:?}"
+    );
+    // And crucially: nothing was written into the not-ready surface.
+    assert!(
+        !read_from_zero(&mgr, key).contains("should-not-appear"),
+        "submit_prompt must NOT write into a session that never became ready"
+    );
+}
+
+#[test]
 fn agent_arrow_key_navigation_selects_full_access_in_a_permission_menu() {
     let mut mgr = TerminalManager::new();
     let key = "test://drive-menu";
