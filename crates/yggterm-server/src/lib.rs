@@ -14973,10 +14973,44 @@ pub fn run_trace_bundle(lines: usize, include_screenshot: bool) -> anyhow::Resul
     Ok(())
 }
 
+/// Agent-oriented post-processing for a captured screenshot. A full 1920px frame
+/// renders illegibly small when an agent reads it back, so these options crop to
+/// the region of interest and upscale it. The capture itself is unchanged; this
+/// only rewrites the PNG on disk after it lands.
+#[derive(Debug, Clone, Default)]
+pub struct ScreenshotPostProcess {
+    /// "terminal" crops to the active terminal viewport (rect read from app state).
+    pub region: Option<String>,
+    /// Explicit crop rect in screenshot pixels: (x, y, width, height).
+    pub crop: Option<(u32, u32, u32, u32)>,
+    /// Nearest-neighbour upscale factor applied after cropping (1.0 = none).
+    pub scale: f32,
+}
+
+impl ScreenshotPostProcess {
+    fn is_noop(&self) -> bool {
+        self.region.is_none() && self.crop.is_none() && (self.scale - 1.0).abs() < f32::EPSILON
+    }
+}
+
 pub fn run_screenshot_capture(
     target: &str,
     output_path: Option<&str>,
     timeout_ms: u64,
+) -> anyhow::Result<()> {
+    run_screenshot_capture_with_post_process(
+        target,
+        output_path,
+        timeout_ms,
+        ScreenshotPostProcess::default(),
+    )
+}
+
+pub fn run_screenshot_capture_with_post_process(
+    target: &str,
+    output_path: Option<&str>,
+    timeout_ms: u64,
+    post: ScreenshotPostProcess,
 ) -> anyhow::Result<()> {
     let home = resolve_yggterm_home()?;
     let response = match target {
@@ -14994,8 +15028,176 @@ pub fn run_screenshot_capture(
         )?,
         other => anyhow::bail!("unsupported screenshot target: {other}"),
     };
+    let mut response = response;
+    if !post.is_noop() {
+        if let Some(path) = response.output_path.clone() {
+            match apply_screenshot_post_process(&home, std::path::Path::new(&path), &post) {
+                Ok(summary) => {
+                    if let Some(data) = response.data.as_mut().and_then(|v| v.as_object_mut()) {
+                        data.insert("post_process".to_string(), summary);
+                    }
+                }
+                Err(error) => {
+                    if let Some(data) = response.data.as_mut().and_then(|v| v.as_object_mut()) {
+                        data.insert(
+                            "post_process_error".to_string(),
+                            serde_json::Value::String(error.to_string()),
+                        );
+                    }
+                }
+            }
+        }
+    }
     write_stdout_payload(&serde_json::to_string_pretty(&response)?)?;
     Ok(())
+}
+
+/// Resolve the crop rect for `--region terminal` from the active terminal host
+/// rect in app state. Returns screenshot-pixel (x, y, w, h).
+fn terminal_region_crop_from_state(home: &std::path::Path) -> anyhow::Result<(u32, u32, u32, u32)> {
+    let state = request_app_control(home, AppControlCommand::DescribeState, 5_000)?
+        .data
+        .ok_or_else(|| anyhow::anyhow!("app state returned no data"))?;
+    let host = state
+        .get("active_terminal_hosts")
+        .and_then(|v| v.as_array())
+        .and_then(|hosts| hosts.first())
+        .ok_or_else(|| anyhow::anyhow!("no active terminal host to crop to"))?;
+    // rows_rect bounds the rendered terminal rows in window/screenshot pixels.
+    let rect = host
+        .get("rows_rect")
+        .and_then(|v| v.as_object())
+        .ok_or_else(|| anyhow::anyhow!("active terminal host has no rows_rect"))?;
+    let num = |key: &str| rect.get(key).and_then(|v| v.as_f64());
+    let left = num("left").ok_or_else(|| anyhow::anyhow!("rows_rect missing left"))?;
+    let top = num("top").ok_or_else(|| anyhow::anyhow!("rows_rect missing top"))?;
+    let width = num("width").ok_or_else(|| anyhow::anyhow!("rows_rect missing width"))?;
+    let height = num("height").ok_or_else(|| anyhow::anyhow!("rows_rect missing height"))?;
+    Ok((
+        left.max(0.0) as u32,
+        top.max(0.0) as u32,
+        width.max(1.0) as u32,
+        height.max(1.0) as u32,
+    ))
+}
+
+fn apply_screenshot_post_process(
+    home: &std::path::Path,
+    path: &std::path::Path,
+    post: &ScreenshotPostProcess,
+) -> anyhow::Result<serde_json::Value> {
+    let crop = match (post.crop, post.region.as_deref()) {
+        (Some(explicit), _) => Some(explicit),
+        (None, Some("terminal")) => Some(terminal_region_crop_from_state(home)?),
+        (None, Some("full")) | (None, None) => None,
+        (None, Some(other)) => anyhow::bail!("unsupported screenshot region: {other}"),
+    };
+    let bytes = std::fs::read(path)?;
+    let (mut rgba, mut width, mut height) = decode_png_to_rgba(&bytes)?;
+    let mut applied_crop = None;
+    if let Some((cx, cy, cw, ch)) = crop {
+        let (cropped, nw, nh) = crop_rgba(&rgba, width, height, cx, cy, cw, ch);
+        rgba = cropped;
+        width = nw;
+        height = nh;
+        applied_crop = Some(serde_json::json!({"x": cx, "y": cy, "width": nw, "height": nh}));
+    }
+    let scale = post.scale;
+    if scale > 0.0 && (scale - 1.0).abs() >= f32::EPSILON {
+        let (scaled, nw, nh) = scale_rgba_nearest(&rgba, width, height, scale);
+        rgba = scaled;
+        width = nw;
+        height = nh;
+    }
+    let encoded = encode_rgba_to_png(width, height, &rgba)?;
+    std::fs::write(path, encoded)?;
+    Ok(serde_json::json!({
+        "region": post.region,
+        "crop": applied_crop,
+        "scale": scale,
+        "out_width": width,
+        "out_height": height,
+    }))
+}
+
+fn decode_png_to_rgba(bytes: &[u8]) -> anyhow::Result<(Vec<u8>, u32, u32)> {
+    let decoder = png::Decoder::new(std::io::Cursor::new(bytes));
+    let mut reader = decoder.read_info()?;
+    let mut buffer = vec![0; reader.output_buffer_size().unwrap_or(0)];
+    let info = reader.next_frame(&mut buffer)?;
+    let width = info.width;
+    let height = info.height;
+    let pixels = &buffer[..info.buffer_size()];
+    match (info.color_type, info.bit_depth) {
+        (png::ColorType::Rgba, png::BitDepth::Eight) => Ok((pixels.to_vec(), width, height)),
+        (png::ColorType::Rgb, png::BitDepth::Eight) => {
+            let mut rgba = Vec::with_capacity(pixels.len() / 3 * 4);
+            for chunk in pixels.chunks_exact(3) {
+                rgba.extend_from_slice(&[chunk[0], chunk[1], chunk[2], 255]);
+            }
+            Ok((rgba, width, height))
+        }
+        (color, depth) => {
+            anyhow::bail!("unsupported screenshot PNG format: {color:?} {depth:?}")
+        }
+    }
+}
+
+fn encode_rgba_to_png(width: u32, height: u32, rgba: &[u8]) -> anyhow::Result<Vec<u8>> {
+    let mut out = Vec::new();
+    let mut encoder = png::Encoder::new(&mut out, width, height);
+    encoder.set_color(png::ColorType::Rgba);
+    encoder.set_depth(png::BitDepth::Eight);
+    let mut writer = encoder.write_header()?;
+    writer.write_image_data(rgba)?;
+    drop(writer);
+    Ok(out)
+}
+
+fn crop_rgba(
+    rgba: &[u8],
+    width: u32,
+    height: u32,
+    cx: u32,
+    cy: u32,
+    cw: u32,
+    ch: u32,
+) -> (Vec<u8>, u32, u32) {
+    let x0 = cx.min(width.saturating_sub(1));
+    let y0 = cy.min(height.saturating_sub(1));
+    let w = cw.min(width - x0).max(1);
+    let h = ch.min(height - y0).max(1);
+    let mut out = Vec::with_capacity((w * h * 4) as usize);
+    for row in 0..h {
+        let src_y = (y0 + row) as usize;
+        let start = (src_y * width as usize + x0 as usize) * 4;
+        let end = start + (w as usize) * 4;
+        out.extend_from_slice(&rgba[start..end]);
+    }
+    (out, w, h)
+}
+
+fn scale_rgba_nearest(
+    rgba: &[u8],
+    width: u32,
+    height: u32,
+    scale: f32,
+) -> (Vec<u8>, u32, u32) {
+    let nw = ((width as f32) * scale).round().max(1.0) as u32;
+    let nh = ((height as f32) * scale).round().max(1.0) as u32;
+    let mut out = vec![0u8; (nw * nh * 4) as usize];
+    for y in 0..nh {
+        let src_y = ((y as f32) / scale).floor() as u32;
+        let src_y = src_y.min(height - 1);
+        for x in 0..nw {
+            let src_x = ((x as f32) / scale).floor() as u32;
+            let src_x = src_x.min(width - 1);
+            let src = ((src_y * width + src_x) * 4) as usize;
+            let dst = ((y * nw + x) * 4) as usize;
+            out[dst..dst + 4].copy_from_slice(&rgba[src..src + 4]);
+        }
+    }
+    (out, nw, nh)
 }
 
 pub fn run_screenrecord_capture(
@@ -19806,6 +20008,7 @@ fn short_session_id(session_id: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::app_control_open_path_ready;
+    use super::{crop_rgba, decode_png_to_rgba, encode_rgba_to_png, scale_rgba_nearest};
     use super::{
         ClientInstanceRecord, GhosttyHostSupport, GhosttyTerminalHostMode, ManagedSessionView,
         PersistedDaemonState, PersistedLiveSession, PersistedStoredSession, PreviewTone,
@@ -19862,6 +20065,47 @@ mod tests {
 
     static CODEX_HOME_TEST_LOCK: Mutex<()> = Mutex::new(());
     static TERMINAL_IDENTITY_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn screenshot_crop_then_scale_produces_expected_pixels() {
+        // 2x2 RGBA image: TL red, TR green, BL blue, BR white.
+        let r = [255, 0, 0, 255];
+        let g = [0, 255, 0, 255];
+        let b = [0, 0, 255, 255];
+        let w = [255, 255, 255, 255];
+        let mut src = Vec::new();
+        for px in [r, g, b, w] {
+            src.extend_from_slice(&px);
+        }
+        // Crop the bottom-left 1x1 (the blue pixel).
+        let (cropped, cw, ch) = crop_rgba(&src, 2, 2, 0, 1, 1, 1);
+        assert_eq!((cw, ch), (1, 1));
+        assert_eq!(cropped, b);
+        // A crop wider/taller than the source is clamped to the image bounds.
+        let (clamped, clw, clh) = crop_rgba(&src, 2, 2, 1, 0, 99, 99);
+        assert_eq!((clw, clh), (1, 2));
+        assert_eq!(&clamped[0..4], &g); // (1,0) green
+        assert_eq!(&clamped[4..8], &w); // (1,1) white
+        // Nearest-neighbour 2x upscale of the original doubles each pixel.
+        let (scaled, sw, sh) = scale_rgba_nearest(&src, 2, 2, 2.0);
+        assert_eq!((sw, sh), (4, 4));
+        // Top-left 2x2 block should all be red.
+        for y in 0..2 {
+            for x in 0..2 {
+                let idx = ((y * 4 + x) * 4) as usize;
+                assert_eq!(&scaled[idx..idx + 4], &r, "pixel ({x},{y}) should be red");
+            }
+        }
+    }
+
+    #[test]
+    fn screenshot_png_round_trips_through_decode_encode() {
+        let rgba: Vec<u8> = (0..(3 * 2 * 4)).map(|i| (i % 256) as u8).collect();
+        let encoded = encode_rgba_to_png(3, 2, &rgba).expect("encode");
+        let (decoded, w, h) = decode_png_to_rgba(&encoded).expect("decode");
+        assert_eq!((w, h), (3, 2));
+        assert_eq!(decoded, rgba);
+    }
 
     fn restore_env_var(key: &str, value: Option<std::ffi::OsString>) {
         unsafe {
