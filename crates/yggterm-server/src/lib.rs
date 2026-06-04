@@ -20822,6 +20822,21 @@ mod tests {
     }
 
     #[cfg(unix)]
+    /// A unique test root short enough that a bound unix socket fits SUN_LEN even
+    /// when $TMPDIR is deep (the agent sandbox / CI use long temp paths). Mirrors
+    /// the production short-socket base (XDG_RUNTIME_DIR, with temp_dir fallback).
+    fn short_socket_test_root(label: &str) -> std::path::PathBuf {
+        let base = std::env::var_os("XDG_RUNTIME_DIR")
+            .filter(|value| !value.is_empty())
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir);
+        base.join(format!(
+            "ygt-{label}-{}-{}",
+            std::process::id(),
+            current_millis_u64()
+        ))
+    }
+
     fn spawn_one_status_socket(
         path: PathBuf,
         server_version: &'static str,
@@ -20952,11 +20967,10 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn remote_runtime_bridge_falls_back_to_stale_owner_when_hot_update_cannot_start() {
-        let root = std::env::temp_dir().join(format!(
-            "yggterm-remote-runtime-hot-update-fallback-{}-{}",
-            std::process::id(),
-            current_millis_u64()
-        ));
+        // Use a short socket root: this test BINDS a real unix socket, so a deep
+        // $TMPDIR would exceed SUN_LEN at bind time (sandbox/CI). See
+        // short_socket_test_root.
+        let root = short_socket_test_root("hufb");
         let home = root.join(".yggterm");
         fs::create_dir_all(&home).expect("create temp yggterm home");
         let stale_socket = home.join("server-2-2-49.sock");
@@ -22573,7 +22587,12 @@ mod tests {
     }
 
     #[test]
-    fn remote_persistent_resume_keeps_raw_input_but_restores_newline_output_processing() {
+    fn remote_persistent_resume_does_not_preset_terminal_modes() {
+        // Per spec-agent-cli-wrapper-render-parity: the resume wrapper must NOT
+        // pre-set terminal modes (an earlier `stty raw -echo opost onlcr` prefix
+        // pre-empted codex's own TUI init and caused partial-UI rendering). The
+        // command must hand the terminal to codex unmodified — just `codex resume
+        // <id>` (with cwd + appearance), no `stty` prefix.
         let command = super::remote_persistent_resume_shell_command_with_terminal_appearance(
             "019d0000-0000",
             Some("/home/pi/git/samplenotes"),
@@ -22581,9 +22600,8 @@ mod tests {
         );
 
         assert!(
-            command.starts_with(
-                "stty raw -echo opost onlcr </dev/tty >/dev/tty 2>/dev/null || true; "
-            )
+            !command.contains("stty "),
+            "resume wrapper must not pre-set terminal modes; got: {command}"
         );
         assert!(command.contains("resume"));
         assert!(command.contains("019d0000-0000"));
