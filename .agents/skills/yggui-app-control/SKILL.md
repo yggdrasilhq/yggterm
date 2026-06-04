@@ -45,6 +45,32 @@ ssh "$LIVE_HOST" "~/.local/bin/yggterm server app screenshot /tmp/yggui-shot.png
 
 Then read the file with the Read tool to display it visually.
 
+### Crop + zoom for legibility (USE THIS — don't avoid the tool)
+
+A full 1920px frame renders illegibly small when you read it back (159×63 glyphs
+scaled to fit). That is NOT a reason to distrust or skip the screenshot — it's a
+reason to crop/zoom. The capture is faithful (DOM renderer → WebKit snapshot is
+accurate; on KDE/Wayland Spectacle is correctly *skipped* when the window is
+unfocused, per the privacy gate, and the WebKit-DOM fallback is faithful). Use the
+post-process flags to get a legible view of the region you care about:
+
+```bash
+# Just the terminal viewport, doubled — best default for reading terminal content
+ssh "$LIVE_HOST" "~/.local/bin/yggterm server app screenshot /tmp/term.png --region terminal --scale 2"
+# A specific strip (e.g. the bottom rows / composer) at 3x — pixel crop x,y,w,h
+ssh "$LIVE_HOST" "~/.local/bin/yggterm server app screenshot /tmp/strip.png --crop 277,930,1335,230 --scale 3"
+```
+
+- `--region terminal` auto-crops to the active terminal viewport (rect from app state).
+- `--crop x,y,w,h` is an explicit pixel crop in screenshot coordinates (the same
+  coordinates as `active_terminal_hosts[0].rows_rect` in `app state`).
+- `--scale n` nearest-neighbour upscales after cropping (2–3 is usually right).
+- The response records what it did under `data.post_process`.
+
+If a future need isn't covered (e.g. annotate, side-by-side), EXTEND the tool —
+that's the point of agent-first observability — don't fall back to "the screenshot
+is too small to use."
+
 ## App State
 
 ```bash
