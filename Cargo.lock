@@ -6685,6 +6685,7 @@ dependencies = [
  "anyhow",
  "dirs",
  "libc",
+ "png 0.18.1",
  "portable-pty",
  "rusqlite",
  "serde",
