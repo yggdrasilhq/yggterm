@@ -133,6 +133,25 @@ fn main() {
             hold(&args);
             return;
         }
+        // INTERACTIVE: BUSY first, then a ready codex-style prompt, then echo. Models
+        // a session that isn't immediately ready (codex generating / starting up):
+        // emits `working...` for `--ready-after-ms`, then clears to a `>` input row
+        // + model footer (a current-input-row a readiness predicate recognizes), then
+        // echoes input. Lets a test prove submit_prompt WAITS for readiness before
+        // delivering, and that the delivered prompt then lands.
+        "delayed-prompt" => {
+            let ready_after: u64 = arg_value(&args, "--ready-after-ms")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(1500);
+            let _ = write!(w, "working... (esc to interrupt)\r\n");
+            let _ = w.flush();
+            thread::sleep(Duration::from_millis(ready_after));
+            let _ = write!(w, "\x1b[2J\x1b[H\u{203a} \r\n  gpt-mock \u{00b7} ~/mock\r\n");
+            let _ = w.flush();
+            run_echo(&mut w);
+            hold(&args);
+            return;
+        }
         // Plain shell-ish prompt (normal buffer, minimal output).
         _ => {
             let _ = write!(w, "$ MOCK_TUI_PROMPT\r\n$ ");
