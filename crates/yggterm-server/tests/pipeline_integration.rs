@@ -114,6 +114,69 @@ fn submit_prompt_waits_for_readiness_then_delivers() {
 }
 
 #[test]
+fn echo_verified_submit_waits_until_input_is_actually_consumed() {
+    use yggterm_server::PromptSubmitOutcome;
+    let mut mgr = TerminalManager::new();
+    let key = "test://echo-verified";
+    // A composer that DRAWS its prompt immediately but IGNORES input for 2s — exactly
+    // the root-cause bug (prompt shown before the input loop is live). A
+    // display-only readiness check would fire too early; echo-verification must wait.
+    mgr.ensure_session(
+        key,
+        &launch("--scenario composer --ready-after-ms 2000 --hold-ms 12000"),
+        None,
+    )
+    .expect("ensure_session");
+    wait_for_output(&mgr, key);
+    let outcome = mgr
+        .submit_prompt_echo_verified(key, "real prompt now\r", Duration::from_secs(8))
+        .expect("submit_prompt_echo_verified");
+    match outcome {
+        PromptSubmitOutcome::Submitted { waited_ms } => assert!(
+            waited_ms >= 1500,
+            "must WAIT until input is actually consumed (not just prompt shown), waited {waited_ms}ms"
+        ),
+        other => panic!("expected Submitted once input is consumed, got {other:?}"),
+    }
+    // The real prompt is delivered only after echo-verified readiness, so the composer
+    // actually submits it.
+    let data = wait_for_text(&mgr, key, "SUBMITTED: real prompt now", Duration::from_secs(5));
+    assert!(
+        data.contains("SUBMITTED: real prompt now"),
+        "the echo-verified prompt must be the one the composer submits; tail {:?}",
+        &data[data.len().saturating_sub(160)..]
+    );
+}
+
+#[test]
+fn echo_verified_submit_refuses_when_input_never_consumed() {
+    use yggterm_server::PromptSubmitOutcome;
+    let mut mgr = TerminalManager::new();
+    let key = "test://echo-verified-never";
+    // A composer that NEVER starts reading input (huge ready-after window): the probe
+    // never echoes, so the real prompt must never be written.
+    mgr.ensure_session(
+        key,
+        &launch("--scenario composer --ready-after-ms 999999 --hold-ms 8000"),
+        None,
+    )
+    .expect("ensure_session");
+    wait_for_output(&mgr, key);
+    let outcome = mgr
+        .submit_prompt_echo_verified(key, "must-not-submit\r", Duration::from_millis(1200))
+        .expect("submit_prompt_echo_verified");
+    assert!(
+        matches!(outcome, PromptSubmitOutcome::NotReady { .. }),
+        "input never consumed -> must refuse, got {outcome:?}"
+    );
+    assert!(
+        !read_from_zero(&mgr, key).contains("must-not-submit")
+            && !read_from_zero(&mgr, key).contains("SUBMITTED"),
+        "echo-verified submit must NOT write the real prompt when input is never consumed"
+    );
+}
+
+#[test]
 fn submit_prompt_refuses_and_writes_nothing_when_never_ready() {
     use yggterm_server::PromptSubmitOutcome;
     let mut mgr = TerminalManager::new();
