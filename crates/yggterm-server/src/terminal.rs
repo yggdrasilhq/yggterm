@@ -58,6 +58,16 @@ pub struct TerminalReadResult {
     pub eof_without_output: bool,
     pub post_resize_output_seen: bool,
     pub last_resize_seq: u64,
+    /// True when the live chunk ring trimmed chunks BELOW this read's cursor, so
+    /// the returned `chunks` skip a contiguous middle range (the client fell behind
+    /// the ring while output kept flowing — e.g. a backgrounded session streaming
+    /// past MAX_CHUNKS). The bytes are gone from the raw ring but recoverable from
+    /// the daemon vt100 scrollback (DAEMON_VT_SCROLLBACK_ROWS) via a clean
+    /// re-attach. The client MUST treat this as "re-sync required" (re-attach at
+    /// cursor 0) rather than appending the discontiguous chunks. Without this flag
+    /// the gap was SILENT — the middle simply vanished
+    /// (docs/xterm-bugs.md#chunk-ring-trim-drops-mid-stream).
+    pub resync_required: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -1503,6 +1513,17 @@ impl PtySessionRuntime {
         let retained_chunks = self.chunks.lock().expect("pty chunk lock poisoned");
         let next_cursor = self.seq.load(Ordering::SeqCst);
         let effective_cursor = if cursor > next_cursor { 0 } else { cursor };
+        // Mid-stream gap detection: a resuming client (cursor > 0) expects its next
+        // chunk to be `cursor + 1`. If the live ring's oldest surviving chunk is
+        // already past that, the ring trimmed the contiguous middle while the client
+        // was behind — those chunks are gone from the raw ring (recoverable only via
+        // a clean re-attach off the vt100 scrollback). Signal it instead of silently
+        // returning the discontiguous tail. See
+        // docs/xterm-bugs.md#chunk-ring-trim-drops-mid-stream.
+        let resync_required = effective_cursor > 0
+            && retained_chunks
+                .front()
+                .is_some_and(|oldest| oldest.seq > effective_cursor + 1);
         // NOTE: the chunk-ring-gap resync (docs/xterm-bugs.md#chunk-ring-trim-drops-
         // mid-stream) was reverted — replaying history+screen on a gap corrupted
         // ALTERNATE-SCREEN TUIs (codex) on switch-back (normal-buffer history written
@@ -1583,6 +1604,7 @@ impl PtySessionRuntime {
             eof_without_output: self.eof_without_output.load(Ordering::SeqCst),
             post_resize_output_seen: self.post_resize_output_seen(),
             last_resize_seq: self.last_resize_seq(),
+            resync_required,
         }
     }
 
