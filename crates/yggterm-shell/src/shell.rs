@@ -12288,6 +12288,7 @@ fn app_control_command_defers_background_refresh(command: &AppControlCommand) ->
             | AppControlCommand::ReclaimTerminalFocus { .. }
             | AppControlCommand::RedrawTerminal { .. }
             | AppControlCommand::ScrollTerminalViewport { .. }
+            | AppControlCommand::ReadTerminalBuffer { .. }
             | AppControlCommand::PasteTerminalClipboard { .. }
             | AppControlCommand::PasteTerminalClipboardImage { .. }
             | AppControlCommand::ProbeTerminalViewportInput { .. }
@@ -32241,6 +32242,80 @@ async fn scroll_terminal_viewport_for(session_path: &str, to: &str) -> Value {
     receive_probe_eval_value(&script, session_path).await
 }
 
+/// Read the xterm.js buffer text via the buffer API (focus-independent).
+/// `mode` = "full" (whole buffer incl scrollback) or anything else = "screen"
+/// (visible rows). Returns the rendered text + line/nonblank counts + base_y so
+/// it can be diffed against the daemon vt100 screen (endpoint A).
+async fn read_terminal_buffer_for(session_path: &str, mode: &str) -> Value {
+    let session_path_literal =
+        serde_json::to_string(session_path).unwrap_or_else(|_| "null".to_string());
+    let full = mode == "full";
+    let script = format!(
+        r#"
+        (async () => {{
+            try {{
+                const sessionPath = {session_path_literal};
+                const full = {full};
+                const registry = window.__yggtermXtermHosts || {{}};
+                const entries = Object.values(registry)
+                    .filter((entry) => entry && entry.term && entry.sessionPath === sessionPath)
+                    .sort((a, b) => (b.mountedAt || 0) - (a.mountedAt || 0));
+                const visibleEntries = entries.filter((entry) => {{
+                    const host = document.getElementById(entry.hostId);
+                    if (!host) return false;
+                    const rect = host.getBoundingClientRect();
+                    const style = window.getComputedStyle(host);
+                    return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
+                }});
+                const entry = visibleEntries[0] || entries[0] || null;
+                if (!entry || !entry.term || !entry.term.buffer || !entry.term.buffer.active) {{
+                    dioxus.send({{ accepted: false, reason: "terminal_host_missing", session_path: sessionPath }});
+                    return;
+                }}
+                const term = entry.term;
+                const active = term.buffer.active;
+                const length = Math.max(0, Number(active.length || 0));
+                const rows = Math.max(1, Number(term.rows || 0));
+                const viewportY = Math.max(0, Number(active.viewportY || 0));
+                const baseY = Math.max(0, Number(active.baseY || 0));
+                let start;
+                let end;
+                if (full) {{
+                    start = 0;
+                    end = length;
+                }} else {{
+                    start = Math.min(Math.max(0, length - 1), viewportY);
+                    end = Math.min(length, start + rows);
+                }}
+                const lines = [];
+                for (let i = start; i < end; i += 1) {{
+                    const line = active.getLine(i);
+                    lines.push(line && line.translateToString ? String(line.translateToString(true) || "") : "");
+                }}
+                const text = lines.join("\n");
+                const nonblank = lines.filter((l) => String(l || "").trim().length > 0).length;
+                dioxus.send({{
+                    accepted: true,
+                    session_path: sessionPath,
+                    mode: full ? "full" : "screen",
+                    base_y: baseY,
+                    viewport_y: viewportY,
+                    buffer_length: length,
+                    rows,
+                    line_count: lines.length,
+                    nonblank_line_count: nonblank,
+                    char_count: text.length,
+                    text,
+                }});
+            }} catch (error) {{
+                dioxus.send({{ accepted: false, reason: "read_buffer_exception", message: String(error && error.message ? error.message : error) }});
+            }}
+        }})();
+        "#
+    );
+    receive_probe_eval_value(&script, session_path).await
+}
+
 async fn probe_terminal_viewport_scroll_for(session_path: &str, lines: i32) -> Value {
     let session_path_literal =
         serde_json::to_string(session_path).unwrap_or_else(|_| "null".to_string());
@@ -35287,6 +35362,23 @@ async fn process_pending_app_control_requests(
         }
         AppControlCommand::ScrollTerminalViewport { session_path, to } => {
             let result = scroll_terminal_viewport_for(&session_path, &to).await;
+            AppControlResponse {
+                request_id: request.request_id.clone(),
+                handled_by_pid: std::process::id(),
+                completed_at_ms: current_millis() as u128,
+                output_path: None,
+                error: result
+                    .get("accepted")
+                    .and_then(Value::as_bool)
+                    .filter(|accepted| !accepted)
+                    .and_then(|_| result.get("reason"))
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned),
+                data: Some(result),
+            }
+        }
+        AppControlCommand::ReadTerminalBuffer { session_path, mode } => {
+            let result = read_terminal_buffer_for(&session_path, &mode).await;
             AppControlResponse {
                 request_id: request.request_id.clone(),
                 handled_by_pid: std::process::id(),
