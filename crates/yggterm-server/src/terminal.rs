@@ -631,6 +631,13 @@ impl TerminalManager {
             .map(|session| session.screen_snapshot())
     }
 
+    /// The session's clean scrolled-off history rows (vt100 scrollback ring).
+    /// See `PtySessionRuntime::history_rows` — near-empty for cursor-addressed
+    /// in-place repaint TUIs (codex), populated for genuinely-scrolling output.
+    pub fn session_history_rows(&self, key: &str) -> Option<Vec<String>> {
+        self.sessions.get(key).map(|session| session.history_rows())
+    }
+
     pub fn session_keys(&self) -> Vec<String> {
         let mut keys = self
             .sessions
@@ -1602,6 +1609,26 @@ impl PtySessionRuntime {
             .formatted
             .trim_matches('\0')
             .to_string()
+    }
+
+    /// The daemon's CLEAN scrolled-off history rows (vt100 scrollback ring),
+    /// oldest-to-newest, blank rows dropped. Read-only (restores the scrollback
+    /// offset). This is the history that CAN be loaded into the client's xterm
+    /// scrollback on reveal (so base_y > 0). For a cursor-addressed in-place
+    /// repaint TUI (e.g. codex redrawing its window via absolute cursor moves /
+    /// \x1b[2J without scrolling) this is near-empty BY DESIGN — nothing scrolled
+    /// off — which is why such sessions reveal with base_y == 0 (no scrollback to
+    /// scroll into), not a pipeline bug.
+    fn history_rows(&self) -> Vec<String> {
+        let mut screen_state = self
+            .screen_state
+            .lock()
+            .expect("pty screen state lock poisoned");
+        screen_state
+            .vt_scrollback_plain_rows()
+            .into_iter()
+            .filter(|line| !line.is_empty())
+            .collect()
     }
 
     fn screen_snapshot_chunk(&self, next_cursor: u64) -> Option<TerminalChunk> {
