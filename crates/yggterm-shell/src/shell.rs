@@ -12287,6 +12287,7 @@ fn app_control_command_defers_background_refresh(command: &AppControlCommand) ->
             | AppControlCommand::SendTerminalInput { .. }
             | AppControlCommand::ReclaimTerminalFocus { .. }
             | AppControlCommand::RedrawTerminal { .. }
+            | AppControlCommand::ScrollTerminalViewport { .. }
             | AppControlCommand::PasteTerminalClipboard { .. }
             | AppControlCommand::PasteTerminalClipboardImage { .. }
             | AppControlCommand::ProbeTerminalViewportInput { .. }
@@ -32140,6 +32141,106 @@ async fn receive_probe_eval_value(script: &str, session_path: &str) -> Value {
         "session_path": session_path,
     })
 }
+/// Drive the terminal viewport scroll position directly via the real viewport
+/// mover (entry.forceXtermViewportY / forcePromptFollow), not synthetic wheel
+/// events. `to` is "top", "bottom", or a signed line delta ("-10"/"20").
+/// Returns before/after base_y + viewport_y so the caller can verify movement.
+/// This is the agent-facing scroll control (lets an agent navigate scrollback
+/// and confirm whether a viewport is genuinely scroll-locked vs has no
+/// scrollback to scroll into, i.e. base_y == 0).
+async fn scroll_terminal_viewport_for(session_path: &str, to: &str) -> Value {
+    let session_path_literal =
+        serde_json::to_string(session_path).unwrap_or_else(|_| "null".to_string());
+    let to_literal = serde_json::to_string(to).unwrap_or_else(|_| "\"bottom\"".to_string());
+    let script = format!(
+        r#"
+        (async () => {{
+            try {{
+                const sessionPath = {session_path_literal};
+                const to = String({to_literal} || 'bottom');
+                const registry = window.__yggtermXtermHosts || {{}};
+                const entries = Object.values(registry)
+                    .filter((entry) => entry && entry.term && entry.sessionPath === sessionPath)
+                    .sort((a, b) => (b.mountedAt || 0) - (a.mountedAt || 0));
+                const visibleEntries = entries.filter((entry) => {{
+                    const host = document.getElementById(entry.hostId);
+                    if (!host) return false;
+                    const rect = host.getBoundingClientRect();
+                    const style = window.getComputedStyle(host);
+                    return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
+                }});
+                const entry = visibleEntries[0] || entries[0] || null;
+                if (!entry || !entry.term || !entry.term.buffer || !entry.term.buffer.active) {{
+                    dioxus.send({{ accepted: false, reason: "terminal_host_missing", session_path: sessionPath }});
+                    return;
+                }}
+                const term = entry.term;
+                const read = () => {{
+                    const a = term.buffer.active;
+                    return {{
+                        base_y: Math.max(0, Number(a.baseY || 0)),
+                        viewport_y: Math.max(0, Number(a.viewportY || 0)),
+                        length: Math.max(0, Number(a.length || 0)),
+                        rows: Math.max(1, Number(term.rows || 0)),
+                        scrollback_intent: String(entry.scrollbackIntent || 'PromptFollow'),
+                    }};
+                }};
+                const before = read();
+                let target = before.viewport_y;
+                let kind = 'delta';
+                if (to === 'top') {{
+                    target = 0; kind = 'top';
+                }} else if (to === 'bottom') {{
+                    target = before.base_y; kind = 'bottom';
+                }} else {{
+                    const delta = Number.parseInt(to, 10);
+                    if (!Number.isFinite(delta)) {{
+                        dioxus.send({{ accepted: false, reason: "invalid_scroll_target", session_path: sessionPath, to }});
+                        return;
+                    }}
+                    target = Math.max(0, Math.min(before.base_y, before.viewport_y + delta));
+                }}
+                try {{
+                    if (target >= before.base_y) {{
+                        if (entry.forcePromptFollow) {{
+                            entry.forcePromptFollow('app_control_scroll:bottom');
+                        }} else if (term.scrollToBottom) {{
+                            term.scrollToBottom();
+                        }}
+                    }} else {{
+                        if (entry.forceXtermViewportY) {{
+                            entry.forceXtermViewportY(target, `app_control_scroll:${{kind}}`);
+                        }} else if (term.scrollToLine) {{
+                            term.scrollToLine(target);
+                        }}
+                        entry.scrollbackIntent = 'UserScrollback';
+                        entry.scrollbackLocked = true;
+                        entry.lastScrollbackIntentReason = `app_control_scroll:${{kind}}`;
+                        entry.lastScrollbackIntentAtMs = Date.now();
+                    }}
+                }} catch (_moveError) {{}}
+                await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+                await new Promise((resolve) => setTimeout(resolve, 60));
+                const after = read();
+                dioxus.send({{
+                    accepted: true,
+                    session_path: sessionPath,
+                    to,
+                    requested_target_viewport_y: target,
+                    before,
+                    after,
+                    moved: before.viewport_y !== after.viewport_y,
+                    has_scrollback: before.base_y > 0,
+                }});
+            }} catch (error) {{
+                dioxus.send({{ accepted: false, reason: "scroll_exception", message: String(error && error.message ? error.message : error) }});
+            }}
+        }})();
+        "#
+    );
+    receive_probe_eval_value(&script, session_path).await
+}
+
 async fn probe_terminal_viewport_scroll_for(session_path: &str, lines: i32) -> Value {
     let session_path_literal =
         serde_json::to_string(session_path).unwrap_or_else(|_| "null".to_string());
@@ -35169,6 +35270,23 @@ async fn process_pending_app_control_requests(
             lines,
         } => {
             let result = probe_terminal_viewport_scroll_for(&session_path, lines).await;
+            AppControlResponse {
+                request_id: request.request_id.clone(),
+                handled_by_pid: std::process::id(),
+                completed_at_ms: current_millis() as u128,
+                output_path: None,
+                error: result
+                    .get("accepted")
+                    .and_then(Value::as_bool)
+                    .filter(|accepted| !accepted)
+                    .and_then(|_| result.get("reason"))
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned),
+                data: Some(result),
+            }
+        }
+        AppControlCommand::ScrollTerminalViewport { session_path, to } => {
+            let result = scroll_terminal_viewport_for(&session_path, &to).await;
             AppControlResponse {
                 request_id: request.request_id.clone(),
                 handled_by_pid: std::process::id(),
