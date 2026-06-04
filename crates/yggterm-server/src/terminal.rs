@@ -49,6 +49,19 @@ pub struct TerminalChunk {
     pub data: String,
 }
 
+/// Outcome of a readiness-gated `TerminalManager::submit_prompt`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PromptSubmitOutcome {
+    /// The session reached a ready interactive prompt and `data` was written.
+    /// `waited_ms` is how long readiness took (0 if it was already ready).
+    Submitted { waited_ms: u64 },
+    /// The session never reached a ready prompt within the timeout; NOTHING was
+    /// written. The caller should retry later or skip.
+    NotReady { waited_ms: u64 },
+    /// No such session (key absent).
+    NoSession,
+}
+
 #[derive(Debug, Clone)]
 pub struct TerminalReadResult {
     pub cursor: u64,
@@ -643,6 +656,47 @@ impl TerminalManager {
             .get(key)
             .with_context(|| format!("terminal session not found: {key}"))?;
         session.write(data)
+    }
+
+    /// Readiness-gated prompt insertion — the robustness contract behind agent /
+    /// automation prompt insertion (timer-fired prompts must never land in a
+    /// menu / busy / onboarding / update surface and do the wrong thing). Poll the
+    /// session's current vt100 screen with `is_ready` until it reports the session
+    /// is sitting at an idle interactive prompt, THEN write `data`. If the session
+    /// isn't ready within `timeout`, write NOTHING and report `NotReady` so the
+    /// caller can retry later or skip.
+    ///
+    /// `is_ready` is the injected readiness POLICY (e.g. the codex current-input-row
+    /// recognizer the GUI uses) so this primitive stays agnostic of CLI-specific
+    /// prompt shapes and keeps the recognizer's single source of truth in the
+    /// caller's crate. Driven blocking (the caller runs it off the UI thread); the
+    /// live `server app terminal send`/automation paths supply the predicate.
+    pub fn submit_prompt(
+        &self,
+        key: &str,
+        data: &str,
+        is_ready: impl Fn(&str) -> bool,
+        timeout: Duration,
+    ) -> Result<PromptSubmitOutcome> {
+        const POLL_INTERVAL: Duration = Duration::from_millis(120);
+        let start = Instant::now();
+        loop {
+            let Some(screen) = self.session_screen_snapshot(key) else {
+                return Ok(PromptSubmitOutcome::NoSession);
+            };
+            if is_ready(&screen) {
+                self.write(key, data)?;
+                return Ok(PromptSubmitOutcome::Submitted {
+                    waited_ms: start.elapsed().as_millis() as u64,
+                });
+            }
+            if start.elapsed() >= timeout {
+                return Ok(PromptSubmitOutcome::NotReady {
+                    waited_ms: start.elapsed().as_millis() as u64,
+                });
+            }
+            thread::sleep(POLL_INTERVAL);
+        }
     }
 
     pub fn resize(&self, key: &str, cols: u16, rows: u16) -> Result<()> {
