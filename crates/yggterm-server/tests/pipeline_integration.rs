@@ -264,6 +264,71 @@ fn normal_buffer_scrollback_is_retained_end_to_end() {
 }
 
 #[test]
+fn scrolling_output_populates_clean_daemon_history_for_xterm_scrollback() {
+    // The "scroll-lock" question: a session can only scroll up in the client when
+    // the daemon has CLEAN scrolled-off history rows to load into xterm scrollback
+    // (so base_y > 0). Genuinely-scrolling output MUST produce that history.
+    let mut mgr = TerminalManager::new();
+    let key = "test://history-scroll";
+    mgr.ensure_session(
+        key,
+        &launch("--scenario normal-scrollback --rows 120 --hold-ms 4000"),
+        None,
+    )
+    .expect("ensure_session");
+    wait_for_output(&mgr, key);
+    let history = mgr
+        .session_history_rows(key)
+        .expect("session_history_rows for a live session");
+    assert!(
+        history.len() > 40,
+        "scrolling output must leave many clean scrolled-off rows for xterm scrollback; got {}",
+        history.len()
+    );
+    assert!(
+        history.iter().any(|line| line.contains("NORMAL_LINE_0000")),
+        "the oldest scrolled-off line must be in the clean daemon history"
+    );
+}
+
+#[test]
+fn cursor_addressed_repaint_has_no_clean_scrollback_so_base_y_zero_is_correct() {
+    // A cursor-addressed in-place repaint TUI (clear-storm writes \x1b[2J\x1b[H +
+    // content each frame, never scrolling — the codex-class rendering pattern)
+    // OVERWRITES its viewport instead of scrolling, so nothing enters the vt100
+    // scrollback ring. The daemon therefore has ~no clean history to load, and the
+    // client correctly reveals with base_y == 0 (no scrollback to scroll into).
+    // This codifies that the codex "scroll-lock" is inherent to codex's rendering,
+    // NOT a yggterm pipeline bug — fabricating scrollback from the cursor-addressed
+    // repaint stream is the known corruption trap (docs/xterm-bugs.md) and must not
+    // be attempted here.
+    let mut mgr = TerminalManager::new();
+    let key = "test://history-repaint";
+    mgr.ensure_session(
+        key,
+        &launch("--scenario clear-storm --count 40 --hold-ms 4000"),
+        None,
+    )
+    .expect("ensure_session");
+    wait_for_output(&mgr, key);
+    let history = mgr
+        .session_history_rows(key)
+        .expect("session_history_rows for a live session");
+    // The final frame is in the VISIBLE viewport (not scrollback); the overwritten
+    // earlier frames did not scroll off, so clean history is empty/minimal.
+    assert!(
+        history.len() <= 2,
+        "cursor-addressed repaint must NOT fabricate scrollback; got {} rows: {:?}",
+        history.len(),
+        history
+    );
+    assert!(
+        !history.iter().any(|line| line.contains("CLEAR_FRAME_0000")),
+        "overwritten (not scrolled-off) frames must never appear as clean scrollback"
+    );
+}
+
+#[test]
 fn clear_storm_does_not_corrupt_final_frame() {
     let mut mgr = TerminalManager::new();
     let key = "test://clear-storm";
