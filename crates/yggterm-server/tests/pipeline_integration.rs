@@ -127,21 +127,14 @@ fn normal_line_indices(data: &str) -> Vec<usize> {
     out
 }
 
-/// REPRODUCES the open data-loss bug (docs/xterm-bugs.md#chunk-ring-trim-drops-mid-stream).
-///
 /// A client that reads, then falls behind while output keeps flowing, must not
-/// silently lose the lines the ring trimmed in between: the next read from its
-/// cursor must either deliver them contiguously OR re-sync (replay history). Today
-/// `read(cursor)` just returns the surviving `seq > cursor` chunks with no gap
-/// signal, so the trimmed middle vanishes.
-///
-/// `#[ignore]`d: it intentionally fails on current `main` (the gap re-sync was
-/// reverted in 2.8.15 as a TRAP — see incident-gap-fix-cascade-2026-06-03). Run with
-/// `cargo test -p yggterm-server --test pipeline_integration -- --ignored` while
-/// developing the alt-screen-aware re-land; it must go green (and the normal/
-/// alt-screen/streaming tests too) before the fix ships.
+/// SILENTLY lose the lines the ring trimmed in between: the resumed read from its
+/// cursor must either deliver them contiguously OR set `resync_required` so the
+/// client re-attaches (recovering the middle from the daemon vt100 scrollback).
+/// Before the fix, `read(cursor)` returned the discontiguous surviving tail with no
+/// signal and the trimmed middle vanished
+/// (docs/xterm-bugs.md#chunk-ring-trim-drops-mid-stream).
 #[test]
-#[ignore = "reproduces the open mid-stream chunk-ring gap; un-ignore when re-landing the fix"]
 fn read_from_cursor_never_silently_drops_trimmed_middle_chunks() {
     let mut mgr = TerminalManager::new();
     let key = "test://midstream-gap";
@@ -171,8 +164,7 @@ fn read_from_cursor_never_silently_drops_trimmed_middle_chunks() {
     // early cursor but BELOW the latest.
     std::thread::sleep(Duration::from_secs(5));
 
-    // Resume reading from where we left off. The union of what we have seen must be
-    // gap-free up to the latest delivered line.
+    // Resume reading from where we left off.
     let resumed = mgr.read(key, early_cursor).expect("resumed read");
     seen.extend(normal_line_indices(
         &resumed.chunks.iter().map(|c| c.data.as_str()).collect::<String>(),
@@ -185,17 +177,27 @@ fn read_from_cursor_never_silently_drops_trimmed_middle_chunks() {
         "test setup: output must keep flowing past the early read (early_max={early_max}, latest={latest})"
     );
 
-    // The invariant: no missing NORMAL_LINE between the earliest consumed line and
-    // the latest delivered one. A silent trim leaves a hole here.
+    // The contract: the resumed read is EITHER gap-free (no missing NORMAL_LINE
+    // between the earliest consumed line and the latest delivered), OR it sets
+    // resync_required so the client knows to re-attach and recover the trimmed
+    // middle from the vt100 scrollback. What must NOT happen is a SILENT hole.
     let earliest = seen.first().copied().unwrap_or(0);
     let missing: Vec<usize> = (earliest..=latest).filter(|n| !seen.contains(n)).collect();
     assert!(
-        missing.is_empty(),
-        "silent mid-stream data loss: {} lines dropped without a gap signal (e.g. {:?}…) \
-         between NORMAL_LINE_{:04} and NORMAL_LINE_{:04}",
+        missing.is_empty() || resumed.resync_required,
+        "SILENT mid-stream data loss: {} lines dropped with resync_required=false \
+         (e.g. {:?}…) between NORMAL_LINE_{:04} and NORMAL_LINE_{:04}",
         missing.len(),
         &missing[..missing.len().min(5)],
         earliest,
         latest
     );
+    // And when a trim-below-cursor actually happened here, the signal must fire (so
+    // the bug can't silently regress into "no missing lines because nothing trimmed").
+    if !missing.is_empty() {
+        assert!(
+            resumed.resync_required,
+            "ring trimmed below the client cursor but resync_required was not set"
+        );
+    }
 }
