@@ -17205,6 +17205,24 @@ pub fn run_app_control_probe_terminal_viewport_input(
     Ok(())
 }
 
+pub fn run_app_control_scroll_terminal_viewport(
+    session_path: &str,
+    to: &str,
+    timeout_ms: u64,
+) -> anyhow::Result<()> {
+    let home = resolve_yggterm_home()?;
+    let response = request_app_control(
+        &home,
+        AppControlCommand::ScrollTerminalViewport {
+            session_path: session_path.to_string(),
+            to: to.to_string(),
+        },
+        timeout_ms,
+    )?;
+    write_stdout_payload(&serde_json::to_string_pretty(&response)?)?;
+    Ok(())
+}
+
 pub fn run_app_control_probe_terminal_viewport_scroll(
     session_path: &str,
     lines: i32,
