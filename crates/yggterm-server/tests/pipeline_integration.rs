@@ -329,6 +329,46 @@ fn cursor_addressed_repaint_has_no_clean_scrollback_so_base_y_zero_is_correct() 
 }
 
 #[test]
+fn codex_inline_committed_lines_reach_daemon_scrollback() {
+    // codex (ratatui inline viewport) prints committed conversation lines with
+    // newlines (they scroll up) and repaints only a bottom live region in place via
+    // absolute addressing. The user's report: codex scrolls fine in ghostty but is
+    // scroll-locked in yggterm. If the daemon vt100 scrollback ring captures the
+    // committed scrolled-off lines under THIS pattern, then the gap is in the reveal/
+    // load path (fixable), not "codex can't scroll". This test localizes that.
+    let mut mgr = TerminalManager::new();
+    let key = "test://codex-inline";
+    mgr.ensure_session(
+        key,
+        &launch("--scenario codex-inline --rows 80 --screen-rows 24 --repaints 8 --hold-ms 4000"),
+        None,
+    )
+    .expect("ensure_session");
+    wait_for_output(&mgr, key);
+    let history = mgr
+        .session_history_rows(key)
+        .expect("session_history_rows for a live session");
+    let joined = history.join("\n");
+    // The committed conversation MUST be in the daemon's clean scrollback — codex
+    // emitted these with newlines, they scrolled off, the vt100 ring must retain them.
+    assert!(
+        history.len() > 40,
+        "committed inline-viewport lines must reach daemon scrollback; got {} rows",
+        history.len()
+    );
+    assert!(
+        joined.contains("CODEX_MSG_0000"),
+        "the oldest committed conversation line must be retained as clean scrollback"
+    );
+    // The bottom-region repaint content (composer) must NOT pollute scrollback as
+    // scrolled-off history (it never scrolled — repainted in place).
+    assert!(
+        !joined.contains("COMPOSER_FRAME_000"),
+        "in-place bottom-region repaints must not appear as scrolled-off history"
+    );
+}
+
+#[test]
 fn clear_storm_does_not_corrupt_final_frame() {
     let mut mgr = TerminalManager::new();
     let key = "test://clear-storm";

@@ -166,6 +166,41 @@ fn main() {
             hold(&args);
             return;
         }
+        // Codex/ratatui INLINE-VIEWPORT pattern: committed conversation lines are
+        // printed once with newlines (they scroll up into the terminal's scrollback),
+        // and a fixed bottom live region (composer + status) is repainted IN PLACE via
+        // absolute cursor addressing — never scrolling. This mirrors what real codex
+        // emits (verified live: 0 newlines in the recent ring, abs-addressing only to
+        // the bottom rows). Used to test that scroll-off committed content reaches the
+        // daemon vt100 scrollback ring even when interleaved with bottom-region repaints
+        // (the "why can't I scroll codex in yggterm" investigation).
+        "codex-inline" => {
+            let rows: usize = arg_value(&args, "--rows")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(80);
+            let screen: usize = arg_value(&args, "--screen-rows")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(24);
+            let repaints: usize = arg_value(&args, "--repaints")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(8);
+            // Emit committed conversation lines that scroll naturally (newline-driven).
+            for i in 0..rows {
+                let _ = write!(w, "CODEX_MSG_{i:04} committed conversation line\r\n");
+            }
+            // Now repaint a 3-row bottom live region in place, many times, WITHOUT
+            // scrolling — exactly codex's idle composer/status churn.
+            let composer_top = screen.saturating_sub(2);
+            for frame in 0..repaints {
+                for (offset, label) in ["> ", "model ", "esc "].iter().enumerate() {
+                    let row = composer_top + offset;
+                    // absolute position + clear-to-EOL + content (no newline)
+                    let _ = write!(w, "\x1b[{row};1H\x1b[K{label}COMPOSER_FRAME_{frame:03}");
+                }
+                let _ = w.flush();
+                thread::sleep(Duration::from_millis(20));
+            }
+        }
         // Plain shell-ish prompt (normal buffer, minimal output).
         _ => {
             let _ = write!(w, "$ MOCK_TUI_PROMPT\r\n$ ");
