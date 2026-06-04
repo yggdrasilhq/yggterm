@@ -4,34 +4,33 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
-- Root-caused and fixed the surface-health false positive behind the earlier
-  couldn't-observe guard: `prompt_ready_surface` required a focus/input-ownership
-  signal, so a healthy but **unfocused** codex prompt (window not focused) failed
-  every focus-gated branch and was misread as "only showing a plain shell prompt"
-  (driving spurious recovery). Prompt-readiness is now also recognized from the
-  content itself — a current codex input row (a "›" prompt followed by the
-  model/status footer) — which is reliable regardless of focus. The couldn't-observe
-  abstain is now confidence-gated (fires only when the readable content is genuinely
-  too sparse to classify, not merely because the window is unfocused), restoring full
-  surface-health detection for the common unfocused-but-readable case.
+## 2.8.16
+
+- Fixed a surface-health false positive that misread a healthy but **unfocused**
+  terminal as broken and drove spurious fault-recovery. Root cause: prompt-readiness
+  was gated on a focus/input-ownership signal, so a healthy unfocused codex prompt
+  failed every branch and was classified as "only showing a plain shell prompt."
+  Prompt-readiness is now also recognized from the content itself — a current codex
+  input row (a "›" prompt followed by the model/status footer) — which is reliable
+  regardless of focus. The fallback "couldn't observe" abstain is now confidence-gated
+  (it triggers only when the readable content is genuinely too sparse to classify, not
+  merely because the window is unfocused), so full surface-health detection is restored
+  for the common unfocused-but-readable case while transient empty/blur reads still
+  don't cause spurious recovery. See docs/xterm-bugs.md
+  (surface-recovery-false-positive-on-transient → "second cause").
 
 - Renamed the misleading app-control `input_enabled` field (it meant "this host holds
-  input focus/stdin," not "the user can type," and caused a false "session broken"
-  investigation). It is now two accurately-named fields: per-host
-  `terminal_hosts[].host_stdin_enabled` and the summary aggregate
+  input focus/stdin," not "the user can type"). It is now two accurately-named fields:
+  per-host `terminal_hosts[].host_stdin_enabled` and the summary aggregate
   `active_terminal_surface.foreground_input_ready`; the snapshot reason
-  `input_disabled` is now `focus_released`. `raw_input_enabled`/`effective_input_focus`
-  are unchanged. Consumers of `server app state` / probe JSON should use the new keys.
+  `input_disabled` is now `focus_released`. `raw_input_enabled` /
+  `effective_input_focus` are unchanged. Consumers of `server app state` / probe JSON
+  should use the new keys.
 
-- App-control surface health no longer raises a false "empty/plain-shell surface"
-  problem (and the spurious fault-recovery it drives) when the yggterm window is not
-  focused. A buffer read taken with the window unfocused (e.g. during an app-control
-  query, or while another app is foreground) is captured on blur and can read back
-  empty/sparse even though the canvas is painting live content; the detector now
-  abstains on such low-confidence reads when a live daemon paint frame is present and
-  it isn't a transport error. Genuinely stuck/stale surfaces (no live paint frame)
-  and focused-window surfaces are still diagnosed. See docs/xterm-bugs.md
-  (surface-recovery-false-positive-on-transient → "second cause").
+- Test suite stabilized: cleared 11 long-red workspace tests (stale assertions
+  trailing deliberate refactors + environment-fragile socket tests that exceeded
+  SUN_LEN under a deep `$TMPDIR`), with no production-code changes. A green suite is a
+  trustworthy regression gate again.
 
 ## 2.8.15
 
