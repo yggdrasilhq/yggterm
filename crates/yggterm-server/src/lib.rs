@@ -43,7 +43,8 @@ pub use daemon::{
     start_ssh_session_at,
     start_ssh_session_at_with_terminal_appearance, status, switch_agent_session_mode,
     sync_external_window, sync_terminal_identity, sync_terminal_identity_with_profile, sync_theme,
-    terminal_ensure, terminal_read, terminal_resize, terminal_restart, terminal_restart_with_size,
+    terminal_ensure, terminal_history, terminal_read, terminal_resize, terminal_restart,
+    terminal_restart_with_size,
     terminal_retained_snapshot, terminal_snapshot, terminal_write, toggle_preview_block,
     update_session_copy,
 };
