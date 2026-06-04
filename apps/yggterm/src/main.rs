@@ -51,8 +51,8 @@ use yggterm_server::{
     run_app_control_start_action, run_app_control_trigger_update_check, run_attach, run_daemon,
     ScreenshotPostProcess, run_screenrecord_capture, run_screenshot_capture,
     run_screenshot_capture_with_post_process, run_trace_bundle, run_trace_follow, run_trace_tail,
-    shutdown, snapshot, start_local_session, status, terminal_restart, terminal_retained_snapshot,
-    terminal_snapshot, terminal_write, try_run_remote_server_command,
+    shutdown, snapshot, start_local_session, status, terminal_resize, terminal_restart,
+    terminal_retained_snapshot, terminal_snapshot, terminal_write, try_run_remote_server_command,
 };
 use yggterm_shell::{
     ShellBootstrap, launch_shell, start_daemon_watchdog, terminal_identity_appearance_for_settings,
@@ -682,6 +682,7 @@ fn print_server_help() {
   yggterm server shutdown
   yggterm server terminal write <session> (--data <data>|--stdin)
   yggterm server terminal screen <session> [--retained] [--raw]
+  yggterm server terminal resize <session> --cols <n> --rows <n>
   yggterm server terminal restart <session> [--terminal-appearance <dark|light>] [--force-remote]
   yggterm server sessions regenerate-copy [--budget <n>] [--force] [--reset-summary-history] [--json]
   yggterm server smoke
@@ -949,6 +950,31 @@ fn main() -> Result<()> {
                 }))?
             );
         }
+        return Ok(());
+    }
+    // Resize a session's PTY (SIGWINCH). Forces a full-screen TUI repaint —
+    // the safe recovery for a blank/garbled remote viewport where the daemon
+    // holds the content but xterm.js seeded from a stale/empty snapshot and the
+    // idle program won't re-emit on its own. Read-only-ish control op; skips the
+    // is-current version gate so it works against an older running daemon.
+    if args.len() >= 4 && args[0] == "server" && args[1] == "terminal" && args[2] == "resize" {
+        let endpoint = default_endpoint(store.home_dir());
+        let cols = cli_flag_value(&args, "--cols")
+            .and_then(|v| v.parse::<u16>().ok())
+            .context("missing/invalid --cols for server terminal resize")?;
+        let rows = cli_flag_value(&args, "--rows")
+            .and_then(|v| v.parse::<u16>().ok())
+            .context("missing/invalid --rows for server terminal resize")?;
+        terminal_resize(&endpoint, &args[3], cols, rows)?;
+        println!(
+            "{}",
+            serde_json::to_string(&serde_json::json!({
+                "resized": true,
+                "session_path": args[3],
+                "cols": cols,
+                "rows": rows,
+            }))?
+        );
         return Ok(());
     }
     if args.len() >= 4 && args[0] == "server" && args[1] == "terminal" && args[2] == "restart" {
