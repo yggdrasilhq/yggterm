@@ -59,7 +59,7 @@ pub use remote_runtime::{
     RemoteRuntimeRegistry, RemoteRuntimeSession, RemoteRuntimeSessionInput,
     RemoteRuntimeSessionState, RemoteWriterLease,
 };
-pub use terminal::{TerminalChunk, TerminalManager, TerminalReadResult};
+pub use terminal::{PromptSubmitOutcome, TerminalChunk, TerminalManager, TerminalReadResult};
 
 use anyhow::Context;
 use codex_cli::{
