@@ -52,8 +52,9 @@ use yggterm_server::{
     run_app_control_start_action, run_app_control_trigger_update_check, run_attach, run_daemon,
     ScreenshotPostProcess, run_screenrecord_capture, run_screenshot_capture,
     run_screenshot_capture_with_post_process, run_trace_bundle, run_trace_follow, run_trace_tail,
-    shutdown, snapshot, start_local_session, status, terminal_resize, terminal_restart,
-    terminal_retained_snapshot, terminal_snapshot, terminal_write, try_run_remote_server_command,
+    shutdown, snapshot, start_local_session, status, terminal_history, terminal_resize,
+    terminal_restart, terminal_retained_snapshot, terminal_snapshot, terminal_write,
+    try_run_remote_server_command,
 };
 use yggterm_shell::{
     ShellBootstrap, launch_shell, start_daemon_watchdog, terminal_identity_appearance_for_settings,
@@ -682,7 +683,7 @@ fn print_server_help() {
   yggterm server snapshot
   yggterm server shutdown
   yggterm server terminal write <session> (--data <data>|--stdin)
-  yggterm server terminal screen <session> [--retained] [--raw]
+  yggterm server terminal screen <session> [--retained] [--raw] [--history]
   yggterm server terminal resize <session> --cols <n> --rows <n>
   yggterm server terminal restart <session> [--terminal-appearance <dark|light>] [--force-remote]
   yggterm server sessions regenerate-copy [--budget <n>] [--force] [--reset-summary-history] [--json]
@@ -918,6 +919,30 @@ fn main() -> Result<()> {
     // probe-scroll) to tell whether a blank/garbled viewport is a real session
     // problem or an xterm.js render/replay bug. `--retained` uses the full
     // scrollback snapshot; default is the current live screen.
+    if args.len() >= 4
+        && args[0] == "server"
+        && args[1] == "terminal"
+        && args[2] == "screen"
+        && args.iter().any(|arg| arg == "--history")
+    {
+        // Diagnostic: dump the daemon's CLEAN scrolled-off vt100 scrollback rows for
+        // a session (the history that CAN load into xterm scrollback). Read-only;
+        // connect directly like the other terminal-screen reads.
+        let endpoint = default_endpoint(store.home_dir());
+        let (rows, running) = terminal_history(&endpoint, &args[3])?;
+        let nonblank = rows.iter().filter(|line| !line.trim().is_empty()).count();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "session_path": args[3],
+                "running": running,
+                "history_row_count": rows.len(),
+                "nonblank_row_count": nonblank,
+                "rows": rows,
+            }))?
+        );
+        return Ok(());
+    }
     if args.len() >= 4 && args[0] == "server" && args[1] == "terminal" && args[2] == "screen" {
         // Read-only diagnostic: talk to whatever daemon currently holds the socket,
         // regardless of version. Do NOT call ensure_local_server_ready_for_cli — its
