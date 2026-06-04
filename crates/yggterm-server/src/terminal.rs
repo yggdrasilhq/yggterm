@@ -731,10 +731,17 @@ impl TerminalManager {
                 .session_screen_snapshot(key)
                 .is_some_and(|screen| screen.contains(PROBE));
             if echoed {
-                // The program is consuming input. Clear the probe, then submit.
+                // The program is consuming input. Clear the probe, then submit AS A
+                // HUMAN DOES: type the text, then a DISTINCT Enter keypress. codex
+                // treats a \r concatenated with text in one write as a pasted newline
+                // (composer content), NOT a submit — so the Enter must be its own
+                // write after the text settles (verified live 2026-06-04).
                 self.write(key, CLEAR_LINE)?;
                 thread::sleep(Duration::from_millis(60));
-                self.write(key, data)?;
+                let text = data.trim_end_matches(['\r', '\n']);
+                self.write(key, text)?;
+                thread::sleep(Duration::from_millis(80));
+                self.write(key, "\r")?;
                 return Ok(PromptSubmitOutcome::Submitted {
                     waited_ms: start.elapsed().as_millis() as u64,
                 });
