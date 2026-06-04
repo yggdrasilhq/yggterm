@@ -1640,6 +1640,13 @@ pub enum ServerResponse {
         post_resize_output_seen: bool,
         #[serde(default)]
         last_resize_seq: u64,
+        // The live chunk ring trimmed below this read's cursor — the surviving
+        // chunks skip a contiguous middle, so the client must re-attach to recover
+        // it (docs/xterm-bugs.md#chunk-ring-trim-drops-mid-stream). `serde(default)`
+        // keeps it cross-version safe: an older daemon that doesn't send the field
+        // deserializes as `false`, and older clients ignore it.
+        #[serde(default)]
+        resync_required: bool,
     },
     TerminalSnapshot {
         text: String,
@@ -4402,6 +4409,7 @@ impl DaemonRuntime {
                             eof_without_output,
                             post_resize_output_seen,
                             last_resize_seq,
+                            resync_required,
                         )) => {
                             return Ok(ServerResponse::TerminalStream {
                                 cursor,
@@ -4411,6 +4419,7 @@ impl DaemonRuntime {
                                 eof_without_output,
                                 post_resize_output_seen,
                                 last_resize_seq,
+                                resync_required,
                             });
                         }
                         Err(error) => {
@@ -4474,6 +4483,7 @@ impl DaemonRuntime {
                     eof_without_output: stream.eof_without_output,
                     post_resize_output_seen: stream.post_resize_output_seen,
                     last_resize_seq: stream.last_resize_seq,
+                    resync_required: stream.resync_required,
                 }
             }
             ServerRequest::TerminalSnapshot { path } => {
@@ -6525,7 +6535,7 @@ pub fn terminal_read(
     endpoint: &ServerEndpoint,
     path: &str,
     cursor: u64,
-) -> Result<(u64, Vec<TerminalStreamChunk>, bool, bool, bool, bool, u64)> {
+) -> Result<(u64, Vec<TerminalStreamChunk>, bool, bool, bool, bool, u64, bool)> {
     match send_request(
         endpoint,
         &ServerRequest::TerminalRead {
@@ -6541,6 +6551,7 @@ pub fn terminal_read(
             eof_without_output,
             post_resize_output_seen,
             last_resize_seq,
+            resync_required,
         } => Ok((
             cursor,
             chunks,
@@ -6549,6 +6560,7 @@ pub fn terminal_read(
             eof_without_output,
             post_resize_output_seen,
             last_resize_seq,
+            resync_required,
         )),
         ServerResponse::Error { message } => bail!(message),
         other => bail!("unexpected terminal stream response: {:?}", other),

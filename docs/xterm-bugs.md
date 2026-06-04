@@ -1198,16 +1198,24 @@ Covered by `tests/pipeline_integration.rs::read_from_cursor_never_silently_drops
 OR `resync_required`). No runtime behavior change yet — the flag is not consumed
 downstream (see layer 2).
 
-### Fix — layer 2 PENDING: propagate + client re-attach (the live-risky part)
-`resync_required` must be threaded through the socket/SSH protocol → the flattened
-tuple in `terminal_read_with_local_daemon_recovery` (lib.rs ~13498) and the bridge
-stream handler (lib.rs ~13587, which currently drops it) → the GUI read-bridge
-(`shell.rs`), where it triggers a clean re-attach (read from cursor 0 / fresh screen
-snapshot) instead of appending the discontiguous tail. This is multi-layer and must be
-live-verified against the real repro (a BACKGROUNDED session streaming past the ring
-cap, then switch-back) before shipping. Longer term this folds into real-scrollback
-retention (`[[spec-tmux-parity-and-beyond]]`) so the ring/idle-trim never evicts live
-content a connected client still needs.
+### Fix — layer 2a DONE (carry + observe): `resync_required` threaded end-to-end
+The flag now propagates through the whole read path with NO behavior change:
+`ServerResponse::TerminalStream` carries it (`#[serde(default)]` → cross-version safe);
+the daemon request handler sets it from `stream.resync_required` (and forwards it on
+the preserved-owner path); `terminal_read` / `terminal_read_with_local_daemon_recovery`
+(lib.rs) and `terminal_read_async` (shell.rs) extend their tuples; the GUI read-bridge
+loop binds it and emits a `terminal_stream_resync_required` trace event when a gap
+fires. So we can now OBSERVE real-world gaps (event-trace) without changing behavior.
+
+### Fix — layer 2b PENDING: client re-attach action (the live-risky part)
+The only remaining step: in the GUI read-bridge, when `resync_required` is set, trigger
+a clean re-attach (read from cursor 0 / fresh screen snapshot) to recover the trimmed
+middle from the vt100 scrollback, instead of appending the discontiguous tail. This
+changes runtime behavior and must be live-verified against the real repro (a
+BACKGROUNDED session streaming past the ring cap, then switch-back) before shipping —
+do NOT rush it (the in-band-replay variants of this were the 2.8.12/14 TRAP). Longer
+term this folds into real-scrollback retention (`[[spec-tmux-parity-and-beyond]]`) so
+the ring/idle-trim never evicts live content a connected client still needs.
 
 ### Code locations
 `crates/yggterm-server/src/terminal.rs`: `PtySessionRuntime::read` (gap detection +
