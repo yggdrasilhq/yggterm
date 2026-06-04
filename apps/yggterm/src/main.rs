@@ -49,9 +49,10 @@ use yggterm_server::{
     run_app_control_set_theme_editor_values, run_app_control_set_tree_selection,
     run_app_control_set_ui_theme, run_app_control_set_window_chrome_hover,
     run_app_control_start_action, run_app_control_trigger_update_check, run_attach, run_daemon,
-    run_screenrecord_capture, run_screenshot_capture, run_trace_bundle, run_trace_follow,
-    run_trace_tail, shutdown, snapshot, start_local_session, status, terminal_restart,
-    terminal_write, try_run_remote_server_command,
+    ScreenshotPostProcess, run_screenrecord_capture, run_screenshot_capture,
+    run_screenshot_capture_with_post_process, run_trace_bundle, run_trace_follow, run_trace_tail,
+    shutdown, snapshot, start_local_session, status, terminal_restart, terminal_write,
+    try_run_remote_server_command,
 };
 use yggterm_shell::{
     ShellBootstrap, launch_shell, start_daemon_watchdog, terminal_identity_appearance_for_settings,
@@ -392,6 +393,35 @@ fn cli_flag_value<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
     None
 }
 
+/// Parse the agent-oriented screenshot post-process flags:
+///   --region <terminal|full>   crop to the active terminal viewport
+///   --crop <x,y,w,h>           explicit pixel crop
+///   --scale <factor>           nearest-neighbour upscale (e.g. 2 or 2.5)
+/// Returns None when none are present (so the plain capture path is used).
+fn parse_screenshot_post_process(args: &[String]) -> Option<ScreenshotPostProcess> {
+    let region = cli_flag_value(args, "--region").map(str::to_string);
+    let crop = cli_flag_value(args, "--crop").and_then(|raw| {
+        let parts: Vec<u32> = raw
+            .split(',')
+            .filter_map(|piece| piece.trim().parse::<u32>().ok())
+            .collect();
+        if parts.len() == 4 {
+            Some((parts[0], parts[1], parts[2], parts[3]))
+        } else {
+            None
+        }
+    });
+    let scale = cli_flag_value(args, "--scale").and_then(|raw| raw.parse::<f32>().ok());
+    if region.is_none() && crop.is_none() && scale.is_none() {
+        return None;
+    }
+    Some(ScreenshotPostProcess {
+        region,
+        crop,
+        scale: scale.unwrap_or(1.0),
+    })
+}
+
 fn launch_app_background(
     home_dir: &std::path::Path,
     timeout_ms: u64,
@@ -655,7 +685,7 @@ fn print_server_help() {
   yggterm server sessions regenerate-copy [--budget <n>] [--force] [--reset-summary-history] [--json]
   yggterm server smoke
   yggterm server trace <tail|follow|bundle>
-  yggterm server screenshot <target> [output]
+  yggterm server screenshot <target> [output] [--region terminal|full] [--crop x,y,w,h] [--scale n]
   yggterm server screenrecord <target> [output]
   yggterm server app <subcommand>"
     );
@@ -669,7 +699,7 @@ fn print_server_app_help() {
   yggterm server app launch [--wait-visible] [--wait-settled] [--allow-multi-window]
   yggterm server app state [--pid <pid>]
   yggterm server app rows [--pid <pid>]
-  yggterm server app screenshot [output] [--pid <pid>]
+  yggterm server app screenshot [output] [--pid <pid>] [--region terminal|full] [--crop x,y,w,h] [--scale n]
   yggterm server app open <session-path> [--view <terminal|preview>] [--pid <pid>]
   yggterm server app session <remove|delete> <session-path> [--pid <pid>]
   yggterm server app session rename <session-path> <title> [--pid <pid>]
@@ -948,6 +978,14 @@ fn main() -> Result<()> {
             .skip(3)
             .find(|value| !value.starts_with("--"))
             .map(String::as_str);
+        if let Some(post) = parse_screenshot_post_process(&args) {
+            return run_screenshot_capture_with_post_process(
+                &args[2],
+                output_path,
+                timeout_ms,
+                post,
+            );
+        }
         return run_screenshot_capture(&args[2], output_path, timeout_ms);
     }
     if args.len() >= 3 && args[0] == "server" && args[1] == "screenrecord" {
@@ -1024,7 +1062,16 @@ fn main() -> Result<()> {
                 let output_path = cli_positional_args(&args, 3)
                     .into_iter()
                     .find(|value| *value != target);
-                run_screenshot_capture(target, output_path, timeout_ms)
+                if let Some(post) = parse_screenshot_post_process(&args) {
+                    run_screenshot_capture_with_post_process(
+                        target,
+                        output_path,
+                        timeout_ms,
+                        post,
+                    )
+                } else {
+                    run_screenshot_capture(target, output_path, timeout_ms)
+                }
             }
             "screenrecord" => {
                 let duration_secs = args
