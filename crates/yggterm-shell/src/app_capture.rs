@@ -59,6 +59,16 @@ pub struct SurfaceCapture {
     pub output_path: PathBuf,
     pub backend: &'static str,
     pub backend_attempts: Vec<String>,
+    /// Whether this frame faithfully reflects the live terminal. The WebKitGTK
+    /// fallback cannot capture the hardware-accelerated xterm `<canvas>` (so it is
+    /// blind only when the CANVAS renderer is active); the compositor backends
+    /// (Spectacle / X11 grab) always are. The agent must NOT trust terminal-render
+    /// claims from a frame with `faithful == false`. See
+    /// [[finding-app-screenshot-unfaithful-on-wayland]].
+    pub faithful: bool,
+    /// Human-readable reason for the `faithful` verdict (e.g. which renderer was
+    /// active for a webkit-fallback frame).
+    pub faithful_reason: String,
 }
 
 impl SurfaceCapture {
@@ -67,6 +77,10 @@ impl SurfaceCapture {
             output_path: output_path.to_path_buf(),
             backend,
             backend_attempts: Vec::new(),
+            // Compositor backends and the X11 grab are faithful by construction;
+            // the webkit fallback overrides this when the canvas renderer is active.
+            faithful: true,
+            faithful_reason: String::new(),
         }
     }
 
@@ -74,6 +88,22 @@ impl SurfaceCapture {
         self.backend_attempts = backend_attempts;
         self
     }
+
+    fn with_faithful(mut self, faithful: bool, reason: impl Into<String>) -> Self {
+        self.faithful = faithful;
+        self.faithful_reason = reason.into();
+        self
+    }
+}
+
+/// True when the accelerated xterm `<canvas>` renderer may be active — the only
+/// thing the WebKitGTK snapshot cannot capture. Driven by the same env the GUI uses
+/// to enable it (`YGGTERM_ENABLE_XTERM_CANVAS=1`); when unset/0 the terminal renders
+/// via the DOM, which the webkit snapshot DOES capture faithfully.
+fn xterm_canvas_renderer_possibly_active() -> bool {
+    std::env::var("YGGTERM_ENABLE_XTERM_CANVAS")
+        .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
 }
 
 pub async fn capture_visible_app_surface(
@@ -500,9 +530,28 @@ async fn platform_capture_visible_app_surface(
             Err(error) => attempts.push(format!("linux_x11_window: {error:#}")),
         }
     }
-    // Last resort: WebKitGTK snapshot. WARNING: does NOT faithfully capture the
-    // accelerated terminal <canvas> — `attempts` records why the faithful paths
-    // above were unavailable so the degradation is never silent.
+    // Last resort: WebKitGTK snapshot. It does NOT capture the hardware-accelerated
+    // xterm <canvas> — but it DOES faithfully capture the DOM renderer. So this
+    // fallback is faithful EXCEPT when the canvas renderer is active; report that
+    // verdict (rather than blanket-distrusting it) so the agent trusts a DOM frame
+    // and distrusts a canvas one. `attempts` already records why the compositor
+    // paths above were unavailable. See [[finding-app-screenshot-unfaithful-on-wayland]].
+    let canvas_active = xterm_canvas_renderer_possibly_active();
+    let (webkit_faithful, webkit_reason) = if canvas_active {
+        (
+            false,
+            "webkit snapshot cannot capture the accelerated xterm canvas \
+             (YGGTERM_ENABLE_XTERM_CANVAS=1); terminal region may be blank/stale"
+                .to_string(),
+        )
+    } else {
+        (
+            true,
+            "DOM renderer active (canvas disabled) — webkit snapshot captures the \
+             terminal faithfully"
+                .to_string(),
+        )
+    };
     let gtk_webview = desktop.webview.webview();
     let surface = gtk_webview
         .snapshot_future(SnapshotRegion::Visible, SnapshotOptions::NONE)
@@ -515,7 +564,9 @@ async fn platform_capture_visible_app_surface(
             surface
                 .write_to_png(&mut output)
                 .with_context(|| format!("writing screenshot png {}", output_path.display()))?;
-            Ok(SurfaceCapture::new(output_path, "linux_webkit_snapshot").with_attempts(attempts))
+            Ok(SurfaceCapture::new(output_path, "linux_webkit_snapshot")
+                .with_attempts(attempts)
+                .with_faithful(webkit_faithful, webkit_reason))
         }
         ScreenshotTarget::PreviewViewport => {
             let rect = preview_viewport_capture_rect(

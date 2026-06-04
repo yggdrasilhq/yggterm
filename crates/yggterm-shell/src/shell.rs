@@ -33854,6 +33854,8 @@ async fn process_pending_app_control_requests(
                         "active_session_path": state.read().server.active_session_path(),
                         "capture_backend": capture.backend,
                         "capture_backend_attempts": capture.backend_attempts,
+                        "capture_faithful": capture.faithful,
+                        "capture_faithful_reason": capture.faithful_reason,
                         "dom": dom_snapshot,
                     })),
                     error: None,
