@@ -1588,6 +1588,13 @@ pub enum ServerRequest {
     TerminalRetainedSnapshot {
         path: String,
     },
+    /// Diagnostic: the daemon's CLEAN scrolled-off vt100 scrollback rows for a
+    /// session (the history that CAN load into xterm scrollback). Used to confirm
+    /// whether the daemon actually holds a codex session's transcript (proving the
+    /// scroll-lock is a client reveal/load gap) vs the parser never capturing it.
+    TerminalHistory {
+        path: String,
+    },
     TerminalWrite {
         path: String,
         data: String,
@@ -1665,6 +1672,11 @@ pub enum ServerResponse {
         post_resize_output_seen: bool,
         #[serde(default)]
         last_resize_seq: u64,
+    },
+    TerminalHistory {
+        #[serde(default)]
+        rows: Vec<String>,
+        running: bool,
     },
     Ack {
         message: Option<String>,
@@ -4594,6 +4606,34 @@ impl DaemonRuntime {
                     last_resize_seq: self.terminals.session_last_resize_seq(&runtime_path),
                 }
             }
+            ServerRequest::TerminalHistory { path } => {
+                let runtime_path = self.terminal_runtime_key_for_path(&path);
+                if let Some(owner_endpoint) =
+                    self.preserved_owner_endpoint_for_request(&runtime_path)
+                {
+                    match terminal_history(&owner_endpoint, &runtime_path) {
+                        Ok((rows, running)) => {
+                            return Ok(ServerResponse::TerminalHistory { rows, running });
+                        }
+                        Err(error) => {
+                            self.handle_preserved_owner_request_error(
+                                &runtime_path,
+                                &owner_endpoint,
+                                &error,
+                            );
+                            return Err(error);
+                        }
+                    }
+                }
+                let rows = self
+                    .terminals
+                    .session_history_rows(&runtime_path)
+                    .unwrap_or_default();
+                ServerResponse::TerminalHistory {
+                    rows,
+                    running: self.terminals.session_is_running(&runtime_path),
+                }
+            }
             ServerRequest::TerminalWrite { path, data } => {
                 let runtime_path = self.terminal_runtime_key_for_path(&path);
                 if let Some(owner_endpoint) =
@@ -5764,6 +5804,7 @@ fn server_request_name(request: &ServerRequest) -> &'static str {
         ServerRequest::TerminalRead { .. } => "terminal_read",
         ServerRequest::TerminalSnapshot { .. } => "terminal_snapshot",
         ServerRequest::TerminalRetainedSnapshot { .. } => "terminal_retained_snapshot",
+        ServerRequest::TerminalHistory { .. } => "terminal_history",
         ServerRequest::TerminalWrite { .. } => "terminal_write",
         ServerRequest::TerminalResize { .. } => "terminal_resize",
         ServerRequest::TerminalRestart { .. } => "terminal_restart",
@@ -6623,6 +6664,19 @@ pub fn terminal_retained_snapshot(
             "unexpected terminal retained snapshot response: {:?}",
             other
         ),
+    }
+}
+
+pub fn terminal_history(endpoint: &ServerEndpoint, path: &str) -> Result<(Vec<String>, bool)> {
+    match send_request(
+        endpoint,
+        &ServerRequest::TerminalHistory {
+            path: path.to_string(),
+        },
+    )? {
+        ServerResponse::TerminalHistory { rows, running } => Ok((rows, running)),
+        ServerResponse::Error { message } => bail!(message),
+        other => bail!("unexpected terminal history response: {:?}", other),
     }
 }
 
