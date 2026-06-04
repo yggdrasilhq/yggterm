@@ -74772,7 +74772,7 @@ mod tests {
         );
         assert!(
             script.contains("let settledResizeFollowupTimer = null;")
-                && script.contains("emitResize();\n                requestVisiblePaint(true);\n                schedulePromptFollowAfterLayout('settled_resize_followup');\n                emitHostHealth();")
+                && script.contains("emitResize();\n                requestVisiblePaint(true);\n                settledResizeSingleFollow('settled_resize_followup');\n                emitHostHealth();")
                 && !script.contains("fitTerminalToHost('visible_paint')")
                 && !script.contains("applyTerminalRowFitGuard('visible_paint')"),
             "visible-paint repair must not resize xterm or notify the PTY; geometry belongs to explicit resize/refit"
@@ -74982,7 +74982,8 @@ mod tests {
         let script =
             terminal_eval_script_with_canvas_renderer("yggterm-terminal-test", &theme, true, false, "test_reason");
         assert!(script.contains("const canvasRendererEnabled = false;"));
-        assert!(script.contains("if (canvasRendererEnabled && window.CanvasAddon"));
+        assert!(script.contains("let canvasAddonAvailable = Boolean(window.CanvasAddon"));
+        assert!(script.contains("if (canvasRendererEnabled && canvasAddonAvailable"));
     }
 
     #[test]
@@ -75408,7 +75409,7 @@ mod tests {
         assert!(script.contains(
             "resizeChanged\n                    && !fitChanged\n                    && !rowFitGuardApplied"
         ));
-        assert!(script.contains("schedulePromptFollowAfterLayout('settled_resize_followup');"));
+        assert!(script.contains("settledResizeSingleFollow('settled_resize_followup');"));
         assert!(script.contains("lastPromptFollowLayoutGuardReason"));
         assert!(script.contains("promptFollowScheduleSkipCount"));
     }
