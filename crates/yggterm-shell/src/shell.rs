@@ -86999,14 +86999,24 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         );
     }
     #[test]
-    fn remote_open_rearms_ready_attempt_with_stale_attach_lease() {
+    fn ready_daemon_owning_host_stays_reusable_despite_stale_attach_lease() {
+        // 2.8.7 hot-reveal contract. Pre-2.8.7 this scenario (a ready host with a
+        // lingering attach-in-flight marker + stale bootstrap lease) was treated as
+        // "stuck": attach-in-flight POISONED reusability, forcing a rearm + cold
+        // remount on the next open. That remount was the ~1s js-init that dominated
+        // switch-back latency — the user's #1 complaint — so 2.8.7 deliberately
+        // made attach-in-flight NOT poison a ready, daemon-owning host (see the
+        // `daemon_owns_session_runtime` reveal path + the explicit comment in
+        // terminal_session_is_retained_live). The host now stays reveal-reusable,
+        // and `rearm_unready_remote_terminal_bootstrap_for_open` correctly declines
+        // (nothing is unready to rearm — reveal handles it, no remount).
         let active_session_path = "remote-session://dev/ready-but-stuck";
         let bootstrap = test_shell_bootstrap_with_active_session(active_session_path);
         let mut shell = ShellState::new(bootstrap);
         shell.server_busy = false;
         shell.server.set_view_mode(WorkspaceViewMode::Terminal);
         shell.retain_terminal_session_path(active_session_path);
-        let old_epoch = shell.bump_terminal_mount_epoch_for_session(active_session_path);
+        shell.bump_terminal_mount_epoch_for_session(active_session_path);
         shell.begin_terminal_open_attempt(active_session_path, "req-ready", 1, "open_row");
         shell.mark_terminal_open_attempt_ready_for_session(active_session_path, "visual_reveal");
         shell
@@ -87021,36 +87031,12 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
 
         assert!(shell.terminal_session_has_ready_attempt(active_session_path));
         assert!(
-            !shell.terminal_session_is_retained_live(active_session_path),
-            "attach-in-flight must poison a nominally ready attempt"
+            shell.terminal_session_is_retained_live(active_session_path),
+            "a ready, daemon-owning host stays reveal-reusable despite a stale attach-in-flight marker (2.8.7 hot-reveal)"
         );
         assert!(
-            shell.rearm_unready_remote_terminal_bootstrap_for_open(active_session_path),
-            "a ready attempt must not let a stale attach lease block the next resume until timeout"
-        );
-
-        assert!(
-            !shell
-                .terminal_bootstrap_owner_by_session
-                .contains_key(active_session_path)
-        );
-        assert!(
-            !shell
-                .terminal_bootstrap_lease_by_session
-                .contains_key(active_session_path)
-        );
-        assert!(
-            !shell
-                .terminal_attach_in_flight
-                .contains(active_session_path)
-        );
-        assert!(
-            shell
-                .terminal_mount_epochs
-                .get(active_session_path)
-                .copied()
-                .unwrap_or_default()
-                > old_epoch
+            !shell.rearm_unready_remote_terminal_bootstrap_for_open(active_session_path),
+            "a ready host has nothing unready to rearm — reveal reuses it without a cold remount"
         );
     }
     #[test]
@@ -88131,7 +88117,12 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
                 .terminal_session_host_id(active_session_path)
                 .as_deref()
         );
-        assert!(!shell.terminal_session_is_retained_live(active_session_path));
+        // 2.8.7 hot-reveal: a was-ready, daemon-owning host stays reveal-reusable
+        // through a transient retained-surface fault (anti-churn); a DELAYED
+        // retained-fault recovery is armed as the safety net (asserted below).
+        // Non-reveal-eligible hosts (daemon runtime gone) still invalidate — see
+        // active_remote_keep_alive_missing_runtime_does_not_reuse_retained_host.
+        assert!(shell.terminal_session_is_retained_live(active_session_path));
         let recovery_attempt = shell
             .latest_terminal_open_attempt_for_path(active_session_path)
             .expect("recovery attempt should be current");
@@ -88303,7 +88294,12 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
                 .terminal_session_host_id(active_session_path)
                 .as_deref()
         );
-        assert!(!shell.terminal_session_is_retained_live(active_session_path));
+        // 2.8.7 hot-reveal: a was-ready, daemon-owning host stays reveal-reusable
+        // through a transient retained-surface fault (anti-churn); a DELAYED
+        // retained-fault recovery is armed as the safety net (asserted below).
+        // Non-reveal-eligible hosts (daemon runtime gone) still invalidate — see
+        // active_remote_keep_alive_missing_runtime_does_not_reuse_retained_host.
+        assert!(shell.terminal_session_is_retained_live(active_session_path));
         let recovery_attempt = shell
             .latest_terminal_open_attempt_for_path(active_session_path)
             .expect("recovery attempt should be current");
@@ -95125,10 +95121,11 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
                 "problem": "active remote terminal is showing stale retained text before prompt-ready surface"
             }
         }));
-        assert!(
-            !shell.terminal_session_is_retained_live(session_path),
-            "a retained fault should make the host temporarily non-reusable"
-        );
+        // 2.8.7 hot-reveal: a was-ready, daemon-owning host stays reveal-reusable
+        // through a transient retained-surface fault (the anti-churn win). The
+        // point of THIS test is the restore below: a subsequent ready observation
+        // settles the in-flight attempt back to Ready.
+        assert!(shell.terminal_session_is_retained_live(session_path));
 
         shell.observe_terminal_open_attempt_from_viewport(&json!({
             "active_session_path": session_path,
