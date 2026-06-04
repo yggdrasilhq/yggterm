@@ -51,12 +51,24 @@ fn main() {
             let _ = write!(w, "\x1b[?1049l");
         }
         // Normal buffer that accumulates scrollback (base_y grows).
+        //
+        // `--paced-ms N` flushes each line separately (with an N ms gap), so the
+        // daemon reader thread captures one chunk per line — needed to drive the
+        // chunk ring past MAX_CHUNKS deterministically (every byte uniquely labeled
+        // NORMAL_LINE_XXXX so a silent mid-stream trim/gap is detectable).
         "normal-scrollback" => {
             let rows: usize = arg_value(&args, "--rows")
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(50);
+            let paced: u64 = arg_value(&args, "--paced-ms")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0);
             for i in 0..rows {
                 let _ = write!(w, "NORMAL_LINE_{i:04}\r\n");
+                if paced > 0 {
+                    let _ = w.flush();
+                    thread::sleep(Duration::from_millis(paced));
+                }
             }
         }
         // Repeated clear-screen+home then content — the transient-empty / mid-redraw

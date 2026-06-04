@@ -112,3 +112,90 @@ fn high_volume_burst_is_delivered_without_panicking_the_pipeline() {
         data.len()
     );
 }
+
+/// Collect every `NORMAL_LINE_NNNN` index present in `data`, in order.
+fn normal_line_indices(data: &str) -> Vec<usize> {
+    let mut out = Vec::new();
+    for token in data.split("NORMAL_LINE_").skip(1) {
+        let digits: String = token.chars().take(4).take_while(|c| c.is_ascii_digit()).collect();
+        if digits.len() == 4
+            && let Ok(n) = digits.parse::<usize>()
+        {
+            out.push(n);
+        }
+    }
+    out
+}
+
+/// REPRODUCES the open data-loss bug (docs/xterm-bugs.md#chunk-ring-trim-drops-mid-stream).
+///
+/// A client that reads, then falls behind while output keeps flowing, must not
+/// silently lose the lines the ring trimmed in between: the next read from its
+/// cursor must either deliver them contiguously OR re-sync (replay history). Today
+/// `read(cursor)` just returns the surviving `seq > cursor` chunks with no gap
+/// signal, so the trimmed middle vanishes.
+///
+/// `#[ignore]`d: it intentionally fails on current `main` (the gap re-sync was
+/// reverted in 2.8.15 as a TRAP — see incident-gap-fix-cascade-2026-06-03). Run with
+/// `cargo test -p yggterm-server --test pipeline_integration -- --ignored` while
+/// developing the alt-screen-aware re-land; it must go green (and the normal/
+/// alt-screen/streaming tests too) before the fix ships.
+#[test]
+#[ignore = "reproduces the open mid-stream chunk-ring gap; un-ignore when re-landing the fix"]
+fn read_from_cursor_never_silently_drops_trimmed_middle_chunks() {
+    let mut mgr = TerminalManager::new();
+    let key = "test://midstream-gap";
+    // Emit far more paced lines than the live ring cap (MAX_CHUNKS = 512), one chunk
+    // per line, slowly enough that we can read early and then fall behind.
+    mgr.ensure_session(
+        key,
+        &launch("--scenario normal-scrollback --rows 900 --paced-ms 4 --hold-ms 15000"),
+        None,
+    )
+    .expect("ensure_session");
+
+    // Read early to advance the client cursor to a low value (a client that has
+    // consumed the first lines), while the ring has not yet trimmed past it.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline && !mgr.session_has_output(key) {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let first = mgr.read(key, 0).expect("early read");
+    let early_cursor = first.cursor;
+    let mut seen = normal_line_indices(
+        &first.chunks.iter().map(|c| c.data.as_str()).collect::<String>(),
+    );
+    let early_max = seen.iter().copied().max().unwrap_or(0);
+
+    // Fall behind: let the remaining lines emit so the ring trims chunks ABOVE the
+    // early cursor but BELOW the latest.
+    std::thread::sleep(Duration::from_secs(5));
+
+    // Resume reading from where we left off. The union of what we have seen must be
+    // gap-free up to the latest delivered line.
+    let resumed = mgr.read(key, early_cursor).expect("resumed read");
+    seen.extend(normal_line_indices(
+        &resumed.chunks.iter().map(|c| c.data.as_str()).collect::<String>(),
+    ));
+    seen.sort_unstable();
+    seen.dedup();
+    let latest = seen.last().copied().unwrap_or(0);
+    assert!(
+        latest > early_max + 100,
+        "test setup: output must keep flowing past the early read (early_max={early_max}, latest={latest})"
+    );
+
+    // The invariant: no missing NORMAL_LINE between the earliest consumed line and
+    // the latest delivered one. A silent trim leaves a hole here.
+    let earliest = seen.first().copied().unwrap_or(0);
+    let missing: Vec<usize> = (earliest..=latest).filter(|n| !seen.contains(n)).collect();
+    assert!(
+        missing.is_empty(),
+        "silent mid-stream data loss: {} lines dropped without a gap signal (e.g. {:?}…) \
+         between NORMAL_LINE_{:04} and NORMAL_LINE_{:04}",
+        missing.len(),
+        &missing[..missing.len().min(5)],
+        earliest,
+        latest
+    );
+}
