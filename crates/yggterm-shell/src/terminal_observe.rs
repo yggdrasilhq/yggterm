@@ -1776,7 +1776,23 @@ fn terminal_host_problem_for_app_control(host: &Value) -> Option<&'static str> {
         || visible_text_samples
             .iter()
             .any(|sample| terminal_chunk_is_transport_error(sample));
-    if !host_holds_input_focus && surface_has_live_daemon_paint && !any_transport_error {
+    // CONFIDENCE-GATED abstain. The content-finding samples (text_tail /
+    // buffer_text_sample / cursor_line_text, built from readTerminalBufferSample's
+    // trailing+leading fallback) are RELIABLE even when this host is unfocused —
+    // confirmed live 2026-06-04: an unfocused codex surface (focus_released, all
+    // focus flags false) still read text_tail=4044 chars + cursor_line_text="› Use
+    // /skills…". So "unfocused" alone is NOT "couldn't observe"; only an unfocused
+    // host whose readable content is ALSO too sparse to classify is genuinely
+    // unobservable. Abstaining only in that case restores full detection for the
+    // common unfocused-but-readable case (retires the broad focus-only guard) while
+    // still suppressing the real false-positive illusion (empty/sparse blur read).
+    let readable_content_is_sparse =
+        visible_text.chars().filter(|c| !c.is_whitespace()).count() < 8;
+    if !host_holds_input_focus
+        && surface_has_live_daemon_paint
+        && readable_content_is_sparse
+        && !any_transport_error
+    {
         return None;
     }
     let codex_interactive_setup_prompt =
@@ -1956,8 +1972,26 @@ fn terminal_host_problem_for_app_control(host: &Value) -> Option<&'static str> {
             && (terminal_chunk_has_prompt_output(cursor_line_text)
                 || terminal_chunk_has_codex_prompt_output(cursor_line_text)));
     let local_prompt_surface = session_path.starts_with("local://") && prompt_visible;
+    // Focus-INDEPENDENT prompt-ready signal. A *current* codex input row (a "›"
+    // prompt line followed by the model/status footer — see
+    // terminal_chunk_has_current_codex_input_row) is proof codex is sitting at its
+    // live prompt, whether or not THIS host currently holds input focus. The
+    // content read is reliable even when unfocused (the confidence-gated abstain
+    // below relies on the same fact), so prompt-readiness must NOT be withheld just
+    // because the focus / cursor-geometry signals are absent. Without this, a
+    // healthy but unfocused codex prompt fails every focus-gated branch of
+    // prompt_ready_surface and is misread as "only showing a plain shell prompt"
+    // (the 2026-06-04 false positive). Gated to a mounted, rendered remote surface.
+    let current_codex_input_row_present = session_path.starts_with("remote-session://")
+        && (terminal_chunk_has_current_codex_input_row(cursor_line_text)
+            || terminal_chunk_has_current_codex_input_row(visible_text)
+            || sample_has_current_codex_input_row)
+        && mounted_entry_host_connected
+        && (xterm_present || screen_present || rows_present || canvas_count > 0)
+        && !terminal_chunk_is_transport_error(visible_text);
     let prompt_ready_surface = live_remote_codex_interrupted_input_surface
         || local_codex_welcome_with_active_cursor_surface
+        || current_codex_input_row_present
         || (prompt_visible
             && (host_stdin_enabled
                 || helper_textarea_focused
@@ -4055,6 +4089,66 @@ tGPT
         assert!(
             terminal_host_problem_for_app_control(&focused).is_some(),
             "a focused window's empty surface must still be diagnosable"
+        );
+    }
+
+    #[test]
+    fn terminal_host_problem_judges_unfocused_surface_when_content_is_readable() {
+        // #1 root-cause fix (2026-06-04): the couldn't-observe abstain is now
+        // CONFIDENCE-gated, not focus-gated. The content-finding samples
+        // (text_tail / cursor_line_text, built from readTerminalBufferSample's
+        // trailing+leading fallback) are reliable even when the host is unfocused
+        // — confirmed live: an unfocused codex surface (all focus flags false,
+        // focus_released) still read text_tail=4044 chars + cursor_line_text="› Use
+        // /skills…". So an unfocused host with READABLE content must NOT be
+        // abstained-on; the detector must judge it (and here, recognize a healthy
+        // codex prompt -> None). This is what retires the broad focus-only guard:
+        // detection is restored for the common unfocused-but-readable case.
+        let tail = "  Worktree clean. Ready.\n\n› Use /skills to list available skills\n\n  gpt-5.5 medium · ~/git/samplescripts";
+        let host = json!({
+            "session_path": "remote-session://dev/unfocused-readable-codex",
+            "text_sample": tail,
+            "text_tail": tail,
+            "buffer_text_sample": tail,
+            "cursor_line_text": "› Use /skills to list available skills",
+            // unfocused — every focus signal false, snapshot captured on blur
+            "host_stdin_enabled": false,
+            "raw_input_enabled": false,
+            "helper_textarea_focused": false,
+            "host_has_active_element": false,
+            "document_focused": false,
+            "xterm_present": true,
+            "screen_present": true,
+            "rows_present": true,
+            "canvas_count": 0,
+            "render_event_count": 28,
+            "data_event_count": 29,
+            "write_command_count": 30,
+            "last_raw_payload_sample": "\\x1b[?2026h\\x1b[58;2H\\x1b[0m\\x1b[49m\\x1b[K\\x1b[?2026l",
+            "xterm_buffer_kind": "normal",
+            "xterm_cursor_hidden": false,
+            "mounted_entry_host_connected": true,
+            "blank_rows_below_cursor": 4,
+            "base_y": 969,
+            "cursor_y": 58,
+            "rows": 63,
+            "host_rect": {"left": 277.0, "top": 8.0, "width": 1343.0, "height": 1144.0},
+            "host_content_width": 1343.0,
+            "host_content_height": 1144.0,
+            "screen_rect": {"width": 1343.0, "height": 1144.0},
+            "viewport_rect": {"width": 1343.0, "height": 1144.0},
+            "helpers_rect": {"width": 1343.0, "height": 1144.0},
+            "helper_textarea_rect": {"left": -10000.0, "top": 68.0, "width": 1.0, "height": 1.0}
+        });
+        assert!(
+            terminal_chunk_has_current_codex_input_row("› Use /skills to list available skills"),
+            "fixture sanity: the cursor line is a recognized codex input row"
+        );
+        assert_eq!(
+            terminal_host_problem_for_app_control(&host),
+            None,
+            "an unfocused host with a readable, healthy codex prompt must be judged \
+             (not abstained-on) and reported healthy — detection restored"
         );
     }
 

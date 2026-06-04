@@ -4,6 +4,17 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+- Root-caused and fixed the surface-health false positive behind the earlier
+  couldn't-observe guard: `prompt_ready_surface` required a focus/input-ownership
+  signal, so a healthy but **unfocused** codex prompt (window not focused) failed
+  every focus-gated branch and was misread as "only showing a plain shell prompt"
+  (driving spurious recovery). Prompt-readiness is now also recognized from the
+  content itself — a current codex input row (a "›" prompt followed by the
+  model/status footer) — which is reliable regardless of focus. The couldn't-observe
+  abstain is now confidence-gated (fires only when the readable content is genuinely
+  too sparse to classify, not merely because the window is unfocused), restoring full
+  surface-health detection for the common unfocused-but-readable case.
+
 - Renamed the misleading app-control `input_enabled` field (it meant "this host holds
   input focus/stdin," not "the user can type," and caused a false "session broken"
   investigation). It is now two accurately-named fields: per-host
