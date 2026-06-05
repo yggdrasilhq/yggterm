@@ -401,6 +401,37 @@ fn codex_reveal_serves_scrollback_history_to_client() {
 }
 
 #[test]
+fn restart_preserves_session_grid_instead_of_default() {
+    // Regression lock for the post-restart "squish": re-creating a session's PTY on
+    // restart must carry the outgoing grid forward, not drop to the 120x36 default.
+    // Otherwise the program (codex) renders narrow inside the real viewport and the
+    // client's follow-up resize can be wrongly no-op'd against a stale cache.
+    let mut mgr = TerminalManager::new();
+    let key = "test://restart-size";
+    mgr.ensure_session_with_size(
+        key,
+        &launch("--scenario echo --hold-ms 4000"),
+        None,
+        Some((159, 63)),
+    )
+    .expect("ensure_session");
+    wait_for_output(&mgr, key);
+    assert_eq!(
+        mgr.session_size(key),
+        Some((159, 63)),
+        "session should start at the requested grid"
+    );
+    // Restart WITHOUT an explicit size — must preserve 159x63, not fall to 120x36.
+    mgr.restart_session(key, &launch("--scenario echo --hold-ms 4000"), None, None)
+        .expect("restart_session");
+    assert_eq!(
+        mgr.session_size(key),
+        Some((159, 63)),
+        "restart must preserve the session grid, not reset to the 120x36 default"
+    );
+}
+
+#[test]
 fn clear_storm_does_not_corrupt_final_frame() {
     let mut mgr = TerminalManager::new();
     let key = "test://clear-storm";
