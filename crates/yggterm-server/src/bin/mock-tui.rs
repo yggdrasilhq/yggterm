@@ -113,6 +113,20 @@ fn main() {
                  gpt-mock \u{00b7} ~/mock"
             );
         }
+        // A codex/CC-style ACTIVELY-WORKING surface: a transcript line plus the
+        // shared "esc to interrupt" working footer. This is the signal the daemon's
+        // idle gate keys off (screen_text_shows_agent_working) to DEFER updates /
+        // self-retire so an in-flight agent turn is never interrupted. Holds so the
+        // working state is observable.
+        "working" => {
+            let _ = write!(
+                w,
+                "• Running the missing PL9 fixture batch.\r\n\r\n• Working (3s \u{00b7} esc to interrupt)"
+            );
+            let _ = w.flush();
+            hold(&args);
+            return;
+        }
         // INTERACTIVE: echo each stdin line back as `ECHO: <line>`. Exercises the
         // full agent-session-control drive loop (write -> PTY -> program -> read):
         // a test sends a prompt and asserts the program received + responded.
