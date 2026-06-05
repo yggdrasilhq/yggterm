@@ -7077,7 +7077,11 @@ fn spawn_force_remote_restart_daemon_cleanup(_store: &SessionStore, _owner_regis
 /// new on-disk binary. Without this, old daemons sit holding preserved-
 /// owner sessions and never voluntarily retire for newer code.
 #[cfg(target_os = "linux")]
-fn spawn_disk_binary_version_poll(endpoint: ServerEndpoint, home_dir: PathBuf) {
+fn spawn_disk_binary_version_poll(
+    endpoint: ServerEndpoint,
+    home_dir: PathBuf,
+    runtime: Arc<Mutex<DaemonRuntime>>,
+) {
     std::thread::spawn(move || {
         const POLL_INTERVAL_MS: u64 = 60_000;
         loop {
@@ -7088,6 +7092,34 @@ fn spawn_disk_binary_version_poll(endpoint: ServerEndpoint, home_dir: PathBuf) {
             };
             let link_str = link.to_string_lossy();
             if !link_str.ends_with(" (deleted)") {
+                continue;
+            }
+            // The on-disk binary was replaced (an update). BUT self-retiring kills
+            // this daemon's PTYs, and the successor re-resumes each agent — which
+            // INTERRUPTS any in-flight turn ("Conversation interrupted"). Never
+            // retire on top of live work: defer while any owned session is actively
+            // working (esc to interrupt) or was active within the idle window, and
+            // re-check on the next poll cycle. We retire only once idle, so a busy
+            // agent's job is never broken by an update. (Same idle gate as the
+            // hot-update handoff; overridable via YGGTERM_HOT_UPDATE_IGNORE_IDLE_GATE.)
+            let block_reason = {
+                let rt = lock_daemon_runtime(&runtime, "disk_binary_replace_idle_gate");
+                let owned = rt.terminals.session_keys();
+                rt.hot_update_idle_gate_block_reason(&owned)
+            };
+            if let Some(reason) = block_reason {
+                append_trace_event(
+                    &home_dir,
+                    "daemon",
+                    "lifecycle",
+                    "disk_binary_replaced_retire_deferred_idle_gate",
+                    serde_json::json!({
+                        "exe_link": link_str.to_string(),
+                        "current_version": SERVER_PROTOCOL_VERSION,
+                        "current_pid": std::process::id(),
+                        "reason": reason,
+                    }),
+                );
                 continue;
             }
             append_trace_event(
@@ -7417,7 +7449,7 @@ pub fn run_daemon(endpoint: &ServerEndpoint, runtime: GhosttyHostSupport) -> Res
         // the new disk binary. Without this poll, old daemons accumulate
         // for days until the user runs `server retire-stale-daemons`.
         #[cfg(target_os = "linux")]
-        spawn_disk_binary_version_poll(endpoint.clone(), home_dir.clone());
+        spawn_disk_binary_version_poll(endpoint.clone(), home_dir.clone(), runtime.clone());
         let (client_outcome_tx, client_outcome_rx) =
             std::sync::mpsc::channel::<Result<DaemonRequestOutcome>>();
         let mut restart_after_exit = None::<PathBuf>;
