@@ -4,6 +4,23 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+## 2.8.18
+
+- **cwd sidebar drag grabs the row you pressed on.** Dragging a sidebar row almost
+  always picked a "random" neighbour instead of the row under the cursor. A mousedown
+  armed the correct drag source, but mouse-move events fire on whichever row sits under
+  the pointer — a different row the instant the pointer crosses a boundary before the
+  drag threshold trips — and the code re-armed to that neighbour. Once a press has armed
+  a drag, moves now begin the dragging of the pressed row, never re-arm to a crossed-over
+  neighbour.
+
+- **Codex no longer renders squished after a daemon restart / update.** When a daemon
+  restart (e.g. an auto-update) re-resumed a Codex session, its terminal was re-created
+  at the default 120×36 size and the client never re-sent its real grid (the grid hadn't
+  changed, so no resize fired), leaving Codex wrapping narrow inside the full viewport.
+  The client now detects the re-created session and re-sends its current grid so the
+  terminal is resized to match.
+
 ## 2.8.17
 
 - **Codex terminals are scrollable again.** A working Codex session could no longer
