@@ -4,6 +4,15 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+## 2.8.20
+
+- **An update no longer interrupts a working agent.** The daemon retires itself when
+  it detects its on-disk binary was replaced (an auto-update) so the new version can
+  take over — but it did this even mid-job, which re-resumed the agent and dropped its
+  in-flight turn ("Conversation interrupted"). The self-retire now defers while any
+  session is actively working (or was active within the idle window) and only proceeds
+  once idle, so an update waits for the agent to finish instead of breaking its work.
+
 ## 2.8.19
 
 - **Codex composer no longer renders with a broken/split background after a resize.**
