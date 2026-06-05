@@ -773,6 +773,17 @@ impl TerminalManager {
         session.resize(cols, rows)
     }
 
+    /// Current PTY grid (cols, rows) for a session, as tracked by the runtime.
+    /// Exposed for restart/re-resume size-preservation checks and tests.
+    pub fn session_size(&self, key: &str) -> Option<(u16, u16)> {
+        self.sessions.get(key).map(|session| {
+            (
+                session.current_cols.load(Ordering::SeqCst),
+                session.current_rows.load(Ordering::SeqCst),
+            )
+        })
+    }
+
     pub fn session_post_resize_output_seen(&self, key: &str) -> bool {
         self.sessions
             .get(key)
@@ -873,7 +884,23 @@ impl TerminalManager {
         stop_command: Option<&str>,
         initial_size: Option<(u16, u16)>,
     ) -> Result<()> {
-        let (initial_cols, initial_rows) = initial_size.unwrap_or((DEFAULT_COLS, DEFAULT_ROWS));
+        // PRESERVE the outgoing session's grid across a restart. Without an explicit
+        // initial_size, re-creating the PTY at the DEFAULT 120x36 left the new PTY
+        // narrower than the client's real grid (e.g. 159x63). The client would then
+        // try to resize, but the daemon's resize no-op check (cache + observed size)
+        // could mismatch the swap and skip the actual ioctl — leaving the program
+        // (codex) rendering squished. Carrying the old size forward re-creates the
+        // PTY at the right dimensions directly, with no dependence on a follow-up
+        // resize. (For a full daemon-process restart the old size is gone with the
+        // process; the client re-sends its grid on the rewound-cursor re-attach.)
+        let preserved_size = self.sessions.get(key).and_then(|runtime| {
+            let cols = runtime.current_cols.load(Ordering::SeqCst);
+            let rows = runtime.current_rows.load(Ordering::SeqCst);
+            (cols > 0 && rows > 0).then_some((cols, rows))
+        });
+        let effective_initial_size = initial_size.or(preserved_size);
+        let (initial_cols, initial_rows) =
+            effective_initial_size.unwrap_or((DEFAULT_COLS, DEFAULT_ROWS));
         trace_terminal_event(
             "restart",
             serde_json::json!({
@@ -883,12 +910,13 @@ impl TerminalManager {
                 "stop_command": stop_command,
                 "initial_cols": initial_cols,
                 "initial_rows": initial_rows,
+                "preserved_size": preserved_size.is_some() && initial_size.is_none(),
             }),
         );
         if let Some(runtime) = self.sessions.remove(key) {
             runtime.shutdown(stop_command)?;
         }
-        let runtime = PtySessionRuntime::spawn(key, launch_command, cwd, initial_size)?;
+        let runtime = PtySessionRuntime::spawn(key, launch_command, cwd, effective_initial_size)?;
         self.sessions.insert(key.to_string(), runtime);
         Ok(())
     }
