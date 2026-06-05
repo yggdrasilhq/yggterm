@@ -339,6 +339,11 @@ const RETAINED_REVEAL_EMPTY_GRACE_MS: u64 = 1_200;
 // scroll/selection. Require the empty condition to PERSIST across this settle
 // window (codex's redraw fills well within a frame; a genuine empty surface
 // stays empty) before recovering. See [[finding-hot-switch-latency-remount]].
+// After a column-changing resize, wait this long for the program's own SIGWINCH
+// repaint to settle before repainting the visible screen from the daemon's
+// authoritative vt100 state (fixes the reflow-dropped background; see
+// finding-codex-composer-bg-split-reflow).
+const POST_RESIZE_SCREEN_RECONCILE_SETTLE_MS: u64 = 280;
 const RETAINED_EMPTY_SURFACE_SETTLE_MS: u64 = 800;
 // Like the empty-surface transient above, a cold/mid-redraw surface can fail
 // codex-PROMPT recognition for a frame (the prompt hasn't repainted yet). The
@@ -48003,6 +48008,15 @@ fn TerminalCanvas(
             let mut last_sent_terminal_resize_cols = 0_u16;
             let mut last_sent_terminal_resize_rows = 0_u16;
             let mut startup_resize_repair_scheduled = false;
+            // RE-RESUME / REFLOW-BG FIX: when the COLUMN count changes, xterm.js
+            // reflows and drops the background attribute of existing cells; a
+            // delta-rendering TUI (codex) never repaints the unchanged text, so its
+            // composer text is left with the wrong (default) background. After such a
+            // resize settles, repaint the visible screen from the daemon's
+            // authoritative vt100 state (which has the correct per-cell bg). The
+            // daemon's `formatted` screen starts with \e[H\e[J (erase VISIBLE screen
+            // only, not \e[3J), so this preserves xterm scrollback. 0 = none pending.
+            let mut screen_reconcile_due_at_ms: u64 = 0;
             let mut terminal_paint_seen = !is_remote_resume_session;
             let mut cursor = 0u64;
             let mut read_poll_ms = if is_remote_resume_session {
@@ -48115,6 +48129,41 @@ fn TerminalCanvas(
                     && let Some(data) = terminal_write_bridge.flush_due(current_millis())
                 {
                     let _ = eval.send(TerminalJsCommand::Write { data });
+                }
+                // Post-resize background reconcile: a settled column-resize reflow
+                // may have dropped cell backgrounds (codex composer bg-split bug). Once
+                // the settle window passes, repaint the visible screen from the daemon's
+                // authoritative vt100 `formatted` state (correct per-cell bg). Writing it
+                // erases only the VISIBLE screen (\e[H\e[J), so xterm scrollback is kept.
+                if js_ready
+                    && screen_reconcile_due_at_ms != 0
+                    && current_millis() >= screen_reconcile_due_at_ms
+                {
+                    screen_reconcile_due_at_ms = 0;
+                    if let Ok((screen_text, _running, _out, _post, _seq)) = terminal_snapshot_async(
+                        endpoint.clone(),
+                        runtime_session_path.clone(),
+                        &trace_home,
+                    )
+                    .await
+                    {
+                        let screen_text = sanitize_terminal_replay_payload(&screen_text);
+                        if !screen_text.trim().is_empty() {
+                            let _ = eval.send(TerminalJsCommand::Write {
+                                data: screen_text.clone(),
+                            });
+                            append_trace_event(
+                                &trace_home,
+                                "ui",
+                                "terminal_mount",
+                                "post_resize_screen_reconcile",
+                                json!({
+                                    "session_path": session_path.clone(),
+                                    "bytes": screen_text.len(),
+                                }),
+                            );
+                        }
+                    }
                 }
                 if !bootstrap_owner_still_current(state) {
                     release_bootstrap_lease(
@@ -50107,8 +50156,19 @@ fn TerminalCanvas(
                                 .await
                                 {
                                     Ok(()) => {
+                                        // A COLUMN change (not the first resize) is what
+                                        // makes xterm reflow + drop cell backgrounds. Schedule
+                                        // a post-settle repaint from the daemon's authoritative
+                                        // screen to restore them. Gate on previously-known cols
+                                        // (!=0) so the initial mount resize doesn't trigger it.
+                                        let column_changed = last_sent_terminal_resize_cols != 0
+                                            && last_sent_terminal_resize_cols != cols;
                                         last_sent_terminal_resize_cols = cols;
                                         last_sent_terminal_resize_rows = rows;
+                                        if column_changed {
+                                            screen_reconcile_due_at_ms = current_millis()
+                                                .saturating_add(POST_RESIZE_SCREEN_RECONCILE_SETTLE_MS);
+                                        }
                                         if is_remote_resume_session
                                             && !startup_resize_repair_scheduled
                                         {
