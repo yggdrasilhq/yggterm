@@ -50608,6 +50608,32 @@ fn TerminalCanvas(
                                             )
                                         },
                                     );
+                                    // RE-RESUME SQUISH FIX: a rewound cursor means the daemon
+                                    // re-created this session's PTY (e.g. a daemon restart /
+                                    // hot-update re-resumed codex) at the DEFAULT 120x36 size.
+                                    // xterm's grid is unchanged, so NO Resize event will fire to
+                                    // correct it and `last_sent_terminal_resize_*` is stale-equal
+                                    // to the live grid — the guard would suppress a re-send. The
+                                    // codex TUI then renders squished at 120x36 inside the real
+                                    // viewport. Forget the stale last-sent geometry and actively
+                                    // re-send the live grid so the daemon resizes the fresh PTY to
+                                    // match. See finding on the re-resume squish.
+                                    last_sent_terminal_resize_cols = 0;
+                                    last_sent_terminal_resize_rows = 0;
+                                    if terminal_geometry_is_usable(
+                                        current_terminal_cols,
+                                        current_terminal_rows,
+                                    ) {
+                                        spawn_terminal_startup_resize_repair(
+                                            endpoint.clone(),
+                                            runtime_session_path.clone(),
+                                            session_path.clone(),
+                                            current_terminal_cols,
+                                            current_terminal_rows,
+                                            trace_home.clone(),
+                                            "cursor_rewound_geometry_resync",
+                                        );
+                                    }
                                 }
                                 let allow_pre_resize_handoff_replay = state.with(|shell| {
                                     remote_resume_preserved_handoff_allows_pre_resize_replay(
