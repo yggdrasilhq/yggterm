@@ -298,6 +298,37 @@ fn terminal_sidebar_snapshot_from_screen(text: &str) -> Option<(String, Vec<Stri
     Some((status_line, tail))
 }
 
+/// Parse an "X.Y.Z" (semver-ish) version string into a comparable tuple,
+/// tolerating a pre-release/build suffix. Returns None if unparseable.
+fn parse_semverish_version(value: &str) -> Option<(u64, u64, u64)> {
+    let core = value.split(['-', '+']).next().unwrap_or(value).trim();
+    let mut parts = core.split('.');
+    let major = parts.next()?.trim().parse::<u64>().ok()?;
+    let minor = parts.next()?.trim().parse::<u64>().ok()?;
+    let patch = parts
+        .next()
+        .map(|raw| raw.trim().parse::<u64>().unwrap_or(0))
+        .unwrap_or(0);
+    Some((major, minor, patch))
+}
+
+/// True iff `candidate` is a strictly newer server version than `mine`. Used to
+/// retire a stale OLD daemon once an update brought up a newer successor — even
+/// when this daemon's versioned binary still exists on disk (so the
+/// "/proc/self/exe (deleted)" trigger never fires). That stale-daemon split-brain
+/// stranded remote-session terminal streams on the seed placeholder = blank
+/// viewport on every update. Unparseable versions return false (never retire —
+/// safe default). See [[finding-blank-on-restart-split-brain-daemon]].
+fn server_version_is_strictly_newer(candidate: &str, mine: &str) -> bool {
+    match (
+        parse_semverish_version(candidate),
+        parse_semverish_version(mine),
+    ) {
+        (Some(other), Some(own)) => other > own,
+        _ => false,
+    }
+}
+
 #[cfg(unix)]
 fn parse_versioned_server_socket_name(path: &Path) -> Option<(u64, u64, u64)> {
     let file_name = path.file_name()?.to_str()?;
@@ -7131,22 +7162,42 @@ fn spawn_disk_binary_version_poll(
         const POLL_INTERVAL_MS: u64 = 60_000;
         loop {
             std::thread::sleep(std::time::Duration::from_millis(POLL_INTERVAL_MS));
-            let link = match fs::read_link("/proc/self/exe") {
-                Ok(l) => l,
-                Err(_) => continue,
+            // Retire trigger 1: our on-disk binary was replaced by an update.
+            let exe_link = fs::read_link("/proc/self/exe")
+                .map(|link| link.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let binary_replaced = exe_link.ends_with(" (deleted)");
+            // Retire trigger 2: a strictly NEWER-version daemon is already live.
+            // An update spawns a new-version successor, but THIS daemon's versioned
+            // binary still exists on disk (different versioned path), so trigger 1
+            // never fires — leaving a SPLIT-BRAIN of old+new daemons that strands
+            // remote-session terminal streams on the seed placeholder (= blank
+            // viewport on every update). Retiring the stale daemon collapses back to
+            // one. See [[finding-blank-on-restart-split-brain-daemon]].
+            let newer_daemon_version = if binary_replaced {
+                None
+            } else {
+                reachable_versioned_daemon_statuses_excluding_endpoint(&home_dir, &endpoint)
+                    .into_iter()
+                    .map(|(_, status)| status.server_version)
+                    .find(|version| {
+                        server_version_is_strictly_newer(version, SERVER_PROTOCOL_VERSION)
+                    })
             };
-            let link_str = link.to_string_lossy();
-            if !link_str.ends_with(" (deleted)") {
+            let retire_trigger = if binary_replaced {
+                "disk_binary_replaced"
+            } else if newer_daemon_version.is_some() {
+                "newer_daemon_live"
+            } else {
                 continue;
-            }
-            // The on-disk binary was replaced (an update). BUT self-retiring kills
-            // this daemon's PTYs, and the successor re-resumes each agent — which
-            // INTERRUPTS any in-flight turn ("Conversation interrupted"). Never
-            // retire on top of live work: defer while any owned session is actively
-            // working (esc to interrupt) or was active within the idle window, and
-            // re-check on the next poll cycle. We retire only once idle, so a busy
-            // agent's job is never broken by an update. (Same idle gate as the
-            // hot-update handoff; overridable via YGGTERM_HOT_UPDATE_IGNORE_IDLE_GATE.)
+            };
+            // Self-retiring kills this daemon's PTYs and the successor re-resumes
+            // each agent — which INTERRUPTS any in-flight turn. Never retire on top
+            // of live work: defer while any owned session is actively working (esc
+            // to interrupt) or was active within the idle window, and re-check next
+            // poll. We retire only once idle, so a busy agent's job is never broken.
+            // (Same idle gate as the hot-update handoff; overridable via
+            // YGGTERM_HOT_UPDATE_IGNORE_IDLE_GATE.)
             let block_reason = {
                 let rt = lock_daemon_runtime(&runtime, "disk_binary_replace_idle_gate");
                 let owned = rt.terminals.session_keys();
@@ -7157,9 +7208,11 @@ fn spawn_disk_binary_version_poll(
                     &home_dir,
                     "daemon",
                     "lifecycle",
-                    "disk_binary_replaced_retire_deferred_idle_gate",
+                    "daemon_retire_deferred_idle_gate",
                     serde_json::json!({
-                        "exe_link": link_str.to_string(),
+                        "retire_trigger": retire_trigger,
+                        "exe_link": exe_link,
+                        "newer_daemon_version": newer_daemon_version,
                         "current_version": SERVER_PROTOCOL_VERSION,
                         "current_pid": std::process::id(),
                         "reason": reason,
@@ -7171,9 +7224,11 @@ fn spawn_disk_binary_version_poll(
                 &home_dir,
                 "daemon",
                 "lifecycle",
-                "disk_binary_replaced_self_retire",
+                "daemon_self_retire",
                 serde_json::json!({
-                    "exe_link": link_str.to_string(),
+                    "retire_trigger": retire_trigger,
+                    "exe_link": exe_link,
+                    "newer_daemon_version": newer_daemon_version,
                     "current_version": SERVER_PROTOCOL_VERSION,
                     "current_pid": std::process::id(),
                 }),
@@ -9175,7 +9230,8 @@ mod tests {
     use super::{
         cleanup_legacy_unix_daemons, configure_unix_daemon_client_read_timeout,
         daemon_binary_is_legacy, default_endpoint, parse_versioned_server_socket_name,
-        read_request, read_unix_request_with_timeout, unix_socket_path_fits_platform,
+        read_request, read_unix_request_with_timeout, server_version_is_strictly_newer,
+        unix_socket_path_fits_platform,
         versioned_server_socket_alias_candidates, versioned_socket_alias_is_legacy,
         versioned_socket_alias_points_to_current, versioned_socket_candidate_is_symlink,
         wait_for_unix_daemon_client_request,
@@ -11426,6 +11482,25 @@ mod tests {
             parse_versioned_server_socket_name(Path::new("/tmp/server.sock")),
             None
         );
+    }
+
+    #[test]
+    fn server_version_strictly_newer_drives_stale_daemon_retire() {
+        // The backstop that prevents the split-brain blank-on-update: an older
+        // daemon retires when a strictly-newer one is live.
+        assert!(server_version_is_strictly_newer("2.8.22", "2.8.21"));
+        assert!(server_version_is_strictly_newer("2.8.10", "2.8.9")); // numeric, not lexical
+        assert!(server_version_is_strictly_newer("2.9.0", "2.8.99"));
+        assert!(server_version_is_strictly_newer("3.0.0", "2.8.22"));
+        // Same or older must NOT retire (so the NEWEST daemon never retires itself).
+        assert!(!server_version_is_strictly_newer("2.8.22", "2.8.22"));
+        assert!(!server_version_is_strictly_newer("2.8.21", "2.8.22"));
+        assert!(!server_version_is_strictly_newer("2.8.9", "2.8.10"));
+        // Unparseable => never retire (safe default).
+        assert!(!server_version_is_strictly_newer("garbage", "2.8.22"));
+        assert!(!server_version_is_strictly_newer("2.8.22", "garbage"));
+        // Tolerate a pre-release/build suffix.
+        assert!(server_version_is_strictly_newer("2.8.22-rc1", "2.8.21"));
     }
 
     #[cfg(unix)]
