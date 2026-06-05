@@ -7472,13 +7472,18 @@ impl ShellState {
             self.update_drag_pointer(pointer);
             return;
         }
-        let pending_matches_row = self
-            .pending_tree_drag
-            .as_ref()
-            .map(|pending| pending.path == row.full_path)
-            .unwrap_or(false);
-        if pending_matches_row {
-            let _ = self.maybe_begin_tree_drag(row, pointer);
+        // The mousedown that started this gesture already armed the authoritative
+        // drag-source row (`pending_tree_drag`). Mouse-MOVE events, however, fire on
+        // whichever row currently sits under the pointer — which is a DIFFERENT row
+        // the moment the pointer crosses a row boundary before the 6px drag
+        // threshold trips. Re-arming to that move-reported row hijacked the drag
+        // source to a "random" neighbour (the 9/10 wrong-element bug). So once a
+        // pending drag exists, NEVER re-arm from a move; begin the drag of the
+        // PENDING row (resolved by its own path), regardless of which row the move
+        // was reported on. Only arm when there is no pending gesture yet — i.e. this
+        // is effectively the initial press.
+        if self.pending_tree_drag.is_some() {
+            self.update_pending_tree_drag_pointer(pointer);
             return;
         }
         self.arm_tree_drag(row, pointer);
@@ -82242,6 +82247,48 @@ mod tests {
             session_cwd: Some("/tmp".to_string()),
             session_kind: None,
         }
+    }
+
+    #[test]
+    fn tree_drag_source_stays_with_moused_down_row_not_a_crossed_neighbour() {
+        // Regression lock for the "drag selects a random element" bug. A row-level
+        // mousedown arms the authoritative drag source. Mouse-MOVE events, however,
+        // fire on whichever row is under the pointer — a DIFFERENT row the instant
+        // the pointer crosses a boundary before the 6px threshold trips. The old
+        // code re-armed to that move-reported neighbour, hijacking the drag source
+        // (the 9/10 wrong-element symptom). A move over a neighbour must never
+        // re-arm or start the drag on that neighbour.
+        let mut shell =
+            ShellState::new(test_shell_bootstrap_with_active_session("local://drag-a"));
+        let row_a = test_sidebar_row("local://drag-a");
+        let row_b = test_sidebar_row("local://drag-b");
+
+        // mousedown on A arms A as the source.
+        shell.update_tree_drag_pointer(&row_a, (10.0, 10.0));
+        assert_eq!(
+            shell
+                .pending_tree_drag
+                .as_ref()
+                .map(|pending| pending.path.as_str()),
+            Some("local://drag-a"),
+            "mousedown must arm the moused-down row as the drag source"
+        );
+
+        // A move event reported on neighbour B (pointer crossed the boundary) past
+        // the threshold must NOT re-arm to B and must NOT begin a drag on B.
+        shell.update_tree_drag_pointer(&row_b, (200.0, 200.0));
+        assert_ne!(
+            shell
+                .pending_tree_drag
+                .as_ref()
+                .map(|pending| pending.path.as_str()),
+            Some("local://drag-b"),
+            "a move over a neighbour row must never hijack the drag source to it"
+        );
+        assert!(
+            !shell.drag_paths.iter().any(|path| path == "local://drag-b"),
+            "the drag must never start on the crossed-over neighbour row"
+        );
     }
 
     #[test]
