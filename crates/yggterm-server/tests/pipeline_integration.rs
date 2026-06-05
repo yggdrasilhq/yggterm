@@ -432,6 +432,39 @@ fn restart_preserves_session_grid_instead_of_default() {
 }
 
 #[test]
+fn ensure_session_keeps_existing_grid_so_reattach_must_resize_to_client_grid() {
+    // Campaign D1 (squish + bottom-paint bg-split on re-resume): after a daemon
+    // restart the successor auto-resumes a session at the DEFAULT grid, and a
+    // later client (re)attach calls ensure_session_with_size with the client's
+    // REAL grid. This proves the bug PRECONDITION — ensure_session does NOT
+    // resize an existing session — and that an explicit resize (what the daemon
+    // ensure path now does when the client grid differs) corrects it.
+    let mut mgr = TerminalManager::new();
+    let key = "test://reattach-grid";
+    // Successor auto-resume at the default-ish grid.
+    mgr.ensure_session_with_size(key, &launch("--scenario echo --hold-ms 4000"), None, Some((120, 36)))
+        .expect("ensure_session");
+    wait_for_output(&mgr, key);
+    assert_eq!(mgr.session_size(key), Some((120, 36)));
+    // Client re-attach passes its real grid, but ensure must NOT resize an
+    // already-running session (the squish precondition).
+    mgr.ensure_session_with_size(key, &launch("--scenario echo --hold-ms 4000"), None, Some((159, 63)))
+        .expect("ensure_session reattach");
+    assert_eq!(
+        mgr.session_size(key),
+        Some((120, 36)),
+        "ensure_session_with_size must not resize an existing session — this is why the daemon must resize on reattach"
+    );
+    // The daemon's reattach-grid-resync: resize to the client grid takes effect.
+    mgr.resize(key, 159, 63).expect("resize to client grid");
+    assert_eq!(
+        mgr.session_size(key),
+        Some((159, 63)),
+        "reattach resize must bring a stale (squished) PTY to the client's real grid"
+    );
+}
+
+#[test]
 fn working_session_screen_carries_the_idle_gate_interrupt_signal() {
     // The daemon's idle gate (and the disk-binary self-retire deferral) keys off the
     // session screen showing "esc to interrupt" (screen_text_shows_agent_working).

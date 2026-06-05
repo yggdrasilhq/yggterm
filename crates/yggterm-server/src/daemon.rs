@@ -3471,6 +3471,36 @@ impl DaemonRuntime {
             cwd.as_deref(),
             initial_size,
         )?;
+        // D1 (campaign-xterm-dealbreakers): ensure_session_with_size only applies
+        // the grid when it CREATES the PTY. After a daemon restart/handoff the
+        // successor auto-resumes the session at DEFAULT 120x36, and a later client
+        // (re)attach that carries the client's REAL grid would leave the PTY stale
+        // → codex repaints ~120 cols inside the 159-col xterm (squish), and the
+        // partial reflow drops composer cell bg (bottom-paint bg-split). When the
+        // client provides a grid that differs from the running PTY, resize the PTY
+        // to match so codex repaints full-width and clean. Best-effort: never fail
+        // the ensure if the resize errors. See campaign D1.
+        if let Some((cols, rows)) = initial_size
+            && cols > 0
+            && rows > 0
+            && self.terminals.session_size(&runtime_path) != Some((cols, rows))
+        {
+            let resized = self.terminals.resize(&runtime_path, cols, rows);
+            if let Ok(home) = crate::resolve_yggterm_home() {
+                append_trace_event(
+                    &home,
+                    "daemon",
+                    "terminal_ensure",
+                    "reattach_grid_resync",
+                    serde_json::json!({
+                        "path": path,
+                        "client_cols": cols,
+                        "client_rows": rows,
+                        "ok": resized.is_ok(),
+                    }),
+                );
+            }
+        }
         if let Ok(home) = crate::resolve_yggterm_home() {
             append_trace_event(
                 &home,
