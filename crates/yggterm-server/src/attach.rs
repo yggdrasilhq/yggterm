@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::Command;
 use time::OffsetDateTime;
 use yggterm_core::SessionStore;
 
@@ -34,11 +34,7 @@ pub fn run_attach(uuid: &str, cwd: Option<&str>) -> Result<()> {
     let metadata_path = session_dir.join("session.json");
     let mut metadata = load_metadata(&metadata_path).unwrap_or_else(|| AttachMetadata {
         uuid: uuid.to_string(),
-        backend: if tmux_available() {
-            "tmux".to_string()
-        } else {
-            "shell".to_string()
-        },
+        backend: "daemon-shell".to_string(),
         shell: shell_program(),
         hostname: host_label(),
         cwd: std::env::current_dir()
@@ -57,19 +53,25 @@ pub fn run_attach(uuid: &str, cwd: Option<&str>) -> Result<()> {
         .unwrap_or_else(|_| PathBuf::from("."))
         .display()
         .to_string();
-    metadata.backend = if tmux_available() {
-        "tmux".to_string()
-    } else {
-        "shell".to_string()
-    };
+    metadata.backend = "daemon-shell".to_string();
     fs::write(&metadata_path, serde_json::to_string_pretty(&metadata)?)
         .with_context(|| format!("writing attach metadata {}", metadata_path.display()))?;
 
-    if tmux_available() {
-        return exec_tmux(uuid, resolved_cwd.as_deref());
+    // The host daemon owns/persists the shell PTY (it IS the multiplexer per
+    // [[spec-decentralized-host-daemon]]). Bridge stdio to a daemon-owned,
+    // resumable shell session — no external multiplexer (tmux/screen) anywhere.
+    // Fall back to a plain login shell only if the daemon is unreachable, so a
+    // bare `server attach` on a host without a working daemon still gives a
+    // usable (non-persistent) shell instead of failing outright.
+    match crate::run_daemon_shell_attach(uuid, resolved_cwd.as_deref()) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            eprintln!(
+                "yggterm: daemon-owned shell attach unavailable ({error}); falling back to a plain shell"
+            );
+            exec_shell(resolved_cwd.as_deref())
+        }
     }
-
-    exec_shell(resolved_cwd.as_deref())
 }
 
 fn resolve_attach_cwd(cwd: Option<&str>) -> Option<String> {
@@ -115,68 +117,6 @@ fn shell_program() -> String {
         .ok()
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(|| "/bin/bash".to_string())
-}
-
-fn tmux_available() -> bool {
-    Command::new("tmux")
-        .arg("-V")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|status| status.success())
-        .unwrap_or(false)
-}
-
-fn exec_tmux(uuid: &str, cwd: Option<&str>) -> Result<()> {
-    let session_name = format!("yggterm-{}", short_session_name(uuid));
-    let attach_command = attach_shell_command(cwd);
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        let mut command = Command::new("tmux");
-        for key in TERMINAL_ENV_REMOVALS {
-            command.env_remove(key);
-        }
-        command
-            .arg("new-session")
-            .arg("-A")
-            .arg("-s")
-            .arg(session_name);
-        if let Some(cwd) = cwd.map(str::trim).filter(|value| !value.is_empty()) {
-            command.arg("-c").arg(cwd);
-        }
-        if let Some(attach_command) = attach_command.as_deref() {
-            command.arg(attach_command);
-        }
-        let error = command.exec();
-        Err(anyhow::anyhow!("failed to exec tmux: {error}"))
-    }
-
-    #[cfg(not(unix))]
-    {
-        let mut command = Command::new("tmux");
-        for key in TERMINAL_ENV_REMOVALS {
-            command.env_remove(key);
-        }
-        command
-            .arg("new-session")
-            .arg("-A")
-            .arg("-s")
-            .arg(session_name);
-        if let Some(cwd) = cwd.map(str::trim).filter(|value| !value.is_empty()) {
-            command.arg("-c").arg(cwd);
-        }
-        if let Some(attach_command) = attach_command.as_deref() {
-            command.arg(attach_command);
-        }
-        let status = command.status().context("running tmux attach")?;
-        if status.success() {
-            Ok(())
-        } else {
-            Err(anyhow::anyhow!("tmux exited with status {status}"))
-        }
-    }
 }
 
 fn exec_shell(cwd: Option<&str>) -> Result<()> {
@@ -237,20 +177,6 @@ fn uses_bash_shell(shell: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn attach_shell_command(cwd: Option<&str>) -> Option<String> {
-    let cwd = cwd.map(str::trim).filter(|value| !value.is_empty())?;
-    let shell = shell_program();
-    if uses_bash_shell(&shell) {
-        return Some(format!(
-            "env YGGTERM_START_CWD={} PROMPT_COMMAND={} {} -i",
-            shell_single_quote(cwd),
-            shell_single_quote(r#"cd -- "$YGGTERM_START_CWD"; unset PROMPT_COMMAND"#),
-            shell_single_quote(&shell)
-        ));
-    }
-    Some(shell_single_quote(&shell))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -283,10 +209,3 @@ mod tests {
     }
 }
 
-fn shell_single_quote(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "'\\''"))
-}
-
-fn short_session_name(uuid: &str) -> String {
-    uuid.chars().take(16).collect()
-}
