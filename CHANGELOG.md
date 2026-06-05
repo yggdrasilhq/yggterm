@@ -4,6 +4,18 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+## 2.8.19
+
+- **Codex composer no longer renders with a broken/split background after a resize.**
+  A long-standing "codex bottom painting broken": after the terminal's column count
+  changed (window/panel resize, or the squish auto-fix), xterm's reflow dropped the
+  background color of existing cells, and Codex — which only repaints changed cells —
+  never rewrote its composer text, leaving the input row split (text on the plain
+  background, the rest on the composer's shade). After a column resize settles, the
+  visible screen is now repainted from the daemon's authoritative terminal state
+  (which has the correct per-cell colors), so the composer renders uniformly again.
+  Terminal scrollback is preserved across the repaint.
+
 ## 2.8.18
 
 - **cwd sidebar drag grabs the row you pressed on.** Dragging a sidebar row almost
