@@ -27326,6 +27326,9 @@ async fn capture_dom_debug_snapshot_for(active_session_path: Option<&str>) -> Va
                     write_bridge_flush_count: mountedHost ? Number(mountedHost.writeBridgeFlushCount || 0) : 0,
                     write_bridge_in_flight: mountedHost ? Boolean(mountedHost.writeBridgeInFlight) : false,
                     write_bridge_pending_chars: mountedHost ? String(mountedHost.writeBridgePendingData || '').length : 0,
+                    write_bridge_pending_max_chars: mountedHost ? Number(mountedHost.writeBridgePendingMaxChars || 0) : 0,
+                    write_bridge_pending_age_ms: (mountedHost && Number(mountedHost.writeBridgePendingSinceMs || 0) > 0) ? Math.max(0, Date.now() - Number(mountedHost.writeBridgePendingSinceMs)) : 0,
+                    write_bridge_flush_max_elapsed_ms: mountedHost ? Number(mountedHost.writeBridgeFlushMaxElapsedMs || 0) : 0,
                     terminal_input_hot_until_ms: mountedHost ? Number(mountedHost.terminalInputHotUntilMs || 0) : 0,
                     terminal_input_hot: mountedHost ? Date.now() < Number(mountedHost.terminalInputHotUntilMs || 0) : false,
                     forced_refresh_count: mountedHost ? Number(mountedHost.forcedRefreshCount || 0) : 0,
@@ -29017,6 +29020,9 @@ async fn capture_dom_debug_snapshot_basic_for(active_session_path: Option<&str>)
                         write_bridge_flush_count: mountedHost ? Number(mountedHost.writeBridgeFlushCount || 0) : 0,
                         write_bridge_in_flight: mountedHost ? Boolean(mountedHost.writeBridgeInFlight) : false,
                         write_bridge_pending_chars: mountedHost ? String(mountedHost.writeBridgePendingData || '').length : 0,
+                    write_bridge_pending_max_chars: mountedHost ? Number(mountedHost.writeBridgePendingMaxChars || 0) : 0,
+                    write_bridge_pending_age_ms: (mountedHost && Number(mountedHost.writeBridgePendingSinceMs || 0) > 0) ? Math.max(0, Date.now() - Number(mountedHost.writeBridgePendingSinceMs)) : 0,
+                    write_bridge_flush_max_elapsed_ms: mountedHost ? Number(mountedHost.writeBridgeFlushMaxElapsedMs || 0) : 0,
                         terminal_input_hot_until_ms: mountedHost ? Number(mountedHost.terminalInputHotUntilMs || 0) : 0,
                         terminal_input_hot: mountedHost ? Date.now() < Number(mountedHost.terminalInputHotUntilMs || 0) : false,
                         forced_refresh_count: mountedHost ? Number(mountedHost.forcedRefreshCount || 0) : 0,
@@ -63382,7 +63388,23 @@ fn terminal_eval_script_with_canvas_renderer(
             if (!hostIsActiveRenderSurface()) {{
                 return false;
             }}
-            if (terminalWindowFocused() && terminalDocumentHasFocus()) {{
+            // XTERM-BUG: wayland-focus-gate — document.hasFocus() returns false
+            // for a visibly-FOREGROUND KDE/Wayland window, so the old clause that
+            // also required terminalDocumentHasFocus() (document.hasFocus)
+            // starved the active write-frame budget: it fell to the 4000ms idle
+            // value (effectiveTerminalWriteFrameMs), batching codex's continuous
+            // synchronized-output animation into a 4s clock (jaggedy "Working"
+            // wave) and forcing the user to TAP (terminalInputHot, below) to wake
+            // realtime updates after refocus. terminalWindowFocused() derives from
+            // the GTK DesktopWindowEvent::Focused signal (Wayland-reliable, set via
+            // data-terminal-window-focused) and hostIsActiveRenderSurface() (the
+            // top guard of this fn) already excludes hidden/off-screen/backgrounded
+            // hosts — so a genuinely unfocused/backgrounded window still falls
+            // through to the idle budget (spec: unfocused updates slowly). Same
+            // visibility-not-document-focus substitution as the grid-fit fix
+            // (~57626) — see [[finding-wayland-focus-gate-squished-viewport]] and
+            // [[finding-xterm-latency-progressive-degradation]].
+            if (terminalWindowFocused()) {{
                 return true;
             }}
             return terminalInputHot() || (terminalInputOverrideActive() && terminalHostHasInputFocus());
@@ -63452,6 +63474,25 @@ fn terminal_eval_script_with_canvas_renderer(
             const budgetObserver = new MutationObserver(() => {{
                 syncTerminalWriteFrameBudgetHostEntry();
                 handleActiveHostRepaintOnSwitch();
+                // Refocus must become realtime IMMEDIATELY. A flush timer
+                // scheduled while unfocused used the 4000ms idle budget, and
+                // schedulePendingWriteFlush never reschedules an existing timer —
+                // so without this, pending output would stay stranded for up to 4s
+                // after the window is refocused (the "tap + 300-500ms" lag). When
+                // the realtime budget now applies, drop the stale timer and flush
+                // now. This NEVER accelerates a genuinely unfocused/backgrounded
+                // window: activeWriteFrameBudgetApplies() is false there.
+                try {{
+                    const entry = window.__yggtermXtermHosts && window.__yggtermXtermHosts[hostId];
+                    if (entry && !entry.writeBridgeInFlight
+                        && String(entry.writeBridgePendingData || '').length > 0
+                        && writeBridgeFlushTimer !== null
+                        && activeWriteFrameBudgetApplies()) {{
+                        clearTimeout(writeBridgeFlushTimer);
+                        writeBridgeFlushTimer = null;
+                        queueMicrotask(flushPendingWrite);
+                    }}
+                }} catch (_error) {{}}
             }});
             budgetObserver.observe(host, {{
                 attributes: true,
@@ -63673,6 +63714,17 @@ fn terminal_eval_script_with_canvas_renderer(
                 : null;
             if (currentEntry) {{
                 currentEntry.writeBridgeInFlight = false;
+                if (flushElapsedMs !== null) {{
+                    currentEntry.writeBridgeFlushMaxElapsedMs = Math.max(
+                        Number(currentEntry.writeBridgeFlushMaxElapsedMs || 0),
+                        flushElapsedMs
+                    );
+                }}
+                // Backlog drained for this flush cycle; if nothing is queued
+                // behind it, clear the oldest-un-drained-byte clock.
+                if (!String(currentEntry.writeBridgePendingData || '').length) {{
+                    currentEntry.writeBridgePendingSinceMs = 0;
+                }}
                 if (callbackFired) {{
                     currentEntry.writeCallbackCount =
                         Number(currentEntry.writeCallbackCount || 0) + 1;
@@ -64582,6 +64634,20 @@ fn terminal_eval_script_with_canvas_renderer(
                     window.__yggtermXtermHosts[hostId].writeBridgePendingData =
                         String(window.__yggtermXtermHosts[hostId].writeBridgePendingData || '')
                         + incomingWriteData;
+                    // Latency instrumentation: the write-bridge backlog is the
+                    // accumulator suspected behind progressive input lag. Track a
+                    // high-water-mark + the age of the oldest un-drained byte so
+                    // the accumulation is visible in host-health (not just the
+                    // instantaneous depth). See
+                    // [[finding-xterm-latency-progressive-degradation]].
+                    const __ygPendingLen = window.__yggtermXtermHosts[hostId].writeBridgePendingData.length;
+                    window.__yggtermXtermHosts[hostId].writeBridgePendingMaxChars = Math.max(
+                        Number(window.__yggtermXtermHosts[hostId].writeBridgePendingMaxChars || 0),
+                        __ygPendingLen
+                    );
+                    if (__ygPendingLen > 0 && !Number(window.__yggtermXtermHosts[hostId].writeBridgePendingSinceMs || 0)) {{
+                        window.__yggtermXtermHosts[hostId].writeBridgePendingSinceMs = Date.now();
+                    }}
                 }}
                 const forceLowLatencyWrite = terminalPayloadShouldFlushImmediately(incomingWriteData);
                 schedulePendingWriteFlush(forceLowLatencyWrite);
@@ -75248,6 +75314,27 @@ mod tests {
                 && script
                     .contains("if (typeof syncTerminalWriteFrameBudgetHostEntry === 'function')"),
             "input-policy focus repairs must refresh the observable write-frame budget immediately"
+        );
+        // XTERM-BUG: wayland-focus-gate regression lock. The active write-frame
+        // budget must NOT require document.hasFocus() — on KDE/Wayland that is
+        // false for a visibly-focused window, which starved the budget to the
+        // 4000ms idle clock (jaggedy codex animation + "tap to wake" refocus).
+        // See [[finding-xterm-latency-progressive-degradation]].
+        assert!(
+            !script.contains("terminalWindowFocused() && terminalDocumentHasFocus()"),
+            "active write-frame budget must not AND document.hasFocus() (Wayland false-negative for focused windows)"
+        );
+        assert!(
+            script.contains("if (terminalWindowFocused()) {\n                return true;\n            }"),
+            "active write-frame budget must apply on the Wayland-reliable window-focus signal alone"
+        );
+        // Refocus must flush a stale idle-budget timer immediately (no 4s / tap
+        // wait): the budget MutationObserver clears writeBridgeFlushTimer and
+        // flushes when the realtime budget now applies.
+        assert!(
+            script.contains("&& activeWriteFrameBudgetApplies()) {\n                        clearTimeout(writeBridgeFlushTimer);")
+                && script.contains("queueMicrotask(flushPendingWrite);"),
+            "refocus must drop a stale idle-budget flush timer and flush immediately"
         );
         assert!(
             script.contains("const terminalPayloadShouldFlushImmediately = (payload) => {")
