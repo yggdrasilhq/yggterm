@@ -1707,6 +1707,14 @@ fn terminal_host_problem_for_app_control(host: &Value) -> Option<&'static str> {
     let sample_is_codex_prompt_surface = visible_text_samples
         .iter()
         .any(|sample| terminal_chunk_is_codex_prompt_surface(sample));
+    // A codex turn in flight ("esc to interrupt" working footer): the surface is
+    // HEALTHY-BUSY, not faulted, even though it has no `›` input row and may
+    // transiently clear. Used below to suppress the "no current input row" /
+    // "stale scrollback but no current prompt" / "empty surface" fault reasons so
+    // a working codex is never remounted mid-turn (which would destroy scrollback).
+    let codex_working_surface = visible_text_samples
+        .iter()
+        .any(|sample| terminal_chunk_is_codex_working_surface(sample));
     let visible_text = visible_text_parts.join("\n");
     let visible_text = visible_text.as_str();
     if host_transparent
@@ -2117,6 +2125,7 @@ fn terminal_host_problem_for_app_control(host: &Value) -> Option<&'static str> {
         && !terminal_chunk_is_loading_placeholder(visible_text)
         && !terminal_chunk_is_transcript_browser(visible_text)
         && !terminal_chunk_is_generic_codex_idle(visible_text)
+        && !codex_working_surface
     {
         return Some(
             "active remote Codex prompt surface has stale scrollback but no current prompt",
@@ -2133,6 +2142,7 @@ fn terminal_host_problem_for_app_control(host: &Value) -> Option<&'static str> {
         && !terminal_chunk_is_loading_placeholder(visible_text)
         && !terminal_chunk_is_transcript_browser(visible_text)
         && !terminal_chunk_is_generic_codex_idle(visible_text)
+        && !codex_working_surface
     {
         return Some("active remote Codex prompt surface has no current input row");
     }
@@ -2156,6 +2166,7 @@ fn terminal_host_problem_for_app_control(host: &Value) -> Option<&'static str> {
         && !terminal_chunk_is_loading_placeholder(visible_text)
         && !terminal_chunk_is_transcript_browser(visible_text)
         && !terminal_chunk_is_generic_codex_idle(visible_text)
+        && !codex_working_surface
     {
         return Some("active remote Codex prompt surface has no current input row");
     }
@@ -2173,6 +2184,7 @@ fn terminal_host_problem_for_app_control(host: &Value) -> Option<&'static str> {
         && !terminal_chunk_is_loading_placeholder(visible_text)
         && !terminal_chunk_is_transcript_browser(visible_text)
         && !terminal_chunk_is_generic_codex_idle(visible_text)
+        && !codex_working_surface
     {
         return Some("active remote Codex prompt surface has no current input row");
     }
@@ -2942,6 +2954,27 @@ fn terminal_chunk_is_codex_interrupted_input_surface(data: &str) -> bool {
     tail.contains("conversation interrupted - tell the model what to do differently")
 }
 
+/// A codex surface ACTIVELY WORKING: its footer shows the interruptible-working
+/// indicator ("esc to interrupt", as in "• Working (3s · esc to interrupt)" or
+/// "• Booting MCP server… (0s · esc to interrupt)"). While codex is working it
+/// legitimately replaces its `›` composer/input row with the working line and may
+/// transiently clear/repaint — that is a HEALTHY busy state, NOT a faulted
+/// surface. Surface-health must NOT report a "no current input row" / "stale
+/// scrollback but no current prompt" / "empty surface" problem for a working
+/// codex, because doing so trips retained-fault-recovery into a needless REMOUNT
+/// that reseeds xterm from a one-screen snapshot and DESTROYS the session's
+/// scrollback mid-turn (the user-visible "yggterm destroys the scrollback buffer";
+/// see finding-codex-scroll-lock-no-client-scrollback).
+pub(crate) fn terminal_chunk_is_codex_working_surface(data: &str) -> bool {
+    let stripped = strip_terminal_control_sequences(data);
+    let lower = stripped.to_ascii_lowercase();
+    // "esc to interrupt" is codex's canonical interruptible-working footer token.
+    // It is present ONLY while a turn is in flight (Working / Booting / tool calls);
+    // an idle composer never shows it. Matching the token anywhere in the visible
+    // text is sufficient and robust to the surrounding "(Ns · …)" formatting.
+    lower.contains("esc to interrupt")
+}
+
 pub(crate) fn terminal_chunk_is_codex_prompt_surface(data: &str) -> bool {
     let stripped = strip_terminal_control_sequences(data);
     let normalized = stripped
@@ -3578,7 +3611,8 @@ mod tests {
         terminal_chunk_has_codex_prompt_output, terminal_chunk_has_current_codex_input_row,
         terminal_chunk_has_meaningful_output, terminal_chunk_is_claude_prompt_surface,
         terminal_chunk_is_codex_interactive_setup_prompt,
-        terminal_chunk_is_codex_prompt_surface, terminal_chunk_is_local_codex_scaffold,
+        terminal_chunk_is_codex_prompt_surface, terminal_chunk_is_codex_working_surface,
+        terminal_chunk_is_local_codex_scaffold,
         terminal_chunk_is_transport_error, terminal_host_geometry_problem_for_app_control,
         terminal_host_problem_for_app_control,
         terminal_observe_codex_prompt_tail_has_real_scrollback,
@@ -4532,6 +4566,79 @@ Best thing to improve in the meantime:
             terminal_host_problem_for_app_control(&host),
             Some("active remote Codex prompt surface has no current input row")
         );
+    }
+
+    #[test]
+    fn terminal_host_problem_accepts_working_codex_without_input_row() {
+        // Regression lock for the mid-turn remount that destroyed scrollback
+        // (finding-codex-scroll-lock-no-client-scrollback). Identical surface to
+        // the "no current input row" fault above, EXCEPT codex is actively WORKING
+        // (its footer shows the "esc to interrupt" indicator). A working codex
+        // legitimately has no `›` input row; it must NOT be reported as a faulted
+        // surface, or retained-fault-recovery remounts it mid-turn and reseeds
+        // xterm from a one-screen snapshot, destroying the session's scrollback.
+        let text_tail = "Status as of 2026-05-08 11:53 IST:\n\n- PL9 batch is still alive: PID 3573158.\n- Current chart: SAMPLENOTES_BENCH_0307.\n- Current action: generating PH2.\n\nProgress:\n\n- Charts reached: up to 0307.\n- Physical PL9 PDFs present: 1253.\n\n• Working (3s · esc to interrupt)";
+        let host = json!({
+            "session_path": "remote-session://dev/working-codex-no-input-row",
+            "text_sample": text_tail,
+            "text_tail": text_tail,
+            "buffer_text_sample": text_tail,
+            "cursor_line_text": "",
+            "cursor_y": 44,
+            "cursor_expected_rect": {"left": 1005.0, "top": 800.0, "width": 8.0, "height": 18.0},
+            "host_stdin_enabled": true,
+            "helper_textarea_focused": true,
+            "xterm_present": true,
+            "screen_present": true,
+            "viewport_present": true,
+            "rows_present": false,
+            "canvas_count": 4,
+            "render_event_count": 79,
+            "data_event_count": 0,
+            "last_raw_payload_length": 185570,
+            "last_raw_payload_line_count": 2009,
+            "write_command_count": 1,
+            "terminal_content_source": "active_recovery_pty_snapshot",
+            "retained_replay_source": "active_recovery_pty_snapshot",
+            "retained_replay_prompt_follow_ready": true,
+            "xterm_buffer_kind": "normal",
+            "xterm_cursor_hidden": false,
+            "mounted_entry_host_connected": true,
+            "blank_rows_below_cursor": 5,
+            "rows": 50,
+            "base_y": 1000,
+            "scrollback_expected": true,
+            "host_rect": {"left": 0.0, "top": 0.0, "width": 880.0, "height": 900.0},
+            "host_content_width": 880.0,
+            "host_content_height": 900.0,
+            "screen_rect": {"width": 880.0, "height": 900.0},
+            "viewport_rect": {"width": 880.0, "height": 900.0},
+            "helpers_rect": {"width": 880.0, "height": 900.0},
+            "helper_textarea_rect": {"left": -10000.0, "top": 8.0, "width": 1.0, "height": 1.0}
+        });
+        assert_eq!(
+            terminal_host_problem_for_app_control(&host),
+            None,
+            "a working codex (esc to interrupt) must not be reported as a faulted \
+             surface — that remount destroys scrollback mid-turn"
+        );
+    }
+
+    #[test]
+    fn terminal_chunk_is_codex_working_surface_detects_interrupt_footer() {
+        assert!(terminal_chunk_is_codex_working_surface(
+            "• Working (3s · esc to interrupt)"
+        ));
+        assert!(terminal_chunk_is_codex_working_surface(
+            "• Booting MCP server: codex_apps (0s • esc to interrupt)"
+        ));
+        // Idle composer / interrupted state must NOT read as working.
+        assert!(!terminal_chunk_is_codex_working_surface(
+            "› What is the status now?\n\n  gpt-5.5 medium · ~/git"
+        ));
+        assert!(!terminal_chunk_is_codex_working_surface(
+            "■ Conversation interrupted - tell the model what to do differently."
+        ));
     }
 
     #[test]
