@@ -63843,10 +63843,21 @@ fn terminal_eval_script_with_canvas_renderer(
                 entry.writeBridgeFlushCount = Number(entry.writeBridgeFlushCount || 0) + 1;
                 lastWriteFlushStartedAtMs = Date.now();
                 entry.lastWriteFlushStartedAtMs = lastWriteFlushStartedAtMs;
+                // A retained-scrollback replay is a fresh authoritative re-seed
+                // of the buffer (daemon re-resume after a restart/handoff, or a
+                // remount). It lands the viewport at the TOP, so liveCursorNearBottom()
+                // is false and the normal follow gate would leave codex scrolled to
+                // the top with the composer below the fold ("broken bottom" + the
+                // tap-to-scroll-flicker that follows). On a fresh re-seed the user
+                // is not in scrollback, so follow the live cursor to the bottom —
+                // still yielding to an explicit UserScrollback intent / scroll lock.
+                // This guards the follow DECISION, never the low-level mover, per
+                // [[audit-viewport-scroll-control-flow]]. See
+                // [[finding-codex-squish-post-restart-pty-size]].
                 const flushShouldFollow =
                     scrollbackIntent !== 'UserScrollback'
                     && !syncScrollbackLock()
-                    && liveCursorNearBottom();
+                    && (liveCursorNearBottom() || retainedScrollbackReplay);
             const syncWrite = term && term._core && typeof term._core.writeSync === 'function'
                 ? term._core.writeSync.bind(term._core)
                 : entry && entry.term && entry.term._core && entry.term._core._writeBuffer && typeof entry.term._core._writeBuffer.writeSync === 'function'
@@ -75335,6 +75346,14 @@ mod tests {
             script.contains("&& activeWriteFrameBudgetApplies()) {\n                        clearTimeout(writeBridgeFlushTimer);")
                 && script.contains("queueMicrotask(flushPendingWrite);"),
             "refocus must drop a stale idle-budget flush timer and flush immediately"
+        );
+        // Re-resume render: a retained-scrollback replay (daemon restart/handoff
+        // re-seed) must follow the live cursor to the bottom, not leave codex
+        // scrolled to the top with the composer below the fold. See
+        // [[finding-codex-squish-post-restart-pty-size]].
+        assert!(
+            script.contains("&& (liveCursorNearBottom() || retainedScrollbackReplay);"),
+            "retained-scrollback replay must follow to the live cursor (no scroll-to-top after re-resume)"
         );
         assert!(
             script.contains("const terminalPayloadShouldFlushImmediately = (payload) => {")
