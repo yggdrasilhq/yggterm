@@ -432,6 +432,38 @@ fn restart_preserves_session_grid_instead_of_default() {
 }
 
 #[test]
+fn working_session_screen_carries_the_idle_gate_interrupt_signal() {
+    // The daemon's idle gate (and the disk-binary self-retire deferral) keys off the
+    // session screen showing "esc to interrupt" (screen_text_shows_agent_working).
+    // Prove the daemon snapshot of an actively-working agent carries that signal — so
+    // an update is deferred — while an idle session does not.
+    let mut mgr = TerminalManager::new();
+    let working = "test://idle-gate-working";
+    mgr.ensure_session(working, &launch("--scenario working --hold-ms 6000"), None)
+        .expect("ensure working");
+    wait_for_output(&mgr, working);
+    let working_screen = mgr
+        .session_screen_snapshot(working)
+        .expect("working session screen");
+    assert!(
+        working_screen.contains("esc to interrupt"),
+        "an actively-working agent screen must carry the 'esc to interrupt' idle-gate \
+         signal so updates defer; got tail {:?}",
+        &working_screen[working_screen.len().saturating_sub(120)..]
+    );
+
+    let idle = "test://idle-gate-idle";
+    mgr.ensure_session(idle, &launch("--scenario echo --hold-ms 6000"), None)
+        .expect("ensure idle");
+    wait_for_output(&mgr, idle);
+    let idle_screen = mgr.session_screen_snapshot(idle).unwrap_or_default();
+    assert!(
+        !idle_screen.contains("esc to interrupt"),
+        "an idle session must NOT carry the working signal (update may proceed)"
+    );
+}
+
+#[test]
 fn clear_storm_does_not_corrupt_final_frame() {
     let mut mgr = TerminalManager::new();
     let key = "test://clear-storm";
