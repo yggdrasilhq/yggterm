@@ -48,6 +48,7 @@ xterm.js owns vs what the shell owns, cursor/prompt semantics, etc. — see
 | [persisted-scroll-restore-fights-follow](#persisted-scroll-restore-fights-follow) | After GUI restart, every click/keystroke flickers between a saved scroll offset and the live bottom | FIXED 2026-06-02 |
 | [xterm-host-registry-leak](#xterm-host-registry-leak) | Switching/restarting sessions accumulates orphaned xterm.js instances (cleanup keyed to mount epoch that changes on remount) → growing latency on selection/paste/switch | FIXED 2026-06-02 |
 | [chunk-ring-trim-drops-mid-stream](#chunk-ring-trim-drops-mid-stream) | Middle chunks of TUI output silently missing: yggterm-server chunk ring trims oldest while a client's read-cursor is behind the trim, and read(cursor) returns only surviving chunks with no gap signal | LAYER 1 DONE 2026-06-04 (read() detects + signals `resync_required`, no longer silent; tested) — LAYER 2 pending (propagate to client + re-attach, live-risky) |
+| [squish-and-bottom-paint-on-reresume](#squish-and-bottom-paint-on-reresume) | After an update re-resumes a session, codex renders narrow (squish) + composer bg-split (bottom paint) | FIXED 2026-06-05 (v2.8.25) — daemon resizes PTY to client grid on re-attach; deterministic test |
 
 ---
 
@@ -1228,6 +1229,48 @@ read-bridge.
 `[[spec-tmux-parity-and-beyond]]`, `[[finding-hot-switch-latency-remount]]`
 
 ---
+
+## squish-and-bottom-paint-on-reresume
+
+**STATUS:** FIXED 2026-06-05 (v2.8.25)
+
+### Symptom
+After a yggterm update/daemon-restart re-resumes a session, codex renders narrow
+(~120 cols) inside the real viewport (squish), with blank right margin, and the
+composer input row shows a dark terminal-bg patch after the cursor (bg-split).
+Recurred on every update.
+
+### Reproduction
+mock-tui / pipeline_integration: create a PTY at 120x36, then call
+`ensure_session_with_size` again with 159x63 — the session stays 120x36
+(`ensure_session_keeps_existing_grid_so_reattach_must_resize_to_client_grid`).
+Live: any daemon restart that re-resumes a remote codex session.
+
+### Root cause
+The successor daemon auto-resumes a restored session at the DEFAULT 120x36 grid.
+`TerminalManager::ensure_session_with_size` only applies the requested grid when
+it CREATES the PTY, so the later client (re)attach that carries the client's real
+grid was a no-op against the already-running PTY → codex repaints at 120 cols and
+the partial reflow drops composer cell bg. The squish is the ROOT of the bg-split.
+
+### Workaround / fix
+Daemon `ensure_terminal_for_path_with_initial_size_and_seed` (daemon.rs, after the
+`ensure_session_with_size` call) now resizes the PTY to the client's grid when the
+client provides one that differs from the running session — codex repaints
+full-width and clean. Best-effort; traces `reattach_grid_resync`.
+
+### Code locations
+- crates/yggterm-server/src/daemon.rs — reattach grid-resync after ensure_session.
+- crates/yggterm-server/src/terminal.rs:879 restart_session_with_size (in-process grid preserve).
+
+### Tests
+- crates/yggterm-server/tests/pipeline_integration.rs:
+  `ensure_session_keeps_existing_grid_so_reattach_must_resize_to_client_grid`,
+  `restart_preserves_session_grid_instead_of_default`.
+
+### Related
+- memory: campaign-xterm-dealbreakers (D1), finding-codex-squish-post-restart-pty-size,
+  finding-codex-composer-bg-split-reflow, finding-blank-on-restart-split-brain-daemon.
 
 ## Template (copy for new entries)
 
