@@ -4,6 +4,46 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+## 2.8.17
+
+- **Codex terminals are scrollable again.** A working Codex session could no longer
+  be scrolled back, and its scrollback was wiped mid-turn (it scrolled fine in other
+  terminals — a yggterm-only bug). Root cause: while Codex is working it replaces its
+  input row with the "esc to interrupt" footer and transiently repaints; surface-health
+  had no concept of a *working* Codex, so it misread that healthy busy state as a
+  faulted surface and remounted the terminal mid-turn, reseeding it from a single-screen
+  snapshot and discarding the accumulated scrollback. A working Codex surface is now
+  recognized as healthy-busy and never triggers recovery. Scrollback survives turns and
+  session switches, and scrolling up works.
+
+- **Active viewport no longer goes blank on session switch.** Switching back to a
+  retained remote session could show a blank terminal while the session was perfectly
+  alive. The hot-reveal restored from a stale/near-blank in-memory snapshot that
+  suppressed the daemon's authoritative content and then self-perpetuated. The client
+  now refuses to cache or restore a collapsed frame for a session that had real content,
+  so the daemon's content wins and the viewport stays populated.
+
+- **Terminal re-fits to full width even when the window is unfocused.** On Wayland a
+  visible-but-unfocused window reports `document.hasFocus() == false`, which froze the
+  terminal grid at a stale width and made the Codex TUI wrap far short of the viewport
+  ("squished viewport"). Grid re-fitting is now gated on host visibility, not OS focus.
+
+- **Robust agent/automation prompt insertion.** Programmatic prompt submission now waits
+  until the target session is at an idle interactive prompt and echo-verifies that the
+  program is actually consuming input before submitting (and refuses, writing nothing, if
+  the session never becomes ready). The Enter keypress is sent as its own keystroke so
+  Codex submits the prompt instead of leaving it pasted in the composer.
+
+- **Mid-stream terminal data-loss is detected and signalled** instead of silently
+  delivering a discontiguous tail when the daemon's chunk ring trims while a client is
+  behind.
+
+- Agent observability/automation tooling (used by the desktop app-control surface):
+  `server terminal screen [--history|--retained|--raw]` (daemon vt100 screen / clean
+  scrollback dump), `server terminal resize`, `server app terminal scroll`,
+  `server app terminal read-buffer`, and crop/zoom options on `server app screenshot`
+  (`--region`, `--crop`, `--scale`). Screenshot responses now report capture faithfulness.
+
 ## 2.8.16
 
 - Fixed a surface-health false positive that misread a healthy but **unfocused**
