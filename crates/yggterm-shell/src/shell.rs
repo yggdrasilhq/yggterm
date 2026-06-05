@@ -32255,12 +32255,14 @@ async fn read_terminal_buffer_for(session_path: &str, mode: &str) -> Value {
     let session_path_literal =
         serde_json::to_string(session_path).unwrap_or_else(|_| "null".to_string());
     let full = mode == "full";
+    let cells = mode == "cells";
     let script = format!(
         r#"
         (async () => {{
             try {{
                 const sessionPath = {session_path_literal};
                 const full = {full};
+                const cellsMode = {cells};
                 const registry = window.__yggtermXtermHosts || {{}};
                 const entries = Object.values(registry)
                     .filter((entry) => entry && entry.term && entry.sessionPath === sessionPath)
@@ -32281,6 +32283,7 @@ async fn read_terminal_buffer_for(session_path: &str, mode: &str) -> Value {
                 const active = term.buffer.active;
                 const length = Math.max(0, Number(active.length || 0));
                 const rows = Math.max(1, Number(term.rows || 0));
+                const cols = Math.max(1, Number(term.cols || 0));
                 const viewportY = Math.max(0, Number(active.viewportY || 0));
                 const baseY = Math.max(0, Number(active.baseY || 0));
                 let start;
@@ -32291,6 +32294,64 @@ async fn read_terminal_buffer_for(session_path: &str, mode: &str) -> Value {
                 }} else {{
                     start = Math.min(Math.max(0, length - 1), viewportY);
                     end = Math.min(length, start + rows);
+                }}
+                if (cellsMode) {{
+                    // Per-cell BACKGROUND/foreground attribute dump straight from
+                    // xterm's buffer (the rendering source of truth, focus-independent
+                    // unlike DOM/canvas sampling). Compressed into runs of identical bg
+                    // so we can see exactly where xterm assigns the wrong background
+                    // (e.g. the codex composer "written cells lost the inherited bg"
+                    // bug). bg/fg encoded: 'default', '#rrggbb' (RGB), 'p<N>' (palette).
+                    const attr = (cell, kind) => {{
+                        try {{
+                            if (kind === 'bg') {{
+                                if (cell.isBgDefault && cell.isBgDefault()) return 'default';
+                                if (cell.isBgRGB && cell.isBgRGB()) return '#' + ((cell.getBgColor() >>> 0) & 0xffffff).toString(16).padStart(6,'0');
+                                if (cell.isBgPalette && cell.isBgPalette()) return 'p' + cell.getBgColor();
+                                return 'c' + cell.getBgColor();
+                            }}
+                            if (cell.isFgDefault && cell.isFgDefault()) return 'default';
+                            if (cell.isFgRGB && cell.isFgRGB()) return '#' + ((cell.getFgColor() >>> 0) & 0xffffff).toString(16).padStart(6,'0');
+                            if (cell.isFgPalette && cell.isFgPalette()) return 'p' + cell.getFgColor();
+                            return 'c' + cell.getFgColor();
+                        }} catch (_e) {{ return 'err'; }}
+                    }};
+                    const cellRows = [];
+                    for (let i = start; i < end; i += 1) {{
+                        const line = active.getLine(i);
+                        if (!line || typeof line.getCell !== 'function') {{ continue; }}
+                        const runs = [];
+                        let cur = null;
+                        for (let x = 0; x < cols; x += 1) {{
+                            const cell = line.getCell(x);
+                            if (!cell) continue;
+                            const bg = attr(cell, 'bg');
+                            const fg = attr(cell, 'fg');
+                            const dim = (cell.isDim && cell.isDim()) ? 1 : 0;
+                            const ch = cell.getChars ? (cell.getChars() || ' ') : ' ';
+                            const key = bg + '|' + fg + '|' + dim;
+                            if (cur && cur.key === key) {{
+                                cur.to = x;
+                                if (ch.trim()) cur.sample = (cur.sample + ch).slice(0, 24);
+                            }} else {{
+                                if (cur) {{ delete cur.key; runs.push(cur); }}
+                                cur = {{ key, bg, fg, dim, from: x, to: x, sample: ch.trim() ? ch : '' }};
+                            }}
+                        }}
+                        if (cur) {{ delete cur.key; runs.push(cur); }}
+                        cellRows.push({{ row: i, viewport_row: i - viewportY, runs }});
+                    }}
+                    dioxus.send({{
+                        accepted: true,
+                        session_path: sessionPath,
+                        mode: "cells",
+                        base_y: baseY,
+                        viewport_y: viewportY,
+                        cols,
+                        rows,
+                        cell_rows: cellRows,
+                    }});
+                    return;
                 }}
                 const lines = [];
                 for (let i = start; i < end; i += 1) {{
