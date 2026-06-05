@@ -1558,6 +1558,16 @@ pub enum ServerRequest {
         #[serde(default)]
         initial_rows: Option<u16>,
     },
+    /// Daemon-owned resumable plain-shell session (tmux replacement for
+    /// `server attach`). The host daemon owns/persists the shell PTY.
+    EnsureShellSession {
+        session_id: String,
+        cwd: Option<String>,
+        #[serde(default)]
+        initial_cols: Option<u16>,
+        #[serde(default)]
+        initial_rows: Option<u16>,
+    },
     FocusLive {
         key: String,
         view_mode: Option<WorkspaceViewMode>,
@@ -4328,6 +4338,22 @@ impl DaemonRuntime {
                 self.persist()?;
                 ServerResponse::Ack { message: Some(key) }
             }
+            ServerRequest::EnsureShellSession {
+                session_id,
+                cwd,
+                initial_cols,
+                initial_rows,
+            } => {
+                let key = self
+                    .server
+                    .ensure_shell_runtime_session(&session_id, cwd.as_deref())?;
+                let _ = self.ensure_terminal_for_path_with_initial_size(
+                    &key,
+                    valid_initial_terminal_size(initial_cols, initial_rows),
+                )?;
+                self.persist()?;
+                ServerResponse::Ack { message: Some(key) }
+            }
             ServerRequest::FocusLive { key, view_mode } => {
                 self.server.focus_live_session(&key);
                 let mut focused_in_terminal = false;
@@ -5794,6 +5820,7 @@ fn server_request_name(request: &ServerRequest) -> &'static str {
         ServerRequest::StartRemoteRuntimeCodexSession { .. } => {
             "start_remote_runtime_codex_session"
         }
+        ServerRequest::EnsureShellSession { .. } => "ensure_shell_session",
         ServerRequest::FocusLive { .. } => "focus_live",
         ServerRequest::SetViewMode { .. } => "set_view_mode",
         ServerRequest::TogglePreviewBlock { .. } => "toggle_preview_block",
@@ -6475,6 +6502,24 @@ pub fn start_remote_runtime_codex_session(
         },
     )?)?
     .with_context(|| format!("missing runtime session key for {session_id}"))
+}
+
+pub fn ensure_shell_session(
+    endpoint: &ServerEndpoint,
+    session_id: &str,
+    cwd: Option<&str>,
+    initial_size: Option<(u16, u16)>,
+) -> Result<String> {
+    expect_ack(send_request(
+        endpoint,
+        &ServerRequest::EnsureShellSession {
+            session_id: session_id.to_string(),
+            cwd: cwd.map(ToOwned::to_owned),
+            initial_cols: initial_size.map(|(cols, _)| cols),
+            initial_rows: initial_size.map(|(_, rows)| rows),
+        },
+    )?)?
+    .with_context(|| format!("missing shell session key for {session_id}"))
 }
 
 pub fn focus_live(
