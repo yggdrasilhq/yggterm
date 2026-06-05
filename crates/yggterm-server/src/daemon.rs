@@ -7159,7 +7159,11 @@ fn spawn_disk_binary_version_poll(
     runtime: Arc<Mutex<DaemonRuntime>>,
 ) {
     std::thread::spawn(move || {
-        const POLL_INTERVAL_MS: u64 = 60_000;
+        // 20s (was 60s): shrink the window in which a stale OLD daemon coexists
+        // with a newer successor after an update, so the split-brain that strands
+        // remote sessions on the seed placeholder is cleared quickly.
+        // [[finding-blank-on-restart-split-brain-daemon]]
+        const POLL_INTERVAL_MS: u64 = 20_000;
         loop {
             std::thread::sleep(std::time::Duration::from_millis(POLL_INTERVAL_MS));
             // Retire trigger 1: our on-disk binary was replaced by an update.
