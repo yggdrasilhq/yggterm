@@ -2451,23 +2451,14 @@ impl YggtermServer {
 
     pub fn remote_resume_seed_snapshot_for_path(
         &self,
-        path: &str,
+        _path: &str,
     ) -> anyhow::Result<Option<String>> {
-        let Some((raw_machine_key, session_id)) = parse_remote_scanned_session_path(path) else {
-            return Ok(None);
-        };
-        if let Some(session) = self.sessions.get(path)
-            && remote_live_session_starts_new_codex(session)
-        {
-            return Ok(None);
-        }
-        let machine_key = normalize_machine_key(raw_machine_key);
-        let target = self.remote_target_for_machine_key(&machine_key)?;
-        fetch_remote_resume_snapshot_over_ssh(
-            &target.ssh_target,
-            target.prefix.as_deref(),
-            session_id,
-        )
+        // Previously captured a remote tmux/screen pane to seed the resume view.
+        // yggterm no longer uses any external multiplexer: a remote session's
+        // live screen comes from the remote host daemon (`server terminal
+        // screen`) and the daemon-owned resume repaints it. Best-effort seed text
+        // falls through to remote_resume_seed_fallback_for_path.
+        Ok(None)
     }
 
     pub fn remote_resume_seed_fallback_for_path(&self, path: &str) -> Option<String> {
@@ -5348,6 +5339,77 @@ impl YggtermServer {
         Ok(key)
     }
 
+    /// Daemon-owned, resumable plain-shell session keyed by `session_id`.
+    /// This is the tmux replacement for `server attach`: the host daemon owns
+    /// the shell PTY (it IS the multiplexer per [[spec-decentralized-host-daemon]]),
+    /// so re-attaching the same id reconnects the persistent PTY without any
+    /// external multiplexer. Mirrors `start_remote_runtime_codex_session` minus
+    /// the codex-specific runtime registry.
+    pub fn ensure_shell_runtime_session(
+        &mut self,
+        session_id: &str,
+        cwd: Option<&str>,
+    ) -> anyhow::Result<String> {
+        let key = local_live_runtime_key(session_id);
+        let target = local_session_target(SessionKind::Shell, cwd);
+        let title = self
+            .sessions
+            .get(&key)
+            .map(|session| session.title.clone())
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| {
+                live_session_default_title(SessionKind::Shell, target.cwd.as_deref(), &target.label)
+            });
+        if !self.sessions.contains_key(&key) {
+            self.insert_live_session(
+                &key,
+                session_id,
+                SessionKind::Shell,
+                &target,
+                Some(title.clone()),
+            );
+        }
+        let shell = std::env::var("SHELL")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| "/bin/bash".to_string());
+        let launch_command = local_interactive_shell_launch_command(&shell);
+        if let Some(session) = self.sessions.get_mut(&key) {
+            session.id = session_id.to_string();
+            session.session_path = key.clone();
+            session.title = title;
+            session.kind = SessionKind::Shell;
+            session.launch_command = launch_command.clone();
+            session.launch_phase = TerminalLaunchPhase::Queued;
+            session.remote_deploy_state = RemoteDeployState::NotRequired;
+            session.status_line = describe_status_line(
+                session.backend,
+                self.theme,
+                session.source,
+                session.launch_phase,
+                session.remote_deploy_state,
+                session.bridge_available,
+            );
+            upsert_session_metadata(
+                &mut session.metadata,
+                "Source",
+                "daemon-owned-shell".to_string(),
+            );
+            upsert_session_metadata(
+                &mut session.metadata,
+                "Runtime Ownership",
+                "yggterm daemon".to_string(),
+            );
+            if let Some(cwd) = target.cwd.as_deref() {
+                upsert_session_metadata(&mut session.metadata, "Cwd", cwd.to_string());
+            }
+            upsert_session_metadata(&mut session.metadata, "Runtime Session", key.clone());
+        }
+        self.active_session_path = Some(key.clone());
+        self.active_view_mode = WorkspaceViewMode::Terminal;
+        Ok(key)
+    }
+
     pub fn restore_live_session(&mut self, live: PersistedLiveSession) {
         let PersistedLiveSession {
             key,
@@ -7381,162 +7443,12 @@ struct RemoteSavedCodexSessionExistsResponse {
     exists: bool,
 }
 
-fn remote_tmux_session_name(session_id: &str) -> String {
-    let suffix = session_id
-        .chars()
-        .filter(|ch| ch.is_ascii_alphanumeric())
-        .collect::<String>();
-    let suffix = if suffix.len() <= 24 {
-        suffix
-    } else {
-        format!("{}{}", &suffix[..12], &suffix[suffix.len() - 12..])
-    };
-    format!("yggterm-{suffix}")
-}
-
-fn legacy_remote_tmux_session_name(session_id: &str) -> String {
-    let suffix = session_id
-        .chars()
-        .filter(|ch| ch.is_ascii_alphanumeric())
-        .take(24)
-        .collect::<String>();
-    format!("yggterm-{suffix}")
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RemoteMultiplexer {
-    Tmux,
-    Screen,
-}
-
-fn tmux_available() -> anyhow::Result<bool> {
-    Ok(Command::new("sh")
-        .arg("-lc")
-        .arg("command -v tmux >/dev/null 2>&1")
-        .status()
-        .context("checking tmux availability")?
-        .success())
-}
-
-fn screen_available() -> anyhow::Result<bool> {
-    Ok(Command::new("sh")
-        .arg("-lc")
-        .arg("command -v screen >/dev/null 2>&1")
-        .status()
-        .context("checking screen availability")?
-        .success())
-}
-
-fn preferred_remote_multiplexer() -> anyhow::Result<Option<RemoteMultiplexer>> {
-    if tmux_available()? {
-        return Ok(Some(RemoteMultiplexer::Tmux));
-    }
-    if screen_available()? {
-        return Ok(Some(RemoteMultiplexer::Screen));
-    }
-    Ok(None)
-}
-
-fn tmux_has_session(session_name: &str) -> anyhow::Result<bool> {
-    Ok(Command::new("tmux")
-        .args(["has-session", "-t", session_name])
-        .status()
-        .with_context(|| format!("checking tmux session {session_name}"))?
-        .success())
-}
-
-// Deleted 2026-05-26: tmux_spawn_codex_session, tmux_attach_session,
-// tmux_snapshot_bytes, tmux_visible_snapshot_bytes — legacy multiplexer
-// adapters from before yggterm-headless became the remote runtime. The
-// surviving tmux helpers (tmux_available, tmux_has_session, tmux_send_keys,
-// tmux_kill_session) are still used by the remote-session shutdown path
-// in lib.rs:~13906.
-
-fn tmux_send_keys(session_name: &str, text: &str) -> anyhow::Result<()> {
-    let status = Command::new("tmux")
-        .args(["send-keys", "-t", session_name, text, "Enter"])
-        .status()
-        .with_context(|| format!("sending tmux keys to {session_name}"))?;
-    if status.success() {
-        Ok(())
-    } else {
-        anyhow::bail!("tmux send-keys failed for {session_name}: {status}");
-    }
-}
-
-fn tmux_kill_session(session_name: &str) -> anyhow::Result<()> {
-    let status = Command::new("tmux")
-        .args(["kill-session", "-t", session_name])
-        .status()
-        .with_context(|| format!("killing tmux session {session_name}"))?;
-    if status.success() {
-        Ok(())
-    } else {
-        anyhow::bail!("tmux kill-session failed for {session_name}: {status}");
-    }
-}
-
-fn parse_screen_session_ref(screen_ls_output: &str, session_name: &str) -> Option<String> {
-    for line in screen_ls_output.lines() {
-        let token = line.split_whitespace().next()?.trim();
-        if token == session_name || token.ends_with(&format!(".{session_name}")) {
-            return Some(token.to_string());
-        }
-    }
-    None
-}
-
-fn screen_session_ref(session_name: &str) -> anyhow::Result<Option<String>> {
-    let output = Command::new("screen")
-        .args(["-ls", session_name])
-        .output()
-        .with_context(|| format!("listing screen sessions for {session_name}"))?;
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    Ok(parse_screen_session_ref(
-        &format!("{stdout}\n{stderr}"),
-        session_name,
-    ))
-}
-
-fn screen_has_session(session_name: &str) -> anyhow::Result<bool> {
-    Ok(screen_session_ref(session_name)?.is_some())
-}
-
-// Deleted 2026-05-26: screen_spawn_codex_session, screen_attach_shell_command,
-// screen_resume_or_spawn_shell_command, screen_attach_session — legacy
-// multiplexer adapters. The surviving screen helpers (screen_available,
-// screen_session_ref, screen_has_session, screen_send_keys, screen_kill_session)
-// are still used by the remote-session shutdown path in lib.rs:~13906.
-
-fn screen_send_keys(session_name: &str, text: &str) -> anyhow::Result<()> {
-    let target = screen_session_ref(session_name)?.unwrap_or_else(|| session_name.to_string());
-    let payload = format!("{text}\r");
-    let status = Command::new("screen")
-        .args(["-S", &target, "-X", "stuff", &payload])
-        .status()
-        .with_context(|| format!("sending screen keys to {target}"))?;
-    if status.success() {
-        Ok(())
-    } else {
-        anyhow::bail!("screen stuff failed for {target}: {status}");
-    }
-}
-
-fn screen_kill_session(session_name: &str) -> anyhow::Result<()> {
-    let Some(target) = screen_session_ref(session_name)? else {
-        return Ok(());
-    };
-    let status = Command::new("screen")
-        .args(["-S", &target, "-X", "quit"])
-        .status()
-        .with_context(|| format!("killing screen session {target}"))?;
-    if status.success() {
-        Ok(())
-    } else {
-        anyhow::bail!("screen quit failed for {target}: {status}");
-    }
-}
+// Removed 2026-06-05: all external-multiplexer adapters (tmux/screen session
+// naming, availability probes, has/send/kill helpers, RemoteMultiplexer). The
+// host daemon (yggterm-headless) owns and persists every session PTY per
+// [[spec-decentralized-host-daemon]] — it IS the multiplexer. yggterm does not
+// shell out to tmux or screen anywhere; remote session create/attach/snapshot/
+// terminate all go through the daemon.
 
 // Deleted 2026-05-26: sanitize_terminal_snapshot, screen_snapshot_bytes_with_history,
 // screen_snapshot_bytes, screen_visible_snapshot_bytes, terminal_snapshot_emission_bytes,
@@ -10812,123 +10724,9 @@ fn remote_shell_command(exec_prefix: Option<&str>, inner: &str) -> String {
     }
 }
 
-fn fetch_remote_resume_snapshot_over_ssh(
-    ssh_target: &str,
-    exec_prefix: Option<&str>,
-    session_id: &str,
-) -> anyhow::Result<Option<String>> {
-    let session_name = remote_tmux_session_name(session_id);
-    let legacy_session_name = legacy_remote_tmux_session_name(session_id);
-    let inner = format!(
-        r#"needs_trust_continue() {{
-  snapshot=$1
-  normalized=$(printf '%s' "$snapshot" | tr '[:upper:]' '[:lower:]')
-  printf '%s' "$normalized" | grep -Fq -- 'do you trust the contents of this directory' \
-    || printf '%s' "$normalized" | grep -Fq -- 'press enter to continue'
-}}
-for name in {session_name} {legacy_session_name}; do
-if command -v tmux >/dev/null 2>&1 && tmux has-session -t "$name" 2>/dev/null; then
-  snapshot=$(tmux capture-pane -p -S - -t "$name" 2>/dev/null || true)
-  if needs_trust_continue "$snapshot"; then
-    tmux send-keys -t "$name" Enter >/dev/null 2>&1 || true
-    sleep 0.12
-    snapshot=$(tmux capture-pane -p -S - -t "$name" 2>/dev/null || true)
-  fi
-  printf '%s' "$snapshot"
-  exit 0
-fi
-if command -v screen >/dev/null 2>&1 && screen -ls "$name" 2>/dev/null | grep -q '\.'; then
-  tmp=$(mktemp)
-  if screen -S "$name" -X hardcopy -h "$tmp" >/dev/null 2>&1; then
-    snapshot=$(cat "$tmp")
-    if needs_trust_continue "$snapshot"; then
-      screen -S "$name" -X stuff "$(printf '\r')" >/dev/null 2>&1 || true
-      sleep 0.12
-      if screen -S "$name" -X hardcopy -h "$tmp" >/dev/null 2>&1; then
-        snapshot=$(cat "$tmp")
-      fi
-    fi
-    printf '%s' "$snapshot"
-    rm -f "$tmp"
-    exit 0
-  fi
-  rm -f "$tmp"
-fi
-done
-exit 0"#,
-        session_name = shell_single_quote(&session_name),
-        legacy_session_name = shell_single_quote(&legacy_session_name),
-    );
-    let mut cmd = Command::new("ssh");
-    cmd.arg("-o").arg("ConnectTimeout=5");
-    cmd.arg("-o").arg("BatchMode=yes");
-    cmd.arg(ssh_target)
-        .arg(remote_shell_command(exec_prefix, &inner))
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let output = cmd
-        .output()
-        .with_context(|| format!("capturing remote resume snapshot from {ssh_target}"))?;
-    if !output.status.success() {
-        anyhow::bail!(
-            "remote resume snapshot command failed for {}: {}",
-            ssh_target,
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-    }
-    let text = String::from_utf8_lossy(&output.stdout).replace('\0', "");
-    let trimmed = text.trim();
-    if trimmed.is_empty() {
-        if let Ok(home) = resolve_yggterm_home() {
-            append_trace_event(
-                &home,
-                "server",
-                "remote_resume_seed",
-                "empty_multiplexer_snapshot_no_prefill",
-                serde_json::json!({
-                    "ssh_target": ssh_target,
-                    "session_id": session_id,
-                }),
-            );
-        }
-        return Ok(None);
-    }
-    let snapshot_prefill = remote_resume_seed_snapshot_prefill(trimmed.as_bytes());
-    if let Some(prefill) = snapshot_prefill.as_deref()
-        && remote_resume_prefill_has_scrollback(prefill)
-    {
-        if let Ok(home) = resolve_yggterm_home() {
-            append_trace_event(
-                &home,
-                "server",
-                "remote_resume_seed",
-                "multiplexer_snapshot_prefill_used",
-                serde_json::json!({
-                    "ssh_target": ssh_target,
-                    "session_id": session_id,
-                    "bytes": prefill.len(),
-                }),
-            );
-        }
-        return Ok(Some(format!("\x1b[2J\x1b[H{}", prefill)));
-    }
-    if let Some(prefill) = snapshot_prefill.as_deref()
-        && let Ok(home) = resolve_yggterm_home()
-    {
-        append_trace_event(
-            &home,
-            "server",
-            "remote_resume_seed",
-            "shallow_snapshot_prefill_used",
-            serde_json::json!({
-                "ssh_target": ssh_target,
-                "session_id": session_id,
-                "bytes": prefill.len(),
-            }),
-        );
-    }
-    Ok(snapshot_prefill.map(|prefill| format!("\x1b[2J\x1b[H{}", prefill)))
-}
+// Removed 2026-06-05: fetch_remote_resume_snapshot_over_ssh — captured a
+// remote tmux/screen pane to seed the resume view. yggterm no longer uses any
+// external multiplexer; remote screens come from the host daemon.
 
 fn normalize_remote_attach_cwd(
     ssh_target: &str,
@@ -12208,6 +12006,20 @@ pub fn run_remote_resume_codex(
         "initial_cols": initial_size.map(|(cols, _)| cols),
         "initial_rows": initial_size.map(|(_, rows)| rows),
     }));
+    bridge_remote_runtime_session_stdio(&endpoint, &key)
+}
+
+/// Daemon-native replacement for the old tmux-backed `server attach`: ensure the
+/// host daemon is running, create-or-resume a daemon-owned shell PTY keyed by
+/// `session_id` (persists across SSH disconnects — the daemon IS the multiplexer
+/// per [[spec-decentralized-host-daemon]]), then bridge stdio to it using the
+/// same transport the remote codex path uses. No external multiplexer involved.
+pub fn run_daemon_shell_attach(session_id: &str, cwd: Option<&str>) -> anyhow::Result<()> {
+    let home = resolve_yggterm_home()?;
+    let initial_size = current_tty_size();
+    let endpoint = default_endpoint(&home);
+    ensure_local_daemon_running(&endpoint)?;
+    let key = daemon::ensure_shell_session(&endpoint, session_id, cwd, initial_size)?;
     bridge_remote_runtime_session_stdio(&endpoint, &key)
 }
 
@@ -14131,36 +13943,10 @@ pub fn run_remote_terminate_codex(session_id: &str) -> anyhow::Result<()> {
             }),
         );
     }
-    let session_name = remote_tmux_session_name(session_id);
-    match preferred_remote_multiplexer()? {
-        Some(RemoteMultiplexer::Tmux) => {
-            if !tmux_has_session(&session_name)? {
-                return Ok(());
-            }
-            let _ = tmux_send_keys(&session_name, "/quit");
-            for _ in 0..10 {
-                std::thread::sleep(std::time::Duration::from_millis(200));
-                if !tmux_has_session(&session_name)? {
-                    return Ok(());
-                }
-            }
-            tmux_kill_session(&session_name)
-        }
-        Some(RemoteMultiplexer::Screen) => {
-            if !screen_has_session(&session_name)? {
-                return Ok(());
-            }
-            let _ = screen_send_keys(&session_name, "/quit");
-            for _ in 0..10 {
-                std::thread::sleep(std::time::Duration::from_millis(200));
-                if !screen_has_session(&session_name)? {
-                    return Ok(());
-                }
-            }
-            screen_kill_session(&session_name)
-        }
-        None => Ok(()),
-    }
+    // Daemon-native termination above is the single source of truth — the host
+    // daemon owns every yggterm-launched session. No external multiplexer
+    // (tmux/screen) fallback: yggterm does not use them anywhere.
+    Ok(())
 }
 
 fn tail_text_file_lines(path: &std::path::Path, lines: usize) -> Vec<String> {
@@ -17985,53 +17771,15 @@ pub fn terminate_remote_codex_session(
     machine: &RemoteMachineSnapshot,
     session_id: &str,
 ) -> anyhow::Result<()> {
-    match run_remote_yggterm_command(
+    // Daemon-native termination is the SSOT: the remote host daemon owns the
+    // session. No external multiplexer (tmux/screen) fallback anywhere.
+    run_remote_yggterm_command(
         &machine.ssh_target,
         machine.prefix.as_deref(),
         &["server", "remote", "terminate-codex", session_id],
         None,
-    ) {
-        Ok(_) => Ok(()),
-        Err(error) if !should_fallback_to_python(&error) => Err(error),
-        Err(_) => {
-            let session_name = remote_tmux_session_name(session_id);
-            let command = format!(
-                "if command -v tmux >/dev/null 2>&1 && tmux has-session -t {} 2>/dev/null; then tmux send-keys -t {} /quit Enter >/dev/null 2>&1 || true; sleep 2; tmux kill-session -t {} >/dev/null 2>&1 || true; \
-                 elif command -v screen >/dev/null 2>&1 && screen -ls {} 2>/dev/null | grep -q '\\\\.'; then screen -S {} -X stuff '/quit\\015' >/dev/null 2>&1 || true; sleep 2; screen -S {} -X quit >/dev/null 2>&1 || true; fi",
-                shell_single_quote(&session_name),
-                shell_single_quote(&session_name),
-                shell_single_quote(&session_name),
-                shell_single_quote(&session_name),
-                shell_single_quote(&session_name),
-                shell_single_quote(&session_name),
-            );
-            let remote = remote_shell_command(machine.prefix.as_deref(), &command);
-            let status = Command::new("ssh")
-                .arg("-o")
-                .arg("ConnectTimeout=8")
-                .arg("-o")
-                .arg("BatchMode=yes")
-                .arg(&machine.ssh_target)
-                .arg(remote)
-                .status()
-                .with_context(|| {
-                    format!(
-                        "failed to terminate remote codex session {} on {}",
-                        session_id, machine.ssh_target
-                    )
-                })?;
-            if status.success() {
-                Ok(())
-            } else {
-                anyhow::bail!(
-                    "failed to terminate remote codex session {} on {}: {}",
-                    session_id,
-                    machine.ssh_target,
-                    status
-                );
-            }
-        }
-    }
+    )
+    .map(|_| ())
 }
 
 pub fn request_remote_codex_session_shutdown(
@@ -18053,40 +17801,9 @@ fn request_remote_codex_session_quit(
     machine: &RemoteMachineSnapshot,
     session_id: &str,
 ) -> anyhow::Result<()> {
-    let session_name = remote_tmux_session_name(session_id);
-    let command = format!(
-        "if command -v tmux >/dev/null 2>&1 && tmux has-session -t {} 2>/dev/null; then tmux send-keys -t {} /quit Enter >/dev/null 2>&1 || true; \
-         elif command -v screen >/dev/null 2>&1 && screen -ls {} 2>/dev/null | grep -q '\\\\.'; then screen -S {} -X stuff '/quit\\015' >/dev/null 2>&1 || true; fi",
-        shell_single_quote(&session_name),
-        shell_single_quote(&session_name),
-        shell_single_quote(&session_name),
-        shell_single_quote(&session_name),
-    );
-    let remote = remote_shell_command(machine.prefix.as_deref(), &command);
-    let status = Command::new("ssh")
-        .arg("-o")
-        .arg("ConnectTimeout=8")
-        .arg("-o")
-        .arg("BatchMode=yes")
-        .arg(&machine.ssh_target)
-        .arg(remote)
-        .status()
-        .with_context(|| {
-            format!(
-                "failed to request graceful remote codex shutdown {} on {}",
-                session_id, machine.ssh_target
-            )
-        })?;
-    if status.success() {
-        Ok(())
-    } else {
-        anyhow::bail!(
-            "failed to request graceful remote codex shutdown {} on {}: {}",
-            session_id,
-            machine.ssh_target,
-            status
-        );
-    }
+    // Graceful quit now goes through the daemon-native terminate path (idempotent
+    // with the scheduled force-terminate that follows). No tmux/screen anywhere.
+    terminate_remote_codex_session(machine, session_id)
 }
 
 fn snapshot_preview_block(block: SessionPreviewBlock) -> SnapshotPreviewBlock {
@@ -20065,11 +19782,11 @@ mod tests {
         clear_stale_local_daemon_socket_when_no_daemon, client_instances_dir, current_millis_u64,
         dedupe_remote_scanned_sessions, describe_status_line, describe_status_line_with_error,
         launch_command_matches_terminal_appearance, legacy_agent_launch_command,
-        legacy_remote_tmux_session_name, live_session_default_summary,
+        live_session_default_summary,
         load_remote_machine_sessions_from_mirror, local_daemon_connect_error_is_transient,
         local_remote_bootstrap_executable_from_current, looks_like_low_signal_generated_copy,
         managed_session_from_snapshot, mirror_remote_machine_sessions,
-        parse_recent_context_sections, parse_screen_session_ref, parse_stored_transcript,
+        parse_recent_context_sections, parse_stored_transcript,
         push_preview_block, remote_bootstrap_install_command, remote_cache_key,
         remote_command_cache, remote_direct_attach_launch_command,
         remote_resume_requires_missing_saved_session_failure,
@@ -20080,7 +19797,7 @@ mod tests {
         remote_saved_session_screen_is_attachable, remote_scan_roots_with_parents,
         remote_scanned_session_path, remote_snapshot_looks_like_codex,
         remote_snapshot_looks_like_shell_prompt, remote_ssh_launch_command,
-        remote_summary_for_path, remote_tmux_session_name, sanitize_recent_context_payload,
+        remote_summary_for_path, sanitize_recent_context_payload,
         session_metadata_value, should_fallback_to_python,
         should_remove_local_daemon_socket_for_spawn_state, stored_session_launch_command,
         strip_remote_payload_noise, synthesize_remote_scanned_session_view,
@@ -21595,6 +21312,56 @@ mod tests {
         assert_eq!(
             server.snapshot().active_view_mode,
             WorkspaceViewMode::Rendered
+        );
+    }
+
+    #[test]
+    fn ensure_shell_runtime_session_is_resumable_and_daemon_owned() {
+        // The tmux replacement: `server attach <id>` maps to a daemon-owned,
+        // resumable shell session. The same id must resolve to the SAME session
+        // key (so re-attach reconnects the persistent PTY), the kind must be a
+        // plain Shell, and the launch command must be a bare login shell (the
+        // daemon spawns it in the session cwd — no tmux/PROMPT_COMMAND dance).
+        let tree = SessionNode {
+            kind: SessionNodeKind::Group,
+            name: "root".to_string(),
+            title: None,
+            document_kind: None,
+            group_kind: None,
+            path: PathBuf::from("/"),
+            children: Vec::new(),
+            session_id: None,
+            cwd: None,
+            ..Default::default()
+        };
+        let mut server = YggtermServer::new(
+            &tree,
+            false,
+            GhosttyHostSupport::shadow("test".to_string(), false, false),
+            UiTheme::ZedLight,
+        );
+        let id = "testshell-resume-001";
+        let key1 = server
+            .ensure_shell_runtime_session(id, Some("/tmp"))
+            .expect("first ensure");
+        let key2 = server
+            .ensure_shell_runtime_session(id, Some("/tmp"))
+            .expect("second ensure");
+        assert_eq!(key1, key2, "same id must resolve to the same resumable key");
+
+        let session = server.sessions.get(&key1).expect("session present");
+        assert_eq!(session.kind, SessionKind::Shell);
+        assert_eq!(session.id, id);
+        assert!(
+            session.launch_command.contains("-i"),
+            "expected an interactive login shell launch command, got {:?}",
+            session.launch_command
+        );
+        assert!(
+            !session.launch_command.contains("tmux")
+                && !session.launch_command.contains("screen"),
+            "shell launch command must not invoke any external multiplexer: {:?}",
+            session.launch_command
         );
     }
 
@@ -23456,28 +23223,9 @@ terminal_window_id: None,
         assert_eq!(strip_remote_payload_noise(raw.as_bytes()), "2.0.12");
     }
 
-    #[test]
-    fn parse_screen_session_ref_matches_named_session_suffix() {
-        let listing = "There are screens on:\n\t4046775.yggterm-abc123\t(03/28/26 21:42:13)\t(Detached)\n1 Socket in /run/screen/S-pi.\n";
-        assert_eq!(
-            parse_screen_session_ref(listing, "yggterm-abc123"),
-            Some("4046775.yggterm-abc123".to_string())
-        );
-    }
-
-    #[test]
-    fn remote_multiplexer_session_name_uses_full_session_id_to_avoid_prefix_collisions() {
-        let a = remote_tmux_session_name("019c6a41-bef6-71c0-b799-8de1452efa1d");
-        let b = remote_tmux_session_name("019c6a41-bef6-71c0-b799-8de1ffffffff");
-        let legacy_a = legacy_remote_tmux_session_name("019c6a41-bef6-71c0-b799-8de1452efa1d");
-        let legacy_b = legacy_remote_tmux_session_name("019c6a41-bef6-71c0-b799-8de1ffffffff");
-        assert_ne!(a, b);
-        assert_eq!(legacy_a, legacy_b);
-    }
-
-    // Deleted 2026-05-26: screen_attach_shell_command_replays_exact_session_without_injecting_ctrl_l
-    // and screen_resume_or_spawn_shell_command_avoids_screen_ls_on_hot_path —
-    // tested legacy multiplexer adapters deleted in the same commit.
+    // Removed 2026-06-05: parse_screen_session_ref + remote_multiplexer session
+    // naming tests — the external-multiplexer code they covered is gone (daemon
+    // is the multiplexer; no tmux/screen anywhere).
 
     #[test]
     fn reopening_remote_scanned_session_refreshes_stale_launch_command() -> Result<()> {
