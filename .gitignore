@@ -21,3 +21,7 @@ __pycache__/
 .agents/config/
 event-trace.jsonl
 target/
+
+# JS test harness deps
+tools/xterm-harness/node_modules/
+tools/xterm-harness/package-lock.json

@@ -1,0 +1,13 @@
+{
+  "name": "yggterm-xterm-harness",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Headless behavioral test harness for the EXACT vendored xterm.js the app ships, so client-layer xterm behaviors (scrollback, reflow, follow) are deterministically guarded. See campaign-xterm-dealbreakers.",
+  "type": "commonjs",
+  "scripts": {
+    "test": "node --test"
+  },
+  "dependencies": {
+    "jsdom": "^29.1.1"
+  }
+}
