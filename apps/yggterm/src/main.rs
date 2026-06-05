@@ -710,7 +710,7 @@ fn print_server_app_help() {
   yggterm server app start-page [--pid <pid>]
   yggterm server app terminal <new|send|focus|scroll|probe-type|probe-scroll|probe-select|probe-context-menu> ...
   yggterm server app terminal scroll <session> --to <top|bottom|±N>
-  yggterm server app terminal read-buffer <session> [--mode screen|full]
+  yggterm server app terminal read-buffer <session> [--mode screen|full|cells]
   yggterm server app terminal send <session> (--data <data>|--stdin)"
     );
 }
