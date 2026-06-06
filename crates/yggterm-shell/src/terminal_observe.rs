@@ -1474,9 +1474,55 @@ fn terminal_host_has_rendered_surface_for_app_control(host: &Value) -> bool {
         && (canvas_count > 0 || !text_sample.is_empty())
 }
 
+// XTERM-BUG: blank-viewport-client-snapshot-poison
+// "viewport beyond scrollback base" is a TRANSIENT artifact for a cursor-addressed
+// codex surface during a reveal/reseed: codex owns its scrollback so base_y stays
+// near the top, and a brief reseed can leave viewport_y momentarily past base_y.
+// Escalating that as a host fault makes the clean-output checks fail and drives a
+// recovery/remount that interrupts a working session (the live "blink → restart"
+// symptom). True only when the visible text is a codex surface AND base_y is small
+// (no real scrollback). A genuinely scrolled real-scrollback session (base_y in the
+// hundreds/thousands) returns false here and still escalates.
+fn terminal_host_viewport_beyond_base_is_transient_codex_reseed(host: &Value) -> bool {
+    let base_y = host.get("base_y").and_then(Value::as_f64).unwrap_or(0.0);
+    let rows = host
+        .get("rows")
+        .and_then(Value::as_f64)
+        .filter(|value| *value >= 1.0)
+        .unwrap_or(64.0);
+    if base_y > rows {
+        return false;
+    }
+    let visible_text = [
+        "cursor_line_text",
+        "text_tail",
+        "text_sample",
+        "buffer_text_sample",
+        "cursor_row_text",
+    ]
+    .into_iter()
+    .filter_map(|key| host.get(key).and_then(Value::as_str))
+    .map(str::trim)
+    .filter(|value| !value.is_empty())
+    .collect::<Vec<_>>()
+    .join("\n");
+    !visible_text.is_empty()
+        && (terminal_chunk_has_current_codex_input_row(&visible_text)
+            || terminal_chunk_has_codex_prompt_output(&visible_text)
+            || terminal_chunk_is_codex_prompt_surface(&visible_text)
+            || terminal_chunk_is_codex_working_surface(&visible_text))
+}
 fn terminal_host_problem_for_app_control(host: &Value) -> Option<&'static str> {
     if let Some(problem) = terminal_host_geometry_problem_for_app_control(host) {
-        return Some(problem);
+        // Suppress ONLY the transient codex-reseed "viewport beyond base" from the
+        // escalation path (it stays observable via the geometry_problem field). All
+        // other geometry problems, and this one for non-codex / real-scrollback
+        // sessions, still escalate.
+        if !(problem == "active terminal viewport is beyond the xterm scrollback base"
+            && terminal_host_viewport_beyond_base_is_transient_codex_reseed(host))
+        {
+            return Some(problem);
+        }
     }
     let text_sample = host
         .get("text_sample")
@@ -5439,6 +5485,69 @@ Best thing to improve in the meantime:
 
         assert_eq!(
             terminal_host_geometry_problem_for_app_control(&host),
+            Some("active terminal viewport is beyond the xterm scrollback base")
+        );
+    }
+
+    // XTERM-BUG: blank-viewport-client-snapshot-poison — a transient "viewport
+    // beyond scrollback base" on a cursor-addressed codex reseed must stay
+    // OBSERVABLE (geometry fn) but must NOT escalate (host-problem consumer),
+    // so it can't drive a recovery/remount that restarts a working session.
+    #[test]
+    fn host_problem_suppresses_transient_viewport_beyond_base_for_codex_reseed() {
+        // A healthy codex surface (prompt box + input row + model footer) — the
+        // body of terminal_host_problem_for_app_control accepts this as clean.
+        let codex_tail = "\
+╭─────────────────────────────────────────────╮
+│ >_ OpenAI Codex (v0.130.0)                  │
+╰─────────────────────────────────────────────╯
+
+› Run /review on my current changes
+
+  gpt-5.5 medium · ~/gh/yggterm";
+        let cursor_line = "› Run /review on my current changes";
+        // Same surface, but the viewport is transiently beyond a LOW base_y
+        // (codex owns its scrollback) — the reseed artifact.
+        let codex_reseed = json!({
+            "session_path": "codex-runtime://live",
+            "text_sample": codex_tail,
+            "text_tail": codex_tail,
+            "buffer_text_sample": codex_tail,
+            "cursor_line_text": cursor_line,
+            "host_stdin_enabled": true,
+            "helper_textarea_focused": true,
+            "xterm_present": true,
+            "screen_present": true,
+            "rows_present": true,
+            "canvas_count": 1,
+            "terminal_content_source": "daemon_pty",
+            "rows": 63.0,
+            "base_y": 8.0,
+            "viewport_y": 40.0,
+            "public_viewport_y": 40.0,
+            "visual_viewport_y": 40.0,
+            "host_rect": {"left": 0.0, "top": 0.0, "width": 840.0, "height": 830.0},
+            "screen_rect": {"width": 840.0, "height": 830.0},
+            "viewport_rect": {"width": 840.0, "height": 830.0},
+            "helper_textarea_rect": {"left": 0.0, "top": 0.0, "width": 1.0, "height": 1.0}
+        });
+        // Still OBSERVED by the pure geometry detector…
+        assert_eq!(
+            terminal_host_geometry_problem_for_app_control(&codex_reseed),
+            Some("active terminal viewport is beyond the xterm scrollback base")
+        );
+        // …but NOT escalated by the host-problem consumer (no recovery/restart).
+        assert_eq!(terminal_host_problem_for_app_control(&codex_reseed), None);
+
+        // A real-scrollback session (base_y far above rows) with the same
+        // beyond-base reading is a genuine fault and STILL escalates.
+        let mut real_scrollback = codex_reseed.clone();
+        real_scrollback["base_y"] = json!(1000.0);
+        real_scrollback["viewport_y"] = json!(1286.0);
+        real_scrollback["public_viewport_y"] = json!(1000.0);
+        real_scrollback["visual_viewport_y"] = json!(1286.0);
+        assert_eq!(
+            terminal_host_problem_for_app_control(&real_scrollback),
             Some("active terminal viewport is beyond the xterm scrollback base")
         );
     }
