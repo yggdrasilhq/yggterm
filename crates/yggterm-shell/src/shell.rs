@@ -65608,6 +65608,50 @@ fn terminal_replay_retained_data_script_for_session(
             }} catch (_error) {{}}
             if (collapsedScrollbackNeedsReplay && retainedReplayCursorAddressedScrollbackRisk()) {{
               const currentPromptReady = currentPromptReadyInEntry(entry);
+              // XTERM-BUG: blank-viewport-client-snapshot-poison
+              // Reconcile from the daemon's AUTHORITATIVE current screen frame
+              // BEFORE falling back to the cached client snapshot. The client
+              // xterm_session_snapshot can be a collapsed/sparse frame (nonblank
+              // far below the real screen) that the <=1 poison guard does not
+              // catch; preferring it left the codex viewport clipped/blank with
+              // the daemon's full frame never reconciled in (promoted count 0),
+              // which then trips the "viewport beyond scrollback base" surface
+              // problem and the blink/reseed/restart escalation. A daemon SCREEN
+              // snapshot (NOT cursor-addressed scrollback history) is the real
+              // current frame and is safe to write; it self-corrects on the next
+              // codex repaint, unlike the client snapshot which latches.
+              const daemonScreenSnapshotAuthoritative =
+                replaySource === 'daemon_screen_snapshot'
+                || replaySource === 'daemon_retained_history_screen_snapshot';
+              if (daemonScreenSnapshotAuthoritative && writePayloadIntoEntry(entry, data)) {{
+                entry.__yggtermLastRetainedReplayKey = replayKey;
+                entry.lastRawPayloadLength = data.length;
+                entry.lastRawPayloadLineCount = rawPayloadLineCount;
+                entry.lastRawPayloadSample = terminalPayloadDebugSample(data);
+                entry.lastRetainedReplaySource = replaySource;
+                entry.lastRetainedReplayRecoveredFromSnapshot = false;
+                entry.terminalContentSource = replaySource;
+                entry.retainedReplayUnsafeSkipPromptReady = false;
+                entry.retainedReplayPromotedToDaemonPtyCount =
+                  Number(entry.retainedReplayPromotedToDaemonPtyCount || 0) + 1;
+                followPromptForEntry(entry, 'retained_replay_reconcile_from_daemon_screen');
+                try {{
+                  if (typeof entry.term.refresh === "function") {{
+                    entry.term.refresh(0, Math.max(0, Number(entry.term.rows || 1) - 1));
+                  }}
+                }} catch (_error) {{}}
+                try {{
+                  if (typeof entry.emitHostHealth === "function") {{
+                    entry.emitHostHealth('retained_replay_reconcile_from_daemon_screen');
+                  }}
+                }} catch (_error) {{}}
+                if (Date.now() >= current.stableUntilMs && replayPromptReadyInEntry(entry)) {{
+                  current.complete = true;
+                }} else {{
+                  retryLater();
+                }}
+                return;
+              }}
               const snapshot = sessionSnapshotForReplay();
               if (snapshot && replaySessionSnapshotIntoEntry(entry, snapshot)) {{
                 if (Date.now() >= current.stableUntilMs && replayPromptReadyInEntry(entry)) {{
@@ -74462,6 +74506,52 @@ mod tests {
         );
         // …and Codex caret recognition is preserved (no regression for Codex).
         assert!(script.contains("visibleText.includes(\"›\")"));
+    }
+    // XTERM-BUG: blank-viewport-client-snapshot-poison — on a cursor-addressed
+    // (codex) collapsed-scrollback reveal, the replay must reconcile from the
+    // daemon's authoritative SCREEN frame BEFORE falling back to the cached
+    // client snapshot (which can be a sparse/poison frame the <=1 guard misses,
+    // leaving the viewport clipped/blank and never promoting the daemon frame —
+    // the live "switch-back broken paint / restart session" symptom).
+    #[test]
+    fn retained_replay_reconciles_from_daemon_screen_before_client_snapshot() {
+        let script = terminal_replay_retained_data_script_for_session(
+            "remote-session://dev/codex",
+            "\x1b[2J\x1b[Hline 1\r\nline 2\r\n",
+            "daemon_screen_snapshot",
+        );
+        assert!(
+            script.contains("const daemonScreenSnapshotAuthoritative ="),
+            "must recognize an authoritative daemon screen frame"
+        );
+        assert!(
+            script.contains("replaySource === 'daemon_screen_snapshot'")
+                && script.contains("replaySource === 'daemon_retained_history_screen_snapshot'"),
+            "daemon screen + retained-history screen snapshots are authoritative"
+        );
+        assert!(
+            script.contains(
+                "if (daemonScreenSnapshotAuthoritative && writePayloadIntoEntry(entry, data))"
+            ),
+            "must write the daemon frame when authoritative"
+        );
+        assert!(
+            script.contains(
+                "followPromptForEntry(entry, 'retained_replay_reconcile_from_daemon_screen')"
+            ),
+            "reconcile path must follow the prompt and be observable"
+        );
+        // The daemon reconcile must be attempted BEFORE the client-snapshot fallback.
+        let reconcile_ix = script
+            .find("daemonScreenSnapshotAuthoritative && writePayloadIntoEntry")
+            .expect("reconcile branch present");
+        let snapshot_ix = script
+            .find("snapshot && replaySessionSnapshotIntoEntry(entry, snapshot)")
+            .expect("client-snapshot fallback present");
+        assert!(
+            reconcile_ix < snapshot_ix,
+            "daemon screen reconcile must be attempted before the client-snapshot fallback"
+        );
     }
     #[test]
     fn retained_rehydrate_script_replays_only_collapsed_xterm_buffers() {
