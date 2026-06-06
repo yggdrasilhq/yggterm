@@ -4,6 +4,28 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+## 2.8.26
+
+- **Codex sessions no longer show a clipped/blank viewport after switching away and back.**
+  On reveal, a cursor-addressed session (Codex/Claude Code) sometimes restored a stale,
+  sparse client snapshot — leaving the middle/top of the screen blank while only the
+  bottom rows painted — and never reconciled the daemon's authoritative current frame.
+  The reveal now writes the daemon's screen frame before falling back to the client
+  snapshot, so the full screen comes back.
+- **A transient Codex viewport state no longer restarts a working session.** A brief
+  "viewport beyond scrollback base" reading during a reseed was treated as a surface
+  fault and could escalate into a remount/restart that interrupted in-flight work. For a
+  Codex surface (which keeps its scrollback near the top) this transient is now observed
+  but not escalated; a genuinely scrolled session with real scrollback still is.
+- **yggterm's own connection/launch text no longer leaks into the terminal.** Before the
+  PTY painted, the daemon's launch seed ("Launching live … session", "Terminal surface:
+  embedded xterm.js", "Runtime owner: yggterm daemon", …) could be written into the
+  terminal as prefill. That boilerplate is now kept out of the buffer.
+- **Resumed Claude Code sessions settle cleanly instead of flickering.** The retained-
+  replay readiness check only recognized Codex's prompt caret, so a correctly-replayed
+  Claude buffer was judged "not visible" and the loop reset+rewrote it every 100ms until
+  a timeout. It now recognizes Claude's caret and idle footer.
+
 ## 2.8.20
 
 - **An update no longer interrupts a working agent.** The daemon retires itself when
