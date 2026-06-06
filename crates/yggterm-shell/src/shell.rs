@@ -65067,7 +65067,12 @@ fn terminal_replay_retained_data_script_for_session(
             const cursorMoveCount = (data.match(/\x1b\[[0-9;?]*[HfGd]/g) || []).length;
             return csiCount >= 16 || eraseCount >= 8 || cursorMoveCount >= 8;
           }};
-          const promptIx = strippedReplayText.lastIndexOf("›");
+          // XTERM-BUG: remote-cc-replay-codex-only — recognize BOTH the Codex
+          // caret (U+203A ›) and the Claude Code caret (U+276F ❯); a Claude
+          // replay derived a needle only from › before, so it was empty.
+          const codexPromptIx = strippedReplayText.lastIndexOf("›");
+          const claudePromptIx = strippedReplayText.lastIndexOf("❯");
+          const promptIx = Math.max(codexPromptIx, claudePromptIx);
           const promptNeedle = promptIx >= 0
             ? strippedReplayText.slice(promptIx, promptIx + 96).replace(/\s+/g, " ").trim()
             : "";
@@ -65164,7 +65169,16 @@ fn terminal_replay_retained_data_script_for_session(
             if (visibleTextHasInternalTransportLeak(visibleText)) {{
               return false;
             }}
-            if (visibleText.includes("›")) {{
+            // XTERM-BUG: remote-cc-replay-codex-only — a settled replay is
+            // recognized by the Codex caret (U+203A ›) OR the Claude Code caret
+            // (U+276F ❯) OR Claude's idle footer ("? for shortcuts"). Without the
+            // Claude signals a correctly-replayed Claude buffer was judged
+            // not-visible, so completion never fired and the 100ms retry loop
+            // reset+rewrote the buffer every tick (flash/churn) until the deadline.
+            if (visibleText.includes("›") || visibleText.includes("❯")) {{
+              return true;
+            }}
+            if (visibleText.toLowerCase().includes("? for shortcuts")) {{
               return true;
             }}
             return Boolean(promptNeedle && visibleText.replace(/\s+/g, " ").includes(promptNeedle));
@@ -74415,6 +74429,40 @@ mod tests {
         assert!(!remote_resume_stable_bootstrap_epoch(false, false, false));
     }
 
+    // XTERM-BUG: remote-cc-replay-codex-only — the GUI replay idempotency check
+    // must recognize the Claude Code caret (U+276F ❯) and idle footer, not only
+    // the Codex caret (U+203A ›). Otherwise a correctly-replayed Claude buffer is
+    // judged not-visible, completion never fires, and the 100ms retry loop
+    // reset+rewrites the buffer every tick (flash/churn) until the deadline.
+    // Synthetic Claude prompt surface only — no session data.
+    #[test]
+    fn retained_replay_script_recognizes_claude_caret_not_only_codex() {
+        let script = terminal_replay_retained_data_script_for_session(
+            "remote-session://dev/claude",
+            "\x1b[2J\x1b[H❯ Try \"edit <file>\"\r\n? for shortcuts\r\n",
+            "daemon_retained_snapshot",
+        );
+        // promptNeedle is derived from EITHER caret (the later occurrence).
+        assert!(
+            script.contains("const claudePromptIx = strippedReplayText.lastIndexOf(\"❯\");"),
+            "promptNeedle must consider the Claude caret U+276F"
+        );
+        assert!(
+            script.contains("const promptIx = Math.max(codexPromptIx, claudePromptIx);"),
+            "promptIx must take the later of the Codex/Claude carets"
+        );
+        // replayVisibleInEntry recognizes the Claude caret AND the idle footer…
+        assert!(
+            script.contains("visibleText.includes(\"›\") || visibleText.includes(\"❯\")"),
+            "a settled replay must be recognized by the Claude caret, not only the Codex caret"
+        );
+        assert!(
+            script.contains("visibleText.toLowerCase().includes(\"? for shortcuts\")"),
+            "Claude's idle footer must count as a settled, visible replay"
+        );
+        // …and Codex caret recognition is preserved (no regression for Codex).
+        assert!(script.contains("visibleText.includes(\"›\")"));
+    }
     #[test]
     fn retained_rehydrate_script_replays_only_collapsed_xterm_buffers() {
         let script = terminal_replay_retained_data_script_for_session(
