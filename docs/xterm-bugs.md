@@ -50,6 +50,7 @@ xterm.js owns vs what the shell owns, cursor/prompt semantics, etc. — see
 | [chunk-ring-trim-drops-mid-stream](#chunk-ring-trim-drops-mid-stream) | Middle chunks of TUI output silently missing: yggterm-server chunk ring trims oldest while a client's read-cursor is behind the trim, and read(cursor) returns only surviving chunks with no gap signal | LAYER 1 DONE 2026-06-04 (read() detects + signals `resync_required`, no longer silent; tested) — LAYER 2 pending (propagate to client + re-attach, live-risky) |
 | [squish-and-bottom-paint-on-reresume](#squish-and-bottom-paint-on-reresume) | After an update re-resumes a session, codex renders narrow (squish) + composer bg-split (bottom paint) | FIXED 2026-06-05 (v2.8.25) — daemon resizes PTY to client grid on re-attach; deterministic test |
 | [seed-connection-state-in-terminal](#seed-connection-state-in-terminal) | yggterm's own launch/connection seed boilerplate ("Launching live … session", "Terminal surface: embedded xterm.js", "Runtime owner: yggterm daemon") is written into the xterm buffer as prefill before the PTY paints | FIXED 2026-06-06 (D4) — local prefill source + render gate reject the daemon launch seed; deterministic fail-then-pass test |
+| [blank-viewport-client-snapshot-poison](#blank-viewport-client-snapshot-poison) | On reveal/switch-back of a cursor-addressed (codex) session, the viewport is clipped from the middle / blank above the bottom rows: the client restores a sparse cached xterm_session_snapshot instead of reconciling the daemon's authoritative screen frame; trips "viewport beyond scrollback base" → blink/reseed/restart | CAPTURE+RESTORE GUARDS SHIPPED (66d765c3); CODEX RECONCILE FIX 2026-06-06 (Bug 1) — reveal reconciles from daemon screen frame before the client snapshot; NEEDS LIVE VERIFY |
 
 ---
 
@@ -1341,6 +1342,77 @@ impossible at the source rather than filtered client-side.
 
 ### Related
 - memory: campaign-xterm-dealbreakers (D4), finding-blank-on-restart-split-brain-daemon.
+
+## blank-viewport-client-snapshot-poison
+
+**STATUS:** Capture-side + restore-side poison guards SHIPPED (66d765c3, 2026-06-04).
+CODEX RECONCILE FIX 2026-06-06 (campaign Bug 1) — reveal reconciles from the daemon
+authoritative screen frame before the client snapshot. **NEEDS LIVE VERIFY on jojo**
+(the test is a generated-script string+order assertion, not a behavioral xterm.js run;
+a `tools/xterm-harness` behavioral guard is the follow-up hardening).
+
+### Symptom
+On reveal — going away and back, or switching sessions and back — a cursor-addressed
+agent session (codex/CC) renders clipped from the middle: only the bottom few rows
+paint, the region above is blank, and the daemon holds the full frame. Sometimes it
+"blinks" and reseeds, or yggterm escalates to restarting the session. Non-deterministic
+(a later reveal may heal it).
+
+### Reproduction
+Live (jojo 2.8.25): foreground a working codex session, switch away and back a few
+times. App state on the stuck host: `retained_replay_source = xterm_session_snapshot`,
+`xterm_session_snapshot_nonblank_line_count` small (e.g. 4–7),
+`retained_replay_promoted_to_daemon_pty_count = 0`, while `server snapshot` shows the
+full CUP frame. `server trace tail` describe_state: `surface_problem = "active terminal
+viewport is beyond the xterm scrollback base"`, `viewport_ready = false`,
+`render_health = healthy` (viewport-readiness detector, not the renderer).
+Deterministic: `shell::tests::retained_replay_reconciles_from_daemon_screen_before_client_snapshot`.
+
+### Root cause
+In `attemptReplay` (the generated `terminal_replay_retained_data_script_for_session`),
+the cursor-addressed collapsed-recovery branch
+(`collapsedScrollbackNeedsReplay && retainedReplayCursorAddressedScrollbackRisk()`)
+preferred the cached client `xterm_session_snapshot` and, failing that, just
+`retryLater()`. It never wrote the daemon's authoritative screen frame in this branch.
+The client snapshot can be a collapsed/sparse frame (nonblank far below the real
+screen) that the `<=1`-nonblank poison guard does not catch — so the sparse frame is
+latched, the viewport sits past the buffer content, and `terminal_observe.rs`
+(`viewport_beyond_xterm_base`) raises the surface problem that drives blink/reseed/restart.
+NOTE: the poison guard cannot be tightened with a fraction-of-`priorMax` rule —
+`priorMax` is monotonic (`Math.max`), so a legitimately-shorter frame after a big turn
+would be poisoned forever. The fix is at the source choice, not the guard threshold.
+
+### Workaround / fix
+On a cursor-addressed collapsed-recovery reveal, when the reveal carries an
+AUTHORITATIVE daemon screen frame (`replaySource` is `daemon_screen_snapshot` or
+`daemon_retained_history_screen_snapshot`), write it (`writePayloadIntoEntry(entry, data)`)
+and promote it BEFORE falling back to the client snapshot. A daemon screen snapshot is
+the real current frame (not cursor-addressed scrollback history, which stays risky to
+replay), is safe to write, and self-corrects on the next codex repaint. Capture/restore
+poison guards remain as defense in depth.
+TODO (not yet done): gate the `viewport_beyond_xterm_base` surface-problem escalation
+for a working/cursor-addressed codex so a transient clip can't yank/restart a live
+session; fix the transient `active_session_path` set without an `active_session` on switch.
+
+### Code locations
+- `crates/yggterm-shell/src/shell.rs` — `attemptReplay` cursor-addressed branch
+  (reconcile-from-daemon-screen), `xtermSessionSnapshotIsCollapsedPoison` (capture/restore/replay
+  copies), `writePayloadIntoEntry`.
+- `crates/yggterm-shell/src/terminal_observe.rs` — `viewport_beyond_xterm_base` surface-problem detector.
+
+### Tests
+- `crates/yggterm-shell/src/shell.rs`:
+  `retained_replay_reconciles_from_daemon_screen_before_client_snapshot` (fail-then-pass:
+  strings absent on HEAD; asserts the reconcile branch exists AND precedes the client-snapshot fallback);
+  plus the existing capture/restore poison-guard string tests.
+
+### Telemetry
+`retained_replay_reconcile_from_daemon_screen` host-health event; `retained_replay_source`,
+`retained_replay_promoted_to_daemon_pty_count`, `xterm_session_snapshot_nonblank_line_count` in `app state`.
+
+### Related memory
+`[[finding-blank-viewport-client-snapshot-poison]]`, `[[campaign-xterm-dealbreakers]]` (Bug 1, D3/D4),
+`[[finding-blank-on-restart-split-brain-daemon]]`, `[[finding-codex-scroll-lock-no-client-scrollback]]`.
 
 ## Template (copy for new entries)
 
