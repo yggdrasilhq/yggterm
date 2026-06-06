@@ -49,6 +49,7 @@ xterm.js owns vs what the shell owns, cursor/prompt semantics, etc. — see
 | [xterm-host-registry-leak](#xterm-host-registry-leak) | Switching/restarting sessions accumulates orphaned xterm.js instances (cleanup keyed to mount epoch that changes on remount) → growing latency on selection/paste/switch | FIXED 2026-06-02 |
 | [chunk-ring-trim-drops-mid-stream](#chunk-ring-trim-drops-mid-stream) | Middle chunks of TUI output silently missing: yggterm-server chunk ring trims oldest while a client's read-cursor is behind the trim, and read(cursor) returns only surviving chunks with no gap signal | LAYER 1 DONE 2026-06-04 (read() detects + signals `resync_required`, no longer silent; tested) — LAYER 2 pending (propagate to client + re-attach, live-risky) |
 | [squish-and-bottom-paint-on-reresume](#squish-and-bottom-paint-on-reresume) | After an update re-resumes a session, codex renders narrow (squish) + composer bg-split (bottom paint) | FIXED 2026-06-05 (v2.8.25) — daemon resizes PTY to client grid on re-attach; deterministic test |
+| [seed-connection-state-in-terminal](#seed-connection-state-in-terminal) | yggterm's own launch/connection seed boilerplate ("Launching live … session", "Terminal surface: embedded xterm.js", "Runtime owner: yggterm daemon") is written into the xterm buffer as prefill before the PTY paints | FIXED 2026-06-06 (D4) — local prefill source + render gate reject the daemon launch seed; deterministic fail-then-pass test |
 
 ---
 
@@ -1271,6 +1272,64 @@ full-width and clean. Best-effort; traces `reattach_grid_resync`.
 ### Related
 - memory: campaign-xterm-dealbreakers (D1), finding-codex-squish-post-restart-pty-size,
   finding-codex-composer-bg-split-reflow, finding-blank-on-restart-split-brain-daemon.
+
+## seed-connection-state-in-terminal
+
+**STATUS:** FIXED 2026-06-06 (campaign D4) — client-side; structural SSOT follow-up noted below.
+
+### Symptom
+During the pre-first-paint launch window the terminal viewport shows yggterm's OWN
+connection-state / launch seed text instead of program output — e.g. `$ codex`,
+`Launching live Codex session <id>`, `Workspace: <cwd>`, `Deploy state: …`,
+`Launch phase: …`, `Terminal surface: embedded xterm.js`, or the daemon-owned
+variants (`Resume daemon-owned …`, `Runtime owner: yggterm daemon`, `Transport
+bridge: stdio attach to daemon PTY`). When the real stream stalls/strands, the
+seed persists in-buffer (seen as the lingering line during the split-brain blank).
+
+### Reproduction
+Rust unit (`local_terminal_prefill_text_rejects_daemon_launch_seed_lines`): build a
+`ManagedSessionView { source: LiveLocal, … }` whose `terminal_lines` hold the
+`build_live_terminal_lines` seed (PTY not yet painted) → before the fix
+`local_terminal_prefill_text` returns `Some(seed)` and `terminal_prefill_should_render_to_host`
+returns `true`, so the seed is written to the xterm buffer.
+
+### Root cause
+The daemon overloads `session.terminal_lines` as BOTH the launch/connection seed AND
+the PTY screen tail. It only overwrites `terminal_lines` with the real PTY tail once
+`session_screen_snapshot()` is `Some` (daemon.rs); before first paint it holds the
+boilerplate from `build_live_terminal_lines` (lib.rs:19126) or the `terminal_lines =
+vec![..]` seed sites. On the client, `local_terminal_prefill_text` blindly maps
+`session.terminal_lines` → prefill text, and the prefill is written as a real
+`TerminalJsCommand::Write` (shell.rs:48547). The render gate `terminal_resume_output_excerpt`
+did not recognize the seed phrases, so the metadata leaked into the buffer.
+(The REMOTE summary/preview leak is already dead — `remote_terminal_placeholder_text`
+and the `*_prompt_ready_replay_text` fns are neutered to `None`; the bootstrap-warning
+"assets host=…"/"Connecting SSH" strings are DOM chrome / toasts, NOT buffer writes.)
+
+### Workaround / fix
+`terminal_chunk_is_daemon_launch_seed(&str)` recognizes high-specificity
+yggterm-internal seed markers (phrases a CLI never emits). `local_terminal_prefill_text`
+returns `None` when any `terminal_lines` entry matches it (primary fix at the source),
+and `terminal_resume_output_excerpt`'s reject block also drops it (defense in depth).
+**Preferred SSOT follow-up (not yet done, larger blast radius):** stop overloading
+`session.terminal_lines` — route launch/connection seeds to a non-terminal overlay
+field so `terminal_lines` only ever carries real PTY content; that makes the leak
+impossible at the source rather than filtered client-side.
+
+### Code locations
+- `crates/yggterm-shell/src/shell.rs` — `terminal_chunk_is_daemon_launch_seed` (predicate),
+  `local_terminal_prefill_text` (primary guard), `terminal_resume_output_excerpt` (defense in depth).
+- `crates/yggterm-server/src/lib.rs:19126` `build_live_terminal_lines` + the `terminal_lines = vec![..]`
+  seed sites — the source of the boilerplate (SSOT follow-up target).
+
+### Tests
+- `crates/yggterm-shell/src/shell.rs`:
+  `local_terminal_prefill_text_rejects_daemon_launch_seed_lines` (fail-then-pass, proven to bite),
+  `terminal_chunk_is_daemon_launch_seed_matches_seed_not_real_cli_output` (no false positives on agent text),
+  `local_terminal_prefill_text_uses_hot_session_terminal_lines_and_status` (real CLI tail still prefills — kept green).
+
+### Related
+- memory: campaign-xterm-dealbreakers (D4), finding-blank-on-restart-split-brain-daemon.
 
 ## Template (copy for new entries)
 
