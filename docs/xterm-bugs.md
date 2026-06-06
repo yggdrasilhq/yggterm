@@ -819,9 +819,13 @@ silent regressions when this path degrades.
 
 ## remote-cc-replay-codex-only
 
-**STATUS:** FIX PENDING LIVE VERIFY 2026-05-31 — recognizer + readiness
-wiring landed on branch `fix/remote-cc-replay-and-xterm-latency`; unit
-tests pass; dev/jojo live verification still owed before "fixed".
+**STATUS:** FIX PENDING LIVE VERIFY — TWO LAYERS now addressed in code:
+(1) the Rust readiness recognizer (`terminal_chunk_is_claude_prompt_surface`)
+landed on `main` (da0e8bd9 / 2.8.1); (2) the GUI-side replay IDEMPOTENCY gap
+(`replayVisibleInEntry`/`promptNeedle` were Codex-caret-only) is FIXED
+2026-06-06 (campaign D5) — see "Open follow-ups" below. Unit/string-guard tests
+pass (fail-then-pass proven); dev/jojo live verification still owed before "fixed"
+(cycle a real remote-cc session: confirm transient-flash → settled, not blank).
 
 ### Symptom
 A resumed Claude Code session (`remote-cc://…`) renders with its prompt
@@ -882,16 +886,23 @@ in `main` too — it is NOT fixed by the 2.7.86→2.8.0 bump.
   `remote_resume_blank_host_snapshot_is_replayable` (wiring).
 
 ### Open follow-ups
-- GUI-side replay JS (`terminal_replay_retained_data_script_for_session`)
-  still uses Codex's `›`/`promptNeedle` for some idempotency checks
-  (`replayVisibleInEntry`); confirm during dev verify that Claude replay
-  promotes through `promptViewportReadyInEntry` (geometry-only, non-codex
-  path) and add a Claude needle if not.
+- ✅ FIXED 2026-06-06 (campaign D5): GUI-side replay JS
+  (`terminal_replay_retained_data_script_for_session`) used Codex's `›` only for
+  `replayVisibleInEntry`/`promptNeedle`, so a correctly-replayed Claude buffer
+  was judged not-visible → completion never fired → the 100ms retry loop
+  `term.reset()+clear()+rewrite` every tick (flash/churn) until the 15s deadline.
+  `replayVisibleInEntry` now also recognizes the Claude caret `❯` (U+276F) and
+  the `"? for shortcuts"` idle footer, and `promptNeedle` is derived from the
+  later of the Codex/Claude carets. (`replayPromptReadyInEntry` already routed
+  Claude through `promptViewportReadyInEntry` geometry-only, so visibility was
+  the sole remaining gate.) Live-verify on jojo still owed.
 - Consider generalizing `codex_like_session` → an agent-CLI-agnostic
   `agent_like_session` per SSOT instead of accreting per-CLI recognizers.
 
 ### Tests
-`terminal_observe::tests::terminal_chunk_is_claude_prompt_surface_recognizes_claude_surfaces`.
+`terminal_observe::tests::terminal_chunk_is_claude_prompt_surface_recognizes_claude_surfaces`;
+`shell::tests::retained_replay_script_recognizes_claude_caret_not_only_codex`
+(fail-then-pass — the generated replay script now recognizes `❯` + `"? for shortcuts"`).
 
 ### Related memory
 `[[finding-remote-cc-retained-replay-codex-only]]`,
