@@ -1390,9 +1390,14 @@ and promote it BEFORE falling back to the client snapshot. A daemon screen snaps
 the real current frame (not cursor-addressed scrollback history, which stays risky to
 replay), is safe to write, and self-corrects on the next codex repaint. Capture/restore
 poison guards remain as defense in depth.
-TODO (not yet done): gate the `viewport_beyond_xterm_base` surface-problem escalation
-for a working/cursor-addressed codex so a transient clip can't yank/restart a live
-session; fix the transient `active_session_path` set without an `active_session` on switch.
+Escalation gate (DONE 2026-06-06): `terminal_host_problem_for_app_control` no longer
+escalates a transient `viewport_beyond_xterm_base` for a cursor-addressed codex surface
+with a small `base_y` (codex owns its scrollback) — it stays OBSERVABLE via the
+`geometry_problem` field but does not feed the clean-output/recovery path, so a reseed
+artifact can't drive a remount/restart of a working session. A real-scrollback session
+(`base_y` ≫ rows) with the same reading still escalates.
+TODO (not yet done): fix the transient `active_session_path` set without an
+`active_session` on switch-back.
 
 ### Code locations
 - `crates/yggterm-shell/src/shell.rs` — `attemptReplay` cursor-addressed branch
@@ -1405,6 +1410,11 @@ session; fix the transient `active_session_path` set without an `active_session`
   `retained_replay_reconciles_from_daemon_screen_before_client_snapshot` (fail-then-pass:
   strings absent on HEAD; asserts the reconcile branch exists AND precedes the client-snapshot fallback);
   plus the existing capture/restore poison-guard string tests.
+- `crates/yggterm-shell/src/terminal_observe.rs`:
+  `host_problem_suppresses_transient_viewport_beyond_base_for_codex_reseed` (the geometry
+  detector still observes it; the host-problem consumer suppresses it for a low-base_y codex
+  surface but still escalates a real-scrollback session) — and the existing
+  `app_control_terminal_surface_flags_viewport_beyond_xterm_base` stays green.
 
 ### Telemetry
 `retained_replay_reconcile_from_daemon_screen` host-health event; `retained_replay_source`,
