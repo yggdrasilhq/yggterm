@@ -53960,6 +53960,30 @@ fn terminal_chunk_requires_terminal_emulator_forward(data: &str) -> bool {
         && !terminal_chunk_has_visible_output(data)
         && data.contains('\u{1b}')
 }
+// XTERM-BUG: seed-connection-state-in-terminal
+// yggterm-internal launch/connection-state copy that the daemon writes into
+// `session.terminal_lines` BEFORE the PTY paints (`build_live_terminal_lines`
+// plus the `terminal_lines = vec![..]` seed sites in `yggterm-server/src/lib.rs`;
+// the daemon only overwrites `terminal_lines` with the real PTY tail once
+// `session_screen_snapshot()` is `Some`). The inner CLI (codex / claude / shell)
+// never emits these phrases, so they must NEVER be rendered into the xterm buffer
+// as prefill — connection state belongs to overlay status chrome, not the PTY
+// viewport. Markers are deliberately high-specificity (yggterm-internal copy a
+// coding agent would never print) to avoid false-positives on real CLI output.
+fn terminal_chunk_is_daemon_launch_seed(text: &str) -> bool {
+    let normalized = text.to_ascii_lowercase();
+    const SEED_MARKERS: &[&str] = &[
+        "terminal surface: embedded xterm.js",
+        "runtime owner: yggterm daemon",
+        "transport bridge: stdio",
+        "resume daemon-owned ",
+        "queue daemon-owned ",
+        "remote bootstrap: ",
+    ];
+    SEED_MARKERS
+        .iter()
+        .any(|marker| normalized.contains(marker))
+}
 fn terminal_prefill_should_render_to_host(data: &str) -> bool {
     let stripped = strip_terminal_control_sequences(data);
     let normalized = stripped.trim();
@@ -54112,6 +54136,8 @@ fn terminal_resume_output_excerpt(data: &str) -> Option<String> {
         || terminal_chunk_is_codex_resume_instruction(normalized)
         || terminal_chunk_has_prompt_output(normalized)
         || terminal_chunk_is_low_signal_terminal_noise(normalized)
+        // XTERM-BUG: seed-connection-state-in-terminal (defense in depth)
+        || terminal_chunk_is_daemon_launch_seed(normalized)
     {
         return None;
     }
@@ -55545,6 +55571,16 @@ fn terminal_loading_notice_text(session: &ManagedSessionView) -> Option<String> 
 fn local_terminal_prefill_text(session: &ManagedSessionView) -> Option<String> {
     if session.session_path.starts_with("remote-session://")
         || session.source != SessionSource::LiveLocal
+    {
+        return None;
+    }
+    // XTERM-BUG: seed-connection-state-in-terminal — during the pre-first-paint
+    // launch window `session.terminal_lines` holds the daemon's launch/connection
+    // seed boilerplate, not real PTY output. Never prefill that into the buffer.
+    if session
+        .terminal_lines
+        .iter()
+        .any(|line| terminal_chunk_is_daemon_launch_seed(line))
     {
         return None;
     }
@@ -99140,6 +99176,97 @@ Shared connection to 192.0.2.14 closed.\r\n";
             Some(
                 "• I had to add WezTerm’s official APT repository\r\n• wezterm is installed and available\r\n› Explain this codebase\r\n"
             )
+        );
+    }
+    // XTERM-BUG: seed-connection-state-in-terminal — the daemon's launch/connection
+    // seed (build_live_terminal_lines + the terminal_lines = vec![..] sites in
+    // yggterm-server/src/lib.rs) must never be written into the xterm buffer as
+    // prefill. Synthetic seed strings only — no private session data.
+    #[test]
+    fn terminal_chunk_is_daemon_launch_seed_matches_seed_not_real_cli_output() {
+        // The canonical local seed (build_live_terminal_lines) and the daemon-owned
+        // vec![] seed sites are recognized…
+        assert!(terminal_chunk_is_daemon_launch_seed(
+            "Terminal surface: embedded xterm.js"
+        ));
+        assert!(terminal_chunk_is_daemon_launch_seed("Runtime owner: yggterm daemon"));
+        assert!(terminal_chunk_is_daemon_launch_seed(
+            "Transport bridge: stdio attach to daemon PTY"
+        ));
+        assert!(terminal_chunk_is_daemon_launch_seed(
+            "Resume daemon-owned remote Codex session 01ABCDEF"
+        ));
+        assert!(terminal_chunk_is_daemon_launch_seed(
+            "Queue daemon-owned remote Codex session 01ABCDEF"
+        ));
+        assert!(terminal_chunk_is_daemon_launch_seed(
+            "Remote bootstrap: copying yggterm binary"
+        ));
+        // …but real CLI / shell output is NOT (no false positives on agent text).
+        assert!(!terminal_chunk_is_daemon_launch_seed(
+            "• wezterm is installed and available"
+        ));
+        assert!(!terminal_chunk_is_daemon_launch_seed("› Explain this codebase"));
+        assert!(!terminal_chunk_is_daemon_launch_seed("$ cargo build --workspace"));
+        assert!(!terminal_chunk_is_daemon_launch_seed(
+            "Deploy state ready: pushing to production"
+        ));
+    }
+    #[test]
+    fn local_terminal_prefill_text_rejects_daemon_launch_seed_lines() {
+        // A LiveLocal session whose terminal_lines still hold the daemon launch seed
+        // (PTY hasn't painted yet) — exactly the build_live_terminal_lines shape.
+        let session = ManagedSessionView {
+            id: "01ABCDEF".to_string(),
+            session_path: "/home/user/.codex/sessions/2026/06/06/rollout-seed.jsonl".to_string(),
+            title: "Seeded local codex".to_string(),
+            kind: SessionKind::Codex,
+            host_label: "localhost".to_string(),
+            source: yggterm_server::SessionSource::LiveLocal,
+            backend: TerminalBackend::Xterm,
+            bridge_available: false,
+            launch_phase: yggterm_server::TerminalLaunchPhase::Running,
+            remote_deploy_state: yggterm_server::RemoteDeployState::NotRequired,
+            launch_command: "codex".to_string(),
+            status_line: String::new(),
+            terminal_lines: vec![
+                "$ codex".to_string(),
+                "Launching live Codex session 01ABCDEF".to_string(),
+                "Workspace: /tmp/work".to_string(),
+                "Deploy state: not required".to_string(),
+                "Launch phase: running".to_string(),
+                "Terminal surface: embedded xterm.js".to_string(),
+            ],
+            rendered_sections: Vec::new(),
+            preview: yggterm_server::SessionPreview {
+                summary: Vec::new(),
+                blocks: Vec::new(),
+            },
+            metadata: Vec::new(),
+            terminal_process_id: None,
+            terminal_foreground_active: None,
+            terminal_window_id: None,
+            terminal_host_token: None,
+            terminal_host_mode: GhosttyTerminalHostMode::Unsupported,
+            embedded_surface_id: None,
+            embedded_surface_detail: None,
+            last_launch_error: None,
+            last_window_error: None,
+            ssh_target: None,
+            ssh_prefix: None,
+            stored_preview_hydrated: false,
+        };
+        // Primary fix: the local prefill source refuses the seed outright.
+        assert_eq!(
+            local_terminal_prefill_text(&session),
+            None,
+            "daemon launch seed must not become terminal prefill"
+        );
+        // Defense in depth: even if the seed reached the render gate, it is rejected.
+        let joined = session.terminal_lines.join("\r\n");
+        assert!(
+            !terminal_prefill_should_render_to_host(&joined),
+            "daemon launch seed must be rejected by the prefill render gate"
         );
     }
     #[test]
