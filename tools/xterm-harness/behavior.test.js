@@ -47,6 +47,49 @@ test('reverse-index inside a full-screen scroll region does not grow scrollback'
   assert.strictEqual(h.baseY(term), 0, `reverse-index must not grow scrollback, baseY=${h.baseY(term)}`);
 });
 
+test('TODO-1 root-direction: codex frame survives a reveal row-resize (so the blink is RESEED, not grid reflow)', async () => {
+  // The switch-reveal blink (~70% of switches, campaign TODO-1) was HYPOTHESIZED
+  // to be a cap-8 retained host whose grid drifted while hidden -> reveal re-fit
+  // reflow. This test FALSIFIES that hypothesis on the EXACT vendored xterm.js and
+  // redirects the fix: a codex steady-state frame (pure absolute addressing,
+  // baseY=0) is NON-destructive across a row-resize down-then-back-up, so a reveal
+  // re-fit does NOT lose/shift the composer-bottom content. Therefore the visible
+  // "shadow flash + broken bottom paint" is the reveal RESEED (the client paints
+  // its stale retained buffer, then reconciles from the daemon) — the Class A
+  // reveal-reconcile path — NOT grid sizing. See campaign-xterm-dealbreakers
+  // CLASS A + audit-viewport-scroll-control-flow.
+  const buildCodexFrame = (rows) => {
+    let frame = '\x1b[2J\x1b[H';
+    for (let r = 1; r <= rows; r++) {
+      frame += `\x1b[${r};1H` + (r === rows ? '> composer prompt row' : `transcript row ${r}`);
+    }
+    return frame;
+  };
+
+  // (a) same-grid reveal is a true no-op (frame + baseY byte-identical).
+  const sized = h.createTerminal({ cols: 159, rows: 63, scrollback: 1000 });
+  await h.write(sized, buildCodexFrame(63));
+  const before = h.bufferText(sized);
+  const beforeBaseY = h.baseY(sized);
+  sized.resize(159, 63);
+  assert.strictEqual(h.bufferText(sized), before, 'same-grid reveal must be a true no-op');
+  assert.strictEqual(h.baseY(sized), beforeBaseY, 'same-grid reveal must not move baseY');
+
+  // (b) FALSIFICATION: row-resize 63->40->63 of a codex frame PRESERVES the
+  // composer-bottom row. Grid drift is NOT the flicker source -> the fix is in the
+  // reseed/reconcile path, not host sizing.
+  const drifted = h.createTerminal({ cols: 159, rows: 63, scrollback: 1000 });
+  await h.write(drifted, buildCodexFrame(63));
+  const composerRowBefore = h.lineText(drifted, 62);
+  drifted.resize(159, 40);
+  drifted.resize(159, 63);
+  assert.strictEqual(
+    h.lineText(drifted, 62),
+    composerRowBefore,
+    'codex composer row must survive a row-resize round-trip (grid drift is NOT the blink)'
+  );
+});
+
 test('a painted background colour survives a column WIDEN reflow for already-written cells', async () => {
   // Guards the reflow-bg invariant our composer reconcile depends on: when the
   // terminal widens, cells that were already written WITH a bg keep that bg
