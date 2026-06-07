@@ -3471,11 +3471,17 @@ impl DaemonRuntime {
                 }),
             );
         }
+        // XTERM-BUG: squish-and-bottom-paint-on-reresume — when no client grid is
+        // supplied (e.g. the startup re-resume after a daemon-PROCESS restart, which
+        // otherwise defaults to 120x36 and only repairs the ACTIVE session), fall back
+        // to the session's PERSISTED grid so EVERY re-resumed session comes back at its
+        // real grid, not just the mounted one.
+        let effective_initial_size = initial_size.or_else(|| self.server.session_pty_grid(path));
         self.terminals.ensure_session_with_size(
             &runtime_path,
             &launch_command,
             cwd.as_deref(),
-            initial_size,
+            effective_initial_size,
         )?;
         // D1 (campaign-xterm-dealbreakers): ensure_session_with_size only applies
         // the grid when it CREATES the PTY. After a daemon restart/handoff the
@@ -3486,7 +3492,7 @@ impl DaemonRuntime {
         // client provides a grid that differs from the running PTY, resize the PTY
         // to match so codex repaints full-width and clean. Best-effort: never fail
         // the ensure if the resize errors. See campaign D1.
-        if let Some((cols, rows)) = initial_size
+        if let Some((cols, rows)) = effective_initial_size
             && cols > 0
             && rows > 0
             && self.terminals.session_size(&runtime_path) != Some((cols, rows))
@@ -4818,6 +4824,10 @@ impl DaemonRuntime {
                     }
                 }
                 self.terminals.resize(&runtime_path, cols, rows)?;
+                // XTERM-BUG: squish-and-bottom-paint-on-reresume — persist the grid so a
+                // later daemon-process restart re-resumes EVERY session at its real grid
+                // (not DEFAULT 120x36). In-memory only here; the next persist cycle writes it.
+                self.server.record_session_pty_grid(&path, cols, rows);
                 ServerResponse::Ack { message: None }
             }
             ServerRequest::TerminalRestart {
