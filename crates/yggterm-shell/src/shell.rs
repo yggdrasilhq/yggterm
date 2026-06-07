@@ -20810,6 +20810,14 @@ fn inject_cc_sessions_into_stored_rows(
         else {
             continue;
         };
+        // XTERM-BUG: cwd-tree-expand-bypass (Bug2) — do not inject a live session under a
+        // COLLAPSED cwd group. Live local agent rows (local://, codex-runtime://, live::)
+        // bypass the stored-row expansion filter, so without this gate they render under
+        // a collapsed /home/user. Mirror file-backed leaves, which are hidden when their
+        // parent group is collapsed (the session still appears under Live Sessions).
+        if !stored_rows[group_idx].expanded {
+            continue;
+        }
         let insert_idx = find_child_insert_point(stored_rows, group_idx, group_depth);
         let label = live_session_label_with_index(remote_session_index, session, &short_ids);
         let summary = live_session_summary_with_index(remote_session_index, session);
@@ -99288,6 +99296,83 @@ Shared connection to 192.0.2.14 closed.\r\n";
         assert_eq!(
             remote_terminal_placeholder_text(&session, Some("Waiting on real remote output")),
             None
+        );
+    }
+
+    // XTERM-BUG: cwd-tree-expand-bypass (Bug2) — a live local agent session must not be
+    // injected into the cwd tree under a COLLAPSED parent group (it bypasses the
+    // stored-row expansion filter). Hidden under a collapsed group, shown under expanded.
+    #[test]
+    fn live_local_session_not_injected_under_collapsed_cwd_group() {
+        fn grp(full_path: &str, depth: usize, expanded: bool) -> BrowserRow {
+            BrowserRow {
+                kind: BrowserRowKind::Group,
+                full_path: full_path.to_string(),
+                label: full_path.to_string(),
+                detail_label: String::new(),
+                document_kind: None,
+                group_kind: Some(WorkspaceGroupKind::Folder),
+                session_title: None,
+                depth,
+                host_label: "local".to_string(),
+                descendant_sessions: 0,
+                expanded,
+                session_id: None,
+                session_cwd: None,
+                session_kind: None,
+            }
+        }
+        let session = ManagedSessionView {
+            id: "abc123".to_string(),
+            session_path: "local://abc123".to_string(),
+            title: "home/pi codex".to_string(),
+            kind: SessionKind::Codex,
+            host_label: "localhost".to_string(),
+            source: yggterm_server::SessionSource::LiveLocal,
+            backend: TerminalBackend::Xterm,
+            bridge_available: false,
+            launch_phase: yggterm_server::TerminalLaunchPhase::Running,
+            remote_deploy_state: yggterm_server::RemoteDeployState::NotRequired,
+            launch_command: "codex".to_string(),
+            status_line: String::new(),
+            terminal_lines: Vec::new(),
+            rendered_sections: Vec::new(),
+            preview: yggterm_server::SessionPreview {
+                summary: Vec::new(),
+                blocks: Vec::new(),
+            },
+            metadata: vec![yggterm_server::SessionMetadataEntry {
+                label: "Cwd",
+                value: "/home/user".to_string(),
+            }],
+            terminal_process_id: None,
+            terminal_foreground_active: None,
+            terminal_window_id: None,
+            terminal_host_token: None,
+            terminal_host_mode: GhosttyTerminalHostMode::Unsupported,
+            embedded_surface_id: None,
+            embedded_surface_detail: None,
+            last_launch_error: None,
+            last_window_error: None,
+            ssh_target: None,
+            ssh_prefix: None,
+            stored_preview_hydrated: false,
+        };
+        let sessions: Vec<&ManagedSessionView> = vec![&session];
+        let index = RemoteSessionIndex::default();
+
+        let collapsed = vec![grp("local", 0, true), grp("/home/user", 1, false)];
+        let out = inject_cc_sessions_into_stored_rows(&collapsed, &sessions, &index);
+        assert!(
+            !out.iter().any(|r| r.session_id.as_deref() == Some("abc123")),
+            "live session must NOT be injected under a collapsed /home/user"
+        );
+
+        let expanded = vec![grp("local", 0, true), grp("/home/user", 1, true)];
+        let out2 = inject_cc_sessions_into_stored_rows(&expanded, &sessions, &index);
+        assert!(
+            out2.iter().any(|r| r.session_id.as_deref() == Some("abc123")),
+            "live session MUST be injected under an expanded /home/user"
         );
     }
 
