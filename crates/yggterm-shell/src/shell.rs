@@ -61608,6 +61608,43 @@ fn terminal_eval_script_with_canvas_renderer(
             );
         }};
         const inputDriftWatchdog = window.setInterval(() => {{
+            // Consolidated scroll-controller — settle self-heal (mirrors
+            // scroll_mode::should_settle_follow). When the session is Following
+            // (intent !== UserScrollback) and the viewport is stranded BELOW the
+            // live bottom while the user is IDLE (not input-hot), re-assert the
+            // follow to the CURRENT baseY. This fixes the lock-at-top / broken-
+            // bottom captured live (yggterm-stable vp_y=0/base_y=713): the event-
+            // driven follow landed at a stale baseY (mid-load / alt-screen) and
+            // never re-fired after the content settled. Keying off the stranded
+            // state (not the trigger) covers ALL paths — retained-replay, fit-
+            // cascade, alt->normal. SAFE: viewport-only (forceXtermViewportY, the
+            // unguarded mover); the intent!==UserScrollback + !inputHot gates mean
+            // a user who scrolled up (-> UserScrollback) or is typing is NEVER
+            // yanked; once healed, next tick is gap=0 -> no-op (no loop). Gates on
+            // hostLooksUsable() visibility, NOT focus (Wayland false-negative trap).
+            try {{
+                if (
+                    scrollbackIntent !== 'UserScrollback'
+                    && !terminalInputHot()
+                    && hostLooksUsable()
+                    && term && term.buffer && term.buffer.active
+                ) {{
+                    const __healActive = term.buffer.active;
+                    const __healBaseY = Math.max(0, Number(__healActive.baseY || 0));
+                    const __healViewportY = Math.max(0, Number(__healActive.viewportY || 0));
+                    if (__healBaseY - __healViewportY >= 3) {{
+                        forceXtermViewportY(__healBaseY, 'settle_self_heal');
+                        syncScrollbackLock('settle_self_heal');
+                        const __healEntry = window.__yggtermXtermHosts && window.__yggtermXtermHosts[hostId]
+                            ? window.__yggtermXtermHosts[hostId] : null;
+                        if (__healEntry) {{
+                            __healEntry.settleSelfHealCount = Number(__healEntry.settleSelfHealCount || 0) + 1;
+                            __healEntry.lastSettleSelfHealAtMs = Date.now();
+                            __healEntry.lastSettleSelfHealGap = __healBaseY - __healViewportY;
+                        }}
+                    }}
+                }}
+            }} catch (_settleSelfHealError) {{}}
             if (!terminalNeedsPassiveFocusRecovery()) {{
                 return;
             }}
@@ -73015,6 +73052,29 @@ mod tests {
         assert!(script.contains("cursorInactiveStyle: 'block'"));
         assert!(script.contains("if (!nextInputEnabled) {"));
         assert!(script.contains("helperTextarea.blur();"));
+    }
+    // Consolidated scroll-controller Phase 2: the idle-gated settle self-heal must
+    // be present in the watchdog and correctly guarded (Following only, idle only,
+    // viewport-only). Mirrors scroll_mode::should_settle_follow. Regression-locks
+    // the fix for the captured lock-at-top / broken-bottom.
+    #[test]
+    fn terminal_eval_script_has_idle_gated_settle_self_heal() {
+        let theme = terminal_theme(UiTheme::ZedLight, palette(UiTheme::ZedLight), 13.0, "");
+        let script = terminal_eval_script("yggterm-terminal-test", &theme, true);
+        assert!(
+            script.contains("forceXtermViewportY(__healBaseY, 'settle_self_heal');"),
+            "settle self-heal must re-assert follow to the current baseY"
+        );
+        // Gated to Following + idle so it never yanks a scrolled-back or typing user.
+        assert!(script.contains("scrollbackIntent !== 'UserScrollback'"));
+        assert!(
+            script.contains("&& !terminalInputHot()\n                    && hostLooksUsable()"),
+            "self-heal must be gated on idle (not input-hot) + visible (not focus)"
+        );
+        assert!(
+            script.contains("__healBaseY - __healViewportY >= 3"),
+            "self-heal only fires on a real strand (gap >= 3), not a 1-row visual mismatch"
+        );
     }
     #[test]
     fn terminal_eval_script_focuses_host_and_scopes_wheel_capture() {
