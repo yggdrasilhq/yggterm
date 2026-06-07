@@ -48,7 +48,8 @@ use crate::terminal_retained_replay_policy::{
     RetainedRehydrateMode, blank_host_snapshot_replay_from_read_should_start,
     blank_host_snapshot_replay_should_start, daemon_retained_snapshot_replay_identity_key,
     daemon_retained_snapshot_replay_should_start, retained_ready_remote_host_rehydrate_mode,
-    retained_rehydrate_identity_key, retained_remote_host_should_rehydrate,
+    retained_rehydrate_allow_screen_fallback, retained_rehydrate_identity_key,
+    retained_remote_host_should_rehydrate,
 };
 use crate::terminal_themes::{
     default_terminal_theme_name, terminal_theme_by_name, terminal_theme_names_for_mode,
@@ -47040,7 +47041,17 @@ fn TerminalCanvas(
                                 let selection = terminal_select_retained_snapshot_replay(
                                     &data,
                                     Some(&screen_text),
-                                    false,
+                                    // XTERM-BUG: blank-viewport-client-snapshot-poison — offer the
+                                    // daemon's authoritative screen frame for a collapsed-recovery /
+                                    // codex reveal so the client reconcile-from-daemon path engages
+                                    // (daemon_screen_snapshot) instead of downgrading to a sparse
+                                    // client snapshot (clip + broken composer bottom paint). The
+                                    // 2.8.26 client reconcile gated on daemon_screen_snapshot, which
+                                    // the daemon never offered here because this arg was hardcoded false.
+                                    retained_rehydrate_allow_screen_fallback(
+                                        retained_rehydrate_mode,
+                                        codex_like_session_for_task,
+                                    ),
                                 );
                                 let selected_lines = selection.selected_lines;
                                 let screen_lines = selection.screen_lines;
