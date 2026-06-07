@@ -15392,10 +15392,10 @@ fn app_control_open_path_ready(
     session_path: &str,
     view_mode: Option<&AppControlViewMode>,
 ) -> bool {
-    if app_control_session_view_contract_violations(data)
-        .next()
-        .is_some()
-    {
+    // XTERM-BUG: daemon-restart-wedge (Bug6) — block only when a contract violation
+    // concerns THIS target session; a stranded/inconsistent OTHER session must not
+    // deadlock opening a valid one.
+    if app_control_session_view_contract_violations(data).any(|v| v.contains(session_path)) {
         return false;
     }
     if !app_control_selected_path_matches(data, session_path) {
@@ -15660,7 +15660,11 @@ fn app_control_open_path_failure(
     session_path: &str,
     view_mode: Option<&AppControlViewMode>,
 ) -> Option<String> {
-    if let Some(violation) = app_control_session_view_contract_violations(data).next() {
+    // XTERM-BUG: daemon-restart-wedge (Bug6) — fail only on a violation about THIS
+    // target session; an unrelated stranded session must not block this open.
+    if let Some(violation) =
+        app_control_session_view_contract_violations(data).find(|v| v.contains(session_path))
+    {
         return Some(format!("session/view contract violation: {violation}"));
     }
     let viewport = data.get("viewport").and_then(Value::as_object)?;
@@ -21859,6 +21863,63 @@ mod tests {
                 "session/view contract violation: remote scanned terminal session is not backed by LiveSsh: remote-session://dev/test"
                     .to_string()
             )
+        );
+    }
+
+    // XTERM-BUG: daemon-restart-wedge (Bug6) — a contract violation about a DIFFERENT
+    // (stranded/inconsistent) session must NOT deadlock opening a valid target session.
+    #[test]
+    fn app_control_open_path_failure_scopes_contract_violation_to_target() {
+        let target = "remote-session://dev/test";
+        let healthy_viewport = json!({
+            "active_session_path": target,
+            "active_view_mode": "Terminal",
+            "ready": true,
+            "interactive": true,
+            "terminal_settled_kind": "interactive",
+            "active_terminal_surface": { "problem": null },
+            "terminal_hosts": [{
+                "xterm_present": true,
+                "screen_present": true,
+                "viewport_present": true,
+                "resume_overlay_visible": false,
+                "text_sample": "pi@dev:~$"
+            }]
+        });
+        let unrelated = json!({
+            "session_view_contract_violations": [
+                "active_session_path is set without an active_session: local://other-phantom"
+            ],
+            "browser": { "selected_path": target },
+            "active_surface_requests": [],
+            "viewport": healthy_viewport.clone(),
+        });
+        let failure = super::app_control_open_path_failure(
+            &unrelated,
+            target,
+            Some(&super::AppControlViewMode::Terminal),
+        );
+        assert!(
+            failure.as_deref().map_or(true, |e| !e.contains("contract violation")),
+            "unrelated-session violation must not block opening the target, got: {failure:?}"
+        );
+
+        let about_target = json!({
+            "session_view_contract_violations": [
+                format!("active_session_path is set without an active_session: {target}")
+            ],
+            "browser": { "selected_path": target },
+            "active_surface_requests": [],
+            "viewport": healthy_viewport,
+        });
+        let failure_target = super::app_control_open_path_failure(
+            &about_target,
+            target,
+            Some(&super::AppControlViewMode::Terminal),
+        );
+        assert!(
+            failure_target.as_deref().is_some_and(|e| e.contains("contract violation")),
+            "a violation about the target session must still fail the open, got: {failure_target:?}"
         );
     }
 
