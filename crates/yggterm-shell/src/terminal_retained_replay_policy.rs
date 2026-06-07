@@ -13,6 +13,21 @@ impl RetainedRehydrateMode {
     }
 }
 
+// XTERM-BUG: blank-viewport-client-snapshot-poison
+// Whether a retained-rehydrate reveal may fall back to the daemon's AUTHORITATIVE
+// screen snapshot when the retained payload is a cursor-addressed (codex) frame with
+// no plain scrollback history. For a CollapsedScrollbackRecovery reveal (the live
+// broken case: switch-back / surface re-reveal) or any codex-like session, the daemon
+// screen frame is the real current content and MUST be offered, so the client's
+// reconcile-from-daemon path (daemon_screen_snapshot) engages. Otherwise the selector
+// returns daemon_retained_snapshot, which the client downgrades to its own sparse
+// xterm_session_snapshot -> clip + truncated/broken composer bottom paint.
+pub(crate) fn retained_rehydrate_allow_screen_fallback(
+    mode: RetainedRehydrateMode,
+    codex_like: bool,
+) -> bool {
+    codex_like || matches!(mode, RetainedRehydrateMode::CollapsedScrollbackRecovery)
+}
 pub(crate) fn retained_ready_remote_host_should_reuse_bootstrap(
     is_remote_resume_session: bool,
     retained: bool,
@@ -171,6 +186,30 @@ pub(crate) fn blank_host_snapshot_replay_from_read_should_start(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // XTERM-BUG: blank-viewport-client-snapshot-poison — a collapsed-scrollback
+    // recovery reveal (the live switch-back/re-reveal case) OR any codex-like session
+    // must allow the daemon screen-snapshot fallback so the client reconcile-from-daemon
+    // path engages; a plain initial-read of a non-codex session must NOT.
+    #[test]
+    fn collapsed_recovery_or_codex_allows_daemon_screen_fallback() {
+        assert!(retained_rehydrate_allow_screen_fallback(
+            RetainedRehydrateMode::CollapsedScrollbackRecovery,
+            false
+        ));
+        assert!(retained_rehydrate_allow_screen_fallback(
+            RetainedRehydrateMode::InitialRead,
+            true
+        ));
+        assert!(retained_rehydrate_allow_screen_fallback(
+            RetainedRehydrateMode::CollapsedScrollbackRecovery,
+            true
+        ));
+        assert!(!retained_rehydrate_allow_screen_fallback(
+            RetainedRehydrateMode::InitialRead,
+            false
+        ));
+    }
 
     #[test]
     fn retained_ready_remote_host_reuses_bootstrap_on_focus_return() {
