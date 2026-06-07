@@ -98,6 +98,33 @@ these over screenshots.
 - `server status` — daemon version/uptime. `server monitor --scenario panic-report|
   server-list|latency-check|wait-session|hot-restart` — incident triage (see AGENTS.md).
 
+## ⚠️ Match the Linux display backend when launching the GUI (recurring mistake)
+
+**Before launching/relaunching the GUI for a test, detect the session's display
+backend and launch to match it. Forcing the wrong one is a recurring error that
+breaks clipboard/paste, screenshot faithfulness, and native compositing.**
+
+- **Detect:** `ls /run/user/$(id -u)/wayland-*` → if a `wayland-*` socket exists, the
+  session is **Wayland** (jojo is KDE Wayland). `XDG_SESSION_TYPE` over an SSH shell
+  reads `tty` and is USELESS for this — check the socket, or the running GUI's
+  `/proc/<pid>/environ`.
+- **On Wayland, launch with Wayland env — do NOT `export DISPLAY=:0`.** `DISPLAY=:0`
+  forces the app under **XWayland**, and the symptom is exactly what bit us: **paste
+  fails** (X11↔Wayland clipboard mismatch; the GUI shows a "can't paste" notification),
+  plus unfaithful screenshots and disabled compositing. Correct form:
+  ```sh
+  ssh <host> 'XDG_RUNTIME_DIR=/run/user/$(id -u) WAYLAND_DISPLAY=wayland-0 GDK_BACKEND=wayland \
+      ~/.local/bin/yggterm-headless server app launch'
+  ```
+  (unset/omit `DISPLAY`, or `GDK_BACKEND=wayland` overrides it). Verify after launch:
+  `tr '\0' '\n' < /proc/<gui-pid>/environ | grep -E 'WAYLAND_DISPLAY|DISPLAY|GDK_BACKEND'`
+  — `WAYLAND_DISPLAY` should be set and `GDK_BACKEND` should be `wayland`, NOT a bare
+  `DISPLAY=:0`.
+- **On a real X11 session** (only `/tmp/.X11-unix/X0`, no wayland socket): `DISPLAY=:0`
+  is correct; do not force `GDK_BACKEND=wayland`.
+- A GUI launched in the wrong backend must be relaunched correctly — clipboard/paste
+  and screenshot fidelity won't work until it is. See `finding-app-screenshot-unfaithful-on-wayland`.
+
 ## 3. Caveats — which instruments lie (hard-won)
 
 - **`app state` `viewport_y` is STALE when the window is backgrounded.** It can disagree
