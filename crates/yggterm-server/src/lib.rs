@@ -1614,6 +1614,14 @@ pub struct SnapshotSessionView {
     pub last_window_error: Option<String>,
     pub ssh_target: Option<String>,
     pub ssh_prefix: Option<String>,
+    // Observability (campaign grid-squish diagnosis): the PTY's current grid
+    // (cols, rows) as the running program (e.g. codex) sees it. Compare against
+    // the client xterm grid to detect/measure a squish (PTY grid < xterm grid).
+    // serde(default) keeps back-compat with older snapshots.
+    #[serde(default)]
+    pub pty_cols: Option<u16>,
+    #[serde(default)]
+    pub pty_rows: Option<u16>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -17863,6 +17871,8 @@ fn snapshot_session_view(session: ManagedSessionView) -> SnapshotSessionView {
         last_window_error: session.last_window_error,
         ssh_target: session.ssh_target,
         ssh_prefix: session.ssh_prefix,
+        pty_cols: None,
+        pty_rows: None,
     }
 }
 
@@ -17958,6 +17968,8 @@ fn snapshot_live_session_view(session: &ManagedSessionView) -> SnapshotSessionVi
         last_window_error: session.last_window_error.clone(),
         ssh_target: session.ssh_target.clone(),
         ssh_prefix: session.ssh_prefix.clone(),
+        pty_cols: None,
+        pty_rows: None,
     }
 }
 
@@ -20672,6 +20684,8 @@ mod tests {
             last_window_error: None,
             ssh_target: None,
             ssh_prefix: None,
+            pty_cols: None,
+            pty_rows: None,
         }
     }
 
@@ -25380,6 +25394,8 @@ terminal_window_id: None,
             last_window_error: None,
             ssh_target: None,
             ssh_prefix: None,
+            pty_cols: None,
+            pty_rows: None,
         });
 
         assert_eq!(

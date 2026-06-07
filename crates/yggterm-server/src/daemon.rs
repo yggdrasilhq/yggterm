@@ -1976,6 +1976,12 @@ impl DaemonRuntime {
         session.terminal_foreground_active = self
             .terminals
             .session_foreground_process_active(&runtime_path);
+        // Observability (grid-squish): the PTY grid the running program sees, so a
+        // squish (PTY grid < client xterm grid) is directly measurable in `server snapshot`.
+        if let Some((cols, rows)) = self.terminals.session_size(&runtime_path) {
+            session.pty_cols = Some(cols);
+            session.pty_rows = Some(rows);
+        }
         if matches!(
             session.kind,
             SessionKind::Shell
@@ -9759,6 +9765,8 @@ mod tests {
             last_window_error: None,
             ssh_target: Some("dev".to_string()),
             ssh_prefix: None,
+            pty_cols: None,
+            pty_rows: None,
         }
     }
 
