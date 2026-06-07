@@ -46853,6 +46853,20 @@ fn TerminalCanvas(
         let latest_surface_problem = shell
             .latest_terminal_open_attempt_for_path(&session_path)
             .and_then(|attempt| attempt.last_surface_problem.as_deref());
+        // TODO-1 (campaign): on a SETTLED-IDLE codex reveal, do a one-shot
+        // reconcile-from-daemon so the authoritative bottom repaints and the
+        // reveal-shadow / broken-bottom-paint blink is killed. Gated conservatively:
+        // codex-like + the surface previously reached ready + no current surface
+        // problem (the closest cheap "settled, not mid-frame" proxy available here).
+        // When NOT settled-idle we pass false -> old behavior (no reconcile), so a
+        // working/streaming session is never re-read (recovery-churn trap). The
+        // retained_rehydrate_identity_key dedups this to once per reveal/mount.
+        let codex_idle_reveal_reconcile = codex_like_session
+            && shell
+                .latest_terminal_open_attempt_for_path(&session_path)
+                .is_some_and(|attempt| {
+                    attempt.last_observed_ready && attempt.last_surface_problem.is_none()
+                });
         retained_ready_remote_host_rehydrate_mode(
             retained_ready_remote_host,
             active_host_selected,
@@ -46860,6 +46874,7 @@ fn TerminalCanvas(
             shell.terminal_session_has_ready_history(&session_path),
             terminal_live_host_connected(),
             latest_surface_problem,
+            codex_idle_reveal_reconcile,
         )
     };
     let retained_rehydrate_key = retained_rehydrate_identity_key(
