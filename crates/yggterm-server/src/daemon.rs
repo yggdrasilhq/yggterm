@@ -12273,6 +12273,7 @@ mod tests {
                 storage_path: None,
                 restore_reason: None,
             }],
+            session_pty_grids: Vec::new(),
         };
 
         write_persisted_state(&state_path, &expected).expect("write daemon state");
@@ -12299,6 +12300,7 @@ mod tests {
             remote_machines: Vec::new(),
             stored_sessions: Vec::new(),
             live_sessions: Vec::new(),
+            session_pty_grids: Vec::new(),
         };
         let second = PersistedDaemonState {
             active_session_path: Some("remote-session://dev/second".to_string()),
@@ -12307,6 +12309,7 @@ mod tests {
             remote_machines: Vec::new(),
             stored_sessions: Vec::new(),
             live_sessions: Vec::new(),
+            session_pty_grids: Vec::new(),
         };
 
         write_persisted_state(&state_path, &first).expect("write first daemon state");

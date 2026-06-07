@@ -76,7 +76,7 @@ pub use codex_cli::{
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::collections::{BTreeMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs::{self, OpenOptions};
 use std::io::{ErrorKind, Read, Write};
 #[cfg(unix)]
@@ -1810,6 +1810,19 @@ pub struct PersistedStoredSession {
     pub title_hint: Option<String>,
 }
 
+/// Last-known PTY grid for a session, persisted across a daemon-PROCESS restart
+/// so a re-resumed session comes back at its real grid instead of DEFAULT 120×36
+/// (the "squish"). Keyed by the in-memory session key (same key persisted as
+/// PersistedLiveSession.key / PersistedStoredSession.path). See
+/// [[campaign-xterm-dealbreakers]] Bug 10 — the in-memory-only metadata record
+/// did NOT survive a process restart, which is the squish's primary scenario.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PersistedSessionGrid {
+    pub key: String,
+    pub cols: u16,
+    pub rows: u16,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PersistedLiveSession {
     pub key: String,
@@ -1842,6 +1855,8 @@ pub struct PersistedDaemonState {
     pub remote_machines: Vec<RemoteMachineSnapshot>,
     pub stored_sessions: Vec<PersistedStoredSession>,
     pub live_sessions: Vec<PersistedLiveSession>,
+    #[serde(default)]
+    pub session_pty_grids: Vec<PersistedSessionGrid>,
 }
 
 fn default_workspace_view_mode() -> WorkspaceViewMode {
@@ -1896,6 +1911,13 @@ pub struct YggtermServer {
     remote_machines: Vec<RemoteMachineSnapshot>,
     live_session_order: Vec<String>,
     local_cc_sessions: Vec<LocalCcSession>,
+    /// Last-known PTY grid per session key, the SSOT for restoring a re-resumed
+    /// session at its real grid (squish fix, Bug 10). Fed by TerminalResize via
+    /// `record_session_pty_grid`; persisted in PersistedDaemonState and restored
+    /// on daemon start so it survives a daemon-PROCESS restart. The live truth is
+    /// `TerminalManager::session_size` (daemon-owned); this is the persisted
+    /// last-known used only at re-resume time.
+    session_pty_grids: HashMap<String, (u16, u16)>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -1937,6 +1959,7 @@ impl YggtermServer {
             remote_machines: Vec::new(),
             live_session_order: Vec::new(),
             local_cc_sessions,
+            session_pty_grids: HashMap::new(),
         };
 
         this
@@ -2149,19 +2172,24 @@ impl YggtermServer {
         if cols == 0 || rows == 0 {
             return;
         }
-        let Some(key) = self.resolve_session_storage_key(path).map(str::to_string) else {
-            return;
-        };
-        if let Some(session) = self.sessions.get_mut(&key) {
-            upsert_session_metadata(&mut session.metadata, "Pty Grid", format!("{cols}x{rows}"));
-        }
+        // Key by the in-memory session key so it matches what we persist
+        // (PersistedLiveSession.key / PersistedStoredSession.path) and what
+        // `session_pty_grid` resolves at re-resume time. Falling back to the raw
+        // path keeps a grid recorded even for a session not yet in `self.sessions`
+        // (e.g. a runtime key seen before the managed view lands).
+        let key = self
+            .resolve_session_storage_key(path)
+            .map(str::to_string)
+            .unwrap_or_else(|| path.to_string());
+        self.session_pty_grids.insert(key, (cols, rows));
     }
 
     pub fn session_pty_grid(&self, path: &str) -> Option<(u16, u16)> {
+        if let Some(grid) = self.session_pty_grids.get(path) {
+            return Some(*grid);
+        }
         let key = self.resolve_session_storage_key(path)?;
-        let raw = session_metadata_value(self.sessions.get(key)?, "Pty Grid")?;
-        let (cols, rows) = raw.trim().split_once('x')?;
-        Some((cols.trim().parse().ok()?, rows.trim().parse().ok()?))
+        self.session_pty_grids.get(key).copied()
     }
 
     pub(crate) fn focus_live_session_without_launch_if_active_missing(
@@ -3489,6 +3517,24 @@ impl YggtermServer {
             self.active_view_mode
         };
 
+        // Persist the last-known PTY grid for every session we still know about, so a
+        // daemon-PROCESS restart re-resumes each at its real grid (squish fix, Bug 10).
+        // Keyed by session key, this covers BOTH local-live (no ssh_target, so absent
+        // from live_sessions) AND remote/stored — the squish hits both. Filtering to
+        // keys still present in `self.sessions` prunes deleted sessions so the map
+        // can't grow unbounded.
+        let mut session_pty_grids: Vec<PersistedSessionGrid> = self
+            .session_pty_grids
+            .iter()
+            .filter(|(key, _)| self.sessions.contains_key(key.as_str()))
+            .map(|(key, (cols, rows))| PersistedSessionGrid {
+                key: key.clone(),
+                cols: *cols,
+                rows: *rows,
+            })
+            .collect();
+        session_pty_grids.sort_by(|a, b| a.key.cmp(&b.key));
+
         PersistedDaemonState {
             active_session_path,
             active_view_mode,
@@ -3496,6 +3542,7 @@ impl YggtermServer {
             remote_machines: clear_remote_machine_live_runtime_flags(&self.remote_machines),
             stored_sessions,
             live_sessions,
+            session_pty_grids,
         }
     }
 
@@ -3517,6 +3564,14 @@ impl YggtermServer {
         let total_restore_perf = perf_home
             .clone()
             .map(|home| PerfSpan::start(home, "server", "restore_persisted_state"));
+        // Restore last-known PTY grids first so a re-resumed session (squish fix,
+        // Bug 10) comes back at its real grid instead of DEFAULT 120×36.
+        self.session_pty_grids = state
+            .session_pty_grids
+            .iter()
+            .filter(|grid| grid.cols != 0 && grid.rows != 0)
+            .map(|grid| (grid.key.clone(), (grid.cols, grid.rows)))
+            .collect();
         self.ssh_targets = state
             .ssh_targets
             .into_iter()
@@ -21359,11 +21414,7 @@ mod tests {
         );
     }
 
-    // XTERM-BUG: squish-and-bottom-paint-on-reresume — the PTY grid must persist in
-    // session metadata so a daemon-process re-resume restores the real grid instead of
-    // DEFAULT 120x36 (the background-session squish). Roundtrip + zero-guard.
-    #[test]
-    fn session_pty_grid_roundtrips_via_metadata() {
+    fn test_server() -> YggtermServer {
         let tree = SessionNode {
             kind: SessionNodeKind::Group,
             name: "root".to_string(),
@@ -21376,12 +21427,20 @@ mod tests {
             cwd: None,
             ..Default::default()
         };
-        let mut server = YggtermServer::new(
+        YggtermServer::new(
             &tree,
             false,
             GhosttyHostSupport::shadow("test".to_string(), false, false),
             UiTheme::ZedLight,
-        );
+        )
+    }
+
+    // XTERM-BUG: squish-and-bottom-paint-on-reresume — the PTY grid is recorded in
+    // the session_pty_grids map so a re-resume restores the real grid instead of
+    // DEFAULT 120x36 (the background-session squish). In-memory roundtrip + zero-guard.
+    #[test]
+    fn session_pty_grid_roundtrips_in_memory() {
+        let mut server = test_server();
         let path = server.start_local_session(SessionKind::Codex, Some("/home/pi"), Some("codex"));
         assert_eq!(server.session_pty_grid(&path), None);
         server.record_session_pty_grid(&path, 159, 63);
@@ -21389,6 +21448,43 @@ mod tests {
         // Zero dims are ignored (no clobber of a good grid).
         server.record_session_pty_grid(&path, 0, 0);
         assert_eq!(server.session_pty_grid(&path), Some((159, 63)));
+    }
+
+    // XTERM-BUG: squish — the v2.8.31 in-memory-only fix did NOT survive a daemon
+    // PROCESS restart (recGrid=None after the 2.8.32 swap), which IS the squish's
+    // primary scenario. This test simulates that restart: persist -> serialize ->
+    // deserialize -> restore into a FRESH server -> the grid must survive so the
+    // re-resumed session comes back at its real grid, not DEFAULT 120x36.
+    #[test]
+    fn session_pty_grid_survives_daemon_process_restart() {
+        let mut server = test_server();
+        // The grid map persists for any session still in `self.sessions`, regardless
+        // of source or keep-alive — local-live sessions (where the squish was first
+        // measured) are absent from live_sessions, so the map is what carries them.
+        let path = server.start_local_session(SessionKind::Codex, Some("/home/pi"), Some("codex"));
+        server.record_session_pty_grid(&path, 159, 63);
+
+        // Serialize the persisted state exactly as the daemon writes it on
+        // update-restart, then deserialize as the successor daemon reads it.
+        let persisted = server.persisted_state_for_update_restart();
+        assert!(
+            persisted
+                .session_pty_grids
+                .iter()
+                .any(|g| g.cols == 159 && g.rows == 63),
+            "grid must be present in the persisted state"
+        );
+        let wire = serde_json::to_string(&persisted).expect("serialize");
+        let restored: PersistedDaemonState = serde_json::from_str(&wire).expect("deserialize");
+
+        // Fresh successor daemon: drop all in-memory state, restore from disk.
+        let mut successor = test_server();
+        successor.restore_persisted_state_with_launch_policy(restored, None, false);
+        assert_eq!(
+            successor.session_pty_grid(&path),
+            Some((159, 63)),
+            "grid must survive a daemon PROCESS restart so re-resume isn't squished"
+        );
     }
 
     #[test]
@@ -25557,6 +25653,7 @@ terminal_window_id: None,
                 }],
                 stored_sessions: Vec::new(),
                 live_sessions: Vec::new(),
+                session_pty_grids: Vec::new(),
             },
             None,
         );
@@ -25624,6 +25721,7 @@ terminal_window_id: None,
                 }],
                 stored_sessions: Vec::new(),
                 live_sessions: Vec::new(),
+                session_pty_grids: Vec::new(),
             },
             None,
         );
@@ -25758,6 +25856,7 @@ terminal_window_id: None,
                     storage_path: None,
                     restore_reason: None,
                 }],
+                session_pty_grids: Vec::new(),
             },
             None,
         );
@@ -25816,6 +25915,7 @@ terminal_window_id: None,
                     storage_path: None,
                     restore_reason: Some(UPDATE_RESTART_RESTORE_REASON.to_string()),
                 }],
+                session_pty_grids: Vec::new(),
             },
             None,
         );
@@ -25901,6 +26001,7 @@ terminal_window_id: None,
                     storage_path: None,
                     restore_reason: None,
                 }],
+                session_pty_grids: Vec::new(),
             },
             None,
         );
@@ -26551,6 +26652,7 @@ terminal_window_id: None,
                     storage_path: None,
                     restore_reason: None,
                 }],
+                session_pty_grids: Vec::new(),
             },
             None,
         );
@@ -26599,6 +26701,7 @@ terminal_window_id: None,
                     storage_path: None,
                     restore_reason: Some(UPDATE_RESTART_RESTORE_REASON.to_string()),
                 }],
+                session_pty_grids: Vec::new(),
             },
             None,
         );
@@ -26677,6 +26780,7 @@ terminal_window_id: None,
                         restore_reason: Some(UPDATE_RESTART_RESTORE_REASON.to_string()),
                     },
                 ],
+                session_pty_grids: Vec::new(),
             },
             None,
             false,
@@ -26761,6 +26865,7 @@ terminal_window_id: None,
                         restore_reason: None,
                     },
                 ],
+                session_pty_grids: Vec::new(),
             },
             None,
         );
@@ -26844,6 +26949,7 @@ terminal_window_id: None,
                         restore_reason: None,
                     },
                 ],
+                session_pty_grids: Vec::new(),
             },
             None,
         );
@@ -26980,6 +27086,7 @@ terminal_window_id: None,
                         restore_reason: None,
                     },
                 ],
+                session_pty_grids: Vec::new(),
             },
             None,
         );
@@ -27743,6 +27850,7 @@ terminal_window_id: None,
                 remote_machines: vec![machine],
                 stored_sessions: Vec::new(),
                 live_sessions: Vec::new(),
+                session_pty_grids: Vec::new(),
             },
             None,
             false,
@@ -28068,6 +28176,7 @@ terminal_window_id: None,
                     },
                 ],
                 live_sessions: Vec::new(),
+                session_pty_grids: Vec::new(),
             },
             None,
         );
