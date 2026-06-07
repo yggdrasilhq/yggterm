@@ -2138,6 +2138,32 @@ impl YggtermServer {
         self.active_session_path.as_deref()
     }
 
+    // XTERM-BUG: squish-and-bottom-paint-on-reresume — persist the PTY grid in the
+    // session's (persisted) metadata so that after a daemon-PROCESS restart the
+    // re-resume restores each session at its real grid instead of DEFAULT 120x36.
+    // The in-memory preserved_size in restart_session_with_size dies with the old
+    // process, and only the active session's cursor-rewind re-send repaired the grid,
+    // leaving BACKGROUND codex sessions squished. Keyed via the same storage-key
+    // resolution as the rest of the store.
+    pub fn record_session_pty_grid(&mut self, path: &str, cols: u16, rows: u16) {
+        if cols == 0 || rows == 0 {
+            return;
+        }
+        let Some(key) = self.resolve_session_storage_key(path).map(str::to_string) else {
+            return;
+        };
+        if let Some(session) = self.sessions.get_mut(&key) {
+            upsert_session_metadata(&mut session.metadata, "Pty Grid", format!("{cols}x{rows}"));
+        }
+    }
+
+    pub fn session_pty_grid(&self, path: &str) -> Option<(u16, u16)> {
+        let key = self.resolve_session_storage_key(path)?;
+        let raw = session_metadata_value(self.sessions.get(key)?, "Pty Grid")?;
+        let (cols, rows) = raw.trim().split_once('x')?;
+        Some((cols.trim().parse().ok()?, rows.trim().parse().ok()?))
+    }
+
     pub(crate) fn focus_live_session_without_launch_if_active_missing(
         &mut self,
         path: &str,
@@ -21331,6 +21357,38 @@ mod tests {
             server.snapshot().active_view_mode,
             WorkspaceViewMode::Rendered
         );
+    }
+
+    // XTERM-BUG: squish-and-bottom-paint-on-reresume — the PTY grid must persist in
+    // session metadata so a daemon-process re-resume restores the real grid instead of
+    // DEFAULT 120x36 (the background-session squish). Roundtrip + zero-guard.
+    #[test]
+    fn session_pty_grid_roundtrips_via_metadata() {
+        let tree = SessionNode {
+            kind: SessionNodeKind::Group,
+            name: "root".to_string(),
+            title: None,
+            document_kind: None,
+            group_kind: None,
+            path: PathBuf::from("/"),
+            children: Vec::new(),
+            session_id: None,
+            cwd: None,
+            ..Default::default()
+        };
+        let mut server = YggtermServer::new(
+            &tree,
+            false,
+            GhosttyHostSupport::shadow("test".to_string(), false, false),
+            UiTheme::ZedLight,
+        );
+        let path = server.start_local_session(SessionKind::Codex, Some("/home/pi"), Some("codex"));
+        assert_eq!(server.session_pty_grid(&path), None);
+        server.record_session_pty_grid(&path, 159, 63);
+        assert_eq!(server.session_pty_grid(&path), Some((159, 63)));
+        // Zero dims are ignored (no clobber of a good grid).
+        server.record_session_pty_grid(&path, 0, 0);
+        assert_eq!(server.session_pty_grid(&path), Some((159, 63)));
     }
 
     #[test]
