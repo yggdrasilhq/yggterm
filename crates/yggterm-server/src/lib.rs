@@ -1381,6 +1381,18 @@ pub(crate) fn local_live_runtime_key(session_id: &str) -> String {
     format!("local://{session_id}")
 }
 
+/// A stored DOCUMENT must never own a terminal-runtime URI as its path. Such an
+/// entry is a bogus dual-store twin (Bug 9 / [[finding-dual-store-codex-mount-
+/// failure-on-restart]]): the same UUID then exists as BOTH a kind=document
+/// "web view only" stored row AND a live codex runtime, so the GUI oscillates
+/// between Rendered (document identity) and Terminal (codex identity) — the ~3s
+/// blink with intermittent broken bottom paint. Real documents use virtual paths
+/// (e.g. `/documents/...`), never `local://` / `codex-runtime://` / `codex://`.
+/// Filtering these at persist + restore keeps the collision from surviving.
+fn stored_document_owns_runtime_uri(kind: SessionKind, path: &str) -> bool {
+    kind == SessionKind::Document && local_runtime_id_from_key(path).is_some()
+}
+
 fn canonical_local_live_runtime_key(key: &str, session_id: &str) -> String {
     if key.starts_with("codex-runtime://") {
         return key.to_string();
@@ -3447,6 +3459,11 @@ impl YggtermServer {
         let stored_sessions = self
             .sessions
             .iter()
+            .filter(|(path, session)| {
+                // Bug 9: never persist a kind=document stored twin that owns a runtime
+                // URI — it collides with the live codex of the same UUID (the blink).
+                !stored_document_owns_runtime_uri(session.kind, path)
+            })
             .filter_map(|(path, session)| {
                 (session.source == SessionSource::Stored).then(|| PersistedStoredSession {
                     path: path.clone(),
@@ -3688,6 +3705,12 @@ impl YggtermServer {
             .clone()
             .map(|home| PerfSpan::start(home, "server", "restore_stored_sessions"));
         for session in state.stored_sessions {
+            // Bug 9 defense-in-depth: drop a stale kind=document stored twin that owns
+            // a runtime URI so it can't be restored alongside (and collide with) the
+            // live codex of the same UUID. This cleans up twins already on disk.
+            if stored_document_owns_runtime_uri(session.kind, &session.path) {
+                continue;
+            }
             let path = if let Some((machine_key, session_id)) =
                 parse_remote_scanned_session_path(&session.path)
             {
@@ -21448,6 +21471,59 @@ mod tests {
         // Zero dims are ignored (no clobber of a good grid).
         server.record_session_pty_grid(&path, 0, 0);
         assert_eq!(server.session_pty_grid(&path), Some((159, 63)));
+    }
+
+    // Bug 9 (dual-store collision = the ~3s blink): a kind=document stored entry whose
+    // path is a runtime URI is a bogus twin of a live codex of the same UUID. It must
+    // be filtered at BOTH persist and restore so the GUI can't oscillate Rendered
+    // (document) <-> Terminal (codex). See finding-dual-store-codex-mount-failure.
+    #[test]
+    fn stored_document_runtime_uri_twin_is_filtered_at_persist_and_restore() {
+        // The predicate: a document MUST NOT own a runtime URI; real docs are virtual.
+        assert!(super::stored_document_owns_runtime_uri(
+            SessionKind::Document,
+            "codex-runtime://019e9c28-e46d-7480-9f27-4e5676df61b1"
+        ));
+        assert!(super::stored_document_owns_runtime_uri(
+            SessionKind::Document,
+            "local://019e9c28-e46d-7480-9f27-4e5676df61b1"
+        ));
+        // A real document (virtual path) is NOT filtered.
+        assert!(!super::stored_document_owns_runtime_uri(
+            SessionKind::Document,
+            "/documents/notes/foo"
+        ));
+        // A codex session keyed by a runtime URI is NOT a document — never filtered.
+        assert!(!super::stored_document_owns_runtime_uri(
+            SessionKind::Codex,
+            "codex-runtime://019e9c28-e46d-7480-9f27-4e5676df61b1"
+        ));
+
+        // End-to-end: a persisted state carrying the bogus twin must not survive a
+        // restore (the daemon-process restart that re-reads disk drops it).
+        let bogus = PersistedDaemonState {
+            active_session_path: None,
+            active_view_mode: WorkspaceViewMode::Rendered,
+            ssh_targets: Vec::new(),
+            remote_machines: Vec::new(),
+            stored_sessions: vec![PersistedStoredSession {
+                path: "codex-runtime://019e9c28-e46d-7480-9f27-4e5676df61b1".to_string(),
+                kind: SessionKind::Document,
+                session_id: Some("019e9c28-e46d-7480-9f27-4e5676df61b1".to_string()),
+                cwd: None,
+                title_hint: Some("019e9c28-e46d-7480-9f27-4e5676df61b1".to_string()),
+            }],
+            live_sessions: Vec::new(),
+            session_pty_grids: Vec::new(),
+        };
+        let mut server = test_server();
+        server.restore_persisted_state_with_launch_policy(bogus, None, false);
+        assert!(
+            !server
+                .sessions
+                .contains_key("codex-runtime://019e9c28-e46d-7480-9f27-4e5676df61b1"),
+            "the bogus document twin must be dropped on restore, not collide with the codex"
+        );
     }
 
     // XTERM-BUG: squish — the v2.8.31 in-memory-only fix did NOT survive a daemon
