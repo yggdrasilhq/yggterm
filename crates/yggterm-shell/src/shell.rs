@@ -91313,6 +91313,8 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
                 None
             },
             ssh_prefix: None,
+            pty_cols: None,
+            pty_rows: None,
         }
     }
 
