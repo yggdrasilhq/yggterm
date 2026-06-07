@@ -6828,8 +6828,14 @@ impl ShellState {
                             *request_surface,
                         )
                     });
-            snapshot.active_session_path = Some(current_active_path);
+            // XTERM-BUG: daemon-restart-wedge (Bug6) — assert active_session_path only
+            // when a session object resolves, so a background/preview refresh cannot
+            // strand active_session_path without an active_session (the contract
+            // violation that deadlocks every app-open), and cannot keep re-asserting a
+            // hostless/phantom active on each refresh (Bug7). Valid sessions are in
+            // live_sessions/active, so this is a no-op for them.
             if let Some(preferred_session) = preferred_session {
+                snapshot.active_session_path = Some(current_active_path);
                 snapshot.active_session = Some(preferred_session);
             }
             snapshot.active_view_mode = self.server.active_view_mode();
@@ -6854,8 +6860,12 @@ impl ShellState {
                     )
                 },
             );
-        snapshot.active_session_path = Some(preferred_path);
+        // XTERM-BUG: daemon-restart-wedge (Bug6) — assert active_session_path only when a
+        // session resolves; opening a hostless/phantom session must not strand the path
+        // without an active_session (the deadlock). Valid sessions are in
+        // live_sessions/active so this is a no-op for them.
         if let Some(preferred_session) = preferred_session {
+            snapshot.active_session_path = Some(preferred_path);
             snapshot.active_session = Some(preferred_session);
         }
         snapshot.active_view_mode = match request_surface {
