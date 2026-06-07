@@ -1271,6 +1271,43 @@ fn clear_stored_only_active_session(snapshot: &mut ServerUiSnapshot) {
     snapshot.active_view_mode = WorkspaceViewMode::Rendered;
 }
 
+// XTERM-BUG: idle-auto-webview (Bug7)
+// The daemon persists active_view_mode=Rendered and re-applies it on every snapshot
+// adoption (incl. periodic background refreshes). For a LIVE terminal/agent session
+// whose Rendered surface has NO real content (no rendered_sections AND no preview
+// blocks — the pre-alpha webview would show only its placeholder), that is never a
+// desired auto-state: an idle GUI flips to the empty webview on a hostless/transient
+// session. Coerce it back to Terminal. A session with REAL web-view content (preview
+// blocks / rendered_sections) is left untouched, so the in-development codex web view
+// is not disturbed; non-live (Stored/Document) sessions are also left alone (only
+// LiveLocal/LiveSsh require a terminal runtime).
+fn auto_rendered_terminal_session_should_coerce(
+    view_mode: WorkspaceViewMode,
+    source: SessionSource,
+    rendered_sections_empty: bool,
+    preview_blocks_empty: bool,
+) -> bool {
+    view_mode == WorkspaceViewMode::Rendered
+        && matches!(source, SessionSource::LiveLocal | SessionSource::LiveSsh)
+        && rendered_sections_empty
+        && preview_blocks_empty
+}
+fn sanitize_auto_rendered_terminal_session(snapshot: &mut ServerUiSnapshot) -> bool {
+    let Some(session) = snapshot.active_session.as_ref() else {
+        return false;
+    };
+    if !auto_rendered_terminal_session_should_coerce(
+        snapshot.active_view_mode,
+        session.source,
+        session.rendered_sections.is_empty(),
+        session.preview.blocks.is_empty(),
+    ) {
+        return false;
+    }
+    snapshot.active_view_mode = WorkspaceViewMode::Terminal;
+    true
+}
+
 fn limit_live_terminal_retention_for_platform(
     is_kde_plasma: bool,
     has_x11_display: bool,
@@ -4395,6 +4432,9 @@ impl ShellState {
                 {
                     clear_stored_only_active_session(&mut snapshot);
                 }
+                // XTERM-BUG: idle-auto-webview (Bug7) — don't adopt an empty Rendered
+                // webview for a live terminal session (daemon re-asserts it on refresh).
+                sanitize_auto_rendered_terminal_session(&mut snapshot);
                 self.show_start_page_when_no_live_sessions =
                     snapshot.active_session_path.is_none() && snapshot.live_sessions.is_empty();
                 self.server.apply_snapshot(snapshot);
@@ -4552,6 +4592,9 @@ impl ShellState {
                 {
                     clear_stored_only_active_session(&mut snapshot);
                 }
+                // XTERM-BUG: idle-auto-webview (Bug7) — don't adopt an empty Rendered
+                // webview for a live terminal session (daemon re-asserts it on refresh).
+                sanitize_auto_rendered_terminal_session(&mut snapshot);
                 self.show_start_page_when_no_live_sessions =
                     snapshot.active_session_path.is_none() && snapshot.live_sessions.is_empty();
                 self.server.apply_snapshot(snapshot);
@@ -99374,6 +99417,35 @@ Shared connection to 192.0.2.14 closed.\r\n";
             out2.iter().any(|r| r.session_id.as_deref() == Some("abc123")),
             "live session MUST be injected under an expanded /home/user"
         );
+    }
+
+    // XTERM-BUG: idle-auto-webview (Bug7) — coerce an EMPTY Rendered webview to Terminal
+    // for a live terminal session (the auto/background re-assertion), but leave a Rendered
+    // surface with real content (the in-development codex web view) and non-live sessions alone.
+    #[test]
+    fn auto_rendered_terminal_session_coerce_decision() {
+        use yggterm_server::SessionSource;
+        // empty Rendered webview on a live session -> coerce to Terminal
+        assert!(auto_rendered_terminal_session_should_coerce(
+            WorkspaceViewMode::Rendered, SessionSource::LiveLocal, true, true
+        ));
+        assert!(auto_rendered_terminal_session_should_coerce(
+            WorkspaceViewMode::Rendered, SessionSource::LiveSsh, true, true
+        ));
+        // real web-view content present -> leave alone (don't break the in-dev web view)
+        assert!(!auto_rendered_terminal_session_should_coerce(
+            WorkspaceViewMode::Rendered, SessionSource::LiveLocal, false, true
+        ));
+        assert!(!auto_rendered_terminal_session_should_coerce(
+            WorkspaceViewMode::Rendered, SessionSource::LiveLocal, true, false
+        ));
+        // not Rendered, or non-live (stored/document) -> leave alone
+        assert!(!auto_rendered_terminal_session_should_coerce(
+            WorkspaceViewMode::Terminal, SessionSource::LiveLocal, true, true
+        ));
+        assert!(!auto_rendered_terminal_session_should_coerce(
+            WorkspaceViewMode::Rendered, SessionSource::Stored, true, true
+        ));
     }
 
     #[test]
