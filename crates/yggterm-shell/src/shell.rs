@@ -65502,6 +65502,28 @@ fn terminal_replay_retained_data_script_for_session(
             }} catch (error) {{
               debug.error = error && error.message ? error.message : String(error);
             }}
+            // XTERM-BUG: switch-reveal-broken-bottom (campaign TODO-1, 2026-06-07)
+            // The daemon delivers the reveal/reconcile screen+history in CHUNKS, so
+            // baseY keeps growing AFTER this initial follow lands -> the viewport sits
+            // a few rows above the true bottom (live composer below view = "broken
+            // bottom") until an organic trigger catches up (the transient the user
+            // catches on ~70% of switches). Re-assert the follow ONCE after the replay
+            // settles so we land at the FINAL baseY. SAFE: this only moves the viewport
+            // (reuses forcePromptFollow) — it does NOT re-read the daemon or rebuild the
+            // buffer, so it cannot trigger the recovery-churn trap. Gated: the ':settle'
+            // reason prevents recursion, and a user who scrolled back flips intent to
+            // UserScrollback -> the top-guard early-returns (never yanks the user).
+            try {{
+              if (!String(reason || '').endsWith(':settle')) {{
+                window.setTimeout(() => {{
+                  try {{
+                    if (entry && String(entry.scrollbackIntent || 'PromptFollow') !== 'UserScrollback') {{
+                      followPromptForEntry(entry, `${{String(reason || 'retained_replay')}}:settle`);
+                    }}
+                  }} catch (_settleError) {{}}
+                }}, 280);
+              }}
+            }} catch (_scheduleError) {{}}
             return debug;
           }};
           const refreshRetainedReplayPaint = (entry, reason) => {{
@@ -74694,6 +74716,18 @@ mod tests {
         ));
         assert!(script.contains("const replayPromptReadyInEntry = (entry) => {"));
         assert!(script.contains("const followPromptForEntry = (entry, reason) => {"));
+        // TODO-1 (switch-reveal broken bottom): the follow must re-assert ONCE after the
+        // chunked replay settles (the daemon grows baseY after the initial follow), and
+        // the settle pass must not recurse (':settle' guard) nor yank a scrolled-back user
+        // (UserScrollback guard). Reuses forcePromptFollow (viewport-only, no daemon re-read).
+        assert!(
+            script.contains("followPromptForEntry(entry, `${String(reason || 'retained_replay')}:settle`)"),
+            "replay follow must schedule a settled re-follow to land at the final baseY"
+        );
+        assert!(
+            script.contains("if (!String(reason || '').endsWith(':settle')) {"),
+            "the settled re-follow must be guarded against recursion"
+        );
         assert!(script.contains("const retainedReplayCursorAddressedScrollbackRisk = () => {"));
         assert!(script.contains("const sessionSnapshotForReplay = () => {"));
         assert!(script.contains("const authoritativeScreenReplay ="));
