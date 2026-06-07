@@ -90,6 +90,43 @@ test('TODO-1 root-direction: codex frame survives a reveal row-resize (so the bl
   );
 });
 
+test('bg->fg broken bottom self-corrects on the NEXT codex CUP frame (answers: not indefinite)', async () => {
+  // The bg->fg break: a focus-regain repaint from the stale CLIENT snapshot leaves
+  // the bottom rows blank/clipped (missing the codex composer + footer). Question:
+  // does it stay broken indefinitely, or self-correct when codex next emits? codex
+  // repaints its live bottom region with ABSOLUTE CUP every frame, so its next
+  // output must overwrite the stale rows. This proves the answer deterministically
+  // on the EXACT vendored xterm.js: broken bottom is TRANSIENT-until-next-codex-frame
+  // (i.e. it self-corrects the moment the user types / codex animates), NOT indefinite.
+  const rows = 10;
+  const term = h.createTerminal({ cols: 80, rows, scrollback: 1000 });
+  const composerRow = rows - 1; // 0-based; codex composer just above the footer
+  const footerRow = rows;
+  // 1) codex paints a correct frame: transcript + composer + footer (1-based CUP).
+  let frame = '\x1b[2J\x1b[H';
+  for (let r = 1; r <= rows - 2; r++) frame += `\x1b[${r};1Htranscript line ${r}`;
+  frame += `\x1b[${composerRow};1H> the codex composer`;
+  frame += `\x1b[${footerRow};1Hgpt-5.5 medium · ~/proj`;
+  await h.write(term, frame);
+  assert.match(h.lineText(term, composerRow - 1) || '', /the codex composer/);
+
+  // 2) bg->fg break: the stale-snapshot repaint blanks the bottom region (erase the
+  //    composer + footer rows in place — what the user sees as "broken bottom").
+  await h.write(term, `\x1b[${composerRow};1H\x1b[K\x1b[${footerRow};1H\x1b[K`);
+  assert.doesNotMatch(h.lineText(term, composerRow - 1) || '', /codex composer/, 'bottom is now broken (composer erased)');
+
+  // 3) codex's NEXT frame: it repaints the live bottom region via absolute CUP.
+  const nextFrame = `\x1b[${composerRow};1H> the codex composer\x1b[${footerRow};1Hgpt-5.5 medium · ~/proj`;
+  await h.write(term, nextFrame);
+
+  // 4) ASSERT: the composer + footer are restored -> self-corrects on the next codex
+  //    frame. So the live behavior is "broken until codex next emits (e.g. user types
+  //    -> composer redraws), then correct" — the fix must force that repaint on
+  //    focus-regain (reconcile from daemon) so the user never sees the transient.
+  assert.match(h.lineText(term, composerRow - 1) || '', /the codex composer/, 'composer restored by next CUP frame');
+  assert.match(h.lineText(term, footerRow - 1) || '', /gpt-5\.5 medium/, 'footer restored by next CUP frame');
+});
+
 test('a painted background colour survives a column WIDEN reflow for already-written cells', async () => {
   // Guards the reflow-bg invariant our composer reconcile depends on: when the
   // terminal widens, cells that were already written WITH a bg keep that bg
