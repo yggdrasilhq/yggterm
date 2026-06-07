@@ -87,18 +87,34 @@ pub(crate) fn retained_ready_remote_host_rehydrate_mode(
     ready_history: bool,
     terminal_live_host_connected: bool,
     surface_problem: Option<&str>,
+    // TODO-1 (campaign): a SETTLED-IDLE codex reveal may reconcile-from-daemon ONCE
+    // (dedup'd per mount via the identity key) to repaint the authoritative bottom and
+    // kill the reveal-shadow / broken-bottom-paint blink. This deliberately bypasses
+    // the `terminal_live_host_connected` gate — which normally blocks rehydrate because
+    // re-reading a LIVE session is the recovery-churn trap that broke live sessions
+    // (incident-gap-fix-cascade-2026-06-03). It is SAFE ONLY because the caller passes
+    // true exclusively when the surface is settled-idle (ready + no surface problem +
+    // NOT a codex working surface), so there is no in-flight frame to churn. When in
+    // doubt the caller passes false → old behavior (no reconcile), never a regression.
+    codex_idle_reveal_reconcile: bool,
 ) -> Option<RetainedRehydrateMode> {
-    if !retained_ready_remote_host
-        || !active_host_selected
-        || ready_attempt
-        || terminal_live_host_connected
-    {
+    if !retained_ready_remote_host || !active_host_selected || ready_attempt {
+        return None;
+    }
+    // Connected sessions normally do NOT rehydrate (recovery-churn trap). The only
+    // exception is a settled-idle codex reveal, which reconciles exactly once.
+    if terminal_live_host_connected && !codex_idle_reveal_reconcile {
         return None;
     }
     if retained_rehydrate_ready_history_retry_reason(surface_problem) {
         return Some(RetainedRehydrateMode::CollapsedScrollbackRecovery);
     }
     if !ready_history {
+        return Some(RetainedRehydrateMode::InitialRead);
+    }
+    // A settled-idle codex reveal with existing history still reconciles once to
+    // repaint the daemon-authoritative bottom (the reveal-shadow fix).
+    if codex_idle_reveal_reconcile {
         return Some(RetainedRehydrateMode::InitialRead);
     }
     None
@@ -252,27 +268,27 @@ mod tests {
     #[test]
     fn retained_ready_remote_rehydrate_skips_ready_attempt() {
         assert_eq!(
-            retained_ready_remote_host_rehydrate_mode(true, true, true, false, false, None),
+            retained_ready_remote_host_rehydrate_mode(true, true, true, false, false, None, false),
             None
         );
         assert_eq!(
-            retained_ready_remote_host_rehydrate_mode(true, true, false, true, false, None),
+            retained_ready_remote_host_rehydrate_mode(true, true, false, true, false, None, false),
             None
         );
         assert_eq!(
-            retained_ready_remote_host_rehydrate_mode(true, true, false, false, false, None),
+            retained_ready_remote_host_rehydrate_mode(true, true, false, false, false, None, false),
             Some(RetainedRehydrateMode::InitialRead)
         );
         assert_eq!(
-            retained_ready_remote_host_rehydrate_mode(false, true, false, false, false, None),
+            retained_ready_remote_host_rehydrate_mode(false, true, false, false, false, None, false),
             None
         );
         assert_eq!(
-            retained_ready_remote_host_rehydrate_mode(true, false, false, false, false, None),
+            retained_ready_remote_host_rehydrate_mode(true, false, false, false, false, None, false),
             None
         );
         assert_eq!(
-            retained_ready_remote_host_rehydrate_mode(true, true, false, false, true, None),
+            retained_ready_remote_host_rehydrate_mode(true, true, false, false, true, None, false),
             None
         );
         assert_eq!(
@@ -283,8 +299,51 @@ mod tests {
                 false,
                 false,
                 Some("active terminal host exists but xterm surface is empty"),
+                false,
             ),
             Some(RetainedRehydrateMode::CollapsedScrollbackRecovery)
+        );
+    }
+
+    // TODO-1 (campaign): a SETTLED-IDLE codex reveal reconciles-from-daemon ONCE even
+    // when live-connected (the reveal-shadow fix), but a WORKING/non-idle codex reveal
+    // must NEVER reconcile (recovery-churn trap that broke live sessions). The caller
+    // passes codex_idle_reveal_reconcile=false whenever the surface isn't settled-idle.
+    #[test]
+    fn settled_idle_codex_reveal_reconciles_once_but_working_never_churns() {
+        // Connected + ready_history + no problem: old behavior is None (no reconcile);
+        // a settled-idle codex reveal flips it to a one-shot InitialRead reconcile.
+        assert_eq!(
+            retained_ready_remote_host_rehydrate_mode(true, true, false, true, true, None, false),
+            None,
+            "non-codex connected reveal must NOT reconcile (recovery-churn trap)"
+        );
+        assert_eq!(
+            retained_ready_remote_host_rehydrate_mode(true, true, false, true, true, None, true),
+            Some(RetainedRehydrateMode::InitialRead),
+            "settled-idle codex reveal reconciles once to repaint the authoritative bottom"
+        );
+        // The idle flag never overrides the hard gates: a ready_attempt in flight, a
+        // non-active host, or a non-retained host still yields None even for codex.
+        assert_eq!(
+            retained_ready_remote_host_rehydrate_mode(true, true, true, true, true, None, true),
+            None,
+            "a ready attempt in flight must still suppress reconcile (no churn mid-attempt)"
+        );
+        assert_eq!(
+            retained_ready_remote_host_rehydrate_mode(false, true, false, true, true, None, true),
+            None,
+            "a non-retained host never reconciles regardless of codex idle"
+        );
+        assert_eq!(
+            retained_ready_remote_host_rehydrate_mode(true, false, false, true, true, None, true),
+            None,
+            "a non-active host never reconciles regardless of codex idle"
+        );
+        // Disconnected codex idle reveal behaves like the existing initial-read path.
+        assert_eq!(
+            retained_ready_remote_host_rehydrate_mode(true, true, false, false, false, None, true),
+            Some(RetainedRehydrateMode::InitialRead)
         );
     }
 
@@ -298,6 +357,7 @@ mod tests {
                 true,
                 false,
                 Some("active terminal host is only showing a plain shell prompt"),
+                false,
             ),
             Some(RetainedRehydrateMode::CollapsedScrollbackRecovery)
         );
@@ -309,6 +369,7 @@ mod tests {
                 true,
                 false,
                 Some("active remote Codex prompt surface has no current input row"),
+                false,
             ),
             Some(RetainedRehydrateMode::CollapsedScrollbackRecovery)
         );
@@ -320,6 +381,7 @@ mod tests {
                 true,
                 false,
                 Some("active remote terminal lost expected scrollback after retained replay"),
+                false,
             ),
             Some(RetainedRehydrateMode::CollapsedScrollbackRecovery)
         );
@@ -331,6 +393,7 @@ mod tests {
                 true,
                 false,
                 Some("active remote terminal is waiting for resume overlay"),
+                false,
             ),
             None
         );
