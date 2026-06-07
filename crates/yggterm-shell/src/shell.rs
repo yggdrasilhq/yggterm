@@ -1293,15 +1293,24 @@ fn auto_rendered_terminal_session_should_coerce(
         && preview_blocks_empty
 }
 fn sanitize_auto_rendered_terminal_session(snapshot: &mut ServerUiSnapshot) -> bool {
-    let Some(session) = snapshot.active_session.as_ref() else {
+    if snapshot.active_view_mode != WorkspaceViewMode::Rendered {
         return false;
+    }
+    let coerce = match snapshot.active_session.as_ref() {
+        Some(session) => auto_rendered_terminal_session_should_coerce(
+            WorkspaceViewMode::Rendered,
+            session.source,
+            session.rendered_sections.is_empty(),
+            session.preview.blocks.is_empty(),
+        ),
+        // STRAND: active_session_path set without an active_session, showing the empty
+        // webview placeholder (the live auto-webview bug). The start page is
+        // path=None+session=None (leave it); path=Some + session=None + Rendered is the
+        // hostless/transient strand → coerce to Terminal (a blank terminal that mounts
+        // when the runtime settles beats the pre-alpha webview).
+        None => snapshot.active_session_path.is_some(),
     };
-    if !auto_rendered_terminal_session_should_coerce(
-        snapshot.active_view_mode,
-        session.source,
-        session.rendered_sections.is_empty(),
-        session.preview.blocks.is_empty(),
-    ) {
+    if !coerce {
         return false;
     }
     snapshot.active_view_mode = WorkspaceViewMode::Terminal;
