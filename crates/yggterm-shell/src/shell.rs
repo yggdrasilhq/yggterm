@@ -23505,6 +23505,27 @@ fn queue_document_save(
                     shell.last_action = format!("running {}", document.title);
                     should_run_here = true;
                 } else if matches!(after_save, AfterSaveAction::RunNewSession) {
+                    // PHANTOM-BIRTH PROBE ([[spec-codex-cc-title-summary]] phantom #2,
+                    // 2026-06-07): the ONLY producer of a "<title> session" codex is
+                    // this branch. Trace every spawn so a clean user switch-through pins
+                    // whether/how focusing a live agent session reaches run-new-session.
+                    // Diagnostic only — no behavior change.
+                    if let Ok(phantom_trace_home) = resolve_yggterm_home() {
+                        append_trace_event(
+                            &phantom_trace_home,
+                            "ui",
+                            "session_lifecycle",
+                            "run_new_session_from_recipe",
+                            json!({
+                                "virtual_path": document.virtual_path.clone(),
+                                "document_title": document.title.clone(),
+                                "spawned_title": format!("{} session", document.title),
+                                "replay_commands_len": document.replay_commands.len(),
+                                "source_session_cwd": document.source_session_cwd.clone(),
+                                "will_spawn": !document.replay_commands.is_empty(),
+                            }),
+                        );
+                    }
                     if !document.replay_commands.is_empty() {
                         run_new_session = Some((
                             document.source_session_cwd.clone(),
