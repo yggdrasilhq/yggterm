@@ -279,6 +279,17 @@ pub enum AppControlCommand {
     RedrawTerminal {
         session_path: String,
     },
+    /// Reconcile the client xterm.js buffer FROM the daemon's authoritative vt100
+    /// screen: read `server terminal screen` and replay it into the client via the
+    /// same `daemon_screen_snapshot` retained-replay path the reveal-reconcile uses.
+    /// Unlike `RedrawTerminal` (which only re-fits/refreshes the renderer), this
+    /// repaints CONTENT — so it closes a "squish" (client frame smaller than the
+    /// daemon grid) or a broken-bottom where codex delta-rendered while the client
+    /// was transiently mis-sized. One-shot + idempotent (the replay layer dedups).
+    /// The on-demand primitive behind the squish/reveal reconcile fix (TODO-3).
+    ReconcileTerminalFromDaemon {
+        session_path: String,
+    },
     /// Drive the terminal viewport scroll position directly (not synthetic wheel
     /// events), so an agent can scroll/navigate scrollback via app control and
     /// verify movement. `to` is "top", "bottom", or a signed line delta
@@ -412,6 +423,7 @@ impl AppControlCommand {
             Self::SubmitTerminalPrompt { .. } => "submit_terminal_prompt",
             Self::ReclaimTerminalFocus { .. } => "reclaim_terminal_focus",
             Self::RedrawTerminal { .. } => "redraw_terminal",
+            Self::ReconcileTerminalFromDaemon { .. } => "reconcile_terminal_from_daemon",
             Self::ScrollTerminalViewport { .. } => "scroll_terminal_viewport",
             Self::ReadTerminalBuffer { .. } => "read_terminal_buffer",
             Self::PasteTerminalClipboard { .. } => "paste_terminal_clipboard",
