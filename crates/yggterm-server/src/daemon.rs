@@ -3513,6 +3513,17 @@ impl DaemonRuntime {
                 );
             }
         }
+        // RECORD-ON-CREATE (born-at-correct-size invariant): persist whatever grid this
+        // session was ensured at — whether client-supplied (`initial_size`) or the
+        // persisted fallback — so a FUTURE re-resume always has the real grid and codex
+        // initial-paints correctly, even if the client never sends a separate
+        // TerminalResize. Flush only on change. Pairs with the synchronous flush in the
+        // TerminalResize handler. See campaign D1 / the squish root cause.
+        if let Some((cols, rows)) = effective_initial_size
+            && self.server.record_session_pty_grid(path, cols, rows)
+        {
+            let _ = self.persist();
+        }
         if let Ok(home) = crate::resolve_yggterm_home() {
             append_trace_event(
                 &home,
@@ -4826,8 +4837,14 @@ impl DaemonRuntime {
                 self.terminals.resize(&runtime_path, cols, rows)?;
                 // XTERM-BUG: squish-and-bottom-paint-on-reresume — persist the grid so a
                 // later daemon-process restart re-resumes EVERY session at its real grid
-                // (not DEFAULT 120x36). In-memory only here; the next persist cycle writes it.
-                self.server.record_session_pty_grid(&path, cols, rows);
+                // (not DEFAULT 120x36). FLUSH SYNCHRONOUSLY on change: relying on the next
+                // periodic persist cycle lost the grid when the daemon was killed/handed-off
+                // (auto-update, deploy) between the resize and the flush → the successor
+                // defaulted to 120x36 → squish. Only flush when the grid actually changed
+                // (avoids drag-resize write storms). See campaign D1.
+                if self.server.record_session_pty_grid(&path, cols, rows) {
+                    let _ = self.persist();
+                }
                 ServerResponse::Ack { message: None }
             }
             ServerRequest::TerminalRestart {
@@ -4879,6 +4896,11 @@ impl DaemonRuntime {
                     stop_command.as_deref(),
                     initial_size,
                 )?;
+                // RECORD-ON-CREATE: persist the client-supplied restart grid so a later
+                // re-resume recreates at the real size (the persist() below flushes it).
+                if let Some((cols, rows)) = initial_size {
+                    self.server.record_session_pty_grid(&path, cols, rows);
+                }
                 self.prune_duplicate_legacy_owned_runtime_sessions("terminal_restart");
                 self.persist()?;
                 if force_remote {

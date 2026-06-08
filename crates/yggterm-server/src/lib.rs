@@ -2180,9 +2180,14 @@ impl YggtermServer {
     // process, and only the active session's cursor-rewind re-send repaired the grid,
     // leaving BACKGROUND codex sessions squished. Keyed via the same storage-key
     // resolution as the rest of the store.
-    pub fn record_session_pty_grid(&mut self, path: &str, cols: u16, rows: u16) {
+    /// Record a session's PTY grid so a later daemon-process re-resume recreates
+    /// it at the REAL size (not DEFAULT 120x36 → squish). Returns `true` if the
+    /// stored value actually changed, so the caller can flush to disk only on a
+    /// real change (avoids drag-resize write storms). See campaign D1 / the
+    /// born-at-correct-size invariant.
+    pub fn record_session_pty_grid(&mut self, path: &str, cols: u16, rows: u16) -> bool {
         if cols == 0 || rows == 0 {
-            return;
+            return false;
         }
         // Key by the in-memory session key so it matches what we persist
         // (PersistedLiveSession.key / PersistedStoredSession.path) and what
@@ -2193,7 +2198,7 @@ impl YggtermServer {
             .resolve_session_storage_key(path)
             .map(str::to_string)
             .unwrap_or_else(|| path.to_string());
-        self.session_pty_grids.insert(key, (cols, rows));
+        self.session_pty_grids.insert(key, (cols, rows)) != Some((cols, rows))
     }
 
     pub fn session_pty_grid(&self, path: &str) -> Option<(u16, u16)> {
@@ -21501,6 +21506,31 @@ mod tests {
         // Zero dims are ignored (no clobber of a good grid).
         server.record_session_pty_grid(&path, 0, 0);
         assert_eq!(server.session_pty_grid(&path), Some((159, 63)));
+    }
+
+    // The synchronous-flush logic in the TerminalResize handler + record-on-create
+    // flushes to disk only when the grid actually CHANGED. Guard that contract so a
+    // refactor can't turn every redundant resize into a write storm (or, worse, stop
+    // flushing real changes → the squish regresses). See campaign D1.
+    #[test]
+    fn record_session_pty_grid_reports_change_for_flush_gating() {
+        let mut server = test_server();
+        let path = server.start_local_session(SessionKind::Codex, Some("/home/pi"), Some("codex"));
+        assert!(
+            server.record_session_pty_grid(&path, 159, 63),
+            "first record of a grid is a change → must flush"
+        );
+        assert!(
+            !server.record_session_pty_grid(&path, 159, 63),
+            "re-recording the SAME grid is not a change → must NOT flush (no write storm)"
+        );
+        assert!(
+            server.record_session_pty_grid(&path, 167, 63),
+            "a different grid is a change → must flush"
+        );
+        // Zero dims never count as a change.
+        assert!(!server.record_session_pty_grid(&path, 0, 0));
+        assert_eq!(server.session_pty_grid(&path), Some((167, 63)));
     }
 
     // Bug 9 (dual-store collision = the ~3s blink): a kind=document stored entry whose
