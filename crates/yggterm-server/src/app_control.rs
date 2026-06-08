@@ -545,6 +545,45 @@ pub fn app_control_requests_pending_for_worker(home: &Path, worker_pid: u32) -> 
     false
 }
 
+/// True if any request pending for this worker is a MUTATING (non-read-only) command —
+/// i.e. handling it should force a shell re-render. Read-only probes (screenshot /
+/// state / buffer reads) are processed via the waker (Poll event) without forcing a
+/// whole-shell re-render, which cuts the ~4-renders-per-probe churn the DOM-leak
+/// investigation found (heavy agent probing was re-rendering the giant shell tree on
+/// every observation). Same scan/skip rules as `app_control_requests_pending_for_worker`.
+pub fn app_control_pending_render_needed_for_worker(home: &Path, worker_pid: u32) -> bool {
+    let requests_dir = app_control_requests_dir(home);
+    let Ok(entries) = fs::read_dir(&requests_dir) else {
+        return false;
+    };
+    for entry in entries.filter_map(Result::ok) {
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("json")
+            || path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("inflight-"))
+        {
+            continue;
+        }
+        let Some(request) = fs::read(&path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<AppControlRequest>(&bytes).ok())
+        else {
+            continue;
+        };
+        if let Some(preferred_pid) = request.preferred_pid
+            && preferred_pid != worker_pid
+        {
+            continue;
+        }
+        if !request.command.is_read_only() {
+            return true;
+        }
+    }
+    false
+}
+
 pub fn app_control_responses_dir(home: &Path) -> PathBuf {
     home.join(APP_CONTROL_RESPONSES_DIR)
 }
@@ -986,6 +1025,26 @@ mod tests {
                 .exists()
         );
 
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn render_needed_only_for_mutating_pending_requests() {
+        // A read-only probe is pending-but-render-NOT-needed (processed via the waker,
+        // no forced shell re-render — the churn cut). A mutating command IS render-needed.
+        let home = temp_home();
+        let pid = std::process::id();
+        enqueue_app_control_request(&home, AppControlCommand::DescribeState, Some(pid)).unwrap();
+        assert!(app_control_requests_pending_for_worker(&home, pid));
+        assert!(
+            !app_control_pending_render_needed_for_worker(&home, pid),
+            "a read-only probe must NOT force a shell re-render"
+        );
+        enqueue_app_control_request(&home, AppControlCommand::ShowStartPage, Some(pid)).unwrap();
+        assert!(
+            app_control_pending_render_needed_for_worker(&home, pid),
+            "a mutating command must force a re-render"
+        );
         let _ = fs::remove_dir_all(home);
     }
 
