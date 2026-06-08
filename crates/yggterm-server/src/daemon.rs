@@ -3536,7 +3536,7 @@ impl DaemonRuntime {
         if let Some((cols, rows)) = effective_initial_size
             && self.server.record_session_pty_grid(path, cols, rows)
         {
-            let _ = self.persist();
+            let _ = self.persist_state_only();
         }
         if let Ok(home) = crate::resolve_yggterm_home() {
             append_trace_event(
@@ -3567,6 +3567,19 @@ impl DaemonRuntime {
     fn persist(&mut self) -> Result<()> {
         self.refresh_live_codex_runtime_identities_for_persistence();
         self.refresh_live_claude_code_runtime_identities_for_persistence();
+        write_persisted_state(&self.state_path, &self.server.persisted_state())
+    }
+
+    /// Write persisted state WITHOUT re-resolving live-session runtime identities.
+    /// The full `persist()` runs `refresh_live_codex/claude_runtime_identities_*`, which
+    /// re-keys live sessions — fine on genuine lifecycle events, but running it on the
+    /// HIGH-FREQUENCY grid-flush path (every TerminalResize / ensure) churns identity
+    /// resolution far more than needed and widens the window for the local://<->
+    /// codex-runtime:// re-key split (Bug 9 / the focus->start-page + phantom regression).
+    /// The grid flush only needs the grid on disk, so skip the identity refresh here.
+    /// Genuine lifecycle events still call the full `persist()`. See campaign D1 / the
+    /// born-at-correct-size synchronous flush.
+    fn persist_state_only(&self) -> Result<()> {
         write_persisted_state(&self.state_path, &self.server.persisted_state())
     }
 
@@ -4857,7 +4870,7 @@ impl DaemonRuntime {
                 // defaulted to 120x36 → squish. Only flush when the grid actually changed
                 // (avoids drag-resize write storms). See campaign D1.
                 if self.server.record_session_pty_grid(&path, cols, rows) {
-                    let _ = self.persist();
+                    let _ = self.persist_state_only();
                 }
                 ServerResponse::Ack { message: None }
             }
