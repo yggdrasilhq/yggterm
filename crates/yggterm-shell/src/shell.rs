@@ -61607,79 +61607,7 @@ fn terminal_eval_script_with_canvas_renderer(
                 || active === host
             );
         }};
-        // Consolidated scroll-controller — settle self-heal (mirrors
-        // scroll_mode::should_settle_follow). When the session is Following
-        // (intent !== UserScrollback) and the viewport is stranded BELOW the live
-        // bottom while the user is IDLE (not input-hot), re-assert follow to the
-        // CURRENT baseY + force a repaint. Fixes the lock-at-top / broken-bottom:
-        // the event-driven follow landed at a stale baseY (mid-load / alt-screen /
-        // focus-regain reseed) and never re-fired. Keys off the stranded state, not
-        // the trigger, so it covers ALL paths (retained-replay, fit-cascade,
-        // alt->normal, bg->fg). SAFE: viewport-only (forceXtermViewportY, the
-        // unguarded mover) + a repaint; intent!==UserScrollback + !inputHot mean a
-        // user who scrolled up or is typing is NEVER yanked; heals then no-ops.
-        // Gates on hostLooksUsable() VISIBILITY, not focus (Wayland trap).
-        // CRITICAL: measure the strand with effectiveXtermViewportY (the render/
-        // ydisp position, same as app-state + syncScrollbackLock) — NOT
-        // active.viewportY (public buffer pos). On bg->fg the buffer reads
-        // at-bottom while the RENDER is stale rows above; the public read missed
-        // that strand, which is why the timer-only v2.8.37 self-heal fixed
-        // switching but not bg->fg.
-        const runSettleSelfHeal = (reason) => {{
-            try {{
-                if (
-                    scrollbackIntent === 'UserScrollback'
-                    || terminalInputHot()
-                    || !hostLooksUsable()
-                    || !term || !term.buffer || !term.buffer.active
-                ) {{
-                    return false;
-                }}
-                const active = term.buffer.active;
-                const baseY = Math.max(0, Number(active.baseY || 0));
-                const effViewportY = Math.max(0, Number(effectiveXtermViewportY(active)));
-                if (baseY - effViewportY < 3) {{
-                    return false;
-                }}
-                forceXtermViewportY(baseY, `settle_self_heal:${{reason}}`);
-                syncScrollbackLock(`settle_self_heal:${{reason}}`);
-                // A stale-render strand (public at base, render above) needs the
-                // DOM/canvas re-synced even when forceXtermViewportY no-ops on the
-                // public position — force a repaint.
-                try {{ requestVisiblePaint(true); }} catch (_paintErr) {{}}
-                const entry = window.__yggtermXtermHosts && window.__yggtermXtermHosts[hostId]
-                    ? window.__yggtermXtermHosts[hostId] : null;
-                if (entry) {{
-                    entry.settleSelfHealCount = Number(entry.settleSelfHealCount || 0) + 1;
-                    entry.lastSettleSelfHealAtMs = Date.now();
-                    entry.lastSettleSelfHealGap = baseY - effViewportY;
-                    entry.lastSettleSelfHealReason = String(reason || '');
-                }}
-                return true;
-            }} catch (_settleSelfHealError) {{
-                return false;
-            }}
-        }};
-        // Run the self-heal on focus/visibility regain too — NOT only on the timer.
-        // bg->fg is the exact case the timer can miss (WebView background timer
-        // throttling + the render-strand only appears post-transition); a short
-        // delay lets the focus-regain reseed settle before we re-assert.
-        const scheduleFocusRegainSelfHeal = () => {{
-            try {{
-                window.setTimeout(() => runSettleSelfHeal('focus_regain'), 140);
-                window.setTimeout(() => runSettleSelfHeal('focus_regain_late'), 480);
-            }} catch (_focusHealErr) {{}}
-        }};
-        try {{
-            window.addEventListener('focus', scheduleFocusRegainSelfHeal, true);
-            document.addEventListener('visibilitychange', () => {{
-                if (document.visibilityState === 'visible') {{
-                    scheduleFocusRegainSelfHeal();
-                }}
-            }}, true);
-        }} catch (_focusListenerErr) {{}}
         const inputDriftWatchdog = window.setInterval(() => {{
-            runSettleSelfHeal('watchdog');
             if (!terminalNeedsPassiveFocusRecovery()) {{
                 return;
             }}
@@ -73087,41 +73015,6 @@ mod tests {
         assert!(script.contains("cursorInactiveStyle: 'block'"));
         assert!(script.contains("if (!nextInputEnabled) {"));
         assert!(script.contains("helperTextarea.blur();"));
-    }
-    // Consolidated scroll-controller Phase 2: the idle-gated settle self-heal must
-    // be present in the watchdog and correctly guarded (Following only, idle only,
-    // viewport-only). Mirrors scroll_mode::should_settle_follow. Regression-locks
-    // the fix for the captured lock-at-top / broken-bottom.
-    #[test]
-    fn terminal_eval_script_has_idle_gated_settle_self_heal() {
-        let theme = terminal_theme(UiTheme::ZedLight, palette(UiTheme::ZedLight), 13.0, "");
-        let script = terminal_eval_script("yggterm-terminal-test", &theme, true);
-        assert!(
-            script.contains("forceXtermViewportY(baseY, `settle_self_heal:${reason}`);"),
-            "settle self-heal must re-assert follow to the current baseY"
-        );
-        // Gated to Following + idle so it never yanks a scrolled-back or typing user.
-        assert!(script.contains("scrollbackIntent === 'UserScrollback'"));
-        assert!(
-            script.contains("|| terminalInputHot()\n                    || !hostLooksUsable()"),
-            "self-heal must be gated on idle (not input-hot) + visible (not focus)"
-        );
-        // MUST measure the strand with the EFFECTIVE viewport (render position), not
-        // active.viewportY (public) — the bg->fg render-strand the public read missed.
-        assert!(
-            script.contains("const effViewportY = Math.max(0, Number(effectiveXtermViewportY(active)));"),
-            "self-heal must measure the strand with the effective (render) viewport"
-        );
-        assert!(
-            script.contains("if (baseY - effViewportY < 3) {"),
-            "self-heal only fires on a real strand (gap >= 3), not a 1-row visual mismatch"
-        );
-        // Must also force a repaint (render-strand) + run on focus/visibility regain.
-        assert!(script.contains("requestVisiblePaint(true);"));
-        assert!(
-            script.contains("window.addEventListener('focus', scheduleFocusRegainSelfHeal, true);"),
-            "self-heal must also run on focus regain (bg->fg), not only the timer"
-        );
     }
     #[test]
     fn terminal_eval_script_focuses_host_and_scopes_wheel_capture() {
