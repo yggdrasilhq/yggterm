@@ -90,6 +90,15 @@ these over screenshots.
   CAUTION: it re-seeds the client to the CURRENT screen → collapses base_y to 0 (drops
   retained-replay history; harmless for codex which owns no real scrollback, but it IS a
   buffer reset). A REPAIR tool, not a routine op — only run it on an actually-broken surface.
+- `server terminal resize <key> --cols N --rows N [--nudge]` (since v2.8.47) — resize the
+  LOCAL daemon PTY, which sends a SIGWINCH down the ssh channel to the REMOTE agent CLI.
+  **The confirm+recover tool for a "squish"** where the remote codex renders at a stale
+  smaller grid (e.g. default ~120×36) than the client/daemon (e.g. 167×63) after a
+  re-resume/daemon-restart — the daemon PTY can read 167×63 while the remote codex never
+  got the SIGWINCH/repaint. `--nudge` first resizes to (cols-1,rows-1) then to the target,
+  forcing a fresh SIGWINCH when the daemon PTY size already matches. Confirm via a faithful
+  screenshot before/after (does codex reflow to full width / composer drop to the bottom?).
+  See `finding-codex-squish-post-restart-pty-size`.
 - `server app state` — the active session + `active_terminal_hosts[]`: `cols`/`rows`,
   `base_y`, `viewport_y`, `scrollback_intent`, `retained_replay_source`, `text_tail`,
   `xterm_session_snapshot_nonblank_line_count`, `window_focused`/`document_focused`;
@@ -113,10 +122,12 @@ these over screenshots.
   the instrument that ends agent-blindness: take it, `scp` it back, and Read the PNG to
   SEE squish/broken-bottom/blank with your own eyes (never declare a visual state from
   telemetry — see CLAUDE.md missteps). The image IS the terminal region; the redundant
-  `--region terminal` crop is auto-dropped. NOTE: `--region/--crop/--scale` are parsed by
-  the GUI binary but NOT yet by `yggterm-headless` (it ignores them → native-res PNG); the
-  composite is already at devicePixelRatio so it's legible without upscale. Spectacle
-  remains a last-resort fallback (needs yggterm focused — fails over SSH, the old trap).
+  `--region terminal` crop is auto-dropped. The IMAGE POST-PROCESS PIPELINE
+  (`--region terminal|full`, `--crop x,y,w,h`, `--scale N`) is wired into `yggterm-headless`
+  since v2.8.47 (earlier it was GUI-binary-only) — use `--crop`+`--scale` to zoom into a
+  suspect region (composer row, right edge) since a full frame reads small. The composite is
+  at devicePixelRatio so it's legible even without upscale. Spectacle remains a last-resort
+  fallback (needs yggterm focused — fails over SSH, the old trap).
 - `server status` — daemon version/uptime. `server monitor --scenario panic-report|
   server-list|latency-check|wait-session|hot-restart` — incident triage (see AGENTS.md).
 
