@@ -37764,41 +37764,6 @@ fn app() -> Element {
     let mut titlebar_autohide_hovered = use_signal(|| false);
     let mut titlebar_autohide_lingering = use_signal(|| false);
     let mut titlebar_autohide_linger_generation = use_signal(|| 0_u64);
-    if render_trace_enabled() {
-        // RENDER-CAUSE PROBE (diagnostic, YGGTERM_TRACE_RENDER=1 only): log per-render
-        // the App root's auxiliary signals + high-frequency ShellState scalars/lens so
-        // the idle re-render-churn driver can be NAMED by diffing consecutive
-        // app_root_render_cause events. `.peek()` is non-subscribing (does not alter
-        // render behavior). Remove once the driver is pinned. See campaign DOM-leak.
-        let s = state.peek();
-        append_trace_event(
-            &trace_home,
-            "ui",
-            "startup",
-            "app_root_render_cause",
-            json!({
-                "count": APP_ROOT_RENDER_COUNT.load(Ordering::SeqCst),
-                "hovered": hovered.peek().is_some(),
-                "tb_hovered": *titlebar_autohide_hovered.peek(),
-                "tb_lingering": *titlebar_autohide_lingering.peek(),
-                "tb_linger_gen": *titlebar_autohide_linger_generation.peek(),
-                "server_busy": s.server_busy,
-                "window_focused": s.window_focused,
-                "last_action": s.last_action.clone(),
-                "last_terminal_debug_len": s.last_terminal_debug.len(),
-                "last_tree_debug_len": s.last_tree_debug.len(),
-                "notifications": s.notifications.len(),
-                "live_sidebar_samples": s.live_terminal_sidebar_samples.len(),
-                "cached_hot_views": s.cached_hot_session_views.len(),
-                "active_surface_requests": s.active_surface_requests.len(),
-                "title_in_flight": s.title_requests_in_flight.len(),
-                "precis_in_flight": s.precis_requests_in_flight.len(),
-                "summary_in_flight": s.summary_requests_in_flight.len(),
-                "copy_gen_start": s.copy_generation_start_count,
-                "terminal_busy_hints": s.terminal_busy_hint_until_ms.len(),
-            }),
-        );
-    }
     let mut last_active_terminal_input_policy =
         use_signal(|| None::<ActiveTerminalInputPolicySignature>);
     let mut startup_sync_started = use_signal(|| false);
@@ -37827,6 +37792,55 @@ fn app() -> Element {
     let mut last_sidebar_autoscroll_path = use_signal(|| None::<String>);
     let mut last_sidebar_bounds_repair_key = use_signal(|| None::<String>);
     let mut last_tree_rename_focus_path = use_signal(|| None::<String>);
+    if render_trace_enabled() {
+        // RENDER-CAUSE PROBE v2 (diagnostic, YGGTERM_TRACE_RENDER=1 only): now covers the
+        // epoch signals app() subscribes to + CONTENT hashes of the big untracked
+        // ShellState mirrors (sidebar sample values, server live-session views, browser
+        // rows) so the idle re-render driver can be named. `.peek()` is non-subscribing.
+        use std::hash::{Hash, Hasher};
+        let s = state.peek();
+        let mut sidebar_h = std::collections::hash_map::DefaultHasher::new();
+        let mut keys: Vec<&String> = s.live_terminal_sidebar_samples.keys().collect();
+        keys.sort();
+        for k in keys {
+            k.hash(&mut sidebar_h);
+            if let Some(v) = s.live_terminal_sidebar_samples.get(k) {
+                v.cursor_line_text.hash(&mut sidebar_h);
+                v.text_tail.hash(&mut sidebar_h);
+            }
+        }
+        let mut server_h = std::collections::hash_map::DefaultHasher::new();
+        s.server.active_session_path().hash(&mut server_h);
+        for view in s.server.live_session_views() {
+            view.id.hash(&mut server_h);
+            view.title.hash(&mut server_h);
+            view.status_line.hash(&mut server_h);
+            format!("{:?}", view.launch_phase).hash(&mut server_h);
+        }
+        let mut browser_h = std::collections::hash_map::DefaultHasher::new();
+        s.browser.selected_path().hash(&mut browser_h);
+        append_trace_event(
+            &trace_home,
+            "ui",
+            "startup",
+            "app_root_render_cause",
+            json!({
+                "count": APP_ROOT_RENDER_COUNT.load(Ordering::SeqCst),
+                "window_epoch": *window_epoch.peek(),
+                "async_render_epoch": *async_render_epoch.peek(),
+                "hovered": hovered.peek().is_some(),
+                "tb_lingering": *titlebar_autohide_lingering.peek(),
+                "tb_linger_gen": *titlebar_autohide_linger_generation.peek(),
+                "last_action": s.last_action.clone(),
+                "sidebar_content_hash": sidebar_h.finish(),
+                "server_views_hash": server_h.finish(),
+                "browser_sel_hash": browser_h.finish(),
+                "notifications": s.notifications.len(),
+                "terminal_busy_hints": s.terminal_busy_hint_until_ms.len(),
+                "active_surface_requests": s.active_surface_requests.len(),
+            }),
+        );
+    }
     let schedule_ui_update = schedule_update();
     if !browser_tree_refresh_loop_started.swap(true, Ordering::SeqCst) {
         spawn_forever(async move {
