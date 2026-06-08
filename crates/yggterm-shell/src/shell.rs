@@ -30276,6 +30276,10 @@ async fn capture_dom_debug_snapshot_terminal_quick_fallback_for(
                         last_raw_payload_sample: mountedHost ? String(mountedHost.lastRawPayloadSample || '') : '',
                         scrollback_locked: mountedHost ? Boolean(mountedHost.scrollbackLocked) : false,
                         scrollback_intent: mountedHost ? String(mountedHost.lastScrollbackIntent || 'PromptFollow') : 'PromptFollow',
+                        running_animation_count: mountedHost ? Number(mountedHost.runningAnimationCount || 0) : 0,
+                        running_animation_names: mountedHost ? (mountedHost.runningAnimationNames || {}) : {},
+                        running_animation_sampled_at_ms: mountedHost ? Number(mountedHost.runningAnimationSampledAtMs || 0) : 0,
+                        visible_paint_counter: mountedHost ? Number(mountedHost.visiblePaintCounterSnapshot || 0) : 0,
                         document_focused: (() => {
                             try {
                                 return typeof document.hasFocus === 'function' ? Boolean(document.hasFocus()) : true;
