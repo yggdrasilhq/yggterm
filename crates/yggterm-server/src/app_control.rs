@@ -388,6 +388,25 @@ pub enum AppControlCommand {
 }
 
 impl AppControlCommand {
+    /// True for PURE-OBSERVATION commands — they read/capture state without mutating
+    /// any UI or session state, so handling one does NOT require a shell re-render.
+    /// The render-churn investigation (campaign DOM-leak) found that every agent probe
+    /// (screenshot/state/buffer read) currently force-re-renders the whole shell root
+    /// via the app-control poll loop's schedule_ui_update(); gating that force-render on
+    /// `!is_read_only()` would cut the probe-induced churn. This is the tested foundation
+    /// for that gate — wiring it into the poll loop is a separate, verified step (the
+    /// loop must still WAKE to process the request; only the forced re-render is skipped).
+    pub fn is_read_only(&self) -> bool {
+        matches!(
+            self,
+            Self::CaptureScreenshot { .. }
+                | Self::CaptureScreenRecording { .. }
+                | Self::DescribeRows
+                | Self::DescribeState
+                | Self::ReadTerminalBuffer { .. }
+        )
+    }
+
     pub fn name(&self) -> &'static str {
         match self {
             Self::SetMainZoom { .. } => "set_main_zoom",
@@ -889,6 +908,45 @@ pub fn current_millis() -> u128 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn read_only_commands_are_pure_observation() {
+        // Pure-observation: no UI/session mutation → no forced re-render needed.
+        assert!(AppControlCommand::DescribeState.is_read_only());
+        assert!(AppControlCommand::DescribeRows.is_read_only());
+        assert!(
+            AppControlCommand::ReadTerminalBuffer {
+                session_path: "x".into(),
+                mode: "screen".into(),
+            }
+            .is_read_only()
+        );
+        // Mutating commands must NOT be classified read-only (they change UI/session
+        // state and legitimately need a re-render).
+        assert!(!AppControlCommand::ShowStartPage.is_read_only());
+        assert!(
+            !AppControlCommand::SendTerminalInput {
+                session_path: "x".into(),
+                data: "y".into(),
+            }
+            .is_read_only()
+        );
+        assert!(
+            !AppControlCommand::ReconcileTerminalFromDaemon {
+                session_path: "x".into(),
+            }
+            .is_read_only(),
+            "reconcile repaints the client → must re-render"
+        );
+        assert!(
+            !AppControlCommand::ScrollTerminalViewport {
+                session_path: "x".into(),
+                to: "bottom".into(),
+            }
+            .is_read_only(),
+            "scroll moves the viewport → must re-render"
+        );
+    }
 
     fn temp_home() -> PathBuf {
         let home = std::env::temp_dir().join(format!("yggterm-app-control-{}", Uuid::new_v4()));
