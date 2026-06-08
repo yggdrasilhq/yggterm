@@ -16235,6 +16235,22 @@ pub fn run_app_control_redraw_terminal(session_path: &str, timeout_ms: u64) -> a
     Ok(())
 }
 
+pub fn run_app_control_reconcile_terminal_from_daemon(
+    session_path: &str,
+    timeout_ms: u64,
+) -> anyhow::Result<()> {
+    let home = resolve_yggterm_home()?;
+    let response = request_app_control(
+        &home,
+        AppControlCommand::ReconcileTerminalFromDaemon {
+            session_path: session_path.to_string(),
+        },
+        timeout_ms,
+    )?;
+    write_stdout_payload(&serde_json::to_string_pretty(&response)?)?;
+    Ok(())
+}
+
 pub fn run_app_control_paste_terminal_clipboard(
     session_path: &str,
     timeout_ms: u64,

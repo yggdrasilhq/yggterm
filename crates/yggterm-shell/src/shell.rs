@@ -12360,6 +12360,7 @@ fn app_control_command_defers_background_refresh(command: &AppControlCommand) ->
             | AppControlCommand::SendTerminalInput { .. }
             | AppControlCommand::ReclaimTerminalFocus { .. }
             | AppControlCommand::RedrawTerminal { .. }
+            | AppControlCommand::ReconcileTerminalFromDaemon { .. }
             | AppControlCommand::ScrollTerminalViewport { .. }
             | AppControlCommand::ReadTerminalBuffer { .. }
             | AppControlCommand::PasteTerminalClipboard { .. }
@@ -33727,6 +33728,78 @@ async fn redraw_terminal_viewport_for(session_path: &str) -> Value {
     );
     receive_probe_eval_value(&script, session_path).await
 }
+/// Reconcile the client xterm.js buffer FROM the daemon's authoritative vt100
+/// screen. Reads `terminal_snapshot` (source of truth) and replays it via the
+/// `daemon_screen_snapshot` retained-replay path — the SAME machinery the
+/// reveal-reconcile (`retained_ready_remote_host_rehydrate_mode` /
+/// `terminal_replay_retained_data_script_for_session`) uses, just triggered on
+/// demand. Unlike `RedrawTerminal` (renderer re-fit only) this repaints CONTENT,
+/// so it closes a "squish" (client frame smaller than the daemon grid) or a
+/// broken-bottom where codex delta-rendered while the client was transiently
+/// mis-sized. Idempotent (the replay layer dedups by payload key). This is the
+/// on-demand primitive behind the squish/reveal reconcile fix; the xterm-harness
+/// `squish-residual` test proves a full daemon-frame write closes the gap with no
+/// viewport mover. See campaign-xterm-dealbreakers (TODO-3).
+async fn reconcile_terminal_from_daemon_for(
+    endpoint: ServerEndpoint,
+    session_path: &str,
+    trace_home: &Path,
+) -> Value {
+    let snapshot = terminal_snapshot_async(endpoint, session_path.to_string(), trace_home).await;
+    let (screen, running, _runtime_output_seen, _post_resize, _seq) = match snapshot {
+        Ok(value) => value,
+        Err(error) => {
+            return json!({
+                "accepted": false,
+                "reason": format!("daemon_snapshot_failed: {error}"),
+                "session_path": session_path,
+            });
+        }
+    };
+    if screen.trim().is_empty() {
+        return json!({
+            "accepted": false,
+            "reason": "daemon_screen_empty",
+            "session_path": session_path,
+            "running": running,
+        });
+    }
+    // Report (do not block on) whether the daemon screen shows an agent actively
+    // working ("esc to interrupt"). A manual agent-triggered reconcile still runs
+    // — the caller owns the recovery-churn decision — but the auto-trigger that
+    // will call this primitive MUST gate on !looked_working (the recovery-churn
+    // trap, incident-gap-fix-cascade-2026-06-03).
+    let looked_working = yggterm_core::screen_text_shows_agent_working(&screen);
+    let bytes = screen.len();
+    let line_count = screen.matches('\n').count() + 1;
+    let _ = document::eval(&terminal_replay_retained_data_script_for_session(
+        session_path,
+        &screen,
+        "daemon_screen_snapshot",
+    ));
+    append_trace_event(
+        trace_home,
+        "ui",
+        "terminal_mount",
+        "app_control_reconcile_from_daemon",
+        json!({
+            "session_path": session_path,
+            "bytes": bytes,
+            "line_count": line_count,
+            "running": running,
+            "looked_working": looked_working,
+        }),
+    );
+    json!({
+        "accepted": true,
+        "session_path": session_path,
+        "source": "daemon_screen_snapshot",
+        "bytes": bytes,
+        "line_count": line_count,
+        "running": running,
+        "looked_working": looked_working,
+    })
+}
 async fn refresh_runtime_status_for_app_control(
     state: Signal<ShellState>,
     reason: &'static str,
@@ -35272,6 +35345,24 @@ async fn process_pending_app_control_requests(
         }
         AppControlCommand::RedrawTerminal { session_path } => {
             let result = redraw_terminal_viewport_for(&session_path).await;
+            AppControlResponse {
+                request_id: request.request_id.clone(),
+                handled_by_pid: std::process::id(),
+                completed_at_ms: current_millis() as u128,
+                output_path: None,
+                error: result
+                    .get("accepted")
+                    .and_then(Value::as_bool)
+                    .filter(|accepted| !accepted)
+                    .and_then(|_| result.get("reason"))
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned),
+                data: Some(result),
+            }
+        }
+        AppControlCommand::ReconcileTerminalFromDaemon { session_path } => {
+            let endpoint = state.read().bootstrap.server_endpoint.clone();
+            let result = reconcile_terminal_from_daemon_for(endpoint, &session_path, &home).await;
             AppControlResponse {
                 request_id: request.request_id.clone(),
                 handled_by_pid: std::process::id(),
