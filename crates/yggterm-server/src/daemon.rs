@@ -3497,6 +3497,19 @@ impl DaemonRuntime {
             && rows > 0
             && self.terminals.session_size(&runtime_path) != Some((cols, rows))
         {
+            // Grid mismatch on re-resume = the squish case (PTY spawned at a stale/default
+            // size). NUDGE: resize to a transient rows-1 then the real grid, so codex's
+            // event loop sees TWO distinct SIGWINCH events rather than one — maximizing the
+            // chance an idle codex actually processes the resize and repaints full-size.
+            // Best-effort safety net: idle codex MAY still ignore SIGWINCH entirely (only
+            // genuine input reliably repaints it — empirically tested), in which case the
+            // born-at-correct-size persistence above is what actually prevents the squish;
+            // this only fires on a real mismatch so a brief reflow is strictly better than a
+            // stuck squish. See campaign D1 / the squish root cause.
+            let nudge_rows = rows.saturating_sub(1).max(1);
+            if nudge_rows != rows {
+                let _ = self.terminals.resize(&runtime_path, cols, nudge_rows);
+            }
             let resized = self.terminals.resize(&runtime_path, cols, rows);
             if let Ok(home) = crate::resolve_yggterm_home() {
                 append_trace_event(
@@ -3508,6 +3521,7 @@ impl DaemonRuntime {
                         "path": path,
                         "client_cols": cols,
                         "client_rows": rows,
+                        "nudged": nudge_rows != rows,
                         "ok": resized.is_ok(),
                     }),
                 );
