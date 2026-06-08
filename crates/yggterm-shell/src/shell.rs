@@ -59950,6 +59950,27 @@ fn terminal_eval_script_with_canvas_renderer(
                 const buffer = term && term.buffer && term.buffer.active ? term.buffer.active : null;
                 const viewportY = buffer ? Math.max(0, Number(buffer.viewportY || 0)) : 0;
                 const baseY = buffer ? Math.max(0, Number(buffer.baseY || 0)) : 0;
+                // WS3 screen-restore (vacuum fix): also persist the buffer TEXT so a NEW GUI
+                // process restores the transcript. localStorage survives a GUI restart; the
+                // in-memory xtermSessionSnapshot does NOT — so a full GUI+daemon restart
+                // (daemon re-resumes codex on a fresh PTY that doesn't re-print history)
+                // otherwise leaves both text sources empty → vacuum. Reuse the latest
+                // captured snapshot's already-serialized text (no re-serialize), capped for
+                // the localStorage quota, only when it's a real (non-collapsed) frame.
+                let snapshotText = '';
+                let snapshotLineCount = 0;
+                let snapshotNonblankLineCount = 0;
+                try {{
+                    const sp = currentHostSessionPath();
+                    const snap = sp && window.__yggtermXtermSessionSnapshots
+                        ? window.__yggtermXtermSessionSnapshots[sp]
+                        : null;
+                    if (snap && typeof snap.text === 'string' && Number(snap.nonblankLineCount || 0) > 1) {{
+                        snapshotText = snap.text.length > 120000 ? snap.text.slice(-120000) : snap.text;
+                        snapshotLineCount = Number(snap.lineCount || 0);
+                        snapshotNonblankLineCount = Number(snap.nonblankLineCount || 0);
+                    }}
+                }} catch (_textError) {{}}
                 const payload = JSON.stringify({{
                     intent: scrollbackIntent,
                     viewportY,
@@ -59958,6 +59979,9 @@ fn terminal_eval_script_with_canvas_renderer(
                     locked: Boolean(scrollbackLocked),
                     reason: String(reason || ''),
                     savedAtMs: Date.now(),
+                    text: snapshotText,
+                    lineCount: snapshotLineCount,
+                    nonblankLineCount: snapshotNonblankLineCount,
                 }});
                 window.localStorage.setItem(key, payload);
             }} catch (_error) {{}}
@@ -59987,6 +60011,11 @@ fn terminal_eval_script_with_canvas_renderer(
                     locked: Boolean(state.locked),
                     reason: String(state.reason || ''),
                     ageMs,
+                    // WS3 screen-restore: persisted buffer text ('' for entries written
+                    // before this field existed).
+                    text: typeof state.text === 'string' ? state.text : '',
+                    lineCount: Math.max(0, Number(state.lineCount || 0)),
+                    nonblankLineCount: Math.max(0, Number(state.nonblankLineCount || 0)),
                 }};
             }} catch (_error) {{ return null; }}
         }};
@@ -60836,10 +60865,50 @@ fn terminal_eval_script_with_canvas_renderer(
             const snapshot = latestXtermSessionSnapshotForCurrentSession();
             if (!snapshot) {{
                 // XTERM-BUG: scrollback-lost-on-gui-restart — in-memory snapshot is
-                // gone (process restart). Try localStorage. We can't restore the
-                // *text* (daemon's retained-replay will do that) but we can restore
-                // the user's scroll position so they aren't yanked to the bottom.
+                // gone (process restart). Try localStorage for BOTH text and scroll.
                 const persisted = loadScrollStateFromLocalStorage();
+                // WS3 screen-restore (vacuum fix): if localStorage carries the buffer TEXT
+                // (now persisted across GUI restart) and it's a real (non-collapsed) frame,
+                // write it into the fresh xterm so the transcript survives a full GUI+daemon
+                // restart instead of a vacuum (codex resume doesn't re-print history; the
+                // daemon re-resumed on a fresh PTY). Marking the host non-blank + seeding the
+                // nonblank-max stops the blank-host replay from clobbering it with the sparse
+                // fresh-PTY screen. Gated by the same collapsed-poison rule as the cache.
+                if (persisted && typeof persisted.text === 'string' && persisted.text.trim()
+                    && persisted.nonblankLineCount > 1
+                    && !xtermSessionSnapshotIsCollapsedPoison(currentHostSessionPath(), persisted.nonblankLineCount)) {{
+                    const restoredText = persisted.text.replace(/\r?\n/g, "\r\n");
+                    const ws = term && term._core && typeof term._core.writeSync === "function"
+                        ? term._core.writeSync.bind(term._core)
+                        : (term && term._core && term._core._writeBuffer && typeof term._core._writeBuffer.writeSync === "function"
+                            ? term._core._writeBuffer.writeSync.bind(term._core._writeBuffer) : null);
+                    try {{
+                        if (typeof term.reset === "function") {{ term.reset(); }}
+                        if (ws) {{ ws("\x1bc\x1b[H"); ws(restoredText); }}
+                        else if (typeof term.write === "function") {{ term.write(`\x1bc\x1b[H${{restoredText}}`); }}
+                        const tentry = window.__yggtermXtermHosts && window.__yggtermXtermHosts[hostId]
+                            ? window.__yggtermXtermHosts[hostId] : null;
+                        if (tentry) {{
+                            tentry.terminalContentSource = 'localstorage_session_snapshot';
+                            tentry.lastRetainedReplaySource = 'localstorage_session_snapshot';
+                            tentry.lastRetainedReplayRecoveredFromSnapshot = true;
+                            tentry.lastLocalStorageTextRestoreLineCount = persisted.lineCount;
+                            tentry.lastLocalStorageTextRestoreAtMs = Date.now();
+                        }}
+                        window.__yggtermXtermSessionNonblankMax = window.__yggtermXtermSessionNonblankMax || {{}};
+                        const sp2 = currentHostSessionPath();
+                        if (sp2) {{
+                            window.__yggtermXtermSessionNonblankMax[sp2] = Math.max(
+                                Number(window.__yggtermXtermSessionNonblankMax[sp2] || 0),
+                                persisted.nonblankLineCount
+                            );
+                        }}
+                        sendTerminalEvent({{
+                            kind: 'debug',
+                            message: `localstorage_session_text_restored host=${{hostId}} lines=${{persisted.lineCount}} nonblank=${{persisted.nonblankLineCount}} age_ms=${{Math.round(persisted.ageMs)}}`
+                        }});
+                    }} catch (_restoreErr) {{}}
+                }}
                 // Restore whenever user was not at the bottom (locked) OR intent was UserScrollback.
                 if (persisted && (persisted.intent === 'UserScrollback' || persisted.locked || persisted.distanceFromBottom > 0)) {{
                     pendingPersistedScrollRestore = persisted;
