@@ -127,6 +127,55 @@ test('bg->fg broken bottom self-corrects on the NEXT codex CUP frame (answers: n
   assert.match(h.lineText(term, footerRow - 1) || '', /gpt-5\.5 medium/, 'footer restored by next CUP frame');
 });
 
+test('squish-residual: a shrink->grow leaves a content gap that a full daemon-frame rewrite closes (reconcile invariant)', async () => {
+  // TODO-3 / squish-residual (campaign): on a daemon re-resume the client xterm gets
+  // a TRANSIENT shrink (codex repaints at the small grid) then grows back to the real
+  // grid. codex is a pure absolute-CUP delta renderer (baseY stays 0 — see the
+  // cursor-addressed test above) so when it goes IDLE after the grow it does NOT
+  // repaint the newly-exposed rows/cols. Result: content occupies only the old small
+  // sub-rectangle while the daemon PTY holds the full-size screen — the visible
+  // "squish". This locks the invariant the reconcile-from-daemon fix relies on:
+  // (1) the gap is real after shrink->grow, and (2) writing the daemon's authoritative
+  // full frame (one absolute-CUP repaint) closes it completely — no reflow tricks, no
+  // viewport mover. See campaign-xterm-dealbreakers + audit-viewport-scroll-control-flow.
+  const buildCodexFrame = (rows, tag) => {
+    let frame = '\x1b[2J\x1b[H';
+    for (let r = 1; r <= rows - 2; r++) frame += `\x1b[${r};1H${tag} transcript ${r}`;
+    frame += `\x1b[${rows - 1};1H> composer ${tag}`;
+    frame += `\x1b[${rows};1Hgpt-5.5 medium · ~/proj ${tag}`;
+    return frame;
+  };
+
+  // Full-size frame at the real grid (what the daemon PTY holds).
+  const term = h.createTerminal({ cols: 80, rows: 20, scrollback: 1000 });
+  await h.write(term, buildCodexFrame(20, 'big'));
+  assert.match(h.lineText(term, 18) || '', /composer big/, 'precondition: composer at row 19 (full size)');
+  assert.match(h.lineText(term, 19) || '', /gpt-5\.5 medium/, 'precondition: footer at row 20 (full size)');
+
+  // Re-resume window: transient shrink, codex repaints the SMALL grid, then grow back.
+  term.resize(40, 10);
+  await h.write(term, buildCodexFrame(10, 'small'));
+  term.resize(80, 20);
+  // codex is now IDLE — it emits nothing after the grow.
+
+  // (1) The squish gap is real: the bottom region (rows 11..20) does not carry the
+  //     full-size composer/footer; content sits in the old top sub-rectangle.
+  const bottomRegion = [];
+  for (let r = 10; r < 20; r++) bottomRegion.push(h.lineText(term, r) || '');
+  assert.ok(
+    !bottomRegion.some((l) => /composer big/.test(l)),
+    `squish reproduced: full-size composer must be absent from the grown bottom region, got ${JSON.stringify(bottomRegion)}`
+  );
+
+  // (2) Reconcile-from-daemon: one absolute-CUP repaint of the daemon's authoritative
+  //     full frame closes the gap completely — composer + footer land at the real
+  //     bottom rows, baseY stays 0 (no scrollback churn, no viewport move needed).
+  await h.write(term, buildCodexFrame(20, 'big'));
+  assert.strictEqual(h.baseY(term), 0, 'reconcile must not grow scrollback');
+  assert.match(h.lineText(term, 18) || '', /composer big/, 'reconcile restores composer at the full-size row 19');
+  assert.match(h.lineText(term, 19) || '', /gpt-5\.5 medium/, 'reconcile restores footer at the full-size row 20');
+});
+
 test('a painted background colour survives a column WIDEN reflow for already-written cells', async () => {
   // Guards the reflow-bg invariant our composer reconcile depends on: when the
   // terminal widens, cells that were already written WITH a bg keep that bg
