@@ -25,7 +25,8 @@ use yggterm_server::{
     run_app_control_probe_terminal_primary_selection_paste,
     run_app_control_probe_terminal_viewport_input, run_app_control_probe_terminal_viewport_scroll,
     run_app_control_probe_terminal_viewport_select, run_app_control_reclaim_terminal_focus,
-    run_app_control_redraw_terminal, run_app_control_remove_session,
+    run_app_control_reconcile_terminal_from_daemon, run_app_control_redraw_terminal,
+    run_app_control_remove_session,
     run_app_control_rename_session, run_app_control_restart_session,
     run_app_control_reset_theme_editor, run_app_control_resize_window,
     run_app_control_restart_pending_update, run_app_control_scroll_preview,
@@ -1814,6 +1815,17 @@ fn main() -> Result<()> {
                                 )
                             })?;
                         run_app_control_redraw_terminal(session_path, timeout_ms)
+                    }
+                    "reconcile" | "reconcile-from-daemon" => {
+                        let session_path = cli_positional_args(&args, 4)
+                            .into_iter()
+                            .next()
+                            .ok_or_else(|| {
+                                anyhow::anyhow!(
+                                    "missing session path for server app terminal reconcile"
+                                )
+                            })?;
+                        run_app_control_reconcile_terminal_from_daemon(session_path, timeout_ms)
                     }
                     "paste" => {
                         let session_path = cli_positional_args(&args, 4)
