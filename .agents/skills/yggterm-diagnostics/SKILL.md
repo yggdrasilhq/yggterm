@@ -106,9 +106,17 @@ these over screenshots.
   reveal/reconcile/replay sequence. (Rotates — grep `~/.yggterm/trace/*.jsonl` for older.)
 - `server app rows` — browser/sidebar rows (kind, label, full_path).
 - `server app session <remove|delete> <path>` — delete a session (e.g. a phantom).
-- `server app screenshot --region terminal|full --crop x,y,w,h --scale N` — app-level
-  capture; on KDE Wayland it uses Spectacle (see `yggui-app-control`). A 1920px full
-  frame is illegibly small — crop + upscale.
+- `server app screenshot [out.png]` — app capture. **Since v2.8.46, when the active view
+  is a terminal and the canvas renderer is on, this composites the xterm canvas layers
+  IN-PROCESS (`capture_backend=xterm_canvas_composite`, `capture_faithful=true`) — a
+  faithful terminal pixel on EVERY platform with NO Spectacle, NO window focus.** This is
+  the instrument that ends agent-blindness: take it, `scp` it back, and Read the PNG to
+  SEE squish/broken-bottom/blank with your own eyes (never declare a visual state from
+  telemetry — see CLAUDE.md missteps). The image IS the terminal region; the redundant
+  `--region terminal` crop is auto-dropped. NOTE: `--region/--crop/--scale` are parsed by
+  the GUI binary but NOT yet by `yggterm-headless` (it ignores them → native-res PNG); the
+  composite is already at devicePixelRatio so it's legible without upscale. Spectacle
+  remains a last-resort fallback (needs yggterm focused — fails over SSH, the old trap).
 - `server status` — daemon version/uptime. `server monitor --scenario panic-report|
   server-list|latency-check|wait-session|hot-restart` — incident triage (see AGENTS.md).
 
@@ -155,8 +163,13 @@ breaks clipboard/paste, screenshot faithfulness, and native compositing.**
   one transition needs a user trigger; everything else is agent-instrumentable.
 - **Daemon screen = authoritative; client buffer can be stale.** A "broken bottom" is
   almost always client-paint vs a correct daemon screen — diff them.
-- **Screenshots lie on Wayland** unless via the activation+Spectacle path
-  (`finding-app-screenshot-unfaithful-on-wayland`).
+- **Screenshots: FIXED for the terminal (v2.8.46).** `server app screenshot` now
+  composites the xterm canvas in-process (`xterm_canvas_composite`, faithful) — works over
+  SSH, unfocused, any platform. The old "screenshots lie on Wayland" trap
+  (`finding-app-screenshot-unfaithful-on-wayland`) was the Spectacle path needing window
+  focus the agent can't hold; that's now bypassed for the terminal. (Full-app/non-terminal
+  chrome still uses the webkit/Spectacle path — faithful for DOM, canvas-blind only if you
+  capture the terminal region via the full-app path instead of the composite.)
 - **Passing deterministic test ≠ live-fixed** — verify the ACTUAL live path/source the
   symptom uses (the 2.8.26 reconcile passed its string test but the live reveal carried
   a different `retained_replay_source`).
