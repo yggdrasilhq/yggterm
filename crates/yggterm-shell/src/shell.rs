@@ -37764,6 +37764,41 @@ fn app() -> Element {
     let mut titlebar_autohide_hovered = use_signal(|| false);
     let mut titlebar_autohide_lingering = use_signal(|| false);
     let mut titlebar_autohide_linger_generation = use_signal(|| 0_u64);
+    if render_trace_enabled() {
+        // RENDER-CAUSE PROBE (diagnostic, YGGTERM_TRACE_RENDER=1 only): log per-render
+        // the App root's auxiliary signals + high-frequency ShellState scalars/lens so
+        // the idle re-render-churn driver can be NAMED by diffing consecutive
+        // app_root_render_cause events. `.peek()` is non-subscribing (does not alter
+        // render behavior). Remove once the driver is pinned. See campaign DOM-leak.
+        let s = state.peek();
+        append_trace_event(
+            &trace_home,
+            "ui",
+            "startup",
+            "app_root_render_cause",
+            json!({
+                "count": APP_ROOT_RENDER_COUNT.load(Ordering::SeqCst),
+                "hovered": hovered.peek().is_some(),
+                "tb_hovered": *titlebar_autohide_hovered.peek(),
+                "tb_lingering": *titlebar_autohide_lingering.peek(),
+                "tb_linger_gen": *titlebar_autohide_linger_generation.peek(),
+                "server_busy": s.server_busy,
+                "window_focused": s.window_focused,
+                "last_action": s.last_action.clone(),
+                "last_terminal_debug_len": s.last_terminal_debug.len(),
+                "last_tree_debug_len": s.last_tree_debug.len(),
+                "notifications": s.notifications.len(),
+                "live_sidebar_samples": s.live_terminal_sidebar_samples.len(),
+                "cached_hot_views": s.cached_hot_session_views.len(),
+                "active_surface_requests": s.active_surface_requests.len(),
+                "title_in_flight": s.title_requests_in_flight.len(),
+                "precis_in_flight": s.precis_requests_in_flight.len(),
+                "summary_in_flight": s.summary_requests_in_flight.len(),
+                "copy_gen_start": s.copy_generation_start_count,
+                "terminal_busy_hints": s.terminal_busy_hint_until_ms.len(),
+            }),
+        );
+    }
     let mut last_active_terminal_input_policy =
         use_signal(|| None::<ActiveTerminalInputPolicySignature>);
     let mut startup_sync_started = use_signal(|| false);
