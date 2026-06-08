@@ -61707,27 +61707,37 @@ fn terminal_eval_script_with_canvas_renderer(
             // per host-tick; getAnimations() is document-global so any host's sample is
             // representative.
             try {{
-                if (typeof document.getAnimations === 'function') {{
-                    const __anims = document.getAnimations();
-                    const __running = [];
-                    for (let __i = 0; __i < __anims.length; __i++) {{
-                        const __a = __anims[__i];
-                        try {{ if (__a && __a.playState === 'running') __running.push(__a); }} catch (_aErr) {{}}
+                // WebKitGTK lacks document.getAnimations(), so enumerate yggterm-classed
+                // elements and read computed animationName/playState — names the running
+                // CSS keyframe animation (yggterm-tree-loading-dot, yggterm-remote-stage-*,
+                // yggterm-update-ellipsis-pulse, ...) driving continuous compositing.
+                const __names = {{}};
+                let __running = 0;
+                const __cands = document.querySelectorAll('[class*="yggterm"]');
+                const __limit = Math.min(__cands.length, 3000);
+                for (let __i = 0; __i < __limit; __i++) {{
+                    let __cs = null;
+                    try {{ __cs = window.getComputedStyle(__cands[__i]); }} catch (_csErr) {{ continue; }}
+                    if (!__cs) continue;
+                    const __an = String(__cs.animationName || 'none');
+                    const __ps = String(__cs.animationPlayState || 'paused');
+                    if (__an !== 'none' && __an !== '' && __ps.indexOf('running') >= 0) {{
+                        __running++;
+                        const __parts = __an.split(',');
+                        for (let __p = 0; __p < __parts.length; __p++) {{
+                            const __k = __parts[__p].trim();
+                            if (__k && __k !== 'none') __names[__k] = Number(__names[__k] || 0) + 1;
+                        }}
                     }}
-                    const __names = {{}};
-                    for (let __j = 0; __j < __running.length; __j++) {{
-                        let __n = '';
-                        try {{ __n = String(__running[__j].animationName || __running[__j].transitionProperty || (__running[__j].constructor && __running[__j].constructor.name) || 'unknown'); }} catch (_nErr) {{ __n = 'unknown'; }}
-                        __names[__n] = Number(__names[__n] || 0) + 1;
-                    }}
-                    const __diagEntry = window.__yggtermXtermHosts && window.__yggtermXtermHosts[hostId]
-                        ? window.__yggtermXtermHosts[hostId] : null;
-                    if (__diagEntry) {{
-                        __diagEntry.runningAnimationCount = __running.length;
-                        __diagEntry.runningAnimationNames = __names;
-                        __diagEntry.runningAnimationSampledAtMs = Date.now();
-                        __diagEntry.visiblePaintCounterSnapshot = Number(window.__yggtermVisiblePaintCounter || 0);
-                    }}
+                }}
+                const __diagEntry = window.__yggtermXtermHosts && window.__yggtermXtermHosts[hostId]
+                    ? window.__yggtermXtermHosts[hostId] : null;
+                if (__diagEntry) {{
+                    __diagEntry.runningAnimationCount = __running;
+                    __diagEntry.runningAnimationNames = __names;
+                    __diagEntry.runningAnimationSampledAtMs = Date.now();
+                    __diagEntry.runningAnimationCandidateCount = __limit;
+                    __diagEntry.visiblePaintCounterSnapshot = Number(window.__yggtermVisiblePaintCounter || 0);
                 }}
             }} catch (_paintDiagError) {{}}
             if (!terminalNeedsPassiveFocusRecovery()) {{
