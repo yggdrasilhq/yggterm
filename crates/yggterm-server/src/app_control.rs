@@ -730,7 +730,39 @@ pub fn complete_app_control_request(
         )
     })?;
     let _ = fs::remove_file(inflight_path);
+    // Prune ORPHANED responses: a response is normally deleted by the CLI when it
+    // reads it (await_app_control_response), but if the client TIMED OUT before the
+    // response was written it never reads/deletes it → the file leaks forever (1177
+    // accumulated during a heavy agent-probing session). Sweep responses older than
+    // the TTL on each write so orphans can't accumulate unboundedly. Cheap + bounded.
+    prune_stale_app_control_responses(&responses_dir, APP_CONTROL_RESPONSE_ORPHAN_TTL);
     Ok(response_path)
+}
+
+const APP_CONTROL_RESPONSE_ORPHAN_TTL: Duration = Duration::from_secs(120);
+
+/// Remove app-control response files older than `ttl` — orphans whose client timed
+/// out before reading them (the read path deletes the rest). Best-effort.
+fn prune_stale_app_control_responses(responses_dir: &Path, ttl: Duration) {
+    let Ok(entries) = fs::read_dir(responses_dir) else {
+        return;
+    };
+    let now = SystemTime::now();
+    for entry in entries.filter_map(Result::ok) {
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+            continue;
+        }
+        let stale = entry
+            .metadata()
+            .and_then(|meta| meta.modified())
+            .ok()
+            .and_then(|modified| now.duration_since(modified).ok())
+            .is_some_and(|age| age > ttl);
+        if stale {
+            let _ = fs::remove_file(&path);
+        }
+    }
 }
 
 pub fn wait_for_app_control_response(
