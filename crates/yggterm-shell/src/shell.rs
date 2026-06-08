@@ -171,7 +171,8 @@ use yggterm_server::{
     SessionPreviewBlock, SessionRenderedSection, SessionSource, SnapshotSessionView,
     SshConnectTarget, TerminalBackend, TerminalLaunchPhase, WorkspaceViewMode,
     YGG_LOADING_NOTIFICATION_AFTER_MS, YggOperationPriority, YggRequestMeta, YggSurface, YggTarget,
-    YggtermServer, app_control_requests_pending_for_worker, cleanup_legacy_daemons,
+    YggtermServer, app_control_pending_render_needed_for_worker,
+    app_control_requests_pending_for_worker, cleanup_legacy_daemons,
     complete_app_control_request, connect_ssh_custom, enqueue_app_control_request,
     fetch_remote_generation_context, focus_live_with_view, hot_restart,
     local_headless_companion_executable_from_current, managed_cli_refresh_ttl_ms,
@@ -38108,8 +38109,20 @@ fn app() -> Element {
                     let pending =
                         app_control_requests_pending_for_worker(&trace_home, std::process::id());
                     if pending {
+                        // Always WAKE so the request is processed (the Poll-event handler
+                        // drains it independently of any render). Only FORCE a shell
+                        // re-render for MUTATING commands — read-only probes (screenshot /
+                        // state / buffer reads) must not re-render the whole giant shell
+                        // tree (the ~4-renders-per-probe churn from the DOM-leak
+                        // investigation). Mutating commands self-render via their state
+                        // writes anyway. See AppControlCommand::is_read_only.
                         wake_app_control();
-                        schedule_ui_update();
+                        if app_control_pending_render_needed_for_worker(
+                            &trace_home,
+                            std::process::id(),
+                        ) {
+                            schedule_ui_update();
+                        }
                     }
                     thread::sleep(Duration::from_millis(if pending {
                         APP_CONTROL_ACTIVE_POLL_MS
