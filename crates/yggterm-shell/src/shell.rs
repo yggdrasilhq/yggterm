@@ -38241,8 +38241,10 @@ fn app() -> Element {
                                 "pid": std::process::id(),
                             }),
                         );
-                        if app_control_requests_pending_for_worker(&trace_home, std::process::id())
-                        {
+                        if app_control_pending_render_needed_for_worker(
+                            &trace_home,
+                            std::process::id(),
+                        ) {
                             schedule_ui_update();
                         }
                     }
@@ -38315,7 +38317,7 @@ fn app() -> Element {
                 }
                 app_control_drain_in_flight.store(false, Ordering::SeqCst);
                 app_control_drain_started_ms.store(0, Ordering::SeqCst);
-                if app_control_requests_pending_for_worker(&trace_home, std::process::id()) {
+                if app_control_pending_render_needed_for_worker(&trace_home, std::process::id()) {
                     schedule_ui_update();
                 }
             });
