@@ -12,6 +12,7 @@ use yggterm_core::{
 use yggterm_server::{
     AppControlRightPanelMode, AppControlViewMode, ProbeTerminalViewportInputMode,
     RemoteDeployState, RemoteMachineHealth, RemoteMachineSnapshot, RemoteScannedSession,
+    ScreenshotPostProcess,
     SessionKind, SshConnectTarget, default_endpoint, detect_ghostty_host,
     ensure_local_daemon_running, fetch_remote_generation_context,
     persist_remote_generated_copy_with_options, ping, run_app_control_background_window,
@@ -40,8 +41,10 @@ use yggterm_server::{
     run_app_control_set_tree_selection, run_app_control_set_window_chrome_hover,
     run_app_control_show_start_page, run_app_control_start_action,
     run_app_control_trigger_update_check, run_attach, run_daemon, run_screenrecord_capture,
-    run_screenshot_capture, run_trace_bundle, run_trace_follow, run_trace_tail,
-    scan_remote_machine_sessions_for_target, shutdown, snapshot, status, terminal_restart,
+    run_screenshot_capture, run_screenshot_capture_with_post_process, run_trace_bundle,
+    run_trace_follow, run_trace_tail,
+    scan_remote_machine_sessions_for_target, shutdown, snapshot, status, terminal_resize,
+    terminal_restart,
     terminal_write, try_run_remote_server_command,
 };
 
@@ -318,6 +321,35 @@ fn cli_flag_value<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
         }
     }
     None
+}
+
+/// Parse the screenshot post-process flags (`--region <name>`, `--crop x,y,w,h`,
+/// `--scale N`) into a ScreenshotPostProcess. Mirrors the GUI binary's parser so the
+/// headless CLI (what agents drive) gets the SAME crop/zoom/upscale pipeline — the
+/// "1920px-frame-is-illegible → crop + upscale the region of interest" affordance.
+/// Returns None when no post-process flags are present (capture written verbatim).
+fn screenshot_post_process_from_args(args: &[String]) -> Option<ScreenshotPostProcess> {
+    let region = cli_flag_value(args, "--region").map(str::to_string);
+    let crop = cli_flag_value(args, "--crop").and_then(|raw| {
+        let parts: Vec<u32> = raw
+            .split(',')
+            .filter_map(|piece| piece.trim().parse::<u32>().ok())
+            .collect();
+        if parts.len() == 4 {
+            Some((parts[0], parts[1], parts[2], parts[3]))
+        } else {
+            None
+        }
+    });
+    let scale = cli_flag_value(args, "--scale").and_then(|raw| raw.parse::<f32>().ok());
+    if region.is_none() && crop.is_none() && scale.is_none() {
+        return None;
+    }
+    Some(ScreenshotPostProcess {
+        region,
+        crop,
+        scale: scale.unwrap_or(1.0),
+    })
 }
 
 fn ensure_local_server_ready_for_cli(store: &SessionStore) -> Result<()> {
@@ -995,6 +1027,40 @@ fn main() -> Result<()> {
         );
         return Ok(());
     }
+    if args.len() >= 4 && args[0] == "server" && args[1] == "terminal" && args[2] == "resize" {
+        ensure_local_server_ready_for_cli(&store)?;
+        let endpoint = default_endpoint(store.home_dir());
+        let cols = cli_flag_value(&args, "--cols")
+            .and_then(|v| v.parse::<u16>().ok())
+            .context("missing/invalid --cols for server terminal resize")?;
+        let rows = cli_flag_value(&args, "--rows")
+            .and_then(|v| v.parse::<u16>().ok())
+            .context("missing/invalid --rows for server terminal resize")?;
+        // Resizing the LOCAL daemon PTY sends a SIGWINCH down the ssh channel to the
+        // remote agent CLI — the way to confirm/recover a "squish" where the remote
+        // codex is rendering at a stale smaller grid than the client (re-resume after a
+        // daemon restart). Idle codex repaints on the next frame; pass a transient
+        // off-size then the real size with `--nudge` to force a fresh SIGWINCH when the
+        // daemon PTY already matches. See finding-codex-squish-post-restart-pty-size.
+        let nudge = args.iter().any(|a| a == "--nudge");
+        if nudge {
+            let _ = terminal_resize(&endpoint, &args[3], cols.saturating_sub(1).max(1), rows.saturating_sub(1).max(1));
+            std::thread::sleep(std::time::Duration::from_millis(150));
+        }
+        let message = terminal_resize(&endpoint, &args[3], cols, rows)?;
+        println!(
+            "{}",
+            serde_json::to_string(&serde_json::json!({
+                "accepted": true,
+                "session_path": args[3],
+                "cols": cols,
+                "rows": rows,
+                "nudged": nudge,
+                "message": message,
+            }))?
+        );
+        return Ok(());
+    }
     if args.len() >= 3
         && args[0] == "server"
         && matches!(args[1].as_str(), "sessions" | "session-copy")
@@ -1049,7 +1115,15 @@ fn main() -> Result<()> {
             .skip(3)
             .find(|value| !value.starts_with("--"))
             .map(String::as_str);
-        return run_screenshot_capture(&args[2], output_path, timeout_ms);
+        return match screenshot_post_process_from_args(&args) {
+            Some(post) => run_screenshot_capture_with_post_process(
+                &args[2],
+                output_path,
+                timeout_ms,
+                post,
+            ),
+            None => run_screenshot_capture(&args[2], output_path, timeout_ms),
+        };
     }
     if args.len() >= 3 && args[0] == "server" && args[1] == "screenrecord" {
         let duration_secs = args
@@ -1156,7 +1230,15 @@ fn main() -> Result<()> {
                 let output_path = cli_positional_args(&args, 3)
                     .into_iter()
                     .find(|value| *value != target);
-                run_screenshot_capture(target, output_path, timeout_ms)
+                match screenshot_post_process_from_args(&args) {
+                    Some(post) => run_screenshot_capture_with_post_process(
+                        target,
+                        output_path,
+                        timeout_ms,
+                        post,
+                    ),
+                    None => run_screenshot_capture(target, output_path, timeout_ms),
+                }
             }
             "screenrecord" => {
                 let duration_secs = args
