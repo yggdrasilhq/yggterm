@@ -74,10 +74,22 @@ This is the README's prescribed path for D1/D4/D6-class behavioral guards.
 Run via `yggterm-headless server …` on the host (or the active launcher). Prefer
 these over screenshots.
 
-- `server snapshot` — per-session daemon view: `launch_phase`, `remote_deploy_state`,
-  **`pty_cols`/`pty_rows`** (the SQUISH gauge — the PTY's real grid), `terminal_lines`
-  (the daemon's authoritative vt100 screen, escapes inline — strip before diffing),
-  `metadata`, `ssh_target`. The "is the daemon healthy / what does it actually hold" probe.
+- `server snapshot` — the daemon view. `active_session` (and `live_sessions[]`) carry
+  per-session `launch_phase`, `remote_deploy_state`, **`pty_cols`/`pty_rows`** (the SQUISH
+  gauge — the PTY's real grid), and **`terminal_lines`** (the daemon's authoritative
+  vt100 screen, escapes inline — strip before diffing; this IS the daemon-screen ground
+  truth — there is NO separate `server terminal screen` CLI verb), `metadata`, `ssh_target`.
+  The "is the daemon healthy / what does it actually hold" probe. Parse: the JSON is
+  flat at top level (`active_session`, `live_sessions`, `remote_machines`), NOT under a
+  `data` key — but `server app …` responses ARE wrapped in `data`. Mind the difference.
+- `server app terminal reconcile <path>` (alias `reconcile-from-daemon`, since v2.8.45)
+  — **repair a squish / broken-bottom**: reads the daemon's authoritative screen and
+  replays it into the client xterm via the `daemon_screen_snapshot` path (the same
+  reconcile machinery the reveal path uses). Unlike `redraw` (renderer re-fit only) this
+  repaints CONTENT. Returns `{accepted, source, bytes, line_count, running, looked_working}`.
+  CAUTION: it re-seeds the client to the CURRENT screen → collapses base_y to 0 (drops
+  retained-replay history; harmless for codex which owns no real scrollback, but it IS a
+  buffer reset). A REPAIR tool, not a routine op — only run it on an actually-broken surface.
 - `server app state` — the active session + `active_terminal_hosts[]`: `cols`/`rows`,
   `base_y`, `viewport_y`, `scrollback_intent`, `retained_replay_source`, `text_tail`,
   `xterm_session_snapshot_nonblank_line_count`, `window_focused`/`document_focused`;
@@ -86,8 +98,10 @@ these over screenshots.
   ring (every viewport move: reason/target/base/before/after/noop) + per-host counters
   (e.g. `settleSelfHealCount`). **THE reliable instrument for scroll/jump/lock bugs** —
   push-on-move, not a pollable snapshot.
-- `server terminal screen <key>` — the daemon's authoritative vt100 screen (compare
-  vs the client's painted bottom to prove a client paint break).
+- For the daemon's authoritative vt100 screen use **`server snapshot` → `active_session.terminal_lines`**
+  (above). The `server terminal screen` and `server app terminal read-buffer` CLI verbs
+  referenced in older notes are NOT wired in the shipped headless binary (they return
+  "unsupported command") — do not rely on them; use `server snapshot` / `server app state`.
 - `server trace tail` — the event trace (daemon + `ui` events). Time-order it to see a
   reveal/reconcile/replay sequence. (Rotates — grep `~/.yggterm/trace/*.jsonl` for older.)
 - `server app rows` — browser/sidebar rows (kind, label, full_path).
