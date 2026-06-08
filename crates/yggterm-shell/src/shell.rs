@@ -31001,6 +31001,10 @@ async fn capture_dom_debug_snapshot_terminal_fallback_for(
                     low_power_tui_frame_count: mountedHost ? Number(mountedHost.lowPowerTuiFrameCount || 0) : 0,
                     render_health_status: mountedHost ? String(mountedHost.renderHealthStatus || '') : '',
                     render_health_reason: mountedHost ? String(mountedHost.renderHealthReason || '') : '',
+                    running_animation_count: mountedHost ? Number(mountedHost.runningAnimationCount || 0) : 0,
+                    running_animation_names: mountedHost ? (mountedHost.runningAnimationNames || {{}}) : {{}},
+                    running_animation_sampled_at_ms: mountedHost ? Number(mountedHost.runningAnimationSampledAtMs || 0) : 0,
+                    visible_paint_counter: mountedHost ? Number(mountedHost.visiblePaintCounterSnapshot || 0) : 0,
                     document_focused: (() => {{
                         try {{
                             return typeof document.hasFocus === 'function' ? Boolean(document.hasFocus()) : true;
