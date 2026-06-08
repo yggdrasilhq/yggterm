@@ -27427,10 +27427,6 @@ async fn capture_dom_debug_snapshot_for(active_session_path: Option<&str>) -> Va
                     forced_refresh_skipped_count: mountedHost ? Number(mountedHost.forcedRefreshSkippedCount || 0) : 0,
                     activation_repaint_count: mountedHost ? Number(mountedHost.activationRepaintCount || 0) : 0,
                     last_activation_repaint_at_ms: mountedHost ? Number(mountedHost.lastActivationRepaintAtMs || 0) : 0,
-                    running_animation_count: mountedHost ? Number(mountedHost.runningAnimationCount || 0) : 0,
-                    running_animation_names: mountedHost ? (mountedHost.runningAnimationNames || {{}}) : {{}},
-                    running_animation_sampled_at_ms: mountedHost ? Number(mountedHost.runningAnimationSampledAtMs || 0) : 0,
-                    visible_paint_counter: mountedHost ? Number(mountedHost.visiblePaintCounterSnapshot || 0) : 0,
                     last_activation_repaint_reason: mountedHost ? String(mountedHost.lastActivationRepaintReason || '') : '',
                     last_activation_repaint_key: mountedHost ? String(mountedHost.lastActivationRepaintKey || '') : '',
                     renderer_surface_missing: mountedHost ? Boolean(mountedHost.rendererSurfaceMissing) : false,
@@ -30276,10 +30272,6 @@ async fn capture_dom_debug_snapshot_terminal_quick_fallback_for(
                         last_raw_payload_sample: mountedHost ? String(mountedHost.lastRawPayloadSample || '') : '',
                         scrollback_locked: mountedHost ? Boolean(mountedHost.scrollbackLocked) : false,
                         scrollback_intent: mountedHost ? String(mountedHost.lastScrollbackIntent || 'PromptFollow') : 'PromptFollow',
-                        running_animation_count: mountedHost ? Number(mountedHost.runningAnimationCount || 0) : 0,
-                        running_animation_names: mountedHost ? (mountedHost.runningAnimationNames || {}) : {},
-                        running_animation_sampled_at_ms: mountedHost ? Number(mountedHost.runningAnimationSampledAtMs || 0) : 0,
-                        visible_paint_counter: mountedHost ? Number(mountedHost.visiblePaintCounterSnapshot || 0) : 0,
                         document_focused: (() => {
                             try {
                                 return typeof document.hasFocus === 'function' ? Boolean(document.hasFocus()) : true;
@@ -31005,10 +30997,6 @@ async fn capture_dom_debug_snapshot_terminal_fallback_for(
                     low_power_tui_frame_count: mountedHost ? Number(mountedHost.lowPowerTuiFrameCount || 0) : 0,
                     render_health_status: mountedHost ? String(mountedHost.renderHealthStatus || '') : '',
                     render_health_reason: mountedHost ? String(mountedHost.renderHealthReason || '') : '',
-                    running_animation_count: mountedHost ? Number(mountedHost.runningAnimationCount || 0) : 0,
-                    running_animation_names: mountedHost ? (mountedHost.runningAnimationNames || {{}}) : {{}},
-                    running_animation_sampled_at_ms: mountedHost ? Number(mountedHost.runningAnimationSampledAtMs || 0) : 0,
-                    visible_paint_counter: mountedHost ? Number(mountedHost.visiblePaintCounterSnapshot || 0) : 0,
                     document_focused: (() => {{
                         try {{
                             return typeof document.hasFocus === 'function' ? Boolean(document.hasFocus()) : true;
@@ -61029,10 +61017,6 @@ fn terminal_eval_script_with_canvas_renderer(
             }}, waitMs);
         }};
         const requestVisiblePaint = (forceFullRefresh = false) => {{
-            // PAINT DIAGNOSTIC (TODO-5 fan): coarse global repaint counter so the
-            // watchdog sampler can derive repaints/sec and tell whether the elevated
-            // idle WebKit CPU is JS-driven repaint churn vs CSS-animation compositing.
-            try {{ window.__yggtermVisiblePaintCounter = Number(window.__yggtermVisiblePaintCounter || 0) + 1; }} catch (_pcErr) {{}}
             pendingVisiblePaintForceFullRefresh = Boolean(
                 pendingVisiblePaintForceFullRefresh || forceFullRefresh
             );
@@ -61696,50 +61680,6 @@ fn terminal_eval_script_with_canvas_renderer(
         }} catch (_focusListenerErr) {{}}
         const inputDriftWatchdog = window.setInterval(() => {{
             runSettleSelfHeal('watchdog');
-            // PAINT DIAGNOSTIC (TODO-5 fan): on an IDLE app the WebKit renderer sits at
-            // an elevated steady CPU = continuous compositing whose source the daemon
-            // trace cannot see. document.getAnimations() lists every RUNNING web
-            // animation — if a CSS keyframe animation (e.g. yggterm-remote-stage-beam/
-            // pulse, yggterm-tree-loading-dot, yggterm-update-ellipsis-pulse) is running
-            // on an idle frame it forces continuous paint. Sample the running count +
-            // names + a coarse repaint counter onto the host entry so `server app state`
-            // can NAME the culprit instead of guessing. Read-only telemetry. Sampled once
-            // per host-tick; getAnimations() is document-global so any host's sample is
-            // representative.
-            try {{
-                // WebKitGTK lacks document.getAnimations(), so enumerate yggterm-classed
-                // elements and read computed animationName/playState — names the running
-                // CSS keyframe animation (yggterm-tree-loading-dot, yggterm-remote-stage-*,
-                // yggterm-update-ellipsis-pulse, ...) driving continuous compositing.
-                const __names = {{}};
-                let __running = 0;
-                const __cands = document.querySelectorAll('[class*="yggterm"]');
-                const __limit = Math.min(__cands.length, 3000);
-                for (let __i = 0; __i < __limit; __i++) {{
-                    let __cs = null;
-                    try {{ __cs = window.getComputedStyle(__cands[__i]); }} catch (_csErr) {{ continue; }}
-                    if (!__cs) continue;
-                    const __an = String(__cs.animationName || 'none');
-                    const __ps = String(__cs.animationPlayState || 'paused');
-                    if (__an !== 'none' && __an !== '' && __ps.indexOf('running') >= 0) {{
-                        __running++;
-                        const __parts = __an.split(',');
-                        for (let __p = 0; __p < __parts.length; __p++) {{
-                            const __k = __parts[__p].trim();
-                            if (__k && __k !== 'none') __names[__k] = Number(__names[__k] || 0) + 1;
-                        }}
-                    }}
-                }}
-                const __diagEntry = window.__yggtermXtermHosts && window.__yggtermXtermHosts[hostId]
-                    ? window.__yggtermXtermHosts[hostId] : null;
-                if (__diagEntry) {{
-                    __diagEntry.runningAnimationCount = __running;
-                    __diagEntry.runningAnimationNames = __names;
-                    __diagEntry.runningAnimationSampledAtMs = Date.now();
-                    __diagEntry.runningAnimationCandidateCount = __limit;
-                    __diagEntry.visiblePaintCounterSnapshot = Number(window.__yggtermVisiblePaintCounter || 0);
-                }}
-            }} catch (_paintDiagError) {{}}
             if (!terminalNeedsPassiveFocusRecovery()) {{
                 return;
             }}
