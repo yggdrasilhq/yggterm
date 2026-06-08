@@ -14928,6 +14928,20 @@ pub fn run_screenshot_capture_with_post_process(
         other => anyhow::bail!("unsupported screenshot target: {other}"),
     };
     let mut response = response;
+    // The in-process xterm canvas composite (capture_backend=xterm_canvas_composite)
+    // IS already the terminal screen, so a `--region terminal` crop (which derives a
+    // rect in FULL-WINDOW coords from app state) would crop the wrong area. Drop the
+    // region in that case; keep any explicit crop + scale.
+    let mut post = post;
+    let backend_is_terminal_composite = response
+        .data
+        .as_ref()
+        .and_then(|v| v.get("capture_backend"))
+        .and_then(serde_json::Value::as_str)
+        == Some("xterm_canvas_composite");
+    if backend_is_terminal_composite && post.region.as_deref() == Some("terminal") && post.crop.is_none() {
+        post.region = None;
+    }
     if !post.is_noop() {
         if let Some(path) = response.output_path.clone() {
             match apply_screenshot_post_process(&home, std::path::Path::new(&path), &post) {
