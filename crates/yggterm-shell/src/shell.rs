@@ -164,6 +164,7 @@ use yggterm_server::{
     AppControlCommand, AppControlDragCommand, AppControlDragPlacement, AppControlKeyCommand,
     AppControlPointerCommand, AppControlPreviewLayout, AppControlResponse,
     AppControlRightPanelMode, AppControlStartAction, AppControlViewMode, GhosttyTerminalHostMode,
+    ScreenshotTarget,
     ManagedSessionView, PersistedDaemonState, PreviewTone, ProbeTerminalViewportInputMode,
     RemoteDeployState, RemoteMachineHealth, RemoteMachineSnapshot, RemoteScannedSession,
     ServerEndpoint, ServerRuntimeStatus, ServerUiSnapshot, SessionKind, SessionMetadataEntry,
@@ -33800,6 +33801,119 @@ async fn reconcile_terminal_from_daemon_for(
         "looked_working": looked_working,
     })
 }
+/// IN-PROCESS faithful terminal capture: composite the active xterm host's own
+/// `<canvas>` layers into one offscreen 2D canvas and read it back via toDataURL.
+///
+/// WHY this exists / supersedes Spectacle for the terminal: the yggui app-control
+/// screenshot is a WebKitGTK `get_snapshot` of our own webview — cross-platform and
+/// self-capturing (the intended design) BUT BLIND to the GPU-accelerated xterm
+/// `<canvas>` (with the canvas renderer on, the terminal region comes back
+/// blank/stale). The Spectacle pathway was bolted on to recover those pixels, but
+/// it grabs the COMPOSITOR's active window, so it only works when yggterm is the
+/// focused window — which it never is when an AGENT drives the capture over SSH
+/// (the agent's own terminal holds focus → privacy gate skips Spectacle → blind
+/// webkit fallback). xterm's CanvasAddon uses 2D canvases, which are same-origin
+/// and readable via toDataURL with NO compositor, NO window focus, NO privacy gate
+/// — faithful on every platform. Returns the PNG written verdict, or None to fall
+/// through to the platform capture. See feedback-verify-visual-with-faithful-pixel.
+async fn capture_active_terminal_canvas_composite(output_path: &Path) -> Option<Value> {
+    // No format!/interpolation → plain raw string (no brace-doubling needed).
+    // The value MUST be returned via dioxus.send (receive_probe_eval_value reads the
+    // send channel, NOT the script's return value) — a plain `return` hangs the recv.
+    let script = r#"
+        (() => {
+            const send = (v) => { try { dioxus.send(v); } catch (_e) {} };
+            try {
+                const registry = window.__yggtermXtermHosts || {};
+                const entries = Object.values(registry).filter((e) => e && e.term);
+                const isVisible = (e) => {
+                    const h = document.getElementById(e.hostId);
+                    if (!h) { return false; }
+                    const r = h.getBoundingClientRect();
+                    const s = window.getComputedStyle(h);
+                    return r.width > 0 && r.height > 0 && s.display !== 'none' && s.visibility !== 'hidden';
+                };
+                const entry = entries.filter(isVisible).sort((a, b) => (b.mountedAt || 0) - (a.mountedAt || 0))[0]
+                    || entries[0];
+                if (!entry) { send({ ok: false, reason: 'no_terminal_host' }); return; }
+                const host = document.getElementById(entry.hostId);
+                if (!host) { send({ ok: false, reason: 'host_element_missing' }); return; }
+                const screen = host.querySelector('.xterm-screen') || host;
+                const rect = screen.getBoundingClientRect();
+                const dpr = window.devicePixelRatio || 1;
+                const W = Math.max(1, Math.round(rect.width * dpr));
+                const H = Math.max(1, Math.round(rect.height * dpr));
+                const out = document.createElement('canvas');
+                out.width = W; out.height = H;
+                const ctx = out.getContext('2d');
+                if (!ctx) { send({ ok: false, reason: 'no_2d_context' }); return; }
+                let bg = '';
+                try { bg = window.getComputedStyle(screen).backgroundColor || ''; } catch (_e) {}
+                if (!bg || bg === 'rgba(0, 0, 0, 0)' || bg === 'transparent') {
+                    try { bg = window.getComputedStyle(host).backgroundColor || ''; } catch (_e) {}
+                }
+                ctx.fillStyle = (bg && bg !== 'rgba(0, 0, 0, 0)' && bg !== 'transparent') ? bg : '#000000';
+                ctx.fillRect(0, 0, W, H);
+                // Draw every canvas layer (xterm text/selection/link/cursor + our
+                // software overlays) in DOM order at its offset within the screen.
+                const canvases = Array.from(host.querySelectorAll('canvas'));
+                let drawn = 0;
+                for (const c of canvases) {
+                    try {
+                        if (!c.width || !c.height) { continue; }
+                        const cr = c.getBoundingClientRect();
+                        const dx = (cr.left - rect.left) * dpr;
+                        const dy = (cr.top - rect.top) * dpr;
+                        const dw = cr.width * dpr;
+                        const dh = cr.height * dpr;
+                        ctx.drawImage(c, dx, dy, dw, dh);
+                        drawn += 1;
+                    } catch (_e) {}
+                }
+                const dataUrl = out.toDataURL('image/png');
+                send({
+                    ok: true,
+                    dataUrl,
+                    width: W,
+                    height: H,
+                    layers: drawn,
+                    canvas_count: canvases.length,
+                    session_path: String(entry.sessionPath || ''),
+                });
+            } catch (error) {
+                send({ ok: false, reason: (error && error.message) ? error.message : String(error) });
+            }
+        })()
+    "#;
+    let value = receive_probe_eval_value(script, "").await;
+    if value.get("ok").and_then(Value::as_bool) != Some(true) {
+        return Some(json!({
+            "ok": false,
+            "reason": value.get("reason").and_then(Value::as_str).unwrap_or("composite_failed"),
+        }));
+    }
+    let data_url = value.get("dataUrl").and_then(Value::as_str)?;
+    let b64 = data_url
+        .strip_prefix("data:image/png;base64,")
+        .unwrap_or(data_url);
+    let bytes = match BASE64_STANDARD.decode(b64.as_bytes()) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            return Some(json!({ "ok": false, "reason": format!("base64_decode: {error}") }));
+        }
+    };
+    if let Err(error) = std::fs::write(output_path, &bytes) {
+        return Some(json!({ "ok": false, "reason": format!("write_png: {error}") }));
+    }
+    Some(json!({
+        "ok": true,
+        "bytes": bytes.len(),
+        "width": value.get("width").cloned().unwrap_or(Value::Null),
+        "height": value.get("height").cloned().unwrap_or(Value::Null),
+        "layers": value.get("layers").cloned().unwrap_or(Value::Null),
+        "canvas_count": value.get("canvas_count").cloned().unwrap_or(Value::Null),
+    }))
+}
 async fn refresh_runtime_status_for_app_control(
     state: Signal<ShellState>,
     reason: &'static str,
@@ -34252,6 +34366,56 @@ async fn process_pending_app_control_requests(
         } => {
             let dom_snapshot =
                 capture_dom_debug_snapshot_for_or_empty(active_session_path.as_deref()).await;
+            // FAITHFUL TERMINAL CAPTURE (in-process, cross-platform, focus-independent):
+            // when the GPU canvas renderer is on, the WebKit/Spectacle paths are either
+            // blind to the canvas (webkit) or need window focus the agent can't hold over
+            // SSH (spectacle). Composite the xterm canvas layers directly via toDataURL.
+            // Only for App target + an active terminal; any failure falls through to the
+            // platform capture below. The image IS the terminal screen, so the CLI marks
+            // capture_backend=xterm_canvas_composite and skips the redundant region crop.
+            let canvas_composite = if matches!(target, ScreenshotTarget::App)
+                && terminal_xterm_canvas_renderer_enabled()
+                && state.read().server.active_view_mode() == WorkspaceViewMode::Terminal
+            {
+                capture_active_terminal_canvas_composite(Path::new(&output_path)).await
+            } else {
+                None
+            };
+            if let Some(composite) = canvas_composite
+                .as_ref()
+                .filter(|v| v.get("ok").and_then(Value::as_bool) == Some(true))
+            {
+                AppControlResponse {
+                    request_id: request.request_id.clone(),
+                    handled_by_pid: std::process::id(),
+                    completed_at_ms: current_millis() as u128,
+                    output_path: Some(output_path.clone()),
+                    data: Some(json!({
+                        "command": "capture_screenshot",
+                        "target": target,
+                        "window": describe_window(&desktop),
+                        "active_view_mode": format!("{:?}", state.read().server.active_view_mode()),
+                        "active_session_path": state.read().server.active_session_path(),
+                        "capture_backend": "xterm_canvas_composite",
+                        "capture_backend_attempts": Vec::<String>::new(),
+                        "capture_faithful": true,
+                        "capture_faithful_reason": "in-process composite of the xterm canvas layers (toDataURL) — captures the GPU canvas without a compositor or window focus",
+                        "capture_is_terminal_region": true,
+                        "canvas_composite": composite,
+                        "dom": dom_snapshot,
+                    })),
+                    error: None,
+                }
+            } else {
+            if let Some(failed) = canvas_composite.as_ref() {
+                append_trace_event(
+                    &home,
+                    "ui",
+                    "app_control",
+                    "xterm_canvas_composite_fell_through",
+                    json!({ "reason": failed.get("reason") }),
+                );
+            }
             match capture_visible_app_surface(
                 &desktop,
                 Path::new(&output_path),
@@ -34287,6 +34451,7 @@ async fn process_pending_app_control_requests(
                     data: None,
                     error: Some(error.to_string()),
                 },
+            }
             }
         }
         AppControlCommand::ScrollPreview { top_px, ratio } => {
