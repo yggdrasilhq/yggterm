@@ -14315,13 +14315,13 @@ fn client_instance_record_matches_live_process(record: &ClientInstanceRecord) ->
 }
 
 fn app_control_command_requires_explicit_target(command: &AppControlCommand) -> bool {
-    !matches!(
-        command,
-        AppControlCommand::DescribeState
-            | AppControlCommand::DescribeRows
-            | AppControlCommand::CaptureScreenshot { .. }
-            | AppControlCommand::CaptureScreenRecording { .. }
-    )
+    // SSOT: "does this command mutate state" lives in AppControlCommand::is_read_only().
+    // A read-only (pure-observation) command can target the newest GUI without an
+    // explicit --pid; a mutating one must be explicitly targeted. Deriving from the one
+    // owner stops this from drifting out of sync with the render-gating use of the same
+    // concept (it had: ReadTerminalBuffer was missing here, so a buffer read wrongly
+    // required an explicit target — fixed by the single definition).
+    !command.is_read_only()
 }
 
 fn requested_app_control_pid_from_env() -> Option<u32> {
