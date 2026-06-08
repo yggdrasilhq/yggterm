@@ -257,6 +257,22 @@ static ALLOCATOR_TRIM_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
 static LAST_ALLOCATOR_TRIM_CHECK_MS: AtomicU64 = AtomicU64::new(0);
 static LAST_ALLOCATOR_TRIM_MS: AtomicU64 = AtomicU64::new(0);
 static RENDER_TRACE_ENABLED: OnceLock<bool> = OnceLock::new();
+// Render-cause probe v3: previous render's per-field fingerprint, so app() can
+// emit which ShellState field / epoch changed between consecutive renders (and
+// flag "unattributed" forced wakers). Gated behind YGGTERM_TRACE_RENDER=1.
+static RENDER_CAUSE_PREV: OnceCell<Mutex<Vec<(&'static str, u64)>>> = OnceCell::new();
+// Render-cause probe v3: count forced root re-renders (schedule_update/needs_update
+// wakers that fire with no signal mutation). Folded into the fingerprint as
+// "forced_wakes" so a render attributed ONLY to it is a true waker, vs a render
+// with changed.is_empty() AND no forced-wake delta = an untracked use_signal.
+static FORCED_WAKE_TOTAL: AtomicU64 = AtomicU64::new(0);
+// Render-cause probe v3.2: count every safe_shell_mut (the state.with_mut funnel
+// that marks the ShellState signal dirty → re-renders the root regardless of
+// which field changed) by its &'static str context label. Total folded into the
+// fingerprint as "shellstate_mut"; per-context histogram emitted each render so
+// the hot write reasons during a load are nameable. Gated YGGTERM_TRACE_RENDER=1.
+static SHELLSTATE_MUT_TOTAL: AtomicU64 = AtomicU64::new(0);
+static SHELLSTATE_MUT_HIST: OnceCell<Mutex<HashMap<&'static str, u64>>> = OnceCell::new();
 static APP_INSTANCE_ID_SEQ: AtomicU64 = AtomicU64::new(1);
 static PRIMARY_APP_INSTANCE_ID: AtomicU64 = AtomicU64::new(0);
 static DAEMON_ENSURE_IN_FLIGHT: OnceCell<Mutex<HashSet<String>>> = OnceCell::new();
@@ -456,6 +472,11 @@ const TERMINAL_INPUT_HOT_SUPPRESS_MS: u64 = 2_000;
 // churn during controlled input updates cannot commit a half-typed label.
 const TERMINAL_BUSY_HINT_MS: u64 = 650;
 const TERMINAL_CODEX_ACTIVITY_HINT_MS: u64 = 6_000;
+// Minimum interval between cosmetic sidebar live-preview writes per session.
+// The sidebar sample insert re-renders the whole App root; the preview is
+// display-only so a few-times-per-second refresh is visually identical while
+// sparing the root a re-render on every HostHealth emit during a load.
+const SIDEBAR_SAMPLE_MIN_WRITE_INTERVAL_MS: u64 = 750;
 const CODEX_COMPLETION_NOTIFICATION_MIN_BUSY_MS: u64 = 10_000;
 const TITLEBAR_HEIGHT_PX: f64 = 32.0;
 const TITLEBAR_RESPONSIVE_CSS: &str = r#"
@@ -9239,6 +9260,15 @@ fn safe_shell_mut<R>(
     context: &'static str,
     operation: impl FnOnce(&mut ShellState) -> R,
 ) -> std::thread::Result<R> {
+    if render_trace_enabled() {
+        SHELLSTATE_MUT_TOTAL.fetch_add(1, Ordering::SeqCst);
+        if let Ok(mut hist) = SHELLSTATE_MUT_HIST
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+        {
+            *hist.entry(context).or_insert(0) += 1;
+        }
+    }
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| state.with_mut(operation))).map_err(
         |error| {
             warn!(%context, panic_payload=?error, "suppressed shell state panic");
@@ -37694,6 +37724,109 @@ fn render_trace_enabled() -> bool {
             .is_some_and(|value| matches!(value, "1" | "true" | "TRUE" | "yes" | "YES"))
     })
 }
+// Per-field fingerprint of the ShellState fields most likely to churn during
+// terminal streaming, plus the epoch signals app() subscribes to. Diffed
+// render-over-render to name which field forced the whole-root re-render. Only
+// called when render_trace_enabled() — the hashing cost is debug-only.
+fn render_cause_field_hashes(
+    shell: &ShellState,
+    async_render_epoch: u64,
+    window_epoch: u64,
+) -> Vec<(&'static str, u64)> {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    fn map_str_u64(m: &HashMap<String, u64>) -> u64 {
+        let mut entries: Vec<(&String, &u64)> = m.iter().collect();
+        entries.sort_by(|a, b| a.0.cmp(b.0));
+        let mut s = DefaultHasher::new();
+        for (k, v) in entries {
+            k.hash(&mut s);
+            v.hash(&mut s);
+        }
+        s.finish()
+    }
+    fn sidebar_samples_hash(m: &HashMap<String, LiveTerminalSidebarSample>) -> u64 {
+        let mut entries: Vec<(&String, &LiveTerminalSidebarSample)> = m.iter().collect();
+        entries.sort_by(|a, b| a.0.cmp(b.0));
+        let mut s = DefaultHasher::new();
+        for (k, v) in entries {
+            k.hash(&mut s);
+            v.cursor_line_text.hash(&mut s);
+            v.text_tail.hash(&mut s);
+        }
+        s.finish()
+    }
+    fn h<T: Hash>(v: &T) -> u64 {
+        let mut s = DefaultHasher::new();
+        v.hash(&mut s);
+        s.finish()
+    }
+    fn telemetry_hash(m: &HashMap<String, (String, u64)>) -> u64 {
+        let mut entries: Vec<(&String, &(String, u64))> = m.iter().collect();
+        entries.sort_by(|a, b| a.0.cmp(b.0));
+        let mut s = DefaultHasher::new();
+        for (k, (v, t)) in entries {
+            k.hash(&mut s);
+            v.hash(&mut s);
+            t.hash(&mut s);
+        }
+        s.finish()
+    }
+    vec![
+        ("forced_wakes", FORCED_WAKE_TOTAL.load(Ordering::SeqCst)),
+        ("shellstate_mut", SHELLSTATE_MUT_TOTAL.load(Ordering::SeqCst)),
+        ("epoch_async_render", async_render_epoch),
+        ("epoch_window", window_epoch),
+        ("busy_hint_until", map_str_u64(&shell.terminal_busy_hint_until_ms)),
+        (
+            "sidebar_samples",
+            sidebar_samples_hash(&shell.live_terminal_sidebar_samples),
+        ),
+        ("input_hot_until", shell.terminal_input_hot_until_ms),
+        (
+            "snapshot_apply_count",
+            shell.background_live_session_snapshot_apply_count,
+        ),
+        (
+            "snapshot_skipped_input_hot",
+            shell.background_live_session_snapshot_skipped_input_hot_count,
+        ),
+        (
+            "snapshot_skipped_noop",
+            shell.background_live_session_snapshot_skipped_noop_count,
+        ),
+        ("notifications_len", shell.notifications.len() as u64),
+        ("last_action", h(&shell.last_action)),
+        ("last_terminal_debug", h(&shell.last_terminal_debug)),
+        ("last_tree_debug", h(&shell.last_tree_debug)),
+        ("recent_ui_telemetry", telemetry_hash(&shell.recent_ui_telemetry)),
+        (
+            "cached_hot_views_len",
+            shell.cached_hot_session_views.len() as u64,
+        ),
+        ("busy_request_id", h(&shell.busy_request_id)),
+        (
+            "active_surface_requests_len",
+            shell.active_surface_requests.len() as u64,
+        ),
+        ("server_busy", shell.server_busy as u64),
+        ("active_terminal_host_id", h(&shell.active_terminal_host_id)),
+        ("terminal_mount_epochs", map_str_u64(&shell.terminal_mount_epochs)),
+        (
+            "terminal_resume_ready_len",
+            shell.terminal_resume_ready_paths.len() as u64,
+        ),
+        (
+            "latest_runtime_status",
+            h(&shell.latest_runtime_status.is_some()),
+        ),
+        (
+            "active_copy_hydration_len",
+            shell.active_copy_hydration_in_flight.len() as u64,
+        ),
+        ("server_daemon_detail", h(&shell.server_daemon_detail)),
+    ]
+}
 fn app() -> Element {
     let bootstrap = BOOTSTRAP
         .get()
@@ -37785,6 +37918,62 @@ fn app() -> Element {
         use_hook(|| Arc::new(AtomicBool::new(false))).clone();
     let mut window_epoch = use_signal(|| 0_u64);
     let async_render_epoch = use_signal(|| 0_u64);
+    if render_trace_enabled() {
+        let async_epoch_val = *async_render_epoch.peek();
+        let window_epoch_val = *window_epoch.peek();
+        if let Some(current) = safe_shell_read(state, "render_cause_fingerprint", |shell| {
+            render_cause_field_hashes(shell, async_epoch_val, window_epoch_val)
+        }) {
+            let prev_lock = RENDER_CAUSE_PREV.get_or_init(|| Mutex::new(Vec::new()));
+            if let Ok(mut prev) = prev_lock.lock() {
+                let first = prev.is_empty();
+                let changed: Vec<&'static str> = current
+                    .iter()
+                    .filter(|(name, hash)| {
+                        prev.iter()
+                            .find(|(pname, _)| pname == name)
+                            .map(|(_, phash)| phash != hash)
+                            .unwrap_or(true)
+                    })
+                    .map(|(name, _)| *name)
+                    .collect();
+                *prev = current;
+                drop(prev);
+                append_trace_event(
+                    &trace_home,
+                    "ui",
+                    "startup",
+                    "app_root_render_cause",
+                    json!({
+                        "pid": std::process::id(),
+                        "count": render_count,
+                        "changed": changed,
+                        "unattributed": !first && changed.is_empty(),
+                        "first": first,
+                    }),
+                );
+                if let Some(hist) = SHELLSTATE_MUT_HIST.get() {
+                    if let Ok(hist) = hist.lock() {
+                        let snapshot: serde_json::Map<String, Value> = hist
+                            .iter()
+                            .map(|(k, v)| ((*k).to_string(), json!(*v)))
+                            .collect();
+                        append_trace_event(
+                            &trace_home,
+                            "ui",
+                            "startup",
+                            "shell_mut_hist",
+                            json!({
+                                "pid": std::process::id(),
+                                "count": render_count,
+                                "hist": Value::Object(snapshot),
+                            }),
+                        );
+                    }
+                }
+            }
+        }
+    }
     let mut last_startup_terminal_restore_path = use_signal(|| None::<String>);
     let mut last_startup_terminal_recovery_path = use_signal(|| None::<String>);
     let mut last_terminal_mount_key = use_signal(|| None::<String>);
@@ -37794,6 +37983,15 @@ fn app() -> Element {
     let mut last_sidebar_bounds_repair_key = use_signal(|| None::<String>);
     let mut last_tree_rename_focus_path = use_signal(|| None::<String>);
     let schedule_ui_update = schedule_update();
+    let schedule_ui_update: std::sync::Arc<dyn Fn() + Send + Sync> = if render_trace_enabled() {
+        let inner = schedule_ui_update;
+        std::sync::Arc::new(move || {
+            FORCED_WAKE_TOTAL.fetch_add(1, Ordering::SeqCst);
+            inner();
+        })
+    } else {
+        schedule_ui_update
+    };
     if !browser_tree_refresh_loop_started.swap(true, Ordering::SeqCst) {
         spawn_forever(async move {
             loop {
@@ -48470,6 +48668,15 @@ fn TerminalCanvas(
             let mut last_host_health_rows = 0_u16;
             let mut last_host_health_blank_rows_below_cursor = 0_u16;
             let mut last_host_health_render_problem = String::new();
+            // Per-session throttle for the cosmetic sidebar live-preview write.
+            // The sidebar sample insert (terminal_attach_host_health_sample) is
+            // the dominant root re-render driver during a load (~67% of
+            // ShellState writes, measured 2026-06-09): on a chunky remote load
+            // (not frame_like_hot) it fires on EVERY HostHealth emit. The
+            // preview is display-only, so refreshing it at most a few times/sec
+            // is visually identical to the user but spares the 53-read App root
+            // a re-render per emit. See [[campaign-xterm-dealbreakers]] load-churn.
+            let mut last_sidebar_sample_write_ms = 0_u64;
             let mut last_runtime_running = session_launch_phase_running;
             let mut pending_terminal_input_has_text = false;
             let mut input_echo_read_burst_remaining = 0_u8;
@@ -49254,7 +49461,10 @@ fn TerminalCanvas(
                                 if terminal_host_health_should_update_sidebar_sample(
                                     host_health_sample_changed,
                                     frame_like_hot,
+                                    current_millis(),
+                                    last_sidebar_sample_write_ms,
                                 ) {
+                                    last_sidebar_sample_write_ms = current_millis();
                                     let _ = safe_shell_mut(
                                         state,
                                         "terminal_attach_host_health_sample",
@@ -53792,8 +54002,12 @@ fn terminal_frame_style(fullscreen: bool) -> TerminalFrameStyle {
 fn terminal_host_health_should_update_sidebar_sample(
     sample_changed: bool,
     frame_like_hot: bool,
+    now_ms: u64,
+    last_write_ms: u64,
 ) -> bool {
-    sample_changed && !frame_like_hot
+    sample_changed
+        && !frame_like_hot
+        && now_ms.saturating_sub(last_write_ms) >= SIDEBAR_SAMPLE_MIN_WRITE_INTERVAL_MS
 }
 fn terminal_host_health_should_mark_sidebar_busy(
     codex_like_session: bool,
@@ -99191,14 +99405,36 @@ Shared connection to 192.0.2.14 closed.\r\n";
 
     #[test]
     fn terminal_host_health_sidebar_samples_skip_hot_tui_frames() {
+        // Far past the throttle interval so only sample_changed/frame_like_hot gate.
+        let now = SIDEBAR_SAMPLE_MIN_WRITE_INTERVAL_MS * 10;
         assert!(terminal_host_health_should_update_sidebar_sample(
-            true, false
+            true, false, now, 0
         ));
         assert!(!terminal_host_health_should_update_sidebar_sample(
-            true, true
+            true, true, now, 0
         ));
         assert!(!terminal_host_health_should_update_sidebar_sample(
-            false, false
+            false, false, now, 0
+        ));
+    }
+
+    #[test]
+    fn terminal_host_health_sidebar_sample_write_throttled_per_session() {
+        let last = 1_000_u64;
+        // A changed sample within the throttle window is suppressed (the preview
+        // is cosmetic; this spares the App root a re-render per HostHealth emit).
+        assert!(!terminal_host_health_should_update_sidebar_sample(
+            true,
+            false,
+            last + SIDEBAR_SAMPLE_MIN_WRITE_INTERVAL_MS - 1,
+            last
+        ));
+        // Once the interval elapses, the write is allowed again.
+        assert!(terminal_host_health_should_update_sidebar_sample(
+            true,
+            false,
+            last + SIDEBAR_SAMPLE_MIN_WRITE_INTERVAL_MS,
+            last
         ));
     }
 
