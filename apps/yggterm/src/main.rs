@@ -952,7 +952,7 @@ fn main() -> Result<()> {
         let endpoint = default_endpoint(store.home_dir());
         let retained = args.iter().any(|arg| arg == "--retained");
         let raw = args.iter().any(|arg| arg == "--raw");
-        let (text, running, runtime_output_seen, post_resize_output_seen, last_resize_seq) =
+        let (text, running, runtime_output_seen, post_resize_output_seen, last_resize_seq, _runtime_spawn_id) =
             if retained {
                 terminal_retained_snapshot(&endpoint, &args[3])?
             } else {
