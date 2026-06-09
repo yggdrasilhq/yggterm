@@ -59812,6 +59812,12 @@ fn terminal_eval_script_with_canvas_renderer(
         // suppression that also swallowed genuine scroll-ups during output (defect #1).
         let programmaticScrollInProgress = false;
         let lastObservedScrollYdisp = 0;
+        // bg→fg stuck-at-top hardening: a USER scroll-up never DECREASES baseY,
+        // while the programmatic movers the flag can miss (reset/clear reseed,
+        // row-growth fit/reflow clamp on focus-regain) drop baseY together with
+        // ydisp. Tracking baseY lets the detector reject that whole class
+        // (scroll_mode.rs user_scroll_up_detected is the tested oracle).
+        let lastObservedScrollBaseY = 0;
         let lastScrollbackIntentReason = 'initial';
         let lastScrollbackIntentAtMs = Date.now();
         let promptFollowScrollGuardUntilMs = 0;
@@ -60489,7 +60495,8 @@ fn terminal_eval_script_with_canvas_renderer(
                         reason === 'scroll_event'
                         && !programmaticScrollInProgress
                         && !promptFollowLayoutGuardActive()
-                        && viewportY + 0.5 < lastObservedScrollYdisp;
+                        && viewportY + 0.5 < lastObservedScrollYdisp
+                        && baseY + 0.5 >= lastObservedScrollBaseY;
                     const promptFollowVisualMismatchAtBottom =
                         scrollbackIntent !== 'UserScrollback'
                         && publicViewportY + 0.5 >= baseY
@@ -60519,6 +60526,7 @@ fn terminal_eval_script_with_canvas_renderer(
                     // Track the latest ydisp so the NEXT scroll event can compare
                     // direction (decrease = user scroll-up vs unchanged = passive strand).
                     lastObservedScrollYdisp = viewportY;
+                    lastObservedScrollBaseY = baseY;
                 }}
             }} catch (_error) {{
                 scrollbackLocked = false;
@@ -61059,6 +61067,7 @@ fn terminal_eval_script_with_canvas_renderer(
             // Use effectiveXtermViewportY to match syncScrollbackLock's comparison.
             try {{
                 lastObservedScrollYdisp = effectiveXtermViewportY(term.buffer.active);
+                lastObservedScrollBaseY = Math.max(0, Number(term.buffer.active.baseY || 0));
             }} catch (_error) {{}}
             programmaticScrollInProgress = _priorProgrammaticScroll;
             return debug;
@@ -76142,16 +76151,25 @@ mod tests {
         );
         assert!(
             script.contains("&& !programmaticScrollInProgress")
-                && script.contains("&& viewportY + 0.5 < lastObservedScrollYdisp;"),
+                && script.contains("&& viewportY + 0.5 < lastObservedScrollYdisp"),
             "scroll-up detection must be a non-programmatic ydisp decrease"
+        );
+        // bg→fg stuck-at-top hardening: programmatic movers the flag can miss
+        // (reset/clear reseed, row-growth reflow clamp on focus-regain) decrease
+        // baseY together with ydisp — a user scroll-up never decreases baseY, so
+        // the detector must require baseY-non-decrease (scroll_mode.rs oracle).
+        assert!(
+            script.contains("&& baseY + 0.5 >= lastObservedScrollBaseY;"),
+            "scroll-up detection must reject baseY-decreasing (reseed/reflow) moves"
         );
         assert!(
             script.contains("programmaticScrollInProgress = true;"),
             "forceXtermViewportY must flag its own moves as programmatic"
         );
         assert!(
-            script.contains("lastObservedScrollYdisp = viewportY;"),
-            "the latest ydisp must be tracked for scroll-direction comparison"
+            script.contains("lastObservedScrollYdisp = viewportY;")
+                && script.contains("lastObservedScrollBaseY = baseY;"),
+            "the latest ydisp+baseY must be tracked for scroll-direction comparison"
         );
     }
 

@@ -147,8 +147,25 @@ pub(crate) fn should_follow_now(mode: ScrollMode) -> bool {
 /// programmatically (forceXtermViewportY), which must be excluded via the
 /// `programmatic` flag. This is why a passive burst-strand (viewport below base
 /// with ydisp UNCHANGED) does NOT flip to Pinned and is re-followed instead.
-pub(crate) fn user_scroll_up_detected(prev_ydisp: i64, cur_ydisp: i64, programmatic: bool) -> bool {
-    !programmatic && cur_ydisp < prev_ydisp
+///
+/// The baseY discriminator (bg→fg stuck-at-top hardening): a USER scroll-up can
+/// never DECREASE baseY — output only grows it, and the user gesture moves the
+/// viewport, not the buffer. The programmatic movers that the `programmatic`
+/// flag can MISS (term.reset()/clear reseeds, a row-growth fit/reflow clamp on
+/// focus-regain, any direct scrollToLine not routed through forceXtermViewportY)
+/// all decrease baseY together with ydisp. Requiring baseY-non-decrease kills
+/// that whole spurious-flip class — a flip latches Pinned (UserScrollback),
+/// which gates the focus-regain follow off and leaves the session stuck at a
+/// stale offset; the periodic localStorage persist then makes the stuck intent
+/// durable across restarts.
+pub(crate) fn user_scroll_up_detected(
+    prev_ydisp: i64,
+    cur_ydisp: i64,
+    prev_base_y: i64,
+    cur_base_y: i64,
+    programmatic: bool,
+) -> bool {
+    !programmatic && cur_ydisp < prev_ydisp && cur_base_y >= prev_base_y
 }
 
 /// THE core fix: when content/layout SETTLES (replay finished, output burst
@@ -262,14 +279,30 @@ mod tests {
 
     #[test]
     fn user_scroll_up_detected_only_on_nonprogrammatic_decrease() {
-        // A real user scroll-up: ydisp decreased, not programmatic.
-        assert!(user_scroll_up_detected(100, 80, false));
+        // A real user scroll-up: ydisp decreased, baseY unchanged, not programmatic.
+        assert!(user_scroll_up_detected(100, 80, 100, 100, false));
+        // A real scroll-up DURING streaming output: baseY grew between samples.
+        assert!(user_scroll_up_detected(100, 80, 100, 130, false));
         // Programmatic move-up (forceXtermViewportY): excluded.
-        assert!(!user_scroll_up_detected(100, 80, true));
+        assert!(!user_scroll_up_detected(100, 80, 100, 100, true));
         // Passive burst-strand: ydisp UNCHANGED while baseY grows -> NOT a scroll-up.
-        assert!(!user_scroll_up_detected(80, 80, false));
+        assert!(!user_scroll_up_detected(80, 80, 80, 120, false));
         // Auto-follow on output: ydisp increased -> NOT a scroll-up.
-        assert!(!user_scroll_up_detected(80, 100, false));
+        assert!(!user_scroll_up_detected(80, 100, 80, 100, false));
+    }
+
+    #[test]
+    fn base_y_decrease_is_never_a_user_scroll_up() {
+        // bg→fg stuck-at-top hardening: programmatic movers that miss the flag
+        // (reset/clear reseed, row-growth reflow clamp on focus-regain) decrease
+        // baseY together with ydisp — never classify them as a user scroll-up.
+        // Reseed: term.reset() drops both to 0.
+        assert!(!user_scroll_up_detected(1500, 0, 1500, 0, false));
+        // Row-growth fit/reflow clamp at focus-regain: rows grew, baseY shrank,
+        // ydisp clamped down with it.
+        assert!(!user_scroll_up_detected(640, 610, 640, 610, false));
+        // Partial reseed: baseY collapsed while ydisp dropped to a small offset.
+        assert!(!user_scroll_up_detected(1801, 32, 1801, 32, false));
     }
 
     #[test]
