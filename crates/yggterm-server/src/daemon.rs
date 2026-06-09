@@ -1704,6 +1704,12 @@ pub enum ServerResponse {
         post_resize_output_seen: bool,
         #[serde(default)]
         last_resize_seq: u64,
+        // Unique id of the PTY spawn this snapshot was read from (vacuum-guard
+        // cold-re-resume signal). `serde(default)` keeps it cross-version safe:
+        // an older daemon deserializes as 0 = unknown, and the client guard
+        // fails OPEN (no guard) on 0.
+        #[serde(default)]
+        runtime_spawn_id: u64,
     },
     TerminalRetainedSnapshot {
         text: String,
@@ -1713,6 +1719,8 @@ pub enum ServerResponse {
         post_resize_output_seen: bool,
         #[serde(default)]
         last_resize_seq: u64,
+        #[serde(default)]
+        runtime_spawn_id: u64,
     },
     TerminalHistory {
         #[serde(default)]
@@ -2991,6 +2999,7 @@ impl DaemonRuntime {
                 runtime_output_seen,
                 _post_resize_output_seen,
                 _last_resize_seq,
+                _runtime_spawn_id,
             )) => {
                 if !runtime_output_seen || snapshot.trim().is_empty() {
                     return false;
@@ -4655,6 +4664,7 @@ impl DaemonRuntime {
                                 runtime_output_seen,
                                 post_resize_output_seen,
                                 last_resize_seq,
+                                runtime_spawn_id,
                             )) => {
                                 return Ok(ServerResponse::TerminalSnapshot {
                                     text,
@@ -4662,6 +4672,7 @@ impl DaemonRuntime {
                                     runtime_output_seen,
                                     post_resize_output_seen,
                                     last_resize_seq,
+                                    runtime_spawn_id,
                                 });
                             }
                             Err(error) => {
@@ -4687,6 +4698,7 @@ impl DaemonRuntime {
                         .terminals
                         .session_post_resize_output_seen(&runtime_path),
                     last_resize_seq: self.terminals.session_last_resize_seq(&runtime_path),
+                    runtime_spawn_id: self.terminals.session_runtime_spawn_id(&runtime_path),
                 }
             }
             ServerRequest::TerminalRetainedSnapshot { path } => {
@@ -4709,6 +4721,7 @@ impl DaemonRuntime {
                                 runtime_output_seen,
                                 post_resize_output_seen,
                                 last_resize_seq,
+                                runtime_spawn_id,
                             )) => {
                                 return Ok(ServerResponse::TerminalRetainedSnapshot {
                                     text,
@@ -4716,6 +4729,7 @@ impl DaemonRuntime {
                                     runtime_output_seen,
                                     post_resize_output_seen,
                                     last_resize_seq,
+                                    runtime_spawn_id,
                                 });
                             }
                             Err(error) => {
@@ -4741,6 +4755,7 @@ impl DaemonRuntime {
                         .terminals
                         .session_post_resize_output_seen(&runtime_path),
                     last_resize_seq: self.terminals.session_last_resize_seq(&runtime_path),
+                    runtime_spawn_id: self.terminals.session_runtime_spawn_id(&runtime_path),
                 }
             }
             ServerRequest::TerminalHistory { path } => {
@@ -6782,7 +6797,7 @@ pub fn terminal_read(
 pub fn terminal_snapshot(
     endpoint: &ServerEndpoint,
     path: &str,
-) -> Result<(String, bool, bool, bool, u64)> {
+) -> Result<(String, bool, bool, bool, u64, u64)> {
     match send_request(
         endpoint,
         &ServerRequest::TerminalSnapshot {
@@ -6795,12 +6810,14 @@ pub fn terminal_snapshot(
             runtime_output_seen,
             post_resize_output_seen,
             last_resize_seq,
+            runtime_spawn_id,
         } => Ok((
             text,
             running,
             runtime_output_seen,
             post_resize_output_seen,
             last_resize_seq,
+            runtime_spawn_id,
         )),
         ServerResponse::Error { message } => bail!(message),
         other => bail!("unexpected terminal snapshot response: {:?}", other),
@@ -6810,7 +6827,7 @@ pub fn terminal_snapshot(
 pub fn terminal_retained_snapshot(
     endpoint: &ServerEndpoint,
     path: &str,
-) -> Result<(String, bool, bool, bool, u64)> {
+) -> Result<(String, bool, bool, bool, u64, u64)> {
     match send_request(
         endpoint,
         &ServerRequest::TerminalRetainedSnapshot {
@@ -6823,12 +6840,14 @@ pub fn terminal_retained_snapshot(
             runtime_output_seen,
             post_resize_output_seen,
             last_resize_seq,
+            runtime_spawn_id,
         } => Ok((
             text,
             running,
             runtime_output_seen,
             post_resize_output_seen,
             last_resize_seq,
+            runtime_spawn_id,
         )),
         ServerResponse::Error { message } => bail!(message),
         other => bail!(

@@ -28,6 +28,44 @@ pub(crate) fn retained_rehydrate_allow_screen_fallback(
 ) -> bool {
     codex_like || matches!(mode, RetainedRehydrateMode::CollapsedScrollbackRecovery)
 }
+/// The minimum scrollback depth (baseY) for a client buffer to count as a "rich"
+/// transcript worth protecting from a collapse-reseed.
+pub(crate) const RICH_CLIENT_MIN_NONBLANK: u32 = 6;
+
+/// Cold-re-resume vacuum guard (sum-total run #3 redesign of the reverted 2.8.64
+/// guard): refuse a daemon-frame reseed that would VACUUM a substantially richer
+/// client buffer — but ONLY when the frame was read from a DIFFERENT runtime
+/// spawn than the one the client buffer was seeded from (`incoming_from_new_runtime`).
+///
+/// The scenario: a codex runtime exits (e.g. a system update drops the SSH
+/// transport) → the daemon cold-re-resumes it on a FRESH PTY whose vt100 screen is
+/// ~8 lines (codex repaints in place, so the conversation was NEVER in the daemon
+/// scrollback — it lives ONLY in the client xterm buffer) → reseeding the client
+/// from that sparse frame collapses the whole transcript (live-caught: base_y
+/// 1801 → 32).
+///
+/// WHY the runtime-spawn AND is load-bearing (the 2.8.64 lesson): codex daemon
+/// frames are ALWAYS small relative to an accumulated client baseY, so a blanket
+/// magnitude ratio fires on every normal codex reveal and gates the
+/// reveal-reconcile into a persistent shadow + gate notification (sum-test obs
+/// #2/#4/#5 — reverted in 2.8.65). With the spawn-id signal, a same-runtime
+/// reveal can NEVER guard; only a genuinely replaced runtime arms the ratio.
+/// Unknown spawn ids (0, e.g. older daemon or the user/agent reconcile that owns
+/// the churn decision) keep `incoming_from_new_runtime` false → fails open.
+///
+/// Failure mode is benign by construction: at worst it keeps slightly-stale rich
+/// content that the fresh runtime's next comparably-rich frame replaces normally
+/// — never a vacuum.
+pub(crate) fn retained_replay_would_vacuum_richer_client(
+    client_richness: u32,
+    incoming_richness: u32,
+    incoming_from_new_runtime: bool,
+) -> bool {
+    incoming_from_new_runtime
+        && client_richness >= RICH_CLIENT_MIN_NONBLANK
+        && incoming_richness.saturating_mul(3) < client_richness
+}
+
 pub(crate) fn retained_ready_remote_host_should_reuse_bootstrap(
     is_remote_resume_session: bool,
     retained: bool,
@@ -202,6 +240,42 @@ pub(crate) fn blank_host_snapshot_replay_from_read_should_start(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cold_re_resume_vacuum_guard_refuses_only_new_runtime_collapse() {
+        // The live-caught vacuum: client baseY 1801, fresh-PTY frame 32 lines,
+        // runtime replaced → KEEP the client.
+        assert!(retained_replay_would_vacuum_richer_client(1801, 32, true));
+        assert!(retained_replay_would_vacuum_richer_client(60, 8, true));
+        // Threshold: rich client + near-empty frame from a new runtime → guard.
+        assert!(retained_replay_would_vacuum_richer_client(
+            RICH_CLIENT_MIN_NONBLANK,
+            1,
+            true
+        ));
+        // New runtime but the frame is comparably rich → a real reconcile, allow.
+        assert!(!retained_replay_would_vacuum_richer_client(60, 55, true));
+        assert!(!retained_replay_would_vacuum_richer_client(30, 12, true));
+        // Client itself sparse (genuine blank/first reveal) → allow the replay.
+        assert!(!retained_replay_would_vacuum_richer_client(5, 0, true));
+        assert!(!retained_replay_would_vacuum_richer_client(0, 0, true));
+    }
+
+    // THE 2.8.64 REGRESSION LOCK: a SAME-runtime reveal must NEVER guard, no
+    // matter how extreme the magnitude ratio — codex daemon frames are always
+    // small vs an accumulated client baseY, and the blanket ratio gated every
+    // normal codex reveal-reconcile into a persistent shadow + gate notification
+    // (sum-test obs #2/#4/#5, reverted in 2.8.65). Unknown spawn (false) = same.
+    #[test]
+    fn same_runtime_reveal_never_guards_regardless_of_ratio() {
+        assert!(!retained_replay_would_vacuum_richer_client(1801, 32, false));
+        assert!(!retained_replay_would_vacuum_richer_client(10_000, 0, false));
+        assert!(!retained_replay_would_vacuum_richer_client(
+            RICH_CLIENT_MIN_NONBLANK,
+            1,
+            false
+        ));
+    }
 
     // XTERM-BUG: blank-viewport-client-snapshot-poison — a collapsed-scrollback
     // recovery reveal (the live switch-back/re-reveal case) OR any codex-like session
