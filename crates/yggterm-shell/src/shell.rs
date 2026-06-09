@@ -59803,6 +59803,15 @@ fn terminal_eval_script_with_canvas_renderer(
         let forcedRefreshSkippedCount = 0;
         let scrollbackLocked = false;
         let scrollbackIntent = 'PromptFollow';
+        // Working-session-cluster follow fix (finding-working-state-row-overlap):
+        // `programmaticScrollInProgress` is set synchronously around every
+        // forceXtermViewportY move so the onScroll it fires is not mistaken for a
+        // user scroll-up. `lastObservedScrollYdisp` tracks the last viewport ydisp
+        // so syncScrollbackLock can detect a user scroll-up as a NON-programmatic
+        // DECREASE (the harness-locked signal) instead of relying on output-activity
+        // suppression that also swallowed genuine scroll-ups during output (defect #1).
+        let programmaticScrollInProgress = false;
+        let lastObservedScrollYdisp = 0;
         let lastScrollbackIntentReason = 'initial';
         let lastScrollbackIntentAtMs = Date.now();
         let promptFollowScrollGuardUntilMs = 0;
@@ -60458,17 +60467,6 @@ fn terminal_eval_script_with_canvas_renderer(
         }};
         const syncScrollbackLock = (reason = '') => {{
             try {{
-                const suppressProgrammaticScrollIntent =
-                    reason === 'scroll_event'
-                    && (
-                        terminalInputHot()
-                        || promptFollowLayoutGuardActive()
-                        || Boolean(
-                            window.__yggtermXtermHosts
-                            && window.__yggtermXtermHosts[hostId]
-                            && window.__yggtermXtermHosts[hostId].writeBridgeInFlight
-                        )
-                    );
                 if (!term || !term.buffer || !term.buffer.active) {{
                     scrollbackLocked = false;
                 }} else {{
@@ -60476,6 +60474,22 @@ fn terminal_eval_script_with_canvas_renderer(
                     const viewportY = effectiveXtermViewportY(active);
                     const publicViewportY = Math.max(0, Number(active.viewportY || 0));
                     const baseY = Math.max(0, Number(active.baseY || 0));
+                    // User scroll-up detection (working-session cluster fix,
+                    // finding-working-state-row-overlap): a genuine user scroll-up is
+                    // a NON-programmatic DECREASE of the viewport ydisp. Harness-locked
+                    // (tools/xterm-harness/scroll_follow_probe.test.js): output NEVER
+                    // decreases ydisp (it auto-follows up or leaves ydisp unchanged), so
+                    // a non-programmatic decrease uniquely identifies a real scroll-up,
+                    // across ALL gestures, and it fires EVEN DURING OUTPUT — replacing
+                    // the old write-bridge/input-hot suppression that swallowed genuine
+                    // scroll-ups while streaming (defect #1). A passive burst-strand
+                    // (ydisp UNCHANGED while baseY grows) is NOT a scroll-up, so it stays
+                    // PromptFollow and the flush re-follows it instead of stranding.
+                    const userScrolledUp =
+                        reason === 'scroll_event'
+                        && !programmaticScrollInProgress
+                        && !promptFollowLayoutGuardActive()
+                        && viewportY + 0.5 < lastObservedScrollYdisp;
                     const promptFollowVisualMismatchAtBottom =
                         scrollbackIntent !== 'UserScrollback'
                         && publicViewportY + 0.5 >= baseY
@@ -60496,14 +60510,15 @@ fn terminal_eval_script_with_canvas_renderer(
                     if (!scrollbackLocked && scrollbackIntent === 'UserScrollback') {{
                         setScrollbackIntent('PromptFollow', reason ? `${{reason}}_reached_bottom` : 'reached_bottom');
                 }} else if (
-                    scrollbackLocked
+                    userScrolledUp
+                    && scrollbackLocked
                     && scrollbackIntent !== 'UserScrollback'
-                    && reason === 'scroll_event'
-                    && !promptFollowLayoutGuardActive()
-                    && !suppressProgrammaticScrollIntent
                 ) {{
                     setScrollbackIntent('UserScrollback', 'scroll_event');
                 }}
+                    // Track the latest ydisp so the NEXT scroll event can compare
+                    // direction (decrease = user scroll-up vs unchanged = passive strand).
+                    lastObservedScrollYdisp = viewportY;
                 }}
             }} catch (_error) {{
                 scrollbackLocked = false;
@@ -60902,6 +60917,11 @@ fn terminal_eval_script_with_canvas_renderer(
             return targets;
         }};
         const forceXtermViewportY = (targetViewportY, reason = '') => {{
+            // Mark every programmatic viewport move so the onScroll it fires
+            // synchronously is NOT mistaken for a user scroll-up (working-session
+            // cluster follow fix). Saved/restored to survive any nesting.
+            const _priorProgrammaticScroll = programmaticScrollInProgress;
+            programmaticScrollInProgress = true;
             const debug = {{
                 reason: String(reason || ''),
                 requested_target_viewport_y: Number(targetViewportY || 0),
@@ -61034,6 +61054,13 @@ fn terminal_eval_script_with_canvas_renderer(
                     }}
                 }}
             }} catch (_error) {{}}
+            // Record where we landed so the NEXT onScroll can tell a passive strand
+            // (ydisp unchanged while baseY grows) from a user scroll-up (ydisp down).
+            // Use effectiveXtermViewportY to match syncScrollbackLock's comparison.
+            try {{
+                lastObservedScrollYdisp = effectiveXtermViewportY(term.buffer.active);
+            }} catch (_error) {{}}
+            programmaticScrollInProgress = _priorProgrammaticScroll;
             return debug;
         }};
         // XTERM-BUG: blank-viewport-client-snapshot-poison
@@ -64661,21 +64688,26 @@ fn terminal_eval_script_with_canvas_renderer(
                 entry.writeBridgeFlushCount = Number(entry.writeBridgeFlushCount || 0) + 1;
                 lastWriteFlushStartedAtMs = Date.now();
                 entry.lastWriteFlushStartedAtMs = lastWriteFlushStartedAtMs;
-                // A retained-scrollback replay is a fresh authoritative re-seed
-                // of the buffer (daemon re-resume after a restart/handoff, or a
-                // remount). It lands the viewport at the TOP, so liveCursorNearBottom()
-                // is false and the normal follow gate would leave codex scrolled to
-                // the top with the composer below the fold ("broken bottom" + the
-                // tap-to-scroll-flicker that follows). On a fresh re-seed the user
-                // is not in scrollback, so follow the live cursor to the bottom —
-                // still yielding to an explicit UserScrollback intent / scroll lock.
-                // This guards the follow DECISION, never the low-level mover, per
+                // Follow the live bottom whenever we are in PromptFollow (Following).
+                // We intentionally do NOT gate on liveCursorNearBottom / scrollbackLocked:
+                // a Following session whose viewport fell behind during an output burst
+                // (a PASSIVE strand) MUST re-follow to catch up — that strand is the
+                // working-session "past conversation vacuumed + cursor clipped below the
+                // host" symptom (finding-working-state-row-overlap). The old
+                // liveCursorNearBottom gate stopped re-following once the gap exceeded
+                // ~rows/3, leaving the viewport permanently stranded. A GENUINE user
+                // scroll-up now reliably flips intent to UserScrollback via
+                // syncScrollbackLock's ydisp-decrease detection (works even during
+                // output), so following-on-strand never yanks a user reading scrollback.
+                // This also subsumes the retained-replay re-seed case (re-seed lands at
+                // the top with intent PromptFollow -> follow). syncScrollbackLock() is
+                // still called for its reached-bottom/lock side effects. Guards the
+                // follow DECISION, never the low-level mover, per
                 // [[audit-viewport-scroll-control-flow]]. See
-                // [[finding-codex-squish-post-restart-pty-size]].
+                // [[finding-working-state-row-overlap-scrollback-empty]].
+                syncScrollbackLock('write_flush');
                 const flushShouldFollow =
-                    scrollbackIntent !== 'UserScrollback'
-                    && !syncScrollbackLock()
-                    && (liveCursorNearBottom() || retainedScrollbackReplay);
+                    scrollbackIntent !== 'UserScrollback';
             const syncWrite = term && term._core && typeof term._core.writeSync === 'function'
                 ? term._core.writeSync.bind(term._core)
                 : entry && entry.term && entry.term._core && entry.term._core._writeBuffer && typeof entry.term._core._writeBuffer.writeSync === 'function'
@@ -76100,13 +76132,26 @@ mod tests {
             script.contains("syncScrollbackLock('scroll_event');"),
             "xterm scroll events should keep the explicit intent observable"
         );
+        // Working-session cluster fix: a user scroll-up is detected as a
+        // NON-programmatic ydisp DECREASE (fires even during output), NOT via the
+        // old write-bridge/input-hot suppression that swallowed genuine scroll-ups
+        // while streaming (defect #1). The programmatic flag excludes our own moves.
         assert!(
-            script.contains("const suppressProgrammaticScrollIntent ="),
-            "programmatic xterm writes must not masquerade as user scrollback"
+            script.contains("const userScrolledUp ="),
+            "user scroll-up must be detected by viewport-direction, not output-activity suppression"
         );
         assert!(
-            script.contains("window.__yggtermXtermHosts[hostId].writeBridgeInFlight"),
-            "write-in-flight scroll events should keep prompt-follow intent"
+            script.contains("&& !programmaticScrollInProgress")
+                && script.contains("&& viewportY + 0.5 < lastObservedScrollYdisp;"),
+            "scroll-up detection must be a non-programmatic ydisp decrease"
+        );
+        assert!(
+            script.contains("programmaticScrollInProgress = true;"),
+            "forceXtermViewportY must flag its own moves as programmatic"
+        );
+        assert!(
+            script.contains("lastObservedScrollYdisp = viewportY;"),
+            "the latest ydisp must be tracked for scroll-direction comparison"
         );
     }
 
@@ -76367,13 +76412,21 @@ mod tests {
                 && script.contains("queueMicrotask(flushPendingWrite);"),
             "refocus must drop a stale idle-budget flush timer and flush immediately"
         );
-        // Re-resume render: a retained-scrollback replay (daemon restart/handoff
-        // re-seed) must follow the live cursor to the bottom, not leave codex
-        // scrolled to the top with the composer below the fold. See
-        // [[finding-codex-squish-post-restart-pty-size]].
+        // Working-session cluster fix: the write-flush follows the live cursor
+        // whenever Following (intent !== UserScrollback), with NO liveCursorNearBottom
+        // gate — so a passive burst-strand (viewport fell behind) re-follows to the
+        // bottom instead of stranding ("past conversation vacuumed + cursor clipped").
+        // A genuine user scroll-up flips intent to UserScrollback (ydisp-decrease
+        // detection) so this never yanks a reader. Subsumes the retained-replay
+        // re-seed case. See [[finding-working-state-row-overlap-scrollback-empty]].
         assert!(
-            script.contains("&& (liveCursorNearBottom() || retainedScrollbackReplay);"),
-            "retained-scrollback replay must follow to the live cursor (no scroll-to-top after re-resume)"
+            script.contains("syncScrollbackLock('write_flush');")
+                && script.contains("const flushShouldFollow =\n                    scrollbackIntent !== 'UserScrollback';"),
+            "write-flush must follow whenever Following (no liveCursorNearBottom strand gate)"
+        );
+        assert!(
+            !script.contains("&& (liveCursorNearBottom() || retainedScrollbackReplay);"),
+            "the old liveCursorNearBottom flush-follow gate (which stranded burst-behind viewports) must be gone"
         );
         assert!(
             script.contains("const terminalPayloadShouldFlushImmediately = (payload) => {")
