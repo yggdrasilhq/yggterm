@@ -605,6 +605,14 @@ impl TerminalManager {
         self.sessions.get(key).map(|session| session.age_ms())
     }
 
+    /// The current runtime's spawn id (0 = no runtime). See `PtySessionRuntime::spawn_id`.
+    pub fn session_runtime_spawn_id(&self, key: &str) -> u64 {
+        self.sessions
+            .get(key)
+            .map(|session| session.spawn_id)
+            .unwrap_or(0)
+    }
+
     pub fn session_idle_for_ms(&self, key: &str) -> Option<u64> {
         self.sessions.get(key).map(|session| session.idle_for_ms())
     }
@@ -987,6 +995,14 @@ impl TerminalManager {
 
 struct PtySessionRuntime {
     key: String,
+    // Unique per PTY spawn (across daemon restarts too — time-based). The
+    // client uses it as the cold-re-resume signal for the vacuum guard: a
+    // snapshot whose spawn id differs from the one the client buffer was
+    // seeded from came from a REPLACED runtime (exited+re-resumed or a
+    // daemon-restart re-resume), so a sparse frame must not wipe the richer
+    // client transcript. A same-spawn snapshot is a normal reveal and must
+    // never be guarded (the 2.8.64 blanket-ratio regression).
+    spawn_id: u64,
     master: Arc<Mutex<Box<dyn MasterPty + Send>>>,
     writer_tx: SyncSender<TerminalWriteRequest>,
     child: Arc<Mutex<Box<dyn Child + Send + Sync>>>,
@@ -1010,6 +1026,18 @@ struct PtySessionRuntime {
 struct TerminalWriteRequest {
     data: Vec<u8>,
     completion_tx: Option<mpsc::Sender<std::result::Result<(), String>>>,
+}
+
+/// Unique id per PTY spawn: time-based so it stays unique across daemon
+/// process restarts (a counter alone would restart at 0 and could collide
+/// with the id a client recorded from the previous daemon), with a process
+/// counter folded in so two spawns within the same millisecond still differ.
+fn next_runtime_spawn_id(started_at_ms: u64) -> u64 {
+    static RUNTIME_SPAWN_COUNTER: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(0);
+    let counter =
+        RUNTIME_SPAWN_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 1000;
+    started_at_ms.saturating_mul(1000).saturating_add(counter)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1516,6 +1544,7 @@ impl PtySessionRuntime {
 
         Ok(Self {
             key: key.to_string(),
+            spawn_id: next_runtime_spawn_id(started_at_ms),
             master: Arc::new(Mutex::new(pair.master)),
             writer_tx,
             child: Arc::new(Mutex::new(child)),
@@ -2652,6 +2681,31 @@ mod tests {
                 "vt100 resize {start}->{end} must preserve the composer-row bg (no reflow drop)"
             );
         }
+    }
+
+    // Cold-re-resume vacuum guard (sum-total run #3): every PTY spawn gets a
+    // unique runtime spawn id — the client compares the id a snapshot was read
+    // from against the id its buffer was seeded from to detect a replaced
+    // runtime. Uniqueness must hold across rapid consecutive spawns (counter
+    // component) and ids must be non-zero (0 = the "unknown, fail open" value).
+    #[test]
+    fn runtime_spawn_ids_are_unique_and_nonzero() {
+        let now = now_millis();
+        let a = next_runtime_spawn_id(now);
+        let b = next_runtime_spawn_id(now);
+        let c = next_runtime_spawn_id(now);
+        assert!(a != 0 && b != 0 && c != 0, "spawn ids must be non-zero");
+        assert!(a != b && b != c && a != c, "same-millisecond spawns must still differ");
+    }
+
+    #[test]
+    fn missing_session_reports_spawn_id_zero() {
+        let manager = TerminalManager::new();
+        assert_eq!(
+            manager.session_runtime_spawn_id("local://nope"),
+            0,
+            "no runtime => spawn id 0 (client guard fails open)"
+        );
     }
 
     #[test]
