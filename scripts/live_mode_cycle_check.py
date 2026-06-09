@@ -8,11 +8,27 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
+def _default_live_host() -> str | None:
+    # Resolve the live host from the gitignored config so the private SSH alias is
+    # never baked into this public repo. Override with --host. (.agents/config/ is
+    # in .gitignore; the file holds one line, e.g. the host alias.)
+    cfg = Path(__file__).resolve().parents[1] / ".agents" / "config" / "live-host"
+    try:
+        value = cfg.read_text(encoding="utf-8").strip()
+        return value or None
+    except OSError:
+        return None
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Drive a running Yggterm app over SSH app-control and time preview/terminal readiness."
     )
-    parser.add_argument("--host", default="jojo")
+    parser.add_argument(
+        "--host",
+        default=_default_live_host(),
+        help="Live host SSH alias; defaults to .agents/config/live-host (gitignored).",
+    )
     parser.add_argument("--bin", default="~/.local/bin/yggterm")
     parser.add_argument("--out-dir", default="~/.tmp/yggterm/live-mode-cycle")
     parser.add_argument(
@@ -350,6 +366,13 @@ def safe_name(value: str) -> str:
 
 def main() -> int:
     args = parse_args()
+    if not args.host:
+        print(
+            "error: no live host — pass --host, or write the SSH alias to "
+            ".agents/config/live-host",
+            file=sys.stderr,
+        )
+        return 2
     out_dir = Path(args.out_dir).expanduser()
     out_dir.mkdir(parents=True, exist_ok=True)
     binary = args.bin
