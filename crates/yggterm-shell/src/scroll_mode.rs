@@ -136,6 +136,21 @@ pub(crate) fn should_follow_now(mode: ScrollMode) -> bool {
     matches!(mode, ScrollMode::Following)
 }
 
+/// Detect a genuine USER scroll-up from a viewport-position sample, the trigger
+/// that should emit `ScrollEvent::UserScrolledUp`. Harness-locked invariant
+/// (tools/xterm-harness/scroll_follow_probe.test.js): writing output NEVER
+/// decreases the xterm viewport ydisp — at the bottom it auto-follows
+/// (ydisp increases), when scrolled up it leaves ydisp unchanged while baseY
+/// grows. The ONLY thing that decreases ydisp is a real user scroll-up (any
+/// gesture: wheel, scrollbar drag, PageUp, touch). So `cur < prev` uniquely
+/// identifies a user scroll-up — EXCEPT when WE moved the viewport
+/// programmatically (forceXtermViewportY), which must be excluded via the
+/// `programmatic` flag. This is why a passive burst-strand (viewport below base
+/// with ydisp UNCHANGED) does NOT flip to Pinned and is re-followed instead.
+pub(crate) fn user_scroll_up_detected(prev_ydisp: i64, cur_ydisp: i64, programmatic: bool) -> bool {
+    !programmatic && cur_ydisp < prev_ydisp
+}
+
 /// THE core fix: when content/layout SETTLES (replay finished, output burst
 /// ended, alt->normal buffer switch, fit completed), a Following session must
 /// re-assert to the CURRENT baseY — because the earlier follow may have landed at
@@ -243,6 +258,18 @@ mod tests {
         assert!(should_follow_now(ScrollMode::Following));
         assert!(!should_follow_now(ScrollMode::Pinned));
         assert!(!should_follow_now(ScrollMode::Selecting));
+    }
+
+    #[test]
+    fn user_scroll_up_detected_only_on_nonprogrammatic_decrease() {
+        // A real user scroll-up: ydisp decreased, not programmatic.
+        assert!(user_scroll_up_detected(100, 80, false));
+        // Programmatic move-up (forceXtermViewportY): excluded.
+        assert!(!user_scroll_up_detected(100, 80, true));
+        // Passive burst-strand: ydisp UNCHANGED while baseY grows -> NOT a scroll-up.
+        assert!(!user_scroll_up_detected(80, 80, false));
+        // Auto-follow on output: ydisp increased -> NOT a scroll-up.
+        assert!(!user_scroll_up_detected(80, 100, false));
     }
 
     #[test]
