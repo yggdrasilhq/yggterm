@@ -211,6 +211,26 @@ pub(crate) fn terminal_output_has_synchronized_repaint_frame(data: &str) -> bool
             || terminal_csi_count_at_least(data, 8))
 }
 
+/// True when `data` ENDS inside an open synchronized-output region — a
+/// `\e[?2026h` (begin synchronized update / BSU) that has no matching
+/// `\e[?2026l` (end / ESU) after it. codex wraps every repaint in BSU…ESU so
+/// a 2026-honoring terminal applies the whole frame atomically. The vendored
+/// xterm.js does NOT implement mode 2026, so the write bridge MUST stand in for
+/// it: never flush a buffer that ends mid-frame, or xterm paints a torn frame
+/// (rows cleared-to-default by the early part of codex's repaint, the gray
+/// composer + text still pending) = the long-standing "broken bottom /
+/// composer bg-split". See finding-codex-composer-bg-split-reflow (the reflow
+/// theory was falsified — this is frame tearing) + campaign-xterm-dealbreakers #2.
+pub(crate) fn terminal_output_ends_inside_synchronized_frame(data: &str) -> bool {
+    let last_open = data.rfind("\x1b[?2026h");
+    let last_close = data.rfind("\x1b[?2026l");
+    match (last_open, last_close) {
+        (Some(open), Some(close)) => open > close,
+        (Some(_), None) => true,
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 pub(crate) fn terminal_synchronized_output_frame_ranges(data: &str) -> Vec<(usize, usize)> {
     let start_marker = "\x1b[?2026h";
