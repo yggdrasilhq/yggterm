@@ -1,5 +1,15 @@
 # 23 Smoke Tests
 
+> **Execution arms (2026-06-09):** this document remains the release-gate *spec of
+> record*, but it is split for execution. Deterministic, code-level invariants are
+> being salvaged into the offline suites (`tools/xterm-harness`, `pipeline_integration`,
+> `cargo test -p yggterm-shell --lib`, core unit tests) so they run in CI without a live
+> install. The checks that genuinely need a live multi-session GUI — and the
+> agent-drives-switching / user-does-focus-and-eyes division of labor — live in the
+> **`yggterm-deeptest` skill** (`.agents/skills/yggterm-deeptest/SKILL.md`). See that
+> skill's "Salvage map" for which check went to which lane. Migrate remaining quirk-pass
+> checks to their lane as they're exercised; do not bulk-rewrite blind.
+
 The 23 smoke test system is the release gate for promoting a patch train into a
 new `x.y.0` release. The number 23 is a convention, not a product limit: it is
 large enough to expose session graph, terminal rendering, keep-alive, restore,
