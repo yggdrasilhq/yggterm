@@ -60314,6 +60314,14 @@ fn terminal_eval_script_with_canvas_renderer(
         }};
         let pendingPersistedScrollRestore = null;
         let pendingPersistedScrollRestoreDeadlineMs = 0;
+        // Screen-restore part (b): the daemon `reset` command (theme setup, sent
+        // once on attach) runs term.reset() AFTER the construct-time localStorage
+        // transcript restore, wiping it — then the sparse fresh-PTY replay can't
+        // refill it (vacuum). Stash the restored transcript here so the reset
+        // handler re-applies it ONCE after term.reset()+theme; it becomes
+        // scrollback, and the resumed CLI's `\x1b[H\x1b[J` clears only the
+        // viewport, leaving the transcript scrollable above.
+        let pendingPostResetTranscript = null;
         let lastScrollPersistAtMs = 0;
         const setScrollbackIntent = (intent, reason) => {{
             const next = intent === 'UserScrollback' ? 'UserScrollback' : 'PromptFollow';
@@ -61188,6 +61196,14 @@ fn terminal_eval_script_with_canvas_renderer(
                             tentry.lastLocalStorageTextRestoreLineCount = persisted.lineCount;
                             tentry.lastLocalStorageTextRestoreAtMs = Date.now();
                         }}
+                        // Stash for re-application after the daemon `reset` command
+                        // (which fires once on attach AFTER this construct-time
+                        // restore and would otherwise wipe the transcript).
+                        pendingPostResetTranscript = {{
+                            text: restoredText,
+                            lineCount: persisted.lineCount,
+                            nonblankLineCount: persisted.nonblankLineCount,
+                        }};
                         window.__yggtermXtermSessionNonblankMax = window.__yggtermXtermSessionNonblankMax || {{}};
                         const sp2 = currentHostSessionPath();
                         if (sp2) {{
@@ -65385,6 +65401,33 @@ fn terminal_eval_script_with_canvas_renderer(
                     term.options.letterSpacing = 0;
                     term.options.minimumContrastRatio = message.minimum_contrast_ratio;
                     term.options.theme = nextTheme;
+                }}
+                // Screen-restore part (b): the term.reset() above wiped the
+                // construct-time localStorage transcript restore. Re-apply it ONCE
+                // here (after theme) so it becomes scrollback; the resumed CLI's
+                // viewport-only clear (\x1b[H\x1b[J) then leaves it scrollable
+                // above. Without this the sparse fresh-PTY replay = vacuum.
+                if (pendingPostResetTranscript
+                    && typeof pendingPostResetTranscript.text === 'string'
+                    && pendingPostResetTranscript.text.trim()) {{
+                    try {{
+                        const wsReapply = term && term._core && typeof term._core.writeSync === "function"
+                            ? term._core.writeSync.bind(term._core)
+                            : (term && term._core && term._core._writeBuffer && typeof term._core._writeBuffer.writeSync === "function"
+                                ? term._core._writeBuffer.writeSync.bind(term._core._writeBuffer) : null);
+                        if (wsReapply) {{ wsReapply("\x1bc\x1b[H"); wsReapply(pendingPostResetTranscript.text); }}
+                        else if (typeof term.write === "function") {{ term.write(`\x1bc\x1b[H${{pendingPostResetTranscript.text}}`); }}
+                        if (window.__yggtermXtermHosts && window.__yggtermXtermHosts[hostId]) {{
+                            const eReapply = window.__yggtermXtermHosts[hostId];
+                            eReapply.terminalContentSource = 'localstorage_session_snapshot';
+                            eReapply.terminalSourceMismatchReason = '';
+                        }}
+                        sendTerminalEvent({{
+                            kind: 'debug',
+                            message: `localstorage_transcript_reapplied_after_reset host=${{hostId}} lines=${{pendingPostResetTranscript.lineCount}} nonblank=${{pendingPostResetTranscript.nonblankLineCount}}`
+                        }});
+                    }} catch (_reapplyErr) {{}}
+                    pendingPostResetTranscript = null;
                 }}
                 {reset_debug}
                 requestAnimationFrame(() => {{
