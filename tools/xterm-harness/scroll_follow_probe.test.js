@@ -62,3 +62,43 @@ test('a user scroll-up is the only thing that DECREASES ydisp', async () => {
   assert.ok(events.length >= 1 && events[events.length - 1] < before,
     'scroll-up must fire onScroll with a decreased ydisp');
 });
+
+// bg→fg stuck-at-top hardening (sum-test run #3): programmatic buffer/layout
+// mutations that are NOT routed through forceXtermViewportY can ALSO decrease
+// ydisp — but they decrease baseY with it, which a user gesture never does.
+// These two tests lock that signature on the EXACT vendored xterm.js so the
+// detector's baseY-non-decrease discriminator (scroll_mode.rs
+// user_scroll_up_detected) is grounded in measured behavior, not theory.
+
+test('row-growth resize decreases ydisp AND baseY together (reflow clamp is not a user scroll-up)', async () => {
+  const term = createTerminal({ cols: 80, rows: 24, scrollback: 1000 });
+  for (let i = 0; i < 60; i++) await write(term, `line ${i}\r\n`);
+  const ydispBefore = vp(term);
+  const baseBefore = by(term);
+  assert.ok(ydispBefore > 0 && ydispBefore === baseBefore, 'precondition: following at bottom with scrollback');
+  const events = [];
+  term.onScroll((y) => events.push(y));
+  term.resize(80, 48); // rows grow (the focus-regain re-fit shape)
+  const ydispAfter = vp(term);
+  const baseAfter = by(term);
+  assert.ok(baseAfter < baseBefore, 'row growth must shrink baseY');
+  assert.ok(ydispAfter < ydispBefore, 'row growth must clamp ydisp down with baseY');
+  // The discriminator: ydisp decreased but baseY decreased too -> NOT a user scroll-up.
+  assert.ok(!(ydispAfter < ydispBefore && baseAfter >= baseBefore),
+    'a reflow clamp must be rejected by the baseY-non-decrease discriminator');
+});
+
+test('term.reset() drops ydisp and baseY to 0 together (reseed is not a user scroll-up)', async () => {
+  const term = createTerminal({ cols: 80, rows: 24, scrollback: 1000 });
+  for (let i = 0; i < 60; i++) await write(term, `line ${i}\r\n`);
+  const ydispBefore = vp(term);
+  const baseBefore = by(term);
+  assert.ok(ydispBefore > 0, 'precondition: scrollback accumulated');
+  term.reset();
+  const ydispAfter = vp(term);
+  const baseAfter = by(term);
+  assert.strictEqual(ydispAfter, 0, 'reset must drop ydisp to 0');
+  assert.strictEqual(baseAfter, 0, 'reset must drop baseY to 0');
+  assert.ok(!(ydispAfter < ydispBefore && baseAfter >= baseBefore),
+    'a reseed must be rejected by the baseY-non-decrease discriminator');
+});
