@@ -618,3 +618,44 @@ fn read_from_cursor_never_silently_drops_trimmed_middle_chunks() {
         );
     }
 }
+
+// ---- Cold-re-resume signal (vacuum guard, sum-total run #3) --------------------
+// The client's vacuum guard keys off the runtime spawn id: a snapshot read from a
+// DIFFERENT spawn than the one the client buffer was seeded from means the runtime
+// was replaced (cold re-resume) and a sparse fresh-PTY frame must not wipe a richer
+// client transcript. Lock the daemon half: the id is stable while a runtime lives,
+// and CHANGES when an exited runtime is replaced through the real ensure path.
+#[test]
+fn runtime_spawn_id_stable_while_running_and_changes_on_replace() {
+    let mut mgr = TerminalManager::new();
+    let key = "test://spawn-id-replace";
+    // Short-lived program: emits and exits quickly (no hold).
+    let cmd = launch("--scenario burst --hold-ms 150");
+    mgr.ensure_session(key, &cmd, None).expect("ensure_session");
+    wait_for_output(&mgr, key);
+    let first = mgr.session_runtime_spawn_id(key);
+    assert_ne!(first, 0, "a live runtime must report a non-zero spawn id");
+    // ensure on a RUNNING session is a no-op: same runtime, same id.
+    if mgr.session_is_running(key) {
+        mgr.ensure_session(key, &cmd, None).expect("ensure_session noop");
+        assert_eq!(
+            mgr.session_runtime_spawn_id(key),
+            first,
+            "ensure on a running session must not change the spawn id"
+        );
+    }
+    // Wait for the program to exit, then ensure again -> replace_exited_runtime.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline && mgr.session_is_running(key) {
+        std::thread::sleep(Duration::from_millis(40));
+    }
+    assert!(!mgr.session_is_running(key), "mock-tui should have exited");
+    mgr.ensure_session(key, &cmd, None)
+        .expect("ensure_session replace");
+    let second = mgr.session_runtime_spawn_id(key);
+    assert_ne!(second, 0, "replaced runtime must report a spawn id");
+    assert_ne!(
+        second, first,
+        "replacing an exited runtime must change the spawn id (the cold-re-resume signal)"
+    );
+}

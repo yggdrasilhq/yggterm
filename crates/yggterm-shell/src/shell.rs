@@ -16188,7 +16188,7 @@ fn live_terminal_generation_context(
     endpoint: &ServerEndpoint,
     session_path: &str,
 ) -> Option<String> {
-    let (snapshot, _running, _runtime_output_seen, _post_resize_output_seen, _last_resize_seq) =
+    let (snapshot, _running, _runtime_output_seen, _post_resize_output_seen, _last_resize_seq, _runtime_spawn_id) =
         terminal_snapshot(endpoint, session_path).ok()?;
     let stripped = strip_terminal_control_sequences(&snapshot)
         .replace("\r\n", "\n")
@@ -33778,7 +33778,7 @@ async fn reconcile_terminal_from_daemon_for(
     trace_home: &Path,
 ) -> Value {
     let snapshot = terminal_snapshot_async(endpoint, session_path.to_string(), trace_home).await;
-    let (screen, running, _runtime_output_seen, _post_resize, _seq) = match snapshot {
+    let (screen, running, _runtime_output_seen, _post_resize, _seq, _runtime_spawn_id) = match snapshot {
         Ok(value) => value,
         Err(error) => {
             return json!({
@@ -33808,6 +33808,9 @@ async fn reconcile_terminal_from_daemon_for(
         session_path,
         &screen,
         "daemon_screen_snapshot",
+        // User/agent reconcile owns the churn decision — spawn id 0 keeps the
+        // vacuum guard disarmed (the 2.8.64 _unguarded semantics).
+        0,
     ));
     append_trace_event(
         trace_home,
@@ -47018,6 +47021,7 @@ fn TerminalCanvas(
                         &session_path_for_task,
                         &replay_for_task,
                         "server_prompt_snapshot",
+                        0,
                     ));
                     append_trace_event(
                         &trace_home_for_task,
@@ -47108,6 +47112,7 @@ fn TerminalCanvas(
                                             &session_path_for_task,
                                             &snapshot_text,
                                             "daemon_server_prompt_snapshot",
+                                            0,
                                         ),
                                     );
                                     append_trace_event(
@@ -47241,6 +47246,7 @@ fn TerminalCanvas(
                         runtime_output_seen,
                         post_resize_output_seen,
                         last_resize_seq,
+                        _runtime_spawn_id,
                     )) if running
                         && runtime_output_seen
                         && remote_resume_screen_snapshot_is_replayable_for_blank_host(
@@ -47263,6 +47269,7 @@ fn TerminalCanvas(
                             &session_path_for_task,
                             &snapshot_text,
                             "active_recovery_pty_snapshot",
+                            _runtime_spawn_id,
                         ));
                         append_trace_event(
                             &trace_home_for_task,
@@ -47528,6 +47535,9 @@ fn TerminalCanvas(
                                 .collect::<String>(),
                             "daemon_terminal_read",
                             None,
+                            // The read path carries no runtime spawn id; the vacuum
+                            // guard fails OPEN (never arms) on 0.
+                            0u64,
                         )
                     },
                 ),
@@ -47545,6 +47555,7 @@ fn TerminalCanvas(
                             runtime_output_seen,
                             post_resize_output_seen,
                             last_resize_seq,
+                            runtime_spawn_id,
                         )| {
                             (
                                 snapshot_text,
@@ -47555,13 +47566,14 @@ fn TerminalCanvas(
                                     post_resize_output_seen,
                                     last_resize_seq,
                                 )),
+                                runtime_spawn_id,
                             )
                         },
                     )
                 }
             };
             match retained_rehydrate_result {
-                Ok((data, mut replay_source, snapshot_status)) => {
+                Ok((data, mut replay_source, snapshot_status, mut runtime_spawn_id)) => {
                     if let Some((
                         running,
                         runtime_output_seen,
@@ -47611,7 +47623,11 @@ fn TerminalCanvas(
                                 screen_runtime_output_seen,
                                 screen_post_resize_output_seen,
                                 screen_last_resize_seq,
+                                screen_runtime_spawn_id,
                             )) => {
+                                if screen_runtime_spawn_id != 0 {
+                                    runtime_spawn_id = screen_runtime_spawn_id;
+                                }
                                 let screen_text = sanitize_terminal_replay_payload(&screen_text);
                                 let selection = terminal_select_retained_snapshot_replay(
                                     &data,
@@ -47725,6 +47741,7 @@ fn TerminalCanvas(
                         &session_path_for_task,
                         &data,
                         replay_source,
+                        runtime_spawn_id,
                     ));
                     set_signal_if_changed(terminal_resume_surface_staged, true);
                     set_signal_if_changed(terminal_has_meaningful_output, true);
@@ -47865,6 +47882,7 @@ fn TerminalCanvas(
                     runtime_output_seen,
                     post_resize_output_seen,
                     last_resize_seq,
+                    mut runtime_spawn_id,
                 )) => {
                     if codex_like_session
                         && !remote_resume_geometry_fence_allows_snapshot(
@@ -47911,7 +47929,11 @@ fn TerminalCanvas(
                                 screen_runtime_output_seen,
                                 screen_post_resize_output_seen,
                                 screen_last_resize_seq,
+                                screen_runtime_spawn_id,
                             )) => {
+                                if screen_runtime_spawn_id != 0 {
+                                    runtime_spawn_id = screen_runtime_spawn_id;
+                                }
                                 let screen_text = sanitize_terminal_replay_payload(&screen_text);
                                 let selection = terminal_select_retained_snapshot_replay(
                                     &replay_text,
@@ -47984,6 +48006,7 @@ fn TerminalCanvas(
                         &session_path_for_task,
                         &replay_text,
                         replay_source,
+                        runtime_spawn_id,
                     ));
                     set_signal_if_changed(terminal_resume_surface_staged, true);
                     set_signal_if_changed(terminal_has_meaningful_output, true);
@@ -48741,7 +48764,7 @@ fn TerminalCanvas(
                     && current_millis() >= screen_reconcile_due_at_ms
                 {
                     screen_reconcile_due_at_ms = 0;
-                    if let Ok((screen_text, _running, _out, _post, _seq)) = terminal_snapshot_async(
+                    if let Ok((screen_text, _running, _out, _post, _seq, _spawn)) = terminal_snapshot_async(
                         endpoint.clone(),
                         runtime_session_path.clone(),
                         &trace_home,
@@ -50172,6 +50195,7 @@ fn TerminalCanvas(
                                                 runtime_output_seen,
                                                 post_resize_output_seen,
                                                 last_resize_seq,
+                                                _runtime_spawn_id,
                                             ))
                                                 if remote_resume_non_prompt_snapshot_is_replayable(
                                                     &snapshot_text,
@@ -50272,6 +50296,7 @@ fn TerminalCanvas(
                                                 runtime_output_seen,
                                                 post_resize_output_seen,
                                                 last_resize_seq,
+                                                _runtime_spawn_id,
                                             )) => {
                                                 append_trace_event(
                                                     &trace_home,
@@ -50429,6 +50454,7 @@ fn TerminalCanvas(
                                             runtime_output_seen,
                                             post_resize_output_seen,
                                             last_resize_seq,
+                                            _runtime_spawn_id,
                                         ))
                                             if remote_resume_screen_snapshot_is_replayable_for_blank_host(
                                                 &snapshot_text,
@@ -50530,6 +50556,7 @@ fn TerminalCanvas(
                                             runtime_output_seen,
                                             post_resize_output_seen,
                                             last_resize_seq,
+                                            _runtime_spawn_id,
                                         )) => {
                                             append_trace_event(
                                                 &trace_home,
@@ -51561,6 +51588,7 @@ fn TerminalCanvas(
                                             snapshot_output_seen,
                                             snapshot_post_resize_output_seen,
                                             snapshot_last_resize_seq,
+                                            _runtime_spawn_id,
                                         ))
                                             if remote_resume_screen_snapshot_is_replayable_for_blank_host(
                                                 &snapshot_text,
@@ -51662,6 +51690,7 @@ fn TerminalCanvas(
                                             snapshot_output_seen,
                                             snapshot_post_resize_output_seen,
                                             snapshot_last_resize_seq,
+                                            _runtime_spawn_id,
                                         )) => {
                                             append_trace_event(
                                                 &trace_home,
@@ -55711,7 +55740,7 @@ async fn terminal_snapshot_async(
     endpoint: ServerEndpoint,
     session_path: String,
     trace_home: &Path,
-) -> Result<(String, bool, bool, bool, u64)> {
+) -> Result<(String, bool, bool, bool, u64, u64)> {
     run_dedicated_terminal_io("terminal_snapshot", trace_home, move || {
         terminal_snapshot(&endpoint, &session_path)
     })
@@ -55721,7 +55750,7 @@ async fn terminal_retained_snapshot_async(
     endpoint: ServerEndpoint,
     session_path: String,
     trace_home: &Path,
-) -> Result<(String, bool, bool, bool, u64)> {
+) -> Result<(String, bool, bool, bool, u64, u64)> {
     run_dedicated_terminal_io("terminal_retained_snapshot", trace_home, move || {
         terminal_retained_snapshot(&endpoint, &session_path)
     })
@@ -65858,10 +65887,20 @@ fn terminal_set_input_enabled_script_for_session(
 // session-switch) — see retained_replay_script_followPromptForEntry_guards_
 // user_scrollback test in the test module.
 // ============================================================================
+/// `runtime_spawn_id` is the cold-re-resume signal for the vacuum guard
+/// (terminal_retained_replay_policy::retained_replay_would_vacuum_richer_client):
+/// the daemon-reported spawn id of the PTY this payload was read from. The JS
+/// entry records the id it last seeded from; a payload from a DIFFERENT spawn
+/// (runtime exited+replaced, or a daemon-restart re-resume) that is much
+/// sparser than a rich client buffer is refused (kept client). 0 = unknown →
+/// the guard never arms (fails open). Same-spawn payloads are normal reveals
+/// and are NEVER guarded — the 2.8.64 blanket-ratio regression (gating every
+/// codex reveal-reconcile into a shadow) is structurally impossible.
 fn terminal_replay_retained_data_script_for_session(
     session_path: &str,
     data: &str,
     source: &str,
+    runtime_spawn_id: u64,
 ) -> String {
     let session_path = serde_json::to_string(session_path).unwrap_or_else(|_| "null".to_string());
     let data = sanitize_terminal_replay_payload(data);
@@ -65874,6 +65913,7 @@ fn terminal_replay_retained_data_script_for_session(
           const sessionPath = {session_path};
           const data = {data};
           const replaySource = {source};
+          const runtimeSpawnId = {runtime_spawn_id};
           if (!data) {{
             return;
           }}
@@ -66358,6 +66398,43 @@ fn terminal_replay_retained_data_script_for_session(
             }}
           }};
           const writePayloadIntoEntry = (entry, payload) => {{
+            // Vacuum guard (retained_replay_would_vacuum_richer_client): a payload
+            // read from a DIFFERENT runtime spawn than the one this entry was
+            // seeded from is a COLD RE-RESUME (runtime exited+replaced / daemon
+            // restart). If the client scrollback is rich (baseY >= 6) and that
+            // fresh-PTY frame is much sparser (< 1/3 the line count), the reset
+            // prefix below ("\x1b[3J" clears scrollback) would collapse the whole
+            // transcript (live-caught: baseY 1801 -> 32) — codex repaints in
+            // place, so the conversation lives ONLY in the client buffer. KEEP
+            // the client; codex's next frame repaints. A SAME-spawn payload is a
+            // normal reveal and is never guarded (the 2.8.64 blanket-ratio
+            // regression that gated every codex reveal into a shadow); spawn id
+            // 0 (unknown / user reconcile / older daemon) also never guards.
+            try {{
+              const knownSpawnId = Number(entry.lastSeededRuntimeSpawnId || 0);
+              const coldReResume = runtimeSpawnId > 0
+                && knownSpawnId > 0
+                && runtimeSpawnId !== knownSpawnId;
+              if (coldReResume) {{
+                const curBuffer = entry && entry.term && entry.term.buffer && entry.term.buffer.active;
+                const curBaseY = curBuffer ? Math.max(0, Number(curBuffer.baseY || 0)) : 0;
+                const incomingLines = (String(payload).match(/\n/g) || []).length;
+                if (curBaseY >= 6 && incomingLines * 3 < curBaseY) {{
+                  entry.lastRetainedReplayVacuumGuardSkipped = true;
+                  entry.lastRetainedReplayVacuumGuardDebug = {{
+                    base_y: curBaseY,
+                    incoming_lines: incomingLines,
+                    known_spawn_id: knownSpawnId,
+                    incoming_spawn_id: runtimeSpawnId,
+                  }};
+                  // Return TRUE = handled by keeping the client (no retry); the
+                  // client already holds the richer transcript. Do NOT record the
+                  // new spawn id: the guard re-arms until the fresh runtime
+                  // produces a comparably rich frame, which then applies normally.
+                  return true;
+                }}
+              }}
+            }} catch (_error) {{}}
             const replayResetPrefix = replaySource === 'daemon_retained_history_screen_snapshot'
               ? "\x1bc\x1b[H"
               : "\x1bc\x1b[2J\x1b[3J\x1b[H";
@@ -66380,6 +66457,11 @@ fn terminal_replay_retained_data_script_for_session(
                 writeSync(payload);
               }} else if (typeof entry.term.write === "function") {{
                 entry.term.write(`${{replayResetPrefix}}${{payload}}`);
+              }}
+              // Record which runtime spawn this buffer is now seeded from — the
+              // comparison anchor for the cold-re-resume vacuum guard above.
+              if (runtimeSpawnId > 0) {{
+                entry.lastSeededRuntimeSpawnId = runtimeSpawnId;
               }}
               return true;
             }} catch (_error) {{
@@ -75360,6 +75442,7 @@ mod tests {
             "remote-session://dev/claude",
             "\x1b[2J\x1b[H❯ Try \"edit <file>\"\r\n? for shortcuts\r\n",
             "daemon_retained_snapshot",
+            0,
         );
         // promptNeedle is derived from EITHER caret (the later occurrence).
         assert!(
@@ -75382,6 +75465,56 @@ mod tests {
         // …and Codex caret recognition is preserved (no regression for Codex).
         assert!(script.contains("visibleText.includes(\"›\")"));
     }
+    // Sum-total run #3 (#2 cold-re-resume vacuum, redesigned): the retained-replay
+    // builder must carry the spawn-id-gated vacuum guard. The guard arms ONLY when
+    // the payload's runtime spawn id differs from the one the entry was seeded
+    // from (a true cold re-resume) AND the richer-client ratio fires — mirroring
+    // terminal_retained_replay_policy::retained_replay_would_vacuum_richer_client.
+    // A same-spawn or unknown-spawn (0) payload must never guard: the reverted
+    // 2.8.64 blanket ratio gated every normal codex reveal into a shadow.
+    #[test]
+    fn retained_replay_vacuum_guard_is_spawn_id_gated() {
+        let with_spawn = terminal_replay_retained_data_script_for_session(
+            "remote-session://dev/codex",
+            "OpenAI Codex\r\n› prompt\r\n",
+            "daemon_screen_snapshot",
+            1781000000000123,
+        );
+        assert!(
+            with_spawn.contains("const runtimeSpawnId = 1781000000000123;"),
+            "the daemon-reported spawn id must reach the replay script"
+        );
+        assert!(
+            with_spawn.contains("const coldReResume = runtimeSpawnId > 0")
+                && with_spawn.contains("&& runtimeSpawnId !== knownSpawnId;"),
+            "the guard must require a DIFFERENT runtime spawn (cold re-resume), never magnitude alone"
+        );
+        assert!(
+            with_spawn.contains("if (curBaseY >= 6 && incomingLines * 3 < curBaseY) {"),
+            "the richer-client ratio must mirror retained_replay_would_vacuum_richer_client"
+        );
+        assert!(
+            with_spawn.contains("entry.lastRetainedReplayVacuumGuardSkipped = true;"),
+            "a guard skip must be observable on the entry"
+        );
+        assert!(
+            with_spawn.contains("entry.lastSeededRuntimeSpawnId = runtimeSpawnId;"),
+            "an applied payload must record its spawn id as the comparison anchor"
+        );
+        // The user/agent reconcile and any path without a spawn id pass 0 — the
+        // script must carry the disarmed value so coldReResume can never be true.
+        let without_spawn = terminal_replay_retained_data_script_for_session(
+            "remote-session://dev/codex",
+            "OpenAI Codex\r\n› prompt\r\n",
+            "daemon_screen_snapshot",
+            0,
+        );
+        assert!(
+            without_spawn.contains("const runtimeSpawnId = 0;"),
+            "spawn id 0 must keep the guard disarmed (fails open)"
+        );
+    }
+
     // XTERM-BUG: blank-viewport-client-snapshot-poison — on a cursor-addressed
     // (codex) collapsed-scrollback reveal, the replay must reconcile from the
     // daemon's authoritative SCREEN frame BEFORE falling back to the cached
@@ -75394,6 +75527,7 @@ mod tests {
             "remote-session://dev/codex",
             "\x1b[2J\x1b[Hline 1\r\nline 2\r\n",
             "daemon_screen_snapshot",
+            0,
         );
         assert!(
             script.contains("const daemonScreenSnapshotAuthoritative ="),
@@ -75434,6 +75568,7 @@ mod tests {
             "remote-session://dev/test",
             "\x1b[2J\x1b[Hline 1\r\nline 2\r\n",
             "daemon_retained_snapshot",
+            0,
         );
         assert!(script.contains("const retryDelayMs = 100;"));
         assert!(script.contains("const stableUntilMs = Date.now() + 3500;"));
@@ -75594,6 +75729,7 @@ mod tests {
             "remote-session://dev/abc",
             "data",
             "daemon_retained_history_screen_snapshot",
+            0,
         );
         assert!(script.contains(
             "const xtermSessionSnapshotIsCollapsedPoison = (sessionPath, nonblankLineCount) => {"
@@ -75607,6 +75743,7 @@ mod tests {
             "remote-session://dev/test",
             "real output\n› prompt",
             "daemon_terminal_read",
+            0,
         );
 
         assert!(
@@ -75631,6 +75768,7 @@ mod tests {
             "remote-session://dev/test",
             "real output\n› prompt",
             "daemon_terminal_read",
+            0,
         );
 
         assert!(
@@ -75658,6 +75796,7 @@ mod tests {
             "remote-session://dev/test",
             "real output\n› prompt",
             "daemon_terminal_read",
+            0,
         );
 
         let guard_ix = script
@@ -75739,6 +75878,7 @@ mod tests {
             "remote-session://dev/test",
             "old output\n› prompt",
             "daemon_retained_snapshot",
+            0,
         );
 
         assert!(!script.contains("entry.setInputEnabled(true, true)"));
@@ -76217,6 +76357,7 @@ mod tests {
             "remote-session://dev/test",
             "hello\r\nworld\r\n",
             "daemon_retained_snapshot",
+            0,
         );
         // Function definition exists.
         assert!(
@@ -99198,6 +99339,7 @@ Shared connection to 192.0.2.14 closed.\r\n";
             "remote-session://dev/test",
             "real output\n› Error: terminal session not found: local://019d0000-0000-7000-8000-000000000001\nShared connection to 192.0.2.14 closed.\n› prompt",
             "daemon_terminal_read",
+            0,
         );
 
         assert!(script.contains("real output"));
