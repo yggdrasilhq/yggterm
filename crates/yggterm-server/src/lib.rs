@@ -13568,6 +13568,7 @@ fn bridge_remote_runtime_session_stdio(
                     snapshot_runtime_output_seen,
                     _snapshot_post_resize_output_seen,
                     _snapshot_last_resize_seq,
+                    _runtime_spawn_id,
                 )) => {
                     let snapshot_text =
                         bridge_initial_snapshot_text_for_path(path, Some(snapshot.as_str()))
