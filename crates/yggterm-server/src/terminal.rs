@@ -2579,6 +2579,39 @@ mod tests {
     use std::time::Instant;
 
     #[test]
+    fn daemon_vt100_preserves_composer_bg_across_column_resize() {
+        // Regression lock + FALSIFICATION of the long-standing "reflow drops cell
+        // bg" theory for the composer bg-split (issue #2). The daemon's vt100
+        // set_size preserves every already-painted cell's bg across a column
+        // resize in BOTH directions — only newly-exposed cells are default. So the
+        // split is NOT produced by the daemon emulator's reflow (nor xterm's — see
+        // tools/xterm-harness behavior.test.js). The real producer is frame tearing
+        // of codex's synchronized-output repaint. finding-codex-composer-bg-split-reflow.
+        let gray = "\x1b[39;48;2;64;67;75m";
+        let row_is_uniform_gray = |state: &TerminalScreenState, row: u16, upto: u16| -> bool {
+            let screen = state.parser.screen();
+            (0..upto).all(|c| matches!(screen.cell(row, c).map(|cell| cell.bgcolor()),
+                Some(vt100::Color::Rgb(64, 67, 75))))
+        };
+        for (start, end) in [(120u16, 159u16), (159u16, 120u16)] {
+            let mut state = TerminalScreenState::new(10, start);
+            // Composer row painted uniformly gray (codex style: bg inherited across
+            // an absolute move + trailing \e[K).
+            let frame = format!(
+                "\x1b[2J\x1b[H\x1b[8;1H{gray} \x1b[9;1H\x1b[1m\u{203a}\x1b[22m \x1b[2mFind and fix a bug\x1b[9;20H{gray}\x1b[K"
+            );
+            state.process(frame.as_bytes());
+            assert!(row_is_uniform_gray(&state, 8, start), "precondition: composer row uniform gray at {start}");
+            state.resize(10, end);
+            let preserved = end.min(start);
+            assert!(
+                row_is_uniform_gray(&state, 8, preserved),
+                "vt100 resize {start}->{end} must preserve the composer-row bg (no reflow drop)"
+            );
+        }
+    }
+
+    #[test]
     fn vt_scrollback_returns_empty_when_no_lines_have_scrolled_off() {
         let mut state = TerminalScreenState::new(24, 80);
         state.process(b"line one\r\nline two\r\n");
