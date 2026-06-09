@@ -59867,6 +59867,48 @@ fn terminal_eval_script_with_canvas_renderer(
                 return '';
             }}
         }};
+        // SSOT for "read the rendered xterm buffer into transcript text". Used by
+        // both the in-memory snapshot capture AND the localStorage persist (the
+        // screen-restore vacuum fix) so the persist no longer depends on a prior
+        // snapshot capture having run — it serializes term.buffer directly.
+        const serializeTerminalBufferText = () => {{
+            try {{
+                const buffer = term && term.buffer && term.buffer.active ? term.buffer.active : null;
+                if (!buffer || typeof buffer.getLine !== "function") {{
+                    return null;
+                }}
+                const length = Math.max(0, Number(buffer.length || 0));
+                const rows = Math.max(1, Number(term.rows || 1));
+                const maxRows = Math.min(length, Math.max(300, rows * 8));
+                const start = Math.max(0, length - maxRows);
+                const visualLines = [];
+                const logicalLines = [];
+                for (let row = start; row < length; row += 1) {{
+                    const line = buffer.getLine(row);
+                    const lineText = line && typeof line.translateToString === "function"
+                        ? String(line.translateToString(true) || "")
+                        : "";
+                    visualLines.push(lineText);
+                    if (logicalLines.length > 0 && line && line.isWrapped) {{
+                        logicalLines[logicalLines.length - 1] += lineText;
+                    }} else {{
+                        logicalLines.push(lineText);
+                    }}
+                }}
+                const text = logicalLines.join("\r\n");
+                const nonblankLineCount = logicalLines
+                    .filter((line) => String(line || "").trim().length > 0)
+                    .length;
+                return {{
+                    text,
+                    visualLineCount: visualLines.length,
+                    logicalLineCount: logicalLines.length,
+                    nonblankLineCount,
+                }};
+            }} catch (_error) {{
+                return null;
+            }}
+        }};
         const captureSessionXtermSnapshot = (reason = '') => {{
             try {{
                 const sessionPath = currentHostSessionPath();
@@ -59874,29 +59916,16 @@ fn terminal_eval_script_with_canvas_renderer(
                 if (!sessionPath || !buffer || typeof buffer.getLine !== "function") {{
                     return null;
                 }}
-                const length = Math.max(0, Number(buffer.length || 0));
                 const rows = Math.max(1, Number(term.rows || 1));
                 const cols = Math.max(1, Number(term.cols || 1));
-                const maxRows = Math.min(length, Math.max(300, rows * 8));
-                const start = Math.max(0, length - maxRows);
-                const visualLines = [];
-                const logicalLines = [];
-                for (let row = start; row < length; row += 1) {{
-                    const line = buffer.getLine(row);
-                    const text = line && typeof line.translateToString === "function"
-                        ? String(line.translateToString(true) || "")
-                        : "";
-                    visualLines.push(text);
-                    if (logicalLines.length > 0 && line && line.isWrapped) {{
-                        logicalLines[logicalLines.length - 1] += text;
-                    }} else {{
-                        logicalLines.push(text);
-                    }}
+                const serialized = serializeTerminalBufferText();
+                if (!serialized) {{
+                    return null;
                 }}
-                const text = logicalLines.join("\r\n");
-                const nonblankLineCount = logicalLines
-                    .filter((line) => String(line || "").trim().length > 0)
-                    .length;
+                const text = serialized.text;
+                const visualLineCount = serialized.visualLineCount;
+                const logicalLineCount = serialized.logicalLineCount;
+                const nonblankLineCount = serialized.nonblankLineCount;
                 if (!text.trim() || nonblankLineCount <= 0) {{
                     return null;
                 }}
@@ -59956,8 +59985,8 @@ fn terminal_eval_script_with_canvas_renderer(
                     scrollbackIntent,
                     lastScrollbackIntentReason,
                     scrollbackLocked: Boolean(scrollbackLocked),
-                    lineCount: visualLines.length,
-                    logicalLineCount: logicalLines.length,
+                    lineCount: visualLineCount,
+                    logicalLineCount,
                     nonblankLineCount,
                     text,
                     textTail: text.slice(-4096),
@@ -60171,18 +60200,48 @@ fn terminal_eval_script_with_canvas_renderer(
                 // otherwise leaves both text sources empty → vacuum. Reuse the latest
                 // captured snapshot's already-serialized text (no re-serialize), capped for
                 // the localStorage quota, only when it's a real (non-collapsed) frame.
+                // Serialize the transcript DIRECTLY from term.buffer (not the
+                // in-memory snapshot, which may never have been captured for an
+                // idle freshly-opened session — the 2.8.54 failure mode). Only
+                // persist a real (non-collapsed) frame; a 1-nonblank frame would
+                // poison the restore. CRITICAL: never overwrite a previously-saved
+                // RICH transcript with a much sparser current frame — during the
+                // re-resume window the live buffer collapses to ~8 lines, and
+                // persisting THAT would destroy the saved transcript and CAUSE the
+                // vacuum this fix targets. Keep the prior text when the current
+                // frame is a severe collapse (<1/3 of the saved nonblank count).
                 let snapshotText = '';
                 let snapshotLineCount = 0;
                 let snapshotNonblankLineCount = 0;
                 try {{
-                    const sp = currentHostSessionPath();
-                    const snap = sp && window.__yggtermXtermSessionSnapshots
-                        ? window.__yggtermXtermSessionSnapshots[sp]
-                        : null;
-                    if (snap && typeof snap.text === 'string' && Number(snap.nonblankLineCount || 0) > 1) {{
-                        snapshotText = snap.text.length > 120000 ? snap.text.slice(-120000) : snap.text;
-                        snapshotLineCount = Number(snap.lineCount || 0);
-                        snapshotNonblankLineCount = Number(snap.nonblankLineCount || 0);
+                    let prevText = ''; let prevLineCount = 0; let prevNonblank = 0;
+                    try {{
+                        const rawPrev = window.localStorage.getItem(key);
+                        if (rawPrev) {{
+                            const p = JSON.parse(rawPrev);
+                            if (p && typeof p.text === 'string') {{
+                                prevText = p.text;
+                                prevLineCount = Number(p.lineCount || 0);
+                                prevNonblank = Number(p.nonblankLineCount || 0);
+                            }}
+                        }}
+                    }} catch (_prevError) {{}}
+                    const serialized = serializeTerminalBufferText();
+                    const curText = serialized && typeof serialized.text === 'string' ? serialized.text : '';
+                    const curNonblank = serialized ? Number(serialized.nonblankLineCount || 0) : 0;
+                    const curIsReal = curText.trim() && curNonblank > 1;
+                    const curIsSevereCollapse = prevNonblank >= 6 && curNonblank * 3 < prevNonblank;
+                    if (curIsReal && !curIsSevereCollapse) {{
+                        // Cap per-session text so the localStorage origin quota
+                        // (~5MB in WebKit) isn't blown across many session keys.
+                        snapshotText = curText.length > 48000 ? curText.slice(-48000) : curText;
+                        snapshotLineCount = serialized ? Number(serialized.visualLineCount || 0) : 0;
+                        snapshotNonblankLineCount = curNonblank;
+                    }} else if (prevText) {{
+                        // Keep the previously-saved richer transcript intact.
+                        snapshotText = prevText;
+                        snapshotLineCount = prevLineCount;
+                        snapshotNonblankLineCount = prevNonblank;
                     }}
                 }} catch (_textError) {{}}
                 const payload = JSON.stringify({{
@@ -60197,7 +60256,27 @@ fn terminal_eval_script_with_canvas_renderer(
                     lineCount: snapshotLineCount,
                     nonblankLineCount: snapshotNonblankLineCount,
                 }});
-                window.localStorage.setItem(key, payload);
+                try {{
+                    window.localStorage.setItem(key, payload);
+                }} catch (_quotaError) {{
+                    // Quota exceeded (transcript text is the bulk): fall back to a
+                    // scroll-only payload so scroll-position restore never regresses.
+                    try {{
+                        const scrollOnly = JSON.stringify({{
+                            intent: scrollbackIntent,
+                            viewportY,
+                            baseY,
+                            distanceFromBottom: Math.max(0, baseY - viewportY),
+                            locked: Boolean(scrollbackLocked),
+                            reason: String(reason || ''),
+                            savedAtMs: Date.now(),
+                            text: '',
+                            lineCount: 0,
+                            nonblankLineCount: 0,
+                        }});
+                        window.localStorage.setItem(key, scrollOnly);
+                    }} catch (_scrollOnlyError) {{}}
+                }}
             }} catch (_error) {{}}
         }};
         const loadScrollStateFromLocalStorage = () => {{
@@ -62167,6 +62246,22 @@ fn terminal_eval_script_with_canvas_renderer(
             }}
             focusTerminal();
         }}, {terminal_passive_focus_watchdog_ms});
+        // Screen-restore (vacuum fix): periodically persist the rendered transcript
+        // to localStorage so a full GUI+daemon restart can restore it. The
+        // event-driven persists (scroll/intent/snapshot) never fire for an IDLE
+        // freshly-opened session, so its transcript was never saved (the 2.8.54
+        // failure). The persist's collapse-guard keeps a prior rich transcript from
+        // being overwritten by the sparse re-resume buffer. Skipped while a restore
+        // is in flight.
+        const screenRestorePersistTimer = window.setInterval(() => {{
+            try {{
+                const restoreInFlight = Boolean(pendingPersistedScrollRestore)
+                    || (pendingPersistedScrollRestoreDeadlineMs > 0
+                        && Date.now() <= pendingPersistedScrollRestoreDeadlineMs);
+                if (restoreInFlight) {{ return; }}
+                persistScrollStateToLocalStorage('periodic_screen_restore');
+            }} catch (_error) {{}}
+        }}, 4000);
         const setInputEnabled = (enabled, focus, followPrompt = true, policySource = 'local') => {{
             const requestedEnabled = Boolean(enabled);
             const policyTrusted = String(policySource || '') === 'rust_policy';
@@ -65145,6 +65240,9 @@ fn terminal_eval_script_with_canvas_renderer(
             }} catch (_error) {{}}
             try {{
                 window.clearInterval(inputDriftWatchdog);
+            }} catch (_error) {{}}
+            try {{
+                window.clearInterval(screenRestorePersistTimer);
             }} catch (_error) {{}}
             try {{
                 if (visiblePaintRecoveryTimer !== null) {{
