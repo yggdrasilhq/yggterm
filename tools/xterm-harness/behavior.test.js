@@ -191,3 +191,23 @@ test('a painted background colour survives a column WIDEN reflow for already-wri
   bg = h.cellBg(term, 0, 20);
   assert.ok(bg && bg.isPalette && bg.color === 238, `written bg must survive widen reflow, got ${JSON.stringify(bg)}`);
 });
+
+test('a painted background colour ALSO survives a column SHRINK reflow (composer bg-split is NOT reflow)', async () => {
+  // Companion to the widen test, and the FALSIFICATION of the long-standing
+  // "xterm reflow drops cell bg on column resize" root cause for the composer
+  // bg-split (issue #2). The live broken row was "text=default, surroundings=gray";
+  // it was HYPOTHESIZED that a column resize stripped the text cells' bg. Direct
+  // measurement on the EXACT vendored xterm.js shows reflow preserves a written
+  // bg in BOTH directions — so the split is NOT reflow. (The daemon vt100 emulator
+  // preserves it too — see daemon_vt100_preserves_composer_bg_across_column_resize.)
+  // The real producer is frame tearing of codex's \e[?2026h…\e[?2026l synchronized
+  // repaint, fixed in the write bridge. finding-codex-composer-bg-split-reflow.
+  const term = h.createTerminal({ cols: 80, rows: 5, scrollback: 1000 });
+  // Paint cols 0..39 of row 0 with palette-238 bg (the surviving region after shrink).
+  await h.write(term, '\x1b[H\x1b[48;5;238m' + 'x'.repeat(40) + '\x1b[0m');
+  let bg = h.cellBg(term, 0, 20);
+  assert.ok(bg && bg.isPalette && bg.color === 238, `pre-reflow cell must carry the bg, got ${JSON.stringify(bg)}`);
+  term.resize(40, 5); // shrink → reflow
+  bg = h.cellBg(term, 0, 20);
+  assert.ok(bg && bg.isPalette && bg.color === 238, `written bg must survive SHRINK reflow, got ${JSON.stringify(bg)}`);
+});
