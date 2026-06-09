@@ -1,12 +1,23 @@
-use crate::terminal_write_policy::terminal_output_contains_codex_welcome_surface;
+use crate::terminal_write_policy::{
+    terminal_output_contains_codex_welcome_surface,
+    terminal_output_ends_inside_synchronized_frame,
+};
 
 const TERMINAL_FRAME_BRIDGE_PENDING_MAX_BYTES: usize = 256 * 1024;
+
+/// Hard upper bound on how long the bridge will hold a flush waiting for a
+/// synchronized-update region to close (`\e[?2026l`). A real codex frame closes
+/// within a frame or two; this only bites if the ESU never arrives (codex died
+/// mid-frame, dropped bytes) — without it a torn-but-stuck buffer would stall
+/// forever. Generous vs. the ~16ms frame budget so it never clips a real frame.
+const TERMINAL_SYNC_FRAME_MAX_HOLD_MS: u64 = 250;
 
 #[derive(Debug)]
 pub(crate) struct TerminalWriteBridge {
     frame_ms: u64,
     pending: String,
     last_frame_flush_ms: u64,
+    pending_started_ms: u64,
     alt_screen_active: bool,
     cursor_hidden_active: bool,
 }
@@ -17,6 +28,7 @@ impl TerminalWriteBridge {
             frame_ms,
             pending: String::new(),
             last_frame_flush_ms: 0,
+            pending_started_ms: 0,
             alt_screen_active: false,
             cursor_hidden_active: false,
         }
@@ -65,6 +77,9 @@ impl TerminalWriteBridge {
             return writes;
         }
 
+        if self.pending.is_empty() {
+            self.pending_started_ms = now_ms;
+        }
         self.pending.push_str(&data);
         if self.pending.len() > TERMINAL_FRAME_BRIDGE_PENDING_MAX_BYTES {
             return self.flush_all(now_ms).into_iter().collect();
@@ -82,6 +97,16 @@ impl TerminalWriteBridge {
 
     pub(crate) fn flush_due(&mut self, now_ms: u64) -> Option<String> {
         if self.pending.is_empty() {
+            return None;
+        }
+        // Synchronized-output atomicity: if the buffer ends mid-frame (an open
+        // \e[?2026h with no matching \e[?2026l), hold the flush so xterm never
+        // paints a torn frame — the vendored xterm.js doesn't implement mode
+        // 2026, so the bridge enforces it. Bounded by TERMINAL_SYNC_FRAME_MAX_HOLD_MS
+        // so a never-closing frame (codex died mid-repaint) can't stall forever.
+        if terminal_output_ends_inside_synchronized_frame(&self.pending)
+            && now_ms.saturating_sub(self.pending_started_ms) < TERMINAL_SYNC_FRAME_MAX_HOLD_MS
+        {
             return None;
         }
         if self.last_frame_flush_ms == 0
