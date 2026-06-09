@@ -99365,6 +99365,62 @@ Shared connection to 192.0.2.14 closed.\r\n";
         assert_eq!(bridge.flush_due(1_401), Some(frame_two));
     }
     #[test]
+    fn terminal_write_bridge_holds_torn_synchronized_frame_until_esu() {
+        // ROOT FIX for the composer bg-split / "broken bottom" (issue #2): codex
+        // wraps a repaint in \e[?2026h … \e[?2026l (synchronized output). When the
+        // frame arrives split across two daemon reads, the bridge MUST NOT flush
+        // the first half (rows cleared-to-default by codex's repaint preamble, the
+        // gray composer + text still pending) — xterm-as-vendored ignores mode 2026
+        // so a partial flush paints a torn frame. Hold until the ESU arrives, then
+        // emit the whole frame atomically. finding-codex-composer-bg-split-reflow.
+        let mut bridge = TerminalWriteBridge::new(16);
+        // read 1: BSU + repaint preamble that clears rows to default bg, NO ESU yet.
+        let part1 = "\x1b[?2026h\x1b[60;1H\x1b[0m\x1b[49m\x1b[K\x1b[61;1H\x1b[0m\x1b[49m\x1b[K";
+        let held = bridge.stage_or_immediate(part1.to_string(), 1_000, true);
+        assert!(
+            held.is_empty(),
+            "a buffer ending mid synchronized-frame must be held, got {held:?}"
+        );
+        assert_eq!(bridge.pending_for_test(), part1);
+        // The 16ms timer must ALSO refuse to flush the torn frame.
+        assert_eq!(
+            bridge.flush_due(1_100),
+            None,
+            "timer flush must not tear an open synchronized frame"
+        );
+        // read 2: the gray composer fill + text + ESU completes the frame.
+        let part2 = "\x1b[61;1H\x1b[48;2;64;67;75m\u{203a} Find and fix a bug\x1b[61;34H\x1b[K\x1b[?2026l";
+        let flushed = bridge
+            .stage_or_immediate(part2.to_string(), 1_110, true)
+            .join("");
+        assert!(
+            flushed.contains("\x1b[?2026l") && flushed.contains("Find and fix a bug"),
+            "the complete frame must flush atomically once the ESU arrives, got {flushed:?}"
+        );
+        assert!(
+            flushed.starts_with(part1),
+            "the held preamble must lead the atomic flush so the frame is whole"
+        );
+        assert!(bridge.pending_for_test().is_empty());
+    }
+    #[test]
+    fn terminal_write_bridge_flushes_unclosed_synchronized_frame_after_cap() {
+        // Safety valve: if the ESU never arrives (codex died mid-repaint / dropped
+        // bytes) the bridge must not stall forever — flush past the bounded hold.
+        let mut bridge = TerminalWriteBridge::new(16);
+        let part1 = "\x1b[?2026h\x1b[60;1H\x1b[0m\x1b[49m\x1b[K";
+        assert!(
+            bridge.stage_or_immediate(part1.to_string(), 1_000, true).is_empty(),
+            "open frame held initially"
+        );
+        // Well past TERMINAL_SYNC_FRAME_MAX_HOLD_MS (250ms): the stuck frame flushes.
+        assert_eq!(
+            bridge.flush_due(1_000 + 5_000).as_deref(),
+            Some(part1),
+            "an unclosed synchronized frame must flush after the bounded hold"
+        );
+    }
+    #[test]
     fn terminal_write_bridge_can_switch_to_active_frame_budget() {
         let mut bridge = TerminalWriteBridge::new(4000);
         let frame_one = format!("\x1b[H{}\n", "one ".repeat(400));
