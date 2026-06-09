@@ -2409,6 +2409,21 @@ fn terminal_chunk_is_disposable_initial_attach_suffix(data: &str) -> bool {
     if trimmed.is_empty() {
         return true;
     }
+    // XTERM-BUG: content-clip-on-reveal (campaign #1). codex's composer / input
+    // row — a line beginning with the `›` prompt glyph, INCLUDING when it only
+    // shows a rotating placeholder hint ("Summarize recent commits", "Explain
+    // this codebase", …) — is the LIVE INPUT ROW the user types into, not
+    // disposable idle chrome. The generic-attach-prompt / idle-footer matchers
+    // below were classifying it disposable, so the initial-attach replay tail got
+    // trimmed of the composer; the revealed surface then showed a "broken bottom"
+    // (gray composer bar, no `›` text / footer) while the daemon screen had the
+    // full composer, and idle codex never re-emits to repaint it. Wrapper-vs-manual
+    // parity (project-purpose) requires the reveal render exactly what
+    // `ssh codex resume` shows, which includes this composer. So a chunk carrying
+    // it is NEVER a disposable suffix.
+    if terminal_chunk_carries_codex_composer_input_row(&stripped) {
+        return false;
+    }
     if terminal_chunk_has_generic_attach_idle_footer(&stripped) {
         return true;
     }
@@ -2493,6 +2508,34 @@ fn terminal_chunk_is_attach_model_footer_fragment(data: &str) -> bool {
     }
     (normalized.contains("gpt-5") || normalized.contains("gpt-4") || normalized.contains("claude"))
         && normalized.contains("% left")
+}
+
+/// True when the (control-stripped) chunk carries codex's composer / current
+/// input row — a line beginning with the `›` prompt glyph. This is the live row
+/// the user types into; it must survive initial-attach suffix trimming even when
+/// it only shows a placeholder hint. See content-clip-on-reveal (campaign #1).
+fn terminal_chunk_carries_codex_composer_input_row(stripped: &str) -> bool {
+    stripped.lines().any(|line| {
+        let Some(rest) = line.trim_start().strip_prefix('›') else {
+            return false;
+        };
+        // A real composer carries actual text after the `›` glyph — a placeholder
+        // hint or user input. Reject two non-composer cases: (a) a bare `›` with no
+        // real text, and (b) a `›` line that is actually leaked terminal-negotiation
+        // noise (device-attribute / color-query / cursor-report responses, e.g.
+        // "› ^[[?1;2c^[]10;rgb:cccc/cccc/cccc^[[1;1R") which the low-signal detector
+        // already recognizes.
+        if !rest.chars().any(|ch| ch.is_alphanumeric()) {
+            return false;
+        }
+        let lower = rest.to_ascii_lowercase();
+        !(lower.contains("^[[?")
+            || lower.contains("^[]10;")
+            || lower.contains("^[]11;")
+            || lower.contains("rgb:")
+            || lower.contains("[1;1r")
+            || lower.contains("[?1;2c"))
+    })
 }
 
 fn terminal_chunk_mentions_generic_attach_prompt(data: &str) -> bool {
@@ -3043,6 +3086,60 @@ PY"#,
     }
 
     #[test]
+    fn codex_composer_input_row_is_not_a_disposable_attach_suffix() {
+        // XTERM-BUG content-clip-on-reveal (campaign #1): the live codex composer /
+        // input row (a `›` line, even showing a rotating placeholder) must NOT be
+        // trimmed as disposable attach suffix — it's the row the user types into,
+        // and wrapper-vs-manual parity requires showing it. Pre-fix this FAILED:
+        // terminal_chunk_mentions_generic_attach_prompt matched the placeholder
+        // "Summarize recent commits" and marked the composer disposable.
+        let placeholder_composer = "\x1b[60;1H\x1b[39;48;2;64;67;75m \x1b[K\x1b[61;1H\x1b[1m\u{203a}\x1b[22m \x1b[2mSummarize recent commits\x1b[22m\x1b[K";
+        assert!(
+            !terminal_chunk_is_disposable_initial_attach_suffix(placeholder_composer),
+            "live codex composer with a placeholder must be preserved on attach"
+        );
+        let typed_composer = "\x1b[61;1H\x1b[1m\u{203a}\x1b[22m fix the flaky integration test\x1b[K";
+        assert!(
+            !terminal_chunk_is_disposable_initial_attach_suffix(typed_composer),
+            "a user-typed composer must be preserved on attach"
+        );
+        // No regression: genuinely low-signal trailing chrome is still disposable.
+        assert!(terminal_chunk_is_disposable_initial_attach_suffix("   "));
+        assert!(terminal_chunk_is_disposable_initial_attach_suffix(
+            "\x1b[K\x1b[?25l"
+        ));
+    }
+
+    #[test]
+    fn initial_attach_replay_keeps_codex_composer_off_the_trim() {
+        // End-to-end: a meaningful transcript anchor followed by the live composer
+        // as a trailing chunk -> the composer survives select_initial_attach_chunks
+        // (pre-fix it was popped by trim_initial_attach_low_signal_suffix).
+        let mut chunks = VecDeque::new();
+        chunks.push_back(TerminalChunk {
+            seq: 1,
+            data: "Implemented and pushed the change.\r\nWhat changed:\r\n- Added the new selector\r\n- Updated the test suite\r\nValidation: all checks passed.\r\n".to_string(),
+        });
+        chunks.push_back(TerminalChunk {
+            seq: 2,
+            data: "\x1b[60;1H\x1b[39;48;2;64;67;75m \x1b[K\x1b[61;1H\x1b[1m\u{203a}\x1b[22m \x1b[2mSummarize recent commits\x1b[22m\x1b[K".to_string(),
+        });
+        let selected = select_initial_attach_chunks(&chunks);
+        let joined = selected
+            .iter()
+            .map(|chunk| chunk.data.as_str())
+            .collect::<String>();
+        assert!(
+            joined.contains('\u{203a}'),
+            "composer input row must survive the attach trim, got: {joined:?}"
+        );
+        assert!(
+            joined.contains("Summarize recent commits"),
+            "composer placeholder must survive the attach trim"
+        );
+    }
+
+    #[test]
     fn initial_attach_falls_back_to_screen_snapshot_when_local_chunk_buffer_is_empty() {
         let runtime = PtySessionRuntime::spawn(
             "local://test-shell",
@@ -3219,9 +3316,13 @@ PY"#,
             .map(|chunk| chunk.data.as_str())
             .collect::<String>();
 
-        assert_eq!(seqs, vec![1]);
+        // content-clip-on-reveal (campaign #1): the live composer
+        // "›Explain this codebase" is the input row and MUST be preserved — the
+        // suffix trim now stops at it instead of dropping it (previously this
+        // locked seqs==[1], hiding the composer = the broken-bottom reveal).
+        assert!(seqs.contains(&5));
         assert!(combined.contains("origin/main updated successfully"));
-        assert!(!combined.contains("Explain this codebase"));
+        assert!(combined.contains("Explain this codebase"));
     }
 
     #[test]
@@ -3246,8 +3347,14 @@ PY"#,
             .map(|chunk| chunk.data.as_str())
             .collect::<String>();
 
+        // content-clip-on-reveal (campaign #1): the live composer
+        // "› Write tests for @filename" is the input row and MUST be preserved —
+        // this assertion was previously inverted (it locked the trim that produced
+        // the broken-bottom reveal). The trailing model "% left" footer fragment is
+        // still dropped as low-signal chrome.
         assert!(combined.contains("origin/main updated successfully"));
-        assert!(!combined.contains("Write tests for @filename"));
+        assert!(combined.contains("Write tests for @filename"));
+        assert!(!combined.contains("100% left"));
     }
 
     #[test]
