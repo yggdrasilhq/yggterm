@@ -729,6 +729,14 @@ struct ShellState {
     search_query: String,
     search_focused: bool,
     window_focused: bool,
+    // Monitoring override (app-control `force-foreground`): when true the GUI
+    // BEHAVES as foregrounded regardless of real OS focus/backgrounding — the
+    // active session stays hot (reads un-paused, full write-frame budget, hot
+    // warmer running) and screenshots stay fresh. Agents toggle this so
+    // instrument reads stop lying about an unfocused window. Real input
+    // ownership (host_stdin) is NOT overridden. Consumed ONLY through
+    // `effective_window_focused()` — never read raw at a throttle gate.
+    app_control_force_foreground: bool,
     terminal_input_override_active: bool,
     app_control_backgrounded: bool,
     app_control_backgrounded_at_ms: u64,
@@ -2171,6 +2179,7 @@ impl ShellState {
             search_query: String::new(),
             search_focused: false,
             window_focused: true,
+            app_control_force_foreground: false,
             terminal_input_override_active: false,
             app_control_backgrounded: false,
             app_control_backgrounded_at_ms: 0,
@@ -2870,6 +2879,14 @@ impl ShellState {
                 "query": self.search_query,
             }),
         );
+    }
+    /// Focus as the THROTTLE GATES should see it: real OS focus OR the
+    /// app-control `force-foreground` monitoring override. Every gate that
+    /// slows/pauses/drops work for an unfocused window must consult THIS, so
+    /// the override has one owner. Input/stdin ownership intentionally keeps
+    /// reading the raw `window_focused`.
+    fn effective_window_focused(&self) -> bool {
+        self.window_focused || self.app_control_force_foreground
     }
     fn set_window_focused(&mut self, focused: bool) {
         let was_focused = self.window_focused;
@@ -5342,7 +5359,9 @@ impl ShellState {
     /// next 5s tick. Same gating applies to `app_control_backgrounded`
     /// which is the explicit headless-mode background signal.
     fn tick_hot_warmer(&mut self, now_ms: u64) -> Vec<String> {
-        if !self.window_focused || self.app_control_backgrounded {
+        if !self.effective_window_focused()
+            || (self.app_control_backgrounded && !self.app_control_force_foreground)
+        {
             return Vec::new();
         }
         if self.next_hot_warm_check_at_ms > now_ms {
@@ -12436,7 +12455,7 @@ fn terminal_foreground_should_defer_background_refreshes(
 
 fn focused_terminal_should_defer_background_refreshes(shell: &ShellState) -> bool {
     terminal_foreground_should_defer_background_refreshes(
-        shell.window_focused,
+        shell.effective_window_focused(),
         shell.server.active_view_mode(),
         shell.server.active_session_path(),
     )
@@ -12682,7 +12701,7 @@ fn shell_live_session_snapshot_refresh_interval_ms(shell: &ShellState) -> u64 {
         .live_sessions()
         .iter()
         .any(|session| session.terminal_foreground_active == Some(true));
-    if busy && shell.window_focused {
+    if busy && shell.effective_window_focused() {
         LIVE_SESSION_SNAPSHOT_BUSY_POLL_MS
     } else if busy {
         LIVE_SESSION_SNAPSHOT_BACKGROUND_BUSY_POLL_MS
@@ -25292,6 +25311,8 @@ fn describe_app_state_snapshot(
             "titlebar_new_menu_open": shell.titlebar_new_menu_open,
             "fullscreen": shell.fullscreen,
             "window_focused": shell.window_focused,
+            "app_control_force_foreground": shell.app_control_force_foreground,
+            "effective_window_focused": shell.effective_window_focused(),
             "terminal_input_override_active": shell.terminal_input_override_active,
             "app_control_backgrounded": shell.app_control_backgrounded,
             "app_control_backgrounded_at_ms": shell.app_control_backgrounded_at_ms,
@@ -27417,7 +27438,7 @@ async fn capture_dom_debug_snapshot_for(active_session_path: Option<&str>) -> Va
                     hot_host_health_suppressed_count: mountedHost ? Number(mountedHost.hotHostHealthSuppressedCount || 0) : 0,
                     document_focused: (() => {
                         try {
-                            return typeof document.hasFocus === 'function' ? Boolean(document.hasFocus()) : true;
+                            if (window.__yggtermForceForeground === true) { return true; } return typeof document.hasFocus === 'function' ? Boolean(document.hasFocus()) : true;
                         } catch (_error) {
                             return true;
                         }
@@ -29094,7 +29115,7 @@ async fn capture_dom_debug_snapshot_basic_for(active_session_path: Option<&str>)
                     hot_host_health_suppressed_count: mountedHost ? Number(mountedHost.hotHostHealthSuppressedCount || 0) : 0,
                     document_focused: (() => {
                             try {
-                                return typeof document.hasFocus === 'function' ? Boolean(document.hasFocus()) : true;
+                                if (window.__yggtermForceForeground === true) { return true; } return typeof document.hasFocus === 'function' ? Boolean(document.hasFocus()) : true;
                             } catch (_error) {
                                 return true;
                             }
@@ -30307,7 +30328,7 @@ async fn capture_dom_debug_snapshot_terminal_quick_fallback_for(
                         scrollback_intent: mountedHost ? String(mountedHost.lastScrollbackIntent || 'PromptFollow') : 'PromptFollow',
                         document_focused: (() => {
                             try {
-                                return typeof document.hasFocus === 'function' ? Boolean(document.hasFocus()) : true;
+                                if (window.__yggtermForceForeground === true) { return true; } return typeof document.hasFocus === 'function' ? Boolean(document.hasFocus()) : true;
                             } catch (_error) {
                                 return true;
                             }
@@ -31032,7 +31053,7 @@ async fn capture_dom_debug_snapshot_terminal_fallback_for(
                     render_health_reason: mountedHost ? String(mountedHost.renderHealthReason || '') : '',
                     document_focused: (() => {{
                         try {{
-                            return typeof document.hasFocus === 'function' ? Boolean(document.hasFocus()) : true;
+                            if (window.__yggtermForceForeground === true) {{ return true; }} return typeof document.hasFocus === 'function' ? Boolean(document.hasFocus()) : true;
                         }} catch (_error) {{
                             return true;
                         }}
@@ -34708,6 +34729,39 @@ async fn process_pending_app_control_requests(
                 error: Some(error.to_string()),
             },
         },
+        AppControlCommand::SetForceForeground { enabled } => {
+            state.with_mut(|shell| {
+                shell.app_control_force_foreground = enabled;
+                if enabled {
+                    // The override is itself the "user is paying attention"
+                    // signal — let the hot warmer run on the next tick.
+                    shell.next_hot_warm_check_at_ms = 0;
+                }
+            });
+            // Mirror the flag into the webview so per-eval JS focus helpers
+            // (document.hasFocus copies in probe/replay scripts) honor it too;
+            // the per-host data-terminal-window-focused attribute re-renders
+            // from effective_window_focused() on its own.
+            let _ = document::eval(&format!(
+                "window.__yggtermForceForeground = {};",
+                if enabled { "true" } else { "false" }
+            ));
+            let (window_focused, effective) = state.with(|shell| {
+                (shell.window_focused, shell.effective_window_focused())
+            });
+            AppControlResponse {
+                request_id: request.request_id.clone(),
+                handled_by_pid: std::process::id(),
+                completed_at_ms: current_millis() as u128,
+                output_path: None,
+                data: Some(json!({
+                    "enabled": enabled,
+                    "window_focused": window_focused,
+                    "effective_window_focused": effective,
+                })),
+                error: None,
+            }
+        }
         AppControlCommand::MoveWindowBy { delta_x, delta_y } => {
             match move_app_window_by(&desktop, delta_x, delta_y) {
                 Ok(data) => AppControlResponse {
@@ -39407,7 +39461,7 @@ fn app() -> Element {
     let tree_rename_depth = state.read().tree_rename_depth;
     let snapshot: SharedSnapshot = Arc::new(state.read().snapshot());
     let app_control_backgrounded = state.read().app_control_backgrounded;
-    let window_focused = state.read().window_focused;
+    let window_focused = state.read().effective_window_focused();
     let inner = desktop.inner_size();
     let context_menu_window_size = (inner.width as f64, inner.height as f64);
     let titlebar_snapshot = snapshot.clone();
@@ -45317,7 +45371,8 @@ fn terminal_session_bridge_should_pause_reads(shell: &ShellState, session_path: 
     if !terminal_active_visible_for_session(shell, session_path) {
         return true;
     }
-    if !shell.window_focused && !shell.terminal_attach_in_flight.contains(session_path) {
+    if !shell.effective_window_focused() && !shell.terminal_attach_in_flight.contains(session_path)
+    {
         return true;
     }
     false
@@ -48717,7 +48772,8 @@ fn TerminalCanvas(
             let mut inline_status_animation_started_at_ms = 0_u64;
             let mut last_forward_protocol_only_trace_ms = 0_u64;
             let mut suppressed_forward_protocol_only_trace_count = 0_u64;
-            let mut last_window_focused_for_read = state.with(|shell| shell.window_focused);
+            let mut last_window_focused_for_read =
+                state.with(|shell| shell.effective_window_focused());
             let mut terminal_write_bridge = TerminalWriteBridge::new(terminal_write_frame_ms());
             let mut unfocused_tui_drop_active = false;
             let mut eval_result = Box::pin(eval.clone().join::<Value>());
@@ -48725,7 +48781,7 @@ fn TerminalCanvas(
                 let (window_focused_for_read, active_visible_terminal_for_read) =
                     state.with(|shell| {
                         (
-                            shell.window_focused,
+                            shell.effective_window_focused(),
                             terminal_active_visible_for_session(shell, &session_path),
                         )
                     });
@@ -53893,9 +53949,9 @@ fn TerminalCanvas(
     let (app_control_backgrounded, terminal_input_override_active, terminal_window_focused) = state
         .with(|shell| {
             (
-                shell.app_control_backgrounded,
+                shell.app_control_backgrounded && !shell.app_control_force_foreground,
                 shell.terminal_input_override_active,
-                shell.window_focused,
+                shell.effective_window_focused(),
             )
         });
     let context_row = BrowserRow {
@@ -64247,7 +64303,7 @@ fn terminal_eval_script_with_canvas_renderer(
         }};
         const terminalDocumentHasFocus = () => {{
             try {{
-                return typeof document.hasFocus === 'function' ? Boolean(document.hasFocus()) : true;
+                if (window.__yggtermForceForeground === true) {{ return true; }} return typeof document.hasFocus === 'function' ? Boolean(document.hasFocus()) : true;
             }} catch (_error) {{
                 return true;
             }}
@@ -74626,6 +74682,29 @@ mod tests {
                 false,
             ),
             (false, false)
+        );
+    }
+    // App-control `force-foreground` (monitoring override): with the flag on,
+    // an unfocused/backgrounded GUI must still behave as foregrounded at the
+    // throttle gates — effective focus true, bridge reads NOT paused — so the
+    // active session stays hot and agent screenshots stay fresh. The raw
+    // window_focused stays truthful (input ownership untouched).
+    #[test]
+    fn force_foreground_overrides_focus_gates_but_not_raw_focus() {
+        let mut shell = ShellState::new(test_shell_bootstrap_with_active_session("local://shell"));
+        shell.set_window_focused(false);
+        assert!(!shell.effective_window_focused(), "baseline: unfocused");
+        shell.app_control_force_foreground = true;
+        assert!(
+            shell.effective_window_focused(),
+            "force-foreground must make the gates see a focused window"
+        );
+        assert!(!shell.window_focused, "raw focus must stay truthful");
+        // The pause-reads gate (the semi-hot stale-buffer producer) must open.
+        assert!(
+            !terminal_session_bridge_should_pause_reads(&shell, "local://shell")
+                || !terminal_active_visible_for_session(&shell, "local://shell"),
+            "an active-visible session must not pause reads under force-foreground"
         );
     }
     #[test]
