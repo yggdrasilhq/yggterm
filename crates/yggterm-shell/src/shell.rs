@@ -61648,8 +61648,17 @@ fn terminal_eval_script_with_canvas_renderer(
                         }});
                     }} catch (_restoreErr) {{}}
                 }}
-                // Restore whenever user was not at the bottom (locked) OR intent was UserScrollback.
-                if (persisted && (persisted.intent === 'UserScrollback' || persisted.locked || persisted.distanceFromBottom > 0)) {{
+                // Restore whenever user was not at the bottom (locked) OR intent was
+                // UserScrollback — but only for a RECENT record. Sweep capture
+                // (2026-06-10) caught a 12.2-HOUR-old localStorage record re-asserting
+                // UserScrollback at mount, latching a phantom pinned state durably
+                // across restarts. A scroll position only deserves restoring on the
+                // continuity horizon of a restart, not across half a day; the TEXT
+                // restore above is intentionally NOT capped (transcript survival is
+                // the vacuum fix and has no staleness hazard).
+                const scrollRestoreFreshMs = 30 * 60 * 1000;
+                if (persisted && persisted.ageMs <= scrollRestoreFreshMs
+                    && (persisted.intent === 'UserScrollback' || persisted.locked || persisted.distanceFromBottom > 0)) {{
                     pendingPersistedScrollRestore = persisted;
                     pendingPersistedScrollRestoreDeadlineMs = Date.now() + 8000;
                     setScrollbackIntent('UserScrollback', `persisted_scroll_state:age_ms_${{Math.round(persisted.ageMs)}}`);
