@@ -57927,18 +57927,49 @@ fn terminal_eval_script_with_canvas_renderer(
                     return null;
                 }}
                 const reg = window.__yggtermXtermHosts || {{}};
-                const prior = reg[hostId];
-                const priorBuf = prior && prior.term && prior.term.buffer && prior.term.buffer.active;
-                const priorPainted = Boolean(
-                    priorBuf
-                    && (Number(priorBuf.baseY || 0) > 0
-                        || Number(priorBuf.cursorY || 0) > 0
-                        || Number(priorBuf.cursorX || 0) > 0)
-                );
-                if (!priorPainted) {{
-                    return null;
+                const entryPainted = (candidate) => {{
+                    const buf = candidate && candidate.term && candidate.term.buffer
+                        && candidate.term.buffer.active;
+                    return Boolean(
+                        buf
+                        && (Number(buf.baseY || 0) > 0
+                            || Number(buf.cursorY || 0) > 0
+                            || Number(buf.cursorX || 0) > 0)
+                    );
+                }};
+                const screenForEntry = (candidate) => {{
+                    const el = candidate && candidate.term && candidate.term.element
+                        ? candidate.term.element : null;
+                    return el && el.querySelector ? el.querySelector('.xterm-screen') : null;
+                }};
+                let screen = null;
+                if (entryPainted(reg[hostId])) {{
+                    screen = host.querySelector('.xterm-screen');
                 }}
-                const screen = host.querySelector('.xterm-screen');
+                if (!screen) {{
+                    // Cold remount of the SAME session under a new mount epoch:
+                    // the prior epoch's entry (different hostId, same sessionPath)
+                    // is still in the registry at this point — the reap below has
+                    // not run yet — and its detached canvases are still drawable.
+                    // 5-sweep capture (2026-06-10) showed sweep reveals are nearly
+                    // ALL cold remounts (167 constructs / 100 opens), so the
+                    // same-hostId-only ghost covered just 38/100 reveals; this
+                    // fallback covers the rest of the previously-painted ones.
+                    const mountSessionPath = host.getAttribute('data-terminal-session-path') || '';
+                    if (mountSessionPath) {{
+                        for (const priorKey of Object.keys(reg)) {{
+                            if (priorKey === hostId) {{ continue; }}
+                            const candidate = reg[priorKey];
+                            if (!candidate || candidate.sessionPath !== mountSessionPath) {{ continue; }}
+                            if (!entryPainted(candidate)) {{ continue; }}
+                            const candidateScreen = screenForEntry(candidate);
+                            if (candidateScreen && candidateScreen.querySelectorAll('canvas').length) {{
+                                screen = candidateScreen;
+                                break;
+                            }}
+                        }}
+                    }}
+                }}
                 const canvases = screen ? screen.querySelectorAll('canvas') : [];
                 if (!screen || !canvases.length) {{
                     return null;
@@ -57966,12 +57997,27 @@ fn terminal_eval_script_with_canvas_renderer(
                 }}
                 const hostRect = host.getBoundingClientRect();
                 const screenRect = screen.getBoundingClientRect();
+                // A prior-epoch screen is DETACHED (rect 0x0): fall back to the
+                // canvas backing-store size scaled by devicePixelRatio, anchored
+                // at the host origin.
+                const dpr = Math.max(1, Number(window.devicePixelRatio || 1));
+                const attached = screenRect.width > 0 && screenRect.height > 0;
+                const cssWidth = attached
+                    ? Math.round(screenRect.width)
+                    : Math.round(first.width / dpr);
+                const cssHeight = attached
+                    ? Math.round(screenRect.height)
+                    : Math.round(first.height / dpr);
                 ghost.className = 'yggterm-reveal-ghost';
                 ghost.style.position = 'absolute';
-                ghost.style.left = `${{Math.max(0, Math.round(screenRect.left - hostRect.left))}}px`;
-                ghost.style.top = `${{Math.max(0, Math.round(screenRect.top - hostRect.top))}}px`;
-                ghost.style.width = `${{Math.round(screenRect.width || first.clientWidth || 0)}}px`;
-                ghost.style.height = `${{Math.round(screenRect.height || first.clientHeight || 0)}}px`;
+                ghost.style.left = attached
+                    ? `${{Math.max(0, Math.round(screenRect.left - hostRect.left))}}px`
+                    : '0px';
+                ghost.style.top = attached
+                    ? `${{Math.max(0, Math.round(screenRect.top - hostRect.top))}}px`
+                    : '0px';
+                ghost.style.width = `${{cssWidth}}px`;
+                ghost.style.height = `${{cssHeight}}px`;
                 ghost.style.zIndex = '40';
                 ghost.style.pointerEvents = 'none';
                 return ghost;
@@ -74198,10 +74244,15 @@ mod tests {
             wipe_ix < attach_ix,
             "ghost attaches after the wipe (same synchronous task, no paint between)"
         );
-        // Gated on a prior painted entry: a fresh mount has no registry entry for
-        // this hostId and must not ghost.
-        assert!(script.contains("const prior = reg[hostId];"));
-        assert!(script.contains("if (!priorPainted) {"));
+        // Gated on a prior PAINTED entry: same-hostId reveal first, then the
+        // same-session prior-epoch fallback (cold remounts — the dominant sweep
+        // case). A truly fresh session has neither and must not ghost.
+        assert!(script.contains("if (entryPainted(reg[hostId])) {"));
+        assert!(script.contains("candidate.sessionPath !== mountSessionPath"));
+        assert!(
+            script.contains("? Math.round(screenRect.width)"),
+            "detached prior-epoch screens (rect 0x0) need the backing-store size fallback"
+        );
     }
     // Settle-follow watchdog: the executor for scroll_mode::should_settle_follow.
     // A Following session with the viewport stranded below base must re-assert to
