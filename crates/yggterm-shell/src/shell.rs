@@ -363,6 +363,16 @@ const RETAINED_REVEAL_EMPTY_GRACE_MS: u64 = 1_200;
 // authoritative vt100 state (fixes the reflow-dropped background; see
 // finding-codex-composer-bg-split-reflow).
 const POST_RESIZE_SCREEN_RECONCILE_SETTLE_MS: u64 = 280;
+// Settle before the semi-hot REVEAL reconcile: give the resumed bridge reads a
+// beat to catch up (their replayed chunks may already repaint the bottom)
+// before fetching the daemon's authoritative screen.
+const REVEAL_SCREEN_RECONCILE_SETTLE_MS: u64 = 700;
+/// Whether a scheduled visible-screen reconcile may write the daemon frame:
+/// never empty, and never over a WORKING surface (the agent's own next frame
+/// repaints it; a mid-turn overwrite tears — incident-gap-fix-cascade rule).
+fn screen_reconcile_should_write(screen_text: &str) -> bool {
+    !screen_text.trim().is_empty() && !yggterm_core::screen_text_shows_agent_working(screen_text)
+}
 const RETAINED_EMPTY_SURFACE_SETTLE_MS: u64 = 800;
 // Like the empty-surface transient above, a cold/mid-redraw surface can fail
 // codex-PROMPT recognition for a frame (the prompt hasn't repainted yet). The
@@ -48687,6 +48697,8 @@ fn TerminalCanvas(
             // daemon's `formatted` screen starts with \e[H\e[J (erase VISIBLE screen
             // only, not \e[3J), so this preserves xterm scrollback. 0 = none pending.
             let mut screen_reconcile_due_at_ms: u64 = 0;
+            let mut screen_reconcile_reason: &'static str = "post_resize_screen_reconcile";
+            let mut last_bridge_reads_paused = false;
             let mut terminal_paint_seen = !is_remote_resume_session;
             let mut cursor = 0u64;
             let mut read_poll_ms = if is_remote_resume_session {
@@ -48804,6 +48816,23 @@ fn TerminalCanvas(
                 }
                 let bridge_reads_paused = state
                     .with(|shell| terminal_session_bridge_should_pause_reads(shell, &session_path));
+                // Semi-hot reveal reconcile (broken-bottom-on-reveal class): while a
+                // mounted host is backgrounded its bridge reads PAUSE, so the client
+                // buffer misses the TUI's repaints (codex repaints in place — the
+                // composer/footer live only in the missed frames). On the
+                // paused->unpaused transition (the session became active-visible
+                // again) schedule a visible-screen reconcile from the daemon's
+                // authoritative vt100 state — same scrollback-preserving write as the
+                // post-resize reconcile below. Cold mounts (full replay) never pause
+                // first, so they are untouched.
+                if bridge_reads_paused != last_bridge_reads_paused {
+                    if last_bridge_reads_paused && !bridge_reads_paused {
+                        screen_reconcile_due_at_ms =
+                            current_millis().saturating_add(REVEAL_SCREEN_RECONCILE_SETTLE_MS);
+                        screen_reconcile_reason = "semi_hot_reveal_screen_reconcile";
+                    }
+                    last_bridge_reads_paused = bridge_reads_paused;
+                }
                 if js_ready
                     && !bridge_reads_paused
                     && let Some(data) = terminal_write_bridge.flush_due(current_millis())
@@ -48820,6 +48849,8 @@ fn TerminalCanvas(
                     && current_millis() >= screen_reconcile_due_at_ms
                 {
                     screen_reconcile_due_at_ms = 0;
+                    let reconcile_reason = screen_reconcile_reason;
+                    screen_reconcile_reason = "post_resize_screen_reconcile";
                     if let Ok((screen_text, _running, _out, _post, _seq, _spawn)) = terminal_snapshot_async(
                         endpoint.clone(),
                         runtime_session_path.clone(),
@@ -48828,7 +48859,12 @@ fn TerminalCanvas(
                     .await
                     {
                         let screen_text = sanitize_terminal_replay_payload(&screen_text);
-                        if !screen_text.trim().is_empty() {
+                        // Recovery-churn guard (incident-gap-fix-cascade): never
+                        // repaint over a WORKING surface — the agent's own next
+                        // frame repaints it, and a mid-turn overwrite tears.
+                        let looks_working =
+                            yggterm_core::screen_text_shows_agent_working(&screen_text);
+                        if screen_reconcile_should_write(&screen_text) {
                             let _ = eval.send(TerminalJsCommand::Write {
                                 data: screen_text.clone(),
                             });
@@ -48836,10 +48872,21 @@ fn TerminalCanvas(
                                 &trace_home,
                                 "ui",
                                 "terminal_mount",
-                                "post_resize_screen_reconcile",
+                                reconcile_reason,
                                 json!({
                                     "session_path": session_path.clone(),
                                     "bytes": screen_text.len(),
+                                }),
+                            );
+                        } else if looks_working {
+                            append_trace_event(
+                                &trace_home,
+                                "ui",
+                                "terminal_mount",
+                                "screen_reconcile_skipped_working_surface",
+                                json!({
+                                    "session_path": session_path.clone(),
+                                    "reason": reconcile_reason,
                                 }),
                             );
                         }
@@ -74684,6 +74731,20 @@ mod tests {
             (false, false)
         );
     }
+    // Semi-hot reveal reconcile: the daemon-frame repaint must fire for a
+    // settled (idle) screen and must NEVER fire over a working surface or an
+    // empty frame (recovery-churn-during-work trap).
+    #[test]
+    fn screen_reconcile_writes_only_settled_nonempty_screens() {
+        assert!(screen_reconcile_should_write(
+            "transcript line\r\n\u{203a} Find and fix a bug\r\n gpt-5.5 medium\r\n"
+        ));
+        assert!(!screen_reconcile_should_write("   \r\n  "));
+        assert!(!screen_reconcile_should_write(
+            "doing things\r\n(2m 10s \u{2022} esc to interrupt)\r\n"
+        ));
+    }
+
     // App-control `force-foreground` (monitoring override): with the flag on,
     // an unfocused/backgrounded GUI must still behave as foregrounded at the
     // throttle gates — effective focus true, bridge reads NOT paused — so the
