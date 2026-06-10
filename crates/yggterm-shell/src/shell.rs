@@ -62740,7 +62740,16 @@ fn terminal_eval_script_with_canvas_renderer(
                 if (restoreInFlight) {{ return; }}
                 const buf = term && term.buffer ? term.buffer.active : null;
                 if (!buf) {{ return; }}
-                const vy = Math.max(0, Number(buf.viewportY || 0));
+                // Measure the EFFECTIVE viewport (the same clamped value the app
+                // state and the follow executor satisfy). Raw buf.viewportY can
+                // sit below it permanently (visual-beyond-base clamp), which made
+                // the watchdog loop a 1s re-assert against a host that was
+                // already visually at the bottom (live-caught on first deploy).
+                const vy = Math.max(0, Number(
+                    (typeof effectiveXtermViewportY === 'function'
+                        ? effectiveXtermViewportY(buf)
+                        : buf.viewportY) || 0
+                ));
                 const by = Math.max(0, Number(buf.baseY || 0));
                 if (by - vy < 2) {{ return; }}
                 scrollLiveCursorIntoView(false, 'settle_follow_watchdog');
