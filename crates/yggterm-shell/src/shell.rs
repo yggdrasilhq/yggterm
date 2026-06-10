@@ -62768,6 +62768,19 @@ fn terminal_eval_script_with_canvas_renderer(
                 window.__yggtermXtermHosts[hostId].wheelEventCount = wheelEventCount;
                 window.__yggtermXtermHosts[hostId].lastWheelDeltaY = Number(event.deltaY || 0);
             }}
+            // SCROLL-OWNERSHIP (boring loads spec): the user's wheel owns the
+            // viewport from this moment. A pending persisted-scroll restore
+            // (armed at construct, polled for up to 8s) must never fire after
+            // real user scroll input — re-applying the saved offset over the
+            // user's position was the post-reveal "yanks to its liking spot"
+            // fight.
+            if (pendingPersistedScrollRestore) {{
+                pendingPersistedScrollRestore = null;
+                sendTerminalEvent({{
+                    kind: 'debug',
+                    message: `persisted_scroll_restore_cancelled host=${{hostId}} reason=user_wheel`
+                }});
+            }}
             const deltaLines = Math.max(1, Math.round(Math.abs(event.deltaY) / 40));
             revealSoftwareCanvasLinkLayer('wheel');
             const activeBuffer = term && term.buffer ? term.buffer.active : null;
@@ -76696,6 +76709,14 @@ mod tests {
         assert!(
             script.contains("const tryApplyPendingPersistedScrollRestore = (reason = '') => {"),
             "tryApplyPendingPersistedScrollRestore must remain to apply restore once baseY stabilizes after replay"
+        );
+        // SCROLL-OWNERSHIP: real user wheel input must cancel a pending
+        // persisted restore — the 8s restore poll re-applying a saved offset
+        // over the user's own scrolling was the "yanks to its liking spot"
+        // fight after a reveal.
+        assert!(
+            script.contains("reason=user_wheel"),
+            "user wheel input must cancel a pending persisted scroll restore"
         );
         // The key prefix is the persistence handshake — never change it
         // without a migration story.
