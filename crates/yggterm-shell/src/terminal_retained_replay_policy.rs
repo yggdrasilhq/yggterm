@@ -66,6 +66,85 @@ pub(crate) fn retained_replay_would_vacuum_richer_client(
         && incoming_richness.saturating_mul(3) < client_richness
 }
 
+/// Boring retained reveal (spec-boring-session-loads, lane 1): how the
+/// bootstrap read loop should (re)enter the daemon chunk stream for a host.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RetainedRevealReadPlan {
+    /// The host's xterm entry survived backgrounding with this stream's
+    /// content already painted: resume reads at the saved cursor and APPEND
+    /// only the missed delta — no reset, no full replay. The harness locks
+    /// the safety property (stream-split invariance: split feeds equal the
+    /// un-split feed; tools/xterm-harness/boring_reveal_resume.test.js), so
+    /// the revealed buffer ends exactly as if the session never detached.
+    ResumeAppend { cursor: u64 },
+    /// Fresh mount (or no healthy saved cursor): read from 0, full replay.
+    FullReplay,
+}
+
+/// The saved cursor is keyed by (session_path, host_id): the host id is only
+/// reused when the GUI retained the SAME terminal host element (and thus the
+/// same painted xterm entry) across the background/reveal cycle, so presence
+/// of a positive saved cursor IS the "retained and already painted" signal —
+/// a scenario signal, never a magnitude ratio (the 2.8.64 lesson). The store
+/// must only be written by a healthy read loop and cleared on every reset /
+/// cursor-rewind / fault-recovery path, so a stale or churned host never
+/// resumes.
+pub(crate) fn retained_reveal_read_plan(saved_cursor: Option<u64>) -> RetainedRevealReadPlan {
+    match saved_cursor {
+        Some(cursor) if cursor > 0 => RetainedRevealReadPlan::ResumeAppend { cursor },
+        _ => RetainedRevealReadPlan::FullReplay,
+    }
+}
+
+/// When resuming (ResumeAppend), the InitialRead retained-rehydrate task is
+/// pure churn: it re-reads the stream from 0 and reset+replays it into the
+/// already-painted buffer — that reset IS the blink-blink shadow the spec
+/// rejects. Suppress it. A CollapsedScrollbackRecovery rehydrate is a FAULT
+/// path (the surface is already known broken) and must stay armed.
+pub(crate) fn retained_reveal_resume_suppresses_rehydrate(
+    plan: RetainedRevealReadPlan,
+    mode: RetainedRehydrateMode,
+) -> bool {
+    matches!(plan, RetainedRevealReadPlan::ResumeAppend { .. })
+        && matches!(mode, RetainedRehydrateMode::InitialRead)
+}
+
+/// Outcome of the FIRST read after a ResumeAppend, decided from the daemon's
+/// own stream signals (deterministic, no heuristics):
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ResumedReadOutcome {
+    /// Contiguous tail: append the chunks. The boring reveal.
+    AppendChunks,
+    /// The live ring trimmed below our cursor (`resync_required`): the
+    /// returned tail skips a contiguous middle, so appending it would corrupt
+    /// the buffer (docs/xterm-bugs.md#chunk-ring-trim-drops-mid-stream).
+    /// Skip the chunks, advance the cursor past the gap, and arm the
+    /// scrollback-preserving visible-screen reconcile (the shipped 2.8.69
+    /// daemon vt100 write) to repaint the authoritative bottom. The client
+    /// keeps its scrollback; only the unrecoverable gap middle is absent —
+    /// strictly more than the old reset+replay preserved. NEVER replay
+    /// history into the buffer here (the gap-fix cascade trap: history
+    /// written into an alternate-screen TUI corrupted codex on switch-back).
+    SkipGapReconcileScreen,
+    /// The daemon's cursor rewound below ours: the runtime was re-created
+    /// (cold re-resume). The existing rewind path owns this — full reset +
+    /// replay of the fresh stream.
+    FullResetReplay,
+}
+
+pub(crate) fn resumed_read_outcome(
+    resync_required: bool,
+    cursor_rewound: bool,
+) -> ResumedReadOutcome {
+    if cursor_rewound {
+        ResumedReadOutcome::FullResetReplay
+    } else if resync_required {
+        ResumedReadOutcome::SkipGapReconcileScreen
+    } else {
+        ResumedReadOutcome::AppendChunks
+    }
+}
+
 pub(crate) fn retained_ready_remote_host_should_reuse_bootstrap(
     is_remote_resume_session: bool,
     retained: bool,
@@ -240,6 +319,69 @@ pub(crate) fn blank_host_snapshot_replay_from_read_should_start(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Boring retained reveal (spec-boring-session-loads lane 1): a positive
+    // saved cursor — written only by a healthy loop for this exact
+    // (session_path, host_id) — is the ONLY thing that arms ResumeAppend.
+    #[test]
+    fn retained_reveal_resumes_only_on_healthy_saved_cursor() {
+        assert_eq!(
+            retained_reveal_read_plan(Some(249)),
+            RetainedRevealReadPlan::ResumeAppend { cursor: 249 }
+        );
+        assert_eq!(
+            retained_reveal_read_plan(Some(0)),
+            RetainedRevealReadPlan::FullReplay,
+            "a zero cursor means nothing was consumed; full replay"
+        );
+        assert_eq!(retained_reveal_read_plan(None), RetainedRevealReadPlan::FullReplay);
+    }
+
+    // The reset+replay rehydrate is suppressed ONLY when resuming and ONLY for
+    // the InitialRead flavor; the CollapsedScrollbackRecovery fault path stays
+    // armed (the surface is already known broken — recovery owns the churn).
+    #[test]
+    fn resume_suppresses_initial_rehydrate_but_never_fault_recovery() {
+        let resume = RetainedRevealReadPlan::ResumeAppend { cursor: 7 };
+        assert!(retained_reveal_resume_suppresses_rehydrate(
+            resume,
+            RetainedRehydrateMode::InitialRead
+        ));
+        assert!(!retained_reveal_resume_suppresses_rehydrate(
+            resume,
+            RetainedRehydrateMode::CollapsedScrollbackRecovery
+        ));
+        assert!(!retained_reveal_resume_suppresses_rehydrate(
+            RetainedRevealReadPlan::FullReplay,
+            RetainedRehydrateMode::InitialRead
+        ));
+    }
+
+    // The first resumed read is decided purely from the daemon's stream
+    // signals: rewound cursor (runtime re-created) outranks a ring-trim gap;
+    // a gap skips the discontiguous chunks and reconciles the screen instead
+    // of appending (append-on-gap corrupts; replay-history-on-gap was the
+    // gap-fix cascade trap). Contiguous tail = boring append.
+    #[test]
+    fn resumed_read_outcome_orders_rewind_over_gap_over_append() {
+        assert_eq!(
+            resumed_read_outcome(false, false),
+            ResumedReadOutcome::AppendChunks
+        );
+        assert_eq!(
+            resumed_read_outcome(true, false),
+            ResumedReadOutcome::SkipGapReconcileScreen
+        );
+        assert_eq!(
+            resumed_read_outcome(false, true),
+            ResumedReadOutcome::FullResetReplay
+        );
+        assert_eq!(
+            resumed_read_outcome(true, true),
+            ResumedReadOutcome::FullResetReplay,
+            "a rewound cursor means a fresh stream — the gap signal is moot"
+        );
+    }
 
     #[test]
     fn cold_re_resume_vacuum_guard_refuses_only_new_runtime_collapse() {
