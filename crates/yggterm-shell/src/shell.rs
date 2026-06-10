@@ -48328,21 +48328,6 @@ fn TerminalCanvas(
         *retained_recovery_watch_identity.borrow_mut() = String::new();
     }
     if should_schedule_bootstrap {
-        // Semi-hot reveal detection: while a retained host sits INACTIVE its
-        // bootstrap is skipped entirely (bootstrap_spawn_skipped_inactive_
-        // retained_host) — no reads run, so the client buffer misses the TUI's
-        // in-place repaints. When the bootstrap re-spawns for the SAME identity
-        // it is a reveal of that stale retained buffer: schedule the
-        // authoritative visible-screen reconcile (consumes the marker so one
-        // reveal fires once; the next inactive stretch re-arms it).
-        let revealed_from_inactive_retained = {
-            let key = format!("inactive-skip:{bootstrap_identity}");
-            let matched = *inactive_bootstrap_skip_identity.borrow() == key;
-            if matched {
-                *inactive_bootstrap_skip_identity.borrow_mut() = String::new();
-            }
-            matched
-        };
         let watch_startup_restore_recovery = state.with(|shell| {
             shell.startup_terminal_restore_should_open(&session_path)
                 || shell
@@ -48717,16 +48702,23 @@ fn TerminalCanvas(
             // authoritative vt100 state (which has the correct per-cell bg). The
             // daemon's `formatted` screen starts with \e[H\e[J (erase VISIBLE screen
             // only, not \e[3J), so this preserves xterm scrollback. 0 = none pending.
-            let mut screen_reconcile_due_at_ms: u64 = if revealed_from_inactive_retained {
-                current_millis().saturating_add(REVEAL_SCREEN_RECONCILE_SETTLE_MS)
-            } else {
-                0
-            };
-            let mut screen_reconcile_reason: &'static str = if revealed_from_inactive_retained {
-                "semi_hot_reveal_screen_reconcile"
-            } else {
-                "post_resize_screen_reconcile"
-            };
+            // Reveal/bootstrap screen reconcile (semi-hot broken-bottom class):
+            // while a retained host sits inactive its bootstrap is skipped
+            // entirely — no reads run, so the client buffer misses the TUI's
+            // in-place repaints (codex's composer/footer live only in those
+            // frames); the reveal then paints the stale bottom and an idle TUI
+            // never re-emits it. EVERY bootstrap spawn therefore schedules one
+            // settled repaint of the visible screen from the daemon's
+            // authoritative vt100 state. Deterministic by design (spec: no
+            // non-determinism — an earlier inactive-marker trigger fired only
+            // when the backgrounded component happened to re-render, making the
+            // broken bottom alternate between reveals). On a cold mount the
+            // write is an idempotent repaint of what the replay just painted;
+            // screen_reconcile_should_write rejects empty/WORKING/launch-seed
+            // screens, and the write keeps scrollback (\x1b[H\x1b[J only).
+            let mut screen_reconcile_due_at_ms: u64 =
+                current_millis().saturating_add(REVEAL_SCREEN_RECONCILE_SETTLE_MS);
+            let mut screen_reconcile_reason: &'static str = "reveal_screen_reconcile";
             let mut last_bridge_reads_paused = false;
             let mut terminal_paint_seen = !is_remote_resume_session;
             let mut cursor = 0u64;
@@ -48858,7 +48850,7 @@ fn TerminalCanvas(
                     if last_bridge_reads_paused && !bridge_reads_paused {
                         screen_reconcile_due_at_ms =
                             current_millis().saturating_add(REVEAL_SCREEN_RECONCILE_SETTLE_MS);
-                        screen_reconcile_reason = "semi_hot_reveal_screen_reconcile";
+                        screen_reconcile_reason = "read_resume_screen_reconcile";
                     }
                     last_bridge_reads_paused = bridge_reads_paused;
                 }
