@@ -53,6 +53,7 @@ use yggterm_server::{
     run_app_control_start_action, run_app_control_trigger_update_check, run_attach, run_daemon,
     ScreenshotPostProcess, run_screenrecord_capture, run_screenshot_capture,
     run_screenshot_capture_with_post_process, run_trace_bundle, run_trace_follow, run_trace_tail,
+    run_trace_transitions,
     shutdown, snapshot, start_local_session, status, terminal_history, terminal_resize,
     terminal_restart, terminal_retained_snapshot, terminal_snapshot, terminal_write,
     try_run_remote_server_command,
@@ -1051,6 +1052,24 @@ fn main() -> Result<()> {
             .and_then(|value| value.parse::<u64>().ok())
             .unwrap_or(500);
         return run_trace_follow(lines, poll_ms);
+    }
+    if args.len() >= 3 && args[0] == "server" && args[1] == "trace" && args[2] == "transitions" {
+        let session_filter = args
+            .windows(2)
+            .find_map(|window| (window[0] == "--session").then(|| window[1].clone()));
+        let last_ms = args
+            .windows(2)
+            .find_map(|window| {
+                (window[0] == "--last-ms").then(|| window[1].parse::<u64>().ok())?
+            })
+            .unwrap_or(180_000);
+        let limit = args
+            .windows(2)
+            .find_map(|window| {
+                (window[0] == "--limit").then(|| window[1].parse::<usize>().ok())?
+            })
+            .unwrap_or(200);
+        return run_trace_transitions(session_filter.as_deref(), last_ms, limit);
     }
     if args.len() >= 3 && args[0] == "server" && args[1] == "trace" && args[2] == "bundle" {
         let lines = args

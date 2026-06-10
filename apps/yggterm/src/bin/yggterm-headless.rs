@@ -43,7 +43,7 @@ use yggterm_server::{
     run_app_control_show_start_page, run_app_control_start_action,
     run_app_control_trigger_update_check, run_attach, run_daemon, run_screenrecord_capture,
     run_screenshot_capture, run_screenshot_capture_with_post_process, run_trace_bundle,
-    run_trace_follow, run_trace_tail,
+    run_trace_follow, run_trace_tail, run_trace_transitions,
     scan_remote_machine_sessions_for_target, shutdown, snapshot, status, terminal_resize,
     terminal_restart,
     terminal_write, try_run_remote_server_command,
@@ -164,7 +164,7 @@ fn print_server_help() {
   yggterm-headless server terminal restart <session> [--terminal-appearance <dark|light>] [--force-remote]
   yggterm-headless server sessions regenerate-copy [--budget <n>] [--force] [--reset-summary-history] [--skip-local] [--skip-remote] [--json]
   yggterm-headless server monitor --scenario <panic-report|server-list|latency-check|wait-session|hot-restart|managed-cli-refresh>
-  yggterm-headless server trace <tail|follow|bundle>
+  yggterm-headless server trace <tail|follow|bundle|transitions>
   yggterm-headless server screenshot <target> [output]
   yggterm-headless server screenrecord <target> [output]
   yggterm-headless server app <subcommand>"
@@ -1092,6 +1092,24 @@ fn main() -> Result<()> {
             .and_then(|value| value.parse::<u64>().ok())
             .unwrap_or(500);
         return run_trace_follow(lines, poll_ms);
+    }
+    if args.len() >= 3 && args[0] == "server" && args[1] == "trace" && args[2] == "transitions" {
+        let session_filter = args
+            .windows(2)
+            .find_map(|window| (window[0] == "--session").then(|| window[1].clone()));
+        let last_ms = args
+            .windows(2)
+            .find_map(|window| {
+                (window[0] == "--last-ms").then(|| window[1].parse::<u64>().ok())?
+            })
+            .unwrap_or(180_000);
+        let limit = args
+            .windows(2)
+            .find_map(|window| {
+                (window[0] == "--limit").then(|| window[1].parse::<usize>().ok())?
+            })
+            .unwrap_or(200);
+        return run_trace_transitions(session_filter.as_deref(), last_ms, limit);
     }
     if args.len() >= 3 && args[0] == "server" && args[1] == "trace" && args[2] == "bundle" {
         let lines = args
