@@ -3308,6 +3308,66 @@ PY"#,
         assert!(combined.contains("restarted"), "{combined:?}");
     }
 
+    // Boring retained reveal (spec-boring-session-loads lane 1): a resumed read
+    // from a live cursor must deliver ONLY the contiguous delta (seq > cursor),
+    // never re-deliver consumed chunks — the client APPENDS the result into an
+    // already-painted buffer, so any re-delivery would double-paint on reveal.
+    #[test]
+    fn pty_read_from_live_cursor_returns_only_the_unconsumed_delta() {
+        let runtime = PtySessionRuntime::spawn(
+            "local://cursor-resume-delta-test",
+            "bash -lc 'printf phase-one; sleep 0.5; printf phase-two; sleep 2'",
+            None,
+            None,
+        )
+        .expect("spawn cursor resume test runtime");
+        let mut first_cursor = 0_u64;
+        let mut first_data = String::new();
+        for _ in 0..80 {
+            let read = runtime.read(0);
+            first_data = read
+                .chunks
+                .iter()
+                .map(|chunk| chunk.data.as_str())
+                .collect::<String>();
+            first_cursor = read.cursor;
+            if first_data.contains("phase-one") {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        assert!(first_data.contains("phase-one"), "{first_data:?}");
+        let mut resumed_chunks = Vec::new();
+        let mut resumed_data = String::new();
+        for _ in 0..120 {
+            let read = runtime.read(first_cursor);
+            resumed_data = read
+                .chunks
+                .iter()
+                .map(|chunk| chunk.data.as_str())
+                .collect::<String>();
+            resumed_chunks = read.chunks.clone();
+            assert!(!read.resync_required, "no trim happened in this tiny stream");
+            if resumed_data.contains("phase-two") {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        runtime.shutdown(None).expect("shutdown test runtime");
+        assert!(resumed_data.contains("phase-two"), "{resumed_data:?}");
+        assert!(
+            !resumed_data.contains("phase-one"),
+            "resumed read must not re-deliver consumed chunks: {resumed_data:?}"
+        );
+        for chunk in &resumed_chunks {
+            assert!(
+                chunk.seq > first_cursor,
+                "resumed chunk seq {} must be past the consumed cursor {first_cursor}",
+                chunk.seq
+            );
+        }
+    }
+
     #[test]
     fn initial_attach_selection_keeps_last_meaningful_surface_ahead_of_trailing_noise() {
         let mut chunks = VecDeque::new();
