@@ -299,7 +299,14 @@ fn local_live_session_kind_is_recoverable(kind: SessionKind) -> bool {
 }
 
 fn persisted_live_session_is_recoverable(live: &PersistedLiveSession) -> bool {
-    if parse_remote_scanned_session_path(&live.key).is_some() {
+    // remote-cc:// is the Claude Code twin of remote-session:// — both are
+    // first-class remote agent sessions ([[spec-unify-local-remote]]). Only
+    // recognizing the codex scheme here dropped every remote CC keep-alive
+    // session at daemon restart (fell through to the SshShell-only arm;
+    // live-caught 2026-06-10: all CC sessions gone after the 2.8.73 swap).
+    if parse_remote_scanned_session_path(&live.key).is_some()
+        || parse_remote_cc_session_path(&live.key).is_some()
+    {
         return !is_loopback_ssh_target(&live.ssh_target);
     }
     if is_local_codex_storage_session_path(&live.key)
@@ -323,7 +330,10 @@ fn managed_live_session_is_recoverable(key: &str, session: &ManagedSessionView) 
     {
         return false;
     }
-    if parse_remote_scanned_session_path(key).is_some() {
+    // remote-cc:// twin of remote-session:// — see persisted_live_session_is_recoverable.
+    if parse_remote_scanned_session_path(key).is_some()
+        || parse_remote_cc_session_path(key).is_some()
+    {
         return session
             .ssh_target
             .as_deref()
@@ -5827,9 +5837,16 @@ impl YggtermServer {
             if let Some(storage_path) = storage_path.as_deref() {
                 upsert_session_metadata(&mut session.metadata, "Storage", storage_path.to_string());
                 let cwd = session_metadata_value(session, "Cwd").unwrap_or_else(local_default_cwd);
-                if !parse_remote_runtime_codex_session_key(&key).is_some_and(|session_id| {
-                    session.kind == SessionKind::Codex && session_id == id.as_str()
-                }) {
+                // The stored_session_launch_command overwrite builds a LOCAL
+                // resume command; a restored REMOTE session (remote-cc://, now
+                // recoverable) must keep the ssh-wrapped launch that
+                // build_live_session constructed, or the resume runs on the
+                // wrong machine.
+                if is_loopback_ssh_target(&target.ssh_target)
+                    && !parse_remote_runtime_codex_session_key(&key).is_some_and(|session_id| {
+                        session.kind == SessionKind::Codex && session_id == id.as_str()
+                    })
+                {
                     session.launch_command = stored_session_launch_command(session.kind, &cwd, &id);
                 }
                 upsert_session_metadata(
@@ -20075,6 +20092,39 @@ fn short_session_id(session_id: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::app_control_open_path_ready;
+
+    // Keep-alive parity: remote-cc:// (Claude Code) is the twin of
+    // remote-session:// (codex). Only recognizing the codex scheme in the
+    // recoverability predicate dropped EVERY remote CC keep-alive session at
+    // daemon restart (live-caught 2026-06-10, all CC sessions gone after the
+    // 2.8.73 swap while all 19 codex survived).
+    #[test]
+    fn remote_cc_keep_alive_sessions_are_recoverable_like_codex() {
+        let cc = PersistedLiveSession {
+            key: "remote-cc://practice/8247344a-6764-4c06-9cf5-d74757ee09d0".to_string(),
+            id: "8247344a-6764-4c06-9cf5-d74757ee09d0".to_string(),
+            title: "cc keep-alive".to_string(),
+            kind: super::SessionKind::ClaudeCode,
+            keep_alive: true,
+            ssh_target: "pi@practice".to_string(),
+            prefix: None,
+            cwd: Some("/home/pi/git/practice-rs".to_string()),
+            remote_launch_action: None,
+            storage_path: Some("/home/pi/.claude/projects/x/8247344a.jsonl".to_string()),
+            restore_reason: None,
+        };
+        assert!(
+            super::persisted_live_session_is_recoverable(&cc),
+            "remote CC keep-alive must survive a daemon restart exactly like remote codex"
+        );
+        // Loopback remote-cc behaves like loopback codex (excluded — the local
+        // store re-derives it).
+        let loopback = PersistedLiveSession {
+            ssh_target: "pi@localhost".to_string(),
+            ..cc.clone()
+        };
+        assert!(!super::persisted_live_session_is_recoverable(&loopback));
+    }
     use super::{crop_rgba, decode_png_to_rgba, encode_rgba_to_png, scale_rgba_nearest};
     use super::{
         ClientInstanceRecord, GhosttyHostSupport, GhosttyTerminalHostMode, ManagedSessionView,
