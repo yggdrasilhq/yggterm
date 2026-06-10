@@ -43,7 +43,8 @@ use yggterm_server::{
     run_app_control_scroll_terminal_viewport, run_app_control_send_terminal_input,
     run_app_control_submit_terminal_prompt,
     run_app_control_set_clipboard_png_base64, run_app_control_set_clipboard_text,
-    run_app_control_set_fullscreen, run_app_control_set_main_zoom, run_app_control_set_maximized,
+    run_app_control_set_force_foreground, run_app_control_set_fullscreen,
+    run_app_control_set_main_zoom, run_app_control_set_maximized,
     run_app_control_set_preview_layout, run_app_control_set_right_panel_mode,
     run_app_control_set_row_expanded, run_app_control_set_search,
     run_app_control_set_session_keep_alive, run_app_control_set_theme_editor_open,
@@ -1534,6 +1535,18 @@ fn main() -> Result<()> {
                     other => anyhow::bail!("unsupported maximize action: {other}"),
                 };
                 run_app_control_set_maximized(enabled, timeout_ms)
+            }
+            "force-foreground" | "force-fg" => {
+                let action = cli_positional_args(&args, 3)
+                    .into_iter()
+                    .next()
+                    .unwrap_or("on");
+                let enabled = match action {
+                    "on" | "true" | "1" => true,
+                    "off" | "false" | "0" => false,
+                    other => anyhow::bail!("unsupported force-foreground action: {other}"),
+                };
+                run_app_control_set_force_foreground(enabled, timeout_ms)
             }
             "open" => {
                 let session_path = cli_positional_args(&args, 3)
