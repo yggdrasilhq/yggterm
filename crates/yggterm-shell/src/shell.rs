@@ -62605,6 +62605,39 @@ fn terminal_eval_script_with_canvas_renderer(
                 persistScrollStateToLocalStorage('periodic_screen_restore');
             }} catch (_error) {{}}
         }}, 4000);
+        // Settle-follow watchdog — the EXECUTOR for scroll_mode.rs
+        // `should_settle_follow` (Following + viewport stranded below base →
+        // re-assert to the current baseY). The oracle shipped with tests but no
+        // executor called it; live-pinned consequence (practice 2026-06-10): a
+        // reveal replay left viewport_y=0 under base_y=985 with
+        // intent=PromptFollow and NOTHING ever re-followed (force-foreground
+        // removes the focus-gain edge; an idle TUI emits no output edge) — the
+        // user saw a blank/stale top-of-buffer "squish" until a forced refresh.
+        // Decision mirrors the oracle exactly: only PromptFollow (Pinned =
+        // UserScrollback and Selecting never auto-move), never while input-hot
+        // or a persisted-restore is in flight, strand threshold 2 rows (=
+        // PIN_THRESHOLD_LINES) so output-burst jitter never triggers it.
+        const settleFollowWatchdog = window.setInterval(() => {{
+            try {{
+                if (scrollbackIntent !== 'PromptFollow') {{ return; }}
+                if (term && typeof term.hasSelection === 'function' && term.hasSelection()) {{ return; }}
+                if (Date.now() < terminalInputHotUntilMs) {{ return; }}
+                const restoreInFlight = Boolean(pendingPersistedScrollRestore)
+                    || (pendingPersistedScrollRestoreDeadlineMs > 0
+                        && Date.now() <= pendingPersistedScrollRestoreDeadlineMs);
+                if (restoreInFlight) {{ return; }}
+                const buf = term && term.buffer ? term.buffer.active : null;
+                if (!buf) {{ return; }}
+                const vy = Math.max(0, Number(buf.viewportY || 0));
+                const by = Math.max(0, Number(buf.baseY || 0));
+                if (by - vy < 2) {{ return; }}
+                scrollLiveCursorIntoView(false, 'settle_follow_watchdog');
+                sendTerminalEvent({{
+                    kind: 'debug',
+                    message: `settle_follow_reassert host=${{hostId}} from=${{vy}} to=${{by}}`
+                }});
+            }} catch (_error) {{}}
+        }}, 1000);
         const setInputEnabled = (enabled, focus, followPrompt = true, policySource = 'local') => {{
             const requestedEnabled = Boolean(enabled);
             const policyTrusted = String(policySource || '') === 'rust_policy';
@@ -65604,6 +65637,9 @@ fn terminal_eval_script_with_canvas_renderer(
             }} catch (_error) {{}}
             try {{
                 window.clearInterval(screenRestorePersistTimer);
+            }} catch (_error) {{}}
+            try {{
+                window.clearInterval(settleFollowWatchdog);
             }} catch (_error) {{}}
             try {{
                 if (visiblePaintRecoveryTimer !== null) {{
@@ -74166,6 +74202,41 @@ mod tests {
         // this hostId and must not ghost.
         assert!(script.contains("const prior = reg[hostId];"));
         assert!(script.contains("if (!priorPainted) {"));
+    }
+    // Settle-follow watchdog: the executor for scroll_mode::should_settle_follow.
+    // A Following session with the viewport stranded below base must re-assert to
+    // the live bottom (the stranded-viewport / "squish"-blank class); Pinned
+    // (UserScrollback), active selections, input-hot windows, and in-flight
+    // persisted restores must never be auto-moved.
+    #[test]
+    fn terminal_eval_script_wires_settle_follow_watchdog() {
+        let theme = terminal_theme(UiTheme::ZedLight, palette(UiTheme::ZedLight), 13.0, "");
+        let script = terminal_eval_script("yggterm-terminal-test", &theme, true);
+        assert!(script.contains("const settleFollowWatchdog = window.setInterval(() => {"));
+        let watchdog_ix = script
+            .find("const settleFollowWatchdog")
+            .expect("watchdog present");
+        let body = &script[watchdog_ix..watchdog_ix + 2000];
+        assert!(
+            body.contains("if (scrollbackIntent !== 'PromptFollow') { return; }"),
+            "only a Following session may settle-follow (never yank Pinned)"
+        );
+        assert!(
+            body.contains("term.hasSelection()"),
+            "an active selection must never be auto-moved"
+        );
+        assert!(
+            body.contains("if (by - vy < 2) { return; }"),
+            "strand threshold mirrors PIN_THRESHOLD_LINES so jitter never triggers"
+        );
+        assert!(
+            body.contains("scrollLiveCursorIntoView(false, 'settle_follow_watchdog')"),
+            "re-assert goes through the existing follow executor"
+        );
+        assert!(
+            script.contains("window.clearInterval(settleFollowWatchdog);"),
+            "watchdog must be cleared on cleanup (no leaked intervals)"
+        );
     }
     #[test]
     fn terminal_eval_script_focuses_host_and_scopes_wheel_capture() {
