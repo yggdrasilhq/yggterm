@@ -223,6 +223,12 @@ pub enum AppControlCommand {
         contents: YgguiClipboardContents,
     },
     BackgroundWindow,
+    /// Monitoring override: make the GUI BEHAVE as foregrounded regardless of
+    /// real OS focus/backgrounding — active session stays hot (reads un-paused,
+    /// full write-frame budget, hot warmer running) and screenshots stay fresh.
+    SetForceForeground {
+        enabled: bool,
+    },
     MoveWindowBy {
         delta_x: f64,
         delta_y: f64,
@@ -428,6 +434,7 @@ impl AppControlCommand {
             Self::SetWindowChromeHover { .. } => "set_window_chrome_hover",
             Self::SetClipboardContents { .. } => "set_clipboard_contents",
             Self::BackgroundWindow => "background_window",
+            Self::SetForceForeground { .. } => "set_force_foreground",
             Self::MoveWindowBy { .. } => "move_window_by",
             Self::ResizeWindow { .. } => "resize_window",
             Self::CloseWindow => "close_window",
