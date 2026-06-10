@@ -57872,6 +57872,78 @@ fn terminal_eval_script_with_canvas_renderer(
                 await recvTerminalCommand();
             }}
         }}
+        // BORING REVEAL ghost (spec-boring-session-loads): a reveal of a retained
+        // host re-runs this whole eval, which wipes the host DOM and rebuilds a
+        // fresh Terminal + full replay — the blank/blink frames of that churn are
+        // what the user sees as the blink-blink shadow. Capture the ALREADY
+        // PAINTED canvas pixels NOW (before the cleanup below disposes them) and
+        // hold them as a static overlay across the rebuild; released after the
+        // replay + reveal screen-reconcile settle, or on the first keystroke. The
+        // wrong (blank/intermediate) frame never paints; the user sees last-frame
+        // -> settled-frame, one transition. Purely visual: pointer-events none,
+        // input and the terminal pipeline are untouched. Only arms when the SAME
+        // hostId has a prior painted registry entry (a retained reveal); cold
+        // mounts and fresh epochs have neither and never ghost. Kill switch:
+        // window.__yggtermDisableRevealGhost.
+        const captureRevealGhostFrame = () => {{
+            try {{
+                if (window.__yggtermDisableRevealGhost) {{
+                    return null;
+                }}
+                const reg = window.__yggtermXtermHosts || {{}};
+                const prior = reg[hostId];
+                const priorBuf = prior && prior.term && prior.term.buffer && prior.term.buffer.active;
+                const priorPainted = Boolean(
+                    priorBuf
+                    && (Number(priorBuf.baseY || 0) > 0
+                        || Number(priorBuf.cursorY || 0) > 0
+                        || Number(priorBuf.cursorX || 0) > 0)
+                );
+                if (!priorPainted) {{
+                    return null;
+                }}
+                const screen = host.querySelector('.xterm-screen');
+                const canvases = screen ? screen.querySelectorAll('canvas') : [];
+                if (!screen || !canvases.length) {{
+                    return null;
+                }}
+                const first = canvases[0];
+                if (!first.width || !first.height) {{
+                    return null;
+                }}
+                const ghost = document.createElement('canvas');
+                ghost.width = first.width;
+                ghost.height = first.height;
+                const ctx = ghost.getContext('2d');
+                if (!ctx) {{
+                    return null;
+                }}
+                const hostBg = window.getComputedStyle(host).backgroundColor;
+                if (hostBg) {{
+                    ctx.fillStyle = hostBg;
+                    ctx.fillRect(0, 0, ghost.width, ghost.height);
+                }}
+                for (const layer of canvases) {{
+                    try {{
+                        ctx.drawImage(layer, 0, 0);
+                    }} catch (_layerError) {{}}
+                }}
+                const hostRect = host.getBoundingClientRect();
+                const screenRect = screen.getBoundingClientRect();
+                ghost.className = 'yggterm-reveal-ghost';
+                ghost.style.position = 'absolute';
+                ghost.style.left = `${{Math.max(0, Math.round(screenRect.left - hostRect.left))}}px`;
+                ghost.style.top = `${{Math.max(0, Math.round(screenRect.top - hostRect.top))}}px`;
+                ghost.style.width = `${{Math.round(screenRect.width || first.clientWidth || 0)}}px`;
+                ghost.style.height = `${{Math.round(screenRect.height || first.clientHeight || 0)}}px`;
+                ghost.style.zIndex = '40';
+                ghost.style.pointerEvents = 'none';
+                return ghost;
+            }} catch (_error) {{
+                return null;
+            }}
+        }};
+        const revealGhostFrame = captureRevealGhostFrame();
         window.__yggtermXtermCleanups = window.__yggtermXtermCleanups || {{}};
         if (window.__yggtermXtermCleanups[hostId]) {{
             try {{
@@ -57983,6 +58055,36 @@ fn terminal_eval_script_with_canvas_renderer(
             message: `host_chain host=${{hostId}} ${{elementChainMetrics(host)}}`
         }});
         host.innerHTML = "";
+        // BORING REVEAL ghost, attach half: same synchronous task as the wipe
+        // above, so the cleared host never reaches the compositor — the ghost is
+        // already covering it when the next frame paints. Released after the
+        // replay + reveal screen-reconcile settle window, or immediately on the
+        // user's first keystroke (their input echo must not be hidden).
+        if (revealGhostFrame) {{
+            try {{
+                if (window.getComputedStyle(host).position === 'static') {{
+                    host.style.position = 'relative';
+                }}
+                host.appendChild(revealGhostFrame);
+                const releaseRevealGhost = () => {{
+                    try {{
+                        if (revealGhostFrame.isConnected) {{
+                            revealGhostFrame.remove();
+                            sendTerminalEvent({{
+                                kind: "debug",
+                                message: `reveal_ghost_released host=${{hostId}}`
+                            }});
+                        }}
+                    }} catch (_error) {{}}
+                }};
+                window.setTimeout(releaseRevealGhost, 2400);
+                window.addEventListener('keydown', releaseRevealGhost, {{ once: true, capture: true }});
+                sendTerminalEvent({{
+                    kind: "debug",
+                    message: `reveal_ghost_attached host=${{hostId}} w=${{revealGhostFrame.width}} h=${{revealGhostFrame.height}}`
+                }});
+            }} catch (_error) {{}}
+        }}
         const term = new window.Terminal({{
             allowProposedApi: true,
             allowTransparency: false,
@@ -73957,6 +74059,64 @@ mod tests {
         assert!(script.contains("cursorInactiveStyle: 'block'"));
         assert!(script.contains("if (!nextInputEnabled) {"));
         assert!(script.contains("helperTextarea.blur();"));
+    }
+    // BORING REVEAL ghost (spec-boring-session-loads): a retained reveal rebuilds
+    // the Terminal through this eval; the blank/intermediate frames of that churn
+    // must never reach the compositor. The ghost (a static composite of the prior
+    // painted canvases) must be CAPTURED before the prior entry's cleanup disposes
+    // those canvases, and ATTACHED in the same synchronous task as the host wipe
+    // so no cleared frame can paint in between. It must be inert to input
+    // (pointer-events none), self-releasing (settle timeout + first keystroke),
+    // gated on a previously-painted SAME-hostId entry (cold mounts never ghost),
+    // and kill-switchable.
+    #[test]
+    fn terminal_eval_script_reveal_ghost_covers_rebuild_churn() {
+        let theme = terminal_theme(UiTheme::ZedLight, palette(UiTheme::ZedLight), 13.0, "");
+        let script = terminal_eval_script("yggterm-terminal-test", &theme, true);
+        assert!(script.contains("const captureRevealGhostFrame = () => {"));
+        assert!(
+            script.contains("window.__yggtermDisableRevealGhost"),
+            "the ghost needs a kill switch (most-regressed path discipline)"
+        );
+        assert!(
+            script.contains("ghost.style.pointerEvents = 'none';"),
+            "a stuck ghost must never block input"
+        );
+        assert!(
+            script.contains("window.setTimeout(releaseRevealGhost, 2400);"),
+            "release must outlast the 1600ms reveal screen-reconcile settle"
+        );
+        assert!(
+            script
+                .contains("window.addEventListener('keydown', releaseRevealGhost, { once: true, capture: true });"),
+            "the first keystroke must reveal reality (input echo never hidden)"
+        );
+        // Capture BEFORE the prior entry's cleanup (which disposes the canvases),
+        // attach AFTER (and in the same task as) the host wipe.
+        let capture_ix = script
+            .find("const revealGhostFrame = captureRevealGhostFrame();")
+            .expect("ghost capture present");
+        let cleanup_ix = script
+            .find("window.__yggtermXtermCleanups[hostId]();")
+            .expect("prior-entry cleanup present");
+        let wipe_ix = script
+            .find("host.innerHTML = \"\";")
+            .expect("host wipe present");
+        let attach_ix = script
+            .find("host.appendChild(revealGhostFrame);")
+            .expect("ghost attach present");
+        assert!(
+            capture_ix < cleanup_ix,
+            "ghost must be captured before cleanup disposes the prior canvases"
+        );
+        assert!(
+            wipe_ix < attach_ix,
+            "ghost attaches after the wipe (same synchronous task, no paint between)"
+        );
+        // Gated on a prior painted entry: a fresh mount has no registry entry for
+        // this hostId and must not ghost.
+        assert!(script.contains("const prior = reg[hostId];"));
+        assert!(script.contains("if (!priorPainted) {"));
     }
     #[test]
     fn terminal_eval_script_focuses_host_and_scopes_wheel_capture() {
