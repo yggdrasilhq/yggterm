@@ -15454,6 +15454,20 @@ pub fn run_app_control_set_maximized(enabled: bool, timeout_ms: u64) -> anyhow::
     Ok(())
 }
 
+/// Monitoring override: make the GUI behave as foregrounded (hot active
+/// session, fresh screenshots) regardless of real OS focus. See
+/// AppControlCommand::SetForceForeground.
+pub fn run_app_control_set_force_foreground(enabled: bool, timeout_ms: u64) -> anyhow::Result<()> {
+    let home = resolve_yggterm_home()?;
+    let response = request_app_control(
+        &home,
+        AppControlCommand::SetForceForeground { enabled },
+        timeout_ms,
+    )?;
+    write_stdout_payload(&serde_json::to_string_pretty(&response)?)?;
+    Ok(())
+}
+
 pub fn run_app_control_describe_rows(timeout_ms: u64) -> anyhow::Result<()> {
     let home = resolve_yggterm_home()?;
     let response = request_app_control(&home, AppControlCommand::DescribeRows, timeout_ms)?;
