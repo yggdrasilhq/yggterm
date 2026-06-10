@@ -4162,7 +4162,8 @@ impl YggtermServer {
         } else {
             format!("cd {} && ", shell_single_quote(&cwd_display))
         };
-        let inner = format!("{}claude --session-id {}", cwd_prefix, shell_single_quote(&uuid));
+        let claude_extra_args = legacy_claude_code_extra_args();
+        let inner = remote_cc_launch_inner_command(&cwd_prefix, &claude_extra_args, &uuid);
         let launch_command = remote_ssh_shell_command(&ssh_target, prefix.as_deref(), &inner);
         let title = title_hint
             .map(str::trim)
@@ -4214,7 +4215,7 @@ impl YggtermServer {
         upsert_session_metadata(
             &mut session.metadata,
             "Restore",
-            format!("ssh {ssh_target} '{cwd_prefix}claude --resume {uuid}'"),
+            format!("ssh {ssh_target} '{cwd_prefix}claude{claude_extra_args} --resume {uuid}'"),
         );
 
         self.sessions.insert(session_path.clone(), session);
@@ -5047,11 +5048,8 @@ impl YggtermServer {
         } else {
             format!("cd {} && ", shell_single_quote(cwd))
         };
-        let inner = format!(
-            "{}claude --resume {}",
-            cwd_prefix,
-            shell_single_quote(session_id)
-        );
+        let claude_extra_args = legacy_claude_code_extra_args();
+        let inner = remote_cc_resume_inner_command(&cwd_prefix, &claude_extra_args, session_id);
         let launch_command = remote_ssh_shell_command(ssh_target, prefix, &inner);
         let resolved_title = if title_hint.trim().is_empty() {
             short_session_id(session_id)
@@ -5114,7 +5112,9 @@ impl YggtermServer {
             upsert_session_metadata(
                 &mut session.metadata,
                 "Restore",
-                format!("ssh {ssh_target} '{cwd_prefix}claude --resume {session_id}'"),
+                format!(
+                    "ssh {ssh_target} '{cwd_prefix}claude{claude_extra_args} --resume {session_id}'"
+                ),
             );
         }
         if !self.live_session_order.iter().any(|p| p == &session_path) {
@@ -19598,6 +19598,37 @@ fn legacy_codex_extra_args() -> String {
     shell_join_extra_args(&raw)
 }
 
+/// Inner shell command for launching a NEW remote Claude Code session.
+/// `claude_extra_args` is the pre-joined output of `shell_join_extra_args`
+/// over the user's configured Claude Code extra CLI args — these must reach
+/// every CC launch path, local and remote alike.
+fn remote_cc_launch_inner_command(
+    cwd_prefix: &str,
+    claude_extra_args: &str,
+    session_uuid: &str,
+) -> String {
+    format!(
+        "{}claude{} --session-id {}",
+        cwd_prefix,
+        claude_extra_args,
+        shell_single_quote(session_uuid)
+    )
+}
+
+/// Inner shell command for resuming an existing remote Claude Code session.
+fn remote_cc_resume_inner_command(
+    cwd_prefix: &str,
+    claude_extra_args: &str,
+    session_id: &str,
+) -> String {
+    format!(
+        "{}claude{} --resume {}",
+        cwd_prefix,
+        claude_extra_args,
+        shell_single_quote(session_id)
+    )
+}
+
 fn legacy_claude_code_extra_args() -> String {
     let raw = SessionStore::open_or_init()
         .and_then(|store| store.load_settings())
@@ -22725,6 +22756,30 @@ mod tests {
         assert!(command.contains("export NPM_CONFIG_PREFIX="));
         assert!(command.contains("codex resume -C \"$PWD\""));
         assert!(command.contains("'019caa6f-b32c-7a73-b4d3-db83225663dc'"));
+    }
+
+    #[test]
+    fn remote_cc_commands_carry_configured_extra_args() {
+        // User bug (2026-06-10 #3): extra CLI args set in yggterm settings
+        // (e.g. --dangerously-skip-permissions) never reached the remote CC
+        // launch command; only the local legacy builder honored them.
+        use crate::{
+            remote_cc_launch_inner_command, remote_cc_resume_inner_command, shell_join_extra_args,
+        };
+        let extra = shell_join_extra_args("--dangerously-skip-permissions");
+        let resume = remote_cc_resume_inner_command("cd '/srv/ws' && ", &extra, "abc-123");
+        assert_eq!(
+            resume,
+            "cd '/srv/ws' && claude '--dangerously-skip-permissions' --resume 'abc-123'"
+        );
+        let launch = remote_cc_launch_inner_command("", &extra, "abc-123");
+        assert_eq!(
+            launch,
+            "claude '--dangerously-skip-permissions' --session-id 'abc-123'"
+        );
+        // No configured args → identical to the historical command shape.
+        let bare = remote_cc_resume_inner_command("", "", "abc-123");
+        assert_eq!(bare, "claude --resume 'abc-123'");
     }
 
     #[test]
