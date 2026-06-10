@@ -371,7 +371,13 @@ const REVEAL_SCREEN_RECONCILE_SETTLE_MS: u64 = 1600;
 /// never empty, and never over a WORKING surface (the agent's own next frame
 /// repaints it; a mid-turn overwrite tears — incident-gap-fix-cascade rule).
 fn screen_reconcile_should_write(screen_text: &str) -> bool {
-    !screen_text.trim().is_empty() && !yggterm_core::screen_text_shows_agent_working(screen_text)
+    !screen_text.trim().is_empty()
+        && !yggterm_core::screen_text_shows_agent_working(screen_text)
+        // Mid-re-resume the daemon screen is still the yggterm LAUNCH SEED
+        // ("Deploy state: ready" / "Terminal surface: embedded xterm.js") —
+        // painting it would put seed chrome into the viewport (the D4
+        // seed-in-terminal class) over a possibly-richer client buffer.
+        && !terminal_chunk_is_daemon_launch_seed(screen_text)
 }
 const RETAINED_EMPTY_SURFACE_SETTLE_MS: u64 = 800;
 // Like the empty-surface transient above, a cold/mid-redraw surface can fail
@@ -74765,6 +74771,10 @@ mod tests {
         assert!(!screen_reconcile_should_write("   \r\n  "));
         assert!(!screen_reconcile_should_write(
             "doing things\r\n(2m 10s \u{2022} esc to interrupt)\r\n"
+        ));
+        // Mid-re-resume launch seed must never be painted into the viewport.
+        assert!(!screen_reconcile_should_write(
+            "$ codex\r\nLaunching live Codex session\u{2026}\r\nDeploy state: ready\r\nLaunch phase: running\r\nTerminal surface: embedded xterm.js\r\n"
         ));
     }
 
