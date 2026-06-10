@@ -14871,6 +14871,148 @@ pub fn run_trace_follow(lines: usize, poll_ms: u64) -> anyhow::Result<()> {
     follow_trace_lines(&path, lines, poll_ms);
 }
 
+/// Agent observability: a per-session TRANSITION TIMELINE distilled from the
+/// event trace. Reveals / bg→fg / reconciles / ghost / scroll-intent flips /
+/// persisted-restore decisions are scattered across thousands of trace lines;
+/// correlating them by hand is the bottleneck this view removes. One command =
+/// the whole story of what the reveal/viewport machinery decided, in order,
+/// with deltas — so broken behavior is diagnosed from data, not guessed.
+pub fn run_trace_transitions(
+    session_filter: Option<&str>,
+    last_ms: u64,
+    limit: usize,
+) -> anyhow::Result<()> {
+    let home = resolve_yggterm_home()?;
+    let path = event_trace_path(&home);
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or_default();
+    let since_ms = now_ms.saturating_sub(last_ms);
+    // Read a generous tail; the window filter does the real bounding.
+    let lines = tail_text_file_lines(&path, 20_000);
+    let mut picked: Vec<(u64, String)> = Vec::new();
+    // A pid change mid-timeline = the GUI restarted (mount epochs reset, all
+    // retained hosts dropped) — load-bearing context, mark it explicitly.
+    let mut last_pid = None::<u64>;
+    // The JS re-asserts an unchanged scroll intent under many reasons (fit:*,
+    // input_policy_unchanged:*); only intent CHANGES are decisions.
+    let mut last_intent_by_host: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    for line in lines {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        let ts_ms = value.get("ts_ms").and_then(|v| v.as_u64()).unwrap_or(0);
+        if ts_ms < since_ms {
+            continue;
+        }
+        let payload = value.get("payload").cloned().unwrap_or(serde_json::Value::Null);
+        let session_path = payload
+            .get("session_path")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if let Some(filter) = session_filter
+            && !session_path.contains(filter)
+        {
+            continue;
+        }
+        let name = value.get("name").and_then(|v| v.as_str()).unwrap_or("?");
+        // js_debug carries the interesting JS-side decisions in its message
+        // (reveal_ghost_*, scrollback_intent, persisted_scroll_restored,
+        // xterm_session_snapshot_restored, localstorage_session_text_restored …).
+        // Other events get a compact key=value digest of their payload.
+        let detail = if name == "js_debug" {
+            payload
+                .get("message")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string()
+        } else {
+            let mut parts: Vec<String> = Vec::new();
+            if let Some(map) = payload.as_object() {
+                for (key, val) in map {
+                    if key == "session_path" || key == "context" {
+                        continue;
+                    }
+                    let rendered = match val {
+                        serde_json::Value::String(s) => s.chars().take(80).collect::<String>(),
+                        other => {
+                            let s = other.to_string();
+                            s.chars().take(80).collect::<String>()
+                        }
+                    };
+                    parts.push(format!("{key}={rendered}"));
+                    if parts.len() >= 6 {
+                        break;
+                    }
+                }
+            }
+            parts.join(" ")
+        };
+        // Keep timeline noise down: drop high-frequency cosmetic events unless
+        // they carry a decision keyword.
+        if name == "js_debug"
+            && !(detail.contains("reveal_ghost")
+                || detail.contains("scrollback_intent")
+                || detail.contains("persisted_scroll")
+                || detail.contains("snapshot_restored")
+                || detail.contains("text_restored")
+                || detail.contains("bootstrap")
+                || detail.contains("constructed")
+                || detail.contains("reset host="))
+        {
+            continue;
+        }
+        // Same-intent re-assertions are noise; only intent flips are decisions.
+        if detail.contains("scrollback_intent host=") {
+            let host = detail
+                .split("host=")
+                .nth(1)
+                .and_then(|rest| rest.split_whitespace().next())
+                .unwrap_or("")
+                .to_string();
+            let intent = detail
+                .split("intent=")
+                .nth(1)
+                .and_then(|rest| rest.split_whitespace().next())
+                .unwrap_or("")
+                .to_string();
+            if last_intent_by_host.get(&host) == Some(&intent) {
+                continue;
+            }
+            last_intent_by_host.insert(host, intent);
+        }
+        let pid = value.get("pid").and_then(|v| v.as_u64()).unwrap_or(0);
+        if last_pid.is_some_and(|prev| prev != pid) && pid != 0 {
+            picked.push((ts_ms, format!("=== pid changed -> {pid} (GUI/daemon restart) ===")));
+        }
+        if pid != 0 {
+            last_pid = Some(pid);
+        }
+        let short_session = session_path
+            .rsplit('/')
+            .next()
+            .map(|tail| tail.chars().take(12).collect::<String>())
+            .unwrap_or_default();
+        picked.push((ts_ms, format!("{name} [{short_session}] {detail}")));
+    }
+    if picked.len() > limit {
+        let skipped = picked.len() - limit;
+        picked = picked.split_off(skipped);
+        println!("(… {skipped} earlier events trimmed; raise --limit)");
+    }
+    let mut prev_ts = None::<u64>;
+    for (ts_ms, line) in picked {
+        let delta = prev_ts
+            .map(|prev| format!("+{:>6}ms", ts_ms.saturating_sub(prev)))
+            .unwrap_or_else(|| format!("t={ts_ms}"));
+        prev_ts = Some(ts_ms);
+        println!("{delta}  {line}");
+    }
+    Ok(())
+}
+
 pub fn run_trace_bundle(lines: usize, include_screenshot: bool) -> anyhow::Result<()> {
     println!(
         "{}",
