@@ -48719,6 +48719,16 @@ fn TerminalCanvas(
             let mut screen_reconcile_due_at_ms: u64 =
                 current_millis().saturating_add(REVEAL_SCREEN_RECONCILE_SETTLE_MS);
             let mut screen_reconcile_reason: &'static str = "reveal_screen_reconcile";
+            // Reveal-reconcile self-heal: when the daemon screen is not yet
+            // writable at the settle deadline (empty / launch-seed — a remote
+            // attach can still be bootstrapping at +1.6s), the old behavior was a
+            // SILENT one-shot give-up: the stale bottom then persisted until some
+            // unrelated trigger (resize settle / attach_ready) re-armed it — live
+            // timeline showed a 15s stale window the user "fixes" with a forced
+            // refresh. Retry the same guarded write a few times instead. A
+            // WORKING surface still never retries (codex's own next frame owns
+            // the repaint; overwriting mid-turn tears).
+            let mut screen_reconcile_unwritable_retries: u8 = 0;
             let mut last_bridge_reads_paused = false;
             let mut terminal_paint_seen = !is_remote_resume_session;
             let mut cursor = 0u64;
@@ -48886,6 +48896,7 @@ fn TerminalCanvas(
                         let looks_working =
                             yggterm_core::screen_text_shows_agent_working(&screen_text);
                         if screen_reconcile_should_write(&screen_text) {
+                            screen_reconcile_unwritable_retries = 0;
                             let _ = eval.send(TerminalJsCommand::Write {
                                 data: screen_text.clone(),
                             });
@@ -48908,6 +48919,31 @@ fn TerminalCanvas(
                                 json!({
                                     "session_path": session_path.clone(),
                                     "reason": reconcile_reason,
+                                }),
+                            );
+                        } else {
+                            // Unwritable (empty / launch-seed) — previously a
+                            // SILENT give-up. Trace it and re-arm the SAME
+                            // reveal reconcile up to 3 times so the stale
+                            // bottom self-heals once the daemon screen lands.
+                            let retry = screen_reconcile_unwritable_retries < 3;
+                            if retry {
+                                screen_reconcile_unwritable_retries += 1;
+                                screen_reconcile_due_at_ms = current_millis()
+                                    .saturating_add(REVEAL_SCREEN_RECONCILE_SETTLE_MS);
+                                screen_reconcile_reason = reconcile_reason;
+                            }
+                            append_trace_event(
+                                &trace_home,
+                                "ui",
+                                "terminal_mount",
+                                "screen_reconcile_skipped_unwritable",
+                                json!({
+                                    "session_path": session_path.clone(),
+                                    "reason": reconcile_reason,
+                                    "screen_bytes": screen_text.len(),
+                                    "retry_armed": retry,
+                                    "retries": screen_reconcile_unwritable_retries,
                                 }),
                             );
                         }
