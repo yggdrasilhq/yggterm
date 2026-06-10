@@ -42502,6 +42502,40 @@ fn session_sample_text_for_sidebar_icon(session: &ManagedSessionView) -> String 
     session.status_line.clone()
 }
 fn terminal_chunk_looks_idle_for_sidebar_icon(sample: &str) -> bool {
+    // PERF (fan/CPU spin, live stack-sampled 2026-06-10): this runs per sidebar
+    // row per RENDER, and its terminal_chunk_* recognizers each re-run
+    // strip_terminal_control_sequences over the full sample (up to ~128KB of
+    // codex frame) — the GUI main thread was pegged at ~100% inside this exact
+    // call chain (sidebar_row_busy_state -> here -> strip). The sample for a
+    // row only changes when new output arrives, so memoize the verdict by the
+    // sample's hash. Main-thread only (render path) -> thread_local, capped.
+    thread_local! {
+        static SIDEBAR_IDLE_MEMO: std::cell::RefCell<HashMap<u64, bool>> =
+            std::cell::RefCell::new(HashMap::new());
+    }
+    let key = {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        sample.hash(&mut hasher);
+        hasher.finish()
+    };
+    if let Some(hit) =
+        SIDEBAR_IDLE_MEMO.with(|memo| memo.borrow().get(&key).copied())
+    {
+        return hit;
+    }
+    let verdict = terminal_chunk_looks_idle_for_sidebar_icon_uncached(sample);
+    SIDEBAR_IDLE_MEMO.with(|memo| {
+        let mut memo = memo.borrow_mut();
+        if memo.len() >= 512 {
+            memo.clear();
+        }
+        memo.insert(key, verdict);
+    });
+    verdict
+}
+
+fn terminal_chunk_looks_idle_for_sidebar_icon_uncached(sample: &str) -> bool {
     let trimmed = sample.trim();
     if trimmed.is_empty() {
         return false;
@@ -42537,7 +42571,30 @@ fn terminal_chunk_has_agent_working_status_for_sidebar_icon(sample: &str) -> boo
     // SSOT: the detection heuristic lives in yggterm-core so the sidebar
     // working-indicator and the daemon hot-update idle gate share one
     // definition of "agent is working" and cannot diverge.
-    yggterm_core::screen_text_shows_agent_working(sample)
+    // PERF: memoized for the same reason as the idle recognizer above — this
+    // runs per sidebar row per render over up-to-128KB samples.
+    thread_local! {
+        static SIDEBAR_WORKING_MEMO: std::cell::RefCell<HashMap<u64, bool>> =
+            std::cell::RefCell::new(HashMap::new());
+    }
+    let key = {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        sample.hash(&mut hasher);
+        hasher.finish()
+    };
+    if let Some(hit) = SIDEBAR_WORKING_MEMO.with(|memo| memo.borrow().get(&key).copied()) {
+        return hit;
+    }
+    let verdict = yggterm_core::screen_text_shows_agent_working(sample);
+    SIDEBAR_WORKING_MEMO.with(|memo| {
+        let mut memo = memo.borrow_mut();
+        if memo.len() >= 512 {
+            memo.clear();
+        }
+        memo.insert(key, verdict);
+    });
+    verdict
 }
 fn terminal_lines_are_bootstrap_scaffold(lines: &[String]) -> bool {
     let visible = lines
