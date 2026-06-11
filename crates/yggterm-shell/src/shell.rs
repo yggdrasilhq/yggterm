@@ -58513,7 +58513,7 @@ fn terminal_eval_script_with_canvas_renderer(
                 const veilSettlePoll = () => {{
                     try {{
                         if (!veil.isConnected) {{ return; }}
-                        if (Date.now() - veilAttachedAtMs >= 8000) {{
+                        if (Date.now() - veilAttachedAtMs >= 20000) {{
                             releaseColdMountVeil('hard_cap');
                             return;
                         }}
@@ -58521,6 +58521,17 @@ fn terminal_eval_script_with_canvas_renderer(
                             ? window.__yggtermXtermHosts[hostId] : null;
                         const buf = entry && entry.term && entry.term.buffer
                             ? entry.term.buffer.active : null;
+                        // Live catch (charts restore, 2026-06-11): the stale
+                        // client snapshot IS content and IS stable — releasing
+                        // on mere stability dropped the veil onto the shadow
+                        // while the remote attach was still in flight. Require
+                        // DAEMON-sourced content before a settle release; the
+                        // longer cap is harmless (the veil is just the
+                        // background color) and the keystroke release stands.
+                        const contentSource = entry ? String(entry.terminalContentSource || '') : '';
+                        const replaySource = entry ? String(entry.lastRetainedReplaySource || '') : '';
+                        const daemonSourced = contentSource === 'daemon_pty'
+                            || replaySource.indexOf('daemon') === 0;
                         if (buf) {{
                             const baseY = Number(buf.baseY || 0);
                             const cursorY = Number(buf.cursorY || 0);
@@ -58532,7 +58543,7 @@ fn terminal_eval_script_with_canvas_renderer(
                             }}
                             veilLastBaseY = baseY;
                             veilLastCursorY = cursorY;
-                            if (hasContent && veilStablePolls >= 2) {{
+                            if (hasContent && daemonSourced && veilStablePolls >= 2) {{
                                 releaseColdMountVeil('buffer_settled');
                                 return;
                             }}
@@ -76771,8 +76782,11 @@ mod tests {
         let script = terminal_eval_script("yggterm-terminal-test", &theme, true);
         assert!(script.contains("yggterm-cold-mount-veil"));
         assert!(script.contains("cold_mount_veil_attached"));
-        // Settle requires content + two stable polls (never a blank reveal).
-        assert!(script.contains("if (hasContent && veilStablePolls >= 2) {"));
+        // Settle requires DAEMON-sourced content + two stable polls — the
+        // stale client snapshot is content and stable, and releasing on it
+        // dropped the veil onto the shadow (live catch: charts restore).
+        assert!(script.contains("if (hasContent && daemonSourced && veilStablePolls >= 2) {"));
+        assert!(script.contains("contentSource === 'daemon_pty'"));
         // The user's echo is never hidden; the veil can never trap them.
         assert!(script.contains("releaseColdMountVeil('keydown')"));
         assert!(script.contains("releaseColdMountVeil('hard_cap')"));
