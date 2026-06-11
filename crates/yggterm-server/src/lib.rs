@@ -13714,14 +13714,12 @@ fn bridge_remote_runtime_session_stdio(
     let mut stdout = std::io::stdout();
     let start = Instant::now();
     let mut last_size = None::<(u16, u16)>;
-    // Run #19 squish belt: the change-only resize dedup is blind to the
-    // DAEMON-side PTY being recreated at a different size underneath an
-    // unchanged tty (live-caught: a remote-update restart respawned codex at
-    // DEFAULT 120×36 while this bridge's tty stayed 159×63, so the dedup
-    // never re-sent and the squish stuck). Re-assert the size periodically —
-    // a same-size resize is a cheap no-op on the daemon side.
-    const SIZE_REASSERT_INTERVAL: Duration = Duration::from_secs(5);
-    let mut next_size_reassert_at = Instant::now();
+    // SIZE-WAR LESSON (2026-06-11 night, reverted same night): a periodic
+    // size RE-ASSERT here warred with the daemon-side persisted-grid forward
+    // — two writers alternating 120×36↔159×63 every ~5s, SIGWINCH-repainting
+    // codex into a visible oscillation. The remote PTY size has ONE writer:
+    // the owner daemon's `forward_remote_pty_resize` (persisted/client grid).
+    // This bridge only reports genuine tty CHANGES (drag-resize propagation).
     let mut marked_interactive = false;
     let mut initial_snapshot_pending = true;
     let mut initial_snapshot_probe_count = 0_u32;
@@ -13730,11 +13728,10 @@ fn bridge_remote_runtime_session_stdio(
     let registry_home = resolve_yggterm_home().ok();
     loop {
         if let Some((cols, rows)) = current_tty_size()
-            && (last_size != Some((cols, rows)) || Instant::now() >= next_size_reassert_at)
+            && last_size != Some((cols, rows))
         {
             let _ = terminal_resize(endpoint, path, cols, rows);
             last_size = Some((cols, rows));
-            next_size_reassert_at = Instant::now() + SIZE_REASSERT_INTERVAL;
         }
         let initial_read = cursor == 0;
         let (
