@@ -45482,6 +45482,49 @@ fn terminal_session_bridge_should_pause_reads(shell: &ShellState, session_path: 
     }
     false
 }
+
+/// Lane-2 boring-reveal cadence ([[spec-boring-session-loads]]): a retained
+/// host whose bridge reads fully PAUSE while backgrounded accumulates
+/// unbounded staleness — the reveal then has to correct a wrong frame (the
+/// flicker the user rejects). A slow background trickle keeps the client
+/// buffer current at the source so the reveal needs no correction. The user
+/// explicitly accepts the idle SSH/CPU cost ([[spec-xterm-gating-ux]]).
+const TERMINAL_RETAINED_BACKGROUND_TRICKLE_POLL_MS: u64 = 3_000;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TerminalBridgeReadPolicy {
+    /// Session is active-visible and focused — full adaptive read cadence.
+    Active,
+    /// Retained-live host in the background — slow trickle reads keep the
+    /// buffer current so the next reveal is boring.
+    BackgroundTrickle,
+    /// Not retained — no reads while hidden (historical behavior).
+    Paused,
+}
+
+fn terminal_background_trickle_reads_enabled() -> bool {
+    !matches!(
+        std::env::var("YGGTERM_DISABLE_BACKGROUND_TRICKLE_READS")
+            .ok()
+            .as_deref(),
+        Some("1") | Some("true")
+    )
+}
+
+fn terminal_session_bridge_read_policy(
+    shell: &ShellState,
+    session_path: &str,
+) -> TerminalBridgeReadPolicy {
+    if !terminal_session_bridge_should_pause_reads(shell, session_path) {
+        return TerminalBridgeReadPolicy::Active;
+    }
+    if terminal_background_trickle_reads_enabled()
+        && shell.terminal_session_is_retained_live(session_path)
+    {
+        return TerminalBridgeReadPolicy::BackgroundTrickle;
+    }
+    TerminalBridgeReadPolicy::Paused
+}
 fn terminal_session_should_bootstrap_host(
     shell: &ShellState,
     active_session_path: Option<&str>,
@@ -48934,8 +48977,13 @@ fn TerminalCanvas(
                             tokio::time::Instant::now() + Duration::from_millis(read_poll_ms);
                     }
                 }
-                let bridge_reads_paused = state
-                    .with(|shell| terminal_session_bridge_should_pause_reads(shell, &session_path));
+                let bridge_read_policy = state
+                    .with(|shell| terminal_session_bridge_read_policy(shell, &session_path));
+                // "Paused" here means NOT active-visible+focused — the edge
+                // below (paused→unpaused) is the became-active transition the
+                // reveal reconcile keys on. Trickled hosts still count as
+                // paused for that edge so reveal semantics are unchanged.
+                let bridge_reads_paused = bridge_read_policy != TerminalBridgeReadPolicy::Active;
                 // Semi-hot reveal reconcile (broken-bottom-on-reveal class): while a
                 // mounted host is backgrounded its bridge reads PAUSE, so the client
                 // buffer misses the TUI's repaints (codex repaints in place — the
@@ -48954,7 +49002,7 @@ fn TerminalCanvas(
                     last_bridge_reads_paused = bridge_reads_paused;
                 }
                 if js_ready
-                    && !bridge_reads_paused
+                    && bridge_read_policy != TerminalBridgeReadPolicy::Paused
                     && let Some(data) = terminal_write_bridge.flush_due(current_millis())
                 {
                     let _ = eval.send(TerminalJsCommand::Write { data });
@@ -49081,6 +49129,18 @@ fn TerminalCanvas(
                         }),
                     );
                     break;
+                }
+                // Lane-2 trickle: a backgrounded retained host keeps a slow
+                // read cadence instead of the 16s unfocused stall — clamp the
+                // next read deadline so the buffer staleness stays bounded by
+                // the trickle interval (the post-read adaptive cadences are
+                // computed for focused-visible hosts and don't apply here).
+                if bridge_read_policy == TerminalBridgeReadPolicy::BackgroundTrickle {
+                    let trickle_deadline = tokio::time::Instant::now()
+                        + Duration::from_millis(TERMINAL_RETAINED_BACKGROUND_TRICKLE_POLL_MS);
+                    if next_read_deadline > trickle_deadline {
+                        next_read_deadline = trickle_deadline;
+                    }
                 }
                 tokio::select! {
                     result = &mut eval_result => {
@@ -51539,13 +51599,24 @@ fn TerminalCanvas(
                                 + Duration::from_millis(read_poll_ms);
                             continue;
                         }
-                        if state.with(|shell| {
-                            terminal_session_bridge_should_pause_reads(shell, &session_path)
+                        match state.with(|shell| {
+                            terminal_session_bridge_read_policy(shell, &session_path)
                         }) {
-                            read_poll_ms = TERMINAL_UNFOCUSED_OUTPUT_READ_POLL_MS;
-                            next_read_deadline = tokio::time::Instant::now()
-                                + Duration::from_millis(read_poll_ms);
-                            continue;
+                            TerminalBridgeReadPolicy::Paused => {
+                                read_poll_ms = TERMINAL_UNFOCUSED_OUTPUT_READ_POLL_MS;
+                                next_read_deadline = tokio::time::Instant::now()
+                                    + Duration::from_millis(read_poll_ms);
+                                continue;
+                            }
+                            TerminalBridgeReadPolicy::BackgroundTrickle => {
+                                // Lane-2: read at the slow trickle cadence so
+                                // the retained buffer stays current while
+                                // hidden — the reveal then has nothing to
+                                // correct (no flicker). Falls through to the
+                                // normal read below.
+                                read_poll_ms = TERMINAL_RETAINED_BACKGROUND_TRICKLE_POLL_MS;
+                            }
+                            TerminalBridgeReadPolicy::Active => {}
                         }
                         match terminal_read_async(
                             endpoint.clone(),
@@ -92902,6 +92973,45 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             inactive_session_path,
             "stale-host"
         ));
+    }
+
+    #[test]
+    fn retained_background_session_trickles_reads_instead_of_pausing() {
+        // Lane-2 boring reveal (spec-boring-session-loads): a retained host
+        // whose reads fully pause while backgrounded accumulates unbounded
+        // staleness, so the reveal must correct a wrong frame (the flicker).
+        // The policy keeps a slow trickle for retained-live hosts; everything
+        // else keeps the historical pause.
+        let active_session_path = "codex://active";
+        let inactive_session_path = "remote-session://dev/inactive";
+        let bootstrap = test_shell_bootstrap_with_active_session(active_session_path);
+        let mut shell = ShellState::new(bootstrap);
+        shell.server.set_view_mode(WorkspaceViewMode::Terminal);
+        shell.bump_terminal_mount_epoch_for_session(inactive_session_path);
+        shell
+            .terminal_session_host_id(inactive_session_path)
+            .expect("inactive retained session should have a host id");
+        shell.retain_terminal_session_path(inactive_session_path);
+        shell
+            .terminal_resume_ready_paths
+            .insert(inactive_session_path.to_string());
+        shell.active_terminal_host_id = Some("host-active".to_string());
+
+        // Retained-live background host → trickle, not pause.
+        assert!(shell.terminal_session_is_retained_live(inactive_session_path));
+        assert_eq!(
+            terminal_session_bridge_read_policy(&shell, inactive_session_path),
+            TerminalBridgeReadPolicy::BackgroundTrickle
+        );
+        // A non-retained background session keeps the historical pause.
+        assert_eq!(
+            terminal_session_bridge_read_policy(&shell, "local://not-retained"),
+            TerminalBridgeReadPolicy::Paused
+        );
+        // The trickle cadence stays well under the unfocused stall interval.
+        assert!(
+            TERMINAL_RETAINED_BACKGROUND_TRICKLE_POLL_MS < TERMINAL_UNFOCUSED_OUTPUT_READ_POLL_MS
+        );
     }
 
     #[test]
