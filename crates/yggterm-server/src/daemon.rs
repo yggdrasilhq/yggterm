@@ -1870,6 +1870,13 @@ struct DaemonRuntime {
     /// final update-restart snapshot at retire still writes (it carries this
     /// daemon's rows; the successor's takeover import reads it).
     superseded_routine_persist_muted: bool,
+    /// Run #19 permanent squish fix: pending remote-PTY resize forwards
+    /// (latest-wins per session path) + the in-flight session set. The SSH
+    /// round-trip to the remote daemon runs on a background thread, never on
+    /// the request loop.
+    pending_remote_pty_resizes:
+        Arc<Mutex<HashMap<String, (RemoteMachineSnapshot, String, u16, u16)>>>,
+    remote_pty_resize_in_flight: Arc<Mutex<HashSet<String>>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1953,6 +1960,8 @@ impl DaemonRuntime {
             duplicate_runtime_prune_in_flight: Arc::new(AtomicBool::new(false)),
             pending_preserved_owner_removals: Arc::new(Mutex::new(Vec::new())),
             superseded_routine_persist_muted: false,
+            pending_remote_pty_resizes: Arc::new(Mutex::new(HashMap::new())),
+            remote_pty_resize_in_flight: Arc::new(Mutex::new(HashSet::new())),
         };
         let preserved_owner_registry_retargeted = runtime
             .preserved_terminal_owners
@@ -2973,6 +2982,98 @@ impl DaemonRuntime {
         );
     }
 
+    /// Run #19 permanent squish fix: pin the REMOTE daemon's PTY to the new
+    /// grid whenever the local daemon resizes a remote session's attachment.
+    /// The implicit chain (local PTY SIGWINCH → ssh window-change → remote tty
+    /// → bridge size poll → remote daemon resize) has silent failure points —
+    /// live-caught with the remote codex PTY stuck at DEFAULT 120×36 under a
+    /// 159×63 client. Latest-wins per session, one in-flight SSH per session,
+    /// always off the request loop. No-op for non-remote paths.
+    fn forward_remote_pty_resize(&mut self, path: &str, cols: u16, rows: u16) {
+        if cols == 0 || rows == 0 {
+            return;
+        }
+        let Some((machine, session_id)) = self.server.remote_shutdown_target_for_path(path)
+        else {
+            return;
+        };
+        {
+            let mut pending = self
+                .pending_remote_pty_resizes
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            pending.insert(path.to_string(), (machine, session_id, cols, rows));
+        }
+        {
+            let mut in_flight = self
+                .remote_pty_resize_in_flight
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if !in_flight.insert(path.to_string()) {
+                // A worker is already draining this session; it will pick up
+                // the latest pending grid.
+                return;
+            }
+        }
+        let pending = Arc::clone(&self.pending_remote_pty_resizes);
+        let in_flight = Arc::clone(&self.remote_pty_resize_in_flight);
+        let home = self.store.home_dir().to_path_buf();
+        let worker_path = path.to_string();
+        let spawn_result = std::thread::Builder::new()
+            .name("yggterm-remote-pty-resize".to_string())
+            .spawn(move || {
+                let path = worker_path;
+                loop {
+                    let next = {
+                        let mut pending = pending
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        pending.remove(&path)
+                    };
+                    let Some((machine, session_id, cols, rows)) = next else {
+                        let mut in_flight = in_flight
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        in_flight.remove(&path);
+                        // Close the drain/release race: a resize that landed
+                        // between the empty check and the release re-claims.
+                        let has_pending = {
+                            let pending = pending
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner());
+                            pending.contains_key(&path)
+                        };
+                        if has_pending && in_flight.insert(path.clone()) {
+                            continue;
+                        }
+                        break;
+                    };
+                    let result =
+                        crate::resize_remote_codex_session_pty(&machine, &session_id, cols, rows);
+                    append_trace_event(
+                        &home,
+                        "daemon",
+                        "terminal_resize",
+                        "remote_pty_resize_forwarded",
+                        serde_json::json!({
+                            "path": path,
+                            "cols": cols,
+                            "rows": rows,
+                            "ok": result.is_ok(),
+                            "error": result.err().map(|error| error.to_string()),
+                        }),
+                    );
+                }
+            });
+        if spawn_result.is_err() {
+            let mut in_flight = self
+                .remote_pty_resize_in_flight
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            in_flight.remove(path);
+        }
+    }
+
     /// Apply preserved-owner registry removals discovered by the background
     /// duplicate-runtime prune. Runs on the request loop (registry owner).
     fn drain_pending_preserved_owner_removals(&mut self) {
@@ -3701,6 +3802,9 @@ impl DaemonRuntime {
                 let _ = self.terminals.resize(&runtime_path, cols, nudge_rows);
             }
             let resized = self.terminals.resize(&runtime_path, cols, rows);
+            // Run #19: the mismatch resync must also reach the REMOTE
+            // daemon's PTY — the squish lives there, not in the attachment.
+            self.forward_remote_pty_resize(path, cols, rows);
             if let Ok(home) = crate::resolve_yggterm_home() {
                 append_trace_event(
                     &home,
@@ -5145,6 +5249,9 @@ impl DaemonRuntime {
                 if self.server.record_session_pty_grid(&path, cols, rows) {
                     let _ = self.persist_state_only();
                 }
+                // Run #19: pin the remote daemon's PTY explicitly too — the
+                // implicit SIGWINCH→ssh→bridge chain is not reliable.
+                self.forward_remote_pty_resize(&path, cols, rows);
                 ServerResponse::Ack { message: None }
             }
             ServerRequest::TerminalRestart {
@@ -5188,7 +5295,14 @@ impl DaemonRuntime {
                         self.remove_preserved_owner_runtime(&runtime_path, "terminal_restart");
                     }
                 }
-                let initial_size = initial_cols.zip(initial_rows);
+                // Run #19: like the ensure path, a restart without a client
+                // grid falls back to the session's PERSISTED grid before the
+                // 120×36 default — the remote restore/bootstrap restart was
+                // the squish entry point (practice daemon restart spawned
+                // codex at DEFAULT while the client rendered 159×63).
+                let initial_size = initial_cols
+                    .zip(initial_rows)
+                    .or_else(|| self.server.session_pty_grid(&path));
                 self.terminals.restart_session_with_size(
                     &runtime_path,
                     &launch_command,
@@ -10123,6 +10237,42 @@ mod tests {
         let mut stale = runtime_status_with_keys(&[], &[]);
         stale.terminal_session_count = 3;
         assert!(!stale_daemon_retire_covered_by_current(&current, &stale));
+    }
+
+    // Run #19 squish wiring locks: a restart without a client grid must fall
+    // back to the persisted grid (the remote restore/bootstrap restart was
+    // the squish entry point), and both local resize paths must forward the
+    // grid to the REMOTE daemon's PTY (the implicit SIGWINCH→ssh→bridge
+    // chain is unreliable).
+    #[test]
+    fn terminal_restart_and_resize_carry_grid_to_remote_pty() {
+        let source = include_str!("daemon.rs");
+        let restart_block = source
+            .split("ServerRequest::TerminalRestart {")
+            .nth(1)
+            .and_then(|suffix| suffix.split("ServerRequest::SyncExternalWindow").next())
+            .expect("TerminalRestart handler present");
+        assert!(
+            restart_block.contains(".or_else(|| self.server.session_pty_grid(&path))"),
+            "TerminalRestart must fall back to the persisted session grid before DEFAULT 120x36"
+        );
+        let resize_block = source
+            .split("ServerRequest::TerminalResize { path, cols, rows } =>")
+            .nth(1)
+            .and_then(|suffix| suffix.split("ServerRequest::TerminalRestart").next())
+            .expect("TerminalResize handler present");
+        assert!(
+            resize_block.contains("forward_remote_pty_resize"),
+            "TerminalResize must forward the grid to the remote daemon's PTY"
+        );
+        let resync_block = source
+            .split("reattach_grid_resync")
+            .next()
+            .expect("ensure resync present");
+        assert!(
+            resync_block.contains("self.forward_remote_pty_resize(path, cols, rows);"),
+            "the ensure mismatch resync must forward the grid to the remote daemon's PTY"
+        );
     }
 
     // The live jojo 2.8.87 shape: a stale daemon with ZERO owned runtimes

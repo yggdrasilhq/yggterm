@@ -18304,6 +18304,33 @@ pub fn terminate_remote_codex_session(
     .map(|_| ())
 }
 
+/// Permanent squish fix (run #19, 2026-06-11): the implicit local↔remote PTY
+/// size chain (local attachment PTY SIGWINCH → ssh window-change → remote tty
+/// → bridge size poll → remote daemon resize) has several silent failure
+/// points; live-caught with the remote codex PTY stuck at DEFAULT 120×36
+/// while the client rendered 159×63. When the local daemon resizes a remote
+/// session's attachment, ALSO pin the remote daemon's PTY explicitly through
+/// the same daemon-native command path the terminate flow uses.
+pub fn resize_remote_codex_session_pty(
+    machine: &RemoteMachineSnapshot,
+    session_id: &str,
+    cols: u16,
+    rows: u16,
+) -> anyhow::Result<()> {
+    let runtime_key = remote_runtime_codex_session_key(session_id);
+    let cols = cols.to_string();
+    let rows = rows.to_string();
+    run_remote_yggterm_command(
+        &machine.ssh_target,
+        machine.prefix.as_deref(),
+        &[
+            "server", "terminal", "resize", &runtime_key, "--cols", &cols, "--rows", &rows,
+        ],
+        None,
+    )
+    .map(|_| ())
+}
+
 pub fn request_remote_codex_session_shutdown(
     machine: &RemoteMachineSnapshot,
     session_id: &str,
