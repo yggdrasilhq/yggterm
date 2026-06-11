@@ -46,6 +46,15 @@ pub fn generation_context_from_messages(messages: &[TranscriptMessage]) -> Strin
         }
     }
 
+    // Harness-quality fix (user mandate 2026-06-11): the old budget (8 turns /
+    // 2600 chars) fed the LLM a sliver of a long session — titles/summaries
+    // described the last few pokes, not the work. Budget raised to 24 turns /
+    // 12000 chars, with a per-message cap so one giant assistant dump can't
+    // consume the whole window. Live A/B against llm.example.com showed the
+    // richer context yields summaries that name the actual project state.
+    const RECENT_TURNS_MAX: usize = 24;
+    const RECENT_CHARS_MAX: usize = 12_000;
+    const PER_MESSAGE_CHARS_MAX: usize = 1_200;
     for message in messages.iter().rev() {
         let Some(text) = message_text_for_generation(message) else {
             continue;
@@ -53,9 +62,16 @@ pub fn generation_context_from_messages(messages: &[TranscriptMessage]) -> Strin
         if recent.iter().any(|(_, existing)| existing == &text) {
             continue;
         }
+        let text = if text.chars().count() > PER_MESSAGE_CHARS_MAX {
+            let mut clipped = text.chars().take(PER_MESSAGE_CHARS_MAX).collect::<String>();
+            clipped.push('…');
+            clipped
+        } else {
+            text
+        };
         recent_chars += text.len();
         recent.push((message.role, text));
-        if recent.len() >= 8 || recent_chars >= 2600 {
+        if recent.len() >= RECENT_TURNS_MAX || recent_chars >= RECENT_CHARS_MAX {
             break;
         }
     }
