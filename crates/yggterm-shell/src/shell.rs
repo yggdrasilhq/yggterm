@@ -61740,29 +61740,28 @@ fn terminal_eval_script_with_canvas_renderer(
                 entry.lastXtermSessionSnapshotBaseY = Number(snapshot.baseY || 0);
                 entry.lastXtermSessionSnapshotViewportY = Number(snapshot.viewportY || 0);
             }}
+            // XTERM-BUG: phantom-scrollback-latch — the teardown snapshot copies
+            // the dying host's scroll intent verbatim, and this restore used to
+            // re-assert UserScrollback+locked from it, so a single spurious
+            // programmatic flip self-perpetuated across remounts (5-sweep
+            // dataset: 7 UserScrollback flips with no human scroll, 4 of them
+            // via `xterm_session_snapshot:cleanup`). Per the scroll_mode spec a
+            // constructed/cold reveal starts Following; only a live user scroll
+            // may latch UserScrollback. The snapshot keeps carrying the intent
+            // fields for telemetry, but the restore never latches from them.
             const restoredIntent = String(snapshot.scrollbackIntent || '');
             if (restoredIntent === 'UserScrollback') {{
-                setScrollbackIntent('UserScrollback', `xterm_session_snapshot:${{String(snapshot.reason || 'restore')}}`);
-                scrollbackLocked = true;
-                if (entry) {{
-                    entry.scrollbackLocked = true;
-                }}
-                const targetViewportY = Math.max(0, Number(snapshot.viewportY || 0));
-                window.requestAnimationFrame(() => {{
-                    forceXtermViewportY(targetViewportY, 'xterm_session_snapshot_restore');
-                    syncScrollbackLock('xterm_session_snapshot_restore');
-                    syncTerminalScrollController('xterm_session_snapshot_restore');
-                    requestVisiblePaint(true);
-                    emitHostHealth();
-                }});
-            }} else {{
-                setScrollbackIntent('PromptFollow', `xterm_session_snapshot:${{String(snapshot.reason || 'restore')}}`);
-                window.requestAnimationFrame(() => {{
-                    scrollLiveCursorIntoView(false, 'xterm_session_snapshot_restore');
-                    requestVisiblePaint(true);
-                    emitHostHealth();
+                sendTerminalEvent({{
+                    kind: 'debug',
+                    message: `xterm_session_snapshot_intent_latch_dropped host=${{hostId}} reason=${{String(snapshot.reason || 'restore')}}`
                 }});
             }}
+            setScrollbackIntent('PromptFollow', `xterm_session_snapshot:${{String(snapshot.reason || 'restore')}}`);
+            window.requestAnimationFrame(() => {{
+                scrollLiveCursorIntoView(false, 'xterm_session_snapshot_restore');
+                requestVisiblePaint(true);
+                emitHostHealth();
+            }});
             sendTerminalEvent({{
                 kind: "debug",
                 message: `xterm_session_snapshot_restored host=${{hostId}} lines=${{Number(snapshot.lineCount || 0)}} intent=${{restoredIntent || 'PromptFollow'}} age_ms=${{Number(snapshot.ageMs || 0)}}`
@@ -76272,6 +76271,24 @@ mod tests {
         assert!(script.contains(
             "entry.lastXtermSessionSnapshotNonblankLineCount = snapshot.nonblankLineCount;"
         ));
+    }
+
+    #[test]
+    fn xterm_snapshot_restore_never_latches_user_scrollback_intent() {
+        // Regression lock for the phantom-scrollback-latch fix (A.b.1,
+        // run #8): the teardown snapshot carries the dying host's intent
+        // for telemetry only — restoring it must start Following per the
+        // scroll_mode spec, never re-assert UserScrollback+locked (which
+        // made one spurious programmatic flip self-perpetuate across
+        // remounts).
+        let theme = terminal_theme(UiTheme::ZedLight, palette(UiTheme::ZedLight), 13.0, "");
+        let script = terminal_eval_script("yggterm-terminal-test", &theme, true);
+        assert!(
+            !script.contains("setScrollbackIntent('UserScrollback', `xterm_session_snapshot:"),
+            "snapshot restore must not latch UserScrollback from a teardown snapshot"
+        );
+        assert!(script.contains("xterm_session_snapshot_intent_latch_dropped"));
+        assert!(script.contains("setScrollbackIntent('PromptFollow', `xterm_session_snapshot:"));
     }
 
     #[test]
