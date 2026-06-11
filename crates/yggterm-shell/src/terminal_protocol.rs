@@ -111,6 +111,12 @@ pub(crate) enum TerminalJsEvent {
     Debug {
         message: String,
     },
+    /// A clicked terminal link (OSC-8 hyperlink or detected plain-text URL).
+    /// The Rust side validates the scheme and opens the OS browser — JS
+    /// `window.open` is a no-op inside the wry webview.
+    OpenUrl {
+        url: String,
+    },
     /// A terminal-driven attention signal: the BEL (`term.onBell`) or a
     /// notification OSC (9 / 777) emitted by the CLI running in the PTY — e.g.
     /// Claude Code / Codex pinging when a task finishes or needs input. Routed
@@ -195,6 +201,10 @@ enum TerminalJsEventWire {
     Debug {
         message: String,
     },
+    OpenUrl {
+        #[serde(default)]
+        url: String,
+    },
     Notify {
         source: String,
         #[serde(default)]
@@ -276,6 +286,7 @@ impl From<TerminalJsEventWire> for TerminalJsEvent {
                 TerminalJsEvent::ClipboardError { action, message }
             }
             TerminalJsEventWire::Debug { message } => TerminalJsEvent::Debug { message },
+            TerminalJsEventWire::OpenUrl { url } => TerminalJsEvent::OpenUrl { url },
             TerminalJsEventWire::Notify {
                 source,
                 title,
