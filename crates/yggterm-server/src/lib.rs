@@ -395,26 +395,38 @@ fn persisted_live_session_from_managed(
             !(action.as_str() == "start-codex"
                 && (protect_for_update_restart || has_promoted_codex_identity))
         });
-    session
-        .ssh_target
-        .as_ref()
-        .map(|ssh_target| PersistedLiveSession {
-            key: key.to_string(),
-            id: session.id.clone(),
-            title: session.title.clone(),
-            kind: session.kind,
-            keep_alive,
-            ssh_target: ssh_target.clone(),
-            prefix: session.ssh_prefix.clone(),
-            cwd: session
-                .metadata
-                .iter()
-                .find(|entry| entry.label == "Cwd")
-                .map(|entry| entry.value.clone()),
-            remote_launch_action,
-            storage_path: session_metadata_value(session, "Storage"),
-            restore_reason,
-        })
+    let storage_path = session_metadata_value(session, "Storage");
+    // LOGICAL-BLUNDER FIX (user-named, 2026-06-11): LOCAL live sessions have
+    // no ssh_target, so this mapper silently dropped them from persistence —
+    // their identity (row, title, UUID→Storage link) lived ONLY in daemon
+    // memory and died with every daemon swap, even though the CLI transcript
+    // is durable on disk (live-caught: home/pi codex 019e9c28 + litellm both
+    // vanished at the 2.8.78 swap). The restore path already handles loopback
+    // entries (canonical local key + local resume), so persist locals with
+    // the loopback target. Agent kinds restore faithfully via their Storage
+    // JSONL; a not-yet-rebound row (no Storage) still keeps its row + title.
+    let ssh_target = session.ssh_target.clone().or_else(|| {
+        (session.source == SessionSource::LiveLocal
+            && local_live_session_kind_is_recoverable(session.kind))
+        .then(|| "localhost".to_string())
+    });
+    ssh_target.map(|ssh_target| PersistedLiveSession {
+        key: key.to_string(),
+        id: session.id.clone(),
+        title: session.title.clone(),
+        kind: session.kind,
+        keep_alive,
+        ssh_target,
+        prefix: session.ssh_prefix.clone(),
+        cwd: session
+            .metadata
+            .iter()
+            .find(|entry| entry.label == "Cwd")
+            .map(|entry| entry.value.clone()),
+        remote_launch_action,
+        storage_path,
+        restore_reason,
+    })
 }
 
 fn passive_title_hint_can_update(current_title: &str, title_hint: &str, was_missing: bool) -> bool {
@@ -30005,6 +30017,74 @@ terminal_window_id: None,
                 .iter()
                 .any(|path| path == "local://cleanup-me")
         );
+    }
+
+    #[test]
+    fn local_live_codex_sessions_survive_daemon_restart_via_persistence() {
+        // Logical-blunder fix (2026-06-11): local live sessions were silently
+        // dropped from PersistedDaemonState (the mapper required ssh_target),
+        // so their row/title/Storage identity lived only in daemon memory and
+        // died at every swap — even though the codex transcript is durable on
+        // disk. Persist → restore into a FRESH server must keep the row.
+        use crate::{is_loopback_ssh_target, persisted_live_session_is_recoverable};
+        let tree = SessionNode {
+            kind: SessionNodeKind::Group,
+            name: "sessions".to_string(),
+            path: PathBuf::from("/"),
+            ..Default::default()
+        };
+        let mut server = YggtermServer::new(
+            &tree,
+            false,
+            GhosttyHostSupport::shadow("test".to_string(), false, false),
+            UiTheme::ZedLight,
+        );
+        let key = server.start_local_session(
+            SessionKind::Codex,
+            Some("/home/pi"),
+            Some("Proxy Smoke Test Run"),
+        );
+        if let Some(session) = server.sessions.get_mut(&key) {
+            upsert_session_metadata(
+                &mut session.metadata,
+                "Storage",
+                "/home/pi/.codex/sessions/2026/06/06/rollout-test.jsonl".to_string(),
+            );
+        }
+
+        // Update-restart persistence (protect_all_live) must include the
+        // local session even without keep-alive.
+        let persisted = server.persisted_state_with_update_protection(true, None);
+        let live = persisted
+            .live_sessions
+            .iter()
+            .find(|live| live.key == key)
+            .expect("local live codex session must be persisted across a daemon swap");
+        assert!(is_loopback_ssh_target(&live.ssh_target));
+        assert_eq!(live.title, "Proxy Smoke Test Run");
+        assert_eq!(
+            live.storage_path.as_deref(),
+            Some("/home/pi/.codex/sessions/2026/06/06/rollout-test.jsonl")
+        );
+        assert!(persisted_live_session_is_recoverable(live));
+
+        // Restore into a FRESH server (the daemon-process restart) keeps the row.
+        let mut fresh = YggtermServer::new(
+            &tree,
+            false,
+            GhosttyHostSupport::shadow("test".to_string(), false, false),
+            UiTheme::ZedLight,
+        );
+        fresh.restore_live_session(live.clone());
+        let restored_key = fresh
+            .live_session_order
+            .iter()
+            .find(|existing| existing.contains(&live.id))
+            .cloned()
+            .expect("restored local codex session must reappear in live order");
+        let restored = fresh.sessions.get(&restored_key).expect("restored session");
+        assert_eq!(restored.kind, SessionKind::Codex);
+        assert_eq!(restored.title, "Proxy Smoke Test Run");
     }
 
     #[test]
