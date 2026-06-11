@@ -51152,6 +51152,15 @@ fn TerminalCanvas(
                                                     )
                                                 },
                                             )
+                                        } else if action == "osc52" {
+                                            // OSC 52: the CLI in the PTY (e.g. Claude
+                                            // Code select-copy) set the clipboard.
+                                            (
+                                                "Copied to Clipboard",
+                                                format!(
+                                                    "The terminal application copied {chars} character(s)."
+                                                ),
+                                            )
                                         } else {
                                             (
                                                 "Copied to Clipboard",
@@ -58556,6 +58565,50 @@ fn terminal_eval_script_with_canvas_renderer(
         }};
         const notifyOsc9Disposable = registerTerminalNotifyOsc(9, "osc9");
         const notifyOsc777Disposable = registerTerminalNotifyOsc(777, "osc777");
+        // User bug 2: OSC 52 clipboard writes from the CLI (Claude Code's
+        // select-copy / `c`-copy, tmux yank, etc.) were silently dropped —
+        // xterm.js core has no OSC 52 handler (that lives in the
+        // non-vendored clipboard addon), so CC's copy never reached the
+        // system clipboard. Decode `Pc;<base64>` and route the text through
+        // the SAME clipboard event the selection copy uses. Queries (`?`)
+        // ask the terminal to REPLY with clipboard contents — consumed and
+        // ignored (never leak the clipboard back to the PTY).
+        const osc52ClipboardDisposable = (() => {{
+            try {{
+                if (!term || !term.parser || typeof term.parser.registerOscHandler !== 'function') {{
+                    return null;
+                }}
+                return term.parser.registerOscHandler(52, (data) => {{
+                    try {{
+                        const raw = typeof data === 'string' ? data : '';
+                        const sep = raw.indexOf(';');
+                        const payload = sep >= 0 ? raw.slice(sep + 1) : '';
+                        if (!payload || payload === '?') {{
+                            return true;
+                        }}
+                        const bytes = Uint8Array.from(atob(payload), (ch) => ch.charCodeAt(0));
+                        const text = new TextDecoder().decode(bytes);
+                        if (text.length > 0) {{
+                            sendTerminalEvent({{
+                                kind: 'clipboard',
+                                action: 'osc52',
+                                chars: text.length,
+                                text,
+                            }});
+                        }}
+                    }} catch (error) {{
+                        sendTerminalEvent({{
+                            kind: 'clipboard_error',
+                            action: 'osc52',
+                            message: error && error.message ? error.message : String(error),
+                        }});
+                    }}
+                    return true;
+                }});
+            }} catch (_error) {{
+                return null;
+            }}
+        }})();
         let canvasAddonAvailable = Boolean(window.CanvasAddon && window.CanvasAddon.CanvasAddon);
         let rendererDecisionError = '';
         try {{
@@ -76429,6 +76482,20 @@ mod tests {
         assert!(script.contains(
             "entry.lastXtermSessionSnapshotNonblankLineCount = snapshot.nonblankLineCount;"
         ));
+    }
+
+    #[test]
+    fn terminal_osc52_clipboard_writes_reach_the_clipboard_event() {
+        // User bug 2: CC's select-copy emits OSC 52; xterm.js core has no
+        // handler so the copy never left the TUI. The handler must decode
+        // the base64 payload, route it through the clipboard event, and
+        // consume queries without replying.
+        let theme = terminal_theme(UiTheme::ZedLight, palette(UiTheme::ZedLight), 13.0, "");
+        let script = terminal_eval_script("yggterm-terminal-test", &theme, true);
+        assert!(script.contains("term.parser.registerOscHandler(52, (data) => {"));
+        assert!(script.contains("action: 'osc52'"));
+        assert!(script.contains("if (!payload || payload === '?') {"));
+        assert!(script.contains("Uint8Array.from(atob(payload)"));
     }
 
     #[test]
