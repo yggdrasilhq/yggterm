@@ -6609,7 +6609,7 @@ impl ShellState {
             })
             .collect::<Vec<_>>();
         for (session_path, title_hint, precis, summary) in cached {
-            if !title_hint.trim().is_empty() && !looks_like_generated_fallback_title(&title_hint) {
+            if !title_hint.trim().is_empty() && !memoized_generated_fallback_title(&title_hint) {
                 self.server
                     .set_session_title_hint_passive(&session_path, &title_hint);
             }
@@ -14377,7 +14377,7 @@ fn synthesize_app_control_row(shell: &ShellState, session_path: &str) -> Option<
             .cached_summary
             .clone()
             .filter(|summary| !summary.trim().is_empty())
-            .filter(|summary| !looks_like_low_signal_generated_copy(summary))
+            .filter(|summary| !memoized_low_signal_generated_copy(summary))
             .unwrap_or_default();
         return Some(BrowserRow {
             kind: BrowserRowKind::Session,
@@ -16264,7 +16264,7 @@ fn live_terminal_generation_context(
         .lines()
         .map(str::trim)
         .filter(|line| !line.is_empty())
-        .filter(|line| !looks_like_low_signal_generated_copy(line))
+        .filter(|line| !memoized_low_signal_generated_copy(line))
         .filter(|line| !terminal_chunk_is_low_signal_terminal_noise(line))
         .map(ToOwned::to_owned)
         .collect::<Vec<_>>();
@@ -16346,7 +16346,7 @@ fn humanized_title_for_copy_target(target: &CopyGenerationTarget) -> Option<Stri
     let leaf = cwd.rsplit('/').find(|segment| !segment.trim().is_empty())?;
     let leaf = leaf.replace('_', " ").replace('-', " ");
     let title = format!("{} Shell", shell_title_case_words(&leaf));
-    (!looks_like_generated_fallback_title(&title)).then_some(title)
+    (!memoized_generated_fallback_title(&title)).then_some(title)
 }
 fn humanized_summary_for_copy_target(target: &CopyGenerationTarget) -> Option<String> {
     let cwd = target.cwd.trim();
@@ -17028,7 +17028,7 @@ fn background_copy_job_for_target(
     }
     let in_memory_summary = generated_summaries
         .get(&target.session_path)
-        .filter(|summary| !looks_like_low_signal_generated_copy(summary));
+        .filter(|summary| !memoized_low_signal_generated_copy(summary));
     let stored_summary = store
         .resolve_summary_for_session_id(&target.session_id)
         .ok()
@@ -17052,7 +17052,7 @@ fn background_copy_job_for_target(
         && summary_needs_refresh
         && cached_summary
             .as_deref()
-            .is_none_or(looks_like_low_signal_generated_copy);
+            .is_none_or(memoized_low_signal_generated_copy);
     if summary_missing
         && background_copy_job_retry_ready(
             copy_retry_after_ms,
@@ -17376,7 +17376,7 @@ fn resolved_session_summary(shell: &ShellState, session: &ManagedSessionView) ->
                 .and_then(|(_, _, summary)| summary)
         })
         .or_else(|| preview_summary_metadata_value(session, "Summary"))
-        .filter(|summary| !looks_like_low_signal_generated_copy(summary))
+        .filter(|summary| !memoized_low_signal_generated_copy(summary))
 }
 fn active_session_summary_timeline(
     session: &ManagedSessionView,
@@ -17389,13 +17389,13 @@ fn active_session_summary_timeline(
         .into_iter()
         .filter(|entry| {
             !entry.summary.trim().is_empty()
-                && !looks_like_low_signal_generated_copy(&entry.summary)
+                && !memoized_low_signal_generated_copy(&entry.summary)
         })
         .collect::<Vec<_>>();
     if timeline.is_empty()
         && let Some(summary) = fallback_summary
             .map(str::trim)
-            .filter(|summary| !summary.is_empty() && !looks_like_low_signal_generated_copy(summary))
+            .filter(|summary| !summary.is_empty() && !memoized_low_signal_generated_copy(summary))
     {
         timeline.push(SessionSummaryTimelineEntry {
             created_at: "Current".to_string(),
@@ -17418,10 +17418,10 @@ fn active_session_summary_timeline(
 fn fallback_title_from_browser_row(row: &BrowserRow) -> Option<String> {
     row.session_title
         .clone()
-        .filter(|title| !title.trim().is_empty() && !looks_like_generated_fallback_title(title))
+        .filter(|title| !title.trim().is_empty() && !memoized_generated_fallback_title(title))
         .or_else(|| {
             let label = row.label.trim();
-            if label.is_empty() || looks_like_generated_fallback_title(label) {
+            if label.is_empty() || memoized_generated_fallback_title(label) {
                 None
             } else {
                 Some(label.to_string())
@@ -17439,7 +17439,7 @@ fn fallback_summary_for_session_path(shell: &ShellState, session_path: &str) -> 
     if let Some(summary) = remote_generated_copy(&shell.server, session_path)
         .and_then(|(_, _, summary)| summary)
         .filter(|summary| !summary.trim().is_empty())
-        .filter(|summary| !looks_like_low_signal_generated_copy(summary))
+        .filter(|summary| !memoized_low_signal_generated_copy(summary))
     {
         return Some(summary);
     }
@@ -17470,7 +17470,7 @@ fn titlebar_summary_text(
         .clone()
         .or_else(|| preview_summary_metadata_value(session, "Summary"))
         .filter(|summary| !summary.trim().is_empty())
-        .filter(|summary| !looks_like_low_signal_generated_copy(summary))
+        .filter(|summary| !memoized_low_signal_generated_copy(summary))
 }
 fn titlebar_search_dropdown_open(snapshot: &RenderSnapshot) -> bool {
     titlebar_search_dropdown_open_flags(
@@ -19528,7 +19528,7 @@ fn preview_context_from_session(session: &ManagedSessionView) -> Option<String> 
                 } else {
                     format!("{role}: {trimmed}")
                 };
-                (!looks_like_low_signal_generated_copy(&composed)).then_some(composed)
+                (!memoized_low_signal_generated_copy(&composed)).then_some(composed)
             })
         })
         .collect::<Vec<_>>();
@@ -19544,7 +19544,7 @@ fn preview_context_from_session(session: &ManagedSessionView) -> Option<String> 
         .rev()
         .filter_map(|line| {
             let trimmed = line.trim();
-            if trimmed.is_empty() || looks_like_low_signal_generated_copy(trimmed) {
+            if trimmed.is_empty() || memoized_low_signal_generated_copy(trimmed) {
                 None
             } else {
                 Some(trimmed.to_string())
@@ -20705,6 +20705,63 @@ struct RemoteSessionIndex {
     generated_title_by_path: HashMap<String, String>,
     generated_summary_by_path: HashMap<String, String>,
 }
+// PERF (fan/CPU spin #2, live stack-sampled 2026-06-11 on v2.8.76): the GUI
+// main thread pegged ~100% inside ShellState::snapshot ->
+// enrich_sidebar_rows_with_live_titles -> build_remote_session_index ->
+// looks_like_low_signal_generated_copy — the same per-render recognizer-burn
+// class as the 2.8.73 sidebar fix (eec7cb6f), one callee over. Titles and
+// summaries for a session only change when the daemon pushes new copy, so
+// memoize both verdicts by text hash. Main-thread only -> thread_local, capped.
+fn memoized_generated_fallback_title(title: &str) -> bool {
+    thread_local! {
+        static FALLBACK_TITLE_MEMO: std::cell::RefCell<HashMap<u64, bool>> =
+            std::cell::RefCell::new(HashMap::new());
+    }
+    let key = {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        title.hash(&mut hasher);
+        hasher.finish()
+    };
+    if let Some(hit) = FALLBACK_TITLE_MEMO.with(|memo| memo.borrow().get(&key).copied()) {
+        return hit;
+    }
+    let verdict = looks_like_generated_fallback_title(title);
+    FALLBACK_TITLE_MEMO.with(|memo| {
+        let mut memo = memo.borrow_mut();
+        if memo.len() >= 512 {
+            memo.clear();
+        }
+        memo.insert(key, verdict);
+    });
+    verdict
+}
+
+fn memoized_low_signal_generated_copy(text: &str) -> bool {
+    thread_local! {
+        static LOW_SIGNAL_COPY_MEMO: std::cell::RefCell<HashMap<u64, bool>> =
+            std::cell::RefCell::new(HashMap::new());
+    }
+    let key = {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        text.hash(&mut hasher);
+        hasher.finish()
+    };
+    if let Some(hit) = LOW_SIGNAL_COPY_MEMO.with(|memo| memo.borrow().get(&key).copied()) {
+        return hit;
+    }
+    let verdict = looks_like_low_signal_generated_copy(text);
+    LOW_SIGNAL_COPY_MEMO.with(|memo| {
+        let mut memo = memo.borrow_mut();
+        if memo.len() >= 512 {
+            memo.clear();
+        }
+        memo.insert(key, verdict);
+    });
+    verdict
+}
+
 fn build_remote_session_index(remote_machines: &[RemoteMachineSnapshot]) -> RemoteSessionIndex {
     let mut index = RemoteSessionIndex::default();
     for machine in remote_machines {
@@ -20713,7 +20770,7 @@ fn build_remote_session_index(remote_machines: &[RemoteMachineSnapshot]) -> Remo
                 .modified_epoch_by_path
                 .insert(session.session_path.clone(), session.modified_epoch);
             let title = session.title_hint.trim();
-            if !title.is_empty() && !looks_like_generated_fallback_title(title) {
+            if !title.is_empty() && !memoized_generated_fallback_title(title) {
                 index
                     .generated_title_by_path
                     .entry(session.session_path.clone())
@@ -20723,7 +20780,7 @@ fn build_remote_session_index(remote_machines: &[RemoteMachineSnapshot]) -> Remo
                 .cached_summary
                 .as_deref()
                 .filter(|summary| !summary.trim().is_empty())
-                .filter(|summary| !looks_like_low_signal_generated_copy(summary))
+                .filter(|summary| !memoized_low_signal_generated_copy(summary))
             {
                 index
                     .generated_summary_by_path
@@ -21029,13 +21086,13 @@ fn live_session_label_with_index(
     short_ids: &HashMap<String, String>,
 ) -> String {
     let title = session.title.trim();
-    if !title.is_empty() && !looks_like_generated_fallback_title(title) {
+    if !title.is_empty() && !memoized_generated_fallback_title(title) {
         return session.title.clone();
     }
     if let Some(remote_title) = remote_session_index
         .generated_title_by_path
         .get(&session.session_path)
-        .filter(|title| !title.trim().is_empty() && !looks_like_generated_fallback_title(title))
+        .filter(|title| !title.trim().is_empty() && !memoized_generated_fallback_title(title))
     {
         return remote_title.clone();
     }
@@ -21054,12 +21111,12 @@ fn live_session_label_with_index(
         return humanized_terminal_title(session.kind, &cwd, Some(&session.host_label))
             .unwrap_or(cwd);
     }
-    if !title.is_empty() && !looks_like_generated_fallback_title(title) {
+    if !title.is_empty() && !memoized_generated_fallback_title(title) {
         return session.title.clone();
     }
     humanized_terminal_title(session.kind, &cwd, Some(&session.host_label))
         .or_else(|| short_ids.get(&session.session_path).cloned())
-        .filter(|title| !looks_like_generated_fallback_title(title))
+        .filter(|title| !memoized_generated_fallback_title(title))
         .unwrap_or_else(|| {
             humanized_terminal_title(session.kind, "", Some(&session.host_label))
                 .unwrap_or_else(|| "Terminal Session".to_string())
@@ -21072,7 +21129,7 @@ fn live_session_summary_with_index(
     preview_summary_metadata_value(session, "Summary")
         .or_else(|| resolved_session_summary_for_search(session))
         .or_else(|| live_session_default_summary(session))
-        .filter(|summary| !looks_like_low_signal_generated_copy(summary))
+        .filter(|summary| !memoized_low_signal_generated_copy(summary))
         .or_else(|| {
             remote_session_index
                 .generated_summary_by_path
@@ -21205,7 +21262,7 @@ fn enrich_sidebar_rows_with_live_titles(
             .get(&session.session_path)
             .cloned()
             .filter(|summary| !summary.trim().is_empty())
-            .filter(|summary| !looks_like_low_signal_generated_copy(summary))
+            .filter(|summary| !memoized_low_signal_generated_copy(summary))
             .unwrap_or_else(|| live_session_summary_with_index(&remote_session_index, session));
         if !summary.trim().is_empty() {
             summary_by_path.insert(session.session_path.clone(), summary);
@@ -21317,7 +21374,7 @@ fn enrich_sidebar_rows_with_live_titles(
             && (authoritative_live
                 || live_backed
                 || row.label.trim().is_empty()
-                || looks_like_generated_fallback_title(&row.label)
+                || memoized_generated_fallback_title(&row.label)
                 || row
                     .session_cwd
                     .as_deref()
@@ -21685,14 +21742,14 @@ fn remote_scanned_session_label(
     short_ids: &HashMap<String, String>,
 ) -> String {
     let title = session.title_hint.trim();
-    if !title.is_empty() && !looks_like_generated_fallback_title(title) {
+    if !title.is_empty() && !memoized_generated_fallback_title(title) {
         return session.title_hint.clone();
     }
     if let Some(title) = session
         .cached_summary
         .as_deref()
         .filter(|summary| !summary.trim().is_empty())
-        .filter(|summary| !looks_like_low_signal_generated_copy(summary))
+        .filter(|summary| !memoized_low_signal_generated_copy(summary))
         .and_then(best_effort_title_from_context)
     {
         return title;
@@ -21712,7 +21769,7 @@ fn remote_scanned_session_label(
         }
     }
     humanized_terminal_title(SessionKind::Codex, &session.cwd, None)
-        .filter(|title| !looks_like_generated_fallback_title(title))
+        .filter(|title| !memoized_generated_fallback_title(title))
         .or_else(|| short_ids.get(&session.session_path).cloned())
         .unwrap_or_else(|| fallback_label_for_session_path(&session.session_path))
 }
@@ -45344,7 +45401,7 @@ fn RenderedSectionCard(section: SessionRenderedSection, palette: Palette) -> Ele
 }
 fn preview_summary_text(session: &ManagedSessionView) -> String {
     if let Some(summary) = preview_summary_metadata_value(session, "Summary")
-        .filter(|value| !looks_like_low_signal_generated_copy(value))
+        .filter(|value| !memoized_low_signal_generated_copy(value))
     {
         return summary;
     }
@@ -45617,7 +45674,7 @@ fn release_terminal_bootstrap_lease_if_current(
 }
 fn terminal_precis(session: &ManagedSessionView) -> String {
     if let Some(summary) = preview_summary_metadata_value(session, "Summary")
-        .filter(|value| !looks_like_low_signal_generated_copy(value))
+        .filter(|value| !memoized_low_signal_generated_copy(value))
     {
         return summary;
     }
@@ -55083,7 +55140,7 @@ fn terminal_resume_excerpt_is_meaningful(text: &str) -> bool {
     let trimmed = text.trim();
     let normalized = trimmed.to_ascii_lowercase();
     !trimmed.is_empty()
-        && !looks_like_low_signal_generated_copy(trimmed)
+        && !memoized_low_signal_generated_copy(trimmed)
         && !normalized.starts_with("open live terminal ")
         && !normalized.starts_with("launch command prepared:")
         && !normalized.contains("stays attached to the daemon")
@@ -68309,7 +68366,7 @@ fn browser_row_for_remote_scanned_session(
             .cached_summary
             .clone()
             .filter(|summary| !summary.trim().is_empty())
-            .filter(|summary| !looks_like_low_signal_generated_copy(summary))
+            .filter(|summary| !memoized_low_signal_generated_copy(summary))
             .unwrap_or_default(),
         document_kind: None,
         group_kind: None,
@@ -83182,7 +83239,7 @@ mod tests {
         assert_ne!(label, "Yggterm Codex");
         assert_ne!(label, "Codex Session");
         assert!(
-            !looks_like_generated_fallback_title(&label),
+            !memoized_generated_fallback_title(&label),
             "unexpected generated label: {label}"
         );
 
@@ -83196,7 +83253,7 @@ mod tests {
 
         assert_ne!(label, "Codex Session");
         assert!(
-            !looks_like_generated_fallback_title(&label),
+            !memoized_generated_fallback_title(&label),
             "unexpected recent-context label: {label}"
         );
     }
