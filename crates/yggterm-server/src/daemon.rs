@@ -1861,6 +1861,15 @@ struct DaemonRuntime {
     /// Preserved-owner registry removals discovered by the background prune,
     /// applied on the request loop (the registry is not thread-shared).
     pending_preserved_owner_removals: Arc<Mutex<Vec<String>>>,
+    /// GATE #8 (persistence saga root): multiple daemons share ONE
+    /// server-state.json, and a superseded daemon's routine persist clobbers
+    /// the successor's file with its stale in-memory view (live-caught: a
+    /// lingering 2.8.92 daemon kept erasing the locals the 2.8.93 file held).
+    /// Set by the disk-binary poll when a strictly newer daemon is live;
+    /// routine persists become no-ops — the successor owns the file now. The
+    /// final update-restart snapshot at retire still writes (it carries this
+    /// daemon's rows; the successor's takeover import reads it).
+    superseded_routine_persist_muted: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1943,6 +1952,7 @@ impl DaemonRuntime {
             update_restart_state_written: false,
             duplicate_runtime_prune_in_flight: Arc::new(AtomicBool::new(false)),
             pending_preserved_owner_removals: Arc::new(Mutex::new(Vec::new())),
+            superseded_routine_persist_muted: false,
         };
         let preserved_owner_registry_retargeted = runtime
             .preserved_terminal_owners
@@ -2868,6 +2878,106 @@ impl DaemonRuntime {
         }
     }
 
+    /// GATE #8 takeover (persistence saga root): ask every reachable OLDER
+    /// live daemon to PrepareUpdateRestart — the predecessor writes its
+    /// protected snapshot (carrying its non-keep-alive rows) AND latches its
+    /// routine persists off (the proven gate-#3 machinery) — then re-read the
+    /// state file and merge-restore every recoverable live row this daemon
+    /// does not already hold, then persist the merged view. This removes the
+    /// swap-ORDERING dependence: it no longer matters whether the successor
+    /// loaded the file before the predecessor wrote its snapshot.
+    /// Runs once at startup, under the runtime lock (cross-daemon calls are
+    /// bounded by the now-small daemon census; predecessors are idle).
+    fn takeover_superseded_daemon_state(&mut self) {
+        let current_endpoint = default_endpoint(self.store.home_dir());
+        let current_triple = parse_daemon_version_triple(SERVER_PROTOCOL_VERSION);
+        let mut prepared = Vec::new();
+        let mut prepare_errors = Vec::new();
+        for (endpoint, status) in reachable_versioned_daemon_statuses_excluding_endpoint(
+            self.store.home_dir(),
+            &current_endpoint,
+        ) {
+            if status.server_pid == std::process::id() {
+                continue;
+            }
+            let older = match (
+                parse_daemon_version_triple(&status.server_version),
+                current_triple,
+            ) {
+                (Some(theirs), Some(ours)) => theirs < ours,
+                _ => false,
+            };
+            if !older {
+                continue;
+            }
+            match prepare_update_restart(&endpoint) {
+                Ok(_) => prepared.push(owner_endpoint_label(&endpoint)),
+                Err(error) => prepare_errors.push(serde_json::json!({
+                    "endpoint": owner_endpoint_label(&endpoint),
+                    "error": error.to_string(),
+                })),
+            }
+        }
+        if prepared.is_empty() {
+            if !prepare_errors.is_empty() {
+                append_trace_event(
+                    self.store.home_dir(),
+                    "daemon",
+                    "lifecycle",
+                    "superseded_daemon_takeover",
+                    serde_json::json!({
+                        "prepared": prepared,
+                        "prepare_errors": prepare_errors,
+                        "imported_keys": Vec::<String>::new(),
+                    }),
+                );
+            }
+            return;
+        }
+        let saved = match load_persisted_state(&self.state_path) {
+            Ok(Some(saved)) => saved,
+            _ => return,
+        };
+        let normalize = |key: &str| -> String {
+            if let Some(id) = crate::local_runtime_id_from_key(key) {
+                format!("id::{id}")
+            } else {
+                key.to_string()
+            }
+        };
+        let existing: HashSet<String> = self
+            .server
+            .live_session_order
+            .iter()
+            .map(|key| normalize(key))
+            .collect();
+        let mut imported_keys = Vec::new();
+        for live in saved.live_sessions {
+            if existing.contains(&normalize(&live.key))
+                || !crate::persisted_live_session_is_recoverable(&live)
+            {
+                continue;
+            }
+            let key = live.key.clone();
+            self.server.restore_live_session(live);
+            imported_keys.push(key);
+        }
+        if !imported_keys.is_empty() {
+            let _ = self.persist();
+        }
+        append_trace_event(
+            self.store.home_dir(),
+            "daemon",
+            "lifecycle",
+            "superseded_daemon_takeover",
+            serde_json::json!({
+                "prepared": prepared,
+                "prepare_errors": prepare_errors,
+                "imported_keys": imported_keys,
+            }),
+        );
+    }
+
     /// Apply preserved-owner registry removals discovered by the background
     /// duplicate-runtime prune. Runs on the request loop (registry owner).
     fn drain_pending_preserved_owner_removals(&mut self) {
@@ -3650,10 +3760,10 @@ impl DaemonRuntime {
     }
 
     fn persist(&mut self) -> Result<()> {
-        if self.update_restart_state_written {
-            // Never clobber the update-restart snapshot during retire (see
-            // the field doc — this silently dropped every protected
-            // non-keep-alive session at each swap).
+        if self.update_restart_state_written || self.superseded_routine_persist_muted {
+            // Never clobber the update-restart snapshot during retire, and
+            // never clobber the SUCCESSOR's state file once a newer daemon is
+            // live (gate #8 — see the field docs).
             return Ok(());
         }
         self.refresh_live_codex_runtime_identities_for_persistence();
@@ -3671,7 +3781,7 @@ impl DaemonRuntime {
     /// Genuine lifecycle events still call the full `persist()`. See campaign D1 / the
     /// born-at-correct-size synchronous flush.
     fn persist_state_only(&self) -> Result<()> {
-        if self.update_restart_state_written {
+        if self.update_restart_state_written || self.superseded_routine_persist_muted {
             return Ok(());
         }
         write_persisted_state(&self.state_path, &self.server.persisted_state())
@@ -8001,7 +8111,25 @@ fn spawn_disk_binary_version_poll(
             // (Same idle gate as the hot-update handoff; overridable via
             // YGGTERM_HOT_UPDATE_IGNORE_IDLE_GATE.)
             let block_reason = {
-                let rt = lock_daemon_runtime(&runtime, "disk_binary_replace_idle_gate");
+                let mut rt = lock_daemon_runtime(&runtime, "disk_binary_replace_idle_gate");
+                // GATE #8: a strictly newer daemon owns server-state.json from
+                // here on — mute this daemon's routine persists so its stale
+                // in-memory view can never clobber the successor's file while
+                // the idle gate defers the actual retire.
+                if retire_trigger == "newer_daemon_live" && !rt.superseded_routine_persist_muted {
+                    rt.superseded_routine_persist_muted = true;
+                    append_trace_event(
+                        &home_dir,
+                        "daemon",
+                        "lifecycle",
+                        "superseded_routine_persist_muted",
+                        serde_json::json!({
+                            "newer_daemon_version": newer_daemon_version,
+                            "current_version": SERVER_PROTOCOL_VERSION,
+                            "current_pid": std::process::id(),
+                        }),
+                    );
+                }
                 let owned = rt.terminals.session_keys();
                 rt.hot_update_idle_gate_block_reason(&owned)
             };
@@ -8043,6 +8171,21 @@ fn spawn_disk_binary_version_poll(
             break;
         }
     });
+}
+
+/// GATE #8 startup hook: run the superseded-daemon takeover once, off the
+/// accept path, under the runtime lock (see
+/// [`DaemonRuntime::takeover_superseded_daemon_state`]).
+fn spawn_superseded_daemon_takeover(runtime: Arc<Mutex<DaemonRuntime>>) {
+    if let Err(error) = std::thread::Builder::new()
+        .name("yggterm-superseded-takeover".to_string())
+        .spawn(move || {
+            let mut rt = lock_daemon_runtime(&runtime, "superseded_daemon_takeover");
+            rt.takeover_superseded_daemon_state();
+        })
+    {
+        warn!(error=%error, "failed to spawn superseded daemon takeover");
+    }
 }
 
 fn spawn_active_terminal_prewarm(
@@ -8352,6 +8495,7 @@ pub fn run_daemon(endpoint: &ServerEndpoint, runtime: GhosttyHostSupport) -> Res
         // for days until the user runs `server retire-stale-daemons`.
         #[cfg(target_os = "linux")]
         spawn_disk_binary_version_poll(endpoint.clone(), home_dir.clone(), runtime.clone());
+        spawn_superseded_daemon_takeover(runtime.clone());
         let (client_outcome_tx, client_outcome_rx) =
             std::sync::mpsc::channel::<Result<DaemonRequestOutcome>>();
         let mut restart_after_exit = None::<PathBuf>;
