@@ -76540,6 +76540,34 @@ mod tests {
     }
 
     #[test]
+    fn edit5_no_saved_offset_mover_survives_while_following() {
+        // EDIT-5 invariant (audit-viewport-scroll-control-flow, the 2.8.44
+        // oscillation trap): no code path may move the viewport to a SAVED
+        // offset while scroll intent is Following. The three historical
+        // movers and their guards:
+        //  1. persisted localStorage restore — must abandon unless the
+        //     session is armed UserScrollback (f4eed1a).
+        //  2. teardown snapshot restore — must not move the viewport to the
+        //     snapshot offset at all (run #9 A.b.1: always follows).
+        //  3. a stranded Following viewport is re-asserted by the
+        //     settle-follow watchdog, the follow-once executor.
+        let theme = terminal_theme(UiTheme::ZedLight, palette(UiTheme::ZedLight), 13.0, "");
+        let script = terminal_eval_script("yggterm-terminal-test", &theme, true);
+        // Guard 1: the persisted-restore applier bails when follow engaged.
+        assert!(script.contains("if (scrollbackIntent !== 'UserScrollback') {"));
+        assert!(script.contains("persistedScrollRestoreAbandonedReason"));
+        // Guard 2: the snapshot restore path has no offset mover left.
+        assert!(
+            !script.contains("forceXtermViewportY(targetViewportY, 'xterm_session_snapshot_restore')"),
+            "teardown snapshot restore must not re-apply a saved viewport offset"
+        );
+        assert!(script.contains("scrollLiveCursorIntoView(false, 'xterm_session_snapshot_restore');"));
+        // Guard 3: the follow-once executor exists and is intent-gated.
+        assert!(script.contains("settle_follow_reassert"));
+        assert!(script.contains("if (scrollbackIntent !== 'PromptFollow') { return; }"));
+    }
+
+    #[test]
     fn xterm_snapshot_restore_never_latches_user_scrollback_intent() {
         // Regression lock for the phantom-scrollback-latch fix (A.b.1,
         // run #8): the teardown snapshot carries the dying host's intent
