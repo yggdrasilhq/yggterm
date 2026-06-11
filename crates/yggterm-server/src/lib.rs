@@ -341,7 +341,15 @@ fn managed_live_session_is_recoverable(key: &str, session: &ManagedSessionView) 
             .as_deref()
             .is_some_and(|target| !is_loopback_ssh_target(target));
     }
-    if session.source == SessionSource::LiveLocal {
+    // A row holding a LOCAL live runtime key (local:// / codex-runtime://) is
+    // a live runtime session regardless of its `source` — recovery-created
+    // rows (opened from their CLI JSONL) carry source=Stored, and requiring
+    // LiveLocal here silently dropped them from persistence at every swap
+    // (2.8.79 live incident: the roundtrip test passed with LiveLocal while
+    // the recovered live rows kept vanishing). The iteration source is
+    // live_session_order, so a local-keyed entry here is by construction a
+    // live row.
+    if session.source == SessionSource::LiveLocal || local_runtime_id_from_key(key).is_some() {
         return local_live_session_kind_is_recoverable(session.kind);
     }
     session.kind == SessionKind::SshShell
@@ -3549,11 +3557,45 @@ impl YggtermServer {
                 })
             })
             .collect();
+        // Persistence-drop telemetry (live incident 2026-06-11: local rows
+        // kept vanishing at swaps even after the mapper fix; the unit test
+        // passed while the live path failed). Every live key that does NOT
+        // make it into the persisted state traces WHICH gate dropped it.
+        let trace_drop = |key: &str, reason: &str, detail: serde_json::Value| {
+            if let Ok(home) = resolve_yggterm_home() {
+                append_trace_event(
+                    &home,
+                    "server",
+                    "persist",
+                    "live_session_persist_dropped",
+                    serde_json::json!({
+                        "key": key,
+                        "reason": reason,
+                        "detail": detail,
+                        "protect_all_live": protect_all_live,
+                    }),
+                );
+            }
+        };
         let live_sessions: Vec<_> = self
             .live_session_order
             .iter()
             .filter_map(|key| self.sessions.get(key).map(|session| (key, session)))
-            .filter(|(key, session)| managed_live_session_is_recoverable(key, session))
+            .filter(|(key, session)| {
+                let recoverable = managed_live_session_is_recoverable(key, session);
+                if !recoverable {
+                    trace_drop(
+                        key,
+                        "not_recoverable",
+                        serde_json::json!({
+                            "kind": format!("{:?}", session.kind),
+                            "source": format!("{:?}", session.source),
+                            "ssh_target": session.ssh_target,
+                        }),
+                    );
+                }
+                recoverable
+            })
             .filter_map(|(key, session)| {
                 let keep_alive = session_keep_alive(session);
                 if !keep_alive && !protect_all_live {
@@ -3564,18 +3606,37 @@ impl YggtermServer {
                     if !protected_runtime_keys.contains(key)
                         && !protected_runtime_keys.contains(&runtime_key)
                     {
+                        trace_drop(
+                            key,
+                            "not_in_protected_runtime_keys",
+                            serde_json::json!({
+                                "resolved_runtime_key": runtime_key,
+                                "protected_count": protected_runtime_keys.len(),
+                            }),
+                        );
                         return None;
                     }
                 }
                 let restore_reason = (!keep_alive && protect_all_live)
                     .then(|| UPDATE_RESTART_RESTORE_REASON.to_string());
-                persisted_live_session_from_managed(
+                let persisted = persisted_live_session_from_managed(
                     key,
                     session,
                     keep_alive,
                     restore_reason,
                     protect_all_live,
-                )
+                );
+                if persisted.is_none() {
+                    trace_drop(
+                        key,
+                        "mapper_returned_none",
+                        serde_json::json!({
+                            "kind": format!("{:?}", session.kind),
+                            "source": format!("{:?}", session.source),
+                        }),
+                    );
+                }
+                persisted
             })
             .collect();
         let persisted_live_keys: HashSet<_> =
@@ -30067,6 +30128,40 @@ terminal_window_id: None,
             Some("/home/pi/.codex/sessions/2026/06/06/rollout-test.jsonl")
         );
         assert!(persisted_live_session_is_recoverable(live));
+        let live = live.clone();
+
+        // LIVE-PATH VARIANTS (2.8.79 incident: this roundtrip passed while
+        // the live swap still dropped the rows — pin the gate offline):
+        // (a) update-restart passes Some(protected_runtime_keys); a session
+        //     whose key is in the set must persist…
+        let protected: HashSet<String> = [key.clone()].into_iter().collect();
+        let with_protected = server.persisted_state_with_update_protection(true, Some(&protected));
+        assert!(
+            with_protected.live_sessions.iter().any(|l| l.key == key),
+            "local session with its key in protected_runtime_keys must persist"
+        );
+        // …and one outside the set is dropped — the documented gate. If the
+        // live PTY key set uses a different scheme (codex-runtime:// vs
+        // local://, the Bug-9 drift) this is the silent drop point.
+        let other: HashSet<String> = ["local://someone-else".to_string()].into_iter().collect();
+        let without = server.persisted_state_with_update_protection(true, Some(&other));
+        assert!(
+            !without.live_sessions.iter().any(|l| l.key == key),
+            "session outside protected_runtime_keys is dropped (gate documented)"
+        );
+        // (b) a recovery-created session may carry source=Stored; it must
+        //     still be recoverable while holding a live local runtime key.
+        if let Some(session) = server.sessions.get_mut(&key) {
+            session.source = SessionSource::Stored;
+        }
+        let stored_source = server.persisted_state_with_update_protection(true, None);
+        assert!(
+            stored_source.live_sessions.iter().any(|l| l.key == key),
+            "a source=Stored session holding a live local runtime key must still persist"
+        );
+        if let Some(session) = server.sessions.get_mut(&key) {
+            session.source = SessionSource::LiveLocal;
+        }
 
         // Restore into a FRESH server (the daemon-process restart) keeps the row.
         let mut fresh = YggtermServer::new(
