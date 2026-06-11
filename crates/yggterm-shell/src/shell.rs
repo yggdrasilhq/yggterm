@@ -60222,6 +60222,16 @@ fn terminal_eval_script_with_canvas_renderer(
         // ydisp. Tracking baseY lets the detector reject that whole class
         // (scroll_mode.rs user_scroll_up_detected is the tested oracle).
         let lastObservedScrollBaseY = 0;
+        // A.b.3 async-scrollTop gap: `syncXtermViewportElementToBuffer` writes
+        // `.xterm-viewport.scrollTop` directly and the resulting scroll event is
+        // delivered ASYNCHRONOUSLY, after the synchronous
+        // `programmaticScrollInProgress` window has closed — the flag mechanism
+        // structurally cannot cover it (5-sweep dataset: 1/7 phantom
+        // UserScrollback flips via `scroll_event`). The mover records its
+        // expected landing row here; the detector treats a scroll event landing
+        // on that row (±1, within 1.5s) as programmatic and consumes the latch.
+        let pendingProgrammaticViewportTargetY = null;
+        let pendingProgrammaticViewportAtMs = 0;
         let lastScrollbackIntentReason = 'initial';
         let lastScrollbackIntentAtMs = Date.now();
         let promptFollowScrollGuardUntilMs = 0;
@@ -60895,9 +60905,22 @@ fn terminal_eval_script_with_canvas_renderer(
                     // scroll-ups while streaming (defect #1). A passive burst-strand
                     // (ydisp UNCHANGED while baseY grows) is NOT a scroll-up, so it stays
                     // PromptFollow and the flush re-follows it instead of stranding.
+                    // A.b.3: a scroll event that lands on the row a recent
+                    // direct scrollTop write targeted is the ASYNC delivery of
+                    // that programmatic move, not a user gesture. Consume the
+                    // latch so a real user scroll right after is still seen.
+                    const asyncProgrammaticScrollMatch =
+                        reason === 'scroll_event'
+                        && pendingProgrammaticViewportTargetY !== null
+                        && Math.abs(viewportY - pendingProgrammaticViewportTargetY) <= 1
+                        && (Date.now() - pendingProgrammaticViewportAtMs) <= 1500;
+                    if (asyncProgrammaticScrollMatch) {{
+                        pendingProgrammaticViewportTargetY = null;
+                    }}
                     const userScrolledUp =
                         reason === 'scroll_event'
                         && !programmaticScrollInProgress
+                        && !asyncProgrammaticScrollMatch
                         && !promptFollowLayoutGuardActive()
                         && viewportY + 0.5 < lastObservedScrollYdisp
                         && baseY + 0.5 >= lastObservedScrollBaseY;
@@ -61192,6 +61215,11 @@ fn terminal_eval_script_with_canvas_renderer(
                 if (debug) {{
                     debug.viewport_scroll_top_before = Number(viewportElement.scrollTop || 0);
                 }}
+                // Record the expected landing row BEFORE the write: the scroll
+                // event this triggers arrives async (see A.b.3 note at the
+                // declaration) and must not read as a user scroll-up.
+                pendingProgrammaticViewportTargetY = Math.max(0, Number(targetViewportY || 0));
+                pendingProgrammaticViewportAtMs = Date.now();
                 viewportElement.scrollTop = Math.max(0, Number(targetViewportY || 0)) * rowHeightPx;
                 if (debug) {{
                     debug.viewport_scroll_top_after = Number(viewportElement.scrollTop || 0);
@@ -76271,6 +76299,22 @@ mod tests {
         assert!(script.contains(
             "entry.lastXtermSessionSnapshotNonblankLineCount = snapshot.nonblankLineCount;"
         ));
+    }
+
+    #[test]
+    fn async_scrolltop_writes_never_read_as_user_scroll_up() {
+        // Regression lock for A.b.3 (run #8): syncXtermViewportElementToBuffer
+        // writes .xterm-viewport.scrollTop directly; the resulting scroll event
+        // is delivered async after programmaticScrollInProgress closed, so the
+        // detector needs the expected-landing-row latch to reject it.
+        let theme = terminal_theme(UiTheme::ZedLight, palette(UiTheme::ZedLight), 13.0, "");
+        let script = terminal_eval_script("yggterm-terminal-test", &theme, true);
+        assert!(script.contains("pendingProgrammaticViewportTargetY = Math.max(0, Number(targetViewportY || 0));"));
+        assert!(script.contains("const asyncProgrammaticScrollMatch ="));
+        assert!(script.contains("&& !asyncProgrammaticScrollMatch"));
+        // The latch is consumed on match so a real user scroll right after a
+        // programmatic move is still detected.
+        assert!(script.contains("pendingProgrammaticViewportTargetY = null;"));
     }
 
     #[test]
