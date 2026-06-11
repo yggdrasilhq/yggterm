@@ -465,6 +465,10 @@ const APP_CONTROL_BACKGROUND_FOCUS_REARM_GRACE_MS: u64 = 750;
 static XTERM_ASSETS_BOOTSTRAPPED: OnceCell<()> = OnceCell::new();
 const TREE_LOADING_DOT_CSS: &str = "@keyframes yggterm-tree-loading-dot { 0%, 80%, 100% { opacity: 0.28; transform: translateY(0px); } 40% { opacity: 1; transform: translateY(-1px); } } [style*=\"visibility:hidden\"] .yggterm-loading-dot, [style*=\"visibility: hidden\"] .yggterm-loading-dot, .yggterm-loading-dot[style*=\"visibility:hidden\"], .yggterm-loading-dot[style*=\"visibility: hidden\"] { animation: none !important; }";
 const TREE_SPINNER_CSS: &str = ".yggterm-tree-spinner { animation: none !important; }";
+// Status-dot blink — the WORKING signal of the live-session status dot
+// (DESIGN.md "Status indicator vocabulary"): a gentle opacity pulse, calm
+// enough for a sidebar full of rows.
+const STATUS_DOT_BLINK_CSS: &str = "@keyframes yggterm-status-dot-blink { 0%, 100% { opacity: 1; } 50% { opacity: 0.25; } }";
 const REMOTE_SURFACE_STAGE_CSS: &str = "@keyframes yggterm-remote-stage-float { 0%, 100% { transform: translateY(0px); } 50% { transform: translateY(-4px); } } @keyframes yggterm-remote-stage-beam { 0% { transform: translateX(-110%); opacity: 0.15; } 30% { opacity: 0.92; } 100% { transform: translateX(220%); opacity: 0.15; } } @keyframes yggterm-remote-stage-pulse { 0%, 100% { box-shadow: 0 0 0 0 rgba(86, 154, 255, 0.14); opacity: 0.86; } 50% { box-shadow: 0 0 0 12px rgba(86, 154, 255, 0.0); opacity: 1; } }";
 const BACKGROUND_COPY_RETRY_MS: u64 = 300_000;
 const BACKGROUND_COPY_CONTINUE_MS: u64 = 15_000;
@@ -17858,16 +17862,30 @@ fn live_session_close_button_style(palette: Palette, selected: bool) -> String {
         background, color, shadow
     )
 }
-fn live_session_keep_alive_dot_style(palette: Palette) -> String {
+/// Live-session status dot — the traffic-signal vocabulary (DESIGN.md
+/// "Status indicator vocabulary"): GREEN = keep-alive (survives the GUI),
+/// BLUE = non-keep-alive (lives with the GUI), BLINKING = the agent is
+/// working right now. Shared by Live Sessions today and Automated Sessions
+/// later (experimental/automations).
+fn live_session_status_dot_style(palette: Palette, keep_alive: bool, working: bool) -> String {
     let shadow = if palette_is_dark(palette) {
         "0 0 0 1.5px rgba(22,28,34,0.88)"
     } else {
         "0 0 0 1.5px rgba(255,255,255,0.86)"
     };
+    let background = if keep_alive { "#22c55e" } else { "#3b82f6" };
+    let animation = if working {
+        " animation: yggterm-status-dot-blink 1.1s ease-in-out infinite;"
+    } else {
+        ""
+    };
     format!(
-        "display:inline-flex; width:7px; min-width:7px; height:7px; border-radius:999px; background:#22c55e; box-shadow:{};",
-        shadow
+        "display:inline-flex; width:7px; min-width:7px; height:7px; border-radius:999px; background:{background}; box-shadow:{shadow};{animation}",
     )
+}
+
+fn live_session_keep_alive_dot_style(palette: Palette) -> String {
+    live_session_status_dot_style(palette, true, false)
 }
 fn preview_block_cache() -> &'static Mutex<PreviewBlockCache> {
     PREVIEW_BLOCK_CACHE.get_or_init(|| Mutex::new(PreviewBlockCache::default()))
@@ -42373,7 +42391,7 @@ fn Sidebar(
                     }
                 }
             }
-            style { "{TREE_SPINNER_CSS}" }
+            style { "{TREE_SPINNER_CSS}{STATUS_DOT_BLINK_CSS}" }
             div {
                 "data-sidebar-scroll": "1",
                 style: "flex:1; min-height:0; overflow:auto; padding:12px 12px 12px 12px;",
@@ -43489,12 +43507,20 @@ fn SidebarRow(
                         span {
                             "data-sidebar-live-session-status-rail": "1",
                             style: "display:inline-flex; align-items:center; justify-content:center; width:9px; min-width:9px; height:20px;",
-                            if row_kept_alive {
-                                span {
-                                    "data-sidebar-live-session-keep-alive": "1",
-                                    title: "Keep alive",
-                                    style: live_session_keep_alive_dot_style(palette),
-                                }
+                            // Status dot for EVERY live row (DESIGN.md "Status
+                            // indicator vocabulary"): green = keep-alive,
+                            // blue = lives with the GUI, blinking = working.
+                            span {
+                                "data-sidebar-live-session-status-dot": "1",
+                                "data-sidebar-live-session-keep-alive": if row_kept_alive { "1" } else { "0" },
+                                "data-sidebar-live-session-working": if busy_icon { "1" } else { "0" },
+                                title: match (row_kept_alive, busy_icon) {
+                                    (true, true) => "Keep-alive · working",
+                                    (true, false) => "Keep alive",
+                                    (false, true) => "Working",
+                                    (false, false) => "Live (closes with the app)",
+                                },
+                                style: live_session_status_dot_style(palette, row_kept_alive, busy_icon),
                             }
                         }
                     }
@@ -79587,6 +79613,29 @@ mod tests {
 
         let keep_alive_style = live_session_keep_alive_dot_style(dark);
         assert!(keep_alive_style.contains("rgba(22,28,34,0.88)"));
+    }
+    // DESIGN.md "Status indicator vocabulary": green = keep-alive, blue =
+    // non-keep-alive, blinking = working — one dot, two encodings.
+    #[test]
+    fn live_session_status_dot_encodes_keep_alive_color_and_working_blink() {
+        let dark = palette(UiTheme::ZedDark);
+        let kept_idle = live_session_status_dot_style(dark, true, false);
+        assert!(kept_idle.contains("#22c55e"));
+        assert!(!kept_idle.contains("animation:"));
+        let kept_working = live_session_status_dot_style(dark, true, true);
+        assert!(kept_working.contains("#22c55e"));
+        assert!(kept_working.contains("yggterm-status-dot-blink"));
+        let transient_idle = live_session_status_dot_style(dark, false, false);
+        assert!(transient_idle.contains("#3b82f6"));
+        assert!(!transient_idle.contains("animation:"));
+        let transient_working = live_session_status_dot_style(dark, false, true);
+        assert!(transient_working.contains("#3b82f6"));
+        assert!(transient_working.contains("yggterm-status-dot-blink"));
+        // The keep-alive helper stays the green/idle variant.
+        assert_eq!(
+            live_session_keep_alive_dot_style(dark),
+            live_session_status_dot_style(dark, true, false)
+        );
     }
     #[test]
     fn codex_completion_notification_only_fires_after_busy_session_becomes_idle() {

@@ -497,6 +497,27 @@ Each app surface has exactly one source of truth:
 - Normal app close prunes non-Keep-Alive live rows and gracefully closes their runtimes with a one-hour force-cleanup deadline.
 - Update restart protection temporarily treats all recoverable live runtimes as restorable. It must not silently turn unkept sessions into durable Keep Alive sessions.
 
+### Status indicator vocabulary (traffic signal + blue/orange)
+
+One coherent light vocabulary for session state, used by Live Sessions today and Automated Sessions later. The status dot in the live-session rail is the canonical instance; any future surface that signals session state reuses these meanings and colors rather than inventing new ones.
+
+- `GREEN` (`#22c55e`): keep-alive — the session survives the GUI (durable runtime).
+- `BLUE` (`#3b82f6`): live but transient — the session lives only while the GUI does.
+- `BLINKING` (the `yggterm-status-dot-blink` pulse): the agent is working right now. Blink is an orthogonal modifier — a green or blue dot blinks while its session works and returns to steady when idle.
+- `ORANGE/AMBER`: reserved for attention states (recovery in progress, degraded runtime, pending user decision). Not yet wired; when an attention signal is needed, use this slot — do not repurpose green/blue.
+- `RED`: reserved for dead/error (runtime lost, unrecoverable). Same rule: reserved, not yet wired.
+
+Rules: color encodes durability class, blink encodes activity, and reserved colors are introduced only with a spec update here. Automated Sessions (experimental/automations) must adopt this vocabulary unchanged so a user reads one signal system across the whole sidebar.
+
+### Stage-curtain loading rule
+
+Session loads must look like a stage production: the audience never sees the mess. Concretely:
+
+- A loading or rebuilding viewport may show, in order of preference: (1) the correct final frame immediately ("so posh we need no curtain"), (2) the previous faithful frame held perfectly still (ghost), or (3) a flat background-colored veil. Nothing else.
+- The forbidden in-between states: DOM leaks, partial/truncated rows, stale frames that later "correct", broken bottoms, and any blink between a covering layer and the final frame. A wrong frame must never paint, even for one frame — latency is preferred over flicker.
+- The curtain comes down (cover attaches) before any teardown/rebuild churn starts, and is pulled (released) as soon as — and only when — the daemon-sourced final frame is fully painted underneath.
+- The endgame is curtainless: host/eval reuse so reveals repaint in place with no rebuild to hide. Curtains are the contract until each load path earns that.
+
 ### Startpage
 
 Startpage is a re-entry and scoped creation surface, not a connection-settings surface.
