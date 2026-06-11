@@ -25881,15 +25881,15 @@ fn describe_app_rows_snapshot(state: &Signal<ShellState>) -> Value {
                 "child_count": row.descendant_sessions,
                 "busy": busy,
                 "busy_reason": busy_state.reason,
-                "icon_kind": if busy { Some("busy") } else {
+                "icon_kind": ({
                     let base = tree_icon_kind(row);
                     if base == "terminal" && snapshot.live_sessions.iter().any(|s| s.session_path == row.full_path && s.kind == SessionKind::ClaudeCode) {
                         Some("claude-code")
                     } else {
                         Some(base)
                     }
-                },
-                "icon_text": if busy { None::<&str> } else { tree_icon_glyph(row) },
+                }),
+                "icon_text": tree_icon_glyph(row),
                 "live_member": live_member,
                 "live_keep_alive": live_keep_alive,
                 "draggable": is_tree_drag_source_row(row),
@@ -43033,43 +43033,6 @@ fn tree_icon_glyph(row: &BrowserRow) -> Option<&'static str> {
     }
 }
 #[component]
-fn BusyTreeIcon() -> Element {
-    rsx! {
-        span {
-            class: "yggterm-tree-spinner",
-            style: "display:inline-flex; align-items:center; justify-content:center; width:15px; height:15px; opacity:0.92; transform-origin:center;",
-            svg {
-                width: "15",
-                height: "15",
-                view_box: "0 0 16 16",
-                fill: "none",
-                xmlns: "http://www.w3.org/2000/svg",
-                circle {
-                    cx: "8",
-                    cy: "8",
-                    r: "5.4",
-                    stroke: "currentColor",
-                    stroke_opacity: "0.22",
-                    stroke_width: "1.8",
-                }
-                path {
-                    d: "M8 2.6A5.4 5.4 0 0 1 13.4 8",
-                    stroke: "currentColor",
-                    stroke_width: "1.8",
-                    stroke_linecap: "round",
-                }
-                path {
-                    d: "M11.9 4.1A5.35 5.35 0 0 1 13.4 8",
-                    stroke: "currentColor",
-                    stroke_opacity: "0.82",
-                    stroke_width: "1.8",
-                    stroke_linecap: "round",
-                }
-            }
-        }
-    }
-}
-#[component]
 fn SidebarLoadingState(palette: Palette) -> Element {
     rsx! {
         style {
@@ -43332,9 +43295,7 @@ fn SidebarRow(
     } else {
         "transparent"
     };
-    let icon_color = if busy_icon {
-        palette.muted
-    } else if row.kind == BrowserRowKind::Group && row.depth == 0 && row.expanded {
+    let icon_color = if row.kind == BrowserRowKind::Group && row.depth == 0 && row.expanded {
         palette.accent
     } else if selected {
         palette.text
@@ -43526,7 +43487,7 @@ fn SidebarRow(
                     }
                     div {
                         "data-tree-icon": "1",
-                        "data-tree-icon-kind": if busy_icon { "busy" } else { icon_kind.as_str() },
+                        "data-tree-icon-kind": icon_kind.as_str(),
                         "data-sidebar-row-toggle-target": if row_is_group { "icon" } else { "none" },
                         style: format!(
                             "display:inline-flex; align-items:center; justify-content:center; width:20px; min-width:20px; height:20px; color:{};",
@@ -43552,9 +43513,11 @@ fn SidebarRow(
                             }
                             on_end_drag.call(());
                         },
-                        if busy_icon {
-                            BusyTreeIcon {}
-                        } else if icon_kind == "claude-code" {
+                        // Working is signalled by the BLINKING status dot
+                        // (DESIGN.md "Status indicator vocabulary"); the row
+                        // keeps its normal icon — the old busy circle icon is
+                        // retired (user decision 2026-06-11).
+                        if icon_kind == "claude-code" {
                             ClaudeCodeTreeIcon {}
                         } else {
                             TreeIcon { row: row.clone() }
@@ -79085,7 +79048,11 @@ mod tests {
             TREE_LOADING_DOT_CSS.contains(".yggterm-loading-dot[style*=\"visibility:hidden\"]")
         );
         assert!(TREE_LOADING_DOT_CSS.contains("animation: none !important"));
-        assert!(source.contains("class: \"yggterm-tree-spinner\""));
+        // The busy circle icon is retired — working is signalled by the
+        // blinking status dot. Nothing should render the spinner class
+        // anymore. (Needle built at runtime so this line doesn't self-match.)
+        let spinner_class_needle = format!("class: \"{}\"", "yggterm-tree-spinner");
+        assert!(!source.contains(&spinner_class_needle));
         // Build the search needle at runtime so this test's own source text
         // doesn't contain the literal needle and self-trigger the check.
         let spinner_animation_needle = format!("animation:{}", "yggterm-tree-spinner");
