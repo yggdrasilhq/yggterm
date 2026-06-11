@@ -1635,6 +1635,28 @@ fn normalize_app_control_main_zoom_value(value: f32, view_mode: WorkspaceViewMod
         value
     }
 }
+/// Validate and open a terminal-clicked URL with the OS browser (user bug 6).
+/// Only single-token http(s) URLs are accepted — the URL text comes straight
+/// from terminal content, so anything else is rejected rather than executed.
+fn terminal_open_external_url(url: &str) -> bool {
+    let trimmed = url.trim();
+    let valid = (trimmed.starts_with("http://") || trimmed.starts_with("https://"))
+        && trimmed.len() <= 4096
+        && !trimmed.chars().any(|ch| ch.is_whitespace() || ch.is_control());
+    if !valid {
+        return false;
+    }
+    #[cfg(target_os = "linux")]
+    let result = std::process::Command::new("xdg-open").arg(trimmed).spawn();
+    #[cfg(target_os = "macos")]
+    let result = std::process::Command::new("open").arg(trimmed).spawn();
+    #[cfg(target_os = "windows")]
+    let result = std::process::Command::new("cmd")
+        .args(["/C", "start", "", trimmed])
+        .spawn();
+    result.is_ok()
+}
+
 fn terminal_geometry_is_usable(cols: u16, rows: u16) -> bool {
     cols >= 20 && rows >= 4
 }
@@ -49212,6 +49234,24 @@ fn TerminalCanvas(
                                     set_signal_if_changed(terminal_resume_surface_staged, false);
                                 }
                             }
+                            Ok(TerminalJsEvent::OpenUrl { url }) => {
+                                // User bug 6: a clicked terminal link (OSC-8 or
+                                // detected plain-text URL, including ones wrapped
+                                // across rows). window.open is a no-op in the wry
+                                // webview, so the OS browser is launched here.
+                                let opened = terminal_open_external_url(&url);
+                                append_trace_event(
+                                    &trace_home,
+                                    "ui",
+                                    "terminal_link",
+                                    "open_url",
+                                    json!({
+                                        "session_path": session_path.clone(),
+                                        "url_chars": url.chars().count(),
+                                        "opened": opened,
+                                    }),
+                                );
+                            }
                             Ok(TerminalJsEvent::Notify { source, title: notify_title, body }) => {
                                 // A CLI in the PTY (Claude Code / Codex) pinged for
                                 // attention: BEL, OSC 9, or OSC 777. Always surface the
@@ -58236,6 +58276,17 @@ fn terminal_eval_script_with_canvas_renderer(
         }}
         const term = new window.Terminal({{
             allowProposedApi: true,
+            // User bug 6 (multiline URLs): xterm's DEFAULT OSC-8 link handler
+            // shows a confirm() dialog and then calls window.open(), which is
+            // a NO-OP inside the wry webview — the user saw a dead "OK"
+            // dialog. Route activation to the Rust side, which opens the URL
+            // with the OS browser.
+            linkHandler: {{
+                activate: (_event, text) => {{
+                    sendTerminalEvent({{ kind: 'open_url', url: String(text || '') }});
+                }},
+                allowNonHttpProtocols: false,
+            }},
             allowTransparency: false,
             convertEol: false,
             cursorBlink: false,
@@ -58289,6 +58340,85 @@ fn terminal_eval_script_with_canvas_renderer(
         let preferredCanvasRenderer = false;
         const fitAddon = new window.FitAddon.FitAddon();
         term.loadAddon(fitAddon);
+        // User bug 6: plain-text http(s) URLs — including URLs WRAPPED across
+        // several visual rows — must be clickable. xterm.js core only
+        // linkifies OSC-8 hyperlinks; with no provider a click on a long URL
+        // just selected one visual row. This provider joins the full LOGICAL
+        // line (walking wrapped rows) and maps each match back to a
+        // multi-row buffer range, so the whole URL underlines and activates
+        // as one link. Activation routes through the same open_url event as
+        // the OSC-8 handler (Rust opens the OS browser).
+        const terminalUrlPattern = /https?:\/\/[^\s"'`<>]+/g;
+        term.registerLinkProvider({{
+            provideLinks: (lineNumber, callback) => {{
+                try {{
+                    const buffer = term.buffer && term.buffer.active ? term.buffer.active : null;
+                    if (!buffer || typeof buffer.getLine !== 'function') {{
+                        callback(undefined);
+                        return;
+                    }}
+                    // Walk up to the start of the logical (unwrapped) line.
+                    let startRow = Math.max(0, Number(lineNumber || 1) - 1);
+                    while (startRow > 0) {{
+                        const line = buffer.getLine(startRow);
+                        if (!line || !line.isWrapped) {{
+                            break;
+                        }}
+                        startRow -= 1;
+                    }}
+                    const cols = Math.max(1, Number(term.cols || 1));
+                    let logicalText = '';
+                    let row = startRow;
+                    for (;;) {{
+                        const line = buffer.getLine(row);
+                        if (!line) {{
+                            break;
+                        }}
+                        // trimRight=false keeps each row at grid width so a
+                        // string index maps 1:1 onto (row, col) for the ASCII
+                        // characters URLs are made of.
+                        logicalText += line.translateToString(false);
+                        const next = buffer.getLine(row + 1);
+                        if (!next || !next.isWrapped) {{
+                            break;
+                        }}
+                        row += 1;
+                    }}
+                    const links = [];
+                    terminalUrlPattern.lastIndex = 0;
+                    let match;
+                    while ((match = terminalUrlPattern.exec(logicalText)) !== null) {{
+                        let url = String(match[0] || '');
+                        // Trailing prose punctuation is not part of the URL.
+                        url = url.replace(/[.,;:!?'")\]]+$/, '');
+                        if (url.length < 10) {{
+                            continue;
+                        }}
+                        const startIdx = match.index;
+                        const endIdx = startIdx + url.length - 1;
+                        links.push({{
+                            text: url,
+                            range: {{
+                                start: {{
+                                    x: (startIdx % cols) + 1,
+                                    y: startRow + Math.floor(startIdx / cols) + 1,
+                                }},
+                                end: {{
+                                    x: (endIdx % cols) + 1,
+                                    y: startRow + Math.floor(endIdx / cols) + 1,
+                                }},
+                            }},
+                            activate: (_event, text) => {{
+                                sendTerminalEvent({{ kind: 'open_url', url: String(text || url) }});
+                            }},
+                        }});
+                    }}
+                    callback(links.length ? links : undefined);
+                }} catch (_error) {{
+                    callback(undefined);
+                }}
+            }},
+        }});
         term.attachCustomKeyEventHandler((event) => {{
             try {{
                 const active = document.activeElement;
@@ -76299,6 +76429,31 @@ mod tests {
         assert!(script.contains(
             "entry.lastXtermSessionSnapshotNonblankLineCount = snapshot.nonblankLineCount;"
         ));
+    }
+
+    #[test]
+    fn terminal_links_route_to_os_browser_and_span_wrapped_rows() {
+        // User bug 6: xterm's default OSC-8 handler confirm()+window.open()
+        // is a dead dialog inside wry; plain-text URLs had no provider at all
+        // so a click on a wrapped URL just selected one visual row.
+        let theme = terminal_theme(UiTheme::ZedLight, palette(UiTheme::ZedLight), 13.0, "");
+        let script = terminal_eval_script("yggterm-terminal-test", &theme, true);
+        assert!(script.contains("linkHandler: {"));
+        assert!(script.contains("kind: 'open_url'"));
+        assert!(script.contains("term.registerLinkProvider({"));
+        // The provider walks wrapped rows to the logical line start so a URL
+        // spanning visual rows is one link.
+        assert!(script.contains("if (!line || !line.isWrapped) {"));
+        assert!(script.contains("logicalText += line.translateToString(false);"));
+    }
+
+    #[test]
+    fn terminal_open_external_url_rejects_non_http_or_multi_token() {
+        assert!(!terminal_open_external_url("file:///etc/passwd"));
+        assert!(!terminal_open_external_url("javascript:alert(1)"));
+        assert!(!terminal_open_external_url("https://a.example/x y"));
+        assert!(!terminal_open_external_url("ftp://example.com"));
+        assert!(!terminal_open_external_url(""));
     }
 
     #[test]
