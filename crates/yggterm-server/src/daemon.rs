@@ -37,7 +37,8 @@ use time::OffsetDateTime;
 use tracing::{info, warn};
 use yggterm_core::{
     AppSettings, PerfSpan, SessionNode, SessionNodeKind, SessionStore, append_trace_event,
-    looks_like_generated_fallback_title, resolve_yggterm_home,
+    local_cc_session_jsonl_path, looks_like_generated_fallback_title, read_cc_session_title,
+    resolve_yggterm_home,
 };
 use yggui_contract::UiTheme;
 
@@ -1809,6 +1810,13 @@ struct BackgroundCopyCandidate {
     generation_context: Option<String>,
     storage_path: Option<String>,
     cached_summary: Option<String>,
+    /// A LIVE local agent session (yggterm-spawned codex/CC). Its live title
+    /// is a cwd-derived launch hint (e.g. "home/pi codex"), which the
+    /// fallback-title recognizer can't enumerate — so title freshness is
+    /// gated on the resolver DB instead (user bug 5: "new codex opens as
+    /// cwd-derived title and never updates"). Manual renames live in the
+    /// resolver DB and therefore stay protected.
+    live_local_agent: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -5331,6 +5339,7 @@ fn collect_local_copy_candidates(node: &SessionNode, out: &mut Vec<BackgroundCop
                 generation_context: None,
                 storage_path: None,
                 cached_summary: None,
+                live_local_agent: false,
             });
         }
     }
@@ -5373,6 +5382,42 @@ fn collect_live_copy_candidates(
             && !(Path::new(&session.session_path).exists()
                 && session.session_path.ends_with(".jsonl"))
         {
+            // User bug 5: a yggterm-spawned LOCAL codex session has a
+            // `local://<uuid>` key (not a .jsonl path) so it never became a
+            // title candidate — its cwd-derived launch-hint title never
+            // updated. The rebind poll records the CLI's on-disk JSONL in the
+            // "Storage" metadata; once it exists the session can be titled
+            // from the real transcript.
+            let storage = if matches!(
+                session.kind,
+                SessionKind::Codex | SessionKind::CodexLiteLlm
+            ) {
+                session
+                    .metadata
+                    .iter()
+                    .find(|entry| entry.label == "Storage")
+                    .map(|entry| entry.value.clone())
+                    .filter(|value| {
+                        value.ends_with(".jsonl") && Path::new(value).exists()
+                    })
+            } else {
+                None
+            };
+            let Some(storage) = storage else {
+                continue;
+            };
+            out.push(BackgroundCopyCandidate {
+                session_path: session.session_path.clone(),
+                session_id: session.id.clone(),
+                cwd: session_cwd_for_background_copy(session),
+                title: session.title.clone(),
+                source_updated_at: None,
+                remote_machine: None,
+                generation_context: None,
+                storage_path: Some(storage),
+                cached_summary: None,
+                live_local_agent: true,
+            });
             continue;
         }
         out.push(BackgroundCopyCandidate {
@@ -5385,6 +5430,7 @@ fn collect_live_copy_candidates(
             generation_context,
             storage_path: None,
             cached_summary: None,
+            live_local_agent: false,
         });
     }
 }
@@ -5417,10 +5463,62 @@ fn collect_remote_copy_candidates(
                 storage_path: (!session.storage_path.trim().is_empty())
                     .then(|| session.storage_path.clone()),
                 cached_summary: session.cached_summary.clone(),
+                live_local_agent: false,
             });
         }
     }
     out
+}
+
+/// User bug 4/5 (Claude Code half): CC maintains its OWN title (ai-title /
+/// custom-title records in its JSONL) — per [[spec-codex-cc-title-summary]]
+/// yggterm respects it rather than LLM-generating one. The scanned cwd-tree
+/// rows already read it, but a LIVE local CC session kept its launch-hint
+/// title forever. Sync the live row's title from the CC JSONL whenever CC's
+/// title exists and differs (yggterm renames are written back into the JSONL,
+/// so the JSONL stays the single source of truth).
+fn collect_live_cc_title_syncs(live_sessions: &[ManagedSessionView]) -> Vec<BackgroundCopyUpdate> {
+    let mut updates = Vec::new();
+    for session in live_sessions {
+        if session.kind != SessionKind::ClaudeCode
+            || !session.session_path.starts_with("local://")
+        {
+            continue;
+        }
+        let Some(jsonl) = local_cc_session_jsonl_path(&session.id) else {
+            continue;
+        };
+        let Some(title) = read_cc_session_title(&jsonl).ok().flatten() else {
+            continue;
+        };
+        let title = title.trim().to_string();
+        if !title.is_empty() && title != session.title {
+            updates.push(BackgroundCopyUpdate {
+                session_path: session.session_path.clone(),
+                title: Some(title),
+                summary: None,
+            });
+        }
+    }
+    updates
+}
+
+/// Whether the background copy chore should (re)generate a title.
+/// Live local agent sessions (user bug 5) carry a cwd-derived launch-hint
+/// title the fallback recognizer can't enumerate, so for them the resolver
+/// DB alone is the freshness gate — manual renames are saved there and stay
+/// protected. Everything else keeps the historical double gate.
+fn background_copy_title_missing(
+    live_local_agent: bool,
+    candidate_title: &str,
+    stored_title: Option<&str>,
+) -> bool {
+    let stored_missing = stored_title.is_none_or(looks_like_generated_fallback_title);
+    if live_local_agent {
+        stored_missing
+    } else {
+        looks_like_generated_fallback_title(candidate_title) && stored_missing
+    }
 }
 
 fn copy_target_context(
@@ -5460,7 +5558,7 @@ fn build_background_copy_updates(
     collect_live_copy_candidates(store, live_sessions, &mut candidates);
     candidates.extend(collect_remote_copy_candidates(remote_machines));
 
-    let mut updates = Vec::new();
+    let mut updates = collect_live_cc_title_syncs(live_sessions);
     let mut seen_candidates = HashSet::new();
     for candidate in candidates
         .into_iter()
@@ -5471,10 +5569,11 @@ fn build_background_copy_updates(
             .resolve_title_for_session_id(&candidate.session_id)
             .ok()
             .flatten();
-        let title_missing = looks_like_generated_fallback_title(&candidate.title)
-            && stored_title
-                .as_deref()
-                .is_none_or(looks_like_generated_fallback_title);
+        let title_missing = background_copy_title_missing(
+            candidate.live_local_agent,
+            &candidate.title,
+            stored_title.as_deref(),
+        );
         let stored_summary = store
             .resolve_summary_for_session_id(&candidate.session_id)
             .ok()
@@ -5535,13 +5634,20 @@ fn build_background_copy_updates(
             }
             (title, summary)
         } else {
+            // A live local agent candidate's session_path is the live
+            // `local://` key; the readable transcript is its Storage JSONL.
+            let source_path = candidate
+                .storage_path
+                .as_deref()
+                .filter(|_| candidate.remote_machine.is_none())
+                .unwrap_or(&candidate.session_path);
             let title = if title_missing {
-                store.generate_title_for_session_path(settings, &candidate.session_path, false)?
+                store.generate_title_for_session_path(settings, source_path, false)?
             } else {
                 None
             };
             let summary = if summary_missing {
-                store.generate_summary_for_session_path(settings, &candidate.session_path, false)?
+                store.generate_summary_for_session_path(settings, source_path, false)?
             } else {
                 None
             };
@@ -10376,6 +10482,71 @@ mod tests {
         assert_eq!(snapshot.active_view_mode, WorkspaceViewMode::Terminal);
         assert_eq!(snapshot.live_sessions.len(), 1);
         assert_eq!(snapshot.live_sessions[0].session_path.as_str(), active_path);
+    }
+
+    #[test]
+    fn live_local_agent_titles_refresh_when_resolver_has_no_real_title() {
+        // User bug 5: a yggterm-spawned codex opens with a cwd-derived
+        // launch-hint title ("home/pi codex") that the fallback recognizer
+        // can't enumerate — under the historical double gate it never
+        // refreshed. For live local agents the resolver DB alone gates.
+        assert!(super::background_copy_title_missing(
+            true,
+            "home/pi codex",
+            None
+        ));
+        assert!(super::background_copy_title_missing(
+            true,
+            "gh/yggterm codex",
+            Some("local::0a1b2c3d-0000-4000-8000-000000000000")
+        ));
+        // A real stored title (e.g. a manual rename) is never clobbered.
+        assert!(!super::background_copy_title_missing(
+            true,
+            "home/pi codex",
+            Some("Fix the flaky scheduler test")
+        ));
+        // Non-live candidates keep the historical double gate: a
+        // substantive candidate title blocks regeneration.
+        assert!(!super::background_copy_title_missing(
+            false,
+            "Refactor the parser pipeline",
+            None
+        ));
+        assert!(super::background_copy_title_missing(
+            false,
+            "yggterm codex",
+            None
+        ));
+    }
+
+    #[test]
+    fn live_cc_title_sync_skips_sessions_without_jsonl_and_matching_titles() {
+        // collect_live_cc_title_syncs must fail open: no CC JSONL on disk →
+        // no update (and never touch non-CC or remote sessions).
+        let server = {
+            let tree = yggterm_core::SessionNode {
+                kind: yggterm_core::SessionNodeKind::Group,
+                name: "sessions".to_string(),
+                path: std::path::PathBuf::from("/"),
+                ..Default::default()
+            };
+            let mut server = crate::YggtermServer::new(
+                &tree,
+                false,
+                crate::GhosttyHostSupport::shadow("test".to_string(), false, false),
+                yggui_contract::UiTheme::ZedLight,
+            );
+            // A CC session whose id has no ~/.claude JSONL on disk.
+            server.start_local_session(
+                crate::SessionKind::ClaudeCode,
+                Some("/home/pi"),
+                Some("home/pi claude"),
+            );
+            server
+        };
+        let updates = super::collect_live_cc_title_syncs(&server.live_sessions());
+        assert!(updates.is_empty());
     }
 
     #[test]
