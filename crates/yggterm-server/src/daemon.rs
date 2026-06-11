@@ -5229,7 +5229,14 @@ fn snapshot_session_is_keep_alive_recovery_target(session: &SnapshotSessionView)
 /// non-keep-alive shell dies with its PTY. (Run #16 gate-#5 family: runtime
 /// exit was the pre-swap row eraser for local codex rows.)
 fn snapshot_session_is_local_agent_store_recoverable(session: &SnapshotSessionView) -> bool {
-    matches!(session.source, crate::SessionSource::LiveLocal)
+    // Source alone is not enough: restored/recovery-created rows carry
+    // source=Stored while holding a live local runtime key (the 2.8.79
+    // persistence lesson, live-recaught here at the 90→91 swap when restored
+    // local rows vanished from the snapshot while sitting in the persisted
+    // order). Mirror managed_live_session_is_recoverable: a local-keyed row
+    // is a live row by construction.
+    (matches!(session.source, crate::SessionSource::LiveLocal)
+        || crate::local_runtime_id_from_key(&session.session_path).is_some())
         && matches!(
             session.kind,
             SessionKind::Codex | SessionKind::CodexLiteLlm | SessionKind::ClaudeCode
@@ -10917,7 +10924,10 @@ mod tests {
         let cc = {
             let mut session = daemon_test_snapshot_session(
                 "local://019e9c28-e46d-7480-9f27-4e5676df61b1",
-                SessionSource::LiveLocal,
+                // Restored/recovery-created rows carry source=Stored while
+                // holding a live local runtime key (2.8.79 lesson; recaught
+                // at the 90→91 swap) — the local key must be enough.
+                SessionSource::Stored,
             );
             session.kind = SessionKind::ClaudeCode;
             session
