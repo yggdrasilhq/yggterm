@@ -3603,9 +3603,20 @@ impl YggtermServer {
                 }
                 if !keep_alive && let Some(protected_runtime_keys) = protected_runtime_keys {
                     let runtime_key = self.terminal_runtime_key_for_path(key);
-                    if !protected_runtime_keys.contains(key)
-                        && !protected_runtime_keys.contains(&runtime_key)
-                    {
+                    // Bug-9 key duality (drop-telemetry catch, 2026-06-11): a
+                    // local row keyed local://<uuid> can own its PTY under
+                    // codex-runtime://<uuid> in the terminals manager — the
+                    // protected set holds THAT form, so matching only the row
+                    // key + resolved runtime key silently dropped working
+                    // local sessions at every update persist.
+                    let codex_runtime_alias =
+                        local_runtime_id_from_key(key).map(remote_runtime_codex_session_key);
+                    let protected = protected_runtime_keys.contains(key)
+                        || protected_runtime_keys.contains(&runtime_key)
+                        || codex_runtime_alias
+                            .as_ref()
+                            .is_some_and(|alias| protected_runtime_keys.contains(alias));
+                    if !protected {
                         trace_drop(
                             key,
                             "not_in_protected_runtime_keys",
@@ -30140,14 +30151,28 @@ terminal_window_id: None,
             with_protected.live_sessions.iter().any(|l| l.key == key),
             "local session with its key in protected_runtime_keys must persist"
         );
-        // …and one outside the set is dropped — the documented gate. If the
-        // live PTY key set uses a different scheme (codex-runtime:// vs
-        // local://, the Bug-9 drift) this is the silent drop point.
+        // …and one outside the set is dropped — the documented gate.
         let other: HashSet<String> = ["local://someone-else".to_string()].into_iter().collect();
         let without = server.persisted_state_with_update_protection(true, Some(&other));
         assert!(
             !without.live_sessions.iter().any(|l| l.key == key),
             "session outside protected_runtime_keys is dropped (gate documented)"
+        );
+        // Bug-9 key duality (live drop-telemetry catch): the PTY may be keyed
+        // codex-runtime://<uuid> in the terminals manager while the row is
+        // local://<uuid> — the codex-runtime alias must match the gate.
+        let id = server
+            .sessions
+            .get(&key)
+            .map(|session| session.id.clone())
+            .expect("session id");
+        let alias_protected: HashSet<String> =
+            [remote_runtime_codex_session_key(&id)].into_iter().collect();
+        let with_alias =
+            server.persisted_state_with_update_protection(true, Some(&alias_protected));
+        assert!(
+            with_alias.live_sessions.iter().any(|l| l.key == key),
+            "codex-runtime:// alias in protected_runtime_keys must protect the local:// row"
         );
         // (b) a recovery-created session may carry source=Stored; it must
         //     still be recoverable while holding a live local runtime key.
