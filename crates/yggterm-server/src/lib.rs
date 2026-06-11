@@ -335,6 +335,17 @@ fn persisted_live_session_is_recoverable(live: &PersistedLiveSession) -> bool {
 /// (live-caught at the 88→89 swap; zero drop telemetry because the keep-alive
 /// filter skips silently by design). Plain shells stay second-class — their
 /// PTY content dies with the daemon and a restored shell row would be a husk.
+/// Persisted-row twin of [`managed_live_session_is_local_agent_store_recoverable`]
+/// (gate #7): a persisted local agent row restores like a keep-alive row —
+/// its content re-derives from the CLI's JSONL store.
+fn persisted_live_session_is_local_agent_store_recoverable(live: &PersistedLiveSession) -> bool {
+    (is_loopback_ssh_target(&live.ssh_target) || local_runtime_id_from_key(&live.key).is_some())
+        && matches!(
+            live.kind,
+            SessionKind::Codex | SessionKind::CodexLiteLlm | SessionKind::ClaudeCode
+        )
+}
+
 fn managed_live_session_is_local_agent_store_recoverable(
     key: &str,
     session: &ManagedSessionView,
@@ -5696,6 +5707,12 @@ impl YggtermServer {
     }
 
     pub fn restore_live_session(&mut self, live: PersistedLiveSession) {
+        // Gate #7 (persistence saga): gate #6 made non-keep-alive LOCAL AGENT
+        // rows ride every persist, but this restore gate still skipped them on
+        // load (live-caught at the 91→92 swap: 20 persisted, 18 restored).
+        // A store-recoverable local agent row restores like a keep-alive row.
+        let store_recoverable_local_agent =
+            persisted_live_session_is_local_agent_store_recoverable(&live);
         let PersistedLiveSession {
             key,
             id,
@@ -5716,7 +5733,7 @@ impl YggtermServer {
         if kind == SessionKind::Document {
             return;
         }
-        if !keep_alive && !temporary_update_restore {
+        if !keep_alive && !temporary_update_restore && !store_recoverable_local_agent {
             return;
         }
         let remote_scanned_key =
@@ -30283,6 +30300,35 @@ terminal_window_id: None,
         assert!(
             !routine.live_sessions.iter().any(|l| l.key == shell_key),
             "non-keep-alive plain shell stays out of the routine persist"
+        );
+
+        // GATE #7: the routine-persisted row must also RESTORE into a fresh
+        // server without keep-alive (live-caught at the 91→92 swap: persisted
+        // 20, restored 18 — restore_live_session skipped non-keep-alive rows).
+        let persisted_codex = routine
+            .live_sessions
+            .iter()
+            .find(|l| l.key == codex_key)
+            .expect("persisted codex row")
+            .clone();
+        let mut fresh = YggtermServer::new(
+            &tree,
+            false,
+            GhosttyHostSupport::shadow("test".to_string(), false, false),
+            UiTheme::ZedLight,
+        );
+        fresh.restore_live_session(persisted_codex);
+        let restored_key = fresh
+            .live_session_order
+            .first()
+            .cloned()
+            .expect("non-keep-alive local agent row must restore into a fresh server (gate #7)");
+        assert_eq!(
+            fresh
+                .sessions
+                .get(&restored_key)
+                .map(|session| session.kind),
+            Some(SessionKind::Codex),
         );
 
         // A genuinely closed agent row (removed from live order, the user
