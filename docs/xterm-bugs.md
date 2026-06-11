@@ -1424,6 +1424,47 @@ TODO (not yet done): fix the transient `active_session_path` set without an
 `[[finding-blank-viewport-client-snapshot-poison]]`, `[[campaign-xterm-dealbreakers]]` (Bug 1, D3/D4),
 `[[finding-blank-on-restart-split-brain-daemon]]`, `[[finding-codex-scroll-lock-no-client-scrollback]]`.
 
+## cc-alt-screen-no-scrollback
+
+**STATUS:** HISTORICAL (expected behavior by spec decision, 2026-06-11)
+
+### Symptom
+A Claude Code session's xterm buffer holds only one viewport: scrolling up
+shows nothing (no scrollbar), and content that scrolled past appears "lost".
+After some bg→fg cycles CC itself handles scrolling (vim-like pager).
+
+### Reproduction
+1. Open any Claude Code session (local or remote) in yggterm.
+2. Let CC print more than one screen of conversation.
+3. Try to scroll the terminal viewport up.
+
+### Root cause
+NOT a yggterm bug. Claude Code renders on the ALTERNATE screen, and
+alt-screen content never accumulates xterm scrollback — by terminal
+semantics, in every terminal. The wrapper-vs-manual parity rule decides
+this: a manual `ssh -t <machine> claude -r <uuid>` in ghostty/xterm behaves
+identically (no terminal scrollback; scrolled-away content lives only in
+CC's own pager, reachable through CC's scroll keys). Wheel events over an
+alt-screen app are converted by xterm.js to arrow keys (standard behavior),
+so CC's own pager receives them.
+
+### Workaround / fix
+None to build in the terminal path. Spec decision per the wrapper-vs-manual
+parity rule: yggterm must render exactly what the manual invocation renders;
+"fixing" this would mean parsing CC's JSONL into the viewport, which yggterm
+never does. Full scrollable history of a CC conversation is the WEB VIEW's
+job (the JSONL pretty-formatting surface).
+
+### Code locations
+- None (behavioral spec entry).
+
+### Tests
+- None (no code path to lock); parity is the invariant.
+
+### Related memory
+`[[spec-agent-cli-wrapper-render-parity]]`, `[[run8-findings-and-user-bug-batch]]` (user bug 8),
+`[[finding-codex-owns-scrollback-not-term-program]]` (same class: the CLI owns its history).
+
 ## Template (copy for new entries)
 
 ```markdown
