@@ -37996,6 +37996,43 @@ fn app() -> Element {
         .clone();
     let linux_transparent_window = bootstrap.linux_window_transparent;
     let trace_home = perf_home_dir(&bootstrap.settings_path);
+    // RENDER-STORM PROBE (the unpinned ~37 renders/s wake storm — implicated
+    // in two CPU-spin incidents and the main-thread ensure starvation): count
+    // app() executions and trace the rate once a minute, so the storm's
+    // magnitude and its correlation with activity windows is measurable from
+    // the event trace without a debugger.
+    {
+        use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+        static RENDER_COUNT: AtomicU64 = AtomicU64::new(0);
+        static LAST_REPORT_MS: AtomicU64 = AtomicU64::new(0);
+        let count = RENDER_COUNT.fetch_add(1, AtomicOrdering::Relaxed) + 1;
+        let now = current_millis() as u64;
+        let last = LAST_REPORT_MS.load(AtomicOrdering::Relaxed);
+        if now.saturating_sub(last) >= 60_000
+            && LAST_REPORT_MS
+                .compare_exchange(last, now, AtomicOrdering::Relaxed, AtomicOrdering::Relaxed)
+                .is_ok()
+        {
+            let window_ms = if last == 0 { 0 } else { now.saturating_sub(last) };
+            let per_sec = if window_ms > 0 {
+                count as f64 / (window_ms as f64 / 1000.0)
+            } else {
+                0.0
+            };
+            append_trace_event(
+                &trace_home,
+                "ui",
+                "perf",
+                "app_render_rate",
+                json!({
+                    "renders_in_window": count,
+                    "window_ms": window_ms,
+                    "renders_per_sec": (per_sec * 10.0).round() / 10.0,
+                }),
+            );
+            RENDER_COUNT.store(0, AtomicOrdering::Relaxed);
+        }
+    }
     let app_instance_id = use_hook(|| APP_INSTANCE_ID_SEQ.fetch_add(1, Ordering::SeqCst));
     let is_primary_instance = use_hook({
         let trace_home = trace_home.clone();
