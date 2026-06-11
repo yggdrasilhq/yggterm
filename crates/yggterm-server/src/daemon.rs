@@ -5509,12 +5509,16 @@ fn collect_live_copy_candidates(
             let Some(storage) = storage else {
                 continue;
             };
+            // Summary timelines: the JSONL mtime drives the short-horizon
+            // refresh gate so a working session's summary evolves (and the
+            // timeline grows) as the transcript does.
+            let source_updated_at = source_updated_at_for_path(Path::new(&storage));
             out.push(BackgroundCopyCandidate {
                 session_path: session.session_path.clone(),
                 session_id: session.id.clone(),
                 cwd: session_cwd_for_background_copy(session),
                 title: session.title.clone(),
-                source_updated_at: None,
+                source_updated_at,
                 remote_machine: None,
                 generation_context: None,
                 storage_path: Some(storage),
@@ -5727,9 +5731,15 @@ fn build_background_copy_updates(
         let summary_needs_refresh = candidate
             .source_updated_at
             .and_then(|updated_at| {
-                store
-                    .summary_needs_refresh_for_session_id(&candidate.session_id, updated_at)
-                    .ok()
+                if candidate.live_local_agent {
+                    store
+                        .summary_needs_refresh_for_live_session_id(&candidate.session_id, updated_at)
+                        .ok()
+                } else {
+                    store
+                        .summary_needs_refresh_for_session_id(&candidate.session_id, updated_at)
+                        .ok()
+                }
             })
             .unwrap_or(stored_summary.is_none());
         let summary_missing = summary_needs_refresh
@@ -5737,6 +5747,12 @@ fn build_background_copy_updates(
                 .cached_summary
                 .as_deref()
                 .is_none_or(|summary| summary.trim().is_empty());
+        // Timeline refresh: an EXISTING live summary that aged past the live
+        // horizon must regenerate — the generator returns the stored summary
+        // unless forced (put_summary's timeline insert preserves history;
+        // delete_summary leaves the timeline intact).
+        let summary_force_refresh =
+            candidate.live_local_agent && summary_needs_refresh && stored_summary.is_some();
         if !title_missing && !summary_missing {
             continue;
         }
@@ -5786,7 +5802,7 @@ fn build_background_copy_updates(
                     &candidate.session_id,
                     &candidate.cwd,
                     &context,
-                    false,
+                    summary_force_refresh,
                 ) {
                     Ok(summary) => summary,
                     Err(error) => {
@@ -5831,7 +5847,7 @@ fn build_background_copy_updates(
                 None
             };
             let summary = if summary_missing && !rate_limited_this_tick {
-                match store.generate_summary_for_session_path(settings, source_path, false) {
+                match store.generate_summary_for_session_path(settings, source_path, summary_force_refresh) {
                     Ok(summary) => summary,
                     Err(error) => {
                         rate_limited_this_tick |= background_copy_error_is_rate_limit(&error);
