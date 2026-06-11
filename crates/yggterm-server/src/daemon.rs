@@ -8203,6 +8203,9 @@ fn spawn_disk_binary_version_poll(
         // remote sessions on the seed placeholder is cleared quickly.
         // [[finding-blank-on-restart-split-brain-daemon]]
         const POLL_INTERVAL_MS: u64 = 20_000;
+        // Periodic stale-daemon sweep cadence: every Nth poll ≈ 3 minutes.
+        const STALE_SWEEP_EVERY_N_POLLS: u32 = 9;
+        let mut stale_sweep_countdown = STALE_SWEEP_EVERY_N_POLLS;
         loop {
             std::thread::sleep(std::time::Duration::from_millis(POLL_INTERVAL_MS));
             // Retire trigger 1: our on-disk binary was replaced by an update.
@@ -8232,6 +8235,32 @@ fn spawn_disk_binary_version_poll(
             } else if newer_daemon_version.is_some() {
                 "newer_daemon_live"
             } else {
+                // We are the CURRENT daemon. Size-war lesson (2026-06-12): the
+                // startup-only takeover/retire leaves a stale OLDER daemon
+                // that survives that window (idle-gate defer) free to churn
+                // duplicate attachments indefinitely — split-brain until a
+                // human runs retire-stale-daemons. Sweep periodically instead
+                // (~3min; session-safe coverage rules apply).
+                stale_sweep_countdown = stale_sweep_countdown.saturating_sub(1);
+                if stale_sweep_countdown == 0 {
+                    stale_sweep_countdown = STALE_SWEEP_EVERY_N_POLLS;
+                    let report = retire_stale_daemons(&home_dir, SERVER_PROTOCOL_VERSION);
+                    if let Ok(report) = report
+                        && report.retired_count > 0
+                    {
+                        append_trace_event(
+                            &home_dir,
+                            "daemon",
+                            "lifecycle",
+                            "periodic_stale_daemon_sweep",
+                            serde_json::json!({
+                                "retired": report.retired_count,
+                                "skipped": report.skipped_count,
+                                "unreachable": report.unreachable_count,
+                            }),
+                        );
+                    }
+                }
                 continue;
             };
             // Self-retiring kills this daemon's PTYs and the successor re-resumes
