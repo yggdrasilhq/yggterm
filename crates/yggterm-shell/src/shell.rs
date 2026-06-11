@@ -63588,8 +63588,19 @@ fn terminal_eval_script_with_canvas_renderer(
                     syncScrollbackLock(reason || 'user_scrollback');
                     return;
                 }}
-                if (!force && syncScrollbackLock()) {{
-                    return;
+                // DEFECT #1 FIXED (favourite-spot incident 2026-06-11): this
+                // used to ALSO early-return on `syncScrollbackLock()` — i.e.
+                // whenever viewport < base — which no-opped every non-forced
+                // follow in exactly the stranded state the follow exists to
+                // fix (litellm pinned at 705 under base 943 while the settle
+                // watchdog "re-asserted" 1/s with zero effect for 50s+). The
+                // lock conflated "user is reading scrollback" with "viewport
+                // below base". User intent is owned SOLELY by the intent SSOT
+                // above (UserScrollback latches via the harness-locked
+                // scroll-up detector); a PromptFollow session below base is a
+                // strand and MUST follow.
+                if (!force) {{
+                    syncScrollbackLock(reason || 'prompt_follow');
                 }}
                 if (force) {{
                     setScrollbackIntent('PromptFollow', reason || 'prompt_follow');
@@ -77153,9 +77164,15 @@ mod tests {
                 && script.contains("syncScrollbackLock(reason || 'user_scrollback');"),
             "explicit user scrollback should block passive follow even before xterm emits a settled scroll lock"
         );
+        // DEFECT #1 regression lock (favourite-spot incident 2026-06-11):
+        // the follow must NOT gate on scrollbackLocked — that no-opped every
+        // non-forced follow for any viewport-below-base strand, making the
+        // settle watchdog structurally unable to heal (1/s re-assert with
+        // zero effect). UserScrollback intent (the check above) is the ONLY
+        // thing that may block a passive follow.
         assert!(
-            script.contains("if (!force && syncScrollbackLock()) {"),
-            "manual scrollback should still block passive output follow"
+            !script.contains("if (!force && syncScrollbackLock()) {"),
+            "passive follow must not early-return on scrollbackLocked; intent is the only gate"
         );
         assert!(
             script.contains("const focusShouldFollowPrompt = Boolean(focus) && Boolean(followPrompt) && scrollbackIntent !== 'UserScrollback';"),
