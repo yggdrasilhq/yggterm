@@ -7559,6 +7559,49 @@ pub struct RetireStaleDaemonOutcome {
     pub message: Option<String>,
 }
 
+/// A terminal runtime key whose real PTY lives on a REMOTE host's daemon
+/// (`remote-session://` and its Claude Code twin `remote-cc://`, per the
+/// decentralized host-daemon architecture). Dropping a stale local daemon's
+/// record for such a key is non-destructive: the remote daemon keeps the PTY
+/// and the local attachment respawns on the next ensure — the same thing that
+/// already happens on every deploy.
+fn terminal_runtime_key_is_remote_hosted(key: &str) -> bool {
+    crate::is_remote_scanned_live_session_path(key)
+        || crate::parse_remote_cc_session_path(key).is_some()
+}
+
+/// Per [[bug-class-old-daemon-never-retires]]: session-safe coverage rule for
+/// retiring a STALE daemon that still lists terminal sessions. Safe iff every
+/// key the stale daemon holds is (a) also present in the current daemon's
+/// records (owned or preserved — no session record is lost), and (b) either
+/// remote-hosted (its PTY lives on the remote machine) or actually OWNED by
+/// the current daemon (the stale copy is a superseded duplicate runtime).
+/// A stale daemon holding any local PTY key the current daemon does not own
+/// stays running. A stale daemon reporting sessions without listing keys
+/// cannot be verified and stays running.
+pub fn stale_daemon_retire_covered_by_current(
+    current: &ServerRuntimeStatus,
+    stale: &ServerRuntimeStatus,
+) -> bool {
+    if stale.terminal_session_count > stale.terminal_session_keys.len() {
+        return false;
+    }
+    let covered: HashSet<&str> = current
+        .terminal_session_keys
+        .iter()
+        .map(String::as_str)
+        .collect();
+    let owned: HashSet<&str> = current
+        .owned_terminal_session_keys
+        .iter()
+        .map(String::as_str)
+        .collect();
+    stale.terminal_session_keys.iter().all(|key| {
+        covered.contains(key.as_str())
+            && (terminal_runtime_key_is_remote_hosted(key) || owned.contains(key.as_str()))
+    })
+}
+
 /// Per [[bug-class-old-daemon-never-retires]]: yggterm-headless processes
 /// from older deploys keep running because the idle-shutdown gate is too
 /// conservative (it counts preserved-owner sessions as live work) and there
@@ -7566,7 +7609,8 @@ pub struct RetireStaleDaemonOutcome {
 /// `server-*.sock` in `home_dir`, probes the version of the daemon behind
 /// it, and sends `RetireDaemon` to any whose version differs from
 /// `current_version`. Sockets that are unreachable are removed; the current
-/// daemon's own socket is skipped.
+/// daemon's own socket is skipped. A stale daemon that still lists sessions
+/// is retired only under [`stale_daemon_retire_covered_by_current`].
 #[cfg(unix)]
 pub fn retire_stale_daemons(
     home_dir: &Path,
@@ -7581,6 +7625,11 @@ pub fn retire_stale_daemons(
         #[allow(unreachable_patterns)]
         _ => None,
     };
+    // Probed once: the current daemon's status, used for the session-coverage
+    // retire rule. Unreachable current daemon → no coverage-based retires.
+    let current_status = current_endpoint_path
+        .as_ref()
+        .and_then(|path| status(&ServerEndpoint::UnixSocket(path.clone())).ok());
     let entries = match fs::read_dir(home_dir) {
         Ok(entries) => entries,
         Err(error) if error.kind() == ErrorKind::NotFound => return Ok(report),
@@ -7624,11 +7673,19 @@ pub fn retire_stale_daemons(
                         server_pid: Some(s.server_pid),
                         message: None,
                     }
-                } else if s.terminal_session_count > 0 {
+                } else if s.terminal_session_count > 0
+                    && !current_status
+                        .as_ref()
+                        .map(|current| stale_daemon_retire_covered_by_current(current, &s))
+                        .unwrap_or(false)
+                {
                     // SESSION-SAFE: never retire a daemon that still owns live
                     // sessions (incl. preserved hot-update PTYs) — there is no
-                    // fd-handoff, so retiring it would interrupt those sessions.
-                    // It will retire itself once it drains to zero (idle gate +
+                    // fd-handoff, so retiring it would interrupt those sessions —
+                    // unless the current daemon covers every key and none of
+                    // them is a local PTY the stale daemon could still hold
+                    // (see stale_daemon_retire_covered_by_current). It will
+                    // retire itself once it drains to zero (idle gate +
                     // supersession check). Per [[bug-class-old-daemon-never-retires]].
                     report.skipped_count += 1;
                     RetireStaleDaemonOutcome {
@@ -7642,12 +7699,22 @@ pub fn retire_stale_daemons(
                         )),
                     }
                 } else {
-                    match retire_daemon(&endpoint, Some("retire_stale_daemons_cli")) {
+                    let covered_retire = s.terminal_session_count > 0;
+                    let reason = if covered_retire {
+                        "retire_stale_daemons_covered_by_current"
+                    } else {
+                        "retire_stale_daemons_cli"
+                    };
+                    match retire_daemon(&endpoint, Some(reason)) {
                         Ok(message) => {
                             report.retired_count += 1;
                             RetireStaleDaemonOutcome {
                                 socket: path.display().to_string(),
-                                status: "retired".to_string(),
+                                status: if covered_retire {
+                                    "retired_covered_by_current".to_string()
+                                } else {
+                                    "retired".to_string()
+                                },
                                 server_version: Some(s.server_version),
                                 server_pid: Some(s.server_pid),
                                 message,
@@ -9708,6 +9775,91 @@ mod tests {
         // The current daemon version must itself be parseable, or supersession
         // detection silently no-ops.
         assert!(parse_daemon_version_triple(SERVER_PROTOCOL_VERSION).is_some());
+    }
+
+    fn runtime_status_with_keys(
+        owned: &[&str],
+        preserved: &[&str],
+    ) -> super::ServerRuntimeStatus {
+        let mut terminal: Vec<String> = owned
+            .iter()
+            .chain(preserved.iter())
+            .map(|s| s.to_string())
+            .collect();
+        terminal.sort();
+        terminal.dedup();
+        serde_json::from_value(serde_json::json!({
+            "server_version": "test",
+            "host_kind": "test",
+            "host_detail": "test",
+            "embedded_surface_supported": false,
+            "bridge_enabled": false,
+            "owned_terminal_session_keys": owned,
+            "owned_terminal_session_count": owned.len(),
+            "preserved_terminal_owner_keys": preserved,
+            "preserved_terminal_owner_count": preserved.len(),
+            "terminal_session_keys": terminal,
+            "terminal_session_count": terminal.len(),
+        }))
+        .expect("test ServerRuntimeStatus")
+    }
+
+    // Per [[bug-class-old-daemon-never-retires]]: the jojo 2.8.87 lingering
+    // duplicate — a stale daemon holding only remote-session records (real
+    // PTYs live on the remote hosts) that the current daemon already covers
+    // as preserved owners must be retire-eligible.
+    #[test]
+    fn stale_daemon_with_only_covered_remote_keys_is_retire_safe() {
+        use super::stale_daemon_retire_covered_by_current;
+        let remote_a = "remote-session://dev/019ca2da";
+        let remote_b = "remote-cc://practice/8247344a";
+        let current = runtime_status_with_keys(&["local://aaa"], &[remote_a, remote_b]);
+        let stale = runtime_status_with_keys(&[remote_a, remote_b], &[]);
+        assert!(stale_daemon_retire_covered_by_current(&current, &stale));
+    }
+
+    // A stale daemon holding a LOCAL PTY key the current daemon does not own
+    // must never be retired (no fd handoff — retiring kills the PTY).
+    #[test]
+    fn stale_daemon_with_unowned_local_key_is_never_retired() {
+        use super::stale_daemon_retire_covered_by_current;
+        let local = "local://019df7b2";
+        // Current daemon merely PRESERVES the key (does not own a runtime).
+        let current = runtime_status_with_keys(&[], &[local]);
+        let stale = runtime_status_with_keys(&[local], &[]);
+        assert!(!stale_daemon_retire_covered_by_current(&current, &stale));
+    }
+
+    // A local key the current daemon actually OWNS means the stale copy is a
+    // superseded duplicate runtime — retire-eligible (duplicate-prune class).
+    #[test]
+    fn stale_daemon_with_local_key_owned_by_current_is_retire_safe() {
+        use super::stale_daemon_retire_covered_by_current;
+        let local = "local://019df7b2";
+        let current = runtime_status_with_keys(&[local], &[]);
+        let stale = runtime_status_with_keys(&[local], &[]);
+        assert!(stale_daemon_retire_covered_by_current(&current, &stale));
+    }
+
+    // Any stale key the current daemon has NO record of would be lost on
+    // retire — keep the stale daemon running.
+    #[test]
+    fn stale_daemon_with_uncovered_key_is_never_retired() {
+        use super::stale_daemon_retire_covered_by_current;
+        let current = runtime_status_with_keys(&[], &["remote-session://dev/known"]);
+        let stale = runtime_status_with_keys(&["remote-session://dev/unknown"], &[]);
+        assert!(!stale_daemon_retire_covered_by_current(&current, &stale));
+    }
+
+    // Older daemons may report a session COUNT without listing keys — that
+    // cannot be verified key-by-key, so it is never retire-eligible.
+    #[test]
+    fn stale_daemon_with_count_but_no_keys_is_never_retired() {
+        use super::stale_daemon_retire_covered_by_current;
+        let current = runtime_status_with_keys(&[], &["remote-session://dev/known"]);
+        let mut stale = runtime_status_with_keys(&[], &[]);
+        stale.terminal_session_count = 3;
+        assert!(!stale_daemon_retire_covered_by_current(&current, &stale));
     }
     use std::fs;
     use std::io::Write;
