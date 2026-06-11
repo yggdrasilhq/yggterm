@@ -31,7 +31,7 @@ use std::path::{Path, PathBuf};
 use std::sync::MutexGuard;
 use std::sync::{
     Arc, Mutex,
-    atomic::{AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
 };
 use time::OffsetDateTime;
 use tracing::{info, warn};
@@ -1850,6 +1850,17 @@ struct DaemonRuntime {
     /// drop-telemetry showed ZERO drops because the update snapshot itself
     /// was correct). After this is set, routine persists are no-ops.
     update_restart_state_written: bool,
+    /// Run #17 split-brain lesson (structural): cross-daemon duplicate-runtime
+    /// pruning probes/drops/retires against OTHER daemons' sockets — against a
+    /// live-but-busy duplicate each round-trip can take seconds, and running
+    /// that inside a request handler serialized multi-second stalls onto the
+    /// request loop (5 consecutive 10s ensure failures; one ensure took 8.8s).
+    /// The prune now runs on a background thread; this flag keeps it to one
+    /// prune at a time.
+    duplicate_runtime_prune_in_flight: Arc<AtomicBool>,
+    /// Preserved-owner registry removals discovered by the background prune,
+    /// applied on the request loop (the registry is not thread-shared).
+    pending_preserved_owner_removals: Arc<Mutex<Vec<String>>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1930,6 +1941,8 @@ impl DaemonRuntime {
             restored_remote_machines,
             preserved_owner_unreachable_until_ms: HashMap::new(),
             update_restart_state_written: false,
+            duplicate_runtime_prune_in_flight: Arc::new(AtomicBool::new(false)),
+            pending_preserved_owner_removals: Arc::new(Mutex::new(Vec::new())),
         };
         let preserved_owner_registry_retargeted = runtime
             .preserved_terminal_owners
@@ -2797,7 +2810,14 @@ impl DaemonRuntime {
         }
     }
 
+    /// Run #17 split-brain lesson (structural): this prune talks to OTHER
+    /// daemons' sockets (status probes, per-key drops, a retire) — against a
+    /// live-but-busy duplicate each round-trip can take seconds. It therefore
+    /// runs on a BACKGROUND thread; the only daemon-state mutation (the
+    /// preserved-owner registry removal) is queued and applied on the request
+    /// loop via [`Self::drain_pending_preserved_owner_removals`].
     fn prune_duplicate_legacy_owned_runtime_sessions(&mut self, reason: &'static str) {
+        self.drain_pending_preserved_owner_removals();
         let current_runtime_keys = self
             .terminals
             .session_keys()
@@ -2806,115 +2826,65 @@ impl DaemonRuntime {
         if current_runtime_keys.is_empty() {
             return;
         }
-        let current_pid = std::process::id();
-        let current_build_id = current_build_id();
-        let current_endpoint = default_endpoint(self.store.home_dir());
-        let statuses = reachable_versioned_daemon_statuses_excluding_endpoint(
-            self.store.home_dir(),
-            &current_endpoint,
-        );
-        for (owner_endpoint, owner_status) in statuses {
-            let duplicate_runtime_keys = duplicate_legacy_owned_runtime_keys(
-                &current_runtime_keys,
-                SERVER_PROTOCOL_VERSION,
-                current_build_id,
-                current_pid,
-                &owner_status,
-            );
-            if duplicate_runtime_keys.is_empty() {
-                continue;
-            }
-            let mut removed_runtime_keys = Vec::new();
-            let mut errors = Vec::new();
-            for runtime_key in duplicate_runtime_keys {
-                match drop_terminal_runtime(
-                    &owner_endpoint,
-                    &runtime_key,
-                    Some("duplicate_legacy_owned_runtime_prune"),
-                ) {
-                    Ok(_message) => {
-                        let registry_points_to_owner = self
-                            .preserved_terminal_owners
-                            .owner_for_key(&runtime_key)
-                            .is_some_and(|entry| {
-                                server_endpoints_same_target(
-                                    &entry.endpoint.to_endpoint(),
-                                    &owner_endpoint,
-                                )
-                            });
-                        if registry_points_to_owner {
-                            self.remove_preserved_owner(
-                                &runtime_key,
-                                "duplicate_legacy_owned_runtime_pruned_current_owned",
-                            );
-                        }
-                        removed_runtime_keys.push(runtime_key);
-                    }
-                    Err(error) => errors.push(serde_json::json!({
-                        "runtime_key": runtime_key,
-                        "error": error.to_string(),
-                    })),
-                }
-            }
-            let status_after = status(&owner_endpoint).ok();
-            let remaining_duplicate_runtime_keys = status_after
-                .as_ref()
-                .map(|status_after| {
-                    duplicate_legacy_owned_runtime_keys(
-                        &current_runtime_keys,
-                        SERVER_PROTOCOL_VERSION,
-                        current_build_id,
-                        current_pid,
-                        &status_after,
-                    )
-                })
-                .unwrap_or_default();
-            let remaining_owned_runtime_keys = status_after
-                .as_ref()
-                .map(|status_after| status_after.owned_terminal_session_keys.clone())
-                .unwrap_or_default();
-            let stale_daemon_retire = if !removed_runtime_keys.is_empty()
-                && remaining_duplicate_runtime_keys.is_empty()
-                && remaining_owned_runtime_keys.is_empty()
-            {
-                Some(
-                    match retire_daemon(&owner_endpoint, Some("duplicate_runtime_pruned")) {
-                        Ok(message) => serde_json::json!({
-                            "attempted": true,
-                            "ok": true,
-                            "message": message,
-                        }),
-                        Err(error) => serde_json::json!({
-                            "attempted": true,
-                            "ok": false,
-                            "error": error.to_string(),
-                        }),
-                    },
-                )
-            } else {
-                None
-            };
-            append_trace_event(
-                self.store.home_dir(),
-                "daemon",
-                "hot_update",
-                "duplicate_legacy_owned_runtimes_pruned",
-                serde_json::json!({
-                    "reason": reason,
-                    "owner_endpoint": owner_endpoint_label(&owner_endpoint),
-                    "owner_server_version": owner_status.server_version,
-                    "owner_server_build_id": owner_status.server_build_id,
-                    "owner_server_pid": owner_status.server_pid,
-                    "removed_runtime_keys": removed_runtime_keys,
-                    "errors": errors,
-                    "remaining_duplicate_runtime_keys": remaining_duplicate_runtime_keys,
-                    "remaining_owned_runtime_keys": remaining_owned_runtime_keys,
-                    "stale_daemon_retire": stale_daemon_retire,
-                }),
-            );
+        if self
+            .duplicate_runtime_prune_in_flight
+            .swap(true, Ordering::SeqCst)
+        {
+            return;
+        }
+        // Snapshot the registry's owner endpoint per key — the background
+        // thread must never touch the registry itself.
+        let registry_owner_endpoints: HashMap<String, ServerEndpoint> = self
+            .preserved_terminal_owners
+            .keys()
+            .into_iter()
+            .filter_map(|key| {
+                let endpoint = self
+                    .preserved_terminal_owners
+                    .owner_for_key(&key)?
+                    .endpoint
+                    .to_endpoint();
+                Some((key, endpoint))
+            })
+            .collect();
+        let home_dir = self.store.home_dir().to_path_buf();
+        let in_flight = Arc::clone(&self.duplicate_runtime_prune_in_flight);
+        let pending_removals = Arc::clone(&self.pending_preserved_owner_removals);
+        let spawn_result = std::thread::Builder::new()
+            .name("yggterm-duplicate-runtime-prune".to_string())
+            .spawn(move || {
+                run_duplicate_legacy_owned_runtime_prune(
+                    &home_dir,
+                    reason,
+                    &current_runtime_keys,
+                    &registry_owner_endpoints,
+                    &pending_removals,
+                );
+                in_flight.store(false, Ordering::SeqCst);
+            });
+        if spawn_result.is_err() {
+            self.duplicate_runtime_prune_in_flight
+                .store(false, Ordering::SeqCst);
         }
     }
 
+    /// Apply preserved-owner registry removals discovered by the background
+    /// duplicate-runtime prune. Runs on the request loop (registry owner).
+    fn drain_pending_preserved_owner_removals(&mut self) {
+        let drained = {
+            let mut pending = self
+                .pending_preserved_owner_removals
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            std::mem::take(&mut *pending)
+        };
+        for runtime_key in drained {
+            self.remove_preserved_owner(
+                &runtime_key,
+                "duplicate_legacy_owned_runtime_pruned_current_owned",
+            );
+        }
+    }
     fn preserved_owner_status_for_runtime_key(
         &mut self,
         runtime_key: &str,
@@ -3714,6 +3684,9 @@ impl DaemonRuntime {
     }
 
     fn handle_request(&mut self, request: ServerRequest) -> Result<ServerResponse> {
+        // Apply registry removals queued by the background duplicate-runtime
+        // prune (cheap; usually empty).
+        self.drain_pending_preserved_owner_removals();
         let request_name = server_request_name(&request);
         let trace_request = daemon_request_trace_enabled(request_name);
         if trace_request {
@@ -6549,6 +6522,122 @@ pub fn status(endpoint: &ServerEndpoint) -> Result<ServerRuntimeStatus> {
 }
 
 #[cfg(unix)]
+/// Background-thread body of the duplicate-runtime prune (see
+/// `DaemonRuntime::prune_duplicate_legacy_owned_runtime_sessions`): walk the
+/// other reachable daemons, drop runtime keys the current daemon owns, retire
+/// an owner left empty, and queue preserved-owner registry removals for the
+/// request loop to apply. Talks ONLY to other daemons' sockets + the trace
+/// file — never to this daemon's in-memory state.
+fn run_duplicate_legacy_owned_runtime_prune(
+    home_dir: &Path,
+    reason: &'static str,
+    current_runtime_keys: &HashSet<String>,
+    registry_owner_endpoints: &HashMap<String, ServerEndpoint>,
+    pending_preserved_owner_removals: &Mutex<Vec<String>>,
+) {
+    let current_pid = std::process::id();
+    let current_build_id = current_build_id();
+    let current_endpoint = default_endpoint(home_dir);
+    let statuses =
+        reachable_versioned_daemon_statuses_excluding_endpoint(home_dir, &current_endpoint);
+    for (owner_endpoint, owner_status) in statuses {
+        let duplicate_runtime_keys = duplicate_legacy_owned_runtime_keys(
+            current_runtime_keys,
+            SERVER_PROTOCOL_VERSION,
+            current_build_id,
+            current_pid,
+            &owner_status,
+        );
+        if duplicate_runtime_keys.is_empty() {
+            continue;
+        }
+        let mut removed_runtime_keys = Vec::new();
+        let mut errors = Vec::new();
+        for runtime_key in duplicate_runtime_keys {
+            match drop_terminal_runtime(
+                &owner_endpoint,
+                &runtime_key,
+                Some("duplicate_legacy_owned_runtime_prune"),
+            ) {
+                Ok(_message) => {
+                    let registry_points_to_owner = registry_owner_endpoints
+                        .get(&runtime_key)
+                        .is_some_and(|entry| {
+                            server_endpoints_same_target(entry, &owner_endpoint)
+                        });
+                    if registry_points_to_owner {
+                        let mut pending = pending_preserved_owner_removals
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        pending.push(runtime_key.clone());
+                    }
+                    removed_runtime_keys.push(runtime_key);
+                }
+                Err(error) => errors.push(serde_json::json!({
+                    "runtime_key": runtime_key,
+                    "error": error.to_string(),
+                })),
+            }
+        }
+        let status_after = status(&owner_endpoint).ok();
+        let remaining_duplicate_runtime_keys = status_after
+            .as_ref()
+            .map(|status_after| {
+                duplicate_legacy_owned_runtime_keys(
+                    current_runtime_keys,
+                    SERVER_PROTOCOL_VERSION,
+                    current_build_id,
+                    current_pid,
+                    status_after,
+                )
+            })
+            .unwrap_or_default();
+        let remaining_owned_runtime_keys = status_after
+            .as_ref()
+            .map(|status_after| status_after.owned_terminal_session_keys.clone())
+            .unwrap_or_default();
+        let stale_daemon_retire = if !removed_runtime_keys.is_empty()
+            && remaining_duplicate_runtime_keys.is_empty()
+            && remaining_owned_runtime_keys.is_empty()
+        {
+            Some(
+                match retire_daemon(&owner_endpoint, Some("duplicate_runtime_pruned")) {
+                    Ok(message) => serde_json::json!({
+                        "attempted": true,
+                        "ok": true,
+                        "message": message,
+                    }),
+                    Err(error) => serde_json::json!({
+                        "attempted": true,
+                        "ok": false,
+                        "error": error.to_string(),
+                    }),
+                },
+            )
+        } else {
+            None
+        };
+        append_trace_event(
+            home_dir,
+            "daemon",
+            "hot_update",
+            "duplicate_legacy_owned_runtimes_pruned",
+            serde_json::json!({
+                "reason": reason,
+                "owner_endpoint": owner_endpoint_label(&owner_endpoint),
+                "owner_server_version": owner_status.server_version,
+                "owner_server_build_id": owner_status.server_build_id,
+                "owner_server_pid": owner_status.server_pid,
+                "removed_runtime_keys": removed_runtime_keys,
+                "errors": errors,
+                "remaining_duplicate_runtime_keys": remaining_duplicate_runtime_keys,
+                "remaining_owned_runtime_keys": remaining_owned_runtime_keys,
+                "stale_daemon_retire": stale_daemon_retire,
+            }),
+        );
+    }
+}
+
 fn versioned_server_status_probe_paths(home_dir: &Path) -> Vec<PathBuf> {
     let mut seen = HashSet::<PathBuf>::new();
     let mut seen_socket_identities = HashSet::<PathBuf>::new();
