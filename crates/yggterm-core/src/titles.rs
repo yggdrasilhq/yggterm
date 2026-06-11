@@ -847,13 +847,13 @@ fn extract_tail_context(path: &Path) -> Result<String> {
 fn request_litellm_title(settings: &AppSettings, context: &str) -> Result<String> {
     let url = completions_url(&settings.litellm_endpoint);
     let client = Client::builder()
-        .timeout(Duration::from_secs(12))
+        .timeout(Duration::from_secs(30))
         .build()
         .context("failed to build LiteLLM client")?;
     let body = serde_json::json!({
         "model": settings.interface_llm_model,
         "temperature": 0.2,
-        "max_tokens": 64,
+        "max_tokens": 768,
         "messages": [
             {
                 "role": "system",
@@ -913,13 +913,13 @@ fn parse_copy_timestamp(value: &str) -> Result<OffsetDateTime> {
 fn request_litellm_precis(settings: &AppSettings, context: &str) -> Result<String> {
     let url = completions_url(&settings.litellm_endpoint);
     let client = Client::builder()
-        .timeout(Duration::from_secs(12))
+        .timeout(Duration::from_secs(30))
         .build()
         .context("failed to build LiteLLM client")?;
     let body = serde_json::json!({
         "model": settings.interface_llm_model,
         "temperature": 0.2,
-        "max_tokens": 96,
+        "max_tokens": 768,
         "messages": [
             {
                 "role": "system",
@@ -974,13 +974,13 @@ fn request_litellm_precis(settings: &AppSettings, context: &str) -> Result<Strin
 fn request_litellm_summary(settings: &AppSettings, context: &str) -> Result<String> {
     let url = completions_url(&settings.litellm_endpoint);
     let client = Client::builder()
-        .timeout(Duration::from_secs(12))
+        .timeout(Duration::from_secs(30))
         .build()
         .context("failed to build LiteLLM client")?;
     let body = serde_json::json!({
         "model": settings.interface_llm_model,
         "temperature": 0.2,
-        "max_tokens": 220,
+        "max_tokens": 1024,
         "messages": [
             {
                 "role": "system",
