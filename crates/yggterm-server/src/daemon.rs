@@ -1490,6 +1490,9 @@ pub enum ServerRequest {
         title_hint: Option<String>,
         #[serde(default)]
         terminal_appearance: Option<String>,
+        /// Live-order anchor: place the new session directly below this row.
+        #[serde(default)]
+        insert_after: Option<String>,
     },
     StartRemoteCodexSession {
         target: String,
@@ -1498,6 +1501,8 @@ pub enum ServerRequest {
         title_hint: Option<String>,
         #[serde(default)]
         terminal_appearance: Option<String>,
+        #[serde(default)]
+        insert_after: Option<String>,
     },
     StartRemoteClaudeSession {
         target: String,
@@ -1506,6 +1511,8 @@ pub enum ServerRequest {
         title_hint: Option<String>,
         #[serde(default)]
         terminal_appearance: Option<String>,
+        #[serde(default)]
+        insert_after: Option<String>,
     },
     OpenRemoteSession {
         machine_key: String,
@@ -1555,6 +1562,8 @@ pub enum ServerRequest {
         title_hint: Option<String>,
         #[serde(default)]
         terminal_appearance: Option<String>,
+        #[serde(default)]
+        insert_after: Option<String>,
     },
     SwitchAgentSessionMode {
         path: String,
@@ -4070,6 +4079,7 @@ impl DaemonRuntime {
                 cwd,
                 title_hint,
                 terminal_appearance,
+                insert_after,
             } => {
                 sync_terminal_identity_for_request(terminal_appearance.as_deref(), None);
                 let key = self.server.start_ssh_session(
@@ -4078,6 +4088,8 @@ impl DaemonRuntime {
                     cwd.as_deref(),
                     title_hint.as_deref(),
                 )?;
+                self.server
+                    .place_live_session_after(&key, insert_after.as_deref());
                 if self.server.active_session_supports_terminal() {
                     self.ensure_terminal_for_active()?;
                 }
@@ -4090,6 +4102,7 @@ impl DaemonRuntime {
                 cwd,
                 title_hint,
                 terminal_appearance,
+                insert_after,
             } => {
                 sync_terminal_identity_for_request(terminal_appearance.as_deref(), None);
                 let key = self.server.start_remote_codex_session(
@@ -4098,6 +4111,8 @@ impl DaemonRuntime {
                     cwd.as_deref(),
                     title_hint.as_deref(),
                 )?;
+                self.server
+                    .place_live_session_after(&key, insert_after.as_deref());
                 if self.server.active_session_supports_terminal() {
                     self.ensure_terminal_for_active()?;
                 }
@@ -4110,6 +4125,7 @@ impl DaemonRuntime {
                 cwd,
                 title_hint,
                 terminal_appearance,
+                insert_after,
             } => {
                 sync_terminal_identity_for_request(terminal_appearance.as_deref(), None);
                 let key = self.server.start_remote_claude_session(
@@ -4118,6 +4134,8 @@ impl DaemonRuntime {
                     cwd.as_deref(),
                     title_hint.as_deref(),
                 )?;
+                self.server
+                    .place_live_session_after(&key, insert_after.as_deref());
                 if self.server.active_session_supports_terminal() {
                     self.ensure_terminal_for_active()?;
                 }
@@ -4348,6 +4366,7 @@ impl DaemonRuntime {
                 cwd,
                 title_hint,
                 terminal_appearance,
+                insert_after,
             } => {
                 sync_terminal_identity_for_request(terminal_appearance.as_deref(), None);
                 let key = self.server.start_local_session(
@@ -4355,6 +4374,8 @@ impl DaemonRuntime {
                     cwd.as_deref(),
                     title_hint.as_deref(),
                 );
+                self.server
+                    .place_live_session_after(&key, insert_after.as_deref());
                 if self.server.active_session_supports_terminal() {
                     self.ensure_terminal_for_active()?;
                 }
@@ -6346,6 +6367,26 @@ pub fn start_ssh_session_at_with_terminal_appearance(
     title_hint: Option<&str>,
     terminal_appearance: Option<&str>,
 ) -> Result<(ServerUiSnapshot, Option<String>)> {
+    start_ssh_session_placed(
+        endpoint,
+        target,
+        prefix,
+        cwd,
+        title_hint,
+        terminal_appearance,
+        None,
+    )
+}
+
+pub fn start_ssh_session_placed(
+    endpoint: &ServerEndpoint,
+    target: &str,
+    prefix: Option<&str>,
+    cwd: Option<&str>,
+    title_hint: Option<&str>,
+    terminal_appearance: Option<&str>,
+    insert_after: Option<&str>,
+) -> Result<(ServerUiSnapshot, Option<String>)> {
     expect_snapshot(send_request(
         endpoint,
         &ServerRequest::StartSshSession {
@@ -6354,6 +6395,7 @@ pub fn start_ssh_session_at_with_terminal_appearance(
             cwd: cwd.map(ToOwned::to_owned),
             title_hint: title_hint.map(ToOwned::to_owned),
             terminal_appearance: terminal_appearance.map(ToOwned::to_owned),
+            insert_after: insert_after.map(ToOwned::to_owned),
         },
     )?)
 }
@@ -6378,6 +6420,26 @@ pub fn start_remote_codex_session_at_with_terminal_appearance(
     title_hint: Option<&str>,
     terminal_appearance: Option<&str>,
 ) -> Result<(ServerUiSnapshot, Option<String>)> {
+    start_remote_codex_session_placed(
+        endpoint,
+        target,
+        prefix,
+        cwd,
+        title_hint,
+        terminal_appearance,
+        None,
+    )
+}
+
+pub fn start_remote_codex_session_placed(
+    endpoint: &ServerEndpoint,
+    target: &str,
+    prefix: Option<&str>,
+    cwd: Option<&str>,
+    title_hint: Option<&str>,
+    terminal_appearance: Option<&str>,
+    insert_after: Option<&str>,
+) -> Result<(ServerUiSnapshot, Option<String>)> {
     expect_snapshot(send_request(
         endpoint,
         &ServerRequest::StartRemoteCodexSession {
@@ -6386,6 +6448,7 @@ pub fn start_remote_codex_session_at_with_terminal_appearance(
             cwd: cwd.map(ToOwned::to_owned),
             title_hint: title_hint.map(ToOwned::to_owned),
             terminal_appearance: terminal_appearance.map(ToOwned::to_owned),
+            insert_after: insert_after.map(ToOwned::to_owned),
         },
     )?)
 }
@@ -6398,6 +6461,26 @@ pub fn start_remote_claude_session_at_with_terminal_appearance(
     title_hint: Option<&str>,
     terminal_appearance: Option<&str>,
 ) -> Result<(ServerUiSnapshot, Option<String>)> {
+    start_remote_claude_session_placed(
+        endpoint,
+        target,
+        prefix,
+        cwd,
+        title_hint,
+        terminal_appearance,
+        None,
+    )
+}
+
+pub fn start_remote_claude_session_placed(
+    endpoint: &ServerEndpoint,
+    target: &str,
+    prefix: Option<&str>,
+    cwd: Option<&str>,
+    title_hint: Option<&str>,
+    terminal_appearance: Option<&str>,
+    insert_after: Option<&str>,
+) -> Result<(ServerUiSnapshot, Option<String>)> {
     expect_snapshot(send_request(
         endpoint,
         &ServerRequest::StartRemoteClaudeSession {
@@ -6406,6 +6489,7 @@ pub fn start_remote_claude_session_at_with_terminal_appearance(
             cwd: cwd.map(ToOwned::to_owned),
             title_hint: title_hint.map(ToOwned::to_owned),
             terminal_appearance: terminal_appearance.map(ToOwned::to_owned),
+            insert_after: insert_after.map(ToOwned::to_owned),
         },
     )?)
 }
@@ -6555,6 +6639,17 @@ pub fn start_local_session_at_with_terminal_appearance(
     title_hint: Option<&str>,
     terminal_appearance: Option<&str>,
 ) -> Result<(ServerUiSnapshot, Option<String>)> {
+    start_local_session_placed(endpoint, kind, cwd, title_hint, terminal_appearance, None)
+}
+
+pub fn start_local_session_placed(
+    endpoint: &ServerEndpoint,
+    kind: SessionKind,
+    cwd: Option<&str>,
+    title_hint: Option<&str>,
+    terminal_appearance: Option<&str>,
+    insert_after: Option<&str>,
+) -> Result<(ServerUiSnapshot, Option<String>)> {
     expect_snapshot(send_request(
         endpoint,
         &ServerRequest::StartLocalSession {
@@ -6562,6 +6657,7 @@ pub fn start_local_session_at_with_terminal_appearance(
             cwd: cwd.map(ToOwned::to_owned),
             title_hint: title_hint.map(ToOwned::to_owned),
             terminal_appearance: terminal_appearance.map(ToOwned::to_owned),
+            insert_after: insert_after.map(ToOwned::to_owned),
         },
     )?)
 }
@@ -10295,6 +10391,7 @@ mod tests {
                 cwd: Some("/home/pi/gh/yggterm".to_string()),
                 title_hint: Some("Debug".to_string()),
                 terminal_appearance: None,
+                insert_after: None,
             }),
             super::DAEMON_LONG_REQUEST_IO_TIMEOUT_MS
         );
@@ -10305,6 +10402,7 @@ mod tests {
                 cwd: None,
                 title_hint: None,
                 terminal_appearance: None,
+                insert_after: None,
             }),
             super::DAEMON_LONG_REQUEST_IO_TIMEOUT_MS
         );
