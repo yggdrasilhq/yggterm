@@ -8075,9 +8075,18 @@ pub fn retire_stale_daemons(
             }
             Err(_) => {
                 report.unreachable_count += 1;
+                // Socket-litter cleanup (run #19): a dead socket file has no
+                // listener; unlinking it is safe (a daemon removes/rebinds its
+                // own path at startup anyway), and leaving it makes every
+                // cross-daemon walk probe it forever (~600 had accumulated).
+                let removed = fs::remove_file(&path).is_ok();
                 RetireStaleDaemonOutcome {
                     socket: path.display().to_string(),
-                    status: "unreachable".to_string(),
+                    status: if removed {
+                        "removed_stale_socket".to_string()
+                    } else {
+                        "unreachable".to_string()
+                    },
                     server_version: None,
                     server_pid: None,
                     message: None,
@@ -8282,15 +8291,55 @@ fn spawn_disk_binary_version_poll(
     });
 }
 
+/// Socket-litter cleanup (run #19): unlink versioned `server-*.sock` files
+/// with no listener behind them. ~600 dead sockets had accumulated in
+/// ~/.yggterm, and every cross-daemon walk (GUI startup candidate scan,
+/// dedup prune, takeover, retire CLI) probed each one. Unlinking a dead
+/// socket is safe — a daemon that starts later removes/rebinds its own path.
+#[cfg(unix)]
+fn cleanup_dead_versioned_server_sockets(home_dir: &Path, excluded: &ServerEndpoint) -> usize {
+    let mut removed = 0_usize;
+    for path in versioned_server_status_probe_paths_excluding_endpoint(home_dir, excluded) {
+        let endpoint = ServerEndpoint::UnixSocket(path.clone());
+        if status(&endpoint).is_ok() {
+            continue;
+        }
+        if fs::remove_file(&path).is_ok() {
+            removed += 1;
+        }
+    }
+    if removed > 0 {
+        append_trace_event(
+            home_dir,
+            "daemon",
+            "lifecycle",
+            "dead_server_sockets_removed",
+            serde_json::json!({ "removed": removed }),
+        );
+    }
+    removed
+}
+
+#[cfg(not(unix))]
+fn cleanup_dead_versioned_server_sockets(_home_dir: &Path, _excluded: &ServerEndpoint) -> usize {
+    0
+}
+
 /// GATE #8 startup hook: run the superseded-daemon takeover once, off the
 /// accept path, under the runtime lock (see
-/// [`DaemonRuntime::takeover_superseded_daemon_state`]).
+/// [`DaemonRuntime::takeover_superseded_daemon_state`]), then sweep dead
+/// socket litter while the walk is warm.
 fn spawn_superseded_daemon_takeover(runtime: Arc<Mutex<DaemonRuntime>>) {
     if let Err(error) = std::thread::Builder::new()
         .name("yggterm-superseded-takeover".to_string())
         .spawn(move || {
-            let mut rt = lock_daemon_runtime(&runtime, "superseded_daemon_takeover");
-            rt.takeover_superseded_daemon_state();
+            let home_dir = {
+                let mut rt = lock_daemon_runtime(&runtime, "superseded_daemon_takeover");
+                rt.takeover_superseded_daemon_state();
+                rt.store.home_dir().to_path_buf()
+            };
+            let current_endpoint = default_endpoint(&home_dir);
+            let _ = cleanup_dead_versioned_server_sockets(&home_dir, &current_endpoint);
         })
     {
         warn!(error=%error, "failed to spawn superseded daemon takeover");
