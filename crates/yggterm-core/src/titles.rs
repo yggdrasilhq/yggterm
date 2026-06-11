@@ -449,11 +449,26 @@ impl SessionTitleResolver {
         session_id: &str,
         source_updated_at: OffsetDateTime,
     ) -> Result<bool> {
+        self.summary_needs_refresh_with_horizon(session_id, source_updated_at, TimeDuration::days(3))
+    }
+
+    /// Summary-timeline fix (2026-06-11): the fixed 3-day horizon meant a LIVE
+    /// working session refreshed its summary at most every 3 days — the
+    /// summary_timeline table never grew and summaries went stale mid-project.
+    /// Live working sessions pass a short horizon (the trigger is already
+    /// working-gated, capped per tick, and 429-paced, so cost stays bounded);
+    /// stored/remote scans keep the 3-day default.
+    pub fn summary_needs_refresh_with_horizon(
+        &self,
+        session_id: &str,
+        source_updated_at: OffsetDateTime,
+        horizon: TimeDuration,
+    ) -> Result<bool> {
         let Some(record) = self.store.get_summary_record(session_id)? else {
             return Ok(true);
         };
         Ok(looks_like_low_signal_generated_copy(&record.value)
-            || source_updated_at - record.updated_at > TimeDuration::days(3))
+            || source_updated_at - record.updated_at > horizon)
     }
 
     pub fn generate_for_context(

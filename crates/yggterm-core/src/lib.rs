@@ -543,6 +543,20 @@ impl SessionStore {
         resolver.summary_needs_refresh(session_id, source_updated_at)
     }
 
+    /// Short-horizon variant for LIVE working sessions (summary timelines).
+    pub fn summary_needs_refresh_for_live_session_id(
+        &self,
+        session_id: &str,
+        source_updated_at: OffsetDateTime,
+    ) -> Result<bool> {
+        let resolver = SessionTitleResolver::new(&self.home)?;
+        resolver.summary_needs_refresh_with_horizon(
+            session_id,
+            source_updated_at,
+            time::Duration::minutes(30),
+        )
+    }
+
     pub fn generate_precis_for_session_path(
         &self,
         settings: &AppSettings,
