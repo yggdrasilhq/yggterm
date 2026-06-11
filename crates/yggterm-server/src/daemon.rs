@@ -2990,6 +2990,13 @@ impl DaemonRuntime {
     /// 159×63 client. Latest-wins per session, one in-flight SSH per session,
     /// always off the request loop. No-op for non-remote paths.
     fn forward_remote_pty_resize(&mut self, path: &str, cols: u16, rows: u16) {
+        // Kill switch (size-war lesson: every resize writer needs one).
+        if std::env::var("YGGTERM_DISABLE_REMOTE_PTY_RESIZE_FORWARD")
+            .map(|value| !value.trim().is_empty() && value.trim() != "0")
+            .unwrap_or(false)
+        {
+            return;
+        }
         if cols == 0 || rows == 0 {
             return;
         }
