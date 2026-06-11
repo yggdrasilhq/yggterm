@@ -875,6 +875,13 @@ fn request_litellm_title(settings: &AppSettings, context: &str) -> Result<String
         Ok(response) => match response.error_for_status() {
             Ok(response) => response,
             Err(error) => {
+                // Rate limiting (HTTP 429) is TRANSIENT: falling back to a
+                // heuristic title here would persist a junk title that then
+                // permanently blocks LLM regeneration (the resolver gate sees
+                // "a title exists"). Propagate so the chore retries next tick.
+                if error.status() == Some(reqwest::StatusCode::TOO_MANY_REQUESTS) {
+                    return Err(error).context("LiteLLM rate limited (429)");
+                }
                 if let Some(title) = heuristic_title_from_context(context) {
                     return Ok(title);
                 }
@@ -941,6 +948,10 @@ fn request_litellm_precis(settings: &AppSettings, context: &str) -> Result<Strin
         Ok(response) => match response.error_for_status() {
             Ok(response) => response,
             Err(error) => {
+                // 429 is transient — never persist a heuristic over it (see title arm).
+                if error.status() == Some(reqwest::StatusCode::TOO_MANY_REQUESTS) {
+                    return Err(error).context("LiteLLM rate limited (429)");
+                }
                 if let Some(precis) = heuristic_precis_from_context(context) {
                     return Ok(precis);
                 }
@@ -1002,6 +1013,10 @@ fn request_litellm_summary(settings: &AppSettings, context: &str) -> Result<Stri
         Ok(response) => match response.error_for_status() {
             Ok(response) => response,
             Err(error) => {
+                // 429 is transient — never persist a heuristic over it (see title arm).
+                if error.status() == Some(reqwest::StatusCode::TOO_MANY_REQUESTS) {
+                    return Err(error).context("LiteLLM rate limited (429)");
+                }
                 if let Some(summary) = heuristic_summary_from_context(context) {
                     return Ok(summary);
                 }

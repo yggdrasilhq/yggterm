@@ -46,6 +46,12 @@ pub const SERVER_PROTOCOL_VERSION: &str = env!("CARGO_PKG_VERSION");
 const BACKGROUND_COPY_CHORE_MS: u64 = 12_000;
 const BACKGROUND_COPY_MAX_IDLE_CHORE_MS: u64 = 60_000;
 const BACKGROUND_COPY_BUDGET_PER_TICK: usize = 23;
+// Endpoint pacing ([[spec-title-summary-working-indicator]]): llm.example.com
+// 429s under quick successive calls; each generation may be 2 LLM calls.
+const BACKGROUND_COPY_LLM_GENERATIONS_PER_TICK: usize = 3;
+// A session that produced PTY output within this window counts as "working"
+// for the title trigger even if the esc-to-interrupt footer just cleared.
+const BACKGROUND_COPY_WORKING_RECENT_MS: u64 = 30_000;
 const DAEMON_ACCEPT_POLL_MS: u64 = 1000;
 const DEFAULT_DAEMON_IDLE_SHUTDOWN_MS: u64 = 90_000;
 const DEFAULT_TERMINAL_IDLE_TRIM_AFTER_MS: u64 = 45_000;
@@ -5377,10 +5383,21 @@ fn session_cwd_for_background_copy(session: &ManagedSessionView) -> String {
 fn collect_live_copy_candidates(
     store: &SessionStore,
     live_sessions: &[ManagedSessionView],
+    working_paths: &HashSet<String>,
     out: &mut Vec<BackgroundCopyCandidate>,
 ) {
     for session in live_sessions {
         if session.session_path.starts_with("remote-session://") {
+            continue;
+        }
+        // Working-indicator trigger ([[spec-title-summary-working-indicator]]):
+        // a LIVE agent session becomes a title/summary candidate only while it
+        // is (recently) WORKING — generation rides real turns instead of
+        // scanning idle sessions every tick. Documents have no PTY and keep
+        // the old path.
+        if session.kind != SessionKind::Document
+            && !working_paths.contains(&session.session_path)
+        {
             continue;
         }
         let generation_context = if session.kind == SessionKind::Document {
@@ -5494,12 +5511,21 @@ fn collect_remote_copy_candidates(
 /// title forever. Sync the live row's title from the CC JSONL whenever CC's
 /// title exists and differs (yggterm renames are written back into the JSONL,
 /// so the JSONL stays the single source of truth).
-fn collect_live_cc_title_syncs(live_sessions: &[ManagedSessionView]) -> Vec<BackgroundCopyUpdate> {
+fn collect_live_cc_title_syncs(
+    live_sessions: &[ManagedSessionView],
+    working_paths: &HashSet<String>,
+) -> Vec<BackgroundCopyUpdate> {
     let mut updates = Vec::new();
     for session in live_sessions {
         if session.kind != SessionKind::ClaudeCode
             || !session.session_path.starts_with("local://")
         {
+            continue;
+        }
+        // Spec: pick up CC's own title (incl. /rename mid-session) on WORKING
+        // turns — a rename necessarily makes the session active+working, so
+        // polling here is complete coverage with zero idle cost.
+        if !working_paths.contains(&session.session_path) {
             continue;
         }
         let Some(jsonl) = local_cc_session_jsonl_path(&session.id) else {
@@ -5510,6 +5536,19 @@ fn collect_live_cc_title_syncs(live_sessions: &[ManagedSessionView]) -> Vec<Back
         };
         let title = title.trim().to_string();
         if !title.is_empty() && title != session.title {
+            if let Ok(home) = crate::resolve_yggterm_home() {
+                append_trace_event(
+                    &home,
+                    "daemon",
+                    "title_trigger",
+                    "cc_title_pickup",
+                    serde_json::json!({
+                        "session_path": session.session_path,
+                        "previous_title": session.title,
+                        "new_title": title,
+                    }),
+                );
+            }
             updates.push(BackgroundCopyUpdate {
                 session_path: session.session_path.clone(),
                 title: Some(title),
@@ -5562,6 +5601,20 @@ fn copy_target_context(
     fetch_remote_generation_context(target, storage_path).map(Some)
 }
 
+fn background_copy_error_is_rate_limit(error: &anyhow::Error) -> bool {
+    let rate_limited = format!("{error:#}").contains("429");
+    if rate_limited && let Ok(home) = crate::resolve_yggterm_home() {
+        append_trace_event(
+            &home,
+            "daemon",
+            "title_trigger",
+            "rate_limited_backoff",
+            serde_json::json!({ "error": format!("{error:#}") }),
+        );
+    }
+    rate_limited
+}
+
 fn build_background_copy_updates(
     store: &SessionStore,
     settings: &AppSettings,
@@ -5569,14 +5622,21 @@ fn build_background_copy_updates(
     live_sessions: &[ManagedSessionView],
     remote_machines: &[RemoteMachineSnapshot],
     ssh_targets: &[SshConnectTarget],
+    working_paths: &HashSet<String>,
 ) -> Result<Vec<BackgroundCopyUpdate>> {
     let mut candidates = Vec::new();
     collect_local_copy_candidates(local_root, &mut candidates);
-    collect_live_copy_candidates(store, live_sessions, &mut candidates);
+    collect_live_copy_candidates(store, live_sessions, working_paths, &mut candidates);
     candidates.extend(collect_remote_copy_candidates(remote_machines));
 
-    let mut updates = collect_live_cc_title_syncs(live_sessions);
+    let mut updates = collect_live_cc_title_syncs(live_sessions, working_paths);
     let mut seen_candidates = HashSet::new();
+    // Endpoint pacing: the litellm endpoint 429s under quick successive calls
+    // (live-observed 2026-06-11), and each generation can be 2 LLM calls
+    // (title+summary). Cap generations per tick; on a rate-limit error stop
+    // generating for the rest of the tick (the chore retries in ~12s).
+    let mut llm_generations_this_tick = 0usize;
+    let mut rate_limited_this_tick = false;
     for candidate in candidates
         .into_iter()
         .filter(|candidate| seen_candidates.insert(candidate.session_path.clone()))
@@ -5612,27 +5672,59 @@ fn build_background_copy_updates(
             continue;
         }
 
+        if rate_limited_this_tick || llm_generations_this_tick >= BACKGROUND_COPY_LLM_GENERATIONS_PER_TICK {
+            continue;
+        }
+        llm_generations_this_tick += 1;
+        if let Ok(home) = crate::resolve_yggterm_home() {
+            append_trace_event(
+                &home,
+                "daemon",
+                "title_trigger",
+                "generation_begin",
+                serde_json::json!({
+                    "session_path": candidate.session_path,
+                    "title_missing": title_missing,
+                    "summary_missing": summary_missing,
+                    "live_local_agent": candidate.live_local_agent,
+                    "generation_index_this_tick": llm_generations_this_tick,
+                }),
+            );
+        }
+
         let maybe_context = copy_target_context(&candidate, ssh_targets)?;
         let (title, summary) = if let Some(context) = maybe_context {
             let title = if title_missing {
-                store.generate_title_for_context(
+                match store.generate_title_for_context(
                     settings,
                     &candidate.session_id,
                     &candidate.cwd,
                     &context,
                     false,
-                )?
+                ) {
+                    Ok(title) => title,
+                    Err(error) => {
+                        rate_limited_this_tick |= background_copy_error_is_rate_limit(&error);
+                        None
+                    }
+                }
             } else {
                 None
             };
-            let summary = if summary_missing {
-                store.generate_summary_for_context(
+            let summary = if summary_missing && !rate_limited_this_tick {
+                match store.generate_summary_for_context(
                     settings,
                     &candidate.session_id,
                     &candidate.cwd,
                     &context,
                     false,
-                )?
+                ) {
+                    Ok(summary) => summary,
+                    Err(error) => {
+                        rate_limited_this_tick |= background_copy_error_is_rate_limit(&error);
+                        None
+                    }
+                }
             } else {
                 None
             };
@@ -5659,12 +5751,24 @@ fn build_background_copy_updates(
                 .filter(|_| candidate.remote_machine.is_none())
                 .unwrap_or(&candidate.session_path);
             let title = if title_missing {
-                store.generate_title_for_session_path(settings, source_path, false)?
+                match store.generate_title_for_session_path(settings, source_path, false) {
+                    Ok(title) => title,
+                    Err(error) => {
+                        rate_limited_this_tick |= background_copy_error_is_rate_limit(&error);
+                        None
+                    }
+                }
             } else {
                 None
             };
-            let summary = if summary_missing {
-                store.generate_summary_for_session_path(settings, source_path, false)?
+            let summary = if summary_missing && !rate_limited_this_tick {
+                match store.generate_summary_for_session_path(settings, source_path, false) {
+                    Ok(summary) => summary,
+                    Err(error) => {
+                        rate_limited_this_tick |= background_copy_error_is_rate_limit(&error);
+                        None
+                    }
+                }
             } else {
                 None
             };
@@ -5683,10 +5787,34 @@ fn build_background_copy_updates(
 }
 
 fn run_background_copy_chore(runtime: &Arc<Mutex<DaemonRuntime>>) -> Result<usize> {
-    let (store, settings, local_root, live_sessions, remote_machines, ssh_targets, perf_home) = {
+    let (store, settings, local_root, live_sessions, remote_machines, ssh_targets, perf_home, working_paths) = {
         let runtime = lock_daemon_runtime(runtime, "run_background_copy_chore_read");
         let settings = runtime.store.load_settings().unwrap_or_default();
         let local_root = runtime.store.load_codex_tree(&settings)?;
+        // Working-indicator trigger: a live session counts as "working" when
+        // its vt100 screen shows the agent working (esc-to-interrupt SSOT) or
+        // its PTY produced output within the recent window — generation rides
+        // real turns, never idle sessions.
+        let working_paths: HashSet<String> = runtime
+            .server
+            .live_sessions()
+            .iter()
+            .filter(|session| {
+                let runtime_path = runtime.terminal_runtime_key_for_path(&session.session_path);
+                let screen_working = runtime
+                    .terminals
+                    .session_screen_snapshot(&runtime_path)
+                    .is_some_and(|screen| {
+                        yggterm_core::screen_text_shows_agent_working(&screen)
+                    });
+                let recently_active = runtime
+                    .terminals
+                    .session_idle_for_ms(&runtime_path)
+                    .is_some_and(|idle_ms| idle_ms < BACKGROUND_COPY_WORKING_RECENT_MS);
+                screen_working || recently_active
+            })
+            .map(|session| session.session_path.clone())
+            .collect();
         (
             runtime.store.clone(),
             settings,
@@ -5695,6 +5823,7 @@ fn run_background_copy_chore(runtime: &Arc<Mutex<DaemonRuntime>>) -> Result<usiz
             runtime.server.remote_machines().to_vec(),
             runtime.server.ssh_targets().to_vec(),
             runtime.store.home_dir().to_path_buf(),
+            working_paths,
         )
     };
     let perf = PerfSpan::start(&perf_home, "daemon", "background_copy_chore");
@@ -5705,6 +5834,7 @@ fn run_background_copy_chore(runtime: &Arc<Mutex<DaemonRuntime>>) -> Result<usiz
         &live_sessions,
         &remote_machines,
         &ssh_targets,
+        &working_paths,
     )?;
     perf.finish(serde_json::json!({
         "updates": updates.len(),
@@ -10562,8 +10692,74 @@ mod tests {
             );
             server
         };
-        let updates = super::collect_live_cc_title_syncs(&server.live_sessions());
+        // Even while "working", a CC session with no JSONL yields no update.
+        let working: std::collections::HashSet<String> = server
+            .live_sessions()
+            .iter()
+            .map(|s| s.session_path.clone())
+            .collect();
+        let updates = super::collect_live_cc_title_syncs(&server.live_sessions(), &working);
         assert!(updates.is_empty());
+        // And a NON-working CC session is never polled at all (the working
+        // indicator is the trigger — spec-title-summary-working-indicator).
+        let idle = std::collections::HashSet::new();
+        let updates = super::collect_live_cc_title_syncs(&server.live_sessions(), &idle);
+        assert!(updates.is_empty());
+    }
+
+    #[test]
+    fn live_title_candidates_gate_on_working_indicator() {
+        // spec-title-summary-working-indicator: a live agent session becomes
+        // a title candidate ONLY while working; idle sessions are never
+        // scanned or sent to the LLM.
+        let tree = yggterm_core::SessionNode {
+            kind: yggterm_core::SessionNodeKind::Group,
+            name: "sessions".to_string(),
+            path: std::path::PathBuf::from("/"),
+            ..Default::default()
+        };
+        let mut server = crate::YggtermServer::new(
+            &tree,
+            false,
+            crate::GhosttyHostSupport::shadow("test".to_string(), false, false),
+            yggui_contract::UiTheme::ZedLight,
+        );
+        let key = server.start_local_session(
+            crate::SessionKind::Codex,
+            Some("/home/pi"),
+            Some("home/pi codex"),
+        );
+        // Give the live session a Storage JSONL so it would qualify as a
+        // live-local-agent candidate (write a real temp file).
+        let dir = std::env::temp_dir().join("yggterm-test-title-gate");
+        let _ = std::fs::create_dir_all(&dir);
+        let jsonl = dir.join("rollout-test-title-gate.jsonl");
+        let _ = std::fs::write(&jsonl, "{}\n");
+        if let Some(session) = server.sessions.get_mut(&key) {
+            crate::upsert_session_metadata(
+                &mut session.metadata,
+                "Storage",
+                jsonl.to_string_lossy().to_string(),
+            );
+        }
+        let store = yggterm_core::SessionStore::open_or_init().expect("store");
+        let mut out = Vec::new();
+        // Idle → no candidate.
+        let idle = std::collections::HashSet::new();
+        super::collect_live_copy_candidates(&store, &server.live_sessions(), &idle, &mut out);
+        assert!(
+            out.iter().all(|c| c.session_path != key),
+            "idle live session must not become a title candidate"
+        );
+        // Working → candidate appears.
+        let mut out = Vec::new();
+        let working: std::collections::HashSet<String> = [key.clone()].into_iter().collect();
+        super::collect_live_copy_candidates(&store, &server.live_sessions(), &working, &mut out);
+        assert!(
+            out.iter().any(|c| c.session_path == key && c.live_local_agent),
+            "working live agent session must become a title candidate"
+        );
+        let _ = std::fs::remove_file(&jsonl);
     }
 
     #[test]
