@@ -61672,16 +61672,38 @@ fn terminal_eval_script_with_canvas_renderer(
                 if (!viewportElement) {{
                     return;
                 }}
-                const rowHeightPx = Math.max(1, terminalCssCellHeight());
                 if (debug) {{
                     debug.viewport_scroll_top_before = Number(viewportElement.scrollTop || 0);
                 }}
                 // Record the expected landing row BEFORE the write: the scroll
                 // event this triggers arrives async (see A.b.3 note at the
                 // declaration) and must not read as a user scroll-up.
-                pendingProgrammaticViewportTargetY = Math.max(0, Number(targetViewportY || 0));
+                const target = Math.max(0, Number(targetViewportY || 0));
+                pendingProgrammaticViewportTargetY = target;
                 pendingProgrammaticViewportAtMs = Date.now();
-                viewportElement.scrollTop = Math.max(0, Number(targetViewportY || 0)) * rowHeightPx;
+                // BOTTOM-OFFSET FIX (charts live catch 2026-06-11: "bottom sits
+                // ~2 lines above the actual bottom" + bg→fg flicker dance):
+                // scrollTop = rows × cssRowHeight accumulates the fractional
+                // cell-height error over a tall scrollback (~2 rows per 1000).
+                // A bottom target uses the EXACT scroll extent; mid-buffer
+                // targets derive the per-row height from the scroll geometry
+                // itself (scrollHeight / total buffer rows) so the multiplied
+                // error cannot accumulate.
+                const buf = term && term.buffer && term.buffer.active ? term.buffer.active : null;
+                const baseY = buf ? Math.max(0, Number(buf.baseY || 0)) : 0;
+                const maxScrollTop = Math.max(
+                    0,
+                    Number(viewportElement.scrollHeight || 0) - Number(viewportElement.clientHeight || 0)
+                );
+                if (buf && target >= baseY && maxScrollTop > 0) {{
+                    viewportElement.scrollTop = maxScrollTop;
+                }} else {{
+                    const totalRows = baseY + Math.max(1, Number(term && term.rows ? term.rows : 1));
+                    const exactRowHeight = totalRows > 0 && Number(viewportElement.scrollHeight || 0) > 0
+                        ? Number(viewportElement.scrollHeight) / totalRows
+                        : Math.max(1, terminalCssCellHeight());
+                    viewportElement.scrollTop = target * exactRowHeight;
+                }}
                 if (debug) {{
                     debug.viewport_scroll_top_after = Number(viewportElement.scrollTop || 0);
                 }}
@@ -74902,9 +74924,10 @@ mod tests {
                 .contains("const viewportElement = targetHost.querySelector(\".xterm-viewport\");"),
             "wheel handler must not reference the attach callback parameter outside its scope"
         );
-        assert!(script.contains(
-            "viewportElement.scrollTop = Math.max(0, Number(targetViewportY || 0)) * rowHeightPx;"
-        ));
+        // Bottom targets snap to the exact scroll extent; mid-buffer targets
+        // use geometry-derived row height (charts 2-line bottom-offset fix).
+        assert!(script.contains("viewportElement.scrollTop = maxScrollTop;"));
+        assert!(script.contains("viewportElement.scrollTop = target * exactRowHeight;"));
         assert!(script.contains("lastWheelScrollDebug = wheelDebug;"));
         assert!(
             script
@@ -76841,7 +76864,7 @@ mod tests {
         // detector needs the expected-landing-row latch to reject it.
         let theme = terminal_theme(UiTheme::ZedLight, palette(UiTheme::ZedLight), 13.0, "");
         let script = terminal_eval_script("yggterm-terminal-test", &theme, true);
-        assert!(script.contains("pendingProgrammaticViewportTargetY = Math.max(0, Number(targetViewportY || 0));"));
+        assert!(script.contains("pendingProgrammaticViewportTargetY = target;"));
         assert!(script.contains("const asyncProgrammaticScrollMatch ="));
         assert!(script.contains("&& !asyncProgrammaticScrollMatch"));
         // The latch is consumed on match so a real user scroll right after a
