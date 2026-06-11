@@ -6651,6 +6651,28 @@ impl YggtermServer {
             session.title = title_override;
         }
         session.session_path = key.to_string();
+        // Creation hook (phantom-spawn investigation, TODO-2/Bug-3 family):
+        // every live-session birth through this chokepoint is traced with the
+        // prior active pointer so a phantom UUIDv4 spawn (user clicked an
+        // EXISTING session, a NEW one appeared, e.g. local://fe0ea2be
+        // 2026-06-10) pins its upstream on the next occurrence.
+        if let Ok(home) = resolve_yggterm_home() {
+            append_trace_event(
+                &home,
+                "server",
+                "session",
+                "live_session_birth",
+                serde_json::json!({
+                    "key": key,
+                    "kind": format!("{kind:?}"),
+                    "title": session.title,
+                    "cwd": target.cwd,
+                    "ssh_target": target.ssh_target,
+                    "launch_now": launch_now,
+                    "prior_active": self.active_session_path,
+                }),
+            );
+        }
         self.sessions.insert(key.to_string(), session);
         self.live_session_order.retain(|existing| existing != key);
         self.live_session_order.insert(0, key.to_string());
