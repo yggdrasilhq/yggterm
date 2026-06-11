@@ -2891,8 +2891,22 @@ impl DaemonRuntime {
     fn takeover_superseded_daemon_state(&mut self) {
         let current_endpoint = default_endpoint(self.store.home_dir());
         let current_triple = parse_daemon_version_triple(SERVER_PROTOCOL_VERSION);
+        let normalize = |key: &str| -> String {
+            if let Some(id) = crate::local_runtime_id_from_key(key) {
+                format!("id::{id}")
+            } else {
+                key.to_string()
+            }
+        };
+        let mut existing: HashSet<String> = self
+            .server
+            .live_session_order
+            .iter()
+            .map(|key| normalize(key))
+            .collect();
         let mut prepared = Vec::new();
         let mut prepare_errors = Vec::new();
+        let mut imported_keys = Vec::new();
         for (endpoint, status) in reachable_versioned_daemon_statuses_excluding_endpoint(
             self.store.home_dir(),
             &current_endpoint,
@@ -2912,55 +2926,36 @@ impl DaemonRuntime {
             }
             match prepare_update_restart(&endpoint) {
                 Ok(_) => prepared.push(owner_endpoint_label(&endpoint)),
-                Err(error) => prepare_errors.push(serde_json::json!({
-                    "endpoint": owner_endpoint_label(&endpoint),
-                    "error": error.to_string(),
-                })),
+                Err(error) => {
+                    prepare_errors.push(serde_json::json!({
+                        "endpoint": owner_endpoint_label(&endpoint),
+                        "error": error.to_string(),
+                    }));
+                    continue;
+                }
+            }
+            // Merge after EACH prepare: every PrepareUpdateRestart rewrites
+            // the shared state file wholesale, so reading only after the last
+            // one would lose rows unique to an intermediate daemon.
+            let saved = match load_persisted_state(&self.state_path) {
+                Ok(Some(saved)) => saved,
+                _ => continue,
+            };
+            for live in saved.live_sessions {
+                let normalized = normalize(&live.key);
+                if existing.contains(&normalized)
+                    || !crate::persisted_live_session_is_recoverable(&live)
+                {
+                    continue;
+                }
+                let key = live.key.clone();
+                self.server.restore_live_session(live);
+                existing.insert(normalized);
+                imported_keys.push(key);
             }
         }
-        if prepared.is_empty() {
-            if !prepare_errors.is_empty() {
-                append_trace_event(
-                    self.store.home_dir(),
-                    "daemon",
-                    "lifecycle",
-                    "superseded_daemon_takeover",
-                    serde_json::json!({
-                        "prepared": prepared,
-                        "prepare_errors": prepare_errors,
-                        "imported_keys": Vec::<String>::new(),
-                    }),
-                );
-            }
+        if prepared.is_empty() && prepare_errors.is_empty() {
             return;
-        }
-        let saved = match load_persisted_state(&self.state_path) {
-            Ok(Some(saved)) => saved,
-            _ => return,
-        };
-        let normalize = |key: &str| -> String {
-            if let Some(id) = crate::local_runtime_id_from_key(key) {
-                format!("id::{id}")
-            } else {
-                key.to_string()
-            }
-        };
-        let existing: HashSet<String> = self
-            .server
-            .live_session_order
-            .iter()
-            .map(|key| normalize(key))
-            .collect();
-        let mut imported_keys = Vec::new();
-        for live in saved.live_sessions {
-            if existing.contains(&normalize(&live.key))
-                || !crate::persisted_live_session_is_recoverable(&live)
-            {
-                continue;
-            }
-            let key = live.key.clone();
-            self.server.restore_live_session(live);
-            imported_keys.push(key);
         }
         if !imported_keys.is_empty() {
             let _ = self.persist();
