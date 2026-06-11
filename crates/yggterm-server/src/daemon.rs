@@ -809,6 +809,32 @@ fn preserved_owner_error_is_transport_shaped(error: &anyhow::Error) -> bool {
         || error_text.contains("timed out")
 }
 
+/// The version named by the direct-install state on disk, if readable.
+fn staged_direct_install_version() -> Option<String> {
+    let root = yggterm_core::direct_install_root().ok()?;
+    let raw = fs::read_to_string(root.join("install-state.json")).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    value
+        .get("active_version")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+}
+
+/// A client close that happens while an update is staged is part of an update
+/// restart, not a user abandoning their sessions — preserve non-keep-alive
+/// live sessions (gate #5 of the persistence saga).
+fn client_close_should_preserve_for_update(
+    update_restart_state_written: bool,
+    staged_version: Option<&str>,
+    running_version: &str,
+) -> bool {
+    update_restart_state_written
+        || staged_version
+            .map(str::trim)
+            .filter(|version| !version.is_empty())
+            .is_some_and(|version| version != running_version)
+}
+
 fn owner_endpoint_label(endpoint: &ServerEndpoint) -> String {
     PreservedOwnerEndpoint::from_endpoint(endpoint).label()
 }
@@ -3712,6 +3738,39 @@ impl DaemonRuntime {
                 }
             }
             ServerRequest::PrepareClientClose => {
+                // GATE #5 ROOT (persistence saga, 2026-06-11): a GUI restart
+                // during an UPDATE looks exactly like the user closing the
+                // GUI — this handler then removes every non-keep-alive live
+                // session "legitimately" per [[session-keep-alive-spec]]
+                // ("only user-closing-GUI may kill non-keep-alive sessions").
+                // Every deploy swap nuked the local rows through this front
+                // door, which is why no persistence gate ever traced. When an
+                // update is staged (install-state names a different version)
+                // or the update-restart snapshot was already written, the
+                // close is part of an update restart: preserve everything.
+                let staged_version = staged_direct_install_version();
+                if client_close_should_preserve_for_update(
+                    self.update_restart_state_written,
+                    staged_version.as_deref(),
+                    SERVER_PROTOCOL_VERSION,
+                ) {
+                    append_trace_event(
+                        self.store.home_dir(),
+                        "daemon",
+                        "lifecycle",
+                        "client_close_preserved_for_update",
+                        serde_json::json!({
+                            "staged_version": staged_version,
+                            "running_version": SERVER_PROTOCOL_VERSION,
+                            "update_restart_state_written": self.update_restart_state_written,
+                        }),
+                    );
+                    return Ok(ServerResponse::Ack {
+                        message: Some(
+                            "update staged; preserving non-keep-alive live sessions".to_string(),
+                        ),
+                    });
+                }
                 let force_after =
                     std::time::Duration::from_secs(CLIENT_CLOSE_FORCE_SHUTDOWN_AFTER_SECS);
                 let paths = self.server.non_keep_alive_live_session_paths();
@@ -10845,6 +10904,32 @@ mod tests {
             "working live agent session must become a title candidate"
         );
         let _ = std::fs::remove_file(&jsonl);
+    }
+
+    #[test]
+    fn client_close_preserves_sessions_while_an_update_is_staged() {
+        // Gate #5: kill -TERM on the GUI during a deploy looked like a user
+        // close and removed every non-keep-alive local row through the
+        // spec'd client-close path. A staged version difference (or the
+        // update-state latch) marks the close as update-related.
+        assert!(super::client_close_should_preserve_for_update(
+            false,
+            Some("2.8.88"),
+            "2.8.87"
+        ));
+        assert!(super::client_close_should_preserve_for_update(
+            true, None, "2.8.87"
+        ));
+        // Same version staged + no latch = a genuine user close: spec says
+        // non-keep-alive sessions may be removed.
+        assert!(!super::client_close_should_preserve_for_update(
+            false,
+            Some("2.8.87"),
+            "2.8.87"
+        ));
+        assert!(!super::client_close_should_preserve_for_update(
+            false, None, "2.8.87"
+        ));
     }
 
     #[test]
