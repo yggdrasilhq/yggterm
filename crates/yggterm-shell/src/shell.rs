@@ -55388,6 +55388,7 @@ async fn terminal_ensure_with_retry_async(
     let max_attempts = terminal_ensure_max_attempts(&session_path);
     loop {
         attempts += 1;
+        let attempt_started_ms = current_millis();
         let ensure_result = match tokio::time::timeout(
             Duration::from_millis(attempt_timeout_ms),
             terminal_ensure_async(endpoint.clone(), session_path.clone(), trace_home),
@@ -55399,6 +55400,29 @@ async fn terminal_ensure_with_retry_async(
                 "terminal ensure timed out after {attempt_timeout_ms}ms for {session_path}"
             )),
         };
+        // Per-attempt outcome trace (60s-gate incident 2026-06-11): a reveal
+        // of dev/019ca2da sat behind a 62s ensure while the daemon had
+        // finished its handler in <2s, and the existing traces (only
+        // ensure_retry_recovered on success-after-retry) could not
+        // distinguish "one stuck attempt" from "timeout retries". Trace every
+        // attempt that is slow or failed so the next occurrence pins which.
+        let attempt_elapsed_ms = current_millis().saturating_sub(attempt_started_ms);
+        if attempt_elapsed_ms >= 2_000 || ensure_result.is_err() {
+            append_trace_event(
+                trace_home,
+                "ui",
+                "terminal_mount",
+                "ensure_attempt_outcome",
+                json!({
+                    "session_path": session_path,
+                    "attempt": attempts,
+                    "elapsed_ms": attempt_elapsed_ms,
+                    "attempt_timeout_ms": attempt_timeout_ms,
+                    "ok": ensure_result.is_ok(),
+                    "error": ensure_result.as_ref().err().map(|e| e.to_string()),
+                }),
+            );
+        }
         match ensure_result {
             Ok(result) => {
                 if attempts > 1 {
