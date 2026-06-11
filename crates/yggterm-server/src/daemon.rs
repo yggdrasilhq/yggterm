@@ -3802,9 +3802,6 @@ impl DaemonRuntime {
                 let _ = self.terminals.resize(&runtime_path, cols, nudge_rows);
             }
             let resized = self.terminals.resize(&runtime_path, cols, rows);
-            // Run #19: the mismatch resync must also reach the REMOTE
-            // daemon's PTY — the squish lives there, not in the attachment.
-            self.forward_remote_pty_resize(path, cols, rows);
             if let Ok(home) = crate::resolve_yggterm_home() {
                 append_trace_event(
                     &home,
@@ -3831,6 +3828,15 @@ impl DaemonRuntime {
             && self.server.record_session_pty_grid(path, cols, rows)
         {
             let _ = self.persist_state_only();
+        }
+        // Run #19: EVERY ensure of a remote session pins the REMOTE daemon's
+        // PTY to the known grid — not just the local-mismatch resync. The
+        // squish lives on the remote owner, where the local attachment can be
+        // correct while the remote runtime was recreated at DEFAULT (the
+        // local-mismatch gate never fires then). Latest-wins + single
+        // in-flight makes this cheap and idempotent; no-op for local paths.
+        if let Some((cols, rows)) = effective_initial_size {
+            self.forward_remote_pty_resize(path, cols, rows);
         }
         if let Ok(home) = crate::resolve_yggterm_home() {
             append_trace_event(
@@ -10314,13 +10320,14 @@ mod tests {
             resize_block.contains("forward_remote_pty_resize"),
             "TerminalResize must forward the grid to the remote daemon's PTY"
         );
-        let resync_block = source
-            .split("reattach_grid_resync")
-            .next()
-            .expect("ensure resync present");
+        let ensure_block = source
+            .split("RECORD-ON-CREATE (born-at-correct-size invariant)")
+            .nth(1)
+            .and_then(|suffix| suffix.split("ensure_session_end").next())
+            .expect("ensure record-on-create block present");
         assert!(
-            resync_block.contains("self.forward_remote_pty_resize(path, cols, rows);"),
-            "the ensure mismatch resync must forward the grid to the remote daemon's PTY"
+            ensure_block.contains("self.forward_remote_pty_resize(path, cols, rows);"),
+            "EVERY ensure of a remote session must forward the grid to the remote daemon's PTY"
         );
     }
 
