@@ -7677,19 +7677,27 @@ fn terminal_runtime_key_is_remote_hosted(key: &str) -> bool {
 }
 
 /// Per [[bug-class-old-daemon-never-retires]]: session-safe coverage rule for
-/// retiring a STALE daemon that still lists terminal sessions. Safe iff every
-/// key the stale daemon holds is (a) also present in the current daemon's
-/// records (owned or preserved — no session record is lost), and (b) either
-/// remote-hosted (its PTY lives on the remote machine) or actually OWNED by
-/// the current daemon (the stale copy is a superseded duplicate runtime).
-/// A stale daemon holding any local PTY key the current daemon does not own
-/// stays running. A stale daemon reporting sessions without listing keys
-/// cannot be verified and stays running.
+/// retiring a STALE daemon that still lists terminal sessions. Two legs:
+/// (a) COVERAGE — every key the stale daemon lists (owned + preserved) must
+///     also be present in the current daemon's records, so no session record
+///     is lost; and
+/// (b) OWNERSHIP SAFETY — every key the stale daemon actually OWNS (has a
+///     live runtime for) must be remote-hosted (the PTY lives on the remote
+///     machine's daemon; the attachment respawns on demand) or OWNED by the
+///     current daemon (the stale copy is a superseded duplicate runtime).
+/// Preserved-only records carry no process resources (the preserved-owner
+/// registry is a shared file, and there is no fd handoff), so a stale daemon
+/// with zero owned runtimes is retire-safe once coverage holds — the jojo
+/// 2.8.87 lingering duplicate held 14 preserved-only records for hours.
+/// A daemon reporting counts above its key lists cannot be verified and
+/// stays running.
 pub fn stale_daemon_retire_covered_by_current(
     current: &ServerRuntimeStatus,
     stale: &ServerRuntimeStatus,
 ) -> bool {
-    if stale.terminal_session_count > stale.terminal_session_keys.len() {
+    if stale.terminal_session_count > stale.terminal_session_keys.len()
+        || stale.owned_terminal_session_count > stale.owned_terminal_session_keys.len()
+    {
         return false;
     }
     let covered: HashSet<&str> = current
@@ -7697,15 +7705,18 @@ pub fn stale_daemon_retire_covered_by_current(
         .iter()
         .map(String::as_str)
         .collect();
-    let owned: HashSet<&str> = current
+    let owned_by_current: HashSet<&str> = current
         .owned_terminal_session_keys
         .iter()
         .map(String::as_str)
         .collect();
-    stale.terminal_session_keys.iter().all(|key| {
-        covered.contains(key.as_str())
-            && (terminal_runtime_key_is_remote_hosted(key) || owned.contains(key.as_str()))
-    })
+    stale
+        .terminal_session_keys
+        .iter()
+        .all(|key| covered.contains(key.as_str()))
+        && stale.owned_terminal_session_keys.iter().all(|key| {
+            terminal_runtime_key_is_remote_hosted(key) || owned_by_current.contains(key.as_str())
+        })
 }
 
 /// Per [[bug-class-old-daemon-never-retires]]: yggterm-headless processes
@@ -9966,6 +9977,26 @@ mod tests {
         let mut stale = runtime_status_with_keys(&[], &[]);
         stale.terminal_session_count = 3;
         assert!(!stale_daemon_retire_covered_by_current(&current, &stale));
+    }
+
+    // The live jojo 2.8.87 shape: a stale daemon with ZERO owned runtimes
+    // holding only preserved-owner records (incl. local:// and live:: keys)
+    // carries no process resources — retire-safe once the current daemon
+    // covers every key.
+    #[test]
+    fn stale_daemon_with_preserved_only_records_is_retire_safe() {
+        use super::stale_daemon_retire_covered_by_current;
+        let keys = [
+            "live::186f0205-7f4b-4086-a0b1-8a3ed0b83ed6",
+            "local://019e74a0-74db-7fc2-8ae6-00ef153f594e",
+            "remote-session://dev/019e0339",
+        ];
+        let current = runtime_status_with_keys(&[], &keys);
+        let stale = runtime_status_with_keys(&[], &keys);
+        assert!(stale_daemon_retire_covered_by_current(&current, &stale));
+        // …but the same shape with one key the current daemon lacks stays.
+        let partial = runtime_status_with_keys(&[], &keys[..2]);
+        assert!(!stale_daemon_retire_covered_by_current(&partial, &stale));
     }
     use std::fs;
     use std::io::Write;
