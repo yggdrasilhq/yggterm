@@ -63,6 +63,8 @@ const DAEMON_REQUEST_IO_TIMEOUT_MS: u64 = 10_000;
 const DAEMON_LONG_REQUEST_IO_TIMEOUT_MS: u64 = 60_000;
 const DAEMON_CLIENT_REQUEST_READ_TIMEOUT_MS: u64 = 2_000;
 const REMOTE_ATTACH_STARTUP_GRACE_MS: u64 = 900;
+// Negative-cache window for dead preserved-owner sockets (post-swap shadow fix).
+const PRESERVED_OWNER_UNREACHABLE_CACHE_MS: u64 = 60_000;
 const REMOTE_START_CODEX_ATTACH_STARTUP_GRACE_MS: u64 = 18_000;
 const CLIENT_CLOSE_FORCE_SHUTDOWN_AFTER_SECS: u64 = 60 * 60;
 const EXPLICIT_REMOTE_SESSION_CLOSE_FORCE_AFTER_SECS: u64 = 2;
@@ -795,6 +797,16 @@ impl PreservedOwnerEndpoint {
             Self::Tcp { host, port } => format!("{host}:{port}"),
         }
     }
+}
+
+/// Transport-shaped owner-probe failures (timeout / dead socket): the owner
+/// is unreachable; a status() re-probe would burn another full request
+/// timeout against the same dead socket (the post-swap 30s deaf window).
+fn preserved_owner_error_is_transport_shaped(error: &anyhow::Error) -> bool {
+    let error_text = format!("{error:#}").to_ascii_lowercase();
+    error_text.contains("reading daemon response")
+        || error_text.contains("connecting to")
+        || error_text.contains("timed out")
 }
 
 fn owner_endpoint_label(endpoint: &ServerEndpoint) -> String {
@@ -1796,6 +1808,13 @@ struct DaemonRuntime {
     restored_stored_sessions: usize,
     restored_live_sessions: usize,
     restored_remote_machines: usize,
+    /// Negative cache for preserved-owner probes (post-swap shadow incident
+    /// 2026-06-11): probing a dead-but-lingering prior daemon's socket costs
+    /// the full 10s request timeout, and the ensure path re-probed the SAME
+    /// dead socket repeatedly — one terminal_ensure held the request loop
+    /// 30.7s, deafening the daemon while the user stared at the shadow.
+    /// endpoint label → epoch-ms until which it is treated unreachable.
+    preserved_owner_unreachable_until_ms: HashMap<String, u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1874,6 +1893,7 @@ impl DaemonRuntime {
             restored_stored_sessions,
             restored_live_sessions,
             restored_remote_machines,
+            preserved_owner_unreachable_until_ms: HashMap::new(),
         };
         let preserved_owner_registry_retargeted = runtime
             .preserved_terminal_owners
@@ -2184,7 +2204,22 @@ impl DaemonRuntime {
         if server_endpoints_same_target(&endpoint, &default_endpoint(self.store.home_dir())) {
             return None;
         }
+        // Negative cache: a recently-timed-out owner socket is not re-probed
+        // (each probe costs the full request timeout while holding the loop).
+        let label = owner_endpoint_label(&endpoint);
+        if let Some(until) = self.preserved_owner_unreachable_until_ms.get(&label)
+            && (crate::app_control::current_millis() as u64) < *until
+        {
+            return None;
+        }
         Some(endpoint)
+    }
+
+    fn mark_preserved_owner_unreachable(&mut self, owner_endpoint: &ServerEndpoint) {
+        self.preserved_owner_unreachable_until_ms.insert(
+            owner_endpoint_label(owner_endpoint),
+            crate::app_control::current_millis() as u64 + PRESERVED_OWNER_UNREACHABLE_CACHE_MS,
+        );
     }
 
     fn remove_preserved_owner(&mut self, runtime_key: &str, reason: &'static str) {
@@ -2997,6 +3032,15 @@ impl DaemonRuntime {
             self.remove_preserved_owner(runtime_key, "owner_reported_missing_runtime");
             return;
         }
+        // A timeout/connect-shaped failure means the owner socket is dead or
+        // wedged: re-probing it with status() costs ANOTHER full request
+        // timeout against the same dead socket (the post-swap 30s deaf
+        // window). Mark it unreachable and remove without the re-probe.
+        if preserved_owner_error_is_transport_shaped(error) {
+            self.mark_preserved_owner_unreachable(owner_endpoint);
+            self.remove_preserved_owner(runtime_key, "owner_unreachable_after_error");
+            return;
+        }
         match status(owner_endpoint) {
             Ok(status)
                 if status
@@ -3004,7 +3048,10 @@ impl DaemonRuntime {
                     .iter()
                     .any(|key| key == runtime_key) => {}
             Ok(_) => self.remove_preserved_owner(runtime_key, "owner_missing_runtime_after_error"),
-            Err(_) => self.remove_preserved_owner(runtime_key, "owner_unreachable_after_error"),
+            Err(_) => {
+                self.mark_preserved_owner_unreachable(owner_endpoint);
+                self.remove_preserved_owner(runtime_key, "owner_unreachable_after_error")
+            }
         }
     }
 
@@ -10760,6 +10807,28 @@ mod tests {
             "working live agent session must become a title candidate"
         );
         let _ = std::fs::remove_file(&jsonl);
+    }
+
+    #[test]
+    fn preserved_owner_transport_errors_skip_the_status_reprobe() {
+        // Post-swap shadow fix (2026-06-11): one terminal_ensure held the
+        // request loop 30.7s probing dead prior-daemon sockets (10s timeout
+        // each, then a status() re-probe of the same dead socket). Transport-
+        // shaped errors must classify so the re-probe is skipped and the
+        // negative cache arms.
+        for msg in [
+            "reading daemon response",
+            "connecting to /home/pi/.yggterm/server-2-8-80.sock",
+            "terminal ensure timed out after 5000ms",
+        ] {
+            assert!(
+                super::preserved_owner_error_is_transport_shaped(&anyhow::anyhow!("{msg}")),
+                "{msg} must classify as transport-shaped"
+            );
+        }
+        assert!(!super::preserved_owner_error_is_transport_shaped(&anyhow::anyhow!(
+            "terminal session not found: remote-session://dev/x"
+        )));
     }
 
     #[test]
