@@ -39,10 +39,12 @@ pub use daemon::{
     set_all_preview_blocks_folded, set_session_keep_alive, set_view_mode, shutdown, snapshot,
     start_command_session, start_command_session_with_terminal_appearance, start_local_session,
     start_local_session_at, start_local_session_at_with_terminal_appearance,
-    start_remote_claude_session_at_with_terminal_appearance, start_remote_codex_session_at,
-    start_remote_codex_session_at_with_terminal_appearance, start_remote_runtime_codex_session,
-    start_ssh_session_at,
-    start_ssh_session_at_with_terminal_appearance, status, switch_agent_session_mode,
+    start_local_session_placed, start_remote_claude_session_at_with_terminal_appearance,
+    start_remote_claude_session_placed, start_remote_codex_session_at,
+    start_remote_codex_session_at_with_terminal_appearance, start_remote_codex_session_placed,
+    start_remote_runtime_codex_session, start_ssh_session_at,
+    start_ssh_session_at_with_terminal_appearance, start_ssh_session_placed, status,
+    switch_agent_session_mode,
     sync_external_window, sync_terminal_identity, sync_terminal_identity_with_profile, sync_theme,
     terminal_ensure, terminal_history, terminal_read, terminal_resize, terminal_restart,
     terminal_restart_with_size,
@@ -3123,6 +3125,47 @@ impl YggtermServer {
             return false;
         }
         self.live_session_order = next;
+        true
+    }
+
+    /// Place a (newly started) live session directly below an anchor row in
+    /// the Live Sessions order. The context-menu "Open new terminal/CC/codex
+    /// here" actions thread the right-clicked row through as the anchor so
+    /// the new session lands next to where the user asked for it instead of
+    /// at the top (every start_* path inserts at index 0 by default).
+    /// Fails open: an absent/unresolvable anchor leaves the order untouched.
+    pub fn place_live_session_after(&mut self, key: &str, anchor: Option<&str>) -> bool {
+        let Some(anchor) = anchor.map(str::trim).filter(|value| !value.is_empty()) else {
+            return false;
+        };
+        let Some((anchor_key, _)) = self.resolve_live_session_entry(anchor) else {
+            return false;
+        };
+        if anchor_key == key {
+            return false;
+        }
+        let Some(anchor_idx) = self
+            .live_session_order
+            .iter()
+            .position(|existing| existing == &anchor_key)
+        else {
+            return false;
+        };
+        let Some(current_idx) = self
+            .live_session_order
+            .iter()
+            .position(|existing| existing == key)
+        else {
+            return false;
+        };
+        let moved = self.live_session_order.remove(current_idx);
+        let anchor_idx = if current_idx < anchor_idx {
+            anchor_idx - 1
+        } else {
+            anchor_idx
+        };
+        let target = (anchor_idx + 1).min(self.live_session_order.len());
+        self.live_session_order.insert(target, moved);
         true
     }
 
@@ -29940,6 +29983,44 @@ terminal_window_id: None,
                 .iter()
                 .any(|path| path == "local://cleanup-me")
         );
+    }
+
+    #[test]
+    fn place_live_session_after_inserts_below_anchor_and_fails_open() {
+        // User bug (2026-06-10 #7): context-menu "Open new terminal/CC/codex
+        // here" always landed at the TOP of Live Sessions; it must land
+        // directly below the right-clicked row.
+        let tree = SessionNode {
+            kind: SessionNodeKind::Group,
+            name: "sessions".to_string(),
+            title: None,
+            document_kind: None,
+            group_kind: None,
+            path: PathBuf::from("/"),
+            children: Vec::new(),
+            session_id: None,
+            cwd: None,
+            ..Default::default()
+        };
+        let mut server = YggtermServer::new(
+            &tree,
+            false,
+            GhosttyHostSupport::shadow("test".to_string(), false, false),
+            UiTheme::ZedLight,
+        );
+        let a = server.start_local_session(SessionKind::Shell, Some("/home/pi"), Some("a"));
+        let b = server.start_local_session(SessionKind::Shell, Some("/home/pi"), Some("b"));
+        let new = server.start_local_session(SessionKind::Shell, Some("/home/pi"), Some("new"));
+        assert_eq!(server.live_session_order, vec![new.clone(), b.clone(), a.clone()]);
+
+        // Anchor on `a` (the bottom row) → new lands directly below it.
+        assert!(server.place_live_session_after(&new, Some(&a)));
+        assert_eq!(server.live_session_order, vec![b.clone(), a.clone(), new.clone()]);
+
+        // Unresolvable anchor → fails open, order untouched.
+        assert!(!server.place_live_session_after(&new, Some("/not/a/session")));
+        assert!(!server.place_live_session_after(&new, None));
+        assert_eq!(server.live_session_order, vec![b, a, new]);
     }
 
     #[test]
