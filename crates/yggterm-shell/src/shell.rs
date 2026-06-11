@@ -58471,6 +58471,84 @@ fn terminal_eval_script_with_canvas_renderer(
                     message: `reveal_ghost_attached host=${{hostId}} w=${{revealGhostFrame.width}} h=${{revealGhostFrame.height}}`
                 }});
             }} catch (_error) {{}}
+        }} else if (!window.__yggtermDisableRevealGhost) {{
+            // BORING REVEAL lane-3, cold-mount veil: a COLD mount has no prior
+            // canvas to ghost, so the user used to watch the wrong-frame churn
+            // (client-snapshot shadow → replay reset/rewrite → DOM-leak
+            // flicker) behind the resume gate. Per the spec, latency beats
+            // flicker and a wrong frame must never paint: cover the host with
+            // a solid background-colored veil and release it only when the
+            // buffer has SETTLED (nonblank content + stable baseY/cursor for
+            // two consecutive polls), on the user's first keystroke (their
+            // echo must never be hidden), or at an 8s hard cap (never trap
+            // the user behind a veil).
+            try {{
+                if (window.getComputedStyle(host).position === 'static') {{
+                    host.style.position = 'relative';
+                }}
+                const veil = document.createElement('div');
+                veil.className = 'yggterm-cold-mount-veil';
+                veil.style.position = 'absolute';
+                veil.style.inset = '0';
+                veil.style.zIndex = '40';
+                veil.style.pointerEvents = 'none';
+                veil.style.backgroundColor =
+                    window.getComputedStyle(host).backgroundColor || '#000';
+                host.appendChild(veil);
+                const veilAttachedAtMs = Date.now();
+                let veilLastBaseY = -1;
+                let veilLastCursorY = -1;
+                let veilStablePolls = 0;
+                const releaseColdMountVeil = (reason) => {{
+                    try {{
+                        if (veil.isConnected) {{
+                            veil.remove();
+                            sendTerminalEvent({{
+                                kind: "debug",
+                                message: `cold_mount_veil_released host=${{hostId}} reason=${{reason}} held_ms=${{Date.now() - veilAttachedAtMs}}`
+                            }});
+                        }}
+                    }} catch (_error) {{}}
+                }};
+                const veilSettlePoll = () => {{
+                    try {{
+                        if (!veil.isConnected) {{ return; }}
+                        if (Date.now() - veilAttachedAtMs >= 8000) {{
+                            releaseColdMountVeil('hard_cap');
+                            return;
+                        }}
+                        const entry = window.__yggtermXtermHosts && window.__yggtermXtermHosts[hostId]
+                            ? window.__yggtermXtermHosts[hostId] : null;
+                        const buf = entry && entry.term && entry.term.buffer
+                            ? entry.term.buffer.active : null;
+                        if (buf) {{
+                            const baseY = Number(buf.baseY || 0);
+                            const cursorY = Number(buf.cursorY || 0);
+                            const hasContent = baseY > 0 || cursorY > 0 || Number(buf.cursorX || 0) > 0;
+                            if (hasContent && baseY === veilLastBaseY && cursorY === veilLastCursorY) {{
+                                veilStablePolls += 1;
+                            }} else {{
+                                veilStablePolls = 0;
+                            }}
+                            veilLastBaseY = baseY;
+                            veilLastCursorY = cursorY;
+                            if (hasContent && veilStablePolls >= 2) {{
+                                releaseColdMountVeil('buffer_settled');
+                                return;
+                            }}
+                        }}
+                        window.setTimeout(veilSettlePoll, 250);
+                    }} catch (_error) {{
+                        releaseColdMountVeil('poll_error');
+                    }}
+                }};
+                window.setTimeout(veilSettlePoll, 400);
+                window.addEventListener('keydown', () => releaseColdMountVeil('keydown'), {{ once: true, capture: true }});
+                sendTerminalEvent({{
+                    kind: "debug",
+                    message: `cold_mount_veil_attached host=${{hostId}}`
+                }});
+            }} catch (_error) {{}}
         }}
         const term = new window.Terminal({{
             allowProposedApi: true,
@@ -76682,6 +76760,24 @@ mod tests {
         assert!(script.contains(
             "entry.lastXtermSessionSnapshotNonblankLineCount = snapshot.nonblankLineCount;"
         ));
+    }
+
+    #[test]
+    fn cold_mount_veil_covers_wrong_frames_until_buffer_settles() {
+        // Boring-reveal lane-3: a cold mount (no prior canvas to ghost) must
+        // not paint the wrong-frame churn — a solid veil covers the host and
+        // releases only on settle, first keystroke, or the 8s hard cap.
+        let theme = terminal_theme(UiTheme::ZedLight, palette(UiTheme::ZedLight), 13.0, "");
+        let script = terminal_eval_script("yggterm-terminal-test", &theme, true);
+        assert!(script.contains("yggterm-cold-mount-veil"));
+        assert!(script.contains("cold_mount_veil_attached"));
+        // Settle requires content + two stable polls (never a blank reveal).
+        assert!(script.contains("if (hasContent && veilStablePolls >= 2) {"));
+        // The user's echo is never hidden; the veil can never trap them.
+        assert!(script.contains("releaseColdMountVeil('keydown')"));
+        assert!(script.contains("releaseColdMountVeil('hard_cap')"));
+        // Same kill switch as the ghost.
+        assert!(script.contains("} else if (!window.__yggtermDisableRevealGhost) {"));
     }
 
     #[test]
