@@ -4376,6 +4376,23 @@ impl DaemonRuntime {
                 terminal_appearance,
                 insert_after,
             } => {
+                // Phantom-spawn investigation: record that this birth was
+                // GUI/IPC-initiated (vs an internal server-side creation) —
+                // pairs with the live_session_birth chokepoint trace.
+                if let Ok(home) = resolve_yggterm_home() {
+                    append_trace_event(
+                        &home,
+                        "daemon",
+                        "session",
+                        "start_local_session_request",
+                        serde_json::json!({
+                            "kind": format!("{session_kind:?}"),
+                            "cwd": cwd,
+                            "title_hint": title_hint,
+                            "insert_after": insert_after,
+                        }),
+                    );
+                }
                 sync_terminal_identity_for_request(terminal_appearance.as_deref(), None);
                 let key = self.server.start_local_session(
                     session_kind,
