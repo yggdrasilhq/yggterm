@@ -184,10 +184,11 @@ use yggterm_server::{
     set_all_preview_blocks_folded, set_session_keep_alive, set_view_mode as daemon_set_view_mode,
     shutdown as daemon_shutdown, snapshot as daemon_snapshot, snapshot_session_view_for_ui,
     stage_remote_clipboard_png, start_command_session_with_terminal_appearance,
-    start_local_session_at_with_terminal_appearance,
-    start_remote_claude_session_at_with_terminal_appearance,
-    start_remote_codex_session_at_with_terminal_appearance,
-    start_ssh_session_at_with_terminal_appearance, status, take_next_app_control_request,
+    start_local_session_at_with_terminal_appearance, start_local_session_placed,
+    start_remote_claude_session_at_with_terminal_appearance, start_remote_claude_session_placed,
+    start_remote_codex_session_at_with_terminal_appearance, start_remote_codex_session_placed,
+    start_ssh_session_at_with_terminal_appearance, start_ssh_session_placed, status,
+    take_next_app_control_request,
     terminal_ensure, terminal_read, terminal_resize, terminal_restart_with_size,
     terminal_retained_snapshot, terminal_snapshot, terminal_write,
     toggle_preview_block as daemon_toggle_preview_block,
@@ -15260,6 +15261,11 @@ fn spawn_start_group_session(mut state: Signal<ShellState>, row: BrowserRow, kin
     let launch_context = state.with(|shell| group_session_launch_context(shell, &row, kind));
     let terminal_appearance =
         state.with(|shell| shell.effective_terminal_identity_appearance().to_string());
+    // "Open new … here" should land the new row directly below the
+    // right-clicked row in Live Sessions, not at the top. The daemon
+    // resolves the anchor and fails open (top insert) when the clicked
+    // row is not a live session (e.g. a cwd-tree group).
+    let insert_after = row.full_path.clone();
     clear_sidebar_keyboard_owner();
     state.with_mut(|shell| shell.close_context_menu());
     match launch_context {
@@ -15269,12 +15275,13 @@ fn spawn_start_group_session(mut state: Signal<ShellState>, row: BrowserRow, kin
                 if let Some(cwd) = cwd.as_deref() {
                     ensure_home_scoped_workspace_dir(cwd)?;
                 }
-                start_local_session_at_with_terminal_appearance(
+                start_local_session_placed(
                     &endpoint,
                     kind,
                     cwd.as_deref(),
                     title_hint.as_deref(),
                     Some(&terminal_appearance),
+                    Some(&insert_after),
                 )
             });
         }
@@ -15291,31 +15298,34 @@ fn spawn_start_group_session(mut state: Signal<ShellState>, row: BrowserRow, kin
             let terminal_appearance = terminal_appearance.clone();
             spawn_server_snapshot_action(state, pending, move |endpoint| {
                 if matches!(kind, SessionKind::ClaudeCode) {
-                    start_remote_claude_session_at_with_terminal_appearance(
+                    start_remote_claude_session_placed(
                         &endpoint,
                         &ssh_target,
                         prefix.as_deref(),
                         cwd.as_deref(),
                         title_hint.as_deref(),
                         Some(&terminal_appearance),
+                        Some(&insert_after),
                     )
                 } else if matches!(kind, SessionKind::Codex | SessionKind::CodexLiteLlm) {
-                    start_remote_codex_session_at_with_terminal_appearance(
+                    start_remote_codex_session_placed(
                         &endpoint,
                         &ssh_target,
                         prefix.as_deref(),
                         cwd.as_deref(),
                         title_hint.as_deref(),
                         Some(&terminal_appearance),
+                        Some(&insert_after),
                     )
                 } else {
-                    start_ssh_session_at_with_terminal_appearance(
+                    start_ssh_session_placed(
                         &endpoint,
                         &ssh_target,
                         prefix.as_deref(),
                         cwd.as_deref(),
                         title_hint.as_deref(),
                         Some(&terminal_appearance),
+                        Some(&insert_after),
                     )
                 }
             });
