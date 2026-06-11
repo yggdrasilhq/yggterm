@@ -5249,6 +5249,20 @@ fn snapshot_session_is_keep_alive_recovery_target(session: &SnapshotSessionView)
             .any(|entry| entry.label == "Runtime Persistence" && entry.value == "keep-alive")
 }
 
+/// Per the first-class agent-session spec: a LOCAL agent CLI session's row
+/// re-derives from the agent CLI's own store (codex / Claude Code JSONL), so a
+/// runtime exit must never erase the row from the snapshot — the row stays and
+/// the next open re-resumes via the CLI. Plain shells stay second-class: a
+/// non-keep-alive shell dies with its PTY. (Run #16 gate-#5 family: runtime
+/// exit was the pre-swap row eraser for local codex rows.)
+fn snapshot_session_is_local_agent_store_recoverable(session: &SnapshotSessionView) -> bool {
+    matches!(session.source, crate::SessionSource::LiveLocal)
+        && matches!(
+            session.kind,
+            SessionKind::Codex | SessionKind::CodexLiteLlm | SessionKind::ClaudeCode
+        )
+}
+
 fn apply_terminal_runtime_truth_to_snapshot(
     server: &YggtermServer,
     runtime_keys: &HashSet<String>,
@@ -5257,13 +5271,15 @@ fn apply_terminal_runtime_truth_to_snapshot(
     if let Some(active_session) = snapshot.active_session.as_mut()
         && !runtime_keys
             .contains(&server.terminal_runtime_key_for_path(&active_session.session_path))
-        && snapshot_session_is_keep_alive_recovery_target(active_session)
+        && (snapshot_session_is_keep_alive_recovery_target(active_session)
+            || snapshot_session_is_local_agent_store_recoverable(active_session))
     {
         active_session.launch_phase = crate::TerminalLaunchPhase::RemoteBootstrap;
     }
     for session in &mut snapshot.live_sessions {
         if !runtime_keys.contains(&server.terminal_runtime_key_for_path(&session.session_path))
-            && snapshot_session_is_keep_alive_recovery_target(session)
+            && (snapshot_session_is_keep_alive_recovery_target(session)
+                || snapshot_session_is_local_agent_store_recoverable(session))
         {
             session.launch_phase = crate::TerminalLaunchPhase::RemoteBootstrap;
         }
@@ -5279,6 +5295,7 @@ fn apply_terminal_runtime_truth_to_snapshot(
             || (active_path.as_deref() == Some(session.session_path.as_str())
                 && snapshot_session_is_pending_runtime_launch(session))
             || snapshot_session_is_keep_alive_recovery_target(session)
+            || snapshot_session_is_local_agent_store_recoverable(session)
     });
 
     let Some(active_path) = active_path else {
@@ -10757,6 +10774,74 @@ mod tests {
                 .live_sessions
                 .iter()
                 .all(|session| runtime_keys.contains(&session.session_path))
+        );
+    }
+
+    // Run #16 gate-#5 family: a LOCAL agent CLI row re-derives from the CLI's
+    // own JSONL store, so a runtime exit must keep the row (flipped to a
+    // recoverable launch phase) instead of erasing it. A non-keep-alive plain
+    // shell still dies with its PTY (second-class per the keep-alive spec).
+    #[test]
+    fn local_agent_rows_survive_runtime_exit_but_plain_shells_do_not() {
+        let tree = daemon_test_tree();
+        let server = YggtermServer::new(
+            &tree,
+            false,
+            GhosttyHostSupport::shadow("test".to_string(), false, false),
+            UiTheme::ZedLight,
+        );
+        let codex = daemon_test_snapshot_session(
+            "local://019df7b2-550e-7090-956b-d4549d4b55e4",
+            SessionSource::LiveLocal,
+        );
+        let cc = {
+            let mut session = daemon_test_snapshot_session(
+                "local://019e9c28-e46d-7480-9f27-4e5676df61b1",
+                SessionSource::LiveLocal,
+            );
+            session.kind = SessionKind::ClaudeCode;
+            session
+        };
+        let shell = {
+            let mut session =
+                daemon_test_snapshot_session("live::plain-shell", SessionSource::LiveLocal);
+            session.kind = SessionKind::Shell;
+            session
+        };
+        let mut snapshot = ServerUiSnapshot {
+            active_session_path: Some(codex.session_path.clone()),
+            active_session: Some(codex.clone()),
+            active_view_mode: WorkspaceViewMode::Terminal,
+            remote_machines: Vec::new(),
+            ssh_targets: Vec::new(),
+            live_sessions: vec![codex.clone(), cc.clone(), shell],
+        };
+
+        // Every runtime exited (e.g. daemon swap killed the PTYs).
+        apply_terminal_runtime_truth_to_snapshot(&server, &HashSet::new(), &mut snapshot);
+
+        let surviving: Vec<&str> = snapshot
+            .live_sessions
+            .iter()
+            .map(|session| session.session_path.as_str())
+            .collect();
+        assert_eq!(
+            surviving,
+            vec![codex.session_path.as_str(), cc.session_path.as_str()],
+            "agent rows survive runtime exit; plain shell does not"
+        );
+        assert!(
+            snapshot.live_sessions.iter().all(|session| {
+                session.launch_phase == TerminalLaunchPhase::RemoteBootstrap
+            }),
+            "surviving agent rows flip to a recoverable launch phase"
+        );
+        assert_eq!(
+            snapshot
+                .active_session
+                .as_ref()
+                .map(|session| session.launch_phase),
+            Some(TerminalLaunchPhase::RemoteBootstrap),
         );
     }
 
