@@ -1815,6 +1815,15 @@ struct DaemonRuntime {
     /// 30.7s, deafening the daemon while the user stared at the shadow.
     /// endpoint label → epoch-ms until which it is treated unreachable.
     preserved_owner_unreachable_until_ms: HashMap<String, u64>,
+    /// Set once the update-restart snapshot has been written during retire.
+    /// LIVE INCIDENT (2026-06-11, every swap): the retiring daemon keeps
+    /// serving briefly after writing the protected update-restart state, and
+    /// any routine persist() then OVERWRITES it with the keep-alive-only view
+    /// before the successor reads it — silently dropping all protected
+    /// non-keep-alive sessions (the recurring local-row loss; the persist
+    /// drop-telemetry showed ZERO drops because the update snapshot itself
+    /// was correct). After this is set, routine persists are no-ops.
+    update_restart_state_written: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1894,6 +1903,7 @@ impl DaemonRuntime {
             restored_live_sessions,
             restored_remote_machines,
             preserved_owner_unreachable_until_ms: HashMap::new(),
+            update_restart_state_written: false,
         };
         let preserved_owner_registry_retargeted = runtime
             .preserved_terminal_owners
@@ -3644,6 +3654,12 @@ impl DaemonRuntime {
     }
 
     fn persist(&mut self) -> Result<()> {
+        if self.update_restart_state_written {
+            // Never clobber the update-restart snapshot during retire (see
+            // the field doc — this silently dropped every protected
+            // non-keep-alive session at each swap).
+            return Ok(());
+        }
         self.refresh_live_codex_runtime_identities_for_persistence();
         self.refresh_live_claude_code_runtime_identities_for_persistence();
         write_persisted_state(&self.state_path, &self.server.persisted_state())
@@ -3659,6 +3675,9 @@ impl DaemonRuntime {
     /// Genuine lifecycle events still call the full `persist()`. See campaign D1 / the
     /// born-at-correct-size synchronous flush.
     fn persist_state_only(&self) -> Result<()> {
+        if self.update_restart_state_written {
+            return Ok(());
+        }
         write_persisted_state(&self.state_path, &self.server.persisted_state())
     }
 
@@ -3687,6 +3706,7 @@ impl DaemonRuntime {
             ServerRequest::PrepareUpdateRestart => {
                 let state = self.persisted_state_for_update_restart();
                 write_persisted_state(&self.state_path, &state)?;
+                self.update_restart_state_written = true;
                 ServerResponse::Ack {
                     message: Some("update restart prepared".to_string()),
                 }
@@ -3903,6 +3923,7 @@ impl DaemonRuntime {
                             &terminal_session_key_set,
                         );
                     write_persisted_state(&self.state_path, &state)?;
+                    self.update_restart_state_written = true;
                     let owner_endpoint = default_endpoint(self.store.home_dir());
                     let represented_preserved_owner_keys = runtime_status
                         .preserved_terminal_owner_keys
@@ -3977,6 +3998,7 @@ impl DaemonRuntime {
                         &terminal_session_key_set,
                     );
                 write_persisted_state(&self.state_path, &state)?;
+                self.update_restart_state_written = true;
                 let represented_preserved_owner_keys = runtime_status
                     .preserved_terminal_owner_keys
                     .iter()
