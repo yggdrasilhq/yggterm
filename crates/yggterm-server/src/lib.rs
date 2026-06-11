@@ -326,6 +326,26 @@ fn persisted_live_session_is_recoverable(live: &PersistedLiveSession) -> bool {
     live.kind == SessionKind::SshShell && !is_loopback_ssh_target(&live.ssh_target)
 }
 
+/// Per the first-class agent-session spec (gate #6 of the persistence saga,
+/// 2026-06-11): a LOCAL agent CLI row re-derives from the CLI's own JSONL
+/// store, so it rides EVERY persist — not only the protected update-restart
+/// snapshot. The keep-alive-only routine persist made local rows depend on
+/// swap ORDERING: a successor daemon that loaded state before the predecessor
+/// wrote its update-restart snapshot restored a state file without them
+/// (live-caught at the 88→89 swap; zero drop telemetry because the keep-alive
+/// filter skips silently by design). Plain shells stay second-class — their
+/// PTY content dies with the daemon and a restored shell row would be a husk.
+fn managed_live_session_is_local_agent_store_recoverable(
+    key: &str,
+    session: &ManagedSessionView,
+) -> bool {
+    (session.source == SessionSource::LiveLocal || local_runtime_id_from_key(key).is_some())
+        && matches!(
+            session.kind,
+            SessionKind::Codex | SessionKind::CodexLiteLlm | SessionKind::ClaudeCode
+        )
+}
+
 fn managed_live_session_is_recoverable(key: &str, session: &ManagedSessionView) -> bool {
     if is_local_codex_storage_session_path(key)
         || is_local_codex_storage_session_path(&session.session_path)
@@ -3598,10 +3618,20 @@ impl YggtermServer {
             })
             .filter_map(|(key, session)| {
                 let keep_alive = session_keep_alive(session);
-                if !keep_alive && !protect_all_live {
+                // Gate #6: local agent rows are store-recoverable and ride
+                // every persist regardless of keep-alive. The keep-alive spec
+                // is enforced where it belongs — PrepareClientClose removes
+                // them from live_session_order on a genuine user close, so
+                // they never reach this filter there.
+                let store_recoverable_local_agent =
+                    managed_live_session_is_local_agent_store_recoverable(key, session);
+                if !keep_alive && !protect_all_live && !store_recoverable_local_agent {
                     return None;
                 }
-                if !keep_alive && let Some(protected_runtime_keys) = protected_runtime_keys {
+                if !keep_alive
+                    && !store_recoverable_local_agent
+                    && let Some(protected_runtime_keys) = protected_runtime_keys
+                {
                     let runtime_key = self.terminal_runtime_key_for_path(key);
                     // Bug-9 key duality (drop-telemetry catch, 2026-06-11): a
                     // local row keyed local://<uuid> can own its PTY under
@@ -26922,9 +26952,17 @@ terminal_window_id: None,
             .expect("clear codex keep-alive");
         server.focus_live_session(&unkept_shell);
         let persisted = server.persisted_state();
-        assert!(persisted.live_sessions.is_empty());
-        assert_eq!(persisted.active_session_path, None);
-        assert_eq!(persisted.active_view_mode, WorkspaceViewMode::Rendered);
+        // Gate #6: the codex row still rides the routine persist even without
+        // keep-alive (local agent rows are store-recoverable); only the plain
+        // shell drops. The active pointer must still avoid the excluded shell.
+        assert_eq!(persisted.live_sessions.len(), 1);
+        assert_eq!(persisted.live_sessions[0].key, kept_codex);
+        assert_eq!(
+            persisted.active_session_path.as_deref(),
+            Some(kept_codex.as_str()),
+            "normal persistence must not point at a live session excluded from live_sessions"
+        );
+        assert_eq!(persisted.active_view_mode, WorkspaceViewMode::Terminal);
     }
 
     #[test]
@@ -30151,12 +30189,15 @@ terminal_window_id: None,
             with_protected.live_sessions.iter().any(|l| l.key == key),
             "local session with its key in protected_runtime_keys must persist"
         );
-        // …and one outside the set is dropped — the documented gate.
+        // …and a LOCAL AGENT row outside the set persists anyway — gate #6:
+        // local agent rows are store-recoverable and ride every persist (the
+        // protected-keys gate now only drops rows that are NOT re-derivable
+        // from a CLI store).
         let other: HashSet<String> = ["local://someone-else".to_string()].into_iter().collect();
         let without = server.persisted_state_with_update_protection(true, Some(&other));
         assert!(
-            !without.live_sessions.iter().any(|l| l.key == key),
-            "session outside protected_runtime_keys is dropped (gate documented)"
+            without.live_sessions.iter().any(|l| l.key == key),
+            "local agent row outside protected_runtime_keys still persists (gate #6)"
         );
         // Bug-9 key duality (live drop-telemetry catch): the PTY may be keyed
         // codex-runtime://<uuid> in the terminals manager while the row is
@@ -30205,6 +30246,56 @@ terminal_window_id: None,
         let restored = fresh.sessions.get(&restored_key).expect("restored session");
         assert_eq!(restored.kind, SessionKind::Codex);
         assert_eq!(restored.title, "Proxy Smoke Test Run");
+    }
+
+    #[test]
+    fn local_agent_rows_ride_routine_persists_without_keep_alive() {
+        // GATE #6 (persistence saga, live-caught at the 2.8.88→89 swap): the
+        // routine persist carried only the keep-alive view, so a successor
+        // daemon that loaded server-state BEFORE the predecessor wrote its
+        // update-restart snapshot restored a state file without the local
+        // agent rows (swap ORDERING dependence). Local agent rows re-derive
+        // from the CLI's JSONL store and must ride EVERY persist; plain
+        // shells stay second-class.
+        let tree = SessionNode {
+            kind: SessionNodeKind::Group,
+            name: "sessions".to_string(),
+            path: PathBuf::from("/"),
+            ..Default::default()
+        };
+        let mut server = YggtermServer::new(
+            &tree,
+            false,
+            GhosttyHostSupport::shadow("test".to_string(), false, false),
+            UiTheme::ZedLight,
+        );
+        let codex_key =
+            server.start_local_session(SessionKind::Codex, Some("/home/pi"), Some("agent row"));
+        let shell_key =
+            server.start_local_session(SessionKind::Shell, Some("/home/pi"), Some("shell row"));
+
+        // Routine persist (protect_all_live = false), no keep-alive set.
+        let routine = server.persisted_state_with_update_protection(false, None);
+        assert!(
+            routine.live_sessions.iter().any(|l| l.key == codex_key),
+            "non-keep-alive local codex row must ride the routine persist (gate #6)"
+        );
+        assert!(
+            !routine.live_sessions.iter().any(|l| l.key == shell_key),
+            "non-keep-alive plain shell stays out of the routine persist"
+        );
+
+        // A genuinely closed agent row (removed from live order, the user
+        // close path) does not persist — the keep-alive spec is enforced at
+        // removal, not in the persist filter.
+        server
+            .remove_live_session(&codex_key)
+            .expect("remove live session");
+        let after_close = server.persisted_state_with_update_protection(false, None);
+        assert!(
+            !after_close.live_sessions.iter().any(|l| l.key == codex_key),
+            "a removed agent row must not be resurrected by the persist filter"
+        );
     }
 
     #[test]
