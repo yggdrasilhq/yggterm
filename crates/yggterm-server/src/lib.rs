@@ -11180,7 +11180,21 @@ fn overlay_mirrored_remote_sessions(
             .cloned()
             .map(|mut session| {
                 if let Some(mirrored) = mirrored_by_id.get(&session.session_id) {
-                    if !mirrored.title_hint.trim().is_empty() {
+                    // Title precedence: for Claude Code rows (remote-cc://)
+                    // the fresh scan IS the SSOT — CC writes ai-title and
+                    // custom-title (incl. yggterm renames) into its JSONL,
+                    // which the scan just read. The mirror is a stale cache;
+                    // letting it overwrite the scan froze every CC title at
+                    // its first-ever scanned value (and the post-overlay
+                    // re-mirror made the stale title self-perpetuating). The
+                    // mirror only fills in when the scan title is a weak
+                    // generated fallback. Codex rows keep mirror-wins: their
+                    // display titles are generated/renamed locally and live
+                    // in the mirror, not in the remote scan hint.
+                    let scan_title_wins = session.session_path.starts_with("remote-cc://")
+                        && !session.title_hint.trim().is_empty()
+                        && !looks_like_generated_fallback_title(&session.title_hint);
+                    if !mirrored.title_hint.trim().is_empty() && !scan_title_wins {
                         session.title_hint = mirrored.title_hint.clone();
                     }
                     if session.recent_context.trim().is_empty()

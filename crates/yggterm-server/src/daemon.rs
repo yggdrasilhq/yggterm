@@ -5972,8 +5972,13 @@ fn collect_live_cc_title_syncs(
 ) -> Vec<BackgroundCopyUpdate> {
     let mut updates = Vec::new();
     for session in live_sessions {
+        // local:// AND cc-runtime:// both live on THIS machine (the host
+        // daemon that owns the PTY also owns ~/.claude/projects), so both
+        // sync from the local JSONL. remote-cc:// rows belong to another
+        // machine and ride collect_remote_cc_title_syncs instead.
         if session.kind != SessionKind::ClaudeCode
-            || !session.session_path.starts_with("local://")
+            || !(session.session_path.starts_with("local://")
+                || session.session_path.starts_with("cc-runtime://"))
         {
             continue;
         }
@@ -6009,6 +6014,197 @@ fn collect_live_cc_title_syncs(
                 title: Some(title),
                 summary: None,
             });
+        }
+    }
+    updates
+}
+
+/// Reads CC titles for a given list of session ids on the remote machine.
+/// Head (512 KB) catches the early `ai-title`; the tail window catches a
+/// late `custom-title` (a /rename appends at the END of a large JSONL, past
+/// any head cap). Latest record wins, custom-title over ai-title — the same
+/// precedence CC itself displays.
+const REMOTE_CC_TITLE_SCRIPT: &str = r#"
+import json, os, sys
+from pathlib import Path
+HEAD_BYTES = 512 * 1024
+TAIL_BYTES = 128 * 1024
+
+def titles_from_lines(lines):
+    custom = None
+    ai = None
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            r = json.loads(line)
+        except Exception:
+            continue
+        t = r.get('type', '')
+        if t == 'custom-title':
+            ct = (r.get('customTitle') or '').strip()
+            if ct:
+                custom = ct
+        elif t == 'ai-title':
+            at = (r.get('aiTitle') or '').strip()
+            if at:
+                ai = at
+    return custom, ai
+
+ids = [i for i in sys.argv[1:] if i.strip()]
+projects = Path(os.path.expanduser('~/.claude/projects'))
+if not projects.exists() or not ids:
+    sys.exit(0)
+for sid in ids:
+    found = None
+    for project_dir in projects.iterdir():
+        if not project_dir.is_dir():
+            continue
+        candidate = project_dir / (sid + '.jsonl')
+        if candidate.is_file():
+            found = candidate
+            break
+    if found is None:
+        continue
+    try:
+        size = found.stat().st_size
+        with open(found, encoding='utf-8', errors='ignore') as f:
+            head = f.read(HEAD_BYTES).splitlines()
+        tail = []
+        if size > HEAD_BYTES:
+            with open(found, 'rb') as f:
+                f.seek(max(0, size - TAIL_BYTES))
+                raw = f.read().decode('utf-8', errors='ignore')
+            # First chunk is likely a partial line; drop it.
+            tail = raw.splitlines()[1:]
+    except Exception:
+        continue
+    custom_h, ai_h = titles_from_lines(head)
+    custom_t, ai_t = titles_from_lines(tail)
+    title = custom_t or custom_h or ai_t or ai_h
+    if title:
+        print(json.dumps({'session_id': sid, 'title': title}, ensure_ascii=False))
+"#;
+
+/// Pure selection of which live `remote-cc://` rows to poll for a title this
+/// tick: rows on a WORKING turn (renames and ai-titles land during turns)
+/// plus — once per daemon lifetime — every row whose title was never
+/// confirmed against the remote JSONL (heals stale launch-hint titles left
+/// over from restores). Returns (machine_key, session_id, session_path).
+fn remote_cc_title_poll_paths(
+    live_sessions: &[ManagedSessionView],
+    working_paths: &HashSet<String>,
+    confirmed_paths: &HashSet<String>,
+) -> Vec<(String, String, String)> {
+    let mut out = Vec::new();
+    for session in live_sessions {
+        if session.kind != SessionKind::ClaudeCode {
+            continue;
+        }
+        let Some((machine_key, session_id)) =
+            crate::parse_remote_cc_session_path(&session.session_path)
+        else {
+            continue;
+        };
+        if !working_paths.contains(&session.session_path)
+            && confirmed_paths.contains(&session.session_path)
+        {
+            continue;
+        }
+        out.push((
+            machine_key.to_string(),
+            session_id.to_string(),
+            session.session_path.clone(),
+        ));
+    }
+    out
+}
+
+/// Remote half of the CC title sync ([[spec-codex-cc-title-summary]]): live
+/// `remote-cc://machine/uuid` rows read their title from the remote machine's
+/// CC JSONL — the single source of truth (CC writes ai-title/custom-title
+/// there, and yggterm renames are appended there too). One ssh per machine
+/// per tick, only for the rows `remote_cc_title_poll_paths` selects.
+fn collect_remote_cc_title_syncs(
+    live_sessions: &[ManagedSessionView],
+    working_paths: &HashSet<String>,
+    ssh_targets: &[SshConnectTarget],
+    confirmed_paths: &mut HashSet<String>,
+) -> Vec<BackgroundCopyUpdate> {
+    let targets = remote_cc_title_poll_paths(live_sessions, working_paths, confirmed_paths);
+    if targets.is_empty() {
+        return Vec::new();
+    }
+    let mut by_machine: HashMap<String, Vec<(String, String)>> = HashMap::new();
+    for (machine_key, session_id, session_path) in targets {
+        by_machine
+            .entry(machine_key)
+            .or_default()
+            .push((session_id, session_path));
+    }
+    let mut updates = Vec::new();
+    for (machine_key, rows) in by_machine {
+        let Some(target) = ssh_targets
+            .iter()
+            .find(|target| background_machine_key(&target.label) == machine_key)
+        else {
+            continue;
+        };
+        let ids: Vec<String> = rows.iter().map(|(id, _)| id.clone()).collect();
+        let lines = match crate::run_remote_python_lines(
+            &target.ssh_target,
+            target.prefix.as_deref(),
+            REMOTE_CC_TITLE_SCRIPT,
+            &ids,
+        ) {
+            Ok(lines) => lines,
+            // ssh failed: leave the rows unconfirmed so the next tick retries
+            // (the chore's idle backoff bounds the retry rate).
+            Err(_) => continue,
+        };
+        let mut titles: HashMap<String, String> = HashMap::new();
+        for line in &lines {
+            if let Ok(value) = serde_json::from_str::<serde_json::Value>(line)
+                && let (Some(id), Some(title)) = (
+                    value.get("session_id").and_then(|v| v.as_str()),
+                    value.get("title").and_then(|v| v.as_str()),
+                )
+            {
+                titles.insert(id.to_string(), title.trim().to_string());
+            }
+        }
+        for (session_id, session_path) in rows {
+            confirmed_paths.insert(session_path.clone());
+            let Some(title) = titles.get(&session_id).filter(|title| !title.is_empty()) else {
+                continue;
+            };
+            let current = live_sessions
+                .iter()
+                .find(|session| session.session_path == session_path)
+                .map(|session| session.title.as_str())
+                .unwrap_or("");
+            if title.as_str() != current {
+                if let Ok(home) = crate::resolve_yggterm_home() {
+                    append_trace_event(
+                        &home,
+                        "daemon",
+                        "title_trigger",
+                        "remote_cc_title_pickup",
+                        serde_json::json!({
+                            "session_path": session_path,
+                            "machine_key": machine_key,
+                            "previous_title": current,
+                            "new_title": title,
+                        }),
+                    );
+                }
+                updates.push(BackgroundCopyUpdate {
+                    session_path,
+                    title: Some(title.clone()),
+                    summary: None,
+                });
+            }
         }
     }
     updates
@@ -6078,13 +6274,20 @@ fn build_background_copy_updates(
     remote_machines: &[RemoteMachineSnapshot],
     ssh_targets: &[SshConnectTarget],
     working_paths: &HashSet<String>,
+    generation_enabled: bool,
 ) -> Result<Vec<BackgroundCopyUpdate>> {
+    let mut updates = collect_live_cc_title_syncs(live_sessions, working_paths);
+    // LLM title/summary generation is opt-in (env-gated); the CC title sync
+    // above is a cheap local-file read and always runs — CC's JSONL is the
+    // SSOT for CC titles and needs no LLM.
+    if !generation_enabled {
+        return Ok(updates);
+    }
     let mut candidates = Vec::new();
     collect_local_copy_candidates(local_root, &mut candidates);
     collect_live_copy_candidates(store, live_sessions, working_paths, &mut candidates);
     candidates.extend(collect_remote_copy_candidates(remote_machines));
 
-    let mut updates = collect_live_cc_title_syncs(live_sessions, working_paths);
     let mut seen_candidates = HashSet::new();
     // Endpoint pacing: the litellm endpoint 429s under quick successive calls
     // (live-observed 2026-06-11), and each generation can be 2 LLM calls
@@ -6253,7 +6456,11 @@ fn build_background_copy_updates(
     Ok(updates)
 }
 
-fn run_background_copy_chore(runtime: &Arc<Mutex<DaemonRuntime>>) -> Result<usize> {
+fn run_background_copy_chore(
+    runtime: &Arc<Mutex<DaemonRuntime>>,
+    generation_enabled: bool,
+    remote_cc_confirmed: &mut HashSet<String>,
+) -> Result<usize> {
     let (store, settings, local_root, live_sessions, remote_machines, ssh_targets, perf_home, working_paths) = {
         let runtime = lock_daemon_runtime(runtime, "run_background_copy_chore_read");
         let settings = runtime.store.load_settings().unwrap_or_default();
@@ -6294,7 +6501,7 @@ fn run_background_copy_chore(runtime: &Arc<Mutex<DaemonRuntime>>) -> Result<usiz
         )
     };
     let perf = PerfSpan::start(&perf_home, "daemon", "background_copy_chore");
-    let updates = build_background_copy_updates(
+    let mut updates = build_background_copy_updates(
         &store,
         &settings,
         &local_root,
@@ -6302,7 +6509,14 @@ fn run_background_copy_chore(runtime: &Arc<Mutex<DaemonRuntime>>) -> Result<usiz
         &remote_machines,
         &ssh_targets,
         &working_paths,
+        generation_enabled,
     )?;
+    updates.extend(collect_remote_cc_title_syncs(
+        &live_sessions,
+        &working_paths,
+        &ssh_targets,
+        remote_cc_confirmed,
+    ));
     perf.finish(serde_json::json!({
         "updates": updates.len(),
         "live_sessions": live_sessions.len(),
@@ -8662,14 +8876,37 @@ pub fn run_daemon(endpoint: &ServerEndpoint, runtime: GhosttyHostSupport) -> Res
         ),
         Err(error) => warn!(error=%error, "failed to initialize remote runtime registry"),
     }
-    if daemon_background_copy_chore_enabled() {
+    // The chore thread ALWAYS runs: the CC title sync inside it is a cheap
+    // JSONL read that every daemon (local GUI host and remote host daemons
+    // alike) must perform — CC's JSONL is the title SSOT. Only the LLM
+    // title/summary GENERATION half stays behind the env opt-in. (The whole
+    // chore used to sit behind this env, which nothing set — so the CC title
+    // sync shipped as dead code; root cause of "CC titles never update".)
+    {
+        let generation_enabled = daemon_background_copy_chore_enabled();
+        if !generation_enabled {
+            append_trace_event(
+                &home_dir,
+                "daemon",
+                "background_copy",
+                "generation_disabled",
+                serde_json::json!({
+                    "env": ENV_YGGTERM_ENABLE_BACKGROUND_COPY_CHORE,
+                }),
+            );
+        }
         let runtime = runtime.clone();
         let last_activity_ms = last_activity_ms.clone();
         std::thread::spawn(move || {
             let mut sleep_ms = BACKGROUND_COPY_CHORE_MS;
+            let mut remote_cc_confirmed: HashSet<String> = HashSet::new();
             loop {
                 std::thread::sleep(std::time::Duration::from_millis(sleep_ms));
-                match run_background_copy_chore(&runtime) {
+                match run_background_copy_chore(
+                    &runtime,
+                    generation_enabled,
+                    &mut remote_cc_confirmed,
+                ) {
                     Ok(update_count) => {
                         if update_count > 0 {
                             mark_daemon_activity(&last_activity_ms);
@@ -8687,16 +8924,6 @@ pub fn run_daemon(endpoint: &ServerEndpoint, runtime: GhosttyHostSupport) -> Res
                 }
             }
         });
-    } else {
-        append_trace_event(
-            &home_dir,
-            "daemon",
-            "background_copy",
-            "disabled",
-            serde_json::json!({
-                "env": ENV_YGGTERM_ENABLE_BACKGROUND_COPY_CHORE,
-            }),
-        );
     }
     if remote_codex_identity_poll_enabled() {
         let runtime = runtime.clone();
@@ -11740,6 +11967,115 @@ mod tests {
         // indicator is the trigger — spec-title-summary-working-indicator).
         let idle = std::collections::HashSet::new();
         let updates = super::collect_live_cc_title_syncs(&server.live_sessions(), &idle);
+        assert!(updates.is_empty());
+    }
+
+    #[test]
+    fn remote_cc_title_poll_selects_working_and_unconfirmed_rows() {
+        // Working remote-cc rows are always polled (renames/ai-titles land on
+        // working turns); idle rows are polled only until their title has been
+        // confirmed once against the remote JSONL (heals stale launch hints
+        // after a restore). Non-CC and non-remote-cc rows are never selected.
+        let template = {
+            let tree = yggterm_core::SessionNode {
+                kind: yggterm_core::SessionNodeKind::Group,
+                name: "sessions".to_string(),
+                path: std::path::PathBuf::from("/"),
+                ..Default::default()
+            };
+            let mut server = crate::YggtermServer::new(
+                &tree,
+                false,
+                crate::GhosttyHostSupport::shadow("test".to_string(), false, false),
+                yggui_contract::UiTheme::ZedLight,
+            );
+            server.start_local_session(
+                crate::SessionKind::ClaudeCode,
+                Some("/home/pi"),
+                Some("home/pi claude"),
+            );
+            server.live_sessions()[0].clone()
+        };
+        let make = |path: &str, id: &str, kind: crate::SessionKind| {
+            let mut session = template.clone();
+            session.session_path = path.to_string();
+            session.id = id.to_string();
+            session.kind = kind;
+            session
+        };
+        let sessions = vec![
+            make(
+                "remote-cc://practice/aaaa",
+                "aaaa",
+                crate::SessionKind::ClaudeCode,
+            ),
+            make(
+                "remote-cc://practice/bbbb",
+                "bbbb",
+                crate::SessionKind::ClaudeCode,
+            ),
+            make("local://cccc", "cccc", crate::SessionKind::ClaudeCode),
+            make(
+                "remote-session://practice/dddd",
+                "dddd",
+                crate::SessionKind::Codex,
+            ),
+        ];
+        let working: std::collections::HashSet<String> =
+            ["remote-cc://practice/aaaa".to_string()].into();
+        let mut confirmed = std::collections::HashSet::new();
+        // First tick: both remote-cc rows selected (aaaa working, bbbb unconfirmed).
+        let picked = super::remote_cc_title_poll_paths(&sessions, &working, &confirmed);
+        let paths: Vec<&str> = picked.iter().map(|(_, _, p)| p.as_str()).collect();
+        assert_eq!(
+            paths,
+            vec!["remote-cc://practice/aaaa", "remote-cc://practice/bbbb"]
+        );
+        assert_eq!(picked[0].0, "practice");
+        assert_eq!(picked[0].1, "aaaa");
+        // Once confirmed, an idle row is no longer polled; a working row still is.
+        confirmed.insert("remote-cc://practice/aaaa".to_string());
+        confirmed.insert("remote-cc://practice/bbbb".to_string());
+        let picked = super::remote_cc_title_poll_paths(&sessions, &working, &confirmed);
+        let paths: Vec<&str> = picked.iter().map(|(_, _, p)| p.as_str()).collect();
+        assert_eq!(paths, vec!["remote-cc://practice/aaaa"]);
+    }
+
+    #[test]
+    fn live_cc_title_sync_covers_cc_runtime_rows() {
+        // cc-runtime:// rows (the host-daemon runtime lane) live on the same
+        // machine as ~/.claude/projects, so they ride the same local JSONL
+        // sync as local:// rows. With no JSONL on disk this yields no update,
+        // but the row must be CONSIDERED (regression lock for the local://
+        // -only filter that left host-daemon CC rows stuck on launch hints).
+        let session = {
+            let tree = yggterm_core::SessionNode {
+                kind: yggterm_core::SessionNodeKind::Group,
+                name: "sessions".to_string(),
+                path: std::path::PathBuf::from("/"),
+                ..Default::default()
+            };
+            let mut server = crate::YggtermServer::new(
+                &tree,
+                false,
+                crate::GhosttyHostSupport::shadow("test".to_string(), false, false),
+                yggui_contract::UiTheme::ZedLight,
+            );
+            server.start_local_session(
+                crate::SessionKind::ClaudeCode,
+                Some("/home/pi"),
+                Some("home/pi claude"),
+            );
+            let mut session = server.live_sessions()[0].clone();
+            session.session_path =
+                "cc-runtime://00000000-0000-0000-0000-000000000000".to_string();
+            session.id = "00000000-0000-0000-0000-000000000000".to_string();
+            session
+        };
+        let working: std::collections::HashSet<String> =
+            [session.session_path.clone()].into();
+        // No JSONL exists for the nil UUID → fail open with no update (and no panic).
+        let updates = super::collect_live_cc_title_syncs(&[session], &working);
         assert!(updates.is_empty());
     }
 
