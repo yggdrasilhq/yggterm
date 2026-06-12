@@ -12908,9 +12908,25 @@ fn background_snapshot_changes_active_runtime_identity(
     current_runtime_present != incoming_runtime_present
 }
 
+/// Hash of the screen content the sidebar working/idle sample reads (the
+/// terminal-lines tail + status line). Part of the background-snapshot noop
+/// signature: a turn ENDING changes only the screen (working footer →
+/// composer) — none of the runtime-truth fields move — and skipping that
+/// apply freezes the GUI's sample on the stale WORKING frame, leaving the
+/// sidebar dot blinking forever (charts incident 2026-06-12).
+fn live_session_screen_content_signature(terminal_lines: &[String], status_line: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    for line in terminal_lines.iter().rev().take(8) {
+        line.hash(&mut hasher);
+    }
+    status_line.hash(&mut hasher);
+    hasher.finish()
+}
+
 fn live_session_runtime_truth_signature_from_iter<'a>(
     sessions: impl Iterator<Item = &'a ManagedSessionView>,
-) -> Vec<(String, SessionSource, TerminalLaunchPhase, Option<bool>)> {
+) -> Vec<(String, SessionSource, TerminalLaunchPhase, Option<bool>, u64)> {
     let mut signature = sessions
         .filter(|session| {
             matches!(
@@ -12924,6 +12940,10 @@ fn live_session_runtime_truth_signature_from_iter<'a>(
                 session.source,
                 session.launch_phase,
                 session.terminal_foreground_active,
+                live_session_screen_content_signature(
+                    &session.terminal_lines,
+                    &session.status_line,
+                ),
             )
         })
         .collect::<Vec<_>>();
@@ -12933,7 +12953,7 @@ fn live_session_runtime_truth_signature_from_iter<'a>(
 
 fn live_session_runtime_truth_signature_from_snapshot(
     snapshot: &ServerUiSnapshot,
-) -> Vec<(String, SessionSource, TerminalLaunchPhase, Option<bool>)> {
+) -> Vec<(String, SessionSource, TerminalLaunchPhase, Option<bool>, u64)> {
     let mut signature = snapshot
         .live_sessions
         .iter()
@@ -12949,6 +12969,10 @@ fn live_session_runtime_truth_signature_from_snapshot(
                 session.source,
                 session.launch_phase,
                 session.terminal_foreground_active,
+                live_session_screen_content_signature(
+                    &session.terminal_lines,
+                    &session.status_line,
+                ),
             )
         })
         .collect::<Vec<_>>();
@@ -12964,6 +12988,7 @@ fn live_session_runtime_truth_signature_from_snapshot(
             active.source,
             active.launch_phase,
             active.terminal_foreground_active,
+            live_session_screen_content_signature(&active.terminal_lines, &active.status_line),
         ));
     }
     signature.sort_by(|left, right| left.0.cmp(&right.0));
@@ -25263,6 +25288,29 @@ fn describe_app_state_snapshot(
         .live_sessions()
         .iter()
         .map(|session| {
+            // Working-indicator SSOT diagnostics: expose the EXACT inputs the
+            // sidebar dot decides from (sample tail + footer verdict +
+            // optimistic hint), so a blinking dot can be root-caused from a
+            // probe instead of guessing (incident 2026-06-12: probe-vs-pixel
+            // mismatch — the DOM `busy` field still read the retired icon).
+            let sidebar_sample = session_sample_text_for_sidebar_icon(session);
+            let sample_shows_working =
+                terminal_chunk_has_agent_working_status_for_sidebar_icon(&sidebar_sample);
+            let optimistic_busy = snapshot
+                .optimistic_busy_paths
+                .iter()
+                .any(|path| {
+                    normalize_live_session_path(path)
+                        == normalize_live_session_path(&session.session_path)
+                });
+            let sample_tail = strip_terminal_control_sequences(&sidebar_sample)
+                .chars()
+                .rev()
+                .take(220)
+                .collect::<String>()
+                .chars()
+                .rev()
+                .collect::<String>();
             json!({
                 "session_path": session.session_path,
                 "title": session.title,
@@ -25274,6 +25322,10 @@ fn describe_app_state_snapshot(
                 "launch_phase": format!("{:?}", session.launch_phase),
                 "keep_alive": live_session_keep_alive(session),
                 "status_line": session.status_line,
+                "sidebar_sample_shows_working": sample_shows_working,
+                "sidebar_optimistic_busy": optimistic_busy,
+                "sidebar_sample_tail": sample_tail,
+                "terminal_line_count": session.terminal_lines.len(),
             })
         })
         .collect::<Vec<_>>();
@@ -28460,7 +28512,7 @@ async fn capture_dom_debug_snapshot_basic_for(active_session_path: Option<&str>)
                         height: Math.round(rect.height),
                         icon_kind: iconKind,
                         icon_text: treeIcon ? String(treeIcon.textContent || '').trim() : '',
-                        busy: iconKind === 'busy',
+                        busy: row.querySelector('[data-sidebar-live-session-working="1"]') !== null,
                         live_close_text: String(liveClose?.textContent || '').trim(),
                         live_close_color: liveCloseStyle ? liveCloseStyle.color : null,
                         live_close_background_color: liveCloseStyle ? liveCloseStyle.backgroundColor : null,
@@ -94277,6 +94329,37 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         let mut changed = snapshot;
         changed.live_sessions[0].terminal_foreground_active = Some(true);
         assert!(!background_live_session_snapshot_is_noop(&shell, &changed));
+    }
+
+    // A turn ENDING changes only the SCREEN (working footer → idle composer);
+    // none of the runtime-truth fields move. The noop check must treat that
+    // as a real change, or the GUI's terminal_lines freeze on the WORKING
+    // frame and the sidebar dot blinks forever (charts incident 2026-06-12:
+    // 384 noop skips while the daemon screen had long gone idle).
+    #[test]
+    fn background_live_session_snapshot_applies_screen_content_change() {
+        let session_path = "local://active-shell";
+        let mut shell = ShellState::new(test_shell_bootstrap_with_active_session(session_path));
+        let live_session = test_live_shell_session(session_path);
+        let snapshot = ServerUiSnapshot {
+            active_session_path: Some(session_path.to_string()),
+            active_session: Some(snapshot_session_view_for_ui(live_session.clone())),
+            active_view_mode: WorkspaceViewMode::Terminal,
+            remote_machines: Vec::new(),
+            ssh_targets: Vec::new(),
+            live_sessions: vec![snapshot_session_view_for_ui(live_session)],
+        };
+        shell.server.apply_snapshot(snapshot.clone());
+        assert!(background_live_session_snapshot_is_noop(&shell, &snapshot));
+
+        // Same runtime truth, different screen tail = the turn ended.
+        let mut screen_changed = snapshot;
+        screen_changed.live_sessions[0].terminal_lines =
+            vec!["› type a message".to_string(), "gpt-5.5 medium".to_string()];
+        assert!(!background_live_session_snapshot_is_noop(
+            &shell,
+            &screen_changed
+        ));
     }
 
     #[test]
