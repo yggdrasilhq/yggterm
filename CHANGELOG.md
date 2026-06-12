@@ -4,6 +4,16 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+## 2.9.7
+
+- **Restored remote Claude Code sessions no longer come back as phantom local
+  claudes.** A restored or takeover-imported `remote-cc://` row fell through to
+  the generic local launch builder, spawning a fresh `claude` on the local
+  machine while the row claimed to be remote — image pastes then staged on the
+  remote machine and CC complained the files did not exist, and the conversation
+  history was silently absent. Restored remote CC rows are now re-anchored as
+  remote sessions on the resume-cc daemon lane.
+
 ## 2.9.6
 
 - **The sidebar working dot no longer stays stuck blinking after a turn ends.**

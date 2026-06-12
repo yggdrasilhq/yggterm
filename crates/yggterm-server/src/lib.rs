@@ -6197,6 +6197,35 @@ impl YggtermServer {
             false,
         );
         self.append_restored_live_session_order(&key);
+        // remote-cc:// twin of the remote_scanned arm above (the scanned-key
+        // parse only matches remote-session://): build_live_session's
+        // ClaudeCode arm produces a LOCAL launch, so without this rewrite a
+        // restored/imported REMOTE CC row spawns a fresh claude on the WRONG
+        // machine (live-caught 2026-06-12: pasted images staged on practice
+        // while the row's claude ran locally on the client). Re-anchor the
+        // row as a LiveSsh remote CC session and put it on the resume-cc
+        // wrapper lane.
+        if let Some((_machine_key, cc_session_id)) = parse_remote_cc_session_path(&key) {
+            let cc_session_id = cc_session_id.to_string();
+            let remote_machines = self.remote_machines.clone();
+            if let Some(session) = self.sessions.get_mut(&key) {
+                session.source = SessionSource::LiveSsh;
+                session.kind = SessionKind::ClaudeCode;
+                session.id = cc_session_id.clone();
+                session.ssh_target = Some(target.ssh_target.clone());
+                session.ssh_prefix = target.prefix.clone();
+                session.host_label = target.label.clone();
+                upsert_session_metadata(&mut session.metadata, "Host", target.ssh_target.clone());
+                upsert_session_metadata(&mut session.metadata, "UUID", cc_session_id);
+                if let Some(cwd) = target.cwd.as_deref() {
+                    upsert_session_metadata(&mut session.metadata, "Cwd", cwd.to_string());
+                }
+                let _ = refresh_remote_codex_terminal_identity_launch_command(
+                    session,
+                    &remote_machines,
+                );
+            }
+        }
         if let Some(session) = self.sessions.get_mut(&key) {
             let _ = refresh_restored_remote_runtime_codex_launch_command(&key, session);
             if let Some(storage_path) = storage_path.as_deref() {
@@ -28443,6 +28472,81 @@ terminal_window_id: None,
         assert_eq!(
             server.terminal_runtime_key_for_path("codex-runtime://runtime-session"),
             "codex-runtime://runtime-session"
+        );
+    }
+
+    // Live-caught 2026-06-12: a restored/imported remote-cc:// row took the
+    // generic insert path, whose build_live_session ClaudeCode arm builds a
+    // LOCAL `claude` launch — a fresh claude spawned on the WRONG machine
+    // (pasted images staged on practice, claude running on the client). A
+    // restored remote CC row must come back as a LiveSsh session on the
+    // resume-cc wrapper lane.
+    #[test]
+    fn restore_live_session_puts_remote_cc_row_on_wrapper_lane() {
+        let tree = SessionNode {
+            kind: SessionNodeKind::Group,
+            name: "sessions".to_string(),
+            title: None,
+            document_kind: None,
+            group_kind: None,
+            path: PathBuf::from("/"),
+            children: Vec::new(),
+            session_id: None,
+            cwd: None,
+            ..Default::default()
+        };
+        let mut server = YggtermServer::new(
+            &tree,
+            false,
+            GhosttyHostSupport::shadow("test".to_string(), false, false),
+            UiTheme::ZedLight,
+        );
+        server.remote_machines.push(RemoteMachineSnapshot {
+            machine_key: "practice".to_string(),
+            label: "practice".to_string(),
+            ssh_target: "practice".to_string(),
+            prefix: None,
+            remote_binary_expr: Some("$HOME/.yggterm/bin/yggterm".to_string()),
+            remote_deploy_state: RemoteDeployState::Ready,
+            health: RemoteMachineHealth::Healthy,
+            sessions: Vec::new(),
+        });
+
+        let key = "remote-cc://practice/53991819-a835-4bd2-b5c4-76a67631f33c";
+        server.restore_live_session(PersistedLiveSession {
+            key: key.to_string(),
+            id: "53991819-a835-4bd2-b5c4-76a67631f33c".to_string(),
+            title: "practice cc".to_string(),
+            kind: SessionKind::ClaudeCode,
+            keep_alive: true,
+            ssh_target: "practice".to_string(),
+            prefix: None,
+            cwd: Some("/home/pi/git/practice-rs".to_string()),
+            remote_launch_action: None,
+            storage_path: None,
+            restore_reason: None,
+        });
+
+        let session = server.sessions.get(key).expect("restored remote cc row");
+        assert_eq!(session.kind, SessionKind::ClaudeCode);
+        assert_eq!(session.source, SessionSource::LiveSsh);
+        assert_eq!(session.ssh_target.as_deref(), Some("practice"));
+        assert!(
+            session.launch_command.contains("resume-cc"),
+            "restored remote CC must ride the wrapper lane, not a local claude: {}",
+            session.launch_command
+        );
+        assert!(
+            session.launch_command.contains("ssh"),
+            "{}",
+            session.launch_command
+        );
+        assert!(
+            session
+                .launch_command
+                .contains("53991819-a835-4bd2-b5c4-76a67631f33c"),
+            "{}",
+            session.launch_command
         );
     }
 
