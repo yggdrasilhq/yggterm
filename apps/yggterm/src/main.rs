@@ -2611,7 +2611,10 @@ fn configure_linux_desktop_backend() {}
 #[cfg(target_os = "linux")]
 fn configure_linux_terminal_renderer_policy() {
     let policy = linux_terminal_renderer_policy_from_input(LinuxTerminalRendererPolicyInput {
-        explicit_canvas_env: std::env::var_os(ENV_YGGTERM_ENABLE_XTERM_CANVAS).is_some(),
+        explicit_canvas_env: linux_canvas_env_is_user_explicit(
+            std::env::var_os(ENV_YGGTERM_ENABLE_XTERM_CANVAS).is_some(),
+            std::env::var("YGGTERM_XTERM_CANVAS_POLICY").ok().as_deref(),
+        ),
         gdk_backend_x11: std::env::var("GDK_BACKEND")
             .ok()
             .is_some_and(|value| value.split(',').any(|part| part.trim() == "x11")),
@@ -2622,6 +2625,29 @@ fn configure_linux_terminal_renderer_policy() {
         unsafe { std::env::set_var(ENV_YGGTERM_ENABLE_XTERM_CANVAS, value) };
     }
     unsafe { std::env::set_var("YGGTERM_XTERM_CANVAS_POLICY", policy.reason) };
+}
+
+/// Whether YGGTERM_ENABLE_XTERM_CANVAS in this process's env is a USER
+/// override (honor it) or an INHERITED launcher decision (recompute it).
+/// The companion launch lane (`yggterm-headless server app launch` over ssh)
+/// computes the policy in an environment with no display vars and exports
+/// BOTH the canvas flag and YGGTERM_XTERM_CANVAS_POLICY; the windowed GUI it
+/// spawns inherits the pair and — before this guard — mistook the flag for an
+/// explicit override, locking every agent-launched GUI to the DOM renderer
+/// (broken box-drawing / missing highlights) while desktop launches got
+/// canvas. A canvas flag accompanied by a non-explicit policy marker is an
+/// inherited decision; only a bare flag (user export) or one whose marker
+/// says "xterm_canvas_explicit" (re-exec of an honored override) is explicit.
+#[cfg(target_os = "linux")]
+fn linux_canvas_env_is_user_explicit(
+    canvas_env_present: bool,
+    policy_env: Option<&str>,
+) -> bool {
+    canvas_env_present
+        && policy_env
+            .map(str::trim)
+            .filter(|policy| !policy.is_empty())
+            .is_none_or(|policy| policy == "xterm_canvas_explicit")
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -4056,6 +4082,40 @@ mod tests {
             });
         assert_eq!(explicit.set_canvas_env, None);
         assert_eq!(explicit.reason, "xterm_canvas_explicit");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_canvas_env_explicit_only_for_user_overrides_not_inherited_policy() {
+        use super::linux_canvas_env_is_user_explicit;
+
+        // No canvas flag at all → not explicit.
+        assert!(!linux_canvas_env_is_user_explicit(false, None));
+        // Bare user export (no policy marker) → explicit, honor it.
+        assert!(linux_canvas_env_is_user_explicit(true, None));
+        // Re-exec of an honored override carries the explicit marker → still explicit.
+        assert!(linux_canvas_env_is_user_explicit(
+            true,
+            Some("xterm_canvas_explicit")
+        ));
+        // Inherited launcher decisions (companion app-launch over ssh computed
+        // the policy in a display-less env) → NOT explicit, recompute. This is
+        // the rich-vs-broken renderer split: agent-launched GUIs were locked
+        // to the DOM renderer by the inherited pair.
+        assert!(!linux_canvas_env_is_user_explicit(
+            true,
+            Some("xterm_canvas_disabled_by_default")
+        ));
+        assert!(!linux_canvas_env_is_user_explicit(
+            true,
+            Some("xterm_canvas_disabled_for_x11")
+        ));
+        assert!(!linux_canvas_env_is_user_explicit(
+            true,
+            Some("xterm_canvas_enabled_for_wayland")
+        ));
+        // Empty marker behaves like no marker (bare user export).
+        assert!(linux_canvas_env_is_user_explicit(true, Some("  ")));
     }
 
     #[cfg(target_os = "linux")]
