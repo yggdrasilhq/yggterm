@@ -26,6 +26,15 @@ This file tracks user-visible changes in `yggterm`.
 - `Remote Claude Code <id>` runtime placeholders and `yggterm claude-code` /
   `local claude code` launch titles are now recognized as generated fallbacks,
   so real titles can replace them.
+- **Sidebar collapse state now survives restarts.** Collapsing a machine node
+  (or remote folder / Live Sessions) is persisted in settings; on the next
+  launch the group stays collapsed, and the active-session auto-reveal no
+  longer re-expands groups the user explicitly collapsed. Previously the
+  collapse memory was process-local, so every restart re-expanded all
+  machines.
+- Expanded-path settings no longer accumulate junk entries (`remote-cc:`,
+  empty paths) from filesystem-ancestor expansion applied to URL-style
+  session keys.
 
 ## 2.9.8
 
