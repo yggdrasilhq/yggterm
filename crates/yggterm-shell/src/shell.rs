@@ -380,6 +380,44 @@ fn screen_reconcile_should_write(screen_text: &str) -> bool {
         // seed-in-terminal class) over a possibly-richer client buffer.
         && !terminal_chunk_is_daemon_launch_seed(screen_text)
 }
+// The single-sample WORKING test above races codex's transient mid-turn
+// clears: at snapshot time the footer may be momentarily absent, the screen
+// reads not-working, and the reconcile would \e[H\e[J-paint a sparse
+// mid-clear frame over the live surface (the working-session vacuum). The
+// incident-gap-fix-cascade rule is gate-on-NO-RECENT-OUTPUT: a reconcile may
+// only write once forwarded PTY output has been quiet this long.
+const SCREEN_RECONCILE_OUTPUT_QUIET_MS: u64 = 1_200;
+// Re-arm cadence while a due reconcile is deferred (recent output or a
+// working footer). Deferring must NOT drop the reconcile — a vacuumed reveal
+// frame on a working session would otherwise stay wrong for the whole turn;
+// the corrective write lands once the surface is quiet AND idle.
+const SCREEN_RECONCILE_DEFER_REARM_MS: u64 = 3_000;
+/// Outcome for a due visible-screen reconcile once the daemon frame is in
+/// hand. `DeferWorking` means re-arm (never write over a working surface,
+/// never drop the correction); `SkipUnwritable` keeps the bounded
+/// empty/launch-seed retry.
+#[derive(Debug, PartialEq, Eq)]
+enum ScreenReconcileDecision {
+    Write,
+    DeferWorking,
+    SkipUnwritable,
+}
+fn screen_reconcile_decision(screen_text: &str) -> ScreenReconcileDecision {
+    if screen_reconcile_should_write(screen_text) {
+        ScreenReconcileDecision::Write
+    } else if yggterm_core::screen_text_shows_agent_working(screen_text) {
+        ScreenReconcileDecision::DeferWorking
+    } else {
+        ScreenReconcileDecision::SkipUnwritable
+    }
+}
+/// Recent-output pre-gate for a due reconcile, checked BEFORE the daemon
+/// snapshot fetch: while forwarded output is still flowing the surface is
+/// mid-turn (regardless of what a single working-footer sample says) and the
+/// reconcile must defer, not write.
+fn screen_reconcile_output_quiet(now_ms: u64, last_forwarded_output_at_ms: u64) -> bool {
+    now_ms.saturating_sub(last_forwarded_output_at_ms) >= SCREEN_RECONCILE_OUTPUT_QUIET_MS
+}
 const RETAINED_EMPTY_SURFACE_SETTLE_MS: u64 = 800;
 // Like the empty-surface transient above, a cold/mid-redraw surface can fail
 // codex-PROMPT recognition for a frame (the prompt hasn't repainted yet). The
@@ -49086,6 +49124,11 @@ fn TerminalCanvas(
             let mut inline_status_animation_started_at_ms = 0_u64;
             let mut last_forward_protocol_only_trace_ms = 0_u64;
             let mut suppressed_forward_protocol_only_trace_count = 0_u64;
+            // Last time real (non-protocol-only) PTY output was forwarded to
+            // xterm — the recent-output gate for the screen reconcile.
+            let mut last_forwarded_output_at_ms = 0_u64;
+            let mut last_screen_reconcile_defer_trace_ms = 0_u64;
+            let mut suppressed_screen_reconcile_defer_count = 0_u64;
             let mut last_window_focused_for_read =
                 state.with(|shell| shell.effective_window_focused());
             let mut terminal_write_bridge = TerminalWriteBridge::new(terminal_write_frame_ms());
@@ -49155,6 +49198,38 @@ fn TerminalCanvas(
                     && screen_reconcile_due_at_ms != 0
                     && current_millis() >= screen_reconcile_due_at_ms
                 {
+                    let reconcile_now_ms = current_millis();
+                    if !screen_reconcile_output_quiet(reconcile_now_ms, last_forwarded_output_at_ms)
+                    {
+                        // Mid-turn output is still flowing — defer (keep the
+                        // reason) without even fetching the daemon frame. The
+                        // single-sample working test below races codex's
+                        // transient clears; the quiet gate does not.
+                        screen_reconcile_due_at_ms =
+                            reconcile_now_ms.saturating_add(SCREEN_RECONCILE_DEFER_REARM_MS);
+                        if last_screen_reconcile_defer_trace_ms == 0
+                            || reconcile_now_ms
+                                .saturating_sub(last_screen_reconcile_defer_trace_ms)
+                                >= 10_000
+                        {
+                            append_trace_event(
+                                &trace_home,
+                                "ui",
+                                "terminal_mount",
+                                "screen_reconcile_deferred_recent_output",
+                                json!({
+                                    "session_path": session_path.clone(),
+                                    "reason": screen_reconcile_reason,
+                                    "suppressed_since_last": suppressed_screen_reconcile_defer_count,
+                                }),
+                            );
+                            last_screen_reconcile_defer_trace_ms = reconcile_now_ms;
+                            suppressed_screen_reconcile_defer_count = 0;
+                        } else {
+                            suppressed_screen_reconcile_defer_count =
+                                suppressed_screen_reconcile_defer_count.saturating_add(1);
+                        }
+                    } else {
                     screen_reconcile_due_at_ms = 0;
                     let reconcile_reason = screen_reconcile_reason;
                     screen_reconcile_reason = "post_resize_screen_reconcile";
@@ -49169,9 +49244,8 @@ fn TerminalCanvas(
                         // Recovery-churn guard (incident-gap-fix-cascade): never
                         // repaint over a WORKING surface — the agent's own next
                         // frame repaints it, and a mid-turn overwrite tears.
-                        let looks_working =
-                            yggterm_core::screen_text_shows_agent_working(&screen_text);
-                        if screen_reconcile_should_write(&screen_text) {
+                        match screen_reconcile_decision(&screen_text) {
+                        ScreenReconcileDecision::Write => {
                             screen_reconcile_unwritable_retries = 0;
                             let _ = eval.send(TerminalJsCommand::Write {
                                 data: screen_text.clone(),
@@ -49186,7 +49260,16 @@ fn TerminalCanvas(
                                     "bytes": screen_text.len(),
                                 }),
                             );
-                        } else if looks_working {
+                        }
+                        ScreenReconcileDecision::DeferWorking => {
+                            // RE-ARM, don't drop: a vacuumed/stale reveal frame
+                            // under a working turn must still get its corrective
+                            // write once the turn ends. Codex repaints the live
+                            // region itself meanwhile; the reconcile fires on
+                            // the first quiet+idle tick.
+                            screen_reconcile_due_at_ms = current_millis()
+                                .saturating_add(SCREEN_RECONCILE_DEFER_REARM_MS);
+                            screen_reconcile_reason = reconcile_reason;
                             append_trace_event(
                                 &trace_home,
                                 "ui",
@@ -49195,9 +49278,11 @@ fn TerminalCanvas(
                                 json!({
                                     "session_path": session_path.clone(),
                                     "reason": reconcile_reason,
+                                    "rearmed": true,
                                 }),
                             );
-                        } else {
+                        }
+                        ScreenReconcileDecision::SkipUnwritable => {
                             // Unwritable (empty / launch-seed) — previously a
                             // SILENT give-up. Trace it and re-arm the SAME
                             // reveal reconcile up to 3 times so the stale
@@ -49224,6 +49309,8 @@ fn TerminalCanvas(
                             );
                         }
                     }
+                }
+                }
                 }
                 if !bootstrap_owner_still_current(state) {
                     release_bootstrap_lease(
@@ -52604,6 +52691,12 @@ fn TerminalCanvas(
                                         || forward_terminal_protocol_only_output
                                     {
                                         let now_ms = current_millis();
+                                        if !forward_terminal_protocol_only_output {
+                                            // Real output forwarded to xterm —
+                                            // recent-output gate for the screen
+                                            // reconcile (mid-turn never writes).
+                                            last_forwarded_output_at_ms = now_ms;
+                                        }
                                         if forward_terminal_protocol_only_output {
                                             let _ = safe_shell_mut(
                                                 state,
@@ -75786,6 +75879,48 @@ mod tests {
         assert!(!screen_reconcile_should_write(
             "$ codex\r\nLaunching live Codex session\u{2026}\r\nDeploy state: ready\r\nLaunch phase: running\r\nTerminal surface: embedded xterm.js\r\n"
         ));
+    }
+    // Working-session vacuum guards (charts finding): a due reconcile must (a)
+    // DEFER — not drop — over a working footer so the corrective write still
+    // lands when the turn ends, (b) treat empty/launch-seed frames as the
+    // bounded unwritable retry, and (c) never write while forwarded output is
+    // still flowing (the quiet gate beats the single-sample working test,
+    // which races codex's transient mid-turn clears).
+    #[test]
+    fn screen_reconcile_defers_working_and_skips_unwritable() {
+        assert_eq!(
+            screen_reconcile_decision(
+                "transcript line\r\n\u{203a} Find and fix a bug\r\n gpt-5.5 medium\r\n"
+            ),
+            ScreenReconcileDecision::Write
+        );
+        assert_eq!(
+            screen_reconcile_decision("doing things\r\n(2m 10s \u{2022} esc to interrupt)\r\n"),
+            ScreenReconcileDecision::DeferWorking
+        );
+        assert_eq!(
+            screen_reconcile_decision("   \r\n  "),
+            ScreenReconcileDecision::SkipUnwritable
+        );
+        assert_eq!(
+            screen_reconcile_decision(
+                "$ codex\r\nLaunching live Codex session\u{2026}\r\nDeploy state: ready\r\nLaunch phase: running\r\nTerminal surface: embedded xterm.js\r\n"
+            ),
+            ScreenReconcileDecision::SkipUnwritable
+        );
+    }
+    #[test]
+    fn screen_reconcile_quiet_gate_blocks_recent_output() {
+        // Output 200ms ago — mid-turn, must defer even if the working footer
+        // is transiently absent from the snapshot.
+        assert!(!screen_reconcile_output_quiet(10_000, 9_800));
+        // Quiet for the full window — eligible.
+        assert!(screen_reconcile_output_quiet(
+            10_000 + SCREEN_RECONCILE_OUTPUT_QUIET_MS,
+            10_000
+        ));
+        // Never-seen-output (fresh mount, tracker still 0) must not block.
+        assert!(screen_reconcile_output_quiet(5_000, 0));
     }
 
     // App-control `force-foreground` (monitoring override): with the flag on,
