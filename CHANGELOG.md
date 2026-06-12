@@ -4,6 +4,18 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+## 2.9.6
+
+- **The sidebar working dot no longer stays stuck blinking after a turn ends.**
+  The background session refresh skipped "unchanged" snapshots by comparing only
+  runtime fields (launch phase, foreground state) — a turn ending changes only
+  the screen content, so the refresh never applied it and the working indicator
+  kept reading a stale working frame indefinitely. The skip signature now
+  includes the screen tail, so the indicator clears as soon as the agent goes
+  idle. The app-state probe also gained per-session working-indicator
+  diagnostics (`sidebar_sample_shows_working`, sample tail), and its sidebar
+  `busy` field now reads the live working attribute instead of a retired icon.
+
 ## 2.9.5
 
 - **Claude Code sessions now survive restarts, exactly like Codex.** Remote CC
