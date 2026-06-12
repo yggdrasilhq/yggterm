@@ -12278,6 +12278,31 @@ pub fn run_remote_saved_codex_session_exists(session_id: &str) -> anyhow::Result
     Ok(())
 }
 
+/// Forward the bridge process's terminal identity color profile to the host
+/// daemon before it (re)spawns an agent CLI. The SSH attach wrapper exports
+/// YGGTERM_TERMINAL_COLOR_* into the BRIDGE env, but the long-lived host daemon
+/// spawns the CLI from its OWN env — without this sync it answers the CLI's
+/// OSC 10/11 color queries from the hardcoded appearance fallback (#1e1e1e
+/// dark), so e.g. the codex composer renders a mismatched neutral gray instead
+/// of the theme-derived one ("darker prompt bar" inconsistency, root-caused
+/// 2026-06-12 via /proc env: dev codex lacked the color vars while practice
+/// had them). The sync also refreshes stored launch commands, so legacy
+/// sessions self-heal on their next resume. Best-effort: a failed sync only
+/// means the fallback colors, never a failed resume.
+fn sync_terminal_identity_profile_to_host_daemon(
+    endpoint: &ServerEndpoint,
+    terminal_appearance: &str,
+) {
+    let Some(profile) = codex_cli::terminal_identity_color_profile_from_environment() else {
+        return;
+    };
+    let _ = daemon::sync_terminal_identity_with_profile(
+        endpoint,
+        terminal_appearance,
+        Some(&profile),
+    );
+}
+
 pub fn run_remote_resume_codex(
     session_id: &str,
     cwd: Option<&str>,
@@ -12307,6 +12332,7 @@ pub fn run_remote_resume_codex(
     if let Some((endpoint, runtime_key)) =
         endpoint_with_live_remote_codex_session(&home, session_id, Some(&terminal_appearance))?
     {
+        sync_terminal_identity_profile_to_host_daemon(&endpoint, &terminal_appearance);
         finish_span(serde_json::json!({
             "session_id": session_id,
             "cwd": cwd,
@@ -12320,6 +12346,7 @@ pub fn run_remote_resume_codex(
     }
     let endpoint = default_endpoint(&home);
     ensure_local_daemon_running(&endpoint)?;
+    sync_terminal_identity_profile_to_host_daemon(&endpoint, &terminal_appearance);
     let key = daemon_ensure_remote_runtime_codex_session(
         &endpoint,
         session_id,
@@ -12376,6 +12403,7 @@ pub fn run_remote_start_codex(session_id: &str, cwd: Option<&str>) -> anyhow::Re
             Some(&terminal_appearance),
         )?
     {
+        sync_terminal_identity_profile_to_host_daemon(&endpoint, &terminal_appearance);
         finish_span(serde_json::json!({
             "session_id": session_id,
             "cwd": cwd,
@@ -12388,6 +12416,7 @@ pub fn run_remote_start_codex(session_id: &str, cwd: Option<&str>) -> anyhow::Re
     }
     let endpoint = default_endpoint(&home);
     ensure_local_daemon_running(&endpoint)?;
+    sync_terminal_identity_profile_to_host_daemon(&endpoint, &terminal_appearance);
     let key = daemon::start_remote_runtime_codex_session(
         &endpoint,
         session_id,

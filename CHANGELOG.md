@@ -4,6 +4,26 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+## 2.9.2
+
+- **The sidebar working dot no longer blinks on freshly attached idle sessions.** The
+  working indicator's only source of truth is now the agent CLI's own working footer
+  ("esc to interrupt"). Previously, output volume alone (the frame burst a hot attach
+  replays), foreground-process state, and bootstrap launch phases each marked an agent
+  session busy, so every recently attached session blinked "working" with no turn
+  running. Locked by a mock-tui pipeline test: codex-style repaint churn with an idle
+  composer must read as not-working.
+- **Phantom "(title) session" spawns on sidebar switches are suppressed and traced.**
+  A misdispatched click could fire a start-action handler right after a row open,
+  silently starting a brand-new codex session named after the clicked row. Start
+  actions now verify their surface is actually live (start page visible / titlebar
+  menu open) and otherwise drop the event with a `phantom_start_suppressed` trace.
+- **Codex prompt-bar color is now consistent across machines.** The SSH attach bridge
+  forwards the GUI's terminal color profile to the host daemon before a resume, so the
+  daemon answers codex's color queries with the real theme background instead of a
+  hardcoded fallback — which had produced the mismatched darker composer bar on some
+  sessions. Already-running sessions pick the fix up at their next resume.
+
 ## 2.8.26
 
 - **Codex sessions no longer show a clipped/blank viewport after switching away and back.**
