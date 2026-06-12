@@ -45747,8 +45747,15 @@ fn terminal_session_bridge_read_policy(
     if !terminal_session_bridge_should_pause_reads(shell, session_path) {
         return TerminalBridgeReadPolicy::Active;
     }
+    // The ACTIVE session under an UNFOCUSED window must also trickle: a fully
+    // paused read lets a working CLI overrun the daemon chunk ring (512
+    // chunks ≈ tens of seconds of spinner frames), so the refocus read jumps
+    // the cursor (`resync_required`) and the diff-rendering TUI never repaints
+    // the cells lost in the gap — the merged/garbled working timer the user
+    // sees after bg→fg (docs/xterm-bugs.md#chunk-ring-trim-drops-mid-stream).
     if terminal_background_trickle_reads_enabled()
-        && shell.terminal_session_is_retained_live(session_path)
+        && (shell.terminal_session_is_retained_live(session_path)
+            || terminal_active_visible_for_session(shell, session_path))
     {
         return TerminalBridgeReadPolicy::BackgroundTrickle;
     }
@@ -51913,15 +51920,22 @@ fn TerminalCanvas(
                                 last_resize_seq,
                                 resync_required,
                             )) => {
-                                // Layer 2 (carry + observe): the daemon flagged that
-                                // the chunk ring trimmed below our cursor, so these
-                                // chunks skip a contiguous middle
+                                // The daemon flagged that the chunk ring trimmed
+                                // below our cursor, so these chunks skip a
+                                // contiguous middle
                                 // (docs/xterm-bugs.md#chunk-ring-trim-drops-mid-stream).
-                                // For now we only TRACE it — the re-attach action
-                                // (read from cursor 0 to recover the gap from the vt100
-                                // scrollback) lands in a follow-up, gated on live
-                                // verification against a backgrounded-stream repro.
+                                // Per `resumed_read_outcome` →
+                                // SkipGapReconcileScreen: NEVER replay history here
+                                // (the gap-fix cascade trap); instead arm the
+                                // scrollback-preserving visible-screen reconcile so
+                                // the authoritative daemon frame repaints the bottom
+                                // once the surface is quiet/non-working.
                                 if resync_required {
+                                    if screen_reconcile_due_at_ms == 0 {
+                                        screen_reconcile_due_at_ms = current_millis()
+                                            .saturating_add(REVEAL_SCREEN_RECONCILE_SETTLE_MS);
+                                        screen_reconcile_reason = "resync_gap_screen_reconcile";
+                                    }
                                     append_trace_event(
                                         &trace_home,
                                         "ui",
@@ -93573,6 +93587,38 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         // The trickle cadence stays well under the unfocused stall interval.
         assert!(
             TERMINAL_RETAINED_BACKGROUND_TRICKLE_POLL_MS < TERMINAL_UNFOCUSED_OUTPUT_READ_POLL_MS
+        );
+    }
+
+    #[test]
+    fn unfocused_active_session_trickles_reads_instead_of_pausing() {
+        // Timer-smear incident (2026-06-12): the ACTIVE session under an
+        // UNFOCUSED window paused reads entirely, so a working CC/codex
+        // overran the 512-chunk daemon ring while the user was in another
+        // app; the refocus read jumped the cursor (resync_required) and the
+        // diff-rendering TUI never repainted the lost cells — garbled working
+        // timer + missing content until turn end. The active session must
+        // trickle while unfocused, exactly like a retained-live host.
+        let active_session_path = "remote-cc://dev/unfocused-active";
+        let bootstrap = test_shell_bootstrap_with_active_session(active_session_path);
+        let mut shell = ShellState::new(bootstrap);
+        shell.server.set_view_mode(WorkspaceViewMode::Terminal);
+        shell.set_window_focused(false);
+
+        // The unfocused window pauses the full-cadence bridge reads…
+        assert!(terminal_session_bridge_should_pause_reads(
+            &shell,
+            active_session_path
+        ));
+        // …but the active session trickles instead of fully pausing.
+        assert_eq!(
+            terminal_session_bridge_read_policy(&shell, active_session_path),
+            TerminalBridgeReadPolicy::BackgroundTrickle
+        );
+        // A non-retained background session keeps the historical pause.
+        assert_eq!(
+            terminal_session_bridge_read_policy(&shell, "local://not-retained"),
+            TerminalBridgeReadPolicy::Paused
         );
     }
 
