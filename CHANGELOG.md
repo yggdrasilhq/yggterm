@@ -35,6 +35,15 @@ This file tracks user-visible changes in `yggterm`.
 - Expanded-path settings no longer accumulate junk entries (`remote-cc:`,
   empty paths) from filesystem-ancestor expansion applied to URL-style
   session keys.
+- **Rich vs broken terminal rendering no longer depends on how the GUI was
+  launched.** GUIs spawned via the agent/companion lane (`server app launch`
+  over ssh) inherited a renderer policy computed in a display-less
+  environment and treated it as an explicit user override, locking the whole
+  process to the slow DOM renderer — per-character broken box-drawing
+  borders in vim/htop/CC, chopped progress bars, and missing highlights —
+  while desktop launches got the GPU canvas renderer. An inherited policy
+  pair is now recomputed against the desktop-hydrated environment; only a
+  genuine user export of `YGGTERM_ENABLE_XTERM_CANVAS` is honored as-is.
 
 ## 2.9.8
 
