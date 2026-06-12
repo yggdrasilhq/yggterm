@@ -2797,6 +2797,12 @@ pub fn looks_like_generated_fallback_title(title: &str) -> bool {
         && words[2].eq_ignore_ascii_case("litellm")
         && (words[3].len() == 7 || words[3].len() == 8)
         && words[3].chars().all(|ch| ch.is_ascii_hexdigit());
+    let remote_claude_code_runtime_title = words.len() == 4
+        && words[0].eq_ignore_ascii_case("remote")
+        && words[1].eq_ignore_ascii_case("claude")
+        && words[2].eq_ignore_ascii_case("code")
+        && (words[3].len() == 7 || words[3].len() == 8)
+        && words[3].chars().all(|ch| ch.is_ascii_hexdigit());
     let generic_runtime_title = matches!(
         lower.as_str(),
         "local shell"
@@ -2808,6 +2814,10 @@ pub fn looks_like_generated_fallback_title(title: &str) -> bool {
             | "yggterm shell"
             | "yggterm codex"
             | "yggterm codex litellm"
+            | "yggterm claude-code"
+            | "yggterm claude code"
+            | "local claude-code"
+            | "local claude code"
             | "local shell stay alive daemon"
             | "command bin bash"
             | "daemon pty request main viewport"
@@ -2817,6 +2827,7 @@ pub fn looks_like_generated_fallback_title(title: &str) -> bool {
         || bare_hash
         || remote_codex_runtime_title
         || remote_codex_litellm_runtime_title
+        || remote_claude_code_runtime_title
         || generic_runtime_title
         || looks_like_low_signal_generated_title(compact)
 }

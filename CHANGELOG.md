@@ -4,6 +4,29 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+## 2.9.9
+
+- **Claude Code session titles now actually update in the sidebar (Live
+  Sessions and the cwd tree).** Four compounding bugs froze every CC title at
+  its launch hint:
+  - The daemon's background title-sync chore shipped behind an opt-in env var
+    that nothing set, so the CC JSONL title sync never ran anywhere. The chore
+    now always runs; only the LLM title/summary *generation* half remains
+    env-gated (`YGGTERM_ENABLE_BACKGROUND_COPY_CHORE`).
+  - The sync only covered `local://` rows. It now also covers `cc-runtime://`
+    rows (host-daemon runtime lane), and live `remote-cc://` rows sync their
+    title from the remote machine's CC JSONL over SSH — on working turns, plus
+    one heal pass per daemon start for stale launch-hint titles.
+  - The remote-session mirror cache could permanently clobber freshly scanned
+    CC titles (and re-persist the stale value forever). For CC rows the fresh
+    scan now wins; the mirror only fills in over weak generated fallbacks.
+  - Late `/rename`s in large CC sessions were invisible to remote scans (the
+    512 KB head cap missed records appended at the end of the JSONL); the new
+    remote title reader also reads the file tail.
+- `Remote Claude Code <id>` runtime placeholders and `yggterm claude-code` /
+  `local claude code` launch titles are now recognized as generated fallbacks,
+  so real titles can replace them.
+
 ## 2.9.8
 
 - **The working timer / spinner line no longer comes back garbled (and turn
