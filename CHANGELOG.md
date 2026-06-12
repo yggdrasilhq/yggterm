@@ -4,6 +4,19 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+## 2.9.8
+
+- **The working timer / spinner line no longer comes back garbled (and turn
+  content no longer goes missing) after backgrounding a working Codex or
+  Claude Code session.** While the window was unfocused the active session's
+  bridge reads paused entirely, so a working CLI overran the daemon's chunk
+  ring; on refocus the stream resumed past the gap and the diff-rendering TUI
+  never repainted the lost cells — a merged timer like `35s58s` and absent
+  turn content until the turn ended. The active session now keeps the slow
+  background trickle read (same lane as retained hosts) while unfocused, and a
+  detected ring gap arms the scrollback-preserving screen reconcile instead of
+  only tracing it.
+
 ## 2.9.7
 
 - **Restored remote Claude Code sessions no longer come back as phantom local
