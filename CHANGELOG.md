@@ -4,6 +4,19 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+## 2.9.3
+
+- **A working session's viewport can no longer be vacuumed by a mid-turn screen
+  reconcile.** The reveal/resize screen reconcile decided "is the agent working?"
+  from a single daemon-frame sample, which races the agent TUI's transient mid-turn
+  clears — at the wrong instant it would paint a sparse mid-clear frame over the
+  live screen. Reconciles now also require forwarded output to have been quiet for
+  a beat before writing, so a streaming turn always defers.
+- **A stale or vacuumed frame revealed during a working turn now self-corrects when
+  the turn ends.** Previously a reconcile skipped over a working surface was dropped
+  entirely, leaving the broken frame in place for the rest of the turn; it now
+  re-arms and fires on the first quiet, idle tick.
+
 ## 2.9.2
 
 - **The sidebar working dot no longer blinks on freshly attached idle sessions.** The
