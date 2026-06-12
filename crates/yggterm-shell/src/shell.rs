@@ -15435,6 +15435,39 @@ fn preferred_agent_session_kind(settings: &AppSettings) -> SessionKind {
     }
 }
 
+/// PHANTOM-START GUARD (trace-caught 2026-06-12): one physical click on a
+/// sidebar session row also fired a start-action click handler 58ms later,
+/// spawning a phantom "<row label> session" codex via start_local_session
+/// with a row-derived title hint. Start-action
+/// buttons exist only on surfaces with a deterministic visibility condition
+/// (StartPage renders only while no session is active; titlebar new-menu items
+/// render only while the menu is open) — so a start-action click arriving while
+/// that condition is false is provably NOT a live user click on that button
+/// (stale/misdispatched event). Drop it and trace, so the next occurrence pins
+/// the dispatch path.
+fn suppress_phantom_start_action(source: &str, detail: serde_json::Value) {
+    if let Ok(trace_home) = resolve_yggterm_home() {
+        append_trace_event(
+            &trace_home,
+            "ui",
+            "session_lifecycle",
+            "phantom_start_suppressed",
+            json!({ "source": source, "detail": detail }),
+        );
+    }
+}
+
+/// True while the start page is the rendered main surface (the body falls back
+/// to `StartPage` exactly when no active session view exists). Start-page
+/// start-action clicks are only legit in this state.
+fn start_page_is_current_surface(state: &Signal<ShellState>) -> bool {
+    state.with(start_page_is_current_surface_state)
+}
+
+fn start_page_is_current_surface_state(shell: &ShellState) -> bool {
+    shell.server.active_session_path().is_none()
+}
+
 fn spawn_start_preferred_agent_session(state: Signal<ShellState>) {
     spawn_start_preferred_agent_session_for_row(state, None);
 }
@@ -40201,9 +40234,20 @@ fn app() -> Element {
                             on_toggle_overflow_menu: move |_| state.with_mut(|shell| shell.toggle_titlebar_overflow_menu()),
                             on_close_overflow_menu: move |_| state.with_mut(|shell| shell.close_titlebar_overflow_menu()),
                             on_start_claude_code: move |_| {
+                                if !state.with(|shell| shell.titlebar_new_menu_open) {
+                                    suppress_phantom_start_action(
+                                        "titlebar_new_claude_code",
+                                        json!({}),
+                                    );
+                                    return;
+                                }
                                 spawn_start_claude_code_session_for_row(state, None);
                             },
                             on_start_session: move |_| {
+                            if !state.with(|shell| shell.titlebar_new_menu_open) {
+                                suppress_phantom_start_action("titlebar_new_session", json!({}));
+                                return;
+                            }
                             let launch_context = state.with_mut(|shell| {
                                 shell.close_titlebar_new_menu();
                                 current_agent_session_launch_context(shell, preferred_agent_kind)
@@ -40245,6 +40289,10 @@ fn app() -> Element {
                             }
                             },
                             on_start_terminal: move |_| {
+                            if !state.with(|shell| shell.titlebar_new_menu_open) {
+                                suppress_phantom_start_action("titlebar_new_terminal", json!({}));
+                                return;
+                            }
                             let launch_context = state.with_mut(|shell| {
                                 shell.close_titlebar_new_menu();
                                 terminal_launch_context(shell)
@@ -42892,21 +42940,29 @@ fn sidebar_row_busy_state(snapshot: &RenderSnapshot, row: &BrowserRow) -> Sideba
         return SidebarBusyState::busy("optimistic_terminal_input");
     }
     let sidebar_sample = session_sample_text_for_sidebar_icon(session);
+    if matches!(
+        session.kind,
+        SessionKind::Codex | SessionKind::CodexLiteLlm | SessionKind::ClaudeCode
+    ) {
+        // Agent CLI sessions: working has exactly ONE source of truth — the
+        // CLI's own working footer ("esc to interrupt", shared codex/CC shape
+        // via yggterm_core::screen_text_shows_agent_working). Foreground
+        // process state, bootstrap launch phases, and recent-output volume
+        // all read "busy" during attach/replay repaints, which made freshly
+        // attached idle sessions blink as working (false positive,
+        // 2026-06-12). The optimistic input hint above stays: it is direct
+        // user intent, capped at TERMINAL_BUSY_HINT_MS.
+        if terminal_chunk_has_agent_working_status_for_sidebar_icon(&sidebar_sample) {
+            return SidebarBusyState::busy("agent_working_status");
+        }
+        return SidebarBusyState::idle();
+    }
     let has_terminal_line_sample = session
         .terminal_lines
         .iter()
         .any(|line| !line.trim().is_empty())
         && !terminal_lines_are_bootstrap_scaffold(&session.terminal_lines);
     let is_idle = terminal_chunk_looks_idle_for_sidebar_icon(&sidebar_sample);
-    let has_agent_working_status =
-        terminal_chunk_has_agent_working_status_for_sidebar_icon(&sidebar_sample);
-    if matches!(
-        session.kind,
-        SessionKind::Codex | SessionKind::CodexLiteLlm | SessionKind::ClaudeCode
-    ) && has_agent_working_status
-    {
-        return SidebarBusyState::busy("agent_working_status");
-    }
     let is_active_live_session = snapshot.active_session_path.as_deref()
         == Some(session.session_path.as_str())
         && matches!(
@@ -49914,7 +49970,6 @@ fn TerminalCanvas(
                                 }
                                 if terminal_host_health_should_mark_sidebar_busy(
                                     agent_cli_session,
-                                    frame_like_hot,
                                     host_surface_text,
                                 ) {
                                     let _ = safe_shell_mut(
@@ -54470,12 +54525,15 @@ fn terminal_host_health_should_update_sidebar_sample(
 }
 fn terminal_host_health_should_mark_sidebar_busy(
     codex_like_session: bool,
-    frame_like_hot: bool,
     host_surface_text: &str,
 ) -> bool {
+    // Working SSOT: the agent CLI's own working footer ("esc to interrupt").
+    // Output rate (frame_like_hot) must NOT mark busy — a hot attach replays
+    // the whole retained screen as high-volume frame writes, which made every
+    // freshly attached session blink "working" for TERMINAL_CODEX_ACTIVITY_HINT_MS
+    // with no agent turn running (user-reported false positive, 2026-06-12).
     codex_like_session
-        && (terminal_chunk_has_agent_working_status_for_sidebar_icon(host_surface_text)
-            || frame_like_hot)
+        && terminal_chunk_has_agent_working_status_for_sidebar_icon(host_surface_text)
 }
 
 fn remote_preview_should_update_from_terminal_output(
@@ -68640,6 +68698,17 @@ fn StartPage(snapshot: SharedSnapshot, state: Signal<ShellState>) -> Element {
                         onclick: move |evt| {
                             evt.prevent_default();
                             evt.stop_propagation();
+                            if !start_page_is_current_surface(&state) {
+                                suppress_phantom_start_action(
+                                    "start_page_new_codex",
+                                    json!({
+                                        "row": selected_agent_action_row
+                                            .as_ref()
+                                            .map(|row| row.full_path.clone()),
+                                    }),
+                                );
+                                return;
+                            }
                             spawn_start_preferred_agent_session_for_row(
                                 state,
                                 selected_agent_action_row.clone(),
@@ -68658,6 +68727,17 @@ fn StartPage(snapshot: SharedSnapshot, state: Signal<ShellState>) -> Element {
                         onclick: move |evt| {
                             evt.prevent_default();
                             evt.stop_propagation();
+                            if !start_page_is_current_surface(&state) {
+                                suppress_phantom_start_action(
+                                    "start_page_new_claude_code",
+                                    json!({
+                                        "row": selected_claude_code_action_row
+                                            .as_ref()
+                                            .map(|row| row.full_path.clone()),
+                                    }),
+                                );
+                                return;
+                            }
                             spawn_start_claude_code_session_for_row(
                                 state,
                                 selected_claude_code_action_row.clone(),
@@ -68676,6 +68756,17 @@ fn StartPage(snapshot: SharedSnapshot, state: Signal<ShellState>) -> Element {
                         onclick: move |evt| {
                             evt.prevent_default();
                             evt.stop_propagation();
+                            if !start_page_is_current_surface(&state) {
+                                suppress_phantom_start_action(
+                                    "start_page_new_terminal",
+                                    json!({
+                                        "row": selected_terminal_action_row
+                                            .as_ref()
+                                            .map(|row| row.full_path.clone()),
+                                    }),
+                                );
+                                return;
+                            }
                             spawn_start_terminal_session_for_row(
                                 state,
                                 selected_terminal_action_row.clone(),
@@ -95494,6 +95585,84 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             .expect("inactive working live session row");
         assert!(sidebar_row_shows_busy_icon(&snapshot, row));
     }
+
+    #[test]
+    fn phantom_start_guard_rejects_start_page_actions_while_a_session_is_active() {
+        // Phantom-session class (trace-caught 2026-06-12): a misdispatched click
+        // fired a start-page "New Codex Session" handler right after a sidebar
+        // row open, spawning a phantom "<label> session" codex. The start page
+        // renders only while NO session is active, so an active session at
+        // handler time proves the click is not live.
+        let active_path = "local://just-opened-session";
+        let mut shell = ShellState::new(test_shell_bootstrap_with_active_session(active_path));
+        let session = test_live_shell_session(active_path);
+        shell.server.apply_snapshot(ServerUiSnapshot {
+            active_session_path: Some(active_path.to_string()),
+            active_session: Some(snapshot_session_view_for_ui(session.clone())),
+            active_view_mode: WorkspaceViewMode::Terminal,
+            remote_machines: Vec::new(),
+            ssh_targets: Vec::new(),
+            live_sessions: vec![snapshot_session_view_for_ui(session)],
+        });
+        assert!(
+            !start_page_is_current_surface_state(&shell),
+            "an active session means the start page is NOT the rendered surface — start actions must be suppressed"
+        );
+
+        let idle_shell = ShellState::new(test_shell_bootstrap_with_start_page());
+        assert!(
+            start_page_is_current_surface_state(&idle_shell),
+            "with no active session the start page is the surface — start actions are legit"
+        );
+    }
+
+    #[test]
+    fn sidebar_busy_icon_agent_session_ignores_foreground_and_bootstrap_signals() {
+        // Working SSOT for agent CLIs is the "esc to interrupt" footer ONLY.
+        // A hot attach replays the retained screen (recent output, bootstrap
+        // launch phases, foreground-process flips) with no agent turn running —
+        // none of those signals may blink the dot (false positive, 2026-06-12).
+        let attached_path = "remote-session://dev/hot-attached";
+        let mut shell = ShellState::new(test_shell_bootstrap_with_active_session(attached_path));
+        let mut attached = test_live_shell_session(attached_path);
+        attached.id = "hot-attached".to_string();
+        attached.kind = SessionKind::Codex;
+        attached.source = SessionSource::LiveSsh;
+        // The strongest false-positive combination: foreground process reads
+        // active, bootstrap launch phase, fresh non-idle replay output.
+        attached.terminal_foreground_active = Some(true);
+        attached.launch_phase = yggterm_server::TerminalLaunchPhase::RemoteBootstrap;
+        attached.terminal_lines = vec![
+            "• Ran git status --short && git log -1 --oneline".to_string(),
+            "  └ ?? sed_write_test".to_string(),
+        ];
+        shell.server.apply_snapshot(ServerUiSnapshot {
+            active_session_path: Some(attached_path.to_string()),
+            active_session: Some(snapshot_session_view_for_ui(attached.clone())),
+            active_view_mode: WorkspaceViewMode::Terminal,
+            remote_machines: Vec::new(),
+            ssh_targets: Vec::new(),
+            live_sessions: vec![snapshot_session_view_for_ui(attached)],
+        });
+        shell.needs_initial_server_sync = false;
+        shell.browser.select_path(attached_path.to_string());
+
+        let snapshot = shell.snapshot();
+        let row = snapshot
+            .rows
+            .iter()
+            .find(|row| {
+                normalize_live_session_path(&row.full_path)
+                    == normalize_live_session_path(attached_path)
+            })
+            .expect("hot attached live session row");
+        let busy = sidebar_row_busy_state(&snapshot, row);
+        assert!(
+            !busy.visible,
+            "agent session without working footer must stay idle, got {:?}",
+            busy.reason
+        );
+    }
     #[test]
     fn sidebar_busy_icon_ignores_stale_inactive_live_sample_without_foreground_activity() {
         let stale_session = ManagedSessionView {
@@ -101146,23 +101315,21 @@ Shared connection to 192.0.2.14 closed.\r\n";
     fn terminal_host_health_sidebar_busy_tracks_codex_activity_without_sample_writes() {
         assert!(terminal_host_health_should_mark_sidebar_busy(
             true,
-            false,
             "• Working (23s • esc to interrupt)"
         ));
-        assert!(terminal_host_health_should_mark_sidebar_busy(
-            true,
+        // Output volume alone (hot attach replay frames) must NOT read busy:
+        // an idle composer stays idle no matter how hot the write stream is.
+        assert!(!terminal_host_health_should_mark_sidebar_busy(
             true,
             "› Summarize recent commits"
         ));
         assert!(!terminal_host_health_should_mark_sidebar_busy(
             false,
-            true,
             "pi@dev:~$ htop"
         ));
         assert!(!terminal_host_health_should_mark_sidebar_busy(
-            true,
             false,
-            "› Summarize recent commits"
+            "• Working (23s • esc to interrupt)"
         ));
     }
 
