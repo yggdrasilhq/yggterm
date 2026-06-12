@@ -197,6 +197,7 @@ fn parse_managed_cli_tool(value: &str) -> Result<ManagedCliTool> {
     match value {
         "codex" => Ok(ManagedCliTool::Codex),
         "codex-litellm" => Ok(ManagedCliTool::CodexLiteLlm),
+        "claude" | "claude-code" => Ok(ManagedCliTool::ClaudeCode),
         other => bail!("unknown managed cli tool: {other}"),
     }
 }
