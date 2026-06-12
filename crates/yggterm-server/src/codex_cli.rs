@@ -51,6 +51,7 @@ pub const DEFAULT_MANAGED_CLI_REFRESH_TTL_MS: u64 = 6 * 60 * 60_000;
 pub enum ManagedCliTool {
     Codex,
     CodexLiteLlm,
+    ClaudeCode,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -141,11 +142,13 @@ impl ManagedCliTool {
         match kind {
             SessionKind::Codex => Some(Self::Codex),
             SessionKind::CodexLiteLlm => Some(Self::CodexLiteLlm),
-            // Claude Code is not a managed npm CLI; its binary is user-installed.
-            SessionKind::ClaudeCode
-            | SessionKind::Shell
-            | SessionKind::SshShell
-            | SessionKind::Document => None,
+            // Claude Code ships as @anthropic-ai/claude-code on npm and
+            // releases near-daily; an unmanaged binary goes missing/stale and
+            // the user pays an interactive `npm up -g` round-trip mid-flow.
+            // Managing it gives CC the same self-provisioning + 6h refresh
+            // the codex CLIs get ([[spec-cli-binary-auto-provisioning]]).
+            SessionKind::ClaudeCode => Some(Self::ClaudeCode),
+            SessionKind::Shell | SessionKind::SshShell | SessionKind::Document => None,
         }
     }
 
@@ -153,6 +156,7 @@ impl ManagedCliTool {
         match self {
             Self::Codex => "codex",
             Self::CodexLiteLlm => "codex-litellm",
+            Self::ClaudeCode => "claude",
         }
     }
 
@@ -160,6 +164,7 @@ impl ManagedCliTool {
         match self {
             Self::Codex => "@openai/codex",
             Self::CodexLiteLlm => "@avikalpa/codex-litellm",
+            Self::ClaudeCode => "@anthropic-ai/claude-code",
         }
     }
 
@@ -167,6 +172,7 @@ impl ManagedCliTool {
         match self {
             Self::Codex => "Codex",
             Self::CodexLiteLlm => "Codex-LiteLLM",
+            Self::ClaudeCode => "Claude Code",
         }
     }
 }
@@ -1150,6 +1156,42 @@ mod tests {
         );
     }
 
+    // Claude Code rides the managed-CLI lane (self-provision + 6h refresh)
+    // with claude's own conventions: `--resume <id>` flag, not the codex
+    // `resume` subcommand. A wrong shape here silently breaks every CC
+    // launch/resume once the managed lane takes over from the legacy builder.
+    #[test]
+    fn managed_cli_supports_claude_code() {
+        assert_eq!(
+            ManagedCliTool::from_session_kind(SessionKind::ClaudeCode),
+            Some(ManagedCliTool::ClaudeCode)
+        );
+        assert_eq!(ManagedCliTool::ClaudeCode.binary_name(), "claude");
+        assert_eq!(
+            ManagedCliTool::ClaudeCode.package_name(),
+            "@anthropic-ai/claude-code"
+        );
+        let resume = managed_cli_shell_command(
+            SessionKind::ClaudeCode,
+            Some("/tmp"),
+            ManagedCliAction::Resume {
+                session_id: "abc-123",
+                persistent: false,
+            },
+        )
+        .expect("claude resume command");
+        assert!(resume.contains("claude"), "{resume}");
+        assert!(resume.contains("--resume 'abc-123'"), "{resume}");
+        assert!(!resume.contains(" resume 'abc-123'"), "{resume}");
+        let launch = managed_cli_shell_command(
+            SessionKind::ClaudeCode,
+            Some("/tmp"),
+            ManagedCliAction::Launch,
+        )
+        .expect("claude launch command");
+        assert!(!launch.contains("--resume"), "{launch}");
+    }
+
     #[test]
     fn managed_cli_shell_exports_prefer_managed_bin_and_suppress_npm_noise() {
         let paths = ManagedCliPaths {
@@ -1437,12 +1479,19 @@ pub(crate) fn managed_cli_shell_command_with_terminal_appearance(
         parts.push(preamble);
     }
     parts.push(paths.shell_exports_with_terminal_appearance(tool, terminal_appearance));
-    let extra_args = configured_codex_extra_args(kind);
+    let extra_args = configured_cli_extra_args(kind);
+    // Claude resumes via `--resume <id>` (flag), the codex CLIs via the
+    // `resume` subcommand — same conventions the legacy launch builder uses.
+    let is_claude = tool == ManagedCliTool::ClaudeCode;
     let invocation = match action {
         ManagedCliAction::Launch => format!("{}{}", tool.binary_name(), extra_args),
         ManagedCliAction::ResumePicker { persistent } => {
             let prefix = if persistent { "exec " } else { "" };
-            format!("{prefix}{}{} resume", tool.binary_name(), extra_args)
+            if is_claude {
+                format!("{prefix}{}{} --resume", tool.binary_name(), extra_args)
+            } else {
+                format!("{prefix}{}{} resume", tool.binary_name(), extra_args)
+            }
         }
         ManagedCliAction::Resume {
             session_id,
@@ -1456,7 +1505,14 @@ pub(crate) fn managed_cli_shell_command_with_terminal_appearance(
             // wrapper-vs-manual divergence is in yggterm's PTY/preservation
             // path, not in codex flags.
             let prefix = if persistent { "exec " } else { "" };
-            if matches!(kind, SessionKind::Codex) && has_cwd {
+            if is_claude {
+                format!(
+                    "{prefix}{}{} --resume {}",
+                    tool.binary_name(),
+                    extra_args,
+                    shell_single_quote(session_id)
+                )
+            } else if matches!(kind, SessionKind::Codex) && has_cwd {
                 format!(
                     "{prefix}{}{} resume -C \"$PWD\" {}",
                     tool.binary_name(),
@@ -1477,15 +1533,18 @@ pub(crate) fn managed_cli_shell_command_with_terminal_appearance(
     Ok(parts.join(" && "))
 }
 
-fn configured_codex_extra_args(kind: SessionKind) -> String {
-    if !matches!(kind, SessionKind::Codex | SessionKind::CodexLiteLlm) {
-        return String::new();
-    }
-    let raw = SessionStore::open_or_init()
+fn configured_cli_extra_args(kind: SessionKind) -> String {
+    let settings = SessionStore::open_or_init()
         .and_then(|store| store.load_settings())
-        .ok()
-        .map(|settings| settings.codex_extra_args)
-        .unwrap_or_default();
+        .ok();
+    let raw = match kind {
+        SessionKind::Codex | SessionKind::CodexLiteLlm => {
+            settings.map(|settings| settings.codex_extra_args)
+        }
+        SessionKind::ClaudeCode => settings.map(|settings| settings.claude_code_extra_args),
+        _ => None,
+    }
+    .unwrap_or_default();
     shell_join_extra_args(&raw)
 }
 
@@ -1712,7 +1771,11 @@ pub(crate) fn refresh_local_managed_cli(background: bool) -> Result<ManagedCliRe
         }),
     );
     let perf = PerfSpan::start(&paths.home, "cli", "refresh_managed_codex");
-    let tools = [ManagedCliTool::Codex, ManagedCliTool::CodexLiteLlm];
+    let tools = [
+        ManagedCliTool::Codex,
+        ManagedCliTool::CodexLiteLlm,
+        ManagedCliTool::ClaudeCode,
+    ];
     let before = probe_tools(&paths, &tools);
     record_managed_cli_probe_span(
         &paths.home,
