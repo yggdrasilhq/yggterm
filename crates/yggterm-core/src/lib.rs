@@ -176,6 +176,12 @@ pub struct AppSettings {
     pub terminal_telemetry_enabled: bool,
     pub selected_browser_path: Option<String>,
     pub expanded_browser_paths: Vec<String>,
+    /// Synthetic sidebar groups (machine roots, remote folders, Live Sessions)
+    /// the user explicitly collapsed. Persisted so a collapse survives GUI
+    /// restarts: the auto-reveal lanes (active-session visibility, dynamic
+    /// top-level seeding) must respect this set across processes, not just
+    /// within one.
+    pub collapsed_synthetic_paths: Vec<String>,
 }
 
 impl Default for AppSettings {
@@ -206,6 +212,7 @@ impl Default for AppSettings {
             terminal_telemetry_enabled: true,
             selected_browser_path: None,
             expanded_browser_paths: Vec::new(),
+            collapsed_synthetic_paths: Vec::new(),
         }
     }
 }
@@ -909,6 +916,10 @@ fn parse_settings_value(value: &Value) -> Result<AppSettings> {
         settings.expanded_browser_paths = serde_json::from_value(value.clone())
             .context("failed to parse expanded_browser_paths")?;
     }
+    if let Some(value) = object.get("collapsed_synthetic_paths") {
+        settings.collapsed_synthetic_paths = serde_json::from_value(value.clone())
+            .context("failed to parse collapsed_synthetic_paths")?;
+    }
     Ok(settings)
 }
 
@@ -939,6 +950,7 @@ fn serialize_settings_value(settings: &AppSettings) -> Value {
         "terminal_telemetry_enabled": settings.terminal_telemetry_enabled,
         "selected_browser_path": settings.selected_browser_path,
         "expanded_browser_paths": settings.expanded_browser_paths,
+        "collapsed_synthetic_paths": settings.collapsed_synthetic_paths,
     })
 }
 
