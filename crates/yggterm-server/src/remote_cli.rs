@@ -3,8 +3,9 @@ use crate::{
     run_remote_cc_rename, run_remote_local_codex_identities, run_remote_preview,
     run_remote_preview_head,
     run_remote_preview_tail, run_remote_protocol_version, run_remote_refresh_managed_cli,
-    run_remote_resume_codex, run_remote_saved_codex_session_exists, run_remote_scan,
-    run_remote_stage_clipboard_png, run_remote_start_codex, run_remote_terminate_codex,
+    run_remote_resume_cc, run_remote_resume_codex, run_remote_saved_codex_session_exists,
+    run_remote_scan, run_remote_stage_clipboard_png, run_remote_start_cc, run_remote_start_codex,
+    run_remote_terminate_codex,
     run_remote_upsert_generated_copy,
 };
 use anyhow::{Result, bail};
@@ -22,6 +23,17 @@ pub enum RemoteServerCommand {
         require_existing: bool,
     },
     StartCodex {
+        session_id: String,
+        cwd: Option<String>,
+    },
+    /// Claude Code twins of ResumeCodex/StartCodex — the same host-daemon
+    /// runtime lane, so the claude PTY survives client restarts.
+    ResumeCc {
+        session_id: String,
+        cwd: Option<String>,
+        require_existing: bool,
+    },
+    StartCc {
         session_id: String,
         cwd: Option<String>,
     },
@@ -105,6 +117,25 @@ fn parse_remote_server_command(args: &[String]) -> Result<Option<RemoteServerCom
                 .cloned()
                 .filter(|value| !value.is_empty()),
         },
+        "resume-cc" if args.len() >= 4 => RemoteServerCommand::ResumeCc {
+            session_id: args[3].clone(),
+            cwd: args
+                .iter()
+                .skip(4)
+                .find(|value| !value.starts_with("--"))
+                .cloned()
+                .filter(|value| !value.is_empty()),
+            require_existing: args.iter().any(|value| value == "--require-existing"),
+        },
+        "start-cc" if args.len() >= 4 => RemoteServerCommand::StartCc {
+            session_id: args[3].clone(),
+            cwd: args
+                .iter()
+                .skip(4)
+                .find(|value| !value.starts_with("--"))
+                .cloned()
+                .filter(|value| !value.is_empty()),
+        },
         "refresh-managed-cli" if args.len() >= 4 => RemoteServerCommand::RefreshManagedCli {
             background: args[3] == "background",
         },
@@ -165,6 +196,14 @@ fn run_remote_server_command(command: RemoteServerCommand) -> Result<()> {
         RemoteServerCommand::StartCodex { session_id, cwd } => {
             run_remote_start_codex(&session_id, cwd.as_deref())
         }
+        RemoteServerCommand::ResumeCc {
+            session_id,
+            cwd,
+            require_existing,
+        } => run_remote_resume_cc(&session_id, cwd.as_deref(), require_existing),
+        RemoteServerCommand::StartCc { session_id, cwd } => {
+            run_remote_start_cc(&session_id, cwd.as_deref())
+        }
         RemoteServerCommand::RefreshManagedCli { background } => {
             run_remote_refresh_managed_cli(background)
         }
@@ -205,6 +244,44 @@ fn parse_managed_cli_tool(value: &str) -> Result<ManagedCliTool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_resume_cc_and_start_cc_mirror_codex() {
+        let resume = parse_remote_server_command(&[
+            "server".to_string(),
+            "remote".to_string(),
+            "resume-cc".to_string(),
+            "abc-123".to_string(),
+            "/srv/ws".to_string(),
+            "--require-existing".to_string(),
+        ])
+        .expect("parse")
+        .expect("command");
+        assert_eq!(
+            resume,
+            RemoteServerCommand::ResumeCc {
+                session_id: "abc-123".to_string(),
+                cwd: Some("/srv/ws".to_string()),
+                require_existing: true,
+            }
+        );
+        let start = parse_remote_server_command(&[
+            "server".to_string(),
+            "remote".to_string(),
+            "start-cc".to_string(),
+            "abc-123".to_string(),
+            "/srv/ws".to_string(),
+        ])
+        .expect("parse")
+        .expect("command");
+        assert_eq!(
+            start,
+            RemoteServerCommand::StartCc {
+                session_id: "abc-123".to_string(),
+                cwd: Some("/srv/ws".to_string()),
+            }
+        );
+    }
 
     #[test]
     fn parse_resume_codex_supports_require_existing_and_cwd() {

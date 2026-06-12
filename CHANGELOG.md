@@ -4,6 +4,19 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+## 2.9.5
+
+- **Claude Code sessions now survive restarts, exactly like Codex.** Remote CC
+  sessions previously launched as a raw `ssh … claude --resume`, so the claude
+  process was a child of the local app's ssh transport — every local daemon or
+  GUI restart killed it, and keep-alive could not help. CC now rides the same
+  host-daemon runtime lane as codex (`yggterm server remote resume-cc` /
+  `start-cc`): the remote machine's daemon owns the claude PTY and the local
+  app merely re-attaches. Existing CC rows are healed onto the new lane by the
+  periodic launch-command refresh. Configured Claude Code extra CLI args
+  (e.g. `--dangerously-skip-permissions`) travel with the launch. Activates
+  per machine once its `~/.yggterm/bin/yggterm` wrapper updates to 2.9.5.
+
 ## 2.9.4
 
 - **Claude Code is now a managed CLI, like Codex.** yggterm self-installs
