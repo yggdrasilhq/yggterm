@@ -4,6 +4,15 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+## 2.9.4
+
+- **Claude Code is now a managed CLI, like Codex.** yggterm self-installs
+  `@anthropic-ai/claude-code` into its user-local managed npm prefix when the
+  `claude` binary is missing, and keeps it fresh on the same 6-hour background
+  refresh the codex CLIs get — on every machine the wrapper runs on. New CC
+  sessions no longer fail with a missing/stale binary that needed a manual
+  `npm up -g` to fix; opening a CC session is the recourse.
+
 ## 2.9.3
 
 - **A working session's viewport can no longer be vacuumed by a mid-turn screen
