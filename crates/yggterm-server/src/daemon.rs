@@ -1643,6 +1643,38 @@ pub enum ServerRequest {
         #[serde(default)]
         initial_rows: Option<u16>,
     },
+    /// Claude Code twins of the codex daemon-runtime requests — same lane,
+    /// CC PTY owned by this host's daemon ([[spec-unify-local-remote]]).
+    /// Separate variants (not a kind field on the codex ones) so an OLD
+    /// daemon fails LOUDLY on version skew instead of resuming the wrong CLI.
+    EnsureRemoteRuntimeCcSession {
+        session_id: String,
+        cwd: Option<String>,
+        require_existing: bool,
+        #[serde(default)]
+        terminal_appearance: Option<String>,
+        #[serde(default)]
+        initial_cols: Option<u16>,
+        #[serde(default)]
+        initial_rows: Option<u16>,
+        /// Client-side configured claude extra CLI args (raw settings string)
+        /// forwarded so the daemon-spawned `claude` carries them — the host's
+        /// own settings store does not have the client's configuration.
+        #[serde(default)]
+        claude_extra_args: Option<String>,
+    },
+    StartRemoteRuntimeCcSession {
+        session_id: String,
+        cwd: Option<String>,
+        #[serde(default)]
+        terminal_appearance: Option<String>,
+        #[serde(default)]
+        initial_cols: Option<u16>,
+        #[serde(default)]
+        initial_rows: Option<u16>,
+        #[serde(default)]
+        claude_extra_args: Option<String>,
+    },
     /// Daemon-owned resumable plain-shell session (tmux replacement for
     /// `server attach`). The host daemon owns/persists the shell PTY.
     EnsureShellSession {
@@ -4833,6 +4865,54 @@ impl DaemonRuntime {
                 self.persist()?;
                 ServerResponse::Ack { message: Some(key) }
             }
+            ServerRequest::EnsureRemoteRuntimeCcSession {
+                session_id,
+                cwd,
+                require_existing,
+                terminal_appearance,
+                initial_cols,
+                initial_rows,
+                claude_extra_args,
+            } => {
+                sync_terminal_identity_for_request(terminal_appearance.as_deref(), None);
+                sync_claude_extra_args_for_request(claude_extra_args.as_deref());
+                let key = self.server.ensure_remote_runtime_cc_session(
+                    &session_id,
+                    cwd.as_deref(),
+                    require_existing,
+                    terminal_appearance.as_deref(),
+                )?;
+                self.adopt_legacy_local_codex_runtime(&session_id, &key);
+                let _ = self.ensure_terminal_for_path_with_initial_size(
+                    &key,
+                    valid_initial_terminal_size(initial_cols, initial_rows),
+                )?;
+                self.persist()?;
+                ServerResponse::Ack { message: Some(key) }
+            }
+            ServerRequest::StartRemoteRuntimeCcSession {
+                session_id,
+                cwd,
+                terminal_appearance,
+                initial_cols,
+                initial_rows,
+                claude_extra_args,
+            } => {
+                sync_terminal_identity_for_request(terminal_appearance.as_deref(), None);
+                sync_claude_extra_args_for_request(claude_extra_args.as_deref());
+                let key = self.server.start_remote_runtime_cc_session(
+                    &session_id,
+                    cwd.as_deref(),
+                    terminal_appearance.as_deref(),
+                )?;
+                self.adopt_legacy_local_codex_runtime(&session_id, &key);
+                let _ = self.ensure_terminal_for_path_with_initial_size(
+                    &key,
+                    valid_initial_terminal_size(initial_cols, initial_rows),
+                )?;
+                self.persist()?;
+                ServerResponse::Ack { message: Some(key) }
+            }
             ServerRequest::EnsureShellSession {
                 session_id,
                 cwd,
@@ -5426,6 +5506,20 @@ fn sync_terminal_identity_for_request(
         .filter(|appearance| !appearance.is_empty())
     {
         sync_terminal_identity_appearance_with_profile(appearance, terminal_profile);
+    }
+}
+
+/// Same process-wide-env pattern as terminal identity: the CC daemon-runtime
+/// requests carry the CLIENT's configured claude extra args, which the launch
+/// builder reads via YGGTERM_CC_EXTRA_ARGS when spawning `claude`.
+fn sync_claude_extra_args_for_request(claude_extra_args: Option<&str>) {
+    if let Some(args) = claude_extra_args
+        .map(str::trim)
+        .filter(|args| !args.is_empty())
+    {
+        unsafe {
+            std::env::set_var(crate::codex_cli::ENV_YGGTERM_CC_EXTRA_ARGS, args);
+        }
     }
 }
 
@@ -6608,6 +6702,8 @@ fn server_request_name(request: &ServerRequest) -> &'static str {
         ServerRequest::StartRemoteRuntimeCodexSession { .. } => {
             "start_remote_runtime_codex_session"
         }
+        ServerRequest::EnsureRemoteRuntimeCcSession { .. } => "ensure_remote_runtime_cc_session",
+        ServerRequest::StartRemoteRuntimeCcSession { .. } => "start_remote_runtime_cc_session",
         ServerRequest::EnsureShellSession { .. } => "ensure_shell_session",
         ServerRequest::FocusLive { .. } => "focus_live",
         ServerRequest::SetViewMode { .. } => "set_view_mode",
@@ -7478,6 +7574,52 @@ pub fn start_remote_runtime_codex_session(
             terminal_appearance: terminal_appearance.map(ToOwned::to_owned),
             initial_cols: initial_size.map(|(cols, _)| cols),
             initial_rows: initial_size.map(|(_, rows)| rows),
+        },
+    )?)?
+    .with_context(|| format!("missing runtime session key for {session_id}"))
+}
+
+pub fn ensure_remote_runtime_cc_session(
+    endpoint: &ServerEndpoint,
+    session_id: &str,
+    cwd: Option<&str>,
+    require_existing: bool,
+    initial_size: Option<(u16, u16)>,
+    terminal_appearance: Option<&str>,
+    claude_extra_args: Option<&str>,
+) -> Result<String> {
+    expect_ack(send_request(
+        endpoint,
+        &ServerRequest::EnsureRemoteRuntimeCcSession {
+            session_id: session_id.to_string(),
+            cwd: cwd.map(ToOwned::to_owned),
+            require_existing,
+            terminal_appearance: terminal_appearance.map(ToOwned::to_owned),
+            initial_cols: initial_size.map(|(cols, _)| cols),
+            initial_rows: initial_size.map(|(_, rows)| rows),
+            claude_extra_args: claude_extra_args.map(ToOwned::to_owned),
+        },
+    )?)?
+    .with_context(|| format!("missing runtime session key for {session_id}"))
+}
+
+pub fn start_remote_runtime_cc_session(
+    endpoint: &ServerEndpoint,
+    session_id: &str,
+    cwd: Option<&str>,
+    initial_size: Option<(u16, u16)>,
+    terminal_appearance: Option<&str>,
+    claude_extra_args: Option<&str>,
+) -> Result<String> {
+    expect_ack(send_request(
+        endpoint,
+        &ServerRequest::StartRemoteRuntimeCcSession {
+            session_id: session_id.to_string(),
+            cwd: cwd.map(ToOwned::to_owned),
+            terminal_appearance: terminal_appearance.map(ToOwned::to_owned),
+            initial_cols: initial_size.map(|(cols, _)| cols),
+            initial_rows: initial_size.map(|(_, rows)| rows),
+            claude_extra_args: claude_extra_args.map(ToOwned::to_owned),
         },
     )?)?
     .with_context(|| format!("missing runtime session key for {session_id}"))
@@ -10178,6 +10320,8 @@ fn daemon_request_io_timeout_ms(request: &ServerRequest) -> u64 {
         | ServerRequest::RefreshPreview { .. }
         | ServerRequest::EnsureRemoteRuntimeCodexSession { .. }
         | ServerRequest::StartRemoteRuntimeCodexSession { .. }
+        | ServerRequest::EnsureRemoteRuntimeCcSession { .. }
+        | ServerRequest::StartRemoteRuntimeCcSession { .. }
         | ServerRequest::RemoveSession { .. }
         | ServerRequest::TerminalRestart {
             force_remote: true, ..

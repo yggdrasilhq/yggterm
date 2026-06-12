@@ -20,6 +20,7 @@ const EXPORTED_TERM_PROGRAM: &str = "vscode";
 const YGGTERM_TERM_PROGRAM: &str = "yggterm";
 const YGGTERM_TERM_PROGRAM_VERSION: &str = env!("CARGO_PKG_VERSION");
 const ENV_YGGTERM_TERMINAL_APPEARANCE: &str = "YGGTERM_TERMINAL_APPEARANCE";
+pub(crate) const ENV_YGGTERM_CC_EXTRA_ARGS: &str = "YGGTERM_CC_EXTRA_ARGS";
 const ENV_YGGTERM_TERMINAL_COLOR_FOREGROUND: &str = "YGGTERM_TERMINAL_COLOR_FOREGROUND";
 const ENV_YGGTERM_TERMINAL_COLOR_BACKGROUND: &str = "YGGTERM_TERMINAL_COLOR_BACKGROUND";
 const ENV_YGGTERM_TERMINAL_COLOR_PALETTE: [&str; 16] = [
@@ -1534,6 +1535,16 @@ pub(crate) fn managed_cli_shell_command_with_terminal_appearance(
 }
 
 fn configured_cli_extra_args(kind: SessionKind) -> String {
+    // Remote CC daemon-runtime lane: the CLIENT machine's configured claude
+    // extra args (e.g. --dangerously-skip-permissions) travel to this host
+    // via YGGTERM_CC_EXTRA_ARGS (ssh export → wrapper → daemon request env),
+    // because the remote machine's own settings store does not have them.
+    if kind == SessionKind::ClaudeCode
+        && let Ok(forwarded) = env::var(ENV_YGGTERM_CC_EXTRA_ARGS)
+        && !forwarded.trim().is_empty()
+    {
+        return shell_join_extra_args(&forwarded);
+    }
     let settings = SessionStore::open_or_init()
         .and_then(|store| store.load_settings())
         .ok();
