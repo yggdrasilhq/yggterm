@@ -226,8 +226,13 @@ impl SessionBrowserState {
 
     pub fn ensure_visible_path(&mut self, path: &str) {
         let mut changed = false;
-        for ancestor in Path::new(path).ancestors().skip(1) {
-            changed |= self.expanded_paths.insert(ancestor.display().to_string());
+        // Filesystem-ancestor expansion only makes sense for real file paths;
+        // URL-ish session keys (remote-cc://…) and synthetic groups (__…)
+        // would otherwise litter expanded_paths with junk like "remote-cc:".
+        if selected_path_should_expand_ancestors(path) {
+            for ancestor in Path::new(path).ancestors().skip(1) {
+                changed |= self.expanded_paths.insert(ancestor.display().to_string());
+            }
         }
         if changed {
             self.rebuild_rows();
