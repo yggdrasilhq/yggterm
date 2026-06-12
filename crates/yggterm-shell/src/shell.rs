@@ -2221,8 +2221,22 @@ impl ShellState {
         let sidebar_open = settings.show_tree;
         let sidebar_width = clamp_sidebar_width(settings.tree_width);
         let mut browser = SessionBrowserState::new(bootstrap.browser_tree.clone());
+        // A persisted user collapse outranks a stale expanded entry for the
+        // same synthetic path (the two can disagree when an auto-reveal
+        // expanded a machine after the user collapsed it).
+        let restored_collapsed_synthetic_paths = settings
+            .collapsed_synthetic_paths
+            .iter()
+            .cloned()
+            .collect::<HashSet<_>>();
+        let restored_expanded_paths = settings
+            .expanded_browser_paths
+            .iter()
+            .filter(|path| !restored_collapsed_synthetic_paths.contains(path.as_str()))
+            .cloned()
+            .collect::<Vec<_>>();
         browser.restore_ui_state(
-            &settings.expanded_browser_paths,
+            &restored_expanded_paths,
             settings.selected_browser_path.as_deref(),
         );
         let mut server = YggtermServer::new(
@@ -2289,7 +2303,10 @@ impl ShellState {
             alt_overlay_active: false,
             alt_overlay_sequence: String::new(),
             selected_tree_paths: HashSet::new(),
-            user_collapsed_synthetic_paths: HashSet::new(),
+            // Restored from settings so a user collapse of a machine/folder/
+            // Live Sessions group survives GUI restarts (the auto-reveal
+            // lanes consult this set before re-expanding).
+            user_collapsed_synthetic_paths: restored_collapsed_synthetic_paths,
             selection_anchor: None,
             context_menu_row: None,
             context_menu_context_row: None,
@@ -4827,6 +4844,10 @@ impl ShellState {
             paths.push("__live_sessions__".to_string());
         }
         paths.extend(self.active_session_visibility_paths());
+        // Auto-seeding never overrides an explicit user collapse (persisted
+        // across restarts); an explicit open via ensure_session_path_visible
+        // still reveals.
+        paths.retain(|path| !self.user_collapsed_synthetic_paths.contains(path));
         self.browser.ensure_expanded_paths(paths);
         self.sync_browser_settings();
     }
@@ -8100,6 +8121,13 @@ impl ShellState {
         self.settings.tree_width = self.sidebar_width;
         self.settings.selected_browser_path = self.browser.selected_path().map(ToOwned::to_owned);
         self.settings.expanded_browser_paths = self.browser.expanded_paths();
+        let mut collapsed = self
+            .user_collapsed_synthetic_paths
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        collapsed.sort();
+        self.settings.collapsed_synthetic_paths = collapsed;
         self.persist_settings();
     }
     fn toggle_titlebar_new_menu(&mut self) {
@@ -99368,6 +99396,89 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
                 .iter()
                 .any(|path| path == "/home/user")
         );
+    }
+
+    #[test]
+    fn user_collapsed_synthetic_paths_persist_and_block_auto_seeding() {
+        // A collapse of a synthetic group (machine root / Live Sessions) must
+        // survive a GUI restart: it persists into settings, restores into the
+        // new ShellState, blocks restore-time expansion of the same path, and
+        // blocks the dynamic top-level auto-seed from re-expanding it.
+        let mut bootstrap = test_shell_bootstrap_with_active_session("local://fresh-shell");
+        bootstrap.settings.expanded_browser_paths = vec![
+            "__live_sessions__".to_string(),
+            "__remote_machine__/practice".to_string(),
+            "__remote_machine__/dev".to_string(),
+        ];
+        bootstrap.settings.collapsed_synthetic_paths =
+            vec!["__remote_machine__/practice".to_string()];
+        let mut shell = ShellState::new(bootstrap);
+        // Restored collapse outranks the stale expanded entry.
+        assert!(
+            shell
+                .user_collapsed_synthetic_paths
+                .contains("__remote_machine__/practice")
+        );
+        assert!(
+            !shell
+                .browser
+                .expanded_path_set()
+                .contains("__remote_machine__/practice")
+        );
+        assert!(
+            shell
+                .browser
+                .expanded_path_set()
+                .contains("__remote_machine__/dev")
+        );
+        // The auto-seed never re-expands a user-collapsed synthetic path.
+        shell
+            .user_collapsed_synthetic_paths
+            .insert("__live_sessions__".to_string());
+        shell.browser.toggle_virtual_group("__live_sessions__");
+        shell.seed_dynamic_top_level_expansions();
+        assert!(
+            !shell
+                .browser
+                .expanded_path_set()
+                .contains("__live_sessions__")
+        );
+        // sync_browser_settings round-trips the collapse set into settings.
+        shell.sync_browser_settings();
+        assert!(
+            shell
+                .settings
+                .collapsed_synthetic_paths
+                .contains(&"__live_sessions__".to_string())
+        );
+        assert!(
+            shell
+                .settings
+                .collapsed_synthetic_paths
+                .contains(&"__remote_machine__/practice".to_string())
+        );
+        // Expanding again clears the collapse (and would persist the clear).
+        shell.update_synthetic_group_collapse_state("__remote_machine__/practice", true);
+        shell.sync_browser_settings();
+        assert!(
+            !shell
+                .settings
+                .collapsed_synthetic_paths
+                .contains(&"__remote_machine__/practice".to_string())
+        );
+    }
+
+    #[test]
+    fn ensure_visible_path_does_not_litter_url_ancestors() {
+        let mut shell = ShellState::new(test_shell_bootstrap_with_active_session(
+            "local://fresh-shell",
+        ));
+        shell
+            .browser
+            .ensure_visible_path("remote-cc://practice/abcd-1234");
+        let expanded = shell.browser.expanded_path_set();
+        assert!(!expanded.contains("remote-cc:"));
+        assert!(!expanded.contains(""));
     }
 
     #[test]
