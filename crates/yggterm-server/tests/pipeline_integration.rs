@@ -497,6 +497,47 @@ fn working_session_screen_carries_the_idle_gate_interrupt_signal() {
 }
 
 #[test]
+fn attach_replay_churn_does_not_read_as_agent_working() {
+    // The sidebar working dot's ONLY source of truth is the agent CLI's working
+    // footer (yggterm_core::screen_text_shows_agent_working). A hot attach / resume
+    // replays the retained screen as a burst of frame-like repaints — fresh output
+    // with NO agent turn running. That output volume previously blinked the dot
+    // (user-reported false positive, 2026-06-12). Lock the contract through the
+    // real PTY pipeline: a codex-style repaint churn with an idle composer must
+    // produce recent output AND still read as not-working.
+    let mut mgr = TerminalManager::new();
+    let key = "test://attach-replay-idle";
+    mgr.ensure_session(
+        key,
+        &launch("--scenario codex-inline --rows 60 --screen-rows 24 --repaints 6 --hold-ms 4000"),
+        None,
+    )
+    .expect("ensure codex-inline");
+    wait_for_output(&mgr, key);
+    let data = wait_for_text(&mgr, key, "COMPOSER_FRAME_005", Duration::from_secs(5));
+    assert!(
+        data.contains("COMPOSER_FRAME_"),
+        "repaint churn must reach the pipeline"
+    );
+    // The false signal IS present: the session produced output moments ago.
+    let idle_ms = mgr.session_idle_for_ms(key).unwrap_or(u64::MAX);
+    assert!(
+        idle_ms < 5_000,
+        "test premise: the session must look recently active (idle {idle_ms}ms)"
+    );
+    // ...and the working SSOT still says idle.
+    let screen = mgr
+        .session_screen_snapshot(key)
+        .expect("codex-inline screen");
+    assert!(
+        !yggterm_core::screen_text_shows_agent_working(&screen),
+        "repaint churn without the working footer must NOT read as agent-working; \
+         screen tail {:?}",
+        &screen[screen.len().saturating_sub(160)..]
+    );
+}
+
+#[test]
 fn clear_storm_does_not_corrupt_final_frame() {
     let mut mgr = TerminalManager::new();
     let key = "test://clear-storm";
