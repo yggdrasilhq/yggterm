@@ -766,6 +766,13 @@ fn command_arg_is_codex_binary(arg: &str) -> bool {
     )
 }
 
+fn command_arg_is_claude_binary(arg: &str) -> bool {
+    matches!(
+        command_arg_basename(arg),
+        "claude" | "claude.exe" | "claude.cmd"
+    )
+}
+
 #[cfg(target_os = "linux")]
 fn codex_resume_args_match_session(args: &[String], session_id: &str) -> bool {
     args.iter()
@@ -773,6 +780,28 @@ fn codex_resume_args_match_session(args: &[String], session_id: &str) -> bool {
         .any(|arg| command_arg_is_codex_binary(arg))
         && args.iter().any(|arg| arg == "resume")
         && args.iter().any(|arg| arg == session_id)
+}
+
+/// Claude Code twin of [`codex_resume_args_match_session`]: claude attaches a
+/// session via `--resume <id>` / `-r <id>` or owns it from birth via
+/// `--session-id <id>`.
+#[cfg(target_os = "linux")]
+fn cc_resume_args_match_session(args: &[String], session_id: &str) -> bool {
+    args.iter()
+        .take(3)
+        .any(|arg| command_arg_is_claude_binary(arg))
+        && args
+            .iter()
+            .any(|arg| matches!(arg.as_str(), "--resume" | "-r" | "--session-id"))
+        && args.iter().any(|arg| arg == session_id)
+}
+
+#[cfg(target_os = "linux")]
+fn agent_resume_args_match_session(kind: SessionKind, args: &[String], session_id: &str) -> bool {
+    match kind {
+        SessionKind::ClaudeCode => cc_resume_args_match_session(args, session_id),
+        _ => codex_resume_args_match_session(args, session_id),
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -786,8 +815,24 @@ fn yggterm_process_args(args: &[String]) -> bool {
     ) || args.windows(3).any(|window| {
         window[0] == "server"
             && window[1] == "remote"
-            && matches!(window[2].as_str(), "resume-codex" | "start-codex")
+            && matches!(
+                window[2].as_str(),
+                "resume-codex" | "start-codex" | "resume-cc" | "start-cc"
+            )
     })
+}
+
+#[cfg(target_os = "linux")]
+fn agent_resume_process_is_external_for_session(
+    kind: SessionKind,
+    args: &[String],
+    ancestor_args: &[Vec<String>],
+    session_id: &str,
+) -> bool {
+    agent_resume_args_match_session(kind, args, session_id)
+        && !ancestor_args
+            .iter()
+            .any(|ancestor| yggterm_process_args(ancestor))
 }
 
 #[cfg(target_os = "linux")]
@@ -796,10 +841,12 @@ fn codex_resume_process_is_external_for_session(
     ancestor_args: &[Vec<String>],
     session_id: &str,
 ) -> bool {
-    codex_resume_args_match_session(args, session_id)
-        && !ancestor_args
-            .iter()
-            .any(|ancestor| yggterm_process_args(ancestor))
+    agent_resume_process_is_external_for_session(
+        SessionKind::Codex,
+        args,
+        ancestor_args,
+        session_id,
+    )
 }
 
 #[cfg(target_os = "linux")]
@@ -827,7 +874,8 @@ struct ExternalCodexResumeProcess {
 }
 
 #[cfg(target_os = "linux")]
-fn external_codex_resume_processes_for_session(
+fn external_agent_resume_processes_for_session(
+    kind: SessionKind,
     session_id: &str,
 ) -> Vec<ExternalCodexResumeProcess> {
     let Ok(entries) = fs::read_dir("/proc") else {
@@ -841,21 +889,27 @@ fn external_codex_resume_processes_for_session(
         .filter(|pid| linux_proc_state(*pid) != Some('Z'))
         .filter_map(|pid| {
             let args = linux_proc_cmdline_args(pid)?;
-            if !codex_resume_args_match_session(&args, session_id) {
+            if !agent_resume_args_match_session(kind, &args, session_id) {
                 return None;
             }
             let ancestor_args = linux_proc_ancestor_cmdline_args(pid);
-            codex_resume_process_is_external_for_session(&args, &ancestor_args, session_id).then(
-                || ExternalCodexResumeProcess {
+            agent_resume_process_is_external_for_session(kind, &args, &ancestor_args, session_id)
+                .then(|| ExternalCodexResumeProcess {
                     pid,
                     argv0: args.first().cloned().unwrap_or_default(),
-                },
-            )
+                })
         })
         .collect::<Vec<_>>();
     processes.sort_by_key(|process| process.pid);
     processes.dedup_by_key(|process| process.pid);
     processes
+}
+
+#[cfg(target_os = "linux")]
+fn external_codex_resume_processes_for_session(
+    session_id: &str,
+) -> Vec<ExternalCodexResumeProcess> {
+    external_agent_resume_processes_for_session(SessionKind::Codex, session_id)
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -867,6 +921,14 @@ struct ExternalCodexResumeProcess {
 
 #[cfg(not(target_os = "linux"))]
 fn external_codex_resume_processes_for_session(
+    _session_id: &str,
+) -> Vec<ExternalCodexResumeProcess> {
+    Vec::new()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn external_agent_resume_processes_for_session(
+    _kind: SessionKind,
     _session_id: &str,
 ) -> Vec<ExternalCodexResumeProcess> {
     Vec::new()
@@ -894,10 +956,14 @@ fn remote_resume_snapshot_is_external_active_guard(bytes: &[u8]) -> bool {
 }
 
 fn wait_for_external_codex_resume_to_clear(home: &Path, session_id: &str) {
+    wait_for_external_agent_resume_to_clear(SessionKind::Codex, home, session_id)
+}
+
+fn wait_for_external_agent_resume_to_clear(kind: SessionKind, home: &Path, session_id: &str) {
     let mut announced = false;
     let mut last_pids = Vec::<u32>::new();
     loop {
-        let processes = external_codex_resume_processes_for_session(session_id);
+        let processes = external_agent_resume_processes_for_session(kind, session_id);
         if processes.is_empty() {
             if announced {
                 append_trace_event(
@@ -4325,14 +4391,22 @@ impl YggtermServer {
         let uuid = Uuid::new_v4().to_string();
         let session_path = remote_cc_session_path(&machine_key, &uuid);
         let cwd_display = cwd.clone().unwrap_or_default();
-        let cwd_prefix = if cwd_display.trim().is_empty() {
-            String::new()
-        } else {
-            format!("cd {} && ", shell_single_quote(&cwd_display))
-        };
-        let claude_extra_args = legacy_claude_code_extra_args();
-        let inner = remote_cc_launch_inner_command(&cwd_prefix, &claude_extra_args, &uuid);
-        let launch_command = remote_ssh_shell_command(&ssh_target, prefix.as_deref(), &inner);
+        // Host-daemon runtime lane (start-cc), mirroring start-codex — the
+        // remote daemon owns the claude PTY so the session survives local
+        // restarts ([[finding-cc-sessions-bypass-host-daemon]]).
+        let remote_binary = self
+            .remote_machines
+            .iter()
+            .find(|machine| machine.machine_key == machine_key)
+            .and_then(|machine| machine.remote_binary_expr.clone())
+            .unwrap_or_else(preferred_remote_binary_fallback);
+        let launch_command = remote_ssh_launch_command_with_extra_exports(
+            &ssh_target,
+            prefix.as_deref(),
+            &remote_binary,
+            &["server", "remote", "start-cc", &uuid, &cwd_display],
+            &claude_extra_args_remote_exports(),
+        );
         let title = title_hint
             .map(str::trim)
             .filter(|value| !value.is_empty())
@@ -4383,7 +4457,7 @@ impl YggtermServer {
         upsert_session_metadata(
             &mut session.metadata,
             "Restore",
-            format!("ssh {ssh_target} '{cwd_prefix}claude{claude_extra_args} --resume {uuid}'"),
+            format!("ssh {ssh_target} 'yggterm server remote resume-cc {uuid} --require-existing'"),
         );
 
         self.sessions.insert(session_path.clone(), session);
@@ -5211,14 +5285,31 @@ impl YggtermServer {
         title_hint: &str,
     ) -> anyhow::Result<String> {
         let session_path = remote_cc_session_path(machine_key, session_id);
-        let cwd_prefix = if cwd.trim().is_empty() {
-            String::new()
-        } else {
-            format!("cd {} && ", shell_single_quote(cwd))
-        };
-        let claude_extra_args = legacy_claude_code_extra_args();
-        let inner = remote_cc_resume_inner_command(&cwd_prefix, &claude_extra_args, session_id);
-        let launch_command = remote_ssh_shell_command(ssh_target, prefix, &inner);
+        // Route through the host-daemon runtime lane (resume-cc), exactly like
+        // codex: the claude PTY is owned by the REMOTE machine's daemon, so a
+        // local client/daemon restart never kills the session. The old raw
+        // `ssh … claude --resume` launch was the CC-drop root cause
+        // ([[finding-cc-sessions-bypass-host-daemon]]).
+        let remote_binary = self
+            .remote_machines
+            .iter()
+            .find(|machine| machine.machine_key == machine_key)
+            .and_then(|machine| machine.remote_binary_expr.clone())
+            .unwrap_or_else(preferred_remote_binary_fallback);
+        let launch_command = remote_ssh_launch_command_with_extra_exports(
+            ssh_target,
+            prefix,
+            &remote_binary,
+            &[
+                "server",
+                "remote",
+                "resume-cc",
+                session_id,
+                cwd,
+                "--require-existing",
+            ],
+            &claude_extra_args_remote_exports(),
+        );
         let resolved_title = if title_hint.trim().is_empty() {
             short_session_id(session_id)
         } else {
@@ -5281,7 +5372,7 @@ impl YggtermServer {
                 &mut session.metadata,
                 "Restore",
                 format!(
-                    "ssh {ssh_target} '{cwd_prefix}claude{claude_extra_args} --resume {session_id}'"
+                    "ssh {ssh_target} 'yggterm server remote resume-cc {session_id} --require-existing'"
                 ),
             );
         }
@@ -5379,7 +5470,41 @@ impl YggtermServer {
         require_existing: bool,
         terminal_appearance: Option<&str>,
     ) -> anyhow::Result<String> {
-        let saved_session_exists = remote_saved_codex_session_exists(session_id)?;
+        self.ensure_remote_runtime_agent_session(
+            SessionKind::Codex,
+            session_id,
+            cwd,
+            require_existing,
+            terminal_appearance,
+        )
+    }
+
+    pub fn ensure_remote_runtime_cc_session(
+        &mut self,
+        session_id: &str,
+        cwd: Option<&str>,
+        require_existing: bool,
+        terminal_appearance: Option<&str>,
+    ) -> anyhow::Result<String> {
+        self.ensure_remote_runtime_agent_session(
+            SessionKind::ClaudeCode,
+            session_id,
+            cwd,
+            require_existing,
+            terminal_appearance,
+        )
+    }
+
+    fn ensure_remote_runtime_agent_session(
+        &mut self,
+        kind: SessionKind,
+        session_id: &str,
+        cwd: Option<&str>,
+        require_existing: bool,
+        terminal_appearance: Option<&str>,
+    ) -> anyhow::Result<String> {
+        let display = remote_runtime_agent_display(kind);
+        let saved_session_exists = remote_saved_agent_session_exists(kind, session_id)?;
         if remote_resume_requires_missing_saved_session_failure(
             require_existing,
             saved_session_exists,
@@ -5387,7 +5512,8 @@ impl YggtermServer {
             anyhow::bail!(remote_resume_missing_saved_session_error(session_id));
         }
         if saved_session_exists {
-            let external_processes = external_codex_resume_processes_for_session(session_id);
+            let external_processes =
+                external_agent_resume_processes_for_session(kind, session_id);
             if !external_processes.is_empty() {
                 if let Ok(home) = resolve_yggterm_home() {
                     append_trace_event(
@@ -5408,10 +5534,11 @@ impl YggtermServer {
                 ));
             }
         }
-        let key = remote_runtime_codex_session_key(session_id);
-        let target = local_session_target(SessionKind::Codex, cwd);
+        let key = remote_runtime_agent_session_key(kind, session_id)
+            .with_context(|| format!("session kind {kind:?} has no daemon runtime lane"))?;
+        let target = local_session_target(kind, cwd);
         let fallback_title = format!(
-            "Remote Codex {}",
+            "Remote {display} {}",
             session_id.chars().take(8).collect::<String>()
         );
         let title = self
@@ -5424,7 +5551,7 @@ impl YggtermServer {
             self.insert_live_session_with_launch(
                 &key,
                 session_id,
-                SessionKind::Codex,
+                kind,
                 &target,
                 Some(title.clone()),
                 false,
@@ -5432,12 +5559,14 @@ impl YggtermServer {
         }
         let launch_command = if saved_session_exists {
             remote_persistent_resume_shell_command_with_terminal_appearance(
+                kind,
                 session_id,
                 cwd,
                 terminal_appearance,
             )
         } else {
             remote_resume_picker_shell_command_with_terminal_appearance(
+                kind,
                 session_id,
                 cwd,
                 None,
@@ -5450,11 +5579,11 @@ impl YggtermServer {
         let _ = registry.register_session(RemoteRuntimeSessionInput {
             session_id: Some(session_id.to_string()),
             machine_key: "local".to_string(),
-            runtime_kind: RemoteRuntimeKind::Codex,
+            runtime_kind: remote_runtime_agent_registry_kind(kind),
             title: title.clone(),
             cwd: target.cwd.clone(),
             summary: Some(if saved_session_exists {
-                "Daemon-owned remote Codex session".to_string()
+                format!("Daemon-owned remote {display} session")
             } else {
                 "Daemon-owned remote resume picker".to_string()
             }),
@@ -5463,17 +5592,18 @@ impl YggtermServer {
         let _ = registry.transition_session(
             session_id,
             RemoteRuntimeSessionState::AttachingPty,
-            Some("ensuring daemon-owned codex runtime"),
+            Some("ensuring daemon-owned agent runtime"),
             &json!({
                 "saved_session_exists": saved_session_exists,
                 "cwd": target.cwd,
+                "kind": format!("{kind:?}"),
             }),
         )?;
         if let Some(session) = self.sessions.get_mut(&key) {
             session.id = session_id.to_string();
             session.session_path = key.clone();
             session.title = title;
-            session.kind = SessionKind::Codex;
+            session.kind = kind;
             session.launch_command = launch_command.clone();
             session.launch_phase = TerminalLaunchPhase::Queued;
             session.remote_deploy_state = RemoteDeployState::NotRequired;
@@ -5493,7 +5623,10 @@ impl YggtermServer {
             upsert_session_metadata(
                 &mut session.metadata,
                 "Restore",
-                format!("yggterm server remote resume-codex {session_id} --require-existing"),
+                format!(
+                    "yggterm server remote {} {session_id} --require-existing",
+                    remote_agent_resume_subcommand(kind)
+                ),
             );
             if let Some(cwd) = target.cwd.as_deref() {
                 upsert_session_metadata(&mut session.metadata, "Cwd", cwd.to_string());
@@ -5506,7 +5639,7 @@ impl YggtermServer {
             );
             session.terminal_lines = vec![
                 format!("$ {launch_command}"),
-                format!("Queue daemon-owned remote Codex session {session_id}"),
+                format!("Queue daemon-owned remote {display} session {session_id}"),
                 format!(
                     "Workspace: {}",
                     target.cwd.clone().unwrap_or_else(local_default_cwd)
@@ -5526,7 +5659,38 @@ impl YggtermServer {
         cwd: Option<&str>,
         terminal_appearance: Option<&str>,
     ) -> anyhow::Result<String> {
-        let key = remote_runtime_codex_session_key(session_id);
+        self.start_remote_runtime_agent_session(
+            SessionKind::Codex,
+            session_id,
+            cwd,
+            terminal_appearance,
+        )
+    }
+
+    pub fn start_remote_runtime_cc_session(
+        &mut self,
+        session_id: &str,
+        cwd: Option<&str>,
+        terminal_appearance: Option<&str>,
+    ) -> anyhow::Result<String> {
+        self.start_remote_runtime_agent_session(
+            SessionKind::ClaudeCode,
+            session_id,
+            cwd,
+            terminal_appearance,
+        )
+    }
+
+    fn start_remote_runtime_agent_session(
+        &mut self,
+        kind: SessionKind,
+        session_id: &str,
+        cwd: Option<&str>,
+        terminal_appearance: Option<&str>,
+    ) -> anyhow::Result<String> {
+        let display = remote_runtime_agent_display(kind);
+        let key = remote_runtime_agent_session_key(kind, session_id)
+            .with_context(|| format!("session kind {kind:?} has no daemon runtime lane"))?;
         let legacy_local_key = local_live_runtime_key(session_id);
         if legacy_local_key != key {
             self.sessions.remove(&legacy_local_key);
@@ -5536,7 +5700,7 @@ impl YggtermServer {
                 self.active_session_path = Some(key.clone());
             }
         }
-        let target = local_session_target(SessionKind::Codex, cwd);
+        let target = local_session_target(kind, cwd);
         let title = self
             .sessions
             .get(&key)
@@ -5544,7 +5708,7 @@ impl YggtermServer {
             .filter(|value| !value.trim().is_empty())
             .unwrap_or_else(|| {
                 format!(
-                    "Remote Codex {}",
+                    "Remote {display} {}",
                     session_id.chars().take(8).collect::<String>()
                 )
             });
@@ -5552,43 +5716,67 @@ impl YggtermServer {
             self.insert_live_session_with_launch(
                 &key,
                 session_id,
-                SessionKind::Codex,
+                kind,
                 &target,
                 Some(title.clone()),
                 false,
             );
         }
-        let launch_command = managed_cli_shell_command_with_terminal_appearance(
-            SessionKind::Codex,
-            cwd,
-            ManagedCliAction::Launch,
-            terminal_appearance,
-        )
-        .unwrap_or_else(|_| legacy_agent_launch_command(SessionKind::Codex, cwd, None));
+        // A brand-new Claude Code session must be BORN with its identity
+        // (`--session-id <id>`) so the JSONL on disk matches the row; a bare
+        // `claude` would mint its own id. Codex keeps the plain launch (it
+        // reports its id via the session file watch instead).
+        let launch_command = if kind == SessionKind::ClaudeCode {
+            managed_cli_shell_command_with_terminal_appearance(
+                kind,
+                cwd,
+                ManagedCliAction::Launch,
+                terminal_appearance,
+            )
+            .map(|command| {
+                format!("{command} --session-id {}", shell_single_quote(session_id))
+            })
+            .unwrap_or_else(|_| {
+                format!(
+                    "{} --session-id {}",
+                    legacy_agent_launch_command(kind, cwd, None),
+                    shell_single_quote(session_id)
+                )
+            })
+        } else {
+            managed_cli_shell_command_with_terminal_appearance(
+                kind,
+                cwd,
+                ManagedCliAction::Launch,
+                terminal_appearance,
+            )
+            .unwrap_or_else(|_| legacy_agent_launch_command(kind, cwd, None))
+        };
         let home = resolve_yggterm_home()?;
         let registry = RemoteRuntimeRegistry::open(&home)?;
         let _ = registry.register_session(RemoteRuntimeSessionInput {
             session_id: Some(session_id.to_string()),
             machine_key: "local".to_string(),
-            runtime_kind: RemoteRuntimeKind::Codex,
+            runtime_kind: remote_runtime_agent_registry_kind(kind),
             title: title.clone(),
             cwd: target.cwd.clone(),
-            summary: Some("Daemon-owned remote Codex session".to_string()),
+            summary: Some(format!("Daemon-owned remote {display} session")),
             requires_terminal: true,
         })?;
         let _ = registry.transition_session(
             session_id,
             RemoteRuntimeSessionState::AttachingPty,
-            Some("starting daemon-owned remote codex runtime"),
+            Some("starting daemon-owned remote agent runtime"),
             &json!({
                 "cwd": target.cwd,
+                "kind": format!("{kind:?}"),
             }),
         )?;
         if let Some(session) = self.sessions.get_mut(&key) {
             session.id = session_id.to_string();
             session.session_path = key.clone();
             session.title = title;
-            session.kind = SessionKind::Codex;
+            session.kind = kind;
             session.launch_command = launch_command.clone();
             session.launch_phase = TerminalLaunchPhase::Queued;
             session.remote_deploy_state = RemoteDeployState::NotRequired;
@@ -5608,7 +5796,10 @@ impl YggtermServer {
             upsert_session_metadata(
                 &mut session.metadata,
                 "Restore",
-                format!("yggterm server remote start-codex {session_id}"),
+                format!(
+                    "yggterm server remote {} {session_id}",
+                    remote_agent_start_subcommand(kind)
+                ),
             );
             if let Some(cwd) = target.cwd.as_deref() {
                 upsert_session_metadata(&mut session.metadata, "Cwd", cwd.to_string());
@@ -5621,7 +5812,7 @@ impl YggtermServer {
             );
             session.terminal_lines = vec![
                 format!("$ {launch_command}"),
-                format!("Queue daemon-owned remote Codex session {session_id}"),
+                format!("Queue daemon-owned remote {display} session {session_id}"),
                 format!(
                     "Workspace: {}",
                     target.cwd.clone().unwrap_or_else(local_default_cwd)
@@ -7354,6 +7545,67 @@ fn remote_runtime_codex_session_key(session_id: &str) -> String {
     format!("codex-runtime://{session_id}")
 }
 
+/// Claude Code twin of [`remote_runtime_codex_session_key`]: the daemon-owned
+/// runtime key for a CC PTY hosted by THIS machine's daemon (the
+/// decentralized host-daemon lane — the same lane codex uses, so a local
+/// client restart never kills the claude process).
+fn remote_runtime_cc_session_key(session_id: &str) -> String {
+    format!("cc-runtime://{session_id}")
+}
+
+fn parse_remote_runtime_cc_session_key(path: &str) -> Option<&str> {
+    path.strip_prefix("cc-runtime://")
+}
+
+/// Per-kind table for the daemon-owned agent-runtime lane
+/// ([[spec-unify-local-remote]]: codex and Claude Code share ONE code path,
+/// parameterized — never forked). Returns None for kinds that have no
+/// daemon-runtime lane (shells, documents).
+fn remote_runtime_agent_session_key(kind: SessionKind, session_id: &str) -> Option<String> {
+    match kind {
+        SessionKind::Codex | SessionKind::CodexLiteLlm => {
+            Some(remote_runtime_codex_session_key(session_id))
+        }
+        SessionKind::ClaudeCode => Some(remote_runtime_cc_session_key(session_id)),
+        _ => None,
+    }
+}
+
+fn remote_saved_agent_session_exists(kind: SessionKind, session_id: &str) -> anyhow::Result<bool> {
+    match kind {
+        SessionKind::ClaudeCode => remote_saved_cc_session_exists(session_id),
+        _ => remote_saved_codex_session_exists(session_id),
+    }
+}
+
+fn remote_runtime_agent_display(kind: SessionKind) -> &'static str {
+    match kind {
+        SessionKind::ClaudeCode => "Claude Code",
+        _ => "Codex",
+    }
+}
+
+fn remote_agent_resume_subcommand(kind: SessionKind) -> &'static str {
+    match kind {
+        SessionKind::ClaudeCode => "resume-cc",
+        _ => "resume-codex",
+    }
+}
+
+fn remote_agent_start_subcommand(kind: SessionKind) -> &'static str {
+    match kind {
+        SessionKind::ClaudeCode => "start-cc",
+        _ => "start-codex",
+    }
+}
+
+fn remote_runtime_agent_registry_kind(kind: SessionKind) -> RemoteRuntimeKind {
+    match kind {
+        SessionKind::ClaudeCode => RemoteRuntimeKind::ClaudeCode,
+        _ => RemoteRuntimeKind::Codex,
+    }
+}
+
 fn normalize_remote_terminal_write_data(data: &str) -> String {
     if !data.contains('\r') {
         return data.to_string();
@@ -7692,6 +7944,7 @@ fn remote_resume_fallback_line_is_boilerplate(line: &str) -> bool {
 }
 
 fn remote_resume_picker_shell_command_with_terminal_appearance(
+    kind: SessionKind,
     session_id: &str,
     cwd: Option<&str>,
     prefix: Option<&str>,
@@ -7699,20 +7952,21 @@ fn remote_resume_picker_shell_command_with_terminal_appearance(
     terminal_appearance: Option<&str>,
 ) -> String {
     let base = managed_cli_shell_command_with_terminal_appearance(
-        SessionKind::Codex,
+        kind,
         cwd,
         ManagedCliAction::ResumePicker { persistent },
         terminal_appearance,
     )
     .unwrap_or_else(|_| {
-        let codex_command = if persistent {
-            "exec codex resume"
-        } else {
-            "codex resume"
+        let picker = match (kind, persistent) {
+            (SessionKind::ClaudeCode, true) => "exec claude --resume",
+            (SessionKind::ClaudeCode, false) => "claude --resume",
+            (_, true) => "exec codex resume",
+            (_, false) => "codex resume",
         };
         match cwd.filter(|cwd| !cwd.trim().is_empty()) {
-            Some(cwd) => format!("cd {} && {}", shell_single_quote(cwd), codex_command),
-            None => codex_command.to_string(),
+            Some(cwd) => format!("cd {} && {}", shell_single_quote(cwd), picker),
+            None => picker.to_string(),
         }
     });
     let with_notice = format!("{}; {}", remote_resume_picker_notice(session_id), base);
@@ -7723,20 +7977,21 @@ fn remote_resume_picker_shell_command_with_terminal_appearance(
 }
 
 fn remote_persistent_resume_shell_command_with_terminal_appearance(
+    kind: SessionKind,
     session_id: &str,
     cwd: Option<&str>,
     terminal_appearance: Option<&str>,
 ) -> String {
     // Per [[spec-agent-cli-wrapper-render-parity]]: render the same as a
-    // clean `codex resume <UUID>`. A previous version of this wrapper
-    // prefixed `stty raw -echo opost onlcr` here, which pre-empted
-    // codex's own terminal-mode init and caused codex to render only a
-    // partial UI (status bar visible, conversation truncated, cursor
-    // landing on the status bar instead of the input prompt row).
-    // Codex sets raw mode itself when it enters TUI; we no longer
-    // pre-set anything and let codex own the terminal state.
+    // clean `codex resume <UUID>` / `claude --resume <UUID>`. A previous
+    // version of this wrapper prefixed `stty raw -echo opost onlcr` here,
+    // which pre-empted codex's own terminal-mode init and caused codex to
+    // render only a partial UI (status bar visible, conversation truncated,
+    // cursor landing on the status bar instead of the input prompt row).
+    // The TUI sets raw mode itself; we no longer pre-set anything and let
+    // the agent CLI own the terminal state.
     persistent_agent_resume_command_with_terminal_appearance(
-        SessionKind::Codex,
+        kind,
         cwd,
         session_id,
         terminal_appearance,
@@ -7762,6 +8017,27 @@ fn remote_saved_codex_session_exists(session_id: &str) -> anyhow::Result<bool> {
         if let Some((candidate_id, _cwd)) = read_codex_session_identity_fields(&path)?
             && candidate_id == session_id
         {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Claude Code twin of [`remote_saved_codex_session_exists`]: CC stores its
+/// transcripts as `~/.claude/projects/<encoded-cwd>/<session-id>.jsonl`, so
+/// the basename IS the session identity — no per-file identity parse needed.
+fn remote_saved_cc_session_exists(session_id: &str) -> anyhow::Result<bool> {
+    let Some(home) = dirs::home_dir() else {
+        return Ok(false);
+    };
+    let projects_dir = home.join(".claude").join("projects");
+    let Ok(project_entries) = fs::read_dir(&projects_dir) else {
+        return Ok(false);
+    };
+    let wanted = format!("{session_id}.jsonl");
+    for project_entry in project_entries.flatten() {
+        let candidate = project_entry.path().join(&wanted);
+        if candidate.is_file() {
             return Ok(true);
         }
     }
@@ -8579,12 +8855,24 @@ fn remote_ssh_launch_command(
     binary_expr: &str,
     args: &[&str],
 ) -> String {
+    remote_ssh_launch_command_with_extra_exports(ssh_target, prefix, binary_expr, args, &[])
+}
+
+fn remote_ssh_launch_command_with_extra_exports(
+    ssh_target: &str,
+    prefix: Option<&str>,
+    binary_expr: &str,
+    args: &[&str],
+    extra_exports: &[String],
+) -> String {
     let mut inner = String::from(binary_expr);
     for arg in args {
         inner.push(' ');
         inner.push_str(&shell_single_quote(arg));
     }
-    let env_exports = terminal_identity_shell_exports_for_remote().join(" && ");
+    let mut env_exports = terminal_identity_shell_exports_for_remote();
+    env_exports.extend(extra_exports.iter().cloned());
+    let env_exports = env_exports.join(" && ");
     let inner = if env_exports.is_empty() {
         inner
     } else {
@@ -8595,6 +8883,25 @@ fn remote_ssh_launch_command(
         None => inner,
     };
     assemble_remote_ssh_command(ssh_target, &remote)
+}
+
+/// Export carrying the CLIENT's configured claude extra args into the remote
+/// resume-cc/start-cc wrapper env (forwarded onward to the host daemon).
+fn claude_extra_args_remote_exports() -> Vec<String> {
+    let raw = SessionStore::open_or_init()
+        .and_then(|store| store.load_settings())
+        .ok()
+        .map(|settings| settings.claude_code_extra_args)
+        .unwrap_or_default();
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Vec::new();
+    }
+    vec![format!(
+        "export {}={}",
+        codex_cli::ENV_YGGTERM_CC_EXTRA_ARGS,
+        shell_single_quote(trimmed)
+    )]
 }
 
 fn remote_ssh_shell_command(ssh_target: &str, prefix: Option<&str>, inner: &str) -> String {
@@ -8648,15 +8955,24 @@ fn refresh_remote_codex_terminal_identity_launch_command(
     session: &mut ManagedSessionView,
     remote_machines: &[RemoteMachineSnapshot],
 ) -> bool {
-    if session.source != SessionSource::LiveSsh
-        || session.kind != SessionKind::Codex
-        || !session.session_path.starts_with("remote-session://")
-    {
+    // Codex (remote-session://) AND its Claude Code twin (remote-cc://):
+    // both kinds keep their launch command on the host-daemon wrapper lane.
+    // This refresh is also the HEALING path that rewrites pre-2.9.5 raw
+    // `ssh … claude --resume` CC rows onto resume-cc
+    // ([[finding-cc-sessions-bypass-host-daemon]]).
+    let is_codex = session.kind == SessionKind::Codex
+        && session.session_path.starts_with("remote-session://");
+    let is_cc = session.kind == SessionKind::ClaudeCode
+        && session.session_path.starts_with("remote-cc://");
+    if session.source != SessionSource::LiveSsh || (!is_codex && !is_cc) {
         return false;
     }
-    let Some((raw_machine_key, path_session_id)) =
+    let parsed = if is_cc {
+        parse_remote_cc_session_path(&session.session_path)
+    } else {
         parse_remote_scanned_session_path(&session.session_path)
-    else {
+    };
+    let Some((raw_machine_key, path_session_id)) = parsed else {
         return false;
     };
     let machine_key = normalize_machine_key(raw_machine_key);
@@ -8703,7 +9019,7 @@ fn refresh_remote_codex_terminal_identity_launch_command(
         vec![
             "server",
             "remote",
-            "start-codex",
+            remote_agent_start_subcommand(session.kind),
             session_id.as_str(),
             cwd.as_str(),
         ]
@@ -8711,17 +9027,23 @@ fn refresh_remote_codex_terminal_identity_launch_command(
         vec![
             "server",
             "remote",
-            "resume-codex",
+            remote_agent_resume_subcommand(session.kind),
             session_id.as_str(),
             cwd.as_str(),
             "--require-existing",
         ]
     };
-    let launch_command = remote_ssh_launch_command(
+    let extra_exports = if session.kind == SessionKind::ClaudeCode {
+        claude_extra_args_remote_exports()
+    } else {
+        Vec::new()
+    };
+    let launch_command = remote_ssh_launch_command_with_extra_exports(
         &ssh_target,
         prefix.as_deref(),
         &remote_binary,
         args.as_slice(),
+        &extra_exports,
     );
     let changed = session.launch_command != launch_command;
     session.launch_command = launch_command;
@@ -8752,6 +9074,10 @@ fn refresh_remote_codex_terminal_identity_launch_command(
     changed
 }
 
+fn parse_remote_runtime_agent_session_key(path: &str) -> Option<&str> {
+    parse_remote_runtime_codex_session_key(path).or_else(|| parse_remote_runtime_cc_session_key(path))
+}
+
 fn restored_remote_runtime_codex_session_id(
     key: &str,
     session: &ManagedSessionView,
@@ -8762,30 +9088,37 @@ fn restored_remote_runtime_codex_session_id(
     {
         return Some(session_id);
     }
-    if let Some(session_id) = parse_remote_runtime_codex_session_key(key) {
+    if let Some(session_id) = parse_remote_runtime_agent_session_key(key) {
         return Some(session_id.to_string());
     }
-    if let Some(session_id) = parse_remote_runtime_codex_session_key(&session.session_path) {
+    if let Some(session_id) = parse_remote_runtime_agent_session_key(&session.session_path) {
         return Some(session_id.to_string());
     }
     session_metadata_value(session, "Runtime Session")
-        .and_then(|value| parse_remote_runtime_codex_session_key(&value).map(str::to_string))
+        .and_then(|value| parse_remote_runtime_agent_session_key(&value).map(str::to_string))
 }
 
 fn refresh_restored_remote_runtime_codex_launch_command(
     key: &str,
     session: &mut ManagedSessionView,
 ) -> bool {
-    if session.kind != SessionKind::Codex {
+    // Codex AND its Claude Code twin: restored daemon-runtime rows of both
+    // kinds repair their resume launch the same way ([[spec-unify-local-remote]]).
+    if !matches!(session.kind, SessionKind::Codex | SessionKind::ClaudeCode) {
         return false;
     }
+    let resume_needle = if session.kind == SessionKind::ClaudeCode {
+        "--resume"
+    } else {
+        " resume"
+    };
     let Some(session_id) = restored_remote_runtime_codex_session_id(key, session) else {
         return false;
     };
-    let already_resume = session.launch_command.contains(" resume")
+    let already_resume = session.launch_command.contains(resume_needle)
         && session.launch_command.contains(session_id.as_str());
     if !already_resume {
-        match remote_saved_codex_session_exists(&session_id) {
+        match remote_saved_agent_session_exists(session.kind, &session_id) {
             Ok(true) => {}
             Ok(false) => return false,
             Err(error) => {
@@ -8807,13 +9140,16 @@ fn refresh_restored_remote_runtime_codex_launch_command(
             }
         }
     }
-    let runtime_key = remote_runtime_codex_session_key(&session_id);
+    let Some(runtime_key) = remote_runtime_agent_session_key(session.kind, &session_id) else {
+        return false;
+    };
     let cwd = session_metadata_value(session, "Cwd")
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty());
     let existing_appearance =
         terminal::infer_terminal_appearance_from_launch_command(&session.launch_command);
     let launch_command = remote_persistent_resume_shell_command_with_terminal_appearance(
+        session.kind,
         &session_id,
         cwd.as_deref(),
         existing_appearance,
@@ -12423,6 +12759,144 @@ pub fn run_remote_start_codex(session_id: &str, cwd: Option<&str>) -> anyhow::Re
         cwd,
         initial_size,
         Some(&terminal_appearance),
+    )?;
+    finish_span(serde_json::json!({
+        "session_id": session_id,
+        "cwd": cwd,
+        "path": key,
+        "mode": "daemon_runtime_bridge",
+        "initial_cols": initial_size.map(|(cols, _)| cols),
+        "initial_rows": initial_size.map(|(_, rows)| rows),
+    }));
+    bridge_remote_runtime_session_stdio(&endpoint, &key)
+}
+
+/// Claude Code twin of [`run_remote_resume_codex`] — the wrapper entry the
+/// ssh launch invokes ON the session's machine. The host daemon owns the
+/// claude PTY, so a CLIENT-side restart never kills the session
+/// ([[spec-decentralized-host-daemon]]).
+pub fn run_remote_resume_cc(
+    session_id: &str,
+    cwd: Option<&str>,
+    require_existing: bool,
+) -> anyhow::Result<()> {
+    let perf_home = resolve_yggterm_home().ok();
+    let mut perf_span = perf_home
+        .as_ref()
+        .map(|home| PerfSpan::start(home.clone(), "remote", "resume_cc"));
+    let mut finish_span = |meta: serde_json::Value| {
+        if let Some(span) = perf_span.take() {
+            span.finish(meta);
+        }
+    };
+    let home = resolve_yggterm_home()?;
+    let saved_session_exists = remote_saved_cc_session_exists(session_id)?;
+    if remote_resume_requires_missing_saved_session_failure(require_existing, saved_session_exists)
+    {
+        anyhow::bail!(remote_resume_missing_saved_session_error(session_id));
+    }
+    if saved_session_exists {
+        wait_for_external_agent_resume_to_clear(SessionKind::ClaudeCode, &home, session_id);
+    }
+    let _ = ensure_local_managed_cli(ManagedCliTool::ClaudeCode)?;
+    let initial_size = current_tty_size();
+    let terminal_appearance = terminal_identity_appearance_from_environment();
+    let runtime_key = remote_runtime_cc_session_key(session_id);
+    if let Some((endpoint, runtime_key)) =
+        endpoint_with_live_remote_runtime_key_for_bridge_with_terminal_appearance(
+            &home,
+            &runtime_key,
+            Some(&terminal_appearance),
+        )?
+    {
+        sync_terminal_identity_profile_to_host_daemon(&endpoint, &terminal_appearance);
+        finish_span(serde_json::json!({
+            "session_id": session_id,
+            "cwd": cwd,
+            "path": runtime_key,
+            "mode": "existing_daemon_runtime_bridge",
+            "require_existing": require_existing,
+            "initial_cols": initial_size.map(|(cols, _)| cols),
+            "initial_rows": initial_size.map(|(_, rows)| rows),
+        }));
+        return bridge_remote_runtime_session_stdio(&endpoint, &runtime_key);
+    }
+    let endpoint = default_endpoint(&home);
+    ensure_local_daemon_running(&endpoint)?;
+    sync_terminal_identity_profile_to_host_daemon(&endpoint, &terminal_appearance);
+    // The ssh launch line exported the CLIENT's claude extra args into this
+    // wrapper's env; forward them so the daemon-spawned claude carries them.
+    let claude_extra_args = std::env::var(codex_cli::ENV_YGGTERM_CC_EXTRA_ARGS)
+        .ok()
+        .filter(|value| !value.trim().is_empty());
+    let key = daemon::ensure_remote_runtime_cc_session(
+        &endpoint,
+        session_id,
+        cwd,
+        require_existing,
+        initial_size,
+        Some(&terminal_appearance),
+        claude_extra_args.as_deref(),
+    )?;
+    finish_span(serde_json::json!({
+        "session_id": session_id,
+        "cwd": cwd,
+        "path": key,
+        "mode": "daemon_runtime_bridge",
+        "require_existing": require_existing,
+        "initial_cols": initial_size.map(|(cols, _)| cols),
+        "initial_rows": initial_size.map(|(_, rows)| rows),
+    }));
+    bridge_remote_runtime_session_stdio(&endpoint, &key)
+}
+
+/// Claude Code twin of [`run_remote_start_codex`].
+pub fn run_remote_start_cc(session_id: &str, cwd: Option<&str>) -> anyhow::Result<()> {
+    let perf_home = resolve_yggterm_home().ok();
+    let mut perf_span = perf_home
+        .as_ref()
+        .map(|home| PerfSpan::start(home.clone(), "remote", "start_cc"));
+    let mut finish_span = |meta: serde_json::Value| {
+        if let Some(span) = perf_span.take() {
+            span.finish(meta);
+        }
+    };
+    let _ = ensure_local_managed_cli(ManagedCliTool::ClaudeCode)?;
+    let home = resolve_yggterm_home()?;
+    let runtime_key = remote_runtime_cc_session_key(session_id);
+    let initial_size = current_tty_size();
+    let terminal_appearance = terminal_identity_appearance_from_environment();
+    if let Some((endpoint, runtime_key)) =
+        endpoint_with_live_remote_runtime_key_for_bridge_with_terminal_appearance(
+            &home,
+            &runtime_key,
+            Some(&terminal_appearance),
+        )?
+    {
+        sync_terminal_identity_profile_to_host_daemon(&endpoint, &terminal_appearance);
+        finish_span(serde_json::json!({
+            "session_id": session_id,
+            "cwd": cwd,
+            "path": runtime_key,
+            "mode": "existing_daemon_runtime_bridge",
+            "initial_cols": initial_size.map(|(cols, _)| cols),
+            "initial_rows": initial_size.map(|(_, rows)| rows),
+        }));
+        return bridge_remote_runtime_session_stdio(&endpoint, &runtime_key);
+    }
+    let endpoint = default_endpoint(&home);
+    ensure_local_daemon_running(&endpoint)?;
+    sync_terminal_identity_profile_to_host_daemon(&endpoint, &terminal_appearance);
+    let claude_extra_args = std::env::var(codex_cli::ENV_YGGTERM_CC_EXTRA_ARGS)
+        .ok()
+        .filter(|value| !value.trim().is_empty());
+    let key = daemon::start_remote_runtime_cc_session(
+        &endpoint,
+        session_id,
+        cwd,
+        initial_size,
+        Some(&terminal_appearance),
+        claude_extra_args.as_deref(),
     )?;
     finish_span(serde_json::json!({
         "session_id": session_id,
@@ -19856,37 +20330,6 @@ fn legacy_codex_extra_args() -> String {
     shell_join_extra_args(&raw)
 }
 
-/// Inner shell command for launching a NEW remote Claude Code session.
-/// `claude_extra_args` is the pre-joined output of `shell_join_extra_args`
-/// over the user's configured Claude Code extra CLI args — these must reach
-/// every CC launch path, local and remote alike.
-fn remote_cc_launch_inner_command(
-    cwd_prefix: &str,
-    claude_extra_args: &str,
-    session_uuid: &str,
-) -> String {
-    format!(
-        "{}claude{} --session-id {}",
-        cwd_prefix,
-        claude_extra_args,
-        shell_single_quote(session_uuid)
-    )
-}
-
-/// Inner shell command for resuming an existing remote Claude Code session.
-fn remote_cc_resume_inner_command(
-    cwd_prefix: &str,
-    claude_extra_args: &str,
-    session_id: &str,
-) -> String {
-    format!(
-        "{}claude{} --resume {}",
-        cwd_prefix,
-        claude_extra_args,
-        shell_single_quote(session_id)
-    )
-}
-
 fn legacy_claude_code_extra_args() -> String {
     let raw = SessionStore::open_or_init()
         .and_then(|store| store.load_settings())
@@ -23019,25 +23462,46 @@ mod tests {
     #[test]
     fn remote_cc_commands_carry_configured_extra_args() {
         // User bug (2026-06-10 #3): extra CLI args set in yggterm settings
-        // (e.g. --dangerously-skip-permissions) never reached the remote CC
-        // launch command; only the local legacy builder honored them.
-        use crate::{
-            remote_cc_launch_inner_command, remote_cc_resume_inner_command, shell_join_extra_args,
-        };
-        let extra = shell_join_extra_args("--dangerously-skip-permissions");
-        let resume = remote_cc_resume_inner_command("cd '/srv/ws' && ", &extra, "abc-123");
-        assert_eq!(
-            resume,
-            "cd '/srv/ws' && claude '--dangerously-skip-permissions' --resume 'abc-123'"
+        // (e.g. --dangerously-skip-permissions) must reach every remote CC
+        // launch. On the resume-cc daemon-runtime lane they travel as a
+        // YGGTERM_CC_EXTRA_ARGS export in the ssh launch line: the wrapper
+        // forwards them in the daemon request and the launch builder prefers
+        // them over the (client-less) remote settings store.
+        use crate::codex_cli;
+        use crate::{remote_ssh_launch_command_with_extra_exports, shell_single_quote};
+        let launch_command = remote_ssh_launch_command_with_extra_exports(
+            "dev",
+            None,
+            "$HOME/.yggterm/bin/yggterm",
+            &[
+                "server",
+                "remote",
+                "resume-cc",
+                "abc-123",
+                "/srv/ws",
+                "--require-existing",
+            ],
+            &[format!(
+                "export {}={}",
+                codex_cli::ENV_YGGTERM_CC_EXTRA_ARGS,
+                shell_single_quote("--dangerously-skip-permissions")
+            )],
         );
-        let launch = remote_cc_launch_inner_command("", &extra, "abc-123");
-        assert_eq!(
-            launch,
-            "claude '--dangerously-skip-permissions' --session-id 'abc-123'"
+        // The ssh assembly re-quotes for the remote bash -lc layer, so assert
+        // quote-agnostic needles: the export, the value, and the subcommand.
+        assert!(
+            launch_command.contains("export YGGTERM_CC_EXTRA_ARGS="),
+            "{launch_command}"
         );
-        // No configured args → identical to the historical command shape.
-        let bare = remote_cc_resume_inner_command("", "", "abc-123");
-        assert_eq!(bare, "claude --resume 'abc-123'");
+        assert!(
+            launch_command.contains("--dangerously-skip-permissions"),
+            "{launch_command}"
+        );
+        assert!(launch_command.contains("resume-cc"), "{launch_command}");
+        assert!(
+            launch_command.contains("--require-existing"),
+            "{launch_command}"
+        );
     }
 
     #[test]
@@ -23559,6 +24023,7 @@ mod tests {
         // command must hand the terminal to codex unmodified — just `codex resume
         // <id>` (with cwd + appearance), no `stty` prefix.
         let command = super::remote_persistent_resume_shell_command_with_terminal_appearance(
+            SessionKind::Codex,
             "019d0000-0000",
             Some("/home/pi/git/samplenotes"),
             None,
@@ -23567,6 +24032,21 @@ mod tests {
         assert!(
             !command.contains("stty "),
             "resume wrapper must not pre-set terminal modes; got: {command}"
+        );
+        // Claude Code rides the same wrapper with its own resume convention.
+        let cc_command = super::remote_persistent_resume_shell_command_with_terminal_appearance(
+            SessionKind::ClaudeCode,
+            "019d0000-0000",
+            Some("/home/pi/git/samplenotes"),
+            None,
+        );
+        assert!(
+            cc_command.contains("--resume '019d0000-0000'"),
+            "cc resume must use the --resume flag; got: {cc_command}"
+        );
+        assert!(
+            !cc_command.contains("stty "),
+            "cc resume wrapper must not pre-set terminal modes; got: {cc_command}"
         );
         assert!(command.contains("resume"));
         assert!(command.contains("019d0000-0000"));
@@ -29212,8 +29692,12 @@ terminal_window_id: None,
             !session.id.trim().is_empty(),
             "claude session must carry an id"
         );
+        // The launch rides the host-daemon wrapper lane (start-cc), so the
+        // remote daemon owns the claude PTY and the session survives local
+        // restarts ([[finding-cc-sessions-bypass-host-daemon]]). The daemon
+        // side spawns `claude --session-id <row id>` from this same id.
         assert!(
-            session.launch_command.contains("claude --session-id"),
+            session.launch_command.contains("start-cc"),
             "{}",
             session.launch_command
         );
