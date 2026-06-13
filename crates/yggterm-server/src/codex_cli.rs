@@ -799,6 +799,28 @@ mod tests {
     }
 
     #[test]
+    fn managed_cli_focus_cache_reuses_recent_available_probe() {
+        let now = 1_000_000_u64;
+        // Available + within TTL → reuse (no re-probe subprocess).
+        assert!(managed_cli_focus_cache_entry_is_fresh(true, now, now));
+        assert!(managed_cli_focus_cache_entry_is_fresh(
+            true,
+            now,
+            now + MANAGED_CLI_FOCUS_PROBE_TTL_MS - 1
+        ));
+        // Expired → re-probe.
+        assert!(!managed_cli_focus_cache_entry_is_fresh(
+            true,
+            now,
+            now + MANAGED_CLI_FOCUS_PROBE_TTL_MS
+        ));
+        // Not-available is never reused, so a missing tool keeps re-trying install.
+        assert!(!managed_cli_focus_cache_entry_is_fresh(false, now, now));
+        // Clock skew (now < cached_at) is treated as fresh, never underflows.
+        assert!(managed_cli_focus_cache_entry_is_fresh(true, now, now - 5));
+    }
+
+    #[test]
     fn terminal_identity_shell_exports_unset_no_color() {
         let exports = terminal_identity_shell_exports();
         assert_eq!(exports.first().map(String::as_str), Some("unset NO_COLOR"));
@@ -1606,6 +1628,60 @@ pub(crate) fn best_effort_cwd_shell_prefix(cwd: Option<&str>) -> Option<String> 
          if [ \"$__yggterm_cwd_ok\" != 1 ] && [ -n \"$HOME\" ]; then cd \"$HOME\" 2>/dev/null || true; fi",
         requested = shell_single_quote(requested)
     ))
+}
+
+/// How long a focus-path managed-CLI ensure result is reused before re-probing.
+/// `ensure_local_managed_cli` runs a `<cli> --version` subprocess (`probe_tool` →
+/// `run_version_command`) UNCONDITIONALLY at its top, before any TTL gate — and for
+/// the node-based `claude` CLI that spawn-and-wait costs ~100-400ms. It sits on the
+/// terminal-attach critical path (`ensure_managed_cli_for_session_path` →
+/// `ensure_terminal_for_path` → the OpenStoredSession reply), so every local agent
+/// session focus/switch paid it. That made cold switching feel slow ("the server can
+/// attach in a non-blocking IO manner" — user, 2026-06-13). The focus path does not
+/// need a fresh probe on every click; it only needs to know the tool is available so
+/// the PTY launch works. We memoize the ensure result for a short window so a burst of
+/// switches pays the probe at most once. First-run install still works (cache miss →
+/// full ensure → install if needed), and the window is short enough that a genuine
+/// uninstall self-heals within it.
+const MANAGED_CLI_FOCUS_PROBE_TTL_MS: u64 = 60_000;
+
+#[allow(clippy::type_complexity)]
+fn managed_cli_focus_cache()
+-> &'static std::sync::Mutex<BTreeMap<&'static str, (ManagedCliToolStatus, u64)>> {
+    static CACHE: std::sync::OnceLock<
+        std::sync::Mutex<BTreeMap<&'static str, (ManagedCliToolStatus, u64)>>,
+    > = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(BTreeMap::new()))
+}
+
+/// Pure freshness gate for the focus cache: a cached entry is reusable only when the
+/// last ensure found the tool available AND it is within the TTL window. A
+/// not-available cached entry is never reused, so the next focus re-runs the full
+/// ensure and keeps trying to provision.
+fn managed_cli_focus_cache_entry_is_fresh(available: bool, cached_at_ms: u64, now_ms: u64) -> bool {
+    available && now_ms.saturating_sub(cached_at_ms) < MANAGED_CLI_FOCUS_PROBE_TTL_MS
+}
+
+/// Focus/attach-path entry point for the managed-CLI ensure. Reuses a recent ensure
+/// result instead of re-running the `--version` probe subprocess on every session
+/// switch. See [`MANAGED_CLI_FOCUS_PROBE_TTL_MS`]. The explicit refresh paths
+/// (`refresh_local_managed_cli`) still call `ensure_local_managed_cli`/`install_latest`
+/// directly so a user/chore-triggered refresh always re-probes.
+pub(crate) fn ensure_local_managed_cli_for_focus(
+    tool: ManagedCliTool,
+) -> Result<ManagedCliToolStatus> {
+    let now_ms = current_time_ms();
+    if let Ok(cache) = managed_cli_focus_cache().lock()
+        && let Some((status, cached_at_ms)) = cache.get(tool.binary_name())
+        && managed_cli_focus_cache_entry_is_fresh(status.available, *cached_at_ms, now_ms)
+    {
+        return Ok(status.clone());
+    }
+    let status = ensure_local_managed_cli(tool)?;
+    if let Ok(mut cache) = managed_cli_focus_cache().lock() {
+        cache.insert(tool.binary_name(), (status.clone(), now_ms));
+    }
+    Ok(status)
 }
 
 pub(crate) fn ensure_local_managed_cli(tool: ManagedCliTool) -> Result<ManagedCliToolStatus> {
