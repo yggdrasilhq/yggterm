@@ -4725,9 +4725,17 @@ impl YggtermServer {
         let Some(session) = self.sessions.get(key) else {
             return Ok(None);
         };
-        if path.starts_with("remote-session://") {
-            // Remote session attach must stay fast. Background machine refreshes keep the managed
-            // Codex toolchain current; PTY restore should not block on a synchronous SSH upgrade.
+        // Remote agent sessions — codex (`remote-session://`) AND Claude Code
+        // (`remote-cc://`) — run their CLI on the REMOTE machine via the host-daemon
+        // resume/start lane, so the LOCAL managed toolchain is irrelevant to them.
+        // Probing the local `<cli> --version` here is pure waste on the attach path,
+        // and for the node-based claude CLI it cost ~85-910ms PER focus of a remote
+        // CC session (live-measured on jojo, 2026-06-13) — the user's most-used
+        // session kind. The `remote-cc://` arm was missing, so only codex was
+        // exempt; both must be. Background machine refreshes keep the remote
+        // toolchains current; PTY restore must not block on a synchronous local
+        // probe or SSH upgrade.
+        if !session_path_uses_local_managed_cli(path) {
             return Ok(None);
         }
         let Some(tool) = ManagedCliTool::from_session_kind(session.kind) else {
@@ -12366,6 +12374,16 @@ struct RemoteCcSummaryLine {
 
 fn remote_cc_session_path(machine_key: &str, session_id: &str) -> String {
     format!("remote-cc://{machine_key}/{session_id}")
+}
+
+/// Whether a session path's CLI lives on THIS machine (so the local managed
+/// codex/claude toolchain is relevant on the attach path). Remote agent
+/// sessions — codex `remote-session://` and Claude Code `remote-cc://` — run
+/// their CLI on the remote machine via the resume/start lane, so the local
+/// `<cli> --version` probe is pure waste for them. See
+/// `ensure_managed_cli_for_session_path`.
+fn session_path_uses_local_managed_cli(path: &str) -> bool {
+    !(path.starts_with("remote-session://") || path.starts_with("remote-cc://"))
 }
 
 fn parse_remote_cc_session_path(path: &str) -> Option<(&str, &str)> {
@@ -20870,6 +20888,30 @@ fn short_session_id(session_id: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::app_control_open_path_ready;
+
+    // Remote agent sessions run their CLI on the remote machine, so the local
+    // managed codex/claude `--version` probe is pure waste on the attach path.
+    // The `remote-cc://` arm was missing from the exemption, so every focus of a
+    // remote Claude Code session ran a local `claude --version` (~85-910ms,
+    // live-measured 2026-06-13). Both remote schemes must be exempt; local agent
+    // sessions still use the local toolchain.
+    #[test]
+    fn remote_agent_sessions_skip_local_managed_cli_probe() {
+        assert!(!super::session_path_uses_local_managed_cli(
+            "remote-cc://practice/8466ad90-f807-4f4d-bff9-d9cf71753c90"
+        ));
+        assert!(!super::session_path_uses_local_managed_cli(
+            "remote-session://dev/019ebfee-bed5-7de1-9913-7db1c9734b36"
+        ));
+        // Local agent sessions (incl. the host-daemon CC runtime lane) still
+        // resolve the local toolchain.
+        assert!(super::session_path_uses_local_managed_cli(
+            "local://019df7b2-550e-7090-956b-d4549d4b55e4"
+        ));
+        assert!(super::session_path_uses_local_managed_cli(
+            "cc-runtime://8466ad90-f807-4f4d-bff9-d9cf71753c90"
+        ));
+    }
 
     // Keep-alive parity: remote-cc:// (Claude Code) is the twin of
     // remote-session:// (codex). Only recognizing the codex scheme in the
