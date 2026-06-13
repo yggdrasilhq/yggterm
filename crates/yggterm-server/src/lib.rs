@@ -68,7 +68,7 @@ pub use terminal::{PromptSubmitOutcome, TerminalChunk, TerminalManager, Terminal
 use anyhow::Context;
 use codex_cli::{
     ManagedCliAction, ManagedCliRefreshReport, best_effort_cwd_shell_prefix,
-    ensure_local_managed_cli, managed_cli_shell_command,
+    ensure_local_managed_cli, ensure_local_managed_cli_for_focus, managed_cli_shell_command,
     managed_cli_shell_command_with_terminal_appearance, refresh_local_managed_cli,
     summarize_managed_cli_report, sync_terminal_identity_env,
     terminal_identity_appearance_from_environment, terminal_identity_shell_exports_for_remote,
@@ -4733,7 +4733,10 @@ impl YggtermServer {
         let Some(tool) = ManagedCliTool::from_session_kind(session.kind) else {
             return Ok(None);
         };
-        let status = ensure_local_managed_cli(tool)?;
+        // Focus/attach path: reuse a recent ensure result so a session switch does not
+        // re-spawn a `<cli> --version` probe subprocess on every click. First-run
+        // install still happens (cache miss falls through to the full ensure).
+        let status = ensure_local_managed_cli_for_focus(tool)?;
         let install_attempted = status.action == "installed";
         Ok(Some(summarize_managed_cli_report(
             "local",
