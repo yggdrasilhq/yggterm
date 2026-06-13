@@ -6,17 +6,26 @@ This file tracks user-visible changes in `yggterm`.
 
 ## 2.9.10
 
-- **Switching to a local Codex/Claude Code session is faster — the daemon no
-  longer re-runs a `<cli> --version` probe subprocess on every focus.** The
+- **Focusing a remote Claude Code session no longer stalls on a pointless local
+  `claude --version` probe.** The attach path exempted remote *codex*
+  (`remote-session://`) from the local managed-CLI probe but not remote *Claude
+  Code* (`remote-cc://`), so every focus of a remote CC session spawned a local
+  `claude --version` on the GUI host — a ~85-910ms child process (live-measured)
+  for a CLI that actually runs on the *remote* machine via the resume-cc lane.
+  Remote CC sessions are exempt now, like remote codex. This is the dominant
+  switch-latency win because remote CC is a common session kind.
+- **Switching to a local Codex/Claude Code session is also faster — the daemon no
+  longer re-runs the `<cli> --version` probe subprocess on every focus.** The
   managed-CLI ensure that runs on the terminal-attach path always spawned
-  `claude --version` / `codex --version` (a ~100-400ms child process for the
-  node-based `claude` CLI) before any freshness gate, so every session switch
-  paid it on the daemon's reply path. The focus path now reuses a recent ensure
-  result for a short window (60s), so a burst of switches pays the probe at most
-  once. First-run install is unchanged (a cache miss still runs the full ensure
-  and installs if needed), and a genuine uninstall self-heals within the window.
-  This is the first step of "the server attaches in a non-blocking IO manner";
-  the synchronous full-state persist on the same reply path is the next lever.
+  `claude --version` / `codex --version` before any freshness gate, so every
+  local agent switch paid it on the daemon's reply path. The focus path now
+  reuses a recent ensure result for a short window (60s), so a burst of switches
+  pays the probe at most once. First-run install is unchanged (a cache miss still
+  runs the full ensure and installs if needed), and a genuine uninstall
+  self-heals within the window.
+- These are the first steps of "the server attaches in a non-blocking IO
+  manner"; the synchronous full-state persist on the same reply path is the
+  next lever.
 
 ## 2.9.9
 
