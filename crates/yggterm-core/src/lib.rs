@@ -37,8 +37,10 @@ pub use install::{
     refresh_desktop_integration, update_command_hint, write_direct_install_state,
 };
 pub use perf::{
-    PERF_TELEMETRY_FILENAME, PERF_TELEMETRY_MAX_BYTES, PERF_TELEMETRY_ROTATED_FILENAME, PerfSpan,
-    append_bounded_jsonl_record, append_perf_event, perf_telemetry_path,
+    PERF_TELEMETRY_FILENAME, PERF_TELEMETRY_MAX_BYTES, PERF_TELEMETRY_ROTATED_FILENAME, PerfGuard,
+    PerfSpan, PerfSpanSummary, append_bounded_jsonl_record, append_perf_event,
+    perf_profiling_enabled, perf_telemetry_path, set_perf_profiling_enabled,
+    summarize_perf_telemetry,
 };
 pub use session_kind::SessionKind;
 pub use telemetry::{
@@ -174,6 +176,11 @@ pub struct AppSettings {
     pub system_notifications: bool,
     pub notification_sound: bool,
     pub terminal_telemetry_enabled: bool,
+    /// App profiling system: when on, timing spans on hot paths (terminal attach,
+    /// persist, snapshot, render) are written to `perf-telemetry.jsonl` for
+    /// `server perf-summary` analysis. Separate from terminal telemetry because it is
+    /// a heavier, developer-facing diagnostic. Gates [`set_perf_profiling_enabled`].
+    pub perf_profiling_enabled: bool,
     pub selected_browser_path: Option<String>,
     pub expanded_browser_paths: Vec<String>,
     /// Synthetic sidebar groups (machine roots, remote folders, Live Sessions)
@@ -210,6 +217,7 @@ impl Default for AppSettings {
             system_notifications: false,
             notification_sound: false,
             terminal_telemetry_enabled: true,
+            perf_profiling_enabled: true,
             selected_browser_path: None,
             expanded_browser_paths: Vec::new(),
             collapsed_synthetic_paths: Vec::new(),
@@ -908,6 +916,10 @@ fn parse_settings_value(value: &Value) -> Result<AppSettings> {
         settings.terminal_telemetry_enabled = serde_json::from_value(value.clone())
             .context("failed to parse terminal_telemetry_enabled")?;
     }
+    if let Some(value) = object.get("perf_profiling_enabled") {
+        settings.perf_profiling_enabled = serde_json::from_value(value.clone())
+            .context("failed to parse perf_profiling_enabled")?;
+    }
     if let Some(value) = object.get("selected_browser_path") {
         settings.selected_browser_path = serde_json::from_value(value.clone())
             .context("failed to parse selected_browser_path")?;
@@ -948,6 +960,7 @@ fn serialize_settings_value(settings: &AppSettings) -> Value {
         "system_notifications": settings.system_notifications,
         "notification_sound": settings.notification_sound,
         "terminal_telemetry_enabled": settings.terminal_telemetry_enabled,
+        "perf_profiling_enabled": settings.perf_profiling_enabled,
         "selected_browser_path": settings.selected_browser_path,
         "expanded_browser_paths": settings.expanded_browser_paths,
         "collapsed_synthetic_paths": settings.collapsed_synthetic_paths,
