@@ -4,6 +4,25 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+## 2.9.11
+
+- **Switching to a local Codex/Claude Code session is now blazing fast — the
+  terminal-attach path never blocks on a `<cli> --version` subprocess or an npm
+  install.** Live-measuring cold switches surfaced the real villain: the
+  managed-CLI ensure on the attach path. The daemon process runs with a
+  non-login `PATH` that often omits `~/.local/bin`, so it concluded a perfectly
+  good system `codex`/`claude` was *absent* and fired `npm install -g …@latest`
+  on *every* cold focus — a multi-second network stall (measured ~5.5s on the
+  dev host), repeated because an unavailable result is never cached. The attach
+  path now does a cheap, subprocess-free existence check that resolves binaries
+  the same way the launched session will (the login-shell `PATH`, matching
+  wrapper parity), returns immediately, and defers all probe/install work to a
+  background thread. First-run provisioning still happens (a genuinely absent
+  binary triggers a background install, off the switch path), and a
+  Yggterm-managed binary still gets its periodic refresh — just never on the
+  user's click. Live-measured on the dev host: the local Codex attach dropped
+  from 5467ms to 4ms.
+
 ## 2.9.10
 
 - **Focusing a remote Claude Code session no longer stalls on a pointless local
