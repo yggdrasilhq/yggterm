@@ -4,6 +4,23 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+## 2.9.12
+
+- **App profiling system, toggleable in Settings.** The existing `PerfSpan`
+  timing infrastructure (which was always-on and only covered startup/remote/
+  chore paths) is now a real, gateable profiling system. A new **Performance
+  Profiling** toggle sits just below Terminal Telemetry in Settings; when on,
+  timing spans on the interactive hot paths — every daemon request
+  (`daemon_request`), the terminal-attach sub-phases (`attach/managed_cli_ensure`,
+  `attach/request_terminal_launch`), `persist`, and `snapshot_response` — are
+  written to `perf-telemetry.jsonl`. The spans are drop-based and gated by a
+  process-global flag, so when profiling is off they cost only an atomic load.
+- **`yggterm-headless server perf-summary`** aggregates the log into per-span
+  count / p50 / p95 / p99 / max / total (ranked by total wall-clock), with
+  `--category`, `--since-ms`, `--top`, and `--json`. This is how "where is time
+  going?" gets answered without hand-parsing the raw log — the same workflow that
+  surfaced the 2.9.11 attach stall, now a first-class tool.
+
 ## 2.9.11
 
 - **Switching to a local Codex/Claude Code session is now blazing fast — the
