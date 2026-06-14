@@ -1950,6 +1950,9 @@ impl DaemonRuntime {
         let store = SessionStore::open_or_init()?;
         let perf = PerfSpan::start(store.home_dir(), "daemon", "runtime_load");
         let settings = store.load_settings().unwrap_or_default();
+        // Push the profiling toggle into the process-global gate at startup. The chore
+        // re-reads settings each tick, so a GUI toggle propagates to the daemon there.
+        yggterm_core::set_perf_profiling_enabled(settings.perf_profiling_enabled);
         let tree = store
             .load_codex_tree(&settings)
             .or_else(|_| store.load_tree())?;
@@ -2270,6 +2273,7 @@ impl DaemonRuntime {
     }
 
     fn snapshot_response(&self, message: Option<String>) -> ServerResponse {
+        let _perf = yggterm_core::PerfGuard::new(self.store.home_dir(), "daemon", "snapshot_response");
         let mut snapshot = self.server.snapshot();
         let runtime_keys = self
             .terminal_runtime_keys_including_preserved()
@@ -3418,7 +3422,14 @@ impl DaemonRuntime {
         initial_size: Option<(u16, u16)>,
         seed_remote_snapshot: bool,
     ) -> Result<Option<String>> {
-        let prepare_message = self.server.ensure_managed_cli_for_session_path(path)?;
+        let prepare_message = {
+            let _perf = yggterm_core::PerfGuard::new(
+                self.store.home_dir(),
+                "attach",
+                "managed_cli_ensure",
+            );
+            self.server.ensure_managed_cli_for_session_path(path)?
+        };
         if path.starts_with("remote-session://")
             && let Ok(home) = crate::resolve_yggterm_home()
         {
@@ -3445,11 +3456,18 @@ impl DaemonRuntime {
                 }),
             );
         }
-        if seed_remote_snapshot {
-            self.server.request_terminal_launch_for_path(path);
-        } else {
-            self.server
-                .request_terminal_launch_for_path_preserving_active(path);
+        {
+            let _perf = yggterm_core::PerfGuard::new(
+                self.store.home_dir(),
+                "attach",
+                "request_terminal_launch",
+            );
+            if seed_remote_snapshot {
+                self.server.request_terminal_launch_for_path(path);
+            } else {
+                self.server
+                    .request_terminal_launch_for_path_preserving_active(path);
+            }
         }
         let runtime_path = self.terminal_runtime_key_for_path(path);
         let preserved_owner_status = self
@@ -3910,6 +3928,7 @@ impl DaemonRuntime {
             // live (gate #8 — see the field docs).
             return Ok(());
         }
+        let _perf = yggterm_core::PerfGuard::new(self.store.home_dir(), "daemon", "persist");
         self.refresh_live_codex_runtime_identities_for_persistence();
         self.refresh_live_claude_code_runtime_identities_for_persistence();
         write_persisted_state(&self.state_path, &self.server.persisted_state())
@@ -3942,6 +3961,15 @@ impl DaemonRuntime {
         // prune (cheap; usually empty).
         self.drain_pending_preserved_owner_removals();
         let request_name = server_request_name(&request);
+        // App profiling system: time every daemon request, tagged by name, so
+        // `server perf-summary` surfaces the slow ones (the switch path is `terminal_ensure`).
+        // Drop-based so `?` early returns and panics still record. No-op when the
+        // perf_profiling_enabled setting is off.
+        let _perf_request = yggterm_core::PerfGuard::new(
+            self.store.home_dir(),
+            "daemon_request",
+            request_name,
+        );
         let trace_request = daemon_request_trace_enabled(request_name);
         if trace_request {
             append_trace_event(
@@ -6464,6 +6492,8 @@ fn run_background_copy_chore(
     let (store, settings, local_root, live_sessions, remote_machines, ssh_targets, perf_home, working_paths) = {
         let runtime = lock_daemon_runtime(runtime, "run_background_copy_chore_read");
         let settings = runtime.store.load_settings().unwrap_or_default();
+        // Eventual propagation of a GUI profiling toggle into the daemon's gate.
+        yggterm_core::set_perf_profiling_enabled(settings.perf_profiling_enabled);
         let local_root = runtime.store.load_codex_tree(&settings)?;
         // Working-indicator trigger: a live session counts as "working" when
         // its vt100 screen shows the agent working (esc-to-interrupt SSOT) or
