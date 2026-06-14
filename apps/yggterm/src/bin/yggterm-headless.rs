@@ -164,6 +164,7 @@ fn print_server_help() {
   yggterm-headless server terminal restart <session> [--terminal-appearance <dark|light>] [--force-remote]
   yggterm-headless server sessions regenerate-copy [--budget <n>] [--force] [--reset-summary-history] [--skip-local] [--skip-remote] [--json]
   yggterm-headless server monitor --scenario <panic-report|server-list|latency-check|wait-session|hot-restart|managed-cli-refresh>
+  yggterm-headless server perf-summary [--category <c>] [--since-ms <ms>] [--top <n>] [--json]
   yggterm-headless server trace <tail|follow|bundle|transitions>
   yggterm-headless server screenshot <target> [output]
   yggterm-headless server screenrecord <target> [output]
@@ -877,6 +878,15 @@ fn maybe_handoff_to_preferred_headless_executable(
         return Ok(());
     }
     if classify_builtin_cli_command(args).is_some_and(builtin_cli_command_is_pure) {
+        return Ok(());
+    }
+    // `perf-summary` reads the LOCAL perf-telemetry.jsonl in-process and never talks to
+    // the daemon, so it must run in THIS (newest) binary. Handing it off to a stale
+    // active-executable (e.g. a dev deploy that overwrote ~/.local/bin but not
+    // install-state) would hit a binary that predates the command and fail.
+    if matches!(args.first().map(String::as_str), Some("server"))
+        && matches!(args.get(1).map(String::as_str), Some("perf-summary"))
+    {
         return Ok(());
     }
     let Some(preferred) = preferred_headless_executable(install_context) else {
@@ -2178,6 +2188,47 @@ fn main() -> Result<()> {
             yggterm_server::SERVER_PROTOCOL_VERSION,
         )?;
         println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(());
+    }
+    if args.first().map(String::as_str) == Some("server")
+        && args.get(1).map(String::as_str) == Some("perf-summary")
+    {
+        // App profiling system read side: aggregate perf-telemetry.jsonl into per-span
+        // p50/p95/p99/max/total, ranked by total wall-clock. The switch path is the
+        // `attach`/`daemon_request` categories. Honors --category/--since-ms/--top/--json.
+        let category = cli_flag_value(&args, "--category");
+        let since_ms = cli_flag_value(&args, "--since-ms").and_then(|value| value.parse::<u64>().ok());
+        let top = cli_flag_value(&args, "--top")
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(40);
+        let summaries =
+            yggterm_core::summarize_perf_telemetry(store.home_dir(), since_ms, category);
+        if args.iter().any(|arg| arg == "--json") {
+            println!("{}", serde_json::to_string_pretty(&summaries)?);
+        } else if summaries.is_empty() {
+            println!(
+                "(no perf-telemetry data yet — enable Performance Profiling in settings; log: {})",
+                yggterm_core::perf_telemetry_path(store.home_dir()).display()
+            );
+        } else {
+            println!(
+                "{:<24} {:<30} {:>6} {:>8} {:>8} {:>8} {:>8} {:>10}",
+                "category", "name", "count", "p50ms", "p95ms", "p99ms", "maxms", "totalms"
+            );
+            for summary in summaries.iter().take(top) {
+                println!(
+                    "{:<24} {:<30} {:>6} {:>8.1} {:>8.1} {:>8.1} {:>8.1} {:>10.1}",
+                    summary.category,
+                    summary.name,
+                    summary.count,
+                    summary.p50_ms,
+                    summary.p95_ms,
+                    summary.p99_ms,
+                    summary.max_ms,
+                    summary.total_ms
+                );
+            }
+        }
         return Ok(());
     }
     if args.as_slice() == ["server", "ping"] {
