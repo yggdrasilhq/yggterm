@@ -2209,6 +2209,7 @@ impl ShellState {
         let initial_search_query = std::env::var("YGGTERM_SEARCH_QUERY").unwrap_or_default();
         let browser_tree_loaded = bootstrap.browser_tree_loaded;
         let settings = bootstrap.settings.clone();
+        yggterm_core::set_perf_profiling_enabled(settings.perf_profiling_enabled);
         let terminal_appearance = terminal_identity_appearance_for_settings(&settings);
         yggterm_server::sync_terminal_identity_appearance(terminal_appearance);
         let initial_window_maximized = settings.window_maximized;
@@ -6813,6 +6814,20 @@ impl ShellState {
             "terminal telemetry disabled".to_string()
         };
     }
+    fn update_perf_profiling_enabled(&mut self, enabled: bool) {
+        if self.settings.perf_profiling_enabled == enabled {
+            return;
+        }
+        self.settings.perf_profiling_enabled = enabled;
+        // persist_settings flips the process-global perf gate so GUI-side spans
+        // respond immediately; the daemon picks it up on its next chore tick.
+        self.persist_settings();
+        self.last_action = if enabled {
+            "performance profiling enabled".to_string()
+        } else {
+            "performance profiling disabled".to_string()
+        };
+    }
     fn set_titlebar_auto_hide(&mut self, enabled: bool) {
         if self.settings.auto_hide_titlebar == enabled {
             return;
@@ -8098,9 +8113,11 @@ impl ShellState {
         self.context_menu_row = None;
     }
     fn persist_settings(&self) {
+        yggterm_core::set_perf_profiling_enabled(self.settings.perf_profiling_enabled);
         let _ = save_settings_file(&self.bootstrap.settings_path, &self.settings);
     }
     fn persist_settings_async(&self, reason: &'static str) {
+        yggterm_core::set_perf_profiling_enabled(self.settings.perf_profiling_enabled);
         let settings_path = self.bootstrap.settings_path.clone();
         let settings = self.settings.clone();
         spawn(async move {
@@ -25310,6 +25327,7 @@ fn describe_app_state_snapshot(
         "effective_terminal_theme_name": shell.effective_terminal_theme_name(),
         "terminal_telemetry_enabled": shell.settings.terminal_telemetry_enabled,
         "terminal_telemetry_db_path": terminal_telemetry_db_path.clone(),
+        "perf_profiling_enabled": shell.settings.perf_profiling_enabled,
     });
     let live_session_snapshot_debug = shell
         .server
@@ -40818,6 +40836,9 @@ fn app() -> Element {
                             },
                             on_set_terminal_telemetry: move |enabled: bool| {
                                 state.with_mut(|shell| shell.update_terminal_telemetry_enabled(enabled))
+                            },
+                            on_set_perf_profiling: move |enabled: bool| {
+                                state.with_mut(|shell| shell.update_perf_profiling_enabled(enabled))
                             },
                             on_set_titlebar_auto_hide: move |enabled: bool| {
                                 state.with_mut(|shell| shell.set_titlebar_auto_hide(enabled));
@@ -69198,6 +69219,7 @@ fn RightRail(
     on_set_notification_delivery: EventHandler<NotificationDeliveryMode>,
     on_set_notification_sound: EventHandler<bool>,
     on_set_terminal_telemetry: EventHandler<bool>,
+    on_set_perf_profiling: EventHandler<bool>,
     on_set_titlebar_auto_hide: EventHandler<bool>,
     on_adjust_ui_zoom: EventHandler<i32>,
     on_set_ui_zoom: EventHandler<i32>,
@@ -69250,6 +69272,7 @@ fn RightRail(
                     on_set_notification_delivery,
                     on_set_notification_sound,
                     on_set_terminal_telemetry,
+                    on_set_perf_profiling,
                     on_set_titlebar_auto_hide,
                     on_adjust_ui_zoom,
                     on_set_ui_zoom,
@@ -69323,6 +69346,7 @@ fn SettingsRailBody(
     on_set_notification_delivery: EventHandler<NotificationDeliveryMode>,
     on_set_notification_sound: EventHandler<bool>,
     on_set_terminal_telemetry: EventHandler<bool>,
+    on_set_perf_profiling: EventHandler<bool>,
     on_set_titlebar_auto_hide: EventHandler<bool>,
     on_adjust_ui_zoom: EventHandler<i32>,
     on_set_ui_zoom: EventHandler<i32>,
@@ -69469,6 +69493,11 @@ fn SettingsRailBody(
                 enabled: snapshot.settings.terminal_telemetry_enabled,
                 db_path: "~/.yggterm/telemetry/terminal.sqlite3".to_string(),
                 on_change: on_set_terminal_telemetry,
+            }
+            PerfProfilingSettingsSection {
+                palette: snapshot.palette,
+                enabled: snapshot.settings.perf_profiling_enabled,
+                on_change: on_set_perf_profiling,
             }
             ZoomSettingRow {
                 field_key: "interface-zoom".to_string(),
@@ -71262,6 +71291,48 @@ fn TelemetrySettingsSection(
                         palette.muted
                     ),
                     "{db_path}"
+                }
+            }
+        }
+    }
+}
+#[component]
+fn PerfProfilingSettingsSection(
+    palette: Palette,
+    enabled: bool,
+    on_change: EventHandler<bool>,
+) -> Element {
+    rsx! {
+        div {
+            style: "display:flex; flex-direction:column; gap:6px;",
+            div {
+                style: "display:flex; align-items:center; justify-content:space-between; gap:8px;",
+                div {
+                    style: format!("font-size:11px; font-weight:700; letter-spacing:0.02em; color:{};", palette.muted),
+                    "Performance Profiling"
+                }
+                span {
+                    style: format!("font-size:10px; font-weight:700; color:{};", palette.muted),
+                    "Developer"
+                }
+            }
+            div {
+                style: settings_section_card_style(palette),
+                InlineSettingsToggleRow {
+                    field_key: "perf-profiling".to_string(),
+                    label: "Profiling".to_string(),
+                    description: "Time hot paths (terminal attach, persist, snapshot, requests) to perf-telemetry.jsonl. Inspect with `yggterm-headless server perf-summary`.".to_string(),
+                    enabled,
+                    palette,
+                    on_change,
+                }
+                div {
+                    style: format!(
+                        "font-family:'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; \
+                         font-size:9.5px; line-height:1.35; color:{}; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;",
+                        palette.muted
+                    ),
+                    "~/.yggterm/perf-telemetry.jsonl"
                 }
             }
         }
