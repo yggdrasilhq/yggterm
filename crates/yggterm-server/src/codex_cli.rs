@@ -1179,6 +1179,42 @@ mod tests {
         );
     }
 
+    // The focus/attach path's cheap probe must recognize a present managed binary
+    // WITHOUT running a `<cli> --version` subprocess — that subprocess (claude up to
+    // 910ms) plus the npm install it can trigger is the cold-switch latency we removed.
+    // version==None is the proof that no subprocess ran.
+    #[test]
+    fn probe_tool_existence_only_skips_version_subprocess_for_present_managed_binary() {
+        let tmp = std::env::temp_dir().join(format!(
+            "ygg-existence-probe-{}-{}",
+            std::process::id(),
+            current_time_ms()
+        ));
+        let bin_dir = tmp.join("bin");
+        std::fs::create_dir_all(&bin_dir).expect("create temp managed bin dir");
+        // A file that exists but is NOT a runnable binary — if the probe tried to run
+        // `--version` it would garble/fail; version must stay None because we never run it.
+        std::fs::write(bin_dir.join("codex"), b"#!not-a-real-binary").expect("write fake bin");
+        let paths = ManagedCliPaths {
+            home: tmp.clone(),
+            prefix: tmp.join("managed-npm"),
+            bin_dir,
+            cache_dir: tmp.join("cache"),
+        };
+        let probe = probe_tool_existence_only(&paths, ManagedCliTool::Codex);
+        assert!(probe.available, "present managed binary should be available");
+        assert_eq!(probe.source, Some(ManagedCliBinarySource::Managed));
+        assert_eq!(
+            probe.version, None,
+            "the attach probe must not run a --version subprocess"
+        );
+        // And the status it produces is never an install action (no blocking on attach).
+        let status = managed_cli_launch_status_from_probe(ManagedCliTool::Codex, probe);
+        assert_eq!(status.action, "ready");
+        assert_ne!(status.action, "installed");
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
     // Claude Code rides the managed-CLI lane (self-provision + 6h refresh)
     // with claude's own conventions: `--resume <id>` flag, not the codex
     // `resume` subcommand. A wrong shape here silently breaks every CC
@@ -1449,7 +1485,12 @@ fn tool_status(
     }
 }
 
-#[cfg(test)]
+/// Build a managed-CLI status from a CHEAP existence probe (no `--version`
+/// subprocess, no npm install). This is what the focus/attach path returns:
+/// the terminal switch must never block on a probe subprocess or a network
+/// install. A present binary (managed or system) yields `ready`/`system_fallback`;
+/// a truly-absent binary yields `unavailable` and the caller kicks a BACKGROUND
+/// provision — never blocking the user's switch.
 fn managed_cli_launch_status_from_probe(
     tool: ManagedCliTool,
     probe: ToolProbe,
@@ -1662,11 +1703,128 @@ fn managed_cli_focus_cache_entry_is_fresh(available: bool, cached_at_ms: u64, no
     available && now_ms.saturating_sub(cached_at_ms) < MANAGED_CLI_FOCUS_PROBE_TTL_MS
 }
 
-/// Focus/attach-path entry point for the managed-CLI ensure. Reuses a recent ensure
-/// result instead of re-running the `--version` probe subprocess on every session
-/// switch. See [`MANAGED_CLI_FOCUS_PROBE_TTL_MS`]. The explicit refresh paths
-/// (`refresh_local_managed_cli`) still call `ensure_local_managed_cli`/`install_latest`
-/// directly so a user/chore-triggered refresh always re-probes.
+/// The PATH the LAUNCHED session will actually use, resolved once from the user's
+/// login shell and cached for the daemon's lifetime. The daemon process runs with a
+/// non-login environment whose `PATH` frequently omits `~/.local/bin` (where the
+/// fleet installs codex/claude), while the PTY launch command runs under
+/// `bash -lc` and DOES see it ([[spec-cli-binary-auto-provisioning]] login_shell_wrap).
+/// Without this, the daemon's existence probe wrongly concludes a present CLI is
+/// absent and fires a pointless `npm install` on every cold focus (the 5.5s stall
+/// measured on jojo, 2026-06-14). Resolving via the login shell closes that gap so the
+/// probe matches launch parity. One subprocess per daemon lifetime; never on the hot path.
+fn login_shell_path_dirs() -> &'static [PathBuf] {
+    static DIRS: std::sync::OnceLock<Vec<PathBuf>> = std::sync::OnceLock::new();
+    DIRS.get_or_init(|| {
+        let shell = env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string());
+        let output = Command::new(&shell)
+            .arg("-lc")
+            .arg("printf %s \"$PATH\"")
+            .output();
+        match output {
+            Ok(output) if output.status.success() => {
+                let path = String::from_utf8_lossy(&output.stdout);
+                env::split_paths(path.trim()).collect()
+            }
+            _ => Vec::new(),
+        }
+    })
+}
+
+/// Resolve a binary the way the launched session will: daemon `PATH` first (cheap,
+/// already in-process), then the cached login-shell `PATH`. Existence check only —
+/// no `--version` subprocess.
+fn resolve_binary_for_launch_parity(binary_name: &str) -> Option<PathBuf> {
+    if let Some(path) = resolve_binary_on_path(binary_name) {
+        return Some(path);
+    }
+    login_shell_path_dirs()
+        .iter()
+        .map(|base| base.join(binary_name))
+        .find(|candidate| candidate.is_file())
+}
+
+/// Cheap, subprocess-free existence probe for the focus/attach path. Mirrors
+/// `probe_tool`'s source resolution (managed bin dir, else launch-parity PATH) but
+/// SKIPS `run_version_command` — the attach must never block on a `<cli> --version`
+/// subprocess. `version` is left `None`; the background ensure fills it in.
+fn probe_tool_existence_only(paths: &ManagedCliPaths, tool: ManagedCliTool) -> ToolProbe {
+    let managed_binary = paths.bin_dir.join(tool.binary_name());
+    if managed_binary.is_file() {
+        return ToolProbe {
+            version: None,
+            source: Some(ManagedCliBinarySource::Managed),
+            available: true,
+        };
+    }
+    if resolve_binary_for_launch_parity(tool.binary_name()).is_some() {
+        return ToolProbe {
+            version: None,
+            source: Some(ManagedCliBinarySource::System),
+            available: true,
+        };
+    }
+    ToolProbe {
+        version: None,
+        source: None,
+        available: false,
+    }
+}
+
+/// Per-tool in-flight guard so at most one background provision/refresh runs per tool
+/// at a time (no thread pile-up under rapid switching). The 60s focus cache rate-limits
+/// the spawn cadence to <=1/min while actively switching.
+fn managed_cli_background_inflight()
+-> &'static std::sync::Mutex<std::collections::BTreeSet<&'static str>> {
+    static INFLIGHT: std::sync::OnceLock<std::sync::Mutex<std::collections::BTreeSet<&'static str>>> =
+        std::sync::OnceLock::new();
+    INFLIGHT.get_or_init(|| std::sync::Mutex::new(std::collections::BTreeSet::new()))
+}
+
+/// Run the full `ensure_local_managed_cli` (probe + TTL-gated install) on a detached
+/// thread so it NEVER blocks the terminal-attach reply. Used for two cases off the hot
+/// path: (1) genuine first-run provisioning when the binary is absent everywhere
+/// (including the login-shell PATH), and (2) the 6h auto-update of a Yggterm-MANAGED
+/// binary. Deduped per tool. On success it primes the focus cache so the next switch is
+/// instant. `ensure_local_managed_cli` touches only `ManagedCliPaths`/filesystem/npm —
+/// never the daemon mutex — so this is safe to spawn from under it.
+fn spawn_background_managed_cli_refresh(tool: ManagedCliTool) {
+    let name = tool.binary_name();
+    {
+        let Ok(mut inflight) = managed_cli_background_inflight().lock() else {
+            return;
+        };
+        if !inflight.insert(name) {
+            return;
+        }
+    }
+    std::thread::spawn(move || {
+        let result = ensure_local_managed_cli(tool);
+        if let Ok(status) = result
+            && status.available
+            && let Ok(mut cache) = managed_cli_focus_cache().lock()
+        {
+            cache.insert(tool.binary_name(), (status, current_time_ms()));
+        }
+        if let Ok(mut inflight) = managed_cli_background_inflight().lock() {
+            inflight.remove(name);
+        }
+    });
+}
+
+/// Focus/attach-path entry point for the managed-CLI ensure. The terminal switch must
+/// be BLAZING FAST: it never runs a `<cli> --version` subprocess or a blocking npm
+/// install. It returns the status of a CHEAP existence probe (managed bin dir, else the
+/// login-shell PATH the launch will actually use) and defers all subprocess/network work
+/// to a background thread:
+///   - binary present (managed or system) -> return immediately + cache (fast repeat
+///     focuses). For a Yggterm-MANAGED binary, also kick a background ensure so the 6h
+///     auto-update still happens, off the switch path.
+///   - binary absent everywhere -> return `unavailable` immediately (the session launch,
+///     which runs under a login shell, resolves the CLI itself) and kick a background
+///     provision so a genuinely fresh machine still installs — never freezing the switch.
+/// The 60s in-process cache rate-limits the cheap probe + background spawn to <=1/min.
+/// Explicit refresh paths (`refresh_local_managed_cli`) still call
+/// `ensure_local_managed_cli`/`install_latest` directly so a user/chore refresh re-probes.
 pub(crate) fn ensure_local_managed_cli_for_focus(
     tool: ManagedCliTool,
 ) -> Result<ManagedCliToolStatus> {
@@ -1677,9 +1835,20 @@ pub(crate) fn ensure_local_managed_cli_for_focus(
     {
         return Ok(status.clone());
     }
-    let status = ensure_local_managed_cli(tool)?;
-    if let Ok(mut cache) = managed_cli_focus_cache().lock() {
-        cache.insert(tool.binary_name(), (status.clone(), now_ms));
+    let paths = ManagedCliPaths::resolve()?;
+    let probe = probe_tool_existence_only(&paths, tool);
+    let status = managed_cli_launch_status_from_probe(tool, probe.clone());
+    if probe.available {
+        if let Ok(mut cache) = managed_cli_focus_cache().lock() {
+            cache.insert(tool.binary_name(), (status.clone(), now_ms));
+        }
+        // A managed binary still needs its periodic 6h refresh — in the background.
+        // A system binary is the user's to update; don't churn npm trying to shadow it.
+        if probe.source == Some(ManagedCliBinarySource::Managed) {
+            spawn_background_managed_cli_refresh(tool);
+        }
+    } else {
+        spawn_background_managed_cli_refresh(tool);
     }
     Ok(status)
 }
