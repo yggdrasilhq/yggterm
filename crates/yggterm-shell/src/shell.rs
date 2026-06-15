@@ -511,6 +511,12 @@ const REMOTE_SURFACE_STAGE_CSS: &str = "@keyframes yggterm-remote-stage-float { 
 const BACKGROUND_COPY_RETRY_MS: u64 = 300_000;
 const BACKGROUND_COPY_CONTINUE_MS: u64 = 15_000;
 const BACKGROUND_COPY_IDLE_MS: u64 = 120_000;
+// After a SUCCESSFUL title generation, hold a cooldown before the passive scan may
+// re-select the same session. Without it, a generated title that gets clobbered back to
+// a cwd fallback by a snapshot/remote-scan refresh is re-generated every scan cycle —
+// observed as ~12 LLM calls/hour against the SAME session (rate-limited endpoint waste,
+// found via `server perf-summary`, 2026-06-14). A force/user-initiated regen bypasses it.
+const BACKGROUND_COPY_SUCCESS_COOLDOWN_MS: u64 = 3_600_000;
 const ACTIVE_TITLE_AUTOGEN_RETRY_MS: u64 = 15_000;
 const PASSIVE_COPY_GENERATION_ENV: &str = "YGGTERM_ENABLE_PASSIVE_COPY_GENERATION";
 const TERMINAL_RECIPE_DRAG_ENV: &str = "YGGTERM_ENABLE_TERMINAL_RECIPE_DRAG";
@@ -9774,9 +9780,14 @@ fn spawn_title_generation_for_target(
                 shell
                     .passive_copy_failures
                     .remove(&background_copy_retry_key("title", &session_path));
-                shell
-                    .copy_retry_after_ms
-                    .remove(&background_copy_retry_key("title", &session_path));
+                // A success imposes a cooldown rather than clearing the backoff: if the
+                // freshly-generated title later gets clobbered back to a fallback (the
+                // remote-scan/mirror round-trip class), the passive scan must NOT
+                // re-generate it on the very next cycle. Force/user regen ignores this.
+                shell.copy_retry_after_ms.insert(
+                    background_copy_retry_key("title", &session_path),
+                    current_millis() + BACKGROUND_COPY_SUCCESS_COOLDOWN_MS,
+                );
                 if let Some(browser_tree) = browser_tree {
                     restore_browser_tree(shell, browser_tree, Some(&target.session_path));
                 }
@@ -93829,6 +93840,38 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             "summary",
             "remote-session://dev/test",
             now,
+        ));
+    }
+    // Regression guard for the title-regen loop (2026-06-14): a SUCCESSFUL passive title
+    // generation must impose a cooldown that outlasts a scan cycle, so a generated title
+    // clobbered back to a fallback isn't re-generated every cycle (~12 LLM calls/hr/session).
+    #[test]
+    fn title_success_cooldown_outlasts_a_scan_cycle() {
+        let now = 1_000_000u64;
+        let key = background_copy_retry_key("title", "remote-session://dev/test");
+        let mut retry_after = HashMap::new();
+        let passive_failures = HashSet::new();
+        // A success sets now + BACKGROUND_COPY_SUCCESS_COOLDOWN_MS (not a clear).
+        retry_after.insert(key, now + BACKGROUND_COPY_SUCCESS_COOLDOWN_MS);
+        // The cooldown must outlast both the continue and idle scan intervals, or the
+        // passive scan would re-select the session on the next cycle (the bug).
+        assert!(BACKGROUND_COPY_SUCCESS_COOLDOWN_MS > BACKGROUND_COPY_IDLE_MS);
+        assert!(BACKGROUND_COPY_SUCCESS_COOLDOWN_MS > BACKGROUND_COPY_CONTINUE_MS);
+        // Within the cooldown the passive scan refuses to re-select.
+        assert!(!background_copy_job_retry_ready(
+            &retry_after,
+            &passive_failures,
+            "title",
+            "remote-session://dev/test",
+            now + BACKGROUND_COPY_IDLE_MS,
+        ));
+        // After the cooldown it may re-check.
+        assert!(background_copy_job_retry_ready(
+            &retry_after,
+            &passive_failures,
+            "title",
+            "remote-session://dev/test",
+            now + BACKGROUND_COPY_SUCCESS_COOLDOWN_MS + 1,
         ));
     }
     #[test]
