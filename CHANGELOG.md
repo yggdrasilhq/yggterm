@@ -4,6 +4,24 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+## 2.9.14
+
+- **The actual fix for the title-regeneration LLM loop: exponential back-off on
+  "no usable title."** 2.9.13 cooled down the *success* arm, but live verification
+  showed the loop was the *failure* arm — `perf-summary` confirmed 4 sessions still
+  re-generating every ~5 min after 2.9.13. Root cause (live-confirmed): those
+  sessions have empty/scaffold context (`recent_context_len=0` — a codex with no
+  real first turn yet), so generation returns *no usable title*, and the passive
+  scan's `None` arm re-armed a **flat 5-minute retry with no escalation** — forever,
+  against the rate-limited LLM. The `None` arm now backs off exponentially per
+  session (5m → 10m → 20m → 40m → 80m cap), resetting to the fast cadence the moment
+  the session produces a real title. The *active* session keeps its 15s retry, so a
+  session you're looking at still gets titled promptly on its first real turn. This
+  is ~16× less LLM churn for content-less sessions. (This is the no-title symptom of
+  the broader new-codex identity-drift bug class; the identity-convergence and
+  re-attach fixes for that class are a separate, live-pipeline change pending an
+  offline-tested wave.)
+
 ## 2.9.13
 
 - **Stop the title-regeneration LLM-waste loop** (found via `server perf-summary`).
