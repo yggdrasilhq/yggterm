@@ -517,7 +517,21 @@ const BACKGROUND_COPY_IDLE_MS: u64 = 120_000;
 // observed as ~12 LLM calls/hour against the SAME session (rate-limited endpoint waste,
 // found via `server perf-summary`, 2026-06-14). A force/user-initiated regen bypasses it.
 const BACKGROUND_COPY_SUCCESS_COOLDOWN_MS: u64 = 3_600_000;
+// Cap for the exponential no-usable-title backoff (BACKGROUND_COPY_RETRY_MS << streak):
+// 5m, 10m, 20m, 40m, then capped at 80m. An empty-context session re-checks at most every
+// 80 min instead of every 5 min (~16x less rate-limited-LLM churn) while still recovering
+// promptly once it gains titleable content (the streak resets to 0 on a successful title).
+const BACKGROUND_COPY_NO_TITLE_BACKOFF_CAP_MS: u64 = 4_800_000;
 const ACTIVE_TITLE_AUTOGEN_RETRY_MS: u64 = 15_000;
+
+/// Passive retry delay after `streak` consecutive "no usable title" results:
+/// BACKGROUND_COPY_RETRY_MS << streak, capped. streak 0..=4 -> 5m,10m,20m,40m,80m; >=5 -> 80m.
+fn no_title_backoff_ms(streak: u32) -> u64 {
+    BACKGROUND_COPY_RETRY_MS
+        .checked_shl(streak.min(4))
+        .unwrap_or(BACKGROUND_COPY_NO_TITLE_BACKOFF_CAP_MS)
+        .min(BACKGROUND_COPY_NO_TITLE_BACKOFF_CAP_MS)
+}
 const PASSIVE_COPY_GENERATION_ENV: &str = "YGGTERM_ENABLE_PASSIVE_COPY_GENERATION";
 const TERMINAL_RECIPE_DRAG_ENV: &str = "YGGTERM_ENABLE_TERMINAL_RECIPE_DRAG";
 const BACKGROUND_REFRESH_NOTICE_MS: u64 = 12_000;
@@ -865,6 +879,13 @@ struct ShellState {
     passive_copy_suspended: bool,
     passive_copy_failures: HashSet<String>,
     copy_retry_after_ms: HashMap<String, u64>,
+    // Per-session count of consecutive "no usable title produced" passive results. Drives
+    // EXPONENTIAL backoff on the None arm so a session with no titleable content yet (empty
+    // first-turn transcript / scaffold viewport) is not re-generated against the rate-limited
+    // LLM every 5 min forever (observed live: 4 empty-context sessions looping ~12x/hr each,
+    // 2026-06-15). Reset to 0 on a successful title so a session that later gets content
+    // re-titles promptly.
+    copy_title_no_title_streak: HashMap<String, u32>,
     title_autogen_retry_after_ms: HashMap<String, u64>,
     title_autogen_retry_pending: HashSet<String>,
     native_clipboard_owner: Option<Rc<RefCell<NativeClipboardOwner>>>,
@@ -2348,6 +2369,7 @@ impl ShellState {
             passive_copy_suspended,
             passive_copy_failures: HashSet::new(),
             copy_retry_after_ms: HashMap::new(),
+            copy_title_no_title_streak: HashMap::new(),
             title_autogen_retry_after_ms: HashMap::new(),
             title_autogen_retry_pending: HashSet::new(),
             native_clipboard_owner: None,
@@ -9780,6 +9802,9 @@ fn spawn_title_generation_for_target(
                 shell
                     .passive_copy_failures
                     .remove(&background_copy_retry_key("title", &session_path));
+                // The session produced a usable title -> reset the no-title backoff streak
+                // so if it is ever legitimately re-titled later it starts from the fast cadence.
+                shell.copy_title_no_title_streak.remove(&session_path);
                 // A success imposes a cooldown rather than clearing the backoff: if the
                 // freshly-generated title later gets clobbered back to a fallback (the
                 // remote-scan/mirror round-trip class), the passive scan must NOT
@@ -9825,12 +9850,21 @@ fn spawn_title_generation_for_target(
                         .passive_copy_failures
                         .insert(background_copy_retry_key("title", &session_path));
                 }
+                // Exponential backoff on repeated "no usable title": a session with no
+                // titleable content yet (empty first-turn transcript) must not be re-run
+                // against the rate-limited LLM every 5 min forever. 5m,10m,20m,40m,80m(cap).
+                let streak = shell
+                    .copy_title_no_title_streak
+                    .entry(session_path.clone())
+                    .or_insert(0);
+                let backoff = no_title_backoff_ms(*streak);
+                *streak = streak.saturating_add(1);
                 shell.copy_retry_after_ms.insert(
                     background_copy_retry_key("title", &session_path),
-                    current_millis() + BACKGROUND_COPY_RETRY_MS,
+                    current_millis() + backoff,
                 );
                 schedule_active_retry = !force;
-                warn!(session_path=%target.session_path, "title generation produced no usable title");
+                warn!(session_path=%target.session_path, streak=*streak, backoff_ms=backoff, "title generation produced no usable title");
                 if announce {
                     shell.finish_job_notification(
                         &job_key,
@@ -93873,6 +93907,22 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             "remote-session://dev/test",
             now + BACKGROUND_COPY_SUCCESS_COOLDOWN_MS + 1,
         ));
+    }
+    // Regression guard for the no-usable-title LLM loop (2026-06-15): empty-context
+    // sessions must back off exponentially, not retry every 5 min forever.
+    #[test]
+    fn no_title_backoff_is_exponential_and_capped() {
+        assert_eq!(no_title_backoff_ms(0), BACKGROUND_COPY_RETRY_MS); // 5m
+        assert_eq!(no_title_backoff_ms(1), BACKGROUND_COPY_RETRY_MS * 2); // 10m
+        assert_eq!(no_title_backoff_ms(2), BACKGROUND_COPY_RETRY_MS * 4); // 20m
+        assert_eq!(no_title_backoff_ms(3), BACKGROUND_COPY_RETRY_MS * 8); // 40m
+        assert_eq!(no_title_backoff_ms(4), BACKGROUND_COPY_NO_TITLE_BACKOFF_CAP_MS); // 80m cap
+        // Beyond the cap it stays capped (and never overflows on a huge streak).
+        assert_eq!(no_title_backoff_ms(5), BACKGROUND_COPY_NO_TITLE_BACKOFF_CAP_MS);
+        assert_eq!(no_title_backoff_ms(99), BACKGROUND_COPY_NO_TITLE_BACKOFF_CAP_MS);
+        assert_eq!(no_title_backoff_ms(u32::MAX), BACKGROUND_COPY_NO_TITLE_BACKOFF_CAP_MS);
+        // The cap is a real reduction vs the flat retry: >= 16x the base interval.
+        assert!(BACKGROUND_COPY_NO_TITLE_BACKOFF_CAP_MS >= BACKGROUND_COPY_RETRY_MS * 16);
     }
     #[test]
     fn background_copy_snapshot_nudge_preserves_existing_cooldown() {
