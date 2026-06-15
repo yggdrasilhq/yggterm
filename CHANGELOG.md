@@ -4,6 +4,21 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+## 2.9.13
+
+- **Stop the title-regeneration LLM-waste loop** (found via `server perf-summary`).
+  The passive background-copy scan was re-generating titles for the *same* sessions
+  ~12×/hour — `perf-summary` showed 47 generations across only 4 distinct sessions in
+  an hour, each `ok=true` (a title *was* produced). Root cause: a *successful* passive
+  title generation **cleared** its retry cooldown instead of setting one, so when the
+  fresh title got clobbered back to a cwd fallback by a snapshot/remote-scan refresh,
+  the very next scan cycle re-generated it — against a rate-limited LLM endpoint. A
+  successful generation now holds a 1-hour cooldown before the passive scan may
+  re-select that session (force / user-initiated regeneration still runs immediately).
+  This bounds the worst case from ~12 to ~1 LLM call/hour/session. (The deeper
+  "generated title doesn't stick for some remote sessions" round-trip — the
+  remote-scan/mirror-clobber class — remains a separate display follow-up.)
+
 ## 2.9.12
 
 - **App profiling system, toggleable in Settings.** The existing `PerfSpan`
