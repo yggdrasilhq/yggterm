@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions, create_dir_all};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Instant;
 
 /// Process-global gate for the app profiling system. Default ON to preserve the
@@ -32,6 +32,44 @@ pub const PERF_TELEMETRY_MAX_BYTES: u64 = 16 * 1024 * 1024;
 
 pub fn perf_telemetry_path(home: &Path) -> PathBuf {
     home.join(PERF_TELEMETRY_FILENAME)
+}
+
+/// Intelligent telemetry retention: a handful of spans fire thousands of times an
+/// hour at ~0ms (a GUI->daemon `status` poll was ~70% of jojo's perf log, with
+/// per-keystroke `terminal_read`/`terminal_write` and `ping` close behind). At 16 MiB
+/// the log then rotates the genuinely diagnostic spans (`copy_scan`, the chores) out
+/// within a few hours. Rather than 7x-ing the cap (7x disk + 7x slower `perf-summary`
+/// scans, mostly of noise), we KEEP every slow outlier of a noisy span (a `status`
+/// poll that took 40ms IS worth seeing) and 1:50-SAMPLE the rest so the rate stays
+/// visible (count x50) at ~2% of the volume — shrinking the log ~10x so the same cap
+/// holds a day+ of what matters. Everything else is always recorded.
+const NOISY_SPAN_RECORD_FLOOR_MS: f64 = 8.0;
+const NOISY_SPAN_SAMPLE_RATE: u64 = 50;
+static NOISY_SPAN_SAMPLE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// The high-frequency, low-diagnostic-value spans subject to floor+sampling. Pure so
+/// the policy is unit-testable and obvious at a glance.
+pub fn perf_span_is_high_frequency_noise(category: &str, name: &str) -> bool {
+    matches!(
+        (category, name),
+        ("daemon_request", "status")
+            | ("daemon_request", "ping")
+            | ("daemon_request", "terminal_read")
+            | ("daemon_request", "terminal_write")
+            | ("daemon_request", "terminal_snapshot")
+    )
+}
+
+/// Whether a finished span should be written to the telemetry log. Noisy spans are
+/// kept only when SLOW (>= floor) or on the 1:50 sample; everything else always.
+fn perf_span_should_record(category: &str, name: &str, duration_ms: f64) -> bool {
+    if !perf_span_is_high_frequency_noise(category, name) {
+        return true;
+    }
+    if duration_ms >= NOISY_SPAN_RECORD_FLOOR_MS {
+        return true;
+    }
+    NOISY_SPAN_SAMPLE_COUNTER.fetch_add(1, Ordering::Relaxed) % NOISY_SPAN_SAMPLE_RATE == 0
 }
 
 pub fn append_bounded_jsonl_record(
@@ -121,12 +159,16 @@ impl PerfSpan {
     }
 
     pub fn finish(self, payload: Value) {
+        let duration_ms = self.started_at.elapsed().as_secs_f64() * 1000.0;
+        if !perf_span_should_record(&self.category, &self.name, duration_ms) {
+            return;
+        }
         append_perf_event(
             &self.home,
             &self.category,
             &self.name,
             json!({
-                "duration_ms": self.started_at.elapsed().as_secs_f64() * 1000.0,
+                "duration_ms": duration_ms,
                 "meta": payload,
             }),
         );
@@ -297,6 +339,20 @@ mod tests {
         ));
         fs::create_dir_all(&dir).expect("create temp dir");
         dir
+    }
+
+    #[test]
+    fn high_frequency_noise_spans_keep_outliers_and_useful_spans() {
+        // Noisy spans: fast ones are floor/sampled, SLOW ones (an outlier worth seeing)
+        // are always kept.
+        assert!(super::perf_span_is_high_frequency_noise("daemon_request", "status"));
+        assert!(super::perf_span_is_high_frequency_noise("daemon_request", "terminal_read"));
+        assert!(super::perf_span_should_record("daemon_request", "status", 40.0)); // slow → keep
+        // Useful spans are ALWAYS recorded regardless of duration.
+        assert!(!super::perf_span_is_high_frequency_noise("background", "copy_scan"));
+        assert!(super::perf_span_should_record("background", "copy_scan", 0.0));
+        assert!(super::perf_span_should_record("copy_generation", "title", 0.0));
+        assert!(super::perf_span_should_record("daemon", "snapshot_response", 0.0));
     }
 
     #[test]
