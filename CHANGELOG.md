@@ -4,7 +4,21 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
-## 2.9.17
+## 2.9.18
+
+- **A newer GUI no longer strands its sessions on an older daemon.** The daemon's
+  IPC socket is version-named (`server-<version>.sock`) and it only back-aliases
+  socket names for versions ≤ its own, so a GUI deployed *newer* than the running
+  daemon found no socket at its own version and silently fell through to a dead
+  endpoint — every reopened terminal host then froze on the stale client snapshot
+  with the boring-reveal shadow stuck (and the app-control reconcile failed with
+  `connecting to …/server-<newer>.sock`). The GUI now resolves its daemon endpoint
+  with a fallback: if its own-version socket is unreachable, it discovers the
+  highest *reachable* `server-*.sock` daemon and connects to that, and emits a loud
+  `daemon_version_mismatch` startup trace ("deploy the matching daemon"). Same-
+  version and no-daemon startups are unchanged — this only activates on the
+  previously-broken newer-GUI/older-daemon configuration. This makes a GUI-only
+  deploy safe again.
 
 - **Fix the unusable cross-buffer copy/paste (double copy chime + clipboard clobber
   on switch-in).** Claude Code's select-copy (and tmux yank, etc.) emit an **OSC 52**

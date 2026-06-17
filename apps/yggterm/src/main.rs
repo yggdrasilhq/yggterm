@@ -24,6 +24,7 @@ use yggterm_server::{
     PersistedDaemonState, ProbeTerminalViewportInputMode, SessionKind, YggtermServer,
     active_client_instance_records, default_endpoint, detect_ghostty_host,
     ensure_local_daemon_running, local_headless_companion_executable_from_current, ping,
+    resolve_client_daemon_endpoint,
     run_app_control_background_window, run_app_control_close_window,
     run_app_control_close_window_preserving_sessions, run_app_control_create_terminal,
     run_app_control_describe_rows, run_app_control_describe_state,
@@ -2149,7 +2150,29 @@ fn main() -> Result<()> {
     let settings_path = store.settings_path();
     let theme = settings.theme;
     let prefer_ghostty_backend = settings.prefer_ghostty_backend;
-    let endpoint = default_endpoint(store.home_dir());
+    // Connect to the right daemon even when this GUI is NEWER than the running
+    // daemon: the daemon only aliases sockets for versions <= its own, so a newer
+    // GUI's own-version socket is absent. Falling back to the reachable older
+    // daemon here keeps reopened terminal hosts from stranding on the stale client
+    // snapshot (finding-gui-only-deploy-version-socket-mismatch).
+    let resolved_daemon = resolve_client_daemon_endpoint(store.home_dir());
+    if let Some((client_version, daemon_version)) = resolved_daemon.version_mismatch.as_ref() {
+        append_trace_event(
+            &startup_home,
+            "gui",
+            "startup",
+            "daemon_version_mismatch",
+            serde_json::json!({
+                "client_version": client_version,
+                "daemon_version": daemon_version,
+                "connected_endpoint": format!("{:?}", resolved_daemon.endpoint),
+                "detail": "GUI is newer than the running daemon; connected to the \
+                           older daemon so sessions are not stranded. Deploy the \
+                           matching daemon version to clear this.",
+            }),
+        );
+    }
+    let endpoint = resolved_daemon.endpoint;
     install_signal_shutdown(store.home_dir().to_path_buf(), endpoint.clone());
     warm_daemon_start(
         endpoint.clone(),
