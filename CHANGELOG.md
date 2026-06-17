@@ -4,6 +4,19 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+## 2.9.24
+
+- **Latency/fan — stop rebuilding the sidebar search index on every render.** Live
+  profiling of a pegged GUI main thread (eu-stack) caught it in `format!`/string
+  building under `set_sidebar_search_context`, which rebuilt a per-session search blob
+  for **every** session on every remote machine (hundreds) plus every live session —
+  joins, a HashMap, a sort, and a clone — on **every** `ShellState::snapshot()`, i.e.
+  every App re-render. Its inputs change far less often than the render rate, so it now
+  memoizes on a cheap allocation-free fingerprint of those inputs and skips the entire
+  rebuild when nothing changed (the common case). The search-context content hash that
+  invalidates the search-results cache stays correct because the rebuild is skipped only
+  when inputs are byte-identical. First step of the latency campaign; profiling
+  continues on the remaining per-render costs (full-tree VDOM diff, snapshot row clone).
 ## 2.9.23
 
 - **Broken-bottom "no trick fixes it" — re-sync the redraw from the daemon, and stop
