@@ -66026,6 +66026,17 @@ fn terminal_eval_script_with_canvas_renderer(
                     entry.scrollbackExpected = true;
                 }}
             }}
+            // OSC 52 re-fire on switch (finding-osc52-copy-chime-replay-refire): the
+            // daemon re-streams a session's BUFFERED output when the viewer attaches,
+            // and that bulk catch-up carries any OSC 52 the CLI emitted earlier (CC's
+            // select-copy). Replayed history must not re-fire the clipboard copy + chime.
+            // Arm the suppression window ONLY when a bulk/retained-scrollback payload
+            // actually contains an OSC 52 — a genuine live copy is a small incremental
+            // chunk that sets neither bulk flag, so it still fires normally.
+            if ((retainedScrollbackReplay || expectedScrollbackPayload)
+                && payload.indexOf('\x1b]52;') !== -1) {{
+                window.__yggtermOsc52SuppressUntilMs = Date.now() + 2000;
+            }}
             if (!retainedScrollbackReplay) {{
                 payload = coalesceHighVolumeTerminalPayload(payload);
             }}
@@ -77346,6 +77357,12 @@ mod tests {
             2,
             "both mount-script buffer-restore writes must arm OSC 52 suppression (and only those)"
         );
+        // The live daemon-PTY write path arms suppression when a BULK retained/scrollback
+        // payload carries an OSC 52 — this is the daemon's catch-up re-stream on attach
+        // ("switching recopies"), the path the client-side replay arms above do NOT cover.
+        assert!(script.contains("(retainedScrollbackReplay || expectedScrollbackPayload)"));
+        assert!(script.contains("]52;') !== -1"));
+        assert!(script.contains("window.__yggtermOsc52SuppressUntilMs = Date.now() + 2000;"));
         // The reattach retained-replay script — the switch-back path that re-feeds the
         // buffered scrollback into the already-mounted terminal (which carries the OSC 52
         // handler; the window global bridges the two scripts) — arms it on both its writes.
