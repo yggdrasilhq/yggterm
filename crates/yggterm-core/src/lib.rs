@@ -37,10 +37,11 @@ pub use install::{
     refresh_desktop_integration, update_command_hint, write_direct_install_state,
 };
 pub use perf::{
-    PERF_TELEMETRY_FILENAME, PERF_TELEMETRY_MAX_BYTES, PERF_TELEMETRY_ROTATED_FILENAME, PerfGuard,
-    PerfSpan, PerfSpanSummary, append_bounded_jsonl_record, append_perf_event,
-    perf_profiling_enabled, perf_telemetry_path, set_perf_profiling_enabled,
-    summarize_perf_telemetry,
+    PERF_INCIDENT_FILENAME, PERF_TELEMETRY_FILENAME, PERF_TELEMETRY_MAX_BYTES,
+    PERF_TELEMETRY_ROTATED_FILENAME, PerfGuard,
+    PerfSpan, PerfSpanSummary, append_bounded_jsonl_record, append_perf_event, detect_perf_incident,
+    perf_profiling_enabled, perf_telemetry_path, record_perf_incident_if_hot,
+    set_perf_profiling_enabled, summarize_perf_telemetry,
 };
 pub use session_kind::SessionKind;
 pub use telemetry::{

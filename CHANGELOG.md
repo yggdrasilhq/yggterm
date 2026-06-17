@@ -4,6 +4,17 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+## 2.9.22
+
+- **Perf incident capture — catch the random "fan gets angry" flares.** A daemon
+  monitor checks the last 60s of perf telemetry every 30s and, when it looks like a
+  load incident — the title/summary regeneration loop eating half the window, a single
+  span monopolizing it, or a multi-second stall — appends a compact durable snapshot
+  (the trigger + the top spans by total time + live-session counts) to
+  `~/.yggterm/perf-incidents.jsonl`. Debounced to 5 min and kept for weeks, so when an
+  intermittent fan flare is reported hours later the diagnostic snapshot is still there
+  instead of having rotated out of the raw log. (Daemon-side, so it begins recording on
+  the next daemon update; the detection policy is unit-tested.)
 ## 2.9.21
 
 - **Intelligent telemetry retention (instead of just enlarging the log).** A few spans
