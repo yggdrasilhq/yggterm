@@ -234,6 +234,19 @@ static SIDEBAR_MERGE_CACHE: OnceCell<Mutex<SidebarMergeCache>> = OnceCell::new()
 static SIDEBAR_SEARCH_CACHE: OnceCell<Mutex<SidebarSearchCache>> = OnceCell::new();
 static SIDEBAR_SEARCH_CONTEXT: OnceCell<Mutex<HashMap<String, String>>> = OnceCell::new();
 static SIDEBAR_SEARCH_CONTEXT_HASH: AtomicU64 = AtomicU64::new(0);
+// PERF (fan/latency): `set_sidebar_search_context` rebuilds a per-session search
+// blob map for EVERY remote session on EVERY machine (hundreds) plus every live
+// session, on EVERY ShellState::snapshot() — i.e. every App re-render. Profiling
+// the pegged main thread (eu-stack) caught it in `core::fmt::write`/`format!`
+// under this function. Its inputs change far less often than the render rate, so
+// we memoize on a cheap allocation-free fingerprint of the inputs and skip the
+// whole rebuild (string joins + HashMap + sort + clone) when nothing changed.
+// 0 = "never built" sentinel so the first call always builds.
+static LAST_SIDEBAR_SEARCH_INPUT_FINGERPRINT: AtomicU64 = AtomicU64::new(0);
+// Count of ACTUAL rebuilds (skips don't increment). Lets a test prove the memo
+// gate skips redundant work, and is a deterministic live probe (rebuilds should
+// be ≪ App render count once inputs are stable).
+static SIDEBAR_SEARCH_CONTEXT_REBUILD_COUNT: AtomicU64 = AtomicU64::new(0);
 static LOCAL_TRANSCRIPT_SEARCH_CONTEXT: OnceCell<Mutex<HashMap<String, String>>> = OnceCell::new();
 static CLIENT_INSTANCE: OnceCell<ClientInstanceRegistration> = OnceCell::new();
 static SUPPRESS_DAEMON_SHUTDOWN_ON_EXIT: AtomicBool = AtomicBool::new(false);
@@ -18323,6 +18336,63 @@ fn set_sidebar_search_context(
     live_sessions: &[ManagedSessionView],
     generated_summaries: &BTreeMap<String, String>,
 ) {
+    // PERF memo gate: hash exactly the input fields that feed the blobs below,
+    // WITHOUT allocating (borrow + hash only). If identical to the last build,
+    // the store and SIDEBAR_SEARCH_CONTEXT_HASH are already correct — skip the
+    // expensive rebuild. The fingerprint hashes raw preview lines (a superset of
+    // the filtered preview_context), so it can only over-invalidate, never miss a
+    // change. See LAST_SIDEBAR_SEARCH_INPUT_FINGERPRINT.
+    let input_fingerprint = {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        for machine in remote_machines {
+            machine.machine_key.hash(&mut hasher);
+            machine.label.hash(&mut hasher);
+            for session in &machine.sessions {
+                session.session_path.hash(&mut hasher);
+                session.session_id.hash(&mut hasher);
+                session.cwd.hash(&mut hasher);
+                session.storage_path.hash(&mut hasher);
+                session.title_hint.hash(&mut hasher);
+                session.recent_context.hash(&mut hasher);
+                session.cached_precis.hash(&mut hasher);
+                session.cached_summary.hash(&mut hasher);
+                0xa5_u8.hash(&mut hasher);
+            }
+        }
+        for session in live_sessions {
+            session.session_path.hash(&mut hasher);
+            session.id.hash(&mut hasher);
+            session.title.hash(&mut hasher);
+            session.host_label.hash(&mut hasher);
+            for entry in &session.metadata {
+                entry.label.hash(&mut hasher);
+                entry.value.hash(&mut hasher);
+            }
+            for block in &session.preview.blocks {
+                block.role.hash(&mut hasher);
+                for line in &block.lines {
+                    line.hash(&mut hasher);
+                }
+            }
+            generated_summaries
+                .get(&session.session_path)
+                .map(String::as_str)
+                .unwrap_or_default()
+                .hash(&mut hasher);
+            0x5a_u8.hash(&mut hasher);
+        }
+        hasher.finish()
+    };
+    // Never collapse onto the 0 sentinel (treated as "never built").
+    let input_fingerprint = if input_fingerprint == 0 {
+        1
+    } else {
+        input_fingerprint
+    };
+    if LAST_SIDEBAR_SEARCH_INPUT_FINGERPRINT.load(Ordering::Relaxed) == input_fingerprint {
+        return;
+    }
+    SIDEBAR_SEARCH_CONTEXT_REBUILD_COUNT.fetch_add(1, Ordering::Relaxed);
     let mut context = HashMap::<String, String>::new();
     for machine in remote_machines {
         for session in &machine.sessions {
@@ -18379,6 +18449,7 @@ fn set_sidebar_search_context(
     if let Ok(mut store) = sidebar_search_context_store().lock() {
         *store = context;
     }
+    LAST_SIDEBAR_SEARCH_INPUT_FINGERPRINT.store(input_fingerprint, Ordering::Relaxed);
 }
 fn sidebar_search_context_for_path(path: &str) -> Option<String> {
     sidebar_search_context_store()
@@ -74306,6 +74377,54 @@ mod tests {
     use super::*;
     use yggterm_core::SessionNodeKind;
     use yggterm_server::SessionPreview;
+
+    // PERF memo gate: set_sidebar_search_context must NOT rebuild when its inputs
+    // are unchanged (the fan/latency fix). Uses empty inputs so no heavy fixtures
+    // are needed; the gate logic is input-agnostic. Serialized via a mutex because
+    // the function touches process-global statics shared with other tests.
+    #[test]
+    fn sidebar_search_context_memo_skips_rebuild_on_unchanged_inputs() {
+        static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+
+        let machines: Vec<RemoteMachineSnapshot> = Vec::new();
+        let live: Vec<ManagedSessionView> = Vec::new();
+        let summaries: BTreeMap<String, String> = BTreeMap::new();
+
+        // Force a known starting point: pretend nothing was ever built.
+        LAST_SIDEBAR_SEARCH_INPUT_FINGERPRINT.store(0, Ordering::Relaxed);
+        let before = SIDEBAR_SEARCH_CONTEXT_REBUILD_COUNT.load(Ordering::Relaxed);
+
+        set_sidebar_search_context(&machines, &live, &summaries);
+        let after_first = SIDEBAR_SEARCH_CONTEXT_REBUILD_COUNT.load(Ordering::Relaxed);
+        assert_eq!(
+            after_first - before,
+            1,
+            "first call must rebuild once"
+        );
+
+        // Identical inputs → must skip (no rebuild).
+        set_sidebar_search_context(&machines, &live, &summaries);
+        set_sidebar_search_context(&machines, &live, &summaries);
+        let after_repeat = SIDEBAR_SEARCH_CONTEXT_REBUILD_COUNT.load(Ordering::Relaxed);
+        assert_eq!(
+            after_repeat, after_first,
+            "identical inputs must NOT rebuild the search context"
+        );
+
+        // Gate must not be stuck: when the stored fingerprint differs from the
+        // computed one (i.e. inputs changed since the last build), it rebuilds.
+        // Simulating a stale stored fingerprint exercises that branch without
+        // needing heavy session fixtures.
+        LAST_SIDEBAR_SEARCH_INPUT_FINGERPRINT.store(0xDEAD_BEEF, Ordering::Relaxed);
+        set_sidebar_search_context(&machines, &live, &summaries);
+        let after_change = SIDEBAR_SEARCH_CONTEXT_REBUILD_COUNT.load(Ordering::Relaxed);
+        assert_eq!(
+            after_change - after_repeat,
+            1,
+            "a differing stored fingerprint must trigger exactly one rebuild"
+        );
+    }
 
     fn runtime_status_for_test(
         server_version: &str,
