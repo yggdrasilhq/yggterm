@@ -4,6 +4,25 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+## 2.9.23
+
+- **Broken-bottom "no trick fixes it" — re-sync the redraw from the daemon, and stop
+  the resize from scooping content.** Two compounding causes behind a viewport whose
+  bottom (and sometimes whole screen) goes stale — rendering the *content* of the live
+  session but colorless/lifeless (the "shadow"), with no force-repaint helping:
+  - **Redraw now re-fetches the daemon screen.** The right-click *Redraw Terminal*
+    action previously only re-fit the renderer and `refresh()`ed the **existing** client
+    buffer — so when that buffer was the stale shadow (a localStorage session snapshot
+    painted in place of the live PTY content) or a scooped buffer, repainting it "did
+    nothing." It now first reconciles from the daemon's authoritative vt100 screen
+    (promoting the source back to live `daemon_pty`), then re-fits — an unconditional,
+    user-initiated escape hatch that closes the shadow/broken-bottom.
+  - **Resize no longer scoops the restored buffer.** On a re-mount the retained snapshot
+    was written into a fresh 80×24 xterm and only *then* fit up to the real grid, so
+    xterm.js's grow-reflow dropped trailing lines and collapsed scrollback (the
+    `xterm_content_scoop_suspect` event). The term is now fit to its container **before**
+    the restore writes, so content lands at the correct geometry and the later layout
+    fit is a no-op instead of a scoop.
 ## 2.9.22
 
 - **Perf incident capture — catch the random "fan gets angry" flares.** A daemon
