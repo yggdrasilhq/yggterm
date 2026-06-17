@@ -12912,18 +12912,19 @@ fn schedule_live_session_snapshot_refresh(shell: &mut ShellState, debounce_ms: u
         schedule_live_session_snapshot_due_at(shell, now_ms, due_at_ms, debounce_ms);
     }
 }
-fn retarget_stale_live_session_snapshot_due_if_interval_relaxed(
-    shell: &mut ShellState,
-    now_ms: u64,
-) -> bool {
+/// Pure (read-only) predicate: would `retarget_stale_live_session_snapshot_due_if_interval_relaxed`
+/// actually move the schedule? The background-snapshot gate runs every ~250ms; evaluating this
+/// via `state.peek()` (no Signal wake) lets the gate skip a no-op tick without re-rendering the
+/// root component — the render-loop CPU leak fix (the mutation below is the ONLY write the gate
+/// performed, and it fires only in this narrow relaxed-interval case).
+fn live_session_snapshot_retarget_would_fire(shell: &ShellState, now_ms: u64) -> bool {
     if shell.next_live_session_snapshot_after_ms == 0
         || now_ms < shell.next_live_session_snapshot_after_ms
     {
         return false;
     }
     let current_interval_ms = shell_live_session_snapshot_refresh_interval_ms(shell);
-    let scheduled_interval_ms = shell.next_live_session_snapshot_interval_ms;
-    if current_interval_ms <= scheduled_interval_ms {
+    if current_interval_ms <= shell.next_live_session_snapshot_interval_ms {
         return false;
     }
     let scheduled_at_ms = if shell.next_live_session_snapshot_scheduled_at_ms == 0 {
@@ -12932,9 +12933,23 @@ fn retarget_stale_live_session_snapshot_due_if_interval_relaxed(
         shell.next_live_session_snapshot_scheduled_at_ms
     };
     let relaxed_due_at_ms = scheduled_at_ms.saturating_add(current_interval_ms);
-    if now_ms >= relaxed_due_at_ms {
+    now_ms < relaxed_due_at_ms
+}
+
+fn retarget_stale_live_session_snapshot_due_if_interval_relaxed(
+    shell: &mut ShellState,
+    now_ms: u64,
+) -> bool {
+    if !live_session_snapshot_retarget_would_fire(shell, now_ms) {
         return false;
     }
+    let current_interval_ms = shell_live_session_snapshot_refresh_interval_ms(shell);
+    let scheduled_at_ms = if shell.next_live_session_snapshot_scheduled_at_ms == 0 {
+        now_ms
+    } else {
+        shell.next_live_session_snapshot_scheduled_at_ms
+    };
+    let relaxed_due_at_ms = scheduled_at_ms.saturating_add(current_interval_ms);
     schedule_live_session_snapshot_due_at(
         shell,
         scheduled_at_ms,
@@ -13095,8 +13110,21 @@ fn background_live_session_snapshot_is_noop(
             == live_session_runtime_truth_signature_from_snapshot(snapshot)
 }
 
+/// Outcome of the peek-only background-snapshot gate. `Idle` (the common ~250ms tick) takes
+/// no `with_mut`, so the root Dioxus component stays quiescent instead of re-rendering for a
+/// no-op; the other two variants are infrequent real state changes that correctly wake the root.
+enum LiveSnapshotGateDecision {
+    Idle,
+    RetargetSchedule,
+    Spawn(ServerEndpoint, PathBuf),
+}
+
 fn maybe_spawn_background_live_session_snapshot(state: Signal<ShellState>) {
-    let snapshot_target = safe_shell_mut(
+    // Decide via state.peek() (NO Signal wake) so an idle/typing tick does not re-render the
+    // root component ~3-4x/sec (the render-loop CPU leak: this gate runs every ~250ms). Only
+    // the rare ticks that genuinely change state (a relaxed-interval retarget, or actually
+    // spawning the snapshot) take a `with_mut` and wake the root.
+    let decision = safe_shell_read(
         state,
         "maybe_spawn_background_live_session_snapshot_read",
         |shell| {
@@ -13109,21 +13137,34 @@ fn maybe_spawn_background_live_session_snapshot(state: Signal<ShellState>) {
                 || now_ms < shell.next_live_session_snapshot_after_ms
                 || now_ms < shell.terminal_input_hot_until_ms
             {
-                return None;
+                return LiveSnapshotGateDecision::Idle;
             }
-            if retarget_stale_live_session_snapshot_due_if_interval_relaxed(shell, now_ms) {
-                return None;
+            if live_session_snapshot_retarget_would_fire(shell, now_ms) {
+                return LiveSnapshotGateDecision::RetargetSchedule;
             }
-            Some((
+            LiveSnapshotGateDecision::Spawn(
                 shell.bootstrap.server_endpoint.clone(),
                 perf_home_dir(&shell.bootstrap.settings_path),
-            ))
+            )
         },
     )
-    .ok()
-    .flatten();
-    let Some((endpoint, trace_home)) = snapshot_target else {
-        return;
+    .unwrap_or(LiveSnapshotGateDecision::Idle);
+    let (endpoint, trace_home) = match decision {
+        LiveSnapshotGateDecision::Idle => return,
+        LiveSnapshotGateDecision::RetargetSchedule => {
+            let _ = safe_shell_mut(
+                state,
+                "maybe_spawn_background_live_session_snapshot_retarget",
+                |shell| {
+                    retarget_stale_live_session_snapshot_due_if_interval_relaxed(
+                        shell,
+                        current_millis(),
+                    );
+                },
+            );
+            return;
+        }
+        LiveSnapshotGateDecision::Spawn(endpoint, trace_home) => (endpoint, trace_home),
     };
     let already_started = safe_shell_mut(
         state,
@@ -93923,6 +93964,32 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         assert_eq!(no_title_backoff_ms(u32::MAX), BACKGROUND_COPY_NO_TITLE_BACKOFF_CAP_MS);
         // The cap is a real reduction vs the flat retry: >= 16x the base interval.
         assert!(BACKGROUND_COPY_NO_TITLE_BACKOFF_CAP_MS >= BACKGROUND_COPY_RETRY_MS * 16);
+    }
+    // Render-loop CPU fix (2026-06-16): the peek-only snapshot gate decides via this pure
+    // predicate; it must agree exactly with whether retarget actually mutates, or the gate
+    // either misses a real reschedule or wakes the root for a no-op.
+    #[test]
+    fn snapshot_retarget_predicate_gates_the_mutation() {
+        let mut shell = ShellState::new(test_shell_bootstrap_with_active_session("local://test"));
+        let now = 1_000_000u64;
+        // next_after == 0 -> never retargets, never mutates.
+        shell.next_live_session_snapshot_after_ms = 0;
+        assert!(!live_session_snapshot_retarget_would_fire(&shell, now));
+        let before = shell.background_live_session_snapshot_skipped_noop_count;
+        assert!(!retarget_stale_live_session_snapshot_due_if_interval_relaxed(
+            &mut shell, now
+        ));
+        assert_eq!(
+            shell.background_live_session_snapshot_skipped_noop_count, before,
+            "predicate false must mean no mutation"
+        );
+        // Not yet due -> false.
+        shell.next_live_session_snapshot_after_ms = now + 1;
+        assert!(!live_session_snapshot_retarget_would_fire(&shell, now));
+        // SSOT invariant: retarget fires (and mutates) IFF the predicate was true.
+        let predicted = live_session_snapshot_retarget_would_fire(&shell, now);
+        let fired = retarget_stale_live_session_snapshot_due_if_interval_relaxed(&mut shell, now);
+        assert_eq!(predicted, fired, "retarget must agree with its peek predicate");
     }
     #[test]
     fn background_copy_snapshot_nudge_preserves_existing_cooldown() {
