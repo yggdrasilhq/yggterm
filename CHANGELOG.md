@@ -4,6 +4,25 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+## 2.9.17
+
+- **Fix the unusable cross-buffer copy/paste (double copy chime + clipboard clobber
+  on switch-in).** Claude Code's select-copy (and tmux yank, etc.) emit an **OSC 52**
+  clipboard escape that yggterm decodes and routes to the system clipboard. But every
+  *parse* of that escape rang the copy chime + rewrote the clipboard, and switching
+  *into* a session re-feeds its buffered scrollback (which may contain a prior OSC 52)
+  through the **same** parser — so switching to a buffer you'd last copied in
+  re-fired that copy, clobbering whatever you just copied in the other buffer. Net
+  effect: a double chime and "impossible to copy buffer-to-buffer" (the KNotes-launder
+  workaround). The OSC 52 handler now (1) **suppresses** clipboard side-effects while a
+  replay/restore write is in flight (every buffer-restore/retained-replay write arms a
+  short `window.__yggtermOsc52SuppressUntilMs` window first; the live-PTY write path is
+  untouched, so real copies still work), and (2) **dedupes** the c+p double-emit (CC
+  writes both the clipboard and primary selections) to one chime + one write. NOT yet
+  live-verified (behavioral — needs a faithful repro on the KDE host: copy in CC →
+  switch → paste; chime once, paste yields the CC copy). A separate KDE/Klipper suspect
+  for stale-paste (`.exclude_from_history()`) is tracked for live falsification.
+
 ## 2.9.15
 
 - **Fix the GUI render-loop CPU leak (fan/latency while typing).** The background
