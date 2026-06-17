@@ -41145,6 +41145,32 @@ fn app() -> Element {
                                 let label = row.label.clone();
                                 state.with_mut(|shell| shell.close_context_menu());
                                 spawn(async move {
+                                    // FIX C: re-fetch the daemon's authoritative
+                                    // vt100 screen FIRST, then re-fit the
+                                    // renderer. The plain renderer redraw
+                                    // (`redraw_terminal_viewport_for`) only
+                                    // re-fits + `term.refresh()`s the EXISTING
+                                    // client buffer, so when that buffer is the
+                                    // stale "shadow" (a `localstorage_session_snapshot`
+                                    // painted in place of live `daemon_pty`
+                                    // content — colorless/lifeless) or a scooped
+                                    // buffer, repainting it "does nothing". The
+                                    // content reconcile replays the daemon screen
+                                    // via the `daemon_screen_snapshot` path, which
+                                    // promotes the source back to daemon_pty and
+                                    // closes the broken-bottom/shadow. This is the
+                                    // user-initiated escape hatch, so it runs
+                                    // unconditionally (no quiet/working gate — the
+                                    // gates only protect the AUTOMATIC reconcile
+                                    // from recovery-churn).
+                                    let endpoint =
+                                        state.read().bootstrap.server_endpoint.clone();
+                                    if let Ok(home) = resolve_yggterm_home() {
+                                        let _ = reconcile_terminal_from_daemon_for(
+                                            endpoint, &path, &home,
+                                        )
+                                        .await;
+                                    }
                                     let result = redraw_terminal_viewport_for(&path).await;
                                     let accepted = result
                                         .get("accepted")
@@ -41162,7 +41188,7 @@ fn app() -> Element {
                                             shell.push_notification(
                                                 NotificationTone::Info,
                                                 "Redraw Terminal",
-                                                format!("Repainted {label}."),
+                                                format!("Re-synced {label} from daemon."),
                                             );
                                         });
                                         return;
@@ -65057,6 +65083,17 @@ fn terminal_eval_script_with_canvas_renderer(
             lastViewportForceReason: '',
             lastViewportForceAtMs: 0,
         }};
+        // FIX A (content-scoop on remount): fit the term to its container
+        // BEFORE the snapshot restore writes content. A fresh/remounted xterm
+        // is 80x24 until the first fit; restoring the retained snapshot (the
+        // "shadow") at 80x24 and only THEN fitting up to the real grid makes
+        // xterm.js grow-reflow drop trailing buffer lines + collapse scrollback
+        // (the `xterm_content_scoop_suspect` event: buffer_lines 74->63 delta
+        // -11, baseY 50->0). Sizing first lands the restore at the correct
+        // geometry so the subsequent layout fit is a no-op instead of a scoop.
+        // Best-effort: if the host has no layout yet the fit is a guarded no-op
+        // and the later resize behaves exactly as before (no regression).
+        try {{ fitTerminalToHost('pre_restore'); }} catch (_preRestoreFitErr) {{}}
         restoreXtermSessionSnapshotOnConstructed();
         syncTerminalScrollController('constructed');
         scheduleCursorCellBackgroundRefresh('constructed');
