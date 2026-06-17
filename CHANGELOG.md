@@ -4,7 +4,19 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
-## 2.9.20
+## 2.9.21
+
+- **Intelligent telemetry retention (instead of just enlarging the log).** A few spans
+  fired thousands of times an hour at ~0ms — a GUI→daemon `status` poll alone was ~70%
+  of the perf log, with per-keystroke `terminal_read`/`terminal_write` and `ping` close
+  behind — so at the 16 MiB cap the genuinely useful spans (`copy_scan`, the chores)
+  rotated out within a few hours. `PerfSpan::finish` now keeps every *slow* outlier of
+  a noisy span (a `status` poll that took 40ms is worth seeing) and 1:50-samples the
+  rest (so the rate stays visible as count×50) at ~2% of the volume — shrinking the log
+  ~10× so the same cap holds a day-plus of what matters, and `perf-summary` scans stay
+  fast. Everything outside the noisy set is recorded exactly as before. The dominant
+  (`status`) noise is daemon-emitted, so its reduction takes effect on the next daemon
+  update.
 
 - **OSC 52 clipboard: the real discriminator — a copy follows a user gesture.** The
   remaining "switching into a session clobbers the clipboard" case (e.g. copy in the
