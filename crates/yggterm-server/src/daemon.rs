@@ -7065,6 +7065,112 @@ pub fn default_endpoint(home_dir: &Path) -> ServerEndpoint {
     }
 }
 
+/// Which daemon a CLIENT (the GUI) should connect to, plus whether it had to
+/// fall back across a version boundary.
+#[derive(Debug, Clone)]
+pub struct ClientDaemonEndpoint {
+    pub endpoint: ServerEndpoint,
+    /// `Some((client_version, daemon_version))` when the client's OWN-version
+    /// socket was unreachable and we fell back to a reachable older daemon.
+    /// The caller should surface this loudly (it means "deploy the matching
+    /// daemon"); both strings are dotted (e.g. `"2.9.17"`).
+    pub version_mismatch: Option<(String, String)>,
+}
+
+fn format_socket_version((major, minor, patch): (u64, u64, u64)) -> String {
+    format!("{major}.{minor}.{patch}")
+}
+
+/// Pure fallback policy: among version-tagged daemon sockets, the version a
+/// NEWER client should drop back to is the HIGHEST reachable one (closest to the
+/// client). Returns `None` when none are reachable, so the caller keeps its own
+/// endpoint and lets `ensure_local_daemon_running` spawn a fresh daemon.
+/// Factored out so the selection is unit-testable without real sockets.
+fn select_fallback_daemon_version(
+    candidates: &[((u64, u64, u64), bool)],
+) -> Option<(u64, u64, u64)> {
+    candidates
+        .iter()
+        .filter(|(_, reachable)| *reachable)
+        .map(|(version, _)| *version)
+        .max()
+}
+
+/// Resolve the daemon socket the GUI should connect to.
+///
+/// The daemon binds to `server-<own-version>.sock` and only back-aliases socket
+/// names for versions <= its own (`refresh_legacy_server_socket_aliases`). A GUI
+/// NEWER than the running daemon therefore finds NO socket at its own version;
+/// naively using [`default_endpoint`] then points every connection — including
+/// the app-control reconcile and the retained-replay re-source — at a
+/// non-existent socket, silently stranding each reopened terminal host on the
+/// stale client snapshot with the boring-reveal shadow stuck (see
+/// `finding-gui-only-deploy-version-socket-mismatch`).
+///
+/// When the own-version socket is unreachable but an older-version daemon IS
+/// reachable, connect to it (so sessions are not stranded) and report the
+/// mismatch so the caller can surface a loud "deploy the matching daemon"
+/// banner. The same-version case (own socket reachable) and the no-daemon case
+/// (nothing reachable → keep own endpoint so one is spawned) are unchanged, so
+/// this only ever ACTIVATES on the broken newer-GUI-older-daemon configuration.
+#[cfg(unix)]
+pub fn resolve_client_daemon_endpoint(home_dir: &Path) -> ClientDaemonEndpoint {
+    let primary = default_endpoint(home_dir);
+    // Own-version socket reachable → unchanged behaviour.
+    if ping(&primary).is_ok() {
+        return ClientDaemonEndpoint {
+            endpoint: primary,
+            version_mismatch: None,
+        };
+    }
+    let ServerEndpoint::UnixSocket(primary_path) = &primary else {
+        return ClientDaemonEndpoint {
+            endpoint: primary,
+            version_mismatch: None,
+        };
+    };
+    // Probe every existing `server-*.sock` for a reachable daemon.
+    let probed: Vec<((u64, u64, u64), bool)> =
+        versioned_server_socket_alias_candidates(primary_path)
+            .into_iter()
+            .filter_map(|candidate| {
+                let version = parse_versioned_server_socket_name(&candidate)?;
+                let reachable = ping(&ServerEndpoint::UnixSocket(candidate)).is_ok();
+                Some((version, reachable))
+            })
+            .collect();
+    let Some(target_version) = select_fallback_daemon_version(&probed) else {
+        // Nothing reachable — keep the own endpoint so a daemon is spawned.
+        return ClientDaemonEndpoint {
+            endpoint: primary,
+            version_mismatch: None,
+        };
+    };
+    let Some(parent) = primary_path.parent() else {
+        return ClientDaemonEndpoint {
+            endpoint: primary,
+            version_mismatch: None,
+        };
+    };
+    let (major, minor, patch) = target_version;
+    let target_path = parent.join(format!("server-{major}-{minor}-{patch}.sock"));
+    let own_version = parse_versioned_server_socket_name(primary_path)
+        .map(format_socket_version)
+        .unwrap_or_else(|| SERVER_PROTOCOL_VERSION.to_string());
+    ClientDaemonEndpoint {
+        endpoint: ServerEndpoint::UnixSocket(target_path),
+        version_mismatch: Some((own_version, format_socket_version(target_version))),
+    }
+}
+
+#[cfg(not(unix))]
+pub fn resolve_client_daemon_endpoint(home_dir: &Path) -> ClientDaemonEndpoint {
+    ClientDaemonEndpoint {
+        endpoint: default_endpoint(home_dir),
+        version_mismatch: None,
+    }
+}
+
 #[cfg(not(unix))]
 fn versioned_tcp_port() -> u16 {
     let mut parts = SERVER_PROTOCOL_VERSION.split('.');
@@ -13601,6 +13707,28 @@ mod tests {
                 super::SERVER_PROTOCOL_VERSION.replace('.', "-")
             )))
         );
+    }
+
+    #[test]
+    fn fallback_daemon_version_picks_highest_reachable() {
+        // finding-gui-only-deploy-version-socket-mismatch: a newer GUI whose own
+        // socket is absent must fall back to the HIGHEST *reachable* daemon — never
+        // a higher-numbered but DEAD socket (a stale symlink from a prior run).
+        let probed = [
+            ((2, 9, 17), false), // dead stale socket — must be ignored
+            ((2, 9, 15), true),  // the live daemon
+            ((2, 9, 14), true),  // a back-alias to the same daemon, lower version
+            ((2, 1, 5), true),   // protocol-version alias, lower still
+        ];
+        assert_eq!(
+            super::select_fallback_daemon_version(&probed),
+            Some((2, 9, 15)),
+            "must pick the highest REACHABLE version, skipping the dead 2.9.17 socket"
+        );
+        // Nothing reachable → None (caller keeps its own endpoint so a daemon spawns).
+        let none_reachable = [((2, 9, 15), false), ((2, 1, 5), false)];
+        assert_eq!(super::select_fallback_daemon_version(&none_reachable), None);
+        assert_eq!(super::select_fallback_daemon_version(&[]), None);
     }
 
     #[cfg(unix)]
