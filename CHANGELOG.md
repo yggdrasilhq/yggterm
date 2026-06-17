@@ -4,6 +4,19 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+## 2.9.15
+
+- **Fix the GUI render-loop CPU leak (fan/latency while typing).** The background
+  live-session-snapshot gate ran every ~250ms inside `safe_shell_mut`
+  (`state.with_mut`), which wakes the root Dioxus Signal and re-renders the root
+  component every tick even when the gate decides to do nothing — measured live at
+  ~188 root renders/min for ~3 real changes, pegging the GUI main process. The gate
+  now decides via `state.peek()` (no Signal wake) and only takes a `with_mut` on the
+  rare ticks that genuinely change state (a relaxed-interval retarget, or actually
+  spawning the snapshot). Mirrors the sibling `maybe_spawn_background_copy_generation`
+  gate. NOT yet live-verified (user was working; verify the root render-rate drop on
+  next restart).
+
 ## 2.9.14
 
 - **The actual fix for the title-regeneration LLM loop: exponential back-off on
