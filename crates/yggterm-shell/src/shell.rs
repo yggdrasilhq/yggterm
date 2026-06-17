@@ -59218,6 +59218,21 @@ fn terminal_eval_script_with_canvas_renderer(
                         //    and primary selections (two sequences); ring + write ONCE.
                         // Window/global state survives scope boundaries across the mount script.
                         const osc52NowMs = Date.now();
+                        // 3) USER-GESTURE GATE (the load-bearing discriminator): a GENUINE
+                        //    select-copy emits its OSC 52 right after a user mouse-release ON
+                        //    this terminal. A re-emit on switch-IN — CC re-sending its active
+                        //    selection on focus, OR the daemon catch-up replaying a buffered
+                        //    OSC 52 — has NO such gesture (the user switched via the sidebar,
+                        //    not the terminal). Without a recent pointer-up on THIS host, treat
+                        //    the OSC 52 as a re-emit and suppress it. This fixes the shell->CC
+                        //    clobber on switch that the bulk/replay arms missed (the re-emit
+                        //    arrives as a small live chunk, not a bulk replay).
+                        const osc52Host = window.__yggtermXtermHosts && window.__yggtermXtermHosts[hostId]
+                            ? window.__yggtermXtermHosts[hostId] : null;
+                        const osc52GestureAtMs = osc52Host ? Number(osc52Host.lastUserPointerUpAtMs || 0) : 0;
+                        if (osc52NowMs - osc52GestureAtMs > 3000) {{
+                            return true;
+                        }}
                         if (osc52NowMs < (window.__yggtermOsc52SuppressUntilMs || 0)) {{
                             return true;
                         }}
@@ -59249,6 +59264,18 @@ fn terminal_eval_script_with_canvas_renderer(
                 return null;
             }}
         }})();
+        // Stamp the last user mouse-release on this terminal host (capture phase, so it
+        // fires even while the CLI holds mouse-reporting mode and stops propagation). The
+        // OSC 52 handler's gesture gate above uses it to tell a genuine select-copy from a
+        // re-emit on switch-in. See finding-osc52-copy-chime-replay-refire.
+        try {{
+            const stampOsc52Gesture = () => {{
+                const gestureEntry = window.__yggtermXtermHosts && window.__yggtermXtermHosts[hostId];
+                if (gestureEntry) {{ gestureEntry.lastUserPointerUpAtMs = Date.now(); }}
+            }};
+            host.addEventListener('pointerup', stampOsc52Gesture, true);
+            host.addEventListener('mouseup', stampOsc52Gesture, true);
+        }} catch (_osc52GestureError) {{}}
         let canvasAddonAvailable = Boolean(window.CanvasAddon && window.CanvasAddon.CanvasAddon);
         let rendererDecisionError = '';
         try {{
@@ -77349,6 +77376,11 @@ mod tests {
         // The handler honours the suppression window and the same-text dedupe.
         assert!(script.contains("if (osc52NowMs < (window.__yggtermOsc52SuppressUntilMs || 0)) {"));
         assert!(script.contains("text === window.__yggtermOsc52LastCopyText"));
+        // The user-gesture gate: an OSC 52 with no recent mouse-release on this host is a
+        // re-emit on switch-in (CC re-sending its selection / daemon catch-up), not a copy.
+        assert!(script.contains("if (osc52NowMs - osc52GestureAtMs > 3000) {"));
+        assert!(script.contains("gestureEntry.lastUserPointerUpAtMs = Date.now();"));
+        assert!(script.contains("host.addEventListener('mouseup', stampOsc52Gesture, true);"));
         // The mount script's two buffer-restore writes (construct-time localStorage
         // restore + reapply-after-reset) each arm the suppression window first; the
         // live-data write (term.write(payload, ...)) must NOT, or copy breaks entirely.
