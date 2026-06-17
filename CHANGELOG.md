@@ -4,7 +4,20 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
-## 2.9.19
+## 2.9.20
+
+- **OSC 52 clipboard: the real discriminator — a copy follows a user gesture.** The
+  remaining "switching into a session clobbers the clipboard" case (e.g. copy in the
+  shell `edit`, switch to a Claude Code session, and CC's re-emitted selection
+  replaces it) survived the replay/bulk-catch-up suppression because the re-emit
+  arrives as a *small live chunk*, indistinguishable from a genuine copy by payload
+  shape. The handler now gates on a **user gesture**: a genuine select-copy emits its
+  OSC 52 right after a mouse-release on that terminal, whereas a re-emit on switch-in
+  (CC re-sending its active selection on focus, or the daemon replaying a buffered
+  OSC 52) has none — the user switched via the sidebar, not the terminal. An OSC 52
+  with no mouse-release on its host within 3s is treated as a re-emit and suppressed.
+  Captured in the capture phase so it works even while the CLI holds mouse-reporting
+  mode.
 
 - **The OSC 52 "switching recopies" re-fire — actual fix.** 2.9.17 suppressed OSC 52
   copy side-effects during *client-side* buffer replays, but the real re-fire path is
