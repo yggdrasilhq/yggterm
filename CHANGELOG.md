@@ -4,7 +4,18 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
-## 2.9.18
+## 2.9.19
+
+- **The OSC 52 "switching recopies" re-fire — actual fix.** 2.9.17 suppressed OSC 52
+  copy side-effects during *client-side* buffer replays, but the real re-fire path is
+  the **daemon re-streaming a session's buffered output when the viewer attaches on a
+  switch** — that bulk catch-up carries any OSC 52 the CLI emitted earlier, and it
+  arrives through the live daemon-PTY write path (not the client replay paths). The
+  live write path now arms the OSC 52 suppression window when a **bulk
+  retained/scrollback payload contains an OSC 52** — which is exactly the attach
+  catch-up, and never a genuine copy (a real select-copy redraws at most a screen's
+  worth of lines, below the bulk threshold, so it still chimes once and writes the
+  clipboard normally).
 
 - **A newer GUI no longer strands its sessions on an older daemon.** The daemon's
   IPC socket is version-named (`server-<version>.sock`) and it only back-aliases
