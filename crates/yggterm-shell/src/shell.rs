@@ -59207,6 +59207,27 @@ fn terminal_eval_script_with_canvas_renderer(
                         }}
                         const bytes = Uint8Array.from(atob(payload), (ch) => ch.charCodeAt(0));
                         const text = new TextDecoder().decode(bytes);
+                        // OSC 52 copy hygiene (finding-osc52-copy-chime-replay-refire):
+                        // 1) REPLAY SUPPRESSION — switching into a session re-writes its
+                        //    buffered scrollback (which may contain a prior OSC 52) through
+                        //    THIS same parser. That re-parse must NOT re-copy + re-chime and
+                        //    clobber whatever the user just copied in another buffer (the
+                        //    "impossible to copy buffer-to-buffer" bug). The replay/restore
+                        //    writes bump window.__yggtermOsc52SuppressUntilMs just before they run.
+                        // 2) c+p DEDUPE — CC select-copy emits OSC 52 to both the clipboard
+                        //    and primary selections (two sequences); ring + write ONCE.
+                        // Window/global state survives scope boundaries across the mount script.
+                        const osc52NowMs = Date.now();
+                        if (osc52NowMs < (window.__yggtermOsc52SuppressUntilMs || 0)) {{
+                            return true;
+                        }}
+                        if (text === window.__yggtermOsc52LastCopyText
+                            && (osc52NowMs - (window.__yggtermOsc52LastCopyAtMs || 0)) < 1200) {{
+                            window.__yggtermOsc52LastCopyAtMs = osc52NowMs;
+                            return true;
+                        }}
+                        window.__yggtermOsc52LastCopyText = text;
+                        window.__yggtermOsc52LastCopyAtMs = osc52NowMs;
                         if (text.length > 0) {{
                             sendTerminalEvent({{
                                 kind: 'clipboard',
@@ -62477,6 +62498,8 @@ fn terminal_eval_script_with_canvas_renderer(
                             ? term._core._writeBuffer.writeSync.bind(term._core._writeBuffer) : null);
                     try {{
                         if (typeof term.reset === "function") {{ term.reset(); }}
+                        // Replayed scrollback must not re-fire OSC 52 copy (see the OSC 52 handler).
+                        window.__yggtermOsc52SuppressUntilMs = Date.now() + 400;
                         if (ws) {{ ws("\x1bc\x1b[H"); ws(restoredText); }}
                         else if (typeof term.write === "function") {{ term.write(`\x1bc\x1b[H${{restoredText}}`); }}
                         const tentry = window.__yggtermXtermHosts && window.__yggtermXtermHosts[hostId]
@@ -66789,6 +66812,7 @@ fn terminal_eval_script_with_canvas_renderer(
                             ? term._core.writeSync.bind(term._core)
                             : (term && term._core && term._core._writeBuffer && typeof term._core._writeBuffer.writeSync === "function"
                                 ? term._core._writeBuffer.writeSync.bind(term._core._writeBuffer) : null);
+                        window.__yggtermOsc52SuppressUntilMs = Date.now() + 400;
                         if (wsReapply) {{ wsReapply("\x1bc\x1b[H"); wsReapply(pendingPostResetTranscript.text); }}
                         else if (typeof term.write === "function") {{ term.write(`\x1bc\x1b[H${{pendingPostResetTranscript.text}}`); }}
                         if (window.__yggtermXtermHosts && window.__yggtermXtermHosts[hostId]) {{
@@ -67756,6 +67780,8 @@ fn terminal_replay_retained_data_script_for_session(
                 ? entry.term._core._writeBuffer.writeSync.bind(entry.term._core._writeBuffer)
                 : null;
             try {{
+              // Replayed scrollback must not re-fire OSC 52 copy (see the OSC 52 handler).
+              window.__yggtermOsc52SuppressUntilMs = Date.now() + 400;
               if (writeSync) {{
                 writeSync(replayResetPrefix);
                 writeSync(payload);
@@ -67990,6 +68016,8 @@ fn terminal_replay_retained_data_script_for_session(
               const replayResetPrefix = replaySource === 'daemon_retained_history_screen_snapshot'
                 ? "\x1bc\x1b[H"
                 : "\x1bc\x1b[2J\x1b[3J\x1b[H";
+              // Replayed scrollback must not re-fire OSC 52 copy (see the OSC 52 handler).
+              window.__yggtermOsc52SuppressUntilMs = Date.now() + 400;
               if (writeSync) {{
                 writeSync(replayResetPrefix);
                 writeSync(data);
@@ -77295,6 +77323,43 @@ mod tests {
         assert!(script.contains("action: 'osc52'"));
         assert!(script.contains("if (!payload || payload === '?') {"));
         assert!(script.contains("Uint8Array.from(atob(payload)"));
+    }
+
+    #[test]
+    fn terminal_osc52_copy_suppresses_replay_and_dedupes_c_plus_p() {
+        // finding-osc52-copy-chime-replay-refire: switching into a session replays
+        // its buffered scrollback through the SAME parser, so a prior OSC 52 in that
+        // buffer would re-fire the clipboard copy + chime and clobber what the user
+        // just copied elsewhere ("impossible to copy buffer-to-buffer"). The handler
+        // must consume an OSC 52 while the replay window is open, and dedupe CC's
+        // c+p double-emit to one chime.
+        let theme = terminal_theme(UiTheme::ZedLight, palette(UiTheme::ZedLight), 13.0, "");
+        let script = terminal_eval_script("yggterm-terminal-test", &theme, true);
+        // The handler honours the suppression window and the same-text dedupe.
+        assert!(script.contains("if (osc52NowMs < (window.__yggtermOsc52SuppressUntilMs || 0)) {"));
+        assert!(script.contains("text === window.__yggtermOsc52LastCopyText"));
+        // The mount script's two buffer-restore writes (construct-time localStorage
+        // restore + reapply-after-reset) each arm the suppression window first; the
+        // live-data write (term.write(payload, ...)) must NOT, or copy breaks entirely.
+        assert_eq!(
+            script.matches("window.__yggtermOsc52SuppressUntilMs = Date.now() + 400;").count(),
+            2,
+            "both mount-script buffer-restore writes must arm OSC 52 suppression (and only those)"
+        );
+        // The reattach retained-replay script — the switch-back path that re-feeds the
+        // buffered scrollback into the already-mounted terminal (which carries the OSC 52
+        // handler; the window global bridges the two scripts) — arms it on both its writes.
+        let replay = terminal_replay_retained_data_script_for_session(
+            "local://osc52-test",
+            "hello\x1b]52;c;aGk=\x07world",
+            "daemon_retained_snapshot",
+            0,
+        );
+        assert_eq!(
+            replay.matches("window.__yggtermOsc52SuppressUntilMs = Date.now() + 400;").count(),
+            2,
+            "both retained-replay writes must arm OSC 52 suppression"
+        );
     }
 
     #[test]
