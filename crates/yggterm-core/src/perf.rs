@@ -322,6 +322,102 @@ pub fn summarize_perf_telemetry(
     summaries
 }
 
+pub const PERF_INCIDENT_FILENAME: &str = "perf-incidents.jsonl";
+pub const PERF_INCIDENT_ROTATED_FILENAME: &str = "perf-incidents.previous.jsonl";
+// Incidents are tiny (one record) and rare, so a generous cap keeps WEEKS of them —
+// the whole point is to still have the snapshot when the user reports a fan flare
+// from hours/days ago.
+pub const PERF_INCIDENT_MAX_BYTES: u64 = 8 * 1024 * 1024;
+pub const PERF_INCIDENT_DEBOUNCE_MS: u64 = 5 * 60 * 1000;
+const PERF_INCIDENT_STALL_MS: f64 = 30_000.0;
+
+/// Decide whether a recent perf-summary window looks like a LOAD INCIDENT worth a
+/// durable snapshot — the random "jojo fan gets angry" moments you can't predict.
+/// Triggers (each a short reason string):
+///  - `copy_generation_busy`: title/summary generation ate > half the window (the
+///    title-regen loop, the measured jojo fan driver).
+///  - `span_busy`: a single span monopolized > 60% of the window.
+///  - `span_stall`: a span's worst case blew past the stall ceiling.
+/// Returns `None` when the window is calm. Pure, so the policy is unit-tested.
+pub fn detect_perf_incident(summary: &[PerfSpanSummary], window_ms: u64) -> Option<String> {
+    let window = window_ms.max(1) as f64;
+    let generation_total: f64 = summary
+        .iter()
+        .filter(|span| span.category == "copy_generation")
+        .map(|span| span.total_ms)
+        .sum();
+    if generation_total > window * 0.5 {
+        return Some(format!("copy_generation_busy total_ms={generation_total:.0}"));
+    }
+    if let Some(span) = summary.iter().find(|span| span.total_ms > window * 0.6) {
+        return Some(format!(
+            "span_busy {}/{} total_ms={:.0}",
+            span.category, span.name, span.total_ms
+        ));
+    }
+    if let Some(span) = summary.iter().find(|span| span.max_ms >= PERF_INCIDENT_STALL_MS) {
+        return Some(format!(
+            "span_stall {}/{} max_ms={:.0}",
+            span.category, span.name, span.max_ms
+        ));
+    }
+    None
+}
+
+/// If the last `window_ms` of perf telemetry looks like an incident (and none was
+/// recorded within the debounce), append a compact snapshot — the trigger + the top
+/// spans by total time + caller `extra` context — to `perf-incidents.jsonl`. Returns
+/// the timestamp to store as the new `last_incident_ms` (unchanged when nothing was
+/// recorded). The durable record is the catch for the random fan-angry: it's still
+/// there when the user reports it after the fact. No-op when profiling is off.
+pub fn record_perf_incident_if_hot(
+    home: &Path,
+    window_ms: u64,
+    now_ms: u64,
+    last_incident_ms: u64,
+    extra: Value,
+) -> u64 {
+    if !perf_profiling_enabled() {
+        return last_incident_ms;
+    }
+    if now_ms.saturating_sub(last_incident_ms) < PERF_INCIDENT_DEBOUNCE_MS {
+        return last_incident_ms;
+    }
+    let since = now_ms.saturating_sub(window_ms);
+    let summary = summarize_perf_telemetry(home, Some(since), None);
+    let Some(trigger) = detect_perf_incident(&summary, window_ms) else {
+        return last_incident_ms;
+    };
+    let top_spans: Vec<Value> = summary
+        .iter()
+        .take(8)
+        .map(|span| {
+            json!({
+                "category": span.category,
+                "name": span.name,
+                "count": span.count,
+                "total_ms": span.total_ms,
+                "p99_ms": span.p99_ms,
+                "max_ms": span.max_ms,
+            })
+        })
+        .collect();
+    let record = json!({
+        "ts_ms": now_ms,
+        "window_ms": window_ms,
+        "trigger": trigger,
+        "top_spans": top_spans,
+        "extra": extra,
+    });
+    append_bounded_jsonl_record(
+        &home.join(PERF_INCIDENT_FILENAME),
+        PERF_INCIDENT_ROTATED_FILENAME,
+        PERF_INCIDENT_MAX_BYTES,
+        &record,
+    );
+    now_ms
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -339,6 +435,41 @@ mod tests {
         ));
         fs::create_dir_all(&dir).expect("create temp dir");
         dir
+    }
+
+    fn span(category: &str, name: &str, total_ms: f64, max_ms: f64) -> PerfSpanSummary {
+        PerfSpanSummary {
+            category: category.into(),
+            name: name.into(),
+            count: 1,
+            p50_ms: 0.0,
+            p95_ms: 0.0,
+            p99_ms: 0.0,
+            max_ms,
+            mean_ms: 0.0,
+            total_ms,
+        }
+    }
+
+    #[test]
+    fn perf_incident_detects_title_loop_and_stalls_but_not_calm() {
+        let window = 60_000u64;
+        // Calm 60s window — nothing fires.
+        let calm = vec![span("background", "copy_scan", 4_000.0, 300.0)];
+        assert!(super::detect_perf_incident(&calm, window).is_none());
+        // Title-regen loop: > half the window spent generating → incident.
+        let title_loop = vec![span("copy_generation", "title", 40_000.0, 6_000.0)];
+        assert_eq!(
+            super::detect_perf_incident(&title_loop, window).as_deref(),
+            Some("copy_generation_busy total_ms=40000")
+        );
+        // A single span monopolizing the window.
+        let busy = vec![span("daemon", "runtime_load", 45_000.0, 300.0)];
+        assert!(super::detect_perf_incident(&busy, window).unwrap().starts_with("span_busy"));
+        // A stall (worst case past the ceiling) even if total is small.
+        let stall = vec![span("startup", "initial_server_sync", 35_000.0, 284_000.0)];
+        // total 35k > 36k? no (0.6*60k=36k) → falls through to stall on max_ms.
+        assert!(super::detect_perf_incident(&stall, window).unwrap().starts_with("span_stall"));
     }
 
     #[test]
