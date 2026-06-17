@@ -78,6 +78,11 @@ const REMOTE_CODEX_IDENTITY_POLL_MAX_IDLE_MS: u64 = 60_000;
 const REMOTE_CODEX_IDENTITY_POLL_MAX_ATTEMPTS: u32 = 12;
 const ENV_YGGTERM_DISABLE_REMOTE_CODEX_IDENTITY_POLL: &str =
     "YGGTERM_DISABLE_REMOTE_CODEX_IDENTITY_POLL";
+// Perf incident monitor: every MONITOR_MS, look at the last WINDOW_MS of perf
+// telemetry and, if it looks like a load incident (the random "fan gets angry"),
+// append a durable snapshot to perf-incidents.jsonl. See record_perf_incident_if_hot.
+const PERF_INCIDENT_MONITOR_MS: u64 = 30_000;
+const PERF_INCIDENT_WINDOW_MS: u64 = 60_000;
 
 fn spawn_explicit_remote_session_shutdown(
     home: &Path,
@@ -8999,6 +9004,40 @@ pub fn run_daemon(endpoint: &ServerEndpoint, runtime: GhosttyHostSupport) -> Res
             "endpoint": format!("{endpoint:?}"),
         }),
     );
+    {
+        // Perf incident monitor: catch the RANDOM "fan gets angry" flares the user
+        // can't predict. Every 30s, summarize the last 60s of perf telemetry and, if
+        // it looks like a load incident (title-regen loop / a span monopolizing /
+        // a stall), append a durable snapshot to perf-incidents.jsonl (kept for weeks,
+        // debounced 5min) — so the data is still there when reported after the fact.
+        let home_dir = home_dir.clone();
+        let runtime = runtime.clone();
+        std::thread::Builder::new()
+            .name("yggterm-perf-incident-monitor".to_string())
+            .spawn(move || {
+                let mut last_incident_ms = 0u64;
+                loop {
+                    std::thread::sleep(std::time::Duration::from_millis(PERF_INCIDENT_MONITOR_MS));
+                    let now_ms = current_millis_u64();
+                    let extra = {
+                        let runtime = lock_daemon_runtime(&runtime, "perf_incident_extra");
+                        let status = runtime.status();
+                        serde_json::json!({
+                            "owned_terminal_session_count": status.owned_terminal_session_count,
+                            "terminal_session_count": status.terminal_session_count,
+                        })
+                    };
+                    last_incident_ms = yggterm_core::record_perf_incident_if_hot(
+                        &home_dir,
+                        PERF_INCIDENT_WINDOW_MS,
+                        now_ms,
+                        last_incident_ms,
+                        extra,
+                    );
+                }
+            })
+            .ok();
+    }
     match RemoteRuntimeRegistry::open(&home_dir) {
         Ok(registry) => append_trace_event(
             &home_dir,
