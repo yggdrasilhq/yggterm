@@ -4,6 +4,23 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+## 2.9.27
+
+- **Sidebar render cost — the tree icon no longer re-diffs the whole row (jojo
+  latency/"fan angry" campaign).** Each sidebar row's icon is a memoized component
+  that previously took the entire `BrowserRow` as its prop, so its memo comparison
+  was a full struct `memcmp` (over every label/title/path string) for all ~223 rows
+  every render, and the icon was invalidated whenever any unrelated field changed —
+  e.g. the per-turn title-regen churn re-rendered every icon. The icon decision is
+  now collapsed once per row into a small `TreeIconSpec` enum (it only ever depended
+  on six fields: kind, session kind, path, document kind, depth, expanded), so the
+  memo compare is a trivial enum match and the icon only re-renders when the glyph
+  itself actually changes. Also removes a full per-row clone of the row for the icon.
+- **One sidebar snapshot per render, not two.** The main render body built the full
+  ~223-row sidebar projection twice each render — once to compute a scroll-bounds
+  cache key and again for the actual render. It is now built once and reused
+  (behavior-equivalent: the render body never mutates state between the two points).
+
 ## 2.9.26
 
 - **Stop the daemon-respawn CPU loop after a version deploy (jojo "fan angry").** When
