@@ -39647,17 +39647,22 @@ fn app() -> Element {
             last_preview_refresh_marker.set(Some(refresh_marker));
         }
     });
-    let sidebar_bounds_repair_key = {
-        let shell = state.read();
-        let snapshot = shell.snapshot();
-        format!(
-            "{}:{}:{}:{}",
-            snapshot.rows.len(),
-            snapshot.show_loading_tree,
-            snapshot.active_session_path.as_deref().unwrap_or("<none>"),
-            snapshot.selected_path.as_deref().unwrap_or("<none>")
-        )
-    };
+    // Build the per-render snapshot ONCE here and reuse it for the canonical
+    // render below. `snapshot()` clones the full ~223-row sidebar projection;
+    // this render body previously built it twice (here for the bounds-repair
+    // key, then again ~325 lines down for the actual render). The render body
+    // never synchronously mutates the `state` signal between the two points, so
+    // both builds reflected identical ShellState — collapsing to one is
+    // behavior-equivalent and removes a whole row-clone pass per render.
+    // See [[finding-gui-latency-render-path-campaign]].
+    let snapshot: SharedSnapshot = Arc::new(state.read().snapshot());
+    let sidebar_bounds_repair_key = format!(
+        "{}:{}:{}:{}",
+        snapshot.rows.len(),
+        snapshot.show_loading_tree,
+        snapshot.active_session_path.as_deref().unwrap_or("<none>"),
+        snapshot.selected_path.as_deref().unwrap_or("<none>")
+    );
     use_effect(move || {
         if *last_sidebar_bounds_repair_key.read() == Some(sidebar_bounds_repair_key.clone()) {
             return;
@@ -39974,7 +39979,9 @@ fn app() -> Element {
     });
     let _ = *async_render_epoch.read();
     let tree_rename_depth = state.read().tree_rename_depth;
-    let snapshot: SharedSnapshot = Arc::new(state.read().snapshot());
+    // `snapshot` (the canonical SharedSnapshot) was already built once near the
+    // top of this render body — reused here instead of rebuilding the ~223-row
+    // projection a second time. See [[finding-gui-latency-render-path-campaign]].
     let app_control_backgrounded = state.read().app_control_backgrounded;
     let window_focused = state.read().effective_window_focused();
     let inner = desktop.inner_size();
@@ -43927,7 +43934,7 @@ fn SidebarRow(
                         if icon_kind == "claude-code" {
                             ClaudeCodeTreeIcon {}
                         } else {
-                            TreeIcon { row: row.clone() }
+                            TreeIcon { spec: tree_icon_spec(&row) }
                         }
                     }
                     if renaming {
@@ -44219,12 +44226,65 @@ fn ClaudeCodeTreeIcon() -> Element {
         }
     }
 }
+/// Resolved icon decision for a sidebar row — the small, cheap-to-compare key
+/// that drives [`TreeIcon`].
+///
+/// PERF: `TreeIcon` is a memoized `#[component]`; passing the whole `BrowserRow`
+/// made its prop-memo a full `BrowserRow` PartialEq (memcmp over many `String`s)
+/// for every one of ~223 rows, every render, AND invalidated the icon whenever
+/// any unrelated field changed (label/title/detail churn on working turns). The
+/// icon only depends on six fields, so we collapse the decision into this Copy
+/// enum once per row. The memo compare is now a trivial enum match and the icon
+/// only re-renders when the glyph itself actually changes. See
+/// [[finding-gui-latency-render-path-campaign]] (profiled hot stack:
+/// `TreeIconProps::memoize -> <BrowserRow as PartialEq>::eq -> memcmp`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TreeIconSpec {
+    ClaudeCode,
+    BoxedGlyph(&'static str),
+    Document,
+    TerminalRecipe,
+    RootLiveSessions,
+    RootGroup,
+    FolderOpen,
+    FolderClosed,
+}
+
+/// Single owner of the sidebar icon decision tree. Mirrors the branch order in
+/// [`TreeIcon`] exactly — reads only `kind`, `session_kind`, `full_path`,
+/// `document_kind`, `depth`, and `expanded`.
+fn tree_icon_spec(row: &BrowserRow) -> TreeIconSpec {
+    if row_session_kind(row) == Some(SessionKind::ClaudeCode) {
+        return TreeIconSpec::ClaudeCode;
+    }
+    if let Some(glyph) = tree_icon_glyph(row) {
+        return TreeIconSpec::BoxedGlyph(glyph);
+    }
+    if row.kind == BrowserRowKind::Document {
+        if row.document_kind == Some(WorkspaceDocumentKind::TerminalRecipe) {
+            return TreeIconSpec::TerminalRecipe;
+        }
+        return TreeIconSpec::Document;
+    }
+    if row.depth == 0 {
+        if row.full_path == "__live_sessions__" {
+            return TreeIconSpec::RootLiveSessions;
+        }
+        return TreeIconSpec::RootGroup;
+    }
+    if row.expanded {
+        TreeIconSpec::FolderOpen
+    } else {
+        TreeIconSpec::FolderClosed
+    }
+}
+
 #[component]
-fn TreeIcon(row: BrowserRow) -> Element {
-    if row_session_kind(&row) == Some(SessionKind::ClaudeCode) {
+fn TreeIcon(spec: TreeIconSpec) -> Element {
+    if spec == TreeIconSpec::ClaudeCode {
         return rsx! { ClaudeCodeTreeIcon {} };
     }
-    if let Some(glyph) = tree_icon_glyph(&row) {
+    if let TreeIconSpec::BoxedGlyph(glyph) = spec {
         return rsx! {
             svg {
                 width: "19",
@@ -44244,8 +44304,8 @@ fn TreeIcon(row: BrowserRow) -> Element {
             }
         };
     }
-    if row.kind == BrowserRowKind::Document {
-        if row.document_kind == Some(WorkspaceDocumentKind::TerminalRecipe) {
+    if spec == TreeIconSpec::Document || spec == TreeIconSpec::TerminalRecipe {
+        if spec == TreeIconSpec::TerminalRecipe {
             return rsx! {
                 svg {
                     width: "19",
@@ -44273,8 +44333,8 @@ fn TreeIcon(row: BrowserRow) -> Element {
             }
         };
     }
-    if row.depth == 0 {
-        if row.full_path == "__live_sessions__" {
+    if spec == TreeIconSpec::RootLiveSessions || spec == TreeIconSpec::RootGroup {
+        if spec == TreeIconSpec::RootLiveSessions {
             return rsx! {
                 span {
                     style: "display:inline-flex; align-items:center; justify-content:center; font-size:12px; font-weight:700; line-height:1;",
@@ -44313,7 +44373,7 @@ fn TreeIcon(row: BrowserRow) -> Element {
             }
         };
     }
-    if row.expanded {
+    if spec == TreeIconSpec::FolderOpen {
         rsx! {
             svg {
                 width: "19",
@@ -74453,6 +74513,115 @@ mod tests {
             1,
             "a differing stored fingerprint must trigger exactly one rebuild"
         );
+    }
+
+    // Minimal BrowserRow for icon-resolution tests. Fields the icon does NOT
+    // read are filled with deliberately "noisy" values so the churn-stability
+    // test below can mutate them and prove the icon spec is unaffected.
+    fn icon_test_row(kind: BrowserRowKind, full_path: &str) -> BrowserRow {
+        BrowserRow {
+            kind,
+            full_path: full_path.to_string(),
+            label: "label".to_string(),
+            detail_label: "detail".to_string(),
+            document_kind: None,
+            group_kind: None,
+            session_title: Some("title".to_string()),
+            depth: 1,
+            host_label: "host".to_string(),
+            descendant_sessions: 3,
+            expanded: false,
+            session_id: Some("sid".to_string()),
+            session_cwd: Some("/cwd".to_string()),
+            session_kind: None,
+        }
+    }
+
+    // PERF icon-key gate: `tree_icon_spec` must reproduce the exact branch the
+    // old `TreeIcon(row)` body selected, AND must depend ONLY on the six icon
+    // fields — so it stays byte-identical across label/title/detail churn (the
+    // title-regen storm that previously re-rendered every sidebar icon). See
+    // [[finding-gui-latency-render-path-campaign]].
+    #[test]
+    fn tree_icon_spec_maps_every_variant() {
+        // Claude Code session (SSOT via session_kind).
+        let mut cc = icon_test_row(BrowserRowKind::Session, "local://cc");
+        cc.session_kind = Some(SessionKind::ClaudeCode);
+        assert_eq!(tree_icon_spec(&cc), TreeIconSpec::ClaudeCode);
+
+        // Boxed glyphs: codex ">_", shell "$_", and the separator dash "—".
+        let mut codex = icon_test_row(BrowserRowKind::Session, "codex://x");
+        codex.session_kind = Some(SessionKind::Codex);
+        assert_eq!(tree_icon_spec(&codex), TreeIconSpec::BoxedGlyph(">_"));
+        let mut shell = icon_test_row(BrowserRowKind::Session, "local://sh");
+        shell.session_kind = Some(SessionKind::Shell);
+        assert_eq!(tree_icon_spec(&shell), TreeIconSpec::BoxedGlyph("$_"));
+        let sep = icon_test_row(BrowserRowKind::Separator, "sep");
+        assert_eq!(tree_icon_spec(&sep), TreeIconSpec::BoxedGlyph("—"));
+
+        // Documents: generic paper vs terminal-recipe.
+        let paper = icon_test_row(BrowserRowKind::Document, "doc://p");
+        assert_eq!(tree_icon_spec(&paper), TreeIconSpec::Document);
+        let mut recipe = icon_test_row(BrowserRowKind::Document, "doc://r");
+        recipe.document_kind = Some(WorkspaceDocumentKind::TerminalRecipe);
+        assert_eq!(tree_icon_spec(&recipe), TreeIconSpec::TerminalRecipe);
+
+        // Depth-0 groups: the live-sessions sentinel vs a normal root group.
+        let mut live = icon_test_row(BrowserRowKind::Group, "__live_sessions__");
+        live.depth = 0;
+        assert_eq!(tree_icon_spec(&live), TreeIconSpec::RootLiveSessions);
+        let mut root = icon_test_row(BrowserRowKind::Group, "local");
+        root.depth = 0;
+        assert_eq!(tree_icon_spec(&root), TreeIconSpec::RootGroup);
+
+        // Nested groups: folder open vs closed by `expanded`.
+        let mut open = icon_test_row(BrowserRowKind::Group, "local/a");
+        open.expanded = true;
+        assert_eq!(tree_icon_spec(&open), TreeIconSpec::FolderOpen);
+        let closed = icon_test_row(BrowserRowKind::Group, "local/b");
+        assert_eq!(tree_icon_spec(&closed), TreeIconSpec::FolderClosed);
+    }
+
+    #[test]
+    fn tree_icon_spec_is_stable_across_non_icon_field_churn() {
+        // Exactly the fields that change on working turns / title regen / live
+        // sidebar overlays — none of them must move the icon.
+        let churn = |row: &mut BrowserRow| {
+            row.label = "RENAMED — a much longer label now".to_string();
+            row.detail_label = "12m 34s · working".to_string();
+            row.session_title = Some("freshly generated summary title".to_string());
+            row.host_label = "another-host".to_string();
+            row.descendant_sessions = row.descendant_sessions + 99;
+            row.session_id = Some("a-different-session-id".to_string());
+            row.session_cwd = Some("/some/other/cwd".to_string());
+        };
+
+        for base in [
+            {
+                let mut r = icon_test_row(BrowserRowKind::Session, "local://cc");
+                r.session_kind = Some(SessionKind::ClaudeCode);
+                r
+            },
+            {
+                let mut r = icon_test_row(BrowserRowKind::Session, "codex://x");
+                r.session_kind = Some(SessionKind::Codex);
+                r
+            },
+            {
+                let mut r = icon_test_row(BrowserRowKind::Group, "local/a");
+                r.expanded = true;
+                r
+            },
+        ] {
+            let before = tree_icon_spec(&base);
+            let mut churned = base.clone();
+            churn(&mut churned);
+            assert_eq!(
+                tree_icon_spec(&churned),
+                before,
+                "icon spec must not change when only non-icon fields churn"
+            );
+        }
     }
 
     fn runtime_status_for_test(
