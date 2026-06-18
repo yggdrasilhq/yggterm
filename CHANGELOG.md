@@ -4,6 +4,23 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+## 2.9.25
+
+- **Broken-bottom root cause (daemon side) — a deploy no longer re-resumes every
+  agent.** When an update replaced a running daemon's on-disk binary, the daemon
+  detected the replacement (`/proc/self/exe` → `" (deleted)"`) and, once its sessions
+  went idle, **cold-exited** (`run_end hot_restart:false`). The next client connection
+  then recovery-spawned a fresh daemon that re-resumed every agent on a new PTY — i.e.
+  every session repainted its bottom from scratch (the "all my sessions broke at the
+  bottom overnight" symptom: the idle gate deferred the retire all day, then fired once
+  everything went idle). The cold path now hands off through the **same
+  session-preserving hot-restart the explicit deploy path already uses**: on
+  `disk_binary_replaced` with live owned PTYs, the daemon keeps itself alive as the
+  preserved PTY owner and spawns the new-version successor to **adopt** the streams — no
+  re-resume, no broken bottom. Falls back to the old cold shutdown on any handoff
+  failure; `YGGTERM_DISABLE_SELF_RETIRE_HANDOFF=1` reverts to it with no redeploy. New
+  traces: `daemon_self_retire_handoff_ok` / `_failed` / `_skipped`.
+
 ## 2.9.24
 
 - **Latency/fan — stop rebuilding the sidebar search index on every render.** Live
