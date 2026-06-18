@@ -2276,6 +2276,11 @@ impl ShellState {
             .filter(|path| !restored_collapsed_synthetic_paths.contains(path.as_str()))
             .cloned()
             .collect::<Vec<_>>();
+        // Hand the persisted collapse set to the browser BEFORE the first restore
+        // so the default level-one seeding can't re-open a group the user
+        // collapsed last session (the "local" machine root re-expanding on every
+        // restart — finding-sidebar-collapse-not-persisted).
+        browser.set_collapsed_paths(restored_collapsed_synthetic_paths.clone());
         browser.restore_ui_state(
             &restored_expanded_paths,
             settings.selected_browser_path.as_deref(),
@@ -6254,6 +6259,8 @@ impl ShellState {
         };
         self.user_collapsed_synthetic_paths
             .retain(|path| !path.starts_with(&format!("__remote_machine__/{machine_key}")));
+        self.browser
+            .set_collapsed_paths(self.user_collapsed_synthetic_paths.clone());
     }
     fn update_synthetic_group_collapse_state(&mut self, path: &str, expanded: bool) {
         if expanded {
@@ -6261,6 +6268,10 @@ impl ShellState {
         } else {
             self.user_collapsed_synthetic_paths.insert(path.to_string());
         }
+        // Keep the browser's collapse mirror current so the next rebuild's default
+        // level-one seeding honors this collapse instead of re-opening the group.
+        self.browser
+            .set_collapsed_paths(self.user_collapsed_synthetic_paths.clone());
     }
     fn sync_active_session_selection(&mut self) {
         if self.preserve_tree_rename_selection() {
@@ -14871,6 +14882,13 @@ fn set_app_control_row_expanded(shell: &mut ShellState, row: &BrowserRow, expand
         shell.update_synthetic_group_collapse_state(&row.full_path, expanded);
     } else {
         shell.browser.toggle_group(&row.full_path);
+        // Level-one local groups (the "local" machine root and top-level local
+        // folders) are force-opened by the default seeding on every rebuild, so
+        // their collapse must persist the same way synthetic groups' does — else
+        // they re-expand on restart (finding-sidebar-collapse-not-persisted).
+        if shell.browser.is_level_one_group(&row.full_path) {
+            shell.update_synthetic_group_collapse_state(&row.full_path, expanded);
+        }
     }
     shell.sync_browser_settings();
 }
