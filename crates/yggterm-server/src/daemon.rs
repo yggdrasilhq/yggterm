@@ -8807,6 +8807,7 @@ fn spawn_disk_binary_version_poll(
                 );
                 continue;
             }
+            let exe_link_for_handoff = exe_link.clone();
             append_trace_event(
                 &home_dir,
                 "daemon",
@@ -8820,6 +8821,39 @@ fn spawn_disk_binary_version_poll(
                     "current_pid": std::process::id(),
                 }),
             );
+            // A cold shutdown kills this daemon's PTY children; the next client
+            // then recovery-spawns a fresh daemon that RE-RESUMES every agent on
+            // a new PTY — the overnight "all CC bottoms broke" incident
+            // ([[finding-deploy-armed-cold-self-retire-mass-re-resume]]). When the
+            // replacement is a newer on-disk binary AND we still own live PTYs,
+            // prefer the session-preserving hot-restart handoff (the same path the
+            // explicit HotRestart RPC + the deploy-via-hot-restart spec use): keep
+            // THIS process alive as the preserved PTY owner and spawn the
+            // new-version successor to ADOPT the streams — no re-resume. The
+            // newer_daemon_live split-brain case, the kill-switch, and any handoff
+            // failure all fall back to the cold shutdown so we still retire.
+            let handed_off = retire_trigger == "disk_binary_replaced"
+                && !self_retire_handoff_disabled()
+                && {
+                    let owned = lock_daemon_runtime(&runtime, "disk_binary_replace_handoff")
+                        .terminals
+                        .session_keys();
+                    !owned.is_empty()
+                        && attempt_self_retire_preserving_handoff(
+                            &endpoint,
+                            &home_dir,
+                            &exe_link_for_handoff,
+                            &owned,
+                        )
+                };
+            if handed_off {
+                // The handler spawned the new-version successor and wrote the
+                // preserved-owner registry; we now linger as the PTY owner. Do
+                // NOT shutdown (that would kill the PTYs we just preserved). Stop
+                // polling; idle-shutdown / the stale-daemon sweep retires us once
+                // our sessions drain.
+                break;
+            }
             // Best-effort self-shutdown. If the call fails (e.g. socket
             // already torn down), the thread just exits and the daemon
             // continues; the next poll cycle would retry, but the
@@ -8828,6 +8862,122 @@ fn spawn_disk_binary_version_poll(
             break;
         }
     });
+}
+
+/// Kill-switch for the session-preserving self-retire handoff
+/// ([[finding-deploy-armed-cold-self-retire-mass-re-resume]]). Setting
+/// `YGGTERM_DISABLE_SELF_RETIRE_HANDOFF=1` reverts to the cold-shutdown
+/// (re-resume) behaviour with no redeploy, should the handoff ever misbehave
+/// live on the most sensitive daemon-lifecycle path.
+#[cfg(target_os = "linux")]
+fn self_retire_handoff_disabled() -> bool {
+    parse_self_retire_handoff_disabled(
+        std::env::var("YGGTERM_DISABLE_SELF_RETIRE_HANDOFF").ok().as_deref(),
+    )
+}
+
+/// Pure parser for the kill-switch env value (set/unset/`0`/`false` = enabled).
+/// Split out so it is testable without mutating the shared process environment.
+#[cfg(target_os = "linux")]
+fn parse_self_retire_handoff_disabled(value: Option<&str>) -> bool {
+    match value {
+        Some(value) => {
+            let value = value.trim();
+            !value.is_empty() && value != "0" && !value.eq_ignore_ascii_case("false")
+        }
+        None => false,
+    }
+}
+
+/// Resolve the replacement binary for a `disk_binary_replaced` retire. Linux
+/// appends the literal " (deleted)" suffix to `/proc/self/exe` once the file at
+/// our launch path is overwritten, so the un-suffixed path now points at the
+/// NEW on-disk binary. Returns `None` when the link is not a replaced-binary
+/// link (so the handoff is skipped and the caller cold-shuts-down).
+#[cfg(target_os = "linux")]
+fn disk_replace_handoff_target(exe_link: &str) -> Option<PathBuf> {
+    let path = exe_link.strip_suffix(" (deleted)")?;
+    if path.is_empty() {
+        return None;
+    }
+    Some(PathBuf::from(path))
+}
+
+/// Hand this daemon's live PTYs to a freshly-spawned new-version successor
+/// instead of cold-exiting. Routes through the proven `hot_restart` handoff —
+/// `force = true` because an autonomous disk-replace retire is an agent-style
+/// deploy and we cannot cheaply read the successor's version here (the on-disk
+/// binary already IS the new version, so the spawned successor comes up correct).
+/// Returns `true` only when the RPC was accepted; the caller then lingers as the
+/// preserved owner and must NOT shutdown.
+#[cfg(target_os = "linux")]
+fn attempt_self_retire_preserving_handoff(
+    endpoint: &ServerEndpoint,
+    home_dir: &Path,
+    exe_link: &str,
+    owned: &[String],
+) -> bool {
+    let Some(new_exe) = disk_replace_handoff_target(exe_link) else {
+        return false;
+    };
+    if !new_exe.is_file() {
+        append_trace_event(
+            home_dir,
+            "daemon",
+            "lifecycle",
+            "daemon_self_retire_handoff_skipped",
+            serde_json::json!({
+                "reason": "replacement_binary_missing",
+                "new_exe": new_exe.display().to_string(),
+            }),
+        );
+        return false;
+    }
+    match hot_restart_detailed(
+        endpoint,
+        &new_exe,
+        None,
+        None,
+        Some("disk_binary_replaced_self_retire"),
+        true,
+    ) {
+        Ok(result) => {
+            let outcome = match &result {
+                HotRestartResult::Handoff { .. } => "preserved_owner_handoff",
+                HotRestartResult::Restarting { .. } => "restart_no_owned_runtime",
+            };
+            append_trace_event(
+                home_dir,
+                "daemon",
+                "lifecycle",
+                "daemon_self_retire_handoff_ok",
+                serde_json::json!({
+                    "new_exe": new_exe.display().to_string(),
+                    "outcome": outcome,
+                    "owned_terminal_session_count": owned.len(),
+                    "owned_terminal_session_keys": owned,
+                    "message": result.message(),
+                    "current_version": SERVER_PROTOCOL_VERSION,
+                    "current_pid": std::process::id(),
+                }),
+            );
+            true
+        }
+        Err(error) => {
+            append_trace_event(
+                home_dir,
+                "daemon",
+                "lifecycle",
+                "daemon_self_retire_handoff_failed",
+                serde_json::json!({
+                    "new_exe": new_exe.display().to_string(),
+                    "error": error.to_string(),
+                    "current_pid": std::process::id(),
+                }),
+            );
+            false
+        }
+    }
 }
 
 /// Socket-litter cleanup (run #19): unlink versioned `server-*.sock` files
@@ -13632,6 +13782,39 @@ mod tests {
             stale_runtime_keys.is_empty(),
             "a daemon must not prune duplicate runtime keys from a newer or higher-ranked owner"
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn disk_replace_handoff_target_strips_deleted_suffix() {
+        // Linux marks an overwritten /proc/self/exe with the " (deleted)"
+        // suffix; the un-suffixed path is the NEW on-disk binary to hand off to.
+        assert_eq!(
+            super::disk_replace_handoff_target("/home/pi/.yggterm/bin/yggterm-headless (deleted)"),
+            Some(std::path::PathBuf::from("/home/pi/.yggterm/bin/yggterm-headless")),
+        );
+        // A live (un-replaced) link must NOT trigger a handoff.
+        assert_eq!(
+            super::disk_replace_handoff_target("/home/pi/.yggterm/bin/yggterm-headless"),
+            None,
+        );
+        // Defensive: a bare suffix yields no usable path.
+        assert_eq!(super::disk_replace_handoff_target(" (deleted)"), None);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn self_retire_handoff_kill_switch_parses_truthy_values() {
+        // Default (unset) and explicit off values keep the handoff ENABLED.
+        assert!(!super::parse_self_retire_handoff_disabled(None));
+        assert!(!super::parse_self_retire_handoff_disabled(Some("")));
+        assert!(!super::parse_self_retire_handoff_disabled(Some("0")));
+        assert!(!super::parse_self_retire_handoff_disabled(Some("false")));
+        assert!(!super::parse_self_retire_handoff_disabled(Some("FALSE")));
+        // Any other non-empty value disables it (reverts to cold shutdown).
+        assert!(super::parse_self_retire_handoff_disabled(Some("1")));
+        assert!(super::parse_self_retire_handoff_disabled(Some("true")));
+        assert!(super::parse_self_retire_handoff_disabled(Some(" yes ")));
     }
 
     #[cfg(unix)]
