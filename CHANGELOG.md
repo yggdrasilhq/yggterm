@@ -4,6 +4,20 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+## 2.9.26
+
+- **Stop the daemon-respawn CPU loop after a version deploy (jojo "fan angry").** When
+  a daemon from a previous version is still alive owning live sessions (so it can't
+  retire) and the GUI is a newer same-minor version, `ensure_daemon_running` kept
+  trying to "recover" that daemon's version socket — but spawning the current binary
+  binds a *different* version socket, so the endpoint never became "current" and every
+  attempt re-spawned a duplicate daemon that immediately exited: a perpetual ~17s
+  respawn loop burning CPU, on top of N daemons each running full poll/chore loops. The
+  GUI now recognizes a reachable same-minor daemon that owns live sessions as a
+  *preserved owner* and uses it as-is (it serves its sessions over the
+  version-compatible protocol and self-retires once they drain) instead of futilely
+  respawning. New trace: `preserved_stale_daemon_in_use_skip_spawn`.
+
 ## 2.9.25
 
 - **Broken-bottom root cause (daemon side) — a deploy no longer re-resumes every
