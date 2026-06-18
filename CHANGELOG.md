@@ -4,6 +4,17 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+## 2.9.33
+
+- **Sidebar collapse fix (2.9.31), corrected after live verification.** The
+  2.9.31 fix recorded a collapse only for level-one *child* groups, but on a
+  local-only machine the "local" tree row **is the tree root** itself
+  (`root.path`), not a child — so collapsing it still wasn't persisted (verified
+  live: the row collapsed but `collapsed_synthetic_paths` never recorded it). The
+  record condition now matches the exact set the default seeding force-opens (the
+  root *and* level-one groups), so collapsing the local machine tree finally
+  sticks across restarts.
+
 ## 2.9.32
 
 - **Selecting text on a working codex no longer yanks you to the bottom.**
