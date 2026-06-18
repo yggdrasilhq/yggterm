@@ -102,3 +102,47 @@ test('term.reset() drops ydisp and baseY to 0 together (reseed is not a user scr
   assert.ok(!(ydispAfter < ydispBefore && baseAfter >= baseBefore),
     'a reseed must be rejected by the baseY-non-decrease discriminator');
 });
+
+// "Codex select kicks me to the bottom" (user report 2026-06-18): on a WORKING
+// codex the user scrolls up to select a word and gets yanked to the live bottom.
+// Codex's working pattern is NOT plain newline output — committed messages scroll
+// in (newline-driven) WHILE a 3-row bottom live region (composer/status) is
+// repainted in place via absolute CUP (`\x1b[{row};1H\x1b[K…`, no newline), exactly
+// the mock-tui `codex-inline` scenario. This locks whether that mixed pattern keeps
+// the scroll-up signal honest: output (committed lines + CUP repaints) must NEVER
+// decrease ydisp while scrolled up. If it holds, the yank is NOT xterm/codex — it is
+// yggterm's follow wiring (a force-follow on click/redraw racing the UserScrollback
+// latch), which the live viewport_force_log must pin.
+test('codex-inline working frames while scrolled up never decrease ydisp', async () => {
+  const screenRows = 24;
+  const term = createTerminal({ cols: 80, rows: screenRows, scrollback: 2000 });
+  // Committed conversation lines scroll naturally (newline-driven), as codex emits.
+  for (let i = 0; i < 80; i++) await write(term, `CODEX_MSG_${i} committed conversation line\r\n`);
+  // User scrolls up to read/select a word in the scrollback.
+  term.scrollLines(-20);
+  const ydispAfterScroll = vp(term);
+  assert.ok(ydispAfterScroll < by(term), 'precondition: user is scrolled up above the live bottom');
+  const events = [];
+  term.onScroll((y) => events.push(y));
+  // codex working: interleave NEW committed messages (grow baseY) with the bottom
+  // 3-row live-region repaint via absolute CUP (no newline) — its idle/working churn.
+  const composerTop = screenRows - 2; // 1-based rows 22,23,24
+  for (let frame = 0; frame < 12; frame++) {
+    await write(term, `CODEX_MSG_working_${frame} streaming token\r\n`);
+    let repaint = '';
+    ['> ', 'model ', 'esc '].forEach((label, offset) => {
+      const row = composerTop + offset;
+      repaint += `\x1b[${row};1H\x1b[K${label}COMPOSER_FRAME_${frame}`;
+    });
+    await write(term, repaint);
+  }
+  // The invariant: even with CUP bottom-region repaints mixed into the stream, the
+  // user's scroll position (ydisp) must not be dragged down by output.
+  assert.ok(by(term) > ydispAfterScroll, 'baseY should grow as working messages arrive');
+  assert.strictEqual(vp(term), ydispAfterScroll,
+    `ydisp must stay put while scrolled up through codex working frames (got ${vp(term)}, want ${ydispAfterScroll})`);
+  for (const y of events) {
+    assert.ok(y >= ydispAfterScroll,
+      `no codex working frame may decrease ydisp below the user's spot (events=${events})`);
+  }
+});
