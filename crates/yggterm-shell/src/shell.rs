@@ -66784,11 +66784,29 @@ fn terminal_eval_script_with_canvas_renderer(
             // goes to the PTY; the viewport stays where the user is reading.
             // This is the actual production fix that complements the
             // pre-existing telemetry.
+            // A click / drag / wheel in a mouse-reporting TUI (codex, vim) arrives
+            // HERE as onData mouse-report bytes — SGR `\x1b[<…M/m` or legacy
+            // `\x1b[M…`. That is a viewport interaction (and usually the START of a
+            // selection), NEVER "typing at the prompt", so it must not snap the
+            // viewport to the live bottom. The old guard only skipped the snap when
+            // the user was UserScrollback AND > 5 rows off-bottom — so scrolling a
+            // *little* up on a WORKING codex to select a nearby word, then clicking/
+            // dragging, force-followed to the bottom and (because force clears the
+            // UserScrollback latch) re-yanked on every further action ("kicked to the
+            // bottom three times"). A genuine keystroke still snaps. An active
+            // selection is also never yanked (scroll_mode Selecting invariant).
+            const _inputIsMouseReport =
+                typeof data === 'string'
+                && (data.indexOf('\x1b[<') === 0 || data.indexOf('\x1b[M') === 0);
+            const _inputHasActiveSelection =
+                Boolean(term && typeof term.hasSelection === 'function' && term.hasSelection());
             const _scrollJumpUserIsReadingScrollback =
-                scrollbackIntent === 'UserScrollback'
-                && _scrollJumpBeforeY >= 0
-                && _scrollJumpBeforeBaseY >= 0
-                && (_scrollJumpBeforeBaseY - _scrollJumpBeforeY) > 5;
+                _inputIsMouseReport
+                || _inputHasActiveSelection
+                || (scrollbackIntent === 'UserScrollback'
+                    && _scrollJumpBeforeY >= 0
+                    && _scrollJumpBeforeBaseY >= 0
+                    && (_scrollJumpBeforeBaseY - _scrollJumpBeforeY) > 5);
             if (!_scrollJumpUserIsReadingScrollback) {{
                 setScrollbackIntent('PromptFollow', 'input');
                 scrollbackLocked = false;
@@ -78348,6 +78366,16 @@ mod tests {
                 && script.contains("scrollLiveCursorIntoView(true, 'input');")
                 && script.contains("queueTerminalInputData(data);"),
             "real terminal input should reveal the prompt before forwarding bytes"
+        );
+        // Mouse-report input (a click/drag/wheel in a mouse-reporting TUI like
+        // codex) must NOT snap the viewport to the bottom — that yanked the user
+        // off a scrolled-up word the moment they tried to select it. A genuine
+        // keystroke still snaps (above); a mouse report or an active selection
+        // skips the snap.
+        assert!(
+            script.contains("data.indexOf('\\x1b[<') === 0 || data.indexOf('\\x1b[M') === 0")
+                && script.contains("const _inputHasActiveSelection ="),
+            "mouse-report / active-selection input must skip the prompt-follow snap so codex selection isn't yanked to the bottom"
         );
     }
 
