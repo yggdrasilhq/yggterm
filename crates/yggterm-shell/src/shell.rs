@@ -23726,9 +23726,10 @@ fn queue_delete_selected_items(mut state: Signal<ShellState>, hard_delete: bool)
         )
     });
     let close_redirect_target_for_task = close_redirect_target.clone();
-    let delete_job_key = pending
-        .live_session_close
-        .then(|| format!("live-session-close:{}", current_millis()));
+    // A live-session close is optimistic and SILENT on success (user request
+    // 2026-06-18): no "Closing Terminals" progress toast and no "Terminal Closed"
+    // success toast — the row vanishes immediately and the daemon teardown runs in
+    // the background. Only failures (the Err arms below) raise a notification.
     state.with_mut(|shell| {
         shell.server_busy = true;
         shell.pending_delete = None;
@@ -23763,16 +23764,9 @@ fn queue_delete_selected_items(mut state: Signal<ShellState>, hard_delete: bool)
         } else {
             format!("deleting {item_count} item(s)")
         };
-        if let Some(job_key) = delete_job_key.as_ref() {
-            shell.upsert_job_notification(
-                job_key.clone(),
-                NotificationTone::Info,
-                "Closing Terminals",
-                format!("Closing {item_count} live terminal runtime(s)."),
-                None,
-                false,
-            );
-        }
+        // No progress toast for a live-session close — it is optimistic and silent
+        // on success. Failures still notify via the Err arms below. Non-live
+        // deletes never had a progress toast either.
         shell.close_context_menu();
         shell.refresh_tree_debug("delete_confirmed");
     });
@@ -23848,15 +23842,6 @@ fn queue_delete_selected_items(mut state: Signal<ShellState>, hard_delete: bool)
         .await;
         state.with_mut(|shell| match outcome {
             Ok(Ok((deleted, maybe_browser_tree, maybe_daemon_result, redirect_error))) => {
-                if let Some(job_key) = delete_job_key.as_deref() {
-                    shell.finish_job_notification(
-                        job_key,
-                        NotificationTone::Info,
-                        "Closing Complete",
-                        "",
-                        false,
-                    );
-                }
                 if let Some(browser_tree) = maybe_browser_tree {
                     let expanded_paths = shell.browser.expanded_paths();
                     shell.browser = SessionBrowserState::new(browser_tree);
@@ -23871,9 +23856,16 @@ fn queue_delete_selected_items(mut state: Signal<ShellState>, hard_delete: bool)
                     shell.sync_browser_settings();
                 }
                 if let Some(result) = maybe_daemon_result {
+                    // For a live-session close the GUI has ALREADY chosen the active
+                    // surface optimistically (the local close + redirect above). The
+                    // daemon snapshot taken right after `remove_session` can still
+                    // carry the just-closed session as active (a teardown race) — so
+                    // preserve the client's focus instead of adopting it, otherwise
+                    // the view visibly switches BACK to the session being closed.
+                    // Non-live deletes keep the prior adopt-from-daemon behavior.
                     shell.apply_snapshot_result_without_request(
                         Ok(result),
-                        false,
+                        pending.live_session_close,
                         "delete_finished",
                         true,
                     );
@@ -23900,19 +23892,15 @@ fn queue_delete_selected_items(mut state: Signal<ShellState>, hard_delete: bool)
                     format!("deleted {deleted} item(s)")
                 };
                 shell.refresh_tree_debug("delete_finished");
-                let (title, message) = delete_success_notification_text(&pending, deleted);
-                shell.push_notification(NotificationTone::Success, title, message);
+                // Success is silent for a live-session close (user request): the row
+                // already vanished optimistically; a "Terminal Closed" toast is noise.
+                // Stored-item deletes keep their confirmation toast.
+                if !pending.live_session_close {
+                    let (title, message) = delete_success_notification_text(&pending, deleted);
+                    shell.push_notification(NotificationTone::Success, title, message);
+                }
             }
             Ok(Err(error)) => {
-                if let Some(job_key) = delete_job_key.as_deref() {
-                    shell.finish_job_notification(
-                        job_key,
-                        NotificationTone::Error,
-                        "Close Failed",
-                        "",
-                        false,
-                    );
-                }
                 shell.server_busy = false;
                 shell.last_action = format!("delete failed: {error}");
                 shell.refresh_tree_debug("delete_failed");
@@ -23923,15 +23911,6 @@ fn queue_delete_selected_items(mut state: Signal<ShellState>, hard_delete: bool)
                 );
             }
             Err(error) => {
-                if let Some(job_key) = delete_job_key.as_deref() {
-                    shell.finish_job_notification(
-                        job_key,
-                        NotificationTone::Error,
-                        "Close Task Failed",
-                        "",
-                        false,
-                    );
-                }
                 shell.server_busy = false;
                 shell.last_action = format!("delete task failed: {error}");
                 shell.refresh_tree_debug("delete_task_failed");
@@ -74971,14 +74950,26 @@ mod tests {
     }
 
     #[test]
-    fn live_session_close_uses_persistent_progress_notification() {
+    fn live_session_close_is_silent_on_success_and_preserves_focus() {
+        // Source-scraping invariant test (matches the existing pattern in this
+        // module). Note: the searched substrings use real quotes / embedded
+        // newlines, which only match the actual code below — NOT this test's own
+        // escaped (\" , \n) literals — so the assertions are not self-satisfying.
         let source = include_str!("shell.rs");
-        assert!(source.contains("format!(\"live-session-close:{}\", current_millis())"));
-        assert!(source.contains("\"Closing Terminals\""));
-        assert!(source.contains("format!(\"Closing {item_count} live terminal runtime(s).\")"));
-        assert!(
-            source.contains("shell.finish_job_notification(\n                        job_key,")
-        );
+        // The post-close daemon snapshot PRESERVES the optimistic local focus for a
+        // live-session close (preserve_focus = pending.live_session_close), so the
+        // view cannot bounce back to the just-closed session. This is the core fix.
+        assert!(source.contains(
+            "Ok(result),\n                        pending.live_session_close,\n                        \"delete_finished\","
+        ));
+        // The success toast is gated OFF for a live-session close (silent on
+        // success — the row already vanished); stored-item deletes keep their toast.
+        assert!(source.contains(
+            "if !pending.live_session_close {\n                    let (title, message) = delete_success_notification_text(&pending, deleted);"
+        ));
+        // Failures still notify (the Err arms push an error notification).
+        assert!(source.contains("\"Delete Failed\""));
+        assert!(source.contains("\"Delete Task Failed\""));
     }
 
     #[test]
