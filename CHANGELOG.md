@@ -4,6 +4,21 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+## 2.9.30
+
+- **Keyboard-initiated copies (e.g. Claude Code's `c`-to-copy on the login
+  screen) now work on the FIRST press.** The OSC 52 user-gesture gate — added to
+  stop a session-switch from re-firing a buffered clipboard copy and clobbering
+  what you just copied elsewhere — only recognized a recent **mouse-release** as a
+  genuine copy gesture. A copy triggered by the **keyboard** (no pointer event)
+  therefore looked like a re-emit and was silently suppressed: the first `c` set
+  nothing on the clipboard (and showed no copy notification), so a paste elsewhere
+  pasted stale content; only a second `c` — after you'd clicked back into the
+  terminal, which stamped a pointer gesture — went through. The gate now also
+  stamps the gesture on `keydown` (capture phase), so a keyboard copy fires on the
+  first press. Switch-in re-emits are still suppressed — they carry neither a
+  pointer nor a keystroke on the target terminal (you switched via the sidebar).
+
 ## 2.9.29
 
 - **Sidebar render allocates far less per frame (jojo latency campaign).** The
