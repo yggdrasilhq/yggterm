@@ -42566,10 +42566,17 @@ fn Sidebar(
         "translateX(-14px)"
     };
     let drag_active = !snapshot.drag_paths.is_empty();
+    // PERF: rows are wrapped in `Rc` so the sidebar render loop below can hand a
+    // row to ~13 per-row event-handler closures with cheap refcount bumps instead
+    // of deep-cloning the full `BrowserRow` (≈7 String allocs each) 13× per row,
+    // every render, across ~223 rows. A real `BrowserRow` clone now only happens
+    // when an event actually fires (and once for the SidebarRow prop). See
+    // [[finding-gui-latency-render-path-campaign]].
     let visible_rows = snapshot
         .rows
         .iter()
         .cloned()
+        .map(Rc::new)
         .scan(false, |in_live_group, row| {
             if row.depth == 0 {
                 *in_live_group = row.full_path == "__live_sessions__";
@@ -42841,7 +42848,7 @@ fn Sidebar(
                         rsx! {
                             SidebarRow {
                                 key: "{sidebar_row_key}",
-                                row: row.clone(),
+                                row: (*row).clone(),
                                 visible_label: visible_label.clone(),
                                 icon_kind: icon_kind.clone(),
                                 busy_icon,
@@ -42863,56 +42870,56 @@ fn Sidebar(
                                 show_live_close: live_group_member && row.kind == BrowserRowKind::Session,
                                 palette: snapshot.palette,
                                 on_select: move |mode: TreeSelectionMode| {
-                                    on_select_row.call((select_row.clone(), mode));
+                                    on_select_row.call(((*select_row).clone(), mode));
                                 },
                                 on_press_highlight: move |mode: TreeSelectionMode| {
-                                    on_press_highlight_row.call((press_highlight_row.clone(), mode));
+                                    on_press_highlight_row.call(((*press_highlight_row).clone(), mode));
                                 },
                                 on_set_expanded: {
                                     let row = row.clone();
-                                    move |expanded: bool| on_set_row_expanded.call((row.clone(), expanded))
+                                    move |expanded: bool| on_set_row_expanded.call(((*row).clone(), expanded))
                                 },
-                                on_open_context_menu: move |coords: (f64, f64)| on_open_context_menu.call((context_row.clone(), coords)),
-                                on_delete_row: move |_| on_delete_row.call(delete_row.clone()),
+                                on_open_context_menu: move |coords: (f64, f64)| on_open_context_menu.call(((*context_row).clone(), coords)),
+                                on_delete_row: move |_| on_delete_row.call((*delete_row).clone()),
                                 on_begin_rename: {
                                     let row = row.clone();
-                                    move |_| on_begin_rename.call(row.clone())
+                                    move |_| on_begin_rename.call((*row).clone())
                                 },
                                 on_regenerate_title: {
                                     let row = row.clone();
-                                    move |_| on_regenerate_row_title.call(row.clone())
+                                    move |_| on_regenerate_row_title.call((*row).clone())
                                 },
                                 on_update_rename: move |value: String| on_update_rename.call(value),
                                 on_focus_rename: move |_| on_focus_rename.call(()),
                                 on_commit_rename: {
                                     let row = row.clone();
-                                    move |_| on_commit_rename.call(row.clone())
+                                    move |_| on_commit_rename.call((*row).clone())
                                 },
                                 on_cancel_rename: move |_| on_cancel_rename.call(()),
                                 on_start_drag: {
                                     let row = row.clone();
                                     move |evt: MouseEvent| {
                                         let coords = evt.client_coordinates();
-                                        on_start_drag.call((row.clone(), (coords.x, coords.y)))
+                                        on_start_drag.call(((*row).clone(), (coords.x, coords.y)))
                                     }
                                 },
                                 on_drag_move: {
                                     let row = row.clone();
                                     move |evt: MouseEvent| {
                                         let coords = evt.client_coordinates();
-                                        on_start_drag.call((row.clone(), (coords.x, coords.y)))
+                                        on_start_drag.call(((*row).clone(), (coords.x, coords.y)))
                                     }
                                 },
                                 on_drag_hover: {
                                     let row = row.clone();
                                     move |(placement, evt): (DragDropPlacement, MouseEvent)| {
                                         let coords = evt.client_coordinates();
-                                        on_drag_hover.call((row.clone(), (coords.x, coords.y), placement))
+                                        on_drag_hover.call(((*row).clone(), (coords.x, coords.y), placement))
                                     }
                                 },
                                 on_drag_leave: {
                                     let row = row.clone();
-                                    move |_| on_drag_leave.call(row.clone())
+                                    move |_| on_drag_leave.call((*row).clone())
                                 },
                                 on_drop_into_row: move |_| on_drop_into_row.call(()),
                                 on_end_drag: move |_| on_end_drag.call(()),
