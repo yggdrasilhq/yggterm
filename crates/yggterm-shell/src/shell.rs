@@ -12111,6 +12111,35 @@ fn ensure_daemon_running(endpoint: &ServerEndpoint) -> Result<()> {
         );
         return Ok(());
     }
+    // A reachable daemon on the SAME minor line that owns live sessions is a
+    // preserved owner we must NOT try to replace here. Spawning the current
+    // binary binds a DIFFERENT version socket, so THIS endpoint can never
+    // become "current" — every ensure() would re-spawn a duplicate that
+    // immediately exits, a perpetual ~17s CPU-burning loop (the guihost
+    // split-brain churn) while the stale daemon keeps faithfully serving its
+    // own sessions over the version-compatible protocol. Use it as-is; it
+    // self-retires (or hands off) once its sessions drain. The deliberate
+    // upgrade/handoff is driven by the startup reconcile + hot-restart paths,
+    // not by this read/write ensure. [[bug-class-old-daemon-never-retires]]
+    if let Ok(runtime_status) = status(endpoint)
+        && startup_daemon_should_preserve_stale_runtime(
+            &runtime_status,
+            current_version().as_str(),
+        )
+    {
+        note_recent_daemon_start(endpoint);
+        trace_daemon_step(
+            endpoint,
+            "preserved_stale_daemon_in_use_skip_spawn",
+            json!({
+                "stale_version": runtime_status.server_version,
+                "stale_pid": runtime_status.server_pid,
+                "owned_terminal_session_count": runtime_status.owned_terminal_session_count,
+                "owned_terminal_session_keys": runtime_status.owned_terminal_session_keys,
+            }),
+        );
+        return Ok(());
+    }
     #[cfg(unix)]
     if let Some(candidate) = maybe_alias_current_endpoint_to_reachable_versioned_socket(endpoint)? {
         note_recent_daemon_start(endpoint);
@@ -74934,6 +74963,31 @@ mod tests {
         assert!(
             startup_daemon_should_preserve_stale_runtime(&stale_with_sessions, "2.1.52"),
             "the live patch-line daemon should stay available as the runtime owner"
+        );
+    }
+
+    #[test]
+    fn ensure_daemon_skips_spawn_only_for_preserved_stale_owner() {
+        // Regression guard for the guihost split-brain CPU loop: ensure_daemon_running
+        // now uses this predicate to skip the futile respawn for a reachable
+        // same-minor daemon that OWNS live sessions (it serves them over the
+        // version-compatible protocol and self-retires when they drain). A stale
+        // daemon owning NOTHING, or a cross-minor daemon, must NOT be preserved
+        // (normal reconcile/spawn path).
+        let stale_owner = runtime_status_for_test("2.9.24", 2, 90);
+        let stale_empty = runtime_status_for_test("2.9.24", 0, 91);
+        let cross_minor_owner = runtime_status_for_test("2.8.99", 2, 92);
+        assert!(
+            startup_daemon_should_preserve_stale_runtime(&stale_owner, "2.9.25"),
+            "same-minor stale daemon owning sessions must be preserved (skip the respawn loop)"
+        );
+        assert!(
+            !startup_daemon_should_preserve_stale_runtime(&stale_empty, "2.9.25"),
+            "stale daemon owning nothing must NOT be preserved (normal reconcile)"
+        );
+        assert!(
+            !startup_daemon_should_preserve_stale_runtime(&cross_minor_owner, "2.9.25"),
+            "cross-minor daemon is not protocol-compatible; not preserved"
         );
     }
 
