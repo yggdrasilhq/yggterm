@@ -14882,11 +14882,11 @@ fn set_app_control_row_expanded(shell: &mut ShellState, row: &BrowserRow, expand
         shell.update_synthetic_group_collapse_state(&row.full_path, expanded);
     } else {
         shell.browser.toggle_group(&row.full_path);
-        // Level-one local groups (the "local" machine root and top-level local
-        // folders) are force-opened by the default seeding on every rebuild, so
-        // their collapse must persist the same way synthetic groups' does — else
-        // they re-expand on restart (finding-sidebar-collapse-not-persisted).
-        if shell.browser.is_level_one_group(&row.full_path) {
+        // Groups the default seeding force-opens (the "local" machine root — which
+        // IS the tree root on a local-only tree — and top-level local folders) must
+        // persist their collapse the same way synthetic groups' does, else they
+        // re-expand on restart (finding-sidebar-collapse-not-persisted).
+        if shell.browser.is_default_open_group(&row.full_path) {
             shell.update_synthetic_group_collapse_state(&row.full_path, expanded);
         }
     }
