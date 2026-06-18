@@ -4,6 +4,21 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+## 2.9.32
+
+- **Selecting text on a working codex no longer yanks you to the bottom.**
+  Scrolling up a little to select a word on an actively-working codex (or any
+  mouse-reporting TUI) and then clicking/dragging snapped the viewport to the
+  live bottom — repeatedly. Cause: a click/drag in a mouse-reporting TUI arrives
+  as terminal *input* (mouse-report bytes), and the input handler's "reveal the
+  prompt" snap only spared the user when they were scrolled **more than 5 rows**
+  off the bottom; a small scroll-up failed that test, so the click force-followed
+  to the bottom — and because a forced follow clears the scrollback lock, every
+  subsequent action re-yanked. Mouse-report input (and any active selection) now
+  skips the snap entirely; a genuine keystroke at the prompt still reveals it. A
+  deterministic xterm-harness test confirms codex's working frames never move the
+  viewport on their own — the yank was purely yggterm's follow wiring.
+
 ## 2.9.31
 
 - **The local machine tree now remembers being collapsed across restarts.**
