@@ -41,6 +41,12 @@ pub struct SessionBrowserState {
     root: SessionNode,
     filter_query: String,
     expanded_paths: HashSet<String>,
+    // Groups the user has explicitly collapsed (mirror of the shell's persisted
+    // user_collapsed_synthetic_paths SSOT). Subtracted from the default level-one
+    // seeding on every restore_ui_state so an explicit collapse of a level-one
+    // local group (e.g. the "local" machine root) outranks the default-open and
+    // survives restarts — same guarantee synthetic groups already had.
+    collapsed_paths: HashSet<String>,
     rows: Vec<BrowserRow>,
     selected_path: Option<String>,
     metrics: BrowserMetrics,
@@ -60,6 +66,7 @@ impl SessionBrowserState {
             root,
             filter_query: String::new(),
             expanded_paths,
+            collapsed_paths: HashSet::new(),
             rows: Vec::new(),
             selected_path: None,
             metrics: BrowserMetrics::default(),
@@ -158,6 +165,20 @@ impl SessionBrowserState {
         self.selected_path = None;
     }
 
+    /// Mirror of the shell's persisted user-collapse set. Subtracted from the
+    /// default level-one seeding in `restore_ui_state` so an explicit collapse
+    /// of a level-one local group survives rebuilds and restarts.
+    pub fn set_collapsed_paths(&mut self, paths: HashSet<String>) {
+        self.collapsed_paths = paths;
+    }
+
+    /// True when `path` names a level-one group (a direct child group of the
+    /// tree root) — the rows the default seeding force-opens. The shell uses
+    /// this to decide which non-synthetic collapses to persist.
+    pub fn is_level_one_group(&self, path: &str) -> bool {
+        is_level_one_group_path(&self.root, path)
+    }
+
     pub fn restore_ui_state(&mut self, expanded_paths: &[String], selected_path: Option<&str>) {
         self.expanded_paths = default_level_one_expanded_paths(&self.root);
         self.expanded_paths.extend(
@@ -168,6 +189,9 @@ impl SessionBrowserState {
                 })
                 .cloned(),
         );
+        // An explicit user collapse outranks the default-open seeding above.
+        self.expanded_paths
+            .retain(|path| !self.collapsed_paths.contains(path));
         if let Some(path) = selected_path
             && selected_path_should_expand_ancestors(path)
         {
@@ -189,6 +213,9 @@ impl SessionBrowserState {
     ) {
         self.expanded_paths = default_level_one_expanded_paths(&self.root);
         self.expanded_paths.extend(expanded_paths.iter().cloned());
+        // An explicit user collapse outranks the default-open seeding above.
+        self.expanded_paths
+            .retain(|path| !self.collapsed_paths.contains(path));
         self.rebuild_rows();
         if let Some(path) = selected_path {
             self.select_path(path.to_string());
@@ -948,6 +975,52 @@ mod tests {
                 .iter()
                 .any(|path| path == "__remote_machine__/jojo")
         );
+    }
+
+    #[test]
+    fn restore_ui_state_honors_collapsed_level_one_local_group() {
+        // finding-sidebar-collapse-not-persisted: the "local" machine root is a
+        // level-one group, so the default seeding force-opens it on every restore
+        // and a user collapse never stuck (it re-expanded on restart). An explicit
+        // collapse in the override set must now outrank the default-open.
+        let make_root = || SessionNode {
+            kind: SessionNodeKind::Group,
+            name: "root".to_string(),
+            title: None,
+            document_kind: None,
+            group_kind: None,
+            path: PathBuf::from("/"),
+            children: vec![SessionNode {
+                kind: SessionNodeKind::Group,
+                name: "local".to_string(),
+                title: Some("local".to_string()),
+                document_kind: None,
+                group_kind: Some(WorkspaceGroupKind::Folder),
+                path: PathBuf::from("local"),
+                children: Vec::new(),
+                session_id: None,
+                cwd: None,
+                ..Default::default()
+            }],
+            session_id: None,
+            cwd: None,
+            ..Default::default()
+        };
+        // Baseline: with no collapse, the default seeding expands the local root.
+        let mut browser = SessionBrowserState::new(make_root());
+        browser.restore_ui_state(&[], None);
+        assert!(browser.expanded_path_set().contains("local"));
+        assert!(browser.is_level_one_group("local"));
+        // With the local root in the collapse override, restore keeps it collapsed
+        // — even though it is a level-one group the default would otherwise open.
+        let mut browser = SessionBrowserState::new(make_root());
+        browser.set_collapsed_paths(std::collections::HashSet::from(["local".to_string()]));
+        browser.restore_ui_state(&[], None);
+        assert!(!browser.expanded_path_set().contains("local"));
+        // Expanding again (cleared from the override) restores the default-open.
+        browser.set_collapsed_paths(std::collections::HashSet::new());
+        browser.restore_ui_state(&[], None);
+        assert!(browser.expanded_path_set().contains("local"));
     }
 
     #[test]
