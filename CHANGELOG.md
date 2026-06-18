@@ -4,6 +4,17 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+## 2.9.29
+
+- **Sidebar render allocates far less per frame (jojo latency campaign).** The
+  sidebar render loop deep-cloned the full `BrowserRow` (≈7 string allocations
+  each) ~13 times per row — once per event-handler closure plus the row prop —
+  on *every* render, across ~223 rows (~2,900 full-row clones / ~17k string
+  allocations per render). Rows are now shared via `Rc`, so those per-render
+  clones are refcount bumps; a real `BrowserRow` clone happens only when an event
+  actually fires (and once for the row prop). No behavior change — same rows,
+  icons, selection, drag/drop, and rename.
+
 ## 2.9.28
 
 - **Closing a live session is now instant, silent, and doesn't bounce the view.**
