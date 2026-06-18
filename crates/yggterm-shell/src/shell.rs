@@ -59391,17 +59391,20 @@ fn terminal_eval_script_with_canvas_renderer(
                         // Window/global state survives scope boundaries across the mount script.
                         const osc52NowMs = Date.now();
                         // 3) USER-GESTURE GATE (the load-bearing discriminator): a GENUINE
-                        //    select-copy emits its OSC 52 right after a user mouse-release ON
-                        //    this terminal. A re-emit on switch-IN — CC re-sending its active
-                        //    selection on focus, OR the daemon catch-up replaying a buffered
-                        //    OSC 52 — has NO such gesture (the user switched via the sidebar,
-                        //    not the terminal). Without a recent pointer-up on THIS host, treat
-                        //    the OSC 52 as a re-emit and suppress it. This fixes the shell->CC
-                        //    clobber on switch that the bulk/replay arms missed (the re-emit
-                        //    arrives as a small live chunk, not a bulk replay).
+                        //    copy emits its OSC 52 right after a user gesture ON this terminal —
+                        //    a mouse-release (select-copy) OR a keystroke (CC's `c`-to-copy on
+                        //    the login screen, tmux yank, etc.). A re-emit on switch-IN — CC
+                        //    re-sending its active selection on focus, OR the daemon catch-up
+                        //    replaying a buffered OSC 52 — has NO such gesture (the user switched
+                        //    via the sidebar, not the terminal). Without a recent pointer-up OR
+                        //    keydown on THIS host, treat the OSC 52 as a re-emit and suppress it.
+                        //    This fixes the shell->CC clobber on switch that the bulk/replay arms
+                        //    missed (the re-emit arrives as a small live chunk, not a bulk replay)
+                        //    WITHOUT dropping keyboard-initiated copies (finding-osc52: the
+                        //    pointer-only stamp silently ate the FIRST `c`-copy on every login).
                         const osc52Host = window.__yggtermXtermHosts && window.__yggtermXtermHosts[hostId]
                             ? window.__yggtermXtermHosts[hostId] : null;
-                        const osc52GestureAtMs = osc52Host ? Number(osc52Host.lastUserPointerUpAtMs || 0) : 0;
+                        const osc52GestureAtMs = osc52Host ? Number(osc52Host.lastUserGestureAtMs || 0) : 0;
                         if (osc52NowMs - osc52GestureAtMs > 3000) {{
                             return true;
                         }}
@@ -59436,17 +59439,22 @@ fn terminal_eval_script_with_canvas_renderer(
                 return null;
             }}
         }})();
-        // Stamp the last user mouse-release on this terminal host (capture phase, so it
-        // fires even while the CLI holds mouse-reporting mode and stops propagation). The
-        // OSC 52 handler's gesture gate above uses it to tell a genuine select-copy from a
-        // re-emit on switch-in. See finding-osc52-copy-chime-replay-refire.
+        // Stamp the last user gesture on this terminal host (capture phase, so it fires even
+        // while the CLI holds mouse-reporting / keyboard mode and stops propagation). The OSC
+        // 52 handler's gesture gate above uses it to tell a genuine copy from a re-emit on
+        // switch-in. BOTH a mouse-release (select-copy) AND a keydown (CC's `c`-to-copy on the
+        // login screen, tmux yank) are genuine copy gestures — stamping pointer events ALONE
+        // silently dropped the first keyboard copy every time (finding-osc52-copy-chime-replay-
+        // refire). A switch-in re-emit still has neither gesture (the user clicked the sidebar,
+        // not this terminal), so it stays suppressed.
         try {{
             const stampOsc52Gesture = () => {{
                 const gestureEntry = window.__yggtermXtermHosts && window.__yggtermXtermHosts[hostId];
-                if (gestureEntry) {{ gestureEntry.lastUserPointerUpAtMs = Date.now(); }}
+                if (gestureEntry) {{ gestureEntry.lastUserGestureAtMs = Date.now(); }}
             }};
             host.addEventListener('pointerup', stampOsc52Gesture, true);
             host.addEventListener('mouseup', stampOsc52Gesture, true);
+            host.addEventListener('keydown', stampOsc52Gesture, true);
         }} catch (_osc52GestureError) {{}}
         let canvasAddonAvailable = Boolean(window.CanvasAddon && window.CanvasAddon.CanvasAddon);
         let rendererDecisionError = '';
@@ -77753,11 +77761,14 @@ mod tests {
         // The handler honours the suppression window and the same-text dedupe.
         assert!(script.contains("if (osc52NowMs < (window.__yggtermOsc52SuppressUntilMs || 0)) {"));
         assert!(script.contains("text === window.__yggtermOsc52LastCopyText"));
-        // The user-gesture gate: an OSC 52 with no recent mouse-release on this host is a
-        // re-emit on switch-in (CC re-sending its selection / daemon catch-up), not a copy.
+        // The user-gesture gate: an OSC 52 with no recent gesture on this host is a re-emit
+        // on switch-in (CC re-sending its selection / daemon catch-up), not a copy. Both a
+        // mouse-release AND a keydown count as a copy gesture — a keyboard `c`-copy (CC login)
+        // has no pointer event and must NOT be suppressed (finding-osc52-copy-chime-replay-refire).
         assert!(script.contains("if (osc52NowMs - osc52GestureAtMs > 3000) {"));
-        assert!(script.contains("gestureEntry.lastUserPointerUpAtMs = Date.now();"));
+        assert!(script.contains("gestureEntry.lastUserGestureAtMs = Date.now();"));
         assert!(script.contains("host.addEventListener('mouseup', stampOsc52Gesture, true);"));
+        assert!(script.contains("host.addEventListener('keydown', stampOsc52Gesture, true);"));
         // The mount script's two buffer-restore writes (construct-time localStorage
         // restore + reapply-after-reset) each arm the suppression window first; the
         // live-data write (term.write(payload, ...)) must NOT, or copy breaks entirely.
