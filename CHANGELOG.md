@@ -4,6 +4,20 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+## 2.9.31
+
+- **The local machine tree now remembers being collapsed across restarts.**
+  Every other sidebar group (remote machines, Live Sessions) kept its
+  collapsed state, but the local machine root sprang back open on every
+  restart. Cause: the local root is a *level-one* group, and the sidebar's
+  restore always re-seeds level-one groups as expanded by default — with no
+  subtraction for an explicit collapse — so it overrode the saved state
+  (synthetic groups escaped this only because they aren't level-one). The
+  restore now subtracts the persisted user-collapse set from that default
+  seeding, and collapsing the local root (or a top-level local folder) is
+  recorded the same way a machine/Live-Sessions collapse already was. Collapse
+  it once and it stays collapsed.
+
 ## 2.9.30
 
 - **Keyboard-initiated copies (e.g. Claude Code's `c`-to-copy on the login
