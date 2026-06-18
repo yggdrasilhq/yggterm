@@ -4,6 +4,19 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+## 2.9.28
+
+- **Closing a live session is now instant, silent, and doesn't bounce the view.**
+  Closing the *active* session used to apply the daemon's post-close snapshot with
+  `preserve_focus=false`, so a teardown race in that snapshot could re-assert the
+  just-closed session as active — the view visibly switched **back** to the session
+  being closed. The optimistic local close + redirect is now authoritative
+  (`preserve_focus` follows the close), so the view moves once and stays. Also
+  removed the success-path toasts for a live close — the "Closing Terminals"
+  progress toast and the "Terminal Closed" success toast — since the row already
+  vanishes optimistically; only a *failure* now raises a notification. Stored-item
+  deletes keep their confirmation toast.
+
 ## 2.9.27
 
 - **Sidebar render cost — the tree icon no longer re-diffs the whole row (jojo
