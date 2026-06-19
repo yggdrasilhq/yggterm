@@ -4,6 +4,21 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+## 2.9.37
+
+- **Typing latency: the whole shell no longer re-renders on every keystroke.**
+  Holding a key was pinned (render-cause trace) to ~23 full re-renders/sec of the
+  giant root component, pegging the GUI main thread at ~100% — the felt typing
+  lag. Two per-keystroke triggers, both fixed: (1) the window key-event handler
+  bumped a render epoch (`window_epoch`) on *every* key, even plain characters
+  that xterm handles directly — now gated to keys that drive an actual app action
+  (Alt overlay / Escape-cancel / Delete-from-tree); (2) marking input "hot" (to
+  suppress background snapshots mid-type) mutated `ShellState` via `safe_shell_mut`
+  every keystroke — the hot-until timestamp now lives in a non-reactive atomic, and
+  the snapshot scheduler only takes the re-render path when reactive state actually
+  changes (busy hint on submit, or arming a not-yet-scheduled snapshot). Plain
+  character input mid-burst now touches zero reactive state.
+
 ## 2.9.36
 
 - **Image paste (and other remote commands) no longer blocked by a version-string
