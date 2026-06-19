@@ -8185,6 +8185,18 @@ impl ShellState {
             }
         });
     }
+    /// Replace the browser tree (a full rebuild) while re-seeding the collapse
+    /// mirror from the shell SSOT. `SessionBrowserState::new` starts with an
+    /// empty `collapsed_paths`, so without this every rebuild — including the
+    /// ~8-15s daemon background refresh (`restore_browser_tree_preserving_sidebar_view`)
+    /// — would let the default level-one seeding re-open a group the user
+    /// collapsed, which is why a collapsed local machine root kept re-expanding
+    /// even though the collapse was persisted (finding-sidebar-collapse-not-persisted).
+    fn replace_browser_tree(&mut self, tree: SessionNode) {
+        self.browser = SessionBrowserState::new(tree);
+        self.browser
+            .set_collapsed_paths(self.user_collapsed_synthetic_paths.clone());
+    }
     fn sync_browser_settings(&mut self) {
         self.settings.show_tree = self.sidebar_open;
         self.settings.tree_width = self.sidebar_width;
@@ -16404,7 +16416,7 @@ fn commit_copy_edit(mut state: Signal<ShellState>) {
                 Ok(Ok(maybe_tree)) => {
                     if let Some(browser_tree) = maybe_tree {
                         let expanded_paths = shell.browser.expanded_paths();
-                        shell.browser = SessionBrowserState::new(browser_tree);
+                        shell.replace_browser_tree(browser_tree);
                         shell
                             .browser
                             .restore_ui_state(&expanded_paths, Some(&dialog.session_path));
@@ -16737,7 +16749,7 @@ fn restore_browser_tree(
         .filter(|path| path.starts_with("__"))
         .cloned()
         .collect::<Vec<_>>();
-    shell.browser = SessionBrowserState::new(browser_tree);
+    shell.replace_browser_tree(browser_tree);
     shell
         .browser
         .restore_ui_state(&expanded_paths, selected_path.as_deref().or(selected_hint));
@@ -16761,7 +16773,7 @@ fn restore_browser_tree_preserving_sidebar_view(
         .filter(|path| path.starts_with("__"))
         .cloned()
         .collect::<Vec<_>>();
-    shell.browser = SessionBrowserState::new(browser_tree);
+    shell.replace_browser_tree(browser_tree);
     shell.browser.restore_ui_state_preserving_expanded_paths(
         &expanded_paths,
         selected_path.as_deref().or(selected_hint),
@@ -22512,7 +22524,7 @@ fn queue_session_note_creation(mut state: Signal<ShellState>, row: BrowserRow) {
         state.with_mut(|shell| match outcome {
             Ok(Ok((document, browser_tree))) => {
                 let expanded_paths = shell.browser.expanded_paths();
-                shell.browser = SessionBrowserState::new(browser_tree);
+                shell.replace_browser_tree(browser_tree);
                 shell
                     .browser
                     .restore_ui_state(&expanded_paths, Some(&document.virtual_path));
@@ -22586,7 +22598,7 @@ fn queue_new_document(mut state: Signal<ShellState>) {
         state.with_mut(|shell| match outcome {
             Ok(Ok((document, browser_tree))) => {
                 let expanded_paths = shell.browser.expanded_paths();
-                shell.browser = SessionBrowserState::new(browser_tree);
+                shell.replace_browser_tree(browser_tree);
                 shell
                     .browser
                     .restore_ui_state(&expanded_paths, Some(&document.virtual_path));
@@ -22677,7 +22689,7 @@ fn queue_new_workspace_document_for_row(
         state.with_mut(|shell| match outcome {
             Ok(Ok((document, browser_tree))) => {
                 let expanded_paths = shell.browser.expanded_paths();
-                shell.browser = SessionBrowserState::new(browser_tree);
+                shell.replace_browser_tree(browser_tree);
                 shell
                     .browser
                     .restore_ui_state(&expanded_paths, Some(&document.virtual_path));
@@ -22745,7 +22757,7 @@ fn queue_new_group_for_row(mut state: Signal<ShellState>, row: BrowserRow) {
         state.with_mut(|shell| match outcome {
             Ok(Ok((selected_path, browser_tree))) => {
                 let expanded_paths = shell.browser.expanded_paths();
-                shell.browser = SessionBrowserState::new(browser_tree);
+                shell.replace_browser_tree(browser_tree);
                 shell
                     .browser
                     .restore_ui_state(&expanded_paths, Some(&selected_path));
@@ -22850,7 +22862,7 @@ fn queue_new_separator_for_row(mut state: Signal<ShellState>, row: BrowserRow) {
         state.with_mut(|shell| match outcome {
             Ok(Ok((selected_path, browser_tree))) => {
                 let expanded_paths = shell.browser.expanded_paths();
-                shell.browser = SessionBrowserState::new(browser_tree);
+                shell.replace_browser_tree(browser_tree);
                 shell
                     .browser
                     .restore_ui_state(&expanded_paths, Some(&selected_path));
@@ -23280,7 +23292,7 @@ fn queue_move_selected_items_to_group(
                     }),
                 );
                 let expanded_paths = shell.browser.expanded_paths();
-                shell.browser = SessionBrowserState::new(browser_tree);
+                shell.replace_browser_tree(browser_tree);
                 shell.browser.restore_ui_state(
                     &expanded_paths,
                     selected_final_paths.first().map(String::as_str),
@@ -23862,7 +23874,7 @@ fn queue_delete_selected_items(mut state: Signal<ShellState>, hard_delete: bool)
             Ok(Ok((deleted, maybe_browser_tree, maybe_daemon_result, redirect_error))) => {
                 if let Some(browser_tree) = maybe_browser_tree {
                     let expanded_paths = shell.browser.expanded_paths();
-                    shell.browser = SessionBrowserState::new(browser_tree);
+                    shell.replace_browser_tree(browser_tree);
                     shell.browser.restore_ui_state(&expanded_paths, None);
                     shell.selected_tree_paths.clear();
                     if let Some(path) = shell.browser.selected_path().map(ToOwned::to_owned) {
@@ -23979,7 +23991,7 @@ fn queue_document_save(
         state.with_mut(|shell| match outcome {
             Ok(Ok((document, browser_tree))) => {
                 let expanded_paths = shell.browser.expanded_paths();
-                shell.browser = SessionBrowserState::new(browser_tree);
+                shell.replace_browser_tree(browser_tree);
                 shell
                     .browser
                     .restore_ui_state(&expanded_paths, Some(&document.virtual_path));
@@ -100244,6 +100256,61 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
                 .settings
                 .collapsed_synthetic_paths
                 .contains(&"__remote_machine__/practice".to_string())
+        );
+    }
+
+    #[test]
+    fn collapsed_local_root_survives_background_tree_rebuild() {
+        // Regression: the ~8-15s daemon background refresh rebuilds the browser
+        // via `restore_browser_tree_preserving_sidebar_view`, which constructs a
+        // fresh `SessionBrowserState` (empty collapse mirror). Before the fix the
+        // default level-one seeding re-opened the user-collapsed "local" machine
+        // root on every refresh, so the tree never stayed collapsed even though
+        // the collapse was persisted (finding-sidebar-collapse-not-persisted).
+        let local_root = SessionNode {
+            kind: SessionNodeKind::Group,
+            name: "local".to_string(),
+            path: PathBuf::from("local"),
+            children: vec![SessionNode {
+                kind: SessionNodeKind::CodexSession,
+                name: "session".to_string(),
+                path: PathBuf::from("/home/user/.codex/sessions/x.jsonl"),
+                session_id: Some("x".to_string()),
+                cwd: Some("/home/user".to_string()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let root = SessionNode {
+            kind: SessionNodeKind::Group,
+            name: "root".to_string(),
+            path: PathBuf::from("/"),
+            children: vec![local_root],
+            ..Default::default()
+        };
+        let mut bootstrap = test_shell_bootstrap_with_browser_tree(root.clone());
+        bootstrap.settings.collapsed_synthetic_paths = vec!["local".to_string()];
+        let mut shell = ShellState::new(bootstrap);
+        // Construction honors the persisted collapse.
+        assert!(
+            shell.user_collapsed_synthetic_paths.contains("local"),
+            "collapse SSOT seeded from settings"
+        );
+        assert!(
+            !shell.browser.expanded_path_set().contains("local"),
+            "local root starts collapsed after construction"
+        );
+        // A background tree rebuild (the daemon refresh) must NOT re-expand it.
+        restore_browser_tree_preserving_sidebar_view(&mut shell, root.clone(), None);
+        assert!(
+            !shell.browser.expanded_path_set().contains("local"),
+            "local root stays collapsed across a background rebuild"
+        );
+        // Re-running the rebuild repeatedly (the periodic refresh) keeps it collapsed.
+        restore_browser_tree_preserving_sidebar_view(&mut shell, root, None);
+        assert!(
+            !shell.browser.expanded_path_set().contains("local"),
+            "local root stays collapsed across repeated background rebuilds"
         );
     }
 
