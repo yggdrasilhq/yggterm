@@ -4,6 +4,16 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+## 2.9.35
+
+- **Latency probe: terminal-forward rate instrumentation.** Diagnostic only. The
+  GUI main thread runs ~30% CPU while `app()` renders only ~0.4/s, so the typing
+  latency is not the Dioxus render path. Added a `terminal_forward_rate` trace
+  event (mirrors the existing `app_render_rate` probe) that records forwards/sec
+  and bytes/sec at the per-chunk `term.write` eval dispatch, so the forward
+  path's share of the main-thread cost is measurable from `event-trace.jsonl`
+  without a debugger. No behavior change.
+
 ## 2.9.34
 
 - **Collapsed local machine tree stays collapsed (real fix).** Even with 2.9.31
