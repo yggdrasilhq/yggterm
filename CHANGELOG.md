@@ -4,6 +4,22 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+## 2.9.38
+
+- **Claude Code viewport blink / broken-bottom fixed (the rampant one on long
+  turns).** Claude Code wraps every repaint in a synchronized-output frame
+  (`\e[?2026h…\e[?2026l`); the vendored xterm.js doesn't implement mode 2026, so
+  the write bridge enforces atomicity by never handing xterm a buffer that ends
+  mid-frame. But on a long-running turn the animation frame budget relaxes to
+  250–500ms, and with `frame_ms` past the 250ms sync-frame hold cap the pending
+  buffer aged out and the bridge flushed a **torn partial frame** — the early rows
+  cleared, the composer/bottom rows still pending — which xterm painted as a
+  broken bottom until the next frame "blinked" it back. The bridge now flushes
+  only the **complete-frame prefix** and retains the open tail, so complete frames
+  keep flowing on the budget cadence while a still-open frame waits for its
+  terminator. Verified by a falsified bridge unit test (torn frame without the
+  fix, clean with it).
+
 ## 2.9.37
 
 - **Typing latency: the whole shell no longer re-renders on every keystroke.**

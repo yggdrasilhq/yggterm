@@ -1,6 +1,7 @@
 use crate::terminal_write_policy::{
     terminal_output_contains_codex_welcome_surface,
     terminal_output_ends_inside_synchronized_frame,
+    terminal_synchronized_output_complete_prefix_len,
 };
 
 const TERMINAL_FRAME_BRIDGE_PENDING_MAX_BYTES: usize = 256 * 1024;
@@ -99,22 +100,54 @@ impl TerminalWriteBridge {
         if self.pending.is_empty() {
             return None;
         }
-        // Synchronized-output atomicity: if the buffer ends mid-frame (an open
-        // \e[?2026h with no matching \e[?2026l), hold the flush so xterm never
-        // paints a torn frame — the vendored xterm.js doesn't implement mode
-        // 2026, so the bridge enforces it. Bounded by TERMINAL_SYNC_FRAME_MAX_HOLD_MS
-        // so a never-closing frame (codex died mid-repaint) can't stall forever.
-        if terminal_output_ends_inside_synchronized_frame(&self.pending)
-            && now_ms.saturating_sub(self.pending_started_ms) < TERMINAL_SYNC_FRAME_MAX_HOLD_MS
-        {
+        let frame_due = self.last_frame_flush_ms == 0
+            || now_ms.saturating_sub(self.last_frame_flush_ms) >= self.frame_ms;
+        // Synchronized-output atomicity: the vendored xterm.js doesn't implement
+        // mode 2026, so the bridge MUST never hand xterm a buffer that ends inside
+        // an open \e[?2026h…(no \e[?2026l) frame, or xterm paints a torn frame
+        // (the early rows clear-to-default, the composer + text still pending) =
+        // the "broken bottom / blink". codex wraps every repaint in BSU…ESU.
+        if terminal_output_ends_inside_synchronized_frame(&self.pending) {
+            // When a flush is due but the buffer ends mid-frame, flush ONLY the
+            // complete-frame prefix and RETAIN the open tail — never paint a
+            // partial. This is the fix for the rampant CC blink: once the frame
+            // budget relaxes past ~250ms (sustained/long animation: frame_ms
+            // becomes 250–500ms, see terminal_active_animation_effective_write_frame_ms),
+            // the old code let pending age past TERMINAL_SYNC_FRAME_MAX_HOLD_MS and
+            // then flushed the torn partial. Now complete frames keep flowing on
+            // cadence while the open frame waits for its ESU.
+            if frame_due {
+                let prefix_len = terminal_synchronized_output_complete_prefix_len(&self.pending);
+                if prefix_len > 0 {
+                    return Some(self.flush_prefix(prefix_len, now_ms));
+                }
+            }
+            // The whole buffer is a single still-open frame (no complete prefix).
+            // Hold for its ESU, bounded by TERMINAL_SYNC_FRAME_MAX_HOLD_MS so a
+            // never-closing frame (codex/CC died mid-repaint) can't stall forever
+            // — only then do we flush the partial as a last resort.
+            if frame_due
+                && now_ms.saturating_sub(self.pending_started_ms) >= TERMINAL_SYNC_FRAME_MAX_HOLD_MS
+            {
+                return self.flush_all(now_ms);
+            }
             return None;
         }
-        if self.last_frame_flush_ms == 0
-            || now_ms.saturating_sub(self.last_frame_flush_ms) >= self.frame_ms
-        {
+        if frame_due {
             return self.flush_all(now_ms);
         }
         None
+    }
+
+    /// Flush the first `prefix_len` bytes (a run of complete synchronized frames)
+    /// and retain the remaining open-frame tail. Resets the hold clock for the
+    /// retained tail so its own ESU wait is bounded independently.
+    fn flush_prefix(&mut self, prefix_len: usize, now_ms: u64) -> String {
+        let tail = self.pending.split_off(prefix_len);
+        let prefix = std::mem::replace(&mut self.pending, tail);
+        self.last_frame_flush_ms = now_ms;
+        self.pending_started_ms = now_ms;
+        prefix
     }
 
     fn flush_all(&mut self, now_ms: u64) -> Option<String> {
