@@ -11728,6 +11728,23 @@ fn is_remote_protocol_probe_recoverable(output: &str) -> bool {
     false
 }
 
+/// A remote yggterm binary is protocol-compatible when its `build_id` — an FNV
+/// hash of the shipped bootstrap binary, stable across release-version bumps
+/// that don't change the wire protocol — matches ours. The release VERSION
+/// STRING (`SERVER_PROTOCOL_VERSION` = `CARGO_PKG_VERSION`) is deliberately NOT
+/// part of this check. Gating remote commands (clipboard image staging, resume,
+/// scans) on an exact version match is self-defeating: after any GUI-only deploy
+/// the checking process runs a newer version string while the remote runs the
+/// IDENTICAL protocol (same `build_id`), so image paste / resume failed with a
+/// "protocol mismatch" even though nothing was incompatible. Only a differing
+/// `build_id` signals an actual backward-incompatible change.
+fn remote_descriptor_is_protocol_compatible(
+    descriptor: &RemoteProtocolDescriptor,
+    local_build_id: u64,
+) -> bool {
+    descriptor.build_id == local_build_id
+}
+
 fn check_remote_protocol_version(
     ssh_target: &str,
     exec_prefix: Option<&str>,
@@ -11736,7 +11753,7 @@ fn check_remote_protocol_version(
     let descriptor = remote_protocol_descriptor_for_binary(ssh_target, exec_prefix, binary_expr)?;
     let normalized = descriptor.version.trim();
     let local_build_id = current_local_build_id();
-    if normalized == daemon::SERVER_PROTOCOL_VERSION && descriptor.build_id == local_build_id {
+    if remote_descriptor_is_protocol_compatible(&descriptor, local_build_id) {
         return Ok(());
     }
     if is_remote_protocol_probe_recoverable(normalized) {
@@ -12072,8 +12089,7 @@ fn resolve_remote_yggterm_binary(
 
     match remote_protocol_descriptor_for_binary(ssh_target, exec_prefix, installed_binary) {
         Ok(descriptor)
-            if descriptor.version.trim() == daemon::SERVER_PROTOCOL_VERSION
-                && descriptor.build_id == local_build_id =>
+            if remote_descriptor_is_protocol_compatible(&descriptor, local_build_id) =>
         {
             if let Ok(mut cache) = remote_command_cache().lock() {
                 cache.insert(
@@ -12095,7 +12111,7 @@ fn resolve_remote_yggterm_binary(
             return Ok((installed_binary.to_string(), RemoteDeployState::Ready));
         }
         Ok(descriptor) => {
-            if descriptor.version.trim() != daemon::SERVER_PROTOCOL_VERSION
+            if !remote_descriptor_is_protocol_compatible(&descriptor, local_build_id)
                 && !is_remote_protocol_probe_recoverable(&descriptor.version)
             {
                 anyhow::bail!(
@@ -12114,8 +12130,7 @@ fn resolve_remote_yggterm_binary(
 
     match remote_protocol_descriptor_for_binary(ssh_target, exec_prefix, "yggterm") {
         Ok(descriptor)
-            if descriptor.version.trim() == daemon::SERVER_PROTOCOL_VERSION
-                && descriptor.build_id == local_build_id =>
+            if remote_descriptor_is_protocol_compatible(&descriptor, local_build_id) =>
         {
             if let Ok(mut cache) = remote_command_cache().lock() {
                 cache.insert(
@@ -12137,7 +12152,7 @@ fn resolve_remote_yggterm_binary(
             return Ok(("yggterm".to_string(), RemoteDeployState::Ready));
         }
         Ok(descriptor) => {
-            if descriptor.version.trim() != daemon::SERVER_PROTOCOL_VERSION
+            if !remote_descriptor_is_protocol_compatible(&descriptor, local_build_id)
                 && !is_remote_protocol_probe_recoverable(&descriptor.version)
             {
                 anyhow::bail!(
@@ -12157,9 +12172,7 @@ fn resolve_remote_yggterm_binary(
     let installed = bootstrap_remote_yggterm(ssh_target, exec_prefix)?;
     let installed_descriptor =
         remote_protocol_descriptor_for_binary(ssh_target, exec_prefix, &installed)?;
-    if installed_descriptor.version.trim() != daemon::SERVER_PROTOCOL_VERSION
-        || installed_descriptor.build_id != local_build_id
-    {
+    if !remote_descriptor_is_protocol_compatible(&installed_descriptor, local_build_id) {
         anyhow::bail!(
             "remote yggterm protocol mismatch for {}: expected {}@{}, got {}@{}",
             ssh_target,
@@ -20889,6 +20902,45 @@ fn short_session_id(session_id: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::app_control_open_path_ready;
+
+    // Remote protocol compatibility keys off `build_id` (a hash of the shipped
+    // binary, stable across release-version bumps), NOT the release version
+    // string. A GUI-only deploy makes the checking process a newer version while
+    // the remote runs the identical protocol — image paste / resume must keep
+    // working. Only a differing build_id is a real (breaking) mismatch.
+    #[test]
+    fn remote_descriptor_compatible_by_build_id_ignores_version_string() {
+        use super::RemoteProtocolDescriptor;
+        let local_build_id = 11570104518281042630_u64;
+        // Same protocol (build_id), different release version string → COMPATIBLE.
+        let newer_gui_vs_older_remote = RemoteProtocolDescriptor {
+            version: "2.9.26".to_string(),
+            build_id: local_build_id,
+        };
+        assert!(super::remote_descriptor_is_protocol_compatible(
+            &newer_gui_vs_older_remote,
+            local_build_id
+        ));
+        // Identical version + build_id → COMPATIBLE.
+        let exact = RemoteProtocolDescriptor {
+            version: "2.9.35".to_string(),
+            build_id: local_build_id,
+        };
+        assert!(super::remote_descriptor_is_protocol_compatible(
+            &exact,
+            local_build_id
+        ));
+        // Differing build_id (an actual protocol change) → INCOMPATIBLE, even if
+        // the version string happens to match.
+        let breaking = RemoteProtocolDescriptor {
+            version: "2.9.35".to_string(),
+            build_id: local_build_id ^ 0x1,
+        };
+        assert!(!super::remote_descriptor_is_protocol_compatible(
+            &breaking,
+            local_build_id
+        ));
+    }
 
     // Remote agent sessions run their CLI on the remote machine, so the local
     // managed codex/claude `--version` probe is pure waste on the attach path.
