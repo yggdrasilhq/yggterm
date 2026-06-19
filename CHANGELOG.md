@@ -4,6 +4,19 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+## 2.9.34
+
+- **Collapsed local machine tree stays collapsed (real fix).** Even with 2.9.31
+  and 2.9.33 the local tree kept re-expanding on every restart — the collapse
+  *was* persisted, but the ~8–15s daemon background refresh
+  (`restore_browser_tree_preserving_sidebar_view`) rebuilds the sidebar from
+  scratch via `SessionBrowserState::new`, which starts with an empty collapse
+  mirror. The default level-one seeding then re-opened the user-collapsed root,
+  and the collapse-subtraction was a no-op because the mirror was empty. All 11
+  browser-rebuild sites now route through one `replace_browser_tree` helper that
+  re-seeds the collapse mirror from the shell's source of truth, so a collapsed
+  group survives every rebuild — not just the initial construction.
+
 ## 2.9.33
 
 - **Sidebar collapse fix (2.9.31), corrected after live verification.** The
