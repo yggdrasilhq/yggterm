@@ -600,6 +600,23 @@ const LIVE_SESSION_SNAPSHOT_BUSY_POLL_MS: u64 = 10_000;
 const LIVE_SESSION_SNAPSHOT_BACKGROUND_BUSY_POLL_MS: u64 = 15_000;
 const LIVE_SESSION_SNAPSHOT_IDLE_POLL_MS: u64 = 60_000;
 const TERMINAL_INPUT_HOT_SUPPRESS_MS: u64 = 2_000;
+// "Input hot until" is a per-keystroke timestamp that suppresses background
+// snapshot applies so they can't interrupt the user mid-type. It lives in a
+// process-global atomic (there is one active terminal input at a time), NOT in
+// the reactive `ShellState`: setting it must not re-render the root. Holding a
+// key was pinned (render-cause trace, 2026-06-19) to a whole-shell re-render PER
+// character because the old `terminal_input_hot_until_ms()` field was mutated
+// through `safe_shell_mut` every keystroke. See `mark_terminal_input_hot`.
+static TERMINAL_INPUT_HOT_UNTIL_MS: AtomicU64 = AtomicU64::new(0);
+fn mark_terminal_input_hot(now_ms: u64) {
+    TERMINAL_INPUT_HOT_UNTIL_MS.fetch_max(
+        now_ms.saturating_add(TERMINAL_INPUT_HOT_SUPPRESS_MS),
+        Ordering::Relaxed,
+    );
+}
+fn terminal_input_hot_until_ms() -> u64 {
+    TERMINAL_INPUT_HOT_UNTIL_MS.load(Ordering::Relaxed)
+}
 // Inline tree rename focuses asynchronously after context-menu and sidebar
 // interactions. Treat Enter as the commit action so transient WebView focus
 // churn during controlled input updates cannot commit a half-typed label.
@@ -1020,7 +1037,6 @@ struct ShellState {
     next_live_session_snapshot_after_ms: u64,
     next_live_session_snapshot_scheduled_at_ms: u64,
     next_live_session_snapshot_interval_ms: u64,
-    terminal_input_hot_until_ms: u64,
     background_live_session_snapshot_apply_count: u64,
     background_live_session_snapshot_skipped_input_hot_count: u64,
     background_live_session_snapshot_skipped_noop_count: u64,
@@ -2473,7 +2489,6 @@ impl ShellState {
             next_live_session_snapshot_after_ms: 0,
             next_live_session_snapshot_scheduled_at_ms: 0,
             next_live_session_snapshot_interval_ms: LIVE_SESSION_SNAPSHOT_IDLE_POLL_MS,
-            terminal_input_hot_until_ms: 0,
             background_live_session_snapshot_apply_count: 0,
             background_live_session_snapshot_skipped_input_hot_count: 0,
             background_live_session_snapshot_skipped_noop_count: 0,
@@ -12830,7 +12845,7 @@ fn background_refresh_scheduler_wait_ms(shell: &ShellState, now_ms: u64, fallbac
         if snapshot_due_ms > 0 {
             wait_ms = wait_ms.min(snapshot_due_ms);
         }
-        let input_hot_ms = shell.terminal_input_hot_until_ms.saturating_sub(now_ms);
+        let input_hot_ms = terminal_input_hot_until_ms().saturating_sub(now_ms);
         if input_hot_ms > 0 {
             wait_ms =
                 wait_ms.min(input_hot_ms.saturating_add(LIVE_SESSION_SNAPSHOT_TRIGGER_DEBOUNCE_MS));
@@ -13073,9 +13088,7 @@ fn schedule_live_session_snapshot_after_terminal_input(
     show_busy_hint: bool,
 ) {
     let now_ms = current_millis();
-    shell.terminal_input_hot_until_ms = shell
-        .terminal_input_hot_until_ms
-        .max(now_ms.saturating_add(TERMINAL_INPUT_HOT_SUPPRESS_MS));
+    mark_terminal_input_hot(now_ms);
     if show_busy_hint {
         shell.terminal_busy_hint_until_ms.insert(
             session_path.to_string(),
@@ -13086,6 +13099,61 @@ fn schedule_live_session_snapshot_after_terminal_input(
         shell,
         LIVE_SESSION_SNAPSHOT_TRIGGER_DEBOUNCE_MS.max(TERMINAL_INPUT_HOT_SUPPRESS_MS),
     );
+}
+
+/// Read-only mirror of the reactive work `schedule_live_session_snapshot_after_terminal_input`
+/// would do: show the optimistic busy hint, or arm a post-input snapshot that
+/// isn't scheduled yet. Lets the per-keystroke path skip the `safe_shell_mut`
+/// (and thus the whole-shell re-render) when a keystroke changes nothing
+/// reactive — the common case mid-burst, since the snapshot stays armed and the
+/// busy hint only shows on submit.
+fn terminal_input_needs_reactive_snapshot_update(
+    shell: &ShellState,
+    show_busy_hint: bool,
+    now_ms: u64,
+) -> bool {
+    if show_busy_hint {
+        return true;
+    }
+    if !shell_has_live_session_snapshot_refresh_target(shell) {
+        return false;
+    }
+    let debounce_ms = LIVE_SESSION_SNAPSHOT_TRIGGER_DEBOUNCE_MS.max(TERMINAL_INPUT_HOT_SUPPRESS_MS);
+    let due_at_ms = now_ms.saturating_add(debounce_ms);
+    shell.next_live_session_snapshot_after_ms == 0
+        || shell.next_live_session_snapshot_after_ms > due_at_ms
+}
+
+/// Per-keystroke entry point from the terminal input forward path. Marks input
+/// hot in the non-reactive atomic and only takes the `safe_shell_mut` re-render
+/// path when reactive state actually changes. Plain character input mid-burst
+/// touches ZERO reactive state, so holding a key no longer re-renders the whole
+/// shell per keystroke (render-cause-pinned latency, 2026-06-19).
+fn mark_terminal_input_hot_and_schedule_snapshot(
+    state: Signal<ShellState>,
+    session_path: &str,
+    show_busy_hint: bool,
+) {
+    let now_ms = current_millis();
+    mark_terminal_input_hot(now_ms);
+    let needs_reactive_update = terminal_input_needs_reactive_snapshot_update(
+        &state.peek(),
+        show_busy_hint,
+        now_ms,
+    );
+    if needs_reactive_update {
+        let _ = safe_shell_mut(
+            state,
+            "terminal_input_schedule_live_snapshot_refresh",
+            |shell| {
+                schedule_live_session_snapshot_after_terminal_input(
+                    shell,
+                    session_path,
+                    show_busy_hint,
+                );
+            },
+        );
+    }
 }
 
 fn background_snapshot_changes_active_runtime_identity(
@@ -13241,7 +13309,7 @@ fn maybe_spawn_background_live_session_snapshot(state: Signal<ShellState>) {
                 || interactive_surface_request_in_flight(shell)
                 || !shell_has_live_session_snapshot_refresh_target(shell)
                 || now_ms < shell.next_live_session_snapshot_after_ms
-                || now_ms < shell.terminal_input_hot_until_ms
+                || now_ms < terminal_input_hot_until_ms()
             {
                 return LiveSnapshotGateDecision::Idle;
             }
@@ -13303,7 +13371,7 @@ fn maybe_spawn_background_live_session_snapshot(state: Signal<ShellState>) {
                 shell.live_session_snapshot_refresh_in_flight = false;
                 match outcome {
                     Ok((snapshot, message)) => {
-                        let input_hot = current_millis() < shell.terminal_input_hot_until_ms;
+                        let input_hot = current_millis() < terminal_input_hot_until_ms();
                         if input_hot
                             && !background_snapshot_changes_active_runtime_identity(
                                 shell, &snapshot,
@@ -13312,8 +13380,7 @@ fn maybe_spawn_background_live_session_snapshot(state: Signal<ShellState>) {
                             shell.background_live_session_snapshot_skipped_input_hot_count = shell
                                 .background_live_session_snapshot_skipped_input_hot_count
                                 .saturating_add(1);
-                            let due_at_ms = shell
-                                .terminal_input_hot_until_ms
+                            let due_at_ms = terminal_input_hot_until_ms()
                                 .saturating_add(LIVE_SESSION_SNAPSHOT_TRIGGER_DEBOUNCE_MS);
                             let now_ms = current_millis();
                             schedule_live_session_snapshot_due_at(
@@ -25664,8 +25731,8 @@ fn describe_app_state_snapshot(
         "active_runtime_key": active_runtime_key,
         "active_runtime_key_candidates": active_runtime_key_candidates,
         "active_runtime_present": active_runtime_present,
-        "terminal_input_hot_until_ms": shell.terminal_input_hot_until_ms,
-        "terminal_input_hot": notification_now_ms < shell.terminal_input_hot_until_ms,
+        "terminal_input_hot_until_ms": terminal_input_hot_until_ms(),
+        "terminal_input_hot": notification_now_ms < terminal_input_hot_until_ms(),
         "background_live_session_snapshot_apply_count": shell.background_live_session_snapshot_apply_count,
         "background_live_session_snapshot_skipped_input_hot_count": shell.background_live_session_snapshot_skipped_input_hot_count,
         "background_live_session_snapshot_skipped_noop_count": shell.background_live_session_snapshot_skipped_noop_count,
@@ -25879,8 +25946,8 @@ fn describe_app_state_snapshot(
             "live_session_snapshot_refresh_in_flight": shell.live_session_snapshot_refresh_in_flight,
             "live_session_snapshot_nudge_in_flight": shell.live_session_snapshot_nudge_in_flight,
             "next_live_session_snapshot_after_ms": shell.next_live_session_snapshot_after_ms,
-            "terminal_input_hot_until_ms": shell.terminal_input_hot_until_ms,
-            "terminal_input_hot": notification_now_ms < shell.terminal_input_hot_until_ms,
+            "terminal_input_hot_until_ms": terminal_input_hot_until_ms(),
+            "terminal_input_hot": notification_now_ms < terminal_input_hot_until_ms(),
             "background_live_session_snapshot_apply_count": shell.background_live_session_snapshot_apply_count,
             "background_live_session_snapshot_skipped_input_hot_count": shell.background_live_session_snapshot_skipped_input_hot_count,
             "background_live_session_snapshot_skipped_noop_count": shell.background_live_session_snapshot_skipped_noop_count,
@@ -38367,7 +38434,7 @@ fn render_cause_field_hashes(
             "sidebar_samples",
             sidebar_samples_hash(&shell.live_terminal_sidebar_samples),
         ),
-        ("input_hot_until", shell.terminal_input_hot_until_ms),
+        ("input_hot_until", terminal_input_hot_until_ms()),
         (
             "snapshot_apply_count",
             shell.background_live_session_snapshot_apply_count,
@@ -39209,8 +39276,17 @@ fn app() -> Element {
                                 event.physical_key,
                                 TaoKeyCode::AltLeft | TaoKeyCode::AltRight
                             ));
+                    // Only a key that drives an APP-LEVEL action (alt overlay,
+                    // escape-cancel-delete, delete-from-tree) needs to re-render
+                    // the root. Plain character input is handled entirely by
+                    // xterm/the PTY — bumping `window_epoch` on every keystroke
+                    // forced a whole-shell re-render per character (render-cause
+                    // trace: ~half of the ~23 whole-tree renders/s while a key is
+                    // held). Gate the bump on a real action.
+                    let mut app_action_handled = false;
                     if is_alt_press {
                         state.with_mut(|shell| shell.activate_alt_overlay());
+                        app_action_handled = true;
                     }
                     if event.state == ElementState::Pressed
                         && (event.logical_key == TaoKey::Escape
@@ -39218,6 +39294,7 @@ fn app() -> Element {
                         && state.read().pending_delete.is_some()
                     {
                         state.with_mut(|shell| shell.cancel_delete_dialog());
+                        app_action_handled = true;
                     }
                     if event.state == ElementState::Pressed
                         && (event.logical_key == TaoKey::Delete
@@ -39225,8 +39302,11 @@ fn app() -> Element {
                         && state.read().delete_shortcut_should_target_tree()
                     {
                         queue_delete_selected_items(state, false);
+                        app_action_handled = true;
                     }
-                    window_epoch.with_mut(|epoch| *epoch += 1);
+                    if app_action_handled {
+                        window_epoch.with_mut(|epoch| *epoch += 1);
+                    }
                 }
                 DesktopWindowEvent::Moved(_)
                 | DesktopWindowEvent::Resized(_)
@@ -50337,33 +50417,17 @@ fn TerminalCanvas(
                                         codex_busy_started_at_ms.get_or_insert_with(current_millis);
                                         codex_completion_notified = false;
                                     }
-                                    if show_busy_hint
-                                        && terminal_input_uses_optimistic_busy_hint(&session_path)
-                                    {
-                                        let _ = safe_shell_mut(
-                                            state,
-                                            "terminal_input_schedule_live_snapshot_refresh_immediate",
-                                            |shell| {
-                                                schedule_live_session_snapshot_after_terminal_input(
-                                                    shell,
-                                                    &session_path,
-                                                    true,
-                                                );
-                                            },
-                                        );
-                                    } else {
-                                        let _ = safe_shell_mut(
-                                            state,
-                                            "terminal_input_schedule_live_snapshot_refresh",
-                                            |shell| {
-                                                schedule_live_session_snapshot_after_terminal_input(
-                                                    shell,
-                                                    &session_path,
-                                                    false,
-                                                );
-                                            },
-                                        );
-                                    }
+                                    // Mark input hot + arm the post-input snapshot WITHOUT a
+                                    // per-keystroke whole-shell re-render. The optimistic busy
+                                    // hint still shows on submit (it changes reactive state, so
+                                    // it takes the re-render path inside the helper).
+                                    let optimistic_busy_hint = show_busy_hint
+                                        && terminal_input_uses_optimistic_busy_hint(&session_path);
+                                    mark_terminal_input_hot_and_schedule_snapshot(
+                                        state,
+                                        &session_path,
+                                        optimistic_busy_hint,
+                                    );
                                 }
                             }
                             Ok(TerminalJsEvent::ReadNudge { reason }) => {
@@ -86288,11 +86352,11 @@ mod tests {
 
         let now_ms = current_millis();
         assert!(
-            shell.terminal_input_hot_until_ms >= now_ms,
+            terminal_input_hot_until_ms() >= now_ms,
             "typing should mark the shell input-hot so background snapshots wait"
         );
         assert!(
-            shell.next_live_session_snapshot_after_ms >= shell.terminal_input_hot_until_ms,
+            shell.next_live_session_snapshot_after_ms >= terminal_input_hot_until_ms(),
             "input scheduling should not request an immediate daemon snapshot"
         );
         assert!(!shell.live_session_snapshot_nudge_in_flight);
@@ -95219,7 +95283,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             2_000
         );
 
-        shell.terminal_input_hot_until_ms = now_ms + 100;
+        TERMINAL_INPUT_HOT_UNTIL_MS.store(now_ms + 100, Ordering::Relaxed);
         assert_eq!(
             background_refresh_scheduler_wait_ms(&shell, now_ms, BACKGROUND_REFRESH_WAIT_POLL_MS),
             100 + LIVE_SESSION_SNAPSHOT_TRIGGER_DEBOUNCE_MS
