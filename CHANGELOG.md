@@ -4,6 +4,18 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+## 2.9.39
+
+- **Typing into an active Claude Code session no longer batches into ~1s blocks.**
+  Holding a key printed `gggg…` once a second and typing felt frozen. Cause: CC
+  echoes each keystroke as a composer repaint (one synchronized mode-2026 frame),
+  and the write bridge's frame budget relaxes to 250–1000ms once animation has
+  been sustained/long — that animation throttle was wrongly applied to live
+  keystroke echo, so the bridge held and flushed it once per budget interval. The
+  budget is now capped to the responsive active cadence whenever input is hot (the
+  user typed within the last couple of seconds), so echo flushes promptly while
+  the spinner-coalescing throttle still applies when not typing.
+
 ## 2.9.38
 
 - **Claude Code viewport blink / broken-bottom fixed (the rampant one on long
