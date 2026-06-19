@@ -4,6 +4,20 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+## 2.9.36
+
+- **Image paste (and other remote commands) no longer blocked by a version-string
+  mismatch.** Remote clipboard-image staging, resume, and scans gated on the
+  remote binary's release *version string* matching the local one
+  (`SERVER_PROTOCOL_VERSION` = `CARGO_PKG_VERSION`). Because GUI-only deploys are
+  normal, the checking process almost always ran a newer version string than the
+  remote — so pasting a screenshot into a remote session failed with a
+  self-defeating `remote yggterm protocol mismatch` notification even though the
+  wire protocol was identical. The compatibility check now keys off `build_id`
+  (a hash of the shipped binary, stable across release bumps that don't change
+  the protocol) via a shared `remote_descriptor_is_protocol_compatible` helper.
+  Only an actual protocol change (differing `build_id`) is treated as a mismatch.
+
 ## 2.9.35
 
 - **Latency probe: terminal-forward rate instrumentation.** Diagnostic only. The
