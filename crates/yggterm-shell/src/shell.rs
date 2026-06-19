@@ -53282,14 +53282,27 @@ fn TerminalCanvas(
                                                     inline_status_animation_started_at_ms,
                                                 )
                                             };
-                                        terminal_write_bridge.set_frame_ms(
+                                        let animation_frame_ms =
                                             terminal_effective_animation_write_frame_ms(
                                                 window_focused_for_output,
                                                 active_visible_terminal_for_output,
                                                 inline_status_animation_output,
                                                 inline_status_animation_elapsed_ms,
-                                            ),
+                                            );
+                                        // While the user is actively typing, their keystroke
+                                        // echo arrives as a CC composer repaint (one 2026 frame
+                                        // per key). It must NOT inherit the relaxed animation
+                                        // frame budget (250–1000ms once animation has been
+                                        // sustained/long) — that holds the echo and flushes it in
+                                        // ~1s blocks, so a held key prints "gggg…" once a second
+                                        // and typing feels frozen. Cap the budget to the
+                                        // responsive active cadence whenever input is hot.
+                                        let effective_frame_ms = terminal_input_aware_write_frame_ms(
+                                            animation_frame_ms,
+                                            terminal_active_write_frame_ms(),
+                                            terminal_input_hot_until_ms() > current_millis(),
                                         );
+                                        terminal_write_bridge.set_frame_ms(effective_frame_ms);
                                         if is_remote_resume_session && !terminal_overlay_dismissed() {
                                             if traced_attach_ready
                                                 && resume_post_attach_redraw_nudged
@@ -56571,6 +56584,24 @@ fn terminal_effective_write_frame_ms(window_focused: bool, active_visible: bool)
         terminal_active_write_frame_ms()
     } else {
         terminal_write_frame_ms()
+    }
+}
+/// Cap the (possibly animation-relaxed) write frame budget to the responsive
+/// active cadence while the user is actively typing. Keystroke echo arrives as a
+/// CC composer repaint (one mode-2026 frame per key); without this it inherits
+/// the sustained/long animation budget (250–1000ms) and the bridge holds the
+/// echo, flushing it in ~1s blocks — a held key prints "gggg…" once a second and
+/// typing feels frozen. `input_hot` is true while `terminal_input_hot_until_ms()`
+/// is in the future (the user typed within the last TERMINAL_INPUT_HOT_SUPPRESS_MS).
+fn terminal_input_aware_write_frame_ms(
+    animation_frame_ms: u64,
+    active_frame_ms: u64,
+    input_hot: bool,
+) -> u64 {
+    if input_hot {
+        animation_frame_ms.min(active_frame_ms)
+    } else {
+        animation_frame_ms
     }
 }
 fn terminal_effective_animation_write_frame_ms(
@@ -102286,6 +102317,23 @@ Shared connection to 192.0.2.14 closed.\r\n";
             Some(frame_two),
             "repeated small repaint frames should coalesce under the active frame budget"
         );
+    }
+    #[test]
+    fn input_hot_caps_write_frame_budget_to_responsive_cadence() {
+        // Regression: held key printed "gggg…" once a second. CC echoes each
+        // keystroke as a composer repaint; once animation relaxed the budget to
+        // 500–1000ms the bridge batched the echo into ~1s blocks. While the user
+        // is typing (input hot), the budget must drop to the responsive active
+        // cadence so echo flushes promptly.
+        let active = 16;
+        // Sustained/long animation budget while typing → capped to active.
+        assert_eq!(terminal_input_aware_write_frame_ms(500, active, true), 16);
+        assert_eq!(terminal_input_aware_write_frame_ms(1_000, active, true), 16);
+        // If the animation budget is already tighter than active, keep it.
+        assert_eq!(terminal_input_aware_write_frame_ms(8, active, true), 8);
+        // NOT typing → the animation throttle is preserved (spinner coalescing).
+        assert_eq!(terminal_input_aware_write_frame_ms(500, active, false), 500);
+        assert_eq!(terminal_input_aware_write_frame_ms(1_000, active, false), 1_000);
     }
     #[test]
     fn terminal_write_bridge_never_flushes_a_partial_frame_when_budget_relaxed() {
