@@ -231,6 +231,27 @@ pub(crate) fn terminal_output_ends_inside_synchronized_frame(data: &str) -> bool
     }
 }
 
+/// When `data` ends inside an open synchronized frame (per
+/// [`terminal_output_ends_inside_synchronized_frame`]) but a COMPLETE frame
+/// precedes it, returns the byte length of the complete-frame prefix — i.e. the
+/// offset just past the last `\e[?2026l` (ESU). The bridge flushes that prefix
+/// and RETAINS the open tail, so complete frames keep flowing on the frame-budget
+/// cadence while the still-open frame waits for its ESU — instead of either
+/// stalling all complete frames or flushing a torn partial. Returns 0 when there
+/// is no complete frame ahead of the open one (the whole buffer is one open
+/// frame, or pre-frame content + an open frame), in which case the caller holds.
+pub(crate) fn terminal_synchronized_output_complete_prefix_len(data: &str) -> usize {
+    let last_open = data.rfind("\x1b[?2026h");
+    let last_close = data.rfind("\x1b[?2026l");
+    match (last_open, last_close) {
+        // Ends mid-frame (open BSU after the last ESU) AND a complete frame
+        // precedes it: the prefix is everything up to and including that ESU.
+        (Some(open), Some(close)) if open > close => close + "\x1b[?2026l".len(),
+        // Open frame with no preceding complete frame, or not ending mid-frame.
+        _ => 0,
+    }
+}
+
 #[cfg(test)]
 pub(crate) fn terminal_synchronized_output_frame_ranges(data: &str) -> Vec<(usize, usize)> {
     let start_marker = "\x1b[?2026h";

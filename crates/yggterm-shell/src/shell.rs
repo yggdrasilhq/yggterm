@@ -102288,6 +102288,66 @@ Shared connection to 192.0.2.14 closed.\r\n";
         );
     }
     #[test]
+    fn terminal_write_bridge_never_flushes_a_partial_frame_when_budget_relaxed() {
+        // Regression: the rampant CC blink / broken bottom. On a long-running
+        // turn the animation frame budget relaxes to 250–500ms
+        // (terminal_active_animation_effective_write_frame_ms). With frame_ms
+        // (500) > TERMINAL_SYNC_FRAME_MAX_HOLD_MS (250), the buffer ages past the
+        // sync-frame hold cap, so the old flush_due returned the whole pending —
+        // including a still-OPEN frame whose ESU hadn't arrived — and xterm
+        // painted a torn frame (composer/bottom rows missing) until the next
+        // complete frame "blinked" it back. The bridge must instead flush only
+        // the complete-frame prefix and RETAIN the open tail.
+        let mut bridge = TerminalWriteBridge::new(500);
+        let complete = "\x1b[?2026h\x1b[44;2H\x1b[0m\x1b[49m\x1b[K\x1b[45;72H\x1b[K\x1b[?2026l";
+        // An open frame: BSU + some rows, NO closing ESU yet (still arriving).
+        let open_partial = "\x1b[?2026h\x1b[44;2H\x1b[0m\x1b[49m\x1b[K\x1b[45;73H\x1b[K";
+
+        // First (complete) frame flushes immediately (cold buffer).
+        assert_eq!(
+            bridge.stage_or_immediate(complete.to_string(), 1_000, true),
+            vec![complete.to_string()]
+        );
+        // The next complete frame is held under the budget.
+        assert!(
+            bridge
+                .stage_or_immediate(complete.to_string(), 1_050, true)
+                .is_empty()
+        );
+        // Then a partial (open) frame arrives — buffer now ends mid-frame.
+        assert!(
+            bridge
+                .stage_or_immediate(open_partial.to_string(), 1_100, true)
+                .is_empty()
+        );
+        // Way past frame_ms (500) AND past the 250ms hold cap: the old code would
+        // flush the whole buffer (complete + torn partial). The fix flushes only
+        // the complete prefix and retains the open partial.
+        assert_eq!(
+            bridge.flush_due(2_000).as_deref(),
+            Some(complete),
+            "only the complete frame should flush; the open partial must be retained"
+        );
+        assert_eq!(
+            bridge.pending_for_test(),
+            open_partial,
+            "the still-open frame waits for its ESU instead of being painted torn"
+        );
+        // Once the ESU arrives, the completed frame flushes cleanly.
+        let esu_tail = "\x1b[45;74H\x1b[K\x1b[?2026l";
+        assert!(
+            bridge
+                .stage_or_immediate(esu_tail.to_string(), 2_010, true)
+                .is_empty()
+        );
+        let completed = format!("{open_partial}{esu_tail}");
+        assert_eq!(
+            bridge.flush_due(2_600).as_deref(),
+            Some(completed.as_str()),
+            "the now-complete frame flushes whole, never torn"
+        );
+    }
+    #[test]
     fn terminal_write_bridge_keeps_repeated_synchronized_codex_repaints_lossless() {
         let mut bridge = TerminalWriteBridge::new(400);
         let frame_one = "\x1b[?2026h\x1b[44;2H\x1b[0m\x1b[49m\x1b[K\x1b[45;102H\x1b[K\x1b[46;2H\x1b[K\x1b[47;2H\x1b[K\x1b[48;2H\x1b[K\x1b[49;2H\x1b[K\x1b[50;31H\x1b[K\x1b[?2026l";
