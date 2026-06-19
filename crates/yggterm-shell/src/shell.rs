@@ -431,6 +431,47 @@ fn screen_reconcile_decision(screen_text: &str) -> ScreenReconcileDecision {
 fn screen_reconcile_output_quiet(now_ms: u64, last_forwarded_output_at_ms: u64) -> bool {
     now_ms.saturating_sub(last_forwarded_output_at_ms) >= SCREEN_RECONCILE_OUTPUT_QUIET_MS
 }
+
+/// FORWARD-RATE PROBE (latency campaign 2026-06-19): the GUI main thread runs at
+/// ~30% CPU while `app()` renders only ~0.4/s, so the cost is NOT Dioxus render —
+/// the prime suspect is this per-chunk terminal-forward eval bridge. Mirror the
+/// `app_render_rate` probe: accumulate write count + bytes per `eval.send(Write)`
+/// dispatch and emit a `terminal_forward_rate` trace event once a minute, so the
+/// forward frequency (and thus its share of the 30% main-thread CPU) is
+/// measurable from the event trace without a debugger. Cheap when idle (a few
+/// relaxed atomics per forward, one trace line per minute).
+fn record_terminal_forward_sample(trace_home: &std::path::Path, bytes: usize, now_ms: u64) {
+    use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+    static FORWARD_COUNT: AtomicU64 = AtomicU64::new(0);
+    static FORWARD_BYTES: AtomicU64 = AtomicU64::new(0);
+    static LAST_REPORT_MS: AtomicU64 = AtomicU64::new(0);
+    let count = FORWARD_COUNT.fetch_add(1, AtomicOrdering::Relaxed) + 1;
+    let total_bytes = FORWARD_BYTES.fetch_add(bytes as u64, AtomicOrdering::Relaxed) + bytes as u64;
+    let last = LAST_REPORT_MS.load(AtomicOrdering::Relaxed);
+    if now_ms.saturating_sub(last) >= 60_000
+        && LAST_REPORT_MS
+            .compare_exchange(last, now_ms, AtomicOrdering::Relaxed, AtomicOrdering::Relaxed)
+            .is_ok()
+    {
+        let window_ms = if last == 0 { 0 } else { now_ms.saturating_sub(last) };
+        let secs = if window_ms > 0 { window_ms as f64 / 1000.0 } else { 1.0 };
+        append_trace_event(
+            trace_home,
+            "ui",
+            "perf",
+            "terminal_forward_rate",
+            json!({
+                "forwards_in_window": count,
+                "bytes_in_window": total_bytes,
+                "window_ms": window_ms,
+                "forwards_per_sec": ((count as f64 / secs) * 10.0).round() / 10.0,
+                "bytes_per_sec": (total_bytes as f64 / secs).round() as u64,
+            }),
+        );
+        FORWARD_COUNT.store(0, AtomicOrdering::Relaxed);
+        FORWARD_BYTES.store(0, AtomicOrdering::Relaxed);
+    }
+}
 const RETAINED_EMPTY_SURFACE_SETTLE_MS: u64 = 800;
 // Like the empty-surface transient above, a cold/mid-redraw surface can fail
 // codex-PROMPT recognition for a frame (the prompt hasn't repainted yet). The
@@ -49583,6 +49624,7 @@ fn TerminalCanvas(
                     && bridge_read_policy != TerminalBridgeReadPolicy::Paused
                     && let Some(data) = terminal_write_bridge.flush_due(current_millis())
                 {
+                    record_terminal_forward_sample(&trace_home, data.len(), current_millis());
                     let _ = eval.send(TerminalJsCommand::Write { data });
                 }
                 // Post-resize background reconcile: a settled column-resize reflow
@@ -53215,6 +53257,11 @@ fn TerminalCanvas(
                                                 current_millis(),
                                                 false,
                                             ) {
+                                                record_terminal_forward_sample(
+                                                    &trace_home,
+                                                    write.len(),
+                                                    current_millis(),
+                                                );
                                                 let _ =
                                                     eval.send(TerminalJsCommand::Write { data: write });
                                             }
@@ -53296,6 +53343,11 @@ fn TerminalCanvas(
                                                         throttle_bridge_output,
                                                     )
                                                 {
+                                                    record_terminal_forward_sample(
+                                                        &trace_home,
+                                                        write.len(),
+                                                        current_millis(),
+                                                    );
                                                     let _ = eval.send(TerminalJsCommand::Write {
                                                         data: write,
                                                     });
