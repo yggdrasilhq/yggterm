@@ -2394,14 +2394,19 @@ fn linux_terminal_renderer_policy_from_input(
         };
     }
     if input.wayland_display_present {
-        // Wayland: enable the GPU canvas renderer (the DOM renderer is xterm.js's
-        // slowest backend). The X11 idle-CPU regression does not reproduce on
-        // Wayland, and the canvas-renderer false positive in the render-health
-        // heuristic (canvas_low_contrast_foreground_with_buffer_text) is fixed
-        // by trusting canvas ink. See docs/xterm-bugs.md#xterm-pipeline-latency.
+        // Wayland: DOM renderer. Pre-xterm6 this enabled the 2D CANVAS renderer
+        // (@xterm/addon-canvas), which composites fine on WebKitGTK/Wayland. xterm.js
+        // 6 REMOVED the canvas renderer, so "enabled" now loads the WebGL addon — and
+        // WebGL contexts do NOT composite to screen under WebKitGTK/Wayland (the
+        // terminal flashes its last-good frame then goes BLACK; the GPU backing buffer
+        // still reads back via toDataURL, which fooled the canvas-composite screenshot
+        // into reporting it healthy — see finding-xterm6-webgl-migration). DOM is the
+        // only reliable xterm6 tier here AND keeps webkit-snapshot screenshots faithful.
+        // WebGL stays available via an explicit YGGTERM_ENABLE_XTERM_CANVAS=1 override
+        // for hosts where it does composite. See docs/xterm-bugs.md#xterm-pipeline-latency.
         return LinuxTerminalRendererPolicy {
-            set_canvas_env: Some("1"),
-            reason: "xterm_canvas_enabled_for_wayland",
+            set_canvas_env: Some("0"),
+            reason: "xterm_dom_for_webkitgtk_xterm6_webgl_blank",
         };
     }
     LinuxTerminalRendererPolicy {
@@ -4075,17 +4080,18 @@ mod tests {
     fn linux_terminal_renderer_policy_keeps_canvas_opt_in() {
         use super::{LinuxTerminalRendererPolicyInput, linux_terminal_renderer_policy_from_input};
 
-        // Wayland enables the GPU canvas renderer by default (the X11 idle-CPU
-        // regression does not reproduce on Wayland; the render-health false
-        // positive is fixed by trusting canvas ink).
+        // Wayland defaults to the DOM renderer: xterm.js 6 removed the 2D canvas
+        // renderer that used to serve Wayland, and its only GPU tier (WebGL) does
+        // not composite under WebKitGTK/Wayland (flashes then black). DOM is the
+        // reliable tier; WebGL stays opt-in via an explicit canvas env override.
         let wayland = linux_terminal_renderer_policy_from_input(LinuxTerminalRendererPolicyInput {
             explicit_canvas_env: false,
             gdk_backend_x11: false,
             wayland_display_present: true,
             display_present: true,
         });
-        assert_eq!(wayland.set_canvas_env, Some("1"));
-        assert_eq!(wayland.reason, "xterm_canvas_enabled_for_wayland");
+        assert_eq!(wayland.set_canvas_env, Some("0"));
+        assert_eq!(wayland.reason, "xterm_dom_for_webkitgtk_xterm6_webgl_blank");
 
         let x11 = linux_terminal_renderer_policy_from_input(LinuxTerminalRendererPolicyInput {
             explicit_canvas_env: false,
@@ -4135,7 +4141,7 @@ mod tests {
         ));
         assert!(!linux_canvas_env_is_user_explicit(
             true,
-            Some("xterm_canvas_enabled_for_wayland")
+            Some("xterm_dom_for_webkitgtk_xterm6_webgl_blank")
         ));
         // Empty marker behaves like no marker (bare user export).
         assert!(linux_canvas_env_is_user_explicit(true, Some("  ")));
