@@ -4,6 +4,42 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+## 2.9.40
+
+- **CC viewport blink/freeze on long turns is fixed at the source: native xterm.js 6
+  + WebGL.** On a long-running Claude Code turn the viewport blinked every ~10s and
+  froze (couldn't type/scroll) for ~1s. Root cause: the vendored xterm.js did not
+  implement synchronized output (DEC mode 2026), so a yggterm "write bridge" stood in
+  for it — holding/guessing frame boundaries and coalescing ~500ms of frames into one
+  giant write that blocked the main thread and could paint a torn frame. We upgraded
+  the vendored bundle to **xterm.js 6.0.0**, which implements mode 2026 natively (it
+  buffers each frame and paints atomically itself), and **retired the bridge's
+  hold-and-guess** — it is now a pure IPC batcher. ghostty has none of this machinery,
+  which is why it was smooth.
+- **Renderer moved from canvas to WebGL.** xterm.js 6 removed the canvas renderer; we
+  moved to the WebGL (GPU) renderer — the highest-performance tier — with an automatic
+  DOM fallback if the WebGL context is lost (WebKitGTK/Wayland). The dim-prompt-text
+  readability fix is preserved.
+- **Faithful in-process screenshot fixed for xterm 6.** The canvas-composite capture
+  sized its output from `.xterm-screen`, which under xterm 6 carries no explicit height
+  (its canvas layers are `position:absolute`) and so reports a ~0 bounding rect — every
+  faithful screenshot read back a 1px-tall blank. The composite now falls back to the
+  full-height `.xterm-viewport` rect for sizing and draw offsets when `.xterm-screen`
+  is degenerate. Live-verified on the WebGL renderer (`webgl_loaded=1 actual=gpu_canvas`,
+  faithful pixel shows crisp box-drawing, colors, and readable dim prompt text).
+
+### Known follow-up (not yet fixed)
+
+- **Programmatic viewport scroll needs adapting to xterm 6.** User mouse-wheel scroll
+  works (xterm 6's ScrollableElement handles the wheel natively — pixel-verified) and
+  yggterm still detects it (intent flips to `UserScrollback`). But yggterm's
+  *programmatic* mover `forceXtermViewportY` drives `.xterm-viewport.scrollTop`
+  directly, which the new ScrollableElement re-asserts/overrides — so `app terminal
+  scroll`/scroll-to-line and internal force-follow-to-bottom are inert under xterm 6
+  (`moved=false`, viewport stays at the bottom). Wheel scroll + follow-at-bottom are
+  unaffected. Fix: route `forceXtermViewportY` through xterm 6's scroll API / the
+  ScrollableElement instead of writing `scrollTop`.
+
 ## 2.9.39
 
 - **Typing into an active Claude Code session no longer batches into ~1s blocks.**
