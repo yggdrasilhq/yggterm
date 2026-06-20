@@ -28,17 +28,19 @@ This file tracks user-visible changes in `yggterm`.
   is degenerate. Live-verified on the WebGL renderer (`webgl_loaded=1 actual=gpu_canvas`,
   faithful pixel shows crisp box-drawing, colors, and readable dim prompt text).
 
-### Known follow-up (not yet fixed)
-
-- **Programmatic viewport scroll needs adapting to xterm 6.** User mouse-wheel scroll
-  works (xterm 6's ScrollableElement handles the wheel natively — pixel-verified) and
-  yggterm still detects it (intent flips to `UserScrollback`). But yggterm's
-  *programmatic* mover `forceXtermViewportY` drives `.xterm-viewport.scrollTop`
-  directly, which the new ScrollableElement re-asserts/overrides — so `app terminal
-  scroll`/scroll-to-line and internal force-follow-to-bottom are inert under xterm 6
-  (`moved=false`, viewport stays at the bottom). Wheel scroll + follow-at-bottom are
-  unaffected. Fix: route `forceXtermViewportY` through xterm 6's scroll API / the
-  ScrollableElement instead of writing `scrollTop`.
+- **Scroll position tracking fixed for xterm 6 (scroll-up no longer no-ops / mis-detects).**
+  yggterm read the viewport scroll position from `.xterm-viewport.scrollTop`, but
+  xterm 6 moved scrolling to a VS Code-derived ScrollableElement and leaves
+  `.xterm-viewport.scrollTop` pinned at 0. So `effectiveXtermViewportY` reported 0
+  always — which (a) made `app terminal scroll` / scroll-to-line a no-op (the mover
+  saw "already at target" and never called a scroll API) and (b) broke user-scroll-up
+  detection, so a wheel scroll-up followed by streaming output would yank back to the
+  bottom (the 2.9.32 anti-yank, re-broken by the renderer migration). Fix: when the
+  ScrollableElement owns scrolling, trust the authoritative public `viewportY` (ydisp)
+  instead of the decoupled DOM `scrollTop`. Also routed the out-of-closure app-control
+  scroll through the intent SSOT (`setScrollbackIntent`) so the settle-follow watchdog
+  no longer re-yanks an agent scroll-up. Live-verified on WebGL: wheel scroll-up holds
+  through streamed output; `scroll --to top` reaches and holds the buffer top.
 
 ## 2.9.39
 

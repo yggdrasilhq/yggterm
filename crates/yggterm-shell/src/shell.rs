@@ -32966,15 +32966,24 @@ async fn scroll_terminal_viewport_for(session_path: &str, to: &str) -> Value {
                             term.scrollToBottom();
                         }}
                     }} else {{
+                        // Set the intent SSOT FIRST so the settle-follow watchdog
+                        // (reads the closure `scrollbackIntent` via setScrollbackIntent)
+                        // does not re-assert PromptFollow and yank this scroll back to
+                        // the bottom. Setting only entry.scrollbackIntent left the
+                        // closure copy at PromptFollow → watchdog re-followed (xterm 6).
+                        if (entry.setScrollbackIntent) {{
+                            entry.setScrollbackIntent('UserScrollback', `app_control_scroll:${{kind}}`);
+                        }} else {{
+                            entry.scrollbackIntent = 'UserScrollback';
+                            entry.lastScrollbackIntentReason = `app_control_scroll:${{kind}}`;
+                            entry.lastScrollbackIntentAtMs = Date.now();
+                        }}
+                        entry.scrollbackLocked = true;
                         if (entry.forceXtermViewportY) {{
                             entry.forceXtermViewportY(target, `app_control_scroll:${{kind}}`);
                         }} else if (term.scrollToLine) {{
                             term.scrollToLine(target);
                         }}
-                        entry.scrollbackIntent = 'UserScrollback';
-                        entry.scrollbackLocked = true;
-                        entry.lastScrollbackIntentReason = `app_control_scroll:${{kind}}`;
-                        entry.lastScrollbackIntentAtMs = Date.now();
                     }}
                 }} catch (_moveError) {{}}
                 await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
@@ -62501,6 +62510,24 @@ fn terminal_eval_script_with_canvas_renderer(
                 if (!viewportElement) {{
                     return null;
                 }}
+                // xterm.js 6 decoupled scroll position from the `.xterm-viewport`
+                // element: the VS Code-derived ScrollableElement (`.xterm-scrollable-
+                // element`) owns scrolling and `.xterm-viewport.scrollTop` STAYS 0
+                // regardless of where the buffer is scrolled. So the "visual" reading
+                // from scrollTop is garbage (always 0 = always "at top"), which made
+                // effectiveXtermViewportY report 0 always — no-op'ing app-control
+                // scroll AND breaking user-scroll-up detection (the UserScrollback
+                // anti-yank flip). When the ScrollableElement is present the
+                // authoritative position is the public ydisp (active.viewportY), so
+                // return null here and let effectiveXtermViewportY fall through to it.
+                if (host.querySelector(".xterm-scrollable-element")) {{
+                    if (debug) {{
+                        debug.visual_viewport_y = null;
+                        debug.visual_viewport_y_decoupled_scrollable_element = true;
+                        debug.viewport_scroll_top = Number(viewportElement.scrollTop || 0);
+                    }}
+                    return null;
+                }}
                 const rowHeightPx = Math.max(1, terminalCssCellHeight());
                 const visualY = Math.max(0, Math.round(Number(viewportElement.scrollTop || 0) / rowHeightPx));
                 if (debug) {{
@@ -65251,6 +65278,11 @@ fn terminal_eval_script_with_canvas_renderer(
             scrollLiveCursorIntoView,
             forcePromptFollow: (reason = 'prompt_follow') => scrollLiveCursorIntoView(true, reason),
             forceXtermViewportY,
+            // Exposed so the out-of-closure app-control scroll eval can set the
+            // intent SSOT (closure `scrollbackIntent`), not just `entry.scrollbackIntent`
+            // — otherwise the settle-follow watchdog (which reads the closure var)
+            // re-asserts PromptFollow and yanks an app-control scroll-up back to bottom.
+            setScrollbackIntent,
             focusTerminal,
             refreshCursorContrastContract,
             inputEnabled,
