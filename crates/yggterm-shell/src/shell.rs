@@ -56472,22 +56472,28 @@ fn terminal_xterm_canvas_renderer_enabled_from_env(
         if gdk_backend_x11 || (!wayland_display_present && display_present) {
             return false;
         }
-        // Wayland: GPU canvas renderer (see main.rs renderer policy and
-        // docs/xterm-bugs.md#xterm-pipeline-latency).
+        // Wayland: DOM renderer. xterm.js 6 removed the 2D canvas renderer; its only
+        // GPU tier is WebGL, which does NOT composite to screen under WebKitGTK/Wayland
+        // (last-good flash → black void), so DOM is the only reliable tier and it keeps
+        // webkit-snapshot screenshots faithful. Mirrors main.rs's authoritative policy
+        // (xterm_dom_for_webkitgtk_xterm6_webgl_blank). WebGL stays opt-in via the
+        // explicit env override above. See finding-xterm6-webgl-migration.
         if wayland_display_present {
-            return true;
+            return false;
         }
     }
     false
 }
 /// Human-readable reason for the xterm renderer policy decision, so telemetry can
-/// show WHY a given pathway (canvas vs DOM) was chosen on each platform. Mirrors
-/// `terminal_xterm_canvas_renderer_enabled_from_env` exactly. NOTE: xterm.js has
-/// three render tiers — DOM (slowest), canvas (the @xterm/addon-canvas we bundle),
-/// and WebGL (fastest, NOT bundled). We deliberately top out at canvas on
-/// WebKitGTK: WebGL contexts are lossy under WebKitGTK/Wayland compositing and a
-/// lost context blanks the terminal, so canvas is the best *reliable* tier here.
-/// This reason string + the `renderer_decision` trace exist to measure that claim.
+/// show WHY a given pathway (WebGL vs DOM) was chosen on each platform. Mirrors
+/// `terminal_xterm_canvas_renderer_enabled_from_env` exactly. NOTE: xterm.js 6 has
+/// two render tiers — DOM (slowest, but reliable) and WebGL (fastest, bundled as
+/// addon-webgl). The 2D canvas renderer that previously served WebKitGTK/Wayland was
+/// REMOVED in xterm 6. WebGL contexts do NOT composite to screen under WebKitGTK/
+/// Wayland (the terminal flashes its last frame then goes black — confirmed live),
+/// so on Linux we default to DOM. WebGL is opt-in via YGGTERM_ENABLE_XTERM_CANVAS=1
+/// for hosts where it composites. This reason string + the `renderer_decision` trace
+/// exist to measure that claim.
 fn terminal_xterm_renderer_policy_reason() -> String {
     // main.rs (configure_linux_terminal_renderer_policy) resolves the platform
     // policy and exports the authoritative reason as YGGTERM_XTERM_CANVAS_POLICY
@@ -56533,7 +56539,7 @@ fn terminal_xterm_renderer_policy_reason_from_env(
             return "linux_x11_dom_idle_cpu_guard";
         }
         if wayland_display_present {
-            return "linux_wayland_canvas_gpu";
+            return "linux_wayland_dom_xterm6_webgl_blank";
         }
         return "linux_headless_dom";
     }
@@ -79465,7 +79471,7 @@ mod tests {
             );
             assert_eq!(
                 terminal_xterm_renderer_policy_reason_from_env(None, Some("wayland"), true, false),
-                "linux_wayland_canvas_gpu"
+                "linux_wayland_dom_xterm6_webgl_blank"
             );
         }
     }
@@ -79495,14 +79501,15 @@ mod tests {
         assert!(!terminal_xterm_canvas_renderer_enabled_from_env(
             None, None, false, true
         ));
-        // Wayland enables the GPU canvas renderer by default.
-        assert!(terminal_xterm_canvas_renderer_enabled_from_env(
+        // Wayland defaults to DOM under xterm 6: the 2D canvas renderer was removed
+        // and WebGL does not composite under WebKitGTK/Wayland (flashes then black).
+        assert!(!terminal_xterm_canvas_renderer_enabled_from_env(
             None,
             Some("wayland"),
             true,
             true
         ));
-        assert!(terminal_xterm_canvas_renderer_enabled_from_env(
+        assert!(!terminal_xterm_canvas_renderer_enabled_from_env(
             None, None, true, false
         ));
         let theme = terminal_theme(UiTheme::ZedLight, palette(UiTheme::ZedLight), 13.0, "");
