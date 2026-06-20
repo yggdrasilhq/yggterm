@@ -16,17 +16,25 @@ This file tracks user-visible changes in `yggterm`.
   buffers each frame and paints atomically itself), and **retired the bridge's
   hold-and-guess** — it is now a pure IPC batcher. ghostty has none of this machinery,
   which is why it was smooth.
-- **Renderer moved from canvas to WebGL.** xterm.js 6 removed the canvas renderer; we
-  moved to the WebGL (GPU) renderer — the highest-performance tier — with an automatic
-  DOM fallback if the WebGL context is lost (WebKitGTK/Wayland). The dim-prompt-text
-  readability fix is preserved.
-- **Faithful in-process screenshot fixed for xterm 6.** The canvas-composite capture
-  sized its output from `.xterm-screen`, which under xterm 6 carries no explicit height
-  (its canvas layers are `position:absolute`) and so reports a ~0 bounding rect — every
-  faithful screenshot read back a 1px-tall blank. The composite now falls back to the
-  full-height `.xterm-viewport` rect for sizing and draw offsets when `.xterm-screen`
-  is degenerate. Live-verified on the WebGL renderer (`webgl_loaded=1 actual=gpu_canvas`,
-  faithful pixel shows crisp box-drawing, colors, and readable dim prompt text).
+- **Renderer: DOM on WebKitGTK (WebGL was black).** xterm.js 6 removed the 2D canvas
+  renderer that previously served Wayland, leaving only DOM or WebGL. WebGL does **not**
+  composite to screen under WebKitGTK/Wayland — the terminal flashed its last frame then
+  went to a black void — so on Linux we default to the DOM renderer (reliable, and it
+  keeps webkit-snapshot screenshots faithful). WebGL stays available behind an explicit
+  `YGGTERM_ENABLE_XTERM_CANVAS=1` override for hosts where it composites. (The mode-2026
+  blink fix above is renderer-independent; it comes from xterm.js 6, not WebGL.) The
+  dim-prompt-text readability fix is preserved.
+  NOTE: an earlier cut of this release shipped WebGL on Wayland and *looked* fine to the
+  in-process screenshot — that capture reads the GPU backing buffer via `toDataURL`
+  (`preserveDrawingBuffer`), which holds a good image even when the on-screen compositor
+  shows black. The DOM default removes the failure and restores honest screenshots.
+- **Faithful in-process screenshot fixed for xterm 6 (when WebGL is opt-in enabled).**
+  The canvas-composite capture sized its output from `.xterm-screen`, which under
+  xterm 6 carries no explicit height (its canvas layers are `position:absolute`) and so
+  reports a ~0 bounding rect — every composite read back a 1px-tall blank. It now falls
+  back to the full-height `.xterm-viewport` rect when `.xterm-screen` is degenerate.
+  (On the default DOM renderer the composite is skipped and capture uses the faithful
+  webkit DOM snapshot.)
 
 - **Scroll position tracking fixed for xterm 6 (scroll-up no longer no-ops / mis-detects).**
   yggterm read the viewport scroll position from `.xterm-viewport.scrollTop`, but
