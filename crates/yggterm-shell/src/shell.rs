@@ -319,7 +319,7 @@ const CORNER_RESIZE_HANDLE: usize = 10;
 const XTERM_CSS: &str = include_str!("../../../assets/xterm/xterm.css");
 const XTERM_JS: &str = include_str!("../../../assets/xterm/xterm.js");
 const XTERM_FIT_JS: &str = include_str!("../../../assets/xterm/addon-fit.js");
-const XTERM_CANVAS_JS: &str = include_str!("../../../assets/xterm/addon-canvas.js");
+const XTERM_WEBGL_JS: &str = include_str!("../../../assets/xterm/addon-webgl.js");
 const XTERM_CANVAS_RENDERER_ENV: &str = "YGGTERM_ENABLE_XTERM_CANVAS";
 const XTERM_INPUT_LINE_DECORATION_ENV: &str = "YGGTERM_ENABLE_XTERM_INPUT_LINE_DECORATION";
 const TERMINAL_ACTIVE_ANIMATION_WRITE_FRAME_MS_ENV: &str =
@@ -34489,7 +34489,20 @@ async fn capture_active_terminal_canvas_composite(output_path: &Path) -> Option<
                 const host = document.getElementById(entry.hostId);
                 if (!host) { send({ ok: false, reason: 'host_element_missing' }); return; }
                 const screen = host.querySelector('.xterm-screen') || host;
-                const rect = screen.getBoundingClientRect();
+                let rect = screen.getBoundingClientRect();
+                // xterm.js 6: `.xterm-screen` carries no explicit height (its canvas
+                // layers are position:absolute and it no longer gets the renderer's
+                // pixel height the way xterm 5 did), so its getBoundingClientRect
+                // collapses to ~0 — which sized the output canvas to 1px and made
+                // every faithful screenshot read back BLANK. Fall back to the
+                // viewport (full-height scroll container) for sizing AND for the
+                // per-canvas draw offsets; the canvas layers sit at the viewport's
+                // top-left, so their offsets relative to it are correct. The screen
+                // rect is still preferred when it is valid (older renderer / DOM).
+                if (!(rect.width > 1 && rect.height > 1)) {
+                    const fallback = host.querySelector('.xterm-viewport') || host;
+                    rect = fallback.getBoundingClientRect();
+                }
                 const dpr = window.devicePixelRatio || 1;
                 const W = Math.max(1, Math.round(rect.width * dpr));
                 const H = Math.max(1, Math.round(rect.height * dpr));
@@ -57658,7 +57671,7 @@ fn xterm_assets_bootstrap_script() -> String {
     let nerd = NERD_FONT_FACE_STYLE_JS.as_str();
     let xterm = serde_json::to_string(XTERM_JS).expect("serialize xterm js");
     let fit = serde_json::to_string(XTERM_FIT_JS).expect("serialize xterm fit addon");
-    let canvas = serde_json::to_string(XTERM_CANVAS_JS).expect("serialize xterm canvas addon");
+    let webgl = serde_json::to_string(XTERM_WEBGL_JS).expect("serialize xterm webgl addon");
     format!(
         r#"
         (() => {{
@@ -57700,8 +57713,8 @@ fn xterm_assets_bootstrap_script() -> String {
             if (!window.FitAddon || !window.FitAddon.FitAddon) {{
               injectScript("yggterm-xterm-fit-script", {fit});
             }}
-            if (!window.CanvasAddon || !window.CanvasAddon.CanvasAddon) {{
-              injectScript("yggterm-xterm-canvas-script", {canvas});
+            if (!window.WebglAddon || !window.WebglAddon.WebglAddon) {{
+              injectScript("yggterm-xterm-webgl-script", {webgl});
             }}
           }} catch (error) {{
             window.__yggtermXtermBootstrapError = error && error.message ? error.message : String(error);
@@ -58673,8 +58686,8 @@ fn terminal_eval_script_with_canvas_renderer(
     let css = serde_json::to_string(XTERM_CSS).expect("serialize xterm css");
     let xterm = serde_json::to_string(XTERM_JS).expect("serialize xterm js");
     let fit_bundle = serde_json::to_string(XTERM_FIT_JS).expect("serialize xterm fit addon");
-    let canvas_bundle =
-        serde_json::to_string(XTERM_CANVAS_JS).expect("serialize xterm canvas addon");
+    let webgl_bundle =
+        serde_json::to_string(XTERM_WEBGL_JS).expect("serialize xterm webgl addon");
     let background =
         serde_json::to_string(&theme.background).expect("serialize terminal background");
     let foreground =
@@ -58861,8 +58874,8 @@ fn terminal_eval_script_with_canvas_renderer(
                 if (!window.FitAddon || !window.FitAddon.FitAddon) {{
                     injectScript("yggterm-xterm-fit-script", {fit_bundle});
                 }}
-                if (!window.CanvasAddon || !window.CanvasAddon.CanvasAddon) {{
-                    injectScript("yggterm-xterm-canvas-script", {canvas_bundle});
+                if (!window.WebglAddon || !window.WebglAddon.WebglAddon) {{
+                    injectScript("yggterm-xterm-webgl-script", {webgl_bundle});
                 }}
                 for (let attempt = 0; attempt < 80; attempt += 1) {{
                     if (
@@ -58883,7 +58896,7 @@ fn terminal_eval_script_with_canvas_renderer(
         const assetsReady = await ensureXtermAssets();
         sendTerminalEvent({{
             kind: "debug",
-            message: `assets host=${{hostId}} ready=${{assetsReady}} terminal=${{!!window.Terminal}} fit=${{!!(window.FitAddon && window.FitAddon.FitAddon)}} canvas=${{!!(window.CanvasAddon && window.CanvasAddon.CanvasAddon)}} bootstrap=${{window.__yggtermXtermBootstrapError || "none"}}`
+            message: `assets host=${{hostId}} ready=${{assetsReady}} terminal=${{!!window.Terminal}} fit=${{!!(window.FitAddon && window.FitAddon.FitAddon)}} webgl=${{!!(window.WebglAddon && window.WebglAddon.WebglAddon)}} bootstrap=${{window.__yggtermXtermBootstrapError || "none"}}`
         }});
         if (
             !assetsReady
@@ -59307,14 +59320,15 @@ fn terminal_eval_script_with_canvas_renderer(
                 brightWhite: {bright_white},
             }},
         }});
-        // Canvas is the default renderer for heavy terminal output. Keep the
-        // environment gate so field tests can still force the DOM renderer
-        // while isolating compositor-specific WebKit behavior.
+        // WebGL (GPU) is the renderer for heavy terminal output — xterm.js 6
+        // removed the canvas renderer, so the GPU tier is now WebGL. Keep the
+        // environment gate so field tests can still force the DOM renderer while
+        // isolating WebKit/Wayland WebGL-context behavior.
         const canvasRendererEnabled = {canvas_renderer_enabled};
         window.__yggtermXtermCanvasRendererEnabled = Boolean(canvasRendererEnabled);
         const rendererPolicyReason = {renderer_policy_reason};
         window.__yggtermXtermRendererPolicyReason = String(rendererPolicyReason || '');
-        let preferredCanvasRenderer = false;
+        let webglRendererActive = false;
         const fitAddon = new window.FitAddon.FitAddon();
         term.loadAddon(fitAddon);
         // User bug 6: plain-text http(s) URLs — including URLs WRAPPED across
@@ -59633,19 +59647,43 @@ fn terminal_eval_script_with_canvas_renderer(
             host.addEventListener('mouseup', stampOsc52Gesture, true);
             host.addEventListener('keydown', stampOsc52Gesture, true);
         }} catch (_osc52GestureError) {{}}
-        let canvasAddonAvailable = Boolean(window.CanvasAddon && window.CanvasAddon.CanvasAddon);
+        let webglAddonAvailable = Boolean(window.WebglAddon && window.WebglAddon.WebglAddon);
         let rendererDecisionError = '';
+        let webglAddon = null;
         try {{
-            if (canvasRendererEnabled && canvasAddonAvailable) {{
-                const canvasAddon = new window.CanvasAddon.CanvasAddon();
-                term.loadAddon(canvasAddon);
-                preferredCanvasRenderer = true;
+            if (canvasRendererEnabled && webglAddonAvailable) {{
+                // preserveDrawingBuffer=true keeps the WebGL canvas readable via
+                // toDataURL/drawImage — the in-process faithful screenshot
+                // (capture_backend=xterm_canvas_composite) and agent verification
+                // depend on it; without it a WebGL canvas reads back blank.
+                webglAddon = new window.WebglAddon.WebglAddon(true);
+                // WebGL contexts are lossy under WebKitGTK/Wayland compositing; a
+                // lost context would blank the terminal. Dispose the addon on loss
+                // so xterm.js reverts to its DOM renderer (buffer intact) rather
+                // than painting a blank canvas. This is the safety net for the one
+                // real risk of moving off the canvas renderer.
+                try {{
+                    if (typeof webglAddon.onContextLoss === 'function') {{
+                        webglAddon.onContextLoss(() => {{
+                            try {{ webglAddon.dispose(); }} catch (_disposeError) {{}}
+                            webglRendererActive = false;
+                            sendTerminalEvent({{
+                                kind: "debug",
+                                message: `webgl_context_lost host=${{hostId}} -> dom_fallback`
+                            }});
+                        }});
+                    }}
+                }} catch (_lossHookError) {{}}
+                term.loadAddon(webglAddon);
+                webglRendererActive = true;
             }}
         }} catch (error) {{
             rendererDecisionError = error && error.message ? error.message : String(error);
+            try {{ if (webglAddon) {{ webglAddon.dispose(); }} }} catch (_disposeError) {{}}
+            webglRendererActive = false;
             sendTerminalEvent({{
                 kind: "debug",
-                message: `canvas_addon_failed host=${{hostId}} error=${{rendererDecisionError}}`
+                message: `webgl_addon_failed host=${{hostId}} error=${{rendererDecisionError}}`
             }});
         }}
         // RENDERER TELEMETRY: emit the definitive render-pathway decision so we can
@@ -59659,7 +59697,7 @@ fn terminal_eval_script_with_canvas_renderer(
                 const canvasCount = host.querySelectorAll('canvas').length;
                 sendTerminalEvent({{
                     kind: "debug",
-                    message: `renderer_decision host=${{hostId}} phase=${{phase}} reason=${{rendererPolicyReason}} requested=${{canvasRendererEnabled ? 1 : 0}} addon_available=${{canvasAddonAvailable ? 1 : 0}} canvas_loaded=${{preferredCanvasRenderer ? 1 : 0}} actual=${{canvasCount > 0 ? 'canvas' : 'dom'}} canvas_elements=${{canvasCount}}${{rendererDecisionError ? ' error=' + rendererDecisionError : ''}}`
+                    message: `renderer_decision host=${{hostId}} phase=${{phase}} reason=${{rendererPolicyReason}} requested=${{canvasRendererEnabled ? 1 : 0}} addon_available=${{webglAddonAvailable ? 1 : 0}} webgl_loaded=${{webglRendererActive ? 1 : 0}} actual=${{canvasCount > 0 ? 'gpu_canvas' : 'dom'}} canvas_elements=${{canvasCount}}${{rendererDecisionError ? ' error=' + rendererDecisionError : ''}}`
                 }});
             }} catch (_rendererDecisionTraceError) {{}}
         }};
@@ -61676,10 +61714,12 @@ fn terminal_eval_script_with_canvas_renderer(
         let softwareCanvasLinkRevealUntilMs = 0;
         let softwareCanvasLinkRevealTimer = null;
         let lastSoftwareCanvasLayerOptimizationReason = '';
-        const softwareCanvasLayerOptimizationAllowed = () => Boolean(
-            canvasRendererEnabled
-            && preferredCanvasRenderer
-        );
+        // RETIRED for xterm.js 6 / WebGL: this optimization hid redundant layers of
+        // the OLD @xterm/addon-canvas multi-canvas (2D) model. WebGL renders to a
+        // single GPU canvas with no redundant layers, so the optimization is a no-op
+        // and must NEVER hide the WebGL canvas. (Native-surface cleanup per the
+        // "retire un-needed harnesses" directive.)
+        const softwareCanvasLayerOptimizationAllowed = () => false;
         const canvasLayerRole = (canvas) => {{
             try {{
                 const className = String(canvas && canvas.className ? canvas.className : '');
@@ -79349,23 +79389,23 @@ mod tests {
         );
     }
     #[test]
-    fn terminal_eval_script_bootstraps_terminal_fit_and_canvas_assets() {
+    fn terminal_eval_script_bootstraps_terminal_fit_and_webgl_assets() {
         let theme = terminal_theme(UiTheme::ZedLight, palette(UiTheme::ZedLight), 13.0, "");
         let script = terminal_eval_script("yggterm-terminal-test", &theme, true);
         assert!(script.contains("injectScript(\"yggterm-xterm-script\""));
         assert!(script.contains("injectScript(\"yggterm-xterm-fit-script\""));
-        assert!(script.contains("injectScript(\"yggterm-xterm-canvas-script\""));
-        assert!(script.contains("window.CanvasAddon && window.CanvasAddon.CanvasAddon"));
-        assert!(script.contains("const canvasAddon = new window.CanvasAddon.CanvasAddon();"));
-        let canvas_load = script
-            .find("term.loadAddon(canvasAddon);")
-            .expect("canvas addon load present");
+        assert!(script.contains("injectScript(\"yggterm-xterm-webgl-script\""));
+        assert!(script.contains("window.WebglAddon && window.WebglAddon.WebglAddon"));
+        assert!(script.contains("webglAddon = new window.WebglAddon.WebglAddon(true);"));
+        let webgl_load = script
+            .find("term.loadAddon(webglAddon);")
+            .expect("webgl addon load present");
         let terminal_open = script
             .find("term.open(host);")
             .expect("terminal open present");
         assert!(
-            terminal_open < canvas_load,
-            "xterm canvas addon must load after open on WebKitGTK so the terminal surface mounts readable rows"
+            terminal_open < webgl_load,
+            "xterm webgl addon must load after open on WebKitGTK so the terminal surface mounts readable rows"
         );
     }
 
@@ -79437,8 +79477,8 @@ mod tests {
         let script =
             terminal_eval_script_with_canvas_renderer("yggterm-terminal-test", &theme, true, false, "test_reason");
         assert!(script.contains("const canvasRendererEnabled = false;"));
-        assert!(script.contains("let canvasAddonAvailable = Boolean(window.CanvasAddon"));
-        assert!(script.contains("if (canvasRendererEnabled && canvasAddonAvailable"));
+        assert!(script.contains("let webglAddonAvailable = Boolean(window.WebglAddon"));
+        assert!(script.contains("if (canvasRendererEnabled && webglAddonAvailable"));
     }
 
     #[test]
@@ -79477,25 +79517,16 @@ mod tests {
     }
 
     #[test]
-    fn terminal_eval_script_trims_idle_canvas_overlay_layers() {
+    fn terminal_eval_script_retires_canvas_layer_optimization_under_webgl() {
+        // The canvas-layer trim optimization targeted the retired @xterm/addon-canvas
+        // multi-layer (2D) model. Under xterm.js 6 WebGL (single GPU canvas) it must
+        // be gated OFF so it never hides the WebGL canvas. The apply function and its
+        // call sites still exist but early-return; full code removal is a follow-up.
         let theme = terminal_theme(UiTheme::ZedLight, palette(UiTheme::ZedLight), 13.0, "");
         let script =
             terminal_eval_script_with_canvas_renderer("yggterm-terminal-test", &theme, true, true, "test_reason");
-        assert!(script.contains("const softwareCanvasLayerOptimizationAllowed = () => Boolean("));
-        assert!(script.contains("className.includes('xterm-selection-layer')"));
-        assert!(script.contains("className.includes('xterm-link-layer')"));
-        assert!(script.contains("className.includes('xterm-cursor-layer')"));
-        assert!(
-            script.contains("canvas.setAttribute('data-yggterm-software-canvas-hidden', 'true');")
-        );
-        assert!(!script.contains("if (role === 'cursor') {{"));
-        assert!(
-            script.contains(
-                "const selectionDisposable = typeof term.onSelectionChange === 'function'"
-            )
-        );
+        assert!(script.contains("const softwareCanvasLayerOptimizationAllowed = () => false;"));
         assert!(script.contains("applySoftwareCanvasLayerOptimization('initial_mount');"));
-        assert!(script.contains("softwareCanvasLayerOptimizationActive"));
     }
 
     #[test]
@@ -80325,9 +80356,12 @@ mod tests {
     }
 
     #[test]
-    fn xterm_canvas_renderer_keeps_dim_prompt_text_readable() {
-        assert!(XTERM_CANVAS_JS.contains("t.DIM_OPACITY=.78"));
-        assert!(!XTERM_CANVAS_JS.contains("t.DIM_OPACITY=.5"));
+    fn xterm_webgl_renderer_keeps_dim_prompt_text_readable() {
+        // The xterm.js 6 WebGL addon ships DIM_OPACITY=.5, which renders dim prompt
+        // text too faint; yggterm patches it to .78 (the same readability fix
+        // previously applied to the now-retired canvas addon).
+        assert!(XTERM_WEBGL_JS.contains("t.DIM_OPACITY=.78"));
+        assert!(!XTERM_WEBGL_JS.contains("t.DIM_OPACITY=.5"));
     }
 
     #[test]
@@ -102336,16 +102370,16 @@ Shared connection to 192.0.2.14 closed.\r\n";
         assert_eq!(terminal_input_aware_write_frame_ms(1_000, active, false), 1_000);
     }
     #[test]
-    fn terminal_write_bridge_never_flushes_a_partial_frame_when_budget_relaxed() {
-        // Regression: the rampant CC blink / broken bottom. On a long-running
-        // turn the animation frame budget relaxes to 250–500ms
-        // (terminal_active_animation_effective_write_frame_ms). With frame_ms
-        // (500) > TERMINAL_SYNC_FRAME_MAX_HOLD_MS (250), the buffer ages past the
-        // sync-frame hold cap, so the old flush_due returned the whole pending —
-        // including a still-OPEN frame whose ESU hadn't arrived — and xterm
-        // painted a torn frame (composer/bottom rows missing) until the next
-        // complete frame "blinked" it back. The bridge must instead flush only
-        // the complete-frame prefix and RETAIN the open tail.
+    fn terminal_write_bridge_passes_through_partial_frames_for_native_xterm_2026() {
+        // xterm.js 6 implements synchronized output (DEC mode 2026) natively, so it
+        // buffers each \e[?2026h…\e[?2026l frame itself and never paints a partial.
+        // The bridge therefore NO LONGER holds a buffer that ends mid-frame — the
+        // old hold-and-guess (complete-prefix flush + 250ms cap) was the stand-in
+        // for the missing feature and was the source of the long-turn blink/freeze
+        // (a relaxed 250–500ms budget batched a large frame run that could paint a
+        // torn one). The bridge now flushes whatever is pending on the frame
+        // budget; xterm reassembles the open frame from the next write and defers
+        // the paint to the closing ESU.
         let mut bridge = TerminalWriteBridge::new(500);
         let complete = "\x1b[?2026h\x1b[44;2H\x1b[0m\x1b[49m\x1b[K\x1b[45;72H\x1b[K\x1b[?2026l";
         // An open frame: BSU + some rows, NO closing ESU yet (still arriving).
@@ -102368,31 +102402,18 @@ Shared connection to 192.0.2.14 closed.\r\n";
                 .stage_or_immediate(open_partial.to_string(), 1_100, true)
                 .is_empty()
         );
-        // Way past frame_ms (500) AND past the 250ms hold cap: the old code would
-        // flush the whole buffer (complete + torn partial). The fix flushes only
-        // the complete prefix and retains the open partial.
+        // Past the frame budget: flush the WHOLE pending (complete + open partial)
+        // in one write. No hold, no frame-boundary guessing — xterm 6 buffers the
+        // still-open frame until its ESU arrives in the next write.
+        let expected = format!("{complete}{open_partial}");
         assert_eq!(
             bridge.flush_due(2_000).as_deref(),
-            Some(complete),
-            "only the complete frame should flush; the open partial must be retained"
+            Some(expected.as_str()),
+            "bridge flushes pending on cadence; xterm 6 handles 2026 atomicity"
         );
-        assert_eq!(
-            bridge.pending_for_test(),
-            open_partial,
-            "the still-open frame waits for its ESU instead of being painted torn"
-        );
-        // Once the ESU arrives, the completed frame flushes cleanly.
-        let esu_tail = "\x1b[45;74H\x1b[K\x1b[?2026l";
         assert!(
-            bridge
-                .stage_or_immediate(esu_tail.to_string(), 2_010, true)
-                .is_empty()
-        );
-        let completed = format!("{open_partial}{esu_tail}");
-        assert_eq!(
-            bridge.flush_due(2_600).as_deref(),
-            Some(completed.as_str()),
-            "the now-complete frame flushes whole, never torn"
+            bridge.pending_for_test().is_empty(),
+            "nothing retained — the bridge no longer holds open frames"
         );
     }
     #[test]
@@ -102484,62 +102505,6 @@ Shared connection to 192.0.2.14 closed.\r\n";
         assert!(second.is_empty());
         assert_eq!(bridge.flush_due(1_200), None);
         assert_eq!(bridge.flush_due(1_401), Some(frame_two));
-    }
-    #[test]
-    fn terminal_write_bridge_holds_torn_synchronized_frame_until_esu() {
-        // ROOT FIX for the composer bg-split / "broken bottom" (issue #2): codex
-        // wraps a repaint in \e[?2026h … \e[?2026l (synchronized output). When the
-        // frame arrives split across two daemon reads, the bridge MUST NOT flush
-        // the first half (rows cleared-to-default by codex's repaint preamble, the
-        // gray composer + text still pending) — xterm-as-vendored ignores mode 2026
-        // so a partial flush paints a torn frame. Hold until the ESU arrives, then
-        // emit the whole frame atomically. finding-codex-composer-bg-split-reflow.
-        let mut bridge = TerminalWriteBridge::new(16);
-        // read 1: BSU + repaint preamble that clears rows to default bg, NO ESU yet.
-        let part1 = "\x1b[?2026h\x1b[60;1H\x1b[0m\x1b[49m\x1b[K\x1b[61;1H\x1b[0m\x1b[49m\x1b[K";
-        let held = bridge.stage_or_immediate(part1.to_string(), 1_000, true);
-        assert!(
-            held.is_empty(),
-            "a buffer ending mid synchronized-frame must be held, got {held:?}"
-        );
-        assert_eq!(bridge.pending_for_test(), part1);
-        // The 16ms timer must ALSO refuse to flush the torn frame.
-        assert_eq!(
-            bridge.flush_due(1_100),
-            None,
-            "timer flush must not tear an open synchronized frame"
-        );
-        // read 2: the gray composer fill + text + ESU completes the frame.
-        let part2 = "\x1b[61;1H\x1b[48;2;64;67;75m\u{203a} Find and fix a bug\x1b[61;34H\x1b[K\x1b[?2026l";
-        let flushed = bridge
-            .stage_or_immediate(part2.to_string(), 1_110, true)
-            .join("");
-        assert!(
-            flushed.contains("\x1b[?2026l") && flushed.contains("Find and fix a bug"),
-            "the complete frame must flush atomically once the ESU arrives, got {flushed:?}"
-        );
-        assert!(
-            flushed.starts_with(part1),
-            "the held preamble must lead the atomic flush so the frame is whole"
-        );
-        assert!(bridge.pending_for_test().is_empty());
-    }
-    #[test]
-    fn terminal_write_bridge_flushes_unclosed_synchronized_frame_after_cap() {
-        // Safety valve: if the ESU never arrives (codex died mid-repaint / dropped
-        // bytes) the bridge must not stall forever — flush past the bounded hold.
-        let mut bridge = TerminalWriteBridge::new(16);
-        let part1 = "\x1b[?2026h\x1b[60;1H\x1b[0m\x1b[49m\x1b[K";
-        assert!(
-            bridge.stage_or_immediate(part1.to_string(), 1_000, true).is_empty(),
-            "open frame held initially"
-        );
-        // Well past TERMINAL_SYNC_FRAME_MAX_HOLD_MS (250ms): the stuck frame flushes.
-        assert_eq!(
-            bridge.flush_due(1_000 + 5_000).as_deref(),
-            Some(part1),
-            "an unclosed synchronized frame must flush after the bounded hold"
-        );
     }
     #[test]
     fn terminal_write_bridge_can_switch_to_active_frame_budget() {
