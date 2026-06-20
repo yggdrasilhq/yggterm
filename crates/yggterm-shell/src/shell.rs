@@ -60104,6 +60104,7 @@ fn terminal_eval_script_with_canvas_renderer(
             host.style.setProperty('--yggterm-term-font-weight-bold', String({font_weight_bold}));
             host.style.setProperty('--yggterm-term-line-height', String({line_height}));
             host.style.setProperty('--yggterm-term-letter-spacing', '0px');
+            host.style.setProperty('--yggterm-term-background', {background});
             host.style.setProperty('--yggterm-term-foreground', {foreground});
             host.style.setProperty('--yggterm-term-dim-foreground', {dim_foreground});
             host.style.setProperty('--yggterm-term-cursor', {cursor});
@@ -60381,6 +60382,21 @@ fn terminal_eval_script_with_canvas_renderer(
                     color: transparent !important;
                     background-color: transparent !important;
                 }}
+                /* The vendored xterm.css hardcodes `.xterm` / `.xterm-viewport`
+                   background to #000 (an OS X scrollbar-opacity workaround). With
+                   the DOM renderer the viewport is usually a non-integer number of
+                   rows tall, so a sub-row strip below the last row shows that #000
+                   as a BLACK VOID line (the canvas renderer used to paint the whole
+                   viewport, hiding it). Paint the terminal layers in the theme
+                   background explicitly (NOT transparent — transparent reveals
+                   whatever is behind, which can itself be black) so any fit
+                   remainder reads as the terminal background; cells still paint
+                   their own per-cell backgrounds on top. */
+                #${{hostId}} .xterm,
+                #${{hostId}} .xterm-viewport,
+                #${{hostId}} .xterm-screen {{
+                    background-color: var(--yggterm-term-background) !important;
+                }}
                 #${{hostId}} .xterm-screen {{
                     overflow: hidden !important;
                     height: 100% !important;
@@ -60410,11 +60426,19 @@ fn terminal_eval_script_with_canvas_renderer(
                 #${{hostId}} .xterm-viewport:hover {{
                     scrollbar-color: rgba(140, 162, 186, 0.78) transparent !important;
                 }}
+                /* line-height is intentionally NOT !important: xterm.js 6's DOM
+                   renderer sets each row div's inline line-height to the exact cell
+                   height in px (e.g. 18px). A !important override to 1.0 (≈ font
+                   size) beat that inline value and mis-spaced the visible rows —
+                   harmless under the old canvas renderer (these rows were invisible
+                   accessibility nodes) but it is the "staggered output" on the DOM
+                   renderer. A non-important var keeps a fallback while letting
+                   xterm's inline per-row px line-height win. */
                 #${{hostId}} .xterm-rows {{
                     height: 100% !important;
                     color: var(--yggterm-term-foreground) !important;
                     -webkit-text-fill-color: currentColor !important;
-                    line-height: var(--yggterm-term-line-height) !important;
+                    line-height: var(--yggterm-term-line-height);
                 }}
                 #${{hostId}} .xterm-rows,
                 #${{hostId}} .xterm-rows > div,
@@ -60434,11 +60458,11 @@ fn terminal_eval_script_with_canvas_renderer(
                     -webkit-text-fill-color: currentColor !important;
                 }}
                 #${{hostId}} .xterm-rows > div {{
-                    line-height: var(--yggterm-term-line-height) !important;
+                    line-height: var(--yggterm-term-line-height);
                 }}
                 #${{hostId}} .xterm-rows span,
                 #${{hostId}} .xterm-rows div {{
-                    line-height: var(--yggterm-term-line-height) !important;
+                    line-height: var(--yggterm-term-line-height);
                 }}
                 #${{hostId}} .xterm-rows .xterm-dim:not(.xterm-cursor):not([class*="xterm-fg-"]),
                 #${{hostId}} .xterm-rows [style*="opacity: 0"]:not(.xterm-cursor):not([class*="xterm-fg-"]),
