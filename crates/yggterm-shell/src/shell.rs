@@ -60380,7 +60380,7 @@ fn terminal_eval_script_with_canvas_renderer(
                     color: transparent !important;
                     background-color: transparent !important;
                 }}
-                /* The vendored xterm.css hardcodes `.xterm` / `.xterm-viewport`
+                /* The vendored xterm.css hardcodes .xterm / .xterm-viewport
                    background to #000 (an OS X scrollbar-opacity workaround). With
                    the DOM renderer the viewport is usually a non-integer number of
                    rows tall, so a sub-row strip below the last row shows that #000
@@ -60407,6 +60407,25 @@ fn terminal_eval_script_with_canvas_renderer(
                        right so the scrollbar is hit-testable. Matches
                        the ::-webkit-scrollbar width: 8px rule below. */
                     width: calc(100% - 8px) !important;
+                }}
+                /* XTERM-BUG: scrollable-element-zero-height (xterm.js 6)
+                   xterm.js 6 moved .xterm-screen INSIDE a new VS Code-derived
+                   .xterm-scrollable-element (the ScrollableElement that now owns
+                   scrolling — see the ydisp scroll readback fix). That element is
+                   position:relative with NO height, and under the WebGL/canvas
+                   renderer its only children are absolutely-positioned canvases, so
+                   it collapses to 0px tall. .xterm-screen height:100% then
+                   resolves against a 0-tall parent and ALSO collapses to 0 — the
+                   grid canvas (correctly fit) overflows as a thin band at the top
+                   with the rest of the host black (the "squished viewport"). The
+                   DOM renderer hid this because its in-flow .xterm-rows gave the
+                   chain intrinsic height. Give the new element the viewport height
+                   it lacks so .xterm-screen's percentage height resolves and the
+                   terminal fills the host. Harmless when the element is absent
+                   (older xterm / DOM-only builds). */
+                #${{hostId}} .xterm-scrollable-element {{
+                    height: 100% !important;
+                    width: 100% !important;
                 }}
                 #${{hostId}} .xterm-viewport {{
                     height: 100% !important;
@@ -62311,6 +62330,7 @@ fn terminal_eval_script_with_canvas_renderer(
             const helperTextarea = host.querySelector('.xterm-helper-textarea');
             const screen = host.querySelector('.xterm-screen');
             const viewport = host.querySelector('.xterm-viewport');
+            const scrollableElement = host.querySelector('.xterm-scrollable-element');
             const rowsLayer = host.querySelector('.xterm-rows');
             host.style.boxSizing = 'border-box';
             host.style.position = 'relative';
@@ -62324,6 +62344,16 @@ fn terminal_eval_script_with_canvas_renderer(
                 xtermRoot.style.width = '100%';
                 xtermRoot.style.position = 'relative';
                 xtermRoot.style.overflow = 'hidden';
+            }}
+            // XTERM-BUG: scrollable-element-zero-height (xterm.js 6) — the new
+            // `.xterm-scrollable-element` wrapper around `.xterm-screen` has no
+            // height and collapses to 0 under the WebGL/canvas renderer (its only
+            // children are absolutely-positioned canvases), collapsing the screen
+            // with it (the "squished viewport"). Mirror the runtime-style fix
+            // inline so the screen's percentage height resolves to the host.
+            if (scrollableElement) {{
+                scrollableElement.style.height = '100%';
+                scrollableElement.style.width = '100%';
             }}
             applyNonSelectableSurfaceContract();
             if (helpers) {{
@@ -77532,6 +77562,64 @@ mod tests {
         assert!(
             script.contains(".xterm-viewport::-webkit-scrollbar-thumb"),
             "CSS must provide a WebKit scrollbar thumb so dragging is visually possible on Chromium/WebKit"
+        );
+    }
+    #[test]
+    fn terminal_eval_script_sizes_xterm6_scrollable_element_to_prevent_squish() {
+        // XTERM-BUG: scrollable-element-zero-height — xterm.js 6 nests
+        // `.xterm-screen` inside a new `.xterm-scrollable-element` that has no
+        // height; under WebGL its only children are absolutely-positioned
+        // canvases so it collapses to 0, collapsing `.xterm-screen { height:100% }`
+        // with it (the "squished viewport"). Both the runtime stylesheet AND
+        // stretchXtermRoot must give the new element a definite height/width.
+        let theme = terminal_theme(UiTheme::ZedLight, palette(UiTheme::ZedLight), 13.0, "");
+        let script = terminal_eval_script("yggterm-terminal-test", &theme, true);
+        assert!(
+            script.contains("#${hostId} .xterm-scrollable-element {"),
+            "runtime CSS must target the xterm.js 6 .xterm-scrollable-element wrapper"
+        );
+        assert!(
+            script.contains("const scrollableElement = host.querySelector('.xterm-scrollable-element');"),
+            "stretchXtermRoot must look up the .xterm-scrollable-element"
+        );
+        assert!(
+            script.contains("scrollableElement.style.height = '100%';"),
+            "stretchXtermRoot must inline-size the scrollable element so .xterm-screen height resolves"
+        );
+    }
+    #[test]
+    fn terminal_eval_script_runtime_style_template_has_no_stray_backticks() {
+        // REGRESSION: a CSS comment inside the runtime-style JS template literal
+        // (`runtimeStyle.textContent = ` ... `) once contained backticks around
+        // `.xterm` / `.xterm-viewport`. Those backticks TERMINATE the template
+        // literal early; the remainder happens to PARSE as valid JS (member access
+        // + division + more template literals) so the node parse-check passes, but
+        // at runtime WebKit's JSC throws `TypeError: undefined is not a function`,
+        // crashing the ENTIRE mount script before stretchXtermRoot/fit/render run —
+        // the terminal stays a tiny 80x24 box, unpainted (the "squished, black,
+        // no-rendering viewport"). CSS never needs backticks, so the template must
+        // contain none.
+        let theme = terminal_theme(UiTheme::ZedLight, palette(UiTheme::ZedLight), 13.0, "");
+        let script = terminal_eval_script("yggterm-terminal-test", &theme, true);
+        let open = "runtimeStyle.textContent = `";
+        let start = script
+            .find(open)
+            .expect("runtime style template present")
+            + open.len();
+        let body = &script[start..];
+        let end = body
+            .find("`;")
+            .expect("runtime style template is closed with a backtick");
+        let css_template = &body[..end];
+        assert!(
+            !css_template.contains('`'),
+            "runtime-style CSS template must contain NO backticks (a backtick in a CSS \
+             comment terminates the JS template literal and crashes the mount at runtime); \
+             found one near: {:?}",
+            css_template
+                .match_indices('`')
+                .next()
+                .map(|(i, _)| &css_template[i.saturating_sub(40)..(i + 40).min(css_template.len())])
         );
     }
     #[test]
