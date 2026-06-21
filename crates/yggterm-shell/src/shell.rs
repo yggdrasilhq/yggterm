@@ -65181,7 +65181,17 @@ fn terminal_eval_script_with_canvas_renderer(
             if (!accel) {{
                 return true;
             }}
-            if (key === 'v' && !event.shiftKey && !event.altKey) {{
+            // Ctrl+V AND Ctrl+Shift+V both route through the explicit native
+            // clipboard paste. Ctrl+Shift+V previously relied on WebKitGTK
+            // firing a native 'paste' DOM event (caught by handleClipboardPaste)
+            // because this handler returned true (passthrough) for it. Under
+            // xterm.js 6 that native paste event no longer reaches us, so the
+            // keyboard paste silently no-opped while right-click/context-menu
+            // paste (a separate native path) kept working. Handle it here so the
+            // shortcut is independent of the native paste event. requestNative-
+            // ClipboardPaste de-dupes against window.__yggtermLastPasteEventAtMs,
+            // so a native paste (if one still fires) will not double-paste.
+            if (key === 'v' && !event.altKey) {{
                 if (event.preventDefault) {{
                     event.preventDefault();
                 }}
@@ -65191,6 +65201,7 @@ fn terminal_eval_script_with_canvas_renderer(
                 if (event.stopPropagation) {{
                     event.stopPropagation();
                 }}
+                const pasteShiftHeld = Boolean(event.shiftKey);
                 const pasteToken = pendingClipboardPasteToken + 1;
                 pendingClipboardPasteToken = pasteToken;
                 window.setTimeout(() => {{
@@ -65202,7 +65213,7 @@ fn terminal_eval_script_with_canvas_renderer(
                         if (lastPasteEventAt > 0 && Date.now() - lastPasteEventAt < terminalNativePasteDedupeMs) {{
                             return;
                         }}
-                        requestNativeClipboardPaste('ctrl_v_fallback');
+                        requestNativeClipboardPaste(pasteShiftHeld ? 'ctrl_shift_v_fallback' : 'ctrl_v_fallback');
                     }} catch (_error) {{}}
                 }}, 220);
                 window.setTimeout(() => {{
@@ -79912,9 +79923,16 @@ mod tests {
         assert!(
             !script.contains("document.addEventListener('keydown', handleDocumentKeydown, true);")
         );
-        assert!(script.contains("if (key === 'v' && !event.shiftKey && !event.altKey) {"));
+        // Ctrl+V and Ctrl+Shift+V both take the explicit native-paste branch
+        // (no longer excluding shiftKey) so Ctrl+Shift+V works without relying
+        // on a native 'paste' DOM event that xterm.js 6 / WebKitGTK no longer
+        // delivers. See the keydown handler comment.
+        assert!(script.contains("if (key === 'v' && !event.altKey) {"));
+        assert!(!script.contains("if (key === 'v' && !event.shiftKey && !event.altKey) {"));
         assert!(script.contains("requestNativeClipboardPaste('paste_event');"));
-        assert!(script.contains("requestNativeClipboardPaste('ctrl_v_fallback');"));
+        assert!(script.contains(
+            "requestNativeClipboardPaste(pasteShiftHeld ? 'ctrl_shift_v_fallback' : 'ctrl_v_fallback');"
+        ));
         assert!(script.contains("sendTerminalEvent({ kind: \"clipboard_paste_request\" });"));
         assert!(script.contains("if (pasteClaim.hasImage) {"));
         assert!(script.contains("requestNativeClipboardImagePaste();"));
