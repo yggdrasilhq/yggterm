@@ -4,6 +4,52 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+## 2.9.40
+
+- **CC viewport blink/freeze on long turns is fixed at the source: native xterm.js 6
+  + WebGL.** On a long-running Claude Code turn the viewport blinked every ~10s and
+  froze (couldn't type/scroll) for ~1s. Root cause: the vendored xterm.js did not
+  implement synchronized output (DEC mode 2026), so a yggterm "write bridge" stood in
+  for it — holding/guessing frame boundaries and coalescing ~500ms of frames into one
+  giant write that blocked the main thread and could paint a torn frame. We upgraded
+  the vendored bundle to **xterm.js 6.0.0**, which implements mode 2026 natively (it
+  buffers each frame and paints atomically itself), and **retired the bridge's
+  hold-and-guess** — it is now a pure IPC batcher. ghostty has none of this machinery,
+  which is why it was smooth.
+- **Renderer: DOM on WebKitGTK (WebGL was black).** xterm.js 6 removed the 2D canvas
+  renderer that previously served Wayland, leaving only DOM or WebGL. WebGL does **not**
+  composite to screen under WebKitGTK/Wayland — the terminal flashed its last frame then
+  went to a black void — so on Linux we default to the DOM renderer (reliable, and it
+  keeps webkit-snapshot screenshots faithful). WebGL stays available behind an explicit
+  `YGGTERM_ENABLE_XTERM_CANVAS=1` override for hosts where it composites. (The mode-2026
+  blink fix above is renderer-independent; it comes from xterm.js 6, not WebGL.) The
+  dim-prompt-text readability fix is preserved.
+  NOTE: an earlier cut of this release shipped WebGL on Wayland and *looked* fine to the
+  in-process screenshot — that capture reads the GPU backing buffer via `toDataURL`
+  (`preserveDrawingBuffer`), which holds a good image even when the on-screen compositor
+  shows black. The DOM default removes the failure and restores honest screenshots.
+- **Faithful in-process screenshot fixed for xterm 6 (when WebGL is opt-in enabled).**
+  The canvas-composite capture sized its output from `.xterm-screen`, which under
+  xterm 6 carries no explicit height (its canvas layers are `position:absolute`) and so
+  reports a ~0 bounding rect — every composite read back a 1px-tall blank. It now falls
+  back to the full-height `.xterm-viewport` rect when `.xterm-screen` is degenerate.
+  (On the default DOM renderer the composite is skipped and capture uses the faithful
+  webkit DOM snapshot.)
+
+- **Scroll position tracking fixed for xterm 6 (scroll-up no longer no-ops / mis-detects).**
+  yggterm read the viewport scroll position from `.xterm-viewport.scrollTop`, but
+  xterm 6 moved scrolling to a VS Code-derived ScrollableElement and leaves
+  `.xterm-viewport.scrollTop` pinned at 0. So `effectiveXtermViewportY` reported 0
+  always — which (a) made `app terminal scroll` / scroll-to-line a no-op (the mover
+  saw "already at target" and never called a scroll API) and (b) broke user-scroll-up
+  detection, so a wheel scroll-up followed by streaming output would yank back to the
+  bottom (the 2.9.32 anti-yank, re-broken by the renderer migration). Fix: when the
+  ScrollableElement owns scrolling, trust the authoritative public `viewportY` (ydisp)
+  instead of the decoupled DOM `scrollTop`. Also routed the out-of-closure app-control
+  scroll through the intent SSOT (`setScrollbackIntent`) so the settle-follow watchdog
+  no longer re-yanks an agent scroll-up. Live-verified on WebGL: wheel scroll-up holds
+  through streamed output; `scroll --to top` reaches and holds the buffer top.
+
 ## 2.9.39
 
 - **Typing into an active Claude Code session no longer batches into ~1s blocks.**

@@ -211,47 +211,10 @@ pub(crate) fn terminal_output_has_synchronized_repaint_frame(data: &str) -> bool
             || terminal_csi_count_at_least(data, 8))
 }
 
-/// True when `data` ENDS inside an open synchronized-output region — a
-/// `\e[?2026h` (begin synchronized update / BSU) that has no matching
-/// `\e[?2026l` (end / ESU) after it. codex wraps every repaint in BSU…ESU so
-/// a 2026-honoring terminal applies the whole frame atomically. The vendored
-/// xterm.js does NOT implement mode 2026, so the write bridge MUST stand in for
-/// it: never flush a buffer that ends mid-frame, or xterm paints a torn frame
-/// (rows cleared-to-default by the early part of codex's repaint, the gray
-/// composer + text still pending) = the long-standing "broken bottom /
-/// composer bg-split". See finding-codex-composer-bg-split-reflow (the reflow
-/// theory was falsified — this is frame tearing) + campaign-xterm-dealbreakers #2.
-pub(crate) fn terminal_output_ends_inside_synchronized_frame(data: &str) -> bool {
-    let last_open = data.rfind("\x1b[?2026h");
-    let last_close = data.rfind("\x1b[?2026l");
-    match (last_open, last_close) {
-        (Some(open), Some(close)) => open > close,
-        (Some(_), None) => true,
-        _ => false,
-    }
-}
-
-/// When `data` ends inside an open synchronized frame (per
-/// [`terminal_output_ends_inside_synchronized_frame`]) but a COMPLETE frame
-/// precedes it, returns the byte length of the complete-frame prefix — i.e. the
-/// offset just past the last `\e[?2026l` (ESU). The bridge flushes that prefix
-/// and RETAINS the open tail, so complete frames keep flowing on the frame-budget
-/// cadence while the still-open frame waits for its ESU — instead of either
-/// stalling all complete frames or flushing a torn partial. Returns 0 when there
-/// is no complete frame ahead of the open one (the whole buffer is one open
-/// frame, or pre-frame content + an open frame), in which case the caller holds.
-pub(crate) fn terminal_synchronized_output_complete_prefix_len(data: &str) -> usize {
-    let last_open = data.rfind("\x1b[?2026h");
-    let last_close = data.rfind("\x1b[?2026l");
-    match (last_open, last_close) {
-        // Ends mid-frame (open BSU after the last ESU) AND a complete frame
-        // precedes it: the prefix is everything up to and including that ESU.
-        (Some(open), Some(close)) if open > close => close + "\x1b[?2026l".len(),
-        // Open frame with no preceding complete frame, or not ending mid-frame.
-        _ => 0,
-    }
-}
-
+/// xterm.js 6 implements synchronized output (DEC mode 2026) natively, so the
+/// write bridge no longer stands in for it — the old hold-and-guess helpers
+/// (`terminal_output_ends_inside_synchronized_frame`,
+/// `terminal_synchronized_output_complete_prefix_len`) were retired in 2.9.40.
 #[cfg(test)]
 pub(crate) fn terminal_synchronized_output_frame_ranges(data: &str) -> Vec<(usize, usize)> {
     let start_marker = "\x1b[?2026h";
