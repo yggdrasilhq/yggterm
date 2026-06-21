@@ -2394,14 +2394,16 @@ fn linux_terminal_renderer_policy_from_input(
         };
     }
     if input.wayland_display_present {
-        // Wayland: enable the GPU canvas renderer (the DOM renderer is xterm.js's
-        // slowest backend). The X11 idle-CPU regression does not reproduce on
-        // Wayland, and the canvas-renderer false positive in the render-health
-        // heuristic (canvas_low_contrast_foreground_with_buffer_text) is fixed
-        // by trusting canvas ink. See docs/xterm-bugs.md#xterm-pipeline-latency.
+        // Wayland: WebGL (xterm.js 6's GPU renderer — the highest-performance tier).
+        // WebGL only PRESENTS with WebKitGTK accelerated compositing enabled; the
+        // earlier "WebGL is black" was compositing being DISABLED, not WebGL itself.
+        // configure_linux_webkit_compositing now keeps compositing ON with a
+        // software-GL safety net (verified on jojo: WebGL composites, no crash). xterm6
+        // removed the 2D canvas renderer, so WebGL is the GPU tier here; DOM remains the
+        // automatic fallback if the WebGL context is lost.
         return LinuxTerminalRendererPolicy {
             set_canvas_env: Some("1"),
-            reason: "xterm_canvas_enabled_for_wayland",
+            reason: "xterm_webgl_enabled_for_wayland",
         };
     }
     LinuxTerminalRendererPolicy {
@@ -2641,8 +2643,14 @@ fn configure_linux_terminal_renderer_policy() {
         gdk_backend_x11: std::env::var("GDK_BACKEND")
             .ok()
             .is_some_and(|value| value.split(',').any(|part| part.trim() == "x11")),
-        wayland_display_present: std::env::var_os("WAYLAND_DISPLAY").is_some(),
-        display_present: std::env::var_os("DISPLAY").is_some(),
+        // Detect Wayland by the compositor SOCKET, not just $WAYLAND_DISPLAY: the
+        // daemon-spawned GUI (`server app launch`) starts without display env vars (they
+        // are recovered later), so an env-only check ran before WAYLAND_DISPLAY existed
+        // and mis-picked DOM. The socket under XDG_RUNTIME_DIR is present regardless of
+        // env timing — the reliable "a Wayland session is available" signal.
+        wayland_display_present: linux_wayland_session_available(),
+        display_present: std::env::var_os("DISPLAY").is_some()
+            || std::path::Path::new("/tmp/.X11-unix/X0").exists(),
     });
     if let Some(value) = policy.set_canvas_env {
         unsafe { std::env::set_var(ENV_YGGTERM_ENABLE_XTERM_CANVAS, value) };
@@ -2671,6 +2679,35 @@ fn linux_canvas_env_is_user_explicit(
             .map(str::trim)
             .filter(|policy| !policy.is_empty())
             .is_none_or(|policy| policy == "xterm_canvas_explicit")
+}
+
+/// True when a Wayland session is available, detected by the compositor SOCKET under
+/// $XDG_RUNTIME_DIR rather than $WAYLAND_DISPLAY alone. The daemon-spawned GUI
+/// (`server app launch`) starts before its display env is recovered, so an env-only
+/// check ran too early and mis-picked the DOM renderer; the socket is present
+/// regardless of env timing. Honors an explicitly-named WAYLAND_DISPLAY socket and
+/// falls back to the default `wayland-0` / any `wayland-*` socket.
+#[cfg(target_os = "linux")]
+fn linux_wayland_session_available() -> bool {
+    if std::env::var_os("WAYLAND_DISPLAY").is_some() {
+        return true;
+    }
+    let Some(runtime_dir) = std::env::var_os("XDG_RUNTIME_DIR") else {
+        return false;
+    };
+    let runtime = std::path::Path::new(&runtime_dir);
+    if runtime.join("wayland-0").exists() {
+        return true;
+    }
+    std::fs::read_dir(runtime)
+        .map(|entries| {
+            entries.filter_map(Result::ok).any(|entry| {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                name.starts_with("wayland-") && !name.ends_with(".lock")
+            })
+        })
+        .unwrap_or(false)
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -2804,13 +2841,41 @@ fn configure_linux_accessibility_bridge() {
 
 #[cfg(target_os = "linux")]
 fn configure_linux_webkit_compositing() {
-    let compositing_enabled = std::env::var_os(ENV_YGGTERM_ENABLE_WEBKIT_COMPOSITING).is_some();
-    if compositing_enabled || std::env::var_os("WEBKIT_DISABLE_COMPOSITING_MODE").is_some() {
+    // WebGL (xterm.js 6's GPU renderer) can ONLY present to screen with WebKitGTK
+    // accelerated compositing ENABLED. We previously disabled it
+    // (WEBKIT_DISABLE_COMPOSITING_MODE=1) because the GPU compositing path crashed in
+    // Mesa/EGL on hosts with no working hardware GL (jojo: AMD iGPU exposing only
+    // llvmpipe). That left WebGL BLACK — it rendered to its backing buffer (readable
+    // via toDataURL, which fooled the in-process screenshot) but never composited.
+    //
+    // Fix: keep compositing ON, but force the SOFTWARE-GL / non-DMABUF presentation so
+    // the crashing hardware EGL/DMABUF path is never taken:
+    //   LIBGL_ALWAYS_SOFTWARE=1 / GALLIUM_DRIVER=llvmpipe -> software GL (stable)
+    //   WEBKIT_DISABLE_DMABUF_RENDERER=1                  -> SHM presentation path
+    // Verified on jojo via MiniBrowser (same libwebkit2gtk-4.1 as our wry webview): a
+    // WebGL frame composites to screen with zero EGL/Mesa errors and no crash, where
+    // the default (hardware) compositing path goes black/crashes. Hardware GL is a
+    // future optimization — once a host's amdgpu/Mesa GL works, opt back into it with
+    // YGGTERM_ENABLE_WEBKIT_COMPOSITING=1 (skips the software-GL safety net).
+
+    // Escape hatch: if the user force-disabled compositing, respect it — WebGL becomes
+    // unavailable and the renderer policy falls back to DOM.
+    if std::env::var_os("WEBKIT_DISABLE_COMPOSITING_MODE").is_some() {
         return;
     }
-    // Jojo has repeated Mesa/WebKitGTK EGL crashes on the GPU compositing path.
-    // Default to software compositing unless the user opts back in explicitly.
-    unsafe { std::env::set_var("WEBKIT_DISABLE_COMPOSITING_MODE", "1") };
+    // Default to the software-GL safety net; opt out on hosts with working hardware GL.
+    let use_hardware_gl = std::env::var_os(ENV_YGGTERM_ENABLE_WEBKIT_COMPOSITING).is_some();
+    if !use_hardware_gl {
+        if std::env::var_os("LIBGL_ALWAYS_SOFTWARE").is_none() {
+            unsafe { std::env::set_var("LIBGL_ALWAYS_SOFTWARE", "1") };
+        }
+        if std::env::var_os("GALLIUM_DRIVER").is_none() {
+            unsafe { std::env::set_var("GALLIUM_DRIVER", "llvmpipe") };
+        }
+    }
+    if std::env::var_os("WEBKIT_DISABLE_DMABUF_RENDERER").is_none() {
+        unsafe { std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1") };
+    }
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -4075,9 +4140,9 @@ mod tests {
     fn linux_terminal_renderer_policy_keeps_canvas_opt_in() {
         use super::{LinuxTerminalRendererPolicyInput, linux_terminal_renderer_policy_from_input};
 
-        // Wayland enables the GPU canvas renderer by default (the X11 idle-CPU
-        // regression does not reproduce on Wayland; the render-health false
-        // positive is fixed by trusting canvas ink).
+        // Wayland uses the WebGL GPU renderer (xterm 6's fastest tier). It presents
+        // because configure_linux_webkit_compositing enables WebKitGTK compositing with
+        // a software-GL safety net; the earlier "WebGL black" was compositing disabled.
         let wayland = linux_terminal_renderer_policy_from_input(LinuxTerminalRendererPolicyInput {
             explicit_canvas_env: false,
             gdk_backend_x11: false,
@@ -4085,7 +4150,7 @@ mod tests {
             display_present: true,
         });
         assert_eq!(wayland.set_canvas_env, Some("1"));
-        assert_eq!(wayland.reason, "xterm_canvas_enabled_for_wayland");
+        assert_eq!(wayland.reason, "xterm_webgl_enabled_for_wayland");
 
         let x11 = linux_terminal_renderer_policy_from_input(LinuxTerminalRendererPolicyInput {
             explicit_canvas_env: false,
@@ -4135,7 +4200,7 @@ mod tests {
         ));
         assert!(!linux_canvas_env_is_user_explicit(
             true,
-            Some("xterm_canvas_enabled_for_wayland")
+            Some("xterm_webgl_enabled_for_wayland")
         ));
         // Empty marker behaves like no marker (bare user export).
         assert!(linux_canvas_env_is_user_explicit(true, Some("  ")));
