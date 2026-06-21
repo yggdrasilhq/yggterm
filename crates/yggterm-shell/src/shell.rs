@@ -66550,6 +66550,28 @@ fn terminal_eval_script_with_canvas_renderer(
                 if (expectedScrollbackPayload) {{
                     entry.scrollbackExpected = true;
                 }}
+                // XTERM-BUG: webgl-stale-cursor-on-cold-reveal
+                // On a cold switch-in, scheduleActivationRepaint fires its heavy
+                // (atlas-clearing) redraws at now/120ms/360ms — but a COLD remote
+                // session's live daemon content streams in seconds LATER, after
+                // those timers. The shadow->live swap then paints the first live
+                // frame with no atlas-clear, so the WebGL cursor cell is left stale
+                // ("broken paint at the cursor right after switching in", which
+                // self-heals on the next render). Arm a one-shot on switch-in and
+                // force ONE clean redraw when the live daemon content actually
+                // arrives, regardless of how long the cold attach took.
+                if (
+                    entry.pendingRevealDaemonRepaint
+                    && Date.now() < Number(entry.pendingRevealDaemonRepaintUntilMs || 0)
+                ) {{
+                    entry.pendingRevealDaemonRepaint = false;
+                    entry.pendingRevealDaemonRepaintUntilMs = 0;
+                    try {{
+                        window.requestAnimationFrame(() => {{
+                            try {{ redrawTerminal('reveal_daemon_content'); }} catch (_revealRepaintError) {{}}
+                        }});
+                    }} catch (_revealRepaintScheduleError) {{}}
+                }}
             }}
             // OSC 52 re-fire on switch (finding-osc52-copy-chime-replay-refire): the
             // daemon re-streams a session's BUFFERED output when the viewer attaches,
@@ -68694,6 +68716,17 @@ fn terminal_set_input_policy_script_for_active_session(
               window.requestAnimationFrame(() => repaintActiveEntry(entry, `${{reason}}:raf`, false));
               window.setTimeout(() => repaintActiveEntry(entry, `${{reason}}:120ms`, false), 120);
               window.setTimeout(() => repaintActiveEntry(entry, `${{reason}}:360ms`, false), 360);
+              // XTERM-BUG: webgl-stale-cursor-on-cold-reveal — these fixed timers
+              // (<=360ms) fire BEFORE a cold remote session's live daemon content
+              // streams in, so none of them clears the atlas over the live frame.
+              // Arm a one-shot the write path consumes when the live content
+              // actually lands, forcing one clean redraw then. Only for sources
+              // not yet live (shadow/retained); a warm session is already painted
+              // by the :now redraw above.
+              if (String(entry.terminalContentSource || '') !== 'daemon_pty') {{
+                entry.pendingRevealDaemonRepaint = true;
+                entry.pendingRevealDaemonRepaintUntilMs = now + 8000;
+              }}
             }} catch (_error) {{}}
           }};
           const registry = window.__yggtermXtermHosts || {{}};
@@ -77585,6 +77618,34 @@ mod tests {
         assert!(
             script.contains("scrollableElement.style.height = '100%';"),
             "stretchXtermRoot must inline-size the scrollable element so .xterm-screen height resolves"
+        );
+    }
+    #[test]
+    fn terminal_eval_script_forces_clean_redraw_when_cold_reveal_daemon_content_lands() {
+        // XTERM-BUG: webgl-stale-cursor-on-cold-reveal — the fixed activation
+        // repaints (now/120ms/360ms) fire before a cold remote session's live
+        // daemon content arrives, so the shadow->live swap leaves a stale WebGL
+        // cursor cell. A one-shot armed on switch-in must force a clean redraw
+        // when the live daemon content actually lands.
+        let theme = terminal_theme(UiTheme::ZedLight, palette(UiTheme::ZedLight), 13.0, "");
+        let switch_script =
+            terminal_set_input_policy_script_for_active_session("local://x", true, true);
+        assert!(
+            switch_script.contains("entry.pendingRevealDaemonRepaint = true;"),
+            "switch-in must arm the reveal-daemon-content one-shot repaint"
+        );
+        assert!(
+            switch_script.contains("String(entry.terminalContentSource || '') !== 'daemon_pty'"),
+            "the one-shot must only arm for not-yet-live (shadow) sources"
+        );
+        let script = terminal_eval_script("yggterm-terminal-test", &theme, true);
+        assert!(
+            script.contains("entry.pendingRevealDaemonRepaint"),
+            "the write path must consume the reveal-daemon-content one-shot"
+        );
+        assert!(
+            script.contains("redrawTerminal('reveal_daemon_content')"),
+            "the write path must force a clean redraw when live daemon content lands"
         );
     }
     #[test]
