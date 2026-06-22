@@ -39673,11 +39673,18 @@ fn app() -> Element {
             let shell = state.read();
             active_terminal_input_policy_signature(&shell)
         };
-        if *last_active_terminal_input_policy.read() == Some(policy_signature.clone()) {
+        let previous_policy = last_active_terminal_input_policy.read().clone();
+        if previous_policy.as_ref() == Some(&policy_signature) {
             return;
         }
+        // Detect a background->foreground transition so the active terminal heals
+        // its WebGL glyph atlas on foreground (see window_foreground repaint in
+        // terminal_set_input_policy_script_for_active_session).
+        let foreground_regained = previous_policy
+            .as_ref()
+            .is_some_and(|prev| !prev.window_focused && policy_signature.window_focused);
         last_active_terminal_input_policy.set(Some(policy_signature.clone()));
-        apply_active_terminal_input_policy(&policy_signature);
+        apply_active_terminal_input_policy(&policy_signature, foreground_regained);
     });
     use_effect(move || {
         let active = state.read().server.active_session().cloned();
@@ -58188,7 +58195,10 @@ fn active_terminal_input_policy_signature(
         remote_resume_input_ready,
     }
 }
-fn apply_active_terminal_input_policy(signature: &ActiveTerminalInputPolicySignature) {
+fn apply_active_terminal_input_policy(
+    signature: &ActiveTerminalInputPolicySignature,
+    foreground_regained: bool,
+) {
     if signature.active_view_mode != WorkspaceViewMode::Terminal {
         let _ = document::eval(&terminal_clear_input_policy_script());
         return;
@@ -58222,6 +58232,7 @@ fn apply_active_terminal_input_policy(signature: &ActiveTerminalInputPolicySigna
         session_path,
         allow_input,
         focus_input,
+        foreground_regained,
     ));
 }
 fn sync_active_terminal_input_policy(state: Signal<ShellState>) {
@@ -58229,7 +58240,8 @@ fn sync_active_terminal_input_policy(state: Signal<ShellState>) {
         let shell = state.read();
         active_terminal_input_policy_signature(&shell)
     };
-    apply_active_terminal_input_policy(&signature);
+    // Manual resync (titlebar dismiss, etc.) is not a foreground transition.
+    apply_active_terminal_input_policy(&signature, false);
 }
 fn dismiss_titlebar_transients_and_resync_active_terminal(mut state: Signal<ShellState>) {
     state.with_mut(|shell| {
@@ -61505,6 +61517,7 @@ fn terminal_eval_script_with_canvas_renderer(
         let skippedPerfEventCount = 0;
         let terminalInputHotUntilMs = 0;
         let forcedRefreshCount = 0;
+        let forcedAtlasClearCount = 0;
         let forcedRefreshSkippedCount = 0;
         let scrollbackLocked = false;
         let scrollbackIntent = 'PromptFollow';
@@ -63575,10 +63588,30 @@ fn terminal_eval_script_with_canvas_renderer(
                         if (window.__yggtermXtermHosts && window.__yggtermXtermHosts[hostId]) {{
                             window.__yggtermXtermHosts[hostId].forcedRefreshCount = forcedRefreshCount;
                         }}
+                        // WebGL glyph-atlas heal: while the window is backgrounded
+                        // the WebGL render loop (rAF) is throttled and the GPU glyph
+                        // atlas texture goes stale, so the first forced full refresh
+                        // after foreground/switch-in paints cells against a stale
+                        // atlas -> wrong-glyph garble that self-heals ~1s later. A
+                        // bare term.refresh() re-renders cells but reuses that stale
+                        // atlas, so clear it FIRST and let refresh rebuild glyphs in
+                        // the same frame (atomic within this rAF -> blink-free). This
+                        // is exactly what redrawTerminal()/manual-redraw does to heal
+                        // it; doing it on the forced-refresh funnel means foreground,
+                        // switch-in, and settled-resize all rebuild the atlas instead
+                        // of presenting garbage. Gated by the same rate-limit/
+                        // input-hot/frame-like checks so it never fires during
+                        // typing or active output streaming.
+                        clearTerminalTextureAtlas();
+                        forcedAtlasClearCount += 1;
+                        if (window.__yggtermXtermHosts && window.__yggtermXtermHosts[hostId]) {{
+                            window.__yggtermXtermHosts[hostId].forcedAtlasClearCount = forcedAtlasClearCount;
+                        }}
                         term.refresh(0, Math.max(0, term.rows - 1));
                         emitPerf("xterm_forced_refresh", {{
                             reason: "visible_paint",
                             force_full_refresh: Boolean(requestedForceFullRefresh),
+                            atlas_cleared: true,
                         }});
                     }} else if (requestedForceFullRefresh) {{
                         recordVisiblePaintRefreshSkipped(
@@ -68656,6 +68689,7 @@ fn terminal_set_input_policy_script_for_active_session(
     active_session_path: &str,
     enabled: bool,
     focus: bool,
+    foreground_regained: bool,
 ) -> String {
     format!(
         r#"
@@ -68754,8 +68788,19 @@ fn terminal_set_input_policy_script_for_active_session(
                 'rust_policy'
               );
             }} catch (_error) {{}}
-            if (isActive && activeSessionChanged) {{
-              scheduleActivationRepaint(entry, "active_session_switch");
+            // WebGL glyph-atlas heal on FOREGROUND: scheduleActivationRepaint
+            // (atlas-clear + repaint at now/raf/120/360ms) already heals switch-in,
+            // but it only ran on a session SWITCH. A pure background->foreground
+            // (same session, no switch) got no activation repaint, so the stale
+            // WebGL atlas (rAF throttled while unfocused) painted wrong-glyph garble
+            // that only self-healed ~1s later. Foregrounding re-runs this input
+            // policy script (window_focused is in the signature), so fire the SAME
+            // proven repaint on foreground regain too.
+            if (isActive && (activeSessionChanged || {foreground_regained})) {{
+              scheduleActivationRepaint(
+                entry,
+                activeSessionChanged ? "active_session_switch" : "window_foreground"
+              );
             }}
           }}
         }})();
@@ -68763,6 +68808,7 @@ fn terminal_set_input_policy_script_for_active_session(
         active_session_path = active_session_path,
         enabled = if enabled { "true" } else { "false" },
         focus = if focus { "true" } else { "false" },
+        foreground_regained = if foreground_regained { "true" } else { "false" },
     )
 }
 fn terminal_clear_input_policy_script() -> String {
@@ -76297,9 +76343,31 @@ mod tests {
         assert!(script.contains("window.setTimeout(focusInput, 420);"));
     }
     #[test]
+    fn terminal_input_policy_script_repaints_active_host_on_foreground_regain() {
+        // XTERM-BUG: webgl-glyph-atlas-stale-on-foreground — a background->foreground
+        // transition (same session, no switch) must fire the atlas-clearing
+        // activation repaint, not only an active-session switch, else the stale
+        // WebGL atlas paints wrong-glyph garble that self-heals ~1s later.
+        let fg = terminal_set_input_policy_script_for_active_session("local://x", true, true, true);
+        assert!(
+            fg.contains("activeSessionChanged || true"),
+            "foreground_regained=true must let the activation repaint fire without a session switch"
+        );
+        assert!(
+            fg.contains("\"window_foreground\""),
+            "foreground repaint must use the window_foreground reason"
+        );
+        let no_fg =
+            terminal_set_input_policy_script_for_active_session("local://x", true, true, false);
+        assert!(
+            no_fg.contains("activeSessionChanged || false"),
+            "without a foreground transition the repaint stays gated on an actual session switch"
+        );
+    }
+    #[test]
     fn terminal_input_policy_script_disables_inactive_hosts() {
         let script =
-            terminal_set_input_policy_script_for_active_session("local://shell", true, true);
+            terminal_set_input_policy_script_for_active_session("local://shell", true, true, false);
         assert!(script.contains("const activeSessionPath = \"local://shell\";"));
         assert!(script.contains("const previousActiveSessionPath = String(window.__yggtermActiveTerminalSessionPath || '');"));
         assert!(script.contains(
@@ -76324,8 +76392,10 @@ mod tests {
             script
                 .contains("entry.term.refresh(0, Math.max(0, Number(entry.term.rows || 1) - 1));")
         );
-        assert!(script.contains("if (isActive && activeSessionChanged) {"));
-        assert!(script.contains("scheduleActivationRepaint(entry, \"active_session_switch\");"));
+        assert!(script.contains("if (isActive && (activeSessionChanged || false)) {"));
+        assert!(script.contains(
+            "activeSessionChanged ? \"active_session_switch\" : \"window_foreground\""
+        ));
         // XTERM-BUG: scrollback-lost-on-session-switch
         // See docs/xterm-bugs.md#scrollback-lost-on-session-switch
         // Activation repaint must NOT unconditionally call forcePromptFollow.
@@ -77640,7 +77710,7 @@ mod tests {
         // when the live daemon content actually lands.
         let theme = terminal_theme(UiTheme::ZedLight, palette(UiTheme::ZedLight), 13.0, "");
         let switch_script =
-            terminal_set_input_policy_script_for_active_session("local://x", true, true);
+            terminal_set_input_policy_script_for_active_session("local://x", true, true, false);
         assert!(
             switch_script.contains("entry.pendingRevealDaemonRepaint = true;"),
             "switch-in must arm the reveal-daemon-content one-shot repaint"
@@ -77692,6 +77762,35 @@ mod tests {
                 .match_indices('`')
                 .next()
                 .map(|(i, _)| &css_template[i.saturating_sub(40)..(i + 40).min(css_template.len())])
+        );
+    }
+    #[test]
+    fn terminal_eval_script_clears_glyph_atlas_on_forced_visible_refresh() {
+        // XTERM-BUG: webgl-glyph-atlas-stale-on-foreground — while the window is
+        // backgrounded WebGL's rAF is throttled and the GPU glyph-atlas texture
+        // goes stale, so the first forced full refresh after foreground/switch-in
+        // paints cells against a stale atlas => wrong-glyph garble that self-heals
+        // ~1s later (the user-visible "glitched terminal on switch/foreground").
+        // A bare term.refresh() re-renders cells but reuses the stale atlas, so the
+        // forced-refresh funnel (requestVisiblePaint full-refresh) MUST clear the
+        // texture atlas first and let refresh rebuild glyphs in the same rAF.
+        let theme = terminal_theme(UiTheme::ZedLight, palette(UiTheme::ZedLight), 13.0, "");
+        let script = terminal_eval_script("yggterm-terminal-test", &theme, true);
+        let funnel = "const requestVisiblePaint = (forceFullRefresh = false) => {";
+        let start = script
+            .find(funnel)
+            .expect("requestVisiblePaint funnel present");
+        let body = &script[start..];
+        let clear_ix = body
+            .find("clearTerminalTextureAtlas();")
+            .expect("forced full refresh must clear the glyph atlas to avoid stale-atlas garble");
+        let refresh_ix = body
+            .find("term.refresh(0, Math.max(0, term.rows - 1));")
+            .expect("forced full refresh present");
+        assert!(
+            clear_ix < refresh_ix,
+            "atlas clear must run BEFORE term.refresh so the rebuild and paint happen in the \
+             same frame (blink-free); clearing after refresh would still present the stale frame"
         );
     }
     #[test]
