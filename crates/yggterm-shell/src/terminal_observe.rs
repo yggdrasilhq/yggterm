@@ -9,6 +9,150 @@ pub(crate) enum TerminalOpenAttemptState {
     Failed,
 }
 
+/// Snapshot of system memory/swap pressure, sampled when a terminal reveal
+/// begins. The reveal-starvation finding
+/// ([[finding-xterm6-cold-reveal-render-starvation]]) established swap thrash as
+/// the dominant amplifier of slow cold reveals, so every reveal records the swap
+/// state at its start. That makes "the terminal took forever to come up"
+/// self-diagnosing — a slow reveal recorded alongside `swap_used_mb: 9400` tells
+/// the user to free RAM rather than chase a phantom yggterm render bug.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct MemoryPressureSnapshot {
+    pub(crate) swap_used_kb: u64,
+    pub(crate) swap_total_kb: u64,
+    pub(crate) mem_available_kb: u64,
+    pub(crate) mem_total_kb: u64,
+}
+
+impl MemoryPressureSnapshot {
+    pub(crate) fn swap_used_mb(&self) -> u64 {
+        self.swap_used_kb / 1024
+    }
+    pub(crate) fn swap_total_mb(&self) -> u64 {
+        self.swap_total_kb / 1024
+    }
+    pub(crate) fn mem_available_mb(&self) -> u64 {
+        self.mem_available_kb / 1024
+    }
+    pub(crate) fn mem_total_mb(&self) -> u64 {
+        self.mem_total_kb / 1024
+    }
+    /// True when enough swap is in use that a cold mount is likely to fault
+    /// against it. >512 MB is the rough floor where the finding saw cold-reveal
+    /// mounts start thrashing; below that, swap is incidental.
+    pub(crate) fn swap_pressured(&self) -> bool {
+        self.swap_used_kb > 512 * 1024
+    }
+    /// Whether the snapshot carries any usable reading at all (false on
+    /// platforms without `/proc/meminfo` or when the read failed).
+    pub(crate) fn is_present(&self) -> bool {
+        self.mem_total_kb > 0
+    }
+    pub(crate) fn to_json(&self) -> Value {
+        json!({
+            "present": self.is_present(),
+            "swap_used_mb": self.swap_used_mb(),
+            "swap_total_mb": self.swap_total_mb(),
+            "mem_available_mb": self.mem_available_mb(),
+            "mem_total_mb": self.mem_total_mb(),
+            "swap_pressured": self.swap_pressured(),
+        })
+    }
+}
+
+/// Parse kernel `/proc/meminfo` text into a memory-pressure snapshot. Pure (no
+/// I/O) so it is unit-testable with fixture text. Unknown / missing keys leave
+/// their fields at zero; `swap_used = SwapTotal - SwapFree`.
+pub(crate) fn parse_meminfo(text: &str) -> MemoryPressureSnapshot {
+    let mut mem_total_kb = 0_u64;
+    let mut mem_available_kb = 0_u64;
+    let mut swap_total_kb = 0_u64;
+    let mut swap_free_kb = 0_u64;
+    for line in text.lines() {
+        let Some((key, rest)) = line.split_once(':') else {
+            continue;
+        };
+        let Some(value_kb) = rest
+            .split_whitespace()
+            .next()
+            .and_then(|token| token.parse::<u64>().ok())
+        else {
+            continue;
+        };
+        match key.trim() {
+            "MemTotal" => mem_total_kb = value_kb,
+            "MemAvailable" => mem_available_kb = value_kb,
+            "SwapTotal" => swap_total_kb = value_kb,
+            "SwapFree" => swap_free_kb = value_kb,
+            _ => {}
+        }
+    }
+    MemoryPressureSnapshot {
+        swap_used_kb: swap_total_kb.saturating_sub(swap_free_kb),
+        swap_total_kb,
+        mem_available_kb,
+        mem_total_kb,
+    }
+}
+
+/// Read live system memory pressure from `/proc/meminfo`. Returns the default
+/// (all zeros, `is_present() == false`) on any platform without the file or on
+/// read failure — callers treat an absent snapshot as "unknown", never as
+/// "no pressure".
+pub(crate) fn read_memory_pressure_snapshot() -> MemoryPressureSnapshot {
+    std::fs::read_to_string("/proc/meminfo")
+        .map(|text| parse_meminfo(&text))
+        .unwrap_or_default()
+}
+
+/// One finished terminal reveal (ready or failed), retained in a small ring so
+/// the GUI can show a "reveal log" and the agent can review reveal timing +
+/// swap pressure WITHOUT polling app-state — which itself starves the reveal it
+/// is trying to measure (see [[finding-xterm6-cold-reveal-render-starvation]]).
+#[derive(Debug, Clone)]
+pub(crate) struct RevealLogEntry {
+    pub(crate) session_path: String,
+    pub(crate) label: String,
+    pub(crate) kind: String,
+    pub(crate) source: String,
+    pub(crate) tier: String,
+    pub(crate) started_at_ms: u64,
+    pub(crate) finished_at_ms: u64,
+    pub(crate) surface_mounted_at_ms: Option<u64>,
+    pub(crate) first_output_at_ms: Option<u64>,
+    /// "ready" | "failed"
+    pub(crate) outcome: String,
+    pub(crate) failure_reason: Option<String>,
+    pub(crate) memory_pressure: MemoryPressureSnapshot,
+}
+
+impl RevealLogEntry {
+    /// Total wall-clock the reveal took, start to terminal state.
+    pub(crate) fn total_ms(&self) -> u64 {
+        self.finished_at_ms.saturating_sub(self.started_at_ms)
+    }
+    fn relative_ms(&self, at_ms: Option<u64>) -> Option<u64> {
+        at_ms.map(|value| value.saturating_sub(self.started_at_ms))
+    }
+    pub(crate) fn to_json(&self) -> Value {
+        json!({
+            "session_path": self.session_path,
+            "label": self.label,
+            "kind": self.kind,
+            "source": self.source,
+            "tier": self.tier,
+            "started_at_ms": self.started_at_ms,
+            "finished_at_ms": self.finished_at_ms,
+            "total_ms": self.total_ms(),
+            "surface_mounted_ms": self.relative_ms(self.surface_mounted_at_ms),
+            "first_output_ms": self.relative_ms(self.first_output_at_ms),
+            "outcome": self.outcome,
+            "failure_reason": self.failure_reason,
+            "memory_pressure": self.memory_pressure.to_json(),
+        })
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct TerminalOpenAttempt {
     pub(crate) attempt_id: String,
@@ -17,6 +161,14 @@ pub(crate) struct TerminalOpenAttempt {
     pub(crate) open_request_id: u64,
     pub(crate) source: String,
     pub(crate) started_at_ms: u64,
+    /// System memory/swap pressure sampled at reveal start — the amplifier the
+    /// reveal-starvation finding tracks. Carried into the reveal log so a slow
+    /// reveal can be attributed to swap thrash vs an actual render stall.
+    pub(crate) memory_pressure_at_start: MemoryPressureSnapshot,
+    /// True when the daemon did NOT already own this session's runtime at reveal
+    /// start — i.e. a COLD mount (re-resume + fresh PTY), the slow path the
+    /// reveal-starvation finding is about. Hot reveals reuse a retained host.
+    pub(crate) cold_at_start: bool,
     pub(crate) state: TerminalOpenAttemptState,
     pub(crate) observations: u64,
     pub(crate) rearm_count: u32,
@@ -3651,7 +3803,8 @@ fn terminal_chunk_printable_signal_count(data: &str) -> usize {
 #[cfg(test)]
 mod tests {
     use super::{
-        TerminalOpenAttempt, TerminalOpenAttemptState, WorkspaceViewMode,
+        MemoryPressureSnapshot, RevealLogEntry, TerminalOpenAttempt, TerminalOpenAttemptState,
+        WorkspaceViewMode, parse_meminfo,
         describe_terminal_open_attempt, describe_viewport_snapshot,
         summarize_terminal_surface_for_app_control, terminal_bootstrap_activation_epoch,
         terminal_chunk_has_codex_prompt_output, terminal_chunk_has_current_codex_input_row,
@@ -3667,6 +3820,82 @@ mod tests {
     use serde_json::{Value, json};
 
     #[test]
+    fn parse_meminfo_computes_swap_used_and_available() {
+        let text = "\
+MemTotal:       16384000 kB
+MemFree:          512000 kB
+MemAvailable:    4096000 kB
+Buffers:          100000 kB
+SwapTotal:       8388608 kB
+SwapFree:        1048576 kB
+";
+        let snapshot = parse_meminfo(text);
+        assert_eq!(snapshot.mem_total_kb, 16_384_000);
+        assert_eq!(snapshot.mem_available_kb, 4_096_000);
+        assert_eq!(snapshot.swap_total_kb, 8_388_608);
+        // used = total - free = 8388608 - 1048576 = 7340032 kB
+        assert_eq!(snapshot.swap_used_kb, 7_340_032);
+        assert_eq!(snapshot.swap_total_mb(), 8_192);
+        assert_eq!(snapshot.swap_used_mb(), 7_168);
+        assert_eq!(snapshot.mem_available_mb(), 4_000);
+        assert!(snapshot.is_present());
+        // 7 GB of swap in use is well past the 512 MB pressure floor.
+        assert!(snapshot.swap_pressured());
+    }
+
+    #[test]
+    fn parse_meminfo_handles_absent_swap_and_garbage() {
+        // No swap configured, plus a malformed line that must be skipped.
+        let text = "MemTotal: 8000000 kB\nMemAvailable: 6000000 kB\nSwapTotal: 0 kB\nSwapFree: 0 kB\nGarbageLineWithoutColon\nBogus: notanumber kB\n";
+        let snapshot = parse_meminfo(text);
+        assert_eq!(snapshot.swap_used_kb, 0);
+        assert_eq!(snapshot.swap_total_kb, 0);
+        assert_eq!(snapshot.mem_available_kb, 6_000_000);
+        assert!(snapshot.is_present());
+        assert!(!snapshot.swap_pressured());
+    }
+
+    #[test]
+    fn memory_pressure_snapshot_default_is_absent() {
+        let snapshot = MemoryPressureSnapshot::default();
+        assert!(!snapshot.is_present());
+        assert!(!snapshot.swap_pressured());
+        assert_eq!(snapshot.to_json()["present"], json!(false));
+    }
+
+    #[test]
+    fn reveal_log_entry_serializes_timing_and_pressure() {
+        let entry = RevealLogEntry {
+            session_path: "local://abc".to_string(),
+            label: "codex • repo".to_string(),
+            kind: "Codex".to_string(),
+            source: "open_row".to_string(),
+            tier: "cold".to_string(),
+            started_at_ms: 10_000,
+            finished_at_ms: 13_400,
+            surface_mounted_at_ms: Some(10_900),
+            first_output_at_ms: Some(11_250),
+            outcome: "ready".to_string(),
+            failure_reason: None,
+            memory_pressure: MemoryPressureSnapshot {
+                swap_used_kb: 9_400 * 1024,
+                swap_total_kb: 16_000 * 1024,
+                mem_available_kb: 3_500 * 1024,
+                mem_total_kb: 16_000 * 1024,
+            },
+        };
+        assert_eq!(entry.total_ms(), 3_400);
+        let value = entry.to_json();
+        assert_eq!(value["total_ms"], json!(3_400));
+        assert_eq!(value["surface_mounted_ms"], json!(900));
+        assert_eq!(value["first_output_ms"], json!(1_250));
+        assert_eq!(value["tier"], json!("cold"));
+        assert_eq!(value["outcome"], json!("ready"));
+        assert_eq!(value["memory_pressure"]["swap_used_mb"], json!(9_400));
+        assert_eq!(value["memory_pressure"]["swap_pressured"], json!(true));
+    }
+
+    #[test]
     fn terminal_open_attempt_description_splits_resume_timing_phases() {
         let attempt = TerminalOpenAttempt {
             attempt_id: "attempt-1".to_string(),
@@ -3675,6 +3904,8 @@ mod tests {
             open_request_id: 7,
             source: "open_row".to_string(),
             started_at_ms: 1_000,
+            memory_pressure_at_start: MemoryPressureSnapshot::default(),
+            cold_at_start: false,
             state: TerminalOpenAttemptState::Ready,
             observations: 3,
             rearm_count: 1,
