@@ -22,7 +22,8 @@ use crate::session_copy_policy::{
     title_needs_generation_from_visible_titles,
 };
 use crate::terminal_observe::{
-    TerminalOpenAttempt, TerminalOpenAttemptState, describe_terminal_open_attempt,
+    RevealLogEntry, TerminalOpenAttempt, TerminalOpenAttemptState,
+    describe_terminal_open_attempt, read_memory_pressure_snapshot,
     describe_viewport_snapshot, preview_text_looks_like_loading_placeholder,
     strip_terminal_control_sequences, terminal_bootstrap_activation_epoch,
     terminal_bootstrap_should_wait_for_mount_epoch_sync, terminal_chunk_is_claude_prompt_surface,
@@ -1022,6 +1023,12 @@ struct ShellState {
     // Drives hot-reveal recognition when the latest attempt is a cold-recovery
     // one. See [[followups-switch-hotness-update-friction]].
     terminal_sessions_reached_ready: HashSet<String>,
+    // Bounded history of finished terminal reveals (ready or failed), newest
+    // last. Each entry carries timing + the swap snapshot taken at reveal start
+    // so a slow reveal is self-diagnosing (swap thrash vs render stall) without
+    // app-state polling. Drives the reveal-log surface + live status line.
+    // See [[finding-xterm6-cold-reveal-render-starvation]].
+    reveal_log: VecDeque<RevealLogEntry>,
     remote_preview_sync_after_ms: HashMap<String, u64>,
     remote_preview_failures: HashMap<String, PreviewSyncFailure>,
     remote_preview_dirty_epoch: HashMap<String, u64>,
@@ -2474,6 +2481,7 @@ impl ShellState {
             retained_fault_recovery_loop_armed_at_ms: HashMap::new(),
             terminal_reveal_grace_until_ms: HashMap::new(),
             terminal_sessions_reached_ready: HashSet::new(),
+            reveal_log: VecDeque::new(),
             remote_preview_sync_after_ms: HashMap::new(),
             remote_preview_failures: HashMap::new(),
             remote_preview_dirty_epoch: HashMap::new(),
@@ -3596,6 +3604,7 @@ impl ShellState {
                 .insert(session_path.to_string(), (current_millis(), tier));
         }
         let begin_context = self.terminal_open_context_payload(session_path);
+        let cold_at_start = !self.daemon_owns_session_runtime(session_path);
         let attempt_id = format!("terminal-open-{}-{open_request_id}", current_millis());
         let attempt = TerminalOpenAttempt {
             attempt_id: attempt_id.clone(),
@@ -3604,6 +3613,8 @@ impl ShellState {
             open_request_id,
             source: source.to_string(),
             started_at_ms: current_millis(),
+            memory_pressure_at_start: read_memory_pressure_snapshot(),
+            cold_at_start,
             state: TerminalOpenAttemptState::Pending,
             observations: 0,
             rearm_count: 0,
@@ -3723,6 +3734,171 @@ impl ShellState {
             self.drop_terminal_render_state_for_session(session_path, reason);
         }
     }
+    /// Best-effort human label + kind for a reveal-log entry. Resolves the
+    /// session view from the active / hot / live caches, falling back to the
+    /// session-path tail (the id the user sees on the sidebar row) when the
+    /// view isn't known.
+    fn reveal_session_label_and_kind(&self, session_path: &str) -> (String, String) {
+        let fallback_label = || {
+            session_path
+                .rsplit(['/', ':'])
+                .find(|segment| !segment.is_empty())
+                .unwrap_or(session_path)
+                .to_string()
+        };
+        let view = self
+            .server
+            .active_session()
+            .filter(|view| view.session_path == session_path)
+            .cloned()
+            .or_else(|| self.cached_hot_session_view(session_path))
+            .or_else(|| {
+                self.server
+                    .live_sessions()
+                    .into_iter()
+                    .find(|view| view.session_path == session_path)
+            });
+        match view {
+            Some(view) => {
+                let label = if view.title.trim().is_empty() {
+                    fallback_label()
+                } else {
+                    view.title.clone()
+                };
+                (label, format!("{:?}", view.kind))
+            }
+            None => (fallback_label(), "Unknown".to_string()),
+        }
+    }
+
+    /// Record a finished reveal (ready or failed) into the bounded reveal-log
+    /// ring AND the always-on on-disk trace. Timing + the swap snapshot are read
+    /// from the originating open attempt, so a slow reveal is attributable to
+    /// swap thrash vs a render stall without app-state polling (which itself
+    /// starves the reveal — see [[finding-xterm6-cold-reveal-render-starvation]]).
+    fn record_reveal_outcome(
+        &mut self,
+        session_path: &str,
+        attempt_id: &str,
+        outcome: &'static str,
+        failure_reason: Option<String>,
+    ) {
+        const REVEAL_LOG_CAP: usize = 24;
+        let Some(attempt) = self.terminal_open_attempts.get(attempt_id) else {
+            return;
+        };
+        let started_at_ms = attempt.started_at_ms;
+        let surface_mounted_at_ms = attempt.surface_mounted_at_ms;
+        let first_output_at_ms = attempt.first_output_at_ms;
+        let source = attempt.source.clone();
+        let cold_at_start = attempt.cold_at_start;
+        let memory_pressure = attempt.memory_pressure_at_start;
+        let (label, kind) = self.reveal_session_label_and_kind(session_path);
+        let entry = RevealLogEntry {
+            session_path: session_path.to_string(),
+            label,
+            kind,
+            source,
+            tier: if cold_at_start { "cold" } else { "hot" }.to_string(),
+            started_at_ms,
+            finished_at_ms: current_millis(),
+            surface_mounted_at_ms,
+            first_output_at_ms,
+            outcome: outcome.to_string(),
+            failure_reason,
+            memory_pressure,
+        };
+        // Always-on disk trace: the post-mortem signal must survive a GUI
+        // restart and must not require polling. One append per finished reveal
+        // → negligible I/O. Routed through the instance's perf home (a temp dir
+        // under test) so the suite never appends to the user's real trace.
+        let trace_home = perf_home_dir(&self.bootstrap.settings_path);
+        append_trace_event(
+            &trace_home,
+            "ui",
+            "reveal",
+            if outcome == "ready" {
+                "reveal_ready"
+            } else {
+                "reveal_failed"
+            },
+            entry.to_json(),
+        );
+        let notify_label = entry.label.clone();
+        let notify_total_ms = entry.total_ms();
+        let notify_swap_used_mb = entry.memory_pressure.swap_used_mb();
+        let notify_swap_pressured = entry.memory_pressure.swap_pressured();
+        self.reveal_log.push_back(entry);
+        while self.reveal_log.len() > REVEAL_LOG_CAP {
+            self.reveal_log.pop_front();
+        }
+        // Surface the finding's headline: a reveal that dragged on while swap was
+        // thrashing is a memory-pressure problem, not a yggterm render bug. Tell
+        // the user so they can free RAM instead of chasing a phantom. Conservative
+        // threshold so it only fires on the genuinely painful cases;
+        // push_notification dedups repeats. See
+        // [[finding-xterm6-cold-reveal-render-starvation]].
+        const SLOW_REVEAL_NOTIFY_MS: u64 = 6_000;
+        if outcome == "ready" && notify_total_ms >= SLOW_REVEAL_NOTIFY_MS && notify_swap_pressured {
+            self.push_notification(
+                NotificationTone::Info,
+                "Slow terminal reveal",
+                format!(
+                    "Revealing {} took {:.1}s while swap was at {} MB in use. Free RAM to speed up reveals.",
+                    notify_label,
+                    notify_total_ms as f64 / 1000.0,
+                    notify_swap_used_mb,
+                ),
+            );
+        }
+    }
+
+    /// JSON view of the reveal-log ring (newest first) for app-state and the
+    /// openable reveal-log panel.
+    fn reveal_log_json(&self) -> Value {
+        Value::Array(
+            self.reveal_log
+                .iter()
+                .rev()
+                .map(RevealLogEntry::to_json)
+                .collect(),
+        )
+    }
+
+    /// In-flight reveal for the currently active terminal session, if one is
+    /// still running — the source for the live slow-reveal status line. Null
+    /// once the active session has revealed (ready/failed) or when there is no
+    /// active terminal reveal.
+    fn active_reveal_status_json(&self) -> Value {
+        if self.server.active_view_mode() != WorkspaceViewMode::Terminal {
+            return Value::Null;
+        }
+        let Some(active_path) = self.server.active_session_path() else {
+            return Value::Null;
+        };
+        let Some(attempt_id) = self.terminal_open_attempt_by_session.get(active_path) else {
+            return Value::Null;
+        };
+        let Some(attempt) = self.terminal_open_attempts.get(attempt_id) else {
+            return Value::Null;
+        };
+        if attempt.ready_at_ms.is_some() || attempt.latched_failure_reason.is_some() {
+            return Value::Null;
+        }
+        let elapsed_ms = current_millis().saturating_sub(attempt.started_at_ms);
+        json!({
+            "session_path": active_path,
+            "in_flight": true,
+            "elapsed_ms": elapsed_ms,
+            "state": format!("{:?}", attempt.state),
+            "source": attempt.source,
+            "tier": if attempt.cold_at_start { "cold" } else { "hot" },
+            "surface_mounted": attempt.surface_mounted_at_ms.is_some(),
+            "first_output": attempt.first_output_at_ms.is_some(),
+            "memory_pressure": attempt.memory_pressure_at_start.to_json(),
+        })
+    }
+
     fn mark_terminal_open_attempt_ready_for_session(
         &mut self,
         session_path: &str,
@@ -3745,11 +3921,13 @@ impl ShellState {
         self.terminal_sessions_reached_ready
             .insert(session_path.to_string());
         let mut ready_snapshot = None;
+        let mut first_ready_for_reveal_log = false;
         if let Some(attempt) = self.terminal_open_attempts.get_mut(&attempt_id) {
             let first_ready = attempt.ready_at_ms.is_none();
             let recovered_failure = attempt.latched_failure_reason.is_some();
             if first_ready {
                 attempt.ready_at_ms = Some(now_ms);
+                first_ready_for_reveal_log = true;
             }
             if recovered_failure {
                 attempt.latched_failure_at_ms = None;
@@ -3759,6 +3937,12 @@ impl ShellState {
             if first_ready || recovered_failure {
                 ready_snapshot = Some(attempt.clone());
             }
+        }
+        // The first time this attempt reaches ready IS the reveal completing —
+        // record its timing + the swap snapshot taken at reveal start into the
+        // reveal log. Recovered-failure re-readies are not fresh reveals.
+        if first_ready_for_reveal_log {
+            self.record_reveal_outcome(session_path, &attempt_id, "ready", None);
         }
         // Successful recovery is the OTHER natural end of the
         // RetainedFaultRecoveryLoop gate. Record the duration into the
@@ -4240,6 +4424,12 @@ impl ShellState {
             &attempt_snapshot,
             Some(json!({ "reason": reason })),
         );
+        self.record_reveal_outcome(
+            &attempt_snapshot.session_path,
+            &attempt_snapshot.attempt_id,
+            "failed",
+            attempt_snapshot.latched_failure_reason.clone(),
+        );
     }
     fn fail_terminal_open_attempt_for_session(&mut self, session_path: &str, reason: String) {
         let Some(attempt_id) = self
@@ -4263,6 +4453,12 @@ impl ShellState {
             "session_failed",
             &attempt_snapshot,
             Some(json!({ "reason": reason })),
+        );
+        self.record_reveal_outcome(
+            &attempt_snapshot.session_path,
+            &attempt_snapshot.attempt_id,
+            "failed",
+            attempt_snapshot.latched_failure_reason.clone(),
         );
     }
     /// Returns true when the most recent open attempt for this session
@@ -25772,6 +25968,12 @@ fn describe_app_state_snapshot(
         "daemon_update_state": daemon_update_state,
         "idle_policy": idle_policy,
         "background_refresh_suspended": background_refresh_suspended,
+        // Reveal telemetry: a bounded history of finished reveals (timing + the
+        // swap snapshot taken at reveal start) and the active session's in-flight
+        // reveal. Makes slow cold reveals self-diagnosing (swap thrash vs render
+        // stall) without polling — see [[finding-xterm6-cold-reveal-render-starvation]].
+        "reveal_log": shell.reveal_log_json(),
+        "active_reveal": shell.active_reveal_status_json(),
         "active_viewport_freshness": active_viewport_freshness_json,
         "settings": settings_snapshot,
         "terminal_telemetry": {
@@ -39673,11 +39875,18 @@ fn app() -> Element {
             let shell = state.read();
             active_terminal_input_policy_signature(&shell)
         };
-        if *last_active_terminal_input_policy.read() == Some(policy_signature.clone()) {
+        let previous_policy = last_active_terminal_input_policy.read().clone();
+        if previous_policy.as_ref() == Some(&policy_signature) {
             return;
         }
+        // Detect a background->foreground transition so the active terminal heals
+        // its WebGL glyph atlas on foreground (see window_foreground repaint in
+        // terminal_set_input_policy_script_for_active_session).
+        let foreground_regained = previous_policy
+            .as_ref()
+            .is_some_and(|prev| !prev.window_focused && policy_signature.window_focused);
         last_active_terminal_input_policy.set(Some(policy_signature.clone()));
-        apply_active_terminal_input_policy(&policy_signature);
+        apply_active_terminal_input_policy(&policy_signature, foreground_regained);
     });
     use_effect(move || {
         let active = state.read().server.active_session().cloned();
@@ -58188,7 +58397,10 @@ fn active_terminal_input_policy_signature(
         remote_resume_input_ready,
     }
 }
-fn apply_active_terminal_input_policy(signature: &ActiveTerminalInputPolicySignature) {
+fn apply_active_terminal_input_policy(
+    signature: &ActiveTerminalInputPolicySignature,
+    foreground_regained: bool,
+) {
     if signature.active_view_mode != WorkspaceViewMode::Terminal {
         let _ = document::eval(&terminal_clear_input_policy_script());
         return;
@@ -58222,6 +58434,7 @@ fn apply_active_terminal_input_policy(signature: &ActiveTerminalInputPolicySigna
         session_path,
         allow_input,
         focus_input,
+        foreground_regained,
     ));
 }
 fn sync_active_terminal_input_policy(state: Signal<ShellState>) {
@@ -58229,7 +58442,8 @@ fn sync_active_terminal_input_policy(state: Signal<ShellState>) {
         let shell = state.read();
         active_terminal_input_policy_signature(&shell)
     };
-    apply_active_terminal_input_policy(&signature);
+    // Manual resync (titlebar dismiss, etc.) is not a foreground transition.
+    apply_active_terminal_input_policy(&signature, false);
 }
 fn dismiss_titlebar_transients_and_resync_active_terminal(mut state: Signal<ShellState>) {
     state.with_mut(|shell| {
@@ -61505,6 +61719,7 @@ fn terminal_eval_script_with_canvas_renderer(
         let skippedPerfEventCount = 0;
         let terminalInputHotUntilMs = 0;
         let forcedRefreshCount = 0;
+        let forcedAtlasClearCount = 0;
         let forcedRefreshSkippedCount = 0;
         let scrollbackLocked = false;
         let scrollbackIntent = 'PromptFollow';
@@ -63575,10 +63790,30 @@ fn terminal_eval_script_with_canvas_renderer(
                         if (window.__yggtermXtermHosts && window.__yggtermXtermHosts[hostId]) {{
                             window.__yggtermXtermHosts[hostId].forcedRefreshCount = forcedRefreshCount;
                         }}
+                        // WebGL glyph-atlas heal: while the window is backgrounded
+                        // the WebGL render loop (rAF) is throttled and the GPU glyph
+                        // atlas texture goes stale, so the first forced full refresh
+                        // after foreground/switch-in paints cells against a stale
+                        // atlas -> wrong-glyph garble that self-heals ~1s later. A
+                        // bare term.refresh() re-renders cells but reuses that stale
+                        // atlas, so clear it FIRST and let refresh rebuild glyphs in
+                        // the same frame (atomic within this rAF -> blink-free). This
+                        // is exactly what redrawTerminal()/manual-redraw does to heal
+                        // it; doing it on the forced-refresh funnel means foreground,
+                        // switch-in, and settled-resize all rebuild the atlas instead
+                        // of presenting garbage. Gated by the same rate-limit/
+                        // input-hot/frame-like checks so it never fires during
+                        // typing or active output streaming.
+                        clearTerminalTextureAtlas();
+                        forcedAtlasClearCount += 1;
+                        if (window.__yggtermXtermHosts && window.__yggtermXtermHosts[hostId]) {{
+                            window.__yggtermXtermHosts[hostId].forcedAtlasClearCount = forcedAtlasClearCount;
+                        }}
                         term.refresh(0, Math.max(0, term.rows - 1));
                         emitPerf("xterm_forced_refresh", {{
                             reason: "visible_paint",
                             force_full_refresh: Boolean(requestedForceFullRefresh),
+                            atlas_cleared: true,
                         }});
                     }} else if (requestedForceFullRefresh) {{
                         recordVisiblePaintRefreshSkipped(
@@ -65181,7 +65416,17 @@ fn terminal_eval_script_with_canvas_renderer(
             if (!accel) {{
                 return true;
             }}
-            if (key === 'v' && !event.shiftKey && !event.altKey) {{
+            // Ctrl+V AND Ctrl+Shift+V both route through the explicit native
+            // clipboard paste. Ctrl+Shift+V previously relied on WebKitGTK
+            // firing a native 'paste' DOM event (caught by handleClipboardPaste)
+            // because this handler returned true (passthrough) for it. Under
+            // xterm.js 6 that native paste event no longer reaches us, so the
+            // keyboard paste silently no-opped while right-click/context-menu
+            // paste (a separate native path) kept working. Handle it here so the
+            // shortcut is independent of the native paste event. requestNative-
+            // ClipboardPaste de-dupes against window.__yggtermLastPasteEventAtMs,
+            // so a native paste (if one still fires) will not double-paste.
+            if (key === 'v' && !event.altKey) {{
                 if (event.preventDefault) {{
                     event.preventDefault();
                 }}
@@ -65191,6 +65436,7 @@ fn terminal_eval_script_with_canvas_renderer(
                 if (event.stopPropagation) {{
                     event.stopPropagation();
                 }}
+                const pasteShiftHeld = Boolean(event.shiftKey);
                 const pasteToken = pendingClipboardPasteToken + 1;
                 pendingClipboardPasteToken = pasteToken;
                 window.setTimeout(() => {{
@@ -65202,7 +65448,7 @@ fn terminal_eval_script_with_canvas_renderer(
                         if (lastPasteEventAt > 0 && Date.now() - lastPasteEventAt < terminalNativePasteDedupeMs) {{
                             return;
                         }}
-                        requestNativeClipboardPaste('ctrl_v_fallback');
+                        requestNativeClipboardPaste(pasteShiftHeld ? 'ctrl_shift_v_fallback' : 'ctrl_v_fallback');
                     }} catch (_error) {{}}
                 }}, 220);
                 window.setTimeout(() => {{
@@ -68645,6 +68891,7 @@ fn terminal_set_input_policy_script_for_active_session(
     active_session_path: &str,
     enabled: bool,
     focus: bool,
+    foreground_regained: bool,
 ) -> String {
     format!(
         r#"
@@ -68743,8 +68990,19 @@ fn terminal_set_input_policy_script_for_active_session(
                 'rust_policy'
               );
             }} catch (_error) {{}}
-            if (isActive && activeSessionChanged) {{
-              scheduleActivationRepaint(entry, "active_session_switch");
+            // WebGL glyph-atlas heal on FOREGROUND: scheduleActivationRepaint
+            // (atlas-clear + repaint at now/raf/120/360ms) already heals switch-in,
+            // but it only ran on a session SWITCH. A pure background->foreground
+            // (same session, no switch) got no activation repaint, so the stale
+            // WebGL atlas (rAF throttled while unfocused) painted wrong-glyph garble
+            // that only self-healed ~1s later. Foregrounding re-runs this input
+            // policy script (window_focused is in the signature), so fire the SAME
+            // proven repaint on foreground regain too.
+            if (isActive && (activeSessionChanged || {foreground_regained})) {{
+              scheduleActivationRepaint(
+                entry,
+                activeSessionChanged ? "active_session_switch" : "window_foreground"
+              );
             }}
           }}
         }})();
@@ -68752,6 +69010,7 @@ fn terminal_set_input_policy_script_for_active_session(
         active_session_path = active_session_path,
         enabled = if enabled { "true" } else { "false" },
         focus = if focus { "true" } else { "false" },
+        foreground_regained = if foreground_regained { "true" } else { "false" },
     )
 }
 fn terminal_clear_input_policy_script() -> String {
@@ -74816,6 +75075,7 @@ fn interface_font_family() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::terminal_observe::MemoryPressureSnapshot;
     use yggterm_core::SessionNodeKind;
     use yggterm_server::SessionPreview;
 
@@ -76286,9 +76546,31 @@ mod tests {
         assert!(script.contains("window.setTimeout(focusInput, 420);"));
     }
     #[test]
+    fn terminal_input_policy_script_repaints_active_host_on_foreground_regain() {
+        // XTERM-BUG: webgl-glyph-atlas-stale-on-foreground — a background->foreground
+        // transition (same session, no switch) must fire the atlas-clearing
+        // activation repaint, not only an active-session switch, else the stale
+        // WebGL atlas paints wrong-glyph garble that self-heals ~1s later.
+        let fg = terminal_set_input_policy_script_for_active_session("local://x", true, true, true);
+        assert!(
+            fg.contains("activeSessionChanged || true"),
+            "foreground_regained=true must let the activation repaint fire without a session switch"
+        );
+        assert!(
+            fg.contains("\"window_foreground\""),
+            "foreground repaint must use the window_foreground reason"
+        );
+        let no_fg =
+            terminal_set_input_policy_script_for_active_session("local://x", true, true, false);
+        assert!(
+            no_fg.contains("activeSessionChanged || false"),
+            "without a foreground transition the repaint stays gated on an actual session switch"
+        );
+    }
+    #[test]
     fn terminal_input_policy_script_disables_inactive_hosts() {
         let script =
-            terminal_set_input_policy_script_for_active_session("local://shell", true, true);
+            terminal_set_input_policy_script_for_active_session("local://shell", true, true, false);
         assert!(script.contains("const activeSessionPath = \"local://shell\";"));
         assert!(script.contains("const previousActiveSessionPath = String(window.__yggtermActiveTerminalSessionPath || '');"));
         assert!(script.contains(
@@ -76313,8 +76595,10 @@ mod tests {
             script
                 .contains("entry.term.refresh(0, Math.max(0, Number(entry.term.rows || 1) - 1));")
         );
-        assert!(script.contains("if (isActive && activeSessionChanged) {"));
-        assert!(script.contains("scheduleActivationRepaint(entry, \"active_session_switch\");"));
+        assert!(script.contains("if (isActive && (activeSessionChanged || false)) {"));
+        assert!(script.contains(
+            "activeSessionChanged ? \"active_session_switch\" : \"window_foreground\""
+        ));
         // XTERM-BUG: scrollback-lost-on-session-switch
         // See docs/xterm-bugs.md#scrollback-lost-on-session-switch
         // Activation repaint must NOT unconditionally call forcePromptFollow.
@@ -77629,7 +77913,7 @@ mod tests {
         // when the live daemon content actually lands.
         let theme = terminal_theme(UiTheme::ZedLight, palette(UiTheme::ZedLight), 13.0, "");
         let switch_script =
-            terminal_set_input_policy_script_for_active_session("local://x", true, true);
+            terminal_set_input_policy_script_for_active_session("local://x", true, true, false);
         assert!(
             switch_script.contains("entry.pendingRevealDaemonRepaint = true;"),
             "switch-in must arm the reveal-daemon-content one-shot repaint"
@@ -77681,6 +77965,35 @@ mod tests {
                 .match_indices('`')
                 .next()
                 .map(|(i, _)| &css_template[i.saturating_sub(40)..(i + 40).min(css_template.len())])
+        );
+    }
+    #[test]
+    fn terminal_eval_script_clears_glyph_atlas_on_forced_visible_refresh() {
+        // XTERM-BUG: webgl-glyph-atlas-stale-on-foreground — while the window is
+        // backgrounded WebGL's rAF is throttled and the GPU glyph-atlas texture
+        // goes stale, so the first forced full refresh after foreground/switch-in
+        // paints cells against a stale atlas => wrong-glyph garble that self-heals
+        // ~1s later (the user-visible "glitched terminal on switch/foreground").
+        // A bare term.refresh() re-renders cells but reuses the stale atlas, so the
+        // forced-refresh funnel (requestVisiblePaint full-refresh) MUST clear the
+        // texture atlas first and let refresh rebuild glyphs in the same rAF.
+        let theme = terminal_theme(UiTheme::ZedLight, palette(UiTheme::ZedLight), 13.0, "");
+        let script = terminal_eval_script("yggterm-terminal-test", &theme, true);
+        let funnel = "const requestVisiblePaint = (forceFullRefresh = false) => {";
+        let start = script
+            .find(funnel)
+            .expect("requestVisiblePaint funnel present");
+        let body = &script[start..];
+        let clear_ix = body
+            .find("clearTerminalTextureAtlas();")
+            .expect("forced full refresh must clear the glyph atlas to avoid stale-atlas garble");
+        let refresh_ix = body
+            .find("term.refresh(0, Math.max(0, term.rows - 1));")
+            .expect("forced full refresh present");
+        assert!(
+            clear_ix < refresh_ix,
+            "atlas clear must run BEFORE term.refresh so the rebuild and paint happen in the \
+             same frame (blink-free); clearing after refresh would still present the stale frame"
         );
     }
     #[test]
@@ -79912,9 +80225,16 @@ mod tests {
         assert!(
             !script.contains("document.addEventListener('keydown', handleDocumentKeydown, true);")
         );
-        assert!(script.contains("if (key === 'v' && !event.shiftKey && !event.altKey) {"));
+        // Ctrl+V and Ctrl+Shift+V both take the explicit native-paste branch
+        // (no longer excluding shiftKey) so Ctrl+Shift+V works without relying
+        // on a native 'paste' DOM event that xterm.js 6 / WebKitGTK no longer
+        // delivers. See the keydown handler comment.
+        assert!(script.contains("if (key === 'v' && !event.altKey) {"));
+        assert!(!script.contains("if (key === 'v' && !event.shiftKey && !event.altKey) {"));
         assert!(script.contains("requestNativeClipboardPaste('paste_event');"));
-        assert!(script.contains("requestNativeClipboardPaste('ctrl_v_fallback');"));
+        assert!(script.contains(
+            "requestNativeClipboardPaste(pasteShiftHeld ? 'ctrl_shift_v_fallback' : 'ctrl_v_fallback');"
+        ));
         assert!(script.contains("sendTerminalEvent({ kind: \"clipboard_paste_request\" });"));
         assert!(script.contains("if (pasteClaim.hasImage) {"));
         assert!(script.contains("requestNativeClipboardImagePaste();"));
@@ -92511,6 +92831,136 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         assert!(matches!(attempt.state, TerminalOpenAttemptState::Ready));
         assert!(attempt.ready_at_ms.is_some());
         assert!(shell.terminal_session_has_ready_attempt(active_session_path));
+    }
+
+    #[test]
+    fn reveal_log_records_a_ready_reveal_once() {
+        let active_session_path = "remote-session://oc/reveal-ready";
+        let bootstrap = test_shell_bootstrap_with_active_session(active_session_path);
+        let mut shell = ShellState::new(bootstrap);
+        shell.server.set_view_mode(WorkspaceViewMode::Terminal);
+        let _attempt_id =
+            shell.begin_terminal_open_attempt(active_session_path, "req-reveal", 1, "open_row");
+        assert!(shell.reveal_log.is_empty());
+
+        shell.mark_terminal_open_attempt_ready_for_session(active_session_path, "test_ready");
+        assert_eq!(shell.reveal_log.len(), 1);
+        let entry = shell.reveal_log.back().expect("reveal entry");
+        assert_eq!(entry.session_path, active_session_path);
+        assert_eq!(entry.outcome, "ready");
+        assert_eq!(entry.source, "open_row");
+        // Tier reflects daemon ownership at reveal start (hot = retained runtime,
+        // cold = fresh re-resume); both are valid — just assert it's populated.
+        assert!(entry.tier == "hot" || entry.tier == "cold");
+        assert!(entry.finished_at_ms >= entry.started_at_ms);
+
+        // A recovered re-ready of the same attempt must NOT log a duplicate.
+        shell.mark_terminal_open_attempt_ready_for_session(active_session_path, "test_ready_again");
+        assert_eq!(shell.reveal_log.len(), 1);
+    }
+
+    #[test]
+    fn active_reveal_status_reports_in_flight_then_clears_on_ready() {
+        let active_session_path = "remote-session://oc/reveal-inflight";
+        let bootstrap = test_shell_bootstrap_with_active_session(active_session_path);
+        let mut shell = ShellState::new(bootstrap);
+        shell.server.set_view_mode(WorkspaceViewMode::Terminal);
+
+        // No attempt yet → no in-flight reveal.
+        assert!(shell.active_reveal_status_json().is_null());
+
+        shell.begin_terminal_open_attempt(active_session_path, "req-inflight", 9, "open_row");
+        let status = shell.active_reveal_status_json();
+        assert_eq!(status["in_flight"], json!(true));
+        assert_eq!(status["session_path"], json!(active_session_path));
+        assert_eq!(status["source"], json!("open_row"));
+        assert!(status["elapsed_ms"].as_u64().is_some());
+        assert!(status["memory_pressure"].is_object());
+
+        // Once ready, the in-flight status clears (the live status line hides).
+        shell.mark_terminal_open_attempt_ready_for_session(active_session_path, "test_ready");
+        assert!(shell.active_reveal_status_json().is_null());
+    }
+
+    #[test]
+    fn slow_reveal_under_swap_pressure_notifies_to_free_ram() {
+        let active_session_path = "remote-session://oc/reveal-slow-swap";
+        let bootstrap = test_shell_bootstrap_with_active_session(active_session_path);
+        let mut shell = ShellState::new(bootstrap);
+        shell.settings.in_app_notifications = true;
+        shell.settings.system_notifications = false;
+        shell.settings.notification_sound = false;
+        shell.server.set_view_mode(WorkspaceViewMode::Terminal);
+        let attempt_id =
+            shell.begin_terminal_open_attempt(active_session_path, "req-slow", 3, "open_row");
+        // Force a slow reveal that started 7s ago under heavy swap.
+        if let Some(attempt) = shell.terminal_open_attempts.get_mut(&attempt_id) {
+            attempt.started_at_ms = current_millis().saturating_sub(7_000);
+            attempt.memory_pressure_at_start = MemoryPressureSnapshot {
+                swap_used_kb: 9_400 * 1024,
+                swap_total_kb: 16_000 * 1024,
+                mem_available_kb: 1_000 * 1024,
+                mem_total_kb: 16_000 * 1024,
+            };
+        }
+        shell.mark_terminal_open_attempt_ready_for_session(active_session_path, "test_ready");
+        assert!(
+            shell
+                .notifications
+                .iter()
+                .any(|notification| notification.title == "Slow terminal reveal"),
+            "a slow reveal under swap pressure should warn the user to free RAM"
+        );
+    }
+
+    #[test]
+    fn fast_reveal_does_not_notify_even_under_swap_pressure() {
+        let active_session_path = "remote-session://oc/reveal-fast-swap";
+        let bootstrap = test_shell_bootstrap_with_active_session(active_session_path);
+        let mut shell = ShellState::new(bootstrap);
+        shell.settings.in_app_notifications = true;
+        shell.settings.system_notifications = false;
+        shell.settings.notification_sound = false;
+        shell.server.set_view_mode(WorkspaceViewMode::Terminal);
+        let attempt_id =
+            shell.begin_terminal_open_attempt(active_session_path, "req-fast", 4, "open_row");
+        // Swap is high, but the reveal is quick — no nag.
+        if let Some(attempt) = shell.terminal_open_attempts.get_mut(&attempt_id) {
+            attempt.memory_pressure_at_start = MemoryPressureSnapshot {
+                swap_used_kb: 9_400 * 1024,
+                swap_total_kb: 16_000 * 1024,
+                mem_available_kb: 1_000 * 1024,
+                mem_total_kb: 16_000 * 1024,
+            };
+        }
+        shell.mark_terminal_open_attempt_ready_for_session(active_session_path, "test_ready");
+        assert!(
+            !shell
+                .notifications
+                .iter()
+                .any(|notification| notification.title == "Slow terminal reveal"),
+            "a fast reveal must not nag about swap"
+        );
+    }
+
+    #[test]
+    fn reveal_log_records_a_failed_reveal() {
+        let active_session_path = "remote-session://oc/reveal-fail";
+        let bootstrap = test_shell_bootstrap_with_active_session(active_session_path);
+        let mut shell = ShellState::new(bootstrap);
+        shell.server.set_view_mode(WorkspaceViewMode::Terminal);
+        let _attempt_id =
+            shell.begin_terminal_open_attempt(active_session_path, "req-fail", 2, "open_row");
+
+        shell.fail_terminal_open_attempt_for_session(active_session_path, "boom".to_string());
+        assert_eq!(shell.reveal_log.len(), 1);
+        let entry = shell.reveal_log.back().expect("reveal entry");
+        assert_eq!(entry.outcome, "failed");
+        assert_eq!(entry.failure_reason.as_deref(), Some("boom"));
+
+        // The latch is one-shot, so a second failure does not duplicate.
+        shell.fail_terminal_open_attempt_for_session(active_session_path, "again".to_string());
+        assert_eq!(shell.reveal_log.len(), 1);
     }
 
     #[test]
