@@ -4,6 +4,30 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+## 2.9.41
+
+- **Paste into the terminal with `Ctrl+Shift+V` works again.** After the xterm.js 6
+  upgrade, `Ctrl+Shift+V` into a terminal was a silent no-op: the keydown handler only
+  routed plain `Ctrl+V`, and `Ctrl+Shift+V` relied on a native browser `paste` event
+  that xterm 6 no longer fires. Both shortcuts now route straight to native clipboard
+  paste.
+- **WebGL "glitched glyphs" on window foreground / switch-in are fixed.** Bringing the
+  window forward (or switching into a retained terminal) could briefly render the wrong
+  characters — `b`→`⅔`, `w`→`<`, garbled box-drawing — self-healing after ~1s. Root
+  cause: while the window is backgrounded WebKitGTK throttles WebGL's animation frames
+  and the GPU glyph-atlas texture goes stale, so the first paint on foreground draws
+  cells against the stale atlas. The atlas-clearing repaint now fires on a
+  background→foreground transition too (previously only on a session switch), so the
+  first foreground frame is clean.
+- **Slow terminal reveals are now self-diagnosing (reveal telemetry).** A cold terminal
+  reveal that drags on is almost always memory pressure (swap thrashing during the
+  mount), not a yggterm render bug. yggterm now records each finished reveal — timing,
+  hot/cold tier, and the swap snapshot taken at reveal start — into a reveal log
+  (surfaced in app state and the event trace), and when a reveal takes ≥6s while swap is
+  in use it tells you so directly ("…took Ns while swap was at M MB in use. Free RAM to
+  speed up reveals."). No more chasing a phantom render bug when the real fix is closing
+  a few memory-hungry apps.
+
 ## 2.9.40
 
 - **CC viewport blink/freeze on long turns is fixed at the source: native xterm.js 6
