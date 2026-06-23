@@ -3830,6 +3830,52 @@ impl ShellState {
         }
     }
 
+    /// JSON view of the reveal-log ring (newest first) for app-state and the
+    /// openable reveal-log panel.
+    fn reveal_log_json(&self) -> Value {
+        Value::Array(
+            self.reveal_log
+                .iter()
+                .rev()
+                .map(RevealLogEntry::to_json)
+                .collect(),
+        )
+    }
+
+    /// In-flight reveal for the currently active terminal session, if one is
+    /// still running — the source for the live slow-reveal status line. Null
+    /// once the active session has revealed (ready/failed) or when there is no
+    /// active terminal reveal.
+    fn active_reveal_status_json(&self) -> Value {
+        if self.server.active_view_mode() != WorkspaceViewMode::Terminal {
+            return Value::Null;
+        }
+        let Some(active_path) = self.server.active_session_path() else {
+            return Value::Null;
+        };
+        let Some(attempt_id) = self.terminal_open_attempt_by_session.get(active_path) else {
+            return Value::Null;
+        };
+        let Some(attempt) = self.terminal_open_attempts.get(attempt_id) else {
+            return Value::Null;
+        };
+        if attempt.ready_at_ms.is_some() || attempt.latched_failure_reason.is_some() {
+            return Value::Null;
+        }
+        let elapsed_ms = current_millis().saturating_sub(attempt.started_at_ms);
+        json!({
+            "session_path": active_path,
+            "in_flight": true,
+            "elapsed_ms": elapsed_ms,
+            "state": format!("{:?}", attempt.state),
+            "source": attempt.source,
+            "tier": if attempt.cold_at_start { "cold" } else { "hot" },
+            "surface_mounted": attempt.surface_mounted_at_ms.is_some(),
+            "first_output": attempt.first_output_at_ms.is_some(),
+            "memory_pressure": attempt.memory_pressure_at_start.to_json(),
+        })
+    }
+
     fn mark_terminal_open_attempt_ready_for_session(
         &mut self,
         session_path: &str,
@@ -25899,6 +25945,12 @@ fn describe_app_state_snapshot(
         "daemon_update_state": daemon_update_state,
         "idle_policy": idle_policy,
         "background_refresh_suspended": background_refresh_suspended,
+        // Reveal telemetry: a bounded history of finished reveals (timing + the
+        // swap snapshot taken at reveal start) and the active session's in-flight
+        // reveal. Makes slow cold reveals self-diagnosing (swap thrash vs render
+        // stall) without polling — see [[finding-xterm6-cold-reveal-render-starvation]].
+        "reveal_log": shell.reveal_log_json(),
+        "active_reveal": shell.active_reveal_status_json(),
         "active_viewport_freshness": active_viewport_freshness_json,
         "settings": settings_snapshot,
         "terminal_telemetry": {
@@ -92781,6 +92833,29 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         // A recovered re-ready of the same attempt must NOT log a duplicate.
         shell.mark_terminal_open_attempt_ready_for_session(active_session_path, "test_ready_again");
         assert_eq!(shell.reveal_log.len(), 1);
+    }
+
+    #[test]
+    fn active_reveal_status_reports_in_flight_then_clears_on_ready() {
+        let active_session_path = "remote-session://oc/reveal-inflight";
+        let bootstrap = test_shell_bootstrap_with_active_session(active_session_path);
+        let mut shell = ShellState::new(bootstrap);
+        shell.server.set_view_mode(WorkspaceViewMode::Terminal);
+
+        // No attempt yet → no in-flight reveal.
+        assert!(shell.active_reveal_status_json().is_null());
+
+        shell.begin_terminal_open_attempt(active_session_path, "req-inflight", 9, "open_row");
+        let status = shell.active_reveal_status_json();
+        assert_eq!(status["in_flight"], json!(true));
+        assert_eq!(status["session_path"], json!(active_session_path));
+        assert_eq!(status["source"], json!("open_row"));
+        assert!(status["elapsed_ms"].as_u64().is_some());
+        assert!(status["memory_pressure"].is_object());
+
+        // Once ready, the in-flight status clears (the live status line hides).
+        shell.mark_terminal_open_attempt_ready_for_session(active_session_path, "test_ready");
+        assert!(shell.active_reveal_status_json().is_null());
     }
 
     #[test]
