@@ -13008,8 +13008,18 @@ fn remote_runtime_bridge_owner_from_statuses(
 ) -> Option<RemoteRuntimeBridgeOwner> {
     let mut stale_owner = None;
     for (endpoint, runtime) in statuses {
+        // Only a daemon that OWNS the live PTY can serve a bridge. `terminal_session_keys`
+        // is the superset that also includes PRESERVED, foreign-owned entries — a daemon
+        // that merely preserves another (often orphaned, stale) daemon's runtime holds only
+        // a retained last-screen snapshot, not a live process. Matching the superset made a
+        // current-version daemon that merely preserves a split-brain peer's CC runtime get
+        // classified as the live `Current` owner; the bridge then attached to that hollow
+        // snapshot (e.g. claude's "Resume this session with: claude --resume <id>" farewell)
+        // and tore down immediately instead of routing to the stale daemon that actually
+        // holds the PTY. Match `owned_terminal_session_keys` so a preserved-only entry defers
+        // to the real owner (StaleNeedsHotUpdate -> hot-update handoff / direct bridge).
         if !runtime
-            .terminal_session_keys
+            .owned_terminal_session_keys
             .iter()
             .any(|key| key == runtime_key)
         {
@@ -22228,6 +22238,58 @@ mod tests {
                 endpoint: current_endpoint,
                 runtime_key: runtime_key.to_string(),
             }
+        );
+    }
+
+    /// Split-brain regression: a current-version daemon that merely PRESERVES a
+    /// stale peer's runtime (key in `terminal_session_keys` via the preserved set,
+    /// but NOT in `owned_terminal_session_keys`) must NOT be picked as the live
+    /// `Current` owner. The bridge must route to the stale daemon that actually
+    /// holds the PTY. This reproduces the "Resume this session with: claude
+    /// --resume <id>" hollow-snapshot bridge that an orphaned dev daemon caused.
+    #[cfg(unix)]
+    #[test]
+    fn remote_runtime_bridge_owner_skips_current_daemon_that_only_preserves_runtime() {
+        let runtime_key = "cc-runtime://6bc81c46-preserved-not-owned";
+        let stale_endpoint =
+            ServerEndpoint::UnixSocket(PathBuf::from("/tmp/yggterm-server-2-9-26.sock"));
+        let current_endpoint = ServerEndpoint::UnixSocket(PathBuf::from(format!(
+            "/tmp/yggterm-server-{}.sock",
+            super::daemon::SERVER_PROTOCOL_VERSION.replace('.', "-")
+        )));
+
+        // Current-version daemon: key present only as a PRESERVED entry (in the
+        // terminal_session_keys superset) — it does NOT own the live PTY.
+        let mut current_status =
+            minimal_runtime_status_with_version(super::daemon::SERVER_PROTOCOL_VERSION, vec![]);
+        current_status.terminal_session_keys = vec![runtime_key.to_string()];
+        current_status.terminal_session_count = 1;
+        current_status.preserved_terminal_owner_keys = vec![runtime_key.to_string()];
+        current_status.preserved_terminal_owner_count = 1;
+
+        // Stale daemon genuinely OWNS the live PTY.
+        let stale_status =
+            minimal_runtime_status_with_version("2.9.26", vec![runtime_key.to_string()]);
+
+        let owner = super::remote_runtime_bridge_owner_from_statuses(
+            vec![
+                (current_endpoint, current_status),
+                (stale_endpoint.clone(), stale_status),
+            ],
+            runtime_key,
+            super::daemon::SERVER_PROTOCOL_VERSION,
+        )
+        .expect("owner");
+
+        assert_eq!(
+            owner,
+            super::RemoteRuntimeBridgeOwner::StaleNeedsHotUpdate {
+                endpoint: stale_endpoint,
+                runtime_key: runtime_key.to_string(),
+                server_version: "2.9.26".to_string(),
+                server_pid: 0,
+            },
+            "a current daemon that only PRESERVES the runtime must defer to the owning stale daemon"
         );
     }
 
