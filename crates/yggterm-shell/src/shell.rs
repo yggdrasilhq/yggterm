@@ -3824,9 +3824,32 @@ impl ShellState {
             },
             entry.to_json(),
         );
+        let notify_label = entry.label.clone();
+        let notify_total_ms = entry.total_ms();
+        let notify_swap_used_mb = entry.memory_pressure.swap_used_mb();
+        let notify_swap_pressured = entry.memory_pressure.swap_pressured();
         self.reveal_log.push_back(entry);
         while self.reveal_log.len() > REVEAL_LOG_CAP {
             self.reveal_log.pop_front();
+        }
+        // Surface the finding's headline: a reveal that dragged on while swap was
+        // thrashing is a memory-pressure problem, not a yggterm render bug. Tell
+        // the user so they can free RAM instead of chasing a phantom. Conservative
+        // threshold so it only fires on the genuinely painful cases;
+        // push_notification dedups repeats. See
+        // [[finding-xterm6-cold-reveal-render-starvation]].
+        const SLOW_REVEAL_NOTIFY_MS: u64 = 6_000;
+        if outcome == "ready" && notify_total_ms >= SLOW_REVEAL_NOTIFY_MS && notify_swap_pressured {
+            self.push_notification(
+                NotificationTone::Info,
+                "Slow terminal reveal",
+                format!(
+                    "Revealing {} took {:.1}s while swap was at {} MB in use. Free RAM to speed up reveals.",
+                    notify_label,
+                    notify_total_ms as f64 / 1000.0,
+                    notify_swap_used_mb,
+                ),
+            );
         }
     }
 
@@ -75052,6 +75075,7 @@ fn interface_font_family() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::terminal_observe::MemoryPressureSnapshot;
     use yggterm_core::SessionNodeKind;
     use yggterm_server::SessionPreview;
 
@@ -92856,6 +92880,67 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         // Once ready, the in-flight status clears (the live status line hides).
         shell.mark_terminal_open_attempt_ready_for_session(active_session_path, "test_ready");
         assert!(shell.active_reveal_status_json().is_null());
+    }
+
+    #[test]
+    fn slow_reveal_under_swap_pressure_notifies_to_free_ram() {
+        let active_session_path = "remote-session://oc/reveal-slow-swap";
+        let bootstrap = test_shell_bootstrap_with_active_session(active_session_path);
+        let mut shell = ShellState::new(bootstrap);
+        shell.settings.in_app_notifications = true;
+        shell.settings.system_notifications = false;
+        shell.settings.notification_sound = false;
+        shell.server.set_view_mode(WorkspaceViewMode::Terminal);
+        let attempt_id =
+            shell.begin_terminal_open_attempt(active_session_path, "req-slow", 3, "open_row");
+        // Force a slow reveal that started 7s ago under heavy swap.
+        if let Some(attempt) = shell.terminal_open_attempts.get_mut(&attempt_id) {
+            attempt.started_at_ms = current_millis().saturating_sub(7_000);
+            attempt.memory_pressure_at_start = MemoryPressureSnapshot {
+                swap_used_kb: 9_400 * 1024,
+                swap_total_kb: 16_000 * 1024,
+                mem_available_kb: 1_000 * 1024,
+                mem_total_kb: 16_000 * 1024,
+            };
+        }
+        shell.mark_terminal_open_attempt_ready_for_session(active_session_path, "test_ready");
+        assert!(
+            shell
+                .notifications
+                .iter()
+                .any(|notification| notification.title == "Slow terminal reveal"),
+            "a slow reveal under swap pressure should warn the user to free RAM"
+        );
+    }
+
+    #[test]
+    fn fast_reveal_does_not_notify_even_under_swap_pressure() {
+        let active_session_path = "remote-session://oc/reveal-fast-swap";
+        let bootstrap = test_shell_bootstrap_with_active_session(active_session_path);
+        let mut shell = ShellState::new(bootstrap);
+        shell.settings.in_app_notifications = true;
+        shell.settings.system_notifications = false;
+        shell.settings.notification_sound = false;
+        shell.server.set_view_mode(WorkspaceViewMode::Terminal);
+        let attempt_id =
+            shell.begin_terminal_open_attempt(active_session_path, "req-fast", 4, "open_row");
+        // Swap is high, but the reveal is quick — no nag.
+        if let Some(attempt) = shell.terminal_open_attempts.get_mut(&attempt_id) {
+            attempt.memory_pressure_at_start = MemoryPressureSnapshot {
+                swap_used_kb: 9_400 * 1024,
+                swap_total_kb: 16_000 * 1024,
+                mem_available_kb: 1_000 * 1024,
+                mem_total_kb: 16_000 * 1024,
+            };
+        }
+        shell.mark_terminal_open_attempt_ready_for_session(active_session_path, "test_ready");
+        assert!(
+            !shell
+                .notifications
+                .iter()
+                .any(|notification| notification.title == "Slow terminal reveal"),
+            "a fast reveal must not nag about swap"
+        );
     }
 
     #[test]
