@@ -22,7 +22,8 @@ use crate::session_copy_policy::{
     title_needs_generation_from_visible_titles,
 };
 use crate::terminal_observe::{
-    TerminalOpenAttempt, TerminalOpenAttemptState, describe_terminal_open_attempt,
+    RevealLogEntry, TerminalOpenAttempt, TerminalOpenAttemptState,
+    describe_terminal_open_attempt, read_memory_pressure_snapshot,
     describe_viewport_snapshot, preview_text_looks_like_loading_placeholder,
     strip_terminal_control_sequences, terminal_bootstrap_activation_epoch,
     terminal_bootstrap_should_wait_for_mount_epoch_sync, terminal_chunk_is_claude_prompt_surface,
@@ -1022,6 +1023,12 @@ struct ShellState {
     // Drives hot-reveal recognition when the latest attempt is a cold-recovery
     // one. See [[followups-switch-hotness-update-friction]].
     terminal_sessions_reached_ready: HashSet<String>,
+    // Bounded history of finished terminal reveals (ready or failed), newest
+    // last. Each entry carries timing + the swap snapshot taken at reveal start
+    // so a slow reveal is self-diagnosing (swap thrash vs render stall) without
+    // app-state polling. Drives the reveal-log surface + live status line.
+    // See [[finding-xterm6-cold-reveal-render-starvation]].
+    reveal_log: VecDeque<RevealLogEntry>,
     remote_preview_sync_after_ms: HashMap<String, u64>,
     remote_preview_failures: HashMap<String, PreviewSyncFailure>,
     remote_preview_dirty_epoch: HashMap<String, u64>,
@@ -2474,6 +2481,7 @@ impl ShellState {
             retained_fault_recovery_loop_armed_at_ms: HashMap::new(),
             terminal_reveal_grace_until_ms: HashMap::new(),
             terminal_sessions_reached_ready: HashSet::new(),
+            reveal_log: VecDeque::new(),
             remote_preview_sync_after_ms: HashMap::new(),
             remote_preview_failures: HashMap::new(),
             remote_preview_dirty_epoch: HashMap::new(),
@@ -3596,6 +3604,7 @@ impl ShellState {
                 .insert(session_path.to_string(), (current_millis(), tier));
         }
         let begin_context = self.terminal_open_context_payload(session_path);
+        let cold_at_start = !self.daemon_owns_session_runtime(session_path);
         let attempt_id = format!("terminal-open-{}-{open_request_id}", current_millis());
         let attempt = TerminalOpenAttempt {
             attempt_id: attempt_id.clone(),
@@ -3604,6 +3613,8 @@ impl ShellState {
             open_request_id,
             source: source.to_string(),
             started_at_ms: current_millis(),
+            memory_pressure_at_start: read_memory_pressure_snapshot(),
+            cold_at_start,
             state: TerminalOpenAttemptState::Pending,
             observations: 0,
             rearm_count: 0,
@@ -3723,6 +3734,102 @@ impl ShellState {
             self.drop_terminal_render_state_for_session(session_path, reason);
         }
     }
+    /// Best-effort human label + kind for a reveal-log entry. Resolves the
+    /// session view from the active / hot / live caches, falling back to the
+    /// session-path tail (the id the user sees on the sidebar row) when the
+    /// view isn't known.
+    fn reveal_session_label_and_kind(&self, session_path: &str) -> (String, String) {
+        let fallback_label = || {
+            session_path
+                .rsplit(['/', ':'])
+                .find(|segment| !segment.is_empty())
+                .unwrap_or(session_path)
+                .to_string()
+        };
+        let view = self
+            .server
+            .active_session()
+            .filter(|view| view.session_path == session_path)
+            .cloned()
+            .or_else(|| self.cached_hot_session_view(session_path))
+            .or_else(|| {
+                self.server
+                    .live_sessions()
+                    .into_iter()
+                    .find(|view| view.session_path == session_path)
+            });
+        match view {
+            Some(view) => {
+                let label = if view.title.trim().is_empty() {
+                    fallback_label()
+                } else {
+                    view.title.clone()
+                };
+                (label, format!("{:?}", view.kind))
+            }
+            None => (fallback_label(), "Unknown".to_string()),
+        }
+    }
+
+    /// Record a finished reveal (ready or failed) into the bounded reveal-log
+    /// ring AND the always-on on-disk trace. Timing + the swap snapshot are read
+    /// from the originating open attempt, so a slow reveal is attributable to
+    /// swap thrash vs a render stall without app-state polling (which itself
+    /// starves the reveal — see [[finding-xterm6-cold-reveal-render-starvation]]).
+    fn record_reveal_outcome(
+        &mut self,
+        session_path: &str,
+        attempt_id: &str,
+        outcome: &'static str,
+        failure_reason: Option<String>,
+    ) {
+        const REVEAL_LOG_CAP: usize = 24;
+        let Some(attempt) = self.terminal_open_attempts.get(attempt_id) else {
+            return;
+        };
+        let started_at_ms = attempt.started_at_ms;
+        let surface_mounted_at_ms = attempt.surface_mounted_at_ms;
+        let first_output_at_ms = attempt.first_output_at_ms;
+        let source = attempt.source.clone();
+        let cold_at_start = attempt.cold_at_start;
+        let memory_pressure = attempt.memory_pressure_at_start;
+        let (label, kind) = self.reveal_session_label_and_kind(session_path);
+        let entry = RevealLogEntry {
+            session_path: session_path.to_string(),
+            label,
+            kind,
+            source,
+            tier: if cold_at_start { "cold" } else { "hot" }.to_string(),
+            started_at_ms,
+            finished_at_ms: current_millis(),
+            surface_mounted_at_ms,
+            first_output_at_ms,
+            outcome: outcome.to_string(),
+            failure_reason,
+            memory_pressure,
+        };
+        // Always-on disk trace: the post-mortem signal must survive a GUI
+        // restart and must not require polling. One append per finished reveal
+        // → negligible I/O. Routed through the instance's perf home (a temp dir
+        // under test) so the suite never appends to the user's real trace.
+        let trace_home = perf_home_dir(&self.bootstrap.settings_path);
+        append_trace_event(
+            &trace_home,
+            "ui",
+            "reveal",
+            if outcome == "ready" {
+                "reveal_ready"
+            } else {
+                "reveal_failed"
+            },
+            entry.to_json(),
+        );
+        self.reveal_log.push_back(entry);
+        while self.reveal_log.len() > REVEAL_LOG_CAP {
+            self.reveal_log.pop_front();
+        }
+    }
+
     fn mark_terminal_open_attempt_ready_for_session(
         &mut self,
         session_path: &str,
@@ -3745,11 +3852,13 @@ impl ShellState {
         self.terminal_sessions_reached_ready
             .insert(session_path.to_string());
         let mut ready_snapshot = None;
+        let mut first_ready_for_reveal_log = false;
         if let Some(attempt) = self.terminal_open_attempts.get_mut(&attempt_id) {
             let first_ready = attempt.ready_at_ms.is_none();
             let recovered_failure = attempt.latched_failure_reason.is_some();
             if first_ready {
                 attempt.ready_at_ms = Some(now_ms);
+                first_ready_for_reveal_log = true;
             }
             if recovered_failure {
                 attempt.latched_failure_at_ms = None;
@@ -3759,6 +3868,12 @@ impl ShellState {
             if first_ready || recovered_failure {
                 ready_snapshot = Some(attempt.clone());
             }
+        }
+        // The first time this attempt reaches ready IS the reveal completing —
+        // record its timing + the swap snapshot taken at reveal start into the
+        // reveal log. Recovered-failure re-readies are not fresh reveals.
+        if first_ready_for_reveal_log {
+            self.record_reveal_outcome(session_path, &attempt_id, "ready", None);
         }
         // Successful recovery is the OTHER natural end of the
         // RetainedFaultRecoveryLoop gate. Record the duration into the
@@ -4240,6 +4355,12 @@ impl ShellState {
             &attempt_snapshot,
             Some(json!({ "reason": reason })),
         );
+        self.record_reveal_outcome(
+            &attempt_snapshot.session_path,
+            &attempt_snapshot.attempt_id,
+            "failed",
+            attempt_snapshot.latched_failure_reason.clone(),
+        );
     }
     fn fail_terminal_open_attempt_for_session(&mut self, session_path: &str, reason: String) {
         let Some(attempt_id) = self
@@ -4263,6 +4384,12 @@ impl ShellState {
             "session_failed",
             &attempt_snapshot,
             Some(json!({ "reason": reason })),
+        );
+        self.record_reveal_outcome(
+            &attempt_snapshot.session_path,
+            &attempt_snapshot.attempt_id,
+            "failed",
+            attempt_snapshot.latched_failure_reason.clone(),
         );
     }
     /// Returns true when the most recent open attempt for this session
@@ -92628,6 +92755,52 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         assert!(matches!(attempt.state, TerminalOpenAttemptState::Ready));
         assert!(attempt.ready_at_ms.is_some());
         assert!(shell.terminal_session_has_ready_attempt(active_session_path));
+    }
+
+    #[test]
+    fn reveal_log_records_a_ready_reveal_once() {
+        let active_session_path = "remote-session://oc/reveal-ready";
+        let bootstrap = test_shell_bootstrap_with_active_session(active_session_path);
+        let mut shell = ShellState::new(bootstrap);
+        shell.server.set_view_mode(WorkspaceViewMode::Terminal);
+        let _attempt_id =
+            shell.begin_terminal_open_attempt(active_session_path, "req-reveal", 1, "open_row");
+        assert!(shell.reveal_log.is_empty());
+
+        shell.mark_terminal_open_attempt_ready_for_session(active_session_path, "test_ready");
+        assert_eq!(shell.reveal_log.len(), 1);
+        let entry = shell.reveal_log.back().expect("reveal entry");
+        assert_eq!(entry.session_path, active_session_path);
+        assert_eq!(entry.outcome, "ready");
+        assert_eq!(entry.source, "open_row");
+        // Tier reflects daemon ownership at reveal start (hot = retained runtime,
+        // cold = fresh re-resume); both are valid — just assert it's populated.
+        assert!(entry.tier == "hot" || entry.tier == "cold");
+        assert!(entry.finished_at_ms >= entry.started_at_ms);
+
+        // A recovered re-ready of the same attempt must NOT log a duplicate.
+        shell.mark_terminal_open_attempt_ready_for_session(active_session_path, "test_ready_again");
+        assert_eq!(shell.reveal_log.len(), 1);
+    }
+
+    #[test]
+    fn reveal_log_records_a_failed_reveal() {
+        let active_session_path = "remote-session://oc/reveal-fail";
+        let bootstrap = test_shell_bootstrap_with_active_session(active_session_path);
+        let mut shell = ShellState::new(bootstrap);
+        shell.server.set_view_mode(WorkspaceViewMode::Terminal);
+        let _attempt_id =
+            shell.begin_terminal_open_attempt(active_session_path, "req-fail", 2, "open_row");
+
+        shell.fail_terminal_open_attempt_for_session(active_session_path, "boom".to_string());
+        assert_eq!(shell.reveal_log.len(), 1);
+        let entry = shell.reveal_log.back().expect("reveal entry");
+        assert_eq!(entry.outcome, "failed");
+        assert_eq!(entry.failure_reason.as_deref(), Some("boom"));
+
+        // The latch is one-shot, so a second failure does not duplicate.
+        shell.fail_terminal_open_attempt_for_session(active_session_path, "again".to_string());
+        assert_eq!(shell.reveal_log.len(), 1);
     }
 
     #[test]
