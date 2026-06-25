@@ -271,6 +271,45 @@ static NEXT_TERMINAL_BOOTSTRAP_OWNER_ID: AtomicU64 = AtomicU64::new(1);
 static ALLOCATOR_TRIM_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
 static LAST_ALLOCATOR_TRIM_CHECK_MS: AtomicU64 = AtomicU64::new(0);
 static LAST_ALLOCATOR_TRIM_MS: AtomicU64 = AtomicU64::new(0);
+// `js_debug` events are pure diagnostics forwarded from the webview. During a
+// reveal/replay the xterm `onData` handler emits hundreds per second
+// (`on_data_burst` / `input_snap_skipped`), and `append_trace_event` does a
+// synchronous create_dir_all + stat + open + write + close PER CALL on the UI
+// event thread — hundreds of those back-to-back froze the UI for seconds. Cap
+// the js_debug trace WRITE to a sane rate (the Debug message is still fully
+// processed for the functional `rebuild_blank_host` branch; only the disk write
+// is throttled). Rare diagnostics fit comfortably under the cap; only a flood is
+// shed. See [[finding-ui-freeze-js-debug-trace-flood]].
+const JS_DEBUG_TRACE_WINDOW_MS: u64 = 1_000;
+const JS_DEBUG_TRACE_WINDOW_MAX: u64 = 30;
+static JS_DEBUG_TRACE_WINDOW_START_MS: AtomicU64 = AtomicU64::new(0);
+static JS_DEBUG_TRACE_WINDOW_COUNT: AtomicU64 = AtomicU64::new(0);
+static JS_DEBUG_TRACE_DROPPED: AtomicU64 = AtomicU64::new(0);
+/// Decide whether to write this js_debug event to the trace, rate-limiting to
+/// `JS_DEBUG_TRACE_WINDOW_MAX` writes per `JS_DEBUG_TRACE_WINDOW_MS`. Returns
+/// `(should_write, dropped_to_flush)`; `dropped_to_flush` is non-zero only on
+/// the first write of a fresh window after a flood, so the throttling is
+/// observable in the trace (one `js_debug_throttled` line) without itself
+/// flooding. The Debug arm runs on the single UI event thread, so the
+/// read-modify-write across these atomics is effectively serialized; the
+/// atomics exist only to avoid `static mut`. A benign race at a window boundary
+/// can at worst write/drop one extra event — never a correctness issue.
+fn js_debug_trace_write_decision(now_ms: u64) -> (bool, u64) {
+    let window_start = JS_DEBUG_TRACE_WINDOW_START_MS.load(Ordering::Relaxed);
+    if now_ms.saturating_sub(window_start) >= JS_DEBUG_TRACE_WINDOW_MS {
+        JS_DEBUG_TRACE_WINDOW_START_MS.store(now_ms, Ordering::Relaxed);
+        JS_DEBUG_TRACE_WINDOW_COUNT.store(1, Ordering::Relaxed);
+        let dropped = JS_DEBUG_TRACE_DROPPED.swap(0, Ordering::Relaxed);
+        return (true, dropped);
+    }
+    let count = JS_DEBUG_TRACE_WINDOW_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+    if count <= JS_DEBUG_TRACE_WINDOW_MAX {
+        (true, 0)
+    } else {
+        JS_DEBUG_TRACE_DROPPED.fetch_add(1, Ordering::Relaxed);
+        (false, 0)
+    }
+}
 static RENDER_TRACE_ENABLED: OnceLock<bool> = OnceLock::new();
 // Render-cause probe v3: previous render's per-field fingerprint, so app() can
 // emit which ShellState field / epoch changed between consecutive renders (and
@@ -485,6 +524,17 @@ const RETAINED_EMPTY_SURFACE_SETTLE_MS: u64 = 800;
 // and [[audit-viewport-scroll-control-flow]].
 const RETAINED_NON_PROMPT_SETTLE_MS: u64 = 1_500;
 const RETAINED_FAULT_RECOVERY_MAX_REARMS: u32 = 2;
+// A NON-live ACTIVE session whose open-attempt never latches Ready never
+// satisfies `terminal_session_is_retained_live`, so each periodic open
+// re-assert would cold-remount it (epoch bump -> bootstrap_reset -> viewport
+// re-seed) — the idle "blink" loop. Once a session has been cold-remounted at
+// least COUNT times spanning at least MS without ever becoming retained-live,
+// further cold remounts are futile churn: reuse the existing host so it can
+// settle. A healthy reveal reaches Ready in well under MS and resets the
+// streak, so it is never settled prematurely. See
+// [[finding-cc-blink-dead-session-remount-loop]].
+const TERMINAL_FUTILE_COLD_REMOUNT_COUNT: u32 = 3;
+const TERMINAL_FUTILE_COLD_REMOUNT_MS: u64 = 10_000;
 // Per [[feedback-cycle-all-keepalive-after-gate-work]]: after a user click,
 // keep the latch off for this long so the resume flow has runway to actually
 // invoke codex/CC resume and have the daemon claim the PTY. The remote ssh
@@ -1010,6 +1060,13 @@ struct ShellState {
     // the GUI first tries to recover a session, until either success or
     // lost-PTY latch.
     retained_fault_recovery_loop_armed_at_ms: HashMap<String, u64>,
+    // Consecutive cold remounts (mount-effect epoch bumps) of an ACTIVE session
+    // that has never reached a retained-live host, and when that streak began.
+    // Caps the futile re-seed loop on a session whose open-attempt never latches
+    // Ready (the idle "blink"). Cleared once the session becomes retained-live.
+    // See [[finding-cc-blink-dead-session-remount-loop]].
+    terminal_cold_remount_count: HashMap<String, u32>,
+    terminal_cold_remount_since_ms: HashMap<String, u64>,
     // Per-session deadline through which the fault-recovery watchdog treats a
     // benign "xterm surface is empty" on a revealed retained host (one that
     // already reached ready and whose daemon still owns the PTY) as a transient
@@ -2479,6 +2536,8 @@ impl ShellState {
             retained_fault_recovery_lost_pty_sessions: HashSet::new(),
             retained_fault_recovery_latch_grace_until_ms: HashMap::new(),
             retained_fault_recovery_loop_armed_at_ms: HashMap::new(),
+            terminal_cold_remount_count: HashMap::new(),
+            terminal_cold_remount_since_ms: HashMap::new(),
             terminal_reveal_grace_until_ms: HashMap::new(),
             terminal_sessions_reached_ready: HashSet::new(),
             reveal_log: VecDeque::new(),
@@ -4048,6 +4107,27 @@ impl ShellState {
             })),
         );
     }
+    /// Whether the first meaningful output of an open attempt should fast-ready
+    /// the reveal (declare ready immediately instead of waiting for the settle
+    /// path). Two independent grounds, both requiring a not-yet-ready attempt in
+    /// Pending/Recovering:
+    /// - HOT-armed + `prompt_like` (the original Phase 2a shave), or
+    /// - the daemon already owns a LIVE runtime for the session, so the output is
+    ///   real session content regardless of `prompt_like` (the cold remote-cc
+    ///   reveal that otherwise never latched ready — see
+    ///   [[finding-cold-cc-reattach-phase-stuck]]).
+    /// Pure so the decision is unit-testable without a full ShellState.
+    fn first_meaningful_output_fast_ready_eligible(
+        attempt_was_hot: bool,
+        prompt_like: bool,
+        daemon_owns_live_runtime: bool,
+        already_ready: bool,
+        pending_or_recovering: bool,
+    ) -> bool {
+        !already_ready
+            && pending_or_recovering
+            && ((attempt_was_hot && prompt_like) || daemon_owns_live_runtime)
+    }
     fn mark_terminal_open_attempt_first_meaningful_output_for_session(
         &mut self,
         session_path: &str,
@@ -4062,6 +4142,22 @@ impl ShellState {
         else {
             return;
         };
+        // A session whose runtime the daemon already OWNS (or proxies via a
+        // preserved owner) has a live PTY by definition, so its first meaningful
+        // output is real session content, not SSH banner noise. This is the
+        // signal that lets a COLD reveal fast-ready safely (see below). Computed
+        // before the &mut borrow of the attempt. Strict: requires a positive
+        // ownership match, NOT the permissive no-snapshot fallback of
+        // `daemon_owns_session_runtime`, so we never fast-ready on banner noise
+        // when ownership is genuinely unknown.
+        let daemon_owns_live_runtime = self.latest_runtime_status.as_ref().is_some_and(|status| {
+            let runtime_key = self.server.terminal_runtime_key_for_path(session_path);
+            status
+                .owned_terminal_session_keys
+                .iter()
+                .chain(status.preserved_terminal_owner_keys.iter())
+                .any(|key| key == &runtime_key)
+        });
         let Some(attempt) = self.terminal_open_attempts.get_mut(&attempt_id) else {
             return;
         };
@@ -4081,14 +4177,36 @@ impl ShellState {
             .switch_arm_ms_by_session
             .get(session_path)
             .is_some_and(|(_, tier)| matches!(tier, SessionWarmthTier::Hot));
-        let fast_ready_eligible = attempt_was_hot
-            && prompt_like
-            && attempt.ready_at_ms.is_none()
-            && matches!(
+        // DAEMON-OWNED fast-ready ([[finding-cold-cc-reattach-phase-stuck]] /
+        // [[finding-cc-blink-dead-session-remount-loop]]): a remote-cc / remote
+        // reveal of a session whose daemon already owns a LIVE runtime never went
+        // through the HOT-armed path (it cold-mounts every time because it never
+        // latched ready) and its content is not `prompt_like` (Claude Code's UI),
+        // so neither fast-ready clause fired and `mark_ready` was NEVER called.
+        // That left `was_ever_ready` false forever, so `is_retained_live` clause
+        // C failed and every switch cold-remounted (bootstrap_reset re-seed = the
+        // reveal "glitch"; the user's "triple switch"). The daemon owning a live
+        // PTY + meaningful real output IS readiness — latch it. This also makes
+        // `reveal_ready` fire so the slow-reveal swap notification works on these
+        // reveals (previously a telemetry blind spot). `prompt_like` is NOT
+        // required here precisely because the output came from an already-live
+        // daemon runtime, not a cold SSH attach. Does NOT touch the per-chunk
+        // host-health classifiers.
+        let fast_ready_eligible = Self::first_meaningful_output_fast_ready_eligible(
+            attempt_was_hot,
+            prompt_like,
+            daemon_owns_live_runtime,
+            attempt.ready_at_ms.is_some(),
+            matches!(
                 attempt.state,
-                TerminalOpenAttemptState::Pending
-                    | TerminalOpenAttemptState::Recovering
-            );
+                TerminalOpenAttemptState::Pending | TerminalOpenAttemptState::Recovering
+            ),
+        );
+        let fast_ready_reason = if attempt_was_hot && prompt_like {
+            "hot_fast_ready_on_first_meaningful_output"
+        } else {
+            "daemon_owned_fast_ready_on_first_meaningful_output"
+        };
         let attempt_snapshot = attempt.clone();
         self.record_terminal_open_attempt_event(
             "first_meaningful_output",
@@ -4098,13 +4216,11 @@ impl ShellState {
                 "prompt_like": prompt_like,
                 "marker": marker,
                 "fast_ready_eligible": fast_ready_eligible,
+                "daemon_owns_live_runtime": daemon_owns_live_runtime,
             })),
         );
         if fast_ready_eligible {
-            self.mark_terminal_open_attempt_ready_for_session(
-                session_path,
-                "hot_fast_ready_on_first_meaningful_output",
-            );
+            self.mark_terminal_open_attempt_ready_for_session(session_path, fast_ready_reason);
         }
     }
     fn observe_terminal_open_attempt_from_viewport(&mut self, viewport: &Value) {
@@ -5370,6 +5486,58 @@ impl ShellState {
             .or_insert(0);
         *epoch = epoch.saturating_add(1).max(1);
         *epoch
+    }
+    /// Decide the mount epoch when (re)opening the ACTIVE session's terminal
+    /// host. Returns `(epoch, reused_live_host, settled_futile)`.
+    ///
+    /// `reused_live_host` reuses the existing live host with no epoch bump (the
+    /// hot/reveal path). `settled_futile` ALSO reuses the existing host with no
+    /// bump, but for a different reason: the session is NOT retained-live yet
+    /// has been cold-remounted repeatedly without ever settling, so further
+    /// cold remounts are futile churn that just re-seed the viewport on every
+    /// periodic open re-assert — the idle "blink" loop. A live session whose
+    /// open-attempt never latches Ready never satisfies
+    /// `terminal_session_is_retained_live`, so without this cap each re-assert
+    /// bumps the epoch and tears the host down before any attempt can complete.
+    /// Reusing the existing host lets such a session finally settle. A healthy
+    /// reveal reaches Ready well within the futile window and clears the streak,
+    /// so it always takes the cold-mount path on first reveal. The
+    /// retained_fault_recovery path bumps the epoch directly (not through here),
+    /// so genuine fault recovery is unaffected. See
+    /// [[finding-cc-blink-dead-session-remount-loop]].
+    fn resolve_active_open_mount_epoch(
+        &mut self,
+        session_path: &str,
+        now_ms: u64,
+    ) -> (u64, bool, bool) {
+        if self.terminal_session_is_retained_live(session_path) {
+            self.terminal_cold_remount_count.remove(session_path);
+            self.terminal_cold_remount_since_ms.remove(session_path);
+            return (self.retain_terminal_session_path(session_path), true, false);
+        }
+        let already_mounted = self.terminal_session_host_id(session_path).is_some();
+        let count = self
+            .terminal_cold_remount_count
+            .get(session_path)
+            .copied()
+            .unwrap_or(0);
+        let since_ms = *self
+            .terminal_cold_remount_since_ms
+            .entry(session_path.to_string())
+            .or_insert(now_ms);
+        if already_mounted
+            && count >= TERMINAL_FUTILE_COLD_REMOUNT_COUNT
+            && now_ms.saturating_sub(since_ms) >= TERMINAL_FUTILE_COLD_REMOUNT_MS
+        {
+            return (self.retain_terminal_session_path(session_path), false, true);
+        }
+        self.terminal_cold_remount_count
+            .insert(session_path.to_string(), count.saturating_add(1));
+        (
+            self.bump_terminal_mount_epoch_for_session(session_path),
+            false,
+            false,
+        )
     }
     fn terminal_session_host_id(&self, session_path: &str) -> Option<String> {
         self.terminal_mount_epochs
@@ -39696,7 +39864,7 @@ fn app() -> Element {
             return;
         }
         last_terminal_mount_key.set(Some(mount_key.clone()));
-        let (mount_epoch, reused_live_host) = state.with_mut(|shell| {
+        let (mount_epoch, reused_live_host, settled_futile) = state.with_mut(|shell| {
             // Open the reveal grace window BEFORE deciding reuse. A switch-back
             // to a host that previously reached ready is a REVEAL, not a fault:
             // the grace makes both the reuse predicate ignore a stale spurious
@@ -39711,25 +39879,23 @@ fn app() -> Element {
                     current_millis().saturating_add(RETAINED_REVEAL_EMPTY_GRACE_MS),
                 );
             }
-            let reused_live_host = shell.terminal_session_is_retained_live(&active_session_path);
-            let mount_epoch = if reused_live_host {
-                shell.retain_terminal_session_path(&active_session_path)
-            } else {
-                shell.bump_terminal_mount_epoch_for_session(&active_session_path)
-            };
+            let (mount_epoch, reused_live_host, settled_futile) =
+                shell.resolve_active_open_mount_epoch(&active_session_path, current_millis());
             if shell.server.active_view_mode() == WorkspaceViewMode::Terminal
                 && shell.server.active_session_path() == Some(active_session_path.as_str())
             {
                 shell.active_terminal_host_id =
                     shell.terminal_session_host_id(&active_session_path);
             }
-            (mount_epoch, reused_live_host)
+            (mount_epoch, reused_live_host, settled_futile)
         });
         append_trace_event(
             &trace_home_for_mount_epoch,
             "ui",
             "terminal_mount",
-            if reused_live_host {
+            if settled_futile {
+                "mount_epoch_settled_futile"
+            } else if reused_live_host {
                 "mount_epoch_reused"
             } else {
                 "mount_epoch_bump"
@@ -39740,6 +39906,7 @@ fn app() -> Element {
                 "mount_key": mount_key,
                 "mount_epoch": mount_epoch,
                 "reused_live_host": reused_live_host,
+                "settled_futile": settled_futile,
             }),
         );
     });
@@ -52492,16 +52659,36 @@ fn TerminalCanvas(
                                 }
                             }
                             Ok(TerminalJsEvent::Debug { message }) => {
-                                append_trace_event(
-                                    &trace_home,
-                                    "ui",
-                                    "terminal_mount",
-                                    "js_debug",
-                                    json!({
-                                        "session_path": session_path.clone(),
-                                        "message": message.clone(),
-                                    }),
-                                );
+                                // Throttle the synchronous trace WRITE only; the
+                                // message is still processed below for the
+                                // functional rebuild_blank_host branch. A reveal
+                                // burst-storm otherwise floods this with hundreds
+                                // of synchronous disk writes on the UI thread and
+                                // freezes the app. See
+                                // [[finding-ui-freeze-js-debug-trace-flood]].
+                                let (write_js_debug, dropped_js_debug) =
+                                    js_debug_trace_write_decision(current_millis());
+                                if write_js_debug {
+                                    if dropped_js_debug > 0 {
+                                        append_trace_event(
+                                            &trace_home,
+                                            "ui",
+                                            "terminal_mount",
+                                            "js_debug_throttled",
+                                            json!({ "dropped": dropped_js_debug }),
+                                        );
+                                    }
+                                    append_trace_event(
+                                        &trace_home,
+                                        "ui",
+                                        "terminal_mount",
+                                        "js_debug",
+                                        json!({
+                                            "session_path": session_path.clone(),
+                                            "message": message.clone(),
+                                        }),
+                                    );
+                                }
                                 if message.contains("rebuild_blank_host")
                                     && placeholder_rendered
                                     && !terminal_has_visible_output
@@ -91671,6 +91858,34 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         assert!(!shell.startup_terminal_restore_should_open(active_session_path));
     }
     #[test]
+    fn daemon_owned_first_meaningful_output_fast_readies_without_prompt_like() {
+        // [[finding-cold-cc-reattach-phase-stuck]]: a cold remote-cc reveal is
+        // never HOT-armed and its content is not prompt_like, so the original
+        // fast-ready clause never fired and the reveal never latched ready ->
+        // is_retained_live clause C failed -> bootstrap_reset re-seed on every
+        // switch (the reveal "glitch"; the user's "triple switch"). When the
+        // daemon already owns a live runtime, first meaningful output is real
+        // session content and must fast-ready regardless of prompt_like/hot.
+        let eligible = |hot, prompt, owns, ready, pending| {
+            ShellState::first_meaningful_output_fast_ready_eligible(
+                hot, prompt, owns, ready, pending,
+            )
+        };
+        // The fix: daemon-owned + not-prompt-like + cold + pending -> eligible.
+        assert!(eligible(false, false, true, false, true));
+        // Original HOT + prompt_like path still works.
+        assert!(eligible(true, true, false, false, true));
+        // No regression: cold SSH (no daemon ownership) + not prompt_like must
+        // NOT fast-ready (could be banner noise).
+        assert!(!eligible(false, false, false, false, true));
+        // HOT but not prompt_like and not daemon-owned -> still gated (unchanged).
+        assert!(!eligible(true, false, false, false, true));
+        // Already ready -> never re-fires.
+        assert!(!eligible(false, false, true, true, true));
+        // Not Pending/Recovering (already failed/latched) -> not eligible.
+        assert!(!eligible(false, false, true, false, false));
+    }
+    #[test]
     fn terminal_session_is_retained_live_while_bootstrap_lease_is_active() {
         let active_session_path = "codex://test";
         let bootstrap = test_shell_bootstrap_with_active_session(active_session_path);
@@ -91715,6 +91930,142 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             .terminal_resume_ready_paths
             .insert(active_session_path.to_string());
         assert!(shell.terminal_session_is_retained_live(active_session_path));
+    }
+    #[test]
+    fn js_debug_trace_write_decision_throttles_floods_but_keeps_rare_events() {
+        // Regression for the UI freeze ([[finding-ui-freeze-js-debug-trace-flood]]):
+        // a reveal/replay onData burst-storm floods js_debug -> synchronous disk
+        // writes on the UI thread. The write must be rate-limited per window,
+        // dropping only the flood and reporting the dropped count once.
+        // This is the sole user of these module statics, so it is deterministic
+        // despite the statics persisting across tests.
+        let base = 5_000_000u64;
+        // First event opens a fresh window: writes, nothing dropped yet.
+        assert_eq!(js_debug_trace_write_decision(base), (true, 0));
+        // Remaining events up to the cap (same window) all write.
+        for i in 1..JS_DEBUG_TRACE_WINDOW_MAX {
+            assert_eq!(
+                js_debug_trace_write_decision(base + i),
+                (true, 0),
+                "event {i} under the cap must write"
+            );
+        }
+        // Over the cap within the window: dropped (no write).
+        let mut dropped = 0u64;
+        for i in 0..50 {
+            let (write, _) = js_debug_trace_write_decision(base + 100 + i);
+            if !write {
+                dropped += 1;
+            }
+        }
+        assert_eq!(dropped, 50, "every over-cap event in the window is shed");
+        // The first write of the NEXT window flushes the dropped count once.
+        assert_eq!(
+            js_debug_trace_write_decision(base + JS_DEBUG_TRACE_WINDOW_MS),
+            (true, 50)
+        );
+        // ...and the dropped counter is cleared for the following window.
+        assert_eq!(
+            js_debug_trace_write_decision(base + 2 * JS_DEBUG_TRACE_WINDOW_MS),
+            (true, 0)
+        );
+    }
+    #[test]
+    fn futile_cold_remounts_settle_instead_of_looping_forever() {
+        // Regression for the idle "blink" loop
+        // ([[finding-cc-blink-dead-session-remount-loop]]): a live session whose
+        // open-attempt never latches Ready never satisfies
+        // terminal_session_is_retained_live, so each periodic open re-assert would
+        // cold-remount it forever (epoch bump -> bootstrap_reset -> viewport
+        // re-seed). After a futile streak the existing host must be REUSED with no
+        // epoch bump so the session can settle, and the loop must stay broken.
+        let active_session_path = "remote-session://dev/never-ready";
+        let bootstrap = test_shell_bootstrap_with_active_session(active_session_path);
+        let mut shell = ShellState::new(bootstrap);
+        shell.server_busy = false;
+        shell.server.set_view_mode(WorkspaceViewMode::Terminal);
+        // A mounted host that is NOT retained-live (active remote + bootstrap lease,
+        // no ready signal == is_retained_live false), like a never-Ready attempt.
+        shell.retain_terminal_session_path(active_session_path);
+        shell.bump_terminal_mount_epoch_for_session(active_session_path);
+        shell
+            .terminal_bootstrap_owner_by_session
+            .insert(active_session_path.to_string(), "owner:test".to_string());
+        shell
+            .terminal_bootstrap_lease_by_session
+            .insert(active_session_path.to_string(), "lease:test".to_string());
+        assert!(!shell.terminal_session_is_retained_live(active_session_path));
+
+        // First cold remount bumps the epoch (a genuine first reveal always mounts).
+        let (_, reused_first, settled_first) =
+            shell.resolve_active_open_mount_epoch(active_session_path, 1_000);
+        assert!(!reused_first && !settled_first, "first cold remount must bump");
+        let epoch_after_first = *shell
+            .terminal_mount_epochs
+            .get(active_session_path)
+            .expect("epoch present after first cold remount");
+
+        // Re-asserts within the time window keep cold-remounting (epoch climbs).
+        let mut now = 1_000u64;
+        for _ in 0..5 {
+            now += 1_000;
+            shell.resolve_active_open_mount_epoch(active_session_path, now);
+        }
+        let epoch_before_settle = *shell
+            .terminal_mount_epochs
+            .get(active_session_path)
+            .expect("epoch present while churning");
+        assert!(
+            epoch_before_settle > epoch_after_first,
+            "epoch keeps climbing while the futile streak is within budget"
+        );
+
+        // Past BOTH the count and time thresholds: settle (reuse, no epoch bump).
+        now += TERMINAL_FUTILE_COLD_REMOUNT_MS;
+        let (settled_epoch, reused, settled) =
+            shell.resolve_active_open_mount_epoch(active_session_path, now);
+        assert!(settled, "a futile streak must settle instead of remounting");
+        assert!(!reused, "settling reuses the host but is not a genuine live reveal");
+        assert_eq!(
+            settled_epoch, epoch_before_settle,
+            "settling reuses the existing epoch — no remount, no re-seed"
+        );
+
+        // Subsequent re-asserts keep the SAME epoch: the blink loop is broken.
+        now += 60_000;
+        let (epoch_again, _, settled_again) =
+            shell.resolve_active_open_mount_epoch(active_session_path, now);
+        assert!(settled_again);
+        assert_eq!(
+            epoch_again, epoch_before_settle,
+            "no further remounts once settled"
+        );
+
+        // Once the session genuinely becomes retained-live, the streak clears and
+        // the live host is reused with no churn (and a later death re-arms the cap).
+        shell
+            .terminal_bootstrap_owner_by_session
+            .remove(active_session_path);
+        shell
+            .terminal_bootstrap_lease_by_session
+            .remove(active_session_path);
+        shell
+            .terminal_resume_ready_paths
+            .insert(active_session_path.to_string());
+        assert!(shell.terminal_session_is_retained_live(active_session_path));
+        now += 1_000;
+        let (_, reused_live, settled_live) =
+            shell.resolve_active_open_mount_epoch(active_session_path, now);
+        assert!(reused_live && !settled_live, "live host reused, streak cleared");
+        assert!(
+            !shell
+                .terminal_cold_remount_count
+                .contains_key(active_session_path),
+            "streak count cleared when the session becomes retained-live"
+        );
+        assert!(!shell
+            .terminal_cold_remount_since_ms
+            .contains_key(active_session_path));
     }
     #[test]
     fn retained_host_with_ready_history_is_hot_reusable_on_switch_back() {
