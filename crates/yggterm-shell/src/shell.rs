@@ -485,6 +485,17 @@ const RETAINED_EMPTY_SURFACE_SETTLE_MS: u64 = 800;
 // and [[audit-viewport-scroll-control-flow]].
 const RETAINED_NON_PROMPT_SETTLE_MS: u64 = 1_500;
 const RETAINED_FAULT_RECOVERY_MAX_REARMS: u32 = 2;
+// A NON-live ACTIVE session whose open-attempt never latches Ready never
+// satisfies `terminal_session_is_retained_live`, so each periodic open
+// re-assert would cold-remount it (epoch bump -> bootstrap_reset -> viewport
+// re-seed) — the idle "blink" loop. Once a session has been cold-remounted at
+// least COUNT times spanning at least MS without ever becoming retained-live,
+// further cold remounts are futile churn: reuse the existing host so it can
+// settle. A healthy reveal reaches Ready in well under MS and resets the
+// streak, so it is never settled prematurely. See
+// [[finding-cc-blink-dead-session-remount-loop]].
+const TERMINAL_FUTILE_COLD_REMOUNT_COUNT: u32 = 3;
+const TERMINAL_FUTILE_COLD_REMOUNT_MS: u64 = 10_000;
 // Per [[feedback-cycle-all-keepalive-after-gate-work]]: after a user click,
 // keep the latch off for this long so the resume flow has runway to actually
 // invoke codex/CC resume and have the daemon claim the PTY. The remote ssh
@@ -1010,6 +1021,13 @@ struct ShellState {
     // the GUI first tries to recover a session, until either success or
     // lost-PTY latch.
     retained_fault_recovery_loop_armed_at_ms: HashMap<String, u64>,
+    // Consecutive cold remounts (mount-effect epoch bumps) of an ACTIVE session
+    // that has never reached a retained-live host, and when that streak began.
+    // Caps the futile re-seed loop on a session whose open-attempt never latches
+    // Ready (the idle "blink"). Cleared once the session becomes retained-live.
+    // See [[finding-cc-blink-dead-session-remount-loop]].
+    terminal_cold_remount_count: HashMap<String, u32>,
+    terminal_cold_remount_since_ms: HashMap<String, u64>,
     // Per-session deadline through which the fault-recovery watchdog treats a
     // benign "xterm surface is empty" on a revealed retained host (one that
     // already reached ready and whose daemon still owns the PTY) as a transient
@@ -2479,6 +2497,8 @@ impl ShellState {
             retained_fault_recovery_lost_pty_sessions: HashSet::new(),
             retained_fault_recovery_latch_grace_until_ms: HashMap::new(),
             retained_fault_recovery_loop_armed_at_ms: HashMap::new(),
+            terminal_cold_remount_count: HashMap::new(),
+            terminal_cold_remount_since_ms: HashMap::new(),
             terminal_reveal_grace_until_ms: HashMap::new(),
             terminal_sessions_reached_ready: HashSet::new(),
             reveal_log: VecDeque::new(),
@@ -5427,6 +5447,58 @@ impl ShellState {
             .or_insert(0);
         *epoch = epoch.saturating_add(1).max(1);
         *epoch
+    }
+    /// Decide the mount epoch when (re)opening the ACTIVE session's terminal
+    /// host. Returns `(epoch, reused_live_host, settled_futile)`.
+    ///
+    /// `reused_live_host` reuses the existing live host with no epoch bump (the
+    /// hot/reveal path). `settled_futile` ALSO reuses the existing host with no
+    /// bump, but for a different reason: the session is NOT retained-live yet
+    /// has been cold-remounted repeatedly without ever settling, so further
+    /// cold remounts are futile churn that just re-seed the viewport on every
+    /// periodic open re-assert — the idle "blink" loop. A live session whose
+    /// open-attempt never latches Ready never satisfies
+    /// `terminal_session_is_retained_live`, so without this cap each re-assert
+    /// bumps the epoch and tears the host down before any attempt can complete.
+    /// Reusing the existing host lets such a session finally settle. A healthy
+    /// reveal reaches Ready well within the futile window and clears the streak,
+    /// so it always takes the cold-mount path on first reveal. The
+    /// retained_fault_recovery path bumps the epoch directly (not through here),
+    /// so genuine fault recovery is unaffected. See
+    /// [[finding-cc-blink-dead-session-remount-loop]].
+    fn resolve_active_open_mount_epoch(
+        &mut self,
+        session_path: &str,
+        now_ms: u64,
+    ) -> (u64, bool, bool) {
+        if self.terminal_session_is_retained_live(session_path) {
+            self.terminal_cold_remount_count.remove(session_path);
+            self.terminal_cold_remount_since_ms.remove(session_path);
+            return (self.retain_terminal_session_path(session_path), true, false);
+        }
+        let already_mounted = self.terminal_session_host_id(session_path).is_some();
+        let count = self
+            .terminal_cold_remount_count
+            .get(session_path)
+            .copied()
+            .unwrap_or(0);
+        let since_ms = *self
+            .terminal_cold_remount_since_ms
+            .entry(session_path.to_string())
+            .or_insert(now_ms);
+        if already_mounted
+            && count >= TERMINAL_FUTILE_COLD_REMOUNT_COUNT
+            && now_ms.saturating_sub(since_ms) >= TERMINAL_FUTILE_COLD_REMOUNT_MS
+        {
+            return (self.retain_terminal_session_path(session_path), false, true);
+        }
+        self.terminal_cold_remount_count
+            .insert(session_path.to_string(), count.saturating_add(1));
+        (
+            self.bump_terminal_mount_epoch_for_session(session_path),
+            false,
+            false,
+        )
     }
     fn terminal_session_host_id(&self, session_path: &str) -> Option<String> {
         self.terminal_mount_epochs
@@ -39753,7 +39825,7 @@ fn app() -> Element {
             return;
         }
         last_terminal_mount_key.set(Some(mount_key.clone()));
-        let (mount_epoch, reused_live_host) = state.with_mut(|shell| {
+        let (mount_epoch, reused_live_host, settled_futile) = state.with_mut(|shell| {
             // Open the reveal grace window BEFORE deciding reuse. A switch-back
             // to a host that previously reached ready is a REVEAL, not a fault:
             // the grace makes both the reuse predicate ignore a stale spurious
@@ -39768,25 +39840,23 @@ fn app() -> Element {
                     current_millis().saturating_add(RETAINED_REVEAL_EMPTY_GRACE_MS),
                 );
             }
-            let reused_live_host = shell.terminal_session_is_retained_live(&active_session_path);
-            let mount_epoch = if reused_live_host {
-                shell.retain_terminal_session_path(&active_session_path)
-            } else {
-                shell.bump_terminal_mount_epoch_for_session(&active_session_path)
-            };
+            let (mount_epoch, reused_live_host, settled_futile) =
+                shell.resolve_active_open_mount_epoch(&active_session_path, current_millis());
             if shell.server.active_view_mode() == WorkspaceViewMode::Terminal
                 && shell.server.active_session_path() == Some(active_session_path.as_str())
             {
                 shell.active_terminal_host_id =
                     shell.terminal_session_host_id(&active_session_path);
             }
-            (mount_epoch, reused_live_host)
+            (mount_epoch, reused_live_host, settled_futile)
         });
         append_trace_event(
             &trace_home_for_mount_epoch,
             "ui",
             "terminal_mount",
-            if reused_live_host {
+            if settled_futile {
+                "mount_epoch_settled_futile"
+            } else if reused_live_host {
                 "mount_epoch_reused"
             } else {
                 "mount_epoch_bump"
@@ -39797,6 +39867,7 @@ fn app() -> Element {
                 "mount_key": mount_key,
                 "mount_epoch": mount_epoch,
                 "reused_live_host": reused_live_host,
+                "settled_futile": settled_futile,
             }),
         );
     });
@@ -91800,6 +91871,103 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             .terminal_resume_ready_paths
             .insert(active_session_path.to_string());
         assert!(shell.terminal_session_is_retained_live(active_session_path));
+    }
+    #[test]
+    fn futile_cold_remounts_settle_instead_of_looping_forever() {
+        // Regression for the idle "blink" loop
+        // ([[finding-cc-blink-dead-session-remount-loop]]): a live session whose
+        // open-attempt never latches Ready never satisfies
+        // terminal_session_is_retained_live, so each periodic open re-assert would
+        // cold-remount it forever (epoch bump -> bootstrap_reset -> viewport
+        // re-seed). After a futile streak the existing host must be REUSED with no
+        // epoch bump so the session can settle, and the loop must stay broken.
+        let active_session_path = "remote-session://dev/never-ready";
+        let bootstrap = test_shell_bootstrap_with_active_session(active_session_path);
+        let mut shell = ShellState::new(bootstrap);
+        shell.server_busy = false;
+        shell.server.set_view_mode(WorkspaceViewMode::Terminal);
+        // A mounted host that is NOT retained-live (active remote + bootstrap lease,
+        // no ready signal == is_retained_live false), like a never-Ready attempt.
+        shell.retain_terminal_session_path(active_session_path);
+        shell.bump_terminal_mount_epoch_for_session(active_session_path);
+        shell
+            .terminal_bootstrap_owner_by_session
+            .insert(active_session_path.to_string(), "owner:test".to_string());
+        shell
+            .terminal_bootstrap_lease_by_session
+            .insert(active_session_path.to_string(), "lease:test".to_string());
+        assert!(!shell.terminal_session_is_retained_live(active_session_path));
+
+        // First cold remount bumps the epoch (a genuine first reveal always mounts).
+        let (_, reused_first, settled_first) =
+            shell.resolve_active_open_mount_epoch(active_session_path, 1_000);
+        assert!(!reused_first && !settled_first, "first cold remount must bump");
+        let epoch_after_first = *shell
+            .terminal_mount_epochs
+            .get(active_session_path)
+            .expect("epoch present after first cold remount");
+
+        // Re-asserts within the time window keep cold-remounting (epoch climbs).
+        let mut now = 1_000u64;
+        for _ in 0..5 {
+            now += 1_000;
+            shell.resolve_active_open_mount_epoch(active_session_path, now);
+        }
+        let epoch_before_settle = *shell
+            .terminal_mount_epochs
+            .get(active_session_path)
+            .expect("epoch present while churning");
+        assert!(
+            epoch_before_settle > epoch_after_first,
+            "epoch keeps climbing while the futile streak is within budget"
+        );
+
+        // Past BOTH the count and time thresholds: settle (reuse, no epoch bump).
+        now += TERMINAL_FUTILE_COLD_REMOUNT_MS;
+        let (settled_epoch, reused, settled) =
+            shell.resolve_active_open_mount_epoch(active_session_path, now);
+        assert!(settled, "a futile streak must settle instead of remounting");
+        assert!(!reused, "settling reuses the host but is not a genuine live reveal");
+        assert_eq!(
+            settled_epoch, epoch_before_settle,
+            "settling reuses the existing epoch — no remount, no re-seed"
+        );
+
+        // Subsequent re-asserts keep the SAME epoch: the blink loop is broken.
+        now += 60_000;
+        let (epoch_again, _, settled_again) =
+            shell.resolve_active_open_mount_epoch(active_session_path, now);
+        assert!(settled_again);
+        assert_eq!(
+            epoch_again, epoch_before_settle,
+            "no further remounts once settled"
+        );
+
+        // Once the session genuinely becomes retained-live, the streak clears and
+        // the live host is reused with no churn (and a later death re-arms the cap).
+        shell
+            .terminal_bootstrap_owner_by_session
+            .remove(active_session_path);
+        shell
+            .terminal_bootstrap_lease_by_session
+            .remove(active_session_path);
+        shell
+            .terminal_resume_ready_paths
+            .insert(active_session_path.to_string());
+        assert!(shell.terminal_session_is_retained_live(active_session_path));
+        now += 1_000;
+        let (_, reused_live, settled_live) =
+            shell.resolve_active_open_mount_epoch(active_session_path, now);
+        assert!(reused_live && !settled_live, "live host reused, streak cleared");
+        assert!(
+            !shell
+                .terminal_cold_remount_count
+                .contains_key(active_session_path),
+            "streak count cleared when the session becomes retained-live"
+        );
+        assert!(!shell
+            .terminal_cold_remount_since_ms
+            .contains_key(active_session_path));
     }
     #[test]
     fn retained_host_with_ready_history_is_hot_reusable_on_switch_back() {
