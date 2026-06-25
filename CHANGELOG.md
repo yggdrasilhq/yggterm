@@ -13,6 +13,11 @@ This file tracks user-visible changes in `yggterm`.
   Code), so switch-backs reveal the live host instead of cold-remounting it; and (2) a session that has
   cold-remounted repeatedly without ever settling now reuses its existing host instead of re-seeding
   forever, breaking the futile loop. Genuine first reveals and real fault recovery are unaffected.
+- **The terminal no longer freezes for several seconds during a session reveal.** Revealing a session
+  replays its screen, which can arrive as a storm of hundreds of small terminal data bursts; each one
+  emitted an internal diagnostic that was written to the on-disk trace synchronously on the UI thread
+  (open + append + close per event), and the volume blocked the UI for seconds. Those diagnostic writes
+  are now rate-limited, so a reveal storm no longer stalls the interface.
 
 ## 2.9.42
 
