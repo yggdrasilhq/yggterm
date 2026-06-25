@@ -271,6 +271,45 @@ static NEXT_TERMINAL_BOOTSTRAP_OWNER_ID: AtomicU64 = AtomicU64::new(1);
 static ALLOCATOR_TRIM_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
 static LAST_ALLOCATOR_TRIM_CHECK_MS: AtomicU64 = AtomicU64::new(0);
 static LAST_ALLOCATOR_TRIM_MS: AtomicU64 = AtomicU64::new(0);
+// `js_debug` events are pure diagnostics forwarded from the webview. During a
+// reveal/replay the xterm `onData` handler emits hundreds per second
+// (`on_data_burst` / `input_snap_skipped`), and `append_trace_event` does a
+// synchronous create_dir_all + stat + open + write + close PER CALL on the UI
+// event thread — hundreds of those back-to-back froze the UI for seconds. Cap
+// the js_debug trace WRITE to a sane rate (the Debug message is still fully
+// processed for the functional `rebuild_blank_host` branch; only the disk write
+// is throttled). Rare diagnostics fit comfortably under the cap; only a flood is
+// shed. See [[finding-ui-freeze-js-debug-trace-flood]].
+const JS_DEBUG_TRACE_WINDOW_MS: u64 = 1_000;
+const JS_DEBUG_TRACE_WINDOW_MAX: u64 = 30;
+static JS_DEBUG_TRACE_WINDOW_START_MS: AtomicU64 = AtomicU64::new(0);
+static JS_DEBUG_TRACE_WINDOW_COUNT: AtomicU64 = AtomicU64::new(0);
+static JS_DEBUG_TRACE_DROPPED: AtomicU64 = AtomicU64::new(0);
+/// Decide whether to write this js_debug event to the trace, rate-limiting to
+/// `JS_DEBUG_TRACE_WINDOW_MAX` writes per `JS_DEBUG_TRACE_WINDOW_MS`. Returns
+/// `(should_write, dropped_to_flush)`; `dropped_to_flush` is non-zero only on
+/// the first write of a fresh window after a flood, so the throttling is
+/// observable in the trace (one `js_debug_throttled` line) without itself
+/// flooding. The Debug arm runs on the single UI event thread, so the
+/// read-modify-write across these atomics is effectively serialized; the
+/// atomics exist only to avoid `static mut`. A benign race at a window boundary
+/// can at worst write/drop one extra event — never a correctness issue.
+fn js_debug_trace_write_decision(now_ms: u64) -> (bool, u64) {
+    let window_start = JS_DEBUG_TRACE_WINDOW_START_MS.load(Ordering::Relaxed);
+    if now_ms.saturating_sub(window_start) >= JS_DEBUG_TRACE_WINDOW_MS {
+        JS_DEBUG_TRACE_WINDOW_START_MS.store(now_ms, Ordering::Relaxed);
+        JS_DEBUG_TRACE_WINDOW_COUNT.store(1, Ordering::Relaxed);
+        let dropped = JS_DEBUG_TRACE_DROPPED.swap(0, Ordering::Relaxed);
+        return (true, dropped);
+    }
+    let count = JS_DEBUG_TRACE_WINDOW_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+    if count <= JS_DEBUG_TRACE_WINDOW_MAX {
+        (true, 0)
+    } else {
+        JS_DEBUG_TRACE_DROPPED.fetch_add(1, Ordering::Relaxed);
+        (false, 0)
+    }
+}
 static RENDER_TRACE_ENABLED: OnceLock<bool> = OnceLock::new();
 // Render-cause probe v3: previous render's per-field fingerprint, so app() can
 // emit which ShellState field / epoch changed between consecutive renders (and
@@ -52620,16 +52659,36 @@ fn TerminalCanvas(
                                 }
                             }
                             Ok(TerminalJsEvent::Debug { message }) => {
-                                append_trace_event(
-                                    &trace_home,
-                                    "ui",
-                                    "terminal_mount",
-                                    "js_debug",
-                                    json!({
-                                        "session_path": session_path.clone(),
-                                        "message": message.clone(),
-                                    }),
-                                );
+                                // Throttle the synchronous trace WRITE only; the
+                                // message is still processed below for the
+                                // functional rebuild_blank_host branch. A reveal
+                                // burst-storm otherwise floods this with hundreds
+                                // of synchronous disk writes on the UI thread and
+                                // freezes the app. See
+                                // [[finding-ui-freeze-js-debug-trace-flood]].
+                                let (write_js_debug, dropped_js_debug) =
+                                    js_debug_trace_write_decision(current_millis());
+                                if write_js_debug {
+                                    if dropped_js_debug > 0 {
+                                        append_trace_event(
+                                            &trace_home,
+                                            "ui",
+                                            "terminal_mount",
+                                            "js_debug_throttled",
+                                            json!({ "dropped": dropped_js_debug }),
+                                        );
+                                    }
+                                    append_trace_event(
+                                        &trace_home,
+                                        "ui",
+                                        "terminal_mount",
+                                        "js_debug",
+                                        json!({
+                                            "session_path": session_path.clone(),
+                                            "message": message.clone(),
+                                        }),
+                                    );
+                                }
                                 if message.contains("rebuild_blank_host")
                                     && placeholder_rendered
                                     && !terminal_has_visible_output
@@ -91871,6 +91930,45 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             .terminal_resume_ready_paths
             .insert(active_session_path.to_string());
         assert!(shell.terminal_session_is_retained_live(active_session_path));
+    }
+    #[test]
+    fn js_debug_trace_write_decision_throttles_floods_but_keeps_rare_events() {
+        // Regression for the UI freeze ([[finding-ui-freeze-js-debug-trace-flood]]):
+        // a reveal/replay onData burst-storm floods js_debug -> synchronous disk
+        // writes on the UI thread. The write must be rate-limited per window,
+        // dropping only the flood and reporting the dropped count once.
+        // This is the sole user of these module statics, so it is deterministic
+        // despite the statics persisting across tests.
+        let base = 5_000_000u64;
+        // First event opens a fresh window: writes, nothing dropped yet.
+        assert_eq!(js_debug_trace_write_decision(base), (true, 0));
+        // Remaining events up to the cap (same window) all write.
+        for i in 1..JS_DEBUG_TRACE_WINDOW_MAX {
+            assert_eq!(
+                js_debug_trace_write_decision(base + i),
+                (true, 0),
+                "event {i} under the cap must write"
+            );
+        }
+        // Over the cap within the window: dropped (no write).
+        let mut dropped = 0u64;
+        for i in 0..50 {
+            let (write, _) = js_debug_trace_write_decision(base + 100 + i);
+            if !write {
+                dropped += 1;
+            }
+        }
+        assert_eq!(dropped, 50, "every over-cap event in the window is shed");
+        // The first write of the NEXT window flushes the dropped count once.
+        assert_eq!(
+            js_debug_trace_write_decision(base + JS_DEBUG_TRACE_WINDOW_MS),
+            (true, 50)
+        );
+        // ...and the dropped counter is cleared for the following window.
+        assert_eq!(
+            js_debug_trace_write_decision(base + 2 * JS_DEBUG_TRACE_WINDOW_MS),
+            (true, 0)
+        );
     }
     #[test]
     fn futile_cold_remounts_settle_instead_of_looping_forever() {
