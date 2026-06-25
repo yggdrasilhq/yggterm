@@ -4,6 +4,22 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+## 2.9.42
+
+- **Typing into the terminal no longer accumulates on desktops with an input method (ibus/fcitx).**
+  On machines where an input method was active and `GTK_IM_MODULE` was unset (the default on
+  many Debian/GNOME desktops), WebKitGTK routed keystrokes through the IME's commit path, which
+  bypassed xterm.js's keydown handling — so xterm re-sent its *entire* accumulated input buffer
+  on every keystroke (type `s` → `s`, type `t` → `sst`, and so on). Yggterm now forces GTK's
+  simple input module by default (compose and dead keys still work); set `YGGTERM_ENABLE_NATIVE_IME=1`
+  to keep a full IME engine (e.g. CJK). Applied both in the launcher and in-process, so update
+  restarts and daemon-launched windows are covered too.
+- **"Restart to Update" no longer fails at the session-protection step.** Writing the daemon's
+  session snapshot before an update restart is best-effort; if it failed (e.g. a transient disk
+  or permission issue) the whole restart was aborted with an "Update Restart Blocked" error,
+  leaving you stranded on the old version. The snapshot write is now non-fatal — the restart
+  proceeds, live sessions are still preserved, and the failure is recorded in the trace.
+
 ## 2.9.41
 
 - **Paste into the terminal with `Ctrl+Shift+V` works again.** After the xterm.js 6

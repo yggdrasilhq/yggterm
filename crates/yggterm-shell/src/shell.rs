@@ -38382,6 +38382,45 @@ pub fn launch_shell(mut bootstrap: ShellBootstrap) -> Result<()> {
     let linux_window_profile_reason = bootstrap.linux_window_profile_reason.clone();
     let linux_native_decorations = linux_force_native_decorations();
     #[cfg(target_os = "linux")]
+    {
+        // XTERM-BUG: ibus-cumulative-input. On desktops with an active input
+        // method (ibus/fcitx — the Debian/GNOME default) and no explicit
+        // GTK_IM_MODULE, WebKitGTK routes keystrokes through the IME's
+        // Wayland/XIM text-input path. Those commits bypass xterm.js's `keydown`
+        // handler, so xterm never clears its hidden input textarea and re-emits
+        // the WHOLE accumulated buffer via onData on every keystroke (type "s"
+        // -> "s", type "t" -> "st" -> the CLI renders "sst"). Forcing the simple
+        // IM module (compose/dead keys still work) makes keys arrive as ordinary
+        // key events. This mirrors the launcher-script guard so spawn paths that
+        // bypass the launcher are also covered — notably the update-restart
+        // relaunch (`Command::new(next_exe)`) and daemon app-launch. Must run
+        // before the GTK event loop is built below. Opt back into the native IME
+        // (full engines, e.g. CJK) with YGGTERM_ENABLE_NATIVE_IME=1.
+        let enable_native_ime = std::env::var(yggterm_core::ENV_YGGTERM_ENABLE_NATIVE_IME)
+            .map(|value| value == "1")
+            .unwrap_or(false);
+        let im_already_set = std::env::var_os("GTK_IM_MODULE").is_some();
+        if !enable_native_ime && !im_already_set {
+            // SAFETY: startup, before the GTK event loop or any environment-reading
+            // threads are created.
+            unsafe {
+                std::env::set_var("GTK_IM_MODULE", "gtk-im-context-simple");
+            }
+        }
+        append_trace_event(
+            &trace_home,
+            "ui",
+            "startup",
+            "linux_im_module_policy",
+            json!({
+                "pid": std::process::id(),
+                "enable_native_ime": enable_native_ime,
+                "im_already_set": im_already_set,
+                "gtk_im_module": std::env::var("GTK_IM_MODULE").unwrap_or_default(),
+            }),
+        );
+    }
+    #[cfg(target_os = "linux")]
     let linux_desktop_app_id_value = Some(linux_desktop_app_id());
     #[cfg(not(target_os = "linux"))]
     let linux_desktop_app_id_value: Option<String> = None;
