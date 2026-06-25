@@ -4048,6 +4048,27 @@ impl ShellState {
             })),
         );
     }
+    /// Whether the first meaningful output of an open attempt should fast-ready
+    /// the reveal (declare ready immediately instead of waiting for the settle
+    /// path). Two independent grounds, both requiring a not-yet-ready attempt in
+    /// Pending/Recovering:
+    /// - HOT-armed + `prompt_like` (the original Phase 2a shave), or
+    /// - the daemon already owns a LIVE runtime for the session, so the output is
+    ///   real session content regardless of `prompt_like` (the cold remote-cc
+    ///   reveal that otherwise never latched ready — see
+    ///   [[finding-cold-cc-reattach-phase-stuck]]).
+    /// Pure so the decision is unit-testable without a full ShellState.
+    fn first_meaningful_output_fast_ready_eligible(
+        attempt_was_hot: bool,
+        prompt_like: bool,
+        daemon_owns_live_runtime: bool,
+        already_ready: bool,
+        pending_or_recovering: bool,
+    ) -> bool {
+        !already_ready
+            && pending_or_recovering
+            && ((attempt_was_hot && prompt_like) || daemon_owns_live_runtime)
+    }
     fn mark_terminal_open_attempt_first_meaningful_output_for_session(
         &mut self,
         session_path: &str,
@@ -4062,6 +4083,22 @@ impl ShellState {
         else {
             return;
         };
+        // A session whose runtime the daemon already OWNS (or proxies via a
+        // preserved owner) has a live PTY by definition, so its first meaningful
+        // output is real session content, not SSH banner noise. This is the
+        // signal that lets a COLD reveal fast-ready safely (see below). Computed
+        // before the &mut borrow of the attempt. Strict: requires a positive
+        // ownership match, NOT the permissive no-snapshot fallback of
+        // `daemon_owns_session_runtime`, so we never fast-ready on banner noise
+        // when ownership is genuinely unknown.
+        let daemon_owns_live_runtime = self.latest_runtime_status.as_ref().is_some_and(|status| {
+            let runtime_key = self.server.terminal_runtime_key_for_path(session_path);
+            status
+                .owned_terminal_session_keys
+                .iter()
+                .chain(status.preserved_terminal_owner_keys.iter())
+                .any(|key| key == &runtime_key)
+        });
         let Some(attempt) = self.terminal_open_attempts.get_mut(&attempt_id) else {
             return;
         };
@@ -4081,14 +4118,36 @@ impl ShellState {
             .switch_arm_ms_by_session
             .get(session_path)
             .is_some_and(|(_, tier)| matches!(tier, SessionWarmthTier::Hot));
-        let fast_ready_eligible = attempt_was_hot
-            && prompt_like
-            && attempt.ready_at_ms.is_none()
-            && matches!(
+        // DAEMON-OWNED fast-ready ([[finding-cold-cc-reattach-phase-stuck]] /
+        // [[finding-cc-blink-dead-session-remount-loop]]): a remote-cc / remote
+        // reveal of a session whose daemon already owns a LIVE runtime never went
+        // through the HOT-armed path (it cold-mounts every time because it never
+        // latched ready) and its content is not `prompt_like` (Claude Code's UI),
+        // so neither fast-ready clause fired and `mark_ready` was NEVER called.
+        // That left `was_ever_ready` false forever, so `is_retained_live` clause
+        // C failed and every switch cold-remounted (bootstrap_reset re-seed = the
+        // reveal "glitch"; the user's "triple switch"). The daemon owning a live
+        // PTY + meaningful real output IS readiness — latch it. This also makes
+        // `reveal_ready` fire so the slow-reveal swap notification works on these
+        // reveals (previously a telemetry blind spot). `prompt_like` is NOT
+        // required here precisely because the output came from an already-live
+        // daemon runtime, not a cold SSH attach. Does NOT touch the per-chunk
+        // host-health classifiers.
+        let fast_ready_eligible = Self::first_meaningful_output_fast_ready_eligible(
+            attempt_was_hot,
+            prompt_like,
+            daemon_owns_live_runtime,
+            attempt.ready_at_ms.is_some(),
+            matches!(
                 attempt.state,
-                TerminalOpenAttemptState::Pending
-                    | TerminalOpenAttemptState::Recovering
-            );
+                TerminalOpenAttemptState::Pending | TerminalOpenAttemptState::Recovering
+            ),
+        );
+        let fast_ready_reason = if attempt_was_hot && prompt_like {
+            "hot_fast_ready_on_first_meaningful_output"
+        } else {
+            "daemon_owned_fast_ready_on_first_meaningful_output"
+        };
         let attempt_snapshot = attempt.clone();
         self.record_terminal_open_attempt_event(
             "first_meaningful_output",
@@ -4098,13 +4157,11 @@ impl ShellState {
                 "prompt_like": prompt_like,
                 "marker": marker,
                 "fast_ready_eligible": fast_ready_eligible,
+                "daemon_owns_live_runtime": daemon_owns_live_runtime,
             })),
         );
         if fast_ready_eligible {
-            self.mark_terminal_open_attempt_ready_for_session(
-                session_path,
-                "hot_fast_ready_on_first_meaningful_output",
-            );
+            self.mark_terminal_open_attempt_ready_for_session(session_path, fast_ready_reason);
         }
     }
     fn observe_terminal_open_attempt_from_viewport(&mut self, viewport: &Value) {
@@ -91669,6 +91726,34 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         assert!(shell.startup_terminal_restore_should_open(active_session_path));
         shell.bump_terminal_mount_epoch_for_session(active_session_path);
         assert!(!shell.startup_terminal_restore_should_open(active_session_path));
+    }
+    #[test]
+    fn daemon_owned_first_meaningful_output_fast_readies_without_prompt_like() {
+        // [[finding-cold-cc-reattach-phase-stuck]]: a cold remote-cc reveal is
+        // never HOT-armed and its content is not prompt_like, so the original
+        // fast-ready clause never fired and the reveal never latched ready ->
+        // is_retained_live clause C failed -> bootstrap_reset re-seed on every
+        // switch (the reveal "glitch"; the user's "triple switch"). When the
+        // daemon already owns a live runtime, first meaningful output is real
+        // session content and must fast-ready regardless of prompt_like/hot.
+        let eligible = |hot, prompt, owns, ready, pending| {
+            ShellState::first_meaningful_output_fast_ready_eligible(
+                hot, prompt, owns, ready, pending,
+            )
+        };
+        // The fix: daemon-owned + not-prompt-like + cold + pending -> eligible.
+        assert!(eligible(false, false, true, false, true));
+        // Original HOT + prompt_like path still works.
+        assert!(eligible(true, true, false, false, true));
+        // No regression: cold SSH (no daemon ownership) + not prompt_like must
+        // NOT fast-ready (could be banner noise).
+        assert!(!eligible(false, false, false, false, true));
+        // HOT but not prompt_like and not daemon-owned -> still gated (unchanged).
+        assert!(!eligible(true, false, false, false, true));
+        // Already ready -> never re-fires.
+        assert!(!eligible(false, false, true, true, true));
+        // Not Pending/Recovering (already failed/latched) -> not eligible.
+        assert!(!eligible(false, false, true, false, false));
     }
     #[test]
     fn terminal_session_is_retained_live_while_bootstrap_lease_is_active() {
