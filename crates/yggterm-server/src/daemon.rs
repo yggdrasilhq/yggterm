@@ -3990,8 +3990,33 @@ impl DaemonRuntime {
             ServerRequest::Status => ServerResponse::Status(self.status()),
             ServerRequest::Snapshot => self.snapshot_response(None),
             ServerRequest::PrepareUpdateRestart => {
+                // The snapshot write is BEST-EFFORT: it lets the relaunched GUI
+                // restore its session view, but a failed write must NOT abort the
+                // update restart. Previously the `?` propagated the error and the
+                // GUI surfaced "Update Restart Blocked" (the session-protection
+                // step the user hit on popo), leaving them stranded on the old
+                // version. The daemon-owned PTYs survive the GUI relaunch
+                // regardless, and PrepareClientClose still preserves non-keep-alive
+                // sessions via the staged-version gate even without a fresh
+                // snapshot. Always set the flag so that gate trips, and proceed.
                 let state = self.persisted_state_for_update_restart();
-                write_persisted_state(&self.state_path, &state)?;
+                if let Err(error) = write_persisted_state(&self.state_path, &state) {
+                    append_trace_event(
+                        self.store.home_dir(),
+                        "daemon",
+                        "lifecycle",
+                        "update_restart_state_write_failed",
+                        serde_json::json!({
+                            "state_path": self.state_path.display().to_string(),
+                            "error": error.to_string(),
+                        }),
+                    );
+                    tracing::warn!(
+                        state_path = %self.state_path.display(),
+                        error = %error,
+                        "failed to persist daemon state for update restart; proceeding without blocking the restart"
+                    );
+                }
                 self.update_restart_state_written = true;
                 ServerResponse::Ack {
                     message: Some("update restart prepared".to_string()),
