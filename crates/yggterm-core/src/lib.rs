@@ -29,7 +29,8 @@ pub use icon::{
     AppIconAssets, LinuxInstalledIconSet, YGGTERM_ICON_ASSETS, install_linux_icon_assets,
 };
 pub use install::{
-    ENV_YGGTERM_DIRECT_INSTALL_ROOT, InstallChannel, InstallContext, ReleaseUpdate,
+    ENV_YGGTERM_DIRECT_INSTALL_ROOT, ENV_YGGTERM_ENABLE_NATIVE_IME, InstallChannel, InstallContext,
+    ReleaseUpdate,
     ReleaseUpdateInstallProgress, ReleaseUpdateInstallStage, UpdatePolicy, YGGTERM_DESKTOP_APP_ID,
     check_for_update, current_asset_label, current_version, detect_install_context,
     direct_install_root, install_mode_summary, install_release_update,
