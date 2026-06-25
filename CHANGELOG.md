@@ -2,7 +2,7 @@
 
 This file tracks user-visible changes in `yggterm`.
 
-## Unreleased
+## 2.9.43
 
 - **Active terminal sessions no longer periodically "blink"/re-seed while idle, and cold remote reveals
   stop glitching after a switch or two.** A first-class session whose runtime was not yet recognized as
