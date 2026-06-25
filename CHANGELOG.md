@@ -4,6 +4,16 @@ This file tracks user-visible changes in `yggterm`.
 
 ## Unreleased
 
+- **Active terminal sessions no longer periodically "blink"/re-seed while idle, and cold remote reveals
+  stop glitching after a switch or two.** A first-class session whose runtime was not yet recognized as
+  live used to cold-remount its terminal host on every periodic open re-assert (~once a minute, tied to
+  the browser-tree refresh) — tearing the host down and re-seeding the viewport, which is the visible
+  "blink". Two fixes land together: (1) a reveal of a session whose daemon already owns a live runtime
+  now latches "ready" on its first real output even when the CLI's UI is not prompt-shaped (e.g. Claude
+  Code), so switch-backs reveal the live host instead of cold-remounting it; and (2) a session that has
+  cold-remounted repeatedly without ever settling now reuses its existing host instead of re-seeding
+  forever, breaking the futile loop. Genuine first reveals and real fault recovery are unaffected.
+
 ## 2.9.42
 
 - **Typing into the terminal no longer accumulates on desktops with an input method (ibus/fcitx).**
