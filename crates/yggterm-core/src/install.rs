@@ -16,6 +16,15 @@ pub const ENV_YGGTERM_DIRECT_INSTALL_ROOT: &str = "YGGTERM_DIRECT_INSTALL_ROOT";
 pub const YGGTERM_DESKTOP_APP_ID: &str = "dev.yggterm.Yggterm";
 pub const ENV_YGGTERM_ENABLE_ACCESSIBILITY: &str = "YGGTERM_ENABLE_ACCESSIBILITY";
 pub const ENV_YGGTERM_ENABLE_WEBKIT_COMPOSITING: &str = "YGGTERM_ENABLE_WEBKIT_COMPOSITING";
+// Set to 1 to keep the desktop's native input method (ibus/fcitx) for the GUI.
+// By default the launcher forces GTK's simple IM module: on desktops with an
+// active IME, WebKitGTK delivers keystrokes through the IME's Wayland/XIM
+// text-input path, which bypasses xterm.js's keydown handler so xterm never
+// clears its hidden textarea and re-emits the WHOLE accumulated buffer via
+// onData on every keystroke (type "st" -> the CLI sees "s" then "st" -> "sst").
+// The simple module still supports compose/dead keys; only full IME engines
+// (e.g. CJK) need the opt-out. See finding-ibus-cumulative-input.
+pub const ENV_YGGTERM_ENABLE_NATIVE_IME: &str = "YGGTERM_ENABLE_NATIVE_IME";
 const LINUX_LAUNCHER_MARKER: &str = "yggterm-direct-launcher-v3";
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -1280,6 +1289,14 @@ fn linux_launcher_script(
         "if [ \"${{{env_enable}:-0}}\" != '1' ] && [ -z \"${{WEBKIT_DISABLE_COMPOSITING_MODE+x}}\" ]; then\n  export WEBKIT_DISABLE_COMPOSITING_MODE=1\nfi\n",
         env_enable = ENV_YGGTERM_ENABLE_WEBKIT_COMPOSITING,
     );
+    // Force GTK's simple IM module unless the user opts back into the native IME.
+    // Without this, an active ibus/fcitx makes WebKitGTK re-emit the cumulative
+    // textarea buffer on every keystroke (the "s -> s, t -> sst" bug). See
+    // ENV_YGGTERM_ENABLE_NATIVE_IME.
+    let im_module_guard = format!(
+        "if [ \"${{{env_enable}:-0}}\" != '1' ] && [ -z \"${{GTK_IM_MODULE+x}}\" ]; then\n  export GTK_IM_MODULE=gtk-im-context-simple\nfi\n",
+        env_enable = ENV_YGGTERM_ENABLE_NATIVE_IME,
+    );
     let export_root = if context.channel == InstallChannel::Direct {
         format!(
             "export {}={}\n",
@@ -1289,7 +1306,7 @@ fn linux_launcher_script(
         String::new()
     };
     format!(
-        "#!/usr/bin/env sh\n# {marker}\nset -eu\nROOT={root}\nSTATE=\"$ROOT/{state_file}\"\nBINARY_NAME={binary_name}\ntarget=\"\"\nif [ \"$BINARY_NAME\" = 'yggterm' ] && [ -f \"$STATE\" ]; then\n  target=\"$(sed -n 's/.*\"active_executable\"[[:space:]]*:[[:space:]]*\"\\([^\"]*\\)\".*/\\1/p' \"$STATE\" | head -n1)\"\nfi\nif [ -z \"$target\" ] || [ ! -x \"$target\" ]; then\n  latest_version=\"$(find \"$ROOT/versions\" -mindepth 1 -maxdepth 1 -type d -printf '%f\\n' 2>/dev/null | sort -V | tail -n1)\"\n  if [ -n \"$latest_version\" ] && [ -x \"$ROOT/versions/$latest_version/$BINARY_NAME\" ]; then\n    target=\"$ROOT/versions/$latest_version/$BINARY_NAME\"\n  fi\nfi\nif [ -z \"$target\" ] || [ ! -x \"$target\" ]; then\n  target={fallback}\nfi\n[ -x \"$target\" ] || {{ printf '%s\\n' '{launcher_name}: no runnable executable found' >&2; exit 1; }}\nif [ \"$BINARY_NAME\" = 'yggterm' ]; then\n  use_headless=0\n  if [ \"${{1:-}}\" = 'server' ]; then\n    use_headless=1\n    if [ \"${{2:-}}\" = 'app' ] && [ \"${{3:-}}\" = 'launch' ]; then\n      use_headless=0\n    fi\n  fi\n  if [ \"${{1:-}}\" = '--version' ] || [ \"${{1:-}}\" = '-V' ] || [ \"${{1:-}}\" = 'version' ]; then\n    use_headless=1\n  fi\n  if [ \"$use_headless\" = '1' ]; then\n    target_dir=\"$(dirname \"$target\")\"\n    if [ -x \"$target_dir/yggterm-headless\" ]; then\n      target=\"$target_dir/yggterm-headless\"\n    fi\n  fi\nfi\n{accessibility_guard}{webkit_guard}{export_root}exec \"$target\" \"$@\"\n",
+        "#!/usr/bin/env sh\n# {marker}\nset -eu\nROOT={root}\nSTATE=\"$ROOT/{state_file}\"\nBINARY_NAME={binary_name}\ntarget=\"\"\nif [ \"$BINARY_NAME\" = 'yggterm' ] && [ -f \"$STATE\" ]; then\n  target=\"$(sed -n 's/.*\"active_executable\"[[:space:]]*:[[:space:]]*\"\\([^\"]*\\)\".*/\\1/p' \"$STATE\" | head -n1)\"\nfi\nif [ -z \"$target\" ] || [ ! -x \"$target\" ]; then\n  latest_version=\"$(find \"$ROOT/versions\" -mindepth 1 -maxdepth 1 -type d -printf '%f\\n' 2>/dev/null | sort -V | tail -n1)\"\n  if [ -n \"$latest_version\" ] && [ -x \"$ROOT/versions/$latest_version/$BINARY_NAME\" ]; then\n    target=\"$ROOT/versions/$latest_version/$BINARY_NAME\"\n  fi\nfi\nif [ -z \"$target\" ] || [ ! -x \"$target\" ]; then\n  target={fallback}\nfi\n[ -x \"$target\" ] || {{ printf '%s\\n' '{launcher_name}: no runnable executable found' >&2; exit 1; }}\nif [ \"$BINARY_NAME\" = 'yggterm' ]; then\n  use_headless=0\n  if [ \"${{1:-}}\" = 'server' ]; then\n    use_headless=1\n    if [ \"${{2:-}}\" = 'app' ] && [ \"${{3:-}}\" = 'launch' ]; then\n      use_headless=0\n    fi\n  fi\n  if [ \"${{1:-}}\" = '--version' ] || [ \"${{1:-}}\" = '-V' ] || [ \"${{1:-}}\" = 'version' ]; then\n    use_headless=1\n  fi\n  if [ \"$use_headless\" = '1' ]; then\n    target_dir=\"$(dirname \"$target\")\"\n    if [ -x \"$target_dir/yggterm-headless\" ]; then\n      target=\"$target_dir/yggterm-headless\"\n    fi\n  fi\nfi\n{accessibility_guard}{webkit_guard}{im_module_guard}{export_root}exec \"$target\" \"$@\"\n",
         marker = LINUX_LAUNCHER_MARKER,
         root = root_quoted,
         state_file = INSTALL_STATE_FILENAME,
@@ -1298,6 +1315,7 @@ fn linux_launcher_script(
         launcher_name = launcher_quoted,
         accessibility_guard = accessibility_guard,
         webkit_guard = webkit_guard,
+        im_module_guard = im_module_guard,
         export_root = export_root,
     )
 }
@@ -1489,6 +1507,12 @@ mod tests {
             "yggterm launcher",
         );
         assert!(script.contains("yggterm-direct-launcher-v3"));
+        // The IME guard forces GTK's simple input module unless the user opts back
+        // into the native IME — without it ibus/fcitx makes WebKitGTK re-emit the
+        // cumulative input buffer on every keystroke (the "s -> s, t -> sst" bug).
+        assert!(script.contains("export GTK_IM_MODULE=gtk-im-context-simple"));
+        assert!(script.contains("[ -z \"${GTK_IM_MODULE+x}\" ]"));
+        assert!(script.contains("\"${YGGTERM_ENABLE_NATIVE_IME:-0}\" != '1'"));
         assert!(script.contains("if [ \"${1:-}\" = 'server' ]; then"));
         assert!(script.contains("[ \"${2:-}\" = 'app' ] && [ \"${3:-}\" = 'launch' ]"));
         assert!(script.contains("[ \"${1:-}\" = '--version' ]"));
