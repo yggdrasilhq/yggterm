@@ -2,6 +2,16 @@
 
 This file tracks user-visible changes in `yggterm`.
 
+## 2.9.44
+
+- **The on-disk diagnostic trace no longer reopens its file on every event.** Each trace write used to
+  create the directory, stat the file for rotation, open it, append, and close it again — a burst of
+  syscalls paid per event, on the thread that emitted it. Under a high-volume path (the per-chunk
+  terminal-forward loop, or a reveal storm) that per-call cost added up. The trace writer now keeps the
+  file handle open and tracks size in memory, so each event is a single append; rotation at the size cap
+  and immediate visibility to trace followers are unchanged. This is the global complement to the 2.9.43
+  reveal-storm rate-limit, lowering tracing overhead everywhere rather than only on the reveal lane.
+
 ## 2.9.43
 
 - **Active terminal sessions no longer periodically "blink"/re-seed while idle, and cold remote reveals
