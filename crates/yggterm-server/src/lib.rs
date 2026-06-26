@@ -1765,6 +1765,18 @@ pub struct SnapshotSessionView {
     pub pty_cols: Option<u16>,
     #[serde(default)]
     pub pty_rows: Option<u16>,
+    // Daemon-authoritative working state, the SSOT for the sidebar working dot
+    // and the working→done notification. Computed from the session's LIVE vt100
+    // screen at snapshot time (esc-to-interrupt SSOT): `Some(true)` = the agent
+    // is working right now, `Some(false)` = confirmed idle (live screen, no
+    // working footer), `None` = unknown (the daemon holds no live screen for
+    // this session, e.g. preserved/foreign-owned). The dot blinks ONLY on
+    // `Some(true)`, so a session whose screen the daemon can no longer read can
+    // never get stuck blinking; the "done" notification fires only on the
+    // confirmed `Some(true)`→`Some(false)` edge, never on ownership loss.
+    // serde(default) keeps back-compat with older snapshots.
+    #[serde(default)]
+    pub working: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2040,6 +2052,9 @@ pub struct ManagedSessionView {
     pub ssh_target: Option<String>,
     pub ssh_prefix: Option<String>,
     pub stored_preview_hydrated: bool,
+    /// Daemon-authoritative working state — see [`SnapshotSessionView::working`].
+    /// `Some(true)` working, `Some(false)` confirmed idle, `None` unknown.
+    pub working: Option<bool>,
 }
 
 #[derive(Debug, Clone)]
@@ -19007,6 +19022,7 @@ fn snapshot_session_view(session: ManagedSessionView) -> SnapshotSessionView {
         ssh_prefix: session.ssh_prefix,
         pty_cols: None,
         pty_rows: None,
+        working: session.working,
     }
 }
 
@@ -19104,6 +19120,7 @@ fn snapshot_live_session_view(session: &ManagedSessionView) -> SnapshotSessionVi
         ssh_prefix: session.ssh_prefix.clone(),
         pty_cols: None,
         pty_rows: None,
+        working: session.working,
     }
 }
 
@@ -19229,6 +19246,7 @@ fn managed_session_from_snapshot(session: SnapshotSessionView) -> ManagedSession
         ssh_target: session.ssh_target,
         ssh_prefix: session.ssh_prefix,
         stored_preview_hydrated: true,
+        working: session.working,
     }
 }
 
@@ -19592,6 +19610,7 @@ terminal_window_id: None,
         ssh_target: None,
         ssh_prefix: None,
         stored_preview_hydrated: should_hydrate_stored_preview,
+        working: None,
     }
 }
 
@@ -19872,6 +19891,7 @@ fn build_live_session(
         ssh_target: Some(target.ssh_target.clone()),
         ssh_prefix: target.prefix.clone(),
         stored_preview_hydrated: true,
+        working: None,
     }
 }
 
@@ -20803,6 +20823,7 @@ mod recipe_tests {
             ssh_target: None,
             ssh_prefix: None,
             stored_preview_hydrated: true,
+            working: None,
         }
     }
 
@@ -21916,6 +21937,7 @@ mod tests {
             ssh_prefix: None,
             pty_cols: None,
             pty_rows: None,
+            working: None,
         }
     }
 
@@ -23838,6 +23860,7 @@ mod tests {
                 ssh_target: None,
                 ssh_prefix: None,
                 stored_preview_hydrated: true,
+                working: None,
             },
         );
 
@@ -23937,6 +23960,7 @@ mod tests {
             ssh_target: None,
             ssh_prefix: None,
             stored_preview_hydrated: true,
+            working: None,
         };
         let inactive = ManagedSessionView {
             id: "inactive".to_string(),
@@ -23985,6 +24009,7 @@ mod tests {
             ssh_target: Some("jojo".to_string()),
             ssh_prefix: None,
             stored_preview_hydrated: true,
+            working: None,
         };
         server.active_session_path = Some(active.session_path.clone());
         server.live_session_order =
@@ -24776,6 +24801,7 @@ terminal_window_id: None,
             ssh_target: Some("jojo".to_string()),
             ssh_prefix: None,
             stored_preview_hydrated: true,
+            working: None,
         };
 
         let wrong_runtime = b"https://llm.example.com/v1/chat/completions with auth Bearer sk-1234.\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\xe2\x80\xba Improve documentation in @filename\n\n  gpt-5.4 high fast \xc2\xb7 100% left \xc2\xb7 ~\n";
@@ -26890,6 +26916,7 @@ terminal_window_id: None,
             ssh_prefix: None,
             pty_cols: None,
             pty_rows: None,
+            working: None,
         });
 
         assert_eq!(
@@ -29436,6 +29463,7 @@ terminal_window_id: None,
                 ssh_target: None,
                 ssh_prefix: None,
                 stored_preview_hydrated: false,
+                working: None,
             },
         );
         server.live_session_order = vec![stale_path.to_string()];
