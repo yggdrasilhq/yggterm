@@ -2147,16 +2147,34 @@ impl DaemonRuntime {
                 | SessionKind::Codex
                 | SessionKind::CodexLiteLlm
                 | SessionKind::ClaudeCode
-        ) && let Some(screen_text) = self.terminals.session_screen_snapshot(&runtime_path)
-            && let Some((status_line, terminal_lines)) =
-                terminal_sidebar_snapshot_from_screen(&screen_text)
-        {
-            // ClaudeCode must be included: the sidebar working-indicator detects
-            // CC's "esc to interrupt" status, but it can only do so if CC's live
-            // screen text is refreshed here. Omitting it left CC sessions stuck
-            // showing idle. See memory finding-hot-update-interrupts-remote-sessions (#21).
-            session.status_line = status_line;
-            session.terminal_lines = terminal_lines;
+        ) {
+            let screen_text = self.terminals.session_screen_snapshot(&runtime_path);
+            // Daemon-authoritative working state (SSOT for the sidebar dot + the
+            // working→done notification): for agent CLIs, derive it from the
+            // LIVE screen via the shared esc-to-interrupt detector. `Some(true)`
+            // = working now, `Some(false)` = confirmed idle, `None` = no live
+            // screen (preserved/foreign-owned) so the GUI must NOT blink it.
+            // This is what stops a session from blinking forever after its turn
+            // ended but its last-captured frame froze on the working footer.
+            if matches!(
+                session.kind,
+                SessionKind::Codex | SessionKind::CodexLiteLlm | SessionKind::ClaudeCode
+            ) {
+                session.working = screen_text
+                    .as_deref()
+                    .map(yggterm_core::screen_text_shows_agent_working);
+            }
+            if let Some(screen_text) = screen_text.as_deref()
+                && let Some((status_line, terminal_lines)) =
+                    terminal_sidebar_snapshot_from_screen(screen_text)
+            {
+                // ClaudeCode must be included: the sidebar working-indicator detects
+                // CC's "esc to interrupt" status, but it can only do so if CC's live
+                // screen text is refreshed here. Omitting it left CC sessions stuck
+                // showing idle. See memory finding-hot-update-interrupts-remote-sessions (#21).
+                session.status_line = status_line;
+                session.terminal_lines = terminal_lines;
+            }
         }
     }
 
@@ -11736,6 +11754,7 @@ mod tests {
             ssh_prefix: None,
             pty_cols: None,
             pty_rows: None,
+            working: None,
         }
     }
 
