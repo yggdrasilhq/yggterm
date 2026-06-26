@@ -609,9 +609,22 @@ static XTERM_ASSETS_BOOTSTRAPPED: OnceCell<()> = OnceCell::new();
 const TREE_LOADING_DOT_CSS: &str = "@keyframes yggterm-tree-loading-dot { 0%, 80%, 100% { opacity: 0.28; transform: translateY(0px); } 40% { opacity: 1; transform: translateY(-1px); } } [style*=\"visibility:hidden\"] .yggterm-loading-dot, [style*=\"visibility: hidden\"] .yggterm-loading-dot, .yggterm-loading-dot[style*=\"visibility:hidden\"], .yggterm-loading-dot[style*=\"visibility: hidden\"] { animation: none !important; }";
 const TREE_SPINNER_CSS: &str = ".yggterm-tree-spinner { animation: none !important; }";
 // Status-dot blink — the WORKING signal of the live-session status dot
-// (DESIGN.md "Status indicator vocabulary"): a gentle opacity pulse, calm
-// enough for a sidebar full of rows.
-const STATUS_DOT_BLINK_CSS: &str = "@keyframes yggterm-status-dot-blink { 0%, 100% { opacity: 1; } 50% { opacity: 0.25; } }";
+// (DESIGN.md "Status indicator vocabulary"). A HARD square-wave blink: full on
+// for the first half of the cycle, full OFF for the second half, with no fade
+// between (the dot snaps off/on). Paired with `step-end` timing on the
+// animation so the keyframe values jump instead of interpolating (user
+// decision 2026-06-26: "blinking means full off and full on, no fading").
+const STATUS_DOT_BLINK_CSS: &str = "@keyframes yggterm-status-dot-blink { 0%, 100% { opacity: 1; } 50% { opacity: 0; } }";
+// Live-session close [x] visibility + hover (user decision 2026-06-26): the X is
+// HIDDEN at rest and only appears when its row is hovered or selected (not always
+// on). On hover it "burns" in — a soft danger tint + a faint backing — to read as
+// the destructive close it is, while still respecting the theme via the inherited
+// icon color. focus-visible keeps it keyboard-reachable.
+const SIDEBAR_LIVE_CLOSE_CSS: &str = "[data-sidebar-live-session-close]{opacity:0;}\
+[data-sidebar-row-depth]:hover [data-sidebar-live-session-close],\
+[data-sidebar-row-depth][data-selected=\"true\"] [data-sidebar-live-session-close],\
+[data-sidebar-live-session-close]:focus-visible{opacity:1;}\
+[data-sidebar-live-session-close]:hover{opacity:1;color:#ef4444;background:rgba(239,68,68,0.14);}";
 const REMOTE_SURFACE_STAGE_CSS: &str = "@keyframes yggterm-remote-stage-float { 0%, 100% { transform: translateY(0px); } 50% { transform: translateY(-4px); } } @keyframes yggterm-remote-stage-beam { 0% { transform: translateX(-110%); opacity: 0.15; } 30% { opacity: 0.92; } 100% { transform: translateX(220%); opacity: 0.15; } } @keyframes yggterm-remote-stage-pulse { 0%, 100% { box-shadow: 0 0 0 0 rgba(86, 154, 255, 0.14); opacity: 0.86; } 50% { box-shadow: 0 0 0 12px rgba(86, 154, 255, 0.0); opacity: 1; } }";
 const BACKGROUND_COPY_RETRY_MS: u64 = 300_000;
 const BACKGROUND_COPY_CONTINUE_MS: u64 = 15_000;
@@ -955,6 +968,14 @@ struct ShellState {
     always_on_top: bool,
     notifications: Vec<ToastNotification>,
     next_notification_id: u64,
+    // Last DEFINITE daemon-authoritative working verdict per agent session
+    // (`true` = was working, `false` = was idle), the edge detector for the
+    // working→done notification. Only updated on `Some(_)` snapshots — a `None`
+    // (no live screen) leaves the prior verdict intact so a transient
+    // ownership gap doesn't drop the "was working" memory. See
+    // [[finding-stuck-working-dot-noop-signature]] and the daemon-authoritative
+    // working state on ManagedSessionView.
+    session_working_prev: HashMap<String, bool>,
     titlebar_new_menu_open: bool,
     titlebar_new_menu_ignore_toggle_until_ms: u64,
     titlebar_session_menu_open: bool,
@@ -1716,6 +1737,7 @@ fn snapshot_live_sidebar_session_view(session: &ManagedSessionView) -> ManagedSe
         ssh_target: session.ssh_target.clone(),
         ssh_prefix: session.ssh_prefix.clone(),
         stored_preview_hydrated: session.stored_preview_hydrated,
+        working: session.working,
     }
 }
 
@@ -1763,6 +1785,7 @@ fn snapshot_retained_terminal_session_view(session: &ManagedSessionView) -> Mana
         ssh_target: session.ssh_target.clone(),
         ssh_prefix: session.ssh_prefix.clone(),
         stored_preview_hydrated: session.stored_preview_hydrated,
+        working: session.working,
     }
 }
 
@@ -2459,6 +2482,7 @@ impl ShellState {
             always_on_top: false,
             notifications: Vec::new(),
             next_notification_id: 1,
+            session_working_prev: HashMap::new(),
             titlebar_new_menu_open: false,
             titlebar_new_menu_ignore_toggle_until_ms: 0,
             titlebar_session_menu_open: false,
@@ -4520,6 +4544,77 @@ impl ShellState {
             false,
         );
     }
+    /// Fire a toast + audio notification when a BACKGROUND agent session
+    /// finishes its turn — the confirmed daemon-authoritative `Some(true)` →
+    /// `Some(false)` working edge (user decision 2026-06-26: background only, so
+    /// the session you're actively watching never pings you). The "done" verdict
+    /// rides the same daemon-authoritative `working` flag that drives the sidebar
+    /// dot, so the notification fires exactly when the dot stops blinking and can
+    /// never fire on a stale/frozen frame. A `None` (no live screen) does NOT
+    /// update the remembered verdict, so a transient ownership gap can't drop the
+    /// "was working" memory and mis-fire on return.
+    fn notify_finished_working_sessions(&mut self) {
+        if !self.settings.in_app_notifications
+            && !self.settings.system_notifications
+            && !self.settings.notification_sound
+        {
+            // Nothing to surface anywhere — still keep the prev-map current so we
+            // don't fire a backlog of edges the moment notifications are enabled.
+            for session in self.server.live_sessions() {
+                if let Some(working) = session.working {
+                    self.session_working_prev
+                        .insert(session.session_path.clone(), working);
+                }
+            }
+            return;
+        }
+        let active_path = self.server.active_session().map(|s| s.session_path.clone());
+        let mut finished: Vec<(String, SessionKind)> = Vec::new();
+        let mut live_paths: HashSet<String> = HashSet::new();
+        for session in self.server.live_sessions() {
+            live_paths.insert(session.session_path.clone());
+            let Some(working) = session.working else {
+                // Unknown (no live screen): leave the remembered verdict intact.
+                continue;
+            };
+            let was_working = self
+                .session_working_prev
+                .insert(session.session_path.clone(), working)
+                == Some(true);
+            let is_background = active_path.as_deref() != Some(session.session_path.as_str());
+            if was_working && !working && is_background {
+                finished.push((session.title.clone(), session.kind));
+            }
+        }
+        // Drop remembered verdicts for sessions that are gone so the map can't grow
+        // without bound across a long-lived GUI.
+        self.session_working_prev
+            .retain(|path, _| live_paths.contains(path));
+        for (title, kind) in finished {
+            let cli = match kind {
+                SessionKind::ClaudeCode => "Claude Code",
+                SessionKind::Codex | SessionKind::CodexLiteLlm => "Codex",
+                _ => "Agent",
+            };
+            let label = title.trim();
+            let message = if label.is_empty() {
+                format!("{cli} finished working.")
+            } else {
+                format!("{cli} finished working in “{label}”.")
+            };
+            // Toast (+ OS notification / chime when those settings are on).
+            self.push_notification(NotificationTone::Success, "Session finished", message);
+            // The user explicitly wants AUDIO on completion (2026-06-26), but the
+            // global notification_sound defaults off. There is no dedicated
+            // completion-audio setting, so tie the completion chime to the toast
+            // being shown: if in-app notifications are on we always chime once.
+            // When notification_sound is ALSO on, push_notification already
+            // chimed, so guard against a double chime.
+            if self.settings.in_app_notifications && !self.settings.notification_sound {
+                emit_notification_chime(NotificationTone::Success);
+            }
+        }
+    }
     fn fail_terminal_open_attempt_for_request(&mut self, request_id: &str, reason: String) {
         let Some(attempt) = self
             .terminal_open_attempts
@@ -5000,6 +5095,7 @@ impl ShellState {
                 self.show_start_page_when_no_live_sessions =
                     snapshot.active_session_path.is_none() && snapshot.live_sessions.is_empty();
                 self.server.apply_snapshot(snapshot);
+                self.notify_finished_working_sessions();
                 self.refresh_cached_hot_session_views();
                 self.restore_active_preview_if_snapshot_regressed(previous_active_session);
                 self.mark_active_remote_preview_dirty_if_needed();
@@ -5092,6 +5188,7 @@ impl ShellState {
                 self.show_start_page_when_no_live_sessions =
                     snapshot.active_session_path.is_none() && snapshot.live_sessions.is_empty();
                 self.server.apply_snapshot(snapshot);
+                self.notify_finished_working_sessions();
                 self.refresh_cached_hot_session_views();
                 self.restore_active_preview_if_snapshot_regressed(previous_active_session);
                 self.mark_active_remote_preview_dirty_if_needed();
@@ -5160,6 +5257,7 @@ impl ShellState {
                 self.show_start_page_when_no_live_sessions =
                     snapshot.active_session_path.is_none() && snapshot.live_sessions.is_empty();
                 self.server.apply_snapshot(snapshot);
+                self.notify_finished_working_sessions();
                 self.refresh_cached_hot_session_views();
                 self.restore_active_preview_if_snapshot_regressed(previous_active_session);
                 self.mark_active_remote_preview_dirty_if_needed();
@@ -18598,39 +18696,24 @@ fn palette_is_dark(palette: Palette) -> bool {
     palette.panel == "#161c22"
 }
 fn live_session_close_button_style(palette: Palette, selected: bool) -> String {
+    // Themed, minimal close affordance (user decision 2026-06-26): a transparent
+    // icon button holding the SVG X, NOT a filled pill. The X inherits this
+    // `color` (theme-aware muted text). Resting visibility (hidden unless the row
+    // is hovered or selected) and the hover "burn" tint live in
+    // SIDEBAR_LIVE_CLOSE_CSS so they can use :hover / [data-selected]. The
+    // `selected` arg only nudges the resting color a touch stronger.
     let dark = palette_is_dark(palette);
-    let (background, color, shadow) = if dark {
-        if selected {
-            (
-                "rgba(124,200,255,0.18)",
-                palette.text,
-                "inset 0 0 0 1px rgba(124,200,255,0.24)",
-            )
-        } else {
-            (
-                "rgba(221,232,243,0.10)",
-                "rgba(221,232,243,0.78)",
-                "inset 0 0 0 1px rgba(221,232,243,0.08)",
-            )
-        }
+    let color = if dark {
+        if selected { "rgba(221,232,243,0.92)" } else { "rgba(221,232,243,0.74)" }
     } else if selected {
-        (
-            "rgba(255,255,255,0.94)",
-            palette.text,
-            "inset 0 0 0 1px rgba(16,24,40,0.10)",
-        )
+        "rgba(34,44,60,0.92)"
     } else {
-        (
-            "rgba(255,255,255,0.86)",
-            "#344052",
-            "inset 0 0 0 1px rgba(16,24,40,0.08)",
-        )
+        "rgba(52,64,82,0.66)"
     };
     format!(
         "display:inline-flex; align-items:center; justify-content:center; width:18px; min-width:18px; height:18px; \
-         border:none; border-radius:999px; background:{}; color:{}; font-size:11px; font-weight:800; \
-         line-height:1; cursor:pointer; padding:0; box-shadow:{};",
-        background, color, shadow
+         border:none; border-radius:6px; background:transparent; color:{color}; \
+         line-height:1; cursor:pointer; padding:0; transition:opacity 110ms ease, color 110ms ease, background 110ms ease;",
     )
 }
 /// Live-session status dot — the traffic-signal vocabulary (DESIGN.md
@@ -18639,19 +18722,18 @@ fn live_session_close_button_style(palette: Palette, selected: bool) -> String {
 /// working right now. Shared by Live Sessions today and Automated Sessions
 /// later (experimental/automations).
 fn live_session_status_dot_style(palette: Palette, keep_alive: bool, working: bool) -> String {
-    let shadow = if palette_is_dark(palette) {
-        "0 0 0 1.5px rgba(22,28,34,0.88)"
-    } else {
-        "0 0 0 1.5px rgba(255,255,255,0.86)"
-    };
+    let _ = palette;
+    // Plain color circle (user decision 2026-06-26): green = keep-alive,
+    // blue = lives with the GUI. No halo ring — just the flat dot. Working is a
+    // HARD on/off blink via `step-end` (no fade); idle is a steady dot.
     let background = if keep_alive { "#22c55e" } else { "#3b82f6" };
     let animation = if working {
-        " animation: yggterm-status-dot-blink 1.1s ease-in-out infinite;"
+        " animation: yggterm-status-dot-blink 1.1s step-end infinite;"
     } else {
         ""
     };
     format!(
-        "display:inline-flex; width:7px; min-width:7px; height:7px; border-radius:999px; background:{background}; box-shadow:{shadow};{animation}",
+        "display:inline-flex; width:7px; min-width:7px; height:7px; border-radius:999px; background:{background};{animation}",
     )
 }
 
@@ -43371,7 +43453,7 @@ fn Sidebar(
                     }
                 }
             }
-            style { "{TREE_SPINNER_CSS}{STATUS_DOT_BLINK_CSS}" }
+            style { "{TREE_SPINNER_CSS}{STATUS_DOT_BLINK_CSS}{SIDEBAR_LIVE_CLOSE_CSS}" }
             div {
                 "data-sidebar-scroll": "1",
                 style: "flex:1; min-height:0; overflow:auto; padding:12px 12px 12px 12px;",
@@ -43877,15 +43959,19 @@ fn sidebar_row_busy_state(snapshot: &RenderSnapshot, row: &BrowserRow) -> Sideba
         SessionKind::Codex | SessionKind::CodexLiteLlm | SessionKind::ClaudeCode
     ) {
         // Agent CLI sessions: working has exactly ONE source of truth — the
-        // CLI's own working footer ("esc to interrupt", shared codex/CC shape
-        // via yggterm_core::screen_text_shows_agent_working). Foreground
-        // process state, bootstrap launch phases, and recent-output volume
-        // all read "busy" during attach/replay repaints, which made freshly
-        // attached idle sessions blink as working (false positive,
-        // 2026-06-12). The optimistic input hint above stays: it is direct
-        // user intent, capped at TERMINAL_BUSY_HINT_MS.
-        if terminal_chunk_has_agent_working_status_for_sidebar_icon(&sidebar_sample) {
-            return SidebarBusyState::busy("agent_working_status");
+        // DAEMON-authoritative `working` flag, computed from the session's LIVE
+        // vt100 screen at snapshot time (esc-to-interrupt SSOT, shared codex/CC
+        // shape). We blink ONLY on `Some(true)`. `Some(false)` (confirmed idle)
+        // and `None` (the daemon holds no live screen — preserved/foreign-owned,
+        // or an older daemon that doesn't report it) BOTH resolve to idle, so a
+        // session can never get stuck blinking on a frozen last frame after its
+        // turn ended — the previous code re-scraped the GUI's last-captured
+        // screen tail here, which froze on the working footer for non-owned
+        // sessions (the "blinking long after done" bug). The optimistic input
+        // hint above stays: it is direct user intent, capped at
+        // TERMINAL_BUSY_HINT_MS.
+        if session.working == Some(true) {
+            return SidebarBusyState::busy("agent_working_daemon");
         }
         return SidebarBusyState::idle();
     }
@@ -44631,7 +44717,30 @@ fn SidebarRow(
                             evt.stop_propagation();
                             on_delete_row.call(evt);
                         },
-                        "×"
+                        // Themed X close-icon (user decision 2026-06-26): an SVG
+                        // stroke that inherits `currentColor` (the button color,
+                        // theme-aware), not a filled "×" glyph pill. Visibility
+                        // (hover/selected only) + the hover "burn" tint are driven
+                        // by SIDEBAR_LIVE_CLOSE_CSS.
+                        svg {
+                            width: "11",
+                            height: "11",
+                            view_box: "0 0 12 12",
+                            fill: "none",
+                            xmlns: "http://www.w3.org/2000/svg",
+                            path {
+                                d: "M3 3L9 9",
+                                stroke: "currentColor",
+                                stroke_width: "1.5",
+                                stroke_linecap: "round",
+                            }
+                            path {
+                                d: "M9 3L3 9",
+                                stroke: "currentColor",
+                                stroke_width: "1.5",
+                                stroke_linecap: "round",
+                            }
+                        }
                     }
                 } else if row.kind == BrowserRowKind::Group {
                     button {
@@ -81543,17 +81652,22 @@ mod tests {
         assert!(menu_style.contains("rgba(22,28,34,0.98)"));
         assert!(!menu_style.contains("rgba(248,249,252,0.98)"));
 
+        // Redesigned close affordance (2026-06-26): a transparent icon button
+        // (no filled pill) whose X inherits a theme-aware color. Hidden at rest;
+        // visibility/burn-hover live in SIDEBAR_LIVE_CLOSE_CSS, not the style.
         let close_style = live_session_close_button_style(dark, false);
-        assert!(close_style.contains("rgba(221,232,243,0.10)"));
-        assert!(!close_style.contains("rgba(255,255,255,0.94)"));
+        assert!(close_style.contains("background:transparent"));
+        assert!(close_style.contains("rgba(221,232,243,0.74)"));
 
         let light = palette(UiTheme::ZedLight);
         let light_close_style = live_session_close_button_style(light, false);
-        assert!(light_close_style.contains("rgba(255,255,255,0.86)"));
-        assert!(light_close_style.contains("#344052"));
+        assert!(light_close_style.contains("background:transparent"));
+        assert!(light_close_style.contains("rgba(52,64,82,0.66)"));
 
+        // Plain color circle (2026-06-26): no halo ring / box-shadow.
         let keep_alive_style = live_session_keep_alive_dot_style(dark);
-        assert!(keep_alive_style.contains("rgba(22,28,34,0.88)"));
+        assert!(!keep_alive_style.contains("box-shadow"));
+        assert!(keep_alive_style.contains("#22c55e"));
     }
     // DESIGN.md "Status indicator vocabulary": green = keep-alive, blue =
     // non-keep-alive, blinking = working — one dot, two encodings.
@@ -81566,6 +81680,12 @@ mod tests {
         let kept_working = live_session_status_dot_style(dark, true, true);
         assert!(kept_working.contains("#22c55e"));
         assert!(kept_working.contains("yggterm-status-dot-blink"));
+        // HARD on/off blink (2026-06-26): step-end timing (no fade) + plain
+        // circle (no halo ring). The keyframes snap opacity to a full 0.
+        assert!(kept_working.contains("step-end"));
+        assert!(!kept_working.contains("ease-in-out"));
+        assert!(!kept_working.contains("box-shadow"));
+        assert!(STATUS_DOT_BLINK_CSS.contains("opacity: 0;"));
         let transient_idle = live_session_status_dot_style(dark, false, false);
         assert!(transient_idle.contains("#3b82f6"));
         assert!(!transient_idle.contains("animation:"));
@@ -83537,6 +83657,7 @@ mod tests {
                 ssh_target: Some("dev".to_string()),
                 ssh_prefix: None,
                 stored_preview_hydrated: true,
+                working: None,
             }],
             &expanded_paths,
         );
@@ -83603,6 +83724,7 @@ mod tests {
             ssh_target: None,
             ssh_prefix: None,
             stored_preview_hydrated: true,
+            working: None,
         };
         let rows = merged_sidebar_rows(&[], &[], &[], &[session.clone()], &expanded_paths);
         let live_row = rows
@@ -83793,6 +83915,7 @@ mod tests {
                 ssh_target: Some("oc".to_string()),
                 ssh_prefix: None,
                 stored_preview_hydrated: true,
+                working: None,
             }],
             &HashSet::from_iter([
                 "__live_sessions__".to_string(),
@@ -83896,6 +84019,7 @@ mod tests {
                 ssh_target: None,
                 ssh_prefix: None,
                 stored_preview_hydrated: true,
+                working: None,
             }],
             &HashSet::from_iter([
                 "__live_sessions__".to_string(),
@@ -83977,6 +84101,7 @@ mod tests {
                 ssh_target: None,
                 ssh_prefix: None,
                 stored_preview_hydrated: true,
+                working: None,
             }],
             &HashSet::from([
                 "__live_sessions__".to_string(),
@@ -84098,6 +84223,7 @@ mod tests {
                 ssh_target: None,
                 ssh_prefix: None,
                 stored_preview_hydrated: true,
+                working: None,
             }],
             &HashSet::from_iter([
                 "__live_sessions__".to_string(),
@@ -84169,6 +84295,7 @@ mod tests {
                 ssh_target: None,
                 ssh_prefix: None,
                 stored_preview_hydrated: true,
+                working: None,
             }],
             &HashSet::from_iter([
                 "__live_sessions__".to_string(),
@@ -84271,6 +84398,7 @@ mod tests {
                 ssh_target: Some("oc".to_string()),
                 ssh_prefix: None,
                 stored_preview_hydrated: true,
+                working: None,
             }],
             &HashSet::from_iter([
                 "__live_sessions__".to_string(),
@@ -84758,6 +84886,7 @@ mod tests {
                 ssh_target: Some("oc".to_string()),
                 ssh_prefix: None,
                 stored_preview_hydrated: true,
+                working: None,
             }],
             &HashSet::from_iter([
                 "__live_sessions__".to_string(),
@@ -84847,6 +84976,7 @@ mod tests {
             ssh_target: Some("dev".to_string()),
             ssh_prefix: None,
             stored_preview_hydrated: true,
+            working: None,
         };
         let label = live_session_label(&remote_machines, &session, &HashMap::new());
         assert_eq!(label, "Stabilize daemon resume path");
@@ -84990,6 +85120,7 @@ mod tests {
             ssh_target: None,
             ssh_prefix: None,
             stored_preview_hydrated: true,
+            working: None,
         };
         assert_eq!(
             resolved_session_title(&shell, &session).as_deref(),
@@ -85035,6 +85166,7 @@ mod tests {
             ssh_target: None,
             ssh_prefix: None,
             stored_preview_hydrated: true,
+            working: None,
         };
         assert!(supports_generated_session_copy(&session));
     }
@@ -85072,6 +85204,7 @@ mod tests {
             ssh_target: None,
             ssh_prefix: None,
             stored_preview_hydrated: false,
+            working: None,
         };
         assert!(!supports_generated_session_copy(&session));
     }
@@ -85109,6 +85242,7 @@ mod tests {
             ssh_target: None,
             ssh_prefix: None,
             stored_preview_hydrated: true,
+            working: None,
         }];
         let mut rows = vec![BrowserRow {
             kind: BrowserRowKind::Document,
@@ -85176,6 +85310,7 @@ mod tests {
             ssh_target: None,
             ssh_prefix: None,
             stored_preview_hydrated: true,
+            working: None,
         }];
         let mut rows = vec![BrowserRow {
             kind: BrowserRowKind::Session,
@@ -85254,6 +85389,7 @@ mod tests {
             ssh_target: None,
             ssh_prefix: None,
             stored_preview_hydrated: true,
+            working: None,
         }];
         let mut rows = vec![BrowserRow {
             kind: BrowserRowKind::Session,
@@ -85324,6 +85460,7 @@ mod tests {
             ssh_target: None,
             ssh_prefix: None,
             stored_preview_hydrated: true,
+            working: None,
         }];
         let mut rows = vec![BrowserRow {
             kind: BrowserRowKind::Session,
@@ -85521,6 +85658,7 @@ mod tests {
             ssh_target: None,
             ssh_prefix: None,
             stored_preview_hydrated: true,
+            working: None,
         }];
         let mut rows = vec![BrowserRow {
             kind: BrowserRowKind::Session,
@@ -85585,6 +85723,7 @@ mod tests {
             ssh_target: None,
             ssh_prefix: None,
             stored_preview_hydrated: true,
+            working: None,
         }];
         let mut rows = vec![BrowserRow {
             kind: BrowserRowKind::Session,
@@ -85653,6 +85792,7 @@ mod tests {
             ssh_target: Some("dev".to_string()),
             ssh_prefix: None,
             stored_preview_hydrated: true,
+            working: None,
         }];
         let mut rows = vec![BrowserRow {
             kind: BrowserRowKind::Session,
@@ -85718,6 +85858,7 @@ mod tests {
             ssh_target: None,
             ssh_prefix: None,
             stored_preview_hydrated: true,
+            working: None,
         }];
         let mut rows = vec![BrowserRow {
             kind: BrowserRowKind::Session,
@@ -85788,6 +85929,7 @@ mod tests {
                 ssh_target: None,
                 ssh_prefix: None,
                 stored_preview_hydrated: true,
+                working: None,
             }],
             &HashSet::from(["__live_sessions__".to_string()]),
         );
@@ -85860,6 +86002,7 @@ mod tests {
                 ssh_target: Some("guihost".to_string()),
                 ssh_prefix: None,
                 stored_preview_hydrated: true,
+                working: None,
             }],
             &HashSet::from([
                 "__live_sessions__".to_string(),
@@ -85919,6 +86062,7 @@ mod tests {
                 ssh_target: Some("guihost".to_string()),
                 ssh_prefix: None,
                 stored_preview_hydrated: true,
+                working: None,
             }],
             &HashSet::from(["__live_sessions__".to_string()]),
         );
@@ -87665,6 +87809,7 @@ mod tests {
             ssh_target: None,
             ssh_prefix: None,
             stored_preview_hydrated: true,
+            working: None,
         };
         assert!(session_is_idle_for_sidebar_icon(&session));
     }
@@ -87702,6 +87847,7 @@ mod tests {
             ssh_target: None,
             ssh_prefix: None,
             stored_preview_hydrated: true,
+            working: None,
         };
         assert!(!session_is_idle_for_sidebar_icon(&session));
     }
@@ -87786,6 +87932,7 @@ mod tests {
             ssh_target: None,
             ssh_prefix: None,
             stored_preview_hydrated: true,
+            working: None,
         }];
         enrich_sidebar_rows_with_live_titles(
             &mut rows,
@@ -87852,6 +87999,7 @@ mod tests {
             ssh_target: Some("oc".to_string()),
             ssh_prefix: None,
             stored_preview_hydrated: true,
+            working: None,
         };
         let hits = search_content_hits(Some(&session), WorkspaceViewMode::Rendered, "Asia/Kolkata");
         assert_eq!(hits.len(), 1);
@@ -87898,6 +88046,7 @@ mod tests {
             ssh_target: None,
             ssh_prefix: None,
             stored_preview_hydrated: true,
+            working: None,
         };
         assert!(content_search_query("/preview").is_none());
         assert!(
@@ -88238,6 +88387,7 @@ mod tests {
             ssh_target: None,
             ssh_prefix: None,
             stored_preview_hydrated: false,
+            working: None,
         };
         assert!(visible_preview_blocks(&session).is_empty());
         assert!(!preview_summary_text(&session).contains("Launch command prepared"));
@@ -88285,6 +88435,7 @@ mod tests {
             ssh_target: Some("guihost".to_string()),
             ssh_prefix: None,
             stored_preview_hydrated: false,
+            working: None,
         };
         assert!(remote_preview_needs_refresh(&session));
         assert!(remote_preview_should_auto_sync(&session));
@@ -88341,6 +88492,7 @@ mod tests {
             ssh_target: Some("guihost".to_string()),
             ssh_prefix: None,
             stored_preview_hydrated: false,
+            working: None,
         };
         assert!(remote_preview_needs_refresh(&session));
         assert!(remote_preview_should_auto_sync(&session));
@@ -88400,6 +88552,7 @@ mod tests {
             ssh_target: Some("guihost".to_string()),
             ssh_prefix: None,
             stored_preview_hydrated: false,
+            working: None,
         };
         assert!(remote_preview_needs_refresh(&session));
         assert!(!remote_preview_should_auto_sync(&session));
@@ -88457,6 +88610,7 @@ mod tests {
             ssh_target: Some("guihost".to_string()),
             ssh_prefix: None,
             stored_preview_hydrated: false,
+            working: None,
         };
 
         assert!(!preview_should_hide_stale_placeholder_content(&session));
@@ -88510,6 +88664,7 @@ mod tests {
             ssh_target: Some("guihost".to_string()),
             ssh_prefix: None,
             stored_preview_hydrated: false,
+            working: None,
         };
 
         assert!(!preview_should_hide_stale_placeholder_content(&session));
@@ -88559,6 +88714,7 @@ mod tests {
             ssh_target: Some("guihost".to_string()),
             ssh_prefix: None,
             stored_preview_hydrated: false,
+            working: None,
         };
 
         assert!(preview_should_hide_stale_placeholder_content(&session));
@@ -95420,6 +95576,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             ssh_target: None,
             ssh_prefix: None,
             stored_preview_hydrated: false,
+            working: None,
         };
         let inactive_session = ManagedSessionView {
             id: "inactive-session".to_string(),
@@ -95456,6 +95613,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             ssh_target: None,
             ssh_prefix: None,
             stored_preview_hydrated: false,
+            working: None,
         };
         shell.server.apply_snapshot(ServerUiSnapshot {
             active_session_path: Some(active_session_path.to_string()),
@@ -95838,6 +95996,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             ssh_target: Some("dev".to_string()),
             ssh_prefix: None,
             stored_preview_hydrated: true,
+            working: None,
         }
     }
 
@@ -95960,6 +96119,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             ssh_prefix: None,
             pty_cols: None,
             pty_rows: None,
+            working: None,
         }
     }
 
@@ -96195,6 +96355,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             ssh_target: None,
             ssh_prefix: None,
             stored_preview_hydrated: false,
+            working: None,
         }
     }
     #[test]
@@ -97035,6 +97196,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             ssh_target: None,
             ssh_prefix: None,
             stored_preview_hydrated: false,
+            working: None,
         };
         let mut snapshot = ServerUiSnapshot {
             active_session_path: Some(active_session_path.to_string()),
@@ -97098,6 +97260,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             ssh_target: None,
             ssh_prefix: None,
             stored_preview_hydrated: false,
+            working: None,
         };
         shell.server.apply_snapshot(ServerUiSnapshot {
             active_session_path: Some(active_session_path.to_string()),
@@ -97142,6 +97305,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             ssh_target: None,
             ssh_prefix: None,
             stored_preview_hydrated: false,
+            working: None,
         };
         let mut snapshot = ServerUiSnapshot {
             active_session_path: Some(active_session_path.to_string()),
@@ -97306,6 +97470,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             ssh_target: None,
             ssh_prefix: None,
             stored_preview_hydrated: false,
+            working: None,
         };
         shell.server.apply_snapshot(ServerUiSnapshot {
             active_session_path: Some(active_session_path.to_string()),
@@ -97590,6 +97755,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             ssh_target: None,
             ssh_prefix: None,
             stored_preview_hydrated: true,
+            working: None,
         };
         shell.server.apply_snapshot(ServerUiSnapshot {
             active_session_path: Some(active_session_path.to_string()),
@@ -97665,6 +97831,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             ssh_target: None,
             ssh_prefix: None,
             stored_preview_hydrated: false,
+            working: None,
         };
         let row = test_sidebar_row(session_path);
         let snapshot = RenderSnapshot {
@@ -97786,6 +97953,10 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             "› Use /skills to list available skills".to_string(),
             "• Working (1h 14m 34s • esc to interrupt) · 1 background terminal running · /ps to view · /stop to close".to_string(),
         ];
+        // Working is now driven by the daemon-authoritative flag (the daemon
+        // computes it from the live screen via screen_text_shows_agent_working);
+        // the GUI no longer re-scrapes terminal_lines for the footer.
+        live_session.working = Some(true);
         shell.server.apply_snapshot(ServerUiSnapshot {
             active_session_path: Some(session_path.to_string()),
             active_session: Some(snapshot_session_view_for_ui(live_session.clone())),
@@ -97829,6 +98000,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             "› Try \"how does the auth flow work?\"".to_string(),
             "✻ Forging… (12s · ↑ 2.1k tokens · esc to interrupt)".to_string(),
         ];
+        live_session.working = Some(true);
         shell.server.apply_snapshot(ServerUiSnapshot {
             active_session_path: Some(session_path.to_string()),
             active_session: Some(snapshot_session_view_for_ui(live_session.clone())),
@@ -97874,6 +98046,8 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             "› Use /skills to list available skills".to_string(),
             "• Working (23m 04s • esc to interrupt) · 1 background terminal running · /ps to view · /stop to close".to_string(),
         ];
+        working_session.working = Some(true);
+        active_session.working = Some(false);
         shell.server.apply_snapshot(ServerUiSnapshot {
             active_session_path: Some(active_path.to_string()),
             active_session: Some(snapshot_session_view_for_ui(active_session.clone())),
@@ -97898,6 +98072,54 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             })
             .expect("inactive working live session row");
         assert!(sidebar_row_shows_busy_icon(&snapshot, row));
+    }
+
+    #[test]
+    fn sidebar_busy_icon_ignores_frozen_working_footer_when_daemon_says_idle() {
+        // THE fail-proof contract (2026-06-26): the dot is driven ONLY by the
+        // daemon-authoritative `working` flag. A session whose last-captured
+        // screen tail still shows the "esc to interrupt" working footer — the
+        // classic frozen frame of a session that finished long ago — must NOT
+        // blink once the daemon reports it idle (`Some(false)`) or unknown
+        // (`None`). This is the regression that made sessions "blink long after
+        // they were done".
+        let session_path = "remote-cc://dev/frozen";
+        let mut shell = ShellState::new(test_shell_bootstrap_with_active_session(session_path));
+        let mut live_session = test_live_shell_session(session_path);
+        live_session.id = "frozen".to_string();
+        live_session.kind = SessionKind::ClaudeCode;
+        live_session.source = SessionSource::LiveSsh;
+        live_session.terminal_foreground_active = Some(false);
+        // A stale frame still carrying the working footer.
+        live_session.terminal_lines = vec![
+            "› Try \"how does the auth flow work?\"".to_string(),
+            "✻ Forging… (12s · ↑ 2.1k tokens · esc to interrupt)".to_string(),
+        ];
+        for verdict in [Some(false), None] {
+            live_session.working = verdict;
+            shell.server.apply_snapshot(ServerUiSnapshot {
+                active_session_path: Some(session_path.to_string()),
+                active_session: Some(snapshot_session_view_for_ui(live_session.clone())),
+                active_view_mode: WorkspaceViewMode::Terminal,
+                remote_machines: Vec::new(),
+                ssh_targets: Vec::new(),
+                live_sessions: vec![snapshot_session_view_for_ui(live_session.clone())],
+            });
+            shell.needs_initial_server_sync = false;
+            let snapshot = shell.snapshot();
+            let row = snapshot
+                .rows
+                .iter()
+                .find(|row| {
+                    normalize_live_session_path(&row.full_path)
+                        == normalize_live_session_path(session_path)
+                })
+                .expect("frozen live session row");
+            assert!(
+                !sidebar_row_shows_busy_icon(&snapshot, row),
+                "frozen working footer must not blink when daemon verdict is {verdict:?}"
+            );
+        }
     }
 
     #[test]
@@ -98011,6 +98233,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             ssh_target: None,
             ssh_prefix: None,
             stored_preview_hydrated: false,
+            working: None,
         };
         let active_session = ManagedSessionView {
             id: "active".to_string(),
@@ -98044,6 +98267,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             ssh_target: None,
             ssh_prefix: None,
             stored_preview_hydrated: false,
+            working: None,
         };
         let row = test_sidebar_row("local://stale");
         let snapshot = RenderSnapshot {
@@ -98185,6 +98409,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             ssh_target: None,
             ssh_prefix: None,
             stored_preview_hydrated: false,
+            working: None,
         };
         let row = test_sidebar_row(session_path);
         let snapshot = RenderSnapshot {
@@ -98326,6 +98551,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             ssh_target: None,
             ssh_prefix: None,
             stored_preview_hydrated: false,
+            working: None,
         };
         let row = test_sidebar_row(session_path);
         let snapshot = RenderSnapshot {
@@ -98470,6 +98696,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             ssh_target: None,
             ssh_prefix: None,
             stored_preview_hydrated: false,
+            working: None,
         };
         let row = test_sidebar_row(session_path);
         let snapshot = RenderSnapshot {
@@ -98618,6 +98845,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             ssh_target: None,
             ssh_prefix: None,
             stored_preview_hydrated: false,
+            working: None,
         };
         let row = test_sidebar_row(session_path);
         let snapshot = RenderSnapshot {
@@ -98758,6 +98986,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             ssh_target: None,
             ssh_prefix: None,
             stored_preview_hydrated: false,
+            working: None,
         };
         let row = test_sidebar_row("local://active");
         let snapshot = RenderSnapshot {
@@ -98898,6 +99127,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             ssh_target: None,
             ssh_prefix: None,
             stored_preview_hydrated: false,
+            working: None,
         };
         let row = test_sidebar_row("local://active");
         let snapshot = RenderSnapshot {
@@ -99038,6 +99268,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             ssh_target: None,
             ssh_prefix: None,
             stored_preview_hydrated: false,
+            working: None,
         };
         let active_session = ManagedSessionView {
             id: "active".to_string(),
@@ -99071,6 +99302,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             ssh_target: None,
             ssh_prefix: None,
             stored_preview_hydrated: false,
+            working: None,
         };
         let row = test_sidebar_row("remote-session://guihost/idle");
         let snapshot = RenderSnapshot {
@@ -99214,6 +99446,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             ssh_target: None,
             ssh_prefix: None,
             stored_preview_hydrated: false,
+            working: None,
         };
         let row = test_sidebar_row("local://active");
         let snapshot = RenderSnapshot {
@@ -99355,6 +99588,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             ssh_target: None,
             ssh_prefix: None,
             stored_preview_hydrated: false,
+            working: None,
         };
         let live_session = ManagedSessionView {
             id: "active-live".to_string(),
@@ -99388,6 +99622,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             ssh_target: None,
             ssh_prefix: None,
             stored_preview_hydrated: false,
+            working: None,
         };
         let row = test_sidebar_row(session_path);
         let snapshot = RenderSnapshot {
@@ -99886,6 +100121,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             ssh_target: None,
             ssh_prefix: None,
             stored_preview_hydrated: true,
+            working: None,
         };
         shell.server.apply_snapshot(ServerUiSnapshot {
             active_session_path: Some(session_path.to_string()),
@@ -101378,6 +101614,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             ssh_target: Some("localhost".to_string()),
             ssh_prefix: None,
             stored_preview_hydrated: true,
+            working: None,
         };
         shell.server.apply_snapshot(ServerUiSnapshot {
             active_session_path: Some(session_path.to_string()),
@@ -101597,6 +101834,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             ssh_target: Some("localhost".to_string()),
             ssh_prefix: None,
             stored_preview_hydrated: true,
+            working: None,
         };
         shell.server.apply_snapshot(ServerUiSnapshot {
             active_session_path: Some(session_path.to_string()),
@@ -102286,6 +102524,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             ssh_target: None,
             ssh_prefix: None,
             stored_preview_hydrated: false,
+            working: None,
         };
         let codex_session = ManagedSessionView {
             id: "stored-live-codex".to_string(),
@@ -102322,6 +102561,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             ssh_target: None,
             ssh_prefix: None,
             stored_preview_hydrated: true,
+            working: None,
         };
         shell.server.apply_snapshot(ServerUiSnapshot {
             active_session_path: Some(active_path.to_string()),
@@ -102521,6 +102761,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             ssh_target: None,
             ssh_prefix: None,
             stored_preview_hydrated: true,
+            working: None,
         };
         shell.server.apply_snapshot(ServerUiSnapshot {
             active_session_path: Some(session_path.to_string()),
@@ -102577,6 +102818,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             ssh_target: None,
             ssh_prefix: None,
             stored_preview_hydrated: false,
+            working: None,
         };
         shell.server.apply_snapshot(ServerUiSnapshot {
             active_session_path: Some(session_path.to_string()),
@@ -102699,6 +102941,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             ssh_target: None,
             ssh_prefix: None,
             stored_preview_hydrated: false,
+            working: None,
         };
         shell.server.apply_snapshot(ServerUiSnapshot {
             active_session_path: Some(session_path.to_string()),
@@ -102785,6 +103028,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             ssh_target: None,
             ssh_prefix: None,
             stored_preview_hydrated: true,
+            working: None,
         };
         let inactive_session = ManagedSessionView {
             id: "inactive".to_string(),
@@ -102833,6 +103077,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             ssh_target: Some("guihost".to_string()),
             ssh_prefix: None,
             stored_preview_hydrated: true,
+            working: None,
         };
         shell.server.apply_snapshot(ServerUiSnapshot {
             active_session_path: Some(active_path.to_string()),
@@ -104124,6 +104369,7 @@ Shared connection to 192.0.2.14 closed.\r\n";
             ssh_target: Some("guihost".to_string()),
             ssh_prefix: None,
             stored_preview_hydrated: false,
+            working: None,
         };
         assert!(is_remote_resume_agent_session(&session));
         session.source = SessionSource::Stored;
@@ -104171,6 +104417,7 @@ Shared connection to 192.0.2.14 closed.\r\n";
             ssh_target: Some("guihost".to_string()),
             ssh_prefix: None,
             stored_preview_hydrated: true,
+            working: None,
         };
         assert_eq!(
             remote_resume_overlay_excerpt(&session).as_deref(),
@@ -104214,6 +104461,7 @@ Shared connection to 192.0.2.14 closed.\r\n";
             ssh_target: Some("guihost".to_string()),
             ssh_prefix: None,
             stored_preview_hydrated: false,
+            working: None,
         };
         assert_eq!(remote_resume_overlay_excerpt(&session), None);
     }
@@ -104260,6 +104508,7 @@ Shared connection to 192.0.2.14 closed.\r\n";
             ssh_target: Some("guihost".to_string()),
             ssh_prefix: None,
             stored_preview_hydrated: false,
+            working: None,
         };
         assert_eq!(
             remote_resume_overlay_seed_excerpt(&session).as_deref(),
@@ -104318,6 +104567,7 @@ Shared connection to 192.0.2.14 closed.\r\n";
             ssh_target: Some("dev".to_string()),
             ssh_prefix: None,
             stored_preview_hydrated: false,
+            working: None,
         };
         assert_eq!(remote_terminal_prefill_text(&session), None);
         assert_eq!(
@@ -104388,6 +104638,7 @@ Shared connection to 192.0.2.14 closed.\r\n";
             ssh_target: None,
             ssh_prefix: None,
             stored_preview_hydrated: false,
+            working: None,
         };
         let sessions: Vec<&ManagedSessionView> = vec![&session];
         let index = RemoteSessionIndex::default();
@@ -104474,6 +104725,7 @@ Shared connection to 192.0.2.14 closed.\r\n";
             ssh_target: None,
             ssh_prefix: None,
             stored_preview_hydrated: false,
+            working: None,
         };
         assert_eq!(
             local_terminal_prefill_text(&session).as_deref(),
@@ -104559,6 +104811,7 @@ Shared connection to 192.0.2.14 closed.\r\n";
             ssh_target: None,
             ssh_prefix: None,
             stored_preview_hydrated: false,
+            working: None,
         };
         // Primary fix: the local prefill source refuses the seed outright.
         assert_eq!(
