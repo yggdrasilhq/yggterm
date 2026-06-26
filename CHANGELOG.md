@@ -2,6 +2,25 @@
 
 This file tracks user-visible changes in `yggterm`.
 
+## 2.9.45
+
+- **Sidebar "working" dots no longer get stuck blinking long after a session finished.** Whether an
+  agent session is working is now decided by the daemon from each session's LIVE terminal screen at
+  snapshot time, rather than by the GUI re-reading its last-captured frame. A session the daemon no
+  longer holds a live screen for (e.g. one owned by another window) simply reads "not working" instead
+  of blinking forever on a frozen "esc to interrupt" frame. The dot blinks only while the agent is
+  genuinely working right now.
+- **You now get a toast + chime when a background session finishes working.** When an agent session
+  that is NOT the one you're currently watching transitions from working to done, yggterm raises a
+  "Session finished" notification with a completion chime, so you can switch away and be told when it's
+  ready for you — the core handoff workflow. (The session you're actively looking at doesn't ping you.)
+- **The status dots are a cleaner design.** Plain flat color circles (green = keep-alive, blue = lives
+  with the app) with no halo ring, and the working blink is now a hard on/off square wave instead of a
+  soft fade.
+- **The close (×) control on live-session rows is redesigned.** It is now a themed X icon that stays
+  hidden until you hover the row or select it (instead of always showing), and it "burns" in with a
+  soft red tint on hover to read as the destructive close it is.
+
 ## 2.9.44
 
 - **The on-disk diagnostic trace no longer reopens its file on every event.** Each trace write used to
