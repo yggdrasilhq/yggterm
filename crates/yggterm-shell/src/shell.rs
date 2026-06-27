@@ -13667,7 +13667,14 @@ fn live_session_screen_content_signature(terminal_lines: &[String], status_line:
 
 fn live_session_runtime_truth_signature_from_iter<'a>(
     sessions: impl Iterator<Item = &'a ManagedSessionView>,
-) -> Vec<(String, SessionSource, TerminalLaunchPhase, Option<bool>, u64)> {
+) -> Vec<(
+    String,
+    SessionSource,
+    TerminalLaunchPhase,
+    Option<bool>,
+    Option<bool>,
+    u64,
+)> {
     let mut signature = sessions
         .filter(|session| {
             matches!(
@@ -13681,6 +13688,15 @@ fn live_session_runtime_truth_signature_from_iter<'a>(
                 session.source,
                 session.launch_phase,
                 session.terminal_foreground_active,
+                // Daemon-authoritative working flag MUST be part of the runtime
+                // truth: for an agent CLI it is derived from the screen FOOTER
+                // ("esc to interrupt") which can flip true→false a beat after the
+                // visible content (last-8-lines hash) has already settled. Omitting
+                // it made a working-only change look like a no-op, so the apply was
+                // skipped and the sidebar dot kept blinking (and the finish chime
+                // stayed silent) until an unrelated change forced a non-noop apply
+                // seconds later. See [[finding-working-dot-noop-skips-working-only-update]].
+                session.working,
                 live_session_screen_content_signature(
                     &session.terminal_lines,
                     &session.status_line,
@@ -13694,7 +13710,14 @@ fn live_session_runtime_truth_signature_from_iter<'a>(
 
 fn live_session_runtime_truth_signature_from_snapshot(
     snapshot: &ServerUiSnapshot,
-) -> Vec<(String, SessionSource, TerminalLaunchPhase, Option<bool>, u64)> {
+) -> Vec<(
+    String,
+    SessionSource,
+    TerminalLaunchPhase,
+    Option<bool>,
+    Option<bool>,
+    u64,
+)> {
     let mut signature = snapshot
         .live_sessions
         .iter()
@@ -13710,6 +13733,9 @@ fn live_session_runtime_truth_signature_from_snapshot(
                 session.source,
                 session.launch_phase,
                 session.terminal_foreground_active,
+                // See sibling `_from_iter`: the working flag is load-bearing runtime
+                // truth, not a no-op-able cosmetic.
+                session.working,
                 live_session_screen_content_signature(
                     &session.terminal_lines,
                     &session.status_line,
@@ -13729,6 +13755,7 @@ fn live_session_runtime_truth_signature_from_snapshot(
             active.source,
             active.launch_phase,
             active.terminal_foreground_active,
+            active.working,
             live_session_screen_content_signature(&active.terminal_lines, &active.status_line),
         ));
     }
@@ -96711,6 +96738,43 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             &shell,
             &screen_changed
         ));
+    }
+
+    // An agent CLI's daemon-authoritative `working` flag flips true→false from
+    // the screen FOOTER ("esc to interrupt") which can move a beat AFTER the
+    // visible content (last-8-lines hash) has already settled — so the screen
+    // content signature is identical across the working→done transition. If the
+    // no-op check ignores `working`, that working-only snapshot is dropped and
+    // the sidebar dot blinks forever (and the finish chime never fires) until an
+    // unrelated change lands seconds later. The working flag MUST be part of the
+    // runtime truth. See [[finding-working-dot-noop-skips-working-only-update]].
+    #[test]
+    fn background_live_session_snapshot_applies_working_only_change() {
+        let session_path = "local://active-shell";
+        let mut shell = ShellState::new(test_shell_bootstrap_with_active_session(session_path));
+        let mut live_session = test_live_shell_session(session_path);
+        live_session.working = Some(true);
+        let snapshot = ServerUiSnapshot {
+            active_session_path: Some(session_path.to_string()),
+            active_session: Some(snapshot_session_view_for_ui(live_session.clone())),
+            active_view_mode: WorkspaceViewMode::Terminal,
+            remote_machines: Vec::new(),
+            ssh_targets: Vec::new(),
+            live_sessions: vec![snapshot_session_view_for_ui(live_session)],
+        };
+        shell.server.apply_snapshot(snapshot.clone());
+        assert!(background_live_session_snapshot_is_noop(&shell, &snapshot));
+
+        // Identical screen tail + foreground flag, ONLY `working` flips to done.
+        let mut working_done = snapshot;
+        working_done.live_sessions[0].working = Some(false);
+        if let Some(active) = working_done.active_session.as_mut() {
+            active.working = Some(false);
+        }
+        assert!(
+            !background_live_session_snapshot_is_noop(&shell, &working_done),
+            "a working-only true→false change must force an apply (dot must stop blinking)"
+        );
     }
 
     #[test]
