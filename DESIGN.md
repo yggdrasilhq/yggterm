@@ -168,6 +168,23 @@ They should:
 - avoid muddy selected states
 - feel stable and precise
 
+There is ONE standard segmented control, `segmented_control_track_style` +
+`segmented_control_segment_style`. The track is "snug": it is only a hair larger
+than the active segment (3px track padding is the only gap), and the active
+segment is a near-edge-to-edge fill with NO drop shadow. The titlebar Web
+View/Terminal toggle is the reference look. Every multi-segment MODE switch uses
+it — titlebar view mode, the agent-mode selector, Settings Light/Dark,
+Notifications App/Both/System. Do not hand-roll a segmented pill with an opaque
+track + a lifted (`0 3px 10px`) active chip; that reads as a bg pill much larger
+than the selection, which we deliberately retired.
+
+`segment_style(grow, on_chrome)`: `grow` fills the track evenly inside a settings
+row; `on_chrome` uses luminance-aware text against the variable titlebar chrome
+(vs plain palette text on a card).
+
+This is distinct from a binary on/off SWITCH (track + sliding thumb,
+`inline_toggle_*`), used for Auto-hide Titlebar, Sound, etc. — leave those alone.
+
 #### Primary buttons
 
 Primary actions should look unmistakably clickable.
