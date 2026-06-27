@@ -2,6 +2,23 @@
 
 This file tracks user-visible changes in `yggterm`.
 
+## 2.9.46
+
+- **Working dots converge to the daemon that owns each session.** After an in-place update hands a
+  daemon's terminals to its successor, the lingering owner now hands each session, one at a time, to
+  the newest daemon as soon as that session is safe to move — so the "working" dots, titles, and
+  finish notifications come back to life natively instead of staying dormant on a bridged session.
+  A session is only moved when it is genuinely idle: no recent output, no foreground command running
+  in its terminal (including silent ones like `sleep`), and crucially **no typed-but-unsent draft** on
+  its input line (your drafted prompts live only in the running terminal, so they are protected from a
+  move). Opt-in for now via `YGGTERM_ENABLE_PROGRESSIVE_MIGRATION=1` while it bakes.
+- **A plain shell only shows the "working" dot when a command is actually running** in it, decided
+  from the OS (the terminal's foreground process), not from scraped screen text.
+- **Machine and folder rows in the sidebar now show an aggregate "working" status** when a session
+  inside them is working — visible even while the row is collapsed. SSH machine rows adopt the same
+  flat status-dot vocabulary as live sessions (the old haloed indicator is gone) and blink while a
+  session hosted on that machine is working.
+
 ## 2.9.45
 
 - **Sidebar "working" dots no longer get stuck blinking long after a session finished.** Whether an
