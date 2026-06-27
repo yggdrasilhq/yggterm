@@ -43940,9 +43940,41 @@ fn terminal_input_uses_optimistic_busy_hint(session_path: &str) -> bool {
 fn sidebar_row_shows_busy_icon(snapshot: &RenderSnapshot, row: &BrowserRow) -> bool {
     sidebar_row_busy_state(snapshot, row).visible
 }
+/// Aggregate working state for a machine/cwd group row (issue #3): a group
+/// blinks when ANY session in its subtree is working, so a COLLAPSED machine or
+/// cwd still surfaces "work happening inside". Walks the flat, depth-ordered row
+/// list for the group's contiguous descendants (depth > the group's depth) and
+/// reuses the per-session busy SSOT. Cheap (one linear pass over the subtree);
+/// no recursion (only Session descendants are queried, which never re-enter the
+/// group branch). See DESIGN.md "Status indicator vocabulary".
+fn sidebar_group_has_working_descendant(
+    snapshot: &RenderSnapshot,
+    group_row: &BrowserRow,
+) -> bool {
+    let Some(start) = snapshot.rows.iter().position(|candidate| {
+        candidate.kind == BrowserRowKind::Group && candidate.full_path == group_row.full_path
+    }) else {
+        return false;
+    };
+    let group_depth = group_row.depth;
+    snapshot.rows[start + 1..]
+        .iter()
+        .take_while(|descendant| descendant.depth > group_depth)
+        .filter(|descendant| descendant.kind == BrowserRowKind::Session)
+        .any(|descendant| sidebar_row_busy_state(snapshot, descendant).visible)
+}
+
 fn sidebar_row_busy_state(snapshot: &RenderSnapshot, row: &BrowserRow) -> SidebarBusyState {
-    if matches!(row.kind, BrowserRowKind::Group | BrowserRowKind::Separator) {
+    if row.kind == BrowserRowKind::Separator {
         return SidebarBusyState::idle();
+    }
+    if row.kind == BrowserRowKind::Group {
+        // Issue #3: machine/cwd rows aggregate their subtree's working state.
+        return if sidebar_group_has_working_descendant(snapshot, row) {
+            SidebarBusyState::busy("group_descendant_working")
+        } else {
+            SidebarBusyState::idle()
+        };
     }
     let Some(session) = sidebar_row_session_for_icon(snapshot, row) else {
         return SidebarBusyState::idle();
@@ -44700,6 +44732,18 @@ fn SidebarRow(
                                 "display:inline-flex; width:6px; min-width:6px; height:6px; border-radius:999px; background:{}; box-shadow:0 0 0 1.5px rgba(255,255,255,0.74); opacity:0.96;",
                                 machine_indicator_color_value(health)
                             ),
+                        }
+                    }
+                    // Issue #3: aggregate working dot on a machine/cwd row when a
+                    // session in its subtree is working — visible even while the
+                    // group is collapsed. Reuses the live working-dot vocabulary
+                    // (DESIGN.md): blink encodes activity. Sits after the label so
+                    // it never shifts the icon/indent of idle group rows.
+                    if row_is_group && busy_icon {
+                        span {
+                            "data-sidebar-group-working-dot": "1",
+                            title: "Working inside",
+                            style: live_session_status_dot_style(palette, false, true),
                         }
                     }
                 }
@@ -98118,6 +98162,48 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             assert!(
                 !sidebar_row_shows_busy_icon(&snapshot, row),
                 "frozen working footer must not blink when daemon verdict is {verdict:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn sidebar_group_row_aggregates_working_descendant() {
+        // Issue #3: a machine/cwd group row blinks when a session in its subtree
+        // is working (so a collapsed machine surfaces "work happening inside"),
+        // and goes idle the moment the daemon reports the descendant idle.
+        let session_path = "remote-cc://dev/aggregate";
+        let mut shell = ShellState::new(test_shell_bootstrap_with_active_session(session_path));
+        let mut live_session = test_live_shell_session(session_path);
+        live_session.id = "aggregate".to_string();
+        live_session.kind = SessionKind::ClaudeCode;
+        live_session.source = SessionSource::LiveSsh;
+        live_session.terminal_foreground_active = Some(false);
+        for (verdict, expect_busy) in [(Some(true), true), (Some(false), false), (None, false)] {
+            live_session.working = verdict;
+            shell.server.apply_snapshot(ServerUiSnapshot {
+                active_session_path: Some(session_path.to_string()),
+                active_session: Some(snapshot_session_view_for_ui(live_session.clone())),
+                active_view_mode: WorkspaceViewMode::Terminal,
+                remote_machines: Vec::new(),
+                ssh_targets: Vec::new(),
+                live_sessions: vec![snapshot_session_view_for_ui(live_session.clone())],
+            });
+            shell.needs_initial_server_sync = false;
+            let snapshot = shell.snapshot();
+            let group_rows = snapshot
+                .rows
+                .iter()
+                .filter(|row| row.kind == BrowserRowKind::Group)
+                .count();
+            assert!(group_rows > 0, "the remote-cc session must produce a group row");
+            let any_group_busy = snapshot
+                .rows
+                .iter()
+                .filter(|row| row.kind == BrowserRowKind::Group)
+                .any(|row| sidebar_row_shows_busy_icon(&snapshot, row));
+            assert_eq!(
+                any_group_busy, expect_busy,
+                "group aggregate working state mismatch for working={verdict:?}"
             );
         }
     }
