@@ -1003,6 +1003,88 @@ pub fn screen_text_shows_agent_working(sample: &str) -> bool {
     })
 }
 
+/// Single source of truth for "does the current input line hold an unsent
+/// draft after feeding these input bytes", starting from `prev`. This is the
+/// daemon-side safety signal that PROTECTS a session a user typed into but
+/// never submitted: such text lives only in the running process / PTY line
+/// buffer (never the agent JSONL), so a release+re-resume migration would
+/// silently lose it. The flag is STICKY across calls — "typed then walked
+/// away" stays protected until the line is actually submitted or killed.
+///
+/// Escape / control sequences are skipped so they can NEVER fabricate a draft:
+/// arrow keys (`ESC [ A`), F-keys (`ESC O P`), mouse reports
+/// (`ESC [ < 0;34;12 M`) and the bracketed-paste markers (`ESC [ 200~` /
+/// `ESC [ 201~`) all carry printable-looking bytes (digits, letters) that must
+/// not be mistaken for typed text. Note the PASTED CONTENT between the markers
+/// is NOT skipped — a paste into the line genuinely is a draft.
+///
+/// Rules on the un-escaped stream:
+/// - `\r` / `\n` (submit) and Ctrl-C (`0x03`) / Ctrl-U (`0x15`) clear the draft.
+/// - Backspace (`0x08` / `0x7f`) is a no-op: we track a bool, not the line
+///   contents, so we conservatively keep the draft (false-positive draft is
+///   safe — it only delays a migration; a false-negative would lose work).
+/// - Any printable, non-whitespace char sets the draft.
+///
+/// Mirrors the GUI's per-keystroke optimistic busy hint
+/// (`terminal_input_busy_hint_decision`) but is byte-level, escape-aware, and
+/// returns only the sticky-draft bit the migration predicate needs.
+pub fn input_line_has_unsent_draft_after(prev: bool, data: &[u8]) -> bool {
+    #[derive(Clone, Copy)]
+    enum EscState {
+        Normal,
+        Escape,
+        Csi,
+        Ss3,
+        Osc,
+    }
+    let mut draft = prev;
+    let mut state = EscState::Normal;
+    for &byte in data {
+        match state {
+            EscState::Normal => match byte {
+                0x1b => state = EscState::Escape,
+                b'\r' | b'\n' => draft = false,
+                0x03 | 0x15 => draft = false,
+                0x08 | 0x7f => {}
+                // Printable, non-whitespace bytes (incl. UTF-8 continuation
+                // bytes >= 0x80) are typed text. Control bytes (< 0x20) and
+                // ASCII whitespace are ignored.
+                b if b >= 0x20 && b != b' ' && b != b'\t' => draft = true,
+                _ => {}
+            },
+            EscState::Escape => {
+                state = match byte {
+                    b'[' => EscState::Csi,
+                    b'O' => EscState::Ss3,
+                    b']' => EscState::Osc,
+                    // Two-byte ESC sequence (e.g. Alt-key, ESC ESC) — consume
+                    // this one byte and resume.
+                    _ => EscState::Normal,
+                };
+            }
+            EscState::Csi => {
+                // CSI parameter/intermediate bytes run until a final byte in
+                // 0x40..=0x7e. Bracketed-paste `ESC [ 200~` terminates at `~`,
+                // so the pasted content that follows is parsed as Normal text.
+                if (0x40..=0x7e).contains(&byte) {
+                    state = EscState::Normal;
+                }
+            }
+            EscState::Ss3 => state = EscState::Normal,
+            EscState::Osc => {
+                // OSC strings end at BEL; the ST form (ESC \\) resolves on the
+                // ESC, which re-enters Escape and consumes the trailing `\\`.
+                match byte {
+                    0x07 => state = EscState::Normal,
+                    0x1b => state = EscState::Escape,
+                    _ => {}
+                }
+            }
+        }
+    }
+    draft
+}
+
 pub fn resolve_yggterm_home() -> Result<PathBuf> {
     if let Some(value) = std::env::var_os(ENV_YGGTERM_HOME) {
         let p = PathBuf::from(value);
@@ -1988,6 +2070,68 @@ fn short_session_id(session_id: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn input_draft_sets_on_typed_text_and_clears_on_submit() {
+        // Typing printable text raises the draft.
+        assert!(input_line_has_unsent_draft_after(false, b"git status"));
+        // Submitting (Enter) clears it.
+        assert!(!input_line_has_unsent_draft_after(true, b"\r"));
+        assert!(!input_line_has_unsent_draft_after(false, b"ls -la\n"));
+        // Ctrl-C / Ctrl-U clear a pending line.
+        assert!(!input_line_has_unsent_draft_after(true, b"\x03"));
+        assert!(!input_line_has_unsent_draft_after(true, b"\x15"));
+    }
+
+    #[test]
+    fn input_draft_is_sticky_across_calls() {
+        let mut draft = false;
+        draft = input_line_has_unsent_draft_after(draft, b"hel");
+        assert!(draft, "partial typing is a draft");
+        // A later no-op input (e.g. a redraw-triggering resize ack is not input,
+        // but even an arrow key) must keep the draft sticky.
+        draft = input_line_has_unsent_draft_after(draft, b"\x1b[A");
+        assert!(draft, "arrow key must not clear the draft");
+        draft = input_line_has_unsent_draft_after(draft, b"lo\r");
+        assert!(!draft, "submit clears it");
+    }
+
+    #[test]
+    fn input_draft_ignores_escape_sequences() {
+        // Arrow keys, F-keys, and bare cursor moves carry no typed text.
+        assert!(!input_line_has_unsent_draft_after(false, b"\x1b[A\x1b[B\x1b[C\x1b[D"));
+        assert!(!input_line_has_unsent_draft_after(false, b"\x1bOP\x1bOQ"));
+        // Alt-key (ESC + letter) is not a draft.
+        assert!(!input_line_has_unsent_draft_after(false, b"\x1bb"));
+    }
+
+    #[test]
+    fn input_draft_ignores_mouse_reports() {
+        // SGR mouse report: ESC [ < 0 ; 34 ; 12 M — the digits must not look
+        // like typed text, or a moused/scrolled session would never migrate.
+        assert!(!input_line_has_unsent_draft_after(false, b"\x1b[<0;34;12M"));
+        assert!(!input_line_has_unsent_draft_after(false, b"\x1b[<64;10;5m"));
+    }
+
+    #[test]
+    fn input_draft_counts_pasted_content_between_brackets() {
+        // Bracketed paste: markers skipped, content counts as a draft.
+        assert!(input_line_has_unsent_draft_after(
+            false,
+            b"\x1b[200~echo hi\x1b[201~"
+        ));
+        // …but a paste that the user then submits is no longer a draft.
+        assert!(!input_line_has_unsent_draft_after(
+            false,
+            b"\x1b[200~echo hi\x1b[201~\r"
+        ));
+    }
+
+    #[test]
+    fn input_draft_ignores_lone_whitespace() {
+        assert!(!input_line_has_unsent_draft_after(false, b"   "));
+        assert!(!input_line_has_unsent_draft_after(false, b"\t"));
+    }
 
     #[test]
     fn agent_working_detects_esc_to_interrupt_for_both_clis() {
