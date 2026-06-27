@@ -18453,10 +18453,15 @@ fn titlebar_autohide_chrome_border(palette: Palette) -> &'static str {
     }
 }
 fn titlebar_autohide_chrome_shadow(palette: Palette) -> &'static str {
+    // No hard hairline under the revealed hover chrome — the old
+    // `0 1px 0 rgba(255,255,255,…)` painted an ugly bright white separator line
+    // across the full width (user-reported 2026-06-27). A soft downward shadow
+    // gives the floating overlay depth without a visible line; the subtle
+    // `titlebar_autohide_chrome_border` still defines its bottom edge.
     if palette_is_dark(palette) {
-        "0 1px 0 rgba(255,255,255,0.06)"
+        "0 10px 24px rgba(0,0,0,0.34)"
     } else {
-        "0 1px 0 rgba(255,255,255,0.42)"
+        "0 10px 22px rgba(70,92,116,0.12)"
     }
 }
 fn titlebar_wrapper_style(
@@ -42353,12 +42358,14 @@ fn Titlebar(
                     }
                     div {
                         class: "yggterm-titlebar-view-toggle",
-                        style: toggle_slider_style(snapshot.palette),
+                        style: segmented_control_track_style(snapshot.palette),
                         onmousedown: |evt| evt.stop_propagation(),
                         button {
-                            style: toggle_slider_end_style(
+                            style: segmented_control_segment_style(
                                 snapshot.palette,
-                                snapshot.active_view_mode == WorkspaceViewMode::Rendered
+                                snapshot.active_view_mode == WorkspaceViewMode::Rendered,
+                                false,
+                                true,
                             ),
                             ondoubleclick: |evt| evt.stop_propagation(),
                             onclick: move |_| on_set_view_mode.call(WorkspaceViewMode::Rendered),
@@ -42371,9 +42378,11 @@ fn Titlebar(
                             "Web View"
                         }
                         button {
-                            style: toggle_slider_end_style(
+                            style: segmented_control_segment_style(
                                 snapshot.palette,
-                                snapshot.active_view_mode == WorkspaceViewMode::Terminal
+                                snapshot.active_view_mode == WorkspaceViewMode::Terminal,
+                                false,
+                                true,
                             ),
                             ondoubleclick: |evt| evt.stop_propagation(),
                             onclick: move |_| on_set_view_mode.call(WorkspaceViewMode::Terminal),
@@ -47086,15 +47095,15 @@ fn AgentModeSelector(
 ) -> Element {
     rsx! {
         div {
-            style: toggle_slider_style(palette),
+            style: segmented_control_track_style(palette),
             button {
-                style: toggle_slider_end_style(palette, selected == SessionKind::Codex),
+                style: segmented_control_segment_style(palette, selected == SessionKind::Codex, false, true),
                 disabled: disabled,
                 onclick: move |_| on_select.call(SessionKind::Codex),
                 "Codex"
             }
             button {
-                style: toggle_slider_end_style(palette, selected == SessionKind::CodexLiteLlm),
+                style: segmented_control_segment_style(palette, selected == SessionKind::CodexLiteLlm, false, true),
                 disabled: disabled,
                 onclick: move |_| on_select.call(SessionKind::CodexLiteLlm),
                 "Codex LiteLLM"
@@ -72060,17 +72069,14 @@ fn ThemeEditorOverlay(
                     div {
                         style: "display:flex; align-items:center; gap:8px;",
                         div {
-                            style: format!(
-                                "display:flex; align-items:center; gap:4px; padding:4px; border-radius:999px; \
-                                 background:rgba(236,242,247,0.92); box-shadow: inset 0 0 0 1px rgba(210,221,232,0.9);"
-                            ),
+                            style: segmented_control_track_style(snapshot.palette),
                             button {
-                                style: segmented_pill_button_style(snapshot.palette, snapshot.settings.theme == UiTheme::ZedLight),
+                                style: segmented_control_segment_style(snapshot.palette, snapshot.settings.theme == UiTheme::ZedLight, true, false),
                                 onclick: move |_| on_set_ui_theme.call(UiTheme::ZedLight),
                                 "Light"
                             }
                             button {
-                                style: segmented_pill_button_style(snapshot.palette, snapshot.settings.theme == UiTheme::ZedDark),
+                                style: segmented_control_segment_style(snapshot.palette, snapshot.settings.theme == UiTheme::ZedDark, true, false),
                                 onclick: move |_| on_set_ui_theme.call(UiTheme::ZedDark),
                                 "Dark"
                             }
@@ -72475,27 +72481,14 @@ fn ThemeSettingsSection(
                     }
                 ),
                 div {
-                    style: format!(
-                        "display:flex; align-items:center; gap:5px; height:34px; padding:4px; border-radius:999px; \
-                         background:{}; box-shadow: inset 0 0 0 1px {};",
-                        if palette_is_dark(palette) {
-                            "rgba(11,16,21,0.92)"
-                        } else {
-                            "rgba(236,242,247,0.94)"
-                        },
-                        if palette_is_dark(palette) {
-                            "rgba(93,116,134,0.42)"
-                        } else {
-                            "rgba(210,221,232,0.92)"
-                        }
-                    ),
+                    style: segmented_control_track_style(palette),
                     button {
-                        style: segmented_pill_button_style(palette, selected_theme == UiTheme::ZedLight),
+                        style: segmented_control_segment_style(palette, selected_theme == UiTheme::ZedLight, true, false),
                         onclick: move |_| on_select.call(UiTheme::ZedLight),
                         "Light"
                     }
                     button {
-                        style: segmented_pill_button_style(palette, selected_theme == UiTheme::ZedDark),
+                        style: segmented_control_segment_style(palette, selected_theme == UiTheme::ZedDark, true, false),
                         onclick: move |_| on_select.call(UiTheme::ZedDark),
                         "Dark"
                     }
@@ -72627,32 +72620,19 @@ fn NotificationSettingsSection(
             div {
                 style: settings_section_card_style(palette),
                 div {
-                    style: format!(
-                        "display:flex; align-items:center; gap:5px; height:34px; padding:4px; border-radius:999px; \
-                         background:{}; box-shadow: inset 0 0 0 1px {};",
-                        if palette_is_dark(palette) {
-                            "rgba(11,16,21,0.92)"
-                        } else {
-                            "rgba(236,242,247,0.94)"
-                        },
-                        if palette_is_dark(palette) {
-                            "rgba(93,116,134,0.42)"
-                        } else {
-                            "rgba(210,221,232,0.92)"
-                        }
-                    ),
+                    style: segmented_control_track_style(palette),
                     button {
-                        style: segmented_pill_button_style(palette, selected == NotificationDeliveryMode::InApp),
+                        style: segmented_control_segment_style(palette, selected == NotificationDeliveryMode::InApp, true, false),
                         onclick: move |_| on_select.call(NotificationDeliveryMode::InApp),
                         "App"
                     }
                     button {
-                        style: segmented_pill_button_style(palette, selected == NotificationDeliveryMode::Both),
+                        style: segmented_control_segment_style(palette, selected == NotificationDeliveryMode::Both, true, false),
                         onclick: move |_| on_select.call(NotificationDeliveryMode::Both),
                         "Both"
                     }
                     button {
-                        style: segmented_pill_button_style(palette, selected == NotificationDeliveryMode::System),
+                        style: segmented_control_segment_style(palette, selected == NotificationDeliveryMode::System, true, false),
                         onclick: move |_| on_select.call(NotificationDeliveryMode::System),
                         "System"
                     }
@@ -75136,7 +75116,14 @@ fn primary_action_style(palette: Palette) -> String {
         palette.accent
     )
 }
-fn toggle_slider_style(palette: Palette) -> String {
+/// Standard segmented control (pill toggle) — the "snug" look where the track is
+/// only a hair larger than the active segment. The titlebar Web View/Terminal
+/// toggle is the reference. Used by every multi-segment MODE switch: titlebar
+/// view mode, the agent-mode selector, Settings Light/Dark, and Notifications
+/// App/Both/System. NOT for binary on/off switches — those use the
+/// `inline_toggle_*` track+thumb (e.g. Auto-hide Titlebar, Sound).
+/// See DESIGN.md "Segmented controls".
+fn segmented_control_track_style(palette: Palette) -> String {
     format!(
         "display:flex; align-items:center; gap:4px; padding:3px; border:none; border-radius:999px; background:{}; box-shadow: inset 0 0 0 1px {}; user-select:none; -webkit-user-select:none; transition:{};",
         if palette_is_dark(palette) {
@@ -75152,26 +75139,45 @@ fn toggle_slider_style(palette: Palette) -> String {
         standard_transition(&["background-color", "box-shadow"])
     )
 }
-fn toggle_slider_end_style(palette: Palette, selected: bool) -> String {
+/// One segment of a [`segmented_control_track_style`] control. `grow` makes the
+/// segment flex to fill the track evenly (settings panels); `false` keeps a fixed
+/// min-width (compact chrome toggles). `on_chrome` picks luminance-aware text for
+/// the variable titlebar chrome; `false` uses plain palette text on a card. The
+/// snug look comes from a near-edge-to-edge active fill with NO drop shadow — the
+/// track's 3px padding is the only gap (the old settings pill added a
+/// `0 3px 10px` lift that read as a much larger bg pill).
+fn segmented_control_segment_style(
+    palette: Palette,
+    selected: bool,
+    grow: bool,
+    on_chrome: bool,
+) -> String {
+    let sizing = if grow { "flex:1; min-width:0;" } else { "min-width:82px;" };
+    let background = if selected {
+        if palette_is_dark(palette) {
+            "rgba(255,255,255,0.10)"
+        } else {
+            "rgba(255,255,255,0.92)"
+        }
+    } else if palette_is_dark(palette) {
+        "rgba(255,255,255,0.03)"
+    } else {
+        "transparent"
+    };
+    let color: String = if on_chrome {
+        chrome_chip_text_color(palette, selected, selected).to_string()
+    } else if selected {
+        palette.text.to_string()
+    } else {
+        palette.muted.to_string()
+    };
+    let font_weight = if on_chrome || selected { 700 } else { 600 };
     format!(
-        "height:26px; min-width:82px; padding:0 12px; border:none; border-radius:999px; background:{}; color:{}; font-size:11px; font-weight:700; \
+        "{sizing} height:26px; padding:0 12px; border:none; border-radius:999px; background:{}; color:{}; font-size:11px; font-weight:{}; \
          user-select:none; -webkit-user-select:none; transition:{};",
-        if selected {
-            if palette_is_dark(palette) {
-                "rgba(255,255,255,0.10)"
-            } else {
-                "rgba(255,255,255,0.92)"
-            }
-        } else if palette_is_dark(palette) {
-            "rgba(255,255,255,0.03)"
-        } else {
-            "transparent"
-        },
-        if selected {
-            chrome_chip_text_color(palette, true, true)
-        } else {
-            chrome_chip_text_color(palette, false, false)
-        },
+        background,
+        color,
+        font_weight,
         standard_transition(&["background-color", "color"])
     )
 }
@@ -75261,37 +75267,6 @@ fn zoom_button_style(palette: Palette) -> String {
         },
         palette.text,
         standard_transition(&["background-color", "color"])
-    )
-}
-fn segmented_pill_button_style(palette: Palette, selected: bool) -> String {
-    format!(
-        "flex:1; height:26px; border:none; border-radius:999px; background:{}; color:{}; font-size:11px; font-weight:{}; \
-         display:inline-flex; align-items:center; justify-content:center; box-shadow:{}; transition:{};",
-        if selected {
-            if palette_is_dark(palette) {
-                "rgba(23,30,37,0.98)"
-            } else {
-                "rgba(255,255,255,0.98)"
-            }
-        } else {
-            "transparent"
-        },
-        if selected {
-            palette.text
-        } else {
-            palette.muted
-        },
-        if selected { 700 } else { 600 },
-        if selected {
-            if palette_is_dark(palette) {
-                "0 6px 18px rgba(0,0,0,0.18), inset 0 0 0 1px rgba(96,118,136,0.56)"
-            } else {
-                "0 3px 10px rgba(89,111,132,0.12), inset 0 0 0 1px rgba(216,227,236,0.96)"
-            }
-        } else {
-            "none"
-        },
-        standard_transition(&["background-color", "color", "box-shadow"])
     )
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
