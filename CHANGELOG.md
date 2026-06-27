@@ -14,8 +14,10 @@ This file tracks user-visible changes in `yggterm`.
   move). Opt-in for now via `YGGTERM_ENABLE_PROGRESSIVE_MIGRATION=1` while it bakes.
 - **A plain shell only shows the "working" dot when a command is actually running** in it, decided
   from the OS (the terminal's foreground process), not from scraped screen text.
-- **Machine and folder rows in the sidebar now show an aggregate "working" dot** when any session
-  inside them is working — visible even while the row is collapsed.
+- **Machine and folder rows in the sidebar now show an aggregate "working" status** when a session
+  inside them is working — visible even while the row is collapsed. SSH machine rows adopt the same
+  flat status-dot vocabulary as live sessions (the old haloed indicator is gone) and blink while a
+  session hosted on that machine is working.
 
 ## 2.9.45
 
