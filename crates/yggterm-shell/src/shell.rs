@@ -43947,6 +43947,27 @@ fn sidebar_row_shows_busy_icon(snapshot: &RenderSnapshot, row: &BrowserRow) -> b
 /// reuses the per-session busy SSOT. Cheap (one linear pass over the subtree);
 /// no recursion (only Session descendants are queried, which never re-enter the
 /// group branch). See DESIGN.md "Status indicator vocabulary".
+/// A machine ROOT row (`__remote_machine__/<key>`) blinks when any LIVE session
+/// belonging to that machine is working (issue #3). Live sessions hang off the
+/// flat "Live Sessions" group, NOT under the machine's cwd-tree, so the
+/// descendant walk can't see them — match by host instead. Restricted to the
+/// machine-root path prefix so cwd SUBgroups under the machine never inherit the
+/// whole machine's activity. Snapshot-only (no `ShellState`) so it composes with
+/// `sidebar_row_busy_state`.
+fn sidebar_machine_row_has_working_live_session(
+    snapshot: &RenderSnapshot,
+    row: &BrowserRow,
+) -> bool {
+    let Some(machine_key) = row.full_path.strip_prefix("__remote_machine__/") else {
+        return false;
+    };
+    snapshot.live_sessions.iter().any(|session| {
+        session.working == Some(true)
+            && (session.ssh_target.as_deref() == Some(machine_key)
+                || session.host_label == machine_key)
+    })
+}
+
 fn sidebar_group_has_working_descendant(
     snapshot: &RenderSnapshot,
     group_row: &BrowserRow,
@@ -43969,8 +43990,12 @@ fn sidebar_row_busy_state(snapshot: &RenderSnapshot, row: &BrowserRow) -> Sideba
         return SidebarBusyState::idle();
     }
     if row.kind == BrowserRowKind::Group {
-        // Issue #3: machine/cwd rows aggregate their subtree's working state.
-        return if sidebar_group_has_working_descendant(snapshot, row) {
+        // Issue #3: a group blinks when work is happening inside it — either a
+        // session in its cwd subtree (Live Sessions / local folders) OR, for a
+        // machine root row, any live session hosted on that machine.
+        return if sidebar_group_has_working_descendant(snapshot, row)
+            || sidebar_machine_row_has_working_live_session(snapshot, row)
+        {
             SidebarBusyState::busy("group_descendant_working")
         } else {
             SidebarBusyState::idle()
@@ -44740,21 +44765,31 @@ fn SidebarRow(
                             "{visible_label}"
                         }
                     }
+                    // Machine row status dot (issue #3): the OLD haloed
+                    // "traffic-signal" indicator is replaced by the new flat-circle
+                    // vocabulary (DESIGN.md) — color encodes reachability (green
+                    // healthy / amber cached / red offline), and it BLINKS (the
+                    // shared hard step-end pulse) when any session in the machine's
+                    // subtree is working, exactly like a live-session row's dot.
                     if let Some(health) = machine_health {
                         span {
                             "data-machine-indicator": "1",
+                            "data-machine-working": if busy_icon { "1" } else { "0" },
+                            title: if busy_icon { "Working inside" } else { "" },
                             style: format!(
-                                "display:inline-flex; width:6px; min-width:6px; height:6px; border-radius:999px; background:{}; box-shadow:0 0 0 1.5px rgba(255,255,255,0.74); opacity:0.96;",
-                                machine_indicator_color_value(health)
+                                "display:inline-flex; width:7px; min-width:7px; height:7px; border-radius:999px; background:{};{}",
+                                machine_indicator_color_value(health),
+                                if busy_icon {
+                                    " animation: yggterm-status-dot-blink 1.1s step-end infinite;"
+                                } else {
+                                    ""
+                                }
                             ),
                         }
-                    }
-                    // Issue #3: aggregate working dot on a machine/cwd row when a
-                    // session in its subtree is working — visible even while the
-                    // group is collapsed. Reuses the live working-dot vocabulary
-                    // (DESIGN.md): blink encodes activity. Sits after the label so
-                    // it never shifts the icon/indent of idle group rows.
-                    if row_is_group && busy_icon {
+                    } else if row_is_group && busy_icon {
+                        // Non-machine groups (cwd folders, the local root) have no
+                        // health dot; surface their aggregate working state with the
+                        // same blinking working dot the live rows use.
                         span {
                             "data-sidebar-group-working-dot": "1",
                             title: "Working inside",
