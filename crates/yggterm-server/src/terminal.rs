@@ -617,6 +617,16 @@ impl TerminalManager {
         self.sessions.get(key).map(|session| session.idle_for_ms())
     }
 
+    /// `Some(true)` when the owned session has typed-but-unsent input on its
+    /// current line, `Some(false)` when the line is clean, `None` when this
+    /// daemon does not own the session (so the migration predicate must bias to
+    /// "not migratable"). See `PtySessionRuntime::has_pending_input_draft`.
+    pub fn session_has_pending_input_draft(&self, key: &str) -> Option<bool> {
+        self.sessions
+            .get(key)
+            .map(|session| session.has_pending_input_draft())
+    }
+
     pub fn session_process_id(&self, key: &str) -> Option<u32> {
         self.sessions
             .get(key)
@@ -1011,6 +1021,13 @@ struct PtySessionRuntime {
     seq: Arc<AtomicU64>,
     started_at_ms: u64,
     last_activity_ms: Arc<AtomicU64>,
+    // Sticky "the current input line holds typed-but-unsent text" flag,
+    // reconstructed from forwarded input bytes in `write()` via
+    // `yggterm_core::input_line_has_unsent_draft_after`. Protects a drafted
+    // prompt (which lives only in the PTY line buffer, never the agent JSONL)
+    // from a release+re-resume session migration. See
+    // [[finding-daemon-authoritative-working-state-2945]].
+    pending_input_draft: Arc<AtomicBool>,
     runtime_output_seen: Arc<AtomicBool>,
     eof_without_output: Arc<AtomicBool>,
     attach_ready_seen: Arc<AtomicBool>,
@@ -1357,6 +1374,7 @@ impl PtySessionRuntime {
         let seq = Arc::new(AtomicU64::new(0));
         let started_at_ms = now_millis();
         let last_activity_ms = Arc::new(AtomicU64::new(started_at_ms));
+        let pending_input_draft = Arc::new(AtomicBool::new(false));
         let runtime_output_seen = Arc::new(AtomicBool::new(false));
         let eof_without_output = Arc::new(AtomicBool::new(false));
         let attach_ready_seen = Arc::new(AtomicBool::new(false));
@@ -1553,6 +1571,7 @@ impl PtySessionRuntime {
             seq,
             started_at_ms,
             last_activity_ms,
+            pending_input_draft,
             runtime_output_seen,
             eof_without_output,
             attach_ready_seen,
@@ -1649,6 +1668,13 @@ impl PtySessionRuntime {
     /// mid-turn or just finished. See [[finding-hot-update-interrupts-remote-sessions]].
     fn idle_for_ms(&self) -> u64 {
         now_millis().saturating_sub(self.last_activity_ms.load(Ordering::SeqCst))
+    }
+
+    /// `true` when the user has typed text on the current input line but not yet
+    /// submitted it (sticky; see `pending_input_draft`). The migration predicate
+    /// treats this as PROTECTED — releasing such a session would lose the draft.
+    fn has_pending_input_draft(&self) -> bool {
+        self.pending_input_draft.load(Ordering::SeqCst)
     }
 
     fn snapshot(&self) -> String {
@@ -1822,6 +1848,15 @@ impl PtySessionRuntime {
             return Ok(());
         }
         self.last_activity_ms.store(now_millis(), Ordering::SeqCst);
+        // Reconstruct the sticky "unsent draft on the current line" flag from
+        // the forwarded input. This is the ONLY input path the client drives;
+        // daemon-internal protocol auto-responses (DA/DSR replies) bypass it,
+        // so they never fabricate a draft. See `pending_input_draft`.
+        let prev_draft = self.pending_input_draft.load(Ordering::SeqCst);
+        let next_draft = yggterm_core::input_line_has_unsent_draft_after(prev_draft, data.as_bytes());
+        if next_draft != prev_draft {
+            self.pending_input_draft.store(next_draft, Ordering::SeqCst);
+        }
         enqueue_terminal_write(
             &self.writer_tx,
             &self.key,

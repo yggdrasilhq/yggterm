@@ -515,6 +515,73 @@ fn hot_update_idle_gate_overridden() -> bool {
         .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "yes" | "on"))
 }
 
+/// How long a session must have been quiet (no input AND no output — both bump
+/// `last_activity_ms`) before progressive migration may release it. Generous on
+/// purpose: a working codex/CC turn drives an animated spinner ~10fps the whole
+/// time, so output-idle stays ~0 while busy and only climbs at a true prompt;
+/// 45s clears the spinner's frame cadence with headroom while still letting an
+/// idle session migrate promptly. Tunable via `YGGTERM_MIGRATION_IDLE_MS`.
+const MIGRATION_IDLE_THRESHOLD_MS_DEFAULT: u64 = 45_000;
+
+fn migration_idle_threshold_ms() -> u64 {
+    std::env::var("YGGTERM_MIGRATION_IDLE_MS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(MIGRATION_IDLE_THRESHOLD_MS_DEFAULT)
+}
+
+/// The tangible, daemon-side OS signals a progressive session migration weighs.
+/// Every field is an OS fact the PTY owner already has (it holds the master fd
+/// and forwards every byte), uniform across codex/CC/shell — NOT a screen-string
+/// scrape. See [[finding-daemon-authoritative-working-state-2945]] for why the
+/// `esc to interrupt` footer was demoted from a primary signal to the optional
+/// `screen_shows_working` guard.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MigratableSignals {
+    /// Milliseconds since the session last had ANY input or output activity.
+    /// `None` = this daemon doesn't own a live runtime for the key.
+    activity_idle_ms: Option<u64>,
+    /// Sticky "typed-but-unsent draft on the current line". `Some(true)` =
+    /// protected draft present; `None` = not owned.
+    has_pending_draft: Option<bool>,
+    /// `Some(true)` when a foreground command is running in the tty (the PTY's
+    /// foreground pgrp differs from the session leader) — i.e. a shell command
+    /// or an agent tool-execution child, including SILENT ones that emit no
+    /// output (`sleep 300`). `None` = not owned / not a unix runtime.
+    foreground_command_running: Option<bool>,
+    /// Optional belt-and-suspenders guard: the live screen footer still shows a
+    /// recognized agent working indicator. Only ever ADDS safety (an agent
+    /// genuinely mid-turn but momentarily silent); shells never depend on it.
+    screen_shows_working: bool,
+}
+
+/// Pure predicate: is this session SAFE to migrate (release + re-resume on the
+/// newest daemon) right now? Biased entirely to safety — a lingering old daemon
+/// is harmless, but losing a user's unsent work is the cardinal sin — so ANY
+/// unavailable/ambiguous signal (`None`) means NOT migratable.
+fn session_is_migratable(signals: &MigratableSignals, idle_threshold_ms: u64) -> bool {
+    // (a) output/input-idle past the generous threshold.
+    let Some(idle_ms) = signals.activity_idle_ms else {
+        return false;
+    };
+    if idle_ms < idle_threshold_ms {
+        return false;
+    }
+    // (b) no protected draft on the current line.
+    if signals.has_pending_draft != Some(false) {
+        return false;
+    }
+    // (c) no foreground command running in the tty.
+    if signals.foreground_command_running != Some(false) {
+        return false;
+    }
+    // (d) optional working-footer guard.
+    if signals.screen_shows_working {
+        return false;
+    }
+    true
+}
+
 #[cfg(unix)]
 fn server_socket_path_lexists(path: &Path) -> bool {
     fs::symlink_metadata(path).is_ok()
@@ -2129,6 +2196,78 @@ impl DaemonRuntime {
         None
     }
 
+    /// Gather the live OS migration signals for a runtime key we own. Reads the
+    /// PTY owner's own facts (activity idle, sticky draft, foreground pgrp) plus
+    /// the optional screen-footer guard. A key we don't own yields all-`None`
+    /// signals → never migratable (the safety bias lives in the pure predicate).
+    fn session_migratable_signals(&self, runtime_key: &str) -> MigratableSignals {
+        MigratableSignals {
+            activity_idle_ms: self.terminals.session_idle_for_ms(runtime_key),
+            has_pending_draft: self.terminals.session_has_pending_input_draft(runtime_key),
+            foreground_command_running: self
+                .terminals
+                .session_foreground_process_active(runtime_key),
+            screen_shows_working: self
+                .terminals
+                .session_screen_snapshot(runtime_key)
+                .as_deref()
+                .map(yggterm_core::screen_text_shows_agent_working)
+                .unwrap_or(false),
+        }
+    }
+
+    /// `true` when this daemon may safely release `runtime_key` for the newest
+    /// daemon to re-resume and own (progressive migration). Only ever called on
+    /// runtimes THIS daemon owns; see `session_is_migratable`.
+    fn session_is_migratable_now(&self, runtime_key: &str) -> bool {
+        session_is_migratable(
+            &self.session_migratable_signals(runtime_key),
+            migration_idle_threshold_ms(),
+        )
+    }
+
+    /// Release an owned agent session so the newest daemon re-resumes and owns
+    /// it (progressive migration, mechanism (b)). We KILL our PTY runtime but
+    /// keep the logical live session intact — the successor already holds the
+    /// session record (it restored it as a preserved-owner bridge) and, once it
+    /// sees this daemon no longer reports the runtime, re-resumes it on its own
+    /// PTY via the existing owner-unreachable recovery / reveal path. Our own
+    /// routine persists are muted while superseded, so dropping the runtime here
+    /// can never clobber the successor's authoritative server-state.
+    fn release_session_for_migration(&mut self, home_dir: &Path, runtime_key: &str) {
+        let idle_ms = self.terminals.session_idle_for_ms(runtime_key);
+        let kind = self.server.live_session_kind(runtime_key);
+        let removed = match self.terminals.remove_session(runtime_key, None) {
+            Ok(removed) => removed,
+            Err(error) => {
+                append_trace_event(
+                    home_dir,
+                    "daemon",
+                    "lifecycle",
+                    "progressive_migration_release_failed",
+                    serde_json::json!({
+                        "runtime_key": runtime_key,
+                        "error": error.to_string(),
+                    }),
+                );
+                return;
+            }
+        };
+        append_trace_event(
+            home_dir,
+            "daemon",
+            "lifecycle",
+            "progressive_migration_session_released",
+            serde_json::json!({
+                "runtime_key": runtime_key,
+                "kind": kind.map(crate::session_kind_label),
+                "idle_ms": idle_ms,
+                "runtime_removed": removed,
+                "current_pid": std::process::id(),
+            }),
+        );
+    }
+
     fn overlay_terminal_runtime_snapshot_session(&self, session: &mut SnapshotSessionView) {
         let runtime_path = self.terminal_runtime_key_for_path(&session.session_path);
         session.terminal_process_id = self.terminals.session_process_id(&runtime_path);
@@ -2163,6 +2302,14 @@ impl DaemonRuntime {
                 session.working = screen_text
                     .as_deref()
                     .map(yggterm_core::screen_text_shows_agent_working);
+            } else if session.kind == SessionKind::Shell {
+                // Issue #1 ("shell always working"): a plain shell has no agent
+                // footer to scrape — its working state is the OS fact "a
+                // foreground command is running in the tty" (foreground pgrp !=
+                // session leader). `Some(true)` while a command runs (incl.
+                // silent ones), `Some(false)` at a bare prompt, `None` when not
+                // owned (so the GUI must NOT blink a bridged/foreign shell).
+                session.working = self.terminals.session_foreground_process_active(&runtime_path);
             }
             if let Some(screen_text) = screen_text.as_deref()
                 && let Some((status_line, terminal_lines)) =
@@ -8893,8 +9040,17 @@ fn spawn_disk_binary_version_poll(
                 // The handler spawned the new-version successor and wrote the
                 // preserved-owner registry; we now linger as the PTY owner. Do
                 // NOT shutdown (that would kill the PTYs we just preserved). Stop
-                // polling; idle-shutdown / the stale-daemon sweep retires us once
-                // our sessions drain.
+                // polling and, when progressive migration is enabled, hand our
+                // sessions one-by-one to the successor as each becomes safe so
+                // ownership converges to the newest daemon (working-state +
+                // titles then work natively there); otherwise idle-shutdown /
+                // the stale-daemon sweep retires us once our sessions drain.
+                // See [[finding-daemon-authoritative-working-state-2945]].
+                spawn_progressive_session_migration(
+                    endpoint.clone(),
+                    home_dir.clone(),
+                    Arc::clone(&runtime),
+                );
                 break;
             }
             // Best-effort self-shutdown. If the call fails (e.g. socket
@@ -8903,6 +9059,121 @@ fn spawn_disk_binary_version_poll(
             // process should already be on its way out.
             let _ = shutdown(&endpoint);
             break;
+        }
+    });
+}
+
+/// Opt-in gate for progressive per-session migration. Default OFF: the
+/// cross-daemon release+re-resume is a destructive operation on the
+/// outage-prone daemon-lifecycle SSOT and is shipped dormant until it has been
+/// live-verified through a controlled two-deploy rollout. Enable with
+/// `YGGTERM_ENABLE_PROGRESSIVE_MIGRATION=1`. When off, a handed-off daemon
+/// lingers as the preserved owner exactly as before.
+/// See [[finding-daemon-authoritative-working-state-2945]].
+fn progressive_migration_enabled() -> bool {
+    std::env::var("YGGTERM_ENABLE_PROGRESSIVE_MIGRATION")
+        .ok()
+        .is_some_and(|value| matches!(value.trim(), "1" | "true" | "yes" | "on"))
+}
+
+/// Only agent CLI sessions are migratable via release+re-resume: their state
+/// persists in the agent's own JSONL, so killing the PTY and re-resuming on the
+/// newest daemon is lossless (once the migration predicate has ruled out an
+/// unsent draft). A plain shell has no such persistence — re-running its launch
+/// command yields a fresh shell — so it is never released this way (it stays
+/// with the lingering owner, awaiting a future lossless fd-handoff).
+fn session_kind_is_migratable_agent(kind: SessionKind) -> bool {
+    matches!(
+        kind,
+        SessionKind::Codex | SessionKind::CodexLiteLlm | SessionKind::ClaudeCode
+    )
+}
+
+/// One owned session's migration inputs for a single tick.
+struct MigrationCandidateRow {
+    runtime_key: String,
+    re_resumable: bool,
+    migratable: bool,
+    idle_ms: u64,
+}
+
+/// Pick the SINGLE session to migrate this tick — oldest-idle-first (largest
+/// idle wins) among sessions that are BOTH re-resumable agents AND currently
+/// migratable. `None` when nothing is safe yet. Pacing one-per-tick avoids a
+/// post-deploy migration storm (CPU + reveal-storm class). Pure for testing.
+fn select_next_migration_candidate(rows: &[MigrationCandidateRow]) -> Option<String> {
+    rows.iter()
+        .filter(|row| row.re_resumable && row.migratable)
+        .max_by_key(|row| row.idle_ms)
+        .map(|row| row.runtime_key.clone())
+}
+
+/// Drive progressive convergence from a lingering preserved-owner daemon: each
+/// tick, if a successor is reachable to adopt, release the oldest-idle safe
+/// session so the successor re-resumes and OWNS it. Exit once our hands are
+/// empty (the successor owns everything). Sessions that never become migratable
+/// (e.g. a plain keep-alive shell) keep us lingering harmlessly.
+fn spawn_progressive_session_migration(
+    endpoint: ServerEndpoint,
+    home_dir: PathBuf,
+    runtime: Arc<Mutex<DaemonRuntime>>,
+) {
+    if !progressive_migration_enabled() {
+        return;
+    }
+    std::thread::spawn(move || {
+        // Paced cadence: one release per tick, oldest-idle first.
+        const POLL_INTERVAL_MS: u64 = 5_000;
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(POLL_INTERVAL_MS));
+            let owned = {
+                let rt = lock_daemon_runtime(&runtime, "progressive_migration_owned");
+                rt.terminals.session_keys()
+            };
+            if owned.is_empty() {
+                // Empty hands: the successor owns everything now — retire.
+                append_trace_event(
+                    &home_dir,
+                    "daemon",
+                    "lifecycle",
+                    "progressive_migration_owner_empty_retire",
+                    serde_json::json!({ "current_pid": std::process::id() }),
+                );
+                let _ = shutdown(&endpoint);
+                break;
+            }
+            // Never release the only live owner: require a reachable successor
+            // to adopt the released session, or we would strand it.
+            let successor_reachable = !reachable_versioned_daemon_statuses_excluding_endpoint(
+                &home_dir, &endpoint,
+            )
+            .is_empty();
+            if !successor_reachable {
+                continue;
+            }
+            let candidate = {
+                let rt = lock_daemon_runtime(&runtime, "progressive_migration_select");
+                let rows = owned
+                    .iter()
+                    .map(|key| MigrationCandidateRow {
+                        runtime_key: key.clone(),
+                        re_resumable: rt
+                            .server
+                            .live_session_kind(key)
+                            .map(session_kind_is_migratable_agent)
+                            .unwrap_or(false),
+                        migratable: rt.session_is_migratable_now(key),
+                        idle_ms: rt.terminals.session_idle_for_ms(key).unwrap_or(0),
+                    })
+                    .collect::<Vec<_>>();
+                select_next_migration_candidate(&rows)
+            };
+            let Some(runtime_key) = candidate else {
+                // Nothing safe to migrate this tick; keep lingering and re-check.
+                continue;
+            };
+            let mut rt = lock_daemon_runtime(&runtime, "progressive_migration_release");
+            rt.release_session_for_migration(&home_dir, &runtime_key);
         }
     });
 }
@@ -10958,16 +11229,145 @@ fn terminal_write_strategy_for_path(
 #[cfg(test)]
 mod tests {
     use super::{
-        RemoteMachineRefreshQueueStatus, SERVER_PROTOCOL_VERSION,
-        apply_terminal_runtime_truth_to_snapshot, daemon_background_copy_chore_enabled_from_env,
-        mark_remote_machine_refresh_queued, parse_daemon_version_triple,
-        preserved_owner_candidate_for_runtime_key,
+        MigratableSignals, MigrationCandidateRow, RemoteMachineRefreshQueueStatus,
+        SERVER_PROTOCOL_VERSION, apply_terminal_runtime_truth_to_snapshot,
+        daemon_background_copy_chore_enabled_from_env, mark_remote_machine_refresh_queued,
+        parse_daemon_version_triple, preserved_owner_candidate_for_runtime_key,
         preserved_owner_saved_session_mismatch_should_detach,
-        remove_session_should_detach_keep_alive_runtime, terminal_reuse_needs_restart,
+        remove_session_should_detach_keep_alive_runtime, select_next_migration_candidate,
+        session_is_migratable, session_kind_is_migratable_agent, terminal_reuse_needs_restart,
         terminal_sidebar_snapshot_from_screen,
     };
     use crate::TerminalManager;
     use std::collections::{BTreeMap, HashMap, HashSet};
+
+    const MIGRATE_IDLE_MS: u64 = 45_000;
+
+    fn migratable_idle_session() -> MigratableSignals {
+        // The all-clear baseline: idle long enough, no draft, no foreground
+        // command, no working footer.
+        MigratableSignals {
+            activity_idle_ms: Some(60_000),
+            has_pending_draft: Some(false),
+            foreground_command_running: Some(false),
+            screen_shows_working: false,
+        }
+    }
+
+    #[test]
+    fn migratable_when_all_signals_clear() {
+        assert!(session_is_migratable(
+            &migratable_idle_session(),
+            MIGRATE_IDLE_MS
+        ));
+    }
+
+    #[test]
+    fn not_migratable_when_recently_active() {
+        let mut sig = migratable_idle_session();
+        sig.activity_idle_ms = Some(1_000);
+        assert!(!session_is_migratable(&sig, MIGRATE_IDLE_MS));
+    }
+
+    #[test]
+    fn not_migratable_when_draft_present() {
+        let mut sig = migratable_idle_session();
+        sig.has_pending_draft = Some(true);
+        assert!(
+            !session_is_migratable(&sig, MIGRATE_IDLE_MS),
+            "a typed-but-unsent draft must protect the session from release"
+        );
+    }
+
+    #[test]
+    fn not_migratable_when_foreground_command_running() {
+        let mut sig = migratable_idle_session();
+        sig.foreground_command_running = Some(true);
+        assert!(
+            !session_is_migratable(&sig, MIGRATE_IDLE_MS),
+            "a running tty command (incl. silent ones) must block migration"
+        );
+    }
+
+    #[test]
+    fn not_migratable_when_working_footer_present() {
+        let mut sig = migratable_idle_session();
+        sig.screen_shows_working = true;
+        assert!(!session_is_migratable(&sig, MIGRATE_IDLE_MS));
+    }
+
+    #[test]
+    fn not_migratable_when_any_signal_unavailable() {
+        // Safety bias: every ambiguous/unowned signal blocks migration.
+        for mutate in [
+            |s: &mut MigratableSignals| s.activity_idle_ms = None,
+            |s: &mut MigratableSignals| s.has_pending_draft = None,
+            |s: &mut MigratableSignals| s.foreground_command_running = None,
+        ] {
+            let mut sig = migratable_idle_session();
+            mutate(&mut sig);
+            assert!(
+                !session_is_migratable(&sig, MIGRATE_IDLE_MS),
+                "an unavailable signal must never be treated as migratable"
+            );
+        }
+    }
+
+    fn migration_row(key: &str, re: bool, mig: bool, idle_ms: u64) -> MigrationCandidateRow {
+        MigrationCandidateRow {
+            runtime_key: key.to_string(),
+            re_resumable: re,
+            migratable: mig,
+            idle_ms,
+        }
+    }
+
+    #[test]
+    fn migration_picks_oldest_idle_safe_session() {
+        let rows = vec![
+            migration_row("remote-cc://dev/a", true, true, 60_000),
+            migration_row("remote-cc://dev/b", true, true, 120_000),
+            migration_row("remote-cc://dev/c", true, true, 90_000),
+        ];
+        assert_eq!(
+            select_next_migration_candidate(&rows).as_deref(),
+            Some("remote-cc://dev/b"),
+            "the longest-idle safe session migrates first"
+        );
+    }
+
+    #[test]
+    fn migration_skips_non_re_resumable_and_non_migratable() {
+        let rows = vec![
+            // Longest idle but a plain shell -> not re-resumable, skipped.
+            migration_row("local://shell", false, true, 999_000),
+            // Re-resumable but not yet migratable (busy/draft), skipped.
+            migration_row("remote-cc://dev/busy", true, false, 500_000),
+            // The only safe, re-resumable candidate.
+            migration_row("remote-cc://dev/ok", true, true, 50_000),
+        ];
+        assert_eq!(
+            select_next_migration_candidate(&rows).as_deref(),
+            Some("remote-cc://dev/ok")
+        );
+    }
+
+    #[test]
+    fn migration_yields_nothing_when_no_safe_candidate() {
+        let rows = vec![
+            migration_row("local://shell", false, true, 999_000),
+            migration_row("remote-cc://dev/busy", true, false, 500_000),
+        ];
+        assert_eq!(select_next_migration_candidate(&rows), None);
+    }
+
+    #[test]
+    fn migratable_agent_kinds_exclude_plain_shell() {
+        assert!(session_kind_is_migratable_agent(SessionKind::Codex));
+        assert!(session_kind_is_migratable_agent(SessionKind::ClaudeCode));
+        assert!(session_kind_is_migratable_agent(SessionKind::CodexLiteLlm));
+        assert!(!session_kind_is_migratable_agent(SessionKind::Shell));
+    }
 
     #[test]
     fn daemon_version_triple_parses_and_orders() {
