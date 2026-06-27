@@ -44007,6 +44007,21 @@ fn sidebar_row_busy_state(snapshot: &RenderSnapshot, row: &BrowserRow) -> Sideba
         }
         return SidebarBusyState::idle();
     }
+    // Issue #1: a plain shell's working state has the SAME daemon-authoritative
+    // SSOT as agents — the daemon sets `working` from the OS foreground-process
+    // signal (a command actually running in the tty), which is correct even when
+    // the prompt text "looks idle" (`pi@host:~$ sleep 90`). Trust it when the
+    // daemon reports it (`Some` = owned); only fall back to the screen/foreground
+    // heuristic below when it is `None` (not owned / an older daemon that does
+    // not compute it). This stops the screen-text "looks idle" early-return from
+    // preempting a genuinely-running command.
+    if session.kind == SessionKind::Shell {
+        match session.working {
+            Some(true) => return SidebarBusyState::busy("shell_working_daemon"),
+            Some(false) => return SidebarBusyState::idle(),
+            None => {}
+        }
+    }
     let has_terminal_line_sample = session
         .terminal_lines
         .iter()
@@ -98162,6 +98177,47 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             assert!(
                 !sidebar_row_shows_busy_icon(&snapshot, row),
                 "frozen working footer must not blink when daemon verdict is {verdict:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn sidebar_shell_busy_follows_daemon_working_flag() {
+        // Issue #1: the shell dot follows the daemon's OS-derived `working`
+        // flag, not screen-text "looks idle" heuristics — so a shell running a
+        // command blinks even though its prompt line looks like an idle prompt.
+        let session_path = "local://shell-working";
+        let mut shell = ShellState::new(test_shell_bootstrap_with_active_session(session_path));
+        let mut live_session = test_live_shell_session(session_path);
+        live_session.id = "shell-working".to_string();
+        live_session.kind = SessionKind::Shell;
+        live_session.launch_phase = yggterm_server::TerminalLaunchPhase::Running;
+        // Prompt text that the screen-idle heuristic would read as idle.
+        live_session.terminal_lines = vec!["pi@guihost:~$ sleep 90".to_string()];
+        for (verdict, expect_busy) in [(Some(true), true), (Some(false), false)] {
+            live_session.working = verdict;
+            shell.server.apply_snapshot(ServerUiSnapshot {
+                active_session_path: Some(session_path.to_string()),
+                active_session: Some(snapshot_session_view_for_ui(live_session.clone())),
+                active_view_mode: WorkspaceViewMode::Terminal,
+                remote_machines: Vec::new(),
+                ssh_targets: Vec::new(),
+                live_sessions: vec![snapshot_session_view_for_ui(live_session.clone())],
+            });
+            shell.needs_initial_server_sync = false;
+            let snapshot = shell.snapshot();
+            let row = snapshot
+                .rows
+                .iter()
+                .find(|row| {
+                    normalize_live_session_path(&row.full_path)
+                        == normalize_live_session_path(session_path)
+                })
+                .expect("shell session row");
+            assert_eq!(
+                sidebar_row_shows_busy_icon(&snapshot, row),
+                expect_busy,
+                "shell dot must follow daemon working={verdict:?} despite idle-looking prompt"
             );
         }
     }
