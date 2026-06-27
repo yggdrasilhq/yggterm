@@ -3070,6 +3070,18 @@ impl YggtermServer {
             .is_some_and(|(_resolved_key, session)| session_is_temporary_update_restore(&session))
     }
 
+    /// The session kind for a live runtime key/path, if one is registered.
+    /// Used by progressive migration to release ONLY re-resumable agent CLI
+    /// sessions (their state persists in the agent's own JSONL, so a
+    /// release+re-resume on the newest daemon is lossless once the migration
+    /// predicate has ruled out an unsent draft). A plain shell is NOT
+    /// re-resumable — re-running its launch command yields a fresh shell — so
+    /// it is never migrated this way. See [[finding-daemon-authoritative-working-state-2945]].
+    pub fn live_session_kind(&self, path: &str) -> Option<SessionKind> {
+        self.resolve_live_session_entry(path)
+            .map(|(_resolved_key, session)| session.kind)
+    }
+
     pub fn non_keep_alive_live_session_paths(&self) -> Vec<String> {
         self.live_session_order
             .iter()
