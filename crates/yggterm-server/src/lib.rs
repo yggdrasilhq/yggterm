@@ -19195,6 +19195,28 @@ fn managed_session_from_snapshot(session: SnapshotSessionView) -> ManagedSession
     } else {
         session.source
     };
+    // The wire snapshot carries the daemon-authoritative PTY grid, but the GUI's
+    // ManagedSessionView model does not have dedicated pty_cols/rows fields.
+    // Surface the grid as a "PTY size" metadata entry so the Session Metadata
+    // rail can show "how big is this PTY" without a model/struct change.
+    let pty_size_entry = match (session.pty_cols, session.pty_rows) {
+        (Some(cols), Some(rows)) if cols > 0 && rows > 0 => Some(SessionMetadataEntry {
+            label: "PTY size",
+            value: format!("{cols} × {rows} cells"),
+        }),
+        _ => None,
+    };
+    let mut metadata: Vec<SessionMetadataEntry> = session
+        .metadata
+        .into_iter()
+        .map(|entry| SessionMetadataEntry {
+            label: canonical_static_label(entry.label),
+            value: entry.value,
+        })
+        .collect();
+    if let Some(entry) = pty_size_entry {
+        metadata.push(entry);
+    }
     ManagedSessionView {
         id: session.id,
         session_path: session.session_path,
@@ -19238,14 +19260,7 @@ fn managed_session_from_snapshot(session: SnapshotSessionView) -> ManagedSession
                 })
                 .collect(),
         },
-        metadata: session
-            .metadata
-            .into_iter()
-            .map(|entry| SessionMetadataEntry {
-                label: canonical_static_label(entry.label),
-                value: entry.value,
-            })
-            .collect(),
+        metadata,
         terminal_process_id: session.terminal_process_id,
         terminal_foreground_active: session.terminal_foreground_active,
         terminal_window_id: session.terminal_window_id,

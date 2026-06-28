@@ -477,6 +477,116 @@ fn crop_visible_surface_to_rect(
     Ok(())
 }
 
+/// Pure scale math for [`overlay_terminal_canvas_onto_snapshot`]: map the terminal's
+/// CSS-px rect into the chrome snapshot's pixel space, returned as
+/// `(dest_x, dest_y, dest_width, dest_height)`. The snapshot-px / window-css ratio
+/// absorbs the device-pixel-ratio, so this is correct on HiDPI too.
+fn overlay_dest_rect(
+    snapshot_width: i32,
+    snapshot_height: i32,
+    css_left: f64,
+    css_top: f64,
+    css_width: f64,
+    css_height: f64,
+    window_width: f64,
+    window_height: f64,
+) -> (f64, f64, f64, f64) {
+    let scale_x = snapshot_width as f64 / window_width.max(1.0);
+    let scale_y = snapshot_height as f64 / window_height.max(1.0);
+    (
+        css_left * scale_x,
+        css_top * scale_y,
+        (css_width * scale_x).max(1.0),
+        (css_height * scale_y).max(1.0),
+    )
+}
+
+/// Composite a faithful terminal-canvas PNG (the in-webview `toDataURL` capture)
+/// onto a full-window WebKit DOM snapshot at the terminal's rect. A DOM snapshot
+/// is BLIND to the WebGL terminal canvas (it captures chrome but a blank terminal),
+/// and the canvas composite is terminal-region only — so neither alone shows the
+/// chrome AND a faithful terminal. Overlaying the canvas onto the chrome snapshot
+/// yields both in one frame. `css_*` is the terminal viewport's CSS-px rect;
+/// `window_*` is `window.inner{Width,Height}`. The snapshot is scaled by
+/// snapshot-px / window-css, so device-pixel-ratio is handled by the ratio.
+#[cfg(target_os = "linux")]
+pub fn overlay_terminal_canvas_onto_snapshot(
+    snapshot_path: &Path,
+    terminal_png: &[u8],
+    css_left: f64,
+    css_top: f64,
+    css_width: f64,
+    css_height: f64,
+    window_width: f64,
+    window_height: f64,
+) -> Result<()> {
+    if css_width <= 1.0 || css_height <= 1.0 {
+        anyhow::bail!("terminal rect too small to overlay");
+    }
+    let snapshot = {
+        let mut file = File::open(snapshot_path)
+            .with_context(|| format!("opening chrome snapshot {}", snapshot_path.display()))?;
+        ImageSurface::create_from_png(&mut file).context("decoding chrome snapshot png")?
+    };
+    let terminal = {
+        let mut cursor = std::io::Cursor::new(terminal_png);
+        ImageSurface::create_from_png(&mut cursor).context("decoding terminal canvas png")?
+    };
+    let snapshot_width = snapshot.width();
+    let snapshot_height = snapshot.height();
+    if snapshot_width <= 0 || snapshot_height <= 0 {
+        anyhow::bail!("chrome snapshot surface is empty");
+    }
+    let terminal_width = terminal.width() as f64;
+    let terminal_height = terminal.height() as f64;
+    if terminal_width < 1.0 || terminal_height < 1.0 {
+        anyhow::bail!("terminal canvas surface is empty");
+    }
+    let (dest_x, dest_y, dest_width, dest_height) = overlay_dest_rect(
+        snapshot_width,
+        snapshot_height,
+        css_left,
+        css_top,
+        css_width,
+        css_height,
+        window_width,
+        window_height,
+    );
+    let context = CairoContext::new(&snapshot).context("creating overlay cairo context")?;
+    context.translate(dest_x, dest_y);
+    context.scale(dest_width / terminal_width, dest_height / terminal_height);
+    // Clip to the terminal source extent so the overlay touches only the terminal
+    // rect (EXTEND_NONE already prevents smearing; the clip is belt-and-braces).
+    context.rectangle(0.0, 0.0, terminal_width, terminal_height);
+    context.clip();
+    context
+        .set_source_surface(&terminal, 0.0, 0.0)
+        .context("binding terminal overlay source surface")?;
+    context.paint().context("painting terminal overlay")?;
+    drop(context);
+    snapshot.flush();
+    let mut output = File::create(snapshot_path)
+        .with_context(|| format!("rewriting merged screenshot {}", snapshot_path.display()))?;
+    snapshot
+        .write_to_png(&mut output)
+        .context("writing merged screenshot png")?;
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn overlay_terminal_canvas_onto_snapshot(
+    _snapshot_path: &Path,
+    _terminal_png: &[u8],
+    _css_left: f64,
+    _css_top: f64,
+    _css_width: f64,
+    _css_height: f64,
+    _window_width: f64,
+    _window_height: f64,
+) -> Result<()> {
+    anyhow::bail!("terminal canvas overlay is only implemented on linux")
+}
+
 #[cfg(target_os = "linux")]
 async fn platform_capture_visible_app_surface(
     desktop: &DesktopContext,
@@ -732,5 +842,43 @@ async fn platform_record_visible_app_surface(
         let _ = output_path;
         let _ = duration_secs;
         anyhow::bail!("native app screen recording is not implemented for this platform yet")
+    }
+}
+
+#[cfg(test)]
+mod overlay_tests {
+    use super::overlay_dest_rect;
+
+    fn approx(a: f64, b: f64) {
+        assert!((a - b).abs() < 1e-6, "{a} != {b}");
+    }
+
+    #[test]
+    fn maps_terminal_rect_unscaled_when_snapshot_matches_window() {
+        // DPR 1: snapshot pixels == window CSS px, so the rect passes through.
+        let (x, y, w, h) =
+            overlay_dest_rect(1920, 1160, 225.0, 30.0, 1335.0, 1100.0, 1920.0, 1160.0);
+        approx(x, 225.0);
+        approx(y, 30.0);
+        approx(w, 1335.0);
+        approx(h, 1100.0);
+    }
+
+    #[test]
+    fn scales_terminal_rect_for_hidpi_snapshot() {
+        // A 2x snapshot (e.g. HiDPI or a compositor grab) must scale the CSS rect up.
+        let (x, y, w, h) =
+            overlay_dest_rect(3840, 2320, 225.0, 30.0, 1335.0, 1100.0, 1920.0, 1160.0);
+        approx(x, 450.0);
+        approx(y, 60.0);
+        approx(w, 2670.0);
+        approx(h, 2200.0);
+    }
+
+    #[test]
+    fn clamps_dest_size_to_at_least_one_pixel() {
+        let (_x, _y, w, h) = overlay_dest_rect(100, 100, 0.0, 0.0, 0.0, 0.0, 1920.0, 1160.0);
+        approx(w, 1.0);
+        approx(h, 1.0);
     }
 }
