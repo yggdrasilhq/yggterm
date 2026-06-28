@@ -1,6 +1,7 @@
 use crate::app_capture::{
     background_app_window, capture_visible_app_surface, describe_window, focus_app_window,
-    move_app_window_by, record_visible_app_surface, resize_app_window,
+    move_app_window_by, overlay_terminal_canvas_onto_snapshot, record_visible_app_surface,
+    resize_app_window,
 };
 use crate::hot_update_policy::{
     daemon_update_state_json, runtime_status_is_current_app_version,
@@ -13667,7 +13668,14 @@ fn live_session_screen_content_signature(terminal_lines: &[String], status_line:
 
 fn live_session_runtime_truth_signature_from_iter<'a>(
     sessions: impl Iterator<Item = &'a ManagedSessionView>,
-) -> Vec<(String, SessionSource, TerminalLaunchPhase, Option<bool>, u64)> {
+) -> Vec<(
+    String,
+    SessionSource,
+    TerminalLaunchPhase,
+    Option<bool>,
+    Option<bool>,
+    u64,
+)> {
     let mut signature = sessions
         .filter(|session| {
             matches!(
@@ -13681,6 +13689,15 @@ fn live_session_runtime_truth_signature_from_iter<'a>(
                 session.source,
                 session.launch_phase,
                 session.terminal_foreground_active,
+                // Daemon-authoritative working flag MUST be part of the runtime
+                // truth: for an agent CLI it is derived from the screen FOOTER
+                // ("esc to interrupt") which can flip true→false a beat after the
+                // visible content (last-8-lines hash) has already settled. Omitting
+                // it made a working-only change look like a no-op, so the apply was
+                // skipped and the sidebar dot kept blinking (and the finish chime
+                // stayed silent) until an unrelated change forced a non-noop apply
+                // seconds later. See [[finding-working-dot-noop-skips-working-only-update]].
+                session.working,
                 live_session_screen_content_signature(
                     &session.terminal_lines,
                     &session.status_line,
@@ -13694,7 +13711,14 @@ fn live_session_runtime_truth_signature_from_iter<'a>(
 
 fn live_session_runtime_truth_signature_from_snapshot(
     snapshot: &ServerUiSnapshot,
-) -> Vec<(String, SessionSource, TerminalLaunchPhase, Option<bool>, u64)> {
+) -> Vec<(
+    String,
+    SessionSource,
+    TerminalLaunchPhase,
+    Option<bool>,
+    Option<bool>,
+    u64,
+)> {
     let mut signature = snapshot
         .live_sessions
         .iter()
@@ -13710,6 +13734,9 @@ fn live_session_runtime_truth_signature_from_snapshot(
                 session.source,
                 session.launch_phase,
                 session.terminal_foreground_active,
+                // See sibling `_from_iter`: the working flag is load-bearing runtime
+                // truth, not a no-op-able cosmetic.
+                session.working,
                 live_session_screen_content_signature(
                     &session.terminal_lines,
                     &session.status_line,
@@ -13729,6 +13756,7 @@ fn live_session_runtime_truth_signature_from_snapshot(
             active.source,
             active.launch_phase,
             active.terminal_foreground_active,
+            active.working,
             live_session_screen_content_signature(&active.terminal_lines, &active.status_line),
         ));
     }
@@ -18418,18 +18446,17 @@ fn titlebar_autohide_chrome_background_color(
 fn titlebar_autohide_chrome_background_image(palette: Palette) -> String {
     format!("var(--yggterm-shell-gradient, {})", palette.gradient)
 }
-fn titlebar_autohide_chrome_border(palette: Palette) -> &'static str {
-    if palette_is_dark(palette) {
-        "rgba(187,204,219,0.14)"
-    } else {
-        "rgba(162,181,202,0.28)"
-    }
-}
 fn titlebar_autohide_chrome_shadow(palette: Palette) -> &'static str {
+    // No hard hairline under the revealed hover chrome — the old
+    // `0 1px 0 rgba(255,255,255,…)` painted an ugly bright white separator line
+    // across the full width (user-reported 2026-06-27). A soft downward shadow
+    // gives the floating overlay depth without a visible line; this shadow is now
+    // the ONLY edge cue (there is no bottom border at all — see
+    // `format_titlebar_wrapper_style`).
     if palette_is_dark(palette) {
-        "0 1px 0 rgba(255,255,255,0.06)"
+        "0 12px 26px rgba(0,0,0,0.38)"
     } else {
-        "0 1px 0 rgba(255,255,255,0.42)"
+        "0 12px 24px rgba(70,92,116,0.16)"
     }
 }
 fn titlebar_wrapper_style(
@@ -18467,11 +18494,6 @@ fn titlebar_wrapper_style(
     } else {
         "none".to_string()
     };
-    let border = if auto_hide_enabled && revealed {
-        titlebar_autohide_chrome_border(palette)
-    } else {
-        "transparent"
-    };
     let shadow = if auto_hide_enabled && revealed {
         titlebar_autohide_chrome_shadow(palette)
     } else {
@@ -18493,7 +18515,6 @@ fn titlebar_wrapper_style(
         collapsed,
         background_color,
         background_image,
-        border,
         shadow,
         &backdrop,
         &transition,
@@ -18505,15 +18526,19 @@ fn format_titlebar_wrapper_style(
     collapsed: bool,
     background_color: String,
     background_image: String,
-    border: &str,
     shadow: &str,
     backdrop: &str,
     transition: &str,
 ) -> String {
+    // No `border-bottom` on the revealed chrome. A 1px border strip paints the
+    // background-COLOR (chrome fill, e.g. #f3f7fa) — the gradient image is sized
+    // to the padding-box and never reaches the border region — so ANY bottom
+    // border (even `solid transparent`) re-introduces the bright hairline the
+    // user reported. Depth comes from `box-shadow` alone.
     format!(
         "{} display:flex; flex-direction:column; min-width:0; height:{}px; min-height:{}px; max-height:{}px; \
          overflow:{}; z-index:180; background-color:{}; background-image:{}; background-size:var(--yggterm-shell-background-size, 100% 100vh); \
-         background-repeat:var(--yggterm-shell-background-repeat, no-repeat); background-position:top center; border-bottom:1px solid {}; box-shadow:{}; {} transition:{};",
+         background-repeat:var(--yggterm-shell-background-repeat, no-repeat); background-position:top center; border-bottom:none; box-shadow:{}; {} transition:{};",
         positioning,
         height_px,
         height_px,
@@ -18521,7 +18546,6 @@ fn format_titlebar_wrapper_style(
         if collapsed { "hidden" } else { "visible" },
         background_color,
         background_image,
-        border,
         shadow,
         backdrop,
         transition
@@ -34927,7 +34951,12 @@ async fn reconcile_terminal_from_daemon_for(
 /// and readable via toDataURL with NO compositor, NO window focus, NO privacy gate
 /// — faithful on every platform. Returns the PNG written verdict, or None to fall
 /// through to the platform capture. See feedback-verify-visual-with-faithful-pixel.
-async fn capture_active_terminal_canvas_composite(output_path: &Path) -> Option<Value> {
+/// Run the in-webview composite of the active terminal's xterm canvas layers and
+/// return the raw result Value (NO file write): `dataUrl` (faithful terminal PNG),
+/// its device-px `width`/`height`, the terminal viewport's CSS-px rect
+/// (`css_left`/`css_top`/`css_width`/`css_height`) and `win_w`/`win_h` so callers
+/// can overlay it onto a full-window chrome snapshot (`overlay_terminal_canvas_layer`).
+async fn eval_active_terminal_canvas_composite() -> Value {
     // No format!/interpolation → plain raw string (no brace-doubling needed).
     // The value MUST be returned via dioxus.send (receive_probe_eval_value reads the
     // send channel, NOT the script's return value) — a plain `return` hangs the recv.
@@ -35000,6 +35029,12 @@ async fn capture_active_terminal_canvas_composite(output_path: &Path) -> Option<
                     dataUrl,
                     width: W,
                     height: H,
+                    css_left: rect.left,
+                    css_top: rect.top,
+                    css_width: rect.width,
+                    css_height: rect.height,
+                    win_w: window.innerWidth,
+                    win_h: window.innerHeight,
                     layers: drawn,
                     canvas_count: canvases.length,
                     session_path: String(entry.sessionPath || ''),
@@ -35009,22 +35044,60 @@ async fn capture_active_terminal_canvas_composite(output_path: &Path) -> Option<
             }
         })()
     "#;
-    let value = receive_probe_eval_value(script, "").await;
+    receive_probe_eval_value(script, "").await
+}
+/// Decode the base64 `dataUrl` from an [`eval_active_terminal_canvas_composite`]
+/// result into raw PNG bytes.
+fn decode_composite_data_url(value: &Value) -> Result<Vec<u8>, String> {
+    let data_url = value
+        .get("dataUrl")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "composite result has no dataUrl".to_string())?;
+    let b64 = data_url
+        .strip_prefix("data:image/png;base64,")
+        .unwrap_or(data_url);
+    BASE64_STANDARD
+        .decode(b64.as_bytes())
+        .map_err(|error| format!("base64_decode: {error}"))
+}
+/// Overlay the faithful terminal canvas (from `layer`) onto a full-window chrome
+/// snapshot at `snapshot_path`, in place, producing one frame with chrome AND a
+/// faithful terminal. See [`overlay_terminal_canvas_onto_snapshot`].
+fn overlay_terminal_canvas_layer(snapshot_path: &Path, layer: &Value) -> Result<(), String> {
+    let png = decode_composite_data_url(layer)?;
+    let field = |key: &str| {
+        layer
+            .get(key)
+            .and_then(Value::as_f64)
+            .ok_or_else(|| format!("composite result missing {key}"))
+    };
+    overlay_terminal_canvas_onto_snapshot(
+        snapshot_path,
+        &png,
+        field("css_left")?,
+        field("css_top")?,
+        field("css_width")?,
+        field("css_height")?,
+        field("win_w")?,
+        field("win_h")?,
+    )
+    .map_err(|error| error.to_string())
+}
+/// Terminal-region-only faithful composite: run the in-webview canvas composite and
+/// write the PNG to `output_path`. The merged path
+/// ([`overlay_terminal_canvas_layer`]) is preferred; this remains the fallback when
+/// the chrome snapshot is unavailable.
+async fn capture_active_terminal_canvas_composite(output_path: &Path) -> Option<Value> {
+    let value = eval_active_terminal_canvas_composite().await;
     if value.get("ok").and_then(Value::as_bool) != Some(true) {
         return Some(json!({
             "ok": false,
             "reason": value.get("reason").and_then(Value::as_str).unwrap_or("composite_failed"),
         }));
     }
-    let data_url = value.get("dataUrl").and_then(Value::as_str)?;
-    let b64 = data_url
-        .strip_prefix("data:image/png;base64,")
-        .unwrap_or(data_url);
-    let bytes = match BASE64_STANDARD.decode(b64.as_bytes()) {
+    let bytes = match decode_composite_data_url(&value) {
         Ok(bytes) => bytes,
-        Err(error) => {
-            return Some(json!({ "ok": false, "reason": format!("base64_decode: {error}") }));
-        }
+        Err(reason) => return Some(json!({ "ok": false, "reason": reason })),
     };
     if let Err(error) = std::fs::write(output_path, &bytes) {
         return Some(json!({ "ok": false, "reason": format!("write_png: {error}") }));
@@ -35490,92 +35563,135 @@ async fn process_pending_app_control_requests(
         } => {
             let dom_snapshot =
                 capture_dom_debug_snapshot_for_or_empty(active_session_path.as_deref()).await;
-            // FAITHFUL TERMINAL CAPTURE (in-process, cross-platform, focus-independent):
-            // when the GPU canvas renderer is on, the WebKit/Spectacle paths are either
-            // blind to the canvas (webkit) or need window focus the agent can't hold over
-            // SSH (spectacle). Composite the xterm canvas layers directly via toDataURL.
-            // Only for App target + an active terminal; any failure falls through to the
-            // platform capture below. The image IS the terminal screen, so the CLI marks
-            // capture_backend=xterm_canvas_composite and skips the redundant region crop.
-            let canvas_composite = if matches!(target, ScreenshotTarget::App)
+            let output = Path::new(&output_path);
+            let prefer_terminal_composite = matches!(target, ScreenshotTarget::App)
                 && terminal_xterm_canvas_renderer_enabled()
-                && state.read().server.active_view_mode() == WorkspaceViewMode::Terminal
-            {
-                capture_active_terminal_canvas_composite(Path::new(&output_path)).await
-            } else {
-                None
-            };
-            if let Some(composite) = canvas_composite
-                .as_ref()
-                .filter(|v| v.get("ok").and_then(Value::as_bool) == Some(true))
-            {
-                AppControlResponse {
-                    request_id: request.request_id.clone(),
-                    handled_by_pid: std::process::id(),
-                    completed_at_ms: current_millis() as u128,
-                    output_path: Some(output_path.clone()),
-                    data: Some(json!({
-                        "command": "capture_screenshot",
-                        "target": target,
-                        "window": describe_window(&desktop),
-                        "active_view_mode": format!("{:?}", state.read().server.active_view_mode()),
-                        "active_session_path": state.read().server.active_session_path(),
-                        "capture_backend": "xterm_canvas_composite",
-                        "capture_backend_attempts": Vec::<String>::new(),
-                        "capture_faithful": true,
-                        "capture_faithful_reason": "in-process composite of the xterm canvas layers (toDataURL) — captures the GPU canvas without a compositor or window focus",
-                        "capture_is_terminal_region": true,
-                        "canvas_composite": composite,
-                        "dom": dom_snapshot,
-                    })),
-                    error: None,
+                && state.read().server.active_view_mode() == WorkspaceViewMode::Terminal;
+            // (backend, faithful, faithful_reason, is_terminal_region, attempts, output_path)
+            let mut success: Option<(String, bool, String, bool, Vec<String>, String)> = None;
+            let mut capture_error: Option<String> = None;
+
+            // MERGED FAITHFUL CAPTURE: a full-window WebKit DOM snapshot (chrome —
+            // sidebar, titlebar, right rail) with the faithful xterm canvas composited
+            // into the terminal rect. A DOM snapshot alone is BLIND to the WebGL canvas
+            // (chrome only); the canvas composite alone is terminal-region only (no
+            // chrome). Overlaying the canvas onto the chrome snapshot yields BOTH in one
+            // frame — so an agent can screenshot the right rail in Terminal view without
+            // disabling the GPU renderer. `--region terminal` still crops afterwards.
+            if prefer_terminal_composite {
+                match capture_visible_app_surface(&desktop, output, target, Some(&dom_snapshot))
+                    .await
+                {
+                    Ok(chrome) => {
+                        let layer = eval_active_terminal_canvas_composite().await;
+                        if layer.get("ok").and_then(Value::as_bool) == Some(true) {
+                            match overlay_terminal_canvas_layer(output, &layer) {
+                                Ok(()) => {
+                                    success = Some((
+                                        "xterm_canvas_composite_over_dom".to_string(),
+                                        true,
+                                        "full-window WebKit DOM snapshot (chrome) with the faithful xterm canvas composited into the terminal rect".to_string(),
+                                        false,
+                                        chrome.backend_attempts.clone(),
+                                        chrome.output_path.display().to_string(),
+                                    ));
+                                }
+                                Err(reason) => append_trace_event(
+                                    &home,
+                                    "ui",
+                                    "app_control",
+                                    "xterm_canvas_overlay_failed",
+                                    json!({ "reason": reason }),
+                                ),
+                            }
+                        } else {
+                            append_trace_event(
+                                &home,
+                                "ui",
+                                "app_control",
+                                "xterm_canvas_layer_unavailable",
+                                json!({ "reason": layer.get("reason") }),
+                            );
+                        }
+                    }
+                    Err(error) => append_trace_event(
+                        &home,
+                        "ui",
+                        "app_control",
+                        "merged_chrome_snapshot_failed",
+                        json!({ "reason": error.to_string() }),
+                    ),
                 }
-            } else {
-            if let Some(failed) = canvas_composite.as_ref() {
-                append_trace_event(
-                    &home,
-                    "ui",
-                    "app_control",
-                    "xterm_canvas_composite_fell_through",
-                    json!({ "reason": failed.get("reason") }),
-                );
+                // Fallback: faithful terminal-only composite (overwrites output) when the
+                // chrome snapshot or the overlay could not complete.
+                if success.is_none()
+                    && capture_active_terminal_canvas_composite(output)
+                        .await
+                        .filter(|v| v.get("ok").and_then(Value::as_bool) == Some(true))
+                        .is_some()
+                {
+                    success = Some((
+                        "xterm_canvas_composite".to_string(),
+                        true,
+                        "in-process composite of the xterm canvas layers (toDataURL) — terminal region only; chrome overlay unavailable".to_string(),
+                        true,
+                        Vec::new(),
+                        output_path.clone(),
+                    ));
+                }
             }
-            match capture_visible_app_surface(
-                &desktop,
-                Path::new(&output_path),
-                target,
-                Some(&dom_snapshot),
-            )
-            .await
-            {
-                Ok(capture) => AppControlResponse {
-                    request_id: request.request_id.clone(),
-                    handled_by_pid: std::process::id(),
-                    completed_at_ms: current_millis() as u128,
-                    output_path: Some(capture.output_path.display().to_string()),
-                    data: Some(json!({
-                        "command": "capture_screenshot",
-                        "target": target,
-                        "window": describe_window(&desktop),
-                        "active_view_mode": format!("{:?}", state.read().server.active_view_mode()),
-                        "active_session_path": state.read().server.active_session_path(),
-                        "capture_backend": capture.backend,
-                        "capture_backend_attempts": capture.backend_attempts,
-                        "capture_faithful": capture.faithful,
-                        "capture_faithful_reason": capture.faithful_reason,
-                        "dom": dom_snapshot,
-                    })),
-                    error: None,
-                },
-                Err(error) => AppControlResponse {
+
+            // Plain platform snapshot (non-terminal views, or every faithful path failed).
+            if success.is_none() {
+                match capture_visible_app_surface(&desktop, output, target, Some(&dom_snapshot))
+                    .await
+                {
+                    Ok(capture) => {
+                        success = Some((
+                            capture.backend.to_string(),
+                            capture.faithful,
+                            capture.faithful_reason.to_string(),
+                            false,
+                            capture.backend_attempts.clone(),
+                            capture.output_path.display().to_string(),
+                        ));
+                    }
+                    Err(error) => capture_error = Some(error.to_string()),
+                }
+            }
+
+            match success {
+                Some((backend, faithful, faithful_reason, terminal_region, attempts, out)) => {
+                    AppControlResponse {
+                        request_id: request.request_id.clone(),
+                        handled_by_pid: std::process::id(),
+                        completed_at_ms: current_millis() as u128,
+                        output_path: Some(out),
+                        data: Some(json!({
+                            "command": "capture_screenshot",
+                            "target": target,
+                            "window": describe_window(&desktop),
+                            "active_view_mode": format!("{:?}", state.read().server.active_view_mode()),
+                            "active_session_path": state.read().server.active_session_path(),
+                            "capture_backend": backend,
+                            "capture_backend_attempts": attempts,
+                            "capture_faithful": faithful,
+                            "capture_faithful_reason": faithful_reason,
+                            "capture_is_terminal_region": terminal_region,
+                            "dom": dom_snapshot,
+                        })),
+                        error: None,
+                    }
+                }
+                None => AppControlResponse {
                     request_id: request.request_id.clone(),
                     handled_by_pid: std::process::id(),
                     completed_at_ms: current_millis() as u128,
                     output_path: None,
                     data: None,
-                    error: Some(error.to_string()),
+                    error: capture_error
+                        .or_else(|| Some("screenshot capture failed".to_string())),
                 },
-            }
             }
         }
         AppControlCommand::ScrollPreview { top_px, ratio } => {
@@ -42326,12 +42442,14 @@ fn Titlebar(
                     }
                     div {
                         class: "yggterm-titlebar-view-toggle",
-                        style: toggle_slider_style(snapshot.palette),
+                        style: segmented_control_track_style(snapshot.palette),
                         onmousedown: |evt| evt.stop_propagation(),
                         button {
-                            style: toggle_slider_end_style(
+                            style: segmented_control_segment_style(
                                 snapshot.palette,
-                                snapshot.active_view_mode == WorkspaceViewMode::Rendered
+                                snapshot.active_view_mode == WorkspaceViewMode::Rendered,
+                                false,
+                                true,
                             ),
                             ondoubleclick: |evt| evt.stop_propagation(),
                             onclick: move |_| on_set_view_mode.call(WorkspaceViewMode::Rendered),
@@ -42344,9 +42462,11 @@ fn Titlebar(
                             "Web View"
                         }
                         button {
-                            style: toggle_slider_end_style(
+                            style: segmented_control_segment_style(
                                 snapshot.palette,
-                                snapshot.active_view_mode == WorkspaceViewMode::Terminal
+                                snapshot.active_view_mode == WorkspaceViewMode::Terminal,
+                                false,
+                                true,
                             ),
                             ondoubleclick: |evt| evt.stop_propagation(),
                             onclick: move |_| on_set_view_mode.call(WorkspaceViewMode::Terminal),
@@ -47059,15 +47179,15 @@ fn AgentModeSelector(
 ) -> Element {
     rsx! {
         div {
-            style: toggle_slider_style(palette),
+            style: segmented_control_track_style(palette),
             button {
-                style: toggle_slider_end_style(palette, selected == SessionKind::Codex),
+                style: segmented_control_segment_style(palette, selected == SessionKind::Codex, false, true),
                 disabled: disabled,
                 onclick: move |_| on_select.call(SessionKind::Codex),
                 "Codex"
             }
             button {
-                style: toggle_slider_end_style(palette, selected == SessionKind::CodexLiteLlm),
+                style: segmented_control_segment_style(palette, selected == SessionKind::CodexLiteLlm, false, true),
                 disabled: disabled,
                 onclick: move |_| on_select.call(SessionKind::CodexLiteLlm),
                 "Codex LiteLLM"
@@ -70691,31 +70811,228 @@ fn RightRail(
 #[component]
 fn MetadataRailBody(snapshot: SharedSnapshot) -> Element {
     let session = snapshot.active_session.clone();
+    let palette = snapshot.palette;
     rsx! {
-        RailHeader { title: "Session Metadata".to_string(), color: snapshot.palette.text.to_string() }
+        RailHeader { title: "Session Metadata".to_string(), color: palette.text.to_string() }
         RailScrollBody {
             content: rsx!{
             if let Some(session) = session {
-                MetadataGroup {
-                    title: "Overview".to_string(),
-                    entries: session.metadata.iter().take(6).cloned().collect(),
-                    palette: snapshot.palette,
-                }
-                MetadataGroup {
-                    title: "Runtime".to_string(),
-                    entries: session.metadata.iter().skip(6).cloned().collect(),
-                    palette: snapshot.palette,
-                }
+                {render_session_metadata(&session, palette)}
             } else {
                 MetadataGroup {
-                    title: "Overview".to_string(),
+                    title: "Session".to_string(),
                     entries: vec![SessionMetadataEntry {
                         label: "State",
                         value: "No session selected".to_string(),
                     }],
-                    palette: snapshot.palette,
+                    palette,
                 }
             }
+            }
+        }
+    }
+}
+/// Friendly, user-facing label for a session kind. The raw enum names
+/// (`ClaudeCode`, `CodexLiteLlm`) are an implementation detail.
+fn friendly_session_kind(kind: SessionKind) -> &'static str {
+    match kind {
+        SessionKind::Codex => "Codex",
+        SessionKind::CodexLiteLlm => "Codex · LiteLLM",
+        SessionKind::ClaudeCode => "Claude Code",
+        SessionKind::Shell => "Shell",
+        SessionKind::SshShell => "SSH Shell",
+        SessionKind::Document => "Document",
+    }
+}
+fn friendly_launch_phase(phase: TerminalLaunchPhase) -> &'static str {
+    match phase {
+        TerminalLaunchPhase::Queued => "queued",
+        TerminalLaunchPhase::BridgePending => "starting",
+        TerminalLaunchPhase::RemoteBootstrap => "bootstrapping",
+        TerminalLaunchPhase::Running => "running",
+    }
+}
+/// "How to connect to that PTY" — the product's core value, surfaced verbatim.
+/// The daemon already computes an authoritative `Restore` handoff command
+/// (`ssh <machine> 'yggterm server remote resume-… <uuid> --require-existing'`);
+/// prefer it. Plain shells carry no daemon restore, so fall back to the literal
+/// manual handoff a human would type (ssh into the box, cd into the cwd).
+fn session_connect_command(session: &ManagedSessionView, cwd: &str) -> String {
+    let restore = metadata_value(session, "Restore");
+    if !restore.trim().is_empty() {
+        return restore.trim().to_string();
+    }
+    let cwd = cwd.trim();
+    if let Some(target) = session
+        .ssh_target
+        .as_ref()
+        .map(|target| target.trim())
+        .filter(|target| !target.is_empty())
+    {
+        if cwd.is_empty() {
+            return format!("ssh {target}");
+        }
+        return format!("ssh {target}\ncd {cwd}");
+    }
+    if !cwd.is_empty() {
+        return format!("cd {cwd}");
+    }
+    String::new()
+}
+/// Build the view-aware "useful" metadata panel from the rich snapshot fields
+/// (kind, host/source, pty grid, pid, working state) plus the genuinely useful
+/// daemon metadata entries (cwd, restore command, resume id, transcript stats),
+/// instead of dumping every raw entry (Bytes, Preview Blocks, Launch Error:none,
+/// the multi-line launch shell script). One source of truth per fact.
+fn render_session_metadata(session: &ManagedSessionView, palette: Palette) -> Element {
+    let kind = session.kind;
+    let locality = match session.source {
+        SessionSource::LiveLocal => "local",
+        SessionSource::LiveSsh => "remote",
+        SessionSource::Stored => "stored",
+    };
+    let host = session.host_label.trim();
+    let machine = if host.is_empty() {
+        locality.to_string()
+    } else {
+        format!("{host} · {locality}")
+    };
+    let cwd = {
+        let primary = metadata_value(session, "Cwd");
+        if primary.trim().is_empty() {
+            metadata_value(session, "Target")
+        } else {
+            primary
+        }
+    };
+
+    let mut identity = vec![
+        SessionMetadataEntry {
+            label: "Type",
+            value: friendly_session_kind(kind).to_string(),
+        },
+        SessionMetadataEntry {
+            label: "Machine",
+            value: machine,
+        },
+    ];
+    if !cwd.trim().is_empty() {
+        identity.push(SessionMetadataEntry {
+            label: "Working dir",
+            value: cwd.trim().to_string(),
+        });
+    }
+    if !session.title.trim().is_empty() {
+        identity.push(SessionMetadataEntry {
+            label: "Title",
+            value: session.title.trim().to_string(),
+        });
+    }
+
+    let connect = session_connect_command(session, &cwd);
+
+    let working = match session.working {
+        Some(true) => "working",
+        Some(false) => "idle",
+        None => "—",
+    };
+    let mut runtime = vec![SessionMetadataEntry {
+        label: "Status",
+        value: format!("{} · {working}", friendly_launch_phase(session.launch_phase)),
+    }];
+    // PTY grid is surfaced by `managed_session_from_snapshot` as a "PTY size"
+    // metadata entry (the daemon owns the live grid; the GUI session model does
+    // not carry pty_cols/rows directly).
+    let pty_size = metadata_value(session, "PTY size");
+    if !pty_size.trim().is_empty() {
+        runtime.push(SessionMetadataEntry {
+            label: "PTY size",
+            value: pty_size.trim().to_string(),
+        });
+    }
+    if let Some(pid) = session.terminal_process_id {
+        runtime.push(SessionMetadataEntry {
+            label: "PID",
+            value: pid.to_string(),
+        });
+    }
+    let resume_id = {
+        let uuid = metadata_value(session, "UUID");
+        if uuid.trim().is_empty() {
+            session.id.clone()
+        } else {
+            uuid
+        }
+    };
+    if !resume_id.trim().is_empty() {
+        runtime.push(SessionMetadataEntry {
+            label: match kind {
+                SessionKind::Codex | SessionKind::CodexLiteLlm => "Codex session",
+                SessionKind::ClaudeCode => "Claude Code session",
+                _ => "Session id",
+            },
+            value: resume_id.trim().to_string(),
+        });
+    }
+
+    let mut history = Vec::new();
+    for (label, key) in [
+        ("Conversation", "Messages"),
+        ("Started", "Started"),
+        ("Last active", "Updated"),
+        ("Persistence", "Runtime Persistence"),
+        ("Rollout file", "Storage"),
+    ] {
+        let value = metadata_value(session, key);
+        if !value.trim().is_empty() {
+            history.push(SessionMetadataEntry {
+                label,
+                value: value.trim().to_string(),
+            });
+        }
+    }
+
+    rsx! {
+        MetadataGroup { title: "Session".to_string(), entries: identity, palette }
+        if !connect.trim().is_empty() {
+            MetadataConnectBlock { palette, command: connect }
+        }
+        MetadataGroup { title: "Runtime".to_string(), entries: runtime, palette }
+        if !history.is_empty() {
+            MetadataGroup { title: "History".to_string(), entries: history, palette }
+        }
+    }
+}
+#[component]
+fn MetadataConnectBlock(palette: Palette, command: String) -> Element {
+    let background = if palette_is_dark(palette) {
+        "rgba(255,255,255,0.05)"
+    } else {
+        "rgba(13,21,30,0.04)"
+    };
+    let border = if palette_is_dark(palette) {
+        "rgba(141,160,178,0.20)"
+    } else {
+        "rgba(198,212,224,0.55)"
+    };
+    rsx! {
+        div {
+            style: "display:flex; flex-direction:column; gap:6px; padding-bottom:4px;",
+            RailSectionTitle { title: "Connect".to_string(), muted_color: palette.muted.to_string() }
+            div {
+                style: format!("font-size:11px; line-height:1.45; color:{};", palette.muted),
+                "Reattach to this session's PTY from any shell:"
+            }
+            div {
+                "data-metadata-connect-command": "1",
+                style: format!(
+                    "font-family:ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size:11.5px; \
+                     line-height:1.55; color:{}; background:{}; border-radius:10px; padding:10px 11px; \
+                     white-space:pre-wrap; word-break:break-all; user-select:text; -webkit-user-select:text; \
+                     cursor:text; box-shadow: inset 0 0 0 1px {};",
+                    palette.text, background, border
+                ),
+                "{command}"
             }
         }
     }
@@ -72033,17 +72350,14 @@ fn ThemeEditorOverlay(
                     div {
                         style: "display:flex; align-items:center; gap:8px;",
                         div {
-                            style: format!(
-                                "display:flex; align-items:center; gap:4px; padding:4px; border-radius:999px; \
-                                 background:rgba(236,242,247,0.92); box-shadow: inset 0 0 0 1px rgba(210,221,232,0.9);"
-                            ),
+                            style: segmented_control_track_style(snapshot.palette),
                             button {
-                                style: segmented_pill_button_style(snapshot.palette, snapshot.settings.theme == UiTheme::ZedLight),
+                                style: segmented_control_segment_style(snapshot.palette, snapshot.settings.theme == UiTheme::ZedLight, true, false),
                                 onclick: move |_| on_set_ui_theme.call(UiTheme::ZedLight),
                                 "Light"
                             }
                             button {
-                                style: segmented_pill_button_style(snapshot.palette, snapshot.settings.theme == UiTheme::ZedDark),
+                                style: segmented_control_segment_style(snapshot.palette, snapshot.settings.theme == UiTheme::ZedDark, true, false),
                                 onclick: move |_| on_set_ui_theme.call(UiTheme::ZedDark),
                                 "Dark"
                             }
@@ -72448,27 +72762,14 @@ fn ThemeSettingsSection(
                     }
                 ),
                 div {
-                    style: format!(
-                        "display:flex; align-items:center; gap:5px; height:34px; padding:4px; border-radius:999px; \
-                         background:{}; box-shadow: inset 0 0 0 1px {};",
-                        if palette_is_dark(palette) {
-                            "rgba(11,16,21,0.92)"
-                        } else {
-                            "rgba(236,242,247,0.94)"
-                        },
-                        if palette_is_dark(palette) {
-                            "rgba(93,116,134,0.42)"
-                        } else {
-                            "rgba(210,221,232,0.92)"
-                        }
-                    ),
+                    style: segmented_control_track_style(palette),
                     button {
-                        style: segmented_pill_button_style(palette, selected_theme == UiTheme::ZedLight),
+                        style: segmented_control_segment_style(palette, selected_theme == UiTheme::ZedLight, true, false),
                         onclick: move |_| on_select.call(UiTheme::ZedLight),
                         "Light"
                     }
                     button {
-                        style: segmented_pill_button_style(palette, selected_theme == UiTheme::ZedDark),
+                        style: segmented_control_segment_style(palette, selected_theme == UiTheme::ZedDark, true, false),
                         onclick: move |_| on_select.call(UiTheme::ZedDark),
                         "Dark"
                     }
@@ -72600,32 +72901,19 @@ fn NotificationSettingsSection(
             div {
                 style: settings_section_card_style(palette),
                 div {
-                    style: format!(
-                        "display:flex; align-items:center; gap:5px; height:34px; padding:4px; border-radius:999px; \
-                         background:{}; box-shadow: inset 0 0 0 1px {};",
-                        if palette_is_dark(palette) {
-                            "rgba(11,16,21,0.92)"
-                        } else {
-                            "rgba(236,242,247,0.94)"
-                        },
-                        if palette_is_dark(palette) {
-                            "rgba(93,116,134,0.42)"
-                        } else {
-                            "rgba(210,221,232,0.92)"
-                        }
-                    ),
+                    style: segmented_control_track_style(palette),
                     button {
-                        style: segmented_pill_button_style(palette, selected == NotificationDeliveryMode::InApp),
+                        style: segmented_control_segment_style(palette, selected == NotificationDeliveryMode::InApp, true, false),
                         onclick: move |_| on_select.call(NotificationDeliveryMode::InApp),
                         "App"
                     }
                     button {
-                        style: segmented_pill_button_style(palette, selected == NotificationDeliveryMode::Both),
+                        style: segmented_control_segment_style(palette, selected == NotificationDeliveryMode::Both, true, false),
                         onclick: move |_| on_select.call(NotificationDeliveryMode::Both),
                         "Both"
                     }
                     button {
-                        style: segmented_pill_button_style(palette, selected == NotificationDeliveryMode::System),
+                        style: segmented_control_segment_style(palette, selected == NotificationDeliveryMode::System, true, false),
                         onclick: move |_| on_select.call(NotificationDeliveryMode::System),
                         "System"
                     }
@@ -72745,6 +73033,16 @@ fn ZoomSettingRow(
     let mut draft_percent = use_signal(|| percent.to_string());
     let mut focused = use_signal(|| false);
     let display_percent = draft_percent();
+    // The number's pill snugly tracks its content: the field grows as more digits
+    // are typed / stepped up and shrinks back down for smaller values
+    // (user-reported 2026-06-28). Width is digit-count driven so "50" reads
+    // narrower than "100" reads narrower than "1000".
+    let zoom_input_digits = display_percent
+        .chars()
+        .filter(|ch| !ch.is_whitespace())
+        .count()
+        .max(1);
+    let zoom_input_width_px = 22 + zoom_input_digits as i32 * 12;
     use_effect(move || {
         if !focused() {
             let canonical = percent.to_string();
@@ -72788,10 +73086,10 @@ fn ZoomSettingRow(
                     pattern: "[0-9]*",
                     value: "{display_percent}",
                     style: format!(
-                        "min-width:0; width:54px; height:24px; border:none; border-radius:8px; \
+                        "min-width:0; width:{zoom_input_width_px}px; height:24px; border:none; border-radius:8px; \
                          background:{}; color:{}; outline:none; text-align:center; \
                          font-size:12px; font-weight:750; box-shadow: inset 0 0 0 1px {}; \
-                         appearance:textfield; -moz-appearance:textfield;",
+                         appearance:textfield; -moz-appearance:textfield; transition:width 120ms ease;",
                         if palette_is_dark(palette) {
                             "rgba(10,14,20,0.60)"
                         } else {
@@ -73064,7 +73362,7 @@ fn TerminalThemeSelectRow(
                             value: "{filter_value}",
                             placeholder: "Filter themes",
                             style: format!(
-                                "height:28px; padding:0 9px; border:none; border-radius:8px; background:{}; color:{}; \
+                                "flex:0 0 auto; height:28px; min-height:28px; padding:0 9px; border:none; border-radius:8px; background:{}; color:{}; \
                                  outline:none; box-shadow: inset 0 0 0 1px {}; font-size:12px; font-weight:650;",
                                 control_background,
                                 control_text,
@@ -75109,7 +75407,14 @@ fn primary_action_style(palette: Palette) -> String {
         palette.accent
     )
 }
-fn toggle_slider_style(palette: Palette) -> String {
+/// Standard segmented control (pill toggle) — the "snug" look where the track is
+/// only a hair larger than the active segment. The titlebar Web View/Terminal
+/// toggle is the reference. Used by every multi-segment MODE switch: titlebar
+/// view mode, the agent-mode selector, Settings Light/Dark, and Notifications
+/// App/Both/System. NOT for binary on/off switches — those use the
+/// `inline_toggle_*` track+thumb (e.g. Auto-hide Titlebar, Sound).
+/// See DESIGN.md "Segmented controls".
+fn segmented_control_track_style(palette: Palette) -> String {
     format!(
         "display:flex; align-items:center; gap:4px; padding:3px; border:none; border-radius:999px; background:{}; box-shadow: inset 0 0 0 1px {}; user-select:none; -webkit-user-select:none; transition:{};",
         if palette_is_dark(palette) {
@@ -75125,26 +75430,45 @@ fn toggle_slider_style(palette: Palette) -> String {
         standard_transition(&["background-color", "box-shadow"])
     )
 }
-fn toggle_slider_end_style(palette: Palette, selected: bool) -> String {
+/// One segment of a [`segmented_control_track_style`] control. `grow` makes the
+/// segment flex to fill the track evenly (settings panels); `false` keeps a fixed
+/// min-width (compact chrome toggles). `on_chrome` picks luminance-aware text for
+/// the variable titlebar chrome; `false` uses plain palette text on a card. The
+/// snug look comes from a near-edge-to-edge active fill with NO drop shadow — the
+/// track's 3px padding is the only gap (the old settings pill added a
+/// `0 3px 10px` lift that read as a much larger bg pill).
+fn segmented_control_segment_style(
+    palette: Palette,
+    selected: bool,
+    grow: bool,
+    on_chrome: bool,
+) -> String {
+    let sizing = if grow { "flex:1; min-width:0;" } else { "min-width:82px;" };
+    let background = if selected {
+        if palette_is_dark(palette) {
+            "rgba(255,255,255,0.10)"
+        } else {
+            "rgba(255,255,255,0.92)"
+        }
+    } else if palette_is_dark(palette) {
+        "rgba(255,255,255,0.03)"
+    } else {
+        "transparent"
+    };
+    let color: String = if on_chrome {
+        chrome_chip_text_color(palette, selected, selected).to_string()
+    } else if selected {
+        palette.text.to_string()
+    } else {
+        palette.muted.to_string()
+    };
+    let font_weight = if on_chrome || selected { 700 } else { 600 };
     format!(
-        "height:26px; min-width:82px; padding:0 12px; border:none; border-radius:999px; background:{}; color:{}; font-size:11px; font-weight:700; \
+        "{sizing} height:26px; padding:0 12px; border:none; border-radius:999px; background:{}; color:{}; font-size:11px; font-weight:{}; \
          user-select:none; -webkit-user-select:none; transition:{};",
-        if selected {
-            if palette_is_dark(palette) {
-                "rgba(255,255,255,0.10)"
-            } else {
-                "rgba(255,255,255,0.92)"
-            }
-        } else if palette_is_dark(palette) {
-            "rgba(255,255,255,0.03)"
-        } else {
-            "transparent"
-        },
-        if selected {
-            chrome_chip_text_color(palette, true, true)
-        } else {
-            chrome_chip_text_color(palette, false, false)
-        },
+        background,
+        color,
+        font_weight,
         standard_transition(&["background-color", "color"])
     )
 }
@@ -75234,37 +75558,6 @@ fn zoom_button_style(palette: Palette) -> String {
         },
         palette.text,
         standard_transition(&["background-color", "color"])
-    )
-}
-fn segmented_pill_button_style(palette: Palette, selected: bool) -> String {
-    format!(
-        "flex:1; height:26px; border:none; border-radius:999px; background:{}; color:{}; font-size:11px; font-weight:{}; \
-         display:inline-flex; align-items:center; justify-content:center; box-shadow:{}; transition:{};",
-        if selected {
-            if palette_is_dark(palette) {
-                "rgba(23,30,37,0.98)"
-            } else {
-                "rgba(255,255,255,0.98)"
-            }
-        } else {
-            "transparent"
-        },
-        if selected {
-            palette.text
-        } else {
-            palette.muted
-        },
-        if selected { 700 } else { 600 },
-        if selected {
-            if palette_is_dark(palette) {
-                "0 6px 18px rgba(0,0,0,0.18), inset 0 0 0 1px rgba(96,118,136,0.56)"
-            } else {
-                "0 3px 10px rgba(89,111,132,0.12), inset 0 0 0 1px rgba(216,227,236,0.96)"
-            }
-        } else {
-            "none"
-        },
-        standard_transition(&["background-color", "color", "box-shadow"])
     )
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -96711,6 +97004,43 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             &shell,
             &screen_changed
         ));
+    }
+
+    // An agent CLI's daemon-authoritative `working` flag flips true→false from
+    // the screen FOOTER ("esc to interrupt") which can move a beat AFTER the
+    // visible content (last-8-lines hash) has already settled — so the screen
+    // content signature is identical across the working→done transition. If the
+    // no-op check ignores `working`, that working-only snapshot is dropped and
+    // the sidebar dot blinks forever (and the finish chime never fires) until an
+    // unrelated change lands seconds later. The working flag MUST be part of the
+    // runtime truth. See [[finding-working-dot-noop-skips-working-only-update]].
+    #[test]
+    fn background_live_session_snapshot_applies_working_only_change() {
+        let session_path = "local://active-shell";
+        let mut shell = ShellState::new(test_shell_bootstrap_with_active_session(session_path));
+        let mut live_session = test_live_shell_session(session_path);
+        live_session.working = Some(true);
+        let snapshot = ServerUiSnapshot {
+            active_session_path: Some(session_path.to_string()),
+            active_session: Some(snapshot_session_view_for_ui(live_session.clone())),
+            active_view_mode: WorkspaceViewMode::Terminal,
+            remote_machines: Vec::new(),
+            ssh_targets: Vec::new(),
+            live_sessions: vec![snapshot_session_view_for_ui(live_session)],
+        };
+        shell.server.apply_snapshot(snapshot.clone());
+        assert!(background_live_session_snapshot_is_noop(&shell, &snapshot));
+
+        // Identical screen tail + foreground flag, ONLY `working` flips to done.
+        let mut working_done = snapshot;
+        working_done.live_sessions[0].working = Some(false);
+        if let Some(active) = working_done.active_session.as_mut() {
+            active.working = Some(false);
+        }
+        assert!(
+            !background_live_session_snapshot_is_noop(&shell, &working_done),
+            "a working-only true→false change must force an apply (dot must stop blinking)"
+        );
     }
 
     #[test]
