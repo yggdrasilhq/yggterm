@@ -128,6 +128,11 @@ Yggdrasil shells should support a reusable visual theme editor.
 - Auto-hidden titlebar reveal is chrome, not layout. It must draw over the
   workspace with the same shell tint/gradient language as the visible
   titlebar, and must not resize or vertically shift terminal content.
+- The revealed auto-hide titlebar floats on a soft drop shadow ALONE — never a
+  hard 1px hairline along its bottom edge. A bright (or even faintly tinted)
+  separator line reads as a stray white hairline, most visibly where the chrome
+  overhangs the lighter sidebar. The bottom border stays transparent; depth is
+  the shadow's job (`titlebar_autohide_chrome_shadow`).
 - Transparent desktop chrome must never be alpha-only. The stable material
   stack is theme tint, gradient wash, and enough fill opacity to stay readable
   without compositor blur.
@@ -494,6 +499,17 @@ Each app surface has exactly one source of truth:
 - Terminal mode is a live runtime attachment. Its viewport is fed only by daemon-owned PTY bytes, daemon-owned retained scrollback for that same runtime, or an explicit runtime-unavailable error. It must never be fed by generated Web View copy, Codex JSONL transcript blocks, semantic status-card guesses, or display-copy fallbacks.
 - Web View mode is a read-only presentation of a session for inspection, similar to a chat transcript. Its source of truth is stored/generated presentation data, not the live PTY. It may show `USER`/`ASSISTANT` style blocks when presenting an agent transcript, but those blocks are illegal in Terminal mode. Internal schemas may still use the legacy `Preview` name for compatibility, but user-facing UI should say `Web View`.
 - Display copy is metadata. It can label, summarize, and help users re-enter work, but it never decides which runtime receives input and never repairs a terminal viewport.
+
+The Session Metadata rail is a view-aware, useful summary — not a raw dump of
+every stored field. It surfaces, in order: **Session** identity (friendly kind,
+machine + local/remote, working dir, title); **Connect** — the verbatim handoff
+command to reattach this runtime's PTY from any shell (the daemon's authoritative
+`Restore` string, or a literal `ssh <machine>` + `cd <cwd>` for plain shells),
+rendered as selectable monospace because re-entering work is the product's core
+value; **Runtime** (status, PTY grid size, PID, resume id); and kind-specific
+**History** (transcript counts, started/last-active, persistence, rollout file).
+Internal bookkeeping (Bytes, Preview Blocks, Launch Error: none, the multi-line
+launch shell script, backend internals) is implementation detail and stays out.
 - Retained xterm hosts are display caches. If the cache is missing, stale, or corrupt, the rebuild source is the daemon runtime stream/scrollback for that runtime, not Web View text.
 - Codex-class semantic state is advisory. Codex welcome cards, `/status` output, prompt wording, and model banners are not stable contracts and must not be used as the primary proof that a terminal is healthy.
 
