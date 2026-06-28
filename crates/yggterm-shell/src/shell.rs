@@ -1,6 +1,7 @@
 use crate::app_capture::{
     background_app_window, capture_visible_app_surface, describe_window, focus_app_window,
-    move_app_window_by, record_visible_app_surface, resize_app_window,
+    move_app_window_by, overlay_terminal_canvas_onto_snapshot, record_visible_app_surface,
+    resize_app_window,
 };
 use crate::hot_update_policy::{
     daemon_update_state_json, runtime_status_is_current_app_version,
@@ -18445,23 +18446,17 @@ fn titlebar_autohide_chrome_background_color(
 fn titlebar_autohide_chrome_background_image(palette: Palette) -> String {
     format!("var(--yggterm-shell-gradient, {})", palette.gradient)
 }
-fn titlebar_autohide_chrome_border(palette: Palette) -> &'static str {
-    if palette_is_dark(palette) {
-        "rgba(187,204,219,0.14)"
-    } else {
-        "rgba(162,181,202,0.28)"
-    }
-}
 fn titlebar_autohide_chrome_shadow(palette: Palette) -> &'static str {
     // No hard hairline under the revealed hover chrome — the old
     // `0 1px 0 rgba(255,255,255,…)` painted an ugly bright white separator line
     // across the full width (user-reported 2026-06-27). A soft downward shadow
-    // gives the floating overlay depth without a visible line; the subtle
-    // `titlebar_autohide_chrome_border` still defines its bottom edge.
+    // gives the floating overlay depth without a visible line; this shadow is now
+    // the ONLY edge cue (there is no bottom border at all — see
+    // `format_titlebar_wrapper_style`).
     if palette_is_dark(palette) {
-        "0 10px 24px rgba(0,0,0,0.34)"
+        "0 12px 26px rgba(0,0,0,0.38)"
     } else {
-        "0 10px 22px rgba(70,92,116,0.12)"
+        "0 12px 24px rgba(70,92,116,0.16)"
     }
 }
 fn titlebar_wrapper_style(
@@ -18499,11 +18494,6 @@ fn titlebar_wrapper_style(
     } else {
         "none".to_string()
     };
-    let border = if auto_hide_enabled && revealed {
-        titlebar_autohide_chrome_border(palette)
-    } else {
-        "transparent"
-    };
     let shadow = if auto_hide_enabled && revealed {
         titlebar_autohide_chrome_shadow(palette)
     } else {
@@ -18525,7 +18515,6 @@ fn titlebar_wrapper_style(
         collapsed,
         background_color,
         background_image,
-        border,
         shadow,
         &backdrop,
         &transition,
@@ -18537,15 +18526,19 @@ fn format_titlebar_wrapper_style(
     collapsed: bool,
     background_color: String,
     background_image: String,
-    border: &str,
     shadow: &str,
     backdrop: &str,
     transition: &str,
 ) -> String {
+    // No `border-bottom` on the revealed chrome. A 1px border strip paints the
+    // background-COLOR (chrome fill, e.g. #f3f7fa) — the gradient image is sized
+    // to the padding-box and never reaches the border region — so ANY bottom
+    // border (even `solid transparent`) re-introduces the bright hairline the
+    // user reported. Depth comes from `box-shadow` alone.
     format!(
         "{} display:flex; flex-direction:column; min-width:0; height:{}px; min-height:{}px; max-height:{}px; \
          overflow:{}; z-index:180; background-color:{}; background-image:{}; background-size:var(--yggterm-shell-background-size, 100% 100vh); \
-         background-repeat:var(--yggterm-shell-background-repeat, no-repeat); background-position:top center; border-bottom:1px solid {}; box-shadow:{}; {} transition:{};",
+         background-repeat:var(--yggterm-shell-background-repeat, no-repeat); background-position:top center; border-bottom:none; box-shadow:{}; {} transition:{};",
         positioning,
         height_px,
         height_px,
@@ -18553,7 +18546,6 @@ fn format_titlebar_wrapper_style(
         if collapsed { "hidden" } else { "visible" },
         background_color,
         background_image,
-        border,
         shadow,
         backdrop,
         transition
@@ -34959,7 +34951,12 @@ async fn reconcile_terminal_from_daemon_for(
 /// and readable via toDataURL with NO compositor, NO window focus, NO privacy gate
 /// — faithful on every platform. Returns the PNG written verdict, or None to fall
 /// through to the platform capture. See feedback-verify-visual-with-faithful-pixel.
-async fn capture_active_terminal_canvas_composite(output_path: &Path) -> Option<Value> {
+/// Run the in-webview composite of the active terminal's xterm canvas layers and
+/// return the raw result Value (NO file write): `dataUrl` (faithful terminal PNG),
+/// its device-px `width`/`height`, the terminal viewport's CSS-px rect
+/// (`css_left`/`css_top`/`css_width`/`css_height`) and `win_w`/`win_h` so callers
+/// can overlay it onto a full-window chrome snapshot (`overlay_terminal_canvas_layer`).
+async fn eval_active_terminal_canvas_composite() -> Value {
     // No format!/interpolation → plain raw string (no brace-doubling needed).
     // The value MUST be returned via dioxus.send (receive_probe_eval_value reads the
     // send channel, NOT the script's return value) — a plain `return` hangs the recv.
@@ -35032,6 +35029,12 @@ async fn capture_active_terminal_canvas_composite(output_path: &Path) -> Option<
                     dataUrl,
                     width: W,
                     height: H,
+                    css_left: rect.left,
+                    css_top: rect.top,
+                    css_width: rect.width,
+                    css_height: rect.height,
+                    win_w: window.innerWidth,
+                    win_h: window.innerHeight,
                     layers: drawn,
                     canvas_count: canvases.length,
                     session_path: String(entry.sessionPath || ''),
@@ -35041,22 +35044,60 @@ async fn capture_active_terminal_canvas_composite(output_path: &Path) -> Option<
             }
         })()
     "#;
-    let value = receive_probe_eval_value(script, "").await;
+    receive_probe_eval_value(script, "").await
+}
+/// Decode the base64 `dataUrl` from an [`eval_active_terminal_canvas_composite`]
+/// result into raw PNG bytes.
+fn decode_composite_data_url(value: &Value) -> Result<Vec<u8>, String> {
+    let data_url = value
+        .get("dataUrl")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "composite result has no dataUrl".to_string())?;
+    let b64 = data_url
+        .strip_prefix("data:image/png;base64,")
+        .unwrap_or(data_url);
+    BASE64_STANDARD
+        .decode(b64.as_bytes())
+        .map_err(|error| format!("base64_decode: {error}"))
+}
+/// Overlay the faithful terminal canvas (from `layer`) onto a full-window chrome
+/// snapshot at `snapshot_path`, in place, producing one frame with chrome AND a
+/// faithful terminal. See [`overlay_terminal_canvas_onto_snapshot`].
+fn overlay_terminal_canvas_layer(snapshot_path: &Path, layer: &Value) -> Result<(), String> {
+    let png = decode_composite_data_url(layer)?;
+    let field = |key: &str| {
+        layer
+            .get(key)
+            .and_then(Value::as_f64)
+            .ok_or_else(|| format!("composite result missing {key}"))
+    };
+    overlay_terminal_canvas_onto_snapshot(
+        snapshot_path,
+        &png,
+        field("css_left")?,
+        field("css_top")?,
+        field("css_width")?,
+        field("css_height")?,
+        field("win_w")?,
+        field("win_h")?,
+    )
+    .map_err(|error| error.to_string())
+}
+/// Terminal-region-only faithful composite: run the in-webview canvas composite and
+/// write the PNG to `output_path`. The merged path
+/// ([`overlay_terminal_canvas_layer`]) is preferred; this remains the fallback when
+/// the chrome snapshot is unavailable.
+async fn capture_active_terminal_canvas_composite(output_path: &Path) -> Option<Value> {
+    let value = eval_active_terminal_canvas_composite().await;
     if value.get("ok").and_then(Value::as_bool) != Some(true) {
         return Some(json!({
             "ok": false,
             "reason": value.get("reason").and_then(Value::as_str).unwrap_or("composite_failed"),
         }));
     }
-    let data_url = value.get("dataUrl").and_then(Value::as_str)?;
-    let b64 = data_url
-        .strip_prefix("data:image/png;base64,")
-        .unwrap_or(data_url);
-    let bytes = match BASE64_STANDARD.decode(b64.as_bytes()) {
+    let bytes = match decode_composite_data_url(&value) {
         Ok(bytes) => bytes,
-        Err(error) => {
-            return Some(json!({ "ok": false, "reason": format!("base64_decode: {error}") }));
-        }
+        Err(reason) => return Some(json!({ "ok": false, "reason": reason })),
     };
     if let Err(error) = std::fs::write(output_path, &bytes) {
         return Some(json!({ "ok": false, "reason": format!("write_png: {error}") }));
@@ -35522,92 +35563,135 @@ async fn process_pending_app_control_requests(
         } => {
             let dom_snapshot =
                 capture_dom_debug_snapshot_for_or_empty(active_session_path.as_deref()).await;
-            // FAITHFUL TERMINAL CAPTURE (in-process, cross-platform, focus-independent):
-            // when the GPU canvas renderer is on, the WebKit/Spectacle paths are either
-            // blind to the canvas (webkit) or need window focus the agent can't hold over
-            // SSH (spectacle). Composite the xterm canvas layers directly via toDataURL.
-            // Only for App target + an active terminal; any failure falls through to the
-            // platform capture below. The image IS the terminal screen, so the CLI marks
-            // capture_backend=xterm_canvas_composite and skips the redundant region crop.
-            let canvas_composite = if matches!(target, ScreenshotTarget::App)
+            let output = Path::new(&output_path);
+            let prefer_terminal_composite = matches!(target, ScreenshotTarget::App)
                 && terminal_xterm_canvas_renderer_enabled()
-                && state.read().server.active_view_mode() == WorkspaceViewMode::Terminal
-            {
-                capture_active_terminal_canvas_composite(Path::new(&output_path)).await
-            } else {
-                None
-            };
-            if let Some(composite) = canvas_composite
-                .as_ref()
-                .filter(|v| v.get("ok").and_then(Value::as_bool) == Some(true))
-            {
-                AppControlResponse {
-                    request_id: request.request_id.clone(),
-                    handled_by_pid: std::process::id(),
-                    completed_at_ms: current_millis() as u128,
-                    output_path: Some(output_path.clone()),
-                    data: Some(json!({
-                        "command": "capture_screenshot",
-                        "target": target,
-                        "window": describe_window(&desktop),
-                        "active_view_mode": format!("{:?}", state.read().server.active_view_mode()),
-                        "active_session_path": state.read().server.active_session_path(),
-                        "capture_backend": "xterm_canvas_composite",
-                        "capture_backend_attempts": Vec::<String>::new(),
-                        "capture_faithful": true,
-                        "capture_faithful_reason": "in-process composite of the xterm canvas layers (toDataURL) — captures the GPU canvas without a compositor or window focus",
-                        "capture_is_terminal_region": true,
-                        "canvas_composite": composite,
-                        "dom": dom_snapshot,
-                    })),
-                    error: None,
+                && state.read().server.active_view_mode() == WorkspaceViewMode::Terminal;
+            // (backend, faithful, faithful_reason, is_terminal_region, attempts, output_path)
+            let mut success: Option<(String, bool, String, bool, Vec<String>, String)> = None;
+            let mut capture_error: Option<String> = None;
+
+            // MERGED FAITHFUL CAPTURE: a full-window WebKit DOM snapshot (chrome —
+            // sidebar, titlebar, right rail) with the faithful xterm canvas composited
+            // into the terminal rect. A DOM snapshot alone is BLIND to the WebGL canvas
+            // (chrome only); the canvas composite alone is terminal-region only (no
+            // chrome). Overlaying the canvas onto the chrome snapshot yields BOTH in one
+            // frame — so an agent can screenshot the right rail in Terminal view without
+            // disabling the GPU renderer. `--region terminal` still crops afterwards.
+            if prefer_terminal_composite {
+                match capture_visible_app_surface(&desktop, output, target, Some(&dom_snapshot))
+                    .await
+                {
+                    Ok(chrome) => {
+                        let layer = eval_active_terminal_canvas_composite().await;
+                        if layer.get("ok").and_then(Value::as_bool) == Some(true) {
+                            match overlay_terminal_canvas_layer(output, &layer) {
+                                Ok(()) => {
+                                    success = Some((
+                                        "xterm_canvas_composite_over_dom".to_string(),
+                                        true,
+                                        "full-window WebKit DOM snapshot (chrome) with the faithful xterm canvas composited into the terminal rect".to_string(),
+                                        false,
+                                        chrome.backend_attempts.clone(),
+                                        chrome.output_path.display().to_string(),
+                                    ));
+                                }
+                                Err(reason) => append_trace_event(
+                                    &home,
+                                    "ui",
+                                    "app_control",
+                                    "xterm_canvas_overlay_failed",
+                                    json!({ "reason": reason }),
+                                ),
+                            }
+                        } else {
+                            append_trace_event(
+                                &home,
+                                "ui",
+                                "app_control",
+                                "xterm_canvas_layer_unavailable",
+                                json!({ "reason": layer.get("reason") }),
+                            );
+                        }
+                    }
+                    Err(error) => append_trace_event(
+                        &home,
+                        "ui",
+                        "app_control",
+                        "merged_chrome_snapshot_failed",
+                        json!({ "reason": error.to_string() }),
+                    ),
                 }
-            } else {
-            if let Some(failed) = canvas_composite.as_ref() {
-                append_trace_event(
-                    &home,
-                    "ui",
-                    "app_control",
-                    "xterm_canvas_composite_fell_through",
-                    json!({ "reason": failed.get("reason") }),
-                );
+                // Fallback: faithful terminal-only composite (overwrites output) when the
+                // chrome snapshot or the overlay could not complete.
+                if success.is_none()
+                    && capture_active_terminal_canvas_composite(output)
+                        .await
+                        .filter(|v| v.get("ok").and_then(Value::as_bool) == Some(true))
+                        .is_some()
+                {
+                    success = Some((
+                        "xterm_canvas_composite".to_string(),
+                        true,
+                        "in-process composite of the xterm canvas layers (toDataURL) — terminal region only; chrome overlay unavailable".to_string(),
+                        true,
+                        Vec::new(),
+                        output_path.clone(),
+                    ));
+                }
             }
-            match capture_visible_app_surface(
-                &desktop,
-                Path::new(&output_path),
-                target,
-                Some(&dom_snapshot),
-            )
-            .await
-            {
-                Ok(capture) => AppControlResponse {
-                    request_id: request.request_id.clone(),
-                    handled_by_pid: std::process::id(),
-                    completed_at_ms: current_millis() as u128,
-                    output_path: Some(capture.output_path.display().to_string()),
-                    data: Some(json!({
-                        "command": "capture_screenshot",
-                        "target": target,
-                        "window": describe_window(&desktop),
-                        "active_view_mode": format!("{:?}", state.read().server.active_view_mode()),
-                        "active_session_path": state.read().server.active_session_path(),
-                        "capture_backend": capture.backend,
-                        "capture_backend_attempts": capture.backend_attempts,
-                        "capture_faithful": capture.faithful,
-                        "capture_faithful_reason": capture.faithful_reason,
-                        "dom": dom_snapshot,
-                    })),
-                    error: None,
-                },
-                Err(error) => AppControlResponse {
+
+            // Plain platform snapshot (non-terminal views, or every faithful path failed).
+            if success.is_none() {
+                match capture_visible_app_surface(&desktop, output, target, Some(&dom_snapshot))
+                    .await
+                {
+                    Ok(capture) => {
+                        success = Some((
+                            capture.backend.to_string(),
+                            capture.faithful,
+                            capture.faithful_reason.to_string(),
+                            false,
+                            capture.backend_attempts.clone(),
+                            capture.output_path.display().to_string(),
+                        ));
+                    }
+                    Err(error) => capture_error = Some(error.to_string()),
+                }
+            }
+
+            match success {
+                Some((backend, faithful, faithful_reason, terminal_region, attempts, out)) => {
+                    AppControlResponse {
+                        request_id: request.request_id.clone(),
+                        handled_by_pid: std::process::id(),
+                        completed_at_ms: current_millis() as u128,
+                        output_path: Some(out),
+                        data: Some(json!({
+                            "command": "capture_screenshot",
+                            "target": target,
+                            "window": describe_window(&desktop),
+                            "active_view_mode": format!("{:?}", state.read().server.active_view_mode()),
+                            "active_session_path": state.read().server.active_session_path(),
+                            "capture_backend": backend,
+                            "capture_backend_attempts": attempts,
+                            "capture_faithful": faithful,
+                            "capture_faithful_reason": faithful_reason,
+                            "capture_is_terminal_region": terminal_region,
+                            "dom": dom_snapshot,
+                        })),
+                        error: None,
+                    }
+                }
+                None => AppControlResponse {
                     request_id: request.request_id.clone(),
                     handled_by_pid: std::process::id(),
                     completed_at_ms: current_millis() as u128,
                     output_path: None,
                     data: None,
-                    error: Some(error.to_string()),
+                    error: capture_error
+                        .or_else(|| Some("screenshot capture failed".to_string())),
                 },
-            }
             }
         }
         AppControlCommand::ScrollPreview { top_px, ratio } => {
@@ -70727,31 +70811,228 @@ fn RightRail(
 #[component]
 fn MetadataRailBody(snapshot: SharedSnapshot) -> Element {
     let session = snapshot.active_session.clone();
+    let palette = snapshot.palette;
     rsx! {
-        RailHeader { title: "Session Metadata".to_string(), color: snapshot.palette.text.to_string() }
+        RailHeader { title: "Session Metadata".to_string(), color: palette.text.to_string() }
         RailScrollBody {
             content: rsx!{
             if let Some(session) = session {
-                MetadataGroup {
-                    title: "Overview".to_string(),
-                    entries: session.metadata.iter().take(6).cloned().collect(),
-                    palette: snapshot.palette,
-                }
-                MetadataGroup {
-                    title: "Runtime".to_string(),
-                    entries: session.metadata.iter().skip(6).cloned().collect(),
-                    palette: snapshot.palette,
-                }
+                {render_session_metadata(&session, palette)}
             } else {
                 MetadataGroup {
-                    title: "Overview".to_string(),
+                    title: "Session".to_string(),
                     entries: vec![SessionMetadataEntry {
                         label: "State",
                         value: "No session selected".to_string(),
                     }],
-                    palette: snapshot.palette,
+                    palette,
                 }
             }
+            }
+        }
+    }
+}
+/// Friendly, user-facing label for a session kind. The raw enum names
+/// (`ClaudeCode`, `CodexLiteLlm`) are an implementation detail.
+fn friendly_session_kind(kind: SessionKind) -> &'static str {
+    match kind {
+        SessionKind::Codex => "Codex",
+        SessionKind::CodexLiteLlm => "Codex · LiteLLM",
+        SessionKind::ClaudeCode => "Claude Code",
+        SessionKind::Shell => "Shell",
+        SessionKind::SshShell => "SSH Shell",
+        SessionKind::Document => "Document",
+    }
+}
+fn friendly_launch_phase(phase: TerminalLaunchPhase) -> &'static str {
+    match phase {
+        TerminalLaunchPhase::Queued => "queued",
+        TerminalLaunchPhase::BridgePending => "starting",
+        TerminalLaunchPhase::RemoteBootstrap => "bootstrapping",
+        TerminalLaunchPhase::Running => "running",
+    }
+}
+/// "How to connect to that PTY" — the product's core value, surfaced verbatim.
+/// The daemon already computes an authoritative `Restore` handoff command
+/// (`ssh <machine> 'yggterm server remote resume-… <uuid> --require-existing'`);
+/// prefer it. Plain shells carry no daemon restore, so fall back to the literal
+/// manual handoff a human would type (ssh into the box, cd into the cwd).
+fn session_connect_command(session: &ManagedSessionView, cwd: &str) -> String {
+    let restore = metadata_value(session, "Restore");
+    if !restore.trim().is_empty() {
+        return restore.trim().to_string();
+    }
+    let cwd = cwd.trim();
+    if let Some(target) = session
+        .ssh_target
+        .as_ref()
+        .map(|target| target.trim())
+        .filter(|target| !target.is_empty())
+    {
+        if cwd.is_empty() {
+            return format!("ssh {target}");
+        }
+        return format!("ssh {target}\ncd {cwd}");
+    }
+    if !cwd.is_empty() {
+        return format!("cd {cwd}");
+    }
+    String::new()
+}
+/// Build the view-aware "useful" metadata panel from the rich snapshot fields
+/// (kind, host/source, pty grid, pid, working state) plus the genuinely useful
+/// daemon metadata entries (cwd, restore command, resume id, transcript stats),
+/// instead of dumping every raw entry (Bytes, Preview Blocks, Launch Error:none,
+/// the multi-line launch shell script). One source of truth per fact.
+fn render_session_metadata(session: &ManagedSessionView, palette: Palette) -> Element {
+    let kind = session.kind;
+    let locality = match session.source {
+        SessionSource::LiveLocal => "local",
+        SessionSource::LiveSsh => "remote",
+        SessionSource::Stored => "stored",
+    };
+    let host = session.host_label.trim();
+    let machine = if host.is_empty() {
+        locality.to_string()
+    } else {
+        format!("{host} · {locality}")
+    };
+    let cwd = {
+        let primary = metadata_value(session, "Cwd");
+        if primary.trim().is_empty() {
+            metadata_value(session, "Target")
+        } else {
+            primary
+        }
+    };
+
+    let mut identity = vec![
+        SessionMetadataEntry {
+            label: "Type",
+            value: friendly_session_kind(kind).to_string(),
+        },
+        SessionMetadataEntry {
+            label: "Machine",
+            value: machine,
+        },
+    ];
+    if !cwd.trim().is_empty() {
+        identity.push(SessionMetadataEntry {
+            label: "Working dir",
+            value: cwd.trim().to_string(),
+        });
+    }
+    if !session.title.trim().is_empty() {
+        identity.push(SessionMetadataEntry {
+            label: "Title",
+            value: session.title.trim().to_string(),
+        });
+    }
+
+    let connect = session_connect_command(session, &cwd);
+
+    let working = match session.working {
+        Some(true) => "working",
+        Some(false) => "idle",
+        None => "—",
+    };
+    let mut runtime = vec![SessionMetadataEntry {
+        label: "Status",
+        value: format!("{} · {working}", friendly_launch_phase(session.launch_phase)),
+    }];
+    // PTY grid is surfaced by `managed_session_from_snapshot` as a "PTY size"
+    // metadata entry (the daemon owns the live grid; the GUI session model does
+    // not carry pty_cols/rows directly).
+    let pty_size = metadata_value(session, "PTY size");
+    if !pty_size.trim().is_empty() {
+        runtime.push(SessionMetadataEntry {
+            label: "PTY size",
+            value: pty_size.trim().to_string(),
+        });
+    }
+    if let Some(pid) = session.terminal_process_id {
+        runtime.push(SessionMetadataEntry {
+            label: "PID",
+            value: pid.to_string(),
+        });
+    }
+    let resume_id = {
+        let uuid = metadata_value(session, "UUID");
+        if uuid.trim().is_empty() {
+            session.id.clone()
+        } else {
+            uuid
+        }
+    };
+    if !resume_id.trim().is_empty() {
+        runtime.push(SessionMetadataEntry {
+            label: match kind {
+                SessionKind::Codex | SessionKind::CodexLiteLlm => "Codex session",
+                SessionKind::ClaudeCode => "Claude Code session",
+                _ => "Session id",
+            },
+            value: resume_id.trim().to_string(),
+        });
+    }
+
+    let mut history = Vec::new();
+    for (label, key) in [
+        ("Conversation", "Messages"),
+        ("Started", "Started"),
+        ("Last active", "Updated"),
+        ("Persistence", "Runtime Persistence"),
+        ("Rollout file", "Storage"),
+    ] {
+        let value = metadata_value(session, key);
+        if !value.trim().is_empty() {
+            history.push(SessionMetadataEntry {
+                label,
+                value: value.trim().to_string(),
+            });
+        }
+    }
+
+    rsx! {
+        MetadataGroup { title: "Session".to_string(), entries: identity, palette }
+        if !connect.trim().is_empty() {
+            MetadataConnectBlock { palette, command: connect }
+        }
+        MetadataGroup { title: "Runtime".to_string(), entries: runtime, palette }
+        if !history.is_empty() {
+            MetadataGroup { title: "History".to_string(), entries: history, palette }
+        }
+    }
+}
+#[component]
+fn MetadataConnectBlock(palette: Palette, command: String) -> Element {
+    let background = if palette_is_dark(palette) {
+        "rgba(255,255,255,0.05)"
+    } else {
+        "rgba(13,21,30,0.04)"
+    };
+    let border = if palette_is_dark(palette) {
+        "rgba(141,160,178,0.20)"
+    } else {
+        "rgba(198,212,224,0.55)"
+    };
+    rsx! {
+        div {
+            style: "display:flex; flex-direction:column; gap:6px; padding-bottom:4px;",
+            RailSectionTitle { title: "Connect".to_string(), muted_color: palette.muted.to_string() }
+            div {
+                style: format!("font-size:11px; line-height:1.45; color:{};", palette.muted),
+                "Reattach to this session's PTY from any shell:"
+            }
+            div {
+                "data-metadata-connect-command": "1",
+                style: format!(
+                    "font-family:ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size:11.5px; \
+                     line-height:1.55; color:{}; background:{}; border-radius:10px; padding:10px 11px; \
+                     white-space:pre-wrap; word-break:break-all; user-select:text; -webkit-user-select:text; \
+                     cursor:text; box-shadow: inset 0 0 0 1px {};",
+                    palette.text, background, border
+                ),
+                "{command}"
             }
         }
     }
@@ -72752,6 +73033,16 @@ fn ZoomSettingRow(
     let mut draft_percent = use_signal(|| percent.to_string());
     let mut focused = use_signal(|| false);
     let display_percent = draft_percent();
+    // The number's pill snugly tracks its content: the field grows as more digits
+    // are typed / stepped up and shrinks back down for smaller values
+    // (user-reported 2026-06-28). Width is digit-count driven so "50" reads
+    // narrower than "100" reads narrower than "1000".
+    let zoom_input_digits = display_percent
+        .chars()
+        .filter(|ch| !ch.is_whitespace())
+        .count()
+        .max(1);
+    let zoom_input_width_px = 22 + zoom_input_digits as i32 * 12;
     use_effect(move || {
         if !focused() {
             let canonical = percent.to_string();
@@ -72795,10 +73086,10 @@ fn ZoomSettingRow(
                     pattern: "[0-9]*",
                     value: "{display_percent}",
                     style: format!(
-                        "min-width:0; width:54px; height:24px; border:none; border-radius:8px; \
+                        "min-width:0; width:{zoom_input_width_px}px; height:24px; border:none; border-radius:8px; \
                          background:{}; color:{}; outline:none; text-align:center; \
                          font-size:12px; font-weight:750; box-shadow: inset 0 0 0 1px {}; \
-                         appearance:textfield; -moz-appearance:textfield;",
+                         appearance:textfield; -moz-appearance:textfield; transition:width 120ms ease;",
                         if palette_is_dark(palette) {
                             "rgba(10,14,20,0.60)"
                         } else {
@@ -73071,7 +73362,7 @@ fn TerminalThemeSelectRow(
                             value: "{filter_value}",
                             placeholder: "Filter themes",
                             style: format!(
-                                "height:28px; padding:0 9px; border:none; border-radius:8px; background:{}; color:{}; \
+                                "flex:0 0 auto; height:28px; min-height:28px; padding:0 9px; border:none; border-radius:8px; background:{}; color:{}; \
                                  outline:none; box-shadow: inset 0 0 0 1px {}; font-size:12px; font-weight:650;",
                                 control_background,
                                 control_text,
