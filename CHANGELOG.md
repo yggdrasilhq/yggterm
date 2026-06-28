@@ -2,6 +2,23 @@
 
 This file tracks user-visible changes in `yggterm`.
 
+## 2.9.47
+
+- **The Session Metadata panel now shows useful, view-aware information** instead of a raw dump of
+  internal fields. It surfaces what helps you re-enter work: the session type and machine, the working
+  directory, a selectable **Connect** command to reattach the session's PTY from any shell, and a
+  Runtime block (status, PTY size, process id, resume id) plus transcript and persistence details.
+- **The interface/terminal zoom field hugs its value.** The number pill grows and shrinks to fit the
+  digits you type or step to, instead of sitting in a fixed-width box.
+- **The terminal-theme dropdown search no longer collapses.** The "Filter themes" box keeps its full
+  height while the theme list is showing, rather than being squeezed to a sliver.
+- **The auto-hide titlebar no longer paints a faint hairline along its bottom edge.** The revealed
+  chrome is defined by a soft shadow alone, with no stray line where it overhangs the sidebar.
+- **Agent screenshots capture the chrome and a faithful terminal in one frame.** In Terminal view with
+  the WebGL renderer on, the in-app screenshot tool composites the GPU terminal canvas onto a
+  full-window snapshot, so observability tooling no longer has to disable the renderer to see the side
+  panels.
+
 ## 2.9.46
 
 - **Working dots converge to the daemon that owns each session.** After an in-place update hands a
