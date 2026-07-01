@@ -2,6 +2,20 @@
 
 This file tracks user-visible changes in `yggterm`.
 
+## 2.9.48
+
+- **The local machine now shows a working indicator, just like remote machines.** Its row in the cwd
+  tree blinks whenever any local session is working — including plain local shells, which previously
+  never lit it up. This matches how a remote machine row surfaces "work happening inside" for any
+  session on that host. (The local machine has no reachability dot — it is always reachable — so the
+  blink is the only indicator.)
+- **Fresh local Claude Code sessions get their title on the first turn.** A newly started local
+  Claude Code session used to stay pinned to its generic "local claude-code" launch label because its
+  on-disk transcript was named with an id that did not match the row, so yggterm could never pick up
+  Claude Code's own title. New local Claude Code sessions are now started with their identity fixed up
+  front, so the title Claude Code generates on the first turn is fetched and shown right away — the
+  same way remote and Codex sessions already rename themselves.
+
 ## 2.9.47
 
 - **The Session Metadata panel now shows useful, view-aware information** instead of a raw dump of
