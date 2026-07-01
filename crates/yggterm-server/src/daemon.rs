@@ -6211,6 +6211,11 @@ fn collect_live_cc_title_syncs(
         if !working_paths.contains(&session.session_path) {
             continue;
         }
+        // The session id equals CC's own rollout uuid because a fresh CC session
+        // is launched with `--session-id <uuid>` (build_live_session) and a
+        // resumed one with `--resume <uuid>`, so this id-keyed lookup finds the
+        // JSONL on the very first turn. (A bare `claude` would mint its own uuid
+        // → this lookup fails → stuck launch hint; live-caught drift 2026-07-01.)
         let Some(jsonl) = local_cc_session_jsonl_path(&session.id) else {
             continue;
         };
@@ -12724,7 +12729,8 @@ mod tests {
             );
             server
         };
-        // Even while "working", a CC session with no JSONL yields no update.
+        // Even while "working", a CC session with no JSONL on disk yields no
+        // update (and never touch non-CC or remote sessions).
         let working: std::collections::HashSet<String> = server
             .live_sessions()
             .iter()
