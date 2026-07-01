@@ -19679,7 +19679,7 @@ fn build_live_session(
                 RemoteDeployState::NotRequired,
             ),
             SessionKind::ClaudeCode => (
-                agent_launch_command(SessionKind::ClaudeCode, Some(&default_cwd), None),
+                claude_code_fresh_launch_command(Some(&default_cwd), uuid),
                 local_live_runtime_key(uuid),
                 "local-claude-code".to_string(),
                 default_cwd.clone(),
@@ -20509,6 +20509,25 @@ fn agent_launch_command(kind: SessionKind, cwd: Option<&str>, session_id: Option
         None => managed_cli_shell_command(kind, cwd, ManagedCliAction::Launch),
     };
     managed.unwrap_or_else(|_| legacy_agent_launch_command(kind, cwd, session_id))
+}
+
+/// A FRESH Claude Code session must be BORN with its identity: launch
+/// `claude … --session-id <uuid>` so CC names its rollout JSONL `<uuid>.jsonl`,
+/// matching the yggterm session id. A bare `claude` mints its OWN uuid, so the
+/// JSONL never matches the row and the daemon's id-keyed CC title sync can't find
+/// it — the session stays stuck on its "local claude-code" launch hint and never
+/// renames on the first turn (live-confirmed drift 2026-07-01: `local://1fb5a61f…`
+/// was really CC rollout `ae98d76f…`). Codex needs no equivalent — it reports its
+/// id via the session-file watch. This mirrors the host-daemon runtime lane
+/// (`start-cc`), which already pins `--session-id`. `--session-id` is a real CC
+/// flag and the minimum needed for handoff identity, so it satisfies the
+/// wrapper-vs-manual parity rule.
+fn claude_code_fresh_launch_command(cwd: Option<&str>, session_id: &str) -> String {
+    format!(
+        "{} --session-id {}",
+        agent_launch_command(SessionKind::ClaudeCode, cwd, None),
+        shell_single_quote(session_id)
+    )
 }
 
 fn persistent_agent_resume_command(
@@ -22683,6 +22702,45 @@ mod tests {
             GhosttyHostSupport::shadow("test".to_string(), false, false),
             UiTheme::ZedLight,
         )
+    }
+
+    #[test]
+    fn fresh_local_claude_code_session_pins_its_session_id_at_launch() {
+        // Divergence report (2026-07-01): a fresh local CC session launched with a
+        // bare `claude` minted its OWN rollout uuid, so the JSONL was never named
+        // by the yggterm session id, the daemon's id-keyed title sync could not
+        // find it, and the session stayed stuck on its "local claude-code" launch
+        // hint — never renaming on the first turn (unlike Codex/SSH). Pin CC's id
+        // via `--session-id <uuid>` so the JSONL matches the row and the existing
+        // sync picks up CC's own title at once.
+        let mut server = test_server();
+        let path = server.start_local_session(SessionKind::ClaudeCode, Some("/home/pi"), None);
+        let cc = server
+            .live_sessions()
+            .iter()
+            .find(|session| session.session_path == path)
+            .expect("cc session")
+            .clone();
+        assert!(
+            cc.launch_command
+                .contains(&format!("--session-id '{}'", cc.id)),
+            "fresh CC launch must pin --session-id <uuid>; got: {}",
+            cc.launch_command
+        );
+        // Codex must NOT gain a `--session-id` — it reports its id via the
+        // session-file watch, and the manual `codex` launch does not use it.
+        let codex_path = server.start_local_session(SessionKind::Codex, Some("/home/pi"), None);
+        let codex = server
+            .live_sessions()
+            .iter()
+            .find(|session| session.session_path == codex_path)
+            .expect("codex session")
+            .clone();
+        assert!(
+            !codex.launch_command.contains("--session-id"),
+            "codex must not pin --session-id; got: {}",
+            codex.launch_command
+        );
     }
 
     // XTERM-BUG: squish-and-bottom-paint-on-reresume — the PTY grid is recorded in
