@@ -44067,17 +44067,32 @@ fn sidebar_row_shows_busy_icon(snapshot: &RenderSnapshot, row: &BrowserRow) -> b
 /// reuses the per-session busy SSOT. Cheap (one linear pass over the subtree);
 /// no recursion (only Session descendants are queried, which never re-enter the
 /// group branch). See DESIGN.md "Status indicator vocabulary".
-/// A machine ROOT row (`__remote_machine__/<key>`) blinks when any LIVE session
-/// belonging to that machine is working (issue #3). Live sessions hang off the
-/// flat "Live Sessions" group, NOT under the machine's cwd-tree, so the
-/// descendant walk can't see them — match by host instead. Restricted to the
-/// machine-root path prefix so cwd SUBgroups under the machine never inherit the
-/// whole machine's activity. Snapshot-only (no `ShellState`) so it composes with
-/// `sidebar_row_busy_state`.
+/// A machine ROOT row (`__remote_machine__/<key>` or the LOCAL root `"local"`)
+/// blinks when any LIVE session belonging to that machine is working (issue #3).
+/// Live sessions hang off the flat "Live Sessions" group, NOT under the machine's
+/// cwd-tree, so the descendant walk can't see them — match by host instead.
+/// Restricted to the machine-root path so cwd SUBgroups under the machine never
+/// inherit the whole machine's activity. Snapshot-only (no `ShellState`) so it
+/// composes with `sidebar_row_busy_state`.
+///
+/// The LOCAL root has no `__remote_machine__/` prefix and its live shells live in
+/// "Live Sessions" (not the local cwd subtree), so without this branch a working
+/// local SHELL never surfaces on the local root — a divergence from remote
+/// machines, which blink for any working session via host-match. Local sessions
+/// are identified by locality (no ssh target / `local://…` family). Per the
+/// local-machine indicator decision this is blink-only: the local machine is
+/// always reachable, so it gets no persistent health dot, only this working blink.
 fn sidebar_machine_row_has_working_live_session(
     snapshot: &RenderSnapshot,
     row: &BrowserRow,
 ) -> bool {
+    if row.full_path == "local" {
+        return snapshot.live_sessions.iter().any(|session| {
+            session.working == Some(true)
+                && session.ssh_target.is_none()
+                && is_local_live_session_path(&session.session_path)
+        });
+    }
     let Some(machine_key) = row.full_path.strip_prefix("__remote_machine__/") else {
         return false;
     };
@@ -98627,6 +98642,59 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
                 "group aggregate working state mismatch for working={verdict:?}"
             );
         }
+    }
+
+    #[test]
+    fn local_machine_root_blinks_for_working_local_shell() {
+        // Divergence report (2026-07-01): the LOCAL machine root ("local") had no
+        // working indicator parity with remote machine roots. Remote roots blink
+        // for ANY working session on the host via host-match; the local root only
+        // aggregated its cwd-subtree (local Codex/CC), so a working local SHELL —
+        // which lives in "Live Sessions", not the local cwd subtree — never made
+        // the local root blink. Per the local-machine indicator decision this is
+        // blink-only (no persistent health dot). This test locks the parity.
+        let shell = ShellState::new(test_shell_bootstrap_with_start_page());
+        let mut snapshot = shell.snapshot();
+        let local_root = test_sidebar_group_row("local");
+        snapshot.rows = vec![local_root.clone()];
+
+        let mut local_shell = test_live_shell_session("local://local-shell-working");
+        local_shell.id = "local-shell-working".to_string();
+        local_shell.kind = SessionKind::Shell;
+        local_shell.source = SessionSource::LiveLocal;
+        local_shell.ssh_target = None;
+
+        // Working local shell → the local root blinks.
+        local_shell.working = Some(true);
+        snapshot.live_sessions = vec![local_shell.clone()];
+        assert!(
+            sidebar_machine_row_has_working_live_session(&snapshot, &local_root),
+            "the local root must blink for a working local shell (parity with remote machine roots)"
+        );
+        assert!(
+            sidebar_row_shows_busy_icon(&snapshot, &local_root),
+            "the local group busy icon must reflect the working local shell"
+        );
+
+        // Idle local shell → no blink.
+        local_shell.working = Some(false);
+        snapshot.live_sessions = vec![local_shell];
+        assert!(
+            !sidebar_machine_row_has_working_live_session(&snapshot, &local_root),
+            "an idle local shell must not blink the local root"
+        );
+
+        // A working REMOTE session must never blink the LOCAL root.
+        let mut remote = test_live_shell_session("remote-session://dev/remote-working");
+        remote.id = "remote-working".to_string();
+        remote.source = SessionSource::LiveSsh;
+        remote.ssh_target = Some("dev".to_string());
+        remote.working = Some(true);
+        snapshot.live_sessions = vec![remote];
+        assert!(
+            !sidebar_machine_row_has_working_live_session(&snapshot, &local_root),
+            "a working remote session must not blink the LOCAL machine root"
+        );
     }
 
     #[test]
