@@ -2,6 +2,20 @@
 
 This file tracks user-visible changes in `yggterm`.
 
+## 2.9.49
+
+- **The cwd tree and start page can no longer freeze on days-stale session lists.** The background
+  refresh that scans each remote machine's sessions had no durable driver: it re-armed itself only
+  from the tail of a completed refresh, so a single deferred tick (which happens whenever a terminal
+  is focused) silently killed the chain for the rest of the app's lifetime. Sessions started after
+  that moment never appeared in the cwd tree or on the start page, and closed ones never disappeared,
+  until an app restart or a lucky reconnect. The periodic scheduler now re-arms remote-machine
+  refreshes on every tick, so the truth surfaces recover as soon as refreshes are allowed again.
+- **A remote machine that fails five refreshes in a row is no longer frozen out forever.** The retry
+  ladder used to end in a permanent stop; it now tops out at a repeating 15-minute retry, so a
+  machine that was briefly unreachable (sleep/resume, network blip) re-enters the session scan on its
+  own.
+
 ## 2.9.48
 
 - **The local machine now shows a working indicator, just like remote machines.** Its row in the cwd
