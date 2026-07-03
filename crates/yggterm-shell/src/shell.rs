@@ -659,7 +659,11 @@ const BACKGROUND_REFRESH_INTERACTIVE_DEFER_MS: u64 = 15_000;
 const BACKGROUND_REFRESH_POLL_MS: u64 = 15_000;
 const REMOTE_MACHINE_REFRESH_QUEUED_RETRY_MS: u64 = 60_000;
 const REMOTE_MACHINE_HEALTHY_REFRESH_TTL_MS: u64 = 30_000;
-const REMOTE_MACHINE_REFRESH_BACKOFF_MS: [u64; 5] = [30_000, 120_000, 300_000, 900_000, u64::MAX];
+// The ladder tops out at a repeating 15-minute retry instead of a permanent
+// circuit: a machine that fails 5+ refreshes must still re-enter the truth
+// stage eventually, otherwise the cwd tree + start page freeze on stale scan
+// data for the GUI's whole lifetime.
+const REMOTE_MACHINE_REFRESH_BACKOFF_MS: [u64; 4] = [30_000, 120_000, 300_000, 900_000];
 const LIVE_SESSION_SNAPSHOT_TRIGGER_DEBOUNCE_MS: u64 = 1_200;
 const LIVE_SESSION_SNAPSHOT_BUSY_POLL_MS: u64 = 10_000;
 const LIVE_SESSION_SNAPSHOT_BACKGROUND_BUSY_POLL_MS: u64 = 15_000;
@@ -14273,7 +14277,7 @@ fn remote_machine_refresh_backoff_ms(failure_count: u8) -> u64 {
     REMOTE_MACHINE_REFRESH_BACKOFF_MS
         .get(ix)
         .copied()
-        .unwrap_or(u64::MAX)
+        .unwrap_or(REMOTE_MACHINE_REFRESH_BACKOFF_MS[REMOTE_MACHINE_REFRESH_BACKOFF_MS.len() - 1])
 }
 fn record_remote_machine_refresh_failure(shell: &mut ShellState, machine_key: &str) -> u64 {
     let failure_count = shell
@@ -14286,11 +14290,7 @@ fn record_remote_machine_refresh_failure(shell: &mut ShellState, machine_key: &s
         .remote_machine_refresh_failures
         .insert(machine_key.to_string(), failure_count);
     let delay_ms = remote_machine_refresh_backoff_ms(failure_count);
-    let retry_after = if delay_ms == u64::MAX {
-        u64::MAX
-    } else {
-        current_millis().saturating_add(delay_ms)
-    };
+    let retry_after = current_millis().saturating_add(delay_ms);
     shell
         .remote_machine_refresh_retry_after_ms
         .insert(machine_key.to_string(), retry_after);
@@ -39334,6 +39334,13 @@ fn app() -> Element {
                         selected_hint,
                     );
                 }
+                // Remote-machine truth refreshes have no other durable driver:
+                // their only re-arm points are initial server sync and the tail
+                // of a completed refresh, so one deferred tick (active terminal)
+                // would otherwise kill the chain for the GUI's lifetime and
+                // freeze the cwd tree + start page on stale scan data.
+                maybe_spawn_missing_remote_machine_refreshes(state);
+                maybe_spawn_missing_managed_cli_refreshes(state);
                 sleep(Duration::from_millis(wait_ms)).await;
             }
         });
@@ -82719,6 +82726,33 @@ mod tests {
     }
 
     #[test]
+    fn browser_tree_refresh_loop_rearms_remote_machine_refreshes() {
+        // Regression lock for the 2026-07-03 "broken truth stage" incident:
+        // remote-machine refreshes were only re-armed by initial server sync
+        // and by the tail of a completed refresh. One deferred tick (active
+        // terminal) killed the chain for the GUI's lifetime, freezing the cwd
+        // tree + start page on scan data that was days stale. The periodic
+        // browser-tree loop must re-arm the remote truth stage every tick.
+        let source = include_str!("shell.rs");
+        let start = source
+            .find("if !browser_tree_refresh_loop_started.swap(true, Ordering::SeqCst)")
+            .expect("browser tree refresh loop");
+        let end = source[start..]
+            .find("sleep(Duration::from_millis(wait_ms)).await")
+            .map(|offset| start + offset)
+            .expect("loop sleep");
+        let loop_body = &source[start..end];
+        assert!(
+            loop_body.contains("maybe_spawn_missing_remote_machine_refreshes(state)"),
+            "the periodic loop must re-arm remote machine refreshes; without it the refresh chain dies on the first deferred tick"
+        );
+        assert!(
+            loop_body.contains("maybe_spawn_missing_managed_cli_refreshes(state)"),
+            "the periodic loop must also re-arm managed CLI refreshes for the same chain-death reason"
+        );
+    }
+
+    #[test]
     fn first_live_session_can_drag_down_and_duplicate_sources_are_ignored() {
         let path_a = "remote-session://dev/a";
         let path_b = "remote-session://dev/b";
@@ -97115,19 +97149,26 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
     }
 
     #[test]
-    fn failed_remote_machine_refresh_escalates_to_quiet_circuit() {
+    fn failed_remote_machine_refresh_backoff_caps_and_never_freezes_forever() {
         let mut shell = ShellState::new(test_shell_bootstrap_with_active_session("local://active"));
         let first = record_remote_machine_refresh_failure(&mut shell, "oc");
         let second = record_remote_machine_refresh_failure(&mut shell, "oc");
         let third = record_remote_machine_refresh_failure(&mut shell, "oc");
         let fourth = record_remote_machine_refresh_failure(&mut shell, "oc");
         let fifth = record_remote_machine_refresh_failure(&mut shell, "oc");
+        let sixth = record_remote_machine_refresh_failure(&mut shell, "oc");
 
         assert!(second > first);
         assert!(third > second);
         assert!(fourth > third);
-        assert_eq!(fifth, u64::MAX);
-        assert_eq!(shell.remote_machine_refresh_failures.get("oc"), Some(&5));
+        // 5th+ failures repeat the top-of-ladder delay; a permanent freeze
+        // (u64::MAX) would drop the machine out of the truth stage for the
+        // whole GUI lifetime, hiding every session created after the freeze.
+        assert_eq!(remote_machine_refresh_backoff_ms(5), 900_000);
+        assert_eq!(remote_machine_refresh_backoff_ms(200), 900_000);
+        assert!(fifth < u64::MAX);
+        assert!(sixth < u64::MAX);
+        assert_eq!(shell.remote_machine_refresh_failures.get("oc"), Some(&6));
         assert!(
             pending_remote_machine_refreshes(
                 &[RemoteMachineSnapshot {
