@@ -391,6 +391,15 @@ impl WebviewInstance {
                     return true;
                 }
 
+                // yggterm web surfaces: while any surface is live, http(s)
+                // navigations stay in-frame (sandboxed iframes; see
+                // WEBVIEW_HTTP_NAVIGATION_OPEN).
+                if (var.starts_with("http://") || var.starts_with("https://"))
+                    && webview_http_navigation_open()
+                {
+                    return true;
+                }
+
                 // External links always open somewhere else. Prevents the webview from navigating.
                 if var.starts_with("http://")
                     || var.starts_with("https://")
@@ -702,6 +711,26 @@ pub fn allow_webview_navigation_prefix(prefix: impl Into<String>) {
             list.push(prefix);
         }
     }
+}
+
+/// Process-global gate: while true, ALL http(s) navigations proceed in-frame
+/// instead of bouncing to the OS browser. yggterm opens it while at least one
+/// web surface is live — cross-origin link clicks and redirects inside a
+/// surface iframe reach the policy handler with no frame attribution
+/// (WebKitGTK), so a prefix allowlist cannot cover them. Safety relies on the
+/// surface iframes' sandbox (no allow-top-navigation) and on the shell UI
+/// carrying no plain http(s) anchors that could navigate the main frame.
+static WEBVIEW_HTTP_NAVIGATION_OPEN: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Open/close the blanket in-frame http(s) navigation gate (see
+/// `WEBVIEW_HTTP_NAVIGATION_OPEN`).
+pub fn set_webview_http_navigation_open(open: bool) {
+    WEBVIEW_HTTP_NAVIGATION_OPEN.store(open, std::sync::atomic::Ordering::SeqCst);
+}
+
+pub(crate) fn webview_http_navigation_open() -> bool {
+    WEBVIEW_HTTP_NAVIGATION_OPEN.load(std::sync::atomic::Ordering::SeqCst)
 }
 
 pub(crate) fn webview_navigation_allowlisted(url: &str) -> bool {
