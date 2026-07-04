@@ -56699,13 +56699,13 @@ fn TerminalCanvas(
                             "position:absolute; inset:0; z-index:40; display:flex; flex-direction:column; background:{}; border-radius:{};",
                             theme.background, terminal_shell_radius,
                         ),
-                        // Tab strip: tabs sit on the darker strip; the active
-                        // tab merges into the nav bar below (Chrome-like).
+                        // Tab strip: a translucent tint over the page
+                        // background so the ACTIVE tab (painted solid page
+                        // color) visibly merges into the nav bar below while
+                        // inactive tabs recede (Chrome-like). Tabs share
+                        // width equally and shrink together when crowded.
                         div {
-                            style: format!(
-                                "display:flex; align-items:flex-end; gap:2px; padding:6px 8px 0; background:{}; user-select:none; overflow:hidden;",
-                                terminal_shell_background,
-                            ),
+                            style: "display:flex; align-items:flex-end; gap:2px; padding:6px 8px 0; background:rgba(127,127,127,0.16); user-select:none; overflow:hidden;",
                             {web_overlay.tabs.iter().map(|tab| {
                                 let tab_id = tab.id;
                                 let tab_label = tab.label.clone();
@@ -56713,17 +56713,16 @@ fn TerminalCanvas(
                                 let is_app_tab = tab.is_app_tab;
                                 let select_path = web_surface_session_path.clone();
                                 let close_tab_path = web_surface_session_path.clone();
-                                let tab_background = if tab_active {
-                                    theme.background.clone()
+                                let (tab_background, tab_opacity) = if tab_active {
+                                    (theme.background.clone(), "1")
                                 } else {
-                                    "transparent".to_string()
+                                    ("transparent".to_string(), "0.65")
                                 };
-                                let tab_opacity = if tab_active { "1" } else { "0.6" };
                                 rsx! {
                                     div {
                                         key: "ws-tab-{tab_id}",
                                         style: format!(
-                                            "display:flex; align-items:center; gap:6px; max-width:200px; min-width:0; padding:5px 12px; \
+                                            "display:flex; align-items:center; gap:6px; flex:1 1 0; max-width:200px; min-width:0; padding:6px 10px; \
                                              border-radius:8px 8px 0 0; background:{}; color:{}; opacity:{}; cursor:pointer; font-size:12px;",
                                             tab_background, theme.foreground, tab_opacity,
                                         ),
@@ -56733,40 +56732,75 @@ fn TerminalCanvas(
                                             });
                                         },
                                         span {
-                                            style: "white-space:nowrap; overflow:hidden; text-overflow:ellipsis; min-width:0;",
+                                            style: "flex:1 1 auto; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; min-width:0;",
                                             "{tab_label}"
                                         }
-                                        if !is_app_tab {
-                                            button {
-                                                style: format!(
-                                                    "border:none; background:transparent; color:{}; cursor:pointer; font-size:11px; line-height:1; padding:1px 3px; border-radius:50%;",
-                                                    theme.foreground,
-                                                ),
-                                                title: "Close tab",
-                                                onclick: move |evt| {
-                                                    evt.stop_propagation();
+                                        button {
+                                            style: format!(
+                                                "border:none; background:transparent; color:{}; cursor:pointer; font-size:11px; line-height:1; padding:2px 4px; border-radius:6px; flex:0 0 auto;",
+                                                theme.foreground,
+                                            ),
+                                            title: if is_app_tab {
+                                                "Close web surface (sends Ctrl+C to the app)"
+                                            } else {
+                                                "Close tab"
+                                            },
+                                            onclick: move |evt| {
+                                                evt.stop_propagation();
+                                                if is_app_tab {
+                                                    // The app tab IS the app: closing it
+                                                    // ends the surface the terminal-native
+                                                    // way, same as the overlay ✕.
+                                                    let close_path = close_tab_path.clone();
+                                                    let endpoint = state
+                                                        .read()
+                                                        .bootstrap
+                                                        .server_endpoint
+                                                        .clone();
                                                     state.with_mut(|shell| {
-                                                        shell.web_surface_close_tab(&close_tab_path, tab_id);
+                                                        shell.close_web_surface(&close_path);
                                                     });
-                                                },
-                                                "✕"
-                                            }
+                                                    spawn(async move {
+                                                        let _ = terminal_write_async(
+                                                            endpoint,
+                                                            close_path,
+                                                            "\u{3}".to_string(),
+                                                        )
+                                                        .await;
+                                                    });
+                                                } else {
+                                                    state.with_mut(|shell| {
+                                                        shell.web_surface_close_tab(
+                                                            &close_tab_path,
+                                                            tab_id,
+                                                        );
+                                                    });
+                                                }
+                                            },
+                                            "✕"
                                         }
                                     }
                                 }
                             })}
                             button {
                                 style: format!(
-                                    "border:none; background:transparent; color:{}; cursor:pointer; font-size:15px; line-height:1; padding:4px 8px; opacity:0.75;",
+                                    "border:none; background:transparent; color:{}; cursor:pointer; font-size:15px; line-height:1; padding:4px 8px; opacity:0.75; flex:0 0 auto;",
                                     theme.foreground,
                                 ),
                                 title: "New tab",
                                 onclick: {
                                     let new_tab_path = web_surface_session_path.clone();
+                                    let address_input_id =
+                                        format!("{web_surface_host_id}-ws-address");
                                     move |_| {
                                         state.with_mut(|shell| {
                                             shell.web_surface_new_tab(&new_tab_path);
                                         });
+                                        // Chrome opens new tabs typing-ready: focus
+                                        // the omnibox once the re-render commits.
+                                        let _ = document::eval(&format!(
+                                            "setTimeout(() => {{ const el = document.getElementById({address_input_id:?}); if (el) {{ el.focus(); if (el.select) {{ el.select(); }} }} }}, 60);"
+                                        ));
                                     }
                                 },
                                 "+"
@@ -56887,12 +56921,13 @@ fn TerminalCanvas(
                                         "⟳"
                                     }
                                     input {
+                                        id: "{web_surface_host_id}-ws-address",
                                         // Pill omnibox: deliberate DESIGN.md exception —
                                         // the surface mimics Chrome's vocabulary.
                                         style: format!(
                                             "flex:1 1 auto; min-width:0; padding:5px 14px; border-radius:14px; border:1px solid rgba(127,127,127,0.35); \
-                                             background:{}; color:{}; font-size:12.5px; outline:none;",
-                                            terminal_shell_background, theme.foreground,
+                                             background:rgba(127,127,127,0.12); color:{}; font-size:12.5px; outline:none;",
+                                            theme.foreground,
                                         ),
                                         value: "{address_text}",
                                         spellcheck: "false",
