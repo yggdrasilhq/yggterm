@@ -9327,7 +9327,14 @@ fn remote_terminal_ssh_command(ssh_command: String) -> String {
 }
 
 fn ssh_control_options() -> &'static str {
-    "-o ControlMaster=no -o ControlPath=none"
+    // ServerAlive keepalive is the ONLY dead-bridge detector for interactive
+    // session bridges: after a laptop suspend/resume the TCP connection is
+    // dead but ssh hangs silently (kernel retransmit can take 15+ minutes,
+    // or forever on an idle connection). The daemon's re-resume lane is
+    // exit-driven, so until ssh exits the session sits frozen. 15s x 3 means
+    // a dead bridge self-detects within ~45s of wake and re-resume fires
+    // automatically (2026-07-04 sleep/wake incident).
+    "-o ControlMaster=no -o ControlPath=none -o ServerAliveInterval=15 -o ServerAliveCountMax=3"
 }
 
 fn user_visible_launch_command(launch_command: &str) -> String {
@@ -24181,9 +24188,10 @@ mod tests {
         assert!(command.contains("stty size"));
         assert!(command.contains("\"36 120\"|\"24 80\""));
         assert!(command.contains("\"$__yggterm_tty_wait\" -lt 160"));
-        assert!(
-            command.contains("-tt -o LogLevel=ERROR -o ControlMaster=no -o ControlPath=none jojo ")
-        );
+        assert!(command.contains(
+            "-tt -o LogLevel=ERROR -o ControlMaster=no -o ControlPath=none \
+             -o ServerAliveInterval=15 -o ServerAliveCountMax=3 jojo "
+        ));
         assert!(!command.contains("ControlPersist"));
         assert!(!command.contains("ControlPath=/tmp/yggterm-ssh-%C"));
         assert!(command.contains("tmux new-session -A -s yggterm &&"));
