@@ -4543,7 +4543,7 @@ impl ShellState {
             NotificationTone::Info,
             "Session No Longer On Remote",
             format!(
-                "The saved Codex session on {host_label} has been removed from that machine. Right-click the row in the sidebar → Delete Item to clear it.",
+                "The saved session on {host_label} has been removed from that machine. Right-click the row in the sidebar → Delete Item to clear it.",
             ),
             None,
             false,
@@ -48343,7 +48343,7 @@ fn TerminalCanvas(
                             NotificationTone::Info,
                             "Session No Longer On Remote",
                             format!(
-                                "The saved Codex session on {} has been removed from that machine. Right-click the row in the sidebar → Delete Item to clear it.",
+                                "The saved session on {} has been removed from that machine. Right-click the row in the sidebar → Delete Item to clear it.",
                                 session_host_label
                             ),
                         )
@@ -48426,7 +48426,7 @@ fn TerminalCanvas(
                         (
                             "Session No Longer On Remote",
                             format!(
-                                "The saved Codex session on {} has been removed from that machine. Right-click the row in the sidebar → Delete Item to clear it.",
+                                "The saved session on {} has been removed from that machine. Right-click the row in the sidebar → Delete Item to clear it.",
                                 session_host_label
                             ),
                         )
@@ -53876,7 +53876,7 @@ fn TerminalCanvas(
                                             NotificationTone::Info,
                                             "Session No Longer On Remote",
                                             format!(
-                                                "The saved Codex session on {} has been removed from that machine. Right-click the row in the sidebar → Delete Item to clear it.",
+                                                "The saved session on {} has been removed from that machine. Right-click the row in the sidebar → Delete Item to clear it.",
                                                 session_host_label
                                             ),
                                         )
