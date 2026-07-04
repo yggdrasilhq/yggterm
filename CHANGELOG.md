@@ -2,6 +2,17 @@
 
 This file tracks user-visible changes in `yggterm`.
 
+## 2.9.56
+
+- **Internal: native web-surface substrate (foundation for per-surface egress).** Groundwork for
+  honoring the web-surface egress rule inside the GUI — a surface should reach the network as the
+  machine that launched it, for every URL, not just the first loopback one. The main webview is now
+  wrapped in a `gtk::Overlay`, and a web surface can be rendered as a native child webview with its
+  own web context (hence its own network egress / proxy) layered over the page area, instead of an
+  iframe sharing the app's single shared web context. Not yet wired into the surface UI — today's
+  surfaces still use the iframe renderer — this is the substrate the upcoming per-surface SOCKS
+  egress and host-owned profiles build on.
+
 ## 2.9.55
 
 - **ychrome tab bar polish.** The tab strip is now a translucent tint so the active tab (painted
