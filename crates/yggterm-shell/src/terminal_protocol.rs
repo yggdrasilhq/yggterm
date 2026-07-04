@@ -131,6 +131,19 @@ pub(crate) enum TerminalJsEvent {
         name: String,
         payload: Value,
     },
+    /// libyggterm web-surface control emitted by a program in the PTY as
+    /// OSC 7717 (ychrome pilot). Travels the existing byte relay (remote
+    /// daemon → ssh bridge → local daemon → xterm.js), so it works for
+    /// local and remote sessions uniformly and is invisible to plain
+    /// terminals. `action` is `open` / `close` / `heartbeat`; `session`
+    /// must match the emitting session's YGGTERM_SESSION_ID (weak
+    /// anti-spoof gate: a cat'ed file doesn't know it).
+    WebSurface {
+        action: String,
+        session: String,
+        url: Option<String>,
+        title: Option<String>,
+    },
     Ignored {
         reason: String,
         value: Value,
@@ -216,6 +229,14 @@ enum TerminalJsEventWire {
         name: String,
         payload: Value,
     },
+    WebSurface {
+        action: String,
+        session: String,
+        #[serde(default)]
+        url: Option<String>,
+        #[serde(default)]
+        title: Option<String>,
+    },
 }
 
 impl From<TerminalJsEventWire> for TerminalJsEvent {
@@ -297,6 +318,17 @@ impl From<TerminalJsEventWire> for TerminalJsEvent {
                 body,
             },
             TerminalJsEventWire::Perf { name, payload } => TerminalJsEvent::Perf { name, payload },
+            TerminalJsEventWire::WebSurface {
+                action,
+                session,
+                url,
+                title,
+            } => TerminalJsEvent::WebSurface {
+                action,
+                session,
+                url,
+                title,
+            },
         }
     }
 }
@@ -457,6 +489,37 @@ mod tests {
                 chars: 12,
                 text: None,
             } if action == "copy"
+        ));
+    }
+
+    #[test]
+    fn web_surface_event_deserializes_open_and_close() {
+        let event: TerminalJsEvent = serde_json::from_value(json!({
+            "kind": "web_surface",
+            "action": "open",
+            "session": "local/abc123",
+            "url": "http://localhost:8000/",
+            "title": "dev server",
+        }))
+        .expect("web-surface open payload should deserialize");
+        assert!(matches!(
+            event,
+            TerminalJsEvent::WebSurface { action, session, url: Some(url), title: Some(title) }
+                if action == "open"
+                    && session == "local/abc123"
+                    && url == "http://localhost:8000/"
+                    && title == "dev server"
+        ));
+
+        let close: TerminalJsEvent = serde_json::from_value(json!({
+            "kind": "web_surface",
+            "action": "close",
+            "session": "local/abc123",
+        }))
+        .expect("web-surface close payload should deserialize without url/title");
+        assert!(matches!(
+            close,
+            TerminalJsEvent::WebSurface { action, url: None, title: None, .. } if action == "close"
         ));
     }
 

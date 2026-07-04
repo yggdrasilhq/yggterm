@@ -2,6 +2,20 @@
 
 This file tracks user-visible changes in `yggterm`.
 
+## 2.9.53
+
+- **libyggterm web surfaces (pilot): running `ychrome <url>` in any yggterm terminal turns that
+  session's viewport into a web view of the URL — resolved from the machine the command runs on.**
+  The daemon now exports `YGGTERM_SESSION_ID` / `YGGTERM_BIN` into every PTY it owns (the `$TMUX`
+  pattern), and the GUI understands a new web-surface control sequence (OSC 7717) that travels the
+  existing terminal byte relay — so the feature works identically for local and remote sessions,
+  needs no new RPC channel, and is invisible in plain terminals. For remote sessions with loopback
+  URLs the GUI opens an `ssh -L` forward whose remote end originates the connection **on the
+  session's machine** (the egress rule: `http://localhost:8000` typed on dev means dev's localhost,
+  always). The overlay carries a title bar with the requested URL and a close button that sends a
+  real Ctrl+C to the app; surfaces expire automatically if the app stops heartbeating, so a killed
+  ychrome never leaves a stuck overlay.
+
 ## 2.9.52
 
 - **Sessions recover on their own after a laptop sleep/wake instead of hanging indeterminately.**
