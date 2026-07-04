@@ -2,6 +2,18 @@
 
 This file tracks user-visible changes in `yggterm`.
 
+## 2.9.51
+
+- **A live agent session you launched but never prompted no longer reports itself "no longer available."**
+  When you open an agent session (Codex or Claude Code) whose runtime is still alive on the machine but
+  which has not written a saved transcript yet — e.g. a session launched with a pinned id that you never
+  sent a first message to — resuming it wrongly failed with "saved session is no longer available on this
+  machine, so this row cannot be restored." The resume path checked for the on-disk transcript *before*
+  checking whether the machine's daemon already owns a live terminal for that session, so a live-but-not-
+  yet-persisted session was declared dead even though its terminal was right there. Resume now binds to the
+  live runtime first and only falls back to the transcript check for a genuine cold resume, so these
+  sessions attach instead of false-dying.
+
 ## 2.9.50
 
 - **A Claude Code row whose saved transcript is gone no longer calls itself a "Codex" session.** When
