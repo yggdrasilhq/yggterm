@@ -2,6 +2,22 @@
 
 This file tracks user-visible changes in `yggterm`.
 
+## 2.9.52
+
+- **Sessions recover on their own after a laptop sleep/wake instead of hanging indeterminately.**
+  Suspending the machine kills every SSH connection silently: the interactive session bridges
+  (`ssh -tt … resume`) had no keepalive, so after wake they hung on the dead connection for up to
+  15+ minutes (or forever while idle), the frozen sessions never exited, and the daemon's exit-driven
+  re-resume never fired. The bridges now carry `ServerAliveInterval=15` / `ServerAliveCountMax=3`,
+  so a dead bridge self-detects within ~45 seconds of wake and the session re-resumes automatically.
+- **A broken machine turns green again without you opening a new session to "feed" it.** Background
+  machine scans defer while you have a terminal focused (so they don't disturb interactive work) —
+  but after a wake you are focused on a *broken* terminal whose attach never completes, which held
+  the deferral gate for 18 minutes: no machine re-scanned, the machine indicator stayed grey, and
+  only manually opening a fresh session unblocked everything. Machines that are not currently
+  Healthy now bypass the deferral (the failure backoff still paces attempts), and a successful
+  recovery scan applies immediately instead of being discarded while interactive work is pending.
+
 ## 2.9.51
 
 - **A live agent session you launched but never prompted no longer reports itself "no longer available."**
