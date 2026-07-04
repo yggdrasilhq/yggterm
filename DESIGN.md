@@ -205,6 +205,9 @@ If a user says “this does not look like a button”, that is a design failure.
 
 - Prefer clean rectangular or softly rounded input boxes.
 - Avoid pill-shaped text fields unless there is a strong reason.
+  - Standing exception: the web-surface (ychrome) address bar is a pill —
+    the surface deliberately mimics Chrome's omnibox vocabulary so users
+    don't miss the browser UI they know.
 - Inputs must remain visible against the supporting chrome.
 
 #### Search in chrome
