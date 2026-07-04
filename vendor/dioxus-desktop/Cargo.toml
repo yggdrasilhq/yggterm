@@ -245,6 +245,11 @@ version = "0.17.2"
 features = ["xdg-portal"]
 default-features = false
 
+# yggterm web surfaces: the main webview is wrapped in a gtk::Overlay so native
+# surface webviews can be layered above the page area. Matches wry/tao's gtk 0.18.
+[target.'cfg(any(target_os = "linux",target_os = "dragonfly", target_os = "freebsd", target_os = "netbsd", target_os = "openbsd"))'.dependencies.gtk]
+version = "0.18.2"
+
 [target.'cfg(any(target_os = "windows",target_os = "macos"))'.dependencies.rfd]
 version = "0.17.2"
 default-features = false
