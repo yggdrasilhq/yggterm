@@ -2,6 +2,23 @@
 
 This file tracks user-visible changes in `yggterm`.
 
+## 2.9.54
+
+- **ychrome grows real browser chrome: a tab bar and an address bar.** The web-surface overlay now
+  has a Chrome-style tab strip (the app's own page is the first tab; `+` opens user tabs, which
+  survive the app navigating its tab) and a pill address bar with back/forward/reload. Typed
+  addresses get a scheme automatically (http for loopback dev servers, https otherwise) and
+  non-URL input goes to a web search; loopback addresses on a remote session resolve through the
+  session machine's sshd, same egress rule as `ychrome <url>` itself. While a surface is live,
+  link clicks and redirects inside it now stay in the surface instead of bouncing to the OS
+  browser (the webview navigation policy opens a blanket http(s) gate for the sandboxed iframes;
+  it closes with the last surface), and the terminal input policy hands the keyboard to the
+  overlay so typing in the address bar never leaks into the PTY underneath. Tabs stay mounted
+  when you switch, so pages keep their state.
+- **"Terminal Zoom" is now "Viewport Zoom"** in the settings sidebar and zoom telemetry — the
+  viewport can host non-terminal surfaces (web surfaces today, more libyggterm apps later), and
+  the zoom control governs the viewport, whatever it shows.
+
 ## 2.9.53
 
 - **libyggterm web surfaces (pilot): running `ychrome <url>` in any yggterm terminal turns that
