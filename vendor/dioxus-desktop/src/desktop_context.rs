@@ -70,6 +70,17 @@ pub struct DesktopService {
     pub(crate) file_hover: NativeFileHover,
     pub(crate) close_behaviour: Rc<Cell<WindowCloseBehaviour>>,
 
+    /// yggterm web surfaces (Linux/WebKitGTK): native child webviews layered
+    /// over the main webview's page area. Installed once the main window's
+    /// `gtk::Overlay` exists (see `WebviewInstance::new`).
+    #[cfg(not(any(
+        target_os = "windows",
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "android"
+    )))]
+    pub(crate) web_surface_host: std::cell::RefCell<Option<crate::web_surface::WebSurfaceHost>>,
+
     #[cfg(target_os = "ios")]
     pub(crate) views: Rc<std::cell::RefCell<Vec<*mut objc::runtime::Object>>>,
 }
@@ -100,9 +111,146 @@ impl DesktopService {
             file_hover,
             close_behaviour: Rc::new(Cell::new(close_behaviour)),
             query: Default::default(),
+            #[cfg(not(any(
+                target_os = "windows",
+                target_os = "macos",
+                target_os = "ios",
+                target_os = "android"
+            )))]
+            web_surface_host: std::cell::RefCell::new(None),
             #[cfg(target_os = "ios")]
             views: Default::default(),
         }
+    }
+
+    /// Install the web-surface host (Linux only; called once the main window's
+    /// `gtk::Overlay` has been created in `WebviewInstance::new`).
+    #[cfg(not(any(
+        target_os = "windows",
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "android"
+    )))]
+    pub(crate) fn install_web_surface_host(&self, host: crate::web_surface::WebSurfaceHost) {
+        *self.web_surface_host.borrow_mut() = Some(host);
+    }
+
+    /// Open (or replace) native web surface `id` over the page area, loading
+    /// `url`, optionally egressing through `socks5://127.0.0.1:<port>` (the
+    /// invoking host's tunnel). Bounds are logical pixels from the window's
+    /// top-left. Errors on backends without the GTK/WebKit overlay path.
+    pub fn open_web_surface(
+        &self,
+        id: u64,
+        url: &str,
+        socks_port: Option<u16>,
+        x: i32,
+        y: i32,
+        w: i32,
+        h: i32,
+    ) -> Result<(), String> {
+        #[cfg(not(any(
+            target_os = "windows",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "android"
+        )))]
+        {
+            return match self.web_surface_host.borrow().as_ref() {
+                Some(host) => host.open(id, url, socks_port, x, y, w, h),
+                None => Err("web surface host not installed".to_string()),
+            };
+        }
+        #[cfg(any(
+            target_os = "windows",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "android"
+        ))]
+        {
+            let _ = (id, url, socks_port, x, y, w, h);
+            Err("web surfaces require the GTK/WebKit backend".to_string())
+        }
+    }
+
+    /// Reposition/resize an open web surface (logical pixels from top-left).
+    pub fn set_web_surface_bounds(&self, id: u64, x: i32, y: i32, w: i32, h: i32) {
+        #[cfg(not(any(
+            target_os = "windows",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "android"
+        )))]
+        if let Some(host) = self.web_surface_host.borrow().as_ref() {
+            host.set_bounds(id, x, y, w, h);
+        }
+        #[cfg(any(
+            target_os = "windows",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "android"
+        ))]
+        let _ = (id, x, y, w, h);
+    }
+
+    /// Show/hide an open web surface without destroying it (tab/session switch).
+    pub fn set_web_surface_visible(&self, id: u64, visible: bool) {
+        #[cfg(not(any(
+            target_os = "windows",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "android"
+        )))]
+        if let Some(host) = self.web_surface_host.borrow().as_ref() {
+            host.set_visible(id, visible);
+        }
+        #[cfg(any(
+            target_os = "windows",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "android"
+        ))]
+        let _ = (id, visible);
+    }
+
+    /// Navigate an open web surface to a new URL.
+    pub fn navigate_web_surface(&self, id: u64, url: &str) {
+        #[cfg(not(any(
+            target_os = "windows",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "android"
+        )))]
+        if let Some(host) = self.web_surface_host.borrow().as_ref() {
+            host.navigate(id, url);
+        }
+        #[cfg(any(
+            target_os = "windows",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "android"
+        ))]
+        let _ = (id, url);
+    }
+
+    /// Destroy an open web surface.
+    pub fn close_web_surface(&self, id: u64) {
+        #[cfg(not(any(
+            target_os = "windows",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "android"
+        )))]
+        if let Some(host) = self.web_surface_host.borrow().as_ref() {
+            host.close(id);
+        }
+        #[cfg(any(
+            target_os = "windows",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "android"
+        ))]
+        let _ = id;
     }
 
     /// Start the creation of a new window using the props and window builder
