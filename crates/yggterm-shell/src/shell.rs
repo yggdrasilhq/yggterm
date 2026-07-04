@@ -13053,24 +13053,38 @@ async fn maybe_debug_request_delay() {
     }
     sleep(Duration::from_millis(delay_ms)).await;
 }
-fn maybe_spawn_missing_remote_machine_refreshes(state: Signal<ShellState>) {
-    if safe_shell_read(
-        state,
-        "maybe_spawn_missing_remote_machine_refreshes_gate",
-        remote_machine_refreshes_deferred,
-    )
-    .unwrap_or(false)
-    {
-        return;
+/// Recovery override (2026-07-04 sleep/wake incident): the interactive-work
+/// deferral exists so background scans don't disturb a focused terminal, but
+/// after a suspend/resume the scan IS the recovery driver — the user sits
+/// focused on a broken terminal (attach hung on a dead ssh bridge), which
+/// held the gate for 18 minutes while every machine stayed un-refreshed. A
+/// machine that is not currently Healthy (or not yet known) may scan even
+/// while deferred; the failure backoff ladder still paces those attempts.
+/// Healthy machines keep deferring.
+fn filter_pending_refreshes_for_deferral(
+    pending: Vec<String>,
+    deferred: bool,
+    remote_machines: &[RemoteMachineSnapshot],
+) -> Vec<String> {
+    if !deferred {
+        return pending;
     }
+    let healthy_machine_keys = remote_machines
+        .iter()
+        .filter(|machine| machine.health == RemoteMachineHealth::Healthy)
+        .map(|machine| machine.machine_key.as_str())
+        .collect::<HashSet<_>>();
+    pending
+        .into_iter()
+        .filter(|machine_key| !healthy_machine_keys.contains(machine_key.as_str()))
+        .collect()
+}
+fn maybe_spawn_missing_remote_machine_refreshes(state: Signal<ShellState>) {
     let Some(pending) = safe_shell_read(
         state,
         "maybe_spawn_missing_remote_machine_refreshes_read",
         |shell| {
-            if remote_machine_refreshes_deferred(shell) {
-                return Vec::new();
-            }
-            pending_remote_machine_refreshes(
+            let pending = pending_remote_machine_refreshes(
                 shell.server.remote_machines(),
                 shell.server.ssh_targets(),
                 &shell.server.live_sessions(),
@@ -13078,6 +13092,11 @@ fn maybe_spawn_missing_remote_machine_refreshes(state: Signal<ShellState>) {
                 &shell.remote_machine_refresh_completed,
                 &shell.remote_machine_refresh_retry_after_ms,
                 current_millis(),
+            );
+            filter_pending_refreshes_for_deferral(
+                pending,
+                remote_machine_refreshes_deferred(shell),
+                shell.server.remote_machines(),
             )
         },
     ) else {
@@ -14150,8 +14169,21 @@ fn spawn_background_remote_machine_refresh(state: Signal<ShellState>, machine_ke
             shell.remote_machine_refresh_requests.remove(&machine_key);
             match outcome {
                 Ok(Ok((mut snapshot, message))) => {
-                    if terminal_attach_blocks_background_work(shell)
-                        || interactive_surface_request_in_flight(shell)
+                    // Recovery override (2026-07-04 sleep/wake incident): a
+                    // successful scan of a machine the client currently holds
+                    // as NOT Healthy must apply even while interactive work
+                    // defers background snapshots — discarding it kept the
+                    // machine indicator stale (not green) for as long as the
+                    // user stared at a broken focused terminal.
+                    let machine_recovering = shell
+                        .server
+                        .remote_machines()
+                        .iter()
+                        .find(|machine| machine.machine_key == machine_key)
+                        .is_none_or(|machine| machine.health != RemoteMachineHealth::Healthy);
+                    if !machine_recovering
+                        && (terminal_attach_blocks_background_work(shell)
+                            || interactive_surface_request_in_flight(shell))
                     {
                         shell
                             .remote_machine_refresh_retry_after_ms
@@ -97146,6 +97178,50 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
 
         assert!(!retarget_stale_live_session_snapshot_due_if_interval_relaxed(&mut shell, now_ms));
         assert!(shell.next_live_session_snapshot_after_ms <= now_ms);
+    }
+
+    #[test]
+    fn deferred_refreshes_still_scan_unhealthy_machines_for_recovery() {
+        // 2026-07-04 sleep/wake incident: with the user focused on a broken
+        // terminal the deferral gate held for 18 minutes, so no machine ever
+        // re-scanned and the sidebar stayed stale/not-green. Unhealthy (and
+        // unknown) machines must bypass the deferral; Healthy machines keep
+        // deferring.
+        let machine = |key: &str, health: RemoteMachineHealth| RemoteMachineSnapshot {
+            machine_key: key.to_string(),
+            label: key.to_string(),
+            ssh_target: key.to_string(),
+            prefix: None,
+            remote_binary_expr: None,
+            remote_deploy_state: RemoteDeployState::Ready,
+            health,
+            sessions: Vec::new(),
+        };
+        let machines = vec![
+            machine("dev", RemoteMachineHealth::Cached),
+            machine("oc", RemoteMachineHealth::Offline),
+            machine("charts-webapp", RemoteMachineHealth::Healthy),
+        ];
+        let pending = vec![
+            "dev".to_string(),
+            "oc".to_string(),
+            "charts-webapp".to_string(),
+            "unknown-machine".to_string(),
+        ];
+        assert_eq!(
+            filter_pending_refreshes_for_deferral(pending.clone(), false, &machines),
+            pending,
+            "not deferred: everything pending scans"
+        );
+        assert_eq!(
+            filter_pending_refreshes_for_deferral(pending, true, &machines),
+            vec![
+                "dev".to_string(),
+                "oc".to_string(),
+                "unknown-machine".to_string()
+            ],
+            "deferred: only non-Healthy and unknown machines scan (recovery)"
+        );
     }
 
     #[test]
