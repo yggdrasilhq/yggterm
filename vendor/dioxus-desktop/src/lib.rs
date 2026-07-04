@@ -25,6 +25,7 @@ mod protocol;
 mod query;
 mod shortcut;
 mod waker;
+mod web_surface;
 mod webview;
 
 // mobile shortcut is only supported on mobile platforms
