@@ -2,6 +2,17 @@
 
 This file tracks user-visible changes in `yggterm`.
 
+## 2.9.50
+
+- **A Claude Code row whose saved transcript is gone no longer calls itself a "Codex" session.** When
+  a remote agent session's transcript has been removed from the machine, yggterm keeps the live row
+  and explains why it cannot be resumed — but the wrapper hardcoded the word "Codex" in that message
+  and in the follow-up toast, so a Claude Code session reported that its "saved Codex session is no
+  longer available." The message now names the correct agent ("saved Claude Code session …"), and the
+  dead-session detector keys on the agent-agnostic part of the wrapper output, so both Codex and
+  Claude Code rows are classified the same and surface the same actionable Delete-to-clear toast
+  (previously a mislabeled Claude Code message could have been misread as a generic transport error).
+
 ## 2.9.49
 
 - **The cwd tree and start page can no longer freeze on days-stale session lists.** The background
