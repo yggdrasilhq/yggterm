@@ -5548,7 +5548,7 @@ impl YggtermServer {
             require_existing,
             saved_session_exists,
         ) {
-            anyhow::bail!(remote_resume_missing_saved_session_error(session_id));
+            anyhow::bail!(remote_resume_missing_saved_session_error(kind, session_id));
         }
         if saved_session_exists {
             let external_processes =
@@ -7807,14 +7807,17 @@ fn remote_resume_picker_notice(session_id: &str) -> String {
     )
 }
 
-fn remote_resume_missing_saved_session_error(session_id: &str) -> String {
+fn remote_resume_missing_saved_session_error(kind: SessionKind, session_id: &str) -> String {
+    let display = remote_runtime_agent_display(kind);
     format!(
-        "yggterm: saved Codex session {session_id} is no longer available on this machine, so this row cannot be restored as a live terminal."
+        "yggterm: saved {display} session {session_id} is no longer available on this machine, so this row cannot be restored as a live terminal."
     )
 }
 
 fn preserve_missing_saved_remote_live_session(session: &mut ManagedSessionView, session_id: &str) {
-    session.last_launch_error = Some(remote_resume_missing_saved_session_error(session_id));
+    let display = remote_runtime_agent_display(session.kind);
+    session.last_launch_error =
+        Some(remote_resume_missing_saved_session_error(session.kind, session_id));
     upsert_session_metadata(
         &mut session.metadata,
         "Saved Session",
@@ -7823,7 +7826,7 @@ fn preserve_missing_saved_remote_live_session(session: &mut ManagedSessionView, 
     upsert_session_metadata(
         &mut session.metadata,
         "Status",
-        "saved Codex transcript missing; preserving live PTY row".to_string(),
+        format!("saved {display} transcript missing; preserving live PTY row"),
     );
 }
 
@@ -12762,7 +12765,10 @@ pub fn run_remote_resume_codex(
     let saved_session_exists = remote_saved_codex_session_exists(session_id)?;
     if remote_resume_requires_missing_saved_session_failure(require_existing, saved_session_exists)
     {
-        anyhow::bail!(remote_resume_missing_saved_session_error(session_id));
+        anyhow::bail!(remote_resume_missing_saved_session_error(
+            SessionKind::Codex,
+            session_id
+        ));
     }
     if saved_session_exists {
         wait_for_external_codex_resume_to_clear(&home, session_id);
@@ -12898,7 +12904,10 @@ pub fn run_remote_resume_cc(
     let saved_session_exists = remote_saved_cc_session_exists(session_id)?;
     if remote_resume_requires_missing_saved_session_failure(require_existing, saved_session_exists)
     {
-        anyhow::bail!(remote_resume_missing_saved_session_error(session_id));
+        anyhow::bail!(remote_resume_missing_saved_session_error(
+            SessionKind::ClaudeCode,
+            session_id
+        ));
     }
     if saved_session_exists {
         wait_for_external_agent_resume_to_clear(SessionKind::ClaudeCode, &home, session_id);
