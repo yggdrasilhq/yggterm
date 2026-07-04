@@ -355,6 +355,13 @@ impl WebviewInstance {
 
         let navigation_handler = cfg.navigation_handler.take();
         let page_loaded = AtomicBool::new(false);
+        // yggterm web surfaces (OSC 7717 / ychrome pilot): WebKitGTK routes
+        // IFRAME subframe navigations through this same policy handler, so
+        // the blanket "http(s) → OS browser, veto" below silently blanked
+        // every embedded web surface. URLs registered on the allowlist
+        // (surface tunnel ends / requested surface URLs) navigate in-webview.
+        // The iframe carries a sandbox attribute without allow-top-navigation,
+        // so embedded content cannot use this to steal the main frame.
 
         let requested_webview_visible = cfg.window.window.visible;
         let mut webview = WebViewBuilder::new_with_web_context(&mut web_context)
@@ -378,6 +385,10 @@ impl WebviewInstance {
                     // After the page has loaded once, don't allow any more navigation
                     let page_loaded = page_loaded.swap(true, std::sync::atomic::Ordering::SeqCst);
                     return !page_loaded;
+                }
+
+                if webview_navigation_allowlisted(&var) {
+                    return true;
                 }
 
                 // External links always open somewhere else. Prevents the webview from navigating.
@@ -668,4 +679,36 @@ impl PendingWebview {
 
         window
     }
+}
+
+/// Process-global allowlist of URL prefixes the webview may navigate to
+/// in-frame (yggterm web surfaces — see the navigation handler above).
+/// Registered by the shell when a web surface opens; consulted for every
+/// http(s) policy decision. Prefix match on scheme://host[:port].
+static WEBVIEW_NAVIGATION_ALLOWLIST: std::sync::OnceLock<std::sync::Mutex<Vec<String>>> =
+    std::sync::OnceLock::new();
+
+/// Register a URL prefix (scheme://host[:port]) that the webview may
+/// navigate to in-frame instead of bouncing to the OS browser. Used by
+/// yggterm web surfaces (embedded iframes); see the navigation handler.
+pub fn allow_webview_navigation_prefix(prefix: impl Into<String>) {
+    let prefix = prefix.into();
+    if prefix.is_empty() {
+        return;
+    }
+    let list = WEBVIEW_NAVIGATION_ALLOWLIST.get_or_init(|| std::sync::Mutex::new(Vec::new()));
+    if let Ok(mut list) = list.lock() {
+        if !list.contains(&prefix) {
+            list.push(prefix);
+        }
+    }
+}
+
+pub(crate) fn webview_navigation_allowlisted(url: &str) -> bool {
+    let Some(list) = WEBVIEW_NAVIGATION_ALLOWLIST.get() else {
+        return false;
+    };
+    list.lock()
+        .map(|list| list.iter().any(|prefix| url.starts_with(prefix.as_str())))
+        .unwrap_or(false)
 }

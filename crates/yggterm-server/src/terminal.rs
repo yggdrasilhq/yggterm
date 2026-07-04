@@ -1358,7 +1358,7 @@ impl PtySessionRuntime {
             })
             .context("opening pty")?;
 
-        let command = shell_command(launch_command, cwd);
+        let command = shell_command(launch_command, cwd, Some(key));
         let child = pair
             .slave
             .spawn_command(command)
@@ -2095,7 +2095,26 @@ fn now_millis() -> u64 {
         .as_millis() as u64
 }
 
-fn shell_command(launch_command: &str, cwd: Option<&str>) -> CommandBuilder {
+/// Session-identity handshake for libyggterm apps (the `$TMUX` pattern):
+/// every daemon-owned PTY exports which yggterm session it is and where the
+/// yggterm CLI binary lives, so a program like `ychrome` can detect it is
+/// inside yggterm and drive the daemon (e.g. `server web-surface`) without
+/// re-deriving endpoint/protocol knowledge the CLI already owns.
+fn apply_session_identity_env(command: &mut CommandBuilder, session_key: Option<&str>) {
+    let Some(session_key) = session_key else {
+        return;
+    };
+    command.env("YGGTERM_SESSION_ID", session_key);
+    if let Ok(exe) = std::env::current_exe() {
+        command.env("YGGTERM_BIN", exe.as_os_str());
+    }
+}
+
+fn shell_command(
+    launch_command: &str,
+    cwd: Option<&str>,
+    session_key: Option<&str>,
+) -> CommandBuilder {
     if cfg!(windows) {
         let mut command = CommandBuilder::new("cmd.exe");
         command.arg("/C");
@@ -2106,6 +2125,7 @@ fn shell_command(launch_command: &str, cwd: Option<&str>) -> CommandBuilder {
         for (key, value) in terminal_identity_env_pairs() {
             command.env(key, value);
         }
+        apply_session_identity_env(&mut command, session_key);
         if let Some(cwd) = cwd {
             command.cwd(cwd);
         }
@@ -2127,6 +2147,7 @@ fn shell_command(launch_command: &str, cwd: Option<&str>) -> CommandBuilder {
     for (key, value) in terminal_identity_env_pairs() {
         command.env(key, value);
     }
+    apply_session_identity_env(&mut command, session_key);
     if let Some(cwd) = cwd {
         if shell_uses_bash_prompt_cwd() {
             command.env("YGGTERM_START_CWD", cwd);
