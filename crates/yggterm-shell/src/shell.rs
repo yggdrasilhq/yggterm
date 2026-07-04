@@ -895,6 +895,169 @@ struct LiveTerminalSidebarSample {
     cursor_line_text: String,
     text_tail: String,
 }
+/// libyggterm web surface (ychrome pilot): a program in this session's PTY
+/// asked for the viewport to become a web view via OSC 7717. Keyed by GUI
+/// session_path in `ShellState::web_surfaces`. The OSC heartbeat (re-emitted
+/// by the app every few seconds) is the liveness truth: a surface whose
+/// heartbeats stop is expired, so a SIGKILLed app never leaks a full-screen
+/// overlay, and a terminal remount (which replays scrollback through the
+/// parser) self-heals the surface from the next heartbeat.
+#[derive(Debug, Clone)]
+struct WebSurfaceUiState {
+    url: String,
+    title: Option<String>,
+    /// What the iframe actually loads: the requested URL for local sessions
+    /// and direct-loadable remotes, or the local end of the session-side
+    /// `ssh -L` forward for remote loopback URLs. The forward's remote sshd
+    /// originates the target connection, so network egress stays on the
+    /// session's machine (ychrome docs/architecture.md "egress rule").
+    effective_url: String,
+    opened_at_ms: u64,
+    last_seen_ms: u64,
+    /// Shared because ShellState is Clone; killed EXPLICITLY by the close /
+    /// sweep / replace paths (never on Drop — a state clone dropping must not
+    /// tear down a live forward).
+    forward_child: Option<Arc<Mutex<std::process::Child>>>,
+}
+fn kill_web_surface_forward(surface: &WebSurfaceUiState) {
+    if let Some(child) = &surface.forward_child
+        && let Ok(mut child) = child.lock()
+    {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+}
+/// Heartbeats arrive every ~4s from a live app; 3 missed beats = gone.
+const WEB_SURFACE_STALE_AFTER_MS: u64 = 15_000;
+/// dioxus-desktop's navigation policy vetoes every http(s) navigation and
+/// bounces it to the OS browser — and WebKitGTK routes IFRAME subframe
+/// loads through the same policy, which blanked every web surface. Each
+/// surface's origin is registered on the vendored allowlist so the iframe
+/// may navigate in-webview; the iframe's sandbox (no allow-top-navigation)
+/// keeps embedded content from stealing the main frame through the same
+/// allowance.
+fn allow_web_surface_navigation(effective_url: &str) {
+    dioxus::desktop::allow_webview_navigation_prefix(web_surface_origin_prefix(effective_url));
+}
+fn web_surface_origin_prefix(url: &str) -> String {
+    if let Some(scheme_end) = url.find("://") {
+        let after_scheme = scheme_end + 3;
+        let end = url[after_scheme..]
+            .find('/')
+            .map(|index| after_scheme + index)
+            .unwrap_or(url.len());
+        url[..end].to_string()
+    } else {
+        url.to_string()
+    }
+}
+fn web_surface_url_is_loopback(url: &str) -> bool {
+    let host = url
+        .split_once("://")
+        .map(|(_, rest)| rest)
+        .unwrap_or(url)
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or("")
+        .rsplit_once('@')
+        .map(|(_, host)| host)
+        .unwrap_or_else(|| {
+            url.split_once("://")
+                .map(|(_, rest)| rest)
+                .unwrap_or(url)
+                .split(['/', '?', '#'])
+                .next()
+                .unwrap_or("")
+        });
+    let host = host.strip_prefix('[').unwrap_or(host);
+    let bare = host.split(']').next().unwrap_or(host);
+    let bare = bare.split(':').next().unwrap_or(bare);
+    bare.eq_ignore_ascii_case("localhost") || bare.starts_with("127.") || bare == "::1"
+}
+fn web_surface_url_scheme_allowed(url: &str) -> bool {
+    url.starts_with("http://") || url.starts_with("https://")
+}
+/// Split an http(s) URL into (host, port, path-and-after) for forward
+/// construction. Returns None when the URL is not parseable enough.
+fn web_surface_url_parts(url: &str) -> Option<(String, u16, String)> {
+    let (scheme, rest) = url.split_once("://")?;
+    let default_port = if scheme.eq_ignore_ascii_case("https") {
+        443
+    } else {
+        80
+    };
+    let split_at = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let (authority, tail) = rest.split_at(split_at);
+    let authority = authority
+        .rsplit_once('@')
+        .map(|(_, host)| host)
+        .unwrap_or(authority);
+    let (host, port) = if let Some(stripped) = authority.strip_prefix('[') {
+        let (host, after) = stripped.split_once(']')?;
+        let port = after
+            .strip_prefix(':')
+            .and_then(|p| p.parse().ok())
+            .unwrap_or(default_port);
+        (host.to_string(), port)
+    } else if let Some((host, port)) = authority.rsplit_once(':') {
+        match port.parse() {
+            Ok(port) => (host.to_string(), port),
+            Err(_) => (authority.to_string(), default_port),
+        }
+    } else {
+        (authority.to_string(), default_port)
+    };
+    Some((host, port, tail.to_string()))
+}
+/// Session-side egress for a remote web surface: `ssh -N -L` where the
+/// REMOTE sshd resolves the host and originates the target connection on the
+/// session's machine. Returns (local_port, child) once the local end accepts,
+/// or None on failure/timeout (caller falls back to direct load).
+fn spawn_web_surface_forward(
+    ssh_target: &str,
+    remote_host: &str,
+    remote_port: u16,
+) -> Option<(u16, std::process::Child)> {
+    let local_port = std::net::TcpListener::bind("127.0.0.1:0")
+        .and_then(|listener| listener.local_addr())
+        .map(|addr| addr.port())
+        .ok()?;
+    let mut child = std::process::Command::new("ssh")
+        .args([
+            "-N",
+            "-o",
+            "ExitOnForwardFailure=yes",
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "ConnectTimeout=8",
+            "-L",
+            &format!("{local_port}:{remote_host}:{remote_port}"),
+            ssh_target,
+        ])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok()?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+    loop {
+        if std::net::TcpStream::connect_timeout(
+            &std::net::SocketAddr::from(([127, 0, 0, 1], local_port)),
+            std::time::Duration::from_millis(250),
+        )
+        .is_ok()
+        {
+            return Some((local_port, child));
+        }
+        if child.try_wait().ok().flatten().is_some() || std::time::Instant::now() > deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(120));
+    }
+}
 #[derive(Clone, PartialEq, Eq)]
 struct ActiveTerminalInputPolicySignature {
     active_view_mode: WorkspaceViewMode,
@@ -981,6 +1144,10 @@ struct ShellState {
     // [[finding-stuck-working-dot-noop-signature]] and the daemon-authoritative
     // working state on ManagedSessionView.
     session_working_prev: HashMap<String, bool>,
+    // Open libyggterm web surfaces keyed by GUI session_path (OSC 7717,
+    // ychrome pilot). SSOT for the viewport web overlay; entries expire when
+    // the app's OSC heartbeats stop (WEB_SURFACE_STALE_AFTER_MS).
+    web_surfaces: HashMap<String, WebSurfaceUiState>,
     titlebar_new_menu_open: bool,
     titlebar_new_menu_ignore_toggle_until_ms: u64,
     titlebar_session_menu_open: bool,
@@ -2488,6 +2655,7 @@ impl ShellState {
             notifications: Vec::new(),
             next_notification_id: 1,
             session_working_prev: HashMap::new(),
+            web_surfaces: HashMap::new(),
             titlebar_new_menu_open: false,
             titlebar_new_menu_ignore_toggle_until_ms: 0,
             titlebar_session_menu_open: false,
@@ -3184,6 +3352,95 @@ impl ShellState {
     /// reading the raw `window_focused`.
     fn effective_window_focused(&self) -> bool {
         self.window_focused || self.app_control_force_foreground
+    }
+    /// Upsert a web surface for a session (OSC 7717 open/heartbeat with a
+    /// URL). `effective_url`/`forward` are precomputed by the caller (forward
+    /// setup blocks, so it must not run under the state lock).
+    fn upsert_web_surface(
+        &mut self,
+        session_path: &str,
+        url: String,
+        title: Option<String>,
+        effective_url: String,
+        forward_child: Option<std::process::Child>,
+        now_ms: u64,
+    ) {
+        if let Some(existing) = self.web_surfaces.get_mut(session_path) {
+            if existing.url == url {
+                existing.last_seen_ms = now_ms;
+                if title.is_some() {
+                    existing.title = title;
+                }
+                // Keep the established forward; kill the redundant new one.
+                if let Some(mut child) = forward_child {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
+                return;
+            }
+        }
+        if let Some(replaced) = self.web_surfaces.insert(
+            session_path.to_string(),
+            WebSurfaceUiState {
+                url,
+                title,
+                effective_url,
+                opened_at_ms: now_ms,
+                last_seen_ms: now_ms,
+                forward_child: forward_child.map(|child| Arc::new(Mutex::new(child))),
+            },
+        ) {
+            kill_web_surface_forward(&replaced);
+        }
+    }
+    /// Refresh liveness for an existing surface (heartbeat without URL).
+    fn touch_web_surface(&mut self, session_path: &str, now_ms: u64) -> bool {
+        if let Some(surface) = self.web_surfaces.get_mut(session_path) {
+            surface.last_seen_ms = now_ms;
+            true
+        } else {
+            false
+        }
+    }
+    fn close_web_surface(&mut self, session_path: &str) -> bool {
+        if let Some(removed) = self.web_surfaces.remove(session_path) {
+            kill_web_surface_forward(&removed);
+            true
+        } else {
+            false
+        }
+    }
+    fn sweep_stale_web_surfaces(&mut self, now_ms: u64) {
+        self.web_surfaces.retain(|_, surface| {
+            let live =
+                now_ms.saturating_sub(surface.last_seen_ms) <= WEB_SURFACE_STALE_AFTER_MS;
+            if !live {
+                kill_web_surface_forward(surface);
+            }
+            live
+        });
+    }
+    /// The viewport overlay view: (effective_url, display_title, requested_url)
+    /// for a live (non-stale) surface on this session.
+    fn web_surface_overlay_for_session(
+        &self,
+        session_path: &str,
+        now_ms: u64,
+    ) -> Option<(String, String, String)> {
+        let surface = self.web_surfaces.get(session_path)?;
+        if now_ms.saturating_sub(surface.last_seen_ms) > WEB_SURFACE_STALE_AFTER_MS {
+            return None;
+        }
+        let display_title = surface
+            .title
+            .clone()
+            .filter(|title| !title.trim().is_empty())
+            .unwrap_or_else(|| "ychrome".to_string());
+        Some((
+            surface.effective_url.clone(),
+            display_title,
+            surface.url.clone(),
+        ))
     }
     fn set_window_focused(&mut self, focused: bool) {
         let was_focused = self.window_focused;
@@ -48147,6 +48404,9 @@ fn TerminalCanvas(
         local_terminal_prefill_text(&session)
     };
     let session_host_label = session.host_label.clone();
+    // libyggterm web-surface egress: remote sessions forward loopback URLs
+    // through the session host's sshd (egress rule). None = local session.
+    let session_ssh_target = session.ssh_target.clone();
     let session_kind = session.kind;
     let codex_like_session = matches!(session_kind, SessionKind::Codex | SessionKind::CodexLiteLlm);
     // First-class agent CLIs that drive the sidebar "working" indicator (Codex
@@ -50078,6 +50338,7 @@ fn TerminalCanvas(
             let mut resume_overlay_failed = resume_overlay_failed;
             let mut resume_overlay_timed_out = resume_overlay_timed_out;
             let session_host_label = session_host_label;
+            let web_surface_ssh_target = session_ssh_target.clone();
             let bootstrap_owner_still_current = |state: Signal<ShellState>| {
                 let shell = state.read();
                 terminal_bootstrap_owner_is_current(
@@ -50946,6 +51207,126 @@ fn TerminalCanvas(
                                         let _ = send_user_notification(&heading, &detail);
                                     }
                                     }
+                                }
+                            }
+                            Ok(TerminalJsEvent::WebSurface {
+                                action,
+                                session: claimed_session,
+                                url,
+                                title: surface_title,
+                            }) => {
+                                // libyggterm web surface (OSC 7717, ychrome
+                                // pilot). Identity truth is the STREAM the OSC
+                                // arrived on (this mount's session), not the
+                                // claimed id — a remote session's env id lives
+                                // in the remote daemon's namespace and is not
+                                // comparable to the GUI path. The claimed id is
+                                // traced for diagnosis only.
+                                let now_ms = current_millis();
+                                let surface_session_path = session_path.clone();
+                                match action.as_str() {
+                                    "open" | "heartbeat" => {
+                                        let touched = state.with_mut(|shell| {
+                                            shell.sweep_stale_web_surfaces(now_ms);
+                                            shell.touch_web_surface(&surface_session_path, now_ms)
+                                        });
+                                        let fresh_url = url
+                                            .filter(|url| web_surface_url_scheme_allowed(url))
+                                            .filter(|url| {
+                                                !touched
+                                                    || state.with(|shell| {
+                                                        shell
+                                                            .web_surfaces
+                                                            .get(&surface_session_path)
+                                                            .is_none_or(|surface| {
+                                                                surface.url != *url
+                                                            })
+                                                    })
+                                            });
+                                        if let Some(url) = fresh_url {
+                                            // Session-side egress: remote loopback
+                                            // URLs go through an ssh -L whose remote
+                                            // sshd originates the connection on the
+                                            // session's machine. The bounded wait
+                                            // runs off the UI event loop.
+                                            let forward_target = web_surface_ssh_target
+                                                .clone()
+                                                .filter(|_| web_surface_url_is_loopback(&url));
+                                            let (effective_url, forward_child) = if let Some(
+                                                target,
+                                            ) = forward_target
+                                            {
+                                                let (host, port, tail) =
+                                                    web_surface_url_parts(&url).unwrap_or_else(
+                                                        || ("127.0.0.1".to_string(), 80, String::new()),
+                                                    );
+                                                let target_for_task = target.clone();
+                                                let forward = task::spawn_blocking(move || {
+                                                    spawn_web_surface_forward(
+                                                        &target_for_task,
+                                                        &host,
+                                                        port,
+                                                    )
+                                                })
+                                                .await
+                                                .ok()
+                                                .flatten();
+                                                match forward {
+                                                    Some((local_port, child)) => (
+                                                        format!(
+                                                            "http://127.0.0.1:{local_port}{tail}"
+                                                        ),
+                                                        Some(child),
+                                                    ),
+                                                    None => (url.clone(), None),
+                                                }
+                                            } else {
+                                                (url.clone(), None)
+                                            };
+                                            append_trace_event(
+                                                &trace_home,
+                                                "ui",
+                                                "web_surface",
+                                                "open",
+                                                json!({
+                                                    "session_path": surface_session_path,
+                                                    "claimed_session": claimed_session,
+                                                    "url": url,
+                                                    "effective_url": effective_url,
+                                                    "forwarded": forward_child.is_some(),
+                                                    "action": action,
+                                                }),
+                                            );
+                                            allow_web_surface_navigation(&effective_url);
+                                            state.with_mut(|shell| {
+                                                shell.upsert_web_surface(
+                                                    &surface_session_path,
+                                                    url,
+                                                    surface_title,
+                                                    effective_url,
+                                                    forward_child,
+                                                    now_ms,
+                                                );
+                                            });
+                                        }
+                                    }
+                                    "close" => {
+                                        let closed = state.with_mut(|shell| {
+                                            shell.close_web_surface(&surface_session_path)
+                                        });
+                                        append_trace_event(
+                                            &trace_home,
+                                            "ui",
+                                            "web_surface",
+                                            "close",
+                                            json!({
+                                                "session_path": surface_session_path,
+                                                "claimed_session": claimed_session,
+                                                "closed": closed,
+                                            }),
+                                        );
+                                    }
+                                    _ => {}
                                 }
                             }
                             Ok(TerminalJsEvent::Paint {
@@ -55842,6 +56223,14 @@ fn TerminalCanvas(
                 shell.effective_window_focused(),
             )
         });
+    // libyggterm web surface (ychrome pilot): when a live surface exists for
+    // this session, an overlay covers the terminal viewport with the app's
+    // web view. The terminal keeps running underneath (the PTY is untouched);
+    // closing the overlay sends a real Ctrl+C to the foreground app.
+    let web_surface_overlay = state.with(|shell| {
+        shell.web_surface_overlay_for_session(&session.session_path, current_millis())
+    });
+    let web_surface_close_session_path = session.session_path.clone();
     let context_row = BrowserRow {
         kind: BrowserRowKind::Session,
         full_path: session.session_path.clone(),
@@ -55941,6 +56330,79 @@ fn TerminalCanvas(
                             });
                         }
                     },
+                }
+                if let Some((surface_url, surface_title, surface_requested_url)) = web_surface_overlay {
+                    div {
+                        style: format!(
+                            "position:absolute; inset:0; z-index:40; display:flex; flex-direction:column; background:{}; border-radius:{};",
+                            theme.background, terminal_shell_radius,
+                        ),
+                        div {
+                            style: format!(
+                                "display:flex; align-items:center; gap:8px; padding:4px 10px; font-size:12px; color:{}; background:{}; user-select:none;",
+                                theme.foreground, terminal_shell_background,
+                            ),
+                            span {
+                                style: "font-weight:600; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;",
+                                "{surface_title}"
+                            }
+                            span {
+                                style: format!(
+                                    "flex:1 1 auto; min-width:0; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; opacity:0.7; color:{};",
+                                    theme.foreground,
+                                ),
+                                "{surface_requested_url}"
+                            }
+                            button {
+                                style: format!(
+                                    "border:none; background:transparent; color:{}; cursor:pointer; font-size:14px; line-height:1; padding:2px 6px;",
+                                    theme.foreground,
+                                ),
+                                title: "Close web surface (sends Ctrl+C to the app)",
+                                onclick: {
+                                    let close_path = web_surface_close_session_path.clone();
+                                    move |_| {
+                                        let close_path = close_path.clone();
+                                        let endpoint = state.read().bootstrap.server_endpoint.clone();
+                                        state.with_mut(|shell| {
+                                            shell.close_web_surface(&close_path);
+                                        });
+                                        spawn(async move {
+                                            let _ = terminal_write_async(
+                                                endpoint,
+                                                close_path,
+                                                "\u{3}".to_string(),
+                                            )
+                                            .await;
+                                        });
+                                    }
+                                },
+                                "✕"
+                            }
+                        }
+                        iframe {
+                            src: "{surface_url}",
+                            // No allow-top-navigation: embedded content must not be able
+                            // to navigate the app's main frame through the vendored
+                            // navigation allowlist (see allow_web_surface_navigation).
+                            "sandbox": "allow-scripts allow-same-origin allow-forms allow-popups allow-modals allow-downloads",
+                            style: "flex:1 1 auto; border:0; width:100%; min-height:0; background:#ffffff;",
+                            onload: {
+                                let loaded_url = surface_url.clone();
+                                move |_| {
+                                    if let Ok(home) = yggterm_core::resolve_yggterm_home() {
+                                        append_trace_event(
+                                            &home,
+                                            "ui",
+                                            "web_surface",
+                                            "iframe_load",
+                                            json!({ "effective_url": loaded_url }),
+                                        );
+                                    }
+                                }
+                            },
+                        }
+                    }
                 }
                 TerminalScrollController {
                     session_path: host_session_path.clone(),
@@ -60377,6 +60839,49 @@ fn terminal_eval_script_with_canvas_renderer(
         }};
         const notifyOsc9Disposable = registerTerminalNotifyOsc(9, "osc9");
         const notifyOsc777Disposable = registerTerminalNotifyOsc(777, "osc777");
+        // libyggterm web-surface control (ychrome pilot): OSC 7717 with payload
+        // `web-surface;<action>;<base64 json>`. The PTY byte relay is the
+        // transport (works identically for local and remote sessions); the OSC
+        // is CONSUMED so it never prints as viewport junk, and plain terminals
+        // ignore unknown OSCs — the degradation story is built into the
+        // channel. Scrollback replay re-parses these, which is self-correcting:
+        // an open followed by its close replays in order, and the Rust side
+        // expires surfaces whose heartbeats stop.
+        const webSurfaceOscDisposable = (() => {{
+            try {{
+                if (!term || !term.parser || typeof term.parser.registerOscHandler !== 'function') {{
+                    return null;
+                }}
+                return term.parser.registerOscHandler(7717, (data) => {{
+                    try {{
+                        const raw = typeof data === 'string' ? data : '';
+                        const parts = raw.split(';');
+                        if (parts[0] !== 'web-surface') {{
+                            return true;
+                        }}
+                        const action = parts[1] || '';
+                        let payload = {{}};
+                        if (parts[2]) {{
+                            const bytes = Uint8Array.from(atob(parts[2]), (ch) => ch.charCodeAt(0));
+                            payload = JSON.parse(new TextDecoder().decode(bytes));
+                        }}
+                        if (!action || typeof payload.session !== 'string' || !payload.session) {{
+                            return true;
+                        }}
+                        sendTerminalEvent({{
+                            kind: 'web_surface',
+                            action,
+                            session: payload.session,
+                            url: typeof payload.url === 'string' ? payload.url : null,
+                            title: typeof payload.title === 'string' ? payload.title : null,
+                        }});
+                    }} catch (_webSurfaceError) {{}}
+                    return true;
+                }});
+            }} catch (_error) {{
+                return null;
+            }}
+        }})();
         // User bug 2: OSC 52 clipboard writes from the CLI (Claude Code's
         // select-copy / `c`-copy, tmux yank, etc.) were silently dropped —
         // xterm.js core has no OSC 52 handler (that lives in the
