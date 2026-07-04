@@ -3586,10 +3586,13 @@ pub(crate) fn terminal_chunk_is_low_signal_terminal_noise(data: &str) -> bool {
 }
 
 /// Per [[spec-xterm-gating-ux]] / dead-session UX: distinguishes the
-/// "saved Codex session UUID is no longer available on this machine"
+/// "saved <agent> session UUID is no longer available on this machine"
 /// failure (from `crates/yggterm-server/src/lib.rs` wrapper) from generic
 /// transport errors. This is recoverable only by Remove-from-sidebar, not by
-/// a retry — so the toast text should differ.
+/// a retry — so the toast text should differ. Matches the agent-agnostic
+/// invariant tail so BOTH the Codex ("saved Codex session …") and Claude Code
+/// ("saved Claude Code session …") wrappers classify the same — the recovery
+/// (Delete row) is identical, so the failure is one concept, not two.
 pub(crate) fn terminal_chunk_is_codex_session_not_on_remote(data: &str) -> bool {
     let stripped = strip_terminal_control_sequences(data);
     let lower: String = stripped
@@ -3599,8 +3602,8 @@ pub(crate) fn terminal_chunk_is_codex_session_not_on_remote(data: &str) -> bool 
         .map(str::to_ascii_lowercase)
         .collect::<Vec<_>>()
         .join(" ");
-    lower.contains("saved codex session")
-        && lower.contains("no longer available on this machine")
+    lower.contains("no longer available on this machine")
+        && lower.contains("cannot be restored as a live terminal")
 }
 pub(crate) fn terminal_chunk_is_transport_error(data: &str) -> bool {
     let stripped = strip_terminal_control_sequences(data);
@@ -3810,7 +3813,8 @@ mod tests {
         terminal_chunk_has_codex_prompt_output, terminal_chunk_has_current_codex_input_row,
         terminal_chunk_has_meaningful_output, terminal_chunk_is_claude_prompt_surface,
         terminal_chunk_is_codex_interactive_setup_prompt,
-        terminal_chunk_is_codex_prompt_surface, terminal_chunk_is_codex_working_surface,
+        terminal_chunk_is_codex_prompt_surface, terminal_chunk_is_codex_session_not_on_remote,
+        terminal_chunk_is_codex_working_surface,
         terminal_chunk_is_local_codex_scaffold,
         terminal_chunk_is_transport_error, terminal_host_geometry_problem_for_app_control,
         terminal_host_problem_for_app_control,
@@ -3818,6 +3822,24 @@ mod tests {
         terminal_observe_prompt_layout_is_acceptable, terminal_timing_for_app_control,
     };
     use serde_json::{Value, json};
+
+    #[test]
+    fn saved_agent_session_gone_classifies_both_codex_and_claude_code() {
+        // Regression: a Claude Code row whose transcript is gone from the remote
+        // must classify as "not on remote" (Delete-to-recover), not as a generic
+        // transport error. The wrapper names the correct agent; the detector keys
+        // on the agent-agnostic invariant tail so both wrappers land here.
+        let codex = "yggterm: saved Codex session 35669b3d-b6c6-4c9f-ad18-bed2e49bb074 \
+             is no longer available on this machine, so this row cannot be restored as a live terminal.";
+        let claude = "yggterm: saved Claude Code session 35669b3d-b6c6-4c9f-ad18-bed2e49bb074 \
+             is no longer available on this machine, so this row cannot be restored as a live terminal.";
+        assert!(terminal_chunk_is_codex_session_not_on_remote(codex));
+        assert!(terminal_chunk_is_codex_session_not_on_remote(claude));
+        // A generic transport error must NOT be misread as a dead-transcript row.
+        assert!(!terminal_chunk_is_codex_session_not_on_remote(
+            "shared connection to dev closed."
+        ));
+    }
 
     #[test]
     fn parse_meminfo_computes_swap_used_and_available() {
