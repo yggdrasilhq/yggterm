@@ -71,6 +71,49 @@ end. The forward dies with the surface. Non-loopback URLs currently load
 directly from the GUI host (documented v0 gap; the general fix is a
 per-surface SOCKS egress, see the ychrome repo's protocol doc).
 
+## Browser chrome: tabs + address bar
+
+The overlay carries a minimal Chrome-like UI (v2.9.54):
+
+- **Tab strip.** `tabs[0]` is the *app tab*, owned by the OSC stream — when the
+  app emits a new URL, the app tab retargets and user tabs survive. The app tab
+  has no per-tab close button; the overlay ✕ (real Ctrl+C) is how the app ends.
+  `+` opens a user tab (blank page, address bar focused for input).
+- **Address bar.** http(s) URLs load as-is; bare hosts get a scheme (http for
+  loopback, https otherwise); anything else goes to a web search
+  (html.duckduckgo.com, which permits framing). Address-bar navigations honor
+  the same egress rule as OSC opens: loopback URLs on a remote session resolve
+  through a fresh `ssh -L` on the session's machine.
+- **Back / forward / reload.** The nav stack covers *yggterm-driven*
+  navigations only (address bar, OSC retargets). In-iframe navigations are
+  cross-origin-invisible, so the address bar does not follow link clicks —
+  documented v0 gap, same class as the SOCKS egress gap.
+- **In-frame link clicks.** While at least one surface is live, the vendored
+  navigation policy opens a blanket http(s) gate
+  (`set_webview_http_navigation_open`) so cross-origin link clicks and
+  redirects inside surface iframes stay in-frame instead of bouncing to the OS
+  browser. WebKitGTK's policy handler has no frame attribution, so a prefix
+  allowlist cannot cover them. Safety: surface iframes are sandboxed without
+  `allow-top-navigation`, and the shell UI carries no plain http(s) anchors.
+  The gate closes with the last surface.
+- **Input ownership.** While a surface covers the active terminal, the
+  terminal input policy disarms the xterm textarea
+  (`web_surface_active` in `ActiveTerminalInputPolicySignature`) — keystrokes
+  belong to the overlay.
+
+Sites that refuse framing (X-Frame-Options / frame-ancestors: google.com,
+most login pages) render blank in a tab — inherent to the iframe renderer,
+accepted for the pilot.
+
+## Sidebars (decision, 2026-07-04)
+
+Web surfaces keep the generic yggterm sidebars: settings (zoom controls are
+named "Viewport Zoom", not "Terminal Zoom", for exactly this reason),
+notifications (pan-yggterm), and metadata (already per-session-type by
+design). libyggterm apps may later contribute *additional* per-app sidebars
+and their own app icon — Cellulose is the first expected consumer (one
+unified scrollable ribbon sidebar to pair with ALT+ navigation).
+
 ## Renderer and security
 
 The surface is an iframe overlay inside the GUI webview. Two guards:

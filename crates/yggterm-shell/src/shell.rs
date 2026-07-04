@@ -904,28 +904,129 @@ struct LiveTerminalSidebarSample {
 /// parser) self-heals the surface from the next heartbeat.
 #[derive(Debug, Clone)]
 struct WebSurfaceUiState {
+    /// Browser tabs. `tabs[0]` is the app tab — owned by the OSC stream (its
+    /// URL follows the app's open payload; it has no per-tab close button).
+    /// Later tabs are user-opened from the tab strip.
+    tabs: Vec<WebSurfaceTab>,
+    /// Id (not index) of the visible tab, stable across tab closes.
+    active_tab: u64,
+    next_tab_id: u64,
+    opened_at_ms: u64,
+    last_seen_ms: u64,
+    /// In-progress address-bar edit for the ACTIVE tab; None shows the tab URL.
+    address_draft: Option<String>,
+}
+#[derive(Debug, Clone)]
+struct WebSurfaceTab {
+    id: u64,
+    /// Requested/display URL (what the address bar shows). Empty on a fresh
+    /// user tab that has not navigated yet.
     url: String,
-    title: Option<String>,
     /// What the iframe actually loads: the requested URL for local sessions
     /// and direct-loadable remotes, or the local end of the session-side
     /// `ssh -L` forward for remote loopback URLs. The forward's remote sshd
     /// originates the target connection, so network egress stays on the
     /// session's machine (ychrome docs/architecture.md "egress rule").
     effective_url: String,
-    opened_at_ms: u64,
-    last_seen_ms: u64,
+    title: Option<String>,
     /// Shared because ShellState is Clone; killed EXPLICITLY by the close /
-    /// sweep / replace paths (never on Drop — a state clone dropping must not
-    /// tear down a live forward).
+    /// sweep / replace / navigate paths (never on Drop — a state clone
+    /// dropping must not tear down a live forward).
     forward_child: Option<Arc<Mutex<std::process::Child>>>,
+    /// yggterm-driven navigation stack of requested URLs. In-iframe
+    /// navigations are cross-origin-invisible, so back/forward cover only
+    /// address-bar/OSC navigations. `history[history_index]` == `url`.
+    history: Vec<String>,
+    history_index: usize,
+}
+impl WebSurfaceTab {
+    fn kill_forward(&self) {
+        if let Some(child) = &self.forward_child
+            && let Ok(mut child) = child.lock()
+        {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
 }
 fn kill_web_surface_forward(surface: &WebSurfaceUiState) {
-    if let Some(child) = &surface.forward_child
-        && let Ok(mut child) = child.lock()
-    {
-        let _ = child.kill();
-        let _ = child.wait();
+    for tab in &surface.tabs {
+        tab.kill_forward();
     }
+}
+/// Render-facing view of a live web surface: tab strip + address bar +
+/// per-tab iframes.
+#[derive(Debug, Clone, PartialEq)]
+struct WebSurfaceOverlayView {
+    tabs: Vec<WebSurfaceOverlayTabView>,
+    active_tab_id: u64,
+    /// Address bar content: the active tab's in-progress draft, or its URL.
+    address_text: String,
+    /// True while the user is editing (a draft is present).
+    address_editing: bool,
+    /// Back/forward targets on the active tab's yggterm-driven nav stack:
+    /// (history_index, url). None disables the button.
+    back_target: Option<(usize, String)>,
+    forward_target: Option<(usize, String)>,
+}
+#[derive(Debug, Clone, PartialEq)]
+struct WebSurfaceOverlayTabView {
+    id: u64,
+    label: String,
+    /// The app tab (tabs[0]) has no per-tab close button; closing the app is
+    /// the overlay ✕ (real Ctrl+C).
+    is_app_tab: bool,
+    effective_url: String,
+    active: bool,
+}
+/// Resolve and commit a user-driven tab navigation (address bar, back,
+/// forward). The blocking egress resolution (possible `ssh -L` setup) runs
+/// off the UI event loop; the result lands via
+/// `apply_web_surface_tab_navigation`, which also owns forward-child cleanup
+/// if the tab vanished meanwhile.
+fn navigate_web_surface_tab(
+    mut state: Signal<ShellState>,
+    session_path: String,
+    tab_id: u64,
+    url: String,
+    ssh_target: Option<String>,
+    history_index: Option<usize>,
+) {
+    spawn(async move {
+        let resolve_url = url.clone();
+        let (effective_url, forward_child) = task::spawn_blocking(move || {
+            resolve_web_surface_effective_url(&resolve_url, ssh_target.as_deref())
+        })
+        .await
+        .unwrap_or_else(|_| (url.clone(), None));
+        allow_web_surface_navigation(&effective_url);
+        if let Ok(home) = yggterm_core::resolve_yggterm_home() {
+            append_trace_event(
+                &home,
+                "ui",
+                "web_surface",
+                "tab_navigate",
+                json!({
+                    "session_path": session_path,
+                    "tab_id": tab_id,
+                    "url": url,
+                    "effective_url": effective_url,
+                    "forwarded": forward_child.is_some(),
+                    "history_index": history_index,
+                }),
+            );
+        }
+        state.with_mut(|shell| {
+            shell.apply_web_surface_tab_navigation(
+                &session_path,
+                tab_id,
+                url,
+                effective_url,
+                forward_child,
+                history_index,
+            );
+        });
+    });
 }
 /// Heartbeats arrive every ~4s from a live app; 3 missed beats = gone.
 const WEB_SURFACE_STALE_AFTER_MS: u64 = 15_000;
@@ -1058,6 +1159,103 @@ fn spawn_web_surface_forward(
         std::thread::sleep(std::time::Duration::from_millis(120));
     }
 }
+/// Resolve a requested surface URL to what the iframe should load, honoring
+/// the egress rule: loopback URLs on a remote session go through an `ssh -L`
+/// forward originated on the session's machine. Blocking (the forward setup
+/// waits for the local end to accept) — callers run it via spawn_blocking.
+fn resolve_web_surface_effective_url(
+    url: &str,
+    ssh_target: Option<&str>,
+) -> (String, Option<std::process::Child>) {
+    if let Some(target) = ssh_target.filter(|_| web_surface_url_is_loopback(url)) {
+        let (host, port, tail) = web_surface_url_parts(url)
+            .unwrap_or_else(|| ("127.0.0.1".to_string(), 80, String::new()));
+        if let Some((local_port, child)) = spawn_web_surface_forward(target, &host, port) {
+            return (format!("http://127.0.0.1:{local_port}{tail}"), Some(child));
+        }
+    }
+    (url.to_string(), None)
+}
+/// Turn address-bar input into a navigable URL: pass http(s) URLs through,
+/// prefix bare hosts with a scheme (http for loopback dev servers, https
+/// otherwise), and send anything that doesn't look like a host to a web
+/// search. Returns None for empty or non-http-scheme input.
+fn web_surface_address_to_url(input: &str) -> Option<String> {
+    let input = input.trim();
+    if input.is_empty() {
+        return None;
+    }
+    if web_surface_url_scheme_allowed(input) {
+        return Some(input.to_string());
+    }
+    if input.contains("://") {
+        return None;
+    }
+    let host = input
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or("")
+        .split(':')
+        .next()
+        .unwrap_or("");
+    let looks_like_host = !input.contains(char::is_whitespace)
+        && (host.contains('.') || host.eq_ignore_ascii_case("localhost"));
+    if looks_like_host {
+        let candidate = format!("http://{input}");
+        if web_surface_url_is_loopback(&candidate) {
+            Some(candidate)
+        } else {
+            Some(format!("https://{input}"))
+        }
+    } else {
+        // Search fallback. html.duckduckgo.com permits framing (google.com
+        // sends X-Frame-Options and would blank the tab).
+        Some(format!(
+            "https://html.duckduckgo.com/html/?q={}",
+            web_surface_query_encode(input)
+        ))
+    }
+}
+/// Minimal percent-encoding for a search query (application/x-www-form-urlencoded
+/// style, spaces as %20).
+fn web_surface_query_encode(query: &str) -> String {
+    let mut encoded = String::with_capacity(query.len() * 3);
+    for byte in query.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                encoded.push(byte as char)
+            }
+            _ => encoded.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    encoded
+}
+/// Label for a tab that never learns its page title (cross-origin iframes are
+/// opaque): the URL's host, or "New Tab" before first navigation.
+fn web_surface_tab_host_label(url: &str) -> String {
+    let host = url
+        .split_once("://")
+        .map(|(_, rest)| rest)
+        .unwrap_or(url)
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or("")
+        .rsplit_once('@')
+        .map(|(_, host)| host)
+        .unwrap_or_else(|| {
+            url.split_once("://")
+                .map(|(_, rest)| rest)
+                .unwrap_or(url)
+                .split(['/', '?', '#'])
+                .next()
+                .unwrap_or("")
+        });
+    if host.is_empty() {
+        "New Tab".to_string()
+    } else {
+        host.to_string()
+    }
+}
 #[derive(Clone, PartialEq, Eq)]
 struct ActiveTerminalInputPolicySignature {
     active_view_mode: WorkspaceViewMode,
@@ -1074,6 +1272,9 @@ struct ActiveTerminalInputPolicySignature {
     terminal_input_override_active: bool,
     app_control_backgrounded: bool,
     remote_resume_input_ready: bool,
+    /// A live web surface covers the active terminal: keystrokes belong to
+    /// the overlay (address bar / iframe), never the xterm textarea.
+    web_surface_active: bool,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct LinuxWindowChromeApplySignature {
@@ -1963,7 +2164,7 @@ fn snapshot_retained_terminal_session_view(session: &ManagedSessionView) -> Mana
 
 fn active_viewport_zoom_label(snapshot: &RenderSnapshot) -> String {
     match snapshot.active_view_mode {
-        WorkspaceViewMode::Terminal => "Terminal Zoom".to_string(),
+        WorkspaceViewMode::Terminal => "Viewport Zoom".to_string(),
         WorkspaceViewMode::Rendered => snapshot
             .selected_row
             .as_ref()
@@ -3353,9 +3554,20 @@ impl ShellState {
     fn effective_window_focused(&self) -> bool {
         self.window_focused || self.app_control_force_foreground
     }
+    /// While any surface is live, the vendored webview navigation policy lets
+    /// http(s) navigations proceed in-frame — link clicks and redirects inside
+    /// surface iframes are cross-origin (WebKitGTK's policy handler cannot
+    /// attribute them to a frame), so an origin allowlist cannot cover them.
+    /// The iframe sandboxes (no allow-top-navigation) keep the main frame
+    /// safe, and the shell UI carries no plain http anchors; the gate closes
+    /// with the last surface.
+    fn sync_web_surface_navigation_gate(&self) {
+        dioxus::desktop::set_webview_http_navigation_open(!self.web_surfaces.is_empty());
+    }
     /// Upsert a web surface for a session (OSC 7717 open/heartbeat with a
     /// URL). `effective_url`/`forward` are precomputed by the caller (forward
-    /// setup blocks, so it must not run under the state lock).
+    /// setup blocks, so it must not run under the state lock). An existing
+    /// surface keeps its user tabs; only the app tab (tabs[0]) retargets.
     fn upsert_web_surface(
         &mut self,
         session_path: &str,
@@ -3365,33 +3577,61 @@ impl ShellState {
         forward_child: Option<std::process::Child>,
         now_ms: u64,
     ) {
-        if let Some(existing) = self.web_surfaces.get_mut(session_path) {
-            if existing.url == url {
-                existing.last_seen_ms = now_ms;
+        if let Some(existing) = self.web_surfaces.get_mut(session_path)
+            && let Some(app_tab) = existing.tabs.first_mut()
+        {
+            existing.last_seen_ms = now_ms;
+            if app_tab.url == url {
                 if title.is_some() {
-                    existing.title = title;
+                    app_tab.title = title;
                 }
                 // Keep the established forward; kill the redundant new one.
                 if let Some(mut child) = forward_child {
                     let _ = child.kill();
                     let _ = child.wait();
                 }
-                return;
+            } else {
+                // The app navigated: retarget the app tab, keep user tabs.
+                app_tab.kill_forward();
+                app_tab.url = url.clone();
+                app_tab.effective_url = effective_url;
+                if title.is_some() {
+                    app_tab.title = title;
+                }
+                app_tab.forward_child = forward_child.map(|child| Arc::new(Mutex::new(child)));
+                app_tab.history.truncate(app_tab.history_index + 1);
+                app_tab.history.push(url);
+                app_tab.history_index = app_tab.history.len() - 1;
+                if existing.active_tab == app_tab.id {
+                    existing.address_draft = None;
+                }
             }
+            self.sync_web_surface_navigation_gate();
+            return;
         }
+        let app_tab = WebSurfaceTab {
+            id: 0,
+            url: url.clone(),
+            effective_url,
+            title,
+            forward_child: forward_child.map(|child| Arc::new(Mutex::new(child))),
+            history: vec![url],
+            history_index: 0,
+        };
         if let Some(replaced) = self.web_surfaces.insert(
             session_path.to_string(),
             WebSurfaceUiState {
-                url,
-                title,
-                effective_url,
+                tabs: vec![app_tab],
+                active_tab: 0,
+                next_tab_id: 1,
                 opened_at_ms: now_ms,
                 last_seen_ms: now_ms,
-                forward_child: forward_child.map(|child| Arc::new(Mutex::new(child))),
+                address_draft: None,
             },
         ) {
             kill_web_surface_forward(&replaced);
         }
+        self.sync_web_surface_navigation_gate();
     }
     /// Refresh liveness for an existing surface (heartbeat without URL).
     fn touch_web_surface(&mut self, session_path: &str, now_ms: u64) -> bool {
@@ -3403,12 +3643,14 @@ impl ShellState {
         }
     }
     fn close_web_surface(&mut self, session_path: &str) -> bool {
-        if let Some(removed) = self.web_surfaces.remove(session_path) {
+        let closed = if let Some(removed) = self.web_surfaces.remove(session_path) {
             kill_web_surface_forward(&removed);
             true
         } else {
             false
-        }
+        };
+        self.sync_web_surface_navigation_gate();
+        closed
     }
     fn sweep_stale_web_surfaces(&mut self, now_ms: u64) {
         self.web_surfaces.retain(|_, surface| {
@@ -3419,28 +3661,160 @@ impl ShellState {
             }
             live
         });
+        self.sync_web_surface_navigation_gate();
     }
-    /// The viewport overlay view: (effective_url, display_title, requested_url)
-    /// for a live (non-stale) surface on this session.
+    /// Cheap liveness probe (no view construction) for the input policy.
+    fn has_live_web_surface(&self, session_path: &str, now_ms: u64) -> bool {
+        self.web_surfaces
+            .get(session_path)
+            .is_some_and(|surface| {
+                now_ms.saturating_sub(surface.last_seen_ms) <= WEB_SURFACE_STALE_AFTER_MS
+            })
+    }
+    fn web_surface_select_tab(&mut self, session_path: &str, tab_id: u64) {
+        if let Some(surface) = self.web_surfaces.get_mut(session_path)
+            && surface.tabs.iter().any(|tab| tab.id == tab_id)
+        {
+            surface.active_tab = tab_id;
+            surface.address_draft = None;
+        }
+    }
+    /// Open a fresh user tab (blank page, address bar in edit mode).
+    fn web_surface_new_tab(&mut self, session_path: &str) {
+        if let Some(surface) = self.web_surfaces.get_mut(session_path) {
+            let id = surface.next_tab_id;
+            surface.next_tab_id += 1;
+            surface.tabs.push(WebSurfaceTab {
+                id,
+                url: String::new(),
+                effective_url: "about:blank".to_string(),
+                title: None,
+                forward_child: None,
+                history: Vec::new(),
+                history_index: 0,
+            });
+            surface.active_tab = id;
+            surface.address_draft = Some(String::new());
+        }
+    }
+    /// Close a user tab. The app tab (tabs[0]) is not closable here — closing
+    /// the app is the overlay ✕, which sends a real Ctrl+C.
+    fn web_surface_close_tab(&mut self, session_path: &str, tab_id: u64) {
+        if let Some(surface) = self.web_surfaces.get_mut(session_path) {
+            let Some(index) = surface.tabs.iter().position(|tab| tab.id == tab_id) else {
+                return;
+            };
+            if index == 0 {
+                return;
+            }
+            let removed = surface.tabs.remove(index);
+            removed.kill_forward();
+            if surface.active_tab == tab_id {
+                surface.active_tab = surface.tabs[index - 1].id;
+                surface.address_draft = None;
+            }
+        }
+    }
+    /// Address-bar edit state for the active tab (None = show the tab URL).
+    fn web_surface_set_address_draft(&mut self, session_path: &str, draft: Option<String>) {
+        if let Some(surface) = self.web_surfaces.get_mut(session_path) {
+            surface.address_draft = draft;
+        }
+    }
+    /// Commit a resolved navigation onto a tab. `history_index` Some = a
+    /// back/forward step to that stack position; None = a new navigation
+    /// pushed after the current position (dropping any forward entries).
+    fn apply_web_surface_tab_navigation(
+        &mut self,
+        session_path: &str,
+        tab_id: u64,
+        url: String,
+        effective_url: String,
+        forward_child: Option<std::process::Child>,
+        history_index: Option<usize>,
+    ) {
+        let mut orphaned_forward = forward_child;
+        if let Some(surface) = self.web_surfaces.get_mut(session_path)
+            && let Some(tab) = surface.tabs.iter_mut().find(|tab| tab.id == tab_id)
+        {
+            tab.kill_forward();
+            tab.url = url.clone();
+            tab.effective_url = effective_url;
+            tab.forward_child = orphaned_forward.take().map(|child| Arc::new(Mutex::new(child)));
+            match history_index {
+                Some(index) if index < tab.history.len() => tab.history_index = index,
+                _ => {
+                    if !tab.history.is_empty() {
+                        tab.history.truncate(tab.history_index + 1);
+                    }
+                    tab.history.push(url);
+                    tab.history_index = tab.history.len() - 1;
+                }
+            }
+            if surface.active_tab == tab_id {
+                surface.address_draft = None;
+            }
+        }
+        // Tab or surface vanished while the forward resolved: don't leak it.
+        if let Some(mut child) = orphaned_forward {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+    /// The viewport overlay view for a live (non-stale) surface: tab strip,
+    /// address bar, and per-tab iframe targets.
     fn web_surface_overlay_for_session(
         &self,
         session_path: &str,
         now_ms: u64,
-    ) -> Option<(String, String, String)> {
+    ) -> Option<WebSurfaceOverlayView> {
         let surface = self.web_surfaces.get(session_path)?;
         if now_ms.saturating_sub(surface.last_seen_ms) > WEB_SURFACE_STALE_AFTER_MS {
             return None;
         }
-        let display_title = surface
-            .title
-            .clone()
-            .filter(|title| !title.trim().is_empty())
-            .unwrap_or_else(|| "ychrome".to_string());
-        Some((
-            surface.effective_url.clone(),
-            display_title,
-            surface.url.clone(),
-        ))
+        let active_tab_id = surface.active_tab;
+        let active = surface.tabs.iter().find(|tab| tab.id == active_tab_id)?;
+        let tabs = surface
+            .tabs
+            .iter()
+            .enumerate()
+            .map(|(index, tab)| WebSurfaceOverlayTabView {
+                id: tab.id,
+                label: tab
+                    .title
+                    .clone()
+                    .filter(|title| !title.trim().is_empty())
+                    .unwrap_or_else(|| {
+                        if index == 0 {
+                            "ychrome".to_string()
+                        } else {
+                            web_surface_tab_host_label(&tab.url)
+                        }
+                    }),
+                is_app_tab: index == 0,
+                effective_url: tab.effective_url.clone(),
+                active: tab.id == active_tab_id,
+            })
+            .collect();
+        let back_target = active
+            .history_index
+            .checked_sub(1)
+            .and_then(|index| active.history.get(index).map(|url| (index, url.clone())));
+        let forward_target = active
+            .history
+            .get(active.history_index + 1)
+            .map(|url| (active.history_index + 1, url.clone()));
+        Some(WebSurfaceOverlayView {
+            tabs,
+            active_tab_id,
+            address_text: surface
+                .address_draft
+                .clone()
+                .unwrap_or_else(|| active.url.clone()),
+            address_editing: surface.address_draft.is_some(),
+            back_target,
+            forward_target,
+        })
     }
     fn set_window_focused(&mut self, focused: bool) {
         let was_focused = self.window_focused;
@@ -7717,7 +8091,7 @@ impl ShellState {
     }
     fn set_main_zoom(&mut self, view_mode: WorkspaceViewMode, value: f32) {
         let label = match view_mode {
-            WorkspaceViewMode::Terminal => "terminal zoom",
+            WorkspaceViewMode::Terminal => "viewport zoom",
             WorkspaceViewMode::Rendered => "preview zoom",
         };
         let (before, after) = set_main_zoom_settings_for_view(&mut self.settings, view_mode, value);
@@ -51239,7 +51613,12 @@ fn TerminalCanvas(
                                                             .web_surfaces
                                                             .get(&surface_session_path)
                                                             .is_none_or(|surface| {
-                                                                surface.url != *url
+                                                                surface
+                                                                    .tabs
+                                                                    .first()
+                                                                    .is_none_or(|app_tab| {
+                                                                        app_tab.url != *url
+                                                                    })
                                                             })
                                                     })
                                             });
@@ -51249,40 +51628,17 @@ fn TerminalCanvas(
                                             // sshd originates the connection on the
                                             // session's machine. The bounded wait
                                             // runs off the UI event loop.
-                                            let forward_target = web_surface_ssh_target
-                                                .clone()
-                                                .filter(|_| web_surface_url_is_loopback(&url));
-                                            let (effective_url, forward_child) = if let Some(
-                                                target,
-                                            ) = forward_target
-                                            {
-                                                let (host, port, tail) =
-                                                    web_surface_url_parts(&url).unwrap_or_else(
-                                                        || ("127.0.0.1".to_string(), 80, String::new()),
-                                                    );
-                                                let target_for_task = target.clone();
-                                                let forward = task::spawn_blocking(move || {
-                                                    spawn_web_surface_forward(
-                                                        &target_for_task,
-                                                        &host,
-                                                        port,
+                                            let resolve_url = url.clone();
+                                            let resolve_target = web_surface_ssh_target.clone();
+                                            let (effective_url, forward_child) =
+                                                task::spawn_blocking(move || {
+                                                    resolve_web_surface_effective_url(
+                                                        &resolve_url,
+                                                        resolve_target.as_deref(),
                                                     )
                                                 })
                                                 .await
-                                                .ok()
-                                                .flatten();
-                                                match forward {
-                                                    Some((local_port, child)) => (
-                                                        format!(
-                                                            "http://127.0.0.1:{local_port}{tail}"
-                                                        ),
-                                                        Some(child),
-                                                    ),
-                                                    None => (url.clone(), None),
-                                                }
-                                            } else {
-                                                (url.clone(), None)
-                                            };
+                                                .unwrap_or_else(|_| (url.clone(), None));
                                             append_trace_event(
                                                 &trace_home,
                                                 "ui",
@@ -56231,6 +56587,12 @@ fn TerminalCanvas(
         shell.web_surface_overlay_for_session(&session.session_path, current_millis())
     });
     let web_surface_close_session_path = session.session_path.clone();
+    let web_surface_session_path = session.session_path.clone();
+    // Address-bar/back/forward navigations honor the same egress rule as OSC
+    // opens: loopback URLs on a remote session resolve through the session
+    // host's sshd.
+    let web_surface_nav_ssh_target = session.ssh_target.clone();
+    let web_surface_host_id = host_id.clone();
     let context_row = BrowserRow {
         kind: BrowserRowKind::Session,
         full_path: session.session_path.clone(),
@@ -56331,31 +56693,88 @@ fn TerminalCanvas(
                         }
                     },
                 }
-                if let Some((surface_url, surface_title, surface_requested_url)) = web_surface_overlay {
+                if let Some(web_overlay) = web_surface_overlay {
                     div {
                         style: format!(
                             "position:absolute; inset:0; z-index:40; display:flex; flex-direction:column; background:{}; border-radius:{};",
                             theme.background, terminal_shell_radius,
                         ),
+                        // Tab strip: tabs sit on the darker strip; the active
+                        // tab merges into the nav bar below (Chrome-like).
                         div {
                             style: format!(
-                                "display:flex; align-items:center; gap:8px; padding:4px 10px; font-size:12px; color:{}; background:{}; user-select:none;",
-                                theme.foreground, terminal_shell_background,
+                                "display:flex; align-items:flex-end; gap:2px; padding:6px 8px 0; background:{}; user-select:none; overflow:hidden;",
+                                terminal_shell_background,
                             ),
-                            span {
-                                style: "font-weight:600; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;",
-                                "{surface_title}"
-                            }
-                            span {
-                                style: format!(
-                                    "flex:1 1 auto; min-width:0; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; opacity:0.7; color:{};",
-                                    theme.foreground,
-                                ),
-                                "{surface_requested_url}"
-                            }
+                            {web_overlay.tabs.iter().map(|tab| {
+                                let tab_id = tab.id;
+                                let tab_label = tab.label.clone();
+                                let tab_active = tab.active;
+                                let is_app_tab = tab.is_app_tab;
+                                let select_path = web_surface_session_path.clone();
+                                let close_tab_path = web_surface_session_path.clone();
+                                let tab_background = if tab_active {
+                                    theme.background.clone()
+                                } else {
+                                    "transparent".to_string()
+                                };
+                                let tab_opacity = if tab_active { "1" } else { "0.6" };
+                                rsx! {
+                                    div {
+                                        key: "ws-tab-{tab_id}",
+                                        style: format!(
+                                            "display:flex; align-items:center; gap:6px; max-width:200px; min-width:0; padding:5px 12px; \
+                                             border-radius:8px 8px 0 0; background:{}; color:{}; opacity:{}; cursor:pointer; font-size:12px;",
+                                            tab_background, theme.foreground, tab_opacity,
+                                        ),
+                                        onclick: move |_| {
+                                            state.with_mut(|shell| {
+                                                shell.web_surface_select_tab(&select_path, tab_id);
+                                            });
+                                        },
+                                        span {
+                                            style: "white-space:nowrap; overflow:hidden; text-overflow:ellipsis; min-width:0;",
+                                            "{tab_label}"
+                                        }
+                                        if !is_app_tab {
+                                            button {
+                                                style: format!(
+                                                    "border:none; background:transparent; color:{}; cursor:pointer; font-size:11px; line-height:1; padding:1px 3px; border-radius:50%;",
+                                                    theme.foreground,
+                                                ),
+                                                title: "Close tab",
+                                                onclick: move |evt| {
+                                                    evt.stop_propagation();
+                                                    state.with_mut(|shell| {
+                                                        shell.web_surface_close_tab(&close_tab_path, tab_id);
+                                                    });
+                                                },
+                                                "✕"
+                                            }
+                                        }
+                                    }
+                                }
+                            })}
                             button {
                                 style: format!(
-                                    "border:none; background:transparent; color:{}; cursor:pointer; font-size:14px; line-height:1; padding:2px 6px;",
+                                    "border:none; background:transparent; color:{}; cursor:pointer; font-size:15px; line-height:1; padding:4px 8px; opacity:0.75;",
+                                    theme.foreground,
+                                ),
+                                title: "New tab",
+                                onclick: {
+                                    let new_tab_path = web_surface_session_path.clone();
+                                    move |_| {
+                                        state.with_mut(|shell| {
+                                            shell.web_surface_new_tab(&new_tab_path);
+                                        });
+                                    }
+                                },
+                                "+"
+                            }
+                            span { style: "flex:1 1 auto;" }
+                            button {
+                                style: format!(
+                                    "border:none; background:transparent; color:{}; cursor:pointer; font-size:14px; line-height:1; padding:4px 8px; opacity:0.75;",
                                     theme.foreground,
                                 ),
                                 title: "Close web surface (sends Ctrl+C to the app)",
@@ -56380,27 +56799,208 @@ fn TerminalCanvas(
                                 "✕"
                             }
                         }
-                        iframe {
-                            src: "{surface_url}",
-                            // No allow-top-navigation: embedded content must not be able
-                            // to navigate the app's main frame through the vendored
-                            // navigation allowlist (see allow_web_surface_navigation).
-                            "sandbox": "allow-scripts allow-same-origin allow-forms allow-popups allow-modals allow-downloads",
-                            style: "flex:1 1 auto; border:0; width:100%; min-height:0; background:#ffffff;",
-                            onload: {
-                                let loaded_url = surface_url.clone();
-                                move |_| {
-                                    if let Ok(home) = yggterm_core::resolve_yggterm_home() {
-                                        append_trace_event(
-                                            &home,
-                                            "ui",
-                                            "web_surface",
-                                            "iframe_load",
-                                            json!({ "effective_url": loaded_url }),
-                                        );
+                        // Nav bar: back / forward / reload over the
+                        // yggterm-driven nav stack, plus the address bar.
+                        {{
+                            let nav_path = web_surface_session_path.clone();
+                            let nav_ssh = web_surface_nav_ssh_target.clone();
+                            let active_tab_id = web_overlay.active_tab_id;
+                            let back_target = web_overlay.back_target.clone();
+                            let forward_target = web_overlay.forward_target.clone();
+                            let address_text = web_overlay.address_text.clone();
+                            let active_frame_id =
+                                format!("{web_surface_host_id}-ws-frame-{active_tab_id}");
+                            let nav_button_style = |enabled: bool| {
+                                format!(
+                                    "border:none; background:transparent; color:{}; font-size:14px; line-height:1; padding:4px 7px; border-radius:6px; cursor:{}; opacity:{};",
+                                    theme.foreground,
+                                    if enabled { "pointer" } else { "default" },
+                                    if enabled { "0.85" } else { "0.3" },
+                                )
+                            };
+                            let back_style = nav_button_style(back_target.is_some());
+                            let forward_style = nav_button_style(forward_target.is_some());
+                            let reload_style = nav_button_style(true);
+                            rsx! {
+                                div {
+                                    style: format!(
+                                        "display:flex; align-items:center; gap:4px; padding:6px 10px; background:{}; user-select:none;",
+                                        theme.background,
+                                    ),
+                                    button {
+                                        style: "{back_style}",
+                                        title: "Back",
+                                        disabled: back_target.is_none(),
+                                        onclick: {
+                                            let nav_path = nav_path.clone();
+                                            let nav_ssh = nav_ssh.clone();
+                                            let back_target = back_target.clone();
+                                            move |_| {
+                                                if let Some((index, url)) = back_target.clone() {
+                                                    navigate_web_surface_tab(
+                                                        state,
+                                                        nav_path.clone(),
+                                                        active_tab_id,
+                                                        url,
+                                                        nav_ssh.clone(),
+                                                        Some(index),
+                                                    );
+                                                }
+                                            }
+                                        },
+                                        "←"
+                                    }
+                                    button {
+                                        style: "{forward_style}",
+                                        title: "Forward",
+                                        disabled: forward_target.is_none(),
+                                        onclick: {
+                                            let nav_path = nav_path.clone();
+                                            let nav_ssh = nav_ssh.clone();
+                                            let forward_target = forward_target.clone();
+                                            move |_| {
+                                                if let Some((index, url)) = forward_target.clone() {
+                                                    navigate_web_surface_tab(
+                                                        state,
+                                                        nav_path.clone(),
+                                                        active_tab_id,
+                                                        url,
+                                                        nav_ssh.clone(),
+                                                        Some(index),
+                                                    );
+                                                }
+                                            }
+                                        },
+                                        "→"
+                                    }
+                                    button {
+                                        style: "{reload_style}",
+                                        title: "Reload",
+                                        onclick: move |_| {
+                                            // Re-assigning src reloads the frame; the
+                                            // parent owns the element, so the sandbox
+                                            // does not block this.
+                                            let _ = document::eval(&format!(
+                                                "(function() {{ const f = document.getElementById({active_frame_id:?}); if (f) {{ f.src = f.src; }} }})();"
+                                            ));
+                                        },
+                                        "⟳"
+                                    }
+                                    input {
+                                        // Pill omnibox: deliberate DESIGN.md exception —
+                                        // the surface mimics Chrome's vocabulary.
+                                        style: format!(
+                                            "flex:1 1 auto; min-width:0; padding:5px 14px; border-radius:14px; border:1px solid rgba(127,127,127,0.35); \
+                                             background:{}; color:{}; font-size:12.5px; outline:none;",
+                                            terminal_shell_background, theme.foreground,
+                                        ),
+                                        value: "{address_text}",
+                                        spellcheck: "false",
+                                        autocomplete: "off",
+                                        placeholder: "Search or enter address",
+                                        oninput: {
+                                            let nav_path = nav_path.clone();
+                                            move |evt: FormEvent| {
+                                                state.with_mut(|shell| {
+                                                    shell.web_surface_set_address_draft(
+                                                        &nav_path,
+                                                        Some(evt.value()),
+                                                    );
+                                                });
+                                            }
+                                        },
+                                        onkeydown: {
+                                            let nav_path = nav_path.clone();
+                                            let nav_ssh = nav_ssh.clone();
+                                            move |evt: KeyboardEvent| {
+                                                if evt.key() == Key::Enter {
+                                                    evt.prevent_default();
+                                                    // Read draft + active tab at commit
+                                                    // time (the render snapshot may lag).
+                                                    let target = state.with(|shell| {
+                                                        let surface =
+                                                            shell.web_surfaces.get(&nav_path)?;
+                                                        let text = surface
+                                                            .address_draft
+                                                            .clone()
+                                                            .or_else(|| {
+                                                                surface
+                                                                    .tabs
+                                                                    .iter()
+                                                                    .find(|tab| {
+                                                                        tab.id == surface.active_tab
+                                                                    })
+                                                                    .map(|tab| tab.url.clone())
+                                                            })?;
+                                                        Some((surface.active_tab, text))
+                                                    });
+                                                    if let Some((tab_id, text)) = target
+                                                        && let Some(url) =
+                                                            web_surface_address_to_url(&text)
+                                                    {
+                                                        navigate_web_surface_tab(
+                                                            state,
+                                                            nav_path.clone(),
+                                                            tab_id,
+                                                            url,
+                                                            nav_ssh.clone(),
+                                                            None,
+                                                        );
+                                                    }
+                                                } else if evt.key() == Key::Escape {
+                                                    state.with_mut(|shell| {
+                                                        shell.web_surface_set_address_draft(
+                                                            &nav_path, None,
+                                                        );
+                                                    });
+                                                }
+                                            }
+                                        },
                                     }
                                 }
-                            },
+                            }
+                        }}
+                        // One iframe per tab; inactive tabs stay mounted
+                        // (hidden) so switching back preserves page state.
+                        div {
+                            style: "flex:1 1 auto; min-height:0; position:relative; display:flex;",
+                            {web_overlay.tabs.iter().map(|tab| {
+                                let frame_id =
+                                    format!("{web_surface_host_id}-ws-frame-{}", tab.id);
+                                let frame_display = if tab.active { "block" } else { "none" };
+                                let loaded_url = tab.effective_url.clone();
+                                let loaded_tab_id = tab.id;
+                                rsx! {
+                                    iframe {
+                                        key: "ws-frame-{loaded_tab_id}",
+                                        id: "{frame_id}",
+                                        src: "{tab.effective_url}",
+                                        // No allow-top-navigation: embedded content must
+                                        // not be able to navigate the app's main frame
+                                        // through the vendored navigation allowances
+                                        // (allow_web_surface_navigation + the surface
+                                        // http gate).
+                                        "sandbox": "allow-scripts allow-same-origin allow-forms allow-popups allow-modals allow-downloads",
+                                        style: format!(
+                                            "flex:1 1 auto; border:0; width:100%; min-height:0; background:#ffffff; display:{frame_display};",
+                                        ),
+                                        onload: move |_| {
+                                            if let Ok(home) = yggterm_core::resolve_yggterm_home() {
+                                                append_trace_event(
+                                                    &home,
+                                                    "ui",
+                                                    "web_surface",
+                                                    "iframe_load",
+                                                    json!({
+                                                        "effective_url": loaded_url,
+                                                        "tab_id": loaded_tab_id,
+                                                    }),
+                                                );
+                                            }
+                                        },
+                                    }
+                                }
+                            })}
                         }
                     }
                 }
@@ -59401,7 +60001,7 @@ fn apply_active_terminal_zoom(state: Signal<ShellState>) {
         session=%session.session_path,
         host_id=?active_host_id,
         font_size=theme.font_size,
-        "applying live terminal zoom"
+        "applying live viewport zoom"
     );
     if let Some(host_id) = active_host_id {
         let _ = document::eval(&terminal_apply_script(&host_id, &theme));
@@ -59445,6 +60045,9 @@ fn active_terminal_input_policy_signature(
             !path.starts_with("remote-session://") && !path.starts_with("ssh://")
         }),
     };
+    let web_surface_active = terminal_session_path
+        .as_deref()
+        .is_some_and(|path| shell.has_live_web_surface(path, current_millis()));
     ActiveTerminalInputPolicySignature {
         active_view_mode,
         active_session_path,
@@ -59460,6 +60063,7 @@ fn active_terminal_input_policy_signature(
         terminal_input_override_active: shell.terminal_input_override_active,
         app_control_backgrounded: shell.app_control_backgrounded,
         remote_resume_input_ready,
+        web_surface_active,
     }
 }
 fn apply_active_terminal_input_policy(
@@ -59492,6 +60096,11 @@ fn apply_active_terminal_input_policy(
         signature.app_control_backgrounded,
     );
     if !signature.remote_resume_input_ready {
+        allow_input = false;
+        focus_input = false;
+    }
+    // A live web surface covers the viewport: the overlay owns the keyboard.
+    if signature.web_surface_active {
         allow_input = false;
         focus_input = false;
     }
@@ -76359,6 +76968,127 @@ mod tests {
     use crate::terminal_observe::MemoryPressureSnapshot;
     use yggterm_core::SessionNodeKind;
     use yggterm_server::SessionPreview;
+
+    #[test]
+    fn web_surface_address_input_resolves_to_urls() {
+        assert_eq!(web_surface_address_to_url("  "), None);
+        assert_eq!(
+            web_surface_address_to_url("https://example.com/a"),
+            Some("https://example.com/a".to_string())
+        );
+        assert_eq!(
+            web_surface_address_to_url("example.com"),
+            Some("https://example.com".to_string())
+        );
+        assert_eq!(
+            web_surface_address_to_url("localhost:8000/x"),
+            Some("http://localhost:8000/x".to_string())
+        );
+        assert_eq!(
+            web_surface_address_to_url("127.0.0.1:3000"),
+            Some("http://127.0.0.1:3000".to_string())
+        );
+        assert_eq!(web_surface_address_to_url("ftp://example.com"), None);
+        assert_eq!(
+            web_surface_address_to_url("rust async book"),
+            Some("https://html.duckduckgo.com/html/?q=rust%20async%20book".to_string())
+        );
+    }
+
+    #[test]
+    fn web_surface_tab_labels_use_url_host() {
+        assert_eq!(web_surface_tab_host_label(""), "New Tab");
+        assert_eq!(web_surface_tab_host_label("https://docs.rs/tokio"), "docs.rs");
+        assert_eq!(
+            web_surface_tab_host_label("http://user@host:8000/x"),
+            "host:8000"
+        );
+    }
+
+    #[test]
+    fn web_surface_tabs_keep_user_tabs_across_app_navigation_and_track_history() {
+        let bootstrap = test_shell_bootstrap_with_active_session("local://ws");
+        let mut shell = ShellState::new(bootstrap);
+        shell.upsert_web_surface(
+            "local://ws",
+            "http://localhost:8000/".to_string(),
+            Some("app".to_string()),
+            "http://localhost:8000/".to_string(),
+            None,
+            1_000,
+        );
+        shell.web_surface_new_tab("local://ws");
+        shell.apply_web_surface_tab_navigation(
+            "local://ws",
+            1,
+            "https://example.com".to_string(),
+            "https://example.com".to_string(),
+            None,
+            None,
+        );
+        // App heartbeat navigates the app tab; the user tab survives.
+        shell.upsert_web_surface(
+            "local://ws",
+            "http://localhost:8000/next".to_string(),
+            None,
+            "http://localhost:8000/next".to_string(),
+            None,
+            2_000,
+        );
+        let overlay = shell
+            .web_surface_overlay_for_session("local://ws", 2_500)
+            .expect("surface is live");
+        assert_eq!(overlay.tabs.len(), 2);
+        assert!(overlay.tabs[0].is_app_tab);
+        assert_eq!(overlay.tabs[0].label, "app");
+        assert_eq!(overlay.tabs[1].label, "example.com");
+        assert_eq!(overlay.active_tab_id, 1);
+        assert_eq!(overlay.address_text, "https://example.com");
+        // A second navigation enables back; a back step enables forward.
+        shell.apply_web_surface_tab_navigation(
+            "local://ws",
+            1,
+            "https://docs.rs".to_string(),
+            "https://docs.rs".to_string(),
+            None,
+            None,
+        );
+        let overlay = shell
+            .web_surface_overlay_for_session("local://ws", 2_500)
+            .unwrap();
+        assert_eq!(
+            overlay.back_target,
+            Some((0, "https://example.com".to_string()))
+        );
+        assert_eq!(overlay.forward_target, None);
+        shell.apply_web_surface_tab_navigation(
+            "local://ws",
+            1,
+            "https://example.com".to_string(),
+            "https://example.com".to_string(),
+            None,
+            Some(0),
+        );
+        let overlay = shell
+            .web_surface_overlay_for_session("local://ws", 2_500)
+            .unwrap();
+        assert_eq!(
+            overlay.forward_target,
+            Some((1, "https://docs.rs".to_string()))
+        );
+        // Closing the user tab falls back to the app tab; the app tab itself
+        // is not closable through the tab strip.
+        shell.web_surface_close_tab("local://ws", 1);
+        let overlay = shell
+            .web_surface_overlay_for_session("local://ws", 2_500)
+            .unwrap();
+        assert_eq!(overlay.tabs.len(), 1);
+        assert_eq!(overlay.active_tab_id, 0);
+        shell.web_surface_close_tab("local://ws", 0);
+        assert!(shell
+            .web_surface_overlay_for_session("local://ws", 2_500)
+            .is_some());
+    }
 
     // PERF memo gate: set_sidebar_search_context must NOT rebuild when its inputs
     // are unchanged (the fan/latency fix). Uses empty inputs so no heavy fixtures
