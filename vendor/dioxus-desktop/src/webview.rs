@@ -516,11 +516,35 @@ impl WebviewInstance {
             target_os = "ios",
             target_os = "android"
         )))]
+        #[cfg(not(any(
+            target_os = "windows",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "android"
+        )))]
+        let web_surface_overlay;
+        #[cfg(not(any(
+            target_os = "windows",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "android"
+        )))]
         let webview = {
+            use gtk::prelude::*;
             use tao::platform::unix::WindowExtUnix;
             use wry::WebViewBuilderExtUnix;
             let vbox = window.default_vbox().unwrap();
-            webview.build_gtk(vbox)
+            // yggterm web surfaces: wrap the main webview in a gtk::Overlay so
+            // native surface webviews (per-surface WebContext + SOCKS proxy) can
+            // be layered above the page area. The main webview becomes the
+            // overlay's base (full-size) child; each surface is added as its own
+            // overlay child (see crate::web_surface::WebSurfaceHost).
+            let overlay = gtk::Overlay::new();
+            vbox.pack_start(&overlay, true, true, 0);
+            overlay.show();
+            let built = webview.build_gtk(&overlay);
+            web_surface_overlay = overlay;
+            built
         };
         let webview = webview.unwrap();
 
@@ -542,6 +566,46 @@ impl WebviewInstance {
             provide_context(provider);
             provide_context(history_provider);
         });
+
+        // yggterm web surfaces: hand the main window's gtk::Overlay to the
+        // desktop context so the shell can layer native surface webviews over
+        // the page area.
+        #[cfg(not(any(
+            target_os = "windows",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "android"
+        )))]
+        {
+            desktop_context.install_web_surface_host(
+                crate::web_surface::WebSurfaceHost::new(web_surface_overlay),
+            );
+
+            // Debug path (validate the overlay/surface primitive live): if the
+            // control file ~/.yggterm/web-surface-test.url exists and holds a
+            // URL, open one surface shortly after the window realizes. Uses a
+            // file (not env) so it is controllable independent of how the GUI is
+            // launched. Not wired into the shell yet.
+            if let Some(test_url) = std::env::var_os("HOME")
+                .map(std::path::PathBuf::from)
+                .map(|h| h.join(".yggterm").join("web-surface-test.url"))
+                .and_then(|p| std::fs::read_to_string(p).ok())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+            {
+                let dc = desktop_context.clone();
+                gtk::glib::timeout_add_local_once(
+                    std::time::Duration::from_millis(1500),
+                    move || {
+                        if let Err(e) =
+                            dc.open_web_surface(9_999_001, &test_url, None, 160, 160, 900, 680)
+                        {
+                            tracing::warn!("web surface test open failed: {e}");
+                        }
+                    },
+                );
+            }
+        }
 
         // Request an initial redraw
         desktop_context.window.request_redraw();
