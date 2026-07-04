@@ -2,6 +2,19 @@
 
 This file tracks user-visible changes in `yggterm`.
 
+## 2.9.55
+
+- **ychrome tab bar polish.** The tab strip is now a translucent tint so the active tab (painted
+  in the page background color) visibly stands out and merges into the nav bar, Chrome-style;
+  tabs share width equally and shrink together when crowded instead of sizing to their labels;
+  every tab carries a ✕ (on the app tab it ends the app with a real Ctrl+C, same as the overlay
+  ✕); and `+` opens the new tab with the address bar focused and ready to type.
+- **ychrome CLI hardening** (ychrome repo): running standalone on a machine with no display now
+  prints a real error with the thin-client hint instead of aborting with GTK assertions, and
+  yggterm detection falls back to `YGGTERM_TERM_PROGRAM=yggterm` when the host daemon predates
+  the `YGGTERM_SESSION_ID` handshake (the GUI keys surfaces by the byte stream, so the missing
+  id is harmless).
+
 ## 2.9.54
 
 - **ychrome grows real browser chrome: a tab bar and an address bar.** The web-surface overlay now
