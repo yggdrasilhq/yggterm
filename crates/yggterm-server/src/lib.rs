@@ -12762,20 +12762,13 @@ pub fn run_remote_resume_codex(
         }
     };
     let home = resolve_yggterm_home()?;
-    let saved_session_exists = remote_saved_codex_session_exists(session_id)?;
-    if remote_resume_requires_missing_saved_session_failure(require_existing, saved_session_exists)
-    {
-        anyhow::bail!(remote_resume_missing_saved_session_error(
-            SessionKind::Codex,
-            session_id
-        ));
-    }
-    if saved_session_exists {
-        wait_for_external_codex_resume_to_clear(&home, session_id);
-    }
-    let _ = ensure_local_managed_cli(ManagedCliTool::Codex)?;
     let initial_size = current_tty_size();
     let terminal_appearance = terminal_identity_appearance_from_environment();
+    // LIVE RUNTIME WINS OVER THE TRANSCRIPT GATE (see run_remote_resume_cc for
+    // the full rationale): a session whose PTY is alive on the daemon is
+    // attachable regardless of whether its saved transcript exists on disk, so
+    // bind to the existing runtime before the `--require-existing` check that
+    // would otherwise false-death a live-but-transcript-less session.
     if let Some((endpoint, runtime_key)) =
         endpoint_with_live_remote_codex_session(&home, session_id, Some(&terminal_appearance))?
     {
@@ -12791,6 +12784,18 @@ pub fn run_remote_resume_codex(
         }));
         return bridge_remote_runtime_session_stdio(&endpoint, &runtime_key);
     }
+    let saved_session_exists = remote_saved_codex_session_exists(session_id)?;
+    if remote_resume_requires_missing_saved_session_failure(require_existing, saved_session_exists)
+    {
+        anyhow::bail!(remote_resume_missing_saved_session_error(
+            SessionKind::Codex,
+            session_id
+        ));
+    }
+    if saved_session_exists {
+        wait_for_external_codex_resume_to_clear(&home, session_id);
+    }
+    let _ = ensure_local_managed_cli(ManagedCliTool::Codex)?;
     let endpoint = default_endpoint(&home);
     ensure_local_daemon_running(&endpoint)?;
     sync_terminal_identity_profile_to_host_daemon(&endpoint, &terminal_appearance);
@@ -12901,21 +12906,17 @@ pub fn run_remote_resume_cc(
         }
     };
     let home = resolve_yggterm_home()?;
-    let saved_session_exists = remote_saved_cc_session_exists(session_id)?;
-    if remote_resume_requires_missing_saved_session_failure(require_existing, saved_session_exists)
-    {
-        anyhow::bail!(remote_resume_missing_saved_session_error(
-            SessionKind::ClaudeCode,
-            session_id
-        ));
-    }
-    if saved_session_exists {
-        wait_for_external_agent_resume_to_clear(SessionKind::ClaudeCode, &home, session_id);
-    }
-    let _ = ensure_local_managed_cli(ManagedCliTool::ClaudeCode)?;
     let initial_size = current_tty_size();
     let terminal_appearance = terminal_identity_appearance_from_environment();
     let runtime_key = remote_runtime_cc_session_key(session_id);
+    // LIVE RUNTIME WINS OVER THE TRANSCRIPT GATE. Whether a session is
+    // attachable is answered by the daemon (does it own a live PTY?), NOT by
+    // whether a `.jsonl` exists on disk. A session launched with a pinned
+    // `--session-id` but never prompted has a live runtime and NO transcript
+    // yet, so the `--require-existing` transcript check below would false-death
+    // it ("no longer available") even though its PTY is right here. Bind to the
+    // existing runtime first; only a session with no live runtime is a true
+    // cold resume where the transcript must exist.
     if let Some((endpoint, runtime_key)) =
         endpoint_with_live_remote_runtime_key_for_bridge_with_terminal_appearance(
             &home,
@@ -12935,6 +12936,18 @@ pub fn run_remote_resume_cc(
         }));
         return bridge_remote_runtime_session_stdio(&endpoint, &runtime_key);
     }
+    let saved_session_exists = remote_saved_cc_session_exists(session_id)?;
+    if remote_resume_requires_missing_saved_session_failure(require_existing, saved_session_exists)
+    {
+        anyhow::bail!(remote_resume_missing_saved_session_error(
+            SessionKind::ClaudeCode,
+            session_id
+        ));
+    }
+    if saved_session_exists {
+        wait_for_external_agent_resume_to_clear(SessionKind::ClaudeCode, &home, session_id);
+    }
+    let _ = ensure_local_managed_cli(ManagedCliTool::ClaudeCode)?;
     let endpoint = default_endpoint(&home);
     ensure_local_daemon_running(&endpoint)?;
     sync_terminal_identity_profile_to_host_daemon(&endpoint, &terminal_appearance);
