@@ -2,6 +2,19 @@
 
 This file tracks user-visible changes in `yggterm`.
 
+## 2.9.59
+
+- **Web surface pages are now real native webviews, not iframes.** Each browser tab in a web
+  surface (ychrome et al.) renders in its own native child webview layered over the page area,
+  with its own private web context — the substrate for per-surface cookies/storage and, next,
+  per-surface SOCKS egress so a remote surface browses on the remote machine's network for ALL
+  URLs. Immediate user-visible win: sites that refuse iframing (google.com, most login pages)
+  now render normally in surface tabs, because each tab is a top-level browsing context. A
+  single reconciler tracks the page rect live, so surfaces follow sidebar/window resizes and
+  hide instantly on tab or session switches; page state survives tab switches. The blanket
+  http(s) navigation gate the iframe renderer needed in the main webview is retired — the
+  app's own frame no longer hosts or navigates to any surface content.
+
 ## 2.9.58
 
 - **Sessions reconnect within seconds of laptop wake, not ~a minute.** 2.9.52 made dead ssh
