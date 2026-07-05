@@ -66,10 +66,13 @@ vs standalone mode. Both survive ssh because the *remote* daemon owns the PTY.
 **A surface's network egress is the invoking host's network.** For a remote
 session with a loopback URL, the GUI spawns `ssh -N -L <local>:<host>:<port>`
 to the session's machine — the *remote sshd* resolves the host and originates
-the target connection on that machine — and points the iframe at the local
-end. The forward dies with the surface. Non-loopback URLs currently load
-directly from the GUI host (documented v0 gap; the general fix is a
-per-surface SOCKS egress, see the ychrome repo's protocol doc).
+the target connection on that machine — and points the surface webview at the
+local end. The forward dies with the surface. Non-loopback URLs currently load
+directly from the GUI host (documented gap). The general fix — a per-surface
+`ssh -D` SOCKS proxy covering ALL URLs — is what the native child-webview
+renderer exists for: each surface owns a private `WebContext`, so its proxy
+can be set independently (`ProxyConfig::Socks5`). Wiring the `-D` tunnels is
+the next step of the egress campaign.
 
 ## Browser chrome: tabs + address bar
 
@@ -85,25 +88,18 @@ The overlay carries a minimal Chrome-like UI (v2.9.54):
   the same egress rule as OSC opens: loopback URLs on a remote session resolve
   through a fresh `ssh -L` on the session's machine.
 - **Back / forward / reload.** The nav stack covers *yggterm-driven*
-  navigations only (address bar, OSC retargets). In-iframe navigations are
-  cross-origin-invisible, so the address bar does not follow link clicks —
-  documented v0 gap, same class as the SOCKS egress gap.
-- **In-frame link clicks.** While at least one surface is live, the vendored
-  navigation policy opens a blanket http(s) gate
-  (`set_webview_http_navigation_open`) so cross-origin link clicks and
-  redirects inside surface iframes stay in-frame instead of bouncing to the OS
-  browser. WebKitGTK's policy handler has no frame attribution, so a prefix
-  allowlist cannot cover them. Safety: surface iframes are sandboxed without
-  `allow-top-navigation`, and the shell UI carries no plain http(s) anchors.
-  The gate closes with the last surface.
+  navigations only (address bar, OSC retargets). In-surface link clicks
+  navigate the native webview directly and are invisible to the shell, so the
+  address bar does not follow them — documented gap. Reload bumps the tab's
+  `reload_nonce`; the reconciler calls `WebView::reload` on the surface.
 - **Input ownership.** While a surface covers the active terminal, the
   terminal input policy disarms the xterm textarea
   (`web_surface_active` in `ActiveTerminalInputPolicySignature`) — keystrokes
-  belong to the overlay.
+  belong to the surface.
 
-Sites that refuse framing (X-Frame-Options / frame-ancestors: google.com,
-most login pages) render blank in a tab — inherent to the iframe renderer,
-accepted for the pilot.
+Because each tab is a real top-level webview (not an iframe), sites that
+refuse framing (X-Frame-Options / frame-ancestors: google.com, most login
+pages) render normally.
 
 ## Sidebars (decision, 2026-07-04)
 
@@ -116,14 +112,31 @@ unified scrollable ribbon sidebar to pair with ALT+ navigation).
 
 ## Renderer and security
 
-The surface is an iframe overlay inside the GUI webview. Two guards:
+Each tab's page is a **native child webview** (wry `build_gtk` into the main
+window's `gtk::Overlay` — vendored `dioxus-desktop/src/web_surface.rs`), NOT
+an iframe in the app's webview. The DOM keeps only the chrome (tab strip, nav
+row, omnibox) plus a white `[data-ws-page]` placeholder div marking the page
+rect. A single reconciler loop in `app()`
+(`web_surface_native_reconcile_loop`) is the ONE writer of native surfaces:
+it diffs `ShellState::web_surfaces` + the placeholder's
+`getBoundingClientRect` against applied state and drives
+create/navigate/reload/bounds/visibility/destroy. The rect is the visibility
+oracle — placeholder laid out ⇒ active tab's surface shown at that rect; no
+rect (session switched away, start page, other view mode) ⇒ hidden. Surfaces
+are created lazily on first visibility and kept alive (hidden) across tab
+switches, so page state survives like `display:none` iframes did.
 
-- dioxus-desktop's navigation policy vetoes all http(s) navigations (subframe
-  loads included, on WebKitGTK); each surface origin is registered on a
-  process-global allowlist (`allow_webview_navigation_prefix`, vendored
-  dioxus-desktop) to permit exactly those loads in-frame.
-- The iframe carries `sandbox` WITHOUT `allow-top-navigation`, so embedded
-  content cannot use the allowlist to navigate the app's main frame.
+Security properties:
+
+- Surface content lives in its own top-level webview with its own
+  `WebContext` — it has no handle on the app's main frame, so the old iframe
+  sandbox and the vendored http(s) navigation gate
+  (`set_webview_http_navigation_open`) are retired; the main webview's
+  navigation policy stays fully closed.
+- Per-surface `WebContext` also means per-surface cookies/storage and a
+  per-surface network proxy — the SOCKS egress substrate.
+- Z-order caveat (v1): native surfaces paint above ALL DOM, including dialogs
+  and context menus that overlap the page rect.
 
 Known accepted risk (v0): any program that can write to the PTY can emit the
 OSC (same class as OSC 777 fake notifications) — e.g. `cat`ing a crafted file
@@ -132,8 +145,9 @@ with its URL and one keypress (Ctrl+C) removes it.
 
 ## Screenshot caveat for agents
 
-`server app screenshot` composites the xterm canvas OVER the DOM in the
-terminal rect — a DOM overlay inside that rect is invisible in the composite.
-Verifying a web surface needs an OS-level capture (Spectacle) or the
-`web_surface` trace events (`open` / `close` / `iframe_load` in
-event-trace.jsonl).
+Native surfaces are invisible to `server app screenshot`'s default in-process
+composite (`xterm_canvas_composite_over_dom` pastes the xterm canvas over a
+DOM snapshot — a native GTK widget is in NEITHER layer). Verifying a web
+surface needs a compositor-level grab: `server app screenshot --backend os`
+(KWin/Spectacle path, v2.9.57+), or the `web_surface` trace events (`open` /
+`close` / `native_open` / `native_close` in event-trace.jsonl).
