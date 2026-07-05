@@ -2,6 +2,25 @@
 
 This file tracks user-visible changes in `yggterm`.
 
+## 2.9.58
+
+- **Sessions reconnect within seconds of laptop wake, not ~a minute.** 2.9.52 made dead ssh
+  bridges self-detect via ServerAlive keepalive, but that detection alone takes ~45 seconds —
+  plus reconnect time on top — so waking the laptop still meant staring at frozen sessions
+  ("reconnecting after wake is not instant"). The daemon now watches for the suspend itself
+  (CLOCK_BOOTTIME advances across a suspend while CLOCK_MONOTONIC does not — a jump in their
+  difference is a precise, dependency-free wake signal) and the moment the machine wakes it
+  kills and respawns every running ssh-carried bridge immediately: recovery now costs one ssh
+  handshake instead of a keepalive timeout. Local sessions are untouched. The keepalive stays as
+  the fallback detector for mid-session network drops.
+- **Live Sessions keep their row order across daemon swaps.** Sessions without keep-alive are
+  absent from the daemon's normal persisted state, so after a daemon handoff they were importable
+  only from the superseded daemon's protected persist — and the import appended them at the END
+  of the list, scattering rows to the bottom on every swap while keep-alive rows held position
+  ("session rows in weird places"). The takeover import now walks the source daemon's order and
+  inserts each imported session immediately after its source predecessor, so the whole column
+  comes back in the order you left it.
+
 ## 2.9.57
 
 - **`app screenshot --backend os`: compositor-grab backend that captures native web surfaces.**
