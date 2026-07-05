@@ -1,5 +1,6 @@
 use crate::app_capture::{
-    background_app_window, capture_visible_app_surface, describe_window, focus_app_window,
+    background_app_window, capture_compositor_app_surface, capture_visible_app_surface,
+    describe_window, focus_app_window,
     move_app_window_by, overlay_terminal_canvas_onto_snapshot, record_visible_app_surface,
     resize_app_window,
 };
@@ -36223,16 +36224,39 @@ async fn process_pending_app_control_requests(
         AppControlCommand::CaptureScreenshot {
             target,
             output_path,
+            compositor,
         } => {
             let dom_snapshot =
                 capture_dom_debug_snapshot_for_or_empty(active_session_path.as_deref()).await;
             let output = Path::new(&output_path);
-            let prefer_terminal_composite = matches!(target, ScreenshotTarget::App)
+            // `--backend os`: compositor-only grab so NATIVE child webviews (web
+            // surfaces) appear in the frame — the composite and DOM paths below are
+            // blind to them. No fallback: a silent DOM frame would lie about what's
+            // on screen, so a refusal (e.g. window could not be focused on Wayland)
+            // is returned as an error the agent can see.
+            let prefer_terminal_composite = !compositor
+                && matches!(target, ScreenshotTarget::App)
                 && terminal_xterm_canvas_renderer_enabled()
                 && state.read().server.active_view_mode() == WorkspaceViewMode::Terminal;
             // (backend, faithful, faithful_reason, is_terminal_region, attempts, output_path)
             let mut success: Option<(String, bool, String, bool, Vec<String>, String)> = None;
             let mut capture_error: Option<String> = None;
+
+            if compositor {
+                match capture_compositor_app_surface(&desktop, output) {
+                    Ok(capture) => {
+                        success = Some((
+                            capture.backend.to_string(),
+                            capture.faithful,
+                            capture.faithful_reason.to_string(),
+                            false,
+                            capture.backend_attempts.clone(),
+                            capture.output_path.display().to_string(),
+                        ));
+                    }
+                    Err(error) => capture_error = Some(error.to_string()),
+                }
+            }
 
             // MERGED FAITHFUL CAPTURE: a full-window WebKit DOM snapshot (chrome —
             // sidebar, titlebar, right rail) with the faithful xterm canvas composited
@@ -36304,8 +36328,10 @@ async fn process_pending_app_control_requests(
                 }
             }
 
-            // Plain platform snapshot (non-terminal views, or every faithful path failed).
-            if success.is_none() {
+            // Plain platform snapshot (non-terminal views, or every faithful path
+            // failed). NOT reached for `--backend os`: a compositor refusal must
+            // surface as an error, not silently degrade to a DOM frame.
+            if success.is_none() && !compositor {
                 match capture_visible_app_surface(&desktop, output, target, Some(&dom_snapshot))
                     .await
                 {

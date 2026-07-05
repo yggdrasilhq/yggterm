@@ -179,7 +179,7 @@ fn print_server_app_help() {
   yggterm-headless server app desktop-identity
   yggterm-headless server app state [--pid <pid>]
   yggterm-headless server app rows [--pid <pid>]
-  yggterm-headless server app screenshot [output] [--pid <pid>]
+  yggterm-headless server app screenshot [output] [--pid <pid>] [--region terminal|full] [--crop x,y,w,h] [--scale n] [--backend os]
   yggterm-headless server app open <session-path> [--view <terminal|preview>] [--pid <pid>]
   yggterm-headless server app resize-window --width <px> --height <px> [--pid <pid>]
   yggterm-headless server app maximize <on|off|toggle> [--pid <pid>]
@@ -331,6 +331,16 @@ fn cli_flag_value<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
 /// headless CLI (what agents drive) gets the SAME crop/zoom/upscale pipeline — the
 /// "1920px-frame-is-illegible → crop + upscale the region of interest" affordance.
 /// Returns None when no post-process flags are present (capture written verbatim).
+/// `--backend os` forces an OS-compositor grab of the window so NATIVE child
+/// widgets (web-surface webviews) appear in the frame — the default composite/
+/// DOM backends are blind to them. Any other value (or absent) keeps the
+/// default backend selection. Mirrors the GUI binary's parser.
+fn screenshot_backend_is_compositor(args: &[String]) -> bool {
+    cli_flag_value(args, "--backend")
+        .map(|value| value.eq_ignore_ascii_case("os"))
+        .unwrap_or(false)
+}
+
 fn screenshot_post_process_from_args(args: &[String]) -> Option<ScreenshotPostProcess> {
     let region = cli_flag_value(args, "--region").map(str::to_string);
     let crop = cli_flag_value(args, "--crop").and_then(|raw| {
@@ -1140,19 +1150,24 @@ fn main() -> Result<()> {
                 }
             })
             .unwrap_or(15_000);
-        let output_path = args
-            .iter()
-            .skip(3)
-            .find(|value| !value.starts_with("--"))
-            .map(String::as_str);
-        return match screenshot_post_process_from_args(&args) {
-            Some(post) => run_screenshot_capture_with_post_process(
-                &args[2],
+        let target = args[2].clone();
+        let output_path = cli_positional_args(&args, 3)
+            .into_iter()
+            .find(|value| *value != target);
+        let compositor = screenshot_backend_is_compositor(&args);
+        return match (screenshot_post_process_from_args(&args), compositor) {
+            (None, false) => run_screenshot_capture(&target, output_path, timeout_ms),
+            (post, compositor) => run_screenshot_capture_with_post_process(
+                &target,
                 output_path,
                 timeout_ms,
-                post,
+                post.unwrap_or(ScreenshotPostProcess {
+                    region: None,
+                    crop: None,
+                    scale: 1.0,
+                }),
+                compositor,
             ),
-            None => run_screenshot_capture(&args[2], output_path, timeout_ms),
         };
     }
     if args.len() >= 3 && args[0] == "server" && args[1] == "screenrecord" {
@@ -1260,14 +1275,20 @@ fn main() -> Result<()> {
                 let output_path = cli_positional_args(&args, 3)
                     .into_iter()
                     .find(|value| *value != target);
-                match screenshot_post_process_from_args(&args) {
-                    Some(post) => run_screenshot_capture_with_post_process(
+                let compositor = screenshot_backend_is_compositor(&args);
+                match (screenshot_post_process_from_args(&args), compositor) {
+                    (None, false) => run_screenshot_capture(target, output_path, timeout_ms),
+                    (post, compositor) => run_screenshot_capture_with_post_process(
                         target,
                         output_path,
                         timeout_ms,
-                        post,
+                        post.unwrap_or(ScreenshotPostProcess {
+                            region: None,
+                            crop: None,
+                            scale: 1.0,
+                        }),
+                        compositor,
                     ),
-                    None => run_screenshot_capture(target, output_path, timeout_ms),
                 }
             }
             "screenrecord" => {

@@ -67,6 +67,34 @@ ssh "$LIVE_HOST" "~/.local/bin/yggterm server app screenshot /tmp/strip.png --cr
 - `--scale n` nearest-neighbour upscales after cropping (2–3 is usually right).
 - The response records what it did under `data.post_process`.
 
+### Native web surfaces need `--backend os` (v2.9.57+)
+
+The default capture backends are **blind to native child webviews** — the
+web-surface webviews layered over the page area (2.9.56 substrate). The
+xterm-canvas composite pastes canvas over a DOM snapshot, and a native GTK
+widget is in NEITHER layer, so a web surface simply does not appear in a
+default `app screenshot` frame. When verifying anything about a web surface,
+pass `--backend os`:
+
+```bash
+ssh "$LIVE_HOST" "~/.local/bin/yggterm server app screenshot /tmp/surface.png --backend os"
+```
+
+- Forces an OS-compositor grab of the yggterm window (Spectacle on KDE Wayland,
+  X11 window grab on X11) — native surfaces AND the accelerated xterm canvas are
+  both in the frame; `capture_faithful` is true by construction.
+- On Wayland this RAISES/FOCUSES the yggterm window first (KWin force-activate)
+  because Spectacle grabs the active window. Brief focus steal from the user is
+  the cost of a faithful native pixel.
+- **No silent fallback**: if the window cannot be focused (privacy gate — never
+  capture another app's window), the command returns an ERROR instead of quietly
+  handing back a DOM frame that would lie about the surface. Handle the error;
+  don't retry in a tight loop while the user is actively refusing focus.
+- `--region` / `--crop` / `--scale` compose with it as usual.
+- A non-visual cross-check that a surface webview exists at all: each live
+  surface adds a `WebKitWebProcess`+`WebKitNetworkProcess` pair under the GUI pid
+  (`pgrep -a -P <guipid> -f WebKitWebProcess`).
+
 If a future need isn't covered (e.g. annotate, side-by-side), EXTEND the tool —
 that's the point of agent-first observability — don't fall back to "the screenshot
 is too small to use."
