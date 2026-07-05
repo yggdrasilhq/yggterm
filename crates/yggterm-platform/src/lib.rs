@@ -264,8 +264,11 @@ pub fn force_activate_kde_wayland_window(match_substr: &str) -> Result<()> {
         ])
         .output()
         .context("loading KWin activation script via gdbus")?;
-    let _ = std::fs::remove_file(&script_path);
+    // Do NOT remove the script file yet: current KWin opens it at Script.run
+    // time, not loadScript time — deleting here made run() fail with
+    // org.kde.kwin.Scripting.FileError and the activation silently never ran.
     if !load.status.success() {
+        let _ = std::fs::remove_file(&script_path);
         bail!(
             "KWin loadScript failed: {}",
             String::from_utf8_lossy(&load.stderr)
@@ -299,7 +302,143 @@ pub fn force_activate_kde_wayland_window(match_substr: &str) -> Result<()> {
     run("org.kde.kwin.Script.run");
     std::thread::sleep(std::time::Duration::from_millis(250));
     run("org.kde.kwin.Script.stop");
+    let _ = std::fs::remove_file(&script_path);
     Ok(())
+}
+
+/// Ask KWin (the AUTHORITY for focus on Wayland) whether the currently active
+/// window's resource class / caption matches `match_substr`. tao's
+/// `is_focused()` is not reliably updated on KDE Wayland even when KWin has
+/// activated us, so the compositor-capture gate accepts either signal. The
+/// probe runs a KWin script that prints a nonce-tagged marker with the active
+/// window's class, then reads it back from the user journal (KWin script
+/// `print()` lands there); the nonce guards against matching a stale line.
+#[cfg(target_os = "linux")]
+pub fn kde_wayland_active_window_matches(match_substr: &str) -> Result<bool> {
+    use std::io::Write;
+    let nonce = format!(
+        "YGGPROBE-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0)
+    );
+    let script = format!(
+        "const w = (typeof workspace.activeWindow !== 'undefined') ? workspace.activeWindow : workspace.activeClient;\n\
+         const cls = (w && w.resourceClass) ? w.resourceClass.toString() : '';\n\
+         const cap = (w && w.caption) ? w.caption.toString() : '';\n\
+         print('{nonce} ACTIVE=' + cls.toLowerCase() + '|' + cap.toLowerCase());\n"
+    );
+    let script_path =
+        std::env::temp_dir().join(format!("yggterm-kwin-active-probe-{}.js", std::process::id()));
+    std::fs::File::create(&script_path)
+        .and_then(|mut file| file.write_all(script.as_bytes()))
+        .context("writing KWin active-window probe script")?;
+    let load = Command::new("gdbus")
+        .args([
+            "call",
+            "--session",
+            "--dest",
+            "org.kde.KWin",
+            "--object-path",
+            "/Scripting",
+            "--method",
+            "org.kde.kwin.Scripting.loadScript",
+            &script_path.to_string_lossy(),
+            &nonce,
+        ])
+        .output()
+        .context("loading KWin active-window probe via gdbus")?;
+    // Keep the script file until after Script.run/stop: current KWin opens it
+    // at RUN time (removing it after loadScript made run() fail with
+    // org.kde.kwin.Scripting.FileError — root cause of the probe never firing).
+    if !load.status.success() {
+        let _ = std::fs::remove_file(&script_path);
+        bail!(
+            "KWin loadScript failed: {}",
+            String::from_utf8_lossy(&load.stderr)
+        );
+    }
+    let script_id: String = String::from_utf8_lossy(&load.stdout)
+        .chars()
+        .filter(|c| c.is_ascii_digit())
+        .collect();
+    if script_id.is_empty() {
+        let _ = std::fs::remove_file(&script_path);
+        bail!("KWin loadScript returned no script id");
+    }
+    let object_path = format!("/Scripting/Script{script_id}");
+    let run = |method: &str| -> String {
+        match Command::new("gdbus")
+            .args([
+                "call",
+                "--session",
+                "--dest",
+                "org.kde.KWin",
+                "--object-path",
+                &object_path,
+                "--method",
+                method,
+            ])
+            .output()
+        {
+            Ok(output) => format!(
+                "status={} stdout={} stderr={}",
+                output.status,
+                String::from_utf8_lossy(&output.stdout).trim(),
+                String::from_utf8_lossy(&output.stderr).trim()
+            ),
+            Err(error) => format!("spawn_error={error}"),
+        }
+    };
+    let run_report = run("org.kde.kwin.Script.run");
+    std::thread::sleep(std::time::Duration::from_millis(400));
+    let _ = run("org.kde.kwin.Script.stop");
+    let _ = std::fs::remove_file(&script_path);
+    // journald flushes script print() output asynchronously and a busy desktop
+    // session interleaves plenty of other lines — poll a generous tail a few
+    // times rather than reading once too early (observed live: a single 350ms /
+    // 80-line read reliably missed the marker).
+    let needle = match_substr.to_lowercase();
+    let marker = format!("{nonce} ACTIVE=");
+    let mut last_error: Option<String> = None;
+    let mut journal_lines = 0usize;
+    let mut any_probe_lines = 0usize;
+    for _ in 0..4 {
+        match Command::new("journalctl")
+            .args(["--user", "-o", "cat", "-n", "600"])
+            .output()
+        {
+            Ok(journal) => {
+                let text = String::from_utf8_lossy(&journal.stdout).to_string();
+                journal_lines = text.lines().count();
+                any_probe_lines = text.matches("YGGPROBE-").count();
+                for line in text.lines().rev() {
+                    if let Some(active) = line.split(&marker).nth(1) {
+                        return Ok(active.contains(&needle));
+                    }
+                }
+                if !journal.status.success() {
+                    last_error = Some(format!(
+                        "journalctl status={} stderr={}",
+                        journal.status,
+                        String::from_utf8_lossy(&journal.stderr).trim()
+                    ));
+                }
+            }
+            Err(error) => last_error = Some(error.to_string()),
+        }
+        std::thread::sleep(std::time::Duration::from_millis(300));
+    }
+    bail!(
+        "KWin probe marker not found in user journal after retries \
+         (script_id={script_id} run: {run_report}; journal_lines={journal_lines} \
+         probe_lines_seen={any_probe_lines}{})",
+        last_error
+            .map(|error| format!("; journalctl error: {error}"))
+            .unwrap_or_default()
+    )
 }
 
 #[cfg(target_os = "linux")]

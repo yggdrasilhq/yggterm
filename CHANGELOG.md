@@ -2,6 +2,27 @@
 
 This file tracks user-visible changes in `yggterm`.
 
+## 2.9.57
+
+- **`app screenshot --backend os`: compositor-grab backend that captures native web surfaces.**
+  The default screenshot backends (xterm-canvas composite, WebKit DOM snapshot) are blind to
+  native child webviews — the web-surface layer introduced in 2.9.56 — because a native GTK
+  widget is in neither the DOM nor the canvas. The new flag forces an OS-compositor grab of the
+  yggterm window (Spectacle on KDE Wayland, X11 window grab on X11), which sees everything:
+  native surfaces, the accelerated xterm canvas, and the chrome. On Wayland the window is
+  raised/focused first (KWin force-activate); if focus cannot be obtained the command returns an
+  error instead of silently degrading to a DOM frame that would misrepresent what's on screen.
+  Composes with `--region` / `--crop` / `--scale`. The yggui app-control skill doc gained a
+  section on when to reach for it.
+- **Fixed: KWin force-activate never actually ran.** The KWin activation script (used to raise
+  the window before a Wayland compositor capture) deleted its script file right after
+  `loadScript` — but current KWin opens the file at `Script.run` time, so every run failed with
+  `org.kde.kwin.Scripting.FileError` and the error was swallowed. The window was therefore never
+  raised, and the existing Spectacle capture path only ever worked when yggterm already happened
+  to be focused. Script files are now removed after run/stop. The focus gate also consults KWin
+  directly (nonce-tagged scripting probe read back from the user journal) instead of trusting
+  only tao's `is_focused()`, which lags compositor reality on Wayland.
+
 ## 2.9.56
 
 - **Internal: native web-surface substrate (foundation for per-surface egress).** Groundwork for
