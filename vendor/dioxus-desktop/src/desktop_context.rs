@@ -233,6 +233,26 @@ impl DesktopService {
         let _ = (id, url);
     }
 
+    /// Reload an open web surface's current page.
+    pub fn reload_web_surface(&self, id: u64) {
+        #[cfg(not(any(
+            target_os = "windows",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "android"
+        )))]
+        if let Some(host) = self.web_surface_host.borrow().as_ref() {
+            host.reload(id);
+        }
+        #[cfg(any(
+            target_os = "windows",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "android"
+        ))]
+        let _ = id;
+    }
+
     /// Destroy an open web surface.
     pub fn close_web_surface(&self, id: u64) {
         #[cfg(not(any(
