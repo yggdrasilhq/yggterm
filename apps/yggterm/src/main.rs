@@ -403,6 +403,16 @@ fn cli_flag_value<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
 ///   --crop <x,y,w,h>           explicit pixel crop
 ///   --scale <factor>           nearest-neighbour upscale (e.g. 2 or 2.5)
 /// Returns None when none are present (so the plain capture path is used).
+/// `--backend os` forces an OS-compositor grab of the window so NATIVE child
+/// widgets (web-surface webviews) appear in the frame — the default composite/
+/// DOM backends are blind to them. Any other value (or absent) keeps the
+/// default backend selection.
+fn screenshot_backend_is_compositor(args: &[String]) -> bool {
+    cli_flag_value(args, "--backend")
+        .map(|value| value.eq_ignore_ascii_case("os"))
+        .unwrap_or(false)
+}
+
 fn parse_screenshot_post_process(args: &[String]) -> Option<ScreenshotPostProcess> {
     let region = cli_flag_value(args, "--region").map(str::to_string);
     let crop = cli_flag_value(args, "--crop").and_then(|raw| {
@@ -706,7 +716,7 @@ fn print_server_app_help() {
   yggterm server app launch [--wait-visible] [--wait-settled] [--allow-multi-window]
   yggterm server app state [--pid <pid>]
   yggterm server app rows [--pid <pid>]
-  yggterm server app screenshot [output] [--pid <pid>] [--region terminal|full] [--crop x,y,w,h] [--scale n]
+  yggterm server app screenshot [output] [--pid <pid>] [--region terminal|full] [--crop x,y,w,h] [--scale n] [--backend os]
   yggterm server app open <session-path> [--view <terminal|preview>] [--pid <pid>]
   yggterm server app session <remove|delete> <session-path> [--pid <pid>]
   yggterm server app session rename <session-path> <title> [--pid <pid>]
@@ -1091,20 +1101,26 @@ fn main() -> Result<()> {
                 }
             })
             .unwrap_or(15_000);
-        let output_path = args
-            .iter()
-            .skip(3)
-            .find(|value| !value.starts_with("--"))
-            .map(String::as_str);
-        if let Some(post) = parse_screenshot_post_process(&args) {
+        let target = args[2].clone();
+        let output_path = cli_positional_args(&args, 3)
+            .into_iter()
+            .find(|value| *value != target);
+        let compositor = screenshot_backend_is_compositor(&args);
+        if compositor || parse_screenshot_post_process(&args).is_some() {
+            let post = parse_screenshot_post_process(&args).unwrap_or(ScreenshotPostProcess {
+                region: None,
+                crop: None,
+                scale: 1.0,
+            });
             return run_screenshot_capture_with_post_process(
-                &args[2],
+                &target,
                 output_path,
                 timeout_ms,
                 post,
+                compositor,
             );
         }
-        return run_screenshot_capture(&args[2], output_path, timeout_ms);
+        return run_screenshot_capture(&target, output_path, timeout_ms);
     }
     if args.len() >= 3 && args[0] == "server" && args[1] == "screenrecord" {
         let duration_secs = args
@@ -1180,12 +1196,20 @@ fn main() -> Result<()> {
                 let output_path = cli_positional_args(&args, 3)
                     .into_iter()
                     .find(|value| *value != target);
-                if let Some(post) = parse_screenshot_post_process(&args) {
+                let compositor = screenshot_backend_is_compositor(&args);
+                if compositor || parse_screenshot_post_process(&args).is_some() {
+                    let post =
+                        parse_screenshot_post_process(&args).unwrap_or(ScreenshotPostProcess {
+                            region: None,
+                            crop: None,
+                            scale: 1.0,
+                        });
                     run_screenshot_capture_with_post_process(
                         target,
                         output_path,
                         timeout_ms,
                         post,
+                        compositor,
                     )
                 } else {
                     run_screenshot_capture(target, output_path, timeout_ms)
