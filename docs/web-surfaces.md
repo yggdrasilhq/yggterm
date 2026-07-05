@@ -63,16 +63,16 @@ vs standalone mode. Both survive ssh because the *remote* daemon owns the PTY.
 
 ## The egress rule
 
-**A surface's network egress is the invoking host's network.** For a remote
-session with a loopback URL, the GUI spawns `ssh -N -L <local>:<host>:<port>`
-to the session's machine — the *remote sshd* resolves the host and originates
-the target connection on that machine — and points the surface webview at the
-local end. The forward dies with the surface. Non-loopback URLs currently load
-directly from the GUI host (documented gap). The general fix — a per-surface
-`ssh -D` SOCKS proxy covering ALL URLs — is what the native child-webview
-renderer exists for: each surface owns a private `WebContext`, so its proxy
-can be set independently (`ProxyConfig::Socks5`). Wiring the `-D` tunnels is
-the next step of the egress campaign.
+**A surface's network egress is the invoking host's network — for ALL URLs.**
+Each tab of a remote session's surface gets its own `ssh -N -D <port>` SOCKS
+tunnel to the session's machine, and the tab's webview (private `WebContext`)
+proxies every request through it via `ProxyConfig::Socks5`. The *remote sshd*
+resolves every hostname and originates every connection on that machine —
+loopback URLs reach the REMOTE loopback. The tunnel dies with the tab. If the
+SOCKS tunnel cannot be established, loopback URLs fall back to the older
+`ssh -N -L` per-URL forward, and anything else falls back to direct load from
+the GUI host — a traced egress gap (`egress_gap` in the `open`/`tab_navigate`
+trace events), not a silent one. Local sessions load directly, no proxy.
 
 ## Browser chrome: tabs + address bar
 
