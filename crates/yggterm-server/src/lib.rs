@@ -3319,6 +3319,30 @@ impl YggtermServer {
         self.live_session_order.push(key.to_string());
     }
 
+    /// Reposition `key` in the live-session order to sit immediately after
+    /// `anchor` (or at the FRONT when `anchor` is None). The superseded-daemon
+    /// takeover uses this to import sessions at their SOURCE positions:
+    /// restore_live_session appends at the end, which left every non-keep-alive
+    /// session (absent from the normal persist, so only importable from the
+    /// superseded daemon's protected persist) piled at the bottom after each
+    /// daemon swap — the "rows in weird places after restart" bug.
+    pub(crate) fn move_live_session_after(&mut self, key: &str, anchor: Option<&str>) {
+        let Some(from) = self.live_session_order.iter().position(|entry| entry == key) else {
+            return;
+        };
+        let entry = self.live_session_order.remove(from);
+        let insert_at = match anchor {
+            Some(anchor) => self
+                .live_session_order
+                .iter()
+                .position(|existing| existing == anchor)
+                .map(|index| index + 1)
+                .unwrap_or(self.live_session_order.len()),
+            None => 0,
+        };
+        self.live_session_order.insert(insert_at, entry);
+    }
+
     pub(crate) fn live_codex_session_keys_for_runtime_identity(&self) -> Vec<String> {
         self.live_session_order
             .iter()
@@ -27738,6 +27762,48 @@ terminal_window_id: None,
             !server.represents_terminal_runtime_key("remote-session://dev/non-kept-old"),
             "a stale hot-update owner key is not live truth unless current server state represents it"
         );
+    }
+
+    #[test]
+    fn move_live_session_after_repositions_takeover_imports_at_source_positions() {
+        // The superseded-daemon takeover imports sessions in SOURCE order and
+        // anchors each after its predecessor; appended-at-end imports were the
+        // "rows in weird places after restart" bug.
+        let tree = SessionNode {
+            kind: SessionNodeKind::Group,
+            name: "root".to_string(),
+            title: None,
+            document_kind: None,
+            group_kind: None,
+            path: PathBuf::from("/"),
+            children: Vec::new(),
+            session_id: None,
+            cwd: None,
+            ..Default::default()
+        };
+        let mut server = YggtermServer::new(
+            &tree,
+            false,
+            GhosttyHostSupport::shadow("test".to_string(), false, false),
+            UiTheme::ZedLight,
+        );
+        server.live_session_order = vec![
+            "a".to_string(),
+            "b".to_string(),
+            "d".to_string(),
+            "c".to_string(),
+        ];
+        // Import "c" between "b" and "d" (its source position).
+        server.move_live_session_after("c", Some("b"));
+        assert_eq!(server.live_session_order, vec!["a", "b", "c", "d"]);
+        // Anchor None => front (import precedes every existing source key).
+        server.move_live_session_after("d", None);
+        assert_eq!(server.live_session_order, vec!["d", "a", "b", "c"]);
+        // Missing anchor falls back to the end; unknown key is a no-op.
+        server.move_live_session_after("a", Some("zzz"));
+        assert_eq!(server.live_session_order, vec!["d", "b", "c", "a"]);
+        server.move_live_session_after("zzz", Some("b"));
+        assert_eq!(server.live_session_order, vec!["d", "b", "c", "a"]);
     }
 
     #[test]
