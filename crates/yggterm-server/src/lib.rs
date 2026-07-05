@@ -14998,6 +14998,7 @@ fn capture_embedded_app_screenshot(
     target: ScreenshotTarget,
     output_path: Option<std::path::PathBuf>,
     timeout_ms: u64,
+    compositor: bool,
 ) -> anyhow::Result<AppControlResponse> {
     let command = AppControlCommand::CaptureScreenshot {
         target,
@@ -15005,12 +15006,14 @@ fn capture_embedded_app_screenshot(
             .as_ref()
             .map(|path| path.display().to_string())
             .unwrap_or_default(),
+        compositor,
     };
     let request = enqueue_screenshot_request(
         home,
         target,
         output_path,
         ensure_live_app_control_pid(home, timeout_ms, &command)?,
+        compositor,
     )?;
     wait_for_app_control_response(
         home,
@@ -15695,7 +15698,7 @@ fn trace_bundle(lines: usize, include_screenshot: bool) -> anyhow::Result<serde_
         .ok()
         .and_then(|response| response.data);
     let screenshot_path = if include_screenshot {
-        capture_embedded_app_screenshot(&home, ScreenshotTarget::App, None, 10_000)
+        capture_embedded_app_screenshot(&home, ScreenshotTarget::App, None, 10_000, false)
             .ok()
             .and_then(|response| response.output_path)
             .or_else(|| capture_trace_screenshot(&home).map(|path| path.display().to_string()))
@@ -15917,6 +15920,7 @@ pub fn run_screenshot_capture(
         output_path,
         timeout_ms,
         ScreenshotPostProcess::default(),
+        false,
     )
 }
 
@@ -15925,6 +15929,7 @@ pub fn run_screenshot_capture_with_post_process(
     output_path: Option<&str>,
     timeout_ms: u64,
     post: ScreenshotPostProcess,
+    compositor: bool,
 ) -> anyhow::Result<()> {
     let home = resolve_yggterm_home()?;
     let response = match target {
@@ -15933,12 +15938,14 @@ pub fn run_screenshot_capture_with_post_process(
             ScreenshotTarget::App,
             output_path.map(std::path::PathBuf::from),
             timeout_ms,
+            compositor,
         )?,
         "preview" | "preview_viewport" => capture_embedded_app_screenshot(
             &home,
             ScreenshotTarget::PreviewViewport,
             output_path.map(std::path::PathBuf::from),
             timeout_ms,
+            compositor,
         )?,
         other => anyhow::bail!("unsupported screenshot target: {other}"),
     };
