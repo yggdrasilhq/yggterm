@@ -559,6 +559,50 @@ impl TerminalManager {
         Ok(())
     }
 
+    /// Suspend/wake recovery: kill and immediately respawn every RUNNING
+    /// ssh-carried session (remote resume/attach bridges, ssh shells). After a
+    /// laptop suspend the bridges' TCP connections are dead but ssh hangs
+    /// silently — ServerAlive takes ~45s to notice, and only then does the
+    /// exit-driven re-resume lane fire. The wake watcher calls this the moment
+    /// a suspend gap is detected, so recovery costs one ssh handshake instead
+    /// of a keepalive timeout. Local (non-ssh) sessions are untouched — their
+    /// PTYs survive suspend fine.
+    pub fn respawn_ssh_carried_sessions(&mut self) -> Vec<(String, bool)> {
+        let keys: Vec<String> = self
+            .sessions
+            .iter()
+            .filter(|(_key, session)| {
+                launch_command_is_ssh_carried(&session.launch_command) && session.is_running()
+            })
+            .map(|(key, _session)| key.clone())
+            .collect();
+        let mut results = Vec::new();
+        for key in keys {
+            let Some(runtime) = self.sessions.remove(&key) else {
+                continue;
+            };
+            let launch_command = runtime.launch_command.clone();
+            let cwd = runtime.cwd.clone();
+            let cols = runtime.current_cols.load(Ordering::SeqCst);
+            let rows = runtime.current_rows.load(Ordering::SeqCst);
+            let size = (cols > 0 && rows > 0).then_some((cols, rows));
+            trace_terminal_event(
+                "suspend_wake_bridge_respawn",
+                serde_json::json!({
+                    "path": key,
+                    "cols": cols,
+                    "rows": rows,
+                }),
+            );
+            let _ = runtime.shutdown(None);
+            let respawned = self
+                .ensure_session_with_size(&key, &launch_command, cwd.as_deref(), size)
+                .is_ok();
+            results.push((key, respawned));
+        }
+        results
+    }
+
     pub fn session_matches_spec(&self, key: &str, launch_command: &str, cwd: Option<&str>) -> bool {
         self.sessions
             .get(key)
@@ -2164,6 +2208,14 @@ fn shell_command(
 fn launch_command_looks_like_remote_resume_attach(launch_command: &str) -> bool {
     launch_command.contains("server'\\'' '\\''remote'\\'' '\\''resume-codex")
         || launch_command.contains("server'\\'' '\\''remote'\\'' '\\''start-codex")
+}
+
+/// True when a session's PTY child is carried over ssh (remote agent bridges
+/// use `ssh -tt …`; plain ssh shells start with `ssh `). These are the
+/// sessions whose transport dies across a laptop suspend — see
+/// `respawn_ssh_carried_sessions`.
+fn launch_command_is_ssh_carried(launch_command: &str) -> bool {
+    launch_command.contains("ssh -tt ") || launch_command.trim_start().starts_with("ssh ")
 }
 
 fn remote_resume_attach_shell_command(launch_command: &str) -> String {
