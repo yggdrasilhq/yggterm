@@ -2,6 +2,17 @@
 
 This file tracks user-visible changes in `yggterm`.
 
+## 2.9.60
+
+- **Remote web surfaces now egress on the session's machine for ALL URLs.** Each tab of a
+  remote session's web surface gets its own `ssh -D` SOCKS tunnel to the session host; the
+  native webview's private web context proxies every request through it, so DNS resolution and
+  every connection originate on the remote machine — loopback URLs reach the REMOTE loopback,
+  internal hostnames resolve like they do on that host. This closes the egress gap where only
+  the first loopback URL was forwarded (`ssh -L`) and everything else silently loaded from the
+  GUI host's network. The `-L` rewrite remains only as a loopback fallback when the SOCKS
+  tunnel cannot be established (traced as `egress_gap`).
+
 ## 2.9.59
 
 - **Web surface pages are now real native webviews, not iframes.** Each browser tab in a web
