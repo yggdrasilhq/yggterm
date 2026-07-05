@@ -138,6 +138,12 @@ impl WebSurfaceHost {
         }
     }
 
+    pub fn reload(&self, id: u64) {
+        if let Some(s) = self.surfaces.borrow().get(&id) {
+            let _ = s.webview.reload();
+        }
+    }
+
     pub fn close(&self, id: u64) {
         if let Some(s) = self.surfaces.borrow_mut().remove(&id) {
             self.overlay.remove(&s.container);
