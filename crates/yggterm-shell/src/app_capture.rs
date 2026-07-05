@@ -106,6 +106,112 @@ fn xterm_canvas_renderer_possibly_active() -> bool {
         .unwrap_or(false)
 }
 
+/// Compositor-only capture (`app screenshot --backend os`): grab the yggterm
+/// window through the OS compositor so NATIVE child widgets — the web-surface
+/// webviews layered over the page area — appear in the frame. The default
+/// capture path is blind to them: the WebKit DOM snapshot and the xterm-canvas
+/// composite both only see the main webview's own layers.
+///
+/// Unlike the default path this NEVER falls back to a WebKit snapshot: an agent
+/// asking for `--backend os` wants the native-surface-capable pixel, and a
+/// silent DOM fallback would lie about what's on screen. On Wayland the window
+/// must be focused (Spectacle grabs the ACTIVE window; capturing whatever else
+/// the user has focused would be a privacy leak), so this raises the window
+/// (KWin force-activate on KDE) and refuses with a clear error if focus could
+/// not be obtained.
+pub fn capture_compositor_app_surface(
+    desktop: &DesktopContext,
+    output_path: &Path,
+) -> Result<SurfaceCapture> {
+    if let Some(parent) = output_path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("creating screenshot dir {}", parent.display()))?;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let is_wayland = std::env::var_os("WAYLAND_DISPLAY").is_some()
+            || std::env::var("XDG_SESSION_TYPE")
+                .map(|value| value.eq_ignore_ascii_case("wayland"))
+                .unwrap_or(false);
+        if is_wayland {
+            // TIGHT activate→verify→grab sequence. The default focus_app_window
+            // loop spends ~3.4s in tao focus attempts, which on a machine the
+            // user is actively clicking opens a huge window for focus to bounce
+            // back before the grab — the race, not focus-stealing prevention, is
+            // what usually kills this. Raise once, verify with KWin (the focus
+            // AUTHORITY on Wayland; tao's is_focused() lags/lies here), grab.
+            desktop.set_always_on_bottom(false);
+            desktop.set_visible(true);
+            desktop.set_minimized(false);
+            {
+                use gtk::prelude::*;
+                let gtk_window = desktop.gtk_window();
+                gtk_window.present();
+                if let Some(gdk_window) = gtk_window.window() {
+                    gdk_window.raise();
+                }
+            }
+            let is_kde = std::env::var("XDG_CURRENT_DESKTOP")
+                .map(|name| name.to_uppercase().contains("KDE"))
+                .unwrap_or(false);
+            if is_kde {
+                let _ = force_activate_kde_wayland_window("yggterm");
+            }
+            desktop.set_focus();
+            thread::sleep(Duration::from_millis(300));
+            let kwin_verdict = if is_kde {
+                Some(yggterm_platform::kde_wayland_active_window_matches("yggterm"))
+            } else {
+                None
+            };
+            let active = desktop.is_focused()
+                || matches!(kwin_verdict, Some(Ok(true)));
+            if !active {
+                let probe = match &kwin_verdict {
+                    Some(Ok(active)) => format!("kwin_active={active}"),
+                    Some(Err(error)) => format!("kwin_probe_error={error:#}"),
+                    None => "kwin_probe=not_attempted(non-KDE)".to_string(),
+                };
+                anyhow::bail!(
+                    "compositor capture refused: could not focus the yggterm window \
+                     (spectacle grabs the ACTIVE window; capturing another app would be a \
+                     privacy leak — likely the user is actively holding focus elsewhere). \
+                     tao_focused={} {probe}",
+                    desktop.is_focused()
+                );
+            }
+            capture_linux_wayland_window_screenshot(output_path)?;
+            let metadata = fs::metadata(output_path)
+                .context("reading compositor screenshot metadata")?;
+            if metadata.len() == 0 {
+                anyhow::bail!("compositor capture produced an empty file");
+            }
+            return Ok(SurfaceCapture::new(output_path, "linux_wayland_spectacle")
+                .with_faithful(
+                    true,
+                    "OS compositor grab — includes native child webviews (web surfaces) \
+                     and the accelerated xterm canvas",
+                ));
+        }
+        capture_linux_x11_window_screenshot(std::process::id(), output_path)?;
+        let metadata =
+            fs::metadata(output_path).context("reading compositor screenshot metadata")?;
+        if metadata.len() == 0 {
+            anyhow::bail!("compositor capture produced an empty file");
+        }
+        return Ok(SurfaceCapture::new(output_path, "linux_x11_window").with_faithful(
+            true,
+            "X11 window grab — includes native child webviews (web surfaces) and the \
+             accelerated xterm canvas",
+        ));
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = desktop;
+        anyhow::bail!("--backend os compositor capture is only implemented on linux")
+    }
+}
+
 pub async fn capture_visible_app_surface(
     desktop: &DesktopContext,
     output_path: &Path,

@@ -190,6 +190,12 @@ pub enum AppControlCommand {
     CaptureScreenshot {
         target: ScreenshotTarget,
         output_path: String,
+        /// `--backend os`: force an OS-compositor grab of the window so NATIVE
+        /// child widgets (web-surface webviews) appear in the frame. The default
+        /// composite/DOM backends are blind to them. Defaults false so requests
+        /// from older CLIs keep the existing behavior.
+        #[serde(default)]
+        compositor: bool,
     },
     ScrollPreview {
         #[serde(default)]
@@ -863,6 +869,7 @@ pub fn enqueue_screenshot_request(
     target: ScreenshotTarget,
     output_path: Option<PathBuf>,
     preferred_pid: Option<u32>,
+    compositor: bool,
 ) -> Result<AppControlRequest> {
     let request_id = Uuid::new_v4().to_string();
     let output_path = output_path
@@ -876,6 +883,7 @@ pub fn enqueue_screenshot_request(
         command: AppControlCommand::CaptureScreenshot {
             target,
             output_path,
+            compositor,
         },
     };
     let requests_dir = app_control_requests_dir(home);
