@@ -934,11 +934,15 @@ struct WebSurfaceTab {
     /// sweep / replace / navigate paths (never on Drop — a state clone
     /// dropping must not tear down a live forward).
     forward_child: Option<Arc<Mutex<std::process::Child>>>,
-    /// yggterm-driven navigation stack of requested URLs. In-iframe
-    /// navigations are cross-origin-invisible, so back/forward cover only
+    /// yggterm-driven navigation stack of requested URLs. In-surface
+    /// navigations are invisible to the shell, so back/forward cover only
     /// address-bar/OSC navigations. `history[history_index]` == `url`.
     history: Vec<String>,
     history_index: usize,
+    /// Reload request counter: the ⟳ button bumps it; the native-surface
+    /// reconciler observes the change and calls `WebView::reload` on the
+    /// surface webview.
+    reload_nonce: u64,
 }
 impl WebSurfaceTab {
     fn kill_forward(&self) {
@@ -1000,7 +1004,6 @@ fn navigate_web_surface_tab(
         })
         .await
         .unwrap_or_else(|_| (url.clone(), None));
-        allow_web_surface_navigation(&effective_url);
         if let Ok(home) = yggterm_core::resolve_yggterm_home() {
             append_trace_event(
                 &home,
@@ -1031,26 +1034,239 @@ fn navigate_web_surface_tab(
 }
 /// Heartbeats arrive every ~4s from a live app; 3 missed beats = gone.
 const WEB_SURFACE_STALE_AFTER_MS: u64 = 15_000;
-/// dioxus-desktop's navigation policy vetoes every http(s) navigation and
-/// bounces it to the OS browser — and WebKitGTK routes IFRAME subframe
-/// loads through the same policy, which blanked every web surface. Each
-/// surface's origin is registered on the vendored allowlist so the iframe
-/// may navigate in-webview; the iframe's sandbox (no allow-top-navigation)
-/// keeps embedded content from stealing the main frame through the same
-/// allowance.
-fn allow_web_surface_navigation(effective_url: &str) {
-    dioxus::desktop::allow_webview_navigation_prefix(web_surface_origin_prefix(effective_url));
+/// Reconcile cadence while any surface exists; geometry follows layout
+/// changes (sidebar resize, window resize, tab/session switch) within a tick.
+const WEB_SURFACE_RECONCILE_TICK_MS: u64 = 300;
+/// Idle poll cadence when no surfaces exist and none are applied.
+const WEB_SURFACE_RECONCILE_IDLE_MS: u64 = 750;
+/// A native surface as last applied to the compositor: the reconciler's
+/// record of what the vendored WebSurfaceHost currently holds for one
+/// (session, tab). Applied state lives OUTSIDE ShellState — mutating a Signal
+/// from the reconciler would re-render the app every tick.
+struct AppliedWebSurface {
+    native_id: u64,
+    url: String,
+    bounds: (i32, i32, i32, i32),
+    visible: bool,
+    reload_nonce: u64,
 }
-fn web_surface_origin_prefix(url: &str) -> String {
-    if let Some(scheme_end) = url.find("://") {
-        let after_scheme = scheme_end + 3;
-        let end = url[after_scheme..]
-            .find('/')
-            .map(|index| after_scheme + index)
-            .unwrap_or(url.len());
-        url[..end].to_string()
-    } else {
-        url.to_string()
+/// The ONE writer of native surface webviews: a declarative reconciler that
+/// diffs desired state (`ShellState::web_surfaces`) + the DOM geometry oracle
+/// (`[data-ws-page]` placeholder rects) against what was last applied, and
+/// drives the vendored per-surface webview API (own WebContext per surface —
+/// the per-surface-proxy/egress substrate). Placeholder rect present ⇒ that
+/// session's surface is visibly laid out (active tab shown at the rect);
+/// no rect ⇒ hidden — one truth covering tab switch, session switch, start
+/// page, and view-mode changes. Surfaces are created lazily on first
+/// visibility and destroyed when their (session, tab) leaves the map (close,
+/// sweep, tab close — those paths only mutate the map).
+async fn web_surface_native_reconcile_loop(
+    state: Signal<ShellState>,
+    desktop: dioxus::desktop::DesktopContext,
+    trace_home: std::path::PathBuf,
+) {
+    let mut applied: HashMap<(String, u64), AppliedWebSurface> = HashMap::new();
+    let mut next_native_id: u64 = 1;
+    loop {
+        // Desired: (session, active_tab, [(tab, effective_url, reload_nonce)]).
+        let desired: Vec<(String, u64, Vec<(u64, String, u64)>)> = {
+            let shell = state.peek();
+            shell
+                .web_surfaces
+                .iter()
+                .map(|(session_path, surface)| {
+                    (
+                        session_path.clone(),
+                        surface.active_tab,
+                        surface
+                            .tabs
+                            .iter()
+                            .map(|tab| (tab.id, tab.effective_url.clone(), tab.reload_nonce))
+                            .collect(),
+                    )
+                })
+                .collect()
+        };
+        // Destroy first: closed/swept surfaces and closed tabs must release
+        // their webview (and WebContext) even when the DOM oracle is gone.
+        let live_keys: std::collections::HashSet<(String, u64)> = desired
+            .iter()
+            .flat_map(|(session, _, tabs)| {
+                tabs.iter()
+                    .map(|(tab_id, _, _)| (session.clone(), *tab_id))
+            })
+            .collect();
+        let dead: Vec<(String, u64)> = applied
+            .keys()
+            .filter(|key| !live_keys.contains(key))
+            .cloned()
+            .collect();
+        for key in dead {
+            if let Some(entry) = applied.remove(&key) {
+                desktop.close_web_surface(entry.native_id);
+                append_trace_event(
+                    &trace_home,
+                    "ui",
+                    "web_surface",
+                    "native_close",
+                    json!({
+                        "session_path": key.0,
+                        "tab_id": key.1,
+                        "native_id": entry.native_id,
+                    }),
+                );
+            }
+        }
+        if desired.is_empty() && applied.is_empty() {
+            sleep(Duration::from_millis(WEB_SURFACE_RECONCILE_IDLE_MS)).await;
+            continue;
+        }
+        // Geometry + visibility oracle: the placeholder rect of every web
+        // surface page area currently laid out (CSS px == wry logical px).
+        let mut eval = document::eval(
+            r#"(function(){
+                const out = {};
+                for (const el of document.querySelectorAll('[data-ws-page]')) {
+                    const r = el.getBoundingClientRect();
+                    if (r.width > 1 && r.height > 1) {
+                        out[el.getAttribute('data-ws-page') || ''] = [
+                            Math.round(r.left), Math.round(r.top),
+                            Math.round(r.width), Math.round(r.height),
+                        ];
+                    }
+                }
+                dioxus.send(out);
+            })();"#,
+        );
+        let rects: HashMap<String, (i32, i32, i32, i32)> = match tokio::time::timeout(
+            Duration::from_millis(1500),
+            eval.recv::<Value>(),
+        )
+        .await
+        {
+            Ok(Ok(value)) => value
+                .as_object()
+                .map(|map| {
+                    map.iter()
+                        .filter_map(|(session, rect)| {
+                            let rect = rect.as_array()?;
+                            Some((
+                                session.clone(),
+                                (
+                                    rect.first()?.as_i64()? as i32,
+                                    rect.get(1)?.as_i64()? as i32,
+                                    rect.get(2)?.as_i64()? as i32,
+                                    rect.get(3)?.as_i64()? as i32,
+                                ),
+                            ))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
+            _ => {
+                // Webview not ready / eval hiccup: keep current applied state
+                // (do NOT hide or destroy off a blind tick) and retry.
+                sleep(Duration::from_millis(WEB_SURFACE_RECONCILE_TICK_MS)).await;
+                continue;
+            }
+        };
+        for (session_path, active_tab, tabs) in desired {
+            let rect = rects.get(&session_path).copied();
+            for (tab_id, effective_url, reload_nonce) in tabs {
+                let key = (session_path.clone(), tab_id);
+                let want_visible = rect.is_some() && tab_id == active_tab;
+                if let Some(entry) = applied.get_mut(&key) {
+                    if entry.url != effective_url {
+                        desktop.navigate_web_surface(entry.native_id, &effective_url);
+                        entry.url = effective_url;
+                    }
+                    if entry.reload_nonce != reload_nonce {
+                        desktop.reload_web_surface(entry.native_id);
+                        entry.reload_nonce = reload_nonce;
+                    }
+                    // Bounds before visibility: a surface being revealed must
+                    // not flash at its stale rect.
+                    if let Some(rect) = rect
+                        && want_visible
+                        && entry.bounds != rect
+                    {
+                        desktop.set_web_surface_bounds(
+                            entry.native_id,
+                            rect.0,
+                            rect.1,
+                            rect.2,
+                            rect.3,
+                        );
+                        entry.bounds = rect;
+                    }
+                    if entry.visible != want_visible {
+                        desktop.set_web_surface_visible(entry.native_id, want_visible);
+                        entry.visible = want_visible;
+                    }
+                } else if want_visible
+                    && let Some(rect) = rect
+                {
+                    // Lazy-create on first visibility: no hidden-create flash,
+                    // and background tabs cost nothing until viewed.
+                    let native_id = next_native_id;
+                    next_native_id += 1;
+                    match desktop.open_web_surface(
+                        native_id,
+                        &effective_url,
+                        None,
+                        rect.0,
+                        rect.1,
+                        rect.2,
+                        rect.3,
+                    ) {
+                        Ok(()) => {
+                            append_trace_event(
+                                &trace_home,
+                                "ui",
+                                "web_surface",
+                                "native_open",
+                                json!({
+                                    "session_path": session_path,
+                                    "tab_id": tab_id,
+                                    "native_id": native_id,
+                                    "effective_url": effective_url,
+                                    "rect": [rect.0, rect.1, rect.2, rect.3],
+                                }),
+                            );
+                            applied.insert(
+                                key,
+                                AppliedWebSurface {
+                                    native_id,
+                                    url: effective_url,
+                                    bounds: rect,
+                                    visible: true,
+                                    reload_nonce,
+                                },
+                            );
+                        }
+                        Err(error) => {
+                            append_trace_event(
+                                &trace_home,
+                                "ui",
+                                "web_surface",
+                                "native_open_failed",
+                                json!({
+                                    "session_path": session_path,
+                                    "tab_id": tab_id,
+                                    "error": error,
+                                }),
+                            );
+                            // No surface host on this backend (non-GTK): the
+                            // loop can never succeed — stop burning ticks.
+                            if error.contains("not installed") || error.contains("require") {
+                                return;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        sleep(Duration::from_millis(WEB_SURFACE_RECONCILE_TICK_MS)).await;
     }
 }
 fn web_surface_url_is_loopback(url: &str) -> bool {
@@ -3555,16 +3771,6 @@ impl ShellState {
     fn effective_window_focused(&self) -> bool {
         self.window_focused || self.app_control_force_foreground
     }
-    /// While any surface is live, the vendored webview navigation policy lets
-    /// http(s) navigations proceed in-frame — link clicks and redirects inside
-    /// surface iframes are cross-origin (WebKitGTK's policy handler cannot
-    /// attribute them to a frame), so an origin allowlist cannot cover them.
-    /// The iframe sandboxes (no allow-top-navigation) keep the main frame
-    /// safe, and the shell UI carries no plain http anchors; the gate closes
-    /// with the last surface.
-    fn sync_web_surface_navigation_gate(&self) {
-        dioxus::desktop::set_webview_http_navigation_open(!self.web_surfaces.is_empty());
-    }
     /// Upsert a web surface for a session (OSC 7717 open/heartbeat with a
     /// URL). `effective_url`/`forward` are precomputed by the caller (forward
     /// setup blocks, so it must not run under the state lock). An existing
@@ -3607,7 +3813,6 @@ impl ShellState {
                     existing.address_draft = None;
                 }
             }
-            self.sync_web_surface_navigation_gate();
             return;
         }
         let app_tab = WebSurfaceTab {
@@ -3618,6 +3823,7 @@ impl ShellState {
             forward_child: forward_child.map(|child| Arc::new(Mutex::new(child))),
             history: vec![url],
             history_index: 0,
+            reload_nonce: 0,
         };
         if let Some(replaced) = self.web_surfaces.insert(
             session_path.to_string(),
@@ -3632,7 +3838,6 @@ impl ShellState {
         ) {
             kill_web_surface_forward(&replaced);
         }
-        self.sync_web_surface_navigation_gate();
     }
     /// Refresh liveness for an existing surface (heartbeat without URL).
     fn touch_web_surface(&mut self, session_path: &str, now_ms: u64) -> bool {
@@ -3650,7 +3855,6 @@ impl ShellState {
         } else {
             false
         };
-        self.sync_web_surface_navigation_gate();
         closed
     }
     fn sweep_stale_web_surfaces(&mut self, now_ms: u64) {
@@ -3662,7 +3866,6 @@ impl ShellState {
             }
             live
         });
-        self.sync_web_surface_navigation_gate();
     }
     /// Cheap liveness probe (no view construction) for the input policy.
     fn has_live_web_surface(&self, session_path: &str, now_ms: u64) -> bool {
@@ -3693,6 +3896,7 @@ impl ShellState {
                 forward_child: None,
                 history: Vec::new(),
                 history_index: 0,
+                reload_nonce: 0,
             });
             surface.active_tab = id;
             surface.address_draft = Some(String::new());
@@ -3713,6 +3917,15 @@ impl ShellState {
             if surface.active_tab == tab_id {
                 surface.active_tab = surface.tabs[index - 1].id;
                 surface.address_draft = None;
+            }
+        }
+    }
+    /// Request a reload of the active tab's page (native surface ⟳).
+    fn web_surface_reload_active_tab(&mut self, session_path: &str) {
+        if let Some(surface) = self.web_surfaces.get_mut(session_path) {
+            let active_tab = surface.active_tab;
+            if let Some(tab) = surface.tabs.iter_mut().find(|tab| tab.id == active_tab) {
+                tab.reload_nonce = tab.reload_nonce.wrapping_add(1);
             }
         }
     }
@@ -39999,6 +40212,15 @@ fn app() -> Element {
     } else {
         schedule_ui_update
     };
+    let web_surface_reconcile_loop_started =
+        use_hook(|| Arc::new(AtomicBool::new(false))).clone();
+    if !web_surface_reconcile_loop_started.swap(true, Ordering::SeqCst) {
+        let desktop = desktop.clone();
+        let trace_home = trace_home.clone();
+        spawn_forever(async move {
+            web_surface_native_reconcile_loop(state, desktop, trace_home).await;
+        });
+    }
     if !browser_tree_refresh_loop_started.swap(true, Ordering::SeqCst) {
         spawn_forever(async move {
             loop {
@@ -51679,7 +51901,6 @@ fn TerminalCanvas(
                                                     "action": action,
                                                 }),
                                             );
-                                            allow_web_surface_navigation(&effective_url);
                                             state.with_mut(|shell| {
                                                 shell.upsert_web_surface(
                                                     &surface_session_path,
@@ -56868,8 +57089,6 @@ fn TerminalCanvas(
                             let back_target = web_overlay.back_target.clone();
                             let forward_target = web_overlay.forward_target.clone();
                             let address_text = web_overlay.address_text.clone();
-                            let active_frame_id =
-                                format!("{web_surface_host_id}-ws-frame-{active_tab_id}");
                             let nav_button_style = |enabled: bool| {
                                 format!(
                                     "border:none; background:transparent; color:{}; font-size:14px; line-height:1; padding:4px 7px; border-radius:6px; cursor:{}; opacity:{};",
@@ -56936,13 +57155,13 @@ fn TerminalCanvas(
                                     button {
                                         style: "{reload_style}",
                                         title: "Reload",
-                                        onclick: move |_| {
-                                            // Re-assigning src reloads the frame; the
-                                            // parent owns the element, so the sandbox
-                                            // does not block this.
-                                            let _ = document::eval(&format!(
-                                                "(function() {{ const f = document.getElementById({active_frame_id:?}); if (f) {{ f.src = f.src; }} }})();"
-                                            ));
+                                        onclick: {
+                                            let nav_path = nav_path.clone();
+                                            move |_| {
+                                                state.with_mut(|shell| {
+                                                    shell.web_surface_reload_active_tab(&nav_path);
+                                                });
+                                            }
                                         },
                                         "⟳"
                                     }
@@ -57021,47 +57240,17 @@ fn TerminalCanvas(
                                 }
                             }
                         }}
-                        // One iframe per tab; inactive tabs stay mounted
-                        // (hidden) so switching back preserves page state.
+                        // Page area placeholder: the actual page is a NATIVE
+                        // child webview (own WebContext + optional SOCKS proxy —
+                        // the egress rule) layered over this rect by the
+                        // native-surface reconciler in app(). This div is the
+                        // reconciler's geometry + visibility oracle: its
+                        // getBoundingClientRect IS where the active tab's
+                        // surface paints; no rect (session switched away, start
+                        // page, other view mode) hides the surface.
                         div {
-                            style: "flex:1 1 auto; min-height:0; position:relative; display:flex;",
-                            {web_overlay.tabs.iter().map(|tab| {
-                                let frame_id =
-                                    format!("{web_surface_host_id}-ws-frame-{}", tab.id);
-                                let frame_display = if tab.active { "block" } else { "none" };
-                                let loaded_url = tab.effective_url.clone();
-                                let loaded_tab_id = tab.id;
-                                rsx! {
-                                    iframe {
-                                        key: "ws-frame-{loaded_tab_id}",
-                                        id: "{frame_id}",
-                                        src: "{tab.effective_url}",
-                                        // No allow-top-navigation: embedded content must
-                                        // not be able to navigate the app's main frame
-                                        // through the vendored navigation allowances
-                                        // (allow_web_surface_navigation + the surface
-                                        // http gate).
-                                        "sandbox": "allow-scripts allow-same-origin allow-forms allow-popups allow-modals allow-downloads",
-                                        style: format!(
-                                            "flex:1 1 auto; border:0; width:100%; min-height:0; background:#ffffff; display:{frame_display};",
-                                        ),
-                                        onload: move |_| {
-                                            if let Ok(home) = yggterm_core::resolve_yggterm_home() {
-                                                append_trace_event(
-                                                    &home,
-                                                    "ui",
-                                                    "web_surface",
-                                                    "iframe_load",
-                                                    json!({
-                                                        "effective_url": loaded_url,
-                                                        "tab_id": loaded_tab_id,
-                                                    }),
-                                                );
-                                            }
-                                        },
-                                    }
-                                }
-                            })}
+                            style: "flex:1 1 auto; min-height:0; background:#ffffff;",
+                            "data-ws-page": "{web_surface_session_path}",
                         }
                     }
                 }
