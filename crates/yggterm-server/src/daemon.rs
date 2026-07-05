@@ -3156,16 +3156,37 @@ impl DaemonRuntime {
                 Ok(Some(saved)) => saved,
                 _ => continue,
             };
+            // Order-preserving import: walk the source daemon's live sessions
+            // IN ITS ORDER, tracking the last source key that already exists
+            // here (the anchor). Each import is repositioned to sit right
+            // after its anchor instead of at the end — appending left every
+            // non-keep-alive session (absent from the normal persist, so only
+            // importable here) piled at the bottom after each daemon swap:
+            // the "rows in weird places after restart" bug.
+            let mut order_lookup: HashMap<String, String> = self
+                .server
+                .live_session_order
+                .iter()
+                .map(|key| (normalize(key), key.clone()))
+                .collect();
+            let mut anchor: Option<String> = None;
             for live in saved.live_sessions {
                 let normalized = normalize(&live.key);
-                if existing.contains(&normalized)
-                    || !crate::persisted_live_session_is_recoverable(&live)
-                {
+                if existing.contains(&normalized) {
+                    if let Some(current) = order_lookup.get(&normalized) {
+                        anchor = Some(current.clone());
+                    }
+                    continue;
+                }
+                if !crate::persisted_live_session_is_recoverable(&live) {
                     continue;
                 }
                 let key = live.key.clone();
                 self.server.restore_live_session(live);
-                existing.insert(normalized);
+                self.server.move_live_session_after(&key, anchor.as_deref());
+                existing.insert(normalized.clone());
+                order_lookup.insert(normalized, key.clone());
+                anchor = Some(key.clone());
                 imported_keys.push(key);
             }
         }
@@ -9455,6 +9476,23 @@ fn spawn_active_terminal_prewarm(
     });
 }
 
+/// Milliseconds of accumulated suspend time: CLOCK_BOOTTIME minus
+/// CLOCK_MONOTONIC. Constant while the machine is awake; jumps by the length
+/// of a suspend the moment it ends. See the suspend/wake watcher in
+/// `run_daemon`.
+#[cfg(target_os = "linux")]
+fn suspend_clock_gap_ms() -> Option<i64> {
+    fn clock_ms(clock: libc::clockid_t) -> Option<i64> {
+        let mut ts = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        (unsafe { libc::clock_gettime(clock, &mut ts) } == 0)
+            .then(|| ts.tv_sec as i64 * 1_000 + ts.tv_nsec as i64 / 1_000_000)
+    }
+    Some(clock_ms(libc::CLOCK_BOOTTIME)? - clock_ms(libc::CLOCK_MONOTONIC)?)
+}
+
 pub fn run_daemon(endpoint: &ServerEndpoint, runtime: GhosttyHostSupport) -> Result<()> {
     let runtime = Arc::new(Mutex::new(DaemonRuntime::load(runtime)?));
     let last_activity_ms = Arc::new(AtomicU64::new(current_millis_u64()));
@@ -9502,6 +9540,56 @@ pub fn run_daemon(endpoint: &ServerEndpoint, runtime: GhosttyHostSupport) -> Res
                         now_ms,
                         last_incident_ms,
                         extra,
+                    );
+                }
+            })
+            .ok();
+    }
+    // Suspend/wake watcher: CLOCK_BOOTTIME advances across a suspend while
+    // CLOCK_MONOTONIC does not, so a jump in their difference is a precise,
+    // dependency-free "the machine just woke" signal. On wake every ssh-carried
+    // bridge is dead-but-hung (dead TCP; ServerAlive would take ~45s to notice
+    // — the "reconnect after wake is not instant" complaint). Kill + respawn
+    // them immediately so recovery costs one ssh handshake instead of a
+    // keepalive timeout. See [[finding-sleep-wake-ssh-recovery]].
+    #[cfg(target_os = "linux")]
+    {
+        const WAKE_POLL_MS: u64 = 2_000;
+        const WAKE_SUSPEND_THRESHOLD_MS: i64 = 10_000;
+        let runtime = runtime.clone();
+        let last_activity_ms = last_activity_ms.clone();
+        let home_dir = home_dir.clone();
+        std::thread::Builder::new()
+            .name("yggterm-suspend-wake-watcher".to_string())
+            .spawn(move || {
+                let mut previous_gap = suspend_clock_gap_ms();
+                loop {
+                    std::thread::sleep(std::time::Duration::from_millis(WAKE_POLL_MS));
+                    let Some(gap) = suspend_clock_gap_ms() else {
+                        continue;
+                    };
+                    let jump = previous_gap.map(|prev| gap - prev).unwrap_or(0);
+                    previous_gap = Some(gap);
+                    if jump < WAKE_SUSPEND_THRESHOLD_MS {
+                        continue;
+                    }
+                    let respawned = {
+                        let mut runtime = lock_daemon_runtime(&runtime, "suspend_wake_recovery");
+                        runtime.terminals.respawn_ssh_carried_sessions()
+                    };
+                    mark_daemon_activity(&last_activity_ms);
+                    append_trace_event(
+                        &home_dir,
+                        "daemon",
+                        "suspend_wake",
+                        "bridges_respawned",
+                        serde_json::json!({
+                            "suspend_ms": jump,
+                            "respawned": respawned
+                                .iter()
+                                .map(|(key, ok)| serde_json::json!({ "path": key, "ok": ok }))
+                                .collect::<Vec<_>>(),
+                        }),
                     );
                 }
             })
