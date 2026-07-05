@@ -580,31 +580,6 @@ impl WebviewInstance {
             desktop_context.install_web_surface_host(
                 crate::web_surface::WebSurfaceHost::new(web_surface_overlay),
             );
-
-            // Debug path (validate the overlay/surface primitive live): if the
-            // control file ~/.yggterm/web-surface-test.url exists and holds a
-            // URL, open one surface shortly after the window realizes. Uses a
-            // file (not env) so it is controllable independent of how the GUI is
-            // launched. Not wired into the shell yet.
-            if let Some(test_url) = std::env::var_os("HOME")
-                .map(std::path::PathBuf::from)
-                .map(|h| h.join(".yggterm").join("web-surface-test.url"))
-                .and_then(|p| std::fs::read_to_string(p).ok())
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-            {
-                let dc = desktop_context.clone();
-                gtk::glib::timeout_add_local_once(
-                    std::time::Duration::from_millis(1500),
-                    move || {
-                        if let Err(e) =
-                            dc.open_web_surface(9_999_001, &test_url, None, 160, 160, 900, 680)
-                        {
-                            tracing::warn!("web surface test open failed: {e}");
-                        }
-                    },
-                );
-            }
         }
 
         // Request an initial redraw
