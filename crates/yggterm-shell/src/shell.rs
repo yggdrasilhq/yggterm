@@ -923,12 +923,18 @@ struct WebSurfaceTab {
     /// Requested/display URL (what the address bar shows). Empty on a fresh
     /// user tab that has not navigated yet.
     url: String,
-    /// What the iframe actually loads: the requested URL for local sessions
-    /// and direct-loadable remotes, or the local end of the session-side
-    /// `ssh -L` forward for remote loopback URLs. The forward's remote sshd
-    /// originates the target connection, so network egress stays on the
-    /// session's machine (ychrome docs/architecture.md "egress rule").
+    /// What the surface webview actually loads: the requested URL for local
+    /// sessions, and for remote sessions the requested URL carried through a
+    /// session-side `ssh -D` SOCKS tunnel (`socks_port`) — or, on SOCKS
+    /// fallback, the local end of an `ssh -L` forward for loopback URLs. The
+    /// tunnel's remote sshd originates every target connection, so network
+    /// egress stays on the session's machine (the "egress rule").
     effective_url: String,
+    /// Local port of the per-tab `ssh -D` SOCKS tunnel this tab's webview
+    /// proxies through (None = direct egress: local session or tunnel
+    /// fallback). A change recreates the native webview — the proxy is fixed
+    /// per WebContext.
+    socks_port: Option<u16>,
     title: Option<String>,
     /// Shared because ShellState is Clone; killed EXPLICITLY by the close /
     /// sweep / replace / navigate paths (never on Drop — a state clone
@@ -999,11 +1005,12 @@ fn navigate_web_surface_tab(
 ) {
     spawn(async move {
         let resolve_url = url.clone();
-        let (effective_url, forward_child) = task::spawn_blocking(move || {
+        let remote = ssh_target.is_some();
+        let (effective_url, forward_child, socks_port) = task::spawn_blocking(move || {
             resolve_web_surface_effective_url(&resolve_url, ssh_target.as_deref())
         })
         .await
-        .unwrap_or_else(|_| (url.clone(), None));
+        .unwrap_or_else(|_| (url.clone(), None, None));
         if let Ok(home) = yggterm_core::resolve_yggterm_home() {
             append_trace_event(
                 &home,
@@ -1016,6 +1023,8 @@ fn navigate_web_surface_tab(
                     "url": url,
                     "effective_url": effective_url,
                     "forwarded": forward_child.is_some(),
+                    "socks_port": socks_port,
+                    "egress_gap": remote && socks_port.is_none(),
                     "history_index": history_index,
                 }),
             );
@@ -1027,6 +1036,7 @@ fn navigate_web_surface_tab(
                 url,
                 effective_url,
                 forward_child,
+                socks_port,
                 history_index,
             );
         });
@@ -1049,6 +1059,9 @@ struct AppliedWebSurface {
     bounds: (i32, i32, i32, i32),
     visible: bool,
     reload_nonce: u64,
+    /// SOCKS proxy the surface's WebContext was created with. The proxy is
+    /// fixed per WebContext, so a change means destroy + recreate.
+    socks_port: Option<u16>,
 }
 /// The ONE writer of native surface webviews: a declarative reconciler that
 /// diffs desired state (`ShellState::web_surfaces`) + the DOM geometry oracle
@@ -1068,8 +1081,9 @@ async fn web_surface_native_reconcile_loop(
     let mut applied: HashMap<(String, u64), AppliedWebSurface> = HashMap::new();
     let mut next_native_id: u64 = 1;
     loop {
-        // Desired: (session, active_tab, [(tab, effective_url, reload_nonce)]).
-        let desired: Vec<(String, u64, Vec<(u64, String, u64)>)> = {
+        // Desired: (session, active_tab,
+        //           [(tab, effective_url, reload_nonce, socks_port)]).
+        let desired: Vec<(String, u64, Vec<(u64, String, u64, Option<u16>)>)> = {
             let shell = state.peek();
             shell
                 .web_surfaces
@@ -1081,7 +1095,14 @@ async fn web_surface_native_reconcile_loop(
                         surface
                             .tabs
                             .iter()
-                            .map(|tab| (tab.id, tab.effective_url.clone(), tab.reload_nonce))
+                            .map(|tab| {
+                                (
+                                    tab.id,
+                                    tab.effective_url.clone(),
+                                    tab.reload_nonce,
+                                    tab.socks_port,
+                                )
+                            })
                             .collect(),
                     )
                 })
@@ -1093,7 +1114,7 @@ async fn web_surface_native_reconcile_loop(
             .iter()
             .flat_map(|(session, _, tabs)| {
                 tabs.iter()
-                    .map(|(tab_id, _, _)| (session.clone(), *tab_id))
+                    .map(|(tab_id, _, _, _)| (session.clone(), *tab_id))
             })
             .collect();
         let dead: Vec<(String, u64)> = applied
@@ -1172,9 +1193,30 @@ async fn web_surface_native_reconcile_loop(
         };
         for (session_path, active_tab, tabs) in desired {
             let rect = rects.get(&session_path).copied();
-            for (tab_id, effective_url, reload_nonce) in tabs {
+            for (tab_id, effective_url, reload_nonce, socks_port) in tabs {
                 let key = (session_path.clone(), tab_id);
                 let want_visible = rect.is_some() && tab_id == active_tab;
+                // A proxy change can't be applied to a live WebContext:
+                // destroy now, recreate below on next visibility.
+                if let Some(entry) = applied.get(&key)
+                    && entry.socks_port != socks_port
+                {
+                    let native_id = entry.native_id;
+                    desktop.close_web_surface(native_id);
+                    applied.remove(&key);
+                    append_trace_event(
+                        &trace_home,
+                        "ui",
+                        "web_surface",
+                        "native_close",
+                        json!({
+                            "session_path": key.0,
+                            "tab_id": key.1,
+                            "native_id": native_id,
+                            "reason": "socks_port_changed",
+                        }),
+                    );
+                }
                 if let Some(entry) = applied.get_mut(&key) {
                     if entry.url != effective_url {
                         desktop.navigate_web_surface(entry.native_id, &effective_url);
@@ -1213,7 +1255,7 @@ async fn web_surface_native_reconcile_loop(
                     match desktop.open_web_surface(
                         native_id,
                         &effective_url,
-                        None,
+                        socks_port,
                         rect.0,
                         rect.1,
                         rect.2,
@@ -1230,6 +1272,7 @@ async fn web_surface_native_reconcile_loop(
                                     "tab_id": tab_id,
                                     "native_id": native_id,
                                     "effective_url": effective_url,
+                                    "socks_port": socks_port,
                                     "rect": [rect.0, rect.1, rect.2, rect.3],
                                 }),
                             );
@@ -1241,6 +1284,7 @@ async fn web_surface_native_reconcile_loop(
                                     bounds: rect,
                                     visible: true,
                                     reload_nonce,
+                                    socks_port,
                                 },
                             );
                         }
@@ -1376,22 +1420,82 @@ fn spawn_web_surface_forward(
         std::thread::sleep(std::time::Duration::from_millis(120));
     }
 }
-/// Resolve a requested surface URL to what the iframe should load, honoring
-/// the egress rule: loopback URLs on a remote session go through an `ssh -L`
-/// forward originated on the session's machine. Blocking (the forward setup
-/// waits for the local end to accept) — callers run it via spawn_blocking.
+/// Session-side egress for a remote web surface, general form: `ssh -N -D`
+/// dynamic (SOCKS5) forward to the session's machine. The remote sshd
+/// resolves EVERY host the surface requests and originates every connection
+/// there — the egress rule for ALL URLs, not just loopback. Returns
+/// (local_socks_port, child) once the local end accepts.
+fn spawn_web_surface_socks(ssh_target: &str) -> Option<(u16, std::process::Child)> {
+    let local_port = std::net::TcpListener::bind("127.0.0.1:0")
+        .and_then(|listener| listener.local_addr())
+        .map(|addr| addr.port())
+        .ok()?;
+    let mut child = std::process::Command::new("ssh")
+        .args([
+            "-N",
+            "-o",
+            "ExitOnForwardFailure=yes",
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "ConnectTimeout=8",
+            "-D",
+            &format!("127.0.0.1:{local_port}"),
+            ssh_target,
+        ])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok()?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+    loop {
+        if std::net::TcpStream::connect_timeout(
+            &std::net::SocketAddr::from(([127, 0, 0, 1], local_port)),
+            std::time::Duration::from_millis(250),
+        )
+        .is_ok()
+        {
+            return Some((local_port, child));
+        }
+        if child.try_wait().ok().flatten().is_some() || std::time::Instant::now() > deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(120));
+    }
+}
+/// Resolve a requested surface URL to what the surface webview should load,
+/// honoring the egress rule. Remote sessions get an `ssh -D` SOCKS tunnel
+/// and load the REAL URL through it (the remote host resolves DNS and
+/// originates every connection — loopback included, which resolves to the
+/// REMOTE machine's loopback). SOCKS failure falls back to the older
+/// loopback-only `ssh -L` rewrite, then to direct load (egress gap, traced
+/// by the caller via socks_port None). Blocking (tunnel setup waits for the
+/// local end to accept) — callers run it via spawn_blocking.
+/// Returns (effective_url, tunnel_child, socks_port).
 fn resolve_web_surface_effective_url(
     url: &str,
     ssh_target: Option<&str>,
-) -> (String, Option<std::process::Child>) {
-    if let Some(target) = ssh_target.filter(|_| web_surface_url_is_loopback(url)) {
-        let (host, port, tail) = web_surface_url_parts(url)
-            .unwrap_or_else(|| ("127.0.0.1".to_string(), 80, String::new()));
-        if let Some((local_port, child)) = spawn_web_surface_forward(target, &host, port) {
-            return (format!("http://127.0.0.1:{local_port}{tail}"), Some(child));
+) -> (String, Option<std::process::Child>, Option<u16>) {
+    if let Some(target) = ssh_target {
+        if let Some((socks_port, child)) = spawn_web_surface_socks(target) {
+            return (url.to_string(), Some(child), Some(socks_port));
+        }
+        if web_surface_url_is_loopback(url) {
+            let (host, port, tail) = web_surface_url_parts(url)
+                .unwrap_or_else(|| ("127.0.0.1".to_string(), 80, String::new()));
+            if let Some((local_port, child)) = spawn_web_surface_forward(target, &host, port) {
+                return (
+                    format!("http://127.0.0.1:{local_port}{tail}"),
+                    Some(child),
+                    None,
+                );
+            }
         }
     }
-    (url.to_string(), None)
+    (url.to_string(), None, None)
 }
 /// Turn address-bar input into a navigable URL: pass http(s) URLs through,
 /// prefix bare hosts with a scheme (http for loopback dev servers, https
@@ -3782,6 +3886,7 @@ impl ShellState {
         title: Option<String>,
         effective_url: String,
         forward_child: Option<std::process::Child>,
+        socks_port: Option<u16>,
         now_ms: u64,
     ) {
         if let Some(existing) = self.web_surfaces.get_mut(session_path)
@@ -3802,6 +3907,7 @@ impl ShellState {
                 app_tab.kill_forward();
                 app_tab.url = url.clone();
                 app_tab.effective_url = effective_url;
+                app_tab.socks_port = socks_port;
                 if title.is_some() {
                     app_tab.title = title;
                 }
@@ -3819,6 +3925,7 @@ impl ShellState {
             id: 0,
             url: url.clone(),
             effective_url,
+            socks_port,
             title,
             forward_child: forward_child.map(|child| Arc::new(Mutex::new(child))),
             history: vec![url],
@@ -3892,6 +3999,7 @@ impl ShellState {
                 id,
                 url: String::new(),
                 effective_url: "about:blank".to_string(),
+                socks_port: None,
                 title: None,
                 forward_child: None,
                 history: Vec::new(),
@@ -3945,6 +4053,7 @@ impl ShellState {
         url: String,
         effective_url: String,
         forward_child: Option<std::process::Child>,
+        socks_port: Option<u16>,
         history_index: Option<usize>,
     ) {
         let mut orphaned_forward = forward_child;
@@ -3954,6 +4063,7 @@ impl ShellState {
             tab.kill_forward();
             tab.url = url.clone();
             tab.effective_url = effective_url;
+            tab.socks_port = socks_port;
             tab.forward_child = orphaned_forward.take().map(|child| Arc::new(Mutex::new(child)));
             match history_index {
                 Some(index) if index < tab.history.len() => tab.history_index = index,
@@ -51871,14 +51981,16 @@ fn TerminalCanvas(
                                                     })
                                             });
                                         if let Some(url) = fresh_url {
-                                            // Session-side egress: remote loopback
-                                            // URLs go through an ssh -L whose remote
-                                            // sshd originates the connection on the
-                                            // session's machine. The bounded wait
+                                            // Session-side egress: remote sessions
+                                            // get an ssh -D SOCKS tunnel whose remote
+                                            // sshd originates every connection on the
+                                            // session's machine (ssh -L loopback
+                                            // rewrite as fallback). The bounded wait
                                             // runs off the UI event loop.
                                             let resolve_url = url.clone();
                                             let resolve_target = web_surface_ssh_target.clone();
-                                            let (effective_url, forward_child) =
+                                            let remote = resolve_target.is_some();
+                                            let (effective_url, forward_child, socks_port) =
                                                 task::spawn_blocking(move || {
                                                     resolve_web_surface_effective_url(
                                                         &resolve_url,
@@ -51886,7 +51998,7 @@ fn TerminalCanvas(
                                                     )
                                                 })
                                                 .await
-                                                .unwrap_or_else(|_| (url.clone(), None));
+                                                .unwrap_or_else(|_| (url.clone(), None, None));
                                             append_trace_event(
                                                 &trace_home,
                                                 "ui",
@@ -51898,6 +52010,8 @@ fn TerminalCanvas(
                                                     "url": url,
                                                     "effective_url": effective_url,
                                                     "forwarded": forward_child.is_some(),
+                                                    "socks_port": socks_port,
+                                                    "egress_gap": remote && socks_port.is_none(),
                                                     "action": action,
                                                 }),
                                             );
@@ -51908,6 +52022,7 @@ fn TerminalCanvas(
                                                     surface_title,
                                                     effective_url,
                                                     forward_child,
+                                                    socks_port,
                                                     now_ms,
                                                 );
                                             });
@@ -77265,6 +77380,7 @@ mod tests {
             Some("app".to_string()),
             "http://localhost:8000/".to_string(),
             None,
+            None,
             1_000,
         );
         shell.web_surface_new_tab("local://ws");
@@ -77275,6 +77391,7 @@ mod tests {
             "https://example.com".to_string(),
             None,
             None,
+            None,
         );
         // App heartbeat navigates the app tab; the user tab survives.
         shell.upsert_web_surface(
@@ -77282,6 +77399,7 @@ mod tests {
             "http://localhost:8000/next".to_string(),
             None,
             "http://localhost:8000/next".to_string(),
+            None,
             None,
             2_000,
         );
@@ -77302,6 +77420,7 @@ mod tests {
             "https://docs.rs".to_string(),
             None,
             None,
+            None,
         );
         let overlay = shell
             .web_surface_overlay_for_session("local://ws", 2_500)
@@ -77316,6 +77435,7 @@ mod tests {
             1,
             "https://example.com".to_string(),
             "https://example.com".to_string(),
+            None,
             None,
             Some(0),
         );
