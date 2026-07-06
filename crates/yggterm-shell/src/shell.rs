@@ -949,6 +949,11 @@ struct WebSurfaceTab {
     /// reconciler observes the change and calls `WebView::reload` on the
     /// surface webview.
     reload_nonce: u64,
+    /// Host-owned profile name (from the OSC; default "default"). Selects the
+    /// surface webview's persistent storage jar
+    /// (`~/.yggterm/web-profiles/<profile>/`). A change recreates the webview
+    /// (storage is fixed per WebContext). All tabs of one surface share it.
+    profile: String,
 }
 impl WebSurfaceTab {
     fn kill_forward(&self) {
@@ -1005,7 +1010,11 @@ fn navigate_web_surface_tab(
 ) {
     spawn(async move {
         let resolve_url = url.clone();
-        let remote = ssh_target.is_some();
+        // Loopback ssh_target == a LOCAL session (direct egress); only a real
+        // remote can have an egress gap.
+        let remote = ssh_target
+            .as_deref()
+            .is_some_and(|t| !ssh_target_host_is_loopback(t));
         let (effective_url, forward_child, socks_port) = task::spawn_blocking(move || {
             resolve_web_surface_effective_url(&resolve_url, ssh_target.as_deref())
         })
@@ -1062,6 +1071,9 @@ struct AppliedWebSurface {
     /// SOCKS proxy the surface's WebContext was created with. The proxy is
     /// fixed per WebContext, so a change means destroy + recreate.
     socks_port: Option<u16>,
+    /// Profile (storage jar) the surface's WebContext was created with. Also
+    /// fixed per WebContext — a change means destroy + recreate.
+    profile: String,
 }
 /// The ONE writer of native surface webviews: a declarative reconciler that
 /// diffs desired state (`ShellState::web_surfaces`) + the DOM geometry oracle
@@ -1082,8 +1094,8 @@ async fn web_surface_native_reconcile_loop(
     let mut next_native_id: u64 = 1;
     loop {
         // Desired: (session, active_tab,
-        //           [(tab, effective_url, reload_nonce, socks_port)]).
-        let desired: Vec<(String, u64, Vec<(u64, String, u64, Option<u16>)>)> = {
+        //           [(tab, effective_url, reload_nonce, socks_port, profile)]).
+        let desired: Vec<(String, u64, Vec<(u64, String, u64, Option<u16>, String)>)> = {
             let shell = state.peek();
             shell
                 .web_surfaces
@@ -1101,6 +1113,7 @@ async fn web_surface_native_reconcile_loop(
                                     tab.effective_url.clone(),
                                     tab.reload_nonce,
                                     tab.socks_port,
+                                    tab.profile.clone(),
                                 )
                             })
                             .collect(),
@@ -1114,7 +1127,7 @@ async fn web_surface_native_reconcile_loop(
             .iter()
             .flat_map(|(session, _, tabs)| {
                 tabs.iter()
-                    .map(|(tab_id, _, _, _)| (session.clone(), *tab_id))
+                    .map(|(tab_id, _, _, _, _)| (session.clone(), *tab_id))
             })
             .collect();
         let dead: Vec<(String, u64)> = applied
@@ -1193,15 +1206,32 @@ async fn web_surface_native_reconcile_loop(
         };
         for (session_path, active_tab, tabs) in desired {
             let rect = rects.get(&session_path).copied();
-            for (tab_id, effective_url, reload_nonce, socks_port) in tabs {
+            for (tab_id, effective_url, reload_nonce, socks_port, profile) in tabs {
                 let key = (session_path.clone(), tab_id);
                 let want_visible = rect.is_some() && tab_id == active_tab;
-                // A proxy change can't be applied to a live WebContext:
-                // destroy now, recreate below on next visibility.
+                // Destroy-and-recreate cases (close + remove here; the
+                // lazy-create branch rebuilds a fresh webview the same tick):
+                //   - proxy or profile change: both are fixed per WebContext,
+                //     so a live webview can't adopt them.
+                //   - reload: WebKitGTK stalls the blit of an in-place
+                //     `WebView::reload` while a hidden sibling surface shares
+                //     the overlay (every GTK-level nudge was tried and failed;
+                //     only destroying a webview re-blits). Recreating against
+                //     the SAME persistent per-profile jar keeps cookies/session,
+                //     so recreate-on-reload is lossless.
                 if let Some(entry) = applied.get(&key)
-                    && entry.socks_port != socks_port
+                    && (entry.socks_port != socks_port
+                        || entry.profile != profile
+                        || entry.reload_nonce != reload_nonce)
                 {
                     let native_id = entry.native_id;
+                    let reason = if entry.socks_port != socks_port {
+                        "socks_port_changed"
+                    } else if entry.profile != profile {
+                        "profile_changed"
+                    } else {
+                        "reload"
+                    };
                     desktop.close_web_surface(native_id);
                     applied.remove(&key);
                     append_trace_event(
@@ -1213,7 +1243,7 @@ async fn web_surface_native_reconcile_loop(
                             "session_path": key.0,
                             "tab_id": key.1,
                             "native_id": native_id,
-                            "reason": "socks_port_changed",
+                            "reason": reason,
                         }),
                     );
                 }
@@ -1221,10 +1251,6 @@ async fn web_surface_native_reconcile_loop(
                     if entry.url != effective_url {
                         desktop.navigate_web_surface(entry.native_id, &effective_url);
                         entry.url = effective_url;
-                    }
-                    if entry.reload_nonce != reload_nonce {
-                        desktop.reload_web_surface(entry.native_id);
-                        entry.reload_nonce = reload_nonce;
                     }
                     // Bounds before visibility: a surface being revealed must
                     // not flash at its stale rect.
@@ -1252,10 +1278,14 @@ async fn web_surface_native_reconcile_loop(
                     // and background tabs cost nothing until viewed.
                     let native_id = next_native_id;
                     next_native_id += 1;
+                    // The persistent per-profile storage jar on THIS (GUI)
+                    // host. None => ephemeral (only if home can't resolve).
+                    let profile_dir = web_surface_profile_dir(&profile);
                     match desktop.open_web_surface(
                         native_id,
                         &effective_url,
                         socks_port,
+                        profile_dir.as_deref(),
                         rect.0,
                         rect.1,
                         rect.2,
@@ -1273,6 +1303,7 @@ async fn web_surface_native_reconcile_loop(
                                     "native_id": native_id,
                                     "effective_url": effective_url,
                                     "socks_port": socks_port,
+                                    "profile": profile,
                                     "rect": [rect.0, rect.1, rect.2, rect.3],
                                 }),
                             );
@@ -1285,6 +1316,7 @@ async fn web_surface_native_reconcile_loop(
                                     visible: true,
                                     reload_nonce,
                                     socks_port,
+                                    profile,
                                 },
                             );
                         }
@@ -1336,8 +1368,47 @@ fn web_surface_url_is_loopback(url: &str) -> bool {
     let bare = bare.split(':').next().unwrap_or(bare);
     bare.eq_ignore_ascii_case("localhost") || bare.starts_with("127.") || bare == "::1"
 }
+/// True when an ssh target's host is loopback — i.e. the daemon's stand-in for
+/// a LOCAL session ("localhost"/127.0.0.1/::1), not a real remote. Mirrors the
+/// server's `is_loopback_ssh_target`. `target` may be a bare host or a
+/// `user@host` / `host:port` form; only the host is examined.
+fn ssh_target_host_is_loopback(target: &str) -> bool {
+    let host = target.rsplit_once('@').map(|(_, h)| h).unwrap_or(target);
+    let host = host.strip_prefix('[').unwrap_or(host);
+    let host = host.split(']').next().unwrap_or(host);
+    let host = host.split(':').next().unwrap_or(host);
+    host.eq_ignore_ascii_case("localhost") || host.starts_with("127.") || host == "::1"
+}
 fn web_surface_url_scheme_allowed(url: &str) -> bool {
     url.starts_with("http://") || url.starts_with("https://")
+}
+/// The host-owned web-profile jar name a surface loads under. Comes from the
+/// OSC payload (ychrome `--profile`); defaults to "default" and is sanitized
+/// to a single path-safe component (it is used verbatim as a directory name
+/// under `~/.yggterm/web-profiles/`), so a hostile PTY cannot escape the dir.
+fn normalize_web_surface_profile(profile: Option<&str>) -> String {
+    let name = profile.map(str::trim).unwrap_or("");
+    let safe = !name.is_empty()
+        && name != "."
+        && name != ".."
+        && !name.contains('/')
+        && !name.contains('\\')
+        && !name.contains(std::path::is_separator);
+    if safe {
+        name.to_string()
+    } else {
+        "default".to_string()
+    }
+}
+/// Absolute path of a host-owned web-profile jar on THIS (GUI) host. Mirrors
+/// ychrome's `profile_dir` (`~/.yggterm/web-profiles/<name>/`) so a profile
+/// means the same storage whether ychrome renders it standalone or the GUI
+/// renders it. (For a remote session the jar lives on the GUI host; syncing it
+/// to the invoking host is a documented follow-up.)
+fn web_surface_profile_dir(profile: &str) -> Option<std::path::PathBuf> {
+    yggterm_core::resolve_yggterm_home()
+        .ok()
+        .map(|home| home.join("web-profiles").join(profile))
 }
 /// Split an http(s) URL into (host, port, path-and-after) for forward
 /// construction. Returns None when the URL is not parseable enough.
@@ -1479,7 +1550,11 @@ fn resolve_web_surface_effective_url(
     url: &str,
     ssh_target: Option<&str>,
 ) -> (String, Option<std::process::Child>, Option<u16>) {
-    if let Some(target) = ssh_target {
+    // A LOCAL session is modeled by the daemon as an ssh target whose host is
+    // loopback ("localhost"/127.0.0.1/::1). Its surface must egress DIRECTLY —
+    // tunneling to localhost is pointless and leaks an ssh -D process. So treat
+    // a loopback ssh_target as no target at all.
+    if let Some(target) = ssh_target.filter(|t| !ssh_target_host_is_loopback(t)) {
         if let Some((socks_port, child)) = spawn_web_surface_socks(target) {
             return (url.to_string(), Some(child), Some(socks_port));
         }
@@ -3887,13 +3962,14 @@ impl ShellState {
         effective_url: String,
         forward_child: Option<std::process::Child>,
         socks_port: Option<u16>,
+        profile: String,
         now_ms: u64,
     ) {
         if let Some(existing) = self.web_surfaces.get_mut(session_path)
             && let Some(app_tab) = existing.tabs.first_mut()
         {
             existing.last_seen_ms = now_ms;
-            if app_tab.url == url {
+            if app_tab.url == url && app_tab.profile == profile {
                 if title.is_some() {
                     app_tab.title = title;
                 }
@@ -3903,11 +3979,13 @@ impl ShellState {
                     let _ = child.wait();
                 }
             } else {
-                // The app navigated: retarget the app tab, keep user tabs.
+                // The app navigated (or switched profile): retarget the app
+                // tab, keep user tabs.
                 app_tab.kill_forward();
                 app_tab.url = url.clone();
                 app_tab.effective_url = effective_url;
                 app_tab.socks_port = socks_port;
+                app_tab.profile = profile;
                 if title.is_some() {
                     app_tab.title = title;
                 }
@@ -3931,6 +4009,7 @@ impl ShellState {
             history: vec![url],
             history_index: 0,
             reload_nonce: 0,
+            profile,
         };
         if let Some(replaced) = self.web_surfaces.insert(
             session_path.to_string(),
@@ -3993,6 +4072,13 @@ impl ShellState {
     /// Open a fresh user tab (blank page, address bar in edit mode).
     fn web_surface_new_tab(&mut self, session_path: &str) {
         if let Some(surface) = self.web_surfaces.get_mut(session_path) {
+            // A user tab inherits the surface's (app-tab) profile so every tab
+            // of one ychrome invocation shares the same identity/storage.
+            let profile = surface
+                .tabs
+                .first()
+                .map(|tab| tab.profile.clone())
+                .unwrap_or_else(|| "default".to_string());
             let id = surface.next_tab_id;
             surface.next_tab_id += 1;
             surface.tabs.push(WebSurfaceTab {
@@ -4005,6 +4091,7 @@ impl ShellState {
                 history: Vec::new(),
                 history_index: 0,
                 reload_nonce: 0,
+                profile,
             });
             surface.active_tab = id;
             surface.address_draft = Some(String::new());
@@ -51946,6 +52033,7 @@ fn TerminalCanvas(
                                 session: claimed_session,
                                 url,
                                 title: surface_title,
+                                profile: surface_profile,
                             }) => {
                                 // libyggterm web surface (OSC 7717, ychrome
                                 // pilot). Identity truth is the STREAM the OSC
@@ -51989,7 +52077,9 @@ fn TerminalCanvas(
                                             // runs off the UI event loop.
                                             let resolve_url = url.clone();
                                             let resolve_target = web_surface_ssh_target.clone();
-                                            let remote = resolve_target.is_some();
+                                            let remote = resolve_target
+                                                .as_deref()
+                                                .is_some_and(|t| !ssh_target_host_is_loopback(t));
                                             let (effective_url, forward_child, socks_port) =
                                                 task::spawn_blocking(move || {
                                                     resolve_web_surface_effective_url(
@@ -51999,6 +52089,9 @@ fn TerminalCanvas(
                                                 })
                                                 .await
                                                 .unwrap_or_else(|_| (url.clone(), None, None));
+                                            let profile = normalize_web_surface_profile(
+                                                surface_profile.as_deref(),
+                                            );
                                             append_trace_event(
                                                 &trace_home,
                                                 "ui",
@@ -52012,6 +52105,7 @@ fn TerminalCanvas(
                                                     "forwarded": forward_child.is_some(),
                                                     "socks_port": socks_port,
                                                     "egress_gap": remote && socks_port.is_none(),
+                                                    "profile": profile,
                                                     "action": action,
                                                 }),
                                             );
@@ -52023,6 +52117,7 @@ fn TerminalCanvas(
                                                     effective_url,
                                                     forward_child,
                                                     socks_port,
+                                                    profile,
                                                     now_ms,
                                                 );
                                             });
@@ -61848,6 +61943,7 @@ fn terminal_eval_script_with_canvas_renderer(
                             session: payload.session,
                             url: typeof payload.url === 'string' ? payload.url : null,
                             title: typeof payload.title === 'string' ? payload.title : null,
+                            profile: typeof payload.profile === 'string' ? payload.profile : null,
                         }});
                     }} catch (_webSurfaceError) {{}}
                     return true;
@@ -77381,6 +77477,7 @@ mod tests {
             "http://localhost:8000/".to_string(),
             None,
             None,
+            "default".to_string(),
             1_000,
         );
         shell.web_surface_new_tab("local://ws");
@@ -77401,6 +77498,7 @@ mod tests {
             "http://localhost:8000/next".to_string(),
             None,
             None,
+            "default".to_string(),
             2_000,
         );
         let overlay = shell
