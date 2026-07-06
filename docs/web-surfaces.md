@@ -143,46 +143,34 @@ OSC (same class as OSC 777 fake notifications) — e.g. `cat`ing a crafted file
 opens a surface pointing at an attacker URL. The surface is visibly labeled
 with its URL and one keypress (Ctrl+C) removes it.
 
-## Known issue: reload paints white when 2+ tabs are open
+## Profile picker (no-arg `ychrome`)
 
-Clicking ⟳ (reload) on the active tab paints the page **white** if another tab
-also exists (i.e. a hidden sibling webview shares the `gtk::Overlay`).
-Single-tab reload is fine. Workaround: switch to another tab and back, or close
-the other tab, which repaints. Live-reproduced on Wayland/WebKitGTK (2.9.60).
+`ychrome` with no URL serves a **profile picker** instead of opening a blank
+page. In thin-client mode it binds a loopback HTTP server on the invoking host,
+emits the OSC `open` pointing at `http://127.0.0.1:<port>/`, and renders a
+Chrome-style picker (a card per profile under `~/.yggterm/web-profiles/` plus a
+URL/search field). Submitting the form hits ychrome's own `/open` route, which
+re-emits the OSC `open` with the chosen url+profile — the app tab retargets
+(same profile → navigate; different profile → the surface's `WebContext` is
+rebuilt, per host-owned profiles). This also fixes the old no-arg case: ychrome
+no longer emits `about:blank`, which `web_surface_url_scheme_allowed` rejects
+(only http/https pass). The picker itself is entirely ychrome-side; from
+yggterm's view it is just another loopback http surface. For a remote session
+the picker page resolves through the same SOCKS egress to the invoking host
+where ychrome (and its loopback server) run.
 
-Diagnosis (pinned by live probe): WebKitGTK composites the reloaded frame
-offscreen but never blits it while a **sibling surface webview shares the
-overlay**. The ONLY thing observed to re-blit the survivor is **destroying a
-webview** — closing the other tab (`overlay.remove` + drop of the sibling's
-`WebView`) repaints the active one (reproduced cleanly twice). WebKitGTK
-webviews appear to share a compositor; tearing one down forces the others to
-re-composite. GTK-level nudges do **not** work — all of these were live-tested
-and left the page white: `container.queue_resize()` (coalesced),
-`container.hide()`+`show_all()` unmap/remap (blind and `PageLoadEvent::Finished`
--gated), a direct `WebView::set_bounds` 1px size-allocate (wry's set_bounds is a
-direct `webview.size_allocate`, not the overlay cascade), and adding/removing a
-throwaway overlay child (no webview to destroy). The page-load handler DOES fire
-on the `build_gtk` path (`with_on_page_load_handler` via `new_gtk`→
-`create_webview`), so load-gating is available for the eventual fix.
+## Resolved in 2.9.61
 
-The one approach that repaints is **reload = destroy + recreate the tab's
-webview** (a fresh webview paints reliably). Not yet landed because it (a) loses
-cookies/scroll unless the `WebContext` is preserved across the rebuild inside
-`WebSurfaceHost`, and (b) collides with the local-session SOCKS bug below (a
-recreated local surface re-applies a bad `socks_port` and loads wrong content).
-Fix that first, then recreate-on-reload is clean.
-
-## Known issue: local sessions spawn pointless SOCKS tunnels
-
-A `local://` session's web surface can get a non-null `socks_port` and spawn
-`ssh -N -D 127.0.0.1:<port> localhost`, leaking an ssh process and routing the
-surface through a dead/wrong proxy. Local surfaces should egress directly
-(`socks_port = None`). Suspected cause: the GUI session's `ssh_target` is
-`Some("localhost")` (or the local machine's own ssh alias) instead of `None`,
-so `resolve_web_surface_effective_url` treats it as remote and calls
-`spawn_web_surface_socks`. Dormant before the native renderer (iframes never
-proxied); surfaced by the 2.9.60 SOCKS work. Needs a proper investigation of
-the session→machine→`ssh_target` mapping.
+- **Reload paints white with 2+ tabs** — FIXED. WebKitGTK composited a reloaded
+  frame offscreen but never re-blit it while a sibling surface webview shared the
+  `gtk::Overlay`; GTK-level nudges (`queue_resize`, hide/show remap, 1px
+  `set_bounds`, throwaway overlay child) all left it white. Only **destroying a
+  webview** forces the survivors to re-composite, so reload now = **destroy +
+  recreate the tab's webview**. Made lossless by preserving the per-profile
+  `WebContext` across the rebuild (persistent jar under `~/.yggterm/web-profiles/`).
+- **Local sessions spawned pointless SOCKS tunnels** — FIXED. A `local://`
+  session no longer gets a non-null `socks_port`; its surface egresses directly
+  (`ssh_target = localhost` no longer routes through `ssh -N -D`).
 
 ## Screenshot caveat for agents
 
