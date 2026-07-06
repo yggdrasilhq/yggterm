@@ -143,6 +143,29 @@ OSC (same class as OSC 777 fake notifications) — e.g. `cat`ing a crafted file
 opens a surface pointing at an attacker URL. The surface is visibly labeled
 with its URL and one keypress (Ctrl+C) removes it.
 
+## Known issue: reload paints white when 2+ tabs are open
+
+Clicking ⟳ (reload) on the active tab paints the page **white** if another tab
+also exists (i.e. a hidden sibling webview shares the `gtk::Overlay`).
+Single-tab reload is fine. Workaround: switch to another tab and back, which
+repaints. Live-reproduced on Wayland/WebKitGTK (2.9.60).
+
+Diagnosis (for the eventual fix): the reload navigates and the new content
+composites offscreen, but WebKitGTK never blits it to the window until the
+surviving webview receives a real **size-allocate**. `overlay.remove` of a
+sibling (what tab-close does) triggers that allocate over the survivors, which
+is why closing the other tab or switching tabs recovers. Attempts that did
+**not** force the blit: `container.queue_resize()` (unchanged geometry is
+coalesced), and `container.hide()`+`show_all()` unmap/remap (both a blind
+early nudge and one gated on `PageLoadEvent::Finished`). The mechanism that is
+known to work is a genuine geometry change on the **webview widget itself**
+(`WebView::set_bounds` jiggle), which must happen *after* load completes — but
+the webview handle is not reachable from the build-time page-load handler, so
+a proper fix needs reconciler-side re-blit plumbing (load handler flips a
+per-surface `reblit_pending` flag; the reconciler, which reaches the webview
+via `WebSurfaceHost`, applies a 1px `set_bounds` jiggle across two ticks and
+clears the flag). Not yet built — deferred as a rare-path polish item.
+
 ## Screenshot caveat for agents
 
 Native surfaces are invisible to `server app screenshot`'s default in-process
