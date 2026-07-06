@@ -143,6 +143,9 @@ pub(crate) enum TerminalJsEvent {
         session: String,
         url: Option<String>,
         title: Option<String>,
+        /// Host-owned profile name (ychrome `--profile`, default "default").
+        /// Selects the surface's persistent storage jar.
+        profile: Option<String>,
     },
     Ignored {
         reason: String,
@@ -236,6 +239,8 @@ enum TerminalJsEventWire {
         url: Option<String>,
         #[serde(default)]
         title: Option<String>,
+        #[serde(default)]
+        profile: Option<String>,
     },
 }
 
@@ -323,11 +328,13 @@ impl From<TerminalJsEventWire> for TerminalJsEvent {
                 session,
                 url,
                 title,
+                profile,
             } => TerminalJsEvent::WebSurface {
                 action,
                 session,
                 url,
                 title,
+                profile,
             },
         }
     }
@@ -500,15 +507,19 @@ mod tests {
             "session": "local/abc123",
             "url": "http://localhost:8000/",
             "title": "dev server",
+            "profile": "work",
         }))
         .expect("web-surface open payload should deserialize");
         assert!(matches!(
             event,
-            TerminalJsEvent::WebSurface { action, session, url: Some(url), title: Some(title) }
+            TerminalJsEvent::WebSurface {
+                action, session, url: Some(url), title: Some(title), profile: Some(profile)
+            }
                 if action == "open"
                     && session == "local/abc123"
                     && url == "http://localhost:8000/"
                     && title == "dev server"
+                    && profile == "work"
         ));
 
         let close: TerminalJsEvent = serde_json::from_value(json!({
