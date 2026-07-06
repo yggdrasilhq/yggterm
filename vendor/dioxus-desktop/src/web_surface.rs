@@ -62,12 +62,16 @@ impl WebSurfaceHost {
     /// Open (or replace) surface `id` at the given page-relative bounds, loading
     /// `url`. If `socks_port` is set the surface egresses through
     /// `socks5://127.0.0.1:<port>` (the invoking host's tunnel) — the egress
-    /// rule. Bounds are logical pixels relative to the window's top-left.
+    /// rule. `profile_dir` is the surface's persistent storage jar (cookies/
+    /// localStorage); `None` = ephemeral. Bounds are logical pixels relative to
+    /// the window's top-left.
+    #[allow(clippy::too_many_arguments)]
     pub fn open(
         &self,
         id: u64,
         url: &str,
         socks_port: Option<u16>,
+        profile_dir: Option<&std::path::Path>,
         x: i32,
         y: i32,
         w: i32,
@@ -85,7 +89,11 @@ impl WebSurfaceHost {
         self.overlay.add_overlay(&container);
         container.show();
 
-        let mut ctx = WebContext::new(None);
+        // Persistent per-profile storage when a jar is given; ephemeral
+        // otherwise. Recreating a surface with the SAME profile_dir reuses the
+        // on-disk cookies/localStorage, so destroy+recreate (reload, proxy or
+        // profile change) is lossless.
+        let mut ctx = WebContext::new(profile_dir.map(|p| p.to_path_buf()));
         let mut builder = WebViewBuilder::new_with_web_context(&mut ctx)
             .with_bounds(rect_logical(w, h))
             .with_url(url);
