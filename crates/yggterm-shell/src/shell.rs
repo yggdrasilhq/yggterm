@@ -1095,9 +1095,13 @@ async fn web_surface_native_reconcile_loop(
     loop {
         // Desired: (session, active_tab,
         //           [(tab, effective_url, reload_nonce, socks_port, profile)]).
-        let desired: Vec<(String, u64, Vec<(u64, String, u64, Option<u16>, String)>)> = {
+        let (desired, active_visible_sessions): (
+            Vec<(String, u64, Vec<(u64, String, u64, Option<u16>, String)>)>,
+            std::collections::HashSet<String>,
+        ) = {
             let shell = state.peek();
-            shell
+            let shell_ref: &ShellState = &shell;
+            let desired = shell_ref
                 .web_surfaces
                 .iter()
                 .map(|(session_path, surface)| {
@@ -1119,7 +1123,23 @@ async fn web_surface_native_reconcile_loop(
                             .collect(),
                     )
                 })
-                .collect()
+                .collect();
+            // Which surface sessions are active-visible RIGHT NOW, straight from
+            // ShellState (Terminal view + active session + not backgrounded) — no
+            // DOM eval. This is the visibility authority the starvable rect-eval
+            // below cannot be trusted for: while another session floods output
+            // the eval blinds out for seconds, and a backgrounded surface would
+            // otherwise linger composited over the newly-revealed session (the
+            // "ychrome->terminal switch broken for ~6-7s" class).
+            let active_visible_sessions = shell_ref
+                .web_surfaces
+                .keys()
+                .filter(|session_path| {
+                    terminal_active_visible_for_session(shell_ref, session_path.as_str())
+                })
+                .cloned()
+                .collect();
+            (desired, active_visible_sessions)
         };
         // Destroy first: closed/swept surfaces and closed tabs must release
         // their webview (and WebContext) even when the DOM oracle is gone.
@@ -1198,8 +1218,33 @@ async fn web_surface_native_reconcile_loop(
                 })
                 .unwrap_or_default(),
             _ => {
-                // Webview not ready / eval hiccup: keep current applied state
-                // (do NOT hide or destroy off a blind tick) and retry.
+                // Eval blind (webview busy under another session's output flood,
+                // or not yet ready): do NOT blanket-keep every surface visible —
+                // that is exactly how a backgrounded surface lingered composited
+                // over the newly-revealed session for ~6-7s (the eval starves
+                // precisely while the other session floods output). Hiding a
+                // surface whose session is no longer active-visible needs no rect,
+                // so do it from ShellState now; the active surface's applied state
+                // is left untouched (never hidden off a blind tick). Positioning
+                // and create still wait for a real rect on a sighted tick.
+                for (key, entry) in applied.iter_mut() {
+                    if entry.visible && !active_visible_sessions.contains(key.0.as_str()) {
+                        desktop.set_web_surface_visible(entry.native_id, false);
+                        entry.visible = false;
+                        append_trace_event(
+                            &trace_home,
+                            "ui",
+                            "web_surface",
+                            "native_hide_backgrounded",
+                            json!({
+                                "session_path": key.0,
+                                "tab_id": key.1,
+                                "native_id": entry.native_id,
+                                "reason": "blind_tick_state_hide",
+                            }),
+                        );
+                    }
+                }
                 sleep(Duration::from_millis(WEB_SURFACE_RECONCILE_TICK_MS)).await;
                 continue;
             }
@@ -1208,7 +1253,13 @@ async fn web_surface_native_reconcile_loop(
             let rect = rects.get(&session_path).copied();
             for (tab_id, effective_url, reload_nonce, socks_port, profile) in tabs {
                 let key = (session_path.clone(), tab_id);
-                let want_visible = rect.is_some() && tab_id == active_tab;
+                // Visibility is gated on ShellState's active-visible authority in
+                // addition to the (starvable) DOM rect: a stale rect returned for
+                // a session that is no longer active-visible must not keep its
+                // backgrounded surface shown. Positioning still uses the rect.
+                let want_visible = rect.is_some()
+                    && tab_id == active_tab
+                    && active_visible_sessions.contains(session_path.as_str());
                 // Destroy-and-recreate cases (close + remove here; the
                 // lazy-create branch rebuilds a fresh webview the same tick):
                 //   - proxy or profile change: both are fixed per WebContext,
