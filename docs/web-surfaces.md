@@ -147,24 +147,42 @@ with its URL and one keypress (Ctrl+C) removes it.
 
 Clicking ⟳ (reload) on the active tab paints the page **white** if another tab
 also exists (i.e. a hidden sibling webview shares the `gtk::Overlay`).
-Single-tab reload is fine. Workaround: switch to another tab and back, which
-repaints. Live-reproduced on Wayland/WebKitGTK (2.9.60).
+Single-tab reload is fine. Workaround: switch to another tab and back, or close
+the other tab, which repaints. Live-reproduced on Wayland/WebKitGTK (2.9.60).
 
-Diagnosis (for the eventual fix): the reload navigates and the new content
-composites offscreen, but WebKitGTK never blits it to the window until the
-surviving webview receives a real **size-allocate**. `overlay.remove` of a
-sibling (what tab-close does) triggers that allocate over the survivors, which
-is why closing the other tab or switching tabs recovers. Attempts that did
-**not** force the blit: `container.queue_resize()` (unchanged geometry is
-coalesced), and `container.hide()`+`show_all()` unmap/remap (both a blind
-early nudge and one gated on `PageLoadEvent::Finished`). The mechanism that is
-known to work is a genuine geometry change on the **webview widget itself**
-(`WebView::set_bounds` jiggle), which must happen *after* load completes — but
-the webview handle is not reachable from the build-time page-load handler, so
-a proper fix needs reconciler-side re-blit plumbing (load handler flips a
-per-surface `reblit_pending` flag; the reconciler, which reaches the webview
-via `WebSurfaceHost`, applies a 1px `set_bounds` jiggle across two ticks and
-clears the flag). Not yet built — deferred as a rare-path polish item.
+Diagnosis (pinned by live probe): WebKitGTK composites the reloaded frame
+offscreen but never blits it while a **sibling surface webview shares the
+overlay**. The ONLY thing observed to re-blit the survivor is **destroying a
+webview** — closing the other tab (`overlay.remove` + drop of the sibling's
+`WebView`) repaints the active one (reproduced cleanly twice). WebKitGTK
+webviews appear to share a compositor; tearing one down forces the others to
+re-composite. GTK-level nudges do **not** work — all of these were live-tested
+and left the page white: `container.queue_resize()` (coalesced),
+`container.hide()`+`show_all()` unmap/remap (blind and `PageLoadEvent::Finished`
+-gated), a direct `WebView::set_bounds` 1px size-allocate (wry's set_bounds is a
+direct `webview.size_allocate`, not the overlay cascade), and adding/removing a
+throwaway overlay child (no webview to destroy). The page-load handler DOES fire
+on the `build_gtk` path (`with_on_page_load_handler` via `new_gtk`→
+`create_webview`), so load-gating is available for the eventual fix.
+
+The one approach that repaints is **reload = destroy + recreate the tab's
+webview** (a fresh webview paints reliably). Not yet landed because it (a) loses
+cookies/scroll unless the `WebContext` is preserved across the rebuild inside
+`WebSurfaceHost`, and (b) collides with the local-session SOCKS bug below (a
+recreated local surface re-applies a bad `socks_port` and loads wrong content).
+Fix that first, then recreate-on-reload is clean.
+
+## Known issue: local sessions spawn pointless SOCKS tunnels
+
+A `local://` session's web surface can get a non-null `socks_port` and spawn
+`ssh -N -D 127.0.0.1:<port> localhost`, leaking an ssh process and routing the
+surface through a dead/wrong proxy. Local surfaces should egress directly
+(`socks_port = None`). Suspected cause: the GUI session's `ssh_target` is
+`Some("localhost")` (or the local machine's own ssh alias) instead of `None`,
+so `resolve_web_surface_effective_url` treats it as remote and calls
+`spawn_web_surface_socks`. Dormant before the native renderer (iframes never
+proxied); surfaced by the 2.9.60 SOCKS work. Needs a proper investigation of
+the session→machine→`ssh_target` mapping.
 
 ## Screenshot caveat for agents
 
