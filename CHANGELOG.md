@@ -2,6 +2,24 @@
 
 This file tracks user-visible changes in `yggterm`.
 
+## 2.9.61
+
+- **Web surfaces now remember you: persistent per-profile storage.** A surface's cookies, logins,
+  and localStorage were previously ephemeral (thrown away when the surface closed). Each surface
+  now loads under a named host-owned profile jar at `~/.yggterm/web-profiles/<profile>/`, so logins
+  and sessions persist across opens, and two profiles on the same site stay isolated. ychrome
+  passes the profile with `--profile <name>` (default `default`); every tab of one invocation
+  shares it.
+- **Web surface reload no longer paints white when other tabs are open.** Reloading a tab while
+  another (hidden) tab existed left the page blank — WebKitGTK never blits a reloaded frame while a
+  sibling webview shares the overlay, and no GTK-level nudge forces it (only destroying a webview
+  does). Reload now rebuilds the tab's webview against the same on-disk profile jar: it repaints
+  reliably AND keeps your cookies/session (the jar is on disk, not in the webview).
+- **Local web surfaces no longer open pointless SSH tunnels.** A local session is modeled
+  internally as a loopback ssh target, which made its web surfaces spawn an `ssh -D localhost`
+  SOCKS tunnel — a leaked ssh process and a needless network hop. Loopback targets now egress
+  directly, as they should; only real remote sessions tunnel.
+
 ## 2.9.60
 
 - **Remote web surfaces now egress on the session's machine for ALL URLs.** Each tab of a

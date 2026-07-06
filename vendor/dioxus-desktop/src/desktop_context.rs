@@ -139,11 +139,13 @@ impl DesktopService {
     /// `url`, optionally egressing through `socks5://127.0.0.1:<port>` (the
     /// invoking host's tunnel). Bounds are logical pixels from the window's
     /// top-left. Errors on backends without the GTK/WebKit overlay path.
+    #[allow(clippy::too_many_arguments)]
     pub fn open_web_surface(
         &self,
         id: u64,
         url: &str,
         socks_port: Option<u16>,
+        profile_dir: Option<&std::path::Path>,
         x: i32,
         y: i32,
         w: i32,
@@ -157,7 +159,7 @@ impl DesktopService {
         )))]
         {
             return match self.web_surface_host.borrow().as_ref() {
-                Some(host) => host.open(id, url, socks_port, x, y, w, h),
+                Some(host) => host.open(id, url, socks_port, profile_dir, x, y, w, h),
                 None => Err("web surface host not installed".to_string()),
             };
         }
@@ -168,7 +170,7 @@ impl DesktopService {
             target_os = "android"
         ))]
         {
-            let _ = (id, url, socks_port, x, y, w, h);
+            let _ = (id, url, socks_port, profile_dir, x, y, w, h);
             Err("web surfaces require the GTK/WebKit backend".to_string())
         }
     }
