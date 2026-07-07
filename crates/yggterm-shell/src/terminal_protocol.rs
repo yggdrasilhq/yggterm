@@ -72,6 +72,15 @@ pub(crate) enum TerminalJsEvent {
         render_health_reason: String,
         render_health_recovery_count: u32,
         render_health_recovery_pending: bool,
+        /// Count of non-blank rows in the client's VISIBLE xterm buffer. A very
+        /// low value while the daemon holds a full screen = an incomplete reveal
+        /// (blank-frame-on-working-reveal): safe to force a corrective repaint
+        /// because there is nothing good to tear.
+        visible_nonblank_rows: u16,
+        /// JSON describing a client-detected render FAIL PATTERN (e.g. a redraw
+        /// burst with no session change), empty when none. Logged as a
+        /// `render_fail_pattern` trace event for later inspection.
+        render_anomaly: String,
     },
     Paint {
         child_count: usize,
@@ -174,6 +183,10 @@ enum TerminalJsEventWire {
         render_health_recovery_count: u32,
         #[serde(default)]
         render_health_recovery_pending: bool,
+        #[serde(default)]
+        visible_nonblank_rows: u16,
+        #[serde(default)]
+        render_anomaly: String,
     },
     Paint {
         child_count: usize,
@@ -260,6 +273,8 @@ impl From<TerminalJsEventWire> for TerminalJsEvent {
                 render_health_reason,
                 render_health_recovery_count,
                 render_health_recovery_pending,
+                visible_nonblank_rows,
+                render_anomaly,
             } => TerminalJsEvent::HostHealth {
                 cursor_line_text,
                 text_tail,
@@ -272,6 +287,8 @@ impl From<TerminalJsEventWire> for TerminalJsEvent {
                 render_health_reason,
                 render_health_recovery_count,
                 render_health_recovery_pending,
+                visible_nonblank_rows,
+                render_anomaly,
             },
             TerminalJsEventWire::Paint {
                 child_count,
