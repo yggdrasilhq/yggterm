@@ -1075,6 +1075,34 @@ struct AppliedWebSurface {
     /// fixed per WebContext — a change means destroy + recreate.
     profile: String,
 }
+/// Published mirror of the reconciler's applied surfaces: (session_path,
+/// tab_id) → native surface id. The reconcile loop is the ONLY writer (it
+/// republishes at every tick exit); app-control handlers (web eval /
+/// screenshot / devtools) read it to target a live webview. A missing entry
+/// means no live surface — e.g. the session is backgrounded (surfaces are
+/// destroy-on-background by design).
+static WEB_SURFACE_NATIVE_IDS: std::sync::OnceLock<
+    std::sync::Mutex<HashMap<(String, u64), u64>>,
+> = std::sync::OnceLock::new();
+fn publish_web_surface_native_ids(applied: &HashMap<(String, u64), AppliedWebSurface>) {
+    let registry = WEB_SURFACE_NATIVE_IDS.get_or_init(Default::default);
+    if let Ok(mut map) = registry.lock() {
+        map.clear();
+        map.extend(
+            applied
+                .iter()
+                .map(|(key, entry)| (key.clone(), entry.native_id)),
+        );
+    }
+}
+fn web_surface_native_id_for(session_path: &str, tab_id: u64) -> Option<u64> {
+    WEB_SURFACE_NATIVE_IDS
+        .get()?
+        .lock()
+        .ok()?
+        .get(&(session_path.to_string(), tab_id))
+        .copied()
+}
 /// The ONE writer of native surface webviews: a declarative reconciler that
 /// diffs desired state (`ShellState::web_surfaces`) + the DOM geometry oracle
 /// (`[data-ws-page]` placeholder rects) against what was last applied, and
@@ -1206,6 +1234,7 @@ async fn web_surface_native_reconcile_loop(
             }
         }
         if desired.is_empty() && applied.is_empty() {
+            publish_web_surface_native_ids(&applied);
             sleep(Duration::from_millis(WEB_SURFACE_RECONCILE_IDLE_MS)).await;
             continue;
         }
@@ -1258,6 +1287,7 @@ async fn web_surface_native_reconcile_loop(
                 // session. The only thing a rect would tell us now is positioning
                 // and lazy-create for the ACTIVE surface — both safe to defer — so
                 // keep the active surface's applied state and retry next tick.
+                publish_web_surface_native_ids(&applied);
                 sleep(Duration::from_millis(WEB_SURFACE_RECONCILE_TICK_MS)).await;
                 continue;
             }
@@ -1343,7 +1373,8 @@ async fn web_surface_native_reconcile_loop(
                     let native_id = next_native_id;
                     next_native_id += 1;
                     // The persistent per-profile storage jar on THIS (GUI)
-                    // host. None => ephemeral (only if home can't resolve).
+                    // host. None => engine-native ephemeral context (the
+                    // reserved "temp" profile; also home-resolve failure).
                     let profile_dir = web_surface_profile_dir(&profile);
                     match desktop.open_web_surface(
                         native_id,
@@ -1406,6 +1437,7 @@ async fn web_surface_native_reconcile_loop(
                 }
             }
         }
+        publish_web_surface_native_ids(&applied);
         sleep(Duration::from_millis(WEB_SURFACE_RECONCILE_TICK_MS)).await;
     }
 }
@@ -1464,12 +1496,22 @@ fn normalize_web_surface_profile(profile: Option<&str>) -> String {
         "default".to_string()
     }
 }
+/// Reserved profile name for an ephemeral (private-browsing) surface: no jar
+/// on disk, all website data in memory, gone when the surface closes. Owned
+/// here and mirrored by ychrome's picker/standalone handling — a
+/// `web-profiles/temp/` directory on disk is ignored by design.
+const WEB_SURFACE_TEMP_PROFILE: &str = "temp";
 /// Absolute path of a host-owned web-profile jar on THIS (GUI) host. Mirrors
 /// ychrome's `profile_dir` (`~/.yggterm/web-profiles/<name>/`) so a profile
 /// means the same storage whether ychrome renders it standalone or the GUI
 /// renders it. (For a remote session the jar lives on the GUI host; syncing it
-/// to the invoking host is a documented follow-up.)
+/// to the invoking host is a documented follow-up.) `None` = ephemeral
+/// context: the reserved "temp" profile maps here, so nothing it browses
+/// touches disk.
 fn web_surface_profile_dir(profile: &str) -> Option<std::path::PathBuf> {
+    if profile == WEB_SURFACE_TEMP_PROFILE {
+        return None;
+    }
     yggterm_core::resolve_yggterm_home()
         .ok()
         .map(|home| home.join("web-profiles").join(profile))
@@ -34670,6 +34712,164 @@ async fn scroll_terminal_viewport_for(session_path: &str, to: &str) -> Value {
     receive_probe_eval_value(&script, session_path).await
 }
 
+/// Resolve the live native webview behind a session's ACTIVE web-surface tab.
+/// `session_path` None = the active session. Errors name the actual gap: no
+/// surface for the session vs no live webview (surfaces are
+/// destroy-on-background, so only the foreground session's surface is live).
+fn resolve_live_web_surface(
+    state: &Signal<ShellState>,
+    session_path: Option<&str>,
+) -> Result<(String, u64), String> {
+    let shell = state.peek();
+    let session = match session_path {
+        Some(path) => path.to_string(),
+        None => shell
+            .server
+            .active_session_path()
+            .map(str::to_string)
+            .ok_or("no active session")?,
+    };
+    let surface = shell
+        .web_surfaces
+        .get(&session)
+        .ok_or_else(|| format!("session has no web surface: {session}"))?;
+    let tab_id = surface.active_tab;
+    let native_id = web_surface_native_id_for(&session, tab_id)
+        .ok_or("web surface not live (session backgrounded or not yet revealed)")?;
+    Ok((session, native_id))
+}
+
+/// App-control: evaluate JS in a session's active web-surface tab and return
+/// the completion value as JSON (or the JS exception as the failure reason).
+async fn web_surface_eval_for(
+    state: &Signal<ShellState>,
+    desktop: &dioxus::desktop::DesktopContext,
+    session_path: Option<&str>,
+    script: &str,
+) -> Value {
+    let (session, native_id) = match resolve_live_web_surface(state, session_path) {
+        Ok(resolved) => resolved,
+        Err(reason) => return json!({ "accepted": false, "reason": reason }),
+    };
+    let (tx, rx) = tokio::sync::oneshot::channel::<Result<String, String>>();
+    if let Err(reason) = desktop.eval_web_surface(native_id, script, move |outcome| {
+        let _ = tx.send(outcome);
+    }) {
+        return json!({ "accepted": false, "session_path": session, "reason": reason });
+    }
+    match tokio::time::timeout(Duration::from_secs(10), rx).await {
+        Ok(Ok(Ok(value_json))) => {
+            let value: Value = serde_json::from_str(&value_json)
+                .unwrap_or_else(|_| Value::String(value_json.clone()));
+            json!({
+                "accepted": true,
+                "session_path": session,
+                "native_id": native_id,
+                "value": value,
+            })
+        }
+        Ok(Ok(Err(js_error))) => json!({
+            "accepted": false,
+            "session_path": session,
+            "reason": format!("js: {js_error}"),
+        }),
+        Ok(Err(_)) => json!({
+            "accepted": false,
+            "session_path": session,
+            "reason": "eval callback dropped (surface destroyed mid-eval?)",
+        }),
+        Err(_) => json!({
+            "accepted": false,
+            "session_path": session,
+            "reason": "eval timed out (10s)",
+        }),
+    }
+}
+
+/// App-control: full-document PNG capture of a session's active web-surface
+/// tab via the engine's snapshot API (captures the WHOLE page, not just the
+/// visible viewport — and works where the DOM/composite capture paths are
+/// blind to native surface webviews).
+async fn web_surface_screenshot_for(
+    state: &Signal<ShellState>,
+    desktop: &dioxus::desktop::DesktopContext,
+    session_path: Option<&str>,
+    output_path: &str,
+) -> Value {
+    let (session, native_id) = match resolve_live_web_surface(state, session_path) {
+        Ok(resolved) => resolved,
+        Err(reason) => return json!({ "accepted": false, "reason": reason }),
+    };
+    let path = std::path::PathBuf::from(output_path);
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+        && let Err(error) = std::fs::create_dir_all(parent)
+    {
+        return json!({
+            "accepted": false,
+            "reason": format!("create {}: {error}", parent.display()),
+        });
+    }
+    let (tx, rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
+    if let Err(reason) = desktop.snapshot_web_surface_full_page(native_id, path.clone(), move |outcome| {
+        let _ = tx.send(outcome);
+    }) {
+        return json!({ "accepted": false, "session_path": session, "reason": reason });
+    }
+    match tokio::time::timeout(Duration::from_secs(20), rx).await {
+        Ok(Ok(Ok(()))) => json!({
+            "accepted": true,
+            "session_path": session,
+            "native_id": native_id,
+            "output_path": path.display().to_string(),
+            "capture_backend": "webkit_full_document_snapshot",
+            "capture_faithful": true,
+        }),
+        Ok(Ok(Err(error))) => json!({
+            "accepted": false,
+            "session_path": session,
+            "reason": error,
+        }),
+        Ok(Err(_)) => json!({
+            "accepted": false,
+            "session_path": session,
+            "reason": "snapshot callback dropped (surface destroyed mid-capture?)",
+        }),
+        Err(_) => json!({
+            "accepted": false,
+            "session_path": session,
+            "reason": "snapshot timed out (20s)",
+        }),
+    }
+}
+
+/// App-control: open/close the WebKit inspector on a session's active
+/// web-surface tab.
+fn web_surface_devtools_for(
+    state: &Signal<ShellState>,
+    desktop: &dioxus::desktop::DesktopContext,
+    session_path: Option<&str>,
+    open: bool,
+) -> Value {
+    let (session, native_id) = match resolve_live_web_surface(state, session_path) {
+        Ok(resolved) => resolved,
+        Err(reason) => return json!({ "accepted": false, "reason": reason }),
+    };
+    match desktop.set_web_surface_devtools(native_id, open) {
+        Ok(is_open) => json!({
+            "accepted": true,
+            "session_path": session,
+            "native_id": native_id,
+            "devtools_open": is_open,
+        }),
+        Err(reason) => json!({
+            "accepted": false,
+            "session_path": session,
+            "reason": reason,
+        }),
+    }
+}
+
 /// Read the xterm.js buffer text via the buffer API (focus-independent).
 /// `mode` = "full" (whole buffer incl scrollback) or anything else = "screen"
 /// (visible rows). Returns the rendered text + line/nonblank counts + base_y so
@@ -38274,6 +38474,73 @@ async fn process_pending_app_control_requests(
         }
         AppControlCommand::ScrollTerminalViewport { session_path, to } => {
             let result = scroll_terminal_viewport_for(&session_path, &to).await;
+            AppControlResponse {
+                request_id: request.request_id.clone(),
+                handled_by_pid: std::process::id(),
+                completed_at_ms: current_millis() as u128,
+                output_path: None,
+                error: result
+                    .get("accepted")
+                    .and_then(Value::as_bool)
+                    .filter(|accepted| !accepted)
+                    .and_then(|_| result.get("reason"))
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned),
+                data: Some(result),
+            }
+        }
+        AppControlCommand::WebSurfaceEval {
+            session_path,
+            script,
+        } => {
+            let result =
+                web_surface_eval_for(&state, &desktop, session_path.as_deref(), &script).await;
+            AppControlResponse {
+                request_id: request.request_id.clone(),
+                handled_by_pid: std::process::id(),
+                completed_at_ms: current_millis() as u128,
+                output_path: None,
+                error: result
+                    .get("accepted")
+                    .and_then(Value::as_bool)
+                    .filter(|accepted| !accepted)
+                    .and_then(|_| result.get("reason"))
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned),
+                data: Some(result),
+            }
+        }
+        AppControlCommand::WebSurfaceScreenshot {
+            session_path,
+            output_path,
+        } => {
+            let result = web_surface_screenshot_for(
+                &state,
+                &desktop,
+                session_path.as_deref(),
+                &output_path,
+            )
+            .await;
+            AppControlResponse {
+                request_id: request.request_id.clone(),
+                handled_by_pid: std::process::id(),
+                completed_at_ms: current_millis() as u128,
+                output_path: result
+                    .get("output_path")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned),
+                error: result
+                    .get("accepted")
+                    .and_then(Value::as_bool)
+                    .filter(|accepted| !accepted)
+                    .and_then(|_| result.get("reason"))
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned),
+                data: Some(result),
+            }
+        }
+        AppControlCommand::WebSurfaceDevtools { session_path, open } => {
+            let result = web_surface_devtools_for(&state, &desktop, session_path.as_deref(), open);
             AppControlResponse {
                 request_id: request.request_id.clone(),
                 handled_by_pid: std::process::id(),
