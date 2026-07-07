@@ -51572,6 +51572,12 @@ fn TerminalCanvas(
             let mut last_host_health_text_tail = String::new();
             let mut last_host_health_rows = 0_u16;
             let mut last_host_health_blank_rows_below_cursor = 0_u16;
+            // Non-blank visible rows the client last reported. Low value + a full
+            // daemon screen = an incomplete reveal (blank-frame): the reveal
+            // reconcile below may force its corrective repaint even mid-work
+            // because there is nothing good to tear. u16::MAX until first sample
+            // so a not-yet-reported host never looks "incomplete".
+            let mut last_host_health_visible_nonblank_rows = u16::MAX;
             let mut last_host_health_render_problem = String::new();
             // Per-session throttle for the cosmetic sidebar live-preview write.
             // The sidebar sample insert (terminal_attach_host_health_sample) is
@@ -51675,7 +51681,22 @@ fn TerminalCanvas(
                     && current_millis() >= screen_reconcile_due_at_ms
                 {
                     let reconcile_now_ms = current_millis();
+                    // Blank-frame-on-working-reveal: the reveal reconcile IS the
+                    // broken-bottom fix (it paints the daemon's authoritative
+                    // screen), but the quiet gate below defers it forever while a
+                    // session keeps outputting, so a WORKING session's incomplete
+                    // reveal never corrects (the blank-with-just-a-status-line
+                    // frame). When the client reports its VISIBLE buffer is nearly
+                    // empty (few non-blank rows) it is a confirmed-incomplete reveal
+                    // with nothing good to tear — bypass the quiet defer and (in the
+                    // decision below) force the corrective Write even over a working
+                    // surface. Gated to the reveal reconcile only; false positives
+                    // are harmless (client near-empty => daemon near-empty => the
+                    // write is the same content).
+                    let reveal_incomplete = screen_reconcile_reason == "reveal_screen_reconcile"
+                        && last_host_health_visible_nonblank_rows < 3;
                     if !screen_reconcile_output_quiet(reconcile_now_ms, last_forwarded_output_at_ms)
+                        && !reveal_incomplete
                     {
                         // Mid-turn output is still flowing — defer (keep the
                         // reason) without even fetching the daemon frame. The
@@ -51719,8 +51740,30 @@ fn TerminalCanvas(
                         let screen_text = sanitize_terminal_replay_payload(&screen_text);
                         // Recovery-churn guard (incident-gap-fix-cascade): never
                         // repaint over a WORKING surface — the agent's own next
-                        // frame repaints it, and a mid-turn overwrite tears.
-                        match screen_reconcile_decision(&screen_text) {
+                        // frame repaints it, and a mid-turn overwrite tears. EXCEPT
+                        // when the reveal is confirmed incomplete (client near-blank):
+                        // there is no live frame to tear, so promote DeferWorking to
+                        // Write and fill the blank from the daemon's authoritative
+                        // screen. An unwritable (empty/launch-seed) daemon frame still
+                        // Skips — nothing to paint.
+                        let decision = match screen_reconcile_decision(&screen_text) {
+                            ScreenReconcileDecision::DeferWorking if reveal_incomplete => {
+                                append_trace_event(
+                                    &trace_home,
+                                    "ui",
+                                    "terminal_mount",
+                                    "reveal_forced_incomplete",
+                                    json!({
+                                        "session_path": session_path.clone(),
+                                        "visible_nonblank_rows": last_host_health_visible_nonblank_rows,
+                                        "bytes": screen_text.len(),
+                                    }),
+                                );
+                                ScreenReconcileDecision::Write
+                            }
+                            other => other,
+                        };
+                        match decision {
                         ScreenReconcileDecision::Write => {
                             screen_reconcile_unwritable_retries = 0;
                             let _ = eval.send(TerminalJsCommand::Write {
@@ -52533,7 +52576,36 @@ fn TerminalCanvas(
                                 render_health_reason,
                                 render_health_recovery_count,
                                 render_health_recovery_pending,
+                                visible_nonblank_rows,
+                                render_anomaly,
                             }) => {
+                                last_host_health_visible_nonblank_rows = visible_nonblank_rows;
+                                // Client-detected render fail pattern (e.g. a redraw
+                                // burst with no session change) — record it for later
+                                // inspection so the user need not report every minor
+                                // rendering nuance. Local trace only.
+                                if !render_anomaly.is_empty() {
+                                    let anomaly_value: Value = serde_json::from_str(
+                                        &render_anomaly,
+                                    )
+                                    .unwrap_or(Value::String(render_anomaly.clone()));
+                                    append_trace_event(
+                                        &trace_home,
+                                        "ui",
+                                        "render_fail_pattern",
+                                        "detected",
+                                        json!({
+                                            "session_path": session_path.clone(),
+                                            "anomaly": anomaly_value,
+                                            "render_health_status": render_health_status,
+                                            "render_health_reason": render_health_reason,
+                                            "recovery_count": render_health_recovery_count,
+                                            "rows": rows,
+                                            "cursor_y": cursor_y,
+                                            "visible_nonblank_rows": visible_nonblank_rows,
+                                        }),
+                                    );
+                                }
                                 let host_health_sample_changed =
                                     last_host_health_cursor_line_text != cursor_line_text
                                         || last_host_health_text_tail != text_tail;
@@ -63947,6 +64019,10 @@ fn terminal_eval_script_with_canvas_renderer(
         let lastFrameLikeHostHealthAtMs = 0;
         let hotHostHealthSuppressedCount = 0;
         let manualRedrawCount = 0;
+        // Fail-pattern detector state: recent redraw (ts+reason) ring + a pending
+        // anomaly JSON that the next HostHealth carries to the Rust trace.
+        let recentRedrawEvents = [];
+        let pendingRenderAnomaly = '';
         let renderHealthRecoveryCount = 0;
         let lastRenderHealthRecoveryAtMs = 0;
         let lastRenderHealthCheckedAtMs = 0;
@@ -65666,6 +65742,26 @@ fn terminal_eval_script_with_canvas_renderer(
         const redrawTerminal = (reason = 'manual') => {{
             manualRedrawCount += 1;
             const redrawStartedAtMs = Date.now();
+            // Fail-pattern detection: a burst of repaints with NO session
+            // change/reveal/resize behind them is the user's "3 quick blinks"
+            // symptom (e.g. render-health recovery firing repeatedly). Record it so
+            // the trace shows the pattern + context and the user need not report
+            // every rendering nuance.
+            try {{
+                recentRedrawEvents.push({{ ts: redrawStartedAtMs, reason: String(reason || 'manual') }});
+                if (recentRedrawEvents.length > 12) recentRedrawEvents.shift();
+                const burstWindowMs = 2000;
+                const burst = recentRedrawEvents.filter((e) => redrawStartedAtMs - e.ts <= burstWindowMs);
+                const explained = (r) => /reveal|mount|session|resize|refit|app-control|command-redraw|redraw-terminal|manual/.test(String(r || ''));
+                if (burst.length >= 3 && !burst.some((e) => explained(e.reason))) {{
+                    pendingRenderAnomaly = JSON.stringify({{
+                        pattern: 'redraw_burst',
+                        count: burst.length,
+                        window_ms: burstWindowMs,
+                        reasons: burst.map((e) => e.reason).slice(-5),
+                    }});
+                }}
+            }} catch (_error) {{}}
             const redrawRenderEventCountBefore = Number(renderEventCount || 0);
             const redrawReasonForcesPromptFollow = (value) => {{
                 const text = String(value || 'manual');
@@ -69441,6 +69537,23 @@ fn terminal_eval_script_with_canvas_renderer(
                     textTail,
                     {{ skip_ink_sample: frameLikeHot }}
                 );
+                // Count non-blank rows in the VISIBLE viewport — the completeness
+                // signal for the blank-frame reveal fix. Fall back to `rows` (looks
+                // complete) on any failure so a probe error never forces a repaint.
+                let visibleNonblankRows = rows;
+                try {{
+                    if (active && active.getLine) {{
+                        const top = Number(active.viewportY || 0);
+                        let n = 0;
+                        for (let i = 0; i < rows; i++) {{
+                            const ln = active.getLine(top + i);
+                            const t = ln && ln.translateToString ? ln.translateToString(true) : '';
+                            if (t && t.trim().length > 0) n++;
+                        }}
+                        visibleNonblankRows = n;
+                    }}
+                }} catch (_error) {{ visibleNonblankRows = rows; }}
+                const renderAnomaly = pendingRenderAnomaly || '';
                 const nextKey = JSON.stringify([
                     hasTransportError,
                     cursorLineText.slice(-160),
@@ -69450,11 +69563,14 @@ fn terminal_eval_script_with_canvas_renderer(
                     blankRowsBelowCursor,
                     renderHealth.status,
                     renderHealth.reason,
+                    visibleNonblankRows < 3,
+                    renderAnomaly,
                 ]);
                 if (nextKey === lastHostHealthKey) {{
                     return;
                 }}
                 lastHostHealthKey = nextKey;
+                pendingRenderAnomaly = '';
                 const payload = {{
                     kind: "host_health",
                     cursor_line_text: cursorLineText,
@@ -69468,6 +69584,8 @@ fn terminal_eval_script_with_canvas_renderer(
                     render_health_reason: renderHealth.reason,
                     render_health_recovery_count: renderHealth.recovery_count,
                     render_health_recovery_pending: renderHealth.recovery_pending,
+                    visible_nonblank_rows: Math.max(0, Math.min(65535, Math.round(visibleNonblankRows))),
+                    render_anomaly: renderAnomaly,
                 }};
                 if (entry) {{
                     entry.lastHostHealth = payload;
