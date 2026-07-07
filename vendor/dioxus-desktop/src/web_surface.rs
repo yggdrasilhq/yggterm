@@ -100,8 +100,13 @@ impl WebSurfaceHost {
             Some(dir) => WebContext::new(Some(dir.to_path_buf())),
             None => WebContext::new_ephemeral(),
         };
+        // Devtools are always available on surfaces: the agent is a first-class
+        // user and drives pages through the inspector/eval; the user opens it
+        // per surface. (WebKitGTK: enables developer extras; the inspector
+        // itself only appears via `set_devtools_open`.)
         let mut builder = WebViewBuilder::new_with_web_context(&mut ctx)
             .with_bounds(rect_logical(w, h))
+            .with_devtools(true)
             .with_url(url);
         if let Some(port) = socks_port {
             builder = builder.with_proxy_config(ProxyConfig::Socks5(ProxyEndpoint {
@@ -167,5 +172,90 @@ impl WebSurfaceHost {
 
     pub fn is_open(&self, id: u64) -> bool {
         self.surfaces.borrow().contains_key(&id)
+    }
+
+    /// Evaluate JS in surface `id`'s page. The callback receives
+    /// `Ok(json)` — the completion value serialized as JSON — or `Err(msg)`
+    /// for a JS exception. Goes straight to the engine (wry's own eval
+    /// swallows errors into an empty string, useless for automation).
+    pub fn eval(
+        &self,
+        id: u64,
+        js: &str,
+        callback: impl FnOnce(Result<String, String>) + 'static,
+    ) -> Result<(), String> {
+        use javascriptcore::ValueExt as _;
+        use webkit2gtk::WebViewExt as _;
+        let surfaces = self.surfaces.borrow();
+        let surface = surfaces.get(&id).ok_or("no such surface")?;
+        let webkit = {
+            use wry::WebViewExtUnix;
+            surface.webview.webview()
+        };
+        let cancellable: Option<&gtk::gio::Cancellable> = None;
+        #[allow(deprecated)]
+        webkit.run_javascript(js, cancellable, move |result| {
+            let outcome = match result {
+                Ok(js_result) => Ok(js_result
+                    .js_value()
+                    .and_then(|value| value.to_json(0))
+                    .map(|json| json.to_string())
+                    .unwrap_or_default()),
+                Err(error) => Err(error.to_string()),
+            };
+            callback(outcome);
+        });
+        Ok(())
+    }
+
+    /// Open/close the WebKit inspector (devtools) for surface `id`. Returns
+    /// whether devtools are open after the call.
+    pub fn set_devtools_open(&self, id: u64, open: bool) -> Result<bool, String> {
+        let surfaces = self.surfaces.borrow();
+        let surface = surfaces.get(&id).ok_or("no such surface")?;
+        if open {
+            surface.webview.open_devtools();
+        } else {
+            surface.webview.close_devtools();
+        }
+        Ok(surface.webview.is_devtools_open())
+    }
+
+    /// Capture surface `id`'s FULL DOCUMENT (whole page, not just the visible
+    /// viewport) to a PNG at `path` via the engine's snapshot API. Async: the
+    /// callback fires on the GTK main loop with `Ok(())` once the PNG is
+    /// written, or `Err(msg)`.
+    pub fn snapshot_full_page(
+        &self,
+        id: u64,
+        path: std::path::PathBuf,
+        callback: impl FnOnce(Result<(), String>) + 'static,
+    ) -> Result<(), String> {
+        use webkit2gtk::WebViewExt as _;
+        let surfaces = self.surfaces.borrow();
+        let surface = surfaces.get(&id).ok_or("no such surface")?;
+        let webkit = {
+            use wry::WebViewExtUnix;
+            surface.webview.webview()
+        };
+        let cancellable: Option<&gtk::gio::Cancellable> = None;
+        webkit.snapshot(
+            webkit2gtk::SnapshotRegion::FullDocument,
+            webkit2gtk::SnapshotOptions::empty(),
+            cancellable,
+            move |result| {
+                let outcome = result.map_err(|e| e.to_string()).and_then(|surface| {
+                    let image = cairo::ImageSurface::try_from(surface)
+                        .map_err(|_| "snapshot is not an image surface".to_string())?;
+                    let mut file = std::fs::File::create(&path)
+                        .map_err(|e| format!("create {}: {e}", path.display()))?;
+                    image
+                        .write_to_png(&mut file)
+                        .map_err(|e| format!("encode png: {e}"))
+                });
+                callback(outcome);
+            },
+        );
+        Ok(())
     }
 }

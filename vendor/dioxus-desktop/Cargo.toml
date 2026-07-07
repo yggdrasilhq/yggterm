@@ -250,6 +250,21 @@ default-features = false
 [target.'cfg(any(target_os = "linux",target_os = "dragonfly", target_os = "freebsd", target_os = "netbsd", target_os = "openbsd"))'.dependencies.gtk]
 version = "0.18.2"
 
+# yggterm web-surface capabilities (eval with error reporting, full-document
+# snapshot): direct engine access next to wry's own webkit2gtk dependency —
+# versions must match wry's. cairo png feature: snapshot PNG encoding.
+[target.'cfg(any(target_os = "linux",target_os = "dragonfly", target_os = "freebsd", target_os = "netbsd", target_os = "openbsd"))'.dependencies.webkit2gtk]
+version = "=2.0.2"
+features = ["v2_40"]
+
+[target.'cfg(any(target_os = "linux",target_os = "dragonfly", target_os = "freebsd", target_os = "netbsd", target_os = "openbsd"))'.dependencies.cairo-rs]
+version = "0.18"
+features = ["png"]
+
+[target.'cfg(any(target_os = "linux",target_os = "dragonfly", target_os = "freebsd", target_os = "netbsd", target_os = "openbsd"))'.dependencies.javascriptcore-rs]
+version = "=1.1.2"
+features = ["v2_28"]
+
 [target.'cfg(any(target_os = "windows",target_os = "macos"))'.dependencies.rfd]
 version = "0.17.2"
 default-features = false
