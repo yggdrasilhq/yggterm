@@ -275,6 +275,97 @@ impl DesktopService {
         let _ = id;
     }
 
+    /// Evaluate JS in an open web surface's page; the callback gets the
+    /// completion value as JSON, or the JS exception message.
+    pub fn eval_web_surface(
+        &self,
+        id: u64,
+        js: &str,
+        callback: impl FnOnce(Result<String, String>) + 'static,
+    ) -> Result<(), String> {
+        #[cfg(not(any(
+            target_os = "windows",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "android"
+        )))]
+        {
+            return match self.web_surface_host.borrow().as_ref() {
+                Some(host) => host.eval(id, js, callback),
+                None => Err("web surface host not installed".to_string()),
+            };
+        }
+        #[cfg(any(
+            target_os = "windows",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "android"
+        ))]
+        {
+            let _ = (id, js, callback);
+            Err("web surfaces require the GTK/WebKit backend".to_string())
+        }
+    }
+
+    /// Open/close the inspector (devtools) on an open web surface. Returns
+    /// whether devtools are open after the call.
+    pub fn set_web_surface_devtools(&self, id: u64, open: bool) -> Result<bool, String> {
+        #[cfg(not(any(
+            target_os = "windows",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "android"
+        )))]
+        {
+            return match self.web_surface_host.borrow().as_ref() {
+                Some(host) => host.set_devtools_open(id, open),
+                None => Err("web surface host not installed".to_string()),
+            };
+        }
+        #[cfg(any(
+            target_os = "windows",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "android"
+        ))]
+        {
+            let _ = (id, open);
+            Err("web surfaces require the GTK/WebKit backend".to_string())
+        }
+    }
+
+    /// Capture an open web surface's full document to a PNG at `path`; the
+    /// callback fires when the file is written (or capture failed).
+    pub fn snapshot_web_surface_full_page(
+        &self,
+        id: u64,
+        path: std::path::PathBuf,
+        callback: impl FnOnce(Result<(), String>) + 'static,
+    ) -> Result<(), String> {
+        #[cfg(not(any(
+            target_os = "windows",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "android"
+        )))]
+        {
+            return match self.web_surface_host.borrow().as_ref() {
+                Some(host) => host.snapshot_full_page(id, path, callback),
+                None => Err("web surface host not installed".to_string()),
+            };
+        }
+        #[cfg(any(
+            target_os = "windows",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "android"
+        ))]
+        {
+            let _ = (id, path, callback);
+            Err("web surfaces require the GTK/WebKit backend".to_string())
+        }
+    }
+
     /// Start the creation of a new window using the props and window builder
     ///
     /// Returns a future that resolves to the webview handle for the new window. You can use this
