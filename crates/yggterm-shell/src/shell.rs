@@ -1171,6 +1171,40 @@ async fn web_surface_native_reconcile_loop(
                 );
             }
         }
+        // Destroy surfaces of BACKGROUNDED sessions (state-authoritative, no eval).
+        // GTK `set_visible(false)` does NOT reliably clear a WebKitGTK surface: the
+        // shared compositor won't re-blit a merely-hidden webview (the reload-white
+        // pathology — only destroying a webview re-composites). A backgrounded
+        // surface hidden via set_visible therefore stays stuck-composited over the
+        // newly-revealed session PERMANENTLY (user: "switch leaves example.com over
+        // 90% of the viewport until I bounce back through the ychrome session").
+        // Destroying the webview is the only reliable clear; it recreates lazily
+        // against the persistent per-profile jar on return (cookies/session kept —
+        // the same lossless tradeoff as reload-on-white). Trigger-independent, so it
+        // fixes GUI sidebar switches too. The ACTIVE session's tabs are untouched,
+        // so within-surface tab switches still keep hidden tabs alive.
+        let backgrounded: Vec<(String, u64)> = applied
+            .keys()
+            .filter(|(session, _)| !active_visible_sessions.contains(session.as_str()))
+            .cloned()
+            .collect();
+        for key in backgrounded {
+            if let Some(entry) = applied.remove(&key) {
+                desktop.close_web_surface(entry.native_id);
+                append_trace_event(
+                    &trace_home,
+                    "ui",
+                    "web_surface",
+                    "native_close",
+                    json!({
+                        "session_path": key.0,
+                        "tab_id": key.1,
+                        "native_id": entry.native_id,
+                        "reason": "session_backgrounded",
+                    }),
+                );
+            }
+        }
         if desired.is_empty() && applied.is_empty() {
             sleep(Duration::from_millis(WEB_SURFACE_RECONCILE_IDLE_MS)).await;
             continue;
@@ -1218,33 +1252,12 @@ async fn web_surface_native_reconcile_loop(
                 })
                 .unwrap_or_default(),
             _ => {
-                // Eval blind (webview busy under another session's output flood,
-                // or not yet ready): do NOT blanket-keep every surface visible —
-                // that is exactly how a backgrounded surface lingered composited
-                // over the newly-revealed session for ~6-7s (the eval starves
-                // precisely while the other session floods output). Hiding a
-                // surface whose session is no longer active-visible needs no rect,
-                // so do it from ShellState now; the active surface's applied state
-                // is left untouched (never hidden off a blind tick). Positioning
-                // and create still wait for a real rect on a sighted tick.
-                for (key, entry) in applied.iter_mut() {
-                    if entry.visible && !active_visible_sessions.contains(key.0.as_str()) {
-                        desktop.set_web_surface_visible(entry.native_id, false);
-                        entry.visible = false;
-                        append_trace_event(
-                            &trace_home,
-                            "ui",
-                            "web_surface",
-                            "native_hide_backgrounded",
-                            json!({
-                                "session_path": key.0,
-                                "tab_id": key.1,
-                                "native_id": entry.native_id,
-                                "reason": "blind_tick_state_hide",
-                            }),
-                        );
-                    }
-                }
+                // Eval blind (webview busy / not yet ready): backgrounded-session
+                // surfaces were ALREADY destroyed above (state-authoritative, no
+                // rect needed), so nothing is left stuck-visible over the revealed
+                // session. The only thing a rect would tell us now is positioning
+                // and lazy-create for the ACTIVE surface — both safe to defer — so
+                // keep the active surface's applied state and retry next tick.
                 sleep(Duration::from_millis(WEB_SURFACE_RECONCILE_TICK_MS)).await;
                 continue;
             }
