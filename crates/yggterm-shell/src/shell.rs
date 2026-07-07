@@ -54548,6 +54548,32 @@ fn TerminalCanvas(
                                 last_resize_seq,
                                 resync_required,
                             )) => {
+                                // Cold-reveal backlog drain telemetry: a single
+                                // read that returns a large accumulated backlog
+                                // (paused/trickled reads while the session kept
+                                // producing) is the payload behind the reveal
+                                // freeze bug class — make its size visible so
+                                // freeze reports can be correlated with drain
+                                // sizes without a live repro. Trace-only.
+                                {
+                                    let drain_bytes: usize =
+                                        chunks.iter().map(|chunk| chunk.data.len()).sum();
+                                    if drain_bytes >= 65_536 {
+                                        append_trace_event(
+                                            &trace_home,
+                                            "ui",
+                                            "terminal_mount",
+                                            "reveal_backlog_drain",
+                                            json!({
+                                                "session_path": session_path.clone(),
+                                                "bytes": drain_bytes,
+                                                "chunk_count": chunks.len(),
+                                                "cursor": cursor,
+                                                "next_cursor": next_cursor,
+                                            }),
+                                        );
+                                    }
+                                }
                                 // The daemon flagged that the chunk ring trimmed
                                 // below our cursor, so these chunks skip a
                                 // contiguous middle
@@ -69135,7 +69161,25 @@ fn terminal_eval_script_with_canvas_renderer(
             if (!payload) {{
                 return;
             }}
-            entry.writeBridgePendingData = '';
+            // XTERM-BUG: cold-reveal-bulk-write-freeze — xterm's WriteBuffer
+            // 12ms deadline only yields BETWEEN queued write entries; a single
+            // giant entry parses in one synchronous block (a 516KB backlog
+            // drain measured 5128ms). Cap each term.write slice so a bulk
+            // drain becomes several entries with event-loop breathing room
+            // between them. Cut at a line boundary when one is near the cap so
+            // the line-based leak sanitizers below never see a split marker
+            // line; the remainder stays in writeBridgePendingData and the
+            // existing finalizeWriteFlush -> schedulePendingWriteFlush chain
+            // flushes it. Content and order are unchanged — pacing only.
+            const bulkFlushMaxChars = 131072;
+            if (payload.length > bulkFlushMaxChars) {{
+                let cutAt = payload.lastIndexOf('\n', bulkFlushMaxChars);
+                cutAt = cutAt >= bulkFlushMaxChars / 2 ? cutAt + 1 : bulkFlushMaxChars;
+                entry.writeBridgePendingData = payload.slice(cutAt);
+                payload = payload.slice(0, cutAt);
+            }} else {{
+                entry.writeBridgePendingData = '';
+            }}
             payload = filterPayloadForRenderSurface(payload);
             if (!payload) {{
                 syncLowPowerTuiHostEntry();
@@ -69395,8 +69439,30 @@ fn terminal_eval_script_with_canvas_renderer(
         const scrollDisposable = typeof term.onScroll === 'function'
             ? term.onScroll(() => {{
                 scrollEventCount += 1;
-                if (window.__yggtermXtermHosts && window.__yggtermXtermHosts[hostId]) {{
-                    window.__yggtermXtermHosts[hostId].scrollEventCount = scrollEventCount;
+                const scrollEntry = window.__yggtermXtermHosts && window.__yggtermXtermHosts[hostId];
+                if (scrollEntry) {{
+                    scrollEntry.scrollEventCount = scrollEventCount;
+                }}
+                // XTERM-BUG: cold-reveal-bulk-write-freeze — xterm fires onScroll
+                // once PER SCROLLED LINE, synchronously inside term.write's parse
+                // loop. During a bulk backlog drain (switch-back to a session that
+                // produced thousands of lines while its reads were paused) the
+                // heavy tail below ran thousands of times inside ONE synchronous
+                // parse block and froze the whole webview (measured live: a 516KB
+                // / 4921-line drain spent 5128ms inside a single write flush).
+                // While a bridge write is in flight the per-line work is pure
+                // waste — finalizeWriteFlush runs the same sync work once when
+                // the flush completes. The 30s recency guard self-heals a stuck
+                // in-flight flag so user-scroll semantics can never be lost.
+                if (
+                    scrollEntry
+                    && scrollEntry.writeBridgeInFlight
+                    && Date.now() - Number(scrollEntry.lastWriteFlushStartedAtMs || 0) < 30000
+                ) {{
+                    if (pendingPersistedScrollRestore) {{
+                        tryApplyPendingPersistedScrollRestore('scroll_event');
+                    }}
+                    return;
                 }}
                 // XTERM-BUG: scrollback-lost-on-gui-restart — every scroll event
                 // is a chance to apply a pending persisted restore (replay added rows).
@@ -71003,11 +71069,24 @@ fn terminal_replay_retained_data_script_for_session(
             try {{
               // Replayed scrollback must not re-fire OSC 52 copy (see the OSC 52 handler).
               window.__yggtermOsc52SuppressUntilMs = Date.now() + 400;
-              if (writeSync) {{
-                writeSync(replayResetPrefix);
-                writeSync(payload);
-              }} else if (typeof entry.term.write === "function") {{
-                entry.term.write(`${{replayResetPrefix}}${{payload}}`);
+              // XTERM-BUG: cold-reveal-bulk-write-freeze — raise the bulk-write
+              // in-flight signal so the per-line onScroll heavy tail is skipped
+              // during this replay parse (same skip as bridge write flushes).
+              entry.writeBridgeInFlight = true;
+              entry.lastWriteFlushStartedAtMs = Date.now();
+              try {{
+                if (writeSync) {{
+                  writeSync(replayResetPrefix);
+                  writeSync(payload);
+                }} else if (typeof entry.term.write === "function") {{
+                  entry.term.write(`${{replayResetPrefix}}${{payload}}`, () => {{
+                    entry.writeBridgeInFlight = false;
+                  }});
+                }}
+              }} finally {{
+                if (writeSync) {{
+                  entry.writeBridgeInFlight = false;
+                }}
               }}
               // Record which runtime spawn this buffer is now seeded from — the
               // comparison anchor for the cold-re-resume vacuum guard above.
@@ -71016,6 +71095,7 @@ fn terminal_replay_retained_data_script_for_session(
               }}
               return true;
             }} catch (_error) {{
+              entry.writeBridgeInFlight = false;
               return false;
             }}
           }};
@@ -71239,13 +71319,28 @@ fn terminal_replay_retained_data_script_for_session(
                 : "\x1bc\x1b[2J\x1b[3J\x1b[H";
               // Replayed scrollback must not re-fire OSC 52 copy (see the OSC 52 handler).
               window.__yggtermOsc52SuppressUntilMs = Date.now() + 400;
-              if (writeSync) {{
-                writeSync(replayResetPrefix);
-                writeSync(data);
-              }} else if (typeof entry.term.write === "function") {{
-                entry.term.write(`${{replayResetPrefix}}${{data}}`);
+              // XTERM-BUG: cold-reveal-bulk-write-freeze — raise the bulk-write
+              // in-flight signal so the per-line onScroll heavy tail is skipped
+              // during this replay parse (same skip as bridge write flushes).
+              entry.writeBridgeInFlight = true;
+              entry.lastWriteFlushStartedAtMs = Date.now();
+              try {{
+                if (writeSync) {{
+                  writeSync(replayResetPrefix);
+                  writeSync(data);
+                }} else if (typeof entry.term.write === "function") {{
+                  entry.term.write(`${{replayResetPrefix}}${{data}}`, () => {{
+                    entry.writeBridgeInFlight = false;
+                  }});
+                }}
+              }} finally {{
+                if (writeSync) {{
+                  entry.writeBridgeInFlight = false;
+                }}
               }}
-            }} catch (_error) {{}}
+            }} catch (_error) {{
+              entry.writeBridgeInFlight = false;
+            }}
             try {{
               entry.__yggtermLastRetainedReplayKey = replayKey;
               entry.lastRawPayloadLength = data.length;
