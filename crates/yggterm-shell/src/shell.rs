@@ -1464,12 +1464,22 @@ fn normalize_web_surface_profile(profile: Option<&str>) -> String {
         "default".to_string()
     }
 }
+/// Reserved profile name for an ephemeral (private-browsing) surface: no jar
+/// on disk, all website data in memory, gone when the surface closes. Owned
+/// here and mirrored by ychrome's picker/standalone handling — a
+/// `web-profiles/temp/` directory on disk is ignored by design.
+const WEB_SURFACE_TEMP_PROFILE: &str = "temp";
 /// Absolute path of a host-owned web-profile jar on THIS (GUI) host. Mirrors
 /// ychrome's `profile_dir` (`~/.yggterm/web-profiles/<name>/`) so a profile
 /// means the same storage whether ychrome renders it standalone or the GUI
 /// renders it. (For a remote session the jar lives on the GUI host; syncing it
-/// to the invoking host is a documented follow-up.)
+/// to the invoking host is a documented follow-up.) `None` = ephemeral
+/// context: the reserved "temp" profile maps here, so nothing it browses
+/// touches disk.
 fn web_surface_profile_dir(profile: &str) -> Option<std::path::PathBuf> {
+    if profile == WEB_SURFACE_TEMP_PROFILE {
+        return None;
+    }
     yggterm_core::resolve_yggterm_home()
         .ok()
         .map(|home| home.join("web-profiles").join(profile))
