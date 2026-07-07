@@ -65823,11 +65823,29 @@ fn terminal_eval_script_with_canvas_renderer(
                 entry.lastRenderHealthRecoveryAtMs = lastRenderHealthRecoveryAtMs;
                 entry.pendingRenderHealthRecovery = renderHealthRecoveryPending;
             }}
+            // Re-arm the recovery budget once the canvas is healthy again (after a
+            // brief settle). The old gate (renderHealthRecoveryCount < 1, no reset)
+            // healed a blank canvas exactly ONCE per host lifetime, so a canvas that
+            // RE-blanks later — the returning mid-session blink — was never healed
+            // again. Resetting on sustained health lets each fresh blank episode be
+            // healed, while the per-episode count cap + cooldown keep repeated
+            // redrawTerminal (which clears the glyph atlas) from forming a
+            // full-canvas refresh loop.
+            if (
+                !unhealthy
+                && renderHealthRecoveryCount > 0
+                && now - lastRenderHealthRecoveryAtMs > 2000
+            ) {{
+                renderHealthRecoveryCount = 0;
+                if (entry) {{
+                    entry.renderHealthRecoveryCount = 0;
+                }}
+            }}
             if (
                 unhealthy
                 && !renderHealthRecoveryPending
-                && renderHealthRecoveryCount < 1
-                && now - lastRenderHealthRecoveryAtMs > 5000
+                && renderHealthRecoveryCount < 2
+                && now - lastRenderHealthRecoveryAtMs > 2000
             ) {{
                 renderHealthRecoveryPending = true;
                 renderHealthRecoveryCount += 1;
