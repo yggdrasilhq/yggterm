@@ -6963,6 +6963,33 @@ impl ShellState {
         if !self.active_remote_terminal_session_pending_runtime_launch(&active_path) {
             return false;
         }
+        // Stale-phase blink loop: `launch_phase` can stick at RemoteBootstrap on
+        // a fully-usable remote CC session (finding-cold-cc-reattach-phase-stuck),
+        // and this rearm runs after EVERY snapshot apply (15s refresh). Acting on
+        // the stale phase label alone cold-remounted a healthy active session
+        // every 15s forever (observed live: mount epoch 12 -> 39+ at exactly
+        // 15.3s cadence, each a bootstrap_reset + re-seed flash, while the
+        // faithful pixel showed a perfectly rendered session). The PTY-ownership
+        // truth outranks the phase label: a mounted host that reached ready and
+        // whose PTY the daemon AFFIRMATIVELY owns (per the latest runtime status
+        // — a missing status stays on the recovery path, unlike the fail-open
+        // reveal predicate) has nothing for a remount to recover. A genuine
+        // pending launch (PTY gone / never ready) still falls through.
+        let daemon_affirmatively_owns_runtime =
+            self.latest_runtime_status.as_ref().is_some_and(|status| {
+                let runtime_key = self.server.terminal_runtime_key_for_path(&active_path);
+                status
+                    .owned_terminal_session_keys
+                    .iter()
+                    .chain(status.preserved_terminal_owner_keys.iter())
+                    .any(|key| key == &runtime_key)
+            });
+        if daemon_affirmatively_owns_runtime
+            && self.terminal_session_host_id(&active_path).is_some()
+            && self.terminal_session_was_ever_ready(&active_path)
+        {
+            return false;
+        }
         self.invalidate_retained_remote_non_prompt_surface(&active_path, None)
     }
     fn terminal_session_should_render_retained(&self, session_path: &str) -> bool {
