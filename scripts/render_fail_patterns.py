@@ -89,12 +89,19 @@ def main():
                 anomaly = json.loads(anomaly)
             except Exception:
                 pass
+        extra = ""
+        if isinstance(anomaly, dict) and anomaly.get("pattern") == "stale_atlas_paint":
+            extra = (
+                f" raf_gap_ms={anomaly.get('raf_gap_ms')} atlas_age_ms={anomaly.get('atlas_age_ms')}"
+                f" heals={anomaly.get('heal_count')} focused={anomaly.get('window_focused')}"
+                f" vis={anomaly.get('visibility')}"
+            )
         print(
             f"  ts={d.get('ts_ms')} pat={anomaly.get('pattern','?') if isinstance(anomaly,dict) else anomaly} "
             f"count={anomaly.get('count') if isinstance(anomaly,dict) else '?'} "
             f"health={p.get('render_health_status','')}/{p.get('render_health_reason','')} "
             f"recov={p.get('recovery_count')} nonblank_rows={p.get('visible_nonblank_rows')} "
-            f"reasons={anomaly.get('reasons') if isinstance(anomaly,dict) else ''}"
+            f"reasons={anomaly.get('reasons') if isinstance(anomaly,dict) else ''}" + extra
         )
 
 

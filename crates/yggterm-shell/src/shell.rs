@@ -35963,7 +35963,10 @@ async fn redraw_terminal_viewport_for(session_path: &str) -> Value {
                         ? entry.term._core._renderService._renderer
                         : null;
                     if (renderer && typeof renderer.clearTextureAtlas === 'function') {{
-                        try {{ renderer.clearTextureAtlas(); }} catch (_error) {{}}
+                        try {{
+                            renderer.clearTextureAtlas();
+                            entry.lastAtlasClearAtMs = Date.now();
+                        }} catch (_error) {{}}
                     }}
                 }}
                 const waitStartedAt = Date.now();
@@ -64097,6 +64100,14 @@ fn terminal_eval_script_with_canvas_renderer(
         // anomaly JSON that the next HostHealth carries to the Rust trace.
         let recentRedrawEvents = [];
         let pendingRenderAnomaly = '';
+        // XTERM-BUG: webgl-stale-atlas-garble — stale-atlas paint detector state.
+        // See docs/xterm-bugs.md#webgl-stale-atlas-garble. The garble condition is
+        // "render lands right after a >1s rAF-throttle gap and the glyph atlas was
+        // last cleared BEFORE the gap began" — that is detectable even though the
+        // garbled pixels themselves are not (ink sampling sees a full canvas).
+        let lastAtlasClearAtMs = 0;
+        let lastStaleAtlasHealGapEndMs = 0;
+        let staleAtlasHealCount = 0;
         let renderHealthRecoveryCount = 0;
         let lastRenderHealthRecoveryAtMs = 0;
         let lastRenderHealthCheckedAtMs = 0;
@@ -65797,7 +65808,44 @@ fn terminal_eval_script_with_canvas_renderer(
                 }}
             }} catch (_error) {{}}
         }};
+        // XTERM-BUG: webgl-stale-atlas-garble — page-global rAF gap monitor.
+        // While the window is backgrounded/occluded WebKitGTK throttles rAF, so
+        // this loop's tick timestamps freeze; the first tick after the throttle
+        // computes the gap. A render that lands right after such a gap without an
+        // atlas clear since the gap began paints wrong-glyph garble (stale GPU
+        // glyph atlas). One monitor per page, installed by whichever host mounts
+        // first.
+        try {{
+            if (!window.__yggtermRafGapMonitor) {{
+                const rafGapMonitor = {{
+                    lastTickAtMs: Date.now(),
+                    lastGapMs: 0,
+                    lastGapEndedAtMs: 0,
+                    gapCount: 0,
+                }};
+                window.__yggtermRafGapMonitor = rafGapMonitor;
+                const rafGapTick = () => {{
+                    const now = Date.now();
+                    const gap = now - rafGapMonitor.lastTickAtMs;
+                    if (gap > 1000) {{
+                        rafGapMonitor.lastGapMs = gap;
+                        rafGapMonitor.lastGapEndedAtMs = now;
+                        rafGapMonitor.gapCount += 1;
+                    }}
+                    rafGapMonitor.lastTickAtMs = now;
+                    window.requestAnimationFrame(rafGapTick);
+                }};
+                window.requestAnimationFrame(rafGapTick);
+            }}
+        }} catch (_error) {{}}
         const clearTerminalTextureAtlas = () => {{
+            lastAtlasClearAtMs = Date.now();
+            try {{
+                const atlasEntry = window.__yggtermXtermHosts && window.__yggtermXtermHosts[hostId];
+                if (atlasEntry) {{
+                    atlasEntry.lastAtlasClearAtMs = lastAtlasClearAtMs;
+                }}
+            }} catch (_error) {{}}
             try {{
                 if (typeof term.clearTextureAtlas === 'function') {{
                     term.clearTextureAtlas();
@@ -65977,10 +66025,27 @@ fn terminal_eval_script_with_canvas_renderer(
                 && ink.sampled_pixels > 0
                 && (ink.nontransparent_pixels === 0 || ink.alpha_sum <= 12);
             const unhealthy = unhealthyDomRenderer || unhealthyCanvas;
+            // Background hosts sample blank legitimately (a hidden WebGL canvas
+            // holds no ink), so a recovery redraw can never turn them healthy —
+            // firing it anyway formed an endless ~6s heavy-repaint loop per
+            // backgrounded host (guihost trace 2026-07-07: session kept
+            // unhealthy+recovery_pending every 5-6s for minutes after switch-away).
+            // Keep the unhealthy STATUS (the Rust reveal reconcile uses it to
+            // force a repaint when the session is next revealed) but suffix the
+            // reason and never schedule the recovery redraw for background hosts.
+            const hostActiveAttr = host.getAttribute('data-active-session-host');
+            const hostIsActive = hostActiveAttr === 'true'
+                || (hostActiveAttr === null
+                    && String(host.getAttribute('data-terminal-session-path') || '')
+                        === String(window.__yggtermActiveTerminalSessionPath || ''));
             renderHealthStatus = unhealthy ? 'unhealthy' : 'healthy';
             renderHealthReason = unhealthyDomRenderer
                 ? 'dom_renderer_missing_text_layer_with_buffer_text'
-                : (unhealthyCanvas ? 'canvas_blank_with_buffer_text' : '');
+                : (unhealthyCanvas
+                    ? (hostIsActive
+                        ? 'canvas_blank_with_buffer_text'
+                        : 'canvas_blank_with_buffer_text_background')
+                    : '');
             const entry = window.__yggtermXtermHosts && window.__yggtermXtermHosts[hostId]
                 ? window.__yggtermXtermHosts[hostId]
                 : null;
@@ -66013,6 +66078,7 @@ fn terminal_eval_script_with_canvas_renderer(
             }}
             if (
                 unhealthy
+                && hostIsActive
                 && !renderHealthRecoveryPending
                 && renderHealthRecoveryCount < 2
                 && now - lastRenderHealthRecoveryAtMs > 2000
@@ -69458,6 +69524,60 @@ fn terminal_eval_script_with_canvas_renderer(
                 window.__yggtermXtermHosts[hostId].renderEventCount = renderEventCount;
                 window.__yggtermXtermHosts[hostId].lastRenderEventAtMs = Date.now();
             }}
+            // XTERM-BUG: webgl-stale-atlas-garble — residual glyph-corruption
+            // paths (occlusion throttle, monitor wake, any path the focus/switch
+            // activation repaint misses) render against a glyph atlas that went
+            // stale during a rAF-throttle gap. Detect the exact risk condition
+            // (render right after a >1s rAF gap, no atlas clear since the gap
+            // began, this host visible/active), trace it via the render_anomaly
+            // fail-pattern channel, and heal with a targeted atlas clear +
+            // refresh. Latched per gap episode so the heal's own refresh cannot
+            // re-trigger it.
+            try {{
+                const rafGapMonitor = window.__yggtermRafGapMonitor;
+                const staleAtlasNowMs = Date.now();
+                if (
+                    rafGapMonitor
+                    && rafGapMonitor.lastGapEndedAtMs > 0
+                    && rafGapMonitor.lastGapMs > 1000
+                    && staleAtlasNowMs - rafGapMonitor.lastGapEndedAtMs < 600
+                    && rafGapMonitor.lastGapEndedAtMs !== lastStaleAtlasHealGapEndMs
+                    && host.getAttribute('data-active-session-host') === 'true'
+                ) {{
+                    const gapStartedAtMs = rafGapMonitor.lastGapEndedAtMs - rafGapMonitor.lastGapMs;
+                    const staleAtlasEntry = window.__yggtermXtermHosts && window.__yggtermXtermHosts[hostId];
+                    const atlasClearedAtMs = Math.max(
+                        Number(lastAtlasClearAtMs || 0),
+                        staleAtlasEntry ? Number(staleAtlasEntry.lastAtlasClearAtMs || 0) : 0
+                    );
+                    if (atlasClearedAtMs < gapStartedAtMs) {{
+                        lastStaleAtlasHealGapEndMs = rafGapMonitor.lastGapEndedAtMs;
+                        staleAtlasHealCount += 1;
+                        if (staleAtlasEntry) {{
+                            staleAtlasEntry.staleAtlasHealCount = staleAtlasHealCount;
+                            staleAtlasEntry.lastStaleAtlasHealAtMs = staleAtlasNowMs;
+                        }}
+                        pendingRenderAnomaly = JSON.stringify({{
+                            pattern: 'stale_atlas_paint',
+                            raf_gap_ms: rafGapMonitor.lastGapMs,
+                            atlas_age_ms: atlasClearedAtMs > 0 ? staleAtlasNowMs - atlasClearedAtMs : -1,
+                            heal_count: staleAtlasHealCount,
+                            window_focused: document.hasFocus(),
+                            visibility: String(document.visibilityState || ''),
+                            healed: true,
+                        }});
+                        window.setTimeout(() => {{
+                            try {{
+                                clearTerminalTextureAtlas();
+                                if (term.refresh) {{
+                                    term.refresh(0, Math.max(0, term.rows - 1));
+                                }}
+                            }} catch (_error) {{}}
+                            try {{ emitHostHealth(); }} catch (_error) {{}}
+                        }}, 0);
+                    }}
+                }}
+            }} catch (_error) {{}}
             applySoftwareCanvasLayerOptimization('render');
             syncXtermInputLineDecoration('render');
             scheduleCursorCellBackgroundRefresh('render');
@@ -70423,6 +70543,7 @@ fn terminal_apply_script(host_id: &str, theme: &TerminalTheme) -> String {
           try {{
             if (typeof entry.term.clearTextureAtlas === 'function') {{
               entry.term.clearTextureAtlas();
+              entry.lastAtlasClearAtMs = Date.now();
             }}
           }} catch (_error) {{}}
           try {{
@@ -71451,6 +71572,7 @@ fn terminal_set_input_policy_script_for_active_session(
               }} else {{
                 if (typeof entry.term.clearTextureAtlas === "function") {{
                   entry.term.clearTextureAtlas();
+                  entry.lastAtlasClearAtMs = Date.now();
                 }}
                 if (typeof entry.term.refresh === "function") {{
                   entry.term.refresh(0, Math.max(0, Number(entry.term.rows || 1) - 1));
@@ -71806,6 +71928,7 @@ fn terminal_apply_script_for_session(session_path: &str, theme: &TerminalTheme) 
           try {{
             if (typeof entry.term.clearTextureAtlas === 'function') {{
               entry.term.clearTextureAtlas();
+              entry.lastAtlasClearAtMs = Date.now();
             }}
           }} catch (_error) {{}}
           try {{
@@ -82898,6 +83021,58 @@ mod tests {
         assert!(script.contains("xtermInputLineDecorationElementVisible"));
         assert!(script.contains("xtermInputLineDecorationVisible"));
         assert!(script.contains("xtermInputLineDecorationBackground"));
+    }
+
+    #[test]
+    fn terminal_eval_script_wires_stale_atlas_paint_detector() {
+        // XTERM-BUG: webgl-stale-atlas-garble — glyph corruption (wrong-glyph
+        // paint against an atlas that went stale during a rAF-throttle gap) is
+        // invisible to ink sampling, so telemetry must detect the risk condition
+        // itself: a render right after a >1s rAF gap with no atlas clear since
+        // the gap began. The detector traces a stale_atlas_paint render anomaly
+        // and heals with a targeted atlas clear, latched per gap episode.
+        let theme = terminal_theme(UiTheme::ZedDark, palette(UiTheme::ZedDark), 13.0, "");
+        let script = terminal_eval_script_with_canvas_renderer(
+            "yggterm-terminal-test",
+            &theme,
+            true,
+            true,
+            "test_reason",
+        );
+        assert!(script.contains("window.__yggtermRafGapMonitor"));
+        assert!(script.contains("pattern: 'stale_atlas_paint'"));
+        assert!(
+            script.contains("lastAtlasClearAtMs = Date.now();"),
+            "every atlas clear must stamp the timestamp the detector compares against"
+        );
+        assert!(
+            script.contains(
+                "rafGapMonitor.lastGapEndedAtMs !== lastStaleAtlasHealGapEndMs"
+            ),
+            "the stale-atlas heal must be latched per gap episode so its own refresh cannot loop"
+        );
+    }
+
+    #[test]
+    fn terminal_eval_script_gates_render_health_recovery_on_active_host() {
+        // A hidden/backgrounded host samples blank legitimately, so the recovery
+        // redraw can never heal it — ungated, it loops a heavy redrawTerminal
+        // every ~6s per background host forever. The recovery must only fire for
+        // the active host; background detections keep the unhealthy status (the
+        // reveal reconcile consumes it) under a distinguishable reason.
+        let theme = terminal_theme(UiTheme::ZedDark, palette(UiTheme::ZedDark), 13.0, "");
+        let script = terminal_eval_script_with_canvas_renderer(
+            "yggterm-terminal-test",
+            &theme,
+            true,
+            true,
+            "test_reason",
+        );
+        assert!(script.contains("&& hostIsActive"));
+        assert!(script.contains("'canvas_blank_with_buffer_text_background'"));
+        assert!(script.contains(
+            "const hostActiveAttr = host.getAttribute('data-active-session-host');"
+        ));
     }
 
     #[test]
