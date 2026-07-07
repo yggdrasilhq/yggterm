@@ -6725,6 +6725,27 @@ impl ShellState {
             return (self.retain_terminal_session_path(session_path), true, false);
         }
         let already_mounted = self.terminal_session_host_id(session_path).is_some();
+        // Idle "blink" loop: a periodic open re-assert (the 15s background refresh)
+        // of a session that is ALREADY mounted, previously reached Ready, and whose
+        // daemon still owns the PTY must REVEAL the existing host (stable epoch),
+        // not cold-remount it — a cold remount re-seeds the viewport = a visible
+        // flash every 15s (measured: open-gaps clustered at exactly 15.0s, each a
+        // bootstrap_reset -> reconstruct -> snapshot_restore -> repaint). The
+        // retained_live fast-path above clears this only within the reveal-grace
+        // window; once that expires a healthy backgrounded/re-asserted host drops
+        // out of retained_live yet stays perfectly revealable. This path is ONLY
+        // the periodic re-assert — genuine fault recovery bumps the epoch directly
+        // elsewhere — so reusing the host here cannot suppress a real remount.
+        // See [[finding-cc-blink-dead-session-remount-loop]].
+        if already_mounted
+            && self.terminal_session_was_ever_ready(session_path)
+            && self.daemon_owns_session_runtime(session_path)
+            && !self.terminal_attach_in_flight.contains(session_path)
+        {
+            self.terminal_cold_remount_count.remove(session_path);
+            self.terminal_cold_remount_since_ms.remove(session_path);
+            return (self.retain_terminal_session_path(session_path), true, false);
+        }
         let count = self
             .terminal_cold_remount_count
             .get(session_path)
