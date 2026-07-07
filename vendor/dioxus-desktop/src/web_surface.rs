@@ -92,8 +92,14 @@ impl WebSurfaceHost {
         // Persistent per-profile storage when a jar is given; ephemeral
         // otherwise. Recreating a surface with the SAME profile_dir reuses the
         // on-disk cookies/localStorage, so destroy+recreate (reload, proxy or
-        // profile change) is lossless.
-        let mut ctx = WebContext::new(profile_dir.map(|p| p.to_path_buf()));
+        // profile change) is lossless. `None` MUST be the engine's true
+        // ephemeral mode — `WebContext::new(None)` is NOT that (it silently
+        // shares WebKit's default on-disk jar), which would leak temp-profile
+        // browsing onto disk.
+        let mut ctx = match profile_dir {
+            Some(dir) => WebContext::new(Some(dir.to_path_buf())),
+            None => WebContext::new_ephemeral(),
+        };
         let mut builder = WebViewBuilder::new_with_web_context(&mut ctx)
             .with_bounds(rect_logical(w, h))
             .with_url(url);
