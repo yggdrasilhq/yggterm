@@ -955,6 +955,7 @@ dependencies = [
  "async-trait",
  "base64",
  "bytes",
+ "cairo-rs",
  "cocoa",
  "core-foundation",
  "dioxus-asset-resolver",
@@ -975,6 +976,7 @@ dependencies = [
  "gtk",
  "image",
  "infer",
+ "javascriptcore-rs",
  "jni 0.21.1",
  "lazy-js-bundle",
  "libc",
@@ -1000,6 +1002,7 @@ dependencies = [
  "tray-icon",
  "tungstenite",
  "webbrowser",
+ "webkit2gtk",
  "wry",
 ]
 
