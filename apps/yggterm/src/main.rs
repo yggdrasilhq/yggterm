@@ -42,6 +42,8 @@ use yggterm_server::{
     run_app_control_read_terminal_buffer, run_app_control_restart_pending_update,
     run_app_control_scroll_preview, run_app_control_scroll_right_panel,
     run_app_control_scroll_terminal_viewport, run_app_control_send_terminal_input,
+    run_app_control_web_surface_devtools, run_app_control_web_surface_eval,
+    run_app_control_web_surface_screenshot,
     run_app_control_submit_terminal_prompt,
     run_app_control_set_clipboard_png_base64, run_app_control_set_clipboard_text,
     run_app_control_set_force_foreground, run_app_control_set_fullscreen,
@@ -724,7 +726,10 @@ fn print_server_app_help() {
   yggterm server app terminal <new|send|focus|scroll|probe-type|probe-scroll|probe-select|probe-context-menu> ...
   yggterm server app terminal scroll <session> --to <top|bottom|±N>
   yggterm server app terminal read-buffer <session> [--mode screen|full|cells]
-  yggterm server app terminal send <session> (--data <data>|--stdin)"
+  yggterm server app terminal send <session> (--data <data>|--stdin)
+  yggterm server app web eval (<script>|--script <js>|--stdin) [--session <path>]
+  yggterm server app web screenshot [output.png] [--session <path>]
+  yggterm server app web devtools [--close] [--session <path>]"
     );
 }
 
@@ -2056,6 +2061,50 @@ fn main() -> Result<()> {
                         run_app_control_probe_terminal_context_menu(session_path, timeout_ms)
                     }
                     other => anyhow::bail!("unsupported app terminal action: {other}"),
+                }
+            }
+            "web" => {
+                // Web-surface (ychrome) automation: the agent is a first-class
+                // user of pages. `--session <path>` targets a session's active
+                // surface tab; omitted = the active session.
+                let action = args
+                    .get(3)
+                    .map(String::as_str)
+                    .context("missing action for server app web")?;
+                let session_path = cli_flag_value(&args, "--session");
+                match action {
+                    "eval" => {
+                        let script = if args.iter().any(|arg| arg == "--stdin") {
+                            let mut value = String::new();
+                            std::io::stdin()
+                                .read_to_string(&mut value)
+                                .context("reading app web eval stdin")?;
+                            value
+                        } else {
+                            cli_flag_value(&args, "--script")
+                                .map(str::to_string)
+                                .or_else(|| {
+                                    cli_positional_args(&args, 4)
+                                        .into_iter()
+                                        .next()
+                                        .map(str::to_string)
+                                })
+                                .context("missing script (positional, --script or --stdin) for server app web eval")?
+                        };
+                        run_app_control_web_surface_eval(session_path, &script, timeout_ms)
+                    }
+                    "screenshot" => {
+                        let output = cli_positional_args(&args, 4)
+                            .into_iter()
+                            .next()
+                            .unwrap_or("web-surface.png");
+                        run_app_control_web_surface_screenshot(session_path, output, timeout_ms)
+                    }
+                    "devtools" => {
+                        let open = !args.iter().any(|arg| arg == "--close");
+                        run_app_control_web_surface_devtools(session_path, open, timeout_ms)
+                    }
+                    other => anyhow::bail!("unsupported app web action: {other}"),
                 }
             }
             "session" => {
