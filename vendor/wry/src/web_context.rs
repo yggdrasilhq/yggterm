@@ -50,8 +50,11 @@ impl WebContext {
     }
   }
 
+  /// Create a [`WebContext`] whose website data (cookies, localStorage, caches)
+  /// lives only in memory and vanishes with the context — WebKitGTK's
+  /// ephemeral (private-browsing) mode. Nothing is written to disk.
   #[cfg(gtk)]
-  pub(crate) fn new_ephemeral() -> Self {
+  pub fn new_ephemeral() -> Self {
     Self {
       os: WebContextImpl::new_ephemeral(),
       data_directory: None,
