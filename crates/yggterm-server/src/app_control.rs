@@ -389,6 +389,29 @@ pub enum AppControlCommand {
         #[serde(default)]
         anchor_path: Option<String>,
     },
+    /// Evaluate JS in a session's active web-surface tab (ychrome). The
+    /// completion value comes back as JSON in `data.value`; a JS exception
+    /// comes back as the error. Agent automation's page-scripting primitive.
+    WebSurfaceEval {
+        /// Session owning the surface; None = active session.
+        #[serde(default)]
+        session_path: Option<String>,
+        script: String,
+    },
+    /// Capture a session's active web-surface tab: the FULL DOCUMENT (whole
+    /// page, beyond the visible viewport) rendered to a PNG by the engine.
+    WebSurfaceScreenshot {
+        #[serde(default)]
+        session_path: Option<String>,
+        output_path: String,
+    },
+    /// Open/close the WebKit inspector (devtools) on a session's active
+    /// web-surface tab.
+    WebSurfaceDevtools {
+        #[serde(default)]
+        session_path: Option<String>,
+        open: bool,
+    },
     DescribeRows,
     OpenPath {
         session_path: String,
@@ -416,6 +439,7 @@ impl AppControlCommand {
                 | Self::DescribeRows
                 | Self::DescribeState
                 | Self::ReadTerminalBuffer { .. }
+                | Self::WebSurfaceScreenshot { .. }
         )
     }
 
@@ -473,6 +497,9 @@ impl AppControlCommand {
             Self::SetSessionKeepAlive { .. } => "set_session_keep_alive",
             Self::SetRowExpanded { .. } => "set_row_expanded",
             Self::SetTreeSelection { .. } => "set_tree_selection",
+            Self::WebSurfaceEval { .. } => "web_surface_eval",
+            Self::WebSurfaceScreenshot { .. } => "web_surface_screenshot",
+            Self::WebSurfaceDevtools { .. } => "web_surface_devtools",
             Self::DescribeRows => "describe_rows",
             Self::OpenPath { .. } => "open_path",
             Self::FocusWindow => "focus_window",

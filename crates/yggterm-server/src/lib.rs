@@ -18234,6 +18234,66 @@ pub fn run_app_control_read_terminal_buffer(
     Ok(())
 }
 
+pub fn run_app_control_web_surface_eval(
+    session_path: Option<&str>,
+    script: &str,
+    timeout_ms: u64,
+) -> anyhow::Result<()> {
+    let home = resolve_yggterm_home()?;
+    let response = request_app_control(
+        &home,
+        AppControlCommand::WebSurfaceEval {
+            session_path: session_path.map(str::to_string),
+            script: script.to_string(),
+        },
+        timeout_ms,
+    )?;
+    write_stdout_payload(&serde_json::to_string_pretty(&response)?)?;
+    Ok(())
+}
+
+pub fn run_app_control_web_surface_screenshot(
+    session_path: Option<&str>,
+    output_path: &str,
+    timeout_ms: u64,
+) -> anyhow::Result<()> {
+    let home = resolve_yggterm_home()?;
+    // Absolutize CLI-side: the GUI process has its own cwd.
+    let output_path = if std::path::Path::new(output_path).is_absolute() {
+        std::path::PathBuf::from(output_path)
+    } else {
+        std::env::current_dir()?.join(output_path)
+    };
+    let response = request_app_control(
+        &home,
+        AppControlCommand::WebSurfaceScreenshot {
+            session_path: session_path.map(str::to_string),
+            output_path: output_path.display().to_string(),
+        },
+        timeout_ms,
+    )?;
+    write_stdout_payload(&serde_json::to_string_pretty(&response)?)?;
+    Ok(())
+}
+
+pub fn run_app_control_web_surface_devtools(
+    session_path: Option<&str>,
+    open: bool,
+    timeout_ms: u64,
+) -> anyhow::Result<()> {
+    let home = resolve_yggterm_home()?;
+    let response = request_app_control(
+        &home,
+        AppControlCommand::WebSurfaceDevtools {
+            session_path: session_path.map(str::to_string),
+            open,
+        },
+        timeout_ms,
+    )?;
+    write_stdout_payload(&serde_json::to_string_pretty(&response)?)?;
+    Ok(())
+}
+
 pub fn run_app_control_probe_terminal_viewport_scroll(
     session_path: &str,
     lines: i32,
