@@ -3757,7 +3757,7 @@ mod tests {
         let data = "╭─────────────────────────────────────────────╮\n\
                                                │ >_ OpenAI Codex (v0.130.0)                  │\n\
                                │ model:     gpt-5.5 xhigh   /model to change │\n\
-                                                                              │ directory: ~/git/samplenotes         \n\
+                                                                              │ directory: ~/git/jyas         \n\
                ╰─────────────────────────────────────────────╯\n\
                                                               Error: connecting to /home/pi/.yggterm/server-2-\n\
 1-10.sock\n\n\
@@ -4155,7 +4155,7 @@ Best thing to improve in the meantime:
 
 › Improve documentation in @filename
 
-  gpt-5.5 xhigh · ~/git/samplenotes";
+  gpt-5.5 xhigh · ~/git/jyas";
         let host = json!({
             "session_path": "remote-session://dev/hot-update-real-pty",
             "text_sample": text_tail,
@@ -4381,7 +4381,7 @@ Best thing to improve in the meantime:
     fn terminal_host_problem_rejects_remote_prompt_gated_after_user_input() {
         let text_tail = "Current checkpoint:\n\n- Active chart: JYAS_BENCH_0099\n- Log rows: 742\n- Physical PDFs in output dir: 2510\n\n› What is the status now?\n\n• Working (0s • esc to interrupt)";
         let host = json!({
-            "session_path": "remote-session://dev/samplenotes-paint-regression",
+            "session_path": "remote-session://dev/jyas-paint-regression",
             "text_sample": text_tail,
             "text_tail": text_tail,
             "buffer_text_sample": text_tail,
@@ -4485,13 +4485,13 @@ Best thing to improve in the meantime:
 
     #[test]
     fn terminal_host_problem_rejects_codex_resume_instruction_as_interactive() {
-        let text_tail = "⚠ Heads up, you have less than 5% of your weekly limit left. Run /status for a breakdown.\nToken usage: total=1,064,406 input=1,023,193 (+ 11,361,664 cached) output=41,213 (reasoning 10,977)\nTo continue this session, run codex resume 019d0000-0000-7000-8000-000000000001";
+        let text_tail = "⚠ Heads up, you have less than 5% of your weekly limit left. Run /status for a breakdown.\nToken usage: total=1,064,406 input=1,023,193 (+ 11,361,664 cached) output=41,213 (reasoning 10,977)\nTo continue this session, run codex resume 019dbdcf-9f11-7932-afb2-0d7b7c35914b";
         let host = json!({
             "session_path": "remote-session://dev/exited-codex",
             "text_sample": text_tail,
             "text_tail": text_tail,
             "buffer_text_sample": text_tail,
-            "cursor_line_text": " this session, run codex resume 019d0000-0000-7000-8000-000000000001",
+            "cursor_line_text": " this session, run codex resume 019dbdcf-9f11-7932-afb2-0d7b7c35914b",
             "input_enabled": true,
             "helper_textarea_focused": true,
             "xterm_present": true,
@@ -4872,13 +4872,13 @@ Best thing to improve in the meantime:
 │ >_ OpenAI Codex (v0.130.0)                  │
 │                                             │
 │ model:     gpt-5.5 xhigh   /model to change │
-│ directory: ~/git/samplers                │";
+│ directory: ~/git/practice-rs                │";
         let tail = "\
 ╭─────────────────────────────────────────────╮
 │ >_ OpenAI Codex (v0.130.0)                  │
 │                                             │
 │ model:     gpt-5.5 xhigh   /model to change │
-│ directory: ~/git/samplers                │
+│ directory: ~/git/practice-rs                │
 ╰─────────────────────────────────────────────╯
 
   Tip: GPT-5.5 is now available in Codex.
@@ -4892,7 +4892,7 @@ Best thing to improve in the meantime:
   Send a short alphanumeric code and collect it in six single-character boxes.
   Uppercase the alphabetic code characters even when the user types lowercase.
 
-  gpt-5.5 xhigh · ~/git/samplers";
+  gpt-5.5 xhigh · ~/git/practice-rs";
         let cursor_line =
             "  Uppercase the alphabetic code characters even when the user types lowercase.";
         assert!(
@@ -5138,7 +5138,7 @@ Best thing to improve in the meantime:
     #[test]
     fn app_control_terminal_surface_ignores_stale_cursor_clip_after_matched_prompt_follow_force() {
         let host = json!({
-            "session_path": "remote-session://samplenotes-webapp/live",
+            "session_path": "remote-session://jyas-webapp/live",
             "text_tail": "OpenAI Codex ready\n› Improve documentation in @filename",
             "buffer_text_sample": "OpenAI Codex\n› Improve documentation in @filename",
             "cursor_line_text": "› Improve documentation in @filename",
@@ -5819,7 +5819,7 @@ Best thing to improve in the meantime:
         let host = json!({
             "session_path": "remote-session://dev/stale-codex",
             "text_sample": "- Active chart: JYAS_BENCH_0099\n  - Log rows: 742\n  - Physical PDFs in output dir: 2510",
-            "text_tail": "- Active chart: JYAS_BENCH_0099\n  - Log rows: 742\n\nThe immediate engineering priority is still the harness: no fixture corpus, no rigorous parity measurement.\n \n \n› I’ll use the JYAS v3 research workflow here and check the live PL9 batch before recommending parallel work. I’m going to distinguish runner health from v3 parity work so we do not confuse fixture generation progress with solved logic.git/samplenotes\n\nThe batch is still alive and the repaired open path is working, but the main friction has shifted: VP2+ generation is failing on some charts after the chart opens correctly.",
+            "text_tail": "- Active chart: JYAS_BENCH_0099\n  - Log rows: 742\n\nThe immediate engineering priority is still the harness: no fixture corpus, no rigorous parity measurement.\n \n \n› I’ll use the JYAS v3 research workflow here and check the live PL9 batch before recommending parallel work. I’m going to distinguish runner health from v3 parity work so we do not confuse fixture generation progress with solved logic.git/jyas\n\nThe batch is still alive and the repaired open path is working, but the main friction has shifted: VP2+ generation is failing on some charts after the chart opens correctly.",
             "buffer_text_sample": "- Active chart: JYAS_BENCH_0099\n  - Log rows: 742",
             "cursor_line_text": "",
             "input_enabled": true,
@@ -6163,7 +6163,7 @@ Weekly limit:                21% left
         let host = json!({
             "session_path": "remote-session://dev/live-codex",
             "text_sample": "• I generated the JYAS evidence pack.",
-            "text_tail": "• I generated the JYAS evidence pack.\n\nBest timing:\n- 23 Nov 2026 - 10 Jan 2027\n- 5 Aug 2027 - 4 Oct 2028\n\n› Improve documentation in @filename\n\ngpt-5.5 medium · ~/git/samplenotes",
+            "text_tail": "• I generated the JYAS evidence pack.\n\nBest timing:\n- 23 Nov 2026 - 10 Jan 2027\n- 5 Aug 2027 - 4 Oct 2028\n\n› Improve documentation in @filename\n\ngpt-5.5 medium · ~/git/jyas",
             "buffer_text_sample": "• I generated the JYAS evidence pack.",
             "cursor_line_text": "› Improve documentation in @filename",
             "input_enabled": true,
@@ -6203,7 +6203,7 @@ Weekly limit:                21% left
         let host = json!({
             "session_path": "remote-session://dev/live-codex",
             "text_sample": "• I generated the JYAS evidence pack.",
-            "text_tail": "• I generated the JYAS evidence pack.\n\nBest timing:\n- 23 Nov 2026 - 10 Jan 2027\n- 5 Aug 2027 - 4 Oct 2028\n\n› Improve documentation in @filename\n\ngpt-5.5 medium · ~/git/samplenotes",
+            "text_tail": "• I generated the JYAS evidence pack.\n\nBest timing:\n- 23 Nov 2026 - 10 Jan 2027\n- 5 Aug 2027 - 4 Oct 2028\n\n› Improve documentation in @filename\n\ngpt-5.5 medium · ~/git/jyas",
             "buffer_text_sample": "• I generated the JYAS evidence pack.",
             "cursor_line_text": "› Improve documentation in @filename",
             "input_enabled": true,
@@ -6302,8 +6302,8 @@ Weekly limit:                21% left
     fn terminal_host_problem_rejects_prompt_ready_unsafe_retained_replay_skip() {
         let host = json!({
             "session_path": "remote-session://dev/live-codex",
-            "text_sample": "• Previous output\n\n› Run /review on my current changes\n \n  gpt-5.5 medium · ~/git/samplenotes",
-            "text_tail": "• Previous output\n\n› Run /review on my current changes\n \n  gpt-5.5 medium · ~/git/samplenotes",
+            "text_sample": "• Previous output\n\n› Run /review on my current changes\n \n  gpt-5.5 medium · ~/git/jyas",
+            "text_tail": "• Previous output\n\n› Run /review on my current changes\n \n  gpt-5.5 medium · ~/git/jyas",
             "cursor_line_text": "› Run /review on my current changes",
             "input_enabled": true,
             "helper_textarea_focused": true,
@@ -6343,8 +6343,8 @@ Weekly limit:                21% left
     fn terminal_host_problem_allows_prompt_ready_retained_history_replay() {
         let host = json!({
             "session_path": "remote-session://dev/live-codex",
-            "text_sample": "Previous output\n\n› e s\n \n  gpt-5.5 xhigh · ~/git/samplenotes",
-            "text_tail": "Previous output\n\n› e s\n \n  gpt-5.5 xhigh · ~/git/samplenotes",
+            "text_sample": "Previous output\n\n› e s\n \n  gpt-5.5 xhigh · ~/git/jyas",
+            "text_tail": "Previous output\n\n› e s\n \n  gpt-5.5 xhigh · ~/git/jyas",
             "cursor_line_text": "› e s",
             "input_enabled": true,
             "effective_input_focus": true,
@@ -7182,7 +7182,7 @@ The previous command output stays in scrollback.
 There are enough normal rows before the stale transport line.
 The old detector only sampled the head of the terminal text.
 This needs to behave like a bottom-of-viewport problem.
-› Error: terminal session not found: local://019d0000-0000-7000-8000-000000000001
+› Error: terminal session not found: local://019dbdcf-9f11-7932-afb2-0d7b7c35914b
 Shared connection to 192.0.2.14 closed.
 ›
 ";

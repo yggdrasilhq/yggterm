@@ -1601,9 +1601,9 @@ mod tests {
                 "owned_terminal_session_count": 0,
                 "owned_terminal_session_keys": [],
                 "terminal_session_count": 1,
-                "terminal_session_keys": ["remote-session://dev/samplenotes"],
+                "terminal_session_keys": ["remote-session://dev/jyas"],
                 "preserved_terminal_owner_count": 1,
-                "preserved_terminal_owner_keys": ["remote-session://dev/samplenotes"],
+                "preserved_terminal_owner_keys": ["remote-session://dev/jyas"],
                 "managed_session_count": 0,
             }))
             .expect("stale preserved-only status");
@@ -1617,9 +1617,9 @@ mod tests {
                 "embedded_surface_supported": true,
                 "bridge_enabled": true,
                 "owned_terminal_session_count": 1,
-                "owned_terminal_session_keys": ["remote-session://dev/samplenotes"],
+                "owned_terminal_session_keys": ["remote-session://dev/jyas"],
                 "terminal_session_count": 1,
-                "terminal_session_keys": ["remote-session://dev/samplenotes"],
+                "terminal_session_keys": ["remote-session://dev/jyas"],
                 "preserved_terminal_owner_count": 0,
                 "preserved_terminal_owner_keys": [],
                 "managed_session_count": 0,
