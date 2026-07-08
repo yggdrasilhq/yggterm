@@ -17849,7 +17849,27 @@ fn app_control_key_script(command: &AppControlKeyCommand) -> String {
               return;
             }}
             if ('value' in target && typeof target.value === 'string') {{
-              target.value = nextValue;
+              // Framework-controlled inputs (Dioxus, React) mirror the field's
+              // value into a signal and re-render from it. A direct
+              // `target.value = x` is invisible to that machinery — the signal
+              // stays stale and the very next render wipes the text — so key-type
+              // silently no-ops. Writing through the prototype value setter, then
+              // firing a real InputEvent, is the change the framework's delegated
+              // 'input' listener actually observes, so the signal updates.
+              const proto =
+                (typeof HTMLTextAreaElement !== 'undefined' && target instanceof HTMLTextAreaElement)
+                  ? HTMLTextAreaElement.prototype
+                  : (typeof HTMLInputElement !== 'undefined' && target instanceof HTMLInputElement)
+                    ? HTMLInputElement.prototype
+                    : null;
+              const nativeSetter = proto
+                ? Object.getOwnPropertyDescriptor(proto, 'value')
+                : null;
+              if (nativeSetter && typeof nativeSetter.set === 'function') {{
+                nativeSetter.set.call(target, nextValue);
+              }} else {{
+                target.value = nextValue;
+              }}
             }} else if (target.isContentEditable) {{
               target.textContent = nextValue;
             }}
@@ -38269,7 +38289,20 @@ async fn process_pending_app_control_requests(
                     .and_then(|_| result.get("reason"))
                     .and_then(Value::as_str)
                     .map(ToOwned::to_owned);
-                respond(json!({ "target": "surface", "result": result }), error)
+                // Flatten to match the main-target shape: `data.result` IS the
+                // grid script's return (cells/hit/…), not `data.result.value.…`.
+                // The surface-eval envelope's metadata rides alongside as
+                // siblings so nothing is lost.
+                let inner = result.get("value").cloned().unwrap_or(Value::Null);
+                let mut payload = json!({ "target": "surface", "result": inner });
+                if let Some(obj) = payload.as_object_mut() {
+                    for key in ["accepted", "session_path", "native_id", "reason"] {
+                        if let Some(value) = result.get(key) {
+                            obj.insert(key.to_string(), value.clone());
+                        }
+                    }
+                }
+                respond(payload, error)
             }
         }
         AppControlCommand::DomEval { script } => {
@@ -43203,10 +43236,26 @@ fn app() -> Element {
             onclick: move |_| {
                 let active_terminal_session = state.with_mut(|shell| {
                     shell.clear_alt_overlay();
-                    if shell.server.active_view_mode() == WorkspaceViewMode::Terminal {
-                        shell.server.active_session().map(|session| session.session_path.clone())
-                    } else {
+                    if shell.server.active_view_mode() != WorkspaceViewMode::Terminal {
+                        return None;
+                    }
+                    let path = shell
+                        .server
+                        .active_session()
+                        .map(|session| session.session_path.clone())?;
+                    // A live web surface (profile picker or ychrome page) overlays
+                    // the viewport and OWNS the keyboard. This root-level onclick
+                    // fires for EVERY click in the window — including clicks on the
+                    // picker's own inputs, which bubble up here — so reclaiming
+                    // terminal focus would yank focus straight out of the input the
+                    // user just clicked (the "click the new-profile field and it
+                    // loses focus immediately" bug). Same rule the input policy uses
+                    // (apply_active_terminal_input_policy): overlay present => the
+                    // terminal does not get focus.
+                    if shell.has_live_web_surface(&path, current_millis()) {
                         None
+                    } else {
+                        Some(path)
                     }
                 });
                 dismiss_titlebar_transients_and_resync_active_terminal(state);
