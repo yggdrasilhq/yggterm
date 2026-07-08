@@ -5792,25 +5792,32 @@ fn snapshot_session_is_keep_alive_recovery_target(session: &SnapshotSessionView)
             .any(|entry| entry.label == "Runtime Persistence" && entry.value == "keep-alive")
 }
 
-/// Per the first-class agent-session spec: a LOCAL agent CLI session's row
+/// Per the first-class agent-session spec: an agent CLI session's row
 /// re-derives from the agent CLI's own store (codex / Claude Code JSONL), so a
 /// runtime exit must never erase the row from the snapshot — the row stays and
-/// the next open re-resumes via the CLI. Plain shells stay second-class: a
-/// non-keep-alive shell dies with its PTY. (Run #16 gate-#5 family: runtime
-/// exit was the pre-swap row eraser for local codex rows.)
-fn snapshot_session_is_local_agent_store_recoverable(session: &SnapshotSessionView) -> bool {
+/// the next open re-resumes via the CLI. This covers BOTH local agents
+/// (re-derive from the local store) AND remote agents (re-derive from the remote
+/// store via resume-codex / resume-cc): recognizing only the LOCAL agent here
+/// stripped every non-keep-alive REMOTE agent from the Live Sessions snapshot
+/// whenever its runtime was not currently connected (live-caught on jojo
+/// 2026-07-08). Plain shells stay runtime-gated here: a non-keep-alive shell
+/// with no live PTY is a husk, so it is retained only when its runtime IS
+/// present — never as a recovery target. (Run #16 gate-#5 family: runtime exit
+/// was the pre-swap row eraser for local codex rows.)
+fn snapshot_session_is_agent_store_recoverable(session: &SnapshotSessionView) -> bool {
     // Source alone is not enough: restored/recovery-created rows carry
     // source=Stored while holding a live local runtime key (the 2.8.79
     // persistence lesson, live-recaught here at the 90→91 swap when restored
     // local rows vanished from the snapshot while sitting in the persisted
     // order). Mirror managed_live_session_is_recoverable: a local-keyed row
     // is a live row by construction.
-    (matches!(session.source, crate::SessionSource::LiveLocal)
+    let is_local_agent = (matches!(session.source, crate::SessionSource::LiveLocal)
         || crate::local_runtime_id_from_key(&session.session_path).is_some())
         && matches!(
             session.kind,
             SessionKind::Codex | SessionKind::CodexLiteLlm | SessionKind::ClaudeCode
-        )
+        );
+    is_local_agent || crate::session_path_is_remote_agent(&session.session_path)
 }
 
 fn apply_terminal_runtime_truth_to_snapshot(
@@ -5822,14 +5829,14 @@ fn apply_terminal_runtime_truth_to_snapshot(
         && !runtime_keys
             .contains(&server.terminal_runtime_key_for_path(&active_session.session_path))
         && (snapshot_session_is_keep_alive_recovery_target(active_session)
-            || snapshot_session_is_local_agent_store_recoverable(active_session))
+            || snapshot_session_is_agent_store_recoverable(active_session))
     {
         active_session.launch_phase = crate::TerminalLaunchPhase::RemoteBootstrap;
     }
     for session in &mut snapshot.live_sessions {
         if !runtime_keys.contains(&server.terminal_runtime_key_for_path(&session.session_path))
             && (snapshot_session_is_keep_alive_recovery_target(session)
-                || snapshot_session_is_local_agent_store_recoverable(session))
+                || snapshot_session_is_agent_store_recoverable(session))
         {
             session.launch_phase = crate::TerminalLaunchPhase::RemoteBootstrap;
         }
@@ -5845,7 +5852,7 @@ fn apply_terminal_runtime_truth_to_snapshot(
             || (active_path.as_deref() == Some(session.session_path.as_str())
                 && snapshot_session_is_pending_runtime_launch(session))
             || snapshot_session_is_keep_alive_recovery_target(session)
-            || snapshot_session_is_local_agent_store_recoverable(session)
+            || snapshot_session_is_agent_store_recoverable(session)
     });
 
     let Some(active_path) = active_path else {
@@ -12451,7 +12458,7 @@ mod tests {
     }
 
     #[test]
-    fn daemon_snapshot_filters_live_rows_to_terminal_runtime_keys() {
+    fn daemon_snapshot_keeps_remote_agent_rows_across_runtime_gap() {
         let tree = daemon_test_tree();
         let server = YggtermServer::new(
             &tree,
@@ -12509,13 +12516,26 @@ mod tests {
 
         apply_terminal_runtime_truth_to_snapshot(&server, &runtime_keys, &mut snapshot);
 
-        assert_eq!(snapshot.live_sessions.len(), 4);
-        assert!(
-            snapshot
-                .live_sessions
-                .iter()
-                .all(|session| runtime_keys.contains(&session.session_path))
-        );
+        // FIRST-CLASS SESSIONS (jojo 2026-07-08): remote agent rows re-derive
+        // from the remote CLI's JSONL, so a row whose runtime is not currently
+        // connected is a RECOVERY TARGET, not a husk. All 5 survive the filter;
+        // the one without a live runtime (runtime-4) is downgraded to the
+        // reconnecting phase rather than dropped from Live Sessions.
+        assert_eq!(snapshot.live_sessions.len(), 5);
+        let orphan_path = remote_scanned_session_path("dev", "runtime-4");
+        let orphan = snapshot
+            .live_sessions
+            .iter()
+            .find(|session| session.session_path == orphan_path)
+            .expect("remote agent row without a live runtime is kept as a recovery target");
+        assert_eq!(orphan.launch_phase, TerminalLaunchPhase::RemoteBootstrap);
+        for session in snapshot
+            .live_sessions
+            .iter()
+            .filter(|session| runtime_keys.contains(&session.session_path))
+        {
+            assert_eq!(session.launch_phase, TerminalLaunchPhase::Running);
+        }
     }
 
     // Run #16 gate-#5 family: a LOCAL agent CLI row re-derives from the CLI's
@@ -12590,7 +12610,7 @@ mod tests {
     }
 
     #[test]
-    fn daemon_snapshot_downgrades_restored_remote_live_without_runtime_to_preview() {
+    fn daemon_snapshot_preserves_restored_remote_agent_without_runtime() {
         let tree = daemon_test_tree();
         let mut server = YggtermServer::new(
             &tree,
@@ -12644,8 +12664,14 @@ mod tests {
 
         apply_terminal_runtime_truth_to_snapshot(&server, &HashSet::new(), &mut snapshot);
 
-        assert!(snapshot.live_sessions.is_empty());
-        assert_eq!(snapshot.active_view_mode, WorkspaceViewMode::Rendered);
+        // FIRST-CLASS SESSIONS (jojo 2026-07-08): a restored remote agent row
+        // without a live runtime re-derives from the remote CLI's JSONL, so it is
+        // a RECOVERY TARGET — preserved in Live Sessions as a reconnecting row,
+        // not downgraded to a static preview. This is what keeps the user's dev
+        // sessions in Live Sessions across a reconnect gap after an agentic
+        // restart. Mirrors the keep-alive remote path.
+        assert_eq!(snapshot.live_sessions.len(), 1);
+        assert_eq!(snapshot.active_view_mode, WorkspaceViewMode::Terminal);
         assert_eq!(
             snapshot.active_session_path.as_deref(),
             Some(active_path.as_str())
@@ -12655,7 +12681,18 @@ mod tests {
                 .active_session
                 .as_ref()
                 .map(|session| session.source),
-            Some(SessionSource::Stored)
+            Some(SessionSource::LiveSsh)
+        );
+        assert_eq!(
+            snapshot
+                .active_session
+                .as_ref()
+                .map(|session| session.launch_phase),
+            Some(TerminalLaunchPhase::RemoteBootstrap)
+        );
+        assert_eq!(
+            snapshot.live_sessions[0].launch_phase,
+            TerminalLaunchPhase::RemoteBootstrap
         );
     }
 
@@ -12735,9 +12772,13 @@ mod tests {
         active.kind = SessionKind::SshShell;
         active.launch_phase = TerminalLaunchPhase::RemoteBootstrap;
         active.remote_deploy_state = RemoteDeployState::Planned;
-        let stale_path = remote_scanned_session_path("dev", "old-runtime");
-        let mut stale = daemon_test_snapshot_session(&stale_path, SessionSource::LiveSsh);
-        stale.kind = SessionKind::Codex;
+        // A plain shell with no live PTY is a husk (NOT a recovery target), so it
+        // is still dropped by the runtime-truth filter — this is what keeps the
+        // test discriminating now that remote agent rows are retained across a
+        // runtime gap (see daemon_snapshot_keeps_remote_agent_rows_across_runtime_gap).
+        let stale_path = "live::old-shell";
+        let mut stale = daemon_test_snapshot_session(stale_path, SessionSource::LiveLocal);
+        stale.kind = SessionKind::Shell;
         stale.launch_phase = TerminalLaunchPhase::Running;
         let mut snapshot = ServerUiSnapshot {
             active_session_path: Some(active_path.to_string()),
