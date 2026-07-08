@@ -1377,12 +1377,14 @@ async fn web_surface_native_reconcile_loop(
                     // reserved "temp" profile; also home-resolve failure).
                     let profile_dir = web_surface_profile_dir(&profile);
                     let userscripts = load_web_surface_userscripts(&profile);
+                    let adblock_ruleset = web_surface_adblock_ruleset(&profile);
                     match desktop.open_web_surface(
                         native_id,
                         &effective_url,
                         socks_port,
                         profile_dir.as_deref(),
                         &userscripts,
+                        adblock_ruleset.as_deref(),
                         rect.0,
                         rect.1,
                         rect.2,
@@ -1402,6 +1404,7 @@ async fn web_surface_native_reconcile_loop(
                                     "socks_port": socks_port,
                                     "profile": profile,
                                     "userscripts": userscripts.len(),
+                                    "adblock": adblock_ruleset.is_some(),
                                     "rect": [rect.0, rect.1, rect.2, rect.3],
                                 }),
                             );
@@ -1555,6 +1558,36 @@ fn load_web_surface_userscripts(profile: &str) -> Vec<String> {
         }
     }
     scripts
+}
+/// The adblock ruleset a surface of `profile` loads under, or None = adblock
+/// off for it. Source of truth: `~/.yggterm/web-adblock/rules.json` (WebKit
+/// content-blocker JSON; compiled bytecode cached in `compiled/` next to it)
+/// + `~/.yggterm/web-adblock/config.json`:
+/// `{"enabled": bool, "disabled_profiles": ["name", ...]}`. Defaults: enabled
+/// whenever rules.json exists (missing/broken config = enabled — adblock is a
+/// daily-browser table stake), no per-profile opt-outs. The ychrome settings
+/// pane drives this file.
+fn web_surface_adblock_ruleset(profile: &str) -> Option<std::path::PathBuf> {
+    let dir = yggterm_core::resolve_yggterm_home().ok()?.join("web-adblock");
+    let rules = dir.join("rules.json");
+    if !rules.is_file() {
+        return None;
+    }
+    if let Ok(raw) = std::fs::read_to_string(dir.join("config.json"))
+        && let Ok(config) = serde_json::from_str::<Value>(&raw)
+    {
+        if config.get("enabled").and_then(Value::as_bool) == Some(false) {
+            return None;
+        }
+        let disabled = config
+            .get("disabled_profiles")
+            .and_then(Value::as_array)
+            .is_some_and(|list| list.iter().any(|p| p.as_str() == Some(profile)));
+        if disabled {
+            return None;
+        }
+    }
+    Some(rules)
 }
 /// Split an http(s) URL into (host, port, path-and-after) for forward
 /// construction. Returns None when the URL is not parseable enough.
@@ -2195,6 +2228,10 @@ enum RightPanelMode {
     Settings,
     Connect,
     Notifications,
+    /// The ACTIVE libyggterm app's contributed sidebar (4-surface taxonomy's
+    /// sidebar-contribution surface). First consumer: ychrome settings
+    /// (adblock + userscripts config, all GUI-host-owned files).
+    AppSidebar,
 }
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum PreviewLayoutMode {
@@ -2259,6 +2296,9 @@ struct RenderSnapshot {
     selected_row: Option<BrowserRow>,
     active_session: Option<ManagedSessionView>,
     active_session_path: Option<String>,
+    /// The active session's live web-surface profile (app tab), if it has a
+    /// surface — drives the app-sidebar's per-profile settings.
+    active_web_surface_profile: Option<String>,
     active_view_mode: WorkspaceViewMode,
     retained_terminal_sessions: Vec<ManagedSessionView>,
     terminal_mount_epochs: HashMap<String, u64>,
@@ -3974,6 +4014,12 @@ impl ShellState {
             selected_path,
             selected_row,
             active_session,
+            active_web_surface_profile: active_session_path.as_deref().and_then(|path| {
+                self.web_surfaces
+                    .get(path)
+                    .and_then(|surface| surface.tabs.first())
+                    .map(|app_tab| app_tab.profile.clone())
+            }),
             active_session_path,
             active_view_mode: render_active_view_mode,
             retained_terminal_sessions,
@@ -4583,7 +4629,16 @@ impl ShellState {
             RightPanelMode::Metadata => "metadata opened".to_string(),
             RightPanelMode::Connect => "ssh connect opened".to_string(),
             RightPanelMode::Notifications => "notifications opened".to_string(),
+            RightPanelMode::AppSidebar => "app sidebar opened".to_string(),
         };
+    }
+    fn toggle_app_sidebar_panel(&mut self) {
+        let next_mode = if self.right_panel_mode == RightPanelMode::AppSidebar {
+            RightPanelMode::Hidden
+        } else {
+            RightPanelMode::AppSidebar
+        };
+        self.set_right_panel_mode(next_mode);
     }
     fn toggle_connect_panel(&mut self) {
         let next_mode = if self.right_panel_mode == RightPanelMode::Connect {
@@ -26886,6 +26941,7 @@ fn right_panel_mode_label(mode: RightPanelMode) -> &'static str {
         RightPanelMode::Settings => "settings",
         RightPanelMode::Connect => "connect",
         RightPanelMode::Notifications => "notifications",
+        RightPanelMode::AppSidebar => "app_sidebar",
     }
 }
 
@@ -26896,6 +26952,7 @@ fn app_control_right_panel_mode(mode: AppControlRightPanelMode) -> RightPanelMod
         AppControlRightPanelMode::Notifications => RightPanelMode::Notifications,
         AppControlRightPanelMode::Settings => RightPanelMode::Settings,
         AppControlRightPanelMode::Metadata => RightPanelMode::Metadata,
+        AppControlRightPanelMode::AppSidebar => RightPanelMode::AppSidebar,
     }
 }
 
@@ -43009,6 +43066,10 @@ fn app() -> Element {
                             state.with_mut(|shell| shell.toggle_notifications_panel());
                             sync_active_terminal_input_policy(state);
                             },
+                            on_toggle_app_sidebar: move || {
+                            state.with_mut(|shell| shell.toggle_app_sidebar_panel());
+                            sync_active_terminal_input_policy(state);
+                            },
                             on_restart_update: move || restart_into_pending_update(state),
                             on_request_window_drag: move || {
                             state.with_mut(|shell| shell.note_titlebar_drag_request());
@@ -43370,6 +43431,13 @@ fn app() -> Element {
                             on_ssh_prefix_change: move |value: String| state.with_mut(|shell| shell.update_ssh_connect_prefix(value)),
                             on_clear_notification: move |id: u64| state.with_mut(|shell| shell.clear_notification(id)),
                             on_clear_notifications: move |_| state.with_mut(|shell| shell.clear_notifications()),
+                            on_reload_web_surface: move |_| {
+                                state.with_mut(|shell| {
+                                    if let Some(path) = shell.server.active_session_path().map(str::to_string) {
+                                        shell.web_surface_reload_active_tab(&path);
+                                    }
+                                });
+                            },
                         }
                     }
                 }
@@ -43789,6 +43857,7 @@ fn Titlebar(
     on_toggle_settings: EventHandler<()>,
     on_toggle_connect: EventHandler<()>,
     on_toggle_notifications: EventHandler<()>,
+    on_toggle_app_sidebar: EventHandler<()>,
     on_restart_update: EventHandler<()>,
     on_request_window_drag: EventHandler<()>,
     on_toggle_maximized: EventHandler<()>,
@@ -44580,6 +44649,34 @@ fn Titlebar(
                     div {
                         class: "yggterm-titlebar-inline-secondary",
                         style: "display:flex; align-items:center; gap:8px;",
+                        button {
+                            key: "titlebar-appsidebar-button",
+                            "data-titlebar-appsidebar-button": "1",
+                            title: "App settings (active app's sidebar)",
+                            style: utility_icon_style(
+                                snapshot.palette,
+                                snapshot.right_panel_mode == RightPanelMode::AppSidebar
+                            ),
+                            onmousedown: |evt| {
+                                evt.prevent_default();
+                                evt.stop_propagation();
+                            },
+                            onclick: {
+                                let on_toggle_app_sidebar = on_toggle_app_sidebar.clone();
+                                move |evt| {
+                                    evt.stop_propagation();
+                                    on_toggle_app_sidebar.call(());
+                                }
+                            },
+                            ondoubleclick: |evt| evt.stop_propagation(),
+                            if alt_overlay_badge_visible(&snapshot, "") {
+                                span {
+                                    style: "display:inline-flex; align-items:center; justify-content:center; min-width:16px; height:16px; padding:0 4px; border-radius:6px; background:rgba(95,168,255,0.14); color:#2667a9; font-size:9px; font-weight:800; margin-right:6px;",
+                                    "A"
+                                }
+                            }
+                            "▦"
+                        }
                         button {
                             key: "titlebar-notifications-button",
                             "data-titlebar-notifications-button": "1",
@@ -73143,6 +73240,7 @@ fn RightRail(
     on_ssh_prefix_change: EventHandler<String>,
     on_clear_notification: EventHandler<u64>,
     on_clear_notifications: EventHandler<MouseEvent>,
+    on_reload_web_surface: EventHandler<()>,
 ) -> Element {
     let requested_mode = snapshot.right_panel_mode;
     let mut retained_mode = use_signal(|| requested_mode);
@@ -73204,6 +73302,233 @@ fn RightRail(
                     snapshot: snapshot.clone(),
                     on_clear_notification,
                     on_clear_notifications,
+                }
+            } else if rendered_mode == RightPanelMode::AppSidebar {
+                AppSidebarRailBody {
+                    snapshot: snapshot.clone(),
+                    on_reload_web_surface,
+                }
+            }
+            }
+        }
+    }
+}
+/// On-disk state the app-sidebar (ychrome settings) panel renders: the
+/// GUI-host-owned web content policy. Source of truth is the files themselves
+/// (~/.yggterm/web-adblock/*, ~/.yggterm/web-userscripts/*) — the panel reads
+/// them at render and mutates them directly; surfaces pick changes up on
+/// recreate (reload / switch-back).
+struct YchromeSidebarState {
+    adblock_rules_present: bool,
+    adblock_rule_count: usize,
+    adblock_enabled: bool,
+    adblock_disabled_profiles: Vec<String>,
+    /// (file stem, enabled) for shared userscripts: `name.js` = enabled,
+    /// `name.js.disabled` = disabled.
+    userscripts: Vec<(String, bool)>,
+}
+fn ychrome_sidebar_state() -> YchromeSidebarState {
+    let home = yggterm_core::resolve_yggterm_home().ok();
+    let adblock_dir = home.as_ref().map(|h| h.join("web-adblock"));
+    let rules = adblock_dir.as_ref().map(|d| d.join("rules.json"));
+    let adblock_rules_present = rules.as_ref().is_some_and(|p| p.is_file());
+    let adblock_rule_count = rules
+        .as_ref()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+        .and_then(|v| v.as_array().map(Vec::len))
+        .unwrap_or(0);
+    let config = adblock_dir
+        .as_ref()
+        .and_then(|d| std::fs::read_to_string(d.join("config.json")).ok())
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok());
+    let adblock_enabled = config
+        .as_ref()
+        .and_then(|c| c.get("enabled"))
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+    let adblock_disabled_profiles = config
+        .as_ref()
+        .and_then(|c| c.get("disabled_profiles"))
+        .and_then(Value::as_array)
+        .map(|list| {
+            list.iter()
+                .filter_map(|p| p.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut userscripts: Vec<(String, bool)> = Vec::new();
+    if let Some(home) = &home
+        && let Ok(entries) = std::fs::read_dir(home.join("web-userscripts"))
+    {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if let Some(stem) = name.strip_suffix(".js") {
+                userscripts.push((stem.to_string(), true));
+            } else if let Some(stem) = name.strip_suffix(".js.disabled") {
+                userscripts.push((stem.to_string(), false));
+            }
+        }
+    }
+    userscripts.sort();
+    YchromeSidebarState {
+        adblock_rules_present,
+        adblock_rule_count,
+        adblock_enabled,
+        adblock_disabled_profiles,
+        userscripts,
+    }
+}
+/// Rewrite ~/.yggterm/web-adblock/config.json with `mutate` applied to the
+/// current (or default) config object.
+fn mutate_adblock_config(mutate: impl FnOnce(&mut serde_json::Map<String, Value>)) {
+    let Ok(home) = yggterm_core::resolve_yggterm_home() else {
+        return;
+    };
+    let dir = home.join("web-adblock");
+    let _ = std::fs::create_dir_all(&dir);
+    let path = dir.join("config.json");
+    let mut config = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+        .and_then(|v| v.as_object().cloned())
+        .unwrap_or_default();
+    mutate(&mut config);
+    if let Ok(raw) = serde_json::to_string_pretty(&Value::Object(config)) {
+        let _ = std::fs::write(&path, raw);
+    }
+}
+fn set_adblock_profile_disabled(profile: &str, disabled: bool) {
+    mutate_adblock_config(|config| {
+        let mut list: Vec<Value> = config
+            .get("disabled_profiles")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        list.retain(|p| p.as_str() != Some(profile));
+        if disabled {
+            list.push(Value::String(profile.to_string()));
+        }
+        config.insert("disabled_profiles".to_string(), Value::Array(list));
+    });
+}
+/// Enable/disable a shared userscript by renaming `<stem>.js` ⇄
+/// `<stem>.js.disabled` (the loader only reads `*.js`).
+fn set_userscript_enabled(stem: &str, enabled: bool) {
+    let Ok(home) = yggterm_core::resolve_yggterm_home() else {
+        return;
+    };
+    let dir = home.join("web-userscripts");
+    let (from, to) = if enabled {
+        (format!("{stem}.js.disabled"), format!("{stem}.js"))
+    } else {
+        (format!("{stem}.js"), format!("{stem}.js.disabled"))
+    };
+    let _ = std::fs::rename(dir.join(from), dir.join(to));
+}
+#[component]
+fn AppSidebarRailBody(snapshot: SharedSnapshot, on_reload_web_surface: EventHandler<()>) -> Element {
+    let palette = snapshot.palette;
+    // Bumped after every disk mutation so the panel re-reads the files.
+    let mut refresh = use_signal(|| 0u32);
+    let _ = refresh();
+    let sidebar = ychrome_sidebar_state();
+    let profile = snapshot.active_web_surface_profile.clone();
+    let has_surface = profile.is_some();
+    let profile_label = profile.clone().unwrap_or_else(|| "default".to_string());
+    let profile_adblock_disabled = sidebar
+        .adblock_disabled_profiles
+        .iter()
+        .any(|p| p == &profile_label);
+    let adblock_description = if sidebar.adblock_rules_present {
+        format!(
+            "Engine-native content filter ({} rules) — network blocks + cosmetic hiding.",
+            sidebar.adblock_rule_count
+        )
+    } else {
+        "No ruleset installed (~/.yggterm/web-adblock/rules.json missing).".to_string()
+    };
+    rsx! {
+        RailHeader { title: "ychrome".to_string(), color: palette.text.to_string() }
+        RailScrollBody {
+            content: rsx!{
+            div {
+                style: "display:flex; flex-direction:column; gap:14px;",
+                if !has_surface {
+                    div {
+                        style: format!("font-size:10px; line-height:1.5; color:{};", palette.muted),
+                        "No web app active — settings below apply to every ychrome surface."
+                    }
+                }
+                RailSectionTitle { title: "Ad blocking".to_string(), muted_color: palette.muted.to_string() }
+                InlineSettingsToggleRow {
+                    field_key: "ychrome-adblock-enabled".to_string(),
+                    label: "Block ads & trackers".to_string(),
+                    description: adblock_description,
+                    enabled: sidebar.adblock_enabled && sidebar.adblock_rules_present,
+                    palette,
+                    on_change: move |enabled: bool| {
+                        mutate_adblock_config(|config| {
+                            config.insert("enabled".to_string(), Value::Bool(enabled));
+                        });
+                        refresh += 1;
+                    },
+                }
+                if has_surface {
+                    InlineSettingsToggleRow {
+                        field_key: "ychrome-adblock-profile".to_string(),
+                        label: format!("Enabled for “{profile_label}”"),
+                        description: "Per-profile override for the active surface's profile.".to_string(),
+                        enabled: !profile_adblock_disabled,
+                        palette,
+                        on_change: {
+                            let profile_label = profile_label.clone();
+                            move |enabled: bool| {
+                                set_adblock_profile_disabled(&profile_label, !enabled);
+                                refresh += 1;
+                            }
+                        },
+                    }
+                }
+                RailSectionTitle { title: "Userscripts".to_string(), muted_color: palette.muted.to_string() }
+                if sidebar.userscripts.is_empty() {
+                    div {
+                        style: format!("font-size:10px; line-height:1.5; color:{};", palette.muted),
+                        "None installed. Drop *.js files into ~/.yggterm/web-userscripts/ (all profiles) or a profile's userscripts/ dir."
+                    }
+                }
+                for (stem, enabled) in sidebar.userscripts.clone() {
+                    InlineSettingsToggleRow {
+                        field_key: format!("ychrome-userscript-{stem}"),
+                        label: stem.clone(),
+                        description: "Injected at document-start on every page.".to_string(),
+                        enabled,
+                        palette,
+                        on_change: {
+                            let stem = stem.clone();
+                            move |enabled: bool| {
+                                set_userscript_enabled(&stem, enabled);
+                                refresh += 1;
+                            }
+                        },
+                    }
+                }
+                div {
+                    style: format!("font-size:10px; line-height:1.5; color:{};", palette.muted),
+                    "Changes apply when a surface (re)creates — reload the page or switch away and back."
+                }
+                if has_surface {
+                    button {
+                        r#type: "button",
+                        "data-appsidebar-reload-surface": "1",
+                        style: format!(
+                            "align-self:flex-start; padding:7px 14px; border:0; border-radius:9px; \
+                             background:{}; color:#fff; font-size:11px; font-weight:700; cursor:pointer;",
+                            palette.accent
+                        ),
+                        onclick: move |_| on_reload_web_surface.call(()),
+                        "Reload surface now"
+                    }
                 }
             }
             }
