@@ -36,6 +36,129 @@ struct Surface {
     _ctx: WebContext,
 }
 
+/// Engine-native ad/tracker blocking (AdGuard-class network + cosmetic rules)
+/// via WebKit's declarative content filters — the mechanism GNOME Web uses.
+/// The webkit2gtk 2.0.2 SAFE binding does not bind UserContentFilterStore /
+/// add_filter (only the error enum), so this goes through `webkit2gtk::ffi`
+/// directly. One ruleset per GUI process, compiled once (async, on the GTK
+/// main loop) into a bytecode store dir and attached to every surface opened
+/// with adblock on; surfaces that open while compilation is in flight get the
+/// filter attached from the completion callback (page loads are slower than
+/// the compile, so the first navigation is still covered in practice).
+mod adblock {
+    use gtk::glib::translate::ToGlibPtr as _;
+    use std::cell::RefCell;
+    use webkit2gtk::ffi as wk;
+
+    thread_local! {
+        // (compiled filter, compile started). GTK-main-thread only, like every
+        // other surface path in this module.
+        static STATE: RefCell<(Option<*mut wk::WebKitUserContentFilter>, bool)> =
+            const { RefCell::new((None, false)) };
+        // Webviews that opened with adblock on before compilation finished;
+        // drained by the compile-completion callback. Holding the engine
+        // WebView (a GObject clone) keeps this independent of surface
+        // lifetime bookkeeping — attaching to an already-destroyed webview is
+        // a harmless no-op on a still-live GObject.
+        static PENDING: RefCell<Vec<webkit2gtk::WebView>> = const { RefCell::new(Vec::new()) };
+    }
+
+    fn attach_to(webkit: &webkit2gtk::WebView, filter: *mut wk::WebKitUserContentFilter) {
+        use webkit2gtk::WebViewExt as _;
+        if let Some(manager) = webkit.user_content_manager() {
+            unsafe {
+                wk::webkit_user_content_manager_add_filter(manager.to_glib_none().0, filter);
+            }
+        }
+    }
+
+    /// Attach the compiled filter to a surface webview now, or queue it for
+    /// attachment when compilation finishes. Returns whether it attached now.
+    pub(super) fn attach(webview: &wry::WebView) -> bool {
+        use wry::WebViewExtUnix as _;
+        let webkit = webview.webview();
+        let filter = STATE.with(|s| s.borrow().0);
+        match filter {
+            Some(filter) => {
+                attach_to(&webkit, filter);
+                true
+            }
+            None => {
+                PENDING.with(|p| p.borrow_mut().push(webkit));
+                false
+            }
+        }
+    }
+
+    /// Kick off (once per process) async compilation of the content-blocker
+    /// JSON at `ruleset` into `store_dir`. Completion caches the filter and
+    /// drains the pending-webview queue. No-op if compilation already started.
+    pub(super) fn ensure_compiled(ruleset: &std::path::Path, store_dir: &std::path::Path) {
+        let started = STATE.with(|s| std::mem::replace(&mut s.borrow_mut().1, true));
+        if started {
+            return;
+        }
+        let json = match std::fs::read(ruleset) {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                eprintln!("yggterm adblock: read {}: {err}", ruleset.display());
+                return;
+            }
+        };
+        let _ = std::fs::create_dir_all(store_dir);
+        let bytes = gtk::glib::Bytes::from_owned(json);
+        let store_path = std::ffi::CString::new(store_dir.to_string_lossy().as_bytes())
+            .expect("store path has no NUL");
+        let identifier = std::ffi::CString::new("yggterm-adblock").unwrap();
+
+        unsafe extern "C" fn save_done(
+            source: *mut gtk::glib::gobject_ffi::GObject,
+            result: *mut gtk::gio::ffi::GAsyncResult,
+            _user_data: gtk::glib::ffi::gpointer,
+        ) {
+            let mut error: *mut gtk::glib::ffi::GError = std::ptr::null_mut();
+            let filter = unsafe {
+                wk::webkit_user_content_filter_store_save_finish(
+                    source as *mut wk::WebKitUserContentFilterStore,
+                    result,
+                    &mut error,
+                )
+            };
+            if filter.is_null() {
+                let message = if error.is_null() {
+                    "unknown error".to_string()
+                } else {
+                    let err: gtk::glib::Error =
+                        unsafe { gtk::glib::translate::from_glib_full(error) };
+                    err.to_string()
+                };
+                eprintln!("yggterm adblock: ruleset compile failed: {message}");
+                PENDING.with(|p| p.borrow_mut().clear());
+                return;
+            }
+            STATE.with(|s| s.borrow_mut().0 = Some(filter));
+            let pending = PENDING.with(|p| std::mem::take(&mut *p.borrow_mut()));
+            for webkit in pending {
+                attach_to(&webkit, filter);
+            }
+        }
+
+        unsafe {
+            let store = wk::webkit_user_content_filter_store_new(store_path.as_ptr());
+            wk::webkit_user_content_filter_store_save(
+                store,
+                identifier.as_ptr(),
+                bytes.to_glib_none().0,
+                std::ptr::null_mut(),
+                Some(save_done),
+                std::ptr::null_mut(),
+            );
+            // The store object stays alive for the async op via its own ref;
+            // we deliberately leak our ref (one store per process, tiny).
+        }
+    }
+}
+
 /// Owns the main window's `gtk::Overlay` and the set of live surface webviews.
 /// Held (Linux only) on `DesktopService`; driven from the shell via the
 /// `open_web_surface` / `web_surface_*` methods on `DesktopContext`.
@@ -66,8 +189,10 @@ impl WebSurfaceHost {
     /// localStorage); `None` = ephemeral. `userscripts` are injected into the
     /// TOP frame at document-start on every page this surface loads (the
     /// userscript/content-policy substrate: SponsorBlock-class scripts,
-    /// cosmetic filters, autofill). Bounds are logical pixels relative to the
-    /// window's top-left.
+    /// cosmetic filters, autofill). `adblock_ruleset` = path to a WebKit
+    /// content-blocker JSON; when set, the compiled filter (network blocks +
+    /// cosmetic hiding, engine-native) is attached to this surface. Bounds are
+    /// logical pixels relative to the window's top-left.
     #[allow(clippy::too_many_arguments)]
     pub fn open(
         &self,
@@ -76,6 +201,7 @@ impl WebSurfaceHost {
         socks_port: Option<u16>,
         profile_dir: Option<&std::path::Path>,
         userscripts: &[String],
+        adblock_ruleset: Option<&std::path::Path>,
         x: i32,
         y: i32,
         w: i32,
@@ -130,6 +256,14 @@ impl WebSurfaceHost {
         };
         container.show_all();
 
+        if let Some(ruleset) = adblock_ruleset {
+            let store_dir = ruleset
+                .parent()
+                .map(|dir| dir.join("compiled"))
+                .unwrap_or_else(|| std::path::PathBuf::from("compiled"));
+            adblock::ensure_compiled(ruleset, &store_dir);
+            adblock::attach(&webview);
+        }
         self.surfaces.borrow_mut().insert(
             id,
             Surface {

@@ -45,6 +45,7 @@ pub enum AppControlRightPanelMode {
     Notifications,
     Settings,
     Metadata,
+    AppSidebar,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
