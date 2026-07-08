@@ -22,7 +22,8 @@ use yggterm_server::{
     run_app_control_focus_window, run_app_control_key, run_app_control_list_clients,
     run_app_control_move_window_by, run_app_control_open_path,
     run_app_control_paste_terminal_clipboard, run_app_control_paste_terminal_clipboard_image,
-    run_app_control_dom_eval, run_app_control_pointer, run_app_control_probe_terminal_context_menu,
+    run_app_control_dom_eval, run_app_control_grid, run_app_control_pointer,
+    run_app_control_probe_terminal_context_menu,
     run_app_control_probe_terminal_primary_selection_paste,
     run_app_control_probe_terminal_viewport_input, run_app_control_probe_terminal_viewport_scroll,
     run_app_control_probe_terminal_viewport_select, run_app_control_reclaim_terminal_focus,
@@ -1756,6 +1757,27 @@ fn main() -> Result<()> {
                     steps,
                     step_delay_ms,
                     timeout_ms,
+                )
+            }
+            "grid" => {
+                let action = args
+                    .get(3)
+                    .map(String::as_str)
+                    .context("missing action for server app grid")?;
+                let cell = cli_positional_args(&args, 4).into_iter().next();
+                let cols = cli_flag_value(&args, "--cols").and_then(|v| v.parse::<u32>().ok());
+                let rows = cli_flag_value(&args, "--rows").and_then(|v| v.parse::<u32>().ok());
+                let region = cli_flag_value(&args, "--region");
+                let target = cli_flag_value(&args, "--target");
+                let ttl_secs =
+                    cli_flag_value(&args, "--ttl-secs").and_then(|v| v.parse::<u64>().ok());
+                let button = cli_flag_value(&args, "--button");
+                let count = cli_flag_value(&args, "--count").and_then(|v| v.parse::<u8>().ok());
+                let refine = args.iter().any(|arg| arg == "--refine");
+                let keep = args.iter().any(|arg| arg == "--keep");
+                run_app_control_grid(
+                    action, cell, cols, rows, region, target, ttl_secs, button, count, refine,
+                    keep, timeout_ms,
                 )
             }
             "dom-eval" => {

@@ -106,6 +106,55 @@ LIVE_HOST=$(cat .agents/config/live-host)
 ssh "$LIVE_HOST" "~/.local/bin/yggterm server app state" | python3 -m json.tool 2>/dev/null || true
 ```
 
+## Click Grid (agent pointer targeting — main webview AND ychrome pages)
+
+Full spec: `docs/yggui-click-grid.md`. Labeled grid overlay for the vision loop:
+show → screenshot → read the cell label next to the target → click the cell.
+The GUI resolves cells to coordinates server-side; never read pixel coordinates
+off a screenshot yourself.
+
+```bash
+LIVE_HOST=$(cat .agents/config/live-host)
+# 1. Draw the grid (default 12×8, auto-targets ychrome page if one is live)
+ssh "$LIVE_HOST" "~/.local/bin/yggterm server app grid show --cols 12 --rows 8"
+# 2. Screenshot to choose (grid over a ychrome page needs --backend os)
+ssh "$LIVE_HOST" "~/.local/bin/yggterm server app screenshot /tmp/grid.png --backend os"
+# 3. Click a cell — or refine first for small targets
+ssh "$LIVE_HOST" "~/.local/bin/yggterm server app grid click B7 --refine"   # subdivides B7 into 1-9
+ssh "$LIVE_HOST" "~/.local/bin/yggterm server app grid click B7.5"          # clicks the middle ninth
+ssh "$LIVE_HOST" "~/.local/bin/yggterm server app grid hover C3 --keep"
+ssh "$LIVE_HOST" "~/.local/bin/yggterm server app grid hide"
+```
+
+- `--target main|surface|auto` — `surface` injects the grid INSIDE the active
+  session's native child webview (ychrome page, canvas/3D) in page coordinates;
+  a window-level synthetic click can never reach a native child widget.
+  `--region terminal` (main target) restricts the grid to the viewport.
+- Click/hover responses include the hit element (`tag`, `id`, `cls`, `text`) —
+  ALWAYS check it to verify you hit what you aimed at.
+- A click hides the grid unless `--keep`; TTL auto-hides after 120 s.
+- **When to use which targeting tool:** semantic first — `app dom-eval`
+  (main webview) or `app web eval` (ychrome page DOM) with querySelector →
+  rect is more precise and self-verifying. The grid is for surfaces without
+  usable semantics (canvas, 3D, unfamiliar pages) and quick vision-loop work.
+- **Trust caveat (applies to ALL synthetic pointer/key paths):** dispatched
+  events are untrusted — listeners fire but WebKit withholds native default
+  actions, notably FOCUS on inputs. To focus + type: `grid click` (or
+  `pointer click`) the input, then `app dom-eval "…querySelector(…).focus()"`
+  (or `app web eval` in a page), then `app key type`. Note `app key type`
+  into Dioxus controlled inputs must go through the prototype value setter +
+  InputEvent (dom-eval), or the signal never updates and a re-render wipes
+  the text.
+
+## DOM Eval (main-webview JS probe)
+
+```bash
+# Evaluate JS in the MAIN webview (Dioxus chrome); script body must `return`
+# a JSON-serializable value. The missing eye that `app web eval` (child
+# webviews) cannot provide: focus state, rects, attributes of GUI elements.
+ssh "$LIVE_HOST" "~/.local/bin/yggterm server app dom-eval 'return {active: String(document.activeElement.tagName)}'"
+```
+
 ## Terminal Probe (type text into live terminal)
 
 ```bash
