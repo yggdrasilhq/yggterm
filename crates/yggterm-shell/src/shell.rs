@@ -1222,6 +1222,15 @@ async fn web_surface_native_reconcile_loop(
             let desired = shell_ref
                 .web_surfaces
                 .iter()
+                // Picker-mode surfaces render as a Dioxus overlay (native GUI
+                // profile picker), NEVER a native child webview — so they must
+                // NOT enter the reconciler's desired set. Including them made
+                // the reconciler fast-tick (300ms) + document::eval for a
+                // `[data-ws-page]` rect that picker mode never emits, i.e. a
+                // useless 3/sec main-thread round-trip for the whole time the
+                // picker is up. Excluding them lets the loop go idle when only
+                // a picker is present (no native surface to place).
+                .filter(|(_, surface)| surface.picker.is_none())
                 .map(|(session_path, surface)| {
                     (
                         session_path.clone(),
@@ -58440,6 +58449,7 @@ fn WebSurfacePickerView(control_url: String, foreground: String, background: Str
     };
     let mut choose_profile = choose.clone();
     let mut choose_temp = choose.clone();
+    let mut choose_url = choose.clone();
     let mut choose_new = choose;
     let muted = format!("color:{foreground}; opacity:0.6;");
     let card_style = format!(
@@ -58475,7 +58485,20 @@ fn WebSurfacePickerView(control_url: String, foreground: String, background: Str
                          background:rgba(127,127,127,0.10); color:{foreground}; outline:none; max-width:460px; width:100%; margin:0 auto;"
                     ),
                     value: "{url_input}",
+                    // Autofocus so the user can type immediately (Chrome-like).
+                    // Without it the field needs a click first, and a click
+                    // dropped by a busy UI reads as "I can't type anywhere".
+                    onmounted: move |evt| async move {
+                        let _ = evt.set_focus(true).await;
+                    },
                     oninput: move |evt| url_input.set(evt.value()),
+                    onkeydown: move |evt| {
+                        // Enter in the URL field opens with the default profile,
+                        // matching a normal address bar.
+                        if evt.key() == Key::Enter && !submitted() {
+                            choose_url("default".to_string());
+                        }
+                    },
                 }
                 div {
                     style: "display:flex; flex-wrap:wrap; gap:14px; justify-content:center;",
