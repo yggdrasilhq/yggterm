@@ -1020,6 +1020,23 @@ fn enumerate_web_surface_profiles() -> Vec<String> {
     names.dedup();
     names
 }
+/// Delete a host-owned web-profile jar (cookies, logins, storage) from the
+/// picker UI. The name goes through the same sanitizer the open path uses, so
+/// a hostile value can never escape `~/.yggterm/web-profiles/`; the reserved
+/// ephemeral profile has no jar to delete. Returns whether a jar was removed.
+fn delete_web_surface_profile(profile: &str) -> bool {
+    let normalized = normalize_web_surface_profile(Some(profile));
+    if normalized != profile.trim() || normalized == WEB_SURFACE_TEMP_PROFILE {
+        return false;
+    }
+    let Some(dir) = web_surface_profile_dir(&normalized) else {
+        return false;
+    };
+    if !dir.is_dir() {
+        return false;
+    }
+    std::fs::remove_dir_all(&dir).is_ok()
+}
 /// Minimal loopback HTTP GET (fire the request, drain the response) against a
 /// picker control endpoint — `http://127.0.0.1:<port>/...`, possibly the local
 /// end of an ssh forward. Hand-rolled over TcpStream: matches ychrome's
@@ -58534,23 +58551,32 @@ fn TerminalCanvas(
 /// handler re-emits the real OSC "open".
 #[component]
 fn WebSurfacePickerView(control_url: String, foreground: String, background: String) -> Element {
-    let mut url_input = use_signal(String::new);
     let mut new_profile_input = use_signal(String::new);
     let mut submitted = use_signal(|| false);
+    // Two-step delete arm: the profile whose ✕ was clicked once. A second ✕
+    // click deletes the jar; clicking anything else disarms.
+    let mut pending_delete = use_signal(|| None::<String>);
+    // Bumped after a deletion so the (disk-enumerated) card list re-renders.
+    let mut profiles_refresh = use_signal(|| 0u32);
+    let _ = profiles_refresh();
     let profiles = enumerate_web_surface_profiles();
+    // Profile-first (Chrome-like): the picker ONLY chooses identity. The URL
+    // is typed later in the surface's address bar — an empty url in the /open
+    // GET lands the chosen profile on ychrome's start page. No URL input here:
+    // its async autofocus also stole focus from the new-profile field right
+    // after a click (the "yanks out of focus immediately" bug).
     let choose = move |profile: String| {
         if submitted() {
             return;
         }
         submitted.set(true);
         let get_url = format!(
-            "{}open?url={}&profile={}",
+            "{}open?url=&profile={}",
             if control_url.ends_with('/') {
                 control_url.clone()
             } else {
                 format!("{control_url}/")
             },
-            web_surface_query_encode(url_input().trim()),
             web_surface_query_encode(&profile),
         );
         spawn(async move {
@@ -58559,11 +58585,22 @@ fn WebSurfacePickerView(control_url: String, foreground: String, background: Str
     };
     let mut choose_profile = choose.clone();
     let mut choose_temp = choose.clone();
-    let mut choose_url = choose.clone();
     let mut choose_new = choose;
+    let mut create_new_profile = move |name: String| {
+        let name = name.trim().to_string();
+        // Same sanitizer as the open path: reject path-escaping names and the
+        // reserved ephemeral profile instead of silently mapping to "default".
+        if name.is_empty()
+            || normalize_web_surface_profile(Some(&name)) != name
+            || name == WEB_SURFACE_TEMP_PROFILE
+        {
+            return;
+        }
+        choose_new(name);
+    };
     let muted = format!("color:{foreground}; opacity:0.6;");
     let card_style = format!(
-        "display:flex; flex-direction:column; align-items:center; gap:9px; padding:18px 10px 14px; \
+        "position:relative; display:flex; flex-direction:column; align-items:center; gap:9px; padding:18px 10px 14px; \
          width:118px; border:1px solid rgba(127,127,127,0.35); border-radius:14px; cursor:pointer; \
          background:rgba(127,127,127,0.10); color:{foreground}; font-size:13px;"
     );
@@ -58582,45 +58619,56 @@ fn WebSurfacePickerView(control_url: String, foreground: String, background: Str
                     div { style: "font-size:22px; font-weight:600;", "Choose a profile" }
                     div {
                         style: format!("font-size:13px; {muted}"),
-                        if submitted() { "Opening…" } else { "Each profile keeps its own cookies and logins. Type a URL, or leave it blank to start on search." }
+                        if submitted() { "Opening…" } else { "Each profile keeps its own cookies and logins." }
                     }
-                }
-                input {
-                    r#type: "text",
-                    placeholder: "URL or search — e.g. localhost:8000",
-                    autocomplete: "off",
-                    spellcheck: "false",
-                    style: format!(
-                        "padding:12px 15px; font-size:15px; border:1px solid rgba(127,127,127,0.4); border-radius:11px; \
-                         background:rgba(127,127,127,0.10); color:{foreground}; outline:none; max-width:460px; width:100%; margin:0 auto;"
-                    ),
-                    value: "{url_input}",
-                    // Autofocus so the user can type immediately (Chrome-like).
-                    // Without it the field needs a click first, and a click
-                    // dropped by a busy UI reads as "I can't type anywhere".
-                    onmounted: move |evt| async move {
-                        let _ = evt.set_focus(true).await;
-                    },
-                    oninput: move |evt| url_input.set(evt.value()),
-                    onkeydown: move |evt| {
-                        // Enter in the URL field opens with the default profile,
-                        // matching a normal address bar.
-                        if evt.key() == Key::Enter && !submitted() {
-                            choose_url("default".to_string());
-                        }
-                    },
                 }
                 div {
                     style: "display:flex; flex-wrap:wrap; gap:14px; justify-content:center;",
                     for profile in profiles {
-                        button {
+                        div {
                             key: "picker-{profile}",
                             style: card_style.clone(),
                             onclick: {
                                 let profile = profile.clone();
                                 let mut choose_profile = choose_profile.clone();
-                                move |_| choose_profile(profile.clone())
+                                move |_| {
+                                    if pending_delete().is_some() {
+                                        pending_delete.set(None);
+                                        return;
+                                    }
+                                    choose_profile(profile.clone())
+                                }
                             },
+                            button {
+                                style: format!(
+                                    "position:absolute; top:6px; right:6px; border:none; cursor:pointer; line-height:1; \
+                                     border-radius:8px; font-size:11px; padding:3px 6px; {}",
+                                    if pending_delete().as_deref() == Some(profile.as_str()) {
+                                        "background:#c0392b; color:#fff;".to_string()
+                                    } else {
+                                        format!("background:transparent; color:{foreground}; opacity:0.45;")
+                                    },
+                                ),
+                                title: if pending_delete().as_deref() == Some(profile.as_str()) {
+                                    "Click again to permanently delete this profile's cookies, logins and storage"
+                                } else {
+                                    "Delete profile"
+                                },
+                                onclick: {
+                                    let profile = profile.clone();
+                                    move |evt: MouseEvent| {
+                                        evt.stop_propagation();
+                                        if pending_delete().as_deref() == Some(profile.as_str()) {
+                                            let _ = delete_web_surface_profile(&profile);
+                                            pending_delete.set(None);
+                                            profiles_refresh.set(profiles_refresh().wrapping_add(1));
+                                        } else {
+                                            pending_delete.set(Some(profile.clone()));
+                                        }
+                                    }
+                                },
+                                if pending_delete().as_deref() == Some(profile.as_str()) { "delete?" } else { "✕" }
+                            }
                             span {
                                 style: avatar_style,
                                 {profile.chars().next().map(|c| c.to_uppercase().to_string()).unwrap_or_default()}
@@ -58628,10 +58676,16 @@ fn WebSurfacePickerView(control_url: String, foreground: String, background: Str
                             span { "{profile}" }
                         }
                     }
-                    button {
+                    div {
                         style: card_style.clone(),
                         title: "No history, cookies or storage kept — everything vanishes on close",
-                        onclick: move |_| choose_temp(WEB_SURFACE_TEMP_PROFILE.to_string()),
+                        onclick: move |_| {
+                            if pending_delete().is_some() {
+                                pending_delete.set(None);
+                                return;
+                            }
+                            choose_temp(WEB_SURFACE_TEMP_PROFILE.to_string())
+                        },
                         span {
                             style: "width:46px; height:46px; border-radius:50%; display:grid; place-items:center; \
                                     font-size:20px; font-weight:600; color:#fff; background:linear-gradient(135deg,#5f6672,#3a3f4a);",
@@ -58653,20 +58707,50 @@ fn WebSurfacePickerView(control_url: String, foreground: String, background: Str
                             placeholder: "new profile",
                             autocomplete: "off",
                             spellcheck: "false",
+                            "data-web-picker-new-profile": "1",
                             style: format!(
                                 "width:100%; padding:6px 8px; font-size:12px; text-align:center; border:1px solid rgba(127,127,127,0.4); \
                                  border-radius:8px; background:transparent; color:{foreground}; outline:none;"
                             ),
                             value: "{new_profile_input}",
+                            // Deterministic click-to-focus: WebKit does not run
+                            // native focus for untrusted (synthetic/automation)
+                            // clicks, and even trusted clicks were losing a race
+                            // against other focus writers. An explicit focus on
+                            // click makes the field own the keyboard whenever it
+                            // is clicked, human or agent.
+                            onclick: move |_| {
+                                pending_delete.set(None);
+                                let _ = document::eval(
+                                    r#"
+                                    const input = document.querySelector('[data-web-picker-new-profile="1"]');
+                                    if (input && typeof input.focus === 'function') {
+                                        input.focus({ preventScroll: true });
+                                    }
+                                    "#,
+                                );
+                            },
                             oninput: move |evt| new_profile_input.set(evt.value()),
-                            onkeydown: move |evt| {
-                                if evt.key() == Key::Enter {
-                                    let name = new_profile_input().trim().to_string();
-                                    if !name.is_empty() {
-                                        choose_new(name);
+                            onkeydown: {
+                                let mut create_new_profile = create_new_profile.clone();
+                                move |evt| {
+                                    if evt.key() == Key::Enter {
+                                        create_new_profile(new_profile_input());
                                     }
                                 }
                             },
+                        }
+                        button {
+                            style: format!(
+                                "width:100%; padding:6px 8px; font-size:12px; border:none; border-radius:8px; cursor:pointer; \
+                                 background:linear-gradient(135deg,#6c8cff,#9a6bff); color:#fff;"
+                            ),
+                            "data-web-picker-create": "1",
+                            onclick: move |evt: MouseEvent| {
+                                evt.stop_propagation();
+                                create_new_profile(new_profile_input());
+                            },
+                            "Create"
                         }
                     }
                 }
