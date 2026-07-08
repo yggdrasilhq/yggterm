@@ -6610,7 +6610,11 @@ checksum = "7a5a4b21e1a62b67a2970e6831bc091d7b87e119e7f9791aef9702e3bef04448"
 
 [[package]]
 name = "yggterm"
+<<<<<<< HEAD
 version = "2.6.66"
+=======
+version = "2.5.0"
+>>>>>>> c162185 (Snapshot alpha blur experiment)
 dependencies = [
  "anyhow",
  "ctrlc",
@@ -6632,7 +6636,11 @@ dependencies = [
 
 [[package]]
 name = "yggterm-core"
+<<<<<<< HEAD
 version = "2.6.66"
+=======
+version = "2.5.0"
+>>>>>>> c162185 (Snapshot alpha blur experiment)
 dependencies = [
  "anyhow",
  "dirs",
@@ -6653,7 +6661,11 @@ dependencies = [
 
 [[package]]
 name = "yggterm-ghostty-bridge"
+<<<<<<< HEAD
 version = "2.6.66"
+=======
+version = "2.5.0"
+>>>>>>> c162185 (Snapshot alpha blur experiment)
 dependencies = [
  "anyhow",
  "thiserror 2.0.18",
@@ -6662,11 +6674,19 @@ dependencies = [
 
 [[package]]
 name = "yggterm-gtk-glue"
+<<<<<<< HEAD
 version = "2.6.66"
 
 [[package]]
 name = "yggterm-platform"
 version = "2.6.66"
+=======
+version = "2.5.0"
+
+[[package]]
+name = "yggterm-platform"
+version = "2.5.0"
+>>>>>>> c162185 (Snapshot alpha blur experiment)
 dependencies = [
  "anyhow",
  "objc2",
@@ -6680,7 +6700,11 @@ dependencies = [
 
 [[package]]
 name = "yggterm-server"
+<<<<<<< HEAD
 version = "2.6.66"
+=======
+version = "2.5.0"
+>>>>>>> c162185 (Snapshot alpha blur experiment)
 dependencies = [
  "anyhow",
  "dirs",
@@ -6703,7 +6727,11 @@ dependencies = [
 
 [[package]]
 name = "yggterm-shell"
+<<<<<<< HEAD
 version = "2.6.66"
+=======
+version = "2.5.0"
+>>>>>>> c162185 (Snapshot alpha blur experiment)
 dependencies = [
  "anyhow",
  "arboard",
@@ -6746,7 +6774,11 @@ dependencies = [
 
 [[package]]
 name = "yggui"
+<<<<<<< HEAD
 version = "2.6.66"
+=======
+version = "2.5.0"
+>>>>>>> c162185 (Snapshot alpha blur experiment)
 dependencies = [
  "anyhow",
  "base64",
@@ -6769,7 +6801,11 @@ dependencies = [
 
 [[package]]
 name = "yggui-contract"
+<<<<<<< HEAD
 version = "2.6.66"
+=======
+version = "2.5.0"
+>>>>>>> c162185 (Snapshot alpha blur experiment)
 dependencies = [
  "serde",
 ]

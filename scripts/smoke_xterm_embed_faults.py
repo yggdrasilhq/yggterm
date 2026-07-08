@@ -11400,7 +11400,11 @@ def assert_titlebar_autohide_hover_contract(pid: int, out_dir: Path) -> dict:
         raise AssertionError(
             f"titlebar hover reveal did not paint a chrome background: background={titlebar_background!r} state={revealed!r}"
         )
+<<<<<<< HEAD
     if native_hover_blur and titlebar_alpha is not None and titlebar_alpha >= 0.97:
+=======
+    if titlebar_alpha is not None and titlebar_alpha >= (0.97 if native_hover_blur else 0.94):
+>>>>>>> c162185 (Snapshot alpha blur experiment)
         raise AssertionError(
             f"titlebar hover reveal chrome is too opaque for the blurred integrated-chrome contract: background={titlebar_background!r}"
         )
@@ -12248,8 +12252,13 @@ def assert_settings_terminal_theme_dropdown_contract(pid: int) -> dict:
 
 
 def assert_theme_editor_contract(pid: int, out_dir: Path) -> dict:
+<<<<<<< HEAD
     default_grain = 0.0
     default_alpha = 0.96
+=======
+    default_grain = 0.12
+    default_alpha = 0.78
+>>>>>>> c162185 (Snapshot alpha blur experiment)
     default_brightness = 0.56
     baseline = app_state(pid)
     if titlebar_transient_open(baseline):
@@ -12372,6 +12381,7 @@ def assert_theme_editor_contract(pid: int, out_dir: Path) -> dict:
         raise AssertionError(
             f"theme editor seed button overflows shell bounds: shell={theme_shell_rect!r} seed={seed_rect!r}"
         )
+<<<<<<< HEAD
     if not rect_is_visible(brightness_rect):
         raise AssertionError(f"theme editor brightness slider/input rect missing: state={opened!r}")
     if not rect_contains_rect(theme_shell_rect, brightness_rect):
@@ -12385,6 +12395,16 @@ def assert_theme_editor_contract(pid: int, out_dir: Path) -> dict:
         if rect_is_visible(rect):
             raise AssertionError(
                 f"stable theme editor still exposes the experimental {name} dial: shell={theme_shell_rect!r} dial={rect!r}"
+=======
+    for name, rect in (
+        ("brightness", brightness_rect),
+        ("alpha", alpha_rect),
+        ("grain", grain_rect),
+    ):
+        if rect_is_visible(rect) and not rect_contains_rect(theme_shell_rect, rect):
+            raise AssertionError(
+                f"theme editor {name} dial overflows shell bounds: shell={theme_shell_rect!r} dial={rect!r}"
+>>>>>>> c162185 (Snapshot alpha blur experiment)
             )
     shell_background = str(((opened.get("dom") or {}).get("theme_editor_shell_background")) or "")
     shell_shadow = str(((opened.get("dom") or {}).get("theme_editor_shell_box_shadow")) or "")
@@ -12405,6 +12425,91 @@ def assert_theme_editor_contract(pid: int, out_dir: Path) -> dict:
             "theme editor reset button lost its styled button contract: "
             f"background={reset_button_background!r} shadow={reset_button_shadow!r} radius={reset_button_radius!r}"
         )
+<<<<<<< HEAD
+=======
+    missing_dials = [
+        name
+        for name, rect in (
+            ("brightness", brightness_rect),
+            ("alpha", alpha_rect),
+            ("grain", grain_rect),
+        )
+        if not rect_is_visible(rect)
+    ]
+    if missing_dials:
+        raise AssertionError(f"theme editor dial input rects missing: missing={missing_dials!r} state={opened!r}")
+    dial_click_x = float(grain_rect.get("left") or 0.0) + (
+        float(grain_rect.get("width") or 0.0) * 0.82
+    )
+    dial_click_y = float(grain_rect.get("top") or 0.0) + (
+        float(grain_rect.get("height") or 0.0) * 0.82
+    )
+    dial_click = app_pointer_command(
+        pid,
+        "click",
+        x=dial_click_x,
+        y=dial_click_y,
+        button="primary",
+    )
+    deadline = time.time() + 6.0
+    dial_changed = {}
+    while time.time() < deadline:
+        dial_changed = app_state(pid)
+        dial_grain = theme_grain_value(shell_theme_spec(dial_changed, "saved_yggui_theme"))
+        dial_input = str((dial_changed.get("dom") or {}).get("theme_editor_grain_input_value") or "")
+        try:
+            dial_input_percent = int(float(dial_input))
+        except ValueError:
+            dial_input_percent = -1
+        if dial_grain is not None and dial_grain >= 0.88 and dial_input_percent >= 88:
+            break
+        time.sleep(0.12)
+    dial_grain = theme_grain_value(shell_theme_spec(dial_changed, "saved_yggui_theme"))
+    if dial_grain is None or dial_grain < 0.88:
+        pointer_debug = (dial_changed.get("dom") or {}).get("app_control_pointer_debug") or {}
+        try:
+            pointer_percent = int(float(pointer_debug.get("percent") or -1))
+        except (TypeError, ValueError):
+            pointer_percent = -1
+        try:
+            pointer_input_value = int(float(pointer_debug.get("input_value") or -1))
+        except (TypeError, ValueError):
+            pointer_input_value = -1
+        if pointer_percent < 88 or pointer_input_value < 88:
+            raise AssertionError(
+                f"theme editor grain dial click could not reach the high range: click={dial_click!r} state={dial_changed!r}"
+            )
+        dial_set_result = run(
+            "server",
+            "app",
+            "theme-editor",
+            "set",
+            "--grain",
+            "0.90",
+            "--pid",
+            str(pid),
+            "--timeout-ms",
+            "8000",
+        )
+        deadline = time.time() + 6.0
+        while time.time() < deadline:
+            dial_changed = app_state(pid)
+            dial_grain = theme_grain_value(shell_theme_spec(dial_changed, "saved_yggui_theme"))
+            dial_input = str((dial_changed.get("dom") or {}).get("theme_editor_grain_input_value") or "")
+            try:
+                dial_input_percent = int(float(dial_input))
+            except ValueError:
+                dial_input_percent = -1
+            if dial_grain is not None and dial_grain >= 0.88 and dial_input_percent >= 88:
+                break
+            time.sleep(0.12)
+        dial_grain = theme_grain_value(shell_theme_spec(dial_changed, "saved_yggui_theme"))
+        if dial_grain is None or dial_grain < 0.88:
+            raise AssertionError(
+                "theme editor grain could not reach the high range through deterministic app-control after pointer geometry passed: "
+                f"click={dial_click!r} set={dial_set_result!r} pointer_debug={pointer_debug!r} state={dial_changed!r}"
+            )
+>>>>>>> c162185 (Snapshot alpha blur experiment)
     target_brightness = 0.68
     target_alpha = 0.50
     target_grain = 0.80
@@ -12438,8 +12543,13 @@ def assert_theme_editor_contract(pid: int, out_dir: Path) -> dict:
             and changed_alpha is not None
             and changed_grain is not None
             and abs(changed_brightness - target_brightness) <= 0.015
+<<<<<<< HEAD
             and abs(changed_alpha - default_alpha) <= 0.015
             and abs(changed_grain - default_grain) <= 0.015
+=======
+            and abs(changed_alpha - target_alpha) <= 0.015
+            and abs(changed_grain - target_grain) <= 0.015
+>>>>>>> c162185 (Snapshot alpha blur experiment)
             and abs(changed_brightness - (theme_brightness_value(effective_theme_after_change) or changed_brightness)) <= 0.005
             and abs(changed_alpha - (theme_alpha_value(effective_theme_after_change) or changed_alpha)) <= 0.005
             and abs(changed_grain - (theme_grain_value(effective_theme_after_change) or changed_grain)) <= 0.005
@@ -12456,11 +12566,19 @@ def assert_theme_editor_contract(pid: int, out_dir: Path) -> dict:
         or changed_alpha is None
         or changed_grain is None
         or abs(changed_brightness - target_brightness) > 0.015
+<<<<<<< HEAD
         or abs(changed_alpha - default_alpha) > 0.015
         or abs(changed_grain - default_grain) > 0.015
     ):
         raise AssertionError(
             f"stable theme editor did not apply brightness while pinning alpha/grain: before={saved_theme_before!r} after={saved_theme_after_change!r}"
+=======
+        or abs(changed_alpha - target_alpha) > 0.015
+        or abs(changed_grain - target_grain) > 0.015
+    ):
+        raise AssertionError(
+            f"theme editor set did not auto-apply brightness/alpha/grain to saved theme: before={saved_theme_before!r} after={saved_theme_after_change!r}"
+>>>>>>> c162185 (Snapshot alpha blur experiment)
         )
     shell_frame_after_change = {
         "background": dom_value(changed, "shell_frame_background"),
@@ -12496,6 +12614,7 @@ def assert_theme_editor_contract(pid: int, out_dir: Path) -> dict:
         material_blur_px = float(changed_shell.get("material_blur_px") or 0.0)
     except (TypeError, ValueError):
         material_blur_px = 0.0
+<<<<<<< HEAD
     if live_blur_supported or compositor_blur_active or material_blur_px != 0.0:
         raise AssertionError(
             "stable theme path unexpectedly enabled live/compositor/material blur: "
@@ -12521,6 +12640,39 @@ def assert_theme_editor_contract(pid: int, out_dir: Path) -> dict:
         raise AssertionError(
             "stable theme background repeat includes a repeated layer after grain rollback: "
             f"repeat={after_repeat!r} after={shell_frame_after_change!r}"
+=======
+    if transparent_window and live_blur_supported:
+        if after_alpha is None or abs(after_alpha - target_alpha) > 0.08:
+            raise AssertionError(
+                "alpha dial did not drive the live material alpha on a blur-capable shell: "
+                f"target={target_alpha!r} observed={after_alpha!r} shell={changed_shell!r} after={shell_frame_after_change!r}"
+            )
+        if not compositor_blur_active and after_backdrop in ("", "none"):
+            raise AssertionError(
+                "low-alpha shell did not pair the alpha dial with compositor/CSS blur: "
+                f"shell={changed_shell!r} after={shell_frame_after_change!r}"
+            )
+        if material_blur_px < 24.0:
+            raise AssertionError(
+                "low-alpha material did not compute a stronger blur budget: "
+                f"material_blur_px={material_blur_px!r} shell={changed_shell!r}"
+            )
+    elif transparent_window:
+        if after_alpha is not None and after_alpha < 0.74:
+            raise AssertionError(
+                "low-alpha shell escaped onto a transparent window without blur support: "
+                f"alpha={after_alpha!r} shell={changed_shell!r} after={shell_frame_after_change!r}"
+            )
+    if "4px 4px" not in after_size or "repeat" not in after_repeat:
+        raise AssertionError(
+            "theme editor grain did not become a repeated film-grain layer: "
+            f"after={shell_frame_after_change!r}"
+        )
+    if "radial-gradient(circle at 1px 1px" not in after_image:
+        raise AssertionError(
+            "theme editor grain layer is missing from the shell background image: "
+            f"after={shell_frame_after_change!r}"
+>>>>>>> c162185 (Snapshot alpha blur experiment)
         )
     if shell_frame_after_change["box_shadow"] != shell_frame_before["box_shadow"]:
         raise AssertionError(
@@ -12597,7 +12749,11 @@ def assert_theme_editor_contract(pid: int, out_dir: Path) -> dict:
         "shell_rect": theme_shell_rect,
         "shell_background": shell_background,
         "shell_box_shadow": shell_shadow,
+<<<<<<< HEAD
         "control_rects": {
+=======
+        "dial_rects": {
+>>>>>>> c162185 (Snapshot alpha blur experiment)
             "brightness": brightness_rect,
             "alpha": alpha_rect,
             "grain": grain_rect,

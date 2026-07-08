@@ -16,6 +16,7 @@ Terminal telemetry is the durable incident log for the daemon-owned PTY and xter
 - The PTY and xterm.js remain the terminal source of truth. Telemetry observes readiness, input, render, reconnect, and recovery decisions; it must not become a renderer, alternate input path, or session state authority.
 - The database must be safe to leave enabled during normal work. Writes are low-frequency and should happen off the UI path.
 
+<<<<<<< HEAD
 The observer boundary is defined in
 `docs/architecture-audit-2026-05-16.md`. Telemetry may prove that the GUI made a
 bad decision, that app-control disagrees with daemon truth, or that a switching
@@ -28,6 +29,8 @@ The GUI JSONL/trace writer and duplicate-throttle policy live in
 which event happened, but it must not carry a second copy of the file names,
 rotation limits, timestamp shape, or duplicate suppression rules.
 
+=======
+>>>>>>> c162185 (Snapshot alpha blur experiment)
 ## Schema
 
 The primary table is `terminal_events`.
@@ -91,6 +94,7 @@ Severity mapping:
 - `warn`: recovery paths that should usually self-heal, such as empty xterm surface recovery.
 - `error`: latched failures and failed terminal requests.
 
+<<<<<<< HEAD
 The mounted xterm host also records `terminal_contract/terminal_render_health_unhealthy`
 when xterm.js reports buffered terminal text but the visible render health is
 unhealthy, for example `canvas_blank_with_buffer_text` or
@@ -164,6 +168,8 @@ sparse or broken prompt layouts. A visible current prompt row with acceptable
 blank rows below the cursor remains writable even when no newer daemon write
 arrives after the last typed byte.
 
+=======
+>>>>>>> c162185 (Snapshot alpha blur experiment)
 ## Why This Exists
 
 The repeated regressions came from cross-layer truth splits:
@@ -175,6 +181,7 @@ The repeated regressions came from cross-layer truth splits:
 
 Terminal telemetry makes those splits durable and queryable before another release is declared healthy.
 
+<<<<<<< HEAD
 One repeated mistake was treating a successful recovery as proof that the
 underlying contract was healthy. Telemetry must preserve the incident even when
 the user-facing surface later heals. A session that becomes usable only after a
@@ -182,12 +189,15 @@ switching pass, manual redraw, stale-host remount, or force restart still counts
 as a failed first attach until a later release gate proves the first attach path
 directly.
 
+=======
+>>>>>>> c162185 (Snapshot alpha blur experiment)
 ## Smoke Test Expectations
 
 Terminal smoke tests should assert telemetry as well as pixels and app-control state:
 
 - Opening a terminal must create a `terminal_open_attempt/begin` event.
 - A successful terminal must create `terminal_open_attempt/ready`.
+<<<<<<< HEAD
 - Fast typing probes must report the input-batch counters and require pending
   input to drain before declaring the terminal healthy or broken.
 - A blank xterm surface recovery must create a `warn` event before it is considered fixed.
@@ -199,6 +209,9 @@ Terminal smoke tests should assert telemetry as well as pixels and app-control s
   attempts after the first `ready` event unless the surface remains faulty
   beyond the settle grace; a suppressed post-ready sample should be visible as
   `retained_fault_recovery_suppressed_after_ready`.
+=======
+- A blank xterm surface recovery must create a `warn` event before it is considered fixed.
+>>>>>>> c162185 (Snapshot alpha blur experiment)
 - A live session listed in the sidebar but missing from daemon runtime truth must be treated as an incident.
 - A healthy remote machine with an empty session list after refresh must be treated as an incident when the test requested a terminal from that machine.
 

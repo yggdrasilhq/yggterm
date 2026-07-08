@@ -66,14 +66,18 @@ This is the core determinism rule: Terminal tests should use fake PTY streams, s
   a hidden local `/__remote_folder__/...` implementation branch being expanded.
 - Remote cwd bookmark rename and launch are one contract. The synthetic storage
   path is the durable cwd bookmark; renaming a newly added folder to a relative
-  path such as `git/samplers` moves the bookmark under the selected remote
+  path such as `git/practice-rs` moves the bookmark under the selected remote
   cwd, and Startpage `New Codex Session` / `New Terminal` must launch with that
   resolved remote cwd rather than the previous active session's cwd.
 - Expandable sidebar rows have a split hit-zone contract. Clicking the visible row name selects the row and opens that group's scoped Startpage without closing live runtimes; clicking the icon, disclosure/count control, machine/live-session affordance area, or trailing empty row surface toggles expansion. This applies uniformly to cwd folders, machine groups, and `Live Sessions`, with expansion state still keyed only by the row path.
 - Normal final-client close must notify the user, remove non-Keep-Alive live rows from durable restore state, send graceful runtime shutdown, and schedule force cleanup after one hour.
 - Update restart is different from Keep Alive. Before a direct-install restart, the daemon must persist every recoverable live runtime with a temporary update-restore marker only when current runtime truth still says that unkept runtime exists. That marker allows the next daemon to restore the session once, but it must not silently convert unkept terminals into durable Keep Alive sessions or serialize stale in-memory rows that no longer have a daemon runtime key. After a fresh remote scan reports that an unkept temporary remote runtime is not live, that row must leave `Live Sessions` instead of remaining as a degraded/loading recovery target.
+<<<<<<< HEAD
 - A hot-update preserved-owner registry is a terminal I/O handoff map, not durable session truth. Persisted live-session state is the startup allow-list when it contains runtime keys; `hot-update-terminal-owners.json` is only a fallback when persisted live state is empty. Current server live metadata must authorize every preserved runtime key before it appears in `server status`, app-control runtime truth, or sidebar rows. During handoff, every represented `terminal_session_key` must be written or retargeted to the current outgoing handoff daemon endpoint; chained older sidecar entries must not become direct owner truth for the replacement daemon. Closing a live session or clearing Keep Alive must remove that key from the preserved-owner map. Daemon load must restore persisted live state before judging a registry version mismatch, prune only unrepresented entries from `hot-update-terminal-owners.json`, and retarget surviving entries to the current version instead of carrying latent old runtimes forward or wiping still-represented owners.
 - A temporary update-restored live session has the same survival priority as an explicit Keep Alive session until the handoff verifies or fails. Early saved-session mismatch text from a preserved owner may gate input or keep recovery visible, but it must not detach/remove the owner entry or spawn a duplicate remote resume while the temporary update-restore marker is present.
+=======
+- A hot-update preserved-owner registry is a terminal I/O handoff map, not durable session truth. Persisted live-session state is the startup allow-list when it contains runtime keys; `hot-update-terminal-owners.json` is only a fallback when persisted live state is empty. Current server live metadata must authorize every preserved runtime key before it appears in `server status`, app-control runtime truth, or sidebar rows. Closing a live session or clearing Keep Alive must remove that key from the preserved-owner map, and daemon load must prune unrepresented entries from `hot-update-terminal-owners.json` instead of carrying latent old runtimes forward.
+>>>>>>> c162185 (Snapshot alpha blur experiment)
 - Startup reconciliation must prefer the active/default preserved-only sidecar daemon for retargeting over older orphaned PTY owners. An older same-patch-line daemon should be selected for hot-update handoff only when it actually owns terminal runtimes that the active sidecar does not already represent and those owned runtime keys are authorized by the current preserved-owner registry or persisted live-session state. A ghost-owned runtime for a closed session is not a session-survival reason.
 - Daemon cleanup is home-scoped. An app may reap same-home duplicate, legacy, or orphan daemons, but it must not signal a daemon from another `YGGTERM_HOME`, and it must not reap a legacy daemon that still has registered GUI clients in that daemon's exact endpoint scope or is the current hot-update PTY owner endpoint. App-control may scan legacy client-instance scopes for handoff discovery, but cleanup must not treat the replacement GUI as a client for every stale versioned daemon. During startup cleanup, the newest preserved-only sidecar whose terminal keys are exactly authorized by the current owner registry must remain available as the retarget bridge; older preserved-only sidecars with `owned_terminal_session_count == 0` must not be protected just because the same home has recoverable runtime activity elsewhere.
 - Multi-version daemon discovery is read-only observability, not an attach target. A current remote client may list stale versioned daemons for incident reports, but it must not bridge a live terminal through a daemon whose `server_version` differs from the current protocol version.
@@ -202,6 +206,7 @@ Triage from the report:
 - slow status/snapshot: run `latency-check --all` and inspect trace/perf data
 - healthy daemon but blank or stale screen: use `server app state`,
   `screenshot`, `probe-type`, `probe-scroll`, or `probe-select`
+<<<<<<< HEAD
 - KDE pinning or duplicate app identity: run `server app desktop-identity`.
   The report must prove the canonical `dev.yggterm.Yggterm.desktop` launcher,
   matching `Icon` and `StartupWMClass`, a live app-control client, and a
@@ -211,6 +216,9 @@ Triage from the report:
   may rotate during long smokes. A missing client-record app id is a
   release-blocking regression on KDE because the shell may open under a second
   taskbar icon even when the desktop file itself is correct.
+=======
+- KDE pinning or duplicate app identity: run `server app desktop-identity`
+>>>>>>> c162185 (Snapshot alpha blur experiment)
 - managed Codex/tooling issue: use explicit foreground refresh paths, not
   unattended background installs
 

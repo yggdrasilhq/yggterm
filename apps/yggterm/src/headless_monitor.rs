@@ -491,15 +491,24 @@ fn hot_restart_target_retire_covered_by_expected_server(
         );
     }
     let guard_keys = daemon_status_retire_guard_runtime_keys(target_status);
+<<<<<<< HEAD
     if guard_keys.is_empty() {
         return None;
     }
+=======
+>>>>>>> c162185 (Snapshot alpha blur experiment)
     all_targets
         .iter()
         .map(|(_, status)| status)
         .filter(|status| status.server_pid != target_status.server_pid)
         .filter(|status| status_matches_expected(status, cfg))
+<<<<<<< HEAD
         .filter(|status| daemon_status_owns_all_runtime_keys(status, &guard_keys))
+=======
+        .filter(|status| {
+            guard_keys.is_empty() || daemon_status_owns_all_runtime_keys(status, &guard_keys)
+        })
+>>>>>>> c162185 (Snapshot alpha blur experiment)
         .cloned()
         .max_by_key(|status| (status.server_build_id, status.server_pid))
 }
@@ -1586,9 +1595,9 @@ mod tests {
                 "owned_terminal_session_count": 0,
                 "owned_terminal_session_keys": [],
                 "terminal_session_count": 1,
-                "terminal_session_keys": ["remote-session://dev/samplenotes"],
+                "terminal_session_keys": ["remote-session://dev/jyas"],
                 "preserved_terminal_owner_count": 1,
-                "preserved_terminal_owner_keys": ["remote-session://dev/samplenotes"],
+                "preserved_terminal_owner_keys": ["remote-session://dev/jyas"],
                 "managed_session_count": 0,
             }))
             .expect("stale preserved-only status");
@@ -1602,9 +1611,9 @@ mod tests {
                 "embedded_surface_supported": true,
                 "bridge_enabled": true,
                 "owned_terminal_session_count": 1,
-                "owned_terminal_session_keys": ["remote-session://dev/samplenotes"],
+                "owned_terminal_session_keys": ["remote-session://dev/jyas"],
                 "terminal_session_count": 1,
-                "terminal_session_keys": ["remote-session://dev/samplenotes"],
+                "terminal_session_keys": ["remote-session://dev/jyas"],
                 "preserved_terminal_owner_count": 0,
                 "preserved_terminal_owner_keys": [],
                 "managed_session_count": 0,
@@ -1647,6 +1656,7 @@ mod tests {
     }
 
     #[test]
+<<<<<<< HEAD
     fn hot_restart_monitor_retire_rejects_empty_runtime_coverage() {
         let stale_without_runtime_keys: yggterm_server::ServerRuntimeStatus =
             serde_json::from_value(serde_json::json!({
@@ -1712,6 +1722,8 @@ mod tests {
     }
 
     #[test]
+=======
+>>>>>>> c162185 (Snapshot alpha blur experiment)
     fn server_status_json_reports_hot_update_handoff_owners() {
         let status: yggterm_server::ServerRuntimeStatus =
             serde_json::from_value(serde_json::json!({

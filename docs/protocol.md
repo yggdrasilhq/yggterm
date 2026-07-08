@@ -271,6 +271,7 @@ only when the stale daemon reports zero owned runtime keys or every reported
 runtime key is covered by the current daemon. That fallback must be observable
 in monitor output and must never be used for the only reachable runtime owner.
 
+<<<<<<< HEAD
 Duplicate-owner pruning must not use the user-facing `RemoveSession` request.
 `RemoveSession` is close-session semantics and may terminate a remote Codex
 session before dropping local metadata. When the current daemon already owns a
@@ -281,6 +282,8 @@ daemon still owns another unique runtime key, it remains a preserved owner for
 that key only. It is not allowed to keep participating in hot update for keys
 already owned by the current daemon.
 
+=======
+>>>>>>> c162185 (Snapshot alpha blur experiment)
 ## Adoption And Compatibility
 
 The preferred outcome is direct new-daemon ownership of every pre-update PTY.
@@ -424,6 +427,7 @@ If the active session is missing from the new daemon:
   authoritative allow-list for which old daemon-owned PTYs may be preserved.
   `hot-update-terminal-owners.json` is a handoff cache and may be stale; it may
   be used only when persisted live-session state has no runtime keys.
+<<<<<<< HEAD
 - For an explicit Keep-Alive remote runtime that is still running, stale,
   mismatched, prompt-only, blank-after-grace, or spec-mismatched early output is
   not permission to restart the transport or spawn another resume command under
@@ -432,6 +436,8 @@ If the active session is missing from the new daemon:
   process is gone or after an explicit user/harness-owned force-restart action.
   This applies equally to direct current-daemon runtimes and compatibility
   routes through preserved old owners.
+=======
+>>>>>>> c162185 (Snapshot alpha blur experiment)
 
 If retained xterm text contains an update/bridge error:
 

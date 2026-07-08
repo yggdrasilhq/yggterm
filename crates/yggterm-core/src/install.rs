@@ -1503,6 +1503,7 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+<<<<<<< HEAD
     #[test]
     fn direct_install_state_prefers_modern_version_fields_over_stale_active_fields() {
         let root = std::env::temp_dir().join(format!(
@@ -1536,6 +1537,8 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+=======
+>>>>>>> c162185 (Snapshot alpha blur experiment)
     #[cfg(target_os = "linux")]
     #[test]
     fn linux_desktop_entry_uses_theme_icon_and_canonical_wm_class() {

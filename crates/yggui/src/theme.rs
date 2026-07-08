@@ -8,8 +8,16 @@ const MIN_STOP_ALPHA: f32 = 0.28;
 const MAX_STOP_ALPHA: f32 = 0.86;
 const MIN_THEME_BRIGHTNESS: f32 = 0.38;
 const MAX_THEME_BRIGHTNESS: f32 = 0.72;
+<<<<<<< HEAD
 const STABLE_THEME_ALPHA: f32 = 0.96;
 const STABLE_THEME_GRAIN: f32 = 0.0;
+=======
+const MIN_THEME_ALPHA: f32 = 0.36;
+const MAX_THEME_ALPHA: f32 = 0.92;
+const MAX_THEME_GRAIN: f32 = 1.0;
+const MIN_MATERIAL_BLUR_PX: f32 = 14.0;
+const MAX_MATERIAL_BLUR_PX: f32 = 30.0;
+>>>>>>> c162185 (Snapshot alpha blur experiment)
 const FALLBACK_COLOR: &str = "#7cc8ff";
 pub const THEME_EDITOR_SWATCHES: [&str; 8] = [
     "#7cc8ff", "#b8a1ff", "#efc6dc", "#e3a08f", "#e8c16d", "#7acfb0", "#9caed8", "#dfe8ef",
@@ -20,8 +28,13 @@ pub fn clamp_theme_spec(spec: &YgguiThemeSpec) -> YgguiThemeSpec {
     next.brightness = next
         .brightness
         .clamp(MIN_THEME_BRIGHTNESS, MAX_THEME_BRIGHTNESS);
+<<<<<<< HEAD
     next.alpha = STABLE_THEME_ALPHA;
     next.grain = STABLE_THEME_GRAIN;
+=======
+    next.alpha = next.alpha.clamp(MIN_THEME_ALPHA, MAX_THEME_ALPHA);
+    next.grain = next.grain.clamp(0.0, MAX_THEME_GRAIN);
+>>>>>>> c162185 (Snapshot alpha blur experiment)
     next.colors = next
         .colors
         .iter()
@@ -63,8 +76,13 @@ pub fn default_theme_editor_spec() -> YgguiThemeSpec {
             },
         ],
         brightness: 0.56,
+<<<<<<< HEAD
         alpha: STABLE_THEME_ALPHA,
         grain: STABLE_THEME_GRAIN,
+=======
+        alpha: 0.78,
+        grain: 0.12,
+>>>>>>> c162185 (Snapshot alpha blur experiment)
     }
 }
 
@@ -98,6 +116,7 @@ pub fn live_blur_gradient_css(theme: UiTheme, spec: &YgguiThemeSpec) -> String {
 }
 
 pub fn material_blur_radius_px(spec: &YgguiThemeSpec) -> f32 {
+<<<<<<< HEAD
     let _ = spec;
     0.0
 }
@@ -116,6 +135,28 @@ fn repeated_gradient_background_property(
     grain_value: &'static str,
 ) -> String {
     let spec = clamp_theme_spec(spec);
+=======
+    let spec = clamp_theme_spec(spec);
+    let alpha_range = (MAX_THEME_ALPHA - MIN_THEME_ALPHA).max(f32::EPSILON);
+    let translucency = ((MAX_THEME_ALPHA - spec.alpha) / alpha_range).clamp(0.0, 1.0);
+    MIN_MATERIAL_BLUR_PX + translucency * (MAX_MATERIAL_BLUR_PX - MIN_MATERIAL_BLUR_PX)
+}
+
+pub fn gradient_background_size_css(spec: &YgguiThemeSpec) -> String {
+    repeated_gradient_background_property(spec, "100% 100%", "4px 4px")
+}
+
+pub fn gradient_background_repeat_css(spec: &YgguiThemeSpec) -> String {
+    repeated_gradient_background_property(spec, "no-repeat", "repeat")
+}
+
+fn repeated_gradient_background_property(
+    spec: &YgguiThemeSpec,
+    layer_value: &'static str,
+    grain_value: &'static str,
+) -> String {
+    let spec = clamp_theme_spec(spec);
+>>>>>>> c162185 (Snapshot alpha blur experiment)
     let base_layers = if spec.colors.is_empty() {
         1
     } else {
@@ -170,7 +211,11 @@ fn gradient_css_with_alpha_scale(
 pub fn shell_tint(theme: UiTheme, spec: &YgguiThemeSpec) -> String {
     let spec = clamp_theme_spec(spec);
     let rgb = themed_shell_rgb(theme, &spec);
+<<<<<<< HEAD
     let alpha = spec.alpha;
+=======
+    let alpha = spec.alpha.clamp(MIN_THEME_ALPHA, MAX_THEME_ALPHA);
+>>>>>>> c162185 (Snapshot alpha blur experiment)
     format!("rgba({}, {}, {}, {:.3})", rgb.0, rgb.1, rgb.2, alpha)
 }
 
@@ -178,7 +223,11 @@ pub fn chrome_material_tint(theme: UiTheme, spec: &YgguiThemeSpec) -> String {
     let spec = clamp_theme_spec(spec);
     let rgb = themed_shell_rgb(theme, &spec);
     let brightness_lift = theme_brightness_lift(spec.brightness);
+<<<<<<< HEAD
     let alpha_control = spec.alpha;
+=======
+    let alpha_control = spec.alpha.clamp(MIN_THEME_ALPHA, MAX_THEME_ALPHA);
+>>>>>>> c162185 (Snapshot alpha blur experiment)
     let alpha = match theme {
         UiTheme::ZedLight => 0.86 + brightness_lift * 0.04,
         UiTheme::ZedDark => 0.78 + brightness_lift * 0.06,
@@ -230,7 +279,11 @@ fn default_gradient(theme: UiTheme, alpha_scale: f32) -> String {
 fn default_backdrop(theme: UiTheme, spec: &YgguiThemeSpec, alpha_scale: f32) -> String {
     let base = themed_shell_rgb(theme, spec);
     let brightness_lift = theme_brightness_lift(spec.brightness);
+<<<<<<< HEAD
     let global_alpha = spec.alpha;
+=======
+    let global_alpha = spec.alpha.clamp(MIN_THEME_ALPHA, MAX_THEME_ALPHA);
+>>>>>>> c162185 (Snapshot alpha blur experiment)
     let alpha_scale = alpha_scale.clamp(0.0, 1.0);
     let (top, middle, bottom, top_alpha, middle_alpha, bottom_alpha) = match theme {
         UiTheme::ZedLight => (
@@ -310,7 +363,14 @@ fn rendered_stop_rgba(
         UiTheme::ZedLight => mix_rgb(softened, (255, 255, 255), 0.10 + brightness * 0.08),
         UiTheme::ZedDark => mix_rgb(softened, (230, 240, 248), 0.06 + brightness * 0.05),
     };
+<<<<<<< HEAD
     let layer_alpha = (stop.alpha * global_alpha * (0.30 + brightness * 0.28) + 0.08
+=======
+    let layer_alpha = (stop.alpha
+        * global_alpha.clamp(MIN_THEME_ALPHA, MAX_THEME_ALPHA)
+        * (0.30 + brightness * 0.28)
+        + 0.08
+>>>>>>> c162185 (Snapshot alpha blur experiment)
         - index as f32 * 0.04)
         .clamp(0.12, 0.54)
         * alpha_scale.clamp(0.0, 1.0);
@@ -493,14 +553,20 @@ mod tests {
         };
         let clamped = clamp_theme_spec(&spec);
         assert_eq!(clamped.brightness, MAX_THEME_BRIGHTNESS);
+<<<<<<< HEAD
         assert_eq!(clamped.alpha, STABLE_THEME_ALPHA);
         assert_eq!(clamped.grain, STABLE_THEME_GRAIN);
+=======
+        assert_eq!(clamped.alpha, MAX_THEME_ALPHA);
+        assert_eq!(clamped.grain, 0.8);
+>>>>>>> c162185 (Snapshot alpha blur experiment)
         assert_eq!(clamped.colors[0].color, "#e25050");
         assert!((MIN_STOP_INSET..=MAX_STOP_INSET).contains(&clamped.colors[0].x));
         assert!((MIN_STOP_INSET..=MAX_STOP_INSET).contains(&clamped.colors[0].y));
     }
 
     #[test]
+<<<<<<< HEAD
     fn clamp_theme_spec_pins_grain_for_stable_theme() {
         let mut spec = default_theme_editor_spec();
         spec.grain = 0.9;
@@ -508,6 +574,15 @@ mod tests {
 
         spec.grain = 1.8;
         assert_eq!(clamp_theme_spec(&spec).grain, STABLE_THEME_GRAIN);
+=======
+    fn clamp_theme_spec_keeps_grain_as_full_range_dial() {
+        let mut spec = default_theme_editor_spec();
+        spec.grain = 0.9;
+        assert_eq!(clamp_theme_spec(&spec).grain, 0.9);
+
+        spec.grain = 1.8;
+        assert_eq!(clamp_theme_spec(&spec).grain, 1.0);
+>>>>>>> c162185 (Snapshot alpha blur experiment)
     }
 
     #[test]
@@ -600,20 +675,35 @@ mod tests {
         };
         let gradient = gradient_css(UiTheme::ZedLight, &spec);
         assert!(gradient.contains("linear-gradient("));
+<<<<<<< HEAD
         assert!(!gradient.contains("radial-gradient(circle at 1px 1px"));
     }
 
     #[test]
     fn gradient_background_properties_do_not_emit_grain_layer_on_stable_theme() {
+=======
+        assert!(gradient.contains("radial-gradient(circle at 1px 1px"));
+    }
+
+    #[test]
+    fn gradient_background_properties_repeat_only_the_grain_layer() {
+>>>>>>> c162185 (Snapshot alpha blur experiment)
         let mut spec = default_theme_editor_spec();
         spec.grain = 0.72;
         let size = gradient_background_size_css(&spec);
         let repeat = gradient_background_repeat_css(&spec);
 
+<<<<<<< HEAD
         assert_eq!(size.split(',').count(), spec.colors.len() + 1);
         assert_eq!(repeat.split(',').count(), spec.colors.len() + 1);
         assert!(!size.ends_with("4px 4px"));
         assert!(repeat.split(',').all(|layer| layer.trim() == "no-repeat"));
+=======
+        assert_eq!(size.split(',').count(), spec.colors.len() + 2);
+        assert_eq!(repeat.split(',').count(), spec.colors.len() + 2);
+        assert!(size.ends_with("4px 4px"));
+        assert!(repeat.ends_with("repeat"));
+>>>>>>> c162185 (Snapshot alpha blur experiment)
         assert_eq!(size.matches("100% 100%").count(), spec.colors.len() + 1);
         assert_eq!(repeat.matches("no-repeat").count(), spec.colors.len() + 1);
 
@@ -627,7 +717,11 @@ mod tests {
     }
 
     #[test]
+<<<<<<< HEAD
     fn alpha_is_fixed_for_stable_theme() {
+=======
+    fn global_alpha_changes_shell_gradient_and_tint() {
+>>>>>>> c162185 (Snapshot alpha blur experiment)
         let mut low = default_theme_editor_spec();
         low.alpha = 0.42;
         let mut high = low.clone();
@@ -640,10 +734,18 @@ mod tests {
         let low_material = chrome_material_tint(UiTheme::ZedLight, &low);
         let high_material = chrome_material_tint(UiTheme::ZedLight, &high);
 
+<<<<<<< HEAD
         assert_eq!(low_gradient, high_gradient);
         assert_eq!(low_tint, high_tint);
         assert_eq!(low_material, high_material);
         assert!(low_tint.contains("0.960"));
+=======
+        assert_ne!(low_gradient, high_gradient);
+        assert_ne!(low_tint, high_tint);
+        assert_ne!(low_material, high_material);
+        assert!(low_tint.contains("0.420"));
+        assert!(high_tint.contains("0.900"));
+>>>>>>> c162185 (Snapshot alpha blur experiment)
     }
 
     #[test]
@@ -664,6 +766,7 @@ mod tests {
     }
 
     #[test]
+<<<<<<< HEAD
     fn material_blur_radius_is_disabled_on_stable_theme() {
         let mut translucent = default_theme_editor_spec();
         translucent.alpha = 0.50;
@@ -672,12 +775,27 @@ mod tests {
 
         assert_eq!(material_blur_radius_px(&translucent), 0.0);
         assert_eq!(material_blur_radius_px(&opaque), 0.0);
+=======
+    fn material_blur_radius_increases_as_alpha_drops() {
+        let mut translucent = default_theme_editor_spec();
+        translucent.alpha = 0.50;
+        let mut opaque = translucent.clone();
+        opaque.alpha = MAX_THEME_ALPHA;
+
+        assert!(material_blur_radius_px(&translucent) > material_blur_radius_px(&opaque));
+        assert!((material_blur_radius_px(&translucent) - 26.0).abs() < 0.25);
+        assert!((material_blur_radius_px(&opaque) - MIN_MATERIAL_BLUR_PX).abs() < 0.01);
+>>>>>>> c162185 (Snapshot alpha blur experiment)
     }
 
     #[test]
     fn chrome_material_tint_stays_readable_on_transparent_window_backends() {
         let mut spec = default_theme_editor_spec();
+<<<<<<< HEAD
         spec.alpha = 0.10;
+=======
+        spec.alpha = MIN_THEME_ALPHA;
+>>>>>>> c162185 (Snapshot alpha blur experiment)
         let light = chrome_material_tint(UiTheme::ZedLight, &spec);
         let dark = chrome_material_tint(UiTheme::ZedDark, &spec);
         let alpha = |value: &str| {

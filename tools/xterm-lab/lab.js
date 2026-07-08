@@ -181,7 +181,7 @@
 
   function writeCodexFooter(promptPayload) {
     term.write("\r\n");
-    term.write(`${CSI}90mgpt-5.5 xhigh · ~/git/samplescripts${CSI}0m\r\n`);
+    term.write(`${CSI}90mgpt-5.5 xhigh · ~/git/p01scripts${CSI}0m\r\n`);
     term.write(`${CSI}90mWorked for 1m 50s${CSI}0m\r\n`);
     term.write(promptPayload);
   }

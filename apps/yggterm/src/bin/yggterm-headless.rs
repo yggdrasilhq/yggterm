@@ -2024,6 +2024,7 @@ mod tests {
     }
 
     #[test]
+<<<<<<< HEAD
     fn headless_app_control_exposes_settled_open_path_command() {
         let source = include_str!("yggterm-headless.rs");
         assert!(source.contains("server app open <session-path>"));
@@ -2049,6 +2050,8 @@ mod tests {
     }
 
     #[test]
+=======
+>>>>>>> c162185 (Snapshot alpha blur experiment)
     fn classify_builtin_cli_command_detects_server_sessions_help_without_mutating() {
         assert_eq!(
             classify_builtin_cli_command(&["server".to_string(), "sessions".to_string()]),

@@ -63,10 +63,17 @@ The surrounding chrome should feel supportive, not dominant.
 
 - Side rails should be lighter and quieter than the main canvas.
 - A faint blue-to-green fresh tint over a muted neutral base is desirable.
+<<<<<<< HEAD
 - A light gradient system is preferred for stable desktop shells. Do not ship
   compositor blur or alpha-driven transparency in the stable path; keep blur
   experiments on an explicit experimental branch until they are deterministic
   across focus changes, restore, and platform compositors.
+=======
+- A light gradient plus blur system is preferred when the platform supports it.
+  Treat CSS backdrop blur and compositor live blur as different capabilities:
+  if the compositor cannot blur windows behind the app, use a stable frosted
+  material tint instead of exposing readable background windows through alpha.
+>>>>>>> c162185 (Snapshot alpha blur experiment)
 - Rails should avoid heavy borders.
 - The shell should feel visually unified rather than partitioned into harsh boxes.
 - Titlebar, side rails, and utility surfaces should feel like one seamless scaffold around the floating main canvas.
@@ -106,6 +113,11 @@ Yggdrasil shells should support a reusable visual theme editor.
   - draggable color stops
   - a lightweight color library
   - a brightness control
+<<<<<<< HEAD
+=======
+  - an alpha/translucency control
+  - a grain dial control
+>>>>>>> c162185 (Snapshot alpha blur experiment)
 - Double-clicking the preview pad should be able to add a color stop.
 - The preview pad should use a visible grid, not a blank field, so stop placement feels intentional.
 - Dragging color stops should live-preview the shell background.
@@ -115,15 +127,28 @@ Yggdrasil shells should support a reusable visual theme editor.
 - Reset should always return to the project’s base shell theme, not an empty placeholder state.
 - The active portable theme should be stored in `~/.yggterm/settings.json` under the `theme` object.
 - If no custom colors exist, the shell should fall back to the system gradient cleanly.
+<<<<<<< HEAD
 - Stable Yggterm exposes brightness only as a scalar control. Alpha,
   translucency, grain, and blur controls are experimental and must not affect
   stable shell rendering.
 - The theme editor dialog itself should be opaque to the app behind it, while
   still applying shell edits live around the dialog.
+=======
+- The alpha control is a material-translucency control. On blur-capable shells,
+  alpha 50 means a 50% shell material paired with blur, not alpha scaled down by
+  another hidden opacity factor. The blur budget should increase as alpha drops.
+  Without blur support, the shell should automatically use a more opaque
+  readable material fallback.
+- The theme editor dialog itself should be opaque to the app behind it, while
+  still applying shell edits live around the dialog.
+- The grain control should produce visible repeated film grain on the shell
+  background, not just store a number in settings.
+>>>>>>> c162185 (Snapshot alpha blur experiment)
 
 #### Theme surfaces
 
 - The outer shell background should be theme-driven.
+<<<<<<< HEAD
 - Supporting chrome should inherit the shell gradient subtly without blur.
 - Auto-hidden titlebar reveal is chrome, not layout. It must draw over the
   workspace with the same shell tint/gradient language as the visible
@@ -131,6 +156,15 @@ Yggdrasil shells should support a reusable visual theme editor.
 - Transparent desktop chrome must never be alpha-only. The stable material
   stack is theme tint, gradient wash, and enough fill opacity to stay readable
   without compositor blur.
+=======
+- Supporting chrome should inherit the shell gradient subtly through transparency and blur.
+- Auto-hidden titlebar reveal is chrome, not layout. It must draw over the
+  workspace with the same shell tint/gradient/blur language as the visible
+  titlebar, and must not resize or vertically shift terminal content.
+- Transparent desktop chrome must never be alpha-only. The material stack is:
+  theme tint, gradient wash, saturation/blur where available, and enough fill
+  opacity to stay readable when the OS compositor provides no live blur.
+>>>>>>> c162185 (Snapshot alpha blur experiment)
 - The main workspace should remain calmer and more neutral than the shell chrome.
 - Theme accent can be derived from the dominant gradient stop for lightweight emphasis.
 - The theme modal itself should not blur the background. The surrounding UI should remain clearly visible, with a calm blue active-state halo around the modal to signal focused editing.

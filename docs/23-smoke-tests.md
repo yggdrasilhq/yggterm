@@ -113,6 +113,7 @@ that have previously hidden release-blocking defects:
 
 - reveal and hide the autohidden titlebar while a terminal is active; the hover
   chrome must use the same background/gradient as the visible titlebar and must
+<<<<<<< HEAD
   not resize the terminal grid or shift shell content. Stable builds must not
   report compositor blur, CSS backdrop blur, or a nonzero material blur budget.
 - open the theme editor, reset the theme, change brightness through
@@ -120,6 +121,19 @@ that have previously hidden release-blocking defects:
   alpha/grain remain pinned to stable defaults even if legacy values are set,
   verify no repeated grain layer is emitted, verify the saved/effective theme
   and shell CSS variables change, then reset it again
+=======
+  not resize the terminal grid or shift shell content. Native compositor blur
+  must remain active during the hover transition, and native blur paths must not
+  mix in CSS `backdrop-filter` fallbacks. The alpha dial remains allowed to
+  choose higher or lower material alpha as long as the blur path is active.
+- open the theme editor, reset the theme, change brightness/alpha/grain through
+  app-control, verify the grain dial can reach the high range, verify alpha is
+  applied as a blur-backed material control where alpha 50 yields roughly 50%
+  shell material plus computed blur, with a readable fallback when blur is
+  unavailable, verify grain changes a repeated shell background layer
+  (`background-image`, `background-size`, and `background-repeat`), verify the
+  saved/effective theme and shell CSS variables change, then reset it again
+>>>>>>> c162185 (Snapshot alpha blur experiment)
 - click the active terminal viewport at random positions; the viewport must not
   flicker-scroll or settle at an unintended scrollback location
 - resize or nudge the window; prompt-follow sessions must return to the prompt,
@@ -141,6 +155,7 @@ that have previously hidden release-blocking defects:
 - run the app-control terminal probes for typed echo, scroll, selection/context
   menu, and xterm row style truth; the screenshot, probe, and state JSON must
   agree
+<<<<<<< HEAD
 - reject any state where app-control reports daemon-backed buffer text while
   the screenshot shows a blank terminal, or where canvas mode reports
   low-contrast foreground/background colors over a dark terminal surface
@@ -169,6 +184,11 @@ that have previously hidden release-blocking defects:
   treated as drawable. If app-control screenshot capture is suspected to be a
   background/occlusion artifact, record an OS-level screenshot and classify that
   separately; do not turn a blank app-control capture into a pass silently.
+=======
+- query `~/.yggterm/telemetry/terminal.sqlite3` for the run window; every opened
+  terminal must have `terminal_open_attempt/begin` and either
+  `terminal_open_attempt/ready` or a documented failure/recovery event
+>>>>>>> c162185 (Snapshot alpha blur experiment)
 
 ## Keep-Alive And Restore Pass
 
@@ -187,21 +207,33 @@ metadata contract.
 
 ## Resource Budget
 
+<<<<<<< HEAD
 Resource logging must cover five windows:
+=======
+Resource logging must cover four windows:
+>>>>>>> c162185 (Snapshot alpha blur experiment)
 
 - baseline before opening test sessions
 - active workload while the 23 sessions are visible/reachable
 - cooled period after the GUI is closed and before it is respawned
+<<<<<<< HEAD
 - respawn burst immediately after the GUI is restored
 - respawn settled after the restored sessions have had a short settle period
+=======
+- respawn settle after the GUI is restored
+>>>>>>> c162185 (Snapshot alpha blur experiment)
 
 Record CPU, memory, swap, daemon process list, GUI process list, and app-control
 latency. A pass requires no unexplained sustained CPU spike, no swap growth that
 survives cleanup, and no fan-level load from idle cooled or freshly respawned
 sessions. The release script must preserve the configured budget for each
+<<<<<<< HEAD
 window, not just the cooldown window. The respawn burst budget may be higher
 than the settled budget, but the proof must show the load decays rather than
 turning into a render loop.
+=======
+window, not just the cooldown window.
+>>>>>>> c162185 (Snapshot alpha blur experiment)
 
 For each resource window, include enough samples to distinguish transient work
 from a leak or loop. The proof bundle should mark the causal boundary between
@@ -238,8 +270,12 @@ Keep a proof bundle for each run with:
 - screenshots and app-control JSON before and after restore
 - terminal telemetry query output for opened sessions, recovery warnings, and
   errors during the run window
+<<<<<<< HEAD
 - resource logs for baseline, active workload, cooldown, respawn burst, and
   respawn settled
+=======
+- resource logs for baseline, active workload, cooldown, and respawn
+>>>>>>> c162185 (Snapshot alpha blur experiment)
 - keep-alive set and restore comparison
 - defect notes or explicit "no defect found" summary
 - cleanup report

@@ -3411,6 +3411,7 @@ mod tests {
     }
 
     #[test]
+<<<<<<< HEAD
     fn app_cli_help_exposes_settled_open_path_command() {
         let source = include_str!("main.rs");
         assert!(source.contains("server app open <session-path>"));
@@ -3419,6 +3420,8 @@ mod tests {
     }
 
     #[test]
+=======
+>>>>>>> c162185 (Snapshot alpha blur experiment)
     fn signal_shutdown_policy_preserves_daemon_with_terminal_runtimes() {
         assert!(!signal_shutdown_policy_allows_daemon_shutdown(
             0, 1, 1, 0, true

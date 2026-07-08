@@ -155,7 +155,7 @@ mod tests {
     #[test]
     fn humanized_terminal_title_uses_cwd_before_host_label() {
         assert_eq!(
-            humanized_terminal_title(SessionKind::Shell, "/home/pi/git/samplenotes", Some("dev")),
+            humanized_terminal_title(SessionKind::Shell, "/home/pi/git/jyas", Some("dev")),
             Some("Jyas Shell".to_string())
         );
         assert_eq!(

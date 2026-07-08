@@ -199,8 +199,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--active-max-cpu", type=float, default=30.0)
     parser.add_argument("--cooldown-max-cpu", type=float, default=8.0)
     parser.add_argument("--respawn-max-cpu", type=float, default=18.0)
+<<<<<<< HEAD
     parser.add_argument("--respawn-burst-max-cpu", type=float, default=35.0)
     parser.add_argument("--respawn-settle-sec", type=float, default=20.0)
+=======
+>>>>>>> c162185 (Snapshot alpha blur experiment)
     parser.add_argument("--gui-bin", help="GUI-capable yggterm binary for restore relaunch")
     parser.add_argument("--screenshots", action="store_true")
     parser.add_argument("--skip-quirks", action="store_true")
@@ -1106,8 +1109,11 @@ def main() -> int:
 
     resources: dict[str, dict] = {}
     resource_failures: list[str] = []
+<<<<<<< HEAD
     daemon_reports: dict[str, dict] = {}
     daemon_failures: list[str] = []
+=======
+>>>>>>> c162185 (Snapshot alpha blur experiment)
     launcher_preflight = None
     if not args.skip_launcher_preflight:
         launcher_preflight = direct_install_launcher_preflight(args.host, args.bin, out_dir)
@@ -1322,6 +1328,7 @@ def main() -> int:
             hover_shell = (quirk_results["chrome_hover_state"] or {}).get("shell") or {}
             hover_dom = (quirk_results["chrome_hover_state"] or {}).get("dom") or {}
             hover_failures = []
+<<<<<<< HEAD
             live_blur_supported = bool(hover_shell.get("live_blur_supported"))
             compositor_blur_active = bool(hover_shell.get("compositor_blur_active"))
             css_blur_enabled = bool(hover_shell.get("css_backdrop_filter_enabled"))
@@ -1351,6 +1358,13 @@ def main() -> int:
                     hover_failures.append(
                         f"stable no-blur profile reported shell backdrop filter {shell_filter!r}"
                     )
+=======
+            if hover_shell.get("transparent_window") and not hover_shell.get("compositor_blur_active"):
+                hover_failures.append("native compositor blur inactive while transparent hover chrome is visible")
+            shell_filter = str(hover_dom.get("shell_frame_backdrop_filter") or "")
+            if hover_shell.get("compositor_blur_active") and shell_filter not in {"", "none"}:
+                hover_failures.append(f"native compositor path mixed CSS backdrop filter {shell_filter!r}")
+>>>>>>> c162185 (Snapshot alpha blur experiment)
             titlebar_rect = hover_dom.get("titlebar_rect") or {}
             titlebar_visible = float(titlebar_rect.get("height") or 0) > 8
             titlebar_background = str(hover_dom.get("titlebar_background") or "")
@@ -1358,19 +1372,28 @@ def main() -> int:
             if titlebar_visible and not titlebar_background:
                 hover_failures.append("hovered titlebar material background was not observable")
             if (
+<<<<<<< HEAD
                 compositor_blur_active
+=======
+                hover_shell.get("compositor_blur_active")
+>>>>>>> c162185 (Snapshot alpha blur experiment)
                 and titlebar_visible
                 and titlebar_filter not in {"", "none"}
             ):
                 hover_failures.append(
                     f"native compositor titlebar mixed CSS backdrop filter {titlebar_filter!r}"
                 )
+<<<<<<< HEAD
             if not live_blur_supported and titlebar_filter not in {"", "none"}:
                 hover_failures.append(
                     f"stable no-blur profile reported titlebar backdrop filter {titlebar_filter!r}"
                 )
             shell_background = str(hover_dom.get("shell_frame_background") or "")
             if live_blur_supported and "rgba(" in shell_background:
+=======
+            shell_background = str(hover_dom.get("shell_frame_background") or "")
+            if "rgba(" in shell_background:
+>>>>>>> c162185 (Snapshot alpha blur experiment)
                 try:
                     alpha_text = shell_background.rsplit(",", 1)[1].strip().rstrip(")")
                     if float(alpha_text) >= 0.74:
@@ -1482,12 +1505,18 @@ def main() -> int:
                 args.resource_sample_sec,
                 out_dir,
             )
+<<<<<<< HEAD
             respawn_burst_failure = _resource_failure(
                 resources["respawn_burst"],
                 args.respawn_burst_max_cpu,
             )
             if respawn_burst_failure:
                 resource_failures.append(respawn_burst_failure)
+=======
+            respawn_failure = _resource_failure(resources["respawn"], args.respawn_max_cpu)
+            if respawn_failure:
+                resource_failures.append(respawn_failure)
+>>>>>>> c162185 (Snapshot alpha blur experiment)
             for index, original in enumerate(created_results):
                 session_path = str(original["created_session_path"])
                 restored: dict[str, object] = {
@@ -1637,8 +1666,11 @@ def main() -> int:
             "baseline_max_cpu": args.baseline_max_cpu,
             "active_max_cpu": args.active_max_cpu,
             "cooldown_max_cpu": args.cooldown_max_cpu,
+<<<<<<< HEAD
             "respawn_burst_max_cpu": args.respawn_burst_max_cpu,
             "respawn_settle_sec": args.respawn_settle_sec,
+=======
+>>>>>>> c162185 (Snapshot alpha blur experiment)
             "respawn_max_cpu": args.respawn_max_cpu,
         },
         "launcher_preflight": launcher_preflight,

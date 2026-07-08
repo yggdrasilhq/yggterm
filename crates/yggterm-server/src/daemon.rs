@@ -590,6 +590,7 @@ fn remote_resume_saved_session_mismatch_requires_restart(
     false
 }
 
+<<<<<<< HEAD
 fn terminal_reuse_needs_restart(
     still_running: bool,
     remote_resume_path: bool,
@@ -657,6 +658,8 @@ fn remove_session_should_detach_keep_alive_runtime(keep_alive_runtime: bool) -> 
     false
 }
 
+=======
+>>>>>>> c162185 (Snapshot alpha blur experiment)
 fn valid_initial_terminal_size(cols: Option<u16>, rows: Option<u16>) -> Option<(u16, u16)> {
     match (cols, rows) {
         (Some(cols), Some(rows)) if cols > 0 && rows > 0 => Some((cols, rows)),
@@ -2584,6 +2587,7 @@ impl DaemonRuntime {
                 if !runtime_output_seen || snapshot.trim().is_empty() {
                     return false;
                 }
+<<<<<<< HEAD
                 let runtime_output_mismatches_path = self
                     .server
                     .remote_resume_runtime_output_mismatches_path(path, snapshot.as_bytes());
@@ -2608,6 +2612,12 @@ impl DaemonRuntime {
                             }),
                         );
                     }
+=======
+                if !self
+                    .server
+                    .remote_resume_runtime_output_mismatches_path(path, snapshot.as_bytes())
+                {
+>>>>>>> c162185 (Snapshot alpha blur experiment)
                     return false;
                 }
                 append_trace_event(
@@ -2711,12 +2721,17 @@ impl DaemonRuntime {
                 .request_terminal_launch_for_path_preserving_active(path);
         }
         let runtime_path = self.terminal_runtime_key_for_path(path);
+<<<<<<< HEAD
         let preserved_owner_status = self
             .preserved_owner_status_for_runtime_key(&runtime_path)
             .or_else(|| {
                 self.discover_keep_alive_preserved_owner_for_runtime_key(path, &runtime_path)
             });
         if let Some((owner_endpoint, _owner_status)) = preserved_owner_status
+=======
+        if let Some((owner_endpoint, _owner_status)) =
+            self.preserved_owner_status_for_runtime_key(&runtime_path)
+>>>>>>> c162185 (Snapshot alpha blur experiment)
             && !self.reject_preserved_owner_saved_session_mismatch(
                 path,
                 &runtime_path,
@@ -2892,6 +2907,7 @@ impl DaemonRuntime {
             let spec_matches =
                 self.terminals
                     .session_matches_spec(&runtime_path, &launch_command, cwd.as_deref());
+<<<<<<< HEAD
             let keep_alive_runtime = self.server.live_session_keep_alive(path);
             let (needs_restart, restart_blocked_by_keep_alive) = terminal_reuse_needs_restart(
                 still_running,
@@ -2902,6 +2918,13 @@ impl DaemonRuntime {
                 remote_saved_session_mismatch_requires_restart,
                 spec_matches,
             );
+=======
+            let needs_restart = !still_running
+                || stale_remote_attach
+                || blank_remote_attach
+                || remote_saved_session_mismatch_requires_restart
+                || !spec_matches;
+>>>>>>> c162185 (Snapshot alpha blur experiment)
             if let Ok(home) = crate::resolve_yggterm_home() {
                 append_trace_event(
                     &home,
@@ -2920,8 +2943,11 @@ impl DaemonRuntime {
                         "remote_attach_startup_grace_ms": remote_attach_startup_grace_ms,
                         "runtime_saved_session_mismatch": runtime_saved_session_mismatch,
                         "remote_saved_session_mismatch_requires_restart": remote_saved_session_mismatch_requires_restart,
+<<<<<<< HEAD
                         "keep_alive_runtime": keep_alive_runtime,
                         "restart_blocked_by_keep_alive": restart_blocked_by_keep_alive,
+=======
+>>>>>>> c162185 (Snapshot alpha blur experiment)
                         "spec_matches": spec_matches,
                         "remote_resume_path": remote_resume_path,
                         "needs_restart": needs_restart,
@@ -3908,17 +3934,16 @@ impl DaemonRuntime {
                 if let Some(owner_endpoint) =
                     self.preserved_owner_endpoint_for_request(&runtime_path)
                 {
-                    match terminal_read(&owner_endpoint, &runtime_path, cursor) {
-                        Ok((
-                            cursor,
-                            chunks,
-                            running,
-                            runtime_output_seen,
-                            eof_without_output,
-                            post_resize_output_seen,
-                            last_resize_seq,
-                        )) => {
-                            return Ok(ServerResponse::TerminalStream {
+                    if self.reject_preserved_owner_saved_session_mismatch(
+                        &path,
+                        &runtime_path,
+                        &owner_endpoint,
+                        "terminal_read_saved_session_mismatch",
+                    ) {
+                        let _ = self.ensure_terminal_for_path(&path)?;
+                    } else {
+                        match terminal_read(&owner_endpoint, &runtime_path, cursor) {
+                            Ok((
                                 cursor,
                                 chunks,
                                 running,
@@ -3926,6 +3951,7 @@ impl DaemonRuntime {
                                 eof_without_output,
                                 post_resize_output_seen,
                                 last_resize_seq,
+<<<<<<< HEAD
                             });
                         }
                         Err(error) => {
@@ -3941,6 +3967,27 @@ impl DaemonRuntime {
                                 return Err(error);
                             }
                             let _ = self.ensure_terminal_for_path(&path)?;
+=======
+                            )) => {
+                                return Ok(ServerResponse::TerminalStream {
+                                    cursor,
+                                    chunks,
+                                    running,
+                                    runtime_output_seen,
+                                    eof_without_output,
+                                    post_resize_output_seen,
+                                    last_resize_seq,
+                                });
+                            }
+                            Err(error) => {
+                                self.handle_preserved_owner_request_error(
+                                    &runtime_path,
+                                    &owner_endpoint,
+                                    &error,
+                                );
+                                return Err(error);
+                            }
+>>>>>>> c162185 (Snapshot alpha blur experiment)
                         }
                     }
                 }
@@ -8327,13 +8374,13 @@ mod tests {
         );
         let session_path = remote_scanned_session_path("practice", "241c3f6a");
         let mut owner_session = daemon_test_snapshot_session(&session_path, SessionSource::LiveSsh);
-        owner_session.title = "samplers".to_string();
+        owner_session.title = "practice-rs".to_string();
         owner_session.host_label = "practice".to_string();
         owner_session.ssh_target = Some("practice".to_string());
         owner_session.metadata = vec![
             SnapshotMetadataEntry {
                 label: "Cwd".to_string(),
-                value: "/home/pi/git/samplers".to_string(),
+                value: "/home/pi/git/practice-rs".to_string(),
             },
             SnapshotMetadataEntry {
                 label: "Runtime Persistence".to_string(),
@@ -8887,7 +8934,7 @@ mod tests {
     #[test]
     fn drop_terminal_runtime_is_local_only_and_does_not_retire_daemon() {
         let request = super::ServerRequest::DropTerminalRuntime {
-            runtime_key: "remote-session://dev/current-samplenotes".to_string(),
+            runtime_key: "remote-session://dev/current-jyas".to_string(),
             reason: Some("duplicate_legacy_owned_runtime_prune".to_string()),
         };
         assert_eq!(
@@ -9470,7 +9517,7 @@ mod tests {
             expected_server_version: Some("2.1.191".to_string()),
             entries: vec![
                 super::PreservedTerminalOwnerEntry {
-                    runtime_key: "remote-session://dev/kept-samplenotes".to_string(),
+                    runtime_key: "remote-session://dev/kept-jyas".to_string(),
                     endpoint: super::PreservedOwnerEndpoint::from_endpoint(&first_endpoint),
                     owner_server_version: "2.1.163".to_string(),
                     owner_server_build_id: 0,
@@ -9505,7 +9552,7 @@ mod tests {
                 first_endpoint,
                 vec![
                     "remote-session://dev/kept-erome".to_string(),
-                    "remote-session://dev/kept-samplenotes".to_string(),
+                    "remote-session://dev/kept-jyas".to_string(),
                 ],
             )
         );
@@ -9524,16 +9571,16 @@ mod tests {
             GhosttyHostSupport::shadow("test".to_string(), false, false),
             UiTheme::ZedLight,
         );
-        let kept_samplenotes = remote_scanned_session_path("dev", "kept-samplenotes");
+        let kept_jyas = remote_scanned_session_path("dev", "kept-jyas");
         server.restore_live_session(PersistedLiveSession {
-            key: kept_samplenotes.clone(),
-            id: "kept-samplenotes".to_string(),
-            title: "samplenotes".to_string(),
+            key: kept_jyas.clone(),
+            id: "kept-jyas".to_string(),
+            title: "jyas".to_string(),
             kind: SessionKind::Codex,
             keep_alive: true,
             ssh_target: "dev".to_string(),
             prefix: None,
-            cwd: Some("/home/pi/git/samplenotes".to_string()),
+            cwd: Some("/home/pi/git/jyas".to_string()),
             remote_launch_action: None,
             storage_path: None,
             restore_reason: None,
@@ -9552,7 +9599,7 @@ mod tests {
             storage_path: None,
             restore_reason: Some("update-restart".to_string()),
         });
-        let owner_registry_keys = HashSet::from([kept_samplenotes.clone()]);
+        let owner_registry_keys = HashSet::from([kept_jyas.clone()]);
         let all_registry_keys = owner_registry_keys.clone();
         let current_owned_runtime_keys = HashSet::new();
 
@@ -9562,7 +9609,7 @@ mod tests {
             &all_registry_keys,
             &current_owned_runtime_keys,
             vec![
-                kept_samplenotes,
+                kept_jyas,
                 unkept_update_runtime.clone(),
                 "remote-session://dev/closed-may-6".to_string(),
                 "remote-session://dev/closed-generic-a".to_string(),
@@ -9570,7 +9617,7 @@ mod tests {
             ],
         );
 
-        assert!(server.live_session_keep_alive(&remote_scanned_session_path("dev", "kept-samplenotes")));
+        assert!(server.live_session_keep_alive(&remote_scanned_session_path("dev", "kept-jyas")));
         assert!(!server.live_session_keep_alive(&unkept_update_runtime));
         assert_eq!(
             stale_runtime_keys,
@@ -9596,12 +9643,12 @@ mod tests {
         server.restore_live_session(PersistedLiveSession {
             key: kept_runtime.clone(),
             id: "kept-runtime".to_string(),
-            title: "samplers non-data".to_string(),
+            title: "practice-rs non-data".to_string(),
             kind: SessionKind::Codex,
             keep_alive: true,
             ssh_target: "practice".to_string(),
             prefix: None,
-            cwd: Some("/home/pi/git/samplers".to_string()),
+            cwd: Some("/home/pi/git/practice-rs".to_string()),
             remote_launch_action: None,
             storage_path: None,
             restore_reason: None,
@@ -9637,7 +9684,7 @@ mod tests {
             keep_alive: false,
             ssh_target: "practice".to_string(),
             prefix: None,
-            cwd: Some("/home/pi/git/samplers".to_string()),
+            cwd: Some("/home/pi/git/practice-rs".to_string()),
             remote_launch_action: None,
             storage_path: None,
             restore_reason: None,
@@ -9663,9 +9710,9 @@ mod tests {
             GhosttyHostSupport::shadow("test".to_string(), false, false),
             UiTheme::ZedLight,
         );
-        let kept_samplenotes = remote_scanned_session_path("dev", "kept-samplenotes");
+        let kept_jyas = remote_scanned_session_path("dev", "kept-jyas");
         let duplicate_erome = remote_scanned_session_path("dev", "kept-erome");
-        for key in [&kept_samplenotes, &duplicate_erome] {
+        for key in [&kept_jyas, &duplicate_erome] {
             server.restore_live_session(PersistedLiveSession {
                 key: key.clone(),
                 id: key.rsplit('/').next().unwrap_or("session").to_string(),
@@ -9674,13 +9721,13 @@ mod tests {
                 keep_alive: true,
                 ssh_target: "dev".to_string(),
                 prefix: None,
-                cwd: Some("/home/pi/git/samplenotes".to_string()),
+                cwd: Some("/home/pi/git/jyas".to_string()),
                 remote_launch_action: None,
                 storage_path: None,
                 restore_reason: None,
             });
         }
-        let owner_registry_keys = HashSet::from([kept_samplenotes.clone()]);
+        let owner_registry_keys = HashSet::from([kept_jyas.clone()]);
         let all_registry_keys = owner_registry_keys.clone();
         let current_owned_runtime_keys = HashSet::from([duplicate_erome.clone()]);
 
@@ -9689,7 +9736,7 @@ mod tests {
             &owner_registry_keys,
             &all_registry_keys,
             &current_owned_runtime_keys,
-            vec![kept_samplenotes, duplicate_erome.clone()],
+            vec![kept_jyas, duplicate_erome.clone()],
         );
 
         assert_eq!(
@@ -9708,9 +9755,9 @@ mod tests {
             GhosttyHostSupport::shadow("test".to_string(), false, false),
             UiTheme::ZedLight,
         );
-        let kept_samplenotes = remote_scanned_session_path("dev", "kept-samplenotes");
+        let kept_jyas = remote_scanned_session_path("dev", "kept-jyas");
         let reassigned_erome = remote_scanned_session_path("dev", "kept-erome");
-        for key in [&kept_samplenotes, &reassigned_erome] {
+        for key in [&kept_jyas, &reassigned_erome] {
             server.restore_live_session(PersistedLiveSession {
                 key: key.clone(),
                 id: key.rsplit('/').next().unwrap_or("session").to_string(),
@@ -9719,14 +9766,14 @@ mod tests {
                 keep_alive: true,
                 ssh_target: "dev".to_string(),
                 prefix: None,
-                cwd: Some("/home/pi/git/samplenotes".to_string()),
+                cwd: Some("/home/pi/git/jyas".to_string()),
                 remote_launch_action: None,
                 storage_path: None,
                 restore_reason: None,
             });
         }
-        let owner_registry_keys = HashSet::from([kept_samplenotes.clone()]);
-        let all_registry_keys = HashSet::from([kept_samplenotes.clone(), reassigned_erome.clone()]);
+        let owner_registry_keys = HashSet::from([kept_jyas.clone()]);
+        let all_registry_keys = HashSet::from([kept_jyas.clone(), reassigned_erome.clone()]);
         let current_owned_runtime_keys = HashSet::new();
 
         let stale_runtime_keys = super::unrepresented_preserved_owner_runtime_keys(
@@ -9734,7 +9781,7 @@ mod tests {
             &owner_registry_keys,
             &all_registry_keys,
             &current_owned_runtime_keys,
-            vec![kept_samplenotes, reassigned_erome.clone()],
+            vec![kept_jyas, reassigned_erome.clone()],
         );
 
         assert_eq!(
@@ -9748,7 +9795,7 @@ mod tests {
     fn duplicate_legacy_owned_runtime_prune_candidates_keep_unique_old_runtime_keys() {
         let current_runtime_keys = HashSet::from([
             "remote-session://dev/current-erome".to_string(),
-            "remote-session://dev/current-samplenotes".to_string(),
+            "remote-session://dev/current-jyas".to_string(),
         ]);
         let owner_status: ServerRuntimeStatus = serde_json::from_value(serde_json::json!({
             "server_version": "2.6.1",
@@ -9761,12 +9808,12 @@ mod tests {
             "owned_terminal_session_count": 2,
             "owned_terminal_session_keys": [
                 "remote-session://dev/current-erome",
-                "remote-session://dev/old-only-samplescripts"
+                "remote-session://dev/old-only-p01scripts"
             ],
             "terminal_session_count": 2,
             "terminal_session_keys": [
                 "remote-session://dev/current-erome",
-                "remote-session://dev/old-only-samplescripts"
+                "remote-session://dev/old-only-p01scripts"
             ],
         }))
         .expect("status");
@@ -10898,6 +10945,7 @@ mod tests {
         ));
     }
 
+<<<<<<< HEAD
     #[test]
     fn keep_alive_remote_runtime_blocks_semantic_restart_while_still_running() {
         let (needs_restart, blocked) =
@@ -11071,6 +11119,8 @@ mod tests {
         );
     }
 
+=======
+>>>>>>> c162185 (Snapshot alpha blur experiment)
     #[cfg(unix)]
     #[test]
     fn daemon_idle_shutdown_is_blocked_by_owned_terminal_sessions() {

@@ -1754,8 +1754,13 @@ fn terminal_host_problem_for_app_control(host: &Value) -> Option<&'static str> {
             cursor_line_text,
             visible_text,
         ))
+<<<<<<< HEAD
         && (terminal_chunk_has_meaningful_output(visible_text) || sample_has_meaningful_output)
         && (terminal_chunk_has_codex_prompt_output(visible_text) || sample_has_codex_prompt_output)
+=======
+        && terminal_chunk_has_meaningful_output(visible_text)
+        && terminal_chunk_has_codex_prompt_output(visible_text)
+>>>>>>> c162185 (Snapshot alpha blur experiment)
         && (cursor_sample_visible || cursor_geometry_visible)
         && live_remote_current_frame_has_prompt_signal
         && (xterm_present || screen_present || rows_present || canvas_count > 0)
@@ -1997,6 +2002,43 @@ fn terminal_host_problem_for_app_control(host: &Value) -> Option<&'static str> {
     {
         return Some("active remote Codex prompt surface has no current input row");
     }
+    if session_path.starts_with("remote-session://")
+        && input_enabled
+        && mounted_entry_host_connected
+        && retained_replay_from_pty
+        && xterm_buffer_kind != "alternate"
+        && cursor_line_text.is_empty()
+        && terminal_chunk_has_meaningful_output(visible_text)
+        && (visible_text.contains('›')
+            || terminal_chunk_has_codex_prompt_output(visible_text)
+            || terminal_chunk_is_codex_prompt_surface(visible_text)
+            || terminal_chunk_has_generic_codex_idle_footer(visible_text))
+        && !terminal_chunk_has_current_codex_input_row(visible_text)
+        && !codex_interactive_setup_prompt
+        && !codex_interrupted_input_surface
+        && !terminal_chunk_is_transport_error(visible_text)
+        && !terminal_chunk_is_loading_placeholder(visible_text)
+        && !terminal_chunk_is_transcript_browser(visible_text)
+        && !terminal_chunk_is_generic_codex_idle(visible_text)
+    {
+        return Some("active remote Codex prompt surface has no current input row");
+    }
+    if session_path.starts_with("remote-session://")
+        && input_enabled
+        && mounted_entry_host_connected
+        && retained_replay_from_pty
+        && cursor_line_text.is_empty()
+        && rows >= 8
+        && last_raw_payload_line_count > rows.saturating_add(4)
+        && blank_rows_below_cursor > terminal_observe_max_blank_rows_below_live_cursor(rows)
+        && !terminal_chunk_has_current_codex_input_row(visible_text)
+        && !terminal_chunk_is_transport_error(visible_text)
+        && !terminal_chunk_is_loading_placeholder(visible_text)
+        && !terminal_chunk_is_transcript_browser(visible_text)
+        && !terminal_chunk_is_generic_codex_idle(visible_text)
+    {
+        return Some("active remote Codex prompt surface has no current input row");
+    }
     if (terminal_chunk_has_prompt_output(visible_text)
         || terminal_chunk_has_codex_prompt_output(visible_text)
         || sample_has_prompt_output
@@ -2004,8 +2046,12 @@ fn terminal_host_problem_for_app_control(host: &Value) -> Option<&'static str> {
         && !prompt_ready_surface
     {
         if !session_path.starts_with("remote-session://")
+<<<<<<< HEAD
             && !(terminal_chunk_has_codex_prompt_output(visible_text)
                 || sample_has_codex_prompt_output)
+=======
+            && !terminal_chunk_has_codex_prompt_output(visible_text)
+>>>>>>> c162185 (Snapshot alpha blur experiment)
         {
             return None;
         }
@@ -2400,6 +2446,7 @@ fn terminal_host_geometry_problem_for_app_control(host: &Value) -> Option<&'stat
             );
         }
     }
+<<<<<<< HEAD
     None
 }
 
@@ -2411,6 +2458,11 @@ fn terminal_host_performance_problem_for_app_control(host: &Value) -> Option<&'s
     let terminal_has_effective_input_focus = host
         .get("effective_input_focus")
         .and_then(Value::as_bool)
+=======
+    let terminal_has_effective_input_focus = host
+        .get("effective_input_focus")
+        .and_then(Value::as_bool)
+>>>>>>> c162185 (Snapshot alpha blur experiment)
         .unwrap_or_else(|| {
             let helper_textarea_focused = host
                 .get("helper_textarea_focused")
@@ -2452,6 +2504,7 @@ fn terminal_host_performance_problem_for_app_control(host: &Value) -> Option<&'s
             .get("recent_inline_status_animation_hot")
             .and_then(Value::as_bool)
             .unwrap_or(false);
+<<<<<<< HEAD
     let inline_animation_hot = host
         .get("recent_inline_status_animation_hot")
         .and_then(Value::as_bool)
@@ -2460,6 +2513,8 @@ fn terminal_host_performance_problem_for_app_control(host: &Value) -> Option<&'s
         .get("terminal_input_hot")
         .and_then(Value::as_bool)
         .unwrap_or(false);
+=======
+>>>>>>> c162185 (Snapshot alpha blur experiment)
     if active_visible_terminal && write_budget_fields_present && write_budget_should_be_fast {
         let active_write_frame_budget = host
             .get("active_write_frame_budget")
@@ -2471,12 +2526,16 @@ fn terminal_host_performance_problem_for_app_control(host: &Value) -> Option<&'s
         if !active_write_frame_budget {
             return Some("active visible terminal is using the background write budget");
         }
+<<<<<<< HEAD
         let max_expected_frame_ms = if !terminal_input_hot && inline_animation_hot {
             550.0
         } else {
             220.0
         };
         if effective_frame_ms.is_none_or(|value| value > max_expected_frame_ms) {
+=======
+        if effective_frame_ms.is_none_or(|value| value > 220.0) {
+>>>>>>> c162185 (Snapshot alpha blur experiment)
             return Some("active visible terminal write budget is too slow");
         }
     }
@@ -3181,7 +3240,11 @@ mod tests {
         terminal_chunk_is_local_codex_scaffold, terminal_chunk_is_transport_error,
         terminal_host_problem_for_app_control,
         terminal_observe_codex_prompt_tail_has_real_scrollback,
+<<<<<<< HEAD
         terminal_observe_prompt_layout_is_acceptable, terminal_timing_for_app_control,
+=======
+        terminal_observe_prompt_layout_is_acceptable,
+>>>>>>> c162185 (Snapshot alpha blur experiment)
     };
     use serde_json::{Value, json};
 
@@ -3242,6 +3305,7 @@ mod tests {
     }
 
     #[test]
+<<<<<<< HEAD
     fn terminal_host_problem_rejects_dom_rows_that_fail_hit_test_paint() {
         let host = json!({
             "session_path": "remote-session://practice/paint-hidden",
@@ -3282,6 +3346,8 @@ mod tests {
     }
 
     #[test]
+=======
+>>>>>>> c162185 (Snapshot alpha blur experiment)
     fn terminal_chunk_marks_hot_update_bridge_failure_as_transport_error() {
         let data = "Error: hot update failed before bridging stale remote runtime codex-runtime://019dfde8 from 2.2.49 pid 1629132\r\n\r\nCaused by:\r\n    reading daemon response\r\n    Resource temporarily unavailable (os error 11)\r\n";
 
@@ -3324,7 +3390,7 @@ mod tests {
         let data = "╭─────────────────────────────────────────────╮\n\
                                                │ >_ OpenAI Codex (v0.130.0)                  │\n\
                                │ model:     gpt-5.5 xhigh   /model to change │\n\
-                                                                              │ directory: ~/git/samplenotes         \n\
+                                                                              │ directory: ~/git/jyas         \n\
                ╰─────────────────────────────────────────────╯\n\
                                                               Error: connecting to /home/pi/.yggterm/server-2-\n\
 1-10.sock\n\n\
@@ -3690,7 +3756,7 @@ Best thing to improve in the meantime:
 
 › Improve documentation in @filename
 
-  gpt-5.5 xhigh · ~/git/samplenotes";
+  gpt-5.5 xhigh · ~/git/jyas";
         let host = json!({
             "session_path": "remote-session://dev/hot-update-real-pty",
             "text_sample": text_tail,
@@ -3916,7 +3982,7 @@ Best thing to improve in the meantime:
     fn terminal_host_problem_rejects_remote_prompt_gated_after_user_input() {
         let text_tail = "Current checkpoint:\n\n- Active chart: JYAS_BENCH_0099\n- Log rows: 742\n- Physical PDFs in output dir: 2510\n\n› What is the status now?\n\n• Working (0s • esc to interrupt)";
         let host = json!({
-            "session_path": "remote-session://dev/samplenotes-paint-regression",
+            "session_path": "remote-session://dev/jyas-paint-regression",
             "text_sample": text_tail,
             "text_tail": text_tail,
             "buffer_text_sample": text_tail,
@@ -4020,13 +4086,13 @@ Best thing to improve in the meantime:
 
     #[test]
     fn terminal_host_problem_rejects_codex_resume_instruction_as_interactive() {
-        let text_tail = "⚠ Heads up, you have less than 5% of your weekly limit left. Run /status for a breakdown.\nToken usage: total=1,064,406 input=1,023,193 (+ 11,361,664 cached) output=41,213 (reasoning 10,977)\nTo continue this session, run codex resume 019d0000-0000-7000-8000-000000000001";
+        let text_tail = "⚠ Heads up, you have less than 5% of your weekly limit left. Run /status for a breakdown.\nToken usage: total=1,064,406 input=1,023,193 (+ 11,361,664 cached) output=41,213 (reasoning 10,977)\nTo continue this session, run codex resume 019dbdcf-9f11-7932-afb2-0d7b7c35914b";
         let host = json!({
             "session_path": "remote-session://dev/exited-codex",
             "text_sample": text_tail,
             "text_tail": text_tail,
             "buffer_text_sample": text_tail,
-            "cursor_line_text": " this session, run codex resume 019d0000-0000-7000-8000-000000000001",
+            "cursor_line_text": " this session, run codex resume 019dbdcf-9f11-7932-afb2-0d7b7c35914b",
             "input_enabled": true,
             "helper_textarea_focused": true,
             "xterm_present": true,
@@ -4379,13 +4445,13 @@ Best thing to improve in the meantime:
 │ >_ OpenAI Codex (v0.130.0)                  │
 │                                             │
 │ model:     gpt-5.5 xhigh   /model to change │
-│ directory: ~/git/samplers                │";
+│ directory: ~/git/practice-rs                │";
         let tail = "\
 ╭─────────────────────────────────────────────╮
 │ >_ OpenAI Codex (v0.130.0)                  │
 │                                             │
 │ model:     gpt-5.5 xhigh   /model to change │
-│ directory: ~/git/samplers                │
+│ directory: ~/git/practice-rs                │
 ╰─────────────────────────────────────────────╯
 
   Tip: GPT-5.5 is now available in Codex.
@@ -4399,7 +4465,7 @@ Best thing to improve in the meantime:
   Send a short alphanumeric code and collect it in six single-character boxes.
   Uppercase the alphabetic code characters even when the user types lowercase.
 
-  gpt-5.5 xhigh · ~/git/samplers";
+  gpt-5.5 xhigh · ~/git/practice-rs";
         let cursor_line =
             "  Uppercase the alphabetic code characters even when the user types lowercase.";
         assert!(
@@ -5104,7 +5170,139 @@ Best thing to improve in the meantime:
         let host = json!({
             "session_path": "remote-session://dev/stale-codex",
             "text_sample": "- Active chart: JYAS_BENCH_0099\n  - Log rows: 742\n  - Physical PDFs in output dir: 2510",
-            "text_tail": "- Active chart: JYAS_BENCH_0099\n  - Log rows: 742\n\nThe immediate engineering priority is still the harness: no fixture corpus, no rigorous parity measurement.\n \n \n› I’ll use the JYAS v3 research workflow here and check the live PL9 batch before recommending parallel work. I’m going to distinguish runner health from v3 parity work so we do not confuse fixture generation progress with solved logic.git/samplenotes\n\nThe batch is still alive and the repaired open path is working, but the main friction has shifted: VP2+ generation is failing on some charts after the chart opens correctly.",
+            "text_tail": "- Active chart: JYAS_BENCH_0099\n  - Log rows: 742\n\nThe immediate engineering priority is still the harness: no fixture corpus, no rigorous parity measurement.\n \n \n› I’ll use the JYAS v3 research workflow here and check the live PL9 batch before recommending parallel work. I’m going to distinguish runner health from v3 parity work so we do not confuse fixture generation progress with solved logic.git/jyas\n\nThe batch is still alive and the repaired open path is working, but the main friction has shifted: VP2+ generation is failing on some charts after the chart opens correctly.",
+            "buffer_text_sample": "- Active chart: JYAS_BENCH_0099\n  - Log rows: 742",
+            "cursor_line_text": "",
+            "input_enabled": true,
+            "helper_textarea_focused": true,
+            "host_has_active_element": true,
+            "cursor_node_count": 0,
+            "xterm_present": true,
+            "screen_present": true,
+            "rows_present": false,
+            "canvas_count": 4,
+            "render_event_count": 8,
+            "write_command_count": 2,
+            "last_raw_payload_length": 1098,
+            "last_raw_payload_line_count": 7,
+            "terminal_content_source": "daemon_pty",
+            "retained_replay_source": "",
+            "mounted_entry_host_connected": true,
+            "scrollback_expected": false,
+            "xterm_buffer_kind": "normal",
+            "rows": 50,
+            "cols": 110,
+            "base_y": 1000,
+            "viewport_y": 1000,
+            "blank_rows_below_cursor": 1,
+            "host_rect": {"left": 0.0, "top": 0.0, "width": 840.0, "height": 830.0},
+            "host_content_width": 840.0,
+            "host_content_height": 830.0,
+            "screen_rect": {"width": 840.0, "height": 830.0},
+            "viewport_rect": {"width": 840.0, "height": 830.0},
+            "helpers_rect": {"width": 840.0, "height": 830.0},
+            "helper_textarea_rect": {"left": -10000.0, "top": 68.0, "width": 1.0, "height": 1.0}
+        });
+        assert_eq!(
+            terminal_host_problem_for_app_control(&host),
+            Some("active remote Codex prompt surface has no current input row")
+        );
+    }
+
+    #[test]
+    fn terminal_host_problem_rejects_daemon_pty_retained_scrollback_with_non_prompt_cursor() {
+        let host = json!({
+            "session_path": "remote-session://dev/stale-codex",
+            "text_sample": "- Active chart: JYAS_BENCH_0099\n  - Log rows: 742\n  - Physical PDFs in output dir: 2510",
+            "text_tail": "- Active chart: JYAS_BENCH_0099\n  - Log rows: 742\n  - Physical PDFs in output dir: 2510\n\nThe current actionable improvement is not astrology logic yet.",
+            "cursor_line_text": "  - Physical PDFs in output",
+            "input_enabled": true,
+            "helper_textarea_focused": true,
+            "host_has_active_element": true,
+            "cursor_node_count": 1,
+            "xterm_present": true,
+            "screen_present": true,
+            "rows_present": false,
+            "canvas_count": 4,
+            "render_event_count": 11,
+            "write_command_count": 3,
+            "last_raw_payload_length": 93335,
+            "last_raw_payload_line_count": 1000,
+            "terminal_content_source": "daemon_pty",
+            "retained_replay_source": "daemon_screen_snapshot",
+            "retained_replay_prompt_follow_ready": true,
+            "mounted_entry_host_connected": true,
+            "scrollback_expected": true,
+            "xterm_buffer_kind": "normal",
+            "rows": 50,
+            "cols": 110,
+            "base_y": 1000,
+            "viewport_y": 1000,
+            "blank_rows_below_cursor": 16,
+            "host_rect": {"left": 0.0, "top": 0.0, "width": 840.0, "height": 830.0},
+            "host_content_width": 840.0,
+            "host_content_height": 830.0,
+            "screen_rect": {"width": 840.0, "height": 830.0},
+            "viewport_rect": {"width": 840.0, "height": 830.0},
+            "helpers_rect": {"width": 840.0, "height": 830.0},
+            "helper_textarea_rect": {"left": -10000.0, "top": 68.0, "width": 1.0, "height": 1.0}
+        });
+        assert_eq!(
+            terminal_host_problem_for_app_control(&host),
+            Some("active remote terminal is input-enabled without a prompt-ready surface")
+        );
+    }
+
+    #[test]
+    fn terminal_host_problem_rejects_large_daemon_pty_scrollback_with_blank_input_row() {
+        let host = json!({
+            "session_path": "remote-session://dev/stale-codex",
+            "text_sample": "- Active chart: JYAS_BENCH_0099\n  - Log rows: 742\n  - Physical PDFs in output dir: 2510",
+            "text_tail": "- Active chart: JYAS_BENCH_0099\n  - Log rows: 742\n  - Physical PDFs in output dir: 2510\n\nThe immediate engineering priority is still the harness: no fixture corpus, no rigorous parity measurement.",
+            "buffer_text_sample": "- Active chart: JYAS_BENCH_0099\n  - Log rows: 742\n  - Physical PDFs in output dir: 2510",
+            "cursor_line_text": "",
+            "input_enabled": true,
+            "helper_textarea_focused": true,
+            "host_has_active_element": true,
+            "cursor_node_count": 0,
+            "xterm_present": true,
+            "screen_present": true,
+            "rows_present": false,
+            "canvas_count": 4,
+            "render_event_count": 7,
+            "write_command_count": 1,
+            "last_raw_payload_length": 94404,
+            "last_raw_payload_line_count": 1008,
+            "terminal_content_source": "daemon_pty",
+            "retained_replay_source": "",
+            "mounted_entry_host_connected": true,
+            "scrollback_expected": false,
+            "xterm_buffer_kind": "normal",
+            "rows": 50,
+            "cols": 110,
+            "base_y": 1000,
+            "viewport_y": 1000,
+            "blank_rows_below_cursor": 16,
+            "host_rect": {"left": 0.0, "top": 0.0, "width": 840.0, "height": 830.0},
+            "host_content_width": 840.0,
+            "host_content_height": 830.0,
+            "screen_rect": {"width": 840.0, "height": 830.0},
+            "viewport_rect": {"width": 840.0, "height": 830.0},
+            "helpers_rect": {"width": 840.0, "height": 830.0},
+            "helper_textarea_rect": {"left": -10000.0, "top": 68.0, "width": 1.0, "height": 1.0}
+        });
+        assert_eq!(
+            terminal_host_problem_for_app_control(&host),
+            Some("active remote Codex prompt surface has no current input row")
+        );
+    }
+
+    #[test]
+    fn terminal_host_problem_rejects_daemon_pty_old_prompt_tail_with_enabled_input() {
+        let host = json!({
+            "session_path": "remote-session://dev/stale-codex",
+            "text_sample": "- Active chart: JYAS_BENCH_0099\n  - Log rows: 742\n  - Physical PDFs in output dir: 2510",
+            "text_tail": "- Active chart: JYAS_BENCH_0099\n  - Log rows: 742\n\nThe immediate engineering priority is still the harness: no fixture corpus, no rigorous parity measurement.\n \n \n› I’ll use the JYAS v3 research workflow here and check the live PL9 batch before recommending parallel work. I’m going to distinguish runner health from v3 parity work so we do not confuse fixture generation progress with solved logic.git/jyas\n\nThe batch is still alive and the repaired open path is working, but the main friction has shifted: VP2+ generation is failing on some charts after the chart opens correctly.",
             "buffer_text_sample": "- Active chart: JYAS_BENCH_0099\n  - Log rows: 742",
             "cursor_line_text": "",
             "input_enabled": true,
@@ -5413,8 +5611,8 @@ Weekly limit:                21% left
     fn terminal_host_problem_rejects_prompt_ready_unsafe_retained_replay_skip() {
         let host = json!({
             "session_path": "remote-session://dev/live-codex",
-            "text_sample": "• Previous output\n\n› Run /review on my current changes\n \n  gpt-5.5 medium · ~/git/samplenotes",
-            "text_tail": "• Previous output\n\n› Run /review on my current changes\n \n  gpt-5.5 medium · ~/git/samplenotes",
+            "text_sample": "• Previous output\n\n› Run /review on my current changes\n \n  gpt-5.5 medium · ~/git/jyas",
+            "text_tail": "• Previous output\n\n› Run /review on my current changes\n \n  gpt-5.5 medium · ~/git/jyas",
             "cursor_line_text": "› Run /review on my current changes",
             "input_enabled": true,
             "helper_textarea_focused": true,
@@ -5448,14 +5646,15 @@ Weekly limit:                21% left
             terminal_host_problem_for_app_control(&host),
             Some("active remote terminal lost expected scrollback after retained replay")
         );
+<<<<<<< HEAD
     }
 
     #[test]
     fn terminal_host_problem_rejects_input_enabled_retained_history_replay() {
         let host = json!({
             "session_path": "remote-session://dev/live-codex",
-            "text_sample": "Previous output\n\n› e s\n \n  gpt-5.5 xhigh · ~/git/samplenotes",
-            "text_tail": "Previous output\n\n› e s\n \n  gpt-5.5 xhigh · ~/git/samplenotes",
+            "text_sample": "Previous output\n\n› e s\n \n  gpt-5.5 xhigh · ~/git/jyas",
+            "text_tail": "Previous output\n\n› e s\n \n  gpt-5.5 xhigh · ~/git/jyas",
             "cursor_line_text": "› e s",
             "input_enabled": true,
             "helper_textarea_focused": true,
@@ -5548,6 +5747,8 @@ Weekly limit:                21% left
             surface.get("input_enabled").and_then(Value::as_bool),
             Some(false)
         );
+=======
+>>>>>>> c162185 (Snapshot alpha blur experiment)
     }
 
     #[test]
@@ -6127,7 +6328,7 @@ The previous command output stays in scrollback.
 There are enough normal rows before the stale transport line.
 The old detector only sampled the head of the terminal text.
 This needs to behave like a bottom-of-viewport problem.
-› Error: terminal session not found: local://019d0000-0000-7000-8000-000000000001
+› Error: terminal session not found: local://019dbdcf-9f11-7932-afb2-0d7b7c35914b
 Shared connection to 192.0.2.14 closed.
 ›
 ";

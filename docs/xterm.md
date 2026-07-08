@@ -60,6 +60,7 @@ same Rust bridge as input/resize/clipboard. The shell then opens the existing
 session context menu; it does not create a second menu implementation inside the
 terminal DOM.
 
+<<<<<<< HEAD
 Active terminal write batching must stay below the threshold where typed input
 or Codex's `Working` animation feels stepped. Batching is only a flush-timing
 tool: it may delay a chunk briefly for CPU, but it must never drop, reorder,
@@ -76,6 +77,15 @@ one frame may clear rows, the next may paint only a cursor suffix or prompt
 fragment. If Yggterm drops the earlier frame, xterm.js can show missing letters
 or a broken prompt even though the PTY accepted the input. Deliver synchronized
 frames to xterm in PTY order and let xterm parse them.
+=======
+Active terminal write coalescing must stay below the threshold where typed input
+or Codex's `Working` animation feels stepped. Background terminals can keep the
+large CPU-saving frame budget, but the active visible terminal defaults to a
+160 ms write frame and the inline status-animation hot path stays at the smaller
+animation budget. Long-running inline status animation may cool after the first
+few seconds because the user's input path and session truth are more important
+than keeping a spinner at the initial cadence for minutes.
+>>>>>>> c162185 (Snapshot alpha blur experiment)
 
 Layout-driven resize is not user scrollback. Titlebar auto-hide hover,
 fit-addon row changes, visible-paint refits, and resize-observer bursts arm a
@@ -137,6 +147,7 @@ session is inactive or the app is unfocused. Dropping frames or drawing a
 Yggterm-owned text overlay creates a second terminal truth and leaves stale TUI
 state when the user switches back.
 
+<<<<<<< HEAD
 In 2.6.1, the 23-smoke restore pass exposed the inverse failure for daemon-owned
 live terminals: after a GUI close/relaunch, a fresh xterm could attach to an
 already-running TUI and receive only future incremental cursor-addressed deltas
@@ -269,6 +280,8 @@ App-control must reject canvas hosts that report buffered text but a visibly
 low-contrast foreground/background contract, such as black text on the dark
 terminal surface. State-only buffer text is not enough terminal proof.
 
+=======
+>>>>>>> c162185 (Snapshot alpha blur experiment)
 ## Jojo Finding, 2026-05-13
 
 The live 2.4.0 jojo viewport could become visually blank across the upper xterm
@@ -651,6 +664,7 @@ after fixing that loop, Codex's `Working` wave could keep WebKit hot if Rust
 continued draining the PTY at the generic 60 ms active-output cadence. Active
 inline-status reads now share the same bounded frame cadence as writes, so
 Yggterm does not create extra xterm/WebKit wakeups just to observe animation
+<<<<<<< HEAD
 frames. That cadence is lossless: it changes when bytes flush, not which bytes
 xterm receives.
 
@@ -696,6 +710,9 @@ The stable Rust ownership boundary for this is
 `crates/yggterm-shell/src/terminal_write_bridge.rs` for staging. New terminal
 write throttling or CPU-budget work belongs there first, not in shell chrome,
 session metadata, or telemetry observers.
+=======
+frames that will be coalesced anyway.
+>>>>>>> c162185 (Snapshot alpha blur experiment)
 
 In 2.2.37, the jojo diagonal line-stack failure was traced to PTY line
 discipline, not xterm painting. Remote Codex bridge PTYs were put into raw mode
@@ -822,6 +839,7 @@ dimensions when available. It is a lab, not product code.
   empty-surface watchdog, and immediately ask the daemon to ensure/read the PTY.
   The fallback may remount the xterm bridge, but it must still replay daemon PTY
   bytes rather than shell-owned placeholder text.
+<<<<<<< HEAD
 - During remote-resume recovery, the xterm host may stay mounted so geometry,
   probes, and lifecycle hooks remain stable, but it must be visually hidden
   until the surface is current or recovery has failed. A mounted host with stale
@@ -850,6 +868,8 @@ dimensions when available. It is a lab, not product code.
   classify a prompt as input-gated just because the probe observed disabled
   input; recovery should only react to gated input when the terminal or document
   is actually focused.
+=======
+>>>>>>> c162185 (Snapshot alpha blur experiment)
 
 ## Next Fixes To Apply
 
