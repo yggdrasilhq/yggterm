@@ -21,7 +21,8 @@ use yggterm_core::{
 use yggterm_platform::configure_gui_entry_process;
 use yggterm_server::{
     AppControlPreviewLayout, AppControlRightPanelMode, AppControlViewMode, ClientInstanceRecord,
-    PersistedDaemonState, ProbeTerminalViewportInputMode, SessionKind, YggtermServer,
+    PersistedDaemonState, ProbeTerminalViewportInputMode, SessionKind, WorkspaceViewMode,
+    focus_live_with_view, open_remote_session_with_view, YggtermServer,
     active_client_instance_records, default_endpoint, detect_ghostty_host,
     ensure_local_daemon_running, local_headless_companion_executable_from_current, ping,
     resolve_client_daemon_endpoint,
@@ -685,6 +686,7 @@ common server commands:
   yggterm server daemon
   yggterm server status
   yggterm server snapshot
+  yggterm server connect <session-path> | --list
   yggterm server app <subcommand>"
     );
 }
@@ -694,6 +696,8 @@ fn print_server_help() {
         "usage:
   yggterm server daemon
   yggterm server attach <session> [cwd]
+  yggterm server connect <session-path> [--view terminal|preview]
+  yggterm server connect --list
   yggterm server ping
   yggterm server status
   yggterm server snapshot
@@ -797,6 +801,139 @@ fn run_sessions_regenerate_copy_cli(store: &SessionStore, args: &[String]) -> Re
 fn ensure_local_server_ready_for_cli(store: &SessionStore) -> Result<()> {
     let endpoint = default_endpoint(store.home_dir());
     ensure_local_daemon_running(&endpoint)
+}
+
+/// The trailing session identifier of a session path (`.../<uuid>` → `<uuid>`),
+/// used to match a requested path against the daemon's canonical key regardless
+/// of scheme/prefix normalization.
+fn connect_path_session_uuid(path: &str) -> &str {
+    path.rsplit('/').next().unwrap_or(path)
+}
+
+/// Parse a remote agent path (`remote-session://<machine>/<uuid>` for Codex,
+/// `remote-cc://<machine>/<uuid>` for Claude Code) into `(machine_key, id)`.
+/// Returns None for non-remote or malformed paths.
+fn parse_remote_connect_path(path: &str) -> Option<(String, String)> {
+    let rest = path
+        .trim_start_matches('/')
+        .strip_prefix("remote-session://")
+        .or_else(|| path.trim_start_matches('/').strip_prefix("remote-cc://"))?;
+    let (machine, id) = rest.split_once('/')?;
+    if machine.is_empty() || id.is_empty() {
+        return None;
+    }
+    Some((machine.to_string(), id.to_string()))
+}
+
+fn connect_session_is_active(snapshot: &yggterm_server::ServerUiSnapshot, path: &str) -> bool {
+    let want = connect_path_session_uuid(path);
+    snapshot
+        .active_session_path
+        .as_deref()
+        .is_some_and(|active| active == path || connect_path_session_uuid(active) == want)
+}
+
+fn connect_session_key_is_known(snapshot: &yggterm_server::ServerUiSnapshot, path: &str) -> bool {
+    let want = connect_path_session_uuid(path);
+    connect_session_is_active(snapshot, path)
+        || snapshot.live_sessions.iter().any(|session| {
+            session.session_path == path
+                || connect_path_session_uuid(&session.session_path) == want
+        })
+}
+
+/// `yggterm server connect <session-path>`: connect an existing session into the
+/// live set + GUI. Reuses the same daemon requests the GUI issues on a click.
+fn run_server_connect(
+    endpoint: &yggterm_server::ServerEndpoint,
+    path: &str,
+    view: WorkspaceViewMode,
+) -> Result<()> {
+    // FocusLive reveals + resumes any session the daemon already tracks — even a
+    // row the runtime-truth filter is currently suppressing, since launching its
+    // runtime un-hides it — and is kind-agnostic (it uses the row the daemon
+    // holds). FocusLive is a silent no-op on an unknown key, so for a scan-only
+    // remote agent we fall back to the tree's OpenRemoteSession request.
+    let (mut snapshot, mut message) = focus_live_with_view(endpoint, path, Some(view))?;
+    if !connect_session_is_active(&snapshot, path)
+        && let Some((machine_key, session_id)) = parse_remote_connect_path(path)
+    {
+        let (opened, opened_message) = open_remote_session_with_view(
+            endpoint,
+            &machine_key,
+            &session_id,
+            None,
+            None,
+            Some(view),
+        )?;
+        snapshot = opened;
+        message = opened_message;
+    }
+    let connected =
+        connect_session_is_active(&snapshot, path) || connect_session_key_is_known(&snapshot, path);
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "connected": connected,
+            "requested_path": path,
+            "active_session_path": snapshot.active_session_path,
+            "view": match view {
+                WorkspaceViewMode::Terminal => "terminal",
+                WorkspaceViewMode::Rendered => "preview",
+            },
+            "live_session_count": snapshot.live_sessions.len(),
+            "message": message,
+        }))?
+    );
+    if !connected {
+        anyhow::bail!(
+            "could not connect {path}: not tracked as a live session and not found in remote scans (run `yggterm server connect --list` to see connectable sessions)"
+        );
+    }
+    Ok(())
+}
+
+/// `yggterm server connect --list`: enumerate sessions that EXIST (remote scans)
+/// but are NOT currently in the live set — the connectable "void", newest first.
+fn run_server_connect_list(endpoint: &yggterm_server::ServerEndpoint) -> Result<()> {
+    let (snapshot, _) = snapshot(endpoint)?;
+    let live_uuids: Vec<&str> = snapshot
+        .live_sessions
+        .iter()
+        .map(|session| connect_path_session_uuid(&session.session_path))
+        .collect();
+    let mut connectable: Vec<&yggterm_server::RemoteScannedSession> = snapshot
+        .remote_machines
+        .iter()
+        .flat_map(|machine| machine.sessions.iter())
+        .filter(|scanned| {
+            !live_uuids.contains(&connect_path_session_uuid(&scanned.session_path))
+        })
+        .collect();
+    // Newest first, so the sessions the user was most recently working with are
+    // at the top of what can be a large scan (a busy host has hundreds).
+    connectable.sort_by(|a, b| b.modified_epoch.cmp(&a.modified_epoch));
+    let items: Vec<serde_json::Value> = connectable
+        .iter()
+        .map(|scanned| {
+            serde_json::json!({
+                "path": scanned.session_path,
+                "title": scanned.title_hint,
+                "cwd": scanned.cwd,
+                "modified_epoch": scanned.modified_epoch,
+                "live_runtime": scanned.live_runtime,
+            })
+        })
+        .collect();
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "connectable_count": items.len(),
+            "live_session_count": snapshot.live_sessions.len(),
+            "connectable": items,
+        }))?
+    );
+    Ok(())
 }
 
 fn main() -> Result<()> {
@@ -907,6 +1044,30 @@ fn main() -> Result<()> {
                 .map(String::as_str)
                 .filter(|value| !value.is_empty()),
         );
+    }
+    // `yggterm server connect <session-path>|--list` — headless twin of clicking
+    // a session row. Manually connect an existing-but-unconnected ("void")
+    // session back into the live set + GUI: it sends the SAME daemon requests as
+    // the GUI (FocusLive for a session the daemon already tracks, else
+    // OpenRemoteSession for a scan-only remote), so the session becomes live and
+    // its terminal is attached/resumed. Recovery tool for sessions stranded out
+    // of Live Sessions (e.g. demoted by a restart). See [[project-purpose]].
+    if args.len() >= 2 && args[0] == "server" && args[1] == "connect" {
+        ensure_local_server_ready_for_cli(&store)?;
+        let endpoint = default_endpoint(store.home_dir());
+        let rest = &args[2..];
+        if rest.iter().any(|arg| arg == "--list" || arg == "-l") {
+            return run_server_connect_list(&endpoint);
+        }
+        let view = match cli_flag_value(&args, "--view") {
+            Some("preview") | Some("rendered") => WorkspaceViewMode::Rendered,
+            _ => WorkspaceViewMode::Terminal,
+        };
+        let path = rest
+            .iter()
+            .find(|arg| !arg.starts_with('-'))
+            .context("usage: yggterm server connect <session-path> | --list")?;
+        return run_server_connect(&endpoint, path, view);
     }
     if args.len() >= 5 && args[0] == "server" && args[1] == "terminal" && args[2] == "write" {
         ensure_local_server_ready_for_cli(&store)?;
