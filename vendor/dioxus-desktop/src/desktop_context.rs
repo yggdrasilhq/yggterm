@@ -299,6 +299,59 @@ impl DesktopService {
         let _ = id;
     }
 
+    /// Stash an open web surface: detach it from the overlay, keeping the
+    /// webview (page state) alive. See `WebSurfaceHost::stash`.
+    pub fn stash_web_surface(&self, id: u64) -> Result<(), String> {
+        #[cfg(not(any(
+            target_os = "windows",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "android"
+        )))]
+        {
+            return match self.web_surface_host.borrow().as_ref() {
+                Some(host) => host.stash(id),
+                None => Err("web surface host not installed".to_string()),
+            };
+        }
+        #[cfg(any(
+            target_os = "windows",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "android"
+        ))]
+        {
+            let _ = id;
+            Err("web surfaces require the GTK/WebKit backend".to_string())
+        }
+    }
+
+    /// Re-attach a stashed web surface at the given bounds and show it.
+    pub fn unstash_web_surface(&self, id: u64, x: i32, y: i32, w: i32, h: i32) -> Result<(), String> {
+        #[cfg(not(any(
+            target_os = "windows",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "android"
+        )))]
+        {
+            return match self.web_surface_host.borrow().as_ref() {
+                Some(host) => host.unstash(id, x, y, w, h),
+                None => Err("web surface host not installed".to_string()),
+            };
+        }
+        #[cfg(any(
+            target_os = "windows",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "android"
+        ))]
+        {
+            let _ = (id, x, y, w, h);
+            Err("web surfaces require the GTK/WebKit backend".to_string())
+        }
+    }
+
     /// Evaluate JS in an open web surface's page; the callback gets the
     /// completion value as JSON, or the JS exception message.
     pub fn eval_web_surface(
