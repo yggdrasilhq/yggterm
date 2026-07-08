@@ -1376,11 +1376,13 @@ async fn web_surface_native_reconcile_loop(
                     // host. None => engine-native ephemeral context (the
                     // reserved "temp" profile; also home-resolve failure).
                     let profile_dir = web_surface_profile_dir(&profile);
+                    let userscripts = load_web_surface_userscripts(&profile);
                     match desktop.open_web_surface(
                         native_id,
                         &effective_url,
                         socks_port,
                         profile_dir.as_deref(),
+                        &userscripts,
                         rect.0,
                         rect.1,
                         rect.2,
@@ -1399,6 +1401,7 @@ async fn web_surface_native_reconcile_loop(
                                     "effective_url": effective_url,
                                     "socks_port": socks_port,
                                     "profile": profile,
+                                    "userscripts": userscripts.len(),
                                     "rect": [rect.0, rect.1, rect.2, rect.3],
                                 }),
                             );
@@ -1515,6 +1518,43 @@ fn web_surface_profile_dir(profile: &str) -> Option<std::path::PathBuf> {
     yggterm_core::resolve_yggterm_home()
         .ok()
         .map(|home| home.join("web-profiles").join(profile))
+}
+/// Userscripts injected into a surface's pages at document-start (top frame):
+/// shared `~/.yggterm/web-userscripts/*.js` (every profile, incl. temp) then
+/// per-profile `~/.yggterm/web-profiles/<p>/userscripts/*.js`, each dir sorted
+/// by filename — deterministic order. Only `*.js` files load; disabling a
+/// script = rename away from `.js` (e.g. `.js.disabled`; the settings pane
+/// drives this). Read fresh at every surface (re)create, so a reload picks up
+/// script changes (surfaces recreate on reload by design).
+fn load_web_surface_userscripts(profile: &str) -> Vec<String> {
+    let Ok(home) = yggterm_core::resolve_yggterm_home() else {
+        return Vec::new();
+    };
+    let mut dirs = vec![home.join("web-userscripts")];
+    if profile != WEB_SURFACE_TEMP_PROFILE {
+        dirs.push(home.join("web-profiles").join(profile).join("userscripts"));
+    }
+    let mut scripts = Vec::new();
+    for dir in dirs {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        let mut paths: Vec<std::path::PathBuf> = entries
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.extension().and_then(|ext| ext.to_str()) == Some("js")
+                    && path.is_file()
+            })
+            .collect();
+        paths.sort();
+        for path in paths {
+            if let Ok(source) = std::fs::read_to_string(&path) {
+                scripts.push(source);
+            }
+        }
+    }
+    scripts
 }
 /// Split an http(s) URL into (host, port, path-and-after) for forward
 /// construction. Returns None when the URL is not parseable enough.
