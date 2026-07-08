@@ -32,7 +32,7 @@ use yggterm_server::{
     run_app_control_focus_window, run_app_control_key, run_app_control_list_clients,
     run_app_control_move_window_by, run_app_control_open_path,
     run_app_control_paste_terminal_clipboard, run_app_control_paste_terminal_clipboard_image,
-    run_app_control_pointer, run_app_control_probe_terminal_context_menu,
+    run_app_control_dom_eval, run_app_control_pointer, run_app_control_probe_terminal_context_menu,
     run_app_control_probe_terminal_primary_selection_paste,
     run_app_control_probe_terminal_viewport_input, run_app_control_probe_terminal_viewport_scroll,
     run_app_control_probe_terminal_viewport_select, run_app_control_reclaim_terminal_focus,
@@ -1721,6 +1721,13 @@ fn main() -> Result<()> {
                     step_delay_ms,
                     timeout_ms,
                 )
+            }
+            "dom-eval" => {
+                let script = args
+                    .get(3)
+                    .map(String::as_str)
+                    .context("missing script for server app dom-eval")?;
+                run_app_control_dom_eval(script, timeout_ms)
             }
             "start-action" | "start" => {
                 let action = args

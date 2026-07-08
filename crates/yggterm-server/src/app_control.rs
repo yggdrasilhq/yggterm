@@ -255,6 +255,15 @@ pub enum AppControlCommand {
     Key {
         command: AppControlKeyCommand,
     },
+    /// Agent observability probe: evaluate JS in the MAIN webview (the Dioxus
+    /// chrome — sidebar, picker overlays, terminal hosts) and return the
+    /// script's completion value. The missing eye for main-webview DOM state
+    /// (focus, rects, attribute reads) that `app web eval` (native child
+    /// webviews) cannot see. The script body must `return` a JSON-serializable
+    /// value.
+    DomEval {
+        script: String,
+    },
     Drag {
         command: AppControlDragCommand,
     },
@@ -471,6 +480,7 @@ impl AppControlCommand {
             Self::CloseWindow => "close_window",
             Self::CloseWindowPreservingSessions { .. } => "close_window_preserving_sessions",
             Self::Pointer { .. } => "pointer",
+            Self::DomEval { .. } => "dom-eval",
             Self::Key { .. } => "key",
             Self::Drag { .. } => "drag",
             Self::ShowStartPage => "show_start_page",
