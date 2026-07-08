@@ -146,6 +146,72 @@ pub enum AppControlKeyCommand {
     Type { text: String },
 }
 
+fn default_grid_cols() -> u32 {
+    12
+}
+fn default_grid_rows() -> u32 {
+    8
+}
+fn default_grid_ttl_secs() -> u64 {
+    120
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum AppControlGridRegion {
+    #[default]
+    Full,
+    Terminal,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum AppControlGridTarget {
+    /// Pick what the user sees: `surface` when the active session has a live
+    /// web surface, else `main`.
+    #[default]
+    Auto,
+    Main,
+    Surface,
+}
+
+/// Click-grid verbs — see docs/yggui-click-grid.md.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case")]
+pub enum AppControlGridCommand {
+    Show {
+        #[serde(default = "default_grid_cols")]
+        cols: u32,
+        #[serde(default = "default_grid_rows")]
+        rows: u32,
+        #[serde(default)]
+        region: AppControlGridRegion,
+        #[serde(default)]
+        target: AppControlGridTarget,
+        #[serde(default = "default_grid_ttl_secs")]
+        ttl_secs: u64,
+    },
+    Click {
+        cell: String,
+        #[serde(default)]
+        button: AppControlPointerButton,
+        #[serde(default = "default_app_control_click_count")]
+        count: u8,
+        /// Subdivide the cell into a labeled 3×3 instead of clicking.
+        #[serde(default)]
+        refine: bool,
+        /// Keep the grid visible after the click (default hides it).
+        #[serde(default)]
+        keep: bool,
+    },
+    Hover {
+        cell: String,
+        #[serde(default)]
+        keep: bool,
+    },
+    Hide,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AppControlStartAction {
@@ -254,6 +320,13 @@ pub enum AppControlCommand {
     },
     Key {
         command: AppControlKeyCommand,
+    },
+    /// Agent pointer-targeting overlay (docs/yggui-click-grid.md): draw a
+    /// labeled grid over a yggui surface, resolve cells to coordinates
+    /// server-side, dispatch clicks/hovers. Targets the main webview or the
+    /// active session's native child webview (page coordinates).
+    Grid {
+        command: AppControlGridCommand,
     },
     /// Agent observability probe: evaluate JS in the MAIN webview (the Dioxus
     /// chrome — sidebar, picker overlays, terminal hosts) and return the
@@ -481,6 +554,7 @@ impl AppControlCommand {
             Self::CloseWindowPreservingSessions { .. } => "close_window_preserving_sessions",
             Self::Pointer { .. } => "pointer",
             Self::DomEval { .. } => "dom-eval",
+            Self::Grid { .. } => "grid",
             Self::Key { .. } => "key",
             Self::Drag { .. } => "drag",
             Self::ShowStartPage => "show_start_page",

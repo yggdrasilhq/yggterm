@@ -164,8 +164,9 @@ use yggterm_platform::{DockRect, configure_background_service_command, send_user
 #[cfg(unix)]
 use yggterm_server::local_daemon_socket_should_be_removed_for_spawn;
 use yggterm_server::{
-    AppControlCommand, AppControlDragCommand, AppControlDragPlacement, AppControlKeyCommand,
-    AppControlPointerCommand, AppControlPreviewLayout, AppControlResponse,
+    AppControlCommand, AppControlDragCommand, AppControlDragPlacement, AppControlGridCommand,
+    AppControlGridRegion, AppControlGridTarget, AppControlKeyCommand,
+    AppControlPointerButton, AppControlPointerCommand, AppControlPreviewLayout, AppControlResponse,
     AppControlRightPanelMode, AppControlStartAction, AppControlViewMode, GhosttyTerminalHostMode,
     ScreenshotTarget,
     ManagedSessionView, PersistedDaemonState, PreviewTone, ProbeTerminalViewportInputMode,
@@ -2216,6 +2217,10 @@ struct ShellState {
     // it is remounted (dead PTY, or an app surface covering the viewport).
     // Reset on Ready and on any user-driven open.
     startup_restore_recover_streak: HashMap<String, u32>,
+    // Active click-grid overlay params (docs/yggui-click-grid.md). Geometry is
+    // recomputed in JS from these params at click time — never cached as rects
+    // — so window resizes between show and click cannot skew the target.
+    click_grid: Option<ClickGridParams>,
     // Per-session deadline through which the fault-recovery watchdog treats a
     // benign "xterm surface is empty" on a revealed retained host (one that
     // already reached ready and whose daemon still owns the PTY) as a transient
@@ -3698,6 +3703,7 @@ impl ShellState {
             retained_fault_recovery_loop_armed_at_ms: HashMap::new(),
             terminal_cold_remount_count: HashMap::new(),
             startup_restore_recover_streak: HashMap::new(),
+            click_grid: None,
             terminal_cold_remount_since_ms: HashMap::new(),
             terminal_reveal_grace_until_ms: HashMap::new(),
             terminal_sessions_reached_ready: HashSet::new(),
@@ -17166,6 +17172,240 @@ fn app_control_drag_pointer(row: &BrowserRow, placement: Option<DragDropPlacemen
     };
     (x, y)
 }
+/// Stored click-grid overlay parameters (docs/yggui-click-grid.md). Geometry
+/// derives from these in JS at both show and click time.
+#[derive(Debug, Clone)]
+struct ClickGridParams {
+    cols: u32,
+    rows: u32,
+    /// "full" | "terminal" (main target only; surface grids span the page).
+    region: &'static str,
+    /// false = grid lives INSIDE the active session's native child webview.
+    target_main: bool,
+    /// Session bound at show time for surface-target grids.
+    session_path: Option<String>,
+    ttl_secs: u64,
+}
+
+/// Shared JS core for the click grid: geometry, cell parsing, painter, and
+/// dispatcher. `mode` = "show" | "click" | "hover" | "hide". Returns (as the
+/// IIFE completion value) the cell map for show / the resolved hit for
+/// click+hover. The caller wraps it for its channel (dioxus.send for the main
+/// webview; bare completion value for the web-surface eval).
+#[allow(clippy::too_many_arguments)]
+fn click_grid_core_script(
+    params: &ClickGridParams,
+    mode: &str,
+    cell: &str,
+    button: u8,
+    count: u8,
+    refine: bool,
+    keep: bool,
+) -> String {
+    let cols = params.cols;
+    let rows = params.rows;
+    let region = params.region;
+    let ttl_ms = params.ttl_secs.saturating_mul(1000);
+    format!(
+        r#"
+        const COLS = {cols};
+        const ROWS = {rows};
+        const REGION = {region:?};
+        const MODE = {mode:?};
+        const CELL = {cell:?};
+        const BUTTON = {button};
+        const COUNT = {count};
+        const REFINE = {refine};
+        const KEEP = {keep};
+        const TTL_MS = {ttl_ms};
+        const GRID_ID = "__yggui_click_grid";
+        const removeGrid = () => {{
+            const old = document.getElementById(GRID_ID);
+            if (old) {{ old.remove(); }}
+            if (window.__ygguiGridTtl) {{
+                clearTimeout(window.__ygguiGridTtl);
+                window.__ygguiGridTtl = null;
+            }}
+        }};
+        const regionRect = () => {{
+            if (REGION === "terminal") {{
+                const el = document.querySelector('[data-yggterm-main-surface]');
+                if (el) {{
+                    const r = el.getBoundingClientRect();
+                    return {{ x: r.left, y: r.top, w: r.width, h: r.height }};
+                }}
+            }}
+            return {{ x: 0, y: 0, w: window.innerWidth, h: window.innerHeight }};
+        }};
+        const rowLabel = (index) => {{
+            let s = "";
+            let i = index + 1;
+            while (i > 0) {{ i -= 1; s = String.fromCharCode(65 + (i % 26)) + s; i = Math.floor(i / 26); }}
+            return s;
+        }};
+        const cellRect = (r, row, col) => ({{
+            x: r.x + (col * r.w) / COLS,
+            y: r.y + (row * r.h) / ROWS,
+            w: r.w / COLS,
+            h: r.h / ROWS,
+        }});
+        const parseCell = (code) => {{
+            const m = /^([A-Z]+)(\d+)(?:\.([1-9]))?$/.exec(String(code || "").toUpperCase());
+            if (!m) {{ return null; }}
+            let row = 0;
+            for (const ch of m[1]) {{ row = row * 26 + (ch.charCodeAt(0) - 64); }}
+            row -= 1;
+            const col = Number(m[2]) - 1;
+            if (row < 0 || row >= ROWS || col < 0 || col >= COLS) {{ return null; }}
+            return {{ row, col, sub: m[3] ? Number(m[3]) : null }};
+        }};
+        const resolveRect = (code) => {{
+            const parsed = parseCell(code);
+            if (!parsed) {{ return null; }}
+            let rect = cellRect(regionRect(), parsed.row, parsed.col);
+            if (parsed.sub) {{
+                const sr = Math.floor((parsed.sub - 1) / 3);
+                const sc = (parsed.sub - 1) % 3;
+                rect = {{
+                    x: rect.x + (sc * rect.w) / 3,
+                    y: rect.y + (sr * rect.h) / 3,
+                    w: rect.w / 3,
+                    h: rect.h / 3,
+                }};
+            }}
+            return rect;
+        }};
+        const labelPill = (text, cx, cy, big) => {{
+            const span = document.createElement("span");
+            span.textContent = text;
+            span.style.cssText =
+                "position:absolute; transform:translate(-50%,-50%); left:" + cx + "px; top:" + cy + "px;" +
+                "font:" + (big ? "700 17px" : "700 12px") + " monospace; color:#fff; background:rgba(0,0,0,0.62);" +
+                "padding:1px 5px; border-radius:6px; letter-spacing:0.5px; white-space:nowrap;";
+            return span;
+        }};
+        const paint = (refineCell) => {{
+            removeGrid();
+            const overlay = document.createElement("div");
+            overlay.id = GRID_ID;
+            overlay.style.cssText =
+                "position:fixed; inset:0; z-index:2147483000; pointer-events:none;";
+            const r = regionRect();
+            const cells = {{}};
+            if (refineCell) {{
+                const rect = resolveRect(refineCell);
+                if (!rect) {{ return {{ error: "bad refine cell " + refineCell }}; }}
+                const dim = document.createElement("div");
+                dim.style.cssText =
+                    "position:absolute; left:" + r.x + "px; top:" + r.y + "px; width:" + r.w + "px; height:" + r.h + "px;" +
+                    "background:rgba(0,0,0,0.35);";
+                overlay.appendChild(dim);
+                const hole = document.createElement("div");
+                hole.style.cssText =
+                    "position:absolute; left:" + rect.x + "px; top:" + rect.y + "px; width:" + rect.w + "px; height:" + rect.h + "px;" +
+                    "background:rgba(255,255,255,0.06); outline:2px solid rgba(255,150,0,0.9);";
+                overlay.appendChild(hole);
+                for (let sub = 1; sub <= 9; sub += 1) {{
+                    const sr = Math.floor((sub - 1) / 3);
+                    const sc = (sub - 1) % 3;
+                    const sx = rect.x + (sc * rect.w) / 3;
+                    const sy = rect.y + (sr * rect.h) / 3;
+                    const box = document.createElement("div");
+                    box.style.cssText =
+                        "position:absolute; left:" + sx + "px; top:" + sy + "px; width:" + (rect.w / 3) + "px; height:" + (rect.h / 3) + "px;" +
+                        "outline:1px solid rgba(255,150,0,0.65);";
+                    overlay.appendChild(box);
+                    const code = refineCell + "." + sub;
+                    overlay.appendChild(labelPill(String(sub), sx + rect.w / 6, sy + rect.h / 6, true));
+                    cells[code] = {{
+                        x: sx, y: sy, w: rect.w / 3, h: rect.h / 3,
+                        cx: sx + rect.w / 6, cy: sy + rect.h / 6,
+                    }};
+                }}
+            }} else {{
+                for (let row = 0; row < ROWS; row += 1) {{
+                    for (let col = 0; col < COLS; col += 1) {{
+                        const rect = cellRect(r, row, col);
+                        const box = document.createElement("div");
+                        box.style.cssText =
+                            "position:absolute; left:" + rect.x + "px; top:" + rect.y + "px; width:" + rect.w + "px; height:" + rect.h + "px;" +
+                            "outline:1px solid rgba(255,150,0,0.45);";
+                        overlay.appendChild(box);
+                        const code = rowLabel(row) + String(col + 1);
+                        overlay.appendChild(labelPill(code, rect.x + rect.w / 2, rect.y + rect.h / 2, false));
+                        cells[code] = {{
+                            x: rect.x, y: rect.y, w: rect.w, h: rect.h,
+                            cx: rect.x + rect.w / 2, cy: rect.y + rect.h / 2,
+                        }};
+                    }}
+                }}
+            }}
+            document.body.appendChild(overlay);
+            window.__ygguiGridTtl = setTimeout(removeGrid, TTL_MS);
+            return {{ region: r, cols: COLS, rows: ROWS, cells }};
+        }};
+        const dispatchAt = (x, y, hoverOnly) => {{
+            // The overlay is pointer-events:none, which elementFromPoint
+            // skips by spec — no need to hide it for hit-testing.
+            const target = document.elementFromPoint(x, y) || document.body;
+            const buttons = BUTTON === 2 ? 2 : BUTTON === 1 ? 4 : 1;
+            const base = {{
+                bubbles: true, cancelable: true, composed: true, view: window,
+                clientX: x, clientY: y, button: 0, buttons: 0, detail: 0,
+            }};
+            const fire = (mouseType, pointerType, init) => {{
+                try {{ target.dispatchEvent(new MouseEvent(mouseType, init)); }} catch (_e) {{}}
+                if (typeof PointerEvent === "function" && pointerType) {{
+                    try {{
+                        target.dispatchEvent(new PointerEvent(pointerType, {{
+                            ...init, pointerId: 1, pointerType: "mouse", isPrimary: true,
+                        }}));
+                    }} catch (_e) {{}}
+                }}
+            }};
+            fire("mousemove", "pointermove", base);
+            fire("mouseover", "pointerover", base);
+            if (!hoverOnly) {{
+                for (let i = 0; i < COUNT; i += 1) {{
+                    const press = {{ ...base, button: BUTTON, buttons, detail: i + 1 }};
+                    fire("mousedown", "pointerdown", press);
+                    fire("mouseup", "pointerup", {{ ...press, buttons: 0 }});
+                    try {{
+                        target.dispatchEvent(new MouseEvent("click", {{ ...press, buttons: 0 }}));
+                    }} catch (_e) {{}}
+                }}
+            }}
+            return {{
+                x, y,
+                tag: String(target.tagName || ""),
+                id: String(target.id || ""),
+                cls: String(target.className || "").slice(0, 80),
+                text: String(target.textContent || "").trim().slice(0, 60),
+            }};
+        }};
+        if (MODE === "hide") {{
+            removeGrid();
+            return {{ hidden: true }};
+        }}
+        if (MODE === "show") {{
+            return paint(null);
+        }}
+        const rect = resolveRect(CELL);
+        if (!rect) {{
+            return {{ error: "unknown cell " + CELL }};
+        }}
+        if (MODE === "click" && REFINE) {{
+            return paint(CELL);
+        }}
+        const hit = dispatchAt(rect.x + rect.w / 2, rect.y + rect.h / 2, MODE === "hover");
+        if (!KEEP && MODE === "click") {{
+            removeGrid();
+        }}
+        return {{ cell: CELL, ...hit }};
+        "#
+    )
+}
+
 fn app_control_pointer_script(command: &AppControlPointerCommand) -> String {
     let payload = serde_json::to_string(command).unwrap_or_else(|_| "null".to_string());
     format!(
@@ -37891,6 +38131,139 @@ async fn process_pending_app_control_requests(
                     "command": command,
                 })),
                 error: None,
+            }
+        }
+        AppControlCommand::Grid { command } => 'grid: {
+            let respond = |data: Value, error: Option<String>| AppControlResponse {
+                request_id: request.request_id.clone(),
+                handled_by_pid: std::process::id(),
+                completed_at_ms: current_millis() as u128,
+                output_path: None,
+                data: Some(data),
+                error,
+            };
+            // Resolve params: Show builds fresh ones; other verbs use the
+            // stored grid (geometry re-derives in JS, never cached rects).
+            let (params, mode, cell, button, count, refine, keep) = match &command {
+                AppControlGridCommand::Show {
+                    cols,
+                    rows,
+                    region,
+                    target,
+                    ttl_secs,
+                } => {
+                    let target_main = match target {
+                        AppControlGridTarget::Main => true,
+                        AppControlGridTarget::Surface => false,
+                        AppControlGridTarget::Auto => !state.with(|shell| {
+                            shell
+                                .server
+                                .active_session_path()
+                                .is_some_and(|path| shell.has_live_web_surface(path, current_millis()))
+                        }),
+                    };
+                    let session_path = if target_main {
+                        None
+                    } else {
+                        state.with(|shell| shell.server.active_session_path().map(ToOwned::to_owned))
+                    };
+                    let params = ClickGridParams {
+                        cols: *cols,
+                        rows: *rows,
+                        region: match region {
+                            AppControlGridRegion::Full => "full",
+                            AppControlGridRegion::Terminal => "terminal",
+                        },
+                        target_main,
+                        session_path,
+                        ttl_secs: *ttl_secs,
+                    };
+                    state.with_mut(|shell| shell.click_grid = Some(params.clone()));
+                    (params, "show", String::new(), 0u8, 1u8, false, false)
+                }
+                AppControlGridCommand::Click {
+                    cell,
+                    button,
+                    count,
+                    refine,
+                    keep,
+                } => {
+                    let Some(params) = state.with(|shell| shell.click_grid.clone()) else {
+                        break 'grid respond(
+                            json!({ "accepted": false }),
+                            Some("no active grid; run `server app grid show` first".to_string()),
+                        );
+                    };
+                    let button_code: u8 = match button {
+                        AppControlPointerButton::Primary => 0,
+                        AppControlPointerButton::Middle => 1,
+                        AppControlPointerButton::Secondary => 2,
+                    };
+                    (params, "click", cell.clone(), button_code, (*count).max(1), *refine, *keep)
+                }
+                AppControlGridCommand::Hover { cell, keep } => {
+                    let Some(params) = state.with(|shell| shell.click_grid.clone()) else {
+                        break 'grid respond(
+                            json!({ "accepted": false }),
+                            Some("no active grid; run `server app grid show` first".to_string()),
+                        );
+                    };
+                    (params, "hover", cell.clone(), 0u8, 1u8, false, *keep)
+                }
+                AppControlGridCommand::Hide => {
+                    let params = state
+                        .with(|shell| shell.click_grid.clone())
+                        .unwrap_or(ClickGridParams {
+                            cols: 12,
+                            rows: 8,
+                            region: "full",
+                            target_main: true,
+                            session_path: None,
+                            ttl_secs: 120,
+                        });
+                    state.with_mut(|shell| shell.click_grid = None);
+                    (params, "hide", String::new(), 0u8, 1u8, false, false)
+                }
+            };
+            // A completed (non-kept, non-refine) click retires the grid.
+            if mode == "click" && !keep && !refine {
+                state.with_mut(|shell| shell.click_grid = None);
+            }
+            let core = click_grid_core_script(&params, mode, &cell, button, count, refine, keep);
+            if params.target_main {
+                let wrapped = format!(
+                    "(() => {{ const __r = (function() {{ {core} }})(); dioxus.send(__r === undefined ? null : __r); }})();"
+                );
+                let mut eval = document::eval(&wrapped);
+                match tokio::time::timeout(Duration::from_millis(3000), eval.recv::<Value>()).await
+                {
+                    Ok(Ok(value)) => {
+                        let error = value
+                            .get("error")
+                            .and_then(Value::as_str)
+                            .map(ToOwned::to_owned);
+                        respond(json!({ "target": "main", "result": value }), error)
+                    }
+                    Ok(Err(error)) => respond(json!({ "target": "main" }), Some(error.to_string())),
+                    Err(_) => respond(json!({ "target": "main" }), Some("grid_eval_timeout".to_string())),
+                }
+            } else {
+                let script = format!("(function() {{ {core} }})()");
+                let result = web_surface_eval_for(
+                    &state,
+                    &desktop,
+                    params.session_path.as_deref(),
+                    &script,
+                )
+                .await;
+                let error = result
+                    .get("accepted")
+                    .and_then(Value::as_bool)
+                    .filter(|accepted| !accepted)
+                    .and_then(|_| result.get("reason"))
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned);
+                respond(json!({ "target": "surface", "result": result }), error)
             }
         }
         AppControlCommand::DomEval { script } => {
