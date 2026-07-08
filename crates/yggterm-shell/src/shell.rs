@@ -37893,6 +37893,42 @@ async fn process_pending_app_control_requests(
                 error: None,
             }
         }
+        AppControlCommand::DomEval { script } => {
+            let wrapped = format!(
+                r#"
+                (async () => {{
+                  let result;
+                  try {{
+                    result = await (async () => {{ {script} }})();
+                  }} catch (error) {{
+                    dioxus.send({{ dom_eval_error: String(error) }});
+                    return;
+                  }}
+                  try {{
+                    dioxus.send(result === undefined ? null : result);
+                  }} catch (_error) {{
+                    dioxus.send({{ dom_eval_error: "unserializable result" }});
+                  }}
+                }})();
+                "#
+            );
+            let mut eval = document::eval(&wrapped);
+            let data = match tokio::time::timeout(Duration::from_millis(3000), eval.recv::<Value>())
+                .await
+            {
+                Ok(Ok(value)) => json!({ "result": value }),
+                Ok(Err(error)) => json!({ "error": error.to_string() }),
+                Err(_) => json!({ "error": "dom_eval_timeout" }),
+            };
+            AppControlResponse {
+                request_id: request.request_id.clone(),
+                handled_by_pid: std::process::id(),
+                completed_at_ms: current_millis() as u128,
+                output_path: None,
+                data: Some(data),
+                error: None,
+            }
+        }
         AppControlCommand::Key { command } => {
             let script = app_control_key_script(&command);
             let _ = document::eval(&script);
