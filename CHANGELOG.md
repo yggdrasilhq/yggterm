@@ -2,6 +2,30 @@
 
 This file tracks user-visible changes in `yggterm`.
 
+## 2.9.63
+
+- **Manually reconnect a stranded session from the CLI: `yggterm server connect`.** If a session
+  exists but isn't showing in the GUI's Live Sessions (e.g. it was demoted by a restart and now
+  lives only in the CWD tree), you can pull it back without touching the GUI:
+  `yggterm server connect <session-path>` makes it live and attaches/resumes its terminal — the
+  headless equivalent of clicking the row. It reuses the exact daemon requests the GUI issues
+  (FocusLive for a session the daemon already tracks, OpenRemoteSession for a scan-only remote), so
+  it works for Codex, Claude Code, and shells alike. `yggterm server connect --list` enumerates the
+  connectable sessions (in the scan but not live), newest first, so you can find the one you want.
+
+## 2.9.62
+
+- **Your sessions survive a restart, not just keep-alive ones.** After an agentic/update restart of
+  yggterm (a daemon swap done from another session), non-keep-alive Codex and Claude Code sessions —
+  including remote ones — were demoted out of **Live Sessions**. They were never killed (still alive
+  on their hosts, revealable from the CWD tree), but they stopped being first-class. Root cause:
+  keep-alive was being used as a persistence filter, so only *local* agent rows were carried across a
+  restart. Now keep-alive is purely a user-close policy: every recoverable live session (remote agents
+  AND plain shells) rides every persist and comes back after any restart. The only thing that drops a
+  non-keep-alive session is you closing the yggterm GUI. Remote agent rows that are mid-reconnect show
+  as reconnecting recovery targets instead of vanishing; a plain shell whose PTY did not survive the
+  swap stays hidden rather than showing as a dead husk.
+
 ## 2.9.61
 
 - **Web surfaces now remember you: persistent per-profile storage.** A surface's cookies, logins,
