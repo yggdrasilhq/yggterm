@@ -306,9 +306,44 @@ impl WebSurfaceHost {
 
     pub fn close(&self, id: u64) {
         if let Some(s) = self.surfaces.borrow_mut().remove(&id) {
-            self.overlay.remove(&s.container);
+            // A stashed surface's container is already detached.
+            if s.container.parent().is_some() {
+                self.overlay.remove(&s.container);
+            }
             // Surface drops here: webview + WebContext torn down together.
         }
+    }
+
+    /// Stash surface `id`: detach its container from the overlay WITHOUT
+    /// destroying the webview. The web process (DOM, scroll, playback state)
+    /// stays alive; detaching unmaps the widget, which — unlike
+    /// `set_visible(false)` — makes the shared WebKitGTK compositor actually
+    /// release its pixels (the stuck-composite/reload-white family). The
+    /// background-hold path: unstash on return, destroy on hold expiry.
+    pub fn stash(&self, id: u64) -> Result<(), String> {
+        let surfaces = self.surfaces.borrow();
+        let s = surfaces.get(&id).ok_or("no such surface")?;
+        if s.container.parent().is_some() {
+            self.overlay.remove(&s.container);
+        }
+        Ok(())
+    }
+
+    /// Re-attach a stashed surface at the given bounds and show it.
+    pub fn unstash(&self, id: u64, x: i32, y: i32, w: i32, h: i32) -> Result<(), String> {
+        let surfaces = self.surfaces.borrow();
+        let s = surfaces.get(&id).ok_or("no such surface")?;
+        if s.container.parent().is_none() {
+            self.overlay.add_overlay(&s.container);
+        }
+        s.container.set_margin_start(x.max(0));
+        s.container.set_margin_top(y.max(0));
+        s.container.set_size_request(w.max(1), h.max(1));
+        let _ = s.webview.set_bounds(rect_logical(w, h));
+        let _ = s.webview.set_visible(true);
+        s.container.show_all();
+        self.overlay.queue_resize();
+        Ok(())
     }
 
     pub fn is_open(&self, id: u64) -> bool {

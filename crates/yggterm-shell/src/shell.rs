@@ -1144,6 +1144,26 @@ struct AppliedWebSurface {
     /// Profile (storage jar) the surface's WebContext was created with. Also
     /// fixed per WebContext — a change means destroy + recreate.
     profile: String,
+    /// Set while the surface is STASHED (session backgrounded, webview kept
+    /// alive detached from the overlay). Unstashed on reveal; destroyed when
+    /// the background hold expires.
+    stashed_at_ms: Option<u64>,
+}
+/// How long a backgrounded session's surface stays alive (stashed, page state
+/// intact) before it is destroyed. `~/.yggterm/web-surface.json`
+/// `{"background_hold_secs": N}`; default 600, 0 = destroy immediately (the
+/// pre-hold behavior).
+fn web_surface_background_hold_ms() -> u64 {
+    let default_ms = 600_000;
+    let Ok(home) = yggterm_core::resolve_yggterm_home() else {
+        return default_ms;
+    };
+    std::fs::read_to_string(home.join("web-surface.json"))
+        .ok()
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+        .and_then(|config| config.get("background_hold_secs").and_then(Value::as_u64))
+        .map(|secs| secs.saturating_mul(1000))
+        .unwrap_or(default_ms)
 }
 /// Published mirror of the reconciler's applied surfaces: (session_path,
 /// tab_id) → native surface id. The reconcile loop is the ONLY writer (it
@@ -1269,38 +1289,63 @@ async fn web_surface_native_reconcile_loop(
                 );
             }
         }
-        // Destroy surfaces of BACKGROUNDED sessions (state-authoritative, no eval).
+        // STASH surfaces of BACKGROUNDED sessions (state-authoritative, no eval).
         // GTK `set_visible(false)` does NOT reliably clear a WebKitGTK surface: the
         // shared compositor won't re-blit a merely-hidden webview (the reload-white
-        // pathology — only destroying a webview re-composites). A backgrounded
-        // surface hidden via set_visible therefore stays stuck-composited over the
-        // newly-revealed session PERMANENTLY (user: "switch leaves example.com over
-        // 90% of the viewport until I bounce back through the ychrome session").
-        // Destroying the webview is the only reliable clear; it recreates lazily
-        // against the persistent per-profile jar on return (cookies/session kept —
-        // the same lossless tradeoff as reload-on-white). Trigger-independent, so it
-        // fixes GUI sidebar switches too. The ACTIVE session's tabs are untouched,
-        // so within-surface tab switches still keep hidden tabs alive.
+        // pathology) — a hidden surface stays stuck-composited over the revealed
+        // session PERMANENTLY. Detaching the container from the overlay (stash)
+        // clears it like destroy does, but keeps the web process (DOM, scroll,
+        // playback) alive, so switch-back is instant instead of a reload. The
+        // configurable background hold bounds memory: on expiry the stashed
+        // surface is destroyed (recreates lazily against the per-profile jar).
+        let now_ms = current_millis();
         let backgrounded: Vec<(String, u64)> = applied
             .keys()
             .filter(|(session, _)| !active_visible_sessions.contains(session.as_str()))
             .cloned()
             .collect();
-        for key in backgrounded {
-            if let Some(entry) = applied.remove(&key) {
-                desktop.close_web_surface(entry.native_id);
-                append_trace_event(
-                    &trace_home,
-                    "ui",
-                    "web_surface",
-                    "native_close",
-                    json!({
-                        "session_path": key.0,
-                        "tab_id": key.1,
-                        "native_id": entry.native_id,
-                        "reason": "session_backgrounded",
-                    }),
-                );
+        if !backgrounded.is_empty() {
+            let hold_ms = web_surface_background_hold_ms();
+            for key in backgrounded {
+                let expired = match applied.get(&key).and_then(|entry| entry.stashed_at_ms) {
+                    Some(stashed_at) => now_ms.saturating_sub(stashed_at) >= hold_ms,
+                    None => hold_ms == 0,
+                };
+                if expired {
+                    if let Some(entry) = applied.remove(&key) {
+                        desktop.close_web_surface(entry.native_id);
+                        append_trace_event(
+                            &trace_home,
+                            "ui",
+                            "web_surface",
+                            "native_close",
+                            json!({
+                                "session_path": key.0,
+                                "tab_id": key.1,
+                                "native_id": entry.native_id,
+                                "reason": "background_hold_expired",
+                            }),
+                        );
+                    }
+                } else if let Some(entry) = applied.get_mut(&key)
+                    && entry.stashed_at_ms.is_none()
+                {
+                    let _ = desktop.stash_web_surface(entry.native_id);
+                    entry.stashed_at_ms = Some(now_ms);
+                    entry.visible = false;
+                    append_trace_event(
+                        &trace_home,
+                        "ui",
+                        "web_surface",
+                        "native_stash",
+                        json!({
+                            "session_path": key.0,
+                            "tab_id": key.1,
+                            "native_id": entry.native_id,
+                            "hold_ms": hold_ms,
+                        }),
+                    );
+                }
             }
         }
         if desired.is_empty() && applied.is_empty() {
@@ -1412,6 +1457,34 @@ async fn web_surface_native_reconcile_loop(
                     );
                 }
                 if let Some(entry) = applied.get_mut(&key) {
+                    // Revealed while stashed: re-attach the live webview —
+                    // page state intact, no reload.
+                    if entry.stashed_at_ms.is_some()
+                        && want_visible
+                        && let Some(rect) = rect
+                    {
+                        let _ = desktop.unstash_web_surface(
+                            entry.native_id,
+                            rect.0,
+                            rect.1,
+                            rect.2,
+                            rect.3,
+                        );
+                        entry.stashed_at_ms = None;
+                        entry.bounds = rect;
+                        entry.visible = true;
+                        append_trace_event(
+                            &trace_home,
+                            "ui",
+                            "web_surface",
+                            "native_unstash",
+                            json!({
+                                "session_path": key.0,
+                                "tab_id": key.1,
+                                "native_id": entry.native_id,
+                            }),
+                        );
+                    }
                     if entry.url != effective_url {
                         desktop.navigate_web_surface(entry.native_id, &effective_url);
                         entry.url = effective_url;
@@ -1488,6 +1561,7 @@ async fn web_surface_native_reconcile_loop(
                                     reload_nonce,
                                     socks_port,
                                     profile,
+                                    stashed_at_ms: None,
                                 },
                             );
                         }
