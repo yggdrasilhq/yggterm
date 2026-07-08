@@ -1187,6 +1187,34 @@ fn web_surface_background_hold_ms() -> u64 {
         .map(|secs| secs.saturating_mul(1000))
         .unwrap_or(default_ms)
 }
+/// Read a string key from `~/.yggterm/web-surface.json`. The one config file is
+/// the SSOT for web-surface settings; both this GUI and the standalone `ychrome`
+/// binary read it, so the address-bar omnibox and ychrome's own omnibox agree.
+fn web_surface_config_string(key: &str) -> Option<String> {
+    let home = yggterm_core::resolve_yggterm_home().ok()?;
+    let raw = std::fs::read_to_string(home.join("web-surface.json")).ok()?;
+    let config: Value = serde_json::from_str(&raw).ok()?;
+    config
+        .get(key)
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+}
+/// Search-engine URL template for the omnibox search fallback: a URL with a
+/// `{q}` placeholder that is replaced by the URL-encoded query. SSOT is
+/// `~/.yggterm/web-surface.json` `{"search_url_template": "…{q}…"}`; default is
+/// Brave. Native child webviews aren't iframes, so X-Frame-Options no longer
+/// constrains the choice (the historical reason DuckDuckGo's html/ endpoint was
+/// hard-coded).
+fn web_surface_search_url_template() -> String {
+    web_surface_config_string("search_url_template")
+        .filter(|template| template.contains("{q}"))
+        .unwrap_or_else(|| "https://search.brave.com/search?q={q}".to_string())
+}
+/// Substitute a query into a search-engine URL template's `{q}` placeholder.
+/// Pure (no config/env read) so it is deterministically testable.
+fn web_surface_search_url_from_template(template: &str, query: &str) -> String {
+    template.replace("{q}", &web_surface_query_encode(query))
+}
 /// Published mirror of the reconciler's applied surfaces: (session_path,
 /// tab_id) → native surface id. The reconcile loop is the ONLY writer (it
 /// republishes at every tick exit); app-control handlers (web eval /
@@ -1958,11 +1986,11 @@ fn web_surface_address_to_url(input: &str) -> Option<String> {
             Some(format!("https://{input}"))
         }
     } else {
-        // Search fallback. html.duckduckgo.com permits framing (google.com
-        // sends X-Frame-Options and would blank the tab).
-        Some(format!(
-            "https://html.duckduckgo.com/html/?q={}",
-            web_surface_query_encode(input)
+        // Search fallback: the configured engine (default Brave). SSOT is
+        // ~/.yggterm/web-surface.json, read by both this GUI and ychrome.
+        Some(web_surface_search_url_from_template(
+            &web_surface_search_url_template(),
+            input,
         ))
     }
 }
@@ -79703,9 +79731,21 @@ mod tests {
             Some("http://127.0.0.1:3000".to_string())
         );
         assert_eq!(web_surface_address_to_url("ftp://example.com"), None);
+    }
+
+    #[test]
+    fn web_surface_search_template_substitutes_query() {
+        // Default engine is Brave; the pure substitution is env-independent.
         assert_eq!(
-            web_surface_address_to_url("rust async book"),
-            Some("https://html.duckduckgo.com/html/?q=rust%20async%20book".to_string())
+            web_surface_search_url_from_template(
+                "https://search.brave.com/search?q={q}",
+                "rust async book"
+            ),
+            "https://search.brave.com/search?q=rust%20async%20book".to_string()
+        );
+        assert_eq!(
+            web_surface_search_url_from_template("https://example.com/s?query={q}", "a b"),
+            "https://example.com/s?query=a%20b".to_string()
         );
     }
 
