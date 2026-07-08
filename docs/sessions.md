@@ -88,7 +88,7 @@ second low-signal title classifier or passive-generation gate.
 - A manually renamed title is authoritative until the user regenerates or clears it.
 - Remote scan previews and generated copy jobs may fill missing or fallback
   titles, but they must not overwrite a human/live title already attached to the
-  session. Keep-alive rows such as `samplenotes` and `erome systemd` must survive scan
+  session. Keep-alive rows such as `jyas` and `erome systemd` must survive scan
   refreshes unless the user explicitly renames or regenerates them.
 - If generated and manual titles are unavailable or rejected as low-signal, the sidebar falls back to the short UUID for both live and machine/cwd rows.
 
@@ -128,7 +128,7 @@ are separate read models over the same saved metadata.
 
 Renaming a remote cwd bookmark changes the cwd bookmark path, not only the
 display title. A bookmark created under `practice:/home/pi` and renamed to
-`git/samplers` represents `practice:/home/pi/git/samplers`. Startpage
+`git/practice-rs` represents `practice:/home/pi/git/practice-rs`. Startpage
 actions launched from that scoped folder must pass that exact remote cwd to the
 daemon for both Codex sessions and generic SSH terminals.
 - The daemon must not invent an arbitrary replacement active session after removing a runtime. If a GUI wants to focus another session, it must do so explicitly from the validated viewport history.

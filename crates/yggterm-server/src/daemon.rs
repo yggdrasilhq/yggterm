@@ -9572,13 +9572,13 @@ mod tests {
         );
         let session_path = remote_scanned_session_path("practice", "241c3f6a");
         let mut owner_session = daemon_test_snapshot_session(&session_path, SessionSource::LiveSsh);
-        owner_session.title = "samplers".to_string();
+        owner_session.title = "practice-rs".to_string();
         owner_session.host_label = "practice".to_string();
         owner_session.ssh_target = Some("practice".to_string());
         owner_session.metadata = vec![
             SnapshotMetadataEntry {
                 label: "Cwd".to_string(),
-                value: "/home/pi/git/samplers".to_string(),
+                value: "/home/pi/git/practice-rs".to_string(),
             },
             SnapshotMetadataEntry {
                 label: "Runtime Persistence".to_string(),
@@ -10145,7 +10145,7 @@ mod tests {
     #[test]
     fn drop_terminal_runtime_is_local_only_and_does_not_retire_daemon() {
         let request = super::ServerRequest::DropTerminalRuntime {
-            runtime_key: "remote-session://dev/current-samplenotes".to_string(),
+            runtime_key: "remote-session://dev/current-jyas".to_string(),
             reason: Some("duplicate_legacy_owned_runtime_prune".to_string()),
         };
         assert_eq!(
@@ -10467,13 +10467,13 @@ mod tests {
             "bridge_enabled": true,
             "owned_terminal_session_count": 2,
             "owned_terminal_session_keys": [
-                "remote-session://samplenotes-webapp/current",
-                "remote-session://samplenotes-webapp/other"
+                "remote-session://jyas-webapp/current",
+                "remote-session://jyas-webapp/other"
             ],
             "terminal_session_count": 2,
             "terminal_session_keys": [
-                "remote-session://samplenotes-webapp/current",
-                "remote-session://samplenotes-webapp/other"
+                "remote-session://jyas-webapp/current",
+                "remote-session://jyas-webapp/other"
             ],
         }))
         .expect("status");
@@ -10483,8 +10483,8 @@ mod tests {
             &owner_status,
             Some("2.7.13".to_string()),
             vec![
-                "remote-session://samplenotes-webapp/current".to_string(),
-                "remote-session://samplenotes-webapp/other".to_string(),
+                "remote-session://jyas-webapp/current".to_string(),
+                "remote-session://jyas-webapp/other".to_string(),
             ],
             Vec::new(),
         )
@@ -10493,8 +10493,8 @@ mod tests {
         assert_eq!(
             registry.keys(),
             vec![
-                "remote-session://samplenotes-webapp/current".to_string(),
-                "remote-session://samplenotes-webapp/other".to_string()
+                "remote-session://jyas-webapp/current".to_string(),
+                "remote-session://jyas-webapp/other".to_string()
             ],
             "a current daemon with the same key must not erase preserved-owner state until the duplicate owner is explicitly pruned"
         );
@@ -10860,7 +10860,7 @@ mod tests {
             expected_server_version: Some("2.1.191".to_string()),
             entries: vec![
                 super::PreservedTerminalOwnerEntry {
-                    runtime_key: "remote-session://dev/kept-samplenotes".to_string(),
+                    runtime_key: "remote-session://dev/kept-jyas".to_string(),
                     endpoint: super::PreservedOwnerEndpoint::from_endpoint(&first_endpoint),
                     owner_server_version: "2.1.163".to_string(),
                     owner_server_build_id: 0,
@@ -10895,7 +10895,7 @@ mod tests {
                 first_endpoint,
                 vec![
                     "remote-session://dev/kept-erome".to_string(),
-                    "remote-session://dev/kept-samplenotes".to_string(),
+                    "remote-session://dev/kept-jyas".to_string(),
                 ],
             )
         );
@@ -10914,16 +10914,16 @@ mod tests {
             GhosttyHostSupport::shadow("test".to_string(), false, false),
             UiTheme::ZedLight,
         );
-        let kept_samplenotes = remote_scanned_session_path("dev", "kept-samplenotes");
+        let kept_jyas = remote_scanned_session_path("dev", "kept-jyas");
         server.restore_live_session(PersistedLiveSession {
-            key: kept_samplenotes.clone(),
-            id: "kept-samplenotes".to_string(),
-            title: "samplenotes".to_string(),
+            key: kept_jyas.clone(),
+            id: "kept-jyas".to_string(),
+            title: "jyas".to_string(),
             kind: SessionKind::Codex,
             keep_alive: true,
             ssh_target: "dev".to_string(),
             prefix: None,
-            cwd: Some("/home/pi/git/samplenotes".to_string()),
+            cwd: Some("/home/pi/git/jyas".to_string()),
             remote_launch_action: None,
             storage_path: None,
             restore_reason: None,
@@ -10942,7 +10942,7 @@ mod tests {
             storage_path: None,
             restore_reason: Some("update-restart".to_string()),
         });
-        let owner_registry_keys = HashSet::from([kept_samplenotes.clone()]);
+        let owner_registry_keys = HashSet::from([kept_jyas.clone()]);
         let all_registry_keys = owner_registry_keys.clone();
         let current_owned_runtime_keys = HashSet::new();
 
@@ -10952,7 +10952,7 @@ mod tests {
             &all_registry_keys,
             &current_owned_runtime_keys,
             vec![
-                kept_samplenotes,
+                kept_jyas,
                 unkept_update_runtime.clone(),
                 "remote-session://dev/closed-may-6".to_string(),
                 "remote-session://dev/closed-generic-a".to_string(),
@@ -10960,7 +10960,7 @@ mod tests {
             ],
         );
 
-        assert!(server.live_session_keep_alive(&remote_scanned_session_path("dev", "kept-samplenotes")));
+        assert!(server.live_session_keep_alive(&remote_scanned_session_path("dev", "kept-jyas")));
         assert!(!server.live_session_keep_alive(&unkept_update_runtime));
         assert_eq!(
             stale_runtime_keys,
@@ -10987,7 +10987,7 @@ mod tests {
         running.ssh_target = Some("practice".to_string());
         running.metadata = vec![SnapshotMetadataEntry {
             label: "Cwd".to_string(),
-            value: "/home/pi/git/samplers".to_string(),
+            value: "/home/pi/git/practice-rs".to_string(),
         }];
         let owner_snapshot = ServerUiSnapshot {
             active_session_path: Some(running_path.clone()),
@@ -11047,12 +11047,12 @@ mod tests {
         server.restore_live_session(PersistedLiveSession {
             key: kept_runtime.clone(),
             id: "kept-runtime".to_string(),
-            title: "samplers non-data".to_string(),
+            title: "practice-rs non-data".to_string(),
             kind: SessionKind::Codex,
             keep_alive: true,
             ssh_target: "practice".to_string(),
             prefix: None,
-            cwd: Some("/home/pi/git/samplers".to_string()),
+            cwd: Some("/home/pi/git/practice-rs".to_string()),
             remote_launch_action: None,
             storage_path: None,
             restore_reason: None,
@@ -11088,7 +11088,7 @@ mod tests {
             keep_alive: false,
             ssh_target: "practice".to_string(),
             prefix: None,
-            cwd: Some("/home/pi/git/samplers".to_string()),
+            cwd: Some("/home/pi/git/practice-rs".to_string()),
             remote_launch_action: None,
             storage_path: None,
             restore_reason: None,
@@ -11114,9 +11114,9 @@ mod tests {
             GhosttyHostSupport::shadow("test".to_string(), false, false),
             UiTheme::ZedLight,
         );
-        let kept_samplenotes = remote_scanned_session_path("dev", "kept-samplenotes");
+        let kept_jyas = remote_scanned_session_path("dev", "kept-jyas");
         let duplicate_erome = remote_scanned_session_path("dev", "kept-erome");
-        for key in [&kept_samplenotes, &duplicate_erome] {
+        for key in [&kept_jyas, &duplicate_erome] {
             server.restore_live_session(PersistedLiveSession {
                 key: key.clone(),
                 id: key.rsplit('/').next().unwrap_or("session").to_string(),
@@ -11125,13 +11125,13 @@ mod tests {
                 keep_alive: true,
                 ssh_target: "dev".to_string(),
                 prefix: None,
-                cwd: Some("/home/pi/git/samplenotes".to_string()),
+                cwd: Some("/home/pi/git/jyas".to_string()),
                 remote_launch_action: None,
                 storage_path: None,
                 restore_reason: None,
             });
         }
-        let owner_registry_keys = HashSet::from([kept_samplenotes.clone()]);
+        let owner_registry_keys = HashSet::from([kept_jyas.clone()]);
         let all_registry_keys = owner_registry_keys.clone();
         let current_owned_runtime_keys = HashSet::from([duplicate_erome.clone()]);
 
@@ -11140,7 +11140,7 @@ mod tests {
             &owner_registry_keys,
             &all_registry_keys,
             &current_owned_runtime_keys,
-            vec![kept_samplenotes, duplicate_erome.clone()],
+            vec![kept_jyas, duplicate_erome.clone()],
         );
 
         assert_eq!(
@@ -11159,9 +11159,9 @@ mod tests {
             GhosttyHostSupport::shadow("test".to_string(), false, false),
             UiTheme::ZedLight,
         );
-        let kept_samplenotes = remote_scanned_session_path("dev", "kept-samplenotes");
+        let kept_jyas = remote_scanned_session_path("dev", "kept-jyas");
         let reassigned_erome = remote_scanned_session_path("dev", "kept-erome");
-        for key in [&kept_samplenotes, &reassigned_erome] {
+        for key in [&kept_jyas, &reassigned_erome] {
             server.restore_live_session(PersistedLiveSession {
                 key: key.clone(),
                 id: key.rsplit('/').next().unwrap_or("session").to_string(),
@@ -11170,14 +11170,14 @@ mod tests {
                 keep_alive: true,
                 ssh_target: "dev".to_string(),
                 prefix: None,
-                cwd: Some("/home/pi/git/samplenotes".to_string()),
+                cwd: Some("/home/pi/git/jyas".to_string()),
                 remote_launch_action: None,
                 storage_path: None,
                 restore_reason: None,
             });
         }
-        let owner_registry_keys = HashSet::from([kept_samplenotes.clone()]);
-        let all_registry_keys = HashSet::from([kept_samplenotes.clone(), reassigned_erome.clone()]);
+        let owner_registry_keys = HashSet::from([kept_jyas.clone()]);
+        let all_registry_keys = HashSet::from([kept_jyas.clone(), reassigned_erome.clone()]);
         let current_owned_runtime_keys = HashSet::new();
 
         let stale_runtime_keys = super::unrepresented_preserved_owner_runtime_keys(
@@ -11185,7 +11185,7 @@ mod tests {
             &owner_registry_keys,
             &all_registry_keys,
             &current_owned_runtime_keys,
-            vec![kept_samplenotes, reassigned_erome.clone()],
+            vec![kept_jyas, reassigned_erome.clone()],
         );
 
         assert_eq!(
@@ -11199,7 +11199,7 @@ mod tests {
     fn duplicate_legacy_owned_runtime_prune_candidates_keep_unique_old_runtime_keys() {
         let current_runtime_keys = HashSet::from([
             "remote-session://dev/current-erome".to_string(),
-            "remote-session://dev/current-samplenotes".to_string(),
+            "remote-session://dev/current-jyas".to_string(),
         ]);
         let owner_status: ServerRuntimeStatus = serde_json::from_value(serde_json::json!({
             "server_version": "2.6.1",
@@ -11212,12 +11212,12 @@ mod tests {
             "owned_terminal_session_count": 2,
             "owned_terminal_session_keys": [
                 "remote-session://dev/current-erome",
-                "remote-session://dev/old-only-samplescripts"
+                "remote-session://dev/old-only-p01scripts"
             ],
             "terminal_session_count": 2,
             "terminal_session_keys": [
                 "remote-session://dev/current-erome",
-                "remote-session://dev/old-only-samplescripts"
+                "remote-session://dev/old-only-p01scripts"
             ],
         }))
         .expect("status");

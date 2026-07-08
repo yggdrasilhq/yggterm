@@ -185,7 +185,7 @@ This is the core determinism rule: Terminal tests should use fake PTY streams, s
   a hidden local `/__remote_folder__/...` implementation branch being expanded.
 - Remote cwd bookmark rename and launch are one contract. The synthetic storage
   path is the durable cwd bookmark; renaming a newly added folder to a relative
-  path such as `git/samplers` moves the bookmark under the selected remote
+  path such as `git/practice-rs` moves the bookmark under the selected remote
   cwd, and Startpage `New Codex Session` / `New Terminal` must launch with that
   resolved remote cwd rather than the previous active session's cwd.
 - Expandable sidebar rows have a split hit-zone contract. Clicking the visible row name selects the row and opens that group's scoped Startpage without closing live runtimes; clicking the icon, disclosure/count control, machine/live-session affordance area, or trailing empty row surface toggles expansion. This applies uniformly to cwd folders, machine groups, and `Live Sessions`, with expansion state still keyed only by the row path.

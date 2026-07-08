@@ -180,7 +180,7 @@ debug event. Host-state fields: `persistedScrollRestorePending`,
 `persistedScrollRestoreApplied`, `persistedScrollRestoreTargetViewportY`.
 
 ### Verification (2026-05-26, live on jojo)
-- Scroll up 40 lines in `remote-session://dev/019d0000-0000-7000-8000-000000000001` → `viewport_y=960, base_y=1000`.
+- Scroll up 40 lines in `remote-session://dev/019dbdcf-9f11-7932-afb2-0d7b7c35914b` → `viewport_y=960, base_y=1000`.
 - localStorage SQLite row written: `{viewportY: 960, baseY: 1000, distanceFromBottom: 40, ...}`.
 - SIGTERM GUI, relaunch. After ~6s settle: `viewport_y=960, base_y=1000, scrollback_intent=UserScrollback, scrollback_locked=true, last_viewport_force_reason=persisted_scroll_restore:poll_2000`.
 - Screenshot confirms user is reading scrollback (not at bottom prompt).
@@ -318,7 +318,7 @@ unexpectedly. Variants reported by user:
 Not yet captured deterministically. Reproduce path under investigation:
 mid-output session, scroll up partway, type any key, watch viewport.
 Live host `jojo`, active session
-`remote-session://dev/019d0000-0000-7000-8000-000000000001`.
+`remote-session://dev/019dbdcf-9f11-7932-afb2-0d7b7c35914b`.
 
 ### Root cause
 Unknown. Hypotheses:

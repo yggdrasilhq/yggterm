@@ -20645,7 +20645,7 @@ mod tests {
     #[test]
     fn missing_saved_remote_live_session_marks_error_without_demoting_live_row() {
         let session_id = "25886740-5fa9-436f-b482-f25bf5ef74cc";
-        let path = format!("remote-session://samplenotes-webapp/{session_id}");
+        let path = format!("remote-session://jyas-webapp/{session_id}");
         let mut session =
             managed_session_from_snapshot(snapshot_session(&path, SessionSource::LiveSsh));
 
@@ -20676,12 +20676,12 @@ mod tests {
     #[test]
     fn missing_saved_remote_live_session_blocks_auto_spawn() {
         let session_id = "25886740-5fa9-436f-b482-f25bf5ef74cc";
-        let path = format!("remote-session://samplenotes-webapp/{session_id}");
+        let path = format!("remote-session://jyas-webapp/{session_id}");
         let mut session =
             managed_session_from_snapshot(snapshot_session(&path, SessionSource::LiveSsh));
-        session.ssh_target = Some("samplenotes-webapp".to_string());
+        session.ssh_target = Some("jyas-webapp".to_string());
         session.launch_command =
-            "ssh samplenotes-webapp yggterm server remote resume-codex --require-existing".to_string();
+            "ssh jyas-webapp yggterm server remote resume-codex --require-existing".to_string();
         upsert_session_metadata(
             &mut session.metadata,
             "Remote Launch",
@@ -20724,7 +20724,7 @@ mod tests {
         assert_eq!(
             server.terminal_spec(&path).map(|(command, _)| command),
             Some(
-                "ssh samplenotes-webapp yggterm server remote resume-codex --require-existing".to_string()
+                "ssh jyas-webapp yggterm server remote resume-codex --require-existing".to_string()
             ),
             "the row still supports terminal view; only automatic spawn is blocked"
         );
@@ -22576,7 +22576,7 @@ mod tests {
     fn remote_persistent_resume_keeps_raw_input_but_restores_newline_output_processing() {
         let command = super::remote_persistent_resume_shell_command_with_terminal_appearance(
             "019dbdcf-9f11",
-            Some("/home/pi/git/samplenotes"),
+            Some("/home/pi/git/jyas"),
             None,
         );
 
@@ -22591,7 +22591,7 @@ mod tests {
 
     #[test]
     fn remote_resume_runtime_output_requires_restart_for_codex_resume_instruction() {
-        let exited = b"Token usage: total=1,064,406 input=1,023,193 output=41,213\nTo continue this session, run codex resume 019d0000-0000-7000-8000-000000000001\n";
+        let exited = b"Token usage: total=1,064,406 input=1,023,193 output=41,213\nTo continue this session, run codex resume 019dbdcf-9f11-7932-afb2-0d7b7c35914b\n";
         assert!(remote_resume_runtime_output_requires_restart(exited));
     }
 
@@ -22864,7 +22864,7 @@ mod tests {
         fs::write(
             sessions_dir.join("rollout-test.jsonl"),
             concat!(
-                "{\"id\":\"abc123\",\"cwd\":\"/home/pi/git/sampleclient\"}\n",
+                "{\"id\":\"abc123\",\"cwd\":\"/home/pi/git/ygg_client\"}\n",
                 "{\"timestamp\":\"2026-03-20T10:00:00Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"I want the media controls of the thinkbook to be in the x layer too\"}]}}\n",
                 "{\"timestamp\":\"2026-03-20T10:00:01Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"I will update the ThinkBook KMonad x-modifications layer to add your three media shortcuts.\"}]}}\n"
             ),
@@ -25029,10 +25029,10 @@ terminal_window_id: None,
     fn remote_scanned_preview_does_not_replace_existing_human_title() {
         let mut session = build_session(
             SessionKind::Codex,
-            "remote-session://dev/019d0000-0000-7000-8000-000000000001",
-            Some("019d0000-0000-7000-8000-000000000001"),
-            Some("/home/pi/git/samplenotes"),
-            Some("samplenotes"),
+            "remote-session://dev/019dbdcf-9f11-7932-afb2-0d7b7c35914b",
+            Some("019dbdcf-9f11-7932-afb2-0d7b7c35914b"),
+            Some("/home/pi/git/jyas"),
+            Some("jyas"),
             None,
             TerminalBackend::Xterm,
             UiTheme::ZedLight,
@@ -25040,34 +25040,34 @@ terminal_window_id: None,
             StoredPreviewHydrationMode::Deferred,
         );
         let scanned = RemoteScannedSession {
-            session_path: "remote-session://dev/019d0000-0000-7000-8000-000000000001".to_string(),
-            session_id: "019d0000-0000-7000-8000-000000000001".to_string(),
-            cwd: "/home/pi/git/samplenotes".to_string(),
+            session_path: "remote-session://dev/019dbdcf-9f11-7932-afb2-0d7b7c35914b".to_string(),
+            session_id: "019dbdcf-9f11-7932-afb2-0d7b7c35914b".to_string(),
+            cwd: "/home/pi/git/jyas".to_string(),
             started_at: "May 13, 2026 10:00 PM UTC+0530".to_string(),
             modified_epoch: 1,
             event_count: 42,
             user_message_count: 2,
             assistant_message_count: 2,
             title_hint: "While Those Are Generating Can".to_string(),
-            recent_context: "USER: Keep the manually named samplenotes session stable.".to_string(),
+            recent_context: "USER: Keep the manually named jyas session stable.".to_string(),
             cached_precis: None,
             cached_summary: None,
             live_runtime: true,
-            storage_path: "/home/pi/.codex/sessions/2026/05/samplenotes.jsonl".to_string(),
+            storage_path: "/home/pi/.codex/sessions/2026/05/jyas.jsonl".to_string(),
         };
 
         apply_remote_scanned_session_preview(&mut session, &scanned, "dev", "dev");
 
-        assert_eq!(session.title, "samplenotes");
+        assert_eq!(session.title, "jyas");
     }
 
     #[test]
     fn remote_scanned_preview_can_replace_fallback_title() {
         let mut session = build_session(
             SessionKind::Codex,
-            "remote-session://dev/019d0000-0000-7000-8000-000000000001",
-            Some("019d0000-0000-7000-8000-000000000001"),
-            Some("/home/pi/git/samplenotes"),
+            "remote-session://dev/019dbdcf-9f11-7932-afb2-0d7b7c35914b",
+            Some("019dbdcf-9f11-7932-afb2-0d7b7c35914b"),
+            Some("/home/pi/git/jyas"),
             Some("Remote Codex 019dbdcf"),
             None,
             TerminalBackend::Xterm,
@@ -25076,20 +25076,20 @@ terminal_window_id: None,
             StoredPreviewHydrationMode::Deferred,
         );
         let scanned = RemoteScannedSession {
-            session_path: "remote-session://dev/019d0000-0000-7000-8000-000000000001".to_string(),
-            session_id: "019d0000-0000-7000-8000-000000000001".to_string(),
-            cwd: "/home/pi/git/samplenotes".to_string(),
+            session_path: "remote-session://dev/019dbdcf-9f11-7932-afb2-0d7b7c35914b".to_string(),
+            session_id: "019dbdcf-9f11-7932-afb2-0d7b7c35914b".to_string(),
+            cwd: "/home/pi/git/jyas".to_string(),
             started_at: "May 13, 2026 10:00 PM UTC+0530".to_string(),
             modified_epoch: 1,
             event_count: 42,
             user_message_count: 2,
             assistant_message_count: 2,
             title_hint: "Jyas Terminal Investigation".to_string(),
-            recent_context: "USER: Diagnose the samplenotes terminal restore path.".to_string(),
+            recent_context: "USER: Diagnose the jyas terminal restore path.".to_string(),
             cached_precis: None,
             cached_summary: None,
             live_runtime: true,
-            storage_path: "/home/pi/.codex/sessions/2026/05/samplenotes.jsonl".to_string(),
+            storage_path: "/home/pi/.codex/sessions/2026/05/jyas.jsonl".to_string(),
         };
 
         apply_remote_scanned_session_preview(&mut session, &scanned, "dev", "dev");
@@ -25102,13 +25102,13 @@ terminal_window_id: None,
         assert!(super::should_preserve_existing_remote_title(
             "Jyas Terminal Investigation",
             "interface-llm",
-            Some("samplenotes"),
+            Some("jyas"),
             Some("manual"),
         ));
         assert!(!super::should_preserve_existing_remote_title(
             "Jyas Terminal Investigation",
             "manual",
-            Some("samplenotes"),
+            Some("jyas"),
             Some("manual"),
         ));
     }
@@ -25916,16 +25916,16 @@ terminal_window_id: None,
             "closed live-session metadata must stop authorizing preserved owners"
         );
 
-        let kept_remote = remote_scanned_session_path("dev", "kept-samplenotes");
+        let kept_remote = remote_scanned_session_path("dev", "kept-jyas");
         server.restore_live_session(PersistedLiveSession {
             key: kept_remote.clone(),
-            id: "kept-samplenotes".to_string(),
-            title: "samplenotes".to_string(),
+            id: "kept-jyas".to_string(),
+            title: "jyas".to_string(),
             kind: SessionKind::Codex,
             keep_alive: true,
             ssh_target: "dev".to_string(),
             prefix: None,
-            cwd: Some("/home/pi/git/samplenotes".to_string()),
+            cwd: Some("/home/pi/git/jyas".to_string()),
             remote_launch_action: None,
             storage_path: None,
             restore_reason: None,
@@ -27114,7 +27114,7 @@ terminal_window_id: None,
             keep_alive: true,
             ssh_target: "dev".to_string(),
             prefix: None,
-            cwd: Some("/home/pi/git/samplenotes".to_string()),
+            cwd: Some("/home/pi/git/jyas".to_string()),
             remote_launch_action: Some("start-codex".to_string()),
             storage_path: None,
             restore_reason: None,
@@ -27126,7 +27126,7 @@ terminal_window_id: None,
             &super::CodexRuntimeProcessIdentity {
                 storage_path: PathBuf::from(storage_path),
                 session_id: real_id.to_string(),
-                cwd: "/home/pi/git/samplenotes".to_string(),
+                cwd: "/home/pi/git/jyas".to_string(),
             },
             None,
         ));
@@ -27201,10 +27201,10 @@ terminal_window_id: None,
         let title_store = SessionTitleStore::open(&root)?;
         let synthetic_id = "0dce9c47-2495-4243-a658-d5162507f92e";
         let real_id = "019e0339-aed4-7993-a3fa-f3dad1388e3c";
-        title_store.put_manual_title(synthetic_id, "/home/pi/git/samplenotes", "muhurta")?;
+        title_store.put_manual_title(synthetic_id, "/home/pi/git/jyas", "muhurta")?;
         title_store.put_title(
             real_id,
-            "/home/pi/git/samplenotes",
+            "/home/pi/git/jyas",
             "Q1388e3c",
             "manual",
             "interface-llm",
@@ -27236,7 +27236,7 @@ terminal_window_id: None,
             keep_alive: true,
             ssh_target: "dev".to_string(),
             prefix: None,
-            cwd: Some("/home/pi/git/samplenotes".to_string()),
+            cwd: Some("/home/pi/git/jyas".to_string()),
             remote_launch_action: Some("start-codex".to_string()),
             storage_path: None,
             restore_reason: None,
@@ -27249,7 +27249,7 @@ terminal_window_id: None,
                     "/home/pi/.codex/sessions/2026/05/07/rollout-019e0339-aed4-7993-a3fa-f3dad1388e3c.jsonl",
                 ),
                 session_id: real_id.to_string(),
-                cwd: "/home/pi/git/samplenotes".to_string(),
+                cwd: "/home/pi/git/jyas".to_string(),
             },
             Some(&root),
         ));
@@ -27305,7 +27305,7 @@ terminal_window_id: None,
         upsert_session_metadata(
             &mut session.metadata,
             "Cwd",
-            "/home/pi/git/samplenotes".to_string(),
+            "/home/pi/git/jyas".to_string(),
         );
         server.sessions.insert(runtime_key.clone(), session);
 
@@ -27313,7 +27313,7 @@ terminal_window_id: None,
             .remote_copy_target_for_session_path(&runtime_key)
             .expect("remote copy target");
         assert_eq!(session_id, real_id);
-        assert_eq!(cwd, "/home/pi/git/samplenotes");
+        assert_eq!(cwd, "/home/pi/git/jyas");
     }
 
     #[test]
@@ -27394,7 +27394,7 @@ terminal_window_id: None,
             keep_alive: true,
             ssh_target: "dev".to_string(),
             prefix: None,
-            cwd: Some("/home/pi/git/samplenotes".to_string()),
+            cwd: Some("/home/pi/git/jyas".to_string()),
             remote_launch_action: Some("start-codex".to_string()),
             storage_path: None,
             restore_reason: None,
@@ -27404,7 +27404,7 @@ terminal_window_id: None,
             &super::CodexRuntimeProcessIdentity {
                 storage_path: PathBuf::from(storage_path),
                 session_id: real_id.to_string(),
-                cwd: "/home/pi/git/samplenotes".to_string(),
+                cwd: "/home/pi/git/jyas".to_string(),
             },
             None,
         ));
@@ -27424,7 +27424,7 @@ terminal_window_id: None,
             stored.session_path,
             remote_scanned_session_path("dev", real_id)
         );
-        assert_eq!(stored.cwd, "/home/pi/git/samplenotes");
+        assert_eq!(stored.cwd, "/home/pi/git/jyas");
         assert_eq!(stored.title_hint, "muhurta");
         assert_eq!(stored.storage_path, storage_path);
         assert!(!stored.live_runtime);
@@ -27444,7 +27444,7 @@ terminal_window_id: None,
             cwd: None,
             ..Default::default()
         };
-        let machine_key = "samplenotes-webapp";
+        let machine_key = "jyas-webapp";
         let synthetic_id = "cdb00ffb-757d-4183-9dcd-825d9d18102e";
         let runtime_key = remote_scanned_session_path(machine_key, synthetic_id);
         let mut server = YggtermServer::new(
@@ -27466,7 +27466,7 @@ terminal_window_id: None,
         server.restore_live_session(PersistedLiveSession {
             key: runtime_key.clone(),
             id: synthetic_id.to_string(),
-            title: "samplenotes webapp".to_string(),
+            title: "jyas webapp".to_string(),
             kind: SessionKind::Codex,
             keep_alive: true,
             ssh_target: machine_key.to_string(),
@@ -27509,12 +27509,12 @@ terminal_window_id: None,
             cwd: None,
             ..Default::default()
         };
-        let machine_key = "samplenotes-webapp";
+        let machine_key = "jyas-webapp";
         let phantom_id = "cdb00ffb-757d-4183-9dcd-825d9d18102e";
         let phantom_path = remote_scanned_session_path(machine_key, phantom_id);
         let mut machine = remote_machine_with_scanned_session(machine_key, phantom_id, false);
         machine.sessions[0].storage_path.clear();
-        machine.sessions[0].title_hint = "samplenotes webapp".to_string();
+        machine.sessions[0].title_hint = "jyas webapp".to_string();
         let mut server = YggtermServer::new(
             &tree,
             false,

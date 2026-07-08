@@ -960,15 +960,15 @@ This file tracks user-visible changes in `yggterm`.
 ## 2.6.30
 
 - Keep legacy remote cwd bookmark labels aligned with the repaired cwd path.
-  A stale generated bookmark renamed to `git/samplers` now projects as
-  `/home/pi/git/samplers` without duplicating the renamed path segments into
-  a `git/git/samplers` row.
+  A stale generated bookmark renamed to `git/practice-rs` now projects as
+  `/home/pi/git/practice-rs` without duplicating the renamed path segments into
+  a `git/git/practice-rs` row.
 
 ## 2.6.29
 
 - Treat remote workspace folder renames as cwd bookmark moves. A folder created
-  under `practice:/home/pi` and renamed to `git/samplers` now resolves to
-  `/home/pi/git/samplers`, and Startpage `New Codex Session` / `New
+  under `practice:/home/pi` and renamed to `git/practice-rs` now resolves to
+  `/home/pi/git/practice-rs`, and Startpage `New Codex Session` / `New
   Terminal` launch from that selected remote cwd instead of falling back to the
   parent `/home/pi`.
 
@@ -1188,7 +1188,7 @@ This file tracks user-visible changes in `yggterm`.
   prompt bands do not inherit a stale light theme inside a dark terminal.
 - Stop remote scan previews from replacing an existing human/live session title
   with generated copy. Scanned titles may still fill empty or fallback labels,
-  but they cannot rename keep-alive sessions such as `samplenotes` or `erome systemd`.
+  but they cannot rename keep-alive sessions such as `jyas` or `erome systemd`.
 
 ## 2.6.4
 
@@ -2248,13 +2248,13 @@ This file tracks user-visible changes in `yggterm`.
 
 - Prune unrepresented hot-update preserved-owner entries from disk on daemon load and after live-session keep/close changes, so old non-keep-alive sessions cannot remain latent in `hot-update-terminal-owners.json`.
 - Expose `live_keep_alive` in app-control sidebar row snapshots and keep the regression harness focused on the allowed duplicate shape: an explicitly kept remote live row in `Live Sessions` and its own cwd folder.
-- Add a two-kept-session sidebar regression covering `dev:/home/pi/git/samplenotes` and `dev:/home/pi/git/samplescripts` so kept remote terminals cannot be projected under the wrong cwd folder.
+- Add a two-kept-session sidebar regression covering `dev:/home/pi/git/jyas` and `dev:/home/pi/git/p01scripts` so kept remote terminals cannot be projected under the wrong cwd folder.
 
 ## 2.1.179
 
 - Keep hot-update preserved-owner runtime keys subordinate to current live-session metadata so sessions closed or no longer kept alive cannot resurrect after a restart.
 - Allow Keep Alive toggles for live terminals whose PTY is still owned by a preserved hot-update daemon, preserving the session instead of rejecting the action because the new daemon does not own the PTY locally.
-- Show explicitly kept remote live sessions under their remote cwd folder as well as under `Live Sessions`, so a kept `dev:/home/pi/git/samplenotes` terminal remains findable from the `samplenotes` folder after restart.
+- Show explicitly kept remote live sessions under their remote cwd folder as well as under `Live Sessions`, so a kept `dev:/home/pi/git/jyas` terminal remains findable from the `jyas` folder after restart.
 
 ## 2.1.178
 
