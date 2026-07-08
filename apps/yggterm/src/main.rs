@@ -1471,6 +1471,7 @@ fn main() -> Result<()> {
                     "notifications" | "notification" => AppControlRightPanelMode::Notifications,
                     "settings" => AppControlRightPanelMode::Settings,
                     "metadata" | "session-metadata" => AppControlRightPanelMode::Metadata,
+                    "app-sidebar" | "app_sidebar" | "app" => AppControlRightPanelMode::AppSidebar,
                     other => anyhow::bail!("unsupported app right panel mode: {other}"),
                 };
                 run_app_control_set_right_panel_mode(mode, timeout_ms)
