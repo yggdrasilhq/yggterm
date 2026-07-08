@@ -328,35 +328,44 @@ fn persisted_live_session_is_recoverable(live: &PersistedLiveSession) -> bool {
     live.kind == SessionKind::SshShell && !is_loopback_ssh_target(&live.ssh_target)
 }
 
-/// Per the first-class agent-session spec (gate #6 of the persistence saga,
-/// 2026-06-11): a LOCAL agent CLI row re-derives from the CLI's own JSONL
-/// store, so it rides EVERY persist — not only the protected update-restart
-/// snapshot. The keep-alive-only routine persist made local rows depend on
-/// swap ORDERING: a successor daemon that loaded state before the predecessor
-/// wrote its update-restart snapshot restored a state file without them
-/// (live-caught at the 88→89 swap; zero drop telemetry because the keep-alive
-/// filter skips silently by design). Plain shells stay second-class — their
-/// PTY content dies with the daemon and a restored shell row would be a husk.
-/// Persisted-row twin of [`managed_live_session_is_local_agent_store_recoverable`]
-/// (gate #7): a persisted local agent row restores like a keep-alive row —
-/// its content re-derives from the CLI's JSONL store.
-fn persisted_live_session_is_local_agent_store_recoverable(live: &PersistedLiveSession) -> bool {
-    (is_loopback_ssh_target(&live.ssh_target) || local_runtime_id_from_key(&live.key).is_some())
-        && matches!(
-            live.kind,
-            SessionKind::Codex | SessionKind::CodexLiteLlm | SessionKind::ClaudeCode
-        )
+/// SSOT for "this session path is a REMOTE agent-CLI session" — codex
+/// (`remote-session://`) or Claude Code (`remote-cc://`). Both re-derive from
+/// the REMOTE CLI's own JSONL via `resume-codex` / `resume-cc`, so — exactly
+/// like a local agent row — they ride every persist and never need a preserved
+/// PTY. The scheme alone implies the agent kind (there is no remote-scanned
+/// plain shell), so no kind gate is needed here.
+pub(crate) fn session_path_is_remote_agent(path: &str) -> bool {
+    parse_remote_scanned_session_path(path).is_some() || parse_remote_cc_session_path(path).is_some()
 }
 
-fn managed_live_session_is_local_agent_store_recoverable(
+/// Per the first-class agent-session spec (gate #6 of the persistence saga,
+/// 2026-06-11): an agent CLI row re-derives from the CLI's own JSONL store, so
+/// it rides EVERY persist — not only the protected update-restart snapshot. The
+/// keep-alive-only routine persist made these rows depend on swap ORDERING: a
+/// successor daemon that loaded state before the predecessor wrote its
+/// update-restart snapshot restored a state file without them (live-caught at
+/// the 88→89 swap; zero drop telemetry because the keep-alive filter skips
+/// silently by design). This covers BOTH local agents (re-derive from the local
+/// store) AND remote agents (re-derive from the remote store via resume-codex /
+/// resume-cc) — recognizing only the LOCAL agent here dropped every
+/// non-keep-alive REMOTE agent at daemon swap (live-caught on jojo 2026-07-08:
+/// the dev CC/codex sessions the user was working with vanished from Live
+/// Sessions after an agentic restart). Plain shells are handled separately: they
+/// ride persist too (first-class), but their content lives in the daemon PTY, so
+/// the snapshot runtime-truth filter hides any shell whose PTY did not survive.
+/// Used to let agents SKIP the update-restart husk guard (they need no preserved
+/// PTY); the restore path itself gates on [`persisted_live_session_is_recoverable`].
+fn managed_live_session_is_agent_store_recoverable(
     key: &str,
     session: &ManagedSessionView,
 ) -> bool {
-    (session.source == SessionSource::LiveLocal || local_runtime_id_from_key(key).is_some())
+    let is_local_agent = (session.source == SessionSource::LiveLocal
+        || local_runtime_id_from_key(key).is_some())
         && matches!(
             session.kind,
             SessionKind::Codex | SessionKind::CodexLiteLlm | SessionKind::ClaudeCode
-        )
+        );
+    is_local_agent || session_path_is_remote_agent(key)
 }
 
 fn managed_live_session_is_recoverable(key: &str, session: &ManagedSessionView) -> bool {
@@ -3748,18 +3757,29 @@ impl YggtermServer {
             })
             .filter_map(|(key, session)| {
                 let keep_alive = session_keep_alive(session);
-                // Gate #6: local agent rows are store-recoverable and ride
-                // every persist regardless of keep-alive. The keep-alive spec
-                // is enforced where it belongs — PrepareClientClose removes
-                // them from live_session_order on a genuine user close, so
-                // they never reach this filter there.
-                let store_recoverable_local_agent =
-                    managed_live_session_is_local_agent_store_recoverable(key, session);
-                if !keep_alive && !protect_all_live && !store_recoverable_local_agent {
-                    return None;
-                }
+                // FIRST-CLASS SESSIONS (jojo 2026-07-08): keep_alive is a
+                // USER-CLOSE policy, NOT a persistence filter. Every recoverable
+                // live session rides every persist — the iteration above already
+                // gated on managed_live_session_is_recoverable, so a session here
+                // is by construction recoverable. Agents (local AND remote)
+                // re-derive from their CLI JSONL store; plain shells re-adopt
+                // their preserved daemon PTY across a hot/update restart, and the
+                // snapshot runtime-truth filter hides any shell whose PTY did NOT
+                // survive (so a husk is never shown). The ONLY place a
+                // non-keep-alive session dies is PrepareClientClose — a genuine
+                // user GUI-close — which removes it from live_session_order so it
+                // never reaches this filter. This ends the demotion of still-alive
+                // non-keep-alive sessions out of Live Sessions on an agentic
+                // restart.
+                //
+                // The husk guard below still applies to non-agents (shells): on a
+                // protected update-restart we only persist a shell whose PTY is
+                // actually being carried across. Agents skip it (they re-derive
+                // and need no preserved PTY).
+                let agent_store_recoverable =
+                    managed_live_session_is_agent_store_recoverable(key, session);
                 if !keep_alive
-                    && !store_recoverable_local_agent
+                    && !agent_store_recoverable
                     && let Some(protected_runtime_keys) = protected_runtime_keys
                 {
                     let runtime_key = self.terminal_runtime_key_for_path(key);
@@ -5962,12 +5982,19 @@ impl YggtermServer {
     }
 
     pub fn restore_live_session(&mut self, live: PersistedLiveSession) {
-        // Gate #7 (persistence saga): gate #6 made non-keep-alive LOCAL AGENT
-        // rows ride every persist, but this restore gate still skipped them on
-        // load (live-caught at the 91→92 swap: 20 persisted, 18 restored).
-        // A store-recoverable local agent row restores like a keep-alive row.
-        let store_recoverable_local_agent =
-            persisted_live_session_is_local_agent_store_recoverable(&live);
+        // FIRST-CLASS SESSIONS (jojo 2026-07-08): mirror the persist filter —
+        // every recoverable persisted session restores. keep_alive is a
+        // user-close policy, not a restore filter. Every caller already gates on
+        // persisted_live_session_is_recoverable (the startup loaders) or only
+        // restores runtime-present preserved owners, so a row reaching here was
+        // deliberately persisted: agents (local AND remote) re-derive from their
+        // CLI JSONL store; a plain shell was only persisted when its PTY was
+        // preserved, and the snapshot runtime-truth filter hides any shell whose
+        // PTY did not actually survive — so a husk never shows. The prior gate
+        // (`!keep_alive && !temporary_update_restore && !local_agent`) dropped
+        // still-alive non-keep-alive REMOTE agents and live non-keep-alive shells
+        // on load (jojo: dev CC/codex + shells vanished after an agentic restart).
+        let store_recoverable = persisted_live_session_is_recoverable(&live);
         let PersistedLiveSession {
             key,
             id,
@@ -5988,7 +6015,13 @@ impl YggtermServer {
         if kind == SessionKind::Document {
             return;
         }
-        if !keep_alive && !temporary_update_restore && !store_recoverable_local_agent {
+        // keep_alive and temporary_update_restore preserve the prior allowances;
+        // `store_recoverable` is the NEW first-class arm — an unkept but
+        // recoverable row (a remote agent that re-derives from its JSONL, or a
+        // plain shell whose PTY the snapshot runtime-truth filter will gate)
+        // restores like a keep-alive row instead of being dropped. Only a row
+        // that is none of these (a husk with no way to reconstruct) is skipped.
+        if !keep_alive && !temporary_update_restore && !store_recoverable {
             return;
         }
         let remote_scanned_key =
@@ -27799,7 +27832,12 @@ terminal_window_id: None,
     }
 
     #[test]
-    fn persisted_state_only_keeps_explicitly_kept_live_sessions() {
+    fn persisted_state_keeps_plain_shells_first_class_and_round_trips_keep_alive() {
+        // FIRST-CLASS SESSIONS (jojo 2026-07-08): a plain local shell rides
+        // every routine persist regardless of keep-alive — keep_alive is a
+        // user-close policy, not a persistence filter. The keep_alive FLAG still
+        // round-trips so a genuine user GUI-close (PrepareClientClose) can drop
+        // non-keep-alive rows; that close path is covered separately.
         let tree = SessionNode {
             kind: SessionNodeKind::Group,
             name: "sessions".to_string(),
@@ -27824,8 +27862,11 @@ terminal_window_id: None,
             Some("Ephemeral Local Shell"),
         );
 
+        // Non-keep-alive shell is first-class: it rides the routine persist.
         let persisted = server.persisted_state();
-        assert!(persisted.live_sessions.is_empty());
+        assert_eq!(persisted.live_sessions.len(), 1);
+        assert_eq!(persisted.live_sessions[0].key, local_shell);
+        assert!(!persisted.live_sessions[0].keep_alive);
 
         assert!(
             server
@@ -27837,13 +27878,17 @@ terminal_window_id: None,
         assert_eq!(persisted.live_sessions[0].key, local_shell);
         assert!(persisted.live_sessions[0].keep_alive);
 
+        // Clearing keep-alive keeps the shell first-class (still persisted), it
+        // only flips the flag back to non-keep-alive.
         assert!(
             server
                 .set_live_session_keep_alive(&local_shell, false)
                 .expect("clear shell keep-alive")
         );
         let persisted = server.persisted_state();
-        assert!(persisted.live_sessions.is_empty());
+        assert_eq!(persisted.live_sessions.len(), 1);
+        assert_eq!(persisted.live_sessions[0].key, local_shell);
+        assert!(!persisted.live_sessions[0].keep_alive);
     }
 
     #[test]
@@ -27982,14 +28027,20 @@ terminal_window_id: None,
             .set_live_session_keep_alive(&local_codex, true)
             .expect("mark codex keep-alive");
 
+        // FIRST-CLASS SESSIONS (jojo 2026-07-08): normal persistence now
+        // carries the unkept shell too (durably, with NO update-restart marker),
+        // alongside the kept codex.
         let normal = server.persisted_state();
-        assert_eq!(normal.live_sessions.len(), 1);
-        assert!(
-            normal
-                .live_sessions
-                .iter()
-                .all(|live| live.key != local_shell),
-            "unkept local shell must not be included in normal persistence"
+        assert_eq!(normal.live_sessions.len(), 2);
+        let normal_shell = normal
+            .live_sessions
+            .iter()
+            .find(|live| live.key == local_shell)
+            .expect("unkept local shell rides normal persistence (first-class)");
+        assert!(!normal_shell.keep_alive);
+        assert_eq!(
+            normal_shell.restore_reason, None,
+            "a routine-persisted unkept shell is durable, not a temporary update-restore"
         );
         let normal_codex = normal
             .live_sessions
@@ -28021,7 +28072,10 @@ terminal_window_id: None,
     }
 
     #[test]
-    fn normal_persistence_does_not_select_unpersisted_live_session() {
+    fn normal_persistence_keeps_focused_first_class_shell_active() {
+        // FIRST-CLASS SESSIONS (jojo 2026-07-08): a focused unkept shell is now
+        // persisted (first-class), so the active pointer stays on it — there is
+        // no longer an "excluded live session" for the active pointer to avoid.
         let tree = SessionNode {
             kind: SessionNodeKind::Group,
             name: "sessions".to_string(),
@@ -28057,12 +28111,13 @@ terminal_window_id: None,
         assert_eq!(server.active_session_path(), Some(unkept_shell.as_str()));
 
         let persisted = server.persisted_state();
-        assert_eq!(persisted.live_sessions.len(), 1);
-        assert_eq!(persisted.live_sessions[0].key, kept_codex);
+        assert_eq!(persisted.live_sessions.len(), 2);
+        assert!(persisted.live_sessions.iter().any(|l| l.key == unkept_shell));
+        assert!(persisted.live_sessions.iter().any(|l| l.key == kept_codex));
         assert_eq!(
             persisted.active_session_path.as_deref(),
-            Some(kept_codex.as_str()),
-            "normal persistence must not point at a live session excluded from live_sessions"
+            Some(unkept_shell.as_str()),
+            "the focused first-class shell stays the active pointer"
         );
         assert_eq!(persisted.active_view_mode, WorkspaceViewMode::Terminal);
 
@@ -28071,15 +28126,15 @@ terminal_window_id: None,
             .expect("clear codex keep-alive");
         server.focus_live_session(&unkept_shell);
         let persisted = server.persisted_state();
-        // Gate #6: the codex row still rides the routine persist even without
-        // keep-alive (local agent rows are store-recoverable); only the plain
-        // shell drops. The active pointer must still avoid the excluded shell.
-        assert_eq!(persisted.live_sessions.len(), 1);
-        assert_eq!(persisted.live_sessions[0].key, kept_codex);
+        // Both rows still ride the routine persist: the codex as a local agent
+        // and the shell as a first-class plain shell. The active pointer stays
+        // on the focused shell.
+        assert_eq!(persisted.live_sessions.len(), 2);
+        assert!(persisted.live_sessions.iter().any(|l| l.key == unkept_shell));
+        assert!(persisted.live_sessions.iter().any(|l| l.key == kept_codex));
         assert_eq!(
             persisted.active_session_path.as_deref(),
-            Some(kept_codex.as_str()),
-            "normal persistence must not point at a live session excluded from live_sessions"
+            Some(unkept_shell.as_str()),
         );
         assert_eq!(persisted.active_view_mode, WorkspaceViewMode::Terminal);
     }
@@ -28251,15 +28306,22 @@ terminal_window_id: None,
             .sessions
             .get("local://update-shell")
             .expect("temporary update session restored");
+        // The restore reason must NOT flip the row to keep-alive (that would
+        // make a genuine user close unable to drop it).
         assert_ne!(
             session_metadata_value(session, "Runtime Persistence"),
             Some("keep-alive".to_string())
         );
+        // FIRST-CLASS SESSIONS (jojo 2026-07-08): the restored shell is a
+        // recoverable live row, so it now rides normal persistence (durably,
+        // still non-keep-alive) instead of being dropped after a single restart.
         let persisted = server.persisted_state();
-        assert!(
-            persisted.live_sessions.is_empty(),
-            "a temporary update restore must not become durable normal-close persistence"
-        );
+        let shell = persisted
+            .live_sessions
+            .iter()
+            .find(|live| live.key == "local://update-shell")
+            .expect("restored shell rides normal persistence (first-class)");
+        assert!(!shell.keep_alive);
     }
 
     #[test]
@@ -28318,7 +28380,12 @@ terminal_window_id: None,
     }
 
     #[test]
-    fn restore_persisted_state_skips_unkept_recoverable_live_sessions_without_update_reason() {
+    fn restore_persisted_state_restores_unkept_recoverable_shell_first_class() {
+        // FIRST-CLASS SESSIONS (jojo 2026-07-08): an unkept but recoverable shell
+        // (loopback target, kind Shell) now restores like a keep-alive row rather
+        // than being dropped on load. The daemon snapshot runtime-truth filter is
+        // what hides a restored shell whose PTY did not actually survive — the
+        // row itself is materialized so a surviving PTY can re-adopt it.
         let tree = SessionNode {
             kind: SessionNodeKind::Group,
             name: "sessions".to_string(),
@@ -28339,13 +28406,13 @@ terminal_window_id: None,
         );
         server.restore_persisted_state(
             PersistedDaemonState {
-                active_session_path: Some("local::old-shell".to_string()),
+                active_session_path: Some("local://old-shell".to_string()),
                 active_view_mode: WorkspaceViewMode::Terminal,
                 ssh_targets: Vec::new(),
                 remote_machines: Vec::new(),
                 stored_sessions: Vec::new(),
                 live_sessions: vec![PersistedLiveSession {
-                    key: "local::old-shell".to_string(),
+                    key: "local://old-shell".to_string(),
                     id: "old-shell".to_string(),
                     title: "Old unkept shell".to_string(),
                     kind: SessionKind::Shell,
@@ -28362,12 +28429,12 @@ terminal_window_id: None,
             None,
         );
 
-        assert!(server.live_sessions().is_empty());
-        assert!(!server.sessions.contains_key("local::old-shell"));
+        assert_eq!(server.live_sessions().len(), 1);
+        assert!(server.sessions.contains_key("local://old-shell"));
     }
 
     #[test]
-    fn restore_persisted_state_restores_unkept_update_restart_live_sessions_once() {
+    fn restore_persisted_state_restores_unkept_update_restart_live_sessions_first_class() {
         let tree = SessionNode {
             kind: SessionNodeKind::Group,
             name: "sessions".to_string(),
@@ -28419,7 +28486,16 @@ terminal_window_id: None,
         );
         assert_eq!(server.active_view_mode(), WorkspaceViewMode::Terminal);
         assert!(server.sessions.contains_key("local://old-shell"));
-        assert!(server.persisted_state().live_sessions.is_empty());
+        // FIRST-CLASS SESSIONS (jojo 2026-07-08): the restored shell is
+        // recoverable, so it now rides normal persistence durably (still
+        // non-keep-alive) instead of surviving only a single restart.
+        let persisted = server.persisted_state();
+        let shell = persisted
+            .live_sessions
+            .iter()
+            .find(|live| live.key == "local://old-shell")
+            .expect("restored shell rides normal persistence (first-class)");
+        assert!(!shell.keep_alive);
     }
 
     #[test]
@@ -31454,8 +31530,8 @@ terminal_window_id: None,
         // daemon that loaded server-state BEFORE the predecessor wrote its
         // update-restart snapshot restored a state file without the local
         // agent rows (swap ORDERING dependence). Local agent rows re-derive
-        // from the CLI's JSONL store and must ride EVERY persist; plain
-        // shells stay second-class.
+        // from the CLI's JSONL store and must ride EVERY persist; under the
+        // first-class-sessions change (jojo 2026-07-08) plain shells ride too.
         let tree = SessionNode {
             kind: SessionNodeKind::Group,
             name: "sessions".to_string(),
@@ -31479,9 +31555,13 @@ terminal_window_id: None,
             routine.live_sessions.iter().any(|l| l.key == codex_key),
             "non-keep-alive local codex row must ride the routine persist (gate #6)"
         );
+        // FIRST-CLASS SESSIONS (jojo 2026-07-08): a plain shell now rides the
+        // routine persist too — keep_alive is a user-close policy, not a
+        // persistence filter. The snapshot runtime-truth filter (not this
+        // persist filter) is what hides a shell whose PTY did not survive.
         assert!(
-            !routine.live_sessions.iter().any(|l| l.key == shell_key),
-            "non-keep-alive plain shell stays out of the routine persist"
+            routine.live_sessions.iter().any(|l| l.key == shell_key),
+            "non-keep-alive plain shell is first-class and rides the routine persist"
         );
 
         // GATE #7: the routine-persisted row must also RESTORE into a fresh
