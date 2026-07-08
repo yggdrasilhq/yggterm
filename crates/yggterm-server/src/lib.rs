@@ -9,7 +9,8 @@ mod remote_runtime;
 mod terminal;
 
 pub use app_control::{
-    AppControlCommand, AppControlDragCommand, AppControlDragPlacement, AppControlKeyCommand,
+    AppControlCommand, AppControlDragCommand, AppControlDragPlacement, AppControlGridCommand,
+    AppControlGridRegion, AppControlGridTarget, AppControlKeyCommand,
     AppControlPointerButton, AppControlPointerCommand, AppControlPreviewLayout, AppControlRequest,
     AppControlResponse, AppControlRightPanelMode, AppControlStartAction, AppControlViewMode,
     ProbeTerminalViewportInputMode, ScreenshotTarget, app_control_captures_dir,
@@ -17112,6 +17113,74 @@ pub fn run_app_control_pointer(
         other => anyhow::bail!("unsupported app pointer action: {other}"),
     };
     let response = request_app_control(&home, command, timeout_ms)?;
+    write_stdout_payload(&serde_json::to_string_pretty(&response)?)?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn run_app_control_grid(
+    action: &str,
+    cell: Option<&str>,
+    cols: Option<u32>,
+    rows: Option<u32>,
+    region: Option<&str>,
+    target: Option<&str>,
+    ttl_secs: Option<u64>,
+    button: Option<&str>,
+    count: Option<u8>,
+    refine: bool,
+    keep: bool,
+    timeout_ms: u64,
+) -> anyhow::Result<()> {
+    let home = resolve_yggterm_home()?;
+    let region = match region.unwrap_or("full") {
+        "full" => AppControlGridRegion::Full,
+        "terminal" => AppControlGridRegion::Terminal,
+        other => anyhow::bail!("unsupported grid region: {other}; use full or terminal"),
+    };
+    let target = match target.unwrap_or("auto") {
+        "auto" => AppControlGridTarget::Auto,
+        "main" => AppControlGridTarget::Main,
+        "surface" => AppControlGridTarget::Surface,
+        other => anyhow::bail!("unsupported grid target: {other}; use auto, main, or surface"),
+    };
+    let button = button
+        .map(|value| {
+            parse_app_control_pointer_button(value).with_context(|| {
+                format!(
+                    "unsupported grid pointer button: {value}; use primary, middle, or secondary"
+                )
+            })
+        })
+        .transpose()?
+        .unwrap_or_default();
+    let command = match action {
+        "show" => AppControlGridCommand::Show {
+            cols: cols.unwrap_or(12).clamp(2, 40),
+            rows: rows.unwrap_or(8).clamp(2, 30),
+            region,
+            target,
+            ttl_secs: ttl_secs.unwrap_or(120).clamp(5, 3600),
+        },
+        "click" => AppControlGridCommand::Click {
+            cell: cell
+                .context("missing cell for server app grid click (e.g. B7 or B7.5)")?
+                .to_uppercase(),
+            button,
+            count: count.unwrap_or(1).max(1),
+            refine,
+            keep,
+        },
+        "hover" => AppControlGridCommand::Hover {
+            cell: cell
+                .context("missing cell for server app grid hover")?
+                .to_uppercase(),
+            keep,
+        },
+        "hide" => AppControlGridCommand::Hide,
+        other => anyhow::bail!("unsupported grid action: {other}; use show, click, hover, hide"),
+    };
+    let response = request_app_control(&home, AppControlCommand::Grid { command }, timeout_ms)?;
     write_stdout_payload(&serde_json::to_string_pretty(&response)?)?;
     Ok(())
 }
