@@ -916,6 +916,18 @@ struct WebSurfaceUiState {
     last_seen_ms: u64,
     /// In-progress address-bar edit for the ACTIVE tab; None shows the tab URL.
     address_draft: Option<String>,
+    /// Profile-picker state (OSC action "pick", no-arg ychrome): the surface
+    /// shows the GUI-NATIVE profile picker instead of tab bar + page; choosing
+    /// GETs `/open?url=&profile=` on this (already egress-resolved, so
+    /// GUI-reachable) ychrome control endpoint, whose handler re-emits a real
+    /// OSC "open" that clears this. The forward child (remote sessions) is
+    /// killed by the same close/sweep/replace paths as tab forwards.
+    picker: Option<WebSurfacePickerState>,
+}
+#[derive(Debug, Clone)]
+struct WebSurfacePickerState {
+    control_url: String,
+    forward_child: Option<Arc<Mutex<std::process::Child>>>,
 }
 #[derive(Debug, Clone)]
 struct WebSurfaceTab {
@@ -969,6 +981,60 @@ fn kill_web_surface_forward(surface: &WebSurfaceUiState) {
     for tab in &surface.tabs {
         tab.kill_forward();
     }
+    if let Some(picker) = &surface.picker
+        && let Some(child) = &picker.forward_child
+        && let Ok(mut child) = child.lock()
+    {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+}
+/// Existing host-owned web-profile jars on THIS (GUI) host, for the native
+/// picker. Mirrors ychrome's `enumerate_profiles`: directory names under
+/// `~/.yggterm/web-profiles/`, always including "default", never the reserved
+/// ephemeral "temp" (it gets its own card).
+fn enumerate_web_surface_profiles() -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    if let Ok(home) = yggterm_core::resolve_yggterm_home()
+        && let Ok(entries) = std::fs::read_dir(home.join("web-profiles"))
+    {
+        for entry in entries.flatten() {
+            if entry.file_type().map(|t| t.is_dir()).unwrap_or(false)
+                && let Some(name) = entry.file_name().to_str()
+                && !name.is_empty()
+                && !name.starts_with('.')
+                && name != WEB_SURFACE_TEMP_PROFILE
+            {
+                names.push(name.to_string());
+            }
+        }
+    }
+    if !names.iter().any(|name| name == "default") {
+        names.push("default".to_string());
+    }
+    names.sort();
+    names.dedup();
+    names
+}
+/// Minimal loopback HTTP GET (fire the request, drain the response) against a
+/// picker control endpoint — `http://127.0.0.1:<port>/...`, possibly the local
+/// end of an ssh forward. Hand-rolled over TcpStream: matches ychrome's
+/// dep-light control server; no HTTP client dependency for one GET.
+fn web_surface_picker_control_get(url: &str) -> Result<(), String> {
+    use std::io::{Read as _, Write as _};
+    let (host, port, path) = web_surface_url_parts(url).ok_or("unparseable control url")?;
+    let mut stream = std::net::TcpStream::connect((host.as_str(), port))
+        .map_err(|error| format!("connect {host}:{port}: {error}"))?;
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
+    stream
+        .write_all(
+            format!("GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n").as_bytes(),
+        )
+        .map_err(|error| format!("send: {error}"))?;
+    let mut drain = Vec::new();
+    let _ = stream.read_to_end(&mut drain);
+    Ok(())
 }
 /// Render-facing view of a live web surface: tab strip + address bar +
 /// per-tab iframes.
@@ -984,6 +1050,10 @@ struct WebSurfaceOverlayView {
     /// (history_index, url). None disables the button.
     back_target: Option<(usize, String)>,
     forward_target: Option<(usize, String)>,
+    /// Set while the surface is in picker phase (OSC "pick"): the viewport
+    /// renders the native profile picker (this is the GUI-reachable control
+    /// endpoint to GET /open on) instead of tab bar + page.
+    picker_control_url: Option<String>,
 }
 #[derive(Debug, Clone, PartialEq)]
 struct WebSurfaceOverlayTabView {
@@ -4161,6 +4231,16 @@ impl ShellState {
             && let Some(app_tab) = existing.tabs.first_mut()
         {
             existing.last_seen_ms = now_ms;
+            // A real "open" ends the picker phase (the user chose; ychrome
+            // re-emitted with the chosen url+profile).
+            if let Some(picker) = existing.picker.take() {
+                if let Some(child) = &picker.forward_child
+                    && let Ok(mut child) = child.lock()
+                {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
+            }
             if app_tab.url == url && app_tab.profile == profile {
                 if title.is_some() {
                     app_tab.title = title;
@@ -4212,6 +4292,76 @@ impl ShellState {
                 opened_at_ms: now_ms,
                 last_seen_ms: now_ms,
                 address_draft: None,
+                picker: None,
+            },
+        ) {
+            kill_web_surface_forward(&replaced);
+        }
+    }
+    /// Upsert a surface in PICKER state (OSC action "pick"): no page, no tab
+    /// bar — the viewport renders the GUI-native profile picker; choosing
+    /// GETs the (egress-resolved) ychrome control endpoint. Idempotent for
+    /// "pick" heartbeats (refreshes liveness only).
+    fn upsert_web_surface_picker(
+        &mut self,
+        session_path: &str,
+        control_url: String,
+        forward_child: Option<std::process::Child>,
+        now_ms: u64,
+    ) {
+        if let Some(existing) = self.web_surfaces.get_mut(session_path) {
+            existing.last_seen_ms = now_ms;
+            let fresh = match &existing.picker {
+                Some(picker) => picker.control_url != control_url,
+                // Already past picking (real open landed): a late/racing
+                // "pick" heartbeat must not resurrect the picker.
+                None => false,
+            };
+            if fresh {
+                if let Some(picker) = existing.picker.take()
+                    && let Some(child) = &picker.forward_child
+                    && let Ok(mut child) = child.lock()
+                {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
+                existing.picker = Some(WebSurfacePickerState {
+                    control_url,
+                    forward_child: forward_child.map(|child| Arc::new(Mutex::new(child))),
+                });
+            } else if let Some(mut child) = forward_child {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+            return;
+        }
+        // Fresh picker surface: an app tab placeholder keeps the tabs[0]
+        // invariant (never rendered while picker is set).
+        let app_tab = WebSurfaceTab {
+            id: 0,
+            url: control_url.clone(),
+            effective_url: control_url.clone(),
+            socks_port: None,
+            title: Some("ychrome — choose a profile".to_string()),
+            forward_child: None,
+            history: Vec::new(),
+            history_index: 0,
+            reload_nonce: 0,
+            profile: "default".to_string(),
+        };
+        if let Some(replaced) = self.web_surfaces.insert(
+            session_path.to_string(),
+            WebSurfaceUiState {
+                tabs: vec![app_tab],
+                active_tab: 0,
+                next_tab_id: 1,
+                opened_at_ms: now_ms,
+                last_seen_ms: now_ms,
+                address_draft: None,
+                picker: Some(WebSurfacePickerState {
+                    control_url,
+                    forward_child: forward_child.map(|child| Arc::new(Mutex::new(child))),
+                }),
             },
         ) {
             kill_web_surface_forward(&replaced);
@@ -4417,6 +4567,10 @@ impl ShellState {
             address_editing: surface.address_draft.is_some(),
             back_target,
             forward_target,
+            picker_control_url: surface
+                .picker
+                .as_ref()
+                .map(|picker| picker.control_url.clone()),
         })
     }
     fn set_window_focused(&mut self, focused: bool) {
@@ -42357,6 +42511,19 @@ fn app() -> Element {
         titlebar_reveal_pinned,
         titlebar_autohide_lingering(),
     );
+    // A visible web surface owns the top edge: its tab bar sits exactly where
+    // the revealed titlebar overlays, so an auto-hide reveal there makes tabs
+    // unclickable (aiming at a tab overshoots into the 6px sensor, the
+    // titlebar slides over the tab bar, and the click lands on the titlebar).
+    // While a surface is active the sensor only reveals over the LEFT SIDEBAR
+    // columns — the page-area top edge belongs to the app.
+    let web_surface_owns_top_edge = snapshot.active_web_surface_profile.is_some()
+        && snapshot.active_view_mode == WorkspaceViewMode::Terminal;
+    let titlebar_sensor_page_area_left_px = if snapshot.sidebar_open {
+        snapshot.sidebar_width as f64
+    } else {
+        0.0
+    };
     let preferred_agent_kind = preferred_agent_session_kind(&snapshot.settings);
     let maximized = snapshot.maximized;
     let fullscreen = snapshot.fullscreen;
@@ -42740,8 +42907,10 @@ fn app() -> Element {
                             evt.prevent_default();
                             evt.stop_propagation();
                         },
-                        onmouseenter: move |_| {
-                            if titlebar_auto_hide_enabled {
+                        onmouseenter: move |evt| {
+                            let over_owned_page_area = web_surface_owns_top_edge
+                                && evt.client_coordinates().x > titlebar_sensor_page_area_left_px;
+                            if titlebar_auto_hide_enabled && !over_owned_page_area {
                                 titlebar_autohide_linger_generation
                                     .set(titlebar_autohide_linger_generation() + 1);
                                 titlebar_autohide_hovered.set(true);
@@ -44649,8 +44818,11 @@ fn Titlebar(
                     div {
                         class: "yggterm-titlebar-inline-secondary",
                         style: "display:flex; align-items:center; gap:8px;",
+                        // The app-sidebar is the ACTIVE app's property, not
+                        // yggterm's: no live web surface on the active session
+                        // means no icon (and RightRail hides the pane).
+                        if snapshot.active_web_surface_profile.is_some() {
                         button {
-                            key: "titlebar-appsidebar-button",
                             "data-titlebar-appsidebar-button": "1",
                             title: "App settings (active app's sidebar)",
                             style: utility_icon_style(
@@ -44676,6 +44848,7 @@ fn Titlebar(
                                 }
                             }
                             "▦"
+                        }
                         }
                         button {
                             key: "titlebar-notifications-button",
@@ -52607,6 +52780,60 @@ fn TerminalCanvas(
                                 let now_ms = current_millis();
                                 let surface_session_path = session_path.clone();
                                 match action.as_str() {
+                                    // No-arg ychrome: the GUI renders a NATIVE
+                                    // profile picker; the payload url is the
+                                    // app's loopback CONTROL endpoint (resolved
+                                    // through the session's egress like any
+                                    // surface URL, so remote loopback works).
+                                    "pick" => {
+                                        let touched = state.with_mut(|shell| {
+                                            shell.sweep_stale_web_surfaces(now_ms);
+                                            shell
+                                                .web_surfaces
+                                                .get_mut(&surface_session_path)
+                                                .map(|surface| {
+                                                    surface.last_seen_ms = now_ms;
+                                                    // Heartbeat for a live picker
+                                                    // (or post-choice surface):
+                                                    // liveness only, no re-resolve.
+                                                    true
+                                                })
+                                                .unwrap_or(false)
+                                        });
+                                        if !touched && let Some(control_url) = url {
+                                            let resolve_url = control_url.clone();
+                                            let resolve_target = web_surface_ssh_target.clone();
+                                            let (effective_control, forward_child, _socks) =
+                                                task::spawn_blocking(move || {
+                                                    resolve_web_surface_effective_url(
+                                                        &resolve_url,
+                                                        resolve_target.as_deref(),
+                                                    )
+                                                })
+                                                .await
+                                                .unwrap_or_else(|_| (control_url.clone(), None, None));
+                                            append_trace_event(
+                                                &trace_home,
+                                                "ui",
+                                                "web_surface",
+                                                "pick",
+                                                json!({
+                                                    "session_path": surface_session_path,
+                                                    "control_url": control_url,
+                                                    "effective_control": effective_control,
+                                                    "forwarded": forward_child.is_some(),
+                                                }),
+                                            );
+                                            state.with_mut(|shell| {
+                                                shell.upsert_web_surface_picker(
+                                                    &surface_session_path,
+                                                    effective_control,
+                                                    forward_child,
+                                                    now_ms,
+                                                );
+                                            });
+                                        }
+                                    }
                                     "open" | "heartbeat" => {
                                         let touched = state.with_mut(|shell| {
                                             shell.sweep_stale_web_surfaces(now_ms);
@@ -57768,6 +57995,22 @@ fn TerminalCanvas(
                     },
                 }
                 if let Some(web_overlay) = web_surface_overlay {
+                    if let Some(picker_control_url) = web_overlay.picker_control_url.clone() {
+                        // Picker phase (no-arg ychrome): profile choice is a
+                        // GUI-native step BEFORE any page exists — no tab bar,
+                        // no address bar, no localhost URL (Chrome-like).
+                        div {
+                            style: format!(
+                                "position:absolute; inset:0; z-index:40; display:flex; flex-direction:column; background:{}; border-radius:{};",
+                                theme.background, terminal_shell_radius,
+                            ),
+                            WebSurfacePickerView {
+                                control_url: picker_control_url,
+                                foreground: theme.foreground.clone(),
+                                background: theme.background.clone(),
+                            }
+                        }
+                    } else {
                     div {
                         style: format!(
                             "position:absolute; inset:0; z-index:40; display:flex; flex-direction:column; background:{}; border-radius:{};",
@@ -58080,11 +58323,145 @@ fn TerminalCanvas(
                             "data-ws-page": "{web_surface_session_path}",
                         }
                     }
+                    }
                 }
                 TerminalScrollController {
                     session_path: host_session_path.clone(),
                     host_id: host_id.clone(),
                     palette: terminal_scroll_controller_palette,
+                }
+            }
+        }
+    }
+}
+/// GUI-native ychrome profile picker (surface picker phase). Chrome-like:
+/// profile choice is a first-class step BEFORE any web page exists. Cards
+/// come from the GUI host's `~/.yggterm/web-profiles/` (+ Temporary + New);
+/// choosing GETs `/open?url=&profile=` on the app's control endpoint, whose
+/// handler re-emits the real OSC "open".
+#[component]
+fn WebSurfacePickerView(control_url: String, foreground: String, background: String) -> Element {
+    let mut url_input = use_signal(String::new);
+    let mut new_profile_input = use_signal(String::new);
+    let mut submitted = use_signal(|| false);
+    let profiles = enumerate_web_surface_profiles();
+    let choose = move |profile: String| {
+        if submitted() {
+            return;
+        }
+        submitted.set(true);
+        let get_url = format!(
+            "{}open?url={}&profile={}",
+            if control_url.ends_with('/') {
+                control_url.clone()
+            } else {
+                format!("{control_url}/")
+            },
+            web_surface_query_encode(url_input().trim()),
+            web_surface_query_encode(&profile),
+        );
+        spawn(async move {
+            let _ = task::spawn_blocking(move || web_surface_picker_control_get(&get_url)).await;
+        });
+    };
+    let mut choose_profile = choose.clone();
+    let mut choose_temp = choose.clone();
+    let mut choose_new = choose;
+    let muted = format!("color:{foreground}; opacity:0.6;");
+    let card_style = format!(
+        "display:flex; flex-direction:column; align-items:center; gap:9px; padding:18px 10px 14px; \
+         width:118px; border:1px solid rgba(127,127,127,0.35); border-radius:14px; cursor:pointer; \
+         background:rgba(127,127,127,0.10); color:{foreground}; font-size:13px;"
+    );
+    let avatar_style = "width:46px; height:46px; border-radius:50%; display:grid; place-items:center; \
+         font-size:20px; font-weight:600; color:#fff; background:linear-gradient(135deg,#6c8cff,#9a6bff);";
+    rsx! {
+        div {
+            style: format!(
+                "flex:1 1 auto; min-height:0; display:grid; place-items:center; background:{background}; color:{foreground}; \
+                 font-family:system-ui, sans-serif; overflow:auto;"
+            ),
+            div {
+                style: "width:min(600px, 92%); text-align:center; display:flex; flex-direction:column; gap:26px; padding:32px 0;",
+                div {
+                    style: "display:flex; flex-direction:column; gap:6px;",
+                    div { style: "font-size:22px; font-weight:600;", "Choose a profile" }
+                    div {
+                        style: format!("font-size:13px; {muted}"),
+                        if submitted() { "Opening…" } else { "Each profile keeps its own cookies and logins. Type a URL, or leave it blank to start on search." }
+                    }
+                }
+                input {
+                    r#type: "text",
+                    placeholder: "URL or search — e.g. localhost:8000",
+                    autocomplete: "off",
+                    spellcheck: "false",
+                    style: format!(
+                        "padding:12px 15px; font-size:15px; border:1px solid rgba(127,127,127,0.4); border-radius:11px; \
+                         background:rgba(127,127,127,0.10); color:{foreground}; outline:none; max-width:460px; width:100%; margin:0 auto;"
+                    ),
+                    value: "{url_input}",
+                    oninput: move |evt| url_input.set(evt.value()),
+                }
+                div {
+                    style: "display:flex; flex-wrap:wrap; gap:14px; justify-content:center;",
+                    for profile in profiles {
+                        button {
+                            key: "picker-{profile}",
+                            style: card_style.clone(),
+                            onclick: {
+                                let profile = profile.clone();
+                                let mut choose_profile = choose_profile.clone();
+                                move |_| choose_profile(profile.clone())
+                            },
+                            span {
+                                style: avatar_style,
+                                {profile.chars().next().map(|c| c.to_uppercase().to_string()).unwrap_or_default()}
+                            }
+                            span { "{profile}" }
+                        }
+                    }
+                    button {
+                        style: card_style.clone(),
+                        title: "No history, cookies or storage kept — everything vanishes on close",
+                        onclick: move |_| choose_temp(WEB_SURFACE_TEMP_PROFILE.to_string()),
+                        span {
+                            style: "width:46px; height:46px; border-radius:50%; display:grid; place-items:center; \
+                                    font-size:20px; font-weight:600; color:#fff; background:linear-gradient(135deg,#5f6672,#3a3f4a);",
+                            "⏲"
+                        }
+                        span { "Temporary" }
+                    }
+                    div {
+                        style: card_style.replace("cursor:pointer;", ""),
+                        span {
+                            style: format!(
+                                "width:46px; height:46px; border-radius:50%; display:grid; place-items:center; \
+                                 font-size:20px; font-weight:600; color:{foreground}; opacity:0.6; border:2px dashed rgba(127,127,127,0.6);"
+                            ),
+                            "+"
+                        }
+                        input {
+                            r#type: "text",
+                            placeholder: "new profile",
+                            autocomplete: "off",
+                            spellcheck: "false",
+                            style: format!(
+                                "width:100%; padding:6px 8px; font-size:12px; text-align:center; border:1px solid rgba(127,127,127,0.4); \
+                                 border-radius:8px; background:transparent; color:{foreground}; outline:none;"
+                            ),
+                            value: "{new_profile_input}",
+                            oninput: move |evt| new_profile_input.set(evt.value()),
+                            onkeydown: move |evt| {
+                                if evt.key() == Key::Enter {
+                                    let name = new_profile_input().trim().to_string();
+                                    if !name.is_empty() {
+                                        choose_new(name);
+                                    }
+                                }
+                            },
+                        }
+                    }
                 }
             }
         }
@@ -73252,7 +73629,13 @@ fn RightRail(
             }
         }
     });
-    let visible = requested_mode != RightPanelMode::Hidden;
+    // The app-sidebar belongs to the active app: with no live web surface on
+    // the active session (app exited, session switched, surface swept) the
+    // pane collapses — the mode stays AppSidebar so it re-reveals when the
+    // app is back, matching the icon's own visibility gate.
+    let app_sidebar_available = snapshot.active_web_surface_profile.is_some();
+    let visible = requested_mode != RightPanelMode::Hidden
+        && !(requested_mode == RightPanelMode::AppSidebar && !app_sidebar_available);
     let rendered_mode = if visible {
         requested_mode
     } else {
