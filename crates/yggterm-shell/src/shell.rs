@@ -51943,6 +51943,8 @@ fn TerminalCanvas(
         let delayed_recovery_bootstrap_identity = bootstrap_identity.clone();
         let delayed_recovery_task_identity = bootstrap_task_identity.clone();
         let delayed_recovery_session_path = session_path.clone();
+        let superseded_task_identity = bootstrap_task_identity.clone();
+        let superseded_bootstrap_identity = bootstrap_identity.clone();
         append_trace_event(
             &trace_home,
             "ui",
@@ -52035,11 +52037,28 @@ fn TerminalCanvas(
                     );
                 });
             };
+            // A superseded task must clear the component's task-identity latch
+            // on its way out (same pattern as the watch handlers). The latch
+            // means "a live task exists for this identity"; if the owner slot
+            // was stolen by something that never spawns a loop (e.g. a
+            // transient render-state drop during a switch removed the owner
+            // map entry), leaving the latch set wedges the session with a
+            // dead pipe — retained pixels but no output, no OSC, no recovery —
+            // until a NEW open request happens to change the identity (the
+            // user's "switch away and back to fix it"). Clearing it lets the
+            // very next render re-schedule; if a real successor task exists,
+            // its acquire keeps ownership and the re-schedule no-ops.
+            let clear_superseded_task_latch = || {
+                if *superseded_task_identity.borrow() == superseded_bootstrap_identity {
+                    *superseded_task_identity.borrow_mut() = String::new();
+                }
+            };
             if !bootstrap_owner_still_current(state) {
                 release_bootstrap_lease(
                     state,
                     "terminal_bootstrap_release_superseded_before_begin",
                 );
+                clear_superseded_task_latch();
                 append_trace_event(
                     &trace_home,
                     "ui",
@@ -52232,6 +52251,7 @@ fn TerminalCanvas(
                     state,
                     "terminal_bootstrap_release_superseded_after_ensure",
                 );
+                clear_superseded_task_latch();
                 append_trace_event(
                     &trace_home,
                     "ui",
@@ -52632,6 +52652,7 @@ fn TerminalCanvas(
                         state,
                         "terminal_bootstrap_release_superseded_during_loop",
                     );
+                    clear_superseded_task_latch();
                     append_trace_event(
                         &trace_home,
                         "ui",
