@@ -48967,13 +48967,20 @@ fn terminal_session_should_bootstrap_host(
     active_session_path: Option<&str>,
     session_path: &str,
 ) -> bool {
-    let live_active_session_path = if shell.server.active_view_mode() == WorkspaceViewMode::Terminal
-    {
-        shell.server.active_session_path().or(active_session_path)
-    } else {
-        None
-    };
-    live_active_session_path == Some(session_path)
+    if shell.server.active_view_mode() != WorkspaceViewMode::Terminal {
+        return false;
+    }
+    // Bootstrap when EITHER the server live state OR the render snapshot says
+    // this session is active. During a switch the server-side active path lags
+    // the click by one request round-trip; gating on the live value alone
+    // skipped the spawn for the freshly ACTIVATED session
+    // (bootstrap_spawn_skipped_inactive_retained_host on the session the user
+    // just clicked) and the skip-identity latch kept the host blank until the
+    // user switched away and back — the "session did not mount" bug. A stale
+    // snapshot claiming the OUTGOING session merely boots a host that is
+    // retained anyway; a skipped spawn on the INCOMING one is a blank viewport.
+    shell.server.active_session_path() == Some(session_path)
+        || active_session_path == Some(session_path)
 }
 
 fn next_terminal_bootstrap_owner_id() -> u64 {
@@ -58161,6 +58168,10 @@ fn TerminalCanvas(
                         // GUI-native step BEFORE any page exists — no tab bar,
                         // no address bar, no localhost URL (Chrome-like).
                         div {
+                            // Focus-reclaim scripts treat elements inside this
+                            // container as UI-owned (uiOwnsFocus), so the
+                            // picker's inputs keep keyboard focus.
+                            "data-yggterm-web-picker": "1",
                             style: format!(
                                 "position:absolute; inset:0; z-index:40; display:flex; flex-direction:column; background:{}; border-radius:{};",
                                 theme.background, terminal_shell_radius,
@@ -61791,6 +61802,22 @@ fn blur_terminal_focus_blocking_inputs_script() -> String {
     )
 }
 fn reclaim_active_terminal_input_from_viewport_click(mut state: Signal<ShellState>) {
+    // A live web surface (picker overlay or native page) owns the viewport:
+    // the click the user just made was FOR that surface, not the terminal.
+    // Reclaiming here stole focus from the picker's inputs on a 0..980ms timer
+    // fan (the "clicked the input and lost focus / nothing works" bug) and the
+    // state mutation forced a re-render between mousedown and mouseup, which
+    // replaces the clicked node and swallows the click on the picker cards.
+    let web_surface_owns_viewport = {
+        let shell = state.read();
+        shell
+            .server
+            .active_session_path()
+            .is_some_and(|path| shell.has_live_web_surface(path, current_millis()))
+    };
+    if web_surface_owns_viewport {
+        return;
+    }
     state.with_mut(|shell| {
         shell.dismiss_titlebar_transients();
         shell.terminal_input_override_active = true;
@@ -72668,6 +72695,7 @@ fn terminal_reclaim_focus_script_for_session(session_path: &str) -> String {
                 || (active.closest && active.closest('[data-yggui-side-rail="1"]'))
                 || (active.closest && active.closest('[data-theme-editor-overlay="1"]'))
                 || (active.closest && active.closest('[data-theme-editor-shell="1"]'))
+                || (active.closest && active.closest('[data-yggterm-web-picker="1"]'))
                 || (active.closest && active.closest('#yggterm-sidebar'))
                 || Boolean(settingsFieldKey)
               ) {{
@@ -99756,6 +99784,33 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             &shell,
             active_session_path,
             "host-active"
+        ));
+    }
+
+    #[test]
+    fn freshly_activated_session_bootstraps_while_server_active_path_lags() {
+        // During a switch the server-side active path lags the click by one
+        // request round-trip. The mount effect renders with a snapshot that
+        // already claims the NEW session; gating the spawn on the live server
+        // value alone skipped it (bootstrap_spawn_skipped_inactive_retained_host
+        // on the clicked session) and left the viewport blank until the user
+        // switched away and back.
+        let old_active = "remote-cc://dev/old-active";
+        let clicked = "remote-cc://dev/just-clicked";
+        let bootstrap = test_shell_bootstrap_with_active_session(old_active);
+        let shell = ShellState::new(bootstrap);
+        // Server still says old_active; the render snapshot says clicked.
+        assert!(terminal_session_should_bootstrap_host(
+            &shell,
+            Some(clicked),
+            clicked
+        ));
+        // A background retained session (neither server nor snapshot active)
+        // still must NOT bootstrap.
+        assert!(!terminal_session_should_bootstrap_host(
+            &shell,
+            Some(clicked),
+            "remote-cc://dev/background"
         ));
     }
 
