@@ -394,6 +394,10 @@ const REMOTE_LIVE_PREWARM_ROWS: u16 = 50;
 const REMOTE_TERMINAL_ATTACH_CONFIRMATION_MIN_MS: u64 = 1_500;
 const REMOTE_TERMINAL_ATTACH_CONNECTED_GRACE_MS: u64 = 280;
 const STARTUP_TERMINAL_RESTORE_RECOVERY_MS: u64 = 5_000;
+// Cap on consecutive startup-restore recoveries without a Ready in between —
+// past this, further remounts are futile churn (see
+// startup_terminal_restore_should_recover).
+const STARTUP_TERMINAL_RESTORE_MAX_RECOVERIES: u32 = 3;
 const RETAINED_EMPTY_SURFACE_RECOVERY_REARM_MS: u64 = 900;
 const RETAINED_FAULT_READY_SETTLE_GRACE_MS: u64 = 1_500;
 // HOT switch-back: when a retained host that previously reached ready (and
@@ -2189,6 +2193,12 @@ struct ShellState {
     // See [[finding-cc-blink-dead-session-remount-loop]].
     terminal_cold_remount_count: HashMap<String, u32>,
     terminal_cold_remount_since_ms: HashMap<String, u64>,
+    // Consecutive startup-restore recoveries (each an epoch bump + re-seed) of a
+    // session that never latched Ready in between. Caps the unbounded 5s
+    // recover loop on a session whose surface stays "empty" no matter how often
+    // it is remounted (dead PTY, or an app surface covering the viewport).
+    // Reset on Ready and on any user-driven open.
+    startup_restore_recover_streak: HashMap<String, u32>,
     // Per-session deadline through which the fault-recovery watchdog treats a
     // benign "xterm surface is empty" on a revealed retained host (one that
     // already reached ready and whose daemon still owns the PTY) as a transient
@@ -3670,6 +3680,7 @@ impl ShellState {
             retained_fault_recovery_latch_grace_until_ms: HashMap::new(),
             retained_fault_recovery_loop_armed_at_ms: HashMap::new(),
             terminal_cold_remount_count: HashMap::new(),
+            startup_restore_recover_streak: HashMap::new(),
             terminal_cold_remount_since_ms: HashMap::new(),
             terminal_reveal_grace_until_ms: HashMap::new(),
             terminal_sessions_reached_ready: HashSet::new(),
@@ -5144,6 +5155,9 @@ impl ShellState {
                 session_path.to_string(),
                 current_millis().saturating_add(RETAINED_FAULT_RECOVERY_LATCH_GRACE_MS),
             );
+            // A user-driven open is fresh intent — re-open the startup-restore
+            // recovery budget for this session.
+            self.startup_restore_recover_streak.remove(session_path);
         }
         // Arm the RetainedFaultRecoveryLoop gate. A non-RFR open is the
         // start of a fresh user-felt loop, so when the next RFR attempt
@@ -5488,6 +5502,9 @@ impl ShellState {
         // Cleared in drop_terminal_render_state_for_session.
         self.terminal_sessions_reached_ready
             .insert(session_path.to_string());
+        // Reaching Ready proves recovery isn't futile — re-open the
+        // startup-restore recovery budget.
+        self.startup_restore_recover_streak.remove(session_path);
         let mut ready_snapshot = None;
         let mut first_ready_for_reveal_log = false;
         if let Some(attempt) = self.terminal_open_attempts.get_mut(&attempt_id) {
@@ -5597,24 +5614,38 @@ impl ShellState {
             attempt.first_protocol_only_output_at_ms = Some(now_ms);
             event_name.get_or_insert("first_protocol_only_output");
         }
-        if meaningful && attempt.first_meaningful_output_at_ms.is_none() {
-            attempt.first_meaningful_output_at_ms = Some(now_ms);
-            event_name.get_or_insert("first_meaningful_output");
+        // Meaningful output is latched via
+        // `mark_terminal_open_attempt_first_meaningful_output_for_session` below
+        // (after this borrow ends), NOT inline: setting the timestamp here used
+        // to make that function early-return when the JS-side meaningful-output
+        // event arrived later, which STARVED the daemon-owned fast-ready latch —
+        // attempts on live, working sessions never reached Ready, so
+        // `was_ever_ready` stayed false and every periodic re-assert /
+        // retained-fault rearm cold-remounted the healthy host (the 60s remount
+        // storm under sustained output; the freeze + fan). Daemon output on a
+        // daemon-owned PTY is exactly the readiness signal that latch encodes.
+        let latch_meaningful = meaningful && attempt.first_meaningful_output_at_ms.is_none();
+        if let Some(event_name) = event_name {
+            let attempt_snapshot = attempt.clone();
+            self.record_terminal_open_attempt_event(
+                event_name,
+                &attempt_snapshot,
+                Some(json!({
+                    "reason": reason,
+                    "bytes": bytes,
+                    "meaningful": meaningful,
+                    "protocol_only": protocol_only,
+                })),
+            );
         }
-        let Some(event_name) = event_name else {
-            return;
-        };
-        let attempt_snapshot = attempt.clone();
-        self.record_terminal_open_attempt_event(
-            event_name,
-            &attempt_snapshot,
-            Some(json!({
-                "reason": reason,
-                "bytes": bytes,
-                "meaningful": meaningful,
-                "protocol_only": protocol_only,
-            })),
-        );
+        if latch_meaningful {
+            self.mark_terminal_open_attempt_first_meaningful_output_for_session(
+                session_path,
+                reason,
+                false,
+                false,
+            );
+        }
     }
     /// Whether the first meaningful output of an open attempt should fast-ready
     /// the reveal (declare ready immediately instead of waiting for the settle
@@ -5807,6 +5838,21 @@ impl ShellState {
             .and_then(|value| value.get("problem"))
             .and_then(Value::as_str)
             .map(str::to_string);
+        // A live web surface (ychrome et al.) covers the viewport, so the xterm
+        // behind it is EXPECTED to look blank — an "xterm surface is empty"
+        // reading is not a fault and must not latch onto the attempt, where the
+        // startup-restore / retained-fault recovery loops would read it and
+        // cold-remount the session every watch tick (each remount replays the
+        // app OSC and destroys/recreates the web surface: the picker/ychrome
+        // "nothing works" churn). Content-based health reads are meaningless
+        // while the terminal is not the user-facing surface.
+        let web_surface_covers_viewport = self.has_live_web_surface(active_session_path, now_ms);
+        let surface_problem = surface_problem.filter(|problem| {
+            !(web_surface_covers_viewport && surface_problem_is_empty_xterm(problem))
+        });
+        let reason = reason.filter(|reason| {
+            !(web_surface_covers_viewport && surface_problem_is_empty_xterm(reason))
+        });
         let clean_interactive_terminal_surface =
             ready && interactive && settled_kind == "interactive" && surface_problem.is_none();
         let failure_reason = terminal_open_attempt_failure_reason_from_viewport(viewport);
@@ -7879,6 +7925,28 @@ impl ShellState {
         active_session_path: &str,
         now_ms: u64,
     ) -> bool {
+        // A live web surface owns the viewport: a blank xterm behind it is
+        // expected, and remounting the terminal would replay the app OSC and
+        // destroy/recreate the surface every watch tick (the 5s ychrome churn
+        // storm). Observation-side neutralization covers NEW readings; this
+        // covers a problem latched before the surface came up.
+        if self.has_live_web_surface(active_session_path, now_ms) {
+            return false;
+        }
+        // Futile-recovery cap: each recovery here tears down and re-seeds the
+        // viewport. If N consecutive recoveries ran without the session ever
+        // latching Ready, another remount won't change the outcome — stop the
+        // unbounded 5s epoch-bump loop (observed live at epoch 179+, pegging
+        // the CPU). The streak resets on any Ready and on any user-driven open.
+        if self
+            .startup_restore_recover_streak
+            .get(active_session_path)
+            .copied()
+            .unwrap_or(0)
+            >= STARTUP_TERMINAL_RESTORE_MAX_RECOVERIES
+        {
+            return false;
+        }
         let mut stale_attempt_empty_surface = false;
         let stale_startup_attempt = self
             .latest_terminal_open_attempt_for_path(active_session_path)
@@ -7939,6 +8007,10 @@ impl ShellState {
         if !self.startup_terminal_restore_should_recover(active_session_path, now_ms) {
             return false;
         }
+        *self
+            .startup_restore_recover_streak
+            .entry(active_session_path.to_string())
+            .or_insert(0) += 1;
         if let Some(attempt_id) = self
             .terminal_open_attempt_by_session
             .get(active_session_path)
@@ -10568,6 +10640,12 @@ fn terminal_resume_notification_job_key(session_path: &str) -> String {
 /// classify against this so the detection can never drift between callsites.
 fn surface_problem_is_codex_session_gone(surface_problem: Option<&str>) -> bool {
     surface_problem.is_some_and(|problem| problem.contains("Codex session no longer on remote machine"))
+}
+/// The single "blank xterm" classification string, matched exactly the way the
+/// recovery deciders (`startup_terminal_restore_should_recover`,
+/// `latest_terminal_open_attempt_has_empty_surface`) read it back.
+fn surface_problem_is_empty_xterm(problem: &str) -> bool {
+    problem == "active terminal host exists but xterm surface is empty"
 }
 fn terminal_resume_notification_session_path(job_key: &str) -> Option<&str> {
     job_key.strip_prefix("terminal-resume:")
@@ -96772,6 +96850,95 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
     }
 
     #[test]
+    fn startup_terminal_restore_recovery_skips_session_with_live_web_surface() {
+        // A live web surface (ychrome) owns the viewport; the xterm behind it
+        // is expected to look blank. Recovery would remount the terminal every
+        // watch tick, replaying the app OSC and destroying/recreating the
+        // surface — the 5s ychrome churn storm.
+        let active_session_path = "local://test";
+        let bootstrap = test_shell_bootstrap_with_active_session(active_session_path);
+        let mut shell = ShellState::new(bootstrap);
+        shell.server_busy = false;
+        shell.server.set_view_mode(WorkspaceViewMode::Terminal);
+        shell
+            .terminal_attach_in_flight
+            .insert(active_session_path.to_string());
+        let attempt_id = shell.begin_terminal_open_attempt(
+            active_session_path,
+            "req-test",
+            1,
+            "startup_restore",
+        );
+        if let Some(attempt) = shell.terminal_open_attempts.get_mut(&attempt_id) {
+            attempt.started_at_ms =
+                current_millis().saturating_sub(STARTUP_TERMINAL_RESTORE_RECOVERY_MS + 1);
+        }
+        assert!(
+            shell.startup_terminal_restore_should_recover(active_session_path, current_millis()),
+            "baseline: stale startup attempt must be recoverable without a web surface"
+        );
+        shell.upsert_web_surface(
+            active_session_path,
+            "http://127.0.0.1:45975/".to_string(),
+            None,
+            "http://127.0.0.1:45975/".to_string(),
+            None,
+            None,
+            "default".to_string(),
+            current_millis(),
+        );
+        assert!(
+            !shell.startup_terminal_restore_should_recover(active_session_path, current_millis()),
+            "a live web surface must suppress startup-restore recovery"
+        );
+    }
+    #[test]
+    fn startup_terminal_restore_recovery_streak_caps_then_resets_on_ready() {
+        // The recover loop used to bump the mount epoch every 5s forever
+        // (observed live at epoch 179+). After N consecutive recoveries with
+        // no Ready in between, further recoveries are futile churn and must
+        // stop; reaching Ready re-opens the budget.
+        let active_session_path = "local://test";
+        let bootstrap = test_shell_bootstrap_with_active_session(active_session_path);
+        let mut shell = ShellState::new(bootstrap);
+        shell.server_busy = false;
+        shell.server.set_view_mode(WorkspaceViewMode::Terminal);
+        let make_stale = |shell: &mut ShellState, request: u64| {
+            shell
+                .terminal_attach_in_flight
+                .insert(active_session_path.to_string());
+            let attempt_id = shell.begin_terminal_open_attempt(
+                active_session_path,
+                "req-test",
+                request,
+                "startup_restore",
+            );
+            if let Some(attempt) = shell.terminal_open_attempts.get_mut(&attempt_id) {
+                attempt.started_at_ms =
+                    current_millis().saturating_sub(STARTUP_TERMINAL_RESTORE_RECOVERY_MS + 1);
+            }
+        };
+        for round in 0..STARTUP_TERMINAL_RESTORE_MAX_RECOVERIES {
+            make_stale(&mut shell, u64::from(round) + 1);
+            assert!(
+                shell.recover_startup_terminal_restore(active_session_path, current_millis()),
+                "recovery {round} within the budget must run"
+            );
+        }
+        make_stale(&mut shell, u64::from(STARTUP_TERMINAL_RESTORE_MAX_RECOVERIES) + 1);
+        assert!(
+            !shell.recover_startup_terminal_restore(active_session_path, current_millis()),
+            "recovery past the futile cap must be suppressed"
+        );
+        // Ready proves recovery isn't futile — the budget re-opens.
+        shell.mark_terminal_open_attempt_ready_for_session(active_session_path, "test_ready");
+        make_stale(&mut shell, u64::from(STARTUP_TERMINAL_RESTORE_MAX_RECOVERIES) + 2);
+        assert!(
+            shell.recover_startup_terminal_restore(active_session_path, current_millis()),
+            "reaching Ready must reset the futile-recovery streak"
+        );
+    }
+    #[test]
     fn terminal_open_begin_clears_stale_active_host_identity_on_switch() {
         let active_session_path = "remote-session://practice/current";
         let bootstrap = test_shell_bootstrap_with_active_session(active_session_path);
@@ -98364,6 +98531,155 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         assert!(
             attempt.ready_at_ms.is_none(),
             "COLD session must NOT fast-ready"
+        );
+    }
+
+    #[test]
+    fn daemon_output_first_output_marker_fast_readies_daemon_owned_attempt() {
+        // The forward loop marks first output (reason "daemon_output") BEFORE
+        // the JS-side meaningful-output event arrives. Setting
+        // first_meaningful_output_at_ms inline there made the later fast-ready
+        // call early-return, so attempts on live working sessions NEVER latched
+        // Ready — was_ever_ready stayed false and every periodic re-assert /
+        // retained-fault rearm cold-remounted the healthy host (the 60s remount
+        // storm under sustained output). The marker itself must run the
+        // daemon-owned fast-ready latch.
+        let session_path = "remote-session://dev/daemon-owned-working";
+        let bootstrap = test_shell_bootstrap_with_active_session(session_path);
+        let mut shell = ShellState::new(bootstrap);
+        let owned_runtime_key = shell.server.terminal_runtime_key_for_path(session_path);
+        shell.latest_runtime_status = Some(
+            serde_json::from_value(json!({
+                "server_version": "2.9.61",
+                "server_build_id": 0,
+                "server_pid": 12345,
+                "host_kind": "local",
+                "host_detail": "test",
+                "embedded_surface_supported": true,
+                "bridge_enabled": true,
+                "terminal_session_count": 1,
+                "terminal_session_keys": [owned_runtime_key.clone()],
+                "owned_terminal_session_count": 1,
+                "owned_terminal_session_keys": [owned_runtime_key],
+                "managed_session_count": 0,
+            }))
+            .expect("runtime status"),
+        );
+        let attempt_id = shell.begin_terminal_open_attempt(
+            session_path,
+            "req-daemon",
+            1,
+            "retained_fault_recovery",
+        );
+        shell.mark_terminal_open_attempt_first_output_for_session(
+            session_path,
+            "daemon_output",
+            4096,
+            /* meaningful = */ true,
+            /* protocol_only = */ false,
+        );
+        let attempt = shell.terminal_open_attempts.get(&attempt_id).unwrap();
+        assert!(attempt.first_output_at_ms.is_some());
+        assert!(attempt.first_meaningful_output_at_ms.is_some());
+        assert!(
+            attempt.ready_at_ms.is_some(),
+            "daemon-owned meaningful daemon output must fast-ready via the forward-loop marker"
+        );
+        assert!(matches!(attempt.state, TerminalOpenAttemptState::Ready));
+    }
+
+    #[test]
+    fn protocol_only_first_output_marker_does_not_fast_ready() {
+        // OSC-only output (e.g. a web-surface heartbeat) is not meaningful
+        // content — it must not latch readiness.
+        let session_path = "remote-session://dev/protocol-only";
+        let bootstrap = test_shell_bootstrap_with_active_session(session_path);
+        let mut shell = ShellState::new(bootstrap);
+        let owned_runtime_key = shell.server.terminal_runtime_key_for_path(session_path);
+        shell.latest_runtime_status = Some(
+            serde_json::from_value(json!({
+                "server_version": "2.9.61",
+                "server_build_id": 0,
+                "server_pid": 12345,
+                "host_kind": "local",
+                "host_detail": "test",
+                "embedded_surface_supported": true,
+                "bridge_enabled": true,
+                "terminal_session_count": 1,
+                "terminal_session_keys": [owned_runtime_key.clone()],
+                "owned_terminal_session_count": 1,
+                "owned_terminal_session_keys": [owned_runtime_key],
+                "managed_session_count": 0,
+            }))
+            .expect("runtime status"),
+        );
+        let attempt_id =
+            shell.begin_terminal_open_attempt(session_path, "req-osc", 1, "startup_restore");
+        shell.mark_terminal_open_attempt_first_output_for_session(
+            session_path,
+            "protocol_only_output",
+            32,
+            /* meaningful = */ false,
+            /* protocol_only = */ true,
+        );
+        let attempt = shell.terminal_open_attempts.get(&attempt_id).unwrap();
+        assert!(attempt.first_protocol_only_output_at_ms.is_some());
+        assert!(attempt.first_meaningful_output_at_ms.is_none());
+        assert!(
+            attempt.ready_at_ms.is_none(),
+            "protocol-only output must NOT fast-ready"
+        );
+    }
+
+    #[test]
+    fn viewport_empty_xterm_reading_is_not_a_fault_while_web_surface_live() {
+        // A live web surface covers the viewport, so "xterm surface is empty"
+        // is the EXPECTED state, not a fault. Latching it fed the
+        // startup-restore recovery loop (5s remount churn under ychrome).
+        let session_path = "local://web-surface-session";
+        let mut shell = ShellState::new(test_shell_bootstrap_with_active_session(session_path));
+        shell.server.set_view_mode(WorkspaceViewMode::Terminal);
+        let attempt_id =
+            shell.begin_terminal_open_attempt(session_path, "req-web", 1, "startup_restore");
+        shell.upsert_web_surface(
+            session_path,
+            "http://127.0.0.1:45975/".to_string(),
+            None,
+            "http://127.0.0.1:45975/".to_string(),
+            None,
+            None,
+            "default".to_string(),
+            current_millis(),
+        );
+        shell.observe_terminal_open_attempt_from_viewport(&json!({
+            "active_session_path": session_path,
+            "active_view_mode": "Terminal",
+            "ready": false,
+            "interactive": false,
+            "terminal_settled_kind": "problem",
+            "reason": "active terminal host exists but xterm surface is empty",
+            "terminal_resume_overlay": {
+                "visible": false,
+                "kind": "",
+                "phase": "hidden",
+                "text_sample": ""
+            },
+            "active_terminal_surface": {
+                "problem": "active terminal host exists but xterm surface is empty"
+            }
+        }));
+        let attempt = shell.terminal_open_attempts.get(&attempt_id).unwrap();
+        assert!(
+            attempt.last_surface_problem.is_none(),
+            "empty-xterm problem must not latch while a web surface is live"
+        );
+        assert!(
+            attempt.last_observed_reason.is_none(),
+            "empty-xterm reason must not latch while a web surface is live"
+        );
+        assert!(
+            !shell.latest_terminal_open_attempt_has_empty_surface(session_path),
+            "recovery deciders must not read an empty-surface fault"
         );
     }
 
@@ -101751,6 +102067,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             active_view_mode: WorkspaceViewMode::Terminal,
             retained_terminal_sessions: vec![session.clone()],
             terminal_mount_epochs: HashMap::new(),
+            active_web_surface_profile: None,
             ssh_targets: Vec::new(),
             remote_machines: Vec::new(),
             live_sessions: vec![session],
@@ -102323,6 +102640,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             active_view_mode: WorkspaceViewMode::Terminal,
             retained_terminal_sessions: vec![stale_session.clone(), active_session.clone()],
             terminal_mount_epochs: HashMap::new(),
+            active_web_surface_profile: None,
             ssh_targets: Vec::new(),
             remote_machines: Vec::new(),
             live_sessions: vec![stale_session, active_session],
@@ -102465,6 +102783,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             active_view_mode: WorkspaceViewMode::Rendered,
             retained_terminal_sessions: vec![active_session.clone()],
             terminal_mount_epochs: HashMap::new(),
+            active_web_surface_profile: None,
             ssh_targets: Vec::new(),
             remote_machines: Vec::new(),
             live_sessions: vec![active_session],
@@ -102607,6 +102926,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             active_view_mode: WorkspaceViewMode::Rendered,
             retained_terminal_sessions: vec![active_session.clone()],
             terminal_mount_epochs: HashMap::new(),
+            active_web_surface_profile: None,
             ssh_targets: Vec::new(),
             remote_machines: Vec::new(),
             live_sessions: vec![active_session],
@@ -102752,6 +103072,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             active_view_mode: WorkspaceViewMode::Rendered,
             retained_terminal_sessions: vec![active_session.clone()],
             terminal_mount_epochs: HashMap::new(),
+            active_web_surface_profile: None,
             ssh_targets: Vec::new(),
             remote_machines: Vec::new(),
             live_sessions: vec![active_session],
@@ -102901,6 +103222,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             active_view_mode: WorkspaceViewMode::Rendered,
             retained_terminal_sessions: vec![active_session.clone()],
             terminal_mount_epochs: HashMap::new(),
+            active_web_surface_profile: None,
             ssh_targets: Vec::new(),
             remote_machines: Vec::new(),
             live_sessions: vec![active_session],
@@ -103042,6 +103364,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             active_view_mode: WorkspaceViewMode::Terminal,
             retained_terminal_sessions: vec![active_session.clone()],
             terminal_mount_epochs: HashMap::new(),
+            active_web_surface_profile: None,
             ssh_targets: Vec::new(),
             remote_machines: Vec::new(),
             live_sessions: vec![active_session],
@@ -103183,6 +103506,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             active_view_mode: WorkspaceViewMode::Terminal,
             retained_terminal_sessions: vec![active_session.clone()],
             terminal_mount_epochs: HashMap::new(),
+            active_web_surface_profile: None,
             ssh_targets: Vec::new(),
             remote_machines: Vec::new(),
             live_sessions: vec![active_session],
@@ -103358,6 +103682,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             active_view_mode: WorkspaceViewMode::Terminal,
             retained_terminal_sessions: vec![restored_remote.clone(), active_session.clone()],
             terminal_mount_epochs: HashMap::new(),
+            active_web_surface_profile: None,
             ssh_targets: Vec::new(),
             remote_machines: Vec::new(),
             live_sessions: vec![restored_remote, active_session.clone()],
@@ -103502,6 +103827,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             active_view_mode: WorkspaceViewMode::Terminal,
             retained_terminal_sessions: vec![active_session.clone()],
             terminal_mount_epochs: HashMap::new(),
+            active_web_surface_profile: None,
             ssh_targets: Vec::new(),
             remote_machines: Vec::new(),
             live_sessions: vec![active_session],
@@ -103678,6 +104004,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             active_view_mode: WorkspaceViewMode::Terminal,
             retained_terminal_sessions: vec![live_session.clone()],
             terminal_mount_epochs: HashMap::new(),
+            active_web_surface_profile: None,
             ssh_targets: Vec::new(),
             remote_machines: Vec::new(),
             live_sessions: vec![live_session],
@@ -104031,6 +104358,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             active_view_mode: WorkspaceViewMode::Rendered,
             retained_terminal_sessions: Vec::new(),
             terminal_mount_epochs: HashMap::new(),
+            active_web_surface_profile: None,
             ssh_targets: Vec::new(),
             remote_machines: Vec::new(),
             live_sessions: Vec::new(),
