@@ -17116,6 +17116,19 @@ pub fn run_app_control_pointer(
     Ok(())
 }
 
+pub fn run_app_control_dom_eval(script: &str, timeout_ms: u64) -> anyhow::Result<()> {
+    let home = resolve_yggterm_home()?;
+    let response = request_app_control(
+        &home,
+        AppControlCommand::DomEval {
+            script: script.to_string(),
+        },
+        timeout_ms,
+    )?;
+    write_stdout_payload(&serde_json::to_string_pretty(&response)?)?;
+    Ok(())
+}
+
 pub fn run_app_control_key(
     action: &str,
     keys: &[String],
