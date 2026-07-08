@@ -63,8 +63,11 @@ impl WebSurfaceHost {
     /// `url`. If `socks_port` is set the surface egresses through
     /// `socks5://127.0.0.1:<port>` (the invoking host's tunnel) — the egress
     /// rule. `profile_dir` is the surface's persistent storage jar (cookies/
-    /// localStorage); `None` = ephemeral. Bounds are logical pixels relative to
-    /// the window's top-left.
+    /// localStorage); `None` = ephemeral. `userscripts` are injected into the
+    /// TOP frame at document-start on every page this surface loads (the
+    /// userscript/content-policy substrate: SponsorBlock-class scripts,
+    /// cosmetic filters, autofill). Bounds are logical pixels relative to the
+    /// window's top-left.
     #[allow(clippy::too_many_arguments)]
     pub fn open(
         &self,
@@ -72,6 +75,7 @@ impl WebSurfaceHost {
         url: &str,
         socks_port: Option<u16>,
         profile_dir: Option<&std::path::Path>,
+        userscripts: &[String],
         x: i32,
         y: i32,
         w: i32,
@@ -113,6 +117,9 @@ impl WebSurfaceHost {
                 host: "127.0.0.1".to_string(),
                 port: port.to_string(),
             }));
+        }
+        for script in userscripts {
+            builder = builder.with_initialization_script_for_main_only(script.as_str(), true);
         }
 
         let webview = {
