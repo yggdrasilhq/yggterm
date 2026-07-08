@@ -38155,11 +38155,17 @@ async fn process_pending_app_control_requests(
                     let target_main = match target {
                         AppControlGridTarget::Main => true,
                         AppControlGridTarget::Surface => false,
+                        // Auto = what the user sees. A picker-phase surface is
+                        // a Dioxus overlay (no native webview to eval into),
+                        // so only a live POST-pick surface selects `surface`.
                         AppControlGridTarget::Auto => !state.with(|shell| {
-                            shell
-                                .server
-                                .active_session_path()
-                                .is_some_and(|path| shell.has_live_web_surface(path, current_millis()))
+                            shell.server.active_session_path().is_some_and(|path| {
+                                shell.has_live_web_surface(path, current_millis())
+                                    && shell
+                                        .web_surfaces
+                                        .get(path)
+                                        .is_some_and(|surface| surface.picker.is_none())
+                            })
                         }),
                     };
                     let session_path = if target_main {
