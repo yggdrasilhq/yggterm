@@ -8767,8 +8767,72 @@ pub fn hot_restart_detailed(
     }
 }
 
+/// The first daemon version whose `Shutdown` does not write into live prompts.
+///
+/// Before it, `shutdown_all` WROTE `/exit\r` (Claude Code), `/quit\r` (codex) or
+/// `exit\r` (shells) into every live PTY. A PTY write is appended to whatever
+/// the user has already typed and submitted, so a half-written prompt fired with
+/// `/exit` stuck on the end. [[finding-never-type-into-a-live-prompt]]
+pub const FIRST_VERSION_WITH_SIGNAL_BASED_SHUTDOWN: &str = "2.9.66";
+
+fn daemon_version_triplet(version: &str) -> Option<(u64, u64, u64)> {
+    let mut parts = version.trim().split('.');
+    let major = parts.next()?.parse::<u64>().ok()?;
+    let minor = parts.next().unwrap_or("0").parse::<u64>().ok()?;
+    let patch = parts.next().unwrap_or("0").parse::<u64>().ok()?;
+    Some((major, minor, patch))
+}
+
+/// Would asking a daemon of this version to `Shutdown` type into the user's
+/// prompts? An unparseable version is assumed to be old — the safe direction.
+pub fn daemon_shutdown_writes_into_prompts(server_version: &str) -> bool {
+    let Some(version) = daemon_version_triplet(server_version) else {
+        return true;
+    };
+    let first_safe = daemon_version_triplet(FIRST_VERSION_WITH_SIGNAL_BASED_SHUTDOWN)
+        .expect("the constant is a valid triplet");
+    version < first_safe
+}
+
+/// Stop a daemon, never making it type into a live prompt.
+///
+/// A current daemon gets `Shutdown`: its `terminal_stop_command` returns `None`
+/// for anything with a prompt, so `shutdown_all` signals the children instead of
+/// writing to them. A daemon older than
+/// [`FIRST_VERSION_WITH_SIGNAL_BASED_SHUTDOWN`] would write, so it is asked to
+/// `RetireDaemon` (which never touches terminals) and, if it lingers, signalled.
+/// Closing the PTY master delivers SIGHUP to its children — the same thing a
+/// terminal emulator does when its window closes.
+///
+/// This is the ONE entry point. Every caller — the GUI's legacy-daemon cleanup,
+/// the headless monitor's fallback, the `server shutdown` verb — routes here, so
+/// no code path can resurrect the prompt injection.
 pub fn shutdown(endpoint: &ServerEndpoint) -> Result<Option<String>> {
-    expect_ack(send_request(endpoint, &ServerRequest::Shutdown)?)
+    let legacy_pid = match status(endpoint) {
+        Ok(runtime) if daemon_shutdown_writes_into_prompts(&runtime.server_version) => {
+            Some(runtime.server_pid)
+        }
+        // Current daemon, or unreachable (nothing to protect).
+        _ => None,
+    };
+    let Some(pid) = legacy_pid else {
+        return expect_ack(send_request(endpoint, &ServerRequest::Shutdown)?);
+    };
+    let message = retire_daemon(endpoint, Some("legacy_shutdown_would_type_into_prompts"))?;
+    for _ in 0..20 {
+        if status(endpoint).is_err() {
+            return Ok(message);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    // Still answering: close it the way a terminal emulator closes a window.
+    // SAFETY: `pid` is the daemon that just answered our status request.
+    #[cfg(unix)]
+    unsafe {
+        libc::kill(pid as libc::pid_t, libc::SIGTERM);
+    }
+    let _ = pid;
+    Ok(message)
 }
 
 pub fn retire_daemon(endpoint: &ServerEndpoint, reason: Option<&str>) -> Result<Option<String>> {
@@ -11552,6 +11616,28 @@ fn terminal_write_strategy_for_path(
 
 #[cfg(test)]
 mod tests {
+    // `shutdown()` must never make a pre-2.9.66 daemon type `/exit` into the
+    // user's prompt. An unparseable version is treated as OLD — the safe
+    // direction, because guessing "new" writes into a live prompt.
+    #[test]
+    fn legacy_daemons_are_never_asked_to_shutdown_by_typing() {
+        use super::daemon_shutdown_writes_into_prompts as types;
+
+        for old in ["2.9.63", "2.9.65", "2.9.0", "2.8.99", "1.99.99"] {
+            assert!(types(old), "{old} writes into prompts on Shutdown");
+        }
+        for safe in ["2.9.66", "2.9.67", "2.9.100", "2.10.0", "3.0.0"] {
+            assert!(!types(safe), "{safe} signals instead of writing");
+        }
+        // 2.9.66 is the boundary itself, and a nonsense version fails safe.
+        assert!(!types(super::FIRST_VERSION_WITH_SIGNAL_BASED_SHUTDOWN));
+        for junk in ["", "dev", "2.x.3", "not-a-version"] {
+            assert!(types(junk), "{junk:?} must fail safe (assume old)");
+        }
+        // Ordering is numeric, not lexicographic: "2.9.9" < "2.9.66" as text.
+        assert!(types("2.9.9"), "2.9.9 really is older than 2.9.66");
+    }
+
     // The guard that stops a booting daemon from resurrecting a live
     // predecessor's sessions out of server-state.json. Placed first because it
     // is the one thing standing between a two-daemon window and the 2026-07-09
