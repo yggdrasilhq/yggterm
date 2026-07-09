@@ -12,10 +12,19 @@ This file tracks user-visible changes in `yggterm`.
   (FocusLive for a session the daemon already tracks, OpenRemoteSession for a scan-only remote), so
   it works for Codex, Claude Code, and shells alike. `yggterm server connect --list` enumerates the
   connectable sessions (in the scan but not live), newest first, so you can find the one you want.
-- **Set the Live Sessions row order from the CLI: `yggterm server reorder`.** Connecting a session
-  puts its row on top, which buries an ordering you cared about. `yggterm server reorder <path>...`
-  (or `--stdin`, one path per line) promotes the rows you name to the top; every live row you don't
-  name keeps its relative position after them, so a partial list is safe and never drops a row.
+- **Set the Live Sessions row order from the CLI: `yggterm server reorder`.** `yggterm server
+  reorder <path>...` (or `--stdin`, one path per line) promotes the rows you name to the top; every
+  live row you don't name keeps its relative position after them, so a partial list is safe and
+  never drops a row.
+- **Back up and restore your row order: `yggterm server order`.** Prints the Live Sessions order,
+  one path per line, and round-trips with `server reorder --stdin` — so an ordering you arranged can
+  always be captured before a disruptive operation and put back afterwards:
+  `yggterm server order > order.bak` … `yggterm server reorder --stdin < order.bak`.
+- **`yggterm server connect` no longer scrambles your row order.** It used to prepend every
+  newly-connected session, so reconnecting a batch buried the list you had arranged. Connect now
+  preserves the existing order and places the new row **last** by default; `--after <path>` drops it
+  under a specific row, and `--top` restores the old prepend. Combined with the persistence fix,
+  your Live Sessions ordering now survives both restarts and reconnects.
 
 ## 2.9.62
 
