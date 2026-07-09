@@ -52,8 +52,9 @@ Build each only when an app truly needs it.
    Cellulose (a sqlite spreadsheet shareable as .xlsx). NOT built.
 3. **Sidebar-contribution surface** — the app contributes a right-hand panel of
    icons/controls/metadata. This is where a password-manager sidebar, an ytop
-   signal panel, or a Cellulose ribbon lives. Protocol below; currently only a
-   hardcoded MVP exists and must be generalized.
+   signal panel, or a Cellulose ribbon lives. SHIPPED 2026-07-09 (ychrome's vault
+   pane); the two hardcoded variants it replaces are not deleted yet. Protocol
+   below.
 4. **Chooser / identity surface** — a picker before launch (profile, workspace,
    vault account). SHIPPED for ychrome's no-arg profile picker.
 
@@ -67,13 +68,19 @@ negotiation, no new transport, and unknown OSCs are invisible in a plain
 terminal — that is the degradation story.
 
 ```
-ESC ] 7717 ; web-surface ; <action> ; <base64-json> BEL
+ESC ] 7717 ; <verb> ; <action> ; <base64-json> BEL
 ```
 
-Shipped actions: `open`, `heartbeat` (~4s, full payload), `close`. Payload:
-`{"session": $YGGTERM_SESSION_ID, "url": "...", "title": "..."}`. The GUI keys
-surface state by the *stream* the OSC arrived on; the `session` field is
-diagnostic. Authoritative yggterm-side doc: `docs/web-surfaces.md`. App-side
+Two verbs ship today:
+
+- `web-surface` — actions `open`, `heartbeat` (~4s, full payload), `close`.
+  Payload `{"session": $YGGTERM_SESSION_ID, "url": "...", "title": "..."}`.
+- `sidebar` — actions `declare` (idempotent, re-emitted on the heartbeat
+  cadence), `close`. Payload `{"session", "control", "panes":[{id,icon,title}]}`.
+
+The GUI keys surface AND contribution state by the *stream* the OSC arrived on;
+the `session` field is diagnostic (a remote session's env id lives in the remote
+daemon's namespace and is not comparable to the GUI path). Authoritative yggterm-side doc: `docs/web-surfaces.md`. App-side
 view: ychrome `docs/protocol.md`.
 
 **Detecting thin-client mode:** the daemon exports `YGGTERM_SESSION_ID` and
@@ -110,51 +117,62 @@ That is a whole viewport-surface app. A heavyweight app adds a sidebar
 contribution (below), cwd-tree documents, and a chooser — each via the same OSC
 channel plus a loopback control endpoint for actions.
 
-## Sidebar-contribution surface — the protocol to build
+## Sidebar-contribution surface — SHIPPED 2026-07-09, live-proven
 
-This is **Open question 1** in ychrome's protocol doc and the current top of the
-libyggterm work. The MVP that exists today (the app-sidebar `▦` pane and a vault
-`🔑` pane) is **hardcoded in `yggterm-shell` and is the wrong shape** — it must
-become a generic contribution the app declares.
-
-**What must migrate out of yggterm (the hardcoded chrome to delete):** the
-`RightPanelMode` enum in `yggterm-shell` today has two ychrome-specific variants
-that are the anti-pattern — `Vault` (the Bitwarden pane) and `AppSidebar`
-(ychrome's settings: adblock + userscript toggles). BOTH must become ychrome
-contributions. The adblock rulesets and userscript files are already
-host-resident ychrome-owned config; only their application to the GUI's webview
-stays host-side (like vault fill). The other variants — `Metadata`, `Settings`
-(yggterm's own), `Connect`, `Notifications` — are yggterm's own chrome and stay.
-
-Target protocol (DECIDED 2026-07-09; not yet built):
+Built and live-proven on jojo (yggterm `010b9957`, ychrome `8452654`). ychrome's
+vault pane is a CONTRIBUTION now, not yggterm chrome.
 
 - **Declare**: the app emits `OSC 7717 ; sidebar ; declare ; <base64-json>`
   carrying only `{session, control, panes:[{id, icon, title}]}` — a loopback
-  **control endpoint** URL plus the panes it offers. The schema itself is NOT in
-  the OSC: the GUI `GET`s `<control>/pane/<id>` when a pane is opened, so a
-  1100-row vault never rides the PTY. Re-emitting `declare` on the heartbeat
-  cadence is the liveness signal (idempotent); `sidebar ; close` retires it, and
-  an unswept contribution expires like a surface. NO secrets in a schema, ever.
-- **Render**: yggterm draws the schema with generic widgets in the right panel.
-  It knows nothing about what the app means by them. Widget vocabulary:
-  `section`, `label`, `search-box`, `text-input`, `number-input`, `toggle`,
-  `button`, `list-row` (with action buttons), `tabs`.
+  **control endpoint** URL plus the panes it offers. The schema is NOT in the
+  OSC: the GUI `GET`s `<control>/pane/<id>` when a pane is opened, so a 1100-row
+  vault never rides the PTY. Re-emitting `declare` on the heartbeat cadence is
+  the liveness signal (idempotent — and it must NOT re-resolve the control URL,
+  or you spawn one `ssh -L` per heartbeat); `sidebar ; close` retires it, and an
+  unswept contribution expires like a surface. NO secrets in a schema, ever.
+- **Render**: yggterm draws the schema with generic widgets in the right panel
+  (`AppPaneRailBody`). It knows nothing about what the app means by them.
+  Vocabulary: `section`, `label`, `search-box`, `text-input`, `number-input`,
+  `toggle`, `button`, `list-row` (with action buttons), `tabs`. An unknown
+  `kind` fails the pane rather than rendering a hole.
 - **Act**: a click `POST`s `{pane, action, values}` to `<control>/action`; the
-  app performs it on the invoking host and returns
-  `{schema?, toast?, eval?}` — a fresh schema to re-render, a message to show,
-  and/or a script for the GUI to run in the surface (that is how a host-resident
-  credential reaches a client-rendered page; see surface-eval above).
-- **Reaching the control endpoint**: it is a *loopback* URL on the app's host.
-  The GUI fetches it itself over a plain socket, so it needs a **`ssh -L`
-  forward** — NOT the `ssh -D` SOCKS proxy that the webview uses.
-  `resolve_web_surface_effective_url` returns early on the SOCKS branch with the
-  URL unchanged, which is right for the webview and wrong for anything the GUI
-  fetches. Use the dedicated control-endpoint resolver. (The profile picker has
-  this bug today: on a remote session it GETs the GUI host's loopback.)
+  app performs it on its own host and returns `{schema?, toast?, eval?}` — a
+  fresh schema to re-render, a message to toast, and/or a script for the GUI to
+  run in the surface. That is how a host-resident credential reaches a
+  client-rendered page: the app computes, the GUI injects.
+- **Page context**: the GUI passes the active surface's host as `?host=` on the
+  schema GET and as `values.host` on an action. Non-secret context; the APP
+  decides what a host means (which logins apply to it). One owner GUI-side:
+  `ShellState::web_surface_host_label`.
+- **Reaching the control endpoint**: a *loopback* URL on the app's host. The GUI
+  fetches it over a plain `TcpStream`, so it needs an **`ssh -L` forward** — NOT
+  the `ssh -D` SOCKS proxy the webview uses. Use `resolve_control_endpoint_url`;
+  `resolve_web_surface_effective_url` returns early on the SOCKS branch, which is
+  right for the webview and wrong for anything the GUI fetches itself.
+- **Mode**: `RightPanelMode::AppPane(String)` carries the app's pane id, so the
+  enum is not `Copy`. The rejected alternative — a unit variant plus a separate
+  `active_app_pane: Option<String>` — is two encodings of one fact.
 - **Richness escape hatch (v2)**: REJECTED for the vault pane (2026-07-09) — a
   full WebKitGTK webview in a 300px panel would not follow `DESIGN.md`, would
   render secrets inside a webview, and adds moving parts. Grow the vocabulary
   instead. Keep v2 in reserve for a pane that is genuinely a document.
+
+### Trap: key contributed widgets by identity, never by index
+
+Keying rendered widgets on their position let Dioxus patch a `section` node into
+a `label` when a tab switch changed the widget at that slot — same tag, so the
+node was reused and kept the section's `text-transform`. The Tools tab rendered
+"UNLOCKED · 1107 ITEMS". Key on kind + id. Caught live, not by a test.
+
+### Still hardcoded (the next slice)
+
+`RightPanelMode::Vault` and `::AppSidebar` still exist and still work. The
+contributed vault pane does not yet cover the **password generator** or
+**watchtower**, so deleting `::Vault` now would regress the user's UI. Port
+those, move `vault_password_is_weak` out of `shell.rs`, migrate `::AppSidebar`
+(ychrome's adblock/userscript settings), then delete both variants and move
+`docs/ychrome-password-manager.md` into the ychrome repo. The other variants —
+`Metadata`, `Settings`, `Connect`, `Notifications` — are yggterm's own and stay.
 
 ### Where an app's config lives when the app is remote (DECIDED 2026-07-09)
 
