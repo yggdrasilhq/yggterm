@@ -15531,7 +15531,19 @@ fn maybe_spawn_background_live_session_snapshot(state: Signal<ShellState>) {
         let outcome = run_dedicated_interactive_request_io(
             "background_live_session_snapshot",
             trace_home.as_path(),
-            move || daemon_snapshot(&endpoint),
+            // Fetch the runtime-status manifest in the SAME worker pass: the
+            // GUI's `latest_runtime_status` (owned/preserved PTY manifest) was
+            // previously fetched only at startup, so a session whose PTY the
+            // daemon acquired AFTER GUI start read as not-owned forever —
+            // failing the affirmative-ownership rearm guard and cold-remounting
+            // the healthy active session after background snapshots (guihost
+            // 2026-07-09). Ownership truth must age with the snapshot, not
+            // with the GUI process.
+            move || {
+                let snapshot = daemon_snapshot(&endpoint)?;
+                let runtime_status = status(&endpoint).ok();
+                Ok((snapshot, runtime_status))
+            },
         )
         .await;
         let _ = safe_shell_mut(
@@ -15540,7 +15552,10 @@ fn maybe_spawn_background_live_session_snapshot(state: Signal<ShellState>) {
             |shell| {
                 shell.live_session_snapshot_refresh_in_flight = false;
                 match outcome {
-                    Ok((snapshot, message)) => {
+                    Ok(((snapshot, message), runtime_status)) => {
+                        if let Some(runtime_status) = runtime_status {
+                            shell.latest_runtime_status = Some(runtime_status);
+                        }
                         let input_hot = current_millis() < terminal_input_hot_until_ms();
                         if input_hot
                             && !background_snapshot_changes_active_runtime_identity(
@@ -25882,6 +25897,22 @@ fn queue_move_selected_items_to_group(
         });
     });
 }
+/// Stable row-order ledger scope for THIS GUI client. Multiple yggterm GUIs
+/// can attach to the same host daemon; each records its arrangements under
+/// its own scope so the daemon's ledger can answer per-GUI placement.
+fn gui_row_order_scope() -> String {
+    let host = std::env::var("HOSTNAME")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| {
+            std::fs::read_to_string("/etc/hostname")
+                .ok()
+                .map(|value| value.trim().to_string())
+        })
+        .unwrap_or_else(|| "unknown-host".to_string());
+    format!("gui:{host}")
+}
+
 fn queue_drop_current_drag_target(mut state: Signal<ShellState>) {
     let live_reorder = {
         let shell = state.read();
@@ -25924,9 +25955,14 @@ fn queue_drop_current_drag_target(mut state: Signal<ShellState>) {
             let paths_for_request = reordered_paths.clone();
             spawn(async move {
                 let paths_for_task = paths_for_request.clone();
-                let outcome =
-                    task::spawn_blocking(move || reorder_live_sessions(&endpoint, &paths_for_task))
-                        .await;
+                let outcome = task::spawn_blocking(move || {
+                    yggterm_server::reorder_live_sessions_scoped(
+                        &endpoint,
+                        &paths_for_task,
+                        Some(gui_row_order_scope().as_str()),
+                    )
+                })
+                .await;
                 state.with_mut(|shell| match outcome {
                     Ok(Ok((snapshot, message))) => {
                         shell.server.apply_snapshot(snapshot);
@@ -86800,8 +86836,12 @@ mod tests {
             "drag/drop should optimistically update the visible live-session order"
         );
         assert!(
-            handler.contains("reorder_live_sessions(&endpoint, &paths_for_task)"),
+            handler.contains("reorder_live_sessions_scoped("),
             "drag/drop must also persist the order through the daemon, otherwise GUI restart restores the old order"
+        );
+        assert!(
+            handler.contains("gui_row_order_scope()"),
+            "drag/drop reorders must carry this GUI's ledger scope so per-client arrangements survive"
         );
     }
 
