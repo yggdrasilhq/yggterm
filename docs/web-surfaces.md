@@ -146,18 +146,31 @@ with its URL and one keypress (Ctrl+C) removes it.
 ## Profile picker (no-arg `ychrome`)
 
 `ychrome` with no URL serves a **profile picker** instead of opening a blank
-page. In thin-client mode it binds a loopback HTTP server on the invoking host,
-emits the OSC `open` pointing at `http://127.0.0.1:<port>/`, and renders a
-Chrome-style picker (a card per profile under `~/.yggterm/web-profiles/` plus a
-URL/search field). Submitting the form hits ychrome's own `/open` route, which
-re-emits the OSC `open` with the chosen url+profile — the app tab retargets
-(same profile → navigate; different profile → the surface's `WebContext` is
-rebuilt, per host-owned profiles). This also fixes the old no-arg case: ychrome
-no longer emits `about:blank`, which `web_surface_url_scheme_allowed` rejects
-(only http/https pass). The picker itself is entirely ychrome-side; from
-yggterm's view it is just another loopback http surface. For a remote session
-the picker page resolves through the same SOCKS egress to the invoking host
-where ychrome (and its loopback server) run.
+page. In thin-client mode it binds a loopback HTTP server on the invoking host
+and emits OSC action `pick`, whose payload URL is that server's **control
+endpoint** rather than a page to display: yggterm renders a NATIVE profile
+picker in the viewport, and the user's choice makes the GUI `GET /open?url=&profile=`
+on the endpoint. ychrome's handler re-emits OSC `open` with the chosen
+url+profile, and the app tab retargets (same profile → navigate; different
+profile → the surface's `WebContext` is rebuilt, per host-owned profiles). This
+also fixes the old no-arg case: ychrome no longer emits `about:blank`, which
+`web_surface_url_scheme_allowed` rejects (only http/https pass).
+
+### A control endpoint is not a webview URL
+
+The GUI fetches a control endpoint **itself**, over a hand-rolled `TcpStream`.
+That is a different resolution problem from a URL the *webview* loads:
+
+| | resolver | remote-session mechanism |
+| --- | --- | --- |
+| webview URL | `resolve_web_surface_effective_url` | URL untouched; webview is pointed at an `ssh -D` SOCKS proxy |
+| control endpoint | `resolve_control_endpoint_url` | loopback URL rewritten to the local end of an `ssh -L` forward |
+
+The GUI's HTTP client speaks no SOCKS, so running a control endpoint through the
+webview resolver hands back `http://127.0.0.1:<port>/…` unchanged and the GUI
+then connects to **its own** loopback — the wrong machine, silently. Anything
+the GUI fetches (the picker's `/open`, and the sidebar-contribution surface's
+schema/action routes) must use `resolve_control_endpoint_url`.
 
 ## Resolved in 2.9.61
 

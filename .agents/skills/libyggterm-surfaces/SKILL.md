@@ -126,29 +126,50 @@ host-resident ychrome-owned config; only their application to the GUI's webview
 stays host-side (like vault fill). The other variants — `Metadata`, `Settings`
 (yggterm's own), `Connect`, `Notifications` — are yggterm's own chrome and stay.
 
-Target protocol (design; not yet built):
+Target protocol (DECIDED 2026-07-09; not yet built):
 
-- **Declare**: the app emits an OSC 7717 verb (`sidebar`) whose payload is a
-  declarative schema — a title, an icon, and sections of rows/controls from a
-  fixed widget vocabulary (label, text-input, button, toggle, list-row,
-  search-box), plus a loopback **control endpoint** URL (the picker already
-  proved GUI-GETs-a-loopback-URL). NO secrets in the schema, ever.
+- **Declare**: the app emits `OSC 7717 ; sidebar ; declare ; <base64-json>`
+  carrying only `{session, control, panes:[{id, icon, title}]}` — a loopback
+  **control endpoint** URL plus the panes it offers. The schema itself is NOT in
+  the OSC: the GUI `GET`s `<control>/pane/<id>` when a pane is opened, so a
+  1100-row vault never rides the PTY. Re-emitting `declare` on the heartbeat
+  cadence is the liveness signal (idempotent); `sidebar ; close` retires it, and
+  an unswept contribution expires like a surface. NO secrets in a schema, ever.
 - **Render**: yggterm draws the schema with generic widgets in the right panel.
-  It knows nothing about what the app means by them.
-- **Act**: a click sends the row/action id to the app's control endpoint; the
-  app performs the action (unlock, fill, generate…) on the invoking host and
-  returns updated state or a fresh schema. Page-touching actions use
-  surface-eval as above.
-- **Live update**: the heartbeat may carry a new schema (or the app pushes one);
-  the panel re-renders.
-- **Richness escape hatch (v2)**: when the fixed vocabulary is too poor (a full
-  vault UI with search + generator + watchtower), the app instead serves its
-  sidebar as an HTML page and yggterm docks a WebKitGTK child webview in the
-  right-panel region — the same hosting it already does for the viewport, new
-  geometry only. The app (being a browser-class program) owns the HTML and
-  bridges it to its own logic. Prefer v1's declarative schema first
-  (extraction-not-construction); reach for v2 only when a real app's panel can't
-  be expressed declaratively.
+  It knows nothing about what the app means by them. Widget vocabulary:
+  `section`, `label`, `search-box`, `text-input`, `number-input`, `toggle`,
+  `button`, `list-row` (with action buttons), `tabs`.
+- **Act**: a click `POST`s `{pane, action, values}` to `<control>/action`; the
+  app performs it on the invoking host and returns
+  `{schema?, toast?, eval?}` — a fresh schema to re-render, a message to show,
+  and/or a script for the GUI to run in the surface (that is how a host-resident
+  credential reaches a client-rendered page; see surface-eval above).
+- **Reaching the control endpoint**: it is a *loopback* URL on the app's host.
+  The GUI fetches it itself over a plain socket, so it needs a **`ssh -L`
+  forward** — NOT the `ssh -D` SOCKS proxy that the webview uses.
+  `resolve_web_surface_effective_url` returns early on the SOCKS branch with the
+  URL unchanged, which is right for the webview and wrong for anything the GUI
+  fetches. Use the dedicated control-endpoint resolver. (The profile picker has
+  this bug today: on a remote session it GETs the GUI host's loopback.)
+- **Richness escape hatch (v2)**: REJECTED for the vault pane (2026-07-09) — a
+  full WebKitGTK webview in a 300px panel would not follow `DESIGN.md`, would
+  render secrets inside a webview, and adds moving parts. Grow the vocabulary
+  instead. Keep v2 in reserve for a pane that is genuinely a document.
+
+### Where an app's config lives when the app is remote (DECIDED 2026-07-09)
+
+The app's host owns the config, always — including ychrome's adblock rulesets
+and userscripts. This was previously fudged ("only their application to the
+GUI's webview stays host-side"), and it had no consistent meaning: the GUI's
+webview reads `~/.yggterm/web-adblock/*` **on the GUI host**, so an ychrome
+running over ssh was editing files nothing read.
+
+The rule: the app mutates its own host's config, and the control-endpoint
+response **ships the effective ruleset/userscripts to the GUI**, which applies
+them to the webview. Same shape as vault fill — the app computes, the GUI
+injects, and yggterm persists none of it. A `RightPanelMode` for an app's
+settings is still the anti-pattern; the settings pane is an app contribution
+like any other.
 
 Menu contributions (the titlebar `+` menu) are the same idea for a different
 surface: an app-registry the shell reads instead of hardcoded arms — see
