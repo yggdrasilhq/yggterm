@@ -22,7 +22,8 @@ use yggterm_platform::configure_gui_entry_process;
 use yggterm_server::{
     AppControlPreviewLayout, AppControlRightPanelMode, AppControlViewMode, ClientInstanceRecord,
     PersistedDaemonState, ProbeTerminalViewportInputMode, SessionKind, WorkspaceViewMode,
-    focus_live_with_view, open_remote_session_with_view, YggtermServer,
+    focus_live_with_view, open_remote_session_with_view, open_stored_session_with_view,
+    YggtermServer,
     active_client_instance_records, default_endpoint, detect_ghostty_host,
     ensure_local_daemon_running, local_headless_companion_executable_from_current, ping,
     resolve_client_daemon_endpoint,
@@ -810,19 +811,55 @@ fn connect_path_session_uuid(path: &str) -> &str {
     path.rsplit('/').next().unwrap_or(path)
 }
 
-/// Parse a remote agent path (`remote-session://<machine>/<uuid>` for Codex,
-/// `remote-cc://<machine>/<uuid>` for Claude Code) into `(machine_key, id)`.
-/// Returns None for non-remote or malformed paths.
-fn parse_remote_connect_path(path: &str) -> Option<(String, String)> {
+/// Parse a remote-SCANNED Codex path (`remote-session://<machine>/<uuid>`) into
+/// `(machine_key, id)`. Deliberately does NOT match `remote-cc://`: mirroring the
+/// GUI's `open_session_row`, only a scanned Codex row goes through
+/// OpenRemoteSession; a Claude Code row is opened as a stored session (its path
+/// is not a remote-scanned path, and OpenRemoteSession would look it up as a
+/// Codex transcript and fail with "saved Codex session is no longer available").
+fn parse_remote_scanned_connect_path(path: &str) -> Option<(String, String)> {
     let rest = path
         .trim_start_matches('/')
-        .strip_prefix("remote-session://")
-        .or_else(|| path.trim_start_matches('/').strip_prefix("remote-cc://"))?;
+        .strip_prefix("remote-session://")?;
     let (machine, id) = rest.split_once('/')?;
     if machine.is_empty() || id.is_empty() {
         return None;
     }
     Some((machine.to_string(), id.to_string()))
+}
+
+/// Session kind for a path we are opening as a stored session — the CLI twin of
+/// the GUI's `session_kind_for_row`.
+fn connect_session_kind_for_path(path: &str) -> SessionKind {
+    if path.starts_with("remote-cc://") || path.contains("/.claude/projects/") {
+        SessionKind::ClaudeCode
+    } else {
+        SessionKind::Codex
+    }
+}
+
+/// The scanned `(cwd, title)` for a session id, looked up from the daemon's
+/// remote scans. The resume needs the right cwd (`claude -r` / `codex resume`
+/// run inside the session's directory), so pass it through like the GUI does.
+fn connect_scanned_metadata(
+    snapshot: &yggterm_server::ServerUiSnapshot,
+    path: &str,
+) -> (Option<String>, Option<String>) {
+    let want = connect_path_session_uuid(path);
+    snapshot
+        .remote_machines
+        .iter()
+        .flat_map(|machine| machine.sessions.iter())
+        .find(|scanned| {
+            scanned.session_id == want
+                || connect_path_session_uuid(&scanned.session_path) == want
+        })
+        .map(|scanned| {
+            let cwd = (!scanned.cwd.trim().is_empty()).then(|| scanned.cwd.clone());
+            let title = (!scanned.title_hint.trim().is_empty()).then(|| scanned.title_hint.clone());
+            (cwd, title)
+        })
+        .unwrap_or((None, None))
 }
 
 fn connect_session_is_active(snapshot: &yggterm_server::ServerUiSnapshot, path: &str) -> bool {
@@ -852,20 +889,37 @@ fn run_server_connect(
     // FocusLive reveals + resumes any session the daemon already tracks — even a
     // row the runtime-truth filter is currently suppressing, since launching its
     // runtime un-hides it — and is kind-agnostic (it uses the row the daemon
-    // holds). FocusLive is a silent no-op on an unknown key, so for a scan-only
-    // remote agent we fall back to the tree's OpenRemoteSession request.
+    // holds). FocusLive is a silent no-op on an unknown key, so a session that is
+    // only in the remote scan falls through to the open path below.
     let (mut snapshot, mut message) = focus_live_with_view(endpoint, path, Some(view))?;
-    if !connect_session_is_active(&snapshot, path)
-        && let Some((machine_key, session_id)) = parse_remote_connect_path(path)
-    {
-        let (opened, opened_message) = open_remote_session_with_view(
-            endpoint,
-            &machine_key,
-            &session_id,
-            None,
-            None,
-            Some(view),
-        )?;
+    if !connect_session_is_active(&snapshot, path) {
+        // Mirror the GUI's `open_session_row` exactly (one source of truth): a
+        // scanned CODEX row (remote-session://) goes through OpenRemoteSession;
+        // everything else — notably a Claude Code row (remote-cc://), whose path
+        // is not a remote-scanned path — is opened as a stored session carrying
+        // its kind, id, cwd and title.
+        let (cwd, title) = connect_scanned_metadata(&snapshot, path);
+        let (opened, opened_message) =
+            if let Some((machine_key, session_id)) = parse_remote_scanned_connect_path(path) {
+                open_remote_session_with_view(
+                    endpoint,
+                    &machine_key,
+                    &session_id,
+                    cwd.as_deref(),
+                    title.as_deref(),
+                    Some(view),
+                )?
+            } else {
+                open_stored_session_with_view(
+                    endpoint,
+                    connect_session_kind_for_path(path),
+                    path,
+                    Some(connect_path_session_uuid(path)),
+                    cwd.as_deref(),
+                    title.as_deref(),
+                    Some(view),
+                )?
+            };
         snapshot = opened;
         message = opened_message;
     }
