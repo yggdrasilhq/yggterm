@@ -4270,6 +4270,16 @@ impl ShellState {
             &self.session_title_overrides,
             &self.generated_summaries,
         );
+        // Over `merged_rows`, NOT `self.browser.rows()`: the Live-region rows the
+        // keep-alive item acts on are merged in above and are absent from the cwd
+        // tree, so the tree alone yields an empty target set. Not `rows` either —
+        // a search filter hides rows without deselecting them, and the item must
+        // still act on every selected session.
+        let keep_alive_plan = self.context_menu_row.as_ref().and_then(|row| {
+            keep_alive_plan_for(row, &self.selected_tree_paths, &merged_rows, |path| {
+                self.server.live_session_keep_alive(path)
+            })
+        });
         let rows = sidebar_rows_for_render(&merged_rows, effective_search_query);
         let search_sidebar_matches = search_sidebar_matches(&merged_rows, effective_search_query);
         let active_title = active_session
@@ -4433,7 +4443,7 @@ impl ShellState {
             context_menu_row: self.context_menu_row.clone(),
             context_menu_context_row: self.context_menu_context_row.clone(),
             context_menu_position: self.context_menu_position,
-            keep_alive_plan: self.context_menu_keep_alive_plan(),
+            keep_alive_plan,
             preview_layout: self.preview_layout,
             server_busy: self.server_busy,
             show_loading_tree: (self.needs_initial_server_sync && self.server_busy)
@@ -9738,13 +9748,12 @@ impl ShellState {
     /// the request order and the pending label must be deterministic. One
     /// function serves both the label and the click handler, so what the menu
     /// promises and what the click does cannot drift.
+    /// The plan the context menu is CURRENTLY showing. Reads it straight off the
+    /// render snapshot so the click can never write to a different set than the
+    /// item promised — the snapshot is the one place that knows the sidebar's
+    /// merged row list (cwd tree + Live region).
     fn context_menu_keep_alive_plan(&self) -> Option<KeepAlivePlan> {
-        keep_alive_plan_for(
-            self.context_menu_row.as_ref()?,
-            &self.selected_tree_paths,
-            self.browser.rows(),
-            |path| self.server.live_session_keep_alive(path),
-        )
+        self.snapshot().keep_alive_plan.clone()
     }
     fn close_context_menu(&mut self) {
         self.context_menu_row = None;
@@ -13195,9 +13204,15 @@ fn keep_alive_plan_for(
     let acts_on_selection =
         selected_paths.len() > 1 && selected_paths.contains(row.full_path.as_str());
     let paths: Vec<String> = if acts_on_selection {
+        // A live session has DUAL PRESENCE — one row in the Live region and one
+        // in its cwd-tree folder, both carrying the same `full_path`. Keep the
+        // first (sidebar order) and drop the twin, or the item would fire two
+        // requests per session and its "(N sessions)" count would lie.
+        let mut seen = HashSet::new();
         rows.iter()
             .filter(|row| row_supports_keep_alive(row))
             .filter(|row| selected_paths.contains(row.full_path.as_str()))
+            .filter(|row| seen.insert(row.full_path.as_str()))
             .map(|row| row.full_path.clone())
             .collect()
     } else {
@@ -82038,6 +82053,47 @@ mod tests {
         }
     }
 
+    // The plan must be built from the sidebar's MERGED rows (cwd tree + Live
+    // region), not from `browser.rows()`. Live sessions live only in the merged
+    // list, so sourcing the cwd tree yielded `paths: []` and the menu rendered a
+    // bare "Keep Alive" that wrote to nothing — invisible to the pure-function
+    // tests below, which are handed their rows. Caught on the live host.
+    #[test]
+    fn context_menu_keep_alive_plan_sees_live_region_rows() {
+        let first = "local://alpha";
+        let second = "local://beta";
+        let mut shell = ShellState::new(test_shell_bootstrap_with_active_session(first));
+        let sessions: Vec<_> = [first, second]
+            .into_iter()
+            .map(|path| snapshot_session_view_for_ui(test_live_shell_session(path)))
+            .collect();
+        shell.server.apply_snapshot(ServerUiSnapshot {
+            active_session_path: Some(first.to_string()),
+            active_session: Some(sessions[0].clone()),
+            active_view_mode: WorkspaceViewMode::Terminal,
+            remote_machines: Vec::new(),
+            ssh_targets: Vec::new(),
+            live_sessions: sessions,
+        });
+        shell.selected_tree_paths = [first.to_string(), second.to_string()]
+            .into_iter()
+            .collect();
+        shell.context_menu_row = Some(keep_alive_test_row(first, BrowserRowKind::Session));
+
+        let plan = shell
+            .context_menu_keep_alive_plan()
+            .expect("a live session row has a plan");
+        assert_eq!(
+            plan.paths.len(),
+            2,
+            "the keep-alive item must target both selected LIVE rows, got {:?}",
+            plan.paths
+        );
+        assert!(plan.paths.contains(&first.to_string()));
+        assert!(plan.paths.contains(&second.to_string()));
+        assert!(!plan.all_keep_alive, "neither session is kept alive yet");
+    }
+
     // Right-clicking a row inside a MULTI-selection makes "Keep Alive" a SET,
     // not a per-row toggle: a mixed selection reads "Keep Alive" and turns
     // every selected session on. Only when all of them are already kept alive
@@ -82070,6 +82126,19 @@ mod tests {
         // All on: now the item flips.
         let plan = keep_alive_plan_for(&rows[2], &selected, &rows, |_| true).expect("plan");
         assert!(plan.all_keep_alive);
+
+        // Dual presence: the same session appears in the Live region AND in its
+        // cwd-tree folder. It must be written to once, and counted once.
+        let mut with_twins = rows.clone();
+        with_twins.push(keep_alive_test_row("local://one", BrowserRowKind::Session));
+        with_twins.push(keep_alive_test_row("local://two", BrowserRowKind::Session));
+        let plan = keep_alive_plan_for(&with_twins[2], &selected, &with_twins, |_| false)
+            .expect("plan");
+        assert_eq!(
+            plan.paths,
+            vec!["local://one", "local://two", "ssh://box/three"],
+            "a session with dual presence must appear exactly once"
+        );
     }
 
     #[test]
