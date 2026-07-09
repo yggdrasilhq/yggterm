@@ -35959,6 +35959,167 @@ fn rbw_vault_password(entry_name: &str, user: Option<&str>) -> Result<WebLoginCr
         password,
     })
 }
+/// Add a login to the vault. `rbw add` reads the password (first line) from
+/// $VISUAL — point it at a one-shot helper that copies a 0600 content file
+/// into rbw's tempfile, so the password never appears in argv or the
+/// environment. Blocking; call from spawn_blocking.
+fn rbw_add_login(
+    name: &str,
+    user: &str,
+    password: &str,
+    uri: &str,
+    folder: &str,
+) -> Result<(), String> {
+    let rbw = rbw_binary()?;
+    if name.trim().is_empty() {
+        return Err("entry name is required".to_string());
+    }
+    if password.is_empty() {
+        return Err("password is empty — generate or type one".to_string());
+    }
+    let home = yggterm_core::resolve_yggterm_home()
+        .map_err(|error| format!("resolve yggterm home: {error}"))?;
+    let tmp_dir = home.join("tmp");
+    std::fs::create_dir_all(&tmp_dir).map_err(|error| format!("create tmp dir: {error}"))?;
+    let stamp = current_millis();
+    let content_path = tmp_dir.join(format!("rbw-add-{stamp}-{}.txt", std::process::id()));
+    let helper_path = tmp_dir.join(format!("rbw-add-{stamp}-{}.sh", std::process::id()));
+    let cleanup = |content: &std::path::Path, helper: &std::path::Path| {
+        let _ = std::fs::remove_file(content);
+        let _ = std::fs::remove_file(helper);
+    };
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        use std::io::Write as _;
+        let mut content = std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .open(&content_path)
+            .map_err(|error| format!("write password staging file: {error}"))?;
+        writeln!(content, "{password}")
+            .map_err(|error| format!("write password staging file: {error}"))?;
+        let mut helper = std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o700)
+            .open(&helper_path)
+            .map_err(|error| format!("write editor helper: {error}"))?;
+        write!(helper, "#!/bin/sh\ncat \"$RBW_ADD_CONTENT\" > \"$1\"\n")
+            .map_err(|error| format!("write editor helper: {error}"))?;
+    }
+    let mut add = std::process::Command::new(&rbw);
+    add.arg("add");
+    if !uri.trim().is_empty() {
+        add.args(["--uri", uri.trim()]);
+    }
+    if !folder.trim().is_empty() {
+        add.args(["--folder", folder.trim()]);
+    }
+    add.arg(name.trim());
+    if !user.trim().is_empty() {
+        add.arg(user.trim());
+    }
+    add.env("VISUAL", &helper_path)
+        .env("EDITOR", &helper_path)
+        .env("RBW_ADD_CONTENT", &content_path);
+    let output = add.output();
+    cleanup(&content_path, &helper_path);
+    let output = output.map_err(|error| format!("run rbw add: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "rbw add failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(())
+}
+/// Generate a password with the vault CLI's own generator (`rbw generate`
+/// WITHOUT an entry name prints without storing). Blocking; call from
+/// spawn_blocking.
+fn rbw_generate_password(length: usize, no_symbols: bool) -> Result<String, String> {
+    let rbw = rbw_binary()?;
+    let length = length.clamp(8, 128).to_string();
+    let mut generate = std::process::Command::new(&rbw);
+    generate.arg("generate");
+    if no_symbols {
+        generate.arg("--no-symbols");
+    }
+    generate.arg(&length);
+    let output = generate
+        .output()
+        .map_err(|error| format!("run rbw generate: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "rbw generate failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let password = String::from_utf8_lossy(&output.stdout).trim_end().to_string();
+    if password.is_empty() {
+        return Err("rbw generate produced nothing".to_string());
+    }
+    Ok(password)
+}
+/// One watchtower batch: passwords for a chunk of entries, labeled. Secrets
+/// live only inside the analysis pass and are dropped with the map.
+fn rbw_watchtower_batch(chunk: Vec<VaultEntryMeta>) -> Vec<(String, String)> {
+    let Ok(rbw) = rbw_binary() else {
+        return Vec::new();
+    };
+    chunk
+        .into_iter()
+        .filter_map(|entry| {
+            let mut get = std::process::Command::new(&rbw);
+            get.args(["get", "--field", "password", &entry.name]);
+            if !entry.user.is_empty() {
+                get.arg(&entry.user);
+            }
+            let output = get.output().ok()?;
+            if !output.status.success() {
+                return None;
+            }
+            let password = String::from_utf8_lossy(&output.stdout)
+                .trim_end()
+                .to_string();
+            if password.is_empty() {
+                return None;
+            }
+            let label = if entry.user.is_empty() {
+                entry.name
+            } else {
+                format!("{} ({})", entry.name, entry.user)
+            };
+            Some((label, password))
+        })
+        .collect()
+}
+/// Watchtower verdicts for one password (no secrets retained): weak = short
+/// or single-character-class.
+fn vault_password_is_weak(password: &str) -> bool {
+    if password.chars().count() < 10 {
+        return true;
+    }
+    let classes = [
+        password.chars().any(|c| c.is_ascii_lowercase()),
+        password.chars().any(|c| c.is_ascii_uppercase()),
+        password.chars().any(|c| c.is_ascii_digit()),
+        password.chars().any(|c| !c.is_ascii_alphanumeric()),
+    ]
+    .iter()
+    .filter(|present| **present)
+    .count();
+    classes < 2
+}
+/// Aggregated watchtower results — labels only, never passwords.
+#[derive(Clone, PartialEq, Default)]
+struct VaultWatchtowerReport {
+    scanned: usize,
+    /// Groups of entry labels sharing one password (size ≥ 2).
+    reused: Vec<Vec<String>>,
+    /// Entries with weak passwords.
+    weak: Vec<String>,
+}
 /// Auto-match path: the FIRST (sorted) vault entry whose NAME matches `host`
 /// exactly (or its `www.` twin) — strict on purpose: the user didn't choose,
 /// so no base-domain fuzz here. Blocking; call from spawn_blocking.
@@ -59489,12 +59650,12 @@ fn TerminalCanvas(
                                                     });
                                                 }
                                             },
-                                            // The app tab's button QUITS ychrome
-                                            // (Ctrl+C) — a ✕ there read as "close
-                                            // tab" and killed the whole app on a
-                                            // misclick, so it wears the power
-                                            // glyph instead.
-                                            if is_app_tab { "⏻" } else { "✕" }
+                                            // Every tab wears ✕ (Chrome grammar);
+                                            // the app tab's ✕ still quits the app
+                                            // (its tooltip says so) — the STANDARD
+                                            // quit affordance is the ⏻ in the
+                                            // strip's right cluster.
+                                            "✕"
                                         }
                                     }
                                 }
@@ -59523,6 +59684,42 @@ fn TerminalCanvas(
                                 "+"
                             }
                             span { style: "flex:1 1 auto;" }
+                            // Standard libyggterm app chrome (top-right
+                            // cluster): Zzz suspends the app to its terminal
+                            // (Ctrl+Z — `fg` re-opens the surface, the app
+                            // re-announces on resume), ⏻ quits it (Ctrl+C).
+                            // Future apps may opt out of this convention;
+                            // today it lives GUI-side on the web surface.
+                            button {
+                                style: format!(
+                                    "display:flex; align-items:center; border:none; background:transparent; color:{}; cursor:pointer; font-size:11px; font-weight:700; letter-spacing:0.04em; line-height:1; padding:0 6px; opacity:0.75;",
+                                    theme.foreground,
+                                ),
+                                title: "Suspend to terminal (sends Ctrl+Z — run `fg` to bring the app back)",
+                                onclick: {
+                                    let suspend_path = web_surface_close_session_path.clone();
+                                    move |_| {
+                                        let suspend_path = suspend_path.clone();
+                                        let endpoint = state.read().bootstrap.server_endpoint.clone();
+                                        // Close the overlay NOW — a stopped app
+                                        // can't heartbeat, and waiting out the
+                                        // 15s stale sweep would strand a dead
+                                        // overlay over the revealed terminal.
+                                        state.with_mut(|shell| {
+                                            shell.close_web_surface(&suspend_path);
+                                        });
+                                        spawn(async move {
+                                            let _ = terminal_write_async(
+                                                endpoint,
+                                                suspend_path,
+                                                "\u{1a}".to_string(),
+                                            )
+                                            .await;
+                                        });
+                                    }
+                                },
+                                "Zzz"
+                            }
                             button {
                                 style: format!(
                                     "display:flex; align-items:center; border:none; background:transparent; color:{}; cursor:pointer; font-size:14px; line-height:1; padding:0 8px; opacity:0.75;",
@@ -75632,20 +75829,42 @@ fn AppSidebarRailBody(
         }
     }
 }
+/// Vault pane tabs — the Keyguard/Bitwarden UX split: Fill (browse + fill),
+/// Add (new login + generator), Tools (watchtower).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum VaultPaneTab {
+    Fill,
+    Add,
+    Tools,
+}
 /// ychrome's shipped Bitwarden UX (Keyguard-inspired): search the rbw vault,
 /// site-applicable logins float to the top for the active tab's host, and
 /// clicking ANY entry fills it into the page — the user's multi-account
 /// override path. Metadata only in the pane (name/user/folder); the password
-/// is fetched at fill time and never held in component state.
+/// is fetched at fill time and never held in component state (the Add form's
+/// draft password is the one deliberate exception — it exists to be typed).
 #[component]
 fn VaultRailBody(
     snapshot: SharedSnapshot,
     on_fill_vault_entry: EventHandler<(String, String)>,
 ) -> Element {
     let palette = snapshot.palette;
+    let mut tab = use_signal(|| VaultPaneTab::Fill);
     let mut query = use_signal(String::new);
     let mut entries = use_signal(|| None::<Result<Vec<VaultEntryMeta>, String>>);
     let mut reload_nonce = use_signal(|| 0u32);
+    // Add-form drafts.
+    let mut add_name = use_signal(String::new);
+    let mut add_user = use_signal(String::new);
+    let mut add_password = use_signal(String::new);
+    let mut add_folder = use_signal(String::new);
+    let mut add_status = use_signal(|| None::<Result<String, String>>);
+    let mut add_busy = use_signal(|| false);
+    let mut generate_no_symbols = use_signal(|| false);
+    let mut generate_length = use_signal(|| 24usize);
+    // Watchtower.
+    let mut watchtower = use_signal(|| None::<VaultWatchtowerReport>);
+    let mut watchtower_progress = use_signal(|| None::<(usize, usize)>);
     // (Re)read the vault list off the UI loop whenever the nonce bumps.
     use_effect(move || {
         let _ = reload_nonce();
@@ -75660,6 +75879,17 @@ fn VaultRailBody(
     let host = snapshot.active_web_surface_host.clone();
     let q = query().trim().to_lowercase();
     let muted_style = format!("font-size:10px; line-height:1.5; color:{};", palette.muted);
+    let field_style = format!(
+        "flex:1 1 auto; min-width:0; padding:6px 10px; border-radius:9px; \
+         border:1px solid rgba(127,127,127,0.35); background:rgba(127,127,127,0.10); \
+         color:{}; font-size:11px; outline:none;",
+        palette.text,
+    );
+    let action_button_style = format!(
+        "align-self:flex-start; padding:7px 14px; border:0; border-radius:9px; \
+         background:{}; color:#fff; font-size:11px; font-weight:700; cursor:pointer;",
+        palette.accent
+    );
     let entry_row = |entry: &VaultEntryMeta, key: String| {
         let name = entry.name.clone();
         let user = entry.user.clone();
@@ -75697,6 +75927,306 @@ fn VaultRailBody(
             content: rsx!{
             div {
                 style: "display:flex; flex-direction:column; gap:10px;",
+                // Pilled tab selector (the settings segmented control reused
+                // as tabs — Keyguard's top-tab grammar).
+                div {
+                    style: segmented_control_track_style(palette),
+                    button {
+                        "data-vault-tab": "fill",
+                        style: segmented_control_segment_style(palette, tab() == VaultPaneTab::Fill, true, false),
+                        onclick: move |_| tab.set(VaultPaneTab::Fill),
+                        "Fill"
+                    }
+                    button {
+                        "data-vault-tab": "add",
+                        style: segmented_control_segment_style(palette, tab() == VaultPaneTab::Add, true, false),
+                        onclick: move |_| tab.set(VaultPaneTab::Add),
+                        "Add"
+                    }
+                    button {
+                        "data-vault-tab": "tools",
+                        style: segmented_control_segment_style(palette, tab() == VaultPaneTab::Tools, true, false),
+                        onclick: move |_| tab.set(VaultPaneTab::Tools),
+                        "Tools"
+                    }
+                }
+                if tab() == VaultPaneTab::Add {
+                    div {
+                        style: "display:flex; flex-direction:column; gap:8px;",
+                        RailSectionTitle { title: "New login".to_string(), muted_color: palette.muted.to_string() }
+                        input {
+                            r#type: "text",
+                            "data-vault-add-name": "1",
+                            placeholder: if let Some(host) = host.clone() { format!("Name (e.g. {host})") } else { "Name (site host)".to_string() },
+                            value: "{add_name}",
+                            spellcheck: "false",
+                            autocomplete: "off",
+                            style: "{field_style}",
+                            oninput: move |evt: FormEvent| add_name.set(evt.value()),
+                        }
+                        input {
+                            r#type: "text",
+                            "data-vault-add-user": "1",
+                            placeholder: "Username / email",
+                            value: "{add_user}",
+                            spellcheck: "false",
+                            autocomplete: "off",
+                            style: "{field_style}",
+                            oninput: move |evt: FormEvent| add_user.set(evt.value()),
+                        }
+                        div {
+                            style: "display:flex; align-items:center; gap:6px;",
+                            input {
+                                r#type: "text",
+                                "data-vault-add-password": "1",
+                                placeholder: "Password (type or generate)",
+                                value: "{add_password}",
+                                spellcheck: "false",
+                                autocomplete: "off",
+                                style: "{field_style} font-family:monospace;",
+                                oninput: move |evt: FormEvent| add_password.set(evt.value()),
+                            }
+                        }
+                        input {
+                            r#type: "text",
+                            "data-vault-add-folder": "1",
+                            placeholder: "Folder (optional)",
+                            value: "{add_folder}",
+                            spellcheck: "false",
+                            autocomplete: "off",
+                            style: "{field_style}",
+                            oninput: move |evt: FormEvent| add_folder.set(evt.value()),
+                        }
+                        RailSectionTitle { title: "Generator".to_string(), muted_color: palette.muted.to_string() }
+                        div {
+                            style: "display:flex; align-items:center; gap:8px; flex-wrap:wrap;",
+                            button {
+                                r#type: "button",
+                                "data-vault-generate": "1",
+                                style: "{action_button_style}",
+                                onclick: move |_| {
+                                    let length = generate_length();
+                                    let no_symbols = generate_no_symbols();
+                                    spawn(async move {
+                                        let generated = task::spawn_blocking(move || {
+                                            rbw_generate_password(length, no_symbols)
+                                        })
+                                        .await
+                                        .unwrap_or_else(|join| Err(format!("generate task failed: {join}")));
+                                        match generated {
+                                            Ok(password) => add_password.set(password),
+                                            Err(reason) => add_status.set(Some(Err(reason))),
+                                        }
+                                    });
+                                },
+                                "Generate"
+                            }
+                            div {
+                                style: format!("display:flex; align-items:center; gap:4px; font-size:10px; color:{};", palette.muted),
+                                button {
+                                    r#type: "button",
+                                    style: format!("border:none; background:transparent; color:{}; cursor:pointer; font-size:12px; padding:2px 4px;", palette.text),
+                                    onclick: move |_| {
+                                        let next = generate_length().saturating_sub(4).max(8);
+                                        generate_length.set(next);
+                                    },
+                                    "−"
+                                }
+                                span { "{generate_length} chars" }
+                                button {
+                                    r#type: "button",
+                                    style: format!("border:none; background:transparent; color:{}; cursor:pointer; font-size:12px; padding:2px 4px;", palette.text),
+                                    onclick: move |_| {
+                                        let next = (generate_length() + 4).min(128);
+                                        generate_length.set(next);
+                                    },
+                                    "+"
+                                }
+                            }
+                            label {
+                                style: format!("display:flex; align-items:center; gap:4px; font-size:10px; color:{}; cursor:pointer;", palette.muted),
+                                input {
+                                    r#type: "checkbox",
+                                    checked: generate_no_symbols(),
+                                    onchange: move |evt: FormEvent| generate_no_symbols.set(evt.checked()),
+                                }
+                                "no symbols"
+                            }
+                        }
+                        button {
+                            r#type: "button",
+                            "data-vault-add-save": "1",
+                            disabled: add_busy(),
+                            style: "{action_button_style}",
+                            onclick: {
+                                let host = host.clone();
+                                move |_| {
+                                    if add_busy() {
+                                        return;
+                                    }
+                                    let name = add_name().trim().to_string();
+                                    let user = add_user().trim().to_string();
+                                    let password = add_password();
+                                    let folder = add_folder().trim().to_string();
+                                    // The URI field keeps Bitwarden's own
+                                    // apps/extensions matching this entry too.
+                                    let uri = host
+                                        .clone()
+                                        .map(|host| format!("https://{host}"))
+                                        .unwrap_or_default();
+                                    add_status.set(None);
+                                    add_busy.set(true);
+                                    spawn(async move {
+                                        let save_name = name.clone();
+                                        let result = task::spawn_blocking(move || {
+                                            rbw_add_login(&save_name, &user, &password, &uri, &folder)
+                                        })
+                                        .await
+                                        .unwrap_or_else(|join| Err(format!("add task failed: {join}")));
+                                        add_busy.set(false);
+                                        match result {
+                                            Ok(()) => {
+                                                add_status.set(Some(Ok(format!("Saved “{name}” to the vault."))));
+                                                add_password.set(String::new());
+                                                reload_nonce += 1;
+                                            }
+                                            Err(reason) => add_status.set(Some(Err(reason))),
+                                        }
+                                    });
+                                }
+                            },
+                            if add_busy() { "Saving…" } else { "Save to vault" }
+                        }
+                        match add_status() {
+                            Some(Ok(message)) => rsx! {
+                                div { style: format!("font-size:10px; color:{};", palette.accent), "{message}" }
+                            },
+                            Some(Err(reason)) => rsx! {
+                                div { style: "font-size:10px; color:#c0392b;", "{reason}" }
+                            },
+                            None => rsx! {},
+                        }
+                        div {
+                            style: "{muted_style}",
+                            "Name the entry after the site's host so fill matching finds it. The password is staged in a 0600 file under ~/.yggterm/tmp for the moment of the save, never in a command line."
+                        }
+                    }
+                } else if tab() == VaultPaneTab::Tools {
+                    div {
+                        style: "display:flex; flex-direction:column; gap:8px;",
+                        RailSectionTitle { title: "Watchtower".to_string(), muted_color: palette.muted.to_string() }
+                        div {
+                            style: "{muted_style}",
+                            "Scans every login for reused and weak passwords. Passwords are read in memory for the scan and dropped; only entry names are reported."
+                        }
+                        button {
+                            r#type: "button",
+                            "data-vault-watchtower-run": "1",
+                            disabled: watchtower_progress().is_some(),
+                            style: "{action_button_style}",
+                            onclick: move |_| {
+                                if watchtower_progress().is_some() {
+                                    return;
+                                }
+                                let list = match entries() {
+                                    Some(Ok(list)) => list,
+                                    _ => return,
+                                };
+                                watchtower.set(None);
+                                let total = list.len();
+                                watchtower_progress.set(Some((0, total)));
+                                spawn(async move {
+                                    // Chunked so progress updates and the UI
+                                    // never blocks on one long rbw sweep.
+                                    let mut by_password: HashMap<String, Vec<String>> = HashMap::new();
+                                    let mut weak: Vec<String> = Vec::new();
+                                    let mut scanned = 0usize;
+                                    for chunk in list.chunks(25) {
+                                        let chunk = chunk.to_vec();
+                                        let batch = task::spawn_blocking(move || {
+                                            rbw_watchtower_batch(chunk)
+                                        })
+                                        .await
+                                        .unwrap_or_default();
+                                        for (label, password) in batch {
+                                            scanned += 1;
+                                            if vault_password_is_weak(&password) {
+                                                weak.push(label.clone());
+                                            }
+                                            by_password.entry(password).or_default().push(label);
+                                        }
+                                        watchtower_progress.set(Some((scanned, total)));
+                                    }
+                                    let mut reused: Vec<Vec<String>> = by_password
+                                        .into_values()
+                                        .filter(|labels| labels.len() >= 2)
+                                        .collect();
+                                    reused.sort_by(|a, b| b.len().cmp(&a.len()).then(a.cmp(b)));
+                                    weak.sort();
+                                    watchtower_progress.set(None);
+                                    watchtower.set(Some(VaultWatchtowerReport { scanned, reused, weak }));
+                                });
+                            },
+                            if let Some((done, total)) = watchtower_progress() {
+                                "Scanning {done}/{total}…"
+                            } else {
+                                "Run watchtower scan"
+                            }
+                        }
+                        if let Some(report) = watchtower() {
+                            div {
+                                style: "{muted_style}",
+                                "Scanned {report.scanned} logins: {report.reused.len()} reused-password groups, {report.weak.len()} weak."
+                            }
+                            if !report.reused.is_empty() {
+                                RailSectionTitle { title: format!("Reused passwords ({})", report.reused.len()), muted_color: palette.muted.to_string() }
+                                div {
+                                    style: "display:flex; flex-direction:column; gap:6px;",
+                                    for (group_index, group) in report.reused.iter().take(30).enumerate() {
+                                        div {
+                                            key: "wt-reuse-{group_index}",
+                                            style: "display:flex; flex-direction:column; gap:1px; padding:6px 8px; border-radius:8px; background:rgba(192,57,43,0.10);",
+                                            div {
+                                                style: format!("font-size:10px; font-weight:700; color:{};", palette.text),
+                                                "Shared by {group.len()} logins"
+                                            }
+                                            for (label_index, label) in group.iter().take(8).enumerate() {
+                                                div {
+                                                    key: "wt-reuse-{group_index}-{label_index}",
+                                                    style: format!("font-size:10px; color:{}; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;", palette.muted),
+                                                    "{label}"
+                                                }
+                                            }
+                                            if group.len() > 8 {
+                                                div { style: "{muted_style}", "… and {group.len() - 8} more" }
+                                            }
+                                        }
+                                    }
+                                    if report.reused.len() > 30 {
+                                        div { style: "{muted_style}", "Showing 30 groups of {report.reused.len()}." }
+                                    }
+                                }
+                            }
+                            if !report.weak.is_empty() {
+                                RailSectionTitle { title: format!("Weak passwords ({})", report.weak.len()), muted_color: palette.muted.to_string() }
+                                div {
+                                    style: "display:flex; flex-direction:column; gap:2px;",
+                                    for (weak_index, label) in report.weak.iter().take(60).enumerate() {
+                                        div {
+                                            key: "wt-weak-{weak_index}",
+                                            style: format!("font-size:10px; color:{}; padding:2px 8px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;", palette.muted),
+                                            "{label}"
+                                        }
+                                    }
+                                    if report.weak.len() > 60 {
+                                        div { style: "{muted_style}", "Showing 60 of {report.weak.len()}." }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                if tab() == VaultPaneTab::Fill {
                 div {
                     style: "display:flex; align-items:center; gap:6px;",
                     input {
@@ -75706,12 +76236,7 @@ fn VaultRailBody(
                         value: "{query}",
                         spellcheck: "false",
                         autocomplete: "off",
-                        style: format!(
-                            "flex:1 1 auto; min-width:0; padding:6px 10px; border-radius:9px; \
-                             border:1px solid rgba(127,127,127,0.35); background:rgba(127,127,127,0.10); \
-                             color:{}; font-size:11px; outline:none;",
-                            palette.text,
-                        ),
+                        style: "{field_style}",
                         oninput: move |evt: FormEvent| query.set(evt.value()),
                     }
                     button {
@@ -75805,6 +76330,7 @@ fn VaultRailBody(
                 div {
                     style: "{muted_style}",
                     "Click an entry to fill it into the page. Site matches use the entry's name (exact host or base domain)."
+                }
                 }
             }
             }
