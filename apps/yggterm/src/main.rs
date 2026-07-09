@@ -23,7 +23,7 @@ use yggterm_server::{
     AppControlPreviewLayout, AppControlRightPanelMode, AppControlViewMode, ClientInstanceRecord,
     PersistedDaemonState, ProbeTerminalViewportInputMode, SessionKind, WorkspaceViewMode,
     focus_live_with_view, open_remote_session_with_view, open_stored_session_with_view,
-    reorder_live_sessions, YggtermServer,
+    reorder_live_sessions_scoped, row_order_ledger_report, YggtermServer,
     active_client_instance_records, default_endpoint, detect_ghostty_host,
     ensure_local_daemon_running, local_headless_companion_executable_from_current, ping,
     resolve_client_daemon_endpoint,
@@ -689,7 +689,8 @@ common server commands:
   yggterm server snapshot
   yggterm server connect <session-path> | --list
   yggterm server order [--json]
-  yggterm server reorder <session-path>... | --stdin
+  yggterm server reorder <session-path>... | --stdin [--scope <scope>]
+  yggterm server ledger [--scope <scope>]
   yggterm server app <subcommand>"
     );
 }
@@ -702,7 +703,8 @@ fn print_server_help() {
   yggterm server connect <session-path> [--view terminal|preview] [--top|--after <path>]
   yggterm server connect --list
   yggterm server order [--json]
-  yggterm server reorder <session-path>... | --stdin
+  yggterm server reorder <session-path>... | --stdin [--scope <scope>]
+  yggterm server ledger [--scope <scope>]
   yggterm server ping
   yggterm server status
   yggterm server snapshot
@@ -1002,7 +1004,7 @@ fn run_server_connect(
     let mut placed_at = "top";
     if connected && !matches!(placement, ConnectPlacement::Top) && !before_order.is_empty() {
         let desired = connect_desired_order(&before_order, path, &placement);
-        let (reordered, _) = reorder_live_sessions(endpoint, &desired)?;
+        let (reordered, _) = reorder_live_sessions_scoped(endpoint, &desired, None)?;
         snapshot = reordered;
         placed_at = match placement {
             ConnectPlacement::After(_) => "after_anchor",
@@ -1040,6 +1042,7 @@ fn run_server_connect(
 fn run_server_reorder(
     endpoint: &yggterm_server::ServerEndpoint,
     ordered_paths: &[String],
+    client_scope: Option<&str>,
 ) -> Result<()> {
     let (before, _) = snapshot(endpoint)?;
     let before_order: Vec<String> = before
@@ -1047,7 +1050,7 @@ fn run_server_reorder(
         .iter()
         .map(|session| session.session_path.clone())
         .collect();
-    let (after, message) = reorder_live_sessions(endpoint, ordered_paths)?;
+    let (after, message) = reorder_live_sessions_scoped(endpoint, ordered_paths, client_scope)?;
     let after_order: Vec<String> = after
         .live_sessions
         .iter()
@@ -1292,11 +1295,37 @@ fn main() -> Result<()> {
         }
         return Ok(());
     }
-    // `yggterm server reorder <path>... | --stdin` — set the Live Sessions row
-    // order. Paths are placed in the given order at the TOP; any live row not
-    // listed keeps its relative position AFTER them (the daemon appends the
-    // remainder), so a partial list is safe and never drops a row.
+    // `yggterm server ledger [--scope <scope>]` — dump the durable row-order
+    // ledger (per-client-scope memory of row slots, including rows that are
+    // not currently live). Read-only.
+    if args.len() >= 2 && args[0] == "server" && args[1] == "ledger" {
+        let scope = args
+            .iter()
+            .position(|arg| arg == "--scope")
+            .and_then(|ix| args.get(ix + 1))
+            .map(String::as_str);
+        ensure_local_server_ready_for_cli(&store)?;
+        let endpoint = default_endpoint(store.home_dir());
+        let report = row_order_ledger_report(&endpoint, scope)?;
+        match serde_json::from_str::<serde_json::Value>(&report) {
+            Ok(value) => println!("{}", serde_json::to_string_pretty(&value)?),
+            Err(_) => println!("{report}"),
+        }
+        return Ok(());
+    }
+    // `yggterm server reorder <path>... | --stdin [--scope <scope>]` — set the
+    // Live Sessions row order. Paths are placed in the given order at the TOP;
+    // any live row not listed keeps its relative position AFTER them (the
+    // daemon appends the remainder), so a partial list is safe and never drops
+    // a row. `--scope` also records the order into that client's row-order
+    // ledger scope (multi-GUI arrangements).
     if args.len() >= 2 && args[0] == "server" && args[1] == "reorder" {
+        let scope = args
+            .iter()
+            .position(|arg| arg == "--scope")
+            .and_then(|ix| args.get(ix + 1))
+            .cloned();
+        let scope_value_ix = args.iter().position(|arg| arg == "--scope").map(|ix| ix + 1);
         let ordered: Vec<String> = if args.iter().any(|arg| arg == "--stdin") {
             let mut buf = String::new();
             std::io::stdin()
@@ -1310,16 +1339,19 @@ fn main() -> Result<()> {
         } else {
             args[2..]
                 .iter()
-                .filter(|arg| !arg.starts_with('-'))
-                .cloned()
+                .enumerate()
+                .filter(|(ix, arg)| {
+                    !arg.starts_with('-') && Some(ix + 2) != scope_value_ix
+                })
+                .map(|(_, arg)| arg.clone())
                 .collect()
         };
         if ordered.is_empty() {
-            anyhow::bail!("usage: yggterm server reorder <session-path>... | --stdin");
+            anyhow::bail!("usage: yggterm server reorder <session-path>... | --stdin [--scope <scope>]");
         }
         ensure_local_server_ready_for_cli(&store)?;
         let endpoint = default_endpoint(store.home_dir());
-        return run_server_reorder(&endpoint, &ordered);
+        return run_server_reorder(&endpoint, &ordered, scope.as_deref());
     }
     if args.len() >= 5 && args[0] == "server" && args[1] == "terminal" && args[2] == "write" {
         ensure_local_server_ready_for_cli(&store)?;
