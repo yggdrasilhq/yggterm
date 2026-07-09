@@ -4,7 +4,6 @@ members = [
   "crates/yggui-contract",
   "crates/yggterm-core",
   "crates/yggterm-server",
-  "crates/yggterm-vault",
   "crates/yggui",
   "crates/yggterm-shell",
   "crates/yggterm-gtk-glue",
