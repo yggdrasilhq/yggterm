@@ -2033,19 +2033,56 @@ impl PtySessionRuntime {
         Ok(())
     }
 
+    /// Ask the child to exit the way a terminal emulator does when its window
+    /// closes: SIGHUP, then SIGTERM. Shells and agent CLIs both handle these and
+    /// flush their state. Returns true if the child was gone before we escalate.
+    ///
+    /// This replaces writing `/exit\r` (Claude Code), `/quit\r` (codex), or
+    /// `exit\r` (shells) into the PTY. Synthetic input is APPENDED TO WHATEVER
+    /// THE USER HAS ALREADY TYPED, so a half-written prompt got submitted with
+    /// `/exit` stuck on the end — the agent then acted on it before dying
+    /// (user-reported, 2026-07-09). It also never bought the graceful exit it
+    /// was there for: the old code waited at most 300ms before SIGKILL, and no
+    /// agent CLI shuts down that fast, so the injected text was nearly pure
+    /// downside. A signal cannot collide with the user's input.
+    #[cfg(unix)]
+    fn signal_child_to_exit(&self, child: &mut Box<dyn Child + Send + Sync>) -> Result<bool> {
+        let Some(pid) = child.process_id() else {
+            return Ok(false);
+        };
+        for signal in [libc::SIGHUP, libc::SIGTERM] {
+            // SAFETY: `pid` names this daemon's own PTY child. A dead pid may be
+            // reaped and refused with ESRCH, which we ignore.
+            unsafe {
+                libc::kill(pid as libc::pid_t, signal);
+            }
+            for _ in 0..20 {
+                if child
+                    .try_wait()
+                    .context("checking terminal exit state")?
+                    .is_some()
+                {
+                    return Ok(true);
+                }
+                thread::sleep(Duration::from_millis(50));
+            }
+        }
+        Ok(false)
+    }
+    #[cfg(not(unix))]
+    fn signal_child_to_exit(&self, _child: &mut Box<dyn Child + Send + Sync>) -> Result<bool> {
+        Ok(false)
+    }
+
     fn shutdown(&self, stop_command: Option<&str>) -> Result<()> {
         let mut child = self.child.lock().expect("pty child lock poisoned");
         if let Some(command) = stop_command
             && !command.is_empty()
         {
+            // Non-interactive runners only (recipe documents). Anything with a
+            // prompt is closed by signal — see `signal_child_to_exit`.
             let _ = self.write(command);
-            let normalized = command.trim();
-            let (attempts, sleep_ms) = if normalized == "exit" {
-                (2usize, 50u64)
-            } else {
-                (4usize, 75u64)
-            };
-            for _ in 0..attempts {
+            for _ in 0..2 {
                 if child
                     .try_wait()
                     .context("checking terminal exit state")?
@@ -2053,8 +2090,10 @@ impl PtySessionRuntime {
                 {
                     return Ok(());
                 }
-                thread::sleep(Duration::from_millis(sleep_ms));
+                thread::sleep(Duration::from_millis(50));
             }
+        } else if self.signal_child_to_exit(&mut child)? {
+            return Ok(());
         }
 
         let _ = child.kill();
@@ -2070,7 +2109,21 @@ impl PtySessionRuntime {
         if let Some(command) = stop_command
             && !command.is_empty()
         {
+            // Non-interactive runner (recipe document); see terminal_stop_command.
             let _ = self.write(command);
+        } else {
+            // Prompt-bearing session: ask the process to exit rather than typing
+            // into the user's draft. The loop below still force-kills on timeout.
+            #[cfg(unix)]
+            {
+                let child = self.child.lock().expect("pty child lock poisoned");
+                if let Some(pid) = child.process_id() {
+                    // SAFETY: our own PTY child; ESRCH on an already-reaped pid is ignored.
+                    unsafe {
+                        libc::kill(pid as libc::pid_t, libc::SIGHUP);
+                    }
+                }
+            }
         }
         let key = self.key.clone();
         thread::spawn(move || {
