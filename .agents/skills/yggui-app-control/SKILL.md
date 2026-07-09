@@ -106,6 +106,54 @@ LIVE_HOST=$(cat .agents/config/live-host)
 ssh "$LIVE_HOST" "~/.local/bin/yggterm server app state" | python3 -m json.tool 2>/dev/null || true
 ```
 
+## Session recovery — reconnect stranded sessions, fix row order (v2.9.63+)
+
+These are **daemon-direct** commands (`server …`, not `server app …`): they need no
+GUI and no click. A session that exists but is not in **Live Sessions** — alive on
+its host, reachable only from the CWD tree — is *stranded* ("in the void").
+
+```bash
+LIVE_HOST=$(cat .agents/config/live-host)
+
+# What exists but is NOT live? (remote scans minus the live set, NEWEST FIRST)
+ssh "$LIVE_HOST" "~/.local/bin/yggterm server connect --list"
+# -> {connectable_count, live_session_count, connectable:[{path,title,cwd,modified_epoch,live_runtime}]}
+# A busy host has HUNDREDS of scanned sessions; recency ordering surfaces what the
+# user was just working on. Do NOT bulk-connect the whole list.
+
+# Pull one back into Live Sessions and attach/resume its terminal
+ssh "$LIVE_HOST" "~/.local/bin/yggterm server connect 'remote-cc://dev/<uuid>'"
+# -> {connected:true, active_session_path, live_session_count, message}
+ssh "$LIVE_HOST" "~/.local/bin/yggterm server connect '<path>' --view preview"  # don't launch a terminal
+
+# Set the Live Sessions row order (listed rows go to the TOP)
+ssh "$LIVE_HOST" "~/.local/bin/yggterm server reorder '<path1>' '<path2>'"
+printf '%s\n' "${PATHS[@]}" | ssh "$LIVE_HOST" "~/.local/bin/yggterm server reorder --stdin"
+# -> {requested, live_session_count, changed, order:[...]}
+```
+
+**What `connect` does** — the headless twin of clicking a row, issuing the SAME
+daemon requests as the GUI (one source of truth):
+- a session the daemon already tracks → `FocusLive` (kind-agnostic; also un-hides a
+  row the snapshot runtime-truth filter was suppressing, because it launches the runtime);
+- a scan-only **Codex** row (`remote-session://`) → `OpenRemoteSession`;
+- everything else, notably a **Claude Code** row (`remote-cc://`) → `OpenStoredSession`
+  carrying kind + id + **cwd** + title.
+
+**Traps (all live-caught):**
+- `OpenRemoteSession` is **Codex-only**. Sending a `remote-cc://` uuid through it
+  fails (`saved Codex session … no longer available`) *and leaves an orphan
+  `remote-session://` row*. `connect` handles the branch for you — don't hand-roll it.
+- Always let `connect` pass the scanned **cwd**: the resume runs `claude -r` /
+  `codex resume` inside the session's directory.
+- `connect` **prepends** each new row. After a batch, the user's row order is buried —
+  restore it with `server reorder` (capture the order *before* you connect).
+- `reorder` never drops a row: listed paths go first, every unlisted live row is
+  appended after, so a partial list is safe.
+- Verify a reconnect with the session's `status_line`/`last_launch_error` from
+  `server snapshot`, not `app terminal read-buffer` — the GUI may not have mounted
+  the xterm yet (`accepted:false`) even though the resume is healthy.
+
 ## Click Grid (agent pointer targeting — main webview AND ychrome pages)
 
 Full spec: `docs/yggui-click-grid.md`. Labeled grid overlay for the vision loop:
