@@ -1097,6 +1097,45 @@ fn main() -> Result<()> {
         );
         return Ok(());
     }
+    // `server sessions reorder <order.json>` — set the Live-region row order from
+    // an explicit list of session paths. Written for incident recovery: the DAEMON
+    // owns row order (the GUI's row-order ledger only mirrors it), the GUI's only
+    // way to set it is a mouse drag, and a hand-organized order is real user work
+    // that a bad restart can scramble. A lost order is recoverable from
+    // `event-trace.jsonl` → the last `live_session_reorder_persisted` payload.
+    if args.len() >= 4 && args[0] == "server" && args[1] == "sessions" && args[2] == "reorder" {
+        ensure_local_server_ready_for_cli(&store)?;
+        let endpoint = cli_server_endpoint(store.home_dir());
+        let order_path = &args[3];
+        let raw = std::fs::read_to_string(order_path)
+            .with_context(|| format!("reading order file {order_path}"))?;
+        let ordered_paths: Vec<String> = serde_json::from_str(&raw)
+            .with_context(|| format!("{order_path} must be a JSON array of session paths"))?;
+        if ordered_paths.is_empty() {
+            anyhow::bail!("{order_path} is empty; refusing to clear the row order");
+        }
+        let (snapshot, message) =
+            yggterm_server::reorder_live_sessions(&endpoint, &ordered_paths)?;
+        // The daemon keeps only the rows it actually has, so report what the order
+        // BECAME rather than echoing the request back as if it succeeded.
+        let applied: Vec<&str> = snapshot
+            .live_sessions
+            .iter()
+            .map(|session| session.session_path.as_str())
+            .collect();
+        let requested: Vec<&str> = ordered_paths.iter().map(String::as_str).collect();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "requested": requested.len(),
+                "live_rows": applied.len(),
+                "matches_request": applied == requested,
+                "applied_order": applied,
+                "message": message,
+            }))?
+        );
+        return Ok(());
+    }
     if args.len() >= 3
         && args[0] == "server"
         && matches!(args[1].as_str(), "sessions" | "session-copy")
