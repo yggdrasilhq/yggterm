@@ -135,13 +135,26 @@ ssh "$LIVE_HOST" "~/.local/bin/yggterm server order" > /tmp/order.bak      # one
 ssh "$LIVE_HOST" "~/.local/bin/yggterm server reorder --stdin" < /tmp/order.bak
 ssh "$LIVE_HOST" "~/.local/bin/yggterm server reorder '<path1>' '<path2>'" # listed rows -> TOP
 # -> {requested, live_session_count, changed, order:[...]}
+
+# Inspect the durable row-order LEDGER (v2.9.64+): per-client-scope memory of
+# row slots, including rows that are NOT currently live.
+ssh "$LIVE_HOST" "~/.local/bin/yggterm server ledger"                      # all scopes
+ssh "$LIVE_HOST" "~/.local/bin/yggterm server ledger --scope gui:jojo"     # one GUI's ledger
+ssh "$LIVE_HOST" "~/.local/bin/yggterm server reorder --stdin --scope gui:jojo" < /tmp/order.bak
 ```
 
-**Row order is durable but only for rows that are LIVE.** Since 2.9.62 the daemon
-persists non-keep-alive rows in order, so ordering survives a restart. `server order`
-+ `server reorder --stdin` snapshot and restore it at any time — **take a backup before
-any batch operation.** A row that LEAVES the live set still forgets its slot: reconnect
-it and it lands at the end (or wherever you place it), not its old position.
+**Row order is durable AND remembered across liveness (v2.9.64+).** Since 2.9.62 the
+daemon persists non-keep-alive rows in order, so ordering survives a restart. Since
+2.9.64 the daemon additionally keeps a **row-order ledger** (`row-order-ledger.json`):
+every order change is recorded per client scope (the GUI records under `gui:<host>`,
+CLI/daemon-native under `shared`), and a row that LEAVES the live set keeps its
+remembered slot — when it is reconnected/opened again it is placed back below its
+nearest remembered live neighbor instead of landing at a native position. A row the
+ledger has never seen keeps the old behavior. Multiple GUIs attached to the same
+daemon each get their own ledger scope (a session can hold a slot in several scopes
+at once); placement falls back to the `shared` scope when the client's own scope
+doesn't know the row. `server order` + `server reorder --stdin` still round-trip —
+**take a backup before any batch operation.**
 
 **What `connect` does** — the headless twin of clicking a row, issuing the SAME
 daemon requests as the GUI (one source of truth):

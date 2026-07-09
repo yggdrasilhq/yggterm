@@ -6,6 +6,7 @@ mod host;
 mod protocol;
 mod remote_cli;
 mod remote_runtime;
+mod row_order_ledger;
 mod terminal;
 
 pub use app_control::{
@@ -36,6 +37,7 @@ pub use daemon::{
     prepare_client_close, prepare_update_restart, raise_external_window,
     reachable_versioned_daemon_statuses, refresh_managed_cli, refresh_preview,
     refresh_remote_machine, remove_session, remove_ssh_target, reorder_live_sessions,
+    reorder_live_sessions_scoped, row_order_ledger_report,
     request_terminal_launch, request_terminal_launch_for_path, retire_daemon,
     retire_stale_daemons, RetireStaleDaemonOutcome, RetireStaleDaemonsReport, run_daemon,
     set_all_preview_blocks_folded, set_session_keep_alive, set_view_mode, shutdown, snapshot,
@@ -3257,6 +3259,10 @@ impl YggtermServer {
                     .filter(|session| managed_session_is_live_runtime_session(key, session))
             })
             .collect()
+    }
+
+    pub fn live_session_order_keys(&self) -> &[String] {
+        &self.live_session_order
     }
 
     pub fn replace_live_session_order(&mut self, ordered_paths: &[String]) -> bool {
@@ -7157,7 +7163,7 @@ impl YggtermServer {
         self.active_session_path = self.first_available_live_session_path();
     }
 
-    fn resolve_live_session_entry(
+    pub(crate) fn resolve_live_session_entry(
         &self,
         key_or_path: &str,
     ) -> Option<(String, ManagedSessionView)> {
