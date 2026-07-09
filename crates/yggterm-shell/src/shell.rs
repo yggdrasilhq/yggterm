@@ -25008,7 +25008,7 @@ fn remote_workspace_folder_from_row(row: &BrowserRow) -> Option<(String, RemoteW
     ))
 }
 fn remote_workspace_cwd_uses_generated_leaf(cwd: &str) -> bool {
-    workspace_leaf_name(cwd).is_some_and(|leaf| leaf.starts_with("folder-"))
+    workspace_cwd_uses_generated_leaf(cwd)
 }
 fn remote_workspace_bookmark_label_looks_like_path(label: &str) -> bool {
     let label = label.trim();
@@ -27562,14 +27562,63 @@ fn context_menu_surface_style(
         placement_style, background, shadow, palette.text, backdrop_filter, backdrop_filter
     )
 }
-fn group_session_cwd(row: &BrowserRow) -> Option<String> {
-    if row.full_path.starts_with("__live_") {
+/// Does this virtual path end in a leaf the tree GENERATED rather than a real
+/// directory name? Creating a folder mints `<parent>/folder-<nanos>`
+/// (`new_group_virtual_path_for_row`) and renaming it rewrites only the TITLE —
+/// `put_group(virtual_path, title)` keeps the path as the group's identity — so
+/// the synthetic leaf outlives the rename. SSOT for both the local launch cwd
+/// below and the remote workspace-bookmark path.
+fn workspace_cwd_uses_generated_leaf(path: &str) -> bool {
+    workspace_leaf_name(path).is_some_and(|leaf| leaf.starts_with("folder-"))
+}
+/// The launch cwd for a GROUP row, given a way to test whether a directory
+/// exists. Pure so it can be tested without touching the filesystem.
+///
+/// A workspace group's `full_path` is its IDENTITY, not a directory. Handing a
+/// generated leaf to a launcher starts the agent in a directory that does not
+/// exist — and something downstream then CREATES it, littering the filesystem
+/// with `~/git/folder-1783594131281231525` (reported 2026-07-09).
+///
+/// So: never launch into a generated leaf. Walk up to the nearest real
+/// ancestor. If the group's TITLE names an existing child of that ancestor, use
+/// it — that is exactly what a user means when they mirror a filesystem folder
+/// in the tree. Otherwise fall back to the ancestor itself, which always exists.
+fn group_launch_cwd_for(
+    full_path: &str,
+    title: &str,
+    dir_exists: impl Fn(&str) -> bool,
+) -> Option<String> {
+    if full_path.starts_with("__live_") {
         return None;
     }
-    if row.full_path == "local" {
+    if full_path == "local" {
         return std::env::var_os("HOME").map(|path| path.to_string_lossy().into_owned());
     }
-    Some(row.full_path.clone())
+    let mut base = full_path.to_string();
+    let mut skipped_generated_leaf = false;
+    while workspace_cwd_uses_generated_leaf(&base) {
+        base = workspace_parent_path(&base)?;
+        skipped_generated_leaf = true;
+    }
+    if skipped_generated_leaf {
+        // The title is the name the user gave the folder. Accept it only as a
+        // single path segment — never let a label traverse the filesystem.
+        let title = title.trim();
+        let title_is_a_plain_name =
+            !title.is_empty() && !title.contains('/') && title != "." && title != "..";
+        if title_is_a_plain_name {
+            let candidate = format!("{}/{title}", base.trim_end_matches('/'));
+            if dir_exists(&candidate) {
+                return Some(candidate);
+            }
+        }
+    }
+    Some(base)
+}
+fn group_session_cwd(row: &BrowserRow) -> Option<String> {
+    group_launch_cwd_for(&row.full_path, &row.label, |path| {
+        std::path::Path::new(path).is_dir()
+    })
 }
 fn remote_folder_cwd(row: &BrowserRow) -> Option<String> {
     let normalized = row.full_path.trim_start_matches('/');
@@ -81927,6 +81976,47 @@ mod tests {
         assert!(shell
             .web_surface_overlay_for_session("local://ws", 2_500)
             .is_some());
+    }
+
+    // Creating a folder in the cwd tree mints `<parent>/folder-<nanos>`, and
+    // renaming it changes only the TITLE. Launching an agent in that group used
+    // to hand the synthetic path to the launcher, so Claude Code started in a
+    // nonexistent `~/git/folder-1783594131281231525` (which then got created).
+    #[test]
+    fn a_renamed_tree_folder_launches_in_the_directory_the_user_named() {
+        let generated = "/home/user/git/folder-1783594131281231525";
+        // The user made ~/git/exam-prep-notes on disk and mirrored it.
+        let on_disk = |path: &str| path == "/home/user/git/exam-prep-notes";
+        assert_eq!(
+            group_launch_cwd_for(generated, "exam-prep-notes", on_disk).as_deref(),
+            Some("/home/user/git/exam-prep-notes"),
+        );
+        // No matching directory → the nearest REAL ancestor, never the synthetic
+        // leaf. `~/git` always exists; `~/git/folder-<nanos>` never did.
+        assert_eq!(
+            group_launch_cwd_for(generated, "Some Folder", |_| false).as_deref(),
+            Some("/home/user/git"),
+        );
+        // Nested generated leaves walk all the way up.
+        assert_eq!(
+            group_launch_cwd_for("/home/user/git/folder-111/folder-222", "x", |_| false).as_deref(),
+            Some("/home/user/git"),
+        );
+        // A real directory row is untouched.
+        assert_eq!(
+            group_launch_cwd_for("/home/user/gh/yggterm", "yggterm", |_| true).as_deref(),
+            Some("/home/user/gh/yggterm"),
+        );
+        // A title must never traverse: it is one path segment or nothing.
+        for hostile in ["../../etc", "a/b", "", "  ", ".", ".."] {
+            assert_eq!(
+                group_launch_cwd_for(generated, hostile, |_| true).as_deref(),
+                Some("/home/user/git"),
+                "title {hostile:?} must not escape the parent"
+            );
+        }
+        // Live-region rows have no cwd at all.
+        assert_eq!(group_launch_cwd_for("__live_sessions__", "x", |_| true), None);
     }
 
     fn keep_alive_test_row(full_path: &str, kind: BrowserRowKind) -> BrowserRow {
