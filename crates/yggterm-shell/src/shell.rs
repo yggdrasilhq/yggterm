@@ -2698,6 +2698,7 @@ struct RenderSnapshot {
     context_menu_row: Option<BrowserRow>,
     context_menu_context_row: Option<BrowserRow>,
     context_menu_position: Option<(f64, f64)>,
+    keep_alive_plan: Option<KeepAlivePlan>,
     preview_layout: PreviewLayoutMode,
     server_busy: bool,
     show_loading_tree: bool,
@@ -4432,6 +4433,7 @@ impl ShellState {
             context_menu_row: self.context_menu_row.clone(),
             context_menu_context_row: self.context_menu_context_row.clone(),
             context_menu_position: self.context_menu_position,
+            keep_alive_plan: self.context_menu_keep_alive_plan(),
             preview_layout: self.preview_layout,
             server_busy: self.server_busy,
             show_loading_tree: (self.needs_initial_server_sync && self.server_busy)
@@ -9727,6 +9729,23 @@ impl ShellState {
         );
         self.refresh_tree_debug("open_context_menu");
     }
+    /// The keep-alive item's target set: every SELECTED live session when the
+    /// right-clicked row is part of the selection (the same rule that titles
+    /// the menu "{n} selected items"), otherwise just the right-clicked row.
+    /// `None` when the row cannot be kept alive at all.
+    ///
+    /// Ordered by TREE order, never by `selected_tree_paths` (a `HashSet`):
+    /// the request order and the pending label must be deterministic. One
+    /// function serves both the label and the click handler, so what the menu
+    /// promises and what the click does cannot drift.
+    fn context_menu_keep_alive_plan(&self) -> Option<KeepAlivePlan> {
+        keep_alive_plan_for(
+            self.context_menu_row.as_ref()?,
+            &self.selected_tree_paths,
+            self.browser.rows(),
+            |path| self.server.live_session_keep_alive(path),
+        )
+    }
     fn close_context_menu(&mut self) {
         self.context_menu_row = None;
         self.context_menu_context_row = None;
@@ -13141,6 +13160,56 @@ fn mark_live_session_keep_alive_locally(
         .server
         .set_live_session_keep_alive(path, keep_alive)
         .unwrap_or(false)
+}
+
+/// Only a live runtime session row can be kept alive. SSOT for the context
+/// menu's gate and for the keep-alive plan below — they must never disagree
+/// about which rows the item applies to.
+fn row_supports_keep_alive(row: &BrowserRow) -> bool {
+    row.kind == BrowserRowKind::Session && is_hot_terminal_sidebar_path(&row.full_path)
+}
+
+/// What the context menu's keep-alive item shows and does. `paths` are the
+/// sessions it acts on, in tree order; `all_keep_alive` decides whether the
+/// item reads "Keep Alive" (set every path) or "Stop Keeping Alive" (clear
+/// every path). A MIXED selection is therefore not a per-row toggle: the item
+/// reads "Keep Alive" and turns them all on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct KeepAlivePlan {
+    paths: Vec<String>,
+    all_keep_alive: bool,
+}
+
+/// Pure core of [`ShellState::context_menu_keep_alive_plan`]: the right-clicked
+/// `row`, the tree selection, the tree's rows in display order, and a lookup of
+/// each session's current keep-alive state.
+fn keep_alive_plan_for(
+    row: &BrowserRow,
+    selected_paths: &HashSet<String>,
+    rows: &[BrowserRow],
+    keep_alive: impl Fn(&str) -> bool,
+) -> Option<KeepAlivePlan> {
+    if !row_supports_keep_alive(row) {
+        return None;
+    }
+    let acts_on_selection =
+        selected_paths.len() > 1 && selected_paths.contains(row.full_path.as_str());
+    let paths: Vec<String> = if acts_on_selection {
+        rows.iter()
+            .filter(|row| row_supports_keep_alive(row))
+            .filter(|row| selected_paths.contains(row.full_path.as_str()))
+            .map(|row| row.full_path.clone())
+            .collect()
+    } else {
+        vec![row.full_path.clone()]
+    };
+    // A selected row can outlive its session (the tree keeps the row while the
+    // daemon drops the session), so an empty target set is not "all kept alive".
+    let all_keep_alive = !paths.is_empty() && paths.iter().all(|path| keep_alive(path));
+    Some(KeepAlivePlan {
+        paths,
+        all_keep_alive,
+    })
 }
 
 fn local_keep_alive_session_paths(shell: &ShellState) -> Vec<String> {
@@ -24268,8 +24337,18 @@ fn live_session_summary_with_index(
         })
         .unwrap_or_default()
 }
+/// The metadata label that carries a live session's keep-alive truth. One
+/// constant so the `ManagedSessionView` and `SnapshotSessionView` readers below
+/// cannot drift apart.
+const RUNTIME_PERSISTENCE_LABEL: &str = "Runtime Persistence";
+const RUNTIME_PERSISTENCE_KEEP_ALIVE: &str = "keep-alive";
 fn live_session_keep_alive(session: &ManagedSessionView) -> bool {
-    metadata_value(session, "Runtime Persistence") == "keep-alive"
+    metadata_value(session, RUNTIME_PERSISTENCE_LABEL) == RUNTIME_PERSISTENCE_KEEP_ALIVE
+}
+/// Keep-alive as reported by a daemon SNAPSHOT (the reply to a request), which
+/// carries `SnapshotSessionView` rather than `ManagedSessionView`.
+fn snapshot_session_keep_alive(session: &SnapshotSessionView) -> bool {
+    snapshot_metadata_value(session, RUNTIME_PERSISTENCE_LABEL) == RUNTIME_PERSISTENCE_KEEP_ALIVE
 }
 fn live_session_temporary_update_restore(session: &ManagedSessionView) -> bool {
     metadata_value(session, "Runtime Restore Reason") == "update-restart"
@@ -36034,6 +36113,202 @@ fn rbw_add_login(
     }
     Ok(())
 }
+/// Current TOTP code for a vault entry (`rbw code`). Errors when the entry
+/// carries no authenticator secret. Blocking; call from spawn_blocking.
+fn rbw_vault_totp(entry_name: &str, user: Option<&str>) -> Result<String, String> {
+    let rbw = rbw_binary()?;
+    let mut code = std::process::Command::new(&rbw);
+    code.arg("code").arg(entry_name);
+    if let Some(user) = user.filter(|user| !user.is_empty()) {
+        code.arg(user);
+    }
+    let output = code
+        .output()
+        .map_err(|error| format!("run rbw code: {error}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stderr = stderr.trim();
+        return Err(if stderr.contains("no totp") || stderr.contains("TOTP") {
+            format!("{entry_name} has no authenticator secret")
+        } else {
+            format!("rbw code failed: {stderr}")
+        });
+    }
+    let code = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if code.is_empty() {
+        return Err(format!("{entry_name} has no authenticator secret"));
+    }
+    Ok(code)
+}
+/// In-page script that drops a TOTP code into the visible one-time-code
+/// field. Detection mirrors what password managers key on: the
+/// `one-time-code` autocomplete token first (the standard), then the usual
+/// name/id/placeholder vocabulary, then a short numeric input.
+fn web_surface_totp_script(code: &str, label: &str) -> String {
+    let code_json = serde_json::to_string(code).unwrap_or_default();
+    let label_json = serde_json::to_string(label).unwrap_or_default();
+    format!(
+        r#"(function() {{
+            const code = {code_json};
+            const visible = (el) => {{
+                const rect = el.getBoundingClientRect();
+                return rect.width > 0 && rect.height > 0;
+            }};
+            const setValue = (el, value) => {{
+                const setter = Object.getOwnPropertyDescriptor(
+                    window.HTMLInputElement.prototype, 'value').set;
+                setter.call(el, value);
+                el.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                el.dispatchEvent(new Event('change', {{ bubbles: true }}));
+            }};
+            const toast = () => {{
+                const el = document.createElement('div');
+                el.textContent = {label_json};
+                el.style.cssText = 'position:fixed;right:16px;bottom:16px;z-index:2147483647;' +
+                    'background:rgba(20,22,28,0.92);color:#fff;padding:8px 14px;border-radius:10px;' +
+                    'font:12.5px system-ui,sans-serif;box-shadow:0 4px 18px rgba(0,0,0,0.35);';
+                document.documentElement.appendChild(el);
+                setTimeout(() => el.remove(), 4000);
+            }};
+            const inputs = [...document.querySelectorAll('input')].filter(visible);
+            const looksOtp = (el) => {{
+                const hay = [el.autocomplete, el.name, el.id, el.placeholder,
+                    el.getAttribute('aria-label')].join(' ').toLowerCase();
+                return /one-time-code|otp|totp|2fa|two-factor|verification|authenticator/.test(hay);
+            }};
+            const target = inputs.find((el) => (el.autocomplete || '').includes('one-time-code'))
+                || inputs.find(looksOtp)
+                || inputs.find((el) => el.inputMode === 'numeric' && Number(el.maxLength) === 6);
+            // Split digit boxes (one input per character) are common on 2FA
+            // screens: fill them left to right when the code fits exactly.
+            const boxes = inputs.filter((el) => Number(el.maxLength) === 1);
+            if (!target && boxes.length === code.length) {{
+                boxes.forEach((el, index) => setValue(el, code[index]));
+                boxes[boxes.length - 1].focus();
+                toast();
+                return 'digit-boxes';
+            }}
+            if (!target) return 'no-otp-field';
+            setValue(target, code);
+            target.focus();
+            toast();
+            return 'filled';
+        }})()"#
+    )
+}
+/// App-control: put a vault entry's current TOTP code into the page's
+/// one-time-code field, and onto the clipboard as a fallback. `entry` None =
+/// auto-match the page host (same strict rule as the password fill).
+async fn web_surface_totp_for(
+    state: &Signal<ShellState>,
+    desktop: &dioxus::desktop::DesktopContext,
+    session_path: Option<&str>,
+    entry: Option<&str>,
+    user: Option<&str>,
+) -> Value {
+    let (session, native_id) = match resolve_live_web_surface(state, session_path) {
+        Ok(resolved) => resolved,
+        Err(reason) => return json!({ "accepted": false, "reason": reason }),
+    };
+    let Some((page_url, _)) = desktop.web_surface_page_state(native_id) else {
+        return json!({
+            "accepted": false,
+            "session_path": session,
+            "reason": "surface has no page state",
+        });
+    };
+    if !page_url.starts_with("https://") && !web_surface_url_is_loopback(&page_url) {
+        return json!({
+            "accepted": false,
+            "session_path": session,
+            "reason": format!("refusing to fill a code into a non-https page: {page_url}"),
+        });
+    }
+    let host = web_surface_tab_host_label(&page_url);
+    // Auto-match needs a host; a user-CHOSEN entry doesn't (they decided).
+    if entry.is_none() && (host.is_empty() || host == "New Tab") {
+        return json!({
+            "accepted": false,
+            "session_path": session,
+            "reason": "page has no host to match against the vault",
+        });
+    }
+    let lookup_host = host.split(':').next().unwrap_or(&host).to_string();
+    let chosen_entry = entry.map(str::to_string);
+    let chosen_user = user.map(str::to_string);
+    let resolved = task::spawn_blocking(move || match chosen_entry {
+        Some(entry) => rbw_vault_totp(&entry, chosen_user.as_deref()).map(|code| (entry, code)),
+        None => {
+            let (name, user) = vault_auto_match_for_host(&lookup_host)?;
+            rbw_vault_totp(&name, Some(&user)).map(|code| (name, code))
+        }
+    })
+    .await
+    .unwrap_or_else(|join| Err(format!("totp task failed: {join}")));
+    let (entry_name, code) = match resolved {
+        Ok(resolved) => resolved,
+        Err(reason) => {
+            return json!({ "accepted": false, "session_path": session, "reason": reason })
+        }
+    };
+    // Clipboard as the escape hatch (some 2FA screens defeat scripted fills).
+    // exclude_from_history keeps clipboard managers from archiving the code.
+    let clipboard = if let Ok(home) = yggterm_core::resolve_yggterm_home() {
+        copy_terminal_selection_to_clipboard(&session, "vault_totp", code.clone(), home).is_ok()
+    } else {
+        false
+    };
+    let script = web_surface_totp_script(&code, &format!("yggterm · code for {entry_name}"));
+    let (tx, rx) = tokio::sync::oneshot::channel::<Result<String, String>>();
+    if let Err(reason) = desktop.eval_web_surface(native_id, &script, move |outcome| {
+        let _ = tx.send(outcome);
+    }) {
+        return json!({ "accepted": false, "session_path": session, "reason": reason });
+    }
+    let filled = match tokio::time::timeout(Duration::from_secs(10), rx).await {
+        Ok(Ok(Ok(value_json))) => serde_json::from_str::<Value>(&value_json)
+            .ok()
+            .and_then(|value| value.as_str().map(ToOwned::to_owned))
+            .unwrap_or(value_json),
+        Ok(Ok(Err(js_error))) => {
+            return json!({
+                "accepted": false,
+                "session_path": session,
+                "reason": format!("js: {js_error}"),
+            })
+        }
+        Ok(Err(_)) => {
+            return json!({
+                "accepted": false,
+                "session_path": session,
+                "reason": "totp callback dropped (surface destroyed mid-fill?)",
+            })
+        }
+        Err(_) => {
+            return json!({
+                "accepted": false,
+                "session_path": session,
+                "reason": "totp fill timed out (10s)",
+            })
+        }
+    };
+    // No OTP field is NOT a failure when the code reached the clipboard —
+    // many 2FA screens want a paste.
+    let accepted = filled != "no-otp-field" || clipboard;
+    json!({
+        "accepted": accepted,
+        "session_path": session,
+        "native_id": native_id,
+        "host": host,
+        "entry": entry_name,
+        "filled": filled,
+        "clipboard": clipboard,
+        "digits": code.chars().count(),
+        "reason": if accepted { Value::Null } else {
+            Value::String("no one-time-code field on the page, and the clipboard copy failed".to_string())
+        },
+    })
+}
 /// Generate a password with the vault CLI's own generator (`rbw generate`
 /// WITHOUT an entry name prints without storing). Blocking; call from
 /// spawn_blocking.
@@ -36123,25 +36398,42 @@ struct VaultWatchtowerReport {
 /// Auto-match path: the FIRST (sorted) vault entry whose NAME matches `host`
 /// exactly (or its `www.` twin) — strict on purpose: the user didn't choose,
 /// so no base-domain fuzz here. Blocking; call from spawn_blocking.
-fn web_surface_password_lookup(host: &str) -> Result<WebLoginCredential, String> {
+/// Does entry NAME auto-match `host`? Exact host, its `www.`-stripped twin, or
+/// that twin re-prefixed with `www.`. Deliberately STRICTER than
+/// `vault_entry_applies_to_host` (which only *suggests* sidebar rows): no
+/// base-domain suffix match, because an auto path fills without anyone
+/// confirming the choice.
+fn vault_entry_auto_matches_host(entry_name: &str, host: &str) -> bool {
+    let name = entry_name.trim().to_lowercase();
+    if name.is_empty() {
+        return false;
+    }
+    let host = host.trim().to_lowercase();
+    let bare_host = host.strip_prefix("www.").unwrap_or(&host);
+    name == host || name == bare_host || name == format!("www.{bare_host}")
+}
+/// Auto-match a page host to one vault entry `(name, username)`; first sorted
+/// wins when several accounts share a name. SSOT for every auto path (password
+/// fill, TOTP); a user-CHOSEN entry skips it because they already decided.
+/// Blocking; call from spawn_blocking.
+fn vault_auto_match_for_host(host: &str) -> Result<(String, String), String> {
     let host = host.trim().to_lowercase();
     if host.is_empty() {
         return Err("page has no host".to_string());
     }
-    let bare_host = host.strip_prefix("www.").unwrap_or(&host).to_string();
     let mut candidates: Vec<(String, String)> = rbw_vault_entries()?
         .into_iter()
-        .filter(|entry| {
-            let lowered = entry.name.to_lowercase();
-            lowered == host || lowered == bare_host || lowered == format!("www.{bare_host}")
-        })
+        .filter(|entry| vault_entry_auto_matches_host(&entry.name, &host))
         .map(|entry| (entry.name, entry.user))
         .collect();
     candidates.sort();
-    let (entry_name, username) = candidates
+    candidates
         .into_iter()
         .next()
-        .ok_or_else(|| format!("no vault entry named for host {host}"))?;
+        .ok_or_else(|| format!("no vault entry named for host {host}"))
+}
+fn web_surface_password_lookup(host: &str) -> Result<WebLoginCredential, String> {
+    let (entry_name, username) = vault_auto_match_for_host(host)?;
     rbw_vault_password(&entry_name, Some(&username))
 }
 /// PATH lookup without shelling out (deterministic, no shell parsing).
@@ -40203,6 +40495,34 @@ async fn process_pending_app_control_requests(
                 data: Some(result),
             }
         }
+        AppControlCommand::WebSurfaceTotp {
+            session_path,
+            entry,
+            user,
+        } => {
+            let result = web_surface_totp_for(
+                &state,
+                &desktop,
+                session_path.as_deref(),
+                entry.as_deref(),
+                user.as_deref(),
+            )
+            .await;
+            AppControlResponse {
+                request_id: request.request_id.clone(),
+                handled_by_pid: std::process::id(),
+                completed_at_ms: current_millis() as u128,
+                output_path: None,
+                error: result
+                    .get("accepted")
+                    .and_then(Value::as_bool)
+                    .filter(|accepted| !accepted)
+                    .and_then(|_| result.get("reason"))
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned),
+                data: Some(result),
+            }
+        }
         AppControlCommand::ReadTerminalBuffer { session_path, mode } => {
             let result = read_terminal_buffer_for(&session_path, &mode).await;
             AppControlResponse {
@@ -40443,6 +40763,21 @@ async fn process_pending_app_control_requests(
             match outcome {
                 Ok((snapshot, message)) => {
                     let active_session_path = snapshot.active_session_path.clone();
+                    // A successful ROUND TRIP is not a successful KEEP-ALIVE. The
+                    // daemon refuses a session it holds no terminal runtime for —
+                    // e.g. the runtime belongs to another daemon after a
+                    // version-mismatched restart — and reports that in `message`
+                    // while still returning Ok. Answering `accepted: true` there
+                    // made the CLI and the GUI toast claim a keep-alive that never
+                    // happened. Read the OUTCOME off the returned snapshot, which
+                    // is the SSOT for keep-alive, rather than trusting transport
+                    // success or parsing the daemon's prose.
+                    let applied = snapshot
+                        .live_sessions
+                        .iter()
+                        .find(|session| session.session_path == session_path)
+                        .map(snapshot_session_keep_alive);
+                    let accepted = applied == Some(keep_alive);
                     state.with_mut(|shell| {
                         shell.apply_interactive_snapshot_result(Ok((snapshot, message.clone())));
                     });
@@ -40452,13 +40787,19 @@ async fn process_pending_app_control_requests(
                         completed_at_ms: current_millis() as u128,
                         output_path: None,
                         data: Some(json!({
-                            "accepted": true,
+                            "accepted": accepted,
                             "session_path": session_path,
                             "keep_alive": keep_alive,
                             "active_session_path": active_session_path,
                             "message": message,
                         })),
-                        error: None,
+                        error: (!accepted).then(|| {
+                            message.clone().unwrap_or_else(|| {
+                                format!(
+                                    "daemon did not apply keep_alive={keep_alive} to {session_path}"
+                                )
+                            })
+                        }),
                     }
                 }
                 Err(error) => AppControlResponse {
@@ -45091,6 +45432,60 @@ fn app() -> Element {
                                     });
                                 }
                             },
+                            on_totp_vault_entry: {
+                                let desktop = desktop.clone();
+                                move |(entry, user): (String, String)| {
+                                    let desktop = desktop.clone();
+                                    spawn(async move {
+                                        let user_opt =
+                                            (!user.is_empty()).then_some(user.as_str());
+                                        let result = web_surface_totp_for(
+                                            &state,
+                                            &desktop,
+                                            None,
+                                            Some(entry.as_str()),
+                                            user_opt,
+                                        )
+                                        .await;
+                                        let accepted = result
+                                            .get("accepted")
+                                            .and_then(Value::as_bool)
+                                            .unwrap_or(false);
+                                        let mut state = state;
+                                        if accepted {
+                                            let detail = if result
+                                                .get("filled")
+                                                .and_then(Value::as_str)
+                                                == Some("no-otp-field")
+                                            {
+                                                format!("No code field on the page — {entry}'s code is on the clipboard.")
+                                            } else {
+                                                format!("Filled {entry}'s authenticator code.")
+                                            };
+                                            state.with_mut(|shell| {
+                                                shell.push_notification(
+                                                    NotificationTone::Success,
+                                                    "Authenticator code",
+                                                    detail,
+                                                );
+                                            });
+                                        } else {
+                                            let reason = result
+                                                .get("reason")
+                                                .and_then(Value::as_str)
+                                                .unwrap_or("unknown failure")
+                                                .to_string();
+                                            state.with_mut(|shell| {
+                                                shell.push_notification(
+                                                    NotificationTone::Error,
+                                                    "Authenticator code failed",
+                                                    reason,
+                                                );
+                                            });
+                                        }
+                                    });
+                                }
+                            },
                         }
                     }
                 }
@@ -45101,6 +45496,7 @@ fn app() -> Element {
                         window_size: context_menu_window_size,
                         selected_row: snapshot.selected_row.clone(),
                         selected_tree_paths: snapshot.selected_tree_paths.clone(),
+                        keep_alive_plan: snapshot.keep_alive_plan.clone(),
                         can_remove_saved_ssh_target: saved_ssh_target_machine_key(&row, &snapshot.ssh_targets).is_some(),
                         palette: snapshot.palette,
                         on_close: move |_| {
@@ -45245,25 +45641,52 @@ fn app() -> Element {
                         on_set_keep_alive: {
                             let row = row.clone();
                             move |keep_alive| {
-                                let path = row.full_path.clone();
-                                state.with_mut(|shell| {
-                                    mark_live_session_keep_alive_locally(
-                                        shell,
-                                        &path,
-                                        keep_alive,
-                                    );
+                                // Re-derive from the same function that labelled the
+                                // item, so the click can never write to a different
+                                // set than the menu promised.
+                                let Some(plan) = state.with_mut(|shell| {
+                                    let plan = shell.context_menu_keep_alive_plan();
+                                    if let Some(plan) = plan.as_ref() {
+                                        for path in &plan.paths {
+                                            mark_live_session_keep_alive_locally(
+                                                shell,
+                                                path,
+                                                keep_alive,
+                                            );
+                                        }
+                                    }
                                     shell.close_context_menu();
                                     shell.refresh_tree_debug("keep_alive_optimistic_toggle");
-                                });
+                                    plan
+                                }) else {
+                                    return;
+                                };
+                                let target = if plan.paths.len() > 1 {
+                                    format!("{} sessions", plan.paths.len())
+                                } else {
+                                    row.label.clone()
+                                };
+                                let paths = plan.paths.clone();
                                 spawn_server_snapshot_action(
                                     state,
                                     if keep_alive {
-                                        format!("keeping {} alive", row.label)
+                                        format!("keeping {target} alive")
                                     } else {
-                                        format!("stopping keep-alive for {}", row.label)
+                                        format!("stopping keep-alive for {target}")
                                     },
                                     move |endpoint| {
-                                        set_session_keep_alive(&endpoint, &path, keep_alive)
+                                        // Exact paths, one request each, tree order.
+                                        // The LAST snapshot is the one the UI adopts;
+                                        // a failure anywhere aborts and surfaces.
+                                        let mut result = None;
+                                        for path in &paths {
+                                            result = Some(set_session_keep_alive(
+                                                &endpoint, path, keep_alive,
+                                            )?);
+                                        }
+                                        result.ok_or_else(|| {
+                                            anyhow!("no live session to keep alive")
+                                        })
                                     },
                                 );
                             }
@@ -75500,6 +75923,7 @@ fn RightRail(
     on_reload_web_surface: EventHandler<()>,
     on_fill_web_surface_login: EventHandler<()>,
     on_fill_vault_entry: EventHandler<(String, String)>,
+    on_totp_vault_entry: EventHandler<(String, String)>,
 ) -> Element {
     let requested_mode = snapshot.right_panel_mode;
     let mut retained_mode = use_signal(|| requested_mode);
@@ -75579,6 +76003,7 @@ fn RightRail(
                 VaultRailBody {
                     snapshot: snapshot.clone(),
                     on_fill_vault_entry,
+                    on_totp_vault_entry,
                 }
             }
             }
@@ -75847,6 +76272,7 @@ enum VaultPaneTab {
 fn VaultRailBody(
     snapshot: SharedSnapshot,
     on_fill_vault_entry: EventHandler<(String, String)>,
+    on_totp_vault_entry: EventHandler<(String, String)>,
 ) -> Element {
     let palette = snapshot.palette;
     let mut tab = use_signal(|| VaultPaneTab::Fill);
@@ -75896,27 +76322,46 @@ fn VaultRailBody(
         let folder = entry.folder.clone();
         let fill_name = name.clone();
         let fill_user = user.clone();
+        let totp_name = name.clone();
+        let totp_user = user.clone();
         rsx! {
             div {
                 key: "{key}",
-                title: "Fill this login into the page",
-                style: format!(
-                    "display:flex; flex-direction:column; gap:1px; padding:6px 8px; border-radius:8px; \
-                     cursor:pointer; background:rgba(127,127,127,0.08);",
-                ),
-                onclick: move |_| {
-                    on_fill_vault_entry.call((fill_name.clone(), fill_user.clone()));
-                },
+                style: "display:flex; align-items:center; gap:6px; padding:6px 8px; border-radius:8px; background:rgba(127,127,127,0.08);",
                 div {
-                    style: format!("font-size:11px; font-weight:600; color:{}; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;", palette.text),
-                    "{name}"
-                }
-                div {
-                    style: format!("display:flex; gap:6px; font-size:10px; color:{}; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;", palette.muted),
-                    span { "{user}" }
-                    if !folder.is_empty() {
-                        span { style: "opacity:0.7;", "· {folder}" }
+                    title: "Fill this login into the page",
+                    style: "display:flex; flex-direction:column; gap:1px; flex:1 1 auto; min-width:0; cursor:pointer;",
+                    onclick: move |_| {
+                        on_fill_vault_entry.call((fill_name.clone(), fill_user.clone()));
+                    },
+                    div {
+                        style: format!("font-size:11px; font-weight:600; color:{}; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;", palette.text),
+                        "{name}"
                     }
+                    div {
+                        style: format!("display:flex; gap:6px; font-size:10px; color:{}; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;", palette.muted),
+                        span { "{user}" }
+                        if !folder.is_empty() {
+                            span { style: "opacity:0.7;", "· {folder}" }
+                        }
+                    }
+                }
+                // TOTP is per-ROW rather than gated on "has an authenticator
+                // secret": rbw's list can't tell us, so the button reports
+                // "no authenticator secret" if the entry has none.
+                button {
+                    r#type: "button",
+                    "data-vault-totp": "1",
+                    title: "Fill the authenticator code into the page (also copied to the clipboard)",
+                    style: format!(
+                        "flex:0 0 auto; border:none; background:transparent; color:{}; cursor:pointer; font-size:12px; padding:4px 6px; border-radius:6px;",
+                        palette.muted,
+                    ),
+                    onclick: move |evt: MouseEvent| {
+                        evt.stop_propagation();
+                        on_totp_vault_entry.call((totp_name.clone(), totp_user.clone()));
+                    },
+                    "⏱"
                 }
             }
         }
@@ -77019,6 +77464,7 @@ fn ContextMenuOverlay(
     window_size: (f64, f64),
     selected_row: Option<BrowserRow>,
     selected_tree_paths: Vec<String>,
+    keep_alive_plan: Option<KeepAlivePlan>,
     can_remove_saved_ssh_target: bool,
     palette: Palette,
     on_close: EventHandler<MouseEvent>,
@@ -77068,9 +77514,21 @@ fn ContextMenuOverlay(
     let can_rename = context_menu_allows_rename(&row);
     let can_regenerate_copy = !is_live_sessions_group
         && matches!(row.kind, BrowserRowKind::Session | BrowserRowKind::Group);
-    let is_live_runtime_row =
-        row.kind == BrowserRowKind::Session && is_hot_terminal_sidebar_path(&row.full_path);
-    let keep_alive_active = row.detail_label.starts_with("Kept alive");
+    let is_live_runtime_row = row_supports_keep_alive(&row);
+    // The plan is the SSOT for this item: which sessions it writes to, and
+    // whether it reads "Keep Alive" or "Stop Keeping Alive".
+    let keep_alive_active = keep_alive_plan
+        .as_ref()
+        .is_some_and(|plan| plan.all_keep_alive);
+    let keep_alive_count = keep_alive_plan
+        .as_ref()
+        .map(|plan| plan.paths.len())
+        .unwrap_or(0);
+    let keep_alive_suffix = if keep_alive_count > 1 {
+        format!(" ({keep_alive_count} sessions)")
+    } else {
+        String::new()
+    };
     let selected_count = drag_paths.len().max(1);
     let menu_title = if selected_count > 1 && drag_paths.iter().any(|path| path == &row.full_path) {
         format!("{selected_count} selected items")
@@ -77284,6 +77742,7 @@ fn ContextMenuOverlay(
                         }
                         button {
                             "data-context-menu-action": if keep_alive_active { "stop-keep-alive" } else { "keep-alive" },
+                            "data-keep-alive-count": "{keep_alive_count}",
                             class: "yggterm-menu-item",
                             style: context_menu_action_style(palette, false),
                             onmousedown: |evt| {
@@ -77294,9 +77753,9 @@ fn ContextMenuOverlay(
                                 on_set_keep_alive.call(!keep_alive_active);
                             },
                             if keep_alive_active {
-                                "Stop Keeping Alive"
+                                "Stop Keeping Alive{keep_alive_suffix}"
                             } else {
-                                "Keep Alive"
+                                "Keep Alive{keep_alive_suffix}"
                             }
                         }
                         div {
@@ -81468,6 +81927,136 @@ mod tests {
         assert!(shell
             .web_surface_overlay_for_session("local://ws", 2_500)
             .is_some());
+    }
+
+    fn keep_alive_test_row(full_path: &str, kind: BrowserRowKind) -> BrowserRow {
+        BrowserRow {
+            kind,
+            full_path: full_path.to_string(),
+            label: full_path.to_string(),
+            detail_label: String::new(),
+            document_kind: None,
+            group_kind: None,
+            session_title: None,
+            depth: 1,
+            host_label: "local".to_string(),
+            descendant_sessions: 0,
+            expanded: false,
+            session_id: None,
+            session_cwd: None,
+            session_kind: None,
+        }
+    }
+
+    // Right-clicking a row inside a MULTI-selection makes "Keep Alive" a SET,
+    // not a per-row toggle: a mixed selection reads "Keep Alive" and turns
+    // every selected session on. Only when all of them are already kept alive
+    // does the item flip to "Stop Keeping Alive".
+    #[test]
+    fn keep_alive_plan_over_a_mixed_selection_turns_every_session_on() {
+        let rows = vec![
+            keep_alive_test_row("__live_sessions__", BrowserRowKind::Group),
+            keep_alive_test_row("local://one", BrowserRowKind::Session),
+            keep_alive_test_row("local://two", BrowserRowKind::Session),
+            keep_alive_test_row("ssh://box/three", BrowserRowKind::Session),
+        ];
+        let selected: HashSet<String> = ["local://one", "local://two", "ssh://box/three"]
+            .into_iter()
+            .map(ToOwned::to_owned)
+            .collect();
+        // Mixed: only `two` is currently kept alive.
+        let plan = keep_alive_plan_for(&rows[2], &selected, &rows, |path| path == "local://two")
+            .expect("a live session row has a plan");
+        assert!(
+            !plan.all_keep_alive,
+            "a mixed selection must offer Keep Alive, not Stop Keeping Alive"
+        );
+        // Tree order, not HashSet order — the pending label and the request
+        // order must be deterministic.
+        assert_eq!(
+            plan.paths,
+            vec!["local://one", "local://two", "ssh://box/three"]
+        );
+        // All on: now the item flips.
+        let plan = keep_alive_plan_for(&rows[2], &selected, &rows, |_| true).expect("plan");
+        assert!(plan.all_keep_alive);
+    }
+
+    #[test]
+    fn keep_alive_plan_ignores_the_selection_when_the_clicked_row_is_outside_it() {
+        let rows = vec![
+            keep_alive_test_row("local://one", BrowserRowKind::Session),
+            keep_alive_test_row("local://two", BrowserRowKind::Session),
+            keep_alive_test_row("local://other", BrowserRowKind::Session),
+        ];
+        let selected: HashSet<String> = ["local://one", "local://two"]
+            .into_iter()
+            .map(ToOwned::to_owned)
+            .collect();
+        // Right-clicked a row the user never selected: act on that row alone.
+        let plan = keep_alive_plan_for(&rows[2], &selected, &rows, |_| false).expect("plan");
+        assert_eq!(plan.paths, vec!["local://other"]);
+
+        // A single selected row is not a bulk action either.
+        let single: HashSet<String> = ["local://one"].into_iter().map(ToOwned::to_owned).collect();
+        let plan = keep_alive_plan_for(&rows[0], &single, &rows, |_| false).expect("plan");
+        assert_eq!(plan.paths, vec!["local://one"]);
+    }
+
+    #[test]
+    fn keep_alive_plan_skips_rows_that_are_not_live_sessions() {
+        let group = keep_alive_test_row("__live_sessions__", BrowserRowKind::Group);
+        let saved = keep_alive_test_row("workspace/saved-note", BrowserRowKind::Session);
+        let rows = vec![group.clone(), saved.clone()];
+        let empty = HashSet::new();
+        // A group row has no keep-alive item at all...
+        assert!(keep_alive_plan_for(&group, &empty, &rows, |_| false).is_none());
+        // ...and neither does a session row that is not a live runtime path.
+        assert!(keep_alive_plan_for(&saved, &empty, &rows, |_| false).is_none());
+
+        // A selection that mixes live sessions with groups and saved rows only
+        // ever writes to the live ones.
+        let live = keep_alive_test_row("local://one", BrowserRowKind::Session);
+        let rows = vec![group, live.clone(), saved];
+        let selected: HashSet<String> = ["__live_sessions__", "local://one", "workspace/saved-note"]
+            .into_iter()
+            .map(ToOwned::to_owned)
+            .collect();
+        let plan = keep_alive_plan_for(&live, &selected, &rows, |_| false).expect("plan");
+        assert_eq!(plan.paths, vec!["local://one"]);
+    }
+
+    // The two vault matchers are deliberately asymmetric. The sidebar SUGGESTS
+    // rows with the loose rule (a human then clicks one); the auto paths (fill,
+    // TOTP) commit a secret to the page with nobody confirming, so they take
+    // the strict rule. A base-domain entry must never auto-fill a subdomain.
+    #[test]
+    fn vault_auto_match_is_stricter_than_the_sidebar_suggestion_rule() {
+        // Both agree on the host and its www twin, in either direction.
+        for (name, host) in [
+            ("example.com", "example.com"),
+            ("example.com", "www.example.com"),
+            ("www.example.com", "example.com"),
+            ("EXAMPLE.com", "example.com"),
+        ] {
+            assert!(
+                vault_entry_auto_matches_host(name, host),
+                "auto: {name} should match {host}"
+            );
+            assert!(
+                vault_entry_applies_to_host(name, host),
+                "applies: {name} should match {host}"
+            );
+        }
+        // Base-domain suffix: the sidebar suggests it, the auto path refuses.
+        assert!(vault_entry_applies_to_host("gour.top", "chat.example.com"));
+        assert!(!vault_entry_auto_matches_host("gour.top", "chat.example.com"));
+        // Neither matches an unrelated host, an empty name, or a lookalike
+        // that merely ends with the host's text.
+        for name in ["", "  ", "other.com", "notexample.com"] {
+            assert!(!vault_entry_auto_matches_host(name, "example.com"));
+            assert!(!vault_entry_applies_to_host(name, "example.com"));
+        }
     }
 
     // Heartbeats re-deliver the app's URL every few seconds; they must NOT
@@ -104489,6 +105078,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             context_menu_row: None,
             context_menu_context_row: None,
             context_menu_position: None,
+            keep_alive_plan: None,
             preview_layout: PreviewLayoutMode::Chat,
             server_busy: false,
             show_loading_tree: false,
@@ -105063,6 +105653,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             context_menu_row: None,
             context_menu_context_row: None,
             context_menu_position: None,
+            keep_alive_plan: None,
             preview_layout: PreviewLayoutMode::Chat,
             server_busy: false,
             show_loading_tree: false,
@@ -105207,6 +105798,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             context_menu_row: None,
             context_menu_context_row: None,
             context_menu_position: None,
+            keep_alive_plan: None,
             preview_layout: PreviewLayoutMode::Chat,
             server_busy: false,
             show_loading_tree: false,
@@ -105351,6 +105943,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             context_menu_row: None,
             context_menu_context_row: None,
             context_menu_position: None,
+            keep_alive_plan: None,
             preview_layout: PreviewLayoutMode::Chat,
             server_busy: false,
             show_loading_tree: false,
@@ -105498,6 +106091,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             context_menu_row: None,
             context_menu_context_row: None,
             context_menu_position: None,
+            keep_alive_plan: None,
             preview_layout: PreviewLayoutMode::Chat,
             server_busy: false,
             show_loading_tree: false,
@@ -105649,6 +106243,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             context_menu_row: None,
             context_menu_context_row: None,
             context_menu_position: None,
+            keep_alive_plan: None,
             preview_layout: PreviewLayoutMode::Chat,
             server_busy: false,
             show_loading_tree: false,
@@ -105792,6 +106387,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             context_menu_row: None,
             context_menu_context_row: None,
             context_menu_position: None,
+            keep_alive_plan: None,
             preview_layout: PreviewLayoutMode::Chat,
             server_busy: false,
             show_loading_tree: false,
@@ -105935,6 +106531,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             context_menu_row: None,
             context_menu_context_row: None,
             context_menu_position: None,
+            keep_alive_plan: None,
             preview_layout: PreviewLayoutMode::Chat,
             server_busy: false,
             show_loading_tree: false,
@@ -106112,6 +106709,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             context_menu_row: None,
             context_menu_context_row: None,
             context_menu_position: None,
+            keep_alive_plan: None,
             preview_layout: PreviewLayoutMode::Chat,
             server_busy: false,
             show_loading_tree: false,
@@ -106258,6 +106856,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             context_menu_row: None,
             context_menu_context_row: None,
             context_menu_position: None,
+            keep_alive_plan: None,
             preview_layout: PreviewLayoutMode::Chat,
             server_busy: false,
             show_loading_tree: false,
@@ -106436,6 +107035,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             context_menu_row: None,
             context_menu_context_row: None,
             context_menu_position: None,
+            keep_alive_plan: None,
             preview_layout: PreviewLayoutMode::Chat,
             server_busy: false,
             show_loading_tree: false,
@@ -106791,6 +107391,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             context_menu_row: None,
             context_menu_context_row: None,
             context_menu_position: None,
+            keep_alive_plan: None,
             preview_layout: PreviewLayoutMode::Chat,
             server_busy: false,
             show_loading_tree: false,
