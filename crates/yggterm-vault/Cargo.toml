@@ -1,0 +1,34 @@
+[package]
+name = "yggterm-vault"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+
+# A self-reliant Bitwarden/Vaultwarden client for ychrome's vault sidebar.
+# Replaces shelling out to the `rbw` CLI: prelogin -> token -> sync, plus the
+# EncString crypto to decrypt the vault and generate TOTP codes. Used ONLY by
+# the GUI (yggterm-shell) that renders the vault sidebar; the terminal daemon
+# never depends on it.
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+thiserror = "2"
+reqwest = { version = "0.13.3", default-features = false, features = ["blocking", "json", "rustls"] }
+
+# Bitwarden crypto: KDF -> master key -> stretched key -> user key -> ciphers.
+aes = "0.8"
+cbc = { version = "0.1", features = ["alloc"] }
+hmac = "0.12"
+pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
+hkdf = "0.12"
+sha2 = "0.10"
+sha1 = "0.10"
+argon2 = "0.5"
+base64 = "0.22"
+rand = "0.8"
+subtle = "2"
+zeroize = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+hex = "0.4"
