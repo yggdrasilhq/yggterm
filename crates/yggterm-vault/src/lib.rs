@@ -10,8 +10,13 @@
 //! to disk: the master password unlocks an in-memory user key for the life of
 //! the process, and only a device identifier + refresh token are persisted.
 
+pub mod api;
 pub mod crypto;
+pub mod model;
+pub mod session;
 pub mod totp;
 
 pub use crypto::{CryptoError, EncString, Kdf, MasterKey, SymmetricKey};
+pub use model::{RawCipher, Vault, VaultItem};
+pub use session::{VaultConfig, VaultError, VaultManager, VaultStatus};
 pub use totp::{Totp, TotpError};
