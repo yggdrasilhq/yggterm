@@ -6958,6 +6958,7 @@ dependencies = [
  "yggterm-platform",
  "yggterm-server",
  "yggterm-shell",
+ "yggterm-vault",
  "yggui",
  "yggui-contract",
 ]
