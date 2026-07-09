@@ -1672,6 +1672,16 @@ pub enum ServerRequest {
     },
     ReorderLiveSessions {
         ordered_paths: Vec<String>,
+        /// Stable client identity (e.g. `gui:<host>`): the reorder is also
+        /// recorded into this client's row-order ledger scope, so multiple
+        /// GUIs attached to the same daemon can keep independent arrangements.
+        #[serde(default)]
+        client_scope: Option<String>,
+    },
+    /// Read-only report of the row-order ledger (all scopes, or one).
+    RowOrderLedgerReport {
+        #[serde(default)]
+        scope: Option<String>,
     },
     StartLocalSession {
         session_kind: SessionKind,
@@ -1932,6 +1942,10 @@ struct DaemonRuntime {
     server: YggtermServer,
     terminals: TerminalManager,
     preserved_terminal_owners: PreservedTerminalOwnerRegistry,
+    /// Durable per-client-scope memory of Live Sessions row slots. Observes
+    /// every order change through the persist chokepoint and answers "where
+    /// does this row go when it comes back?" — see `row_order_ledger.rs`.
+    row_order_ledger: crate::row_order_ledger::RowOrderLedger,
     remote_machine_refreshes_in_flight: HashSet<String>,
     codex_process_identity_cache: Mutex<BTreeMap<u32, CodexRuntimeProcessIdentity>>,
     restored_from_persisted_state: bool,
@@ -2049,6 +2063,7 @@ impl DaemonRuntime {
             // then let explicit terminal-open requests or later recovery drive runtime startup.
             server.restore_persisted_state_with_launch_policy(saved, Some(&store), false);
         }
+        let store_home_dir_for_ledger = store.home_dir().to_path_buf();
         let mut runtime = Self {
             support,
             state_path,
@@ -2056,6 +2071,9 @@ impl DaemonRuntime {
             server,
             terminals: TerminalManager::new(),
             preserved_terminal_owners,
+            row_order_ledger: crate::row_order_ledger::RowOrderLedger::load(
+                store_home_dir_for_ledger.as_path(),
+            ),
             remote_machine_refreshes_in_flight: HashSet::new(),
             codex_process_identity_cache: Mutex::new(BTreeMap::new()),
             restored_from_persisted_state,
@@ -4122,7 +4140,65 @@ impl DaemonRuntime {
         let _perf = yggterm_core::PerfGuard::new(self.store.home_dir(), "daemon", "persist");
         self.refresh_live_codex_runtime_identities_for_persistence();
         self.refresh_live_claude_code_runtime_identities_for_persistence();
+        // Ledger chokepoint: every lifecycle event that can change the live
+        // order flows through here, so the shared-scope ledger observes the
+        // order exactly once per mutation, with no per-handler bookkeeping.
+        self.record_row_order_ledger(None);
         write_persisted_state(&self.state_path, &self.server.persisted_state())
+    }
+
+    /// Record the current live order into the shared row-order ledger scope
+    /// and, when a request carried a client scope, into that scope too. Saves
+    /// the ledger only when something changed.
+    fn record_row_order_ledger(&mut self, client_scope: Option<&str>) {
+        let live_order = self.server.live_session_order_keys().to_vec();
+        let mut changed = self.row_order_ledger.record_live_order(
+            crate::row_order_ledger::SHARED_ROW_ORDER_SCOPE,
+            &live_order,
+        );
+        if let Some(scope) = client_scope
+            .map(str::trim)
+            .filter(|scope| !scope.is_empty() && *scope != crate::row_order_ledger::SHARED_ROW_ORDER_SCOPE)
+        {
+            changed |= self.row_order_ledger.record_live_order(scope, &live_order);
+        }
+        if changed
+            && let Err(error) = self.row_order_ledger.save(self.store.home_dir())
+        {
+            tracing::warn!(%error, "failed to save row-order ledger");
+        }
+    }
+
+    /// Restore `path` to its remembered slot in the live order after it
+    /// (re)entered the live set at a daemon-native position. `Unknown` rows
+    /// keep the caller's native placement.
+    fn apply_row_order_ledger_placement(&mut self, path: &str, client_scope: Option<&str>) {
+        let scope = client_scope
+            .map(str::trim)
+            .filter(|scope| !scope.is_empty())
+            .unwrap_or(crate::row_order_ledger::SHARED_ROW_ORDER_SCOPE);
+        let Some((live_key, _)) = self.server.resolve_live_session_entry(path) else {
+            return;
+        };
+        let live_order = self.server.live_session_order_keys().to_vec();
+        let is_live = |candidate: &str| {
+            candidate != live_key && live_order.iter().any(|entry| entry == candidate)
+        };
+        match self.row_order_ledger.placement_for(scope, path, is_live) {
+            crate::row_order_ledger::RowLedgerPlacement::AfterLive(anchor) => {
+                let anchor_key = self
+                    .server
+                    .resolve_live_session_entry(&anchor)
+                    .map(|(key, _)| key)
+                    .unwrap_or(anchor);
+                self.server
+                    .move_live_session_after(&live_key, Some(anchor_key.as_str()));
+            }
+            crate::row_order_ledger::RowLedgerPlacement::Front => {
+                self.server.move_live_session_after(&live_key, None);
+            }
+            crate::row_order_ledger::RowLedgerPlacement::Unknown => {}
+        }
     }
 
     /// Write persisted state WITHOUT re-resolving live-session runtime identities.
@@ -4626,6 +4702,7 @@ impl DaemonRuntime {
                 } else {
                     None
                 };
+                let live_order_before_open = self.server.live_session_order_keys().to_vec();
                 self.server.open_or_focus_session(
                     session_kind,
                     &path,
@@ -4648,6 +4725,18 @@ impl DaemonRuntime {
                             self.server.set_view_mode(WorkspaceViewMode::Rendered);
                         }
                     }
+                }
+                // A row that newly ENTERED the live set lands at the
+                // daemon-native position; restore its remembered ledger slot.
+                // A row that was already live keeps the user's arrangement.
+                if self
+                    .server
+                    .resolve_live_session_entry(&path)
+                    .is_some_and(|(live_key, _)| {
+                        !live_order_before_open.iter().any(|key| key == &live_key)
+                    })
+                {
+                    self.apply_row_order_ledger_placement(&path, None);
                 }
                 self.persist()?;
                 self.snapshot_response(Some(if opened_in_terminal {
@@ -4762,6 +4851,7 @@ impl DaemonRuntime {
                 title_hint,
                 view_mode,
             } => {
+                let live_order_before_open = self.server.live_session_order_keys().to_vec();
                 let key = self.server.open_remote_scanned_session_with_view(
                     &machine_key,
                     &session_id,
@@ -4784,6 +4874,9 @@ impl DaemonRuntime {
                         self.ensure_terminal_for_active()?;
                         opened_in_terminal = true;
                     }
+                }
+                if !live_order_before_open.iter().any(|entry| entry == &key) {
+                    self.apply_row_order_ledger_placement(&key, None);
                 }
                 self.persist()?;
                 self.snapshot_response(Some(
@@ -4965,14 +5058,45 @@ impl DaemonRuntime {
                     format!("no live session for {path}")
                 }))
             }
-            ServerRequest::ReorderLiveSessions { ordered_paths } => {
+            ServerRequest::ReorderLiveSessions {
+                ordered_paths,
+                client_scope,
+            } => {
                 let changed = self.server.replace_live_session_order(&ordered_paths);
+                self.record_row_order_ledger(client_scope.as_deref());
                 self.persist()?;
                 self.snapshot_response(Some(if changed {
                     "reordered live sessions".to_string()
                 } else {
                     "live session order unchanged".to_string()
                 }))
+            }
+            ServerRequest::RowOrderLedgerReport { scope } => {
+                let ledger = &self.row_order_ledger;
+                let live_order = self.server.live_session_order_keys();
+                let scope_report = |name: &str| {
+                    serde_json::json!({
+                        "scope": name,
+                        "rows": ledger.scope_rows(name).iter().map(|row| {
+                            serde_json::json!({
+                                "session_path": row,
+                                "live": live_order.iter().any(|entry| entry == row),
+                            })
+                        }).collect::<Vec<_>>(),
+                    })
+                };
+                let report = match scope.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                    Some(name) => serde_json::json!({ "scopes": [scope_report(name)] }),
+                    None => serde_json::json!({
+                        "scopes": ledger
+                            .scope_names()
+                            .map(scope_report)
+                            .collect::<Vec<_>>(),
+                    }),
+                };
+                ServerResponse::Ack {
+                    message: Some(report.to_string()),
+                }
             }
             ServerRequest::StartLocalSession {
                 session_kind,
@@ -5825,20 +5949,34 @@ fn apply_terminal_runtime_truth_to_snapshot(
     runtime_keys: &HashSet<String>,
     snapshot: &mut ServerUiSnapshot,
 ) {
-    if let Some(active_session) = snapshot.active_session.as_mut()
-        && !runtime_keys
-            .contains(&server.terminal_runtime_key_for_path(&active_session.session_path))
-        && (snapshot_session_is_keep_alive_recovery_target(active_session)
-            || snapshot_session_is_agent_store_recoverable(active_session))
-    {
-        active_session.launch_phase = crate::TerminalLaunchPhase::RemoteBootstrap;
+    if let Some(active_session) = snapshot.active_session.as_mut() {
+        let runtime_owned = runtime_keys
+            .contains(&server.terminal_runtime_key_for_path(&active_session.session_path));
+        if !runtime_owned
+            && (snapshot_session_is_keep_alive_recovery_target(active_session)
+                || snapshot_session_is_agent_store_recoverable(active_session))
+        {
+            active_session.launch_phase = crate::TerminalLaunchPhase::RemoteBootstrap;
+        } else if runtime_owned && snapshot_session_is_pending_runtime_launch(active_session) {
+            // Runtime truth outranks a stale stored phase in BOTH directions: a
+            // session whose PTY the daemon owns is running, no matter what label
+            // the open path last wrote. A stuck RemoteBootstrap on an owned
+            // session made every GUI post-snapshot rearm treat the healthy
+            // active session as a pending launch and cold-remount it (the
+            // sudden-blank-viewport loop, live-caught on jojo 2026-07-09).
+            active_session.launch_phase = crate::TerminalLaunchPhase::Running;
+        }
     }
     for session in &mut snapshot.live_sessions {
-        if !runtime_keys.contains(&server.terminal_runtime_key_for_path(&session.session_path))
+        let runtime_owned =
+            runtime_keys.contains(&server.terminal_runtime_key_for_path(&session.session_path));
+        if !runtime_owned
             && (snapshot_session_is_keep_alive_recovery_target(session)
                 || snapshot_session_is_agent_store_recoverable(session))
         {
             session.launch_phase = crate::TerminalLaunchPhase::RemoteBootstrap;
+        } else if runtime_owned && snapshot_session_is_pending_runtime_launch(session) {
+            session.launch_phase = crate::TerminalLaunchPhase::Running;
         }
     }
     let active_path = snapshot.active_session_path.clone().or_else(|| {
@@ -7165,6 +7303,7 @@ fn server_request_name(request: &ServerRequest) -> &'static str {
         ServerRequest::DropTerminalRuntime { .. } => "drop_terminal_runtime",
         ServerRequest::SetSessionKeepAlive { .. } => "set_session_keep_alive",
         ServerRequest::ReorderLiveSessions { .. } => "reorder_live_sessions",
+        ServerRequest::RowOrderLedgerReport { .. } => "row_order_ledger_report",
         ServerRequest::StartLocalSession { .. } => "start_local_session",
         ServerRequest::SwitchAgentSessionMode { .. } => "switch_agent_session_mode",
         ServerRequest::StartCommandSession { .. } => "start_command_session",
@@ -8024,10 +8163,35 @@ pub fn reorder_live_sessions(
     endpoint: &ServerEndpoint,
     ordered_paths: &[String],
 ) -> Result<(ServerUiSnapshot, Option<String>)> {
+    reorder_live_sessions_scoped(endpoint, ordered_paths, None)
+}
+
+/// Fetch the row-order ledger report (JSON string) — all scopes or one.
+pub fn row_order_ledger_report(
+    endpoint: &ServerEndpoint,
+    scope: Option<&str>,
+) -> Result<String> {
+    match send_request(
+        endpoint,
+        &ServerRequest::RowOrderLedgerReport {
+            scope: scope.map(str::to_string),
+        },
+    )? {
+        ServerResponse::Ack { message } => Ok(message.unwrap_or_else(|| "{}".to_string())),
+        other => anyhow::bail!("unexpected response to row-order ledger report: {other:?}"),
+    }
+}
+
+pub fn reorder_live_sessions_scoped(
+    endpoint: &ServerEndpoint,
+    ordered_paths: &[String],
+    client_scope: Option<&str>,
+) -> Result<(ServerUiSnapshot, Option<String>)> {
     expect_snapshot(send_request(
         endpoint,
         &ServerRequest::ReorderLiveSessions {
             ordered_paths: ordered_paths.to_vec(),
+            client_scope: client_scope.map(str::to_string),
         },
     )?)
 }
@@ -12606,6 +12770,52 @@ mod tests {
                 .as_ref()
                 .map(|session| session.launch_phase),
             Some(TerminalLaunchPhase::RemoteBootstrap),
+        );
+    }
+
+    #[test]
+    fn daemon_snapshot_promotes_stale_pending_phase_when_runtime_owned() {
+        // Defect class (jojo 2026-07-09): a remote-cc session's stored
+        // launch_phase stuck at RemoteBootstrap while the daemon owned its PTY.
+        // The GUI's post-snapshot rearm read the stale phase as "pending
+        // launch" and cold-remounted the healthy ACTIVE session after every
+        // background snapshot — the sudden-blank-viewport loop. Runtime truth
+        // must win in the promote direction too.
+        let tree = daemon_test_tree();
+        let server = YggtermServer::new(
+            &tree,
+            false,
+            GhosttyHostSupport::shadow("test".to_string(), false, false),
+            UiTheme::ZedLight,
+        );
+        let active_path = "remote-cc://dev/stuck-bootstrap".to_string();
+        let mut active = daemon_test_snapshot_session(&active_path, SessionSource::LiveSsh);
+        active.kind = SessionKind::ClaudeCode;
+        active.launch_phase = TerminalLaunchPhase::RemoteBootstrap;
+        let mut snapshot = ServerUiSnapshot {
+            active_session_path: Some(active_path.clone()),
+            active_session: Some(active.clone()),
+            active_view_mode: WorkspaceViewMode::Terminal,
+            remote_machines: Vec::new(),
+            ssh_targets: Vec::new(),
+            live_sessions: vec![active],
+        };
+        let runtime_keys: HashSet<String> = [active_path.clone()].into_iter().collect();
+
+        apply_terminal_runtime_truth_to_snapshot(&server, &runtime_keys, &mut snapshot);
+
+        assert_eq!(
+            snapshot
+                .active_session
+                .as_ref()
+                .map(|session| session.launch_phase),
+            Some(TerminalLaunchPhase::Running),
+            "owned runtime promotes the active session's stale pending phase"
+        );
+        assert_eq!(
+            snapshot.live_sessions[0].launch_phase,
+            TerminalLaunchPhase::Running,
+            "owned runtime promotes the live row's stale pending phase"
         );
     }
 
