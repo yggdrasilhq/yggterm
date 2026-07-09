@@ -712,6 +712,81 @@ fn regenerate_remote_machine_copy(
     report
 }
 
+/// Native Bitwarden/Vaultwarden client CLI — validation and agent access for
+/// the vault sidebar, without shelling out to `rbw`. The unlocked vault is not
+/// held across invocations here (the GUI holds it for the sidebar); `check`
+/// unlocks, summarizes, and exits, so the crypto can be proven against the real
+/// server before the sidebar UI is built.
+fn run_vault_cli(store: &SessionStore, args: &[String]) -> Result<()> {
+    let vault_dir = store.home_dir().join("vault");
+    let flag = |name: &str| -> Option<String> {
+        args.iter()
+            .position(|a| a == name)
+            .and_then(|i| args.get(i + 1))
+            .cloned()
+    };
+    let action = args.first().map(String::as_str).unwrap_or("status");
+    let mut manager = yggterm_vault::VaultManager::load(&vault_dir);
+
+    match action {
+        "status" => {
+            println!("{}", serde_json::to_string_pretty(&status_json(&manager))?);
+            Ok(())
+        }
+        "configure" => {
+            let server = flag("--server")
+                .context("usage: vault configure --server <url> --email <email>")?;
+            let email = flag("--email")
+                .context("usage: vault configure --server <url> --email <email>")?;
+            manager.configure(&server, &email).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+            println!("{}", serde_json::to_string_pretty(&status_json(&manager))?);
+            Ok(())
+        }
+        "check" | "unlock" => {
+            if !manager.is_configured() {
+                anyhow::bail!("not configured; run `vault configure --server <url> --email <email>` first");
+            }
+            // Read the master password from stdin (use `read -rs` so your shell
+            // does not echo it). Never a flag or an env var.
+            let mut password = String::new();
+            std::io::Read::read_to_string(&mut std::io::stdin(), &mut password)
+                .context("reading master password from stdin")?;
+            let password = password.trim_end_matches(['\n', '\r']);
+            if password.is_empty() {
+                anyhow::bail!("no master password on stdin (pipe it: `read -rs PW; echo \"$PW\" | ... vault check`)");
+            }
+            let count = manager.unlock(password).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+            let vault = manager.vault().expect("unlocked");
+            let items = vault.items();
+            let with_totp = items.iter().filter(|i| i.has_totp).count();
+            let sample: Vec<&str> = items.iter().take(8).map(|i| i.name.as_str()).collect();
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "unlocked": true,
+                    "item_count": count,
+                    "items_with_totp": with_totp,
+                    "sample_names": sample,
+                }))?
+            );
+            Ok(())
+        }
+        other => anyhow::bail!("unknown vault action {other:?} (status | configure | check)"),
+    }
+}
+
+fn status_json(manager: &yggterm_vault::VaultManager) -> serde_json::Value {
+    match manager.status() {
+        yggterm_vault::VaultStatus::NotConfigured => serde_json::json!({ "state": "not_configured" }),
+        yggterm_vault::VaultStatus::Locked { email, server_url } => {
+            serde_json::json!({ "state": "locked", "email": email, "server_url": server_url })
+        }
+        yggterm_vault::VaultStatus::Unlocked { email, item_count } => {
+            serde_json::json!({ "state": "unlocked", "email": email, "item_count": item_count })
+        }
+    }
+}
+
 fn run_sessions_regenerate_copy_cli(store: &SessionStore, args: &[String]) -> Result<()> {
     let action = args
         .get(2)
@@ -1010,6 +1085,9 @@ fn main() -> Result<()> {
         let endpoint = default_endpoint(store.home_dir());
         let host = detect_ghostty_host();
         return run_daemon(&endpoint, host);
+    }
+    if args.len() >= 2 && args[0] == "vault" {
+        return run_vault_cli(&store, &args[1..]);
     }
     if args.len() >= 3 && args[0] == "server" && args[1] == "attach" {
         return run_attach(
