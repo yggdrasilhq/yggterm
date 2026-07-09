@@ -2080,6 +2080,39 @@ fn spawn_web_surface_socks(ssh_target: &str) -> Option<(u16, std::process::Child
 /// by the caller via socks_port None). Blocking (tunnel setup waits for the
 /// local end to accept) — callers run it via spawn_blocking.
 /// Returns (effective_url, tunnel_child, socks_port).
+/// Resolve a loopback CONTROL endpoint on the session's host into a URL that
+/// THIS GUI process can reach with a plain `TcpStream`.
+///
+/// Deliberately NOT `resolve_web_surface_effective_url`. That one resolves a
+/// URL for the *webview*: on a remote session it returns the URL untouched and
+/// points the webview at an `ssh -D` SOCKS proxy, which the webview speaks and
+/// the GUI's hand-rolled HTTP client does not. Handing a control endpoint
+/// through it makes the GUI connect to `127.0.0.1:<port>` on its OWN host —
+/// the wrong machine, silently. A control endpoint needs a real `ssh -L`
+/// forward, which is what this does.
+///
+/// A non-loopback control URL is already reachable and is passed through, as is
+/// any URL on a local session (which the daemon models as an ssh target whose
+/// host is loopback).
+fn resolve_control_endpoint_url(
+    url: &str,
+    ssh_target: Option<&str>,
+) -> (String, Option<std::process::Child>) {
+    let Some(target) = ssh_target.filter(|target| !ssh_target_host_is_loopback(target)) else {
+        return (url.to_string(), None);
+    };
+    if !web_surface_url_is_loopback(url) {
+        return (url.to_string(), None);
+    }
+    let Some((host, port, tail)) = web_surface_url_parts(url) else {
+        return (url.to_string(), None);
+    };
+    match spawn_web_surface_forward(target, &host, port) {
+        Some((local_port, child)) => (format!("http://127.0.0.1:{local_port}{tail}"), Some(child)),
+        None => (url.to_string(), None),
+    }
+}
+
 fn resolve_web_surface_effective_url(
     url: &str,
     ssh_target: Option<&str>,
@@ -54827,15 +54860,18 @@ fn TerminalCanvas(
                                         if !touched && let Some(control_url) = url {
                                             let resolve_url = control_url.clone();
                                             let resolve_target = web_surface_ssh_target.clone();
-                                            let (effective_control, forward_child, _socks) =
+                                            // The GUI GETs /open on this itself,
+                                            // so it needs an ssh -L forward, not
+                                            // the webview's SOCKS proxy.
+                                            let (effective_control, forward_child) =
                                                 task::spawn_blocking(move || {
-                                                    resolve_web_surface_effective_url(
+                                                    resolve_control_endpoint_url(
                                                         &resolve_url,
                                                         resolve_target.as_deref(),
                                                     )
                                                 })
                                                 .await
-                                                .unwrap_or_else(|_| (control_url.clone(), None, None));
+                                                .unwrap_or_else(|_| (control_url.clone(), None));
                                             append_trace_event(
                                                 &trace_home,
                                                 "ui",
@@ -82216,6 +82252,34 @@ mod tests {
             assert!(!vault_entry_auto_matches_host(name, "example.com"));
             assert!(!vault_entry_applies_to_host(name, "example.com"));
         }
+    }
+
+    // A CONTROL endpoint is fetched by the GUI itself over a plain socket, so
+    // it can never be resolved the way a webview URL is: the webview gets an
+    // `ssh -D` SOCKS proxy and the URL untouched, which would send the GUI's
+    // own GET to `127.0.0.1:<port>` on the GUI's machine — the wrong host,
+    // silently. Only a loopback URL on a REMOTE session needs a forward; the
+    // cases below need no ssh and assert we never spawn one.
+    #[test]
+    fn control_endpoint_resolution_only_forwards_remote_loopback_urls() {
+        let loopback = "http://127.0.0.1:45231/sidebar";
+
+        // Local session: the daemon models it as an ssh target on loopback.
+        for target in [None, Some("localhost"), Some("127.0.0.1")] {
+            let (url, child) = resolve_control_endpoint_url(loopback, target);
+            assert_eq!(url, loopback, "local target {target:?} needs no forward");
+            assert!(child.is_none());
+        }
+
+        // Remote session, but the endpoint is publicly reachable already.
+        let (url, child) = resolve_control_endpoint_url("https://example.com/sidebar", Some("guihost"));
+        assert_eq!(url, "https://example.com/sidebar");
+        assert!(child.is_none());
+
+        // Unparseable input is passed through rather than dropped.
+        let (url, child) = resolve_control_endpoint_url("not a url", Some("guihost"));
+        assert_eq!(url, "not a url");
+        assert!(child.is_none());
     }
 
     // Heartbeats re-deliver the app's URL every few seconds; they must NOT
