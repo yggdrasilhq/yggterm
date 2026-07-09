@@ -2,6 +2,27 @@
 
 This file tracks user-visible changes in `yggterm`.
 
+## 2.9.66
+
+- **Fixed: navigating a ychrome tab from the address bar "did nothing".** The app's OSC heartbeat
+  re-delivers its URL every ~4s, and the surface compared it against the app tab's *current* URL —
+  which the user's navigation had just changed — so every heartbeat clobbered the navigation back
+  to the start page within seconds. The comparison SSOT is now the last OSC-delivered URL
+  (`osc_url`): heartbeats refresh liveness only; a genuinely new app URL still retargets the app
+  tab. Heartbeats also can no longer *create* a surface (previously an in-flight heartbeat could
+  resurrect a ghost overlay right after closing the app).
+- **Address bar follows the page.** The native-surface reconciler now polls the engine's real page
+  URI + title: in-page navigations (link clicks, redirects, search submits) update the address bar
+  and the tab label (real page titles, not just host names), like a normal browser. `ssh -L`
+  rewritten tabs are exempt (their engine URI is the local forward end).
+- **Omnibox autocomplete.** Typing in the address bar shows a dropdown: a go/search action row plus
+  matching browsing history (most recent first, per profile, matched over URL + title). ArrowUp/
+  ArrowDown select (wrapping), Enter opens the selection, Escape dismisses. History is recorded
+  per profile at `~/.yggterm/web-profiles/<profile>/history.jsonl` from engine-observed
+  navigations; the ephemeral `temp` profile records nothing.
+- **Tab strip icons aligned.** Tabs, per-tab ✕, "+" and the surface ✕ now share one vertical
+  center line (the strip previously baseline-scattered them).
+
 ## 2.9.65
 
 - **Row-order ledger: rows remember their slot across liveness, per GUI.** The daemon now keeps a
