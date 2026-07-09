@@ -2,6 +2,31 @@
 
 This file tracks user-visible changes in `yggterm`.
 
+## 2.9.65
+
+- **Row-order ledger: rows remember their slot across liveness, per GUI.** The daemon now keeps a
+  durable `row-order-ledger.json` recording the Live Sessions arrangement per client scope. When a
+  session leaves the live set (runtime exit, restart demotion) and later comes back via open or
+  `server connect`, it is placed back below its nearest remembered neighbor instead of landing at
+  the top/end. Multiple GUIs attached to the same host daemon record under their own scopes
+  (`gui:<host>`) — each client can keep its own arrangement, and a session can hold a slot in
+  several client ledgers at once; lookups fall back to the daemon-native `shared` scope. New CLI:
+  `yggterm server ledger [--scope <scope>]` to inspect, and `server reorder ... --scope <scope>` to
+  record an order under a specific client scope.
+
+## 2.9.64
+
+- **Fixed: the active session's viewport suddenly going near-blank (sparse spinner + bottom line
+  only) while an agent is working.** Root cause chain: a remote agent session's `launch_phase`
+  could stick at `RemoteBootstrap` in daemon snapshots even though the daemon owned its live PTY,
+  and the GUI's ownership manifest (`latest_runtime_status`) was fetched only once at GUI startup —
+  so any session whose PTY the daemon acquired later read as "not owned". Together these made the
+  post-snapshot recovery rearm treat a healthy, actively-viewed session as a pending launch and
+  cold-remount its xterm (bootstrap reset + sparse re-seed) again and again. Two fixes: the daemon
+  snapshot now promotes a stale pending phase to `Running` whenever runtime truth says the PTY is
+  owned (the same manifest that already demotes phases when the PTY is gone), and the GUI refreshes
+  its runtime-status manifest with every background snapshot instead of freezing it at startup.
+
 ## 2.9.63
 
 - **Manually reconnect a stranded session from the CLI: `yggterm server connect`.** If a session
