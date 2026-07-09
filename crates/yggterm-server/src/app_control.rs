@@ -495,6 +495,16 @@ pub enum AppControlCommand {
         session_path: Option<String>,
         open: bool,
     },
+    /// Fill the login form on a session's active web-surface tab from the
+    /// local password vault (rbw/Bitwarden). The GUI resolves the page's REAL
+    /// origin from the engine (the page cannot lie about it), queries the
+    /// vault for an exact-host match, and injects the credential — key
+    /// material never leaves the GUI host process except into the matching
+    /// page itself.
+    WebSurfaceFill {
+        #[serde(default)]
+        session_path: Option<String>,
+    },
     DescribeRows,
     OpenPath {
         session_path: String,
@@ -585,6 +595,7 @@ impl AppControlCommand {
             Self::WebSurfaceEval { .. } => "web_surface_eval",
             Self::WebSurfaceScreenshot { .. } => "web_surface_screenshot",
             Self::WebSurfaceDevtools { .. } => "web_surface_devtools",
+            Self::WebSurfaceFill { .. } => "web_surface_fill",
             Self::DescribeRows => "describe_rows",
             Self::OpenPath { .. } => "open_path",
             Self::FocusWindow => "focus_window",
