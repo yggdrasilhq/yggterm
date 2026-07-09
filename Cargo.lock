@@ -6614,7 +6614,7 @@ checksum = "7a5a4b21e1a62b67a2970e6831bc091d7b87e119e7f9791aef9702e3bef04448"
 
 [[package]]
 name = "yggterm"
-version = "2.9.65"
+version = "2.9.66"
 dependencies = [
  "anyhow",
  "ctrlc",
@@ -6636,7 +6636,7 @@ dependencies = [
 
 [[package]]
 name = "yggterm-core"
-version = "2.9.65"
+version = "2.9.66"
 dependencies = [
  "anyhow",
  "dirs",
@@ -6657,7 +6657,7 @@ dependencies = [
 
 [[package]]
 name = "yggterm-ghostty-bridge"
-version = "2.9.65"
+version = "2.9.66"
 dependencies = [
  "anyhow",
  "thiserror 2.0.18",
@@ -6666,11 +6666,11 @@ dependencies = [
 
 [[package]]
 name = "yggterm-gtk-glue"
-version = "2.9.65"
+version = "2.9.66"
 
 [[package]]
 name = "yggterm-platform"
-version = "2.9.65"
+version = "2.9.66"
 dependencies = [
  "anyhow",
  "objc2",
@@ -6684,7 +6684,7 @@ dependencies = [
 
 [[package]]
 name = "yggterm-server"
-version = "2.9.65"
+version = "2.9.66"
 dependencies = [
  "anyhow",
  "dirs",
@@ -6708,7 +6708,7 @@ dependencies = [
 
 [[package]]
 name = "yggterm-shell"
-version = "2.9.65"
+version = "2.9.66"
 dependencies = [
  "anyhow",
  "arboard",
@@ -6751,7 +6751,7 @@ dependencies = [
 
 [[package]]
 name = "yggui"
-version = "2.9.65"
+version = "2.9.66"
 dependencies = [
  "anyhow",
  "base64",
@@ -6774,7 +6774,7 @@ dependencies = [
 
 [[package]]
 name = "yggui-contract"
-version = "2.9.65"
+version = "2.9.66"
 dependencies = [
  "serde",
 ]

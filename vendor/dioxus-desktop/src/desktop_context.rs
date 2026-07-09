@@ -279,6 +279,34 @@ impl DesktopService {
         let _ = id;
     }
 
+    /// Current (uri, title) of an open web surface's page, engine-reported.
+    /// Follows in-page navigation the shell's nav model can't see.
+    pub fn web_surface_page_state(&self, id: u64) -> Option<(String, String)> {
+        #[cfg(not(any(
+            target_os = "windows",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "android"
+        )))]
+        {
+            return self
+                .web_surface_host
+                .borrow()
+                .as_ref()
+                .and_then(|host| host.page_state(id));
+        }
+        #[cfg(any(
+            target_os = "windows",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "android"
+        ))]
+        {
+            let _ = id;
+            None
+        }
+    }
+
     /// Destroy an open web surface.
     pub fn close_web_surface(&self, id: u64) {
         #[cfg(not(any(

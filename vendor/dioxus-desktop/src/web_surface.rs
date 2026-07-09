@@ -304,6 +304,23 @@ impl WebSurfaceHost {
         }
     }
 
+    /// Current page (uri, title) as the ENGINE reports them. In-page
+    /// navigations (link clicks, redirects, pushState) never pass through the
+    /// shell's nav model, so this is the only truth for "where is this tab
+    /// now"; the shell polls it to keep the address bar, tab titles and
+    /// history honest.
+    pub fn page_state(&self, id: u64) -> Option<(String, String)> {
+        use webkit2gtk::WebViewExt as _;
+        use wry::WebViewExtUnix as _;
+        self.surfaces.borrow().get(&id).map(|s| {
+            let webkit = s.webview.webview();
+            (
+                webkit.uri().map(|u| u.to_string()).unwrap_or_default(),
+                webkit.title().map(|t| t.to_string()).unwrap_or_default(),
+            )
+        })
+    }
+
     pub fn close(&self, id: u64) {
         if let Some(s) = self.surfaces.borrow_mut().remove(&id) {
             // A stashed surface's container is already detached.
