@@ -46,6 +46,8 @@ pub enum AppControlRightPanelMode {
     Settings,
     Metadata,
     AppSidebar,
+    /// The ychrome-shipped Bitwarden/vault browser (search + fill any login).
+    Vault,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -504,6 +506,13 @@ pub enum AppControlCommand {
     WebSurfaceFill {
         #[serde(default)]
         session_path: Option<String>,
+        /// Explicit vault entry NAME to fill (skips host matching — the user's
+        /// override path). None = exact-host auto match.
+        #[serde(default)]
+        entry: Option<String>,
+        /// Username disambiguator when several entries share `entry`'s name.
+        #[serde(default)]
+        user: Option<String>,
     },
     DescribeRows,
     OpenPath {

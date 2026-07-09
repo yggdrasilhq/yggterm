@@ -1918,6 +1918,7 @@ fn main() -> Result<()> {
                     "settings" => AppControlRightPanelMode::Settings,
                     "metadata" | "session-metadata" => AppControlRightPanelMode::Metadata,
                     "app-sidebar" | "app_sidebar" | "app" => AppControlRightPanelMode::AppSidebar,
+                    "vault" | "passwords" | "bitwarden" => AppControlRightPanelMode::Vault,
                     other => anyhow::bail!("unsupported app right panel mode: {other}"),
                 };
                 run_app_control_set_right_panel_mode(mode, timeout_ms)
@@ -2579,7 +2580,11 @@ fn main() -> Result<()> {
                         let open = !args.iter().any(|arg| arg == "--close");
                         run_app_control_web_surface_devtools(session_path, open, timeout_ms)
                     }
-                    "fill" => run_app_control_web_surface_fill(session_path, timeout_ms),
+                    "fill" => {
+                        let entry = cli_flag_value(&args, "--entry");
+                        let user = cli_flag_value(&args, "--user");
+                        run_app_control_web_surface_fill(session_path, entry, user, timeout_ms)
+                    }
                     other => anyhow::bail!("unsupported app web action: {other}"),
                 }
             }
