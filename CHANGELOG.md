@@ -28,6 +28,19 @@ This file tracks user-visible changes in `yggterm`.
   "Fill login from vault" button fill the visible login form from `rbw`, matched to the page's
   exact host as reported by the engine (https or loopback pages only). See
   docs/ychrome-password-manager.md for setup and the security model.
+- **Standard libyggterm app chrome: Zzz + ⏻.** The web-surface strip's right cluster now carries
+  the standardized app-lifecycle buttons: **Zzz** suspends the app to its terminal (sends Ctrl+Z
+  and closes the overlay immediately; `fg` brings the page back — ychrome ≥f3ad350 re-announces
+  its surface on resume), **⏻** quits it (Ctrl+C). Tabs are back to plain ✕ (Chrome grammar);
+  the app tab's ✕ still quits since the app tab IS the app. Future libyggterm apps inherit the
+  convention; an app may opt out.
+- **Vault pane: Fill / Add / Tools tabs (Bitwarden UX parity).** The pane now opens with a pilled
+  tab selector. *Add*: new-login form (name pre-hinted with the current host, username, password,
+  folder) with an rbw-backed password generator (length stepper, no-symbols toggle); saving uses
+  `rbw add` with the password staged via a 0600 file + one-shot $VISUAL helper — never argv or
+  env. *Tools*: a Watchtower scan for reused-password groups and weak passwords (passwords are
+  read in memory for the scan and dropped; only entry names are reported). *Fill* is the existing
+  browse/search/fill surface.
 - **Vault sidebar pane — ychrome's shipped Bitwarden UX.** New 🔑 titlebar icon (visible while a
   web surface is live) opens a vault browser: search bar on top, entries applicable to the current
   site float into a "For <host>" section (exact host or base-domain match on entry names), and
