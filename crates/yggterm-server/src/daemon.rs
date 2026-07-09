@@ -2054,7 +2054,35 @@ impl DaemonRuntime {
         let mut restored_stored_sessions = 0usize;
         let mut restored_live_sessions = 0usize;
         let mut restored_remote_machines = 0usize;
-        if let Some(saved) = load_persisted_state(&state_path)? {
+        if let Some(mut saved) = load_persisted_state(&state_path)? {
+            // Never resurrect a predecessor's sessions from disk while it is
+            // alive and owns their runtimes; it, not this file, is the truth.
+            let our_pid = std::process::id();
+            let other_daemons: Vec<(u32, usize)> = reachable_versioned_daemon_statuses(store.home_dir())
+                .into_iter()
+                .filter(|(_, runtime)| runtime.server_pid != our_pid)
+                .map(|(_, runtime)| (runtime.server_pid, runtime.owned_terminal_session_count))
+                .collect();
+            if !may_cold_restore_live_sessions(
+                preserved_terminal_owners.expected_server_version.as_deref(),
+                SERVER_PROTOCOL_VERSION,
+                &other_daemons,
+            ) {
+                append_trace_event(
+                    store.home_dir(),
+                    "daemon",
+                    "lifecycle",
+                    "cold_restore_of_live_sessions_refused",
+                    serde_json::json!({
+                        "current_version": SERVER_PROTOCOL_VERSION,
+                        "current_pid": our_pid,
+                        "skipped_live_sessions": saved.live_sessions.len(),
+                        "handoff_target_version": preserved_terminal_owners.expected_server_version,
+                        "other_daemons": other_daemons,
+                    }),
+                );
+                saved.live_sessions.clear();
+            }
             restored_from_persisted_state = true;
             restored_stored_sessions = saved.stored_sessions.len();
             restored_live_sessions = saved.live_sessions.len();
@@ -4453,36 +4481,18 @@ impl DaemonRuntime {
                             message: "hot update handoff requires a different target daemon version when live terminal runtimes are present (pass --force to override for dev/agent deploys)".to_string(),
                         });
                     }
-                    // #19 idle gate: cache preservation > update. Defer the
-                    // hot-update while any owned agent session is mid-turn or
-                    // was active inside the idle window so we never churn the
-                    // daemon (and eventually retire it) on top of live work.
-                    // Overridable via YGGTERM_HOT_UPDATE_IGNORE_IDLE_GATE.
-                    if let Some(reason) =
-                        self.hot_update_idle_gate_block_reason(&owned_terminal_session_keys)
-                    {
-                        append_trace_event(
-                            self.store.home_dir(),
-                            "daemon",
-                            "hot_update",
-                            "hot_update_deferred_idle_gate",
-                            serde_json::json!({
-                                "expected_version": expected_version,
-                                "reason": &reason,
-                                "idle_threshold_ms": hot_update_idle_threshold_ms(),
-                                "owned_terminal_session_count": owned_terminal_session_keys.len(),
-                                "owned_terminal_session_keys": &owned_terminal_session_keys,
-                                "server_version": SERVER_PROTOCOL_VERSION,
-                                "server_pid": std::process::id(),
-                                "update_priority": "defer_update_preserve_cache",
-                            }),
-                        );
-                        return Ok(ServerResponse::Error {
-                            message: format!(
-                                "hot update deferred to preserve agent work/cache: {reason} (set YGGTERM_HOT_UPDATE_IGNORE_IDLE_GATE=1 to override)"
-                            ),
-                        });
-                    }
+                    // NO idle gate here. This handoff PRESERVES every runtime —
+                    // its own success message is "preserving N live terminal
+                    // runtime(s)": this process keeps its PTY fds and lingers as
+                    // the preserved owner while the successor adopts the streams.
+                    // Gating it on session activity meant one busy agent session
+                    // blocked the handoff for all of them, and since progressive
+                    // migration only starts AFTER a handoff, the very mechanism
+                    // built to drain sessions "all but the busy few" could never
+                    // run. jojo sat on 2.9.63 for a day that way.
+                    // The gate now guards the cold-shutdown retire, which is the
+                    // path that actually kills PTYs.
+                    // [[finding-hot-update-never-converges-idle-gate]]
                     let daemon_executable = canonical_hot_restart_executable(&daemon_executable)?;
                     // Under a managed Direct install, every launched binary
                     // re-execs to install-state.active_version. Flip install-state
@@ -9147,19 +9157,11 @@ fn spawn_disk_binary_version_poll(
                 }
                 continue;
             };
-            // Self-retiring kills this daemon's PTYs and the successor re-resumes
-            // each agent — which INTERRUPTS any in-flight turn. Never retire on top
-            // of live work: defer while any owned session is actively working (esc
-            // to interrupt) or was active within the idle window, and re-check next
-            // poll. We retire only once idle, so a busy agent's job is never broken.
-            // (Same idle gate as the hot-update handoff; overridable via
-            // YGGTERM_HOT_UPDATE_IGNORE_IDLE_GATE.)
-            let block_reason = {
-                let mut rt = lock_daemon_runtime(&runtime, "disk_binary_replace_idle_gate");
+            {
                 // GATE #8: a strictly newer daemon owns server-state.json from
                 // here on — mute this daemon's routine persists so its stale
-                // in-memory view can never clobber the successor's file while
-                // the idle gate defers the actual retire.
+                // in-memory view can never clobber the successor's file.
+                let mut rt = lock_daemon_runtime(&runtime, "disk_binary_replace_persist_mute");
                 if retire_trigger == "newer_daemon_live" && !rt.superseded_routine_persist_muted {
                     rt.superseded_routine_persist_muted = true;
                     append_trace_event(
@@ -9174,26 +9176,19 @@ fn spawn_disk_binary_version_poll(
                         }),
                     );
                 }
-                let owned = rt.terminals.session_keys();
-                rt.hot_update_idle_gate_block_reason(&owned)
-            };
-            if let Some(reason) = block_reason {
-                append_trace_event(
-                    &home_dir,
-                    "daemon",
-                    "lifecycle",
-                    "daemon_retire_deferred_idle_gate",
-                    serde_json::json!({
-                        "retire_trigger": retire_trigger,
-                        "exe_link": exe_link,
-                        "newer_daemon_version": newer_daemon_version,
-                        "current_version": SERVER_PROTOCOL_VERSION,
-                        "current_pid": std::process::id(),
-                        "reason": reason,
-                    }),
-                );
-                continue;
             }
+            // The idle gate is deliberately NOT applied here. It used to sit in
+            // front of BOTH branches below, which meant one busy agent session
+            // blocked the PRESERVING handoff for every other session — and the
+            // handoff is exactly what spawns the successor that progressive
+            // migration then drains sessions into, one at a time, as each goes
+            // idle. So a daemon with a single always-active session could never
+            // converge: jojo sat on 2.9.63 for a day while the disk binary was
+            // 2.9.66, deferring on the user's focused Claude Code session.
+            // The gate belongs on the COLD SHUTDOWN fallback below, which really
+            // does kill PTYs and re-resume every agent. Preserving a runtime is
+            // not "churning live work"; killing it is.
+            // [[finding-hot-update-never-converges-idle-gate]]
             let exe_link_for_handoff = exe_link.clone();
             append_trace_event(
                 &home_dir,
@@ -9250,6 +9245,36 @@ fn spawn_disk_binary_version_poll(
                 );
                 break;
             }
+            // No handoff: the only way out is a COLD SHUTDOWN, which kills this
+            // daemon's PTY children and makes the next client recovery-spawn a
+            // daemon that RE-RESUMES every agent on a fresh PTY — interrupting
+            // any in-flight turn. THIS is what the idle gate exists to prevent.
+            // Defer while any owned session is mid-turn or was active inside the
+            // idle window, and re-check next poll; we retire only once idle, so a
+            // busy agent's job is never broken.
+            // Overridable via YGGTERM_HOT_UPDATE_IGNORE_IDLE_GATE.
+            let block_reason = {
+                let rt = lock_daemon_runtime(&runtime, "cold_shutdown_idle_gate");
+                let owned = rt.terminals.session_keys();
+                rt.hot_update_idle_gate_block_reason(&owned)
+            };
+            if let Some(reason) = block_reason {
+                append_trace_event(
+                    &home_dir,
+                    "daemon",
+                    "lifecycle",
+                    "daemon_cold_shutdown_deferred_idle_gate",
+                    serde_json::json!({
+                        "retire_trigger": retire_trigger,
+                        "exe_link": exe_link,
+                        "newer_daemon_version": newer_daemon_version,
+                        "current_version": SERVER_PROTOCOL_VERSION,
+                        "current_pid": std::process::id(),
+                        "reason": reason,
+                    }),
+                );
+                continue;
+            }
             // Best-effort self-shutdown. If the call fails (e.g. socket
             // already torn down), the thread just exits and the daemon
             // continues; the next poll cycle would retry, but the
@@ -9260,17 +9285,24 @@ fn spawn_disk_binary_version_poll(
     });
 }
 
-/// Opt-in gate for progressive per-session migration. Default OFF: the
-/// cross-daemon release+re-resume is a destructive operation on the
-/// outage-prone daemon-lifecycle SSOT and is shipped dormant until it has been
-/// live-verified through a controlled two-deploy rollout. Enable with
-/// `YGGTERM_ENABLE_PROGRESSIVE_MIGRATION=1`. When off, a handed-off daemon
-/// lingers as the preserved owner exactly as before.
-/// See [[finding-daemon-authoritative-working-state-2945]].
+/// Progressive per-session migration: default ON, with a kill switch.
+///
+/// It was shipped dormant "until live-verified through a controlled two-deploy
+/// rollout", and that rollout never came — so a handed-off daemon lingered as
+/// the preserved owner forever and ownership never converged to the newest
+/// daemon. This is the mechanism that releases sessions one at a time as each
+/// becomes safe; its per-session predicate (`session_is_migratable_now`) is
+/// where "all but the busy few" is decided, and it is the reason the handoff
+/// itself must not be gated on session activity.
+///
+/// Disable with `YGGTERM_ENABLE_PROGRESSIVE_MIGRATION=0` (also `false`/`no`/`off`).
+/// See [[finding-hot-update-never-converges-idle-gate]],
+/// [[finding-daemon-authoritative-working-state-2945]].
 fn progressive_migration_enabled() -> bool {
-    std::env::var("YGGTERM_ENABLE_PROGRESSIVE_MIGRATION")
-        .ok()
-        .is_some_and(|value| matches!(value.trim(), "1" | "true" | "yes" | "on"))
+    match std::env::var("YGGTERM_ENABLE_PROGRESSIVE_MIGRATION") {
+        Ok(value) => !matches!(value.trim(), "0" | "false" | "no" | "off"),
+        Err(_) => true,
+    }
 }
 
 /// Only agent CLI sessions are migratable via release+re-resume: their state
@@ -11151,6 +11183,34 @@ struct DaemonRequestOutcome {
     restart_executable: Option<PathBuf>,
 }
 
+/// May a booting daemon cold-restore the LIVE sessions in `server-state.json`?
+///
+/// A lone daemon: yes — that file is its own state. A daemon booting beside a
+/// predecessor that is reachable and still owns terminal runtimes: **no**. The
+/// predecessor holds the truth in memory, `server-state.json` may predate the
+/// user's most recent closes, and restoring from it resurrects sessions the user
+/// deliberately closed — rows with no runtime, which then refuse keep-alive.
+/// That is exactly what happened on 2026-07-09 (19 sessions came back).
+///
+/// The one exception is the daemon the predecessor handed off TO: the retiring
+/// daemon writes a fresh update-restart snapshot and names its successor's
+/// version in the preserved-owner registry. That successor must restore, or the
+/// handoff loses every row.
+///
+/// [[incident-cli-forked-daemon-resurrected-sessions]]
+fn may_cold_restore_live_sessions(
+    handoff_target_version: Option<&str>,
+    our_version: &str,
+    other_daemons: &[(u32, usize)],
+) -> bool {
+    if handoff_target_version.is_some_and(|version| version == our_version) {
+        return true;
+    }
+    !other_daemons
+        .iter()
+        .any(|(_pid, owned_terminal_session_count)| *owned_terminal_session_count > 0)
+}
+
 fn hot_restart_should_defer_for_session_survival(owned_terminal_session_keys: &[String]) -> bool {
     // The daemon only has to stay alive during a hot update when it owns PTY
     // file descriptors. Preserved-owner entries already point at another
@@ -11492,6 +11552,56 @@ fn terminal_write_strategy_for_path(
 
 #[cfg(test)]
 mod tests {
+    // The guard that stops a booting daemon from resurrecting a live
+    // predecessor's sessions out of server-state.json. Placed first because it
+    // is the one thing standing between a two-daemon window and the 2026-07-09
+    // incident (19 closed sessions came back).
+    #[test]
+    fn cold_restore_of_live_sessions_is_refused_beside_a_live_owner() {
+        use super::may_cold_restore_live_sessions as may;
+
+        // Lone daemon: nothing else is reachable, restore is its own state.
+        assert!(may(None, "2.9.66", &[]));
+        // A reachable peer that owns NO runtimes is not an owner of the truth.
+        assert!(may(None, "2.9.66", &[(4242, 0)]));
+
+        // A reachable predecessor still owning runtimes: refuse.
+        assert!(!may(None, "2.9.66", &[(4242, 17)]));
+        assert!(!may(None, "2.9.66", &[(4242, 0), (4243, 1)]));
+
+        // ...unless we are the successor it handed off TO. Restoring is then
+        // mandatory: the retiring daemon wrote a fresh snapshot for us, and
+        // skipping it would drop every row.
+        assert!(may(Some("2.9.66"), "2.9.66", &[(4242, 17)]));
+        // A registry naming some OTHER version is not our handoff.
+        assert!(!may(Some("2.9.63"), "2.9.66", &[(4242, 17)]));
+    }
+
+    // Progressive migration is the mechanism that drains a handed-off daemon's
+    // sessions "all but the busy few". It shipped dormant and never converged;
+    // it is now on by default, with the env var demoted to a kill switch.
+    #[test]
+    fn progressive_migration_defaults_on_and_honours_the_kill_switch() {
+        // SAFETY: single-threaded assertions on one process-wide variable; the
+        // value is restored before returning.
+        let key = "YGGTERM_ENABLE_PROGRESSIVE_MIGRATION";
+        let previous = std::env::var(key).ok();
+        unsafe { std::env::remove_var(key) };
+        assert!(super::progressive_migration_enabled(), "default is ON");
+        for off in ["0", "false", "no", "off"] {
+            unsafe { std::env::set_var(key, off) };
+            assert!(!super::progressive_migration_enabled(), "{off} disables");
+        }
+        for on in ["1", "true", "yes", "on", "anything-else"] {
+            unsafe { std::env::set_var(key, on) };
+            assert!(super::progressive_migration_enabled(), "{on} keeps it on");
+        }
+        match previous {
+            Some(value) => unsafe { std::env::set_var(key, value) },
+            None => unsafe { std::env::remove_var(key) },
+        }
+    }
+
     use super::{
         MigratableSignals, MigrationCandidateRow, RemoteMachineRefreshQueueStatus,
         SERVER_PROTOCOL_VERSION, apply_terminal_runtime_truth_to_snapshot,
