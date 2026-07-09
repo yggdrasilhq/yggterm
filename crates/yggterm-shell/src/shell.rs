@@ -2630,7 +2630,7 @@ enum RightPanelMode {
     /// sidebar-contribution surface). First consumer: ychrome settings
     /// (adblock + userscripts config, all GUI-host-owned files).
     AppSidebar,
-    /// ychrome's shipped Bitwarden/vault browser: search the rbw vault,
+    /// ychrome's shipped Bitwarden/vault browser: search the vault,
     /// site-applicable logins float to the top, click any entry to fill it
     /// into the active surface (the user's multi-account override path).
     Vault,
@@ -36032,77 +36032,96 @@ struct VaultEntryMeta {
     name: String,
     user: String,
     folder: String,
+    /// The item carries an authenticator secret. `rbw list` could not say;
+    /// `ychrome-vault list --json` can, so the ⏱ button is only drawn where it
+    /// will actually do something.
+    has_totp: bool,
 }
-/// The rbw binary, or the setup hint. Backend: `rbw` (agent-cached,
-/// Vaultwarden-friendly); `bw` is deliberately NOT shelled out to — without a
-/// cached session it would prompt, and a GUI process must never sit on an
+/// ychrome's native vault CLI, or the setup hint.
+///
+/// This used to shell out to `rbw`. It now shells out to `ychrome-vault`, which
+/// speaks Bitwarden directly, caches the unlock in its own agent, and — unlike
+/// `rbw list` — knows each item's URIs. `bw` is deliberately NOT used: without
+/// a cached session it prompts, and a GUI process must never sit on an
 /// interactive prompt.
-fn rbw_binary() -> Result<std::path::PathBuf, String> {
-    which_binary("rbw").ok_or_else(|| {
-        "no vault CLI: install `rbw` (Bitwarden/Vaultwarden agent CLI) and run \
-         `rbw config set base_url <vaultwarden-url>` + `rbw register` + `rbw login`"
+///
+/// Shelling out at all is a temporary shape. The vault pane is ychrome's, not
+/// yggterm's; when the sidebar-contribution surface lands it moves to ychrome
+/// and these functions are deleted. See `.agents/skills/libyggterm-surfaces`.
+fn vault_cli() -> Result<std::path::PathBuf, String> {
+    which_binary("ychrome-vault").ok_or_else(|| {
+        "no vault CLI: install `ychrome-vault` and run \
+         `ychrome-vault configure --server <vaultwarden-url> --email <you>` \
+         then `read -rs PW; echo \"$PW\" | ychrome-vault unlock`"
             .to_string()
     })
 }
+
+/// Run `ychrome-vault` and return trimmed stdout, mapping a locked vault to the
+/// one message the whole sidebar shows for it.
+fn vault_cli_output(args: &[&str]) -> Result<String, String> {
+    let cli = vault_cli()?;
+    let output = std::process::Command::new(&cli)
+        .args(args)
+        .output()
+        .map_err(|error| format!("run ychrome-vault: {error}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stderr = stderr.trim();
+        if stderr.contains("vault locked") || stderr.contains("no agent") {
+            return Err("vault locked: run `ychrome-vault unlock` in a terminal first".to_string());
+        }
+        return Err(format!("ychrome-vault {}: {stderr}", args.first().unwrap_or(&"")));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim_end().to_string())
+}
 /// List the unlocked vault's entries (name/user/folder — no secrets).
 /// Blocking; call from spawn_blocking.
-fn rbw_vault_entries() -> Result<Vec<VaultEntryMeta>, String> {
-    let rbw = rbw_binary()?;
-    let unlocked = std::process::Command::new(&rbw)
-        .arg("unlocked")
-        .output()
-        .map_err(|error| format!("run rbw: {error}"))?;
-    if !unlocked.status.success() {
-        return Err("vault locked: run `rbw unlock` in a terminal first".to_string());
-    }
-    let list = std::process::Command::new(&rbw)
-        .args(["list", "--fields", "name,user,folder"])
-        .output()
-        .map_err(|error| format!("run rbw list: {error}"))?;
-    if !list.status.success() {
-        return Err(format!(
-            "rbw list failed: {}",
-            String::from_utf8_lossy(&list.stderr).trim()
-        ));
-    }
-    Ok(String::from_utf8_lossy(&list.stdout)
-        .lines()
-        .filter(|line| !line.trim().is_empty())
-        .map(|line| {
-            let mut cols = line.split('\t');
-            VaultEntryMeta {
-                name: cols.next().unwrap_or("").trim().to_string(),
-                user: cols.next().unwrap_or("").trim().to_string(),
-                folder: cols.next().unwrap_or("").trim().to_string(),
-            }
-        })
-        .collect())
+fn vault_entries() -> Result<Vec<VaultEntryMeta>, String> {
+    vault_entries_from_json(&vault_cli_output(&["list", "--json"])?)
 }
-/// Does a vault entry NAME apply to `host`? Exact host, `www.`-stripped twin,
-/// or base-domain suffix (entry "gour.top" applies to "chat.example.com") —
-/// Bitwarden's default base-domain URI match, transposed onto names (rbw's
-/// list has no URI field; entry naming is the contract).
-fn vault_entry_applies_to_host(entry_name: &str, host: &str) -> bool {
-    let name = entry_name.trim().to_lowercase();
-    if name.is_empty() {
-        return false;
-    }
-    let bare_host = host.strip_prefix("www.").unwrap_or(host);
-    name == host
-        || name == bare_host
-        || name == format!("www.{bare_host}")
-        || bare_host.ends_with(&format!(".{name}"))
+
+/// Rows the vault suggests for a page host (the CLI's LOOSE rule). The matching
+/// rules live in `ychrome-vault`, not here: they are vault domain logic, they
+/// read each item's URIs (which `rbw list` never exposed), and one owner means
+/// the sidebar's suggestions and an auto-fill's refusals can never disagree.
+fn vault_suggest_for_host(host: &str) -> Result<Vec<VaultEntryMeta>, String> {
+    vault_entries_from_json(&vault_cli_output(&["suggest", host])?)
+}
+
+/// `[{name, username, folder, ...}]` — the secret-free item shape both `list
+/// --json` and `suggest` emit.
+fn vault_entries_from_json(json: &str) -> Result<Vec<VaultEntryMeta>, String> {
+    let items: Vec<Value> = serde_json::from_str(json)
+        .map_err(|error| format!("ychrome-vault returned malformed JSON: {error}"))?;
+    Ok(items
+        .into_iter()
+        .map(|item| VaultEntryMeta {
+            name: item["name"].as_str().unwrap_or_default().trim().to_string(),
+            user: item["username"].as_str().unwrap_or_default().trim().to_string(),
+            folder: item["folder"].as_str().unwrap_or_default().trim().to_string(),
+            has_totp: item["has_totp"].as_bool().unwrap_or(false),
+        })
+        .filter(|entry| !entry.name.is_empty())
+        .collect())
 }
 /// Fetch the password for a NAMED entry (user disambiguates same-name
 /// entries). Blocking; call from spawn_blocking.
-fn rbw_vault_password(entry_name: &str, user: Option<&str>) -> Result<WebLoginCredential, String> {
-    let rbw = rbw_binary()?;
-    // Resolve the username when not given (the form fill needs it): first
-    // sorted entry with this name.
+fn vault_password(entry_name: &str, user: Option<&str>) -> Result<WebLoginCredential, String> {
+    let mut args = vec!["get", entry_name];
+    if let Some(user) = user.filter(|user| !user.is_empty()) {
+        args.push(user);
+    }
+    let password = vault_cli_output(&args)?;
+    if password.is_empty() {
+        return Err(format!("vault entry {entry_name} has no password"));
+    }
+    // The fill needs the username too, and `get` prints only the field asked
+    // for. Resolve it the same way the CLI does when it is not given.
     let username = match user {
         Some(user) => user.to_string(),
         None => {
-            let mut users: Vec<String> = rbw_vault_entries()?
+            let mut users: Vec<String> = vault_entries()?
                 .into_iter()
                 .filter(|entry| entry.name == entry_name)
                 .map(|entry| entry.user)
@@ -36111,127 +36130,77 @@ fn rbw_vault_password(entry_name: &str, user: Option<&str>) -> Result<WebLoginCr
             users.into_iter().next().unwrap_or_default()
         }
     };
-    let mut get = std::process::Command::new(&rbw);
-    get.args(["get", "--field", "password", entry_name]);
-    if !username.is_empty() {
-        get.arg(&username);
-    }
-    let got = get
-        .output()
-        .map_err(|error| format!("run rbw get: {error}"))?;
-    if !got.status.success() {
-        return Err(format!(
-            "rbw get failed: {}",
-            String::from_utf8_lossy(&got.stderr).trim()
-        ));
-    }
-    let password = String::from_utf8_lossy(&got.stdout).trim_end().to_string();
-    if password.is_empty() {
-        return Err(format!("vault entry {entry_name} has no password"));
-    }
     Ok(WebLoginCredential {
         entry_name: entry_name.to_string(),
         username,
         password,
     })
 }
-/// Add a login to the vault. `rbw add` reads the password (first line) from
-/// $VISUAL — point it at a one-shot helper that copies a 0600 content file
-/// into rbw's tempfile, so the password never appears in argv or the
-/// environment. Blocking; call from spawn_blocking.
-fn rbw_add_login(
+
+/// Add a login to the vault. The password goes in on STDIN — never argv, never
+/// the environment. (`rbw add` read it from `$VISUAL`, so this used to stage the
+/// password in a 0600 tempfile and point a one-shot editor script at it.)
+/// Blocking; call from spawn_blocking.
+fn vault_add_login(
     name: &str,
     user: &str,
     password: &str,
     uri: &str,
     folder: &str,
 ) -> Result<(), String> {
-    let rbw = rbw_binary()?;
+    use std::io::Write as _;
+
+    let cli = vault_cli()?;
     if name.trim().is_empty() {
         return Err("entry name is required".to_string());
     }
     if password.is_empty() {
         return Err("password is empty — generate or type one".to_string());
     }
-    let home = yggterm_core::resolve_yggterm_home()
-        .map_err(|error| format!("resolve yggterm home: {error}"))?;
-    let tmp_dir = home.join("tmp");
-    std::fs::create_dir_all(&tmp_dir).map_err(|error| format!("create tmp dir: {error}"))?;
-    let stamp = current_millis();
-    let content_path = tmp_dir.join(format!("rbw-add-{stamp}-{}.txt", std::process::id()));
-    let helper_path = tmp_dir.join(format!("rbw-add-{stamp}-{}.sh", std::process::id()));
-    let cleanup = |content: &std::path::Path, helper: &std::path::Path| {
-        let _ = std::fs::remove_file(content);
-        let _ = std::fs::remove_file(helper);
-    };
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        use std::io::Write as _;
-        let mut content = std::fs::OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .mode(0o600)
-            .open(&content_path)
-            .map_err(|error| format!("write password staging file: {error}"))?;
-        writeln!(content, "{password}")
-            .map_err(|error| format!("write password staging file: {error}"))?;
-        let mut helper = std::fs::OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .mode(0o700)
-            .open(&helper_path)
-            .map_err(|error| format!("write editor helper: {error}"))?;
-        write!(helper, "#!/bin/sh\ncat \"$RBW_ADD_CONTENT\" > \"$1\"\n")
-            .map_err(|error| format!("write editor helper: {error}"))?;
+    let mut add = std::process::Command::new(&cli);
+    add.arg("add").arg(name.trim());
+    if !user.trim().is_empty() {
+        add.arg(user.trim());
     }
-    let mut add = std::process::Command::new(&rbw);
-    add.arg("add");
     if !uri.trim().is_empty() {
         add.args(["--uri", uri.trim()]);
     }
     if !folder.trim().is_empty() {
         add.args(["--folder", folder.trim()]);
     }
-    add.arg(name.trim());
-    if !user.trim().is_empty() {
-        add.arg(user.trim());
-    }
-    add.env("VISUAL", &helper_path)
-        .env("EDITOR", &helper_path)
-        .env("RBW_ADD_CONTENT", &content_path);
-    let output = add.output();
-    cleanup(&content_path, &helper_path);
-    let output = output.map_err(|error| format!("run rbw add: {error}"))?;
-    if !output.status.success() {
-        return Err(format!(
-            "rbw add failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
-    }
-    Ok(())
-}
-/// Current TOTP code for a vault entry (`rbw code`). Errors when the entry
-/// carries no authenticator secret. Blocking; call from spawn_blocking.
-fn rbw_vault_totp(entry_name: &str, user: Option<&str>) -> Result<String, String> {
-    let rbw = rbw_binary()?;
-    let mut code = std::process::Command::new(&rbw);
-    code.arg("code").arg(entry_name);
-    if let Some(user) = user.filter(|user| !user.is_empty()) {
-        code.arg(user);
-    }
-    let output = code
-        .output()
-        .map_err(|error| format!("run rbw code: {error}"))?;
+    let mut child = add
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("run ychrome-vault add: {error}"))?;
+    child
+        .stdin
+        .take()
+        .ok_or("no stdin on ychrome-vault add")?
+        .write_all(password.as_bytes())
+        .map_err(|error| format!("send password to ychrome-vault: {error}"))?;
+    let output = child
+        .wait_with_output()
+        .map_err(|error| format!("ychrome-vault add: {error}"))?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         let stderr = stderr.trim();
-        return Err(if stderr.contains("no totp") || stderr.contains("TOTP") {
-            format!("{entry_name} has no authenticator secret")
-        } else {
-            format!("rbw code failed: {stderr}")
-        });
+        if stderr.contains("vault locked") || stderr.contains("no agent") {
+            return Err("vault locked: run `ychrome-vault unlock` in a terminal first".to_string());
+        }
+        return Err(format!("ychrome-vault add failed: {stderr}"));
     }
-    let code = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    Ok(())
+}
+/// Current TOTP code for a vault entry. Errors when the entry
+/// carries no authenticator secret. Blocking; call from spawn_blocking.
+fn vault_totp(entry_name: &str, user: Option<&str>) -> Result<String, String> {
+    let mut args = vec!["totp", entry_name];
+    if let Some(user) = user.filter(|user| !user.is_empty()) {
+        args.push(user);
+    }
+    let code = vault_cli_output(&args)?;
     if code.is_empty() {
         return Err(format!("{entry_name} has no authenticator secret"));
     }
@@ -36334,10 +36303,12 @@ async fn web_surface_totp_for(
     let chosen_entry = entry.map(str::to_string);
     let chosen_user = user.map(str::to_string);
     let resolved = task::spawn_blocking(move || match chosen_entry {
-        Some(entry) => rbw_vault_totp(&entry, chosen_user.as_deref()).map(|code| (entry, code)),
+        Some(entry) => vault_totp(&entry, chosen_user.as_deref()).map(|code| (entry, code)),
         None => {
-            let (name, user) = vault_auto_match_for_host(&lookup_host)?;
-            rbw_vault_totp(&name, Some(&user)).map(|code| (name, code))
+            // The strict rule picks the entry; then its own TOTP.
+            let matched = vault_match_for_host(&lookup_host)?;
+            vault_totp(&matched.entry_name, Some(&matched.username))
+                .map(|code| (matched.entry_name, code))
         }
     })
     .await
@@ -36406,63 +36377,37 @@ async fn web_surface_totp_for(
         },
     })
 }
-/// Generate a password with the vault CLI's own generator (`rbw generate`
-/// WITHOUT an entry name prints without storing). Blocking; call from
-/// spawn_blocking.
-fn rbw_generate_password(length: usize, no_symbols: bool) -> Result<String, String> {
-    let rbw = rbw_binary()?;
+/// Generate a password with the vault CLI's own generator (local dice — no
+/// vault touched, no network). Blocking; call from spawn_blocking.
+fn vault_generate_password(length: usize, no_symbols: bool) -> Result<String, String> {
     let length = length.clamp(8, 128).to_string();
-    let mut generate = std::process::Command::new(&rbw);
-    generate.arg("generate");
+    let mut args = vec!["generate", length.as_str()];
     if no_symbols {
-        generate.arg("--no-symbols");
+        args.push("--no-symbols");
     }
-    generate.arg(&length);
-    let output = generate
-        .output()
-        .map_err(|error| format!("run rbw generate: {error}"))?;
-    if !output.status.success() {
-        return Err(format!(
-            "rbw generate failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
-    }
-    let password = String::from_utf8_lossy(&output.stdout).trim_end().to_string();
+    let password = vault_cli_output(&args)?;
     if password.is_empty() {
-        return Err("rbw generate produced nothing".to_string());
+        return Err("ychrome-vault generate produced nothing".to_string());
     }
     Ok(password)
 }
 /// One watchtower batch: passwords for a chunk of entries, labeled. Secrets
 /// live only inside the analysis pass and are dropped with the map.
-fn rbw_watchtower_batch(chunk: Vec<VaultEntryMeta>) -> Vec<(String, String)> {
-    let Ok(rbw) = rbw_binary() else {
+fn vault_watchtower_batch(chunk: Vec<VaultEntryMeta>) -> Vec<(String, String)> {
+    if vault_cli().is_err() {
         return Vec::new();
-    };
+    }
     chunk
         .into_iter()
         .filter_map(|entry| {
-            let mut get = std::process::Command::new(&rbw);
-            get.args(["get", "--field", "password", &entry.name]);
-            if !entry.user.is_empty() {
-                get.arg(&entry.user);
-            }
-            let output = get.output().ok()?;
-            if !output.status.success() {
-                return None;
-            }
-            let password = String::from_utf8_lossy(&output.stdout)
-                .trim_end()
-                .to_string();
-            if password.is_empty() {
-                return None;
-            }
+            let user = (!entry.user.is_empty()).then_some(entry.user.as_str());
+            let credential = vault_password(&entry.name, user).ok()?;
             let label = if entry.user.is_empty() {
                 entry.name
             } else {
                 format!("{} ({})", entry.name, entry.user)
             };
-            Some((label, password))
+            Some((label, credential.password))
         })
         .collect()
 }
@@ -36492,46 +36437,34 @@ struct VaultWatchtowerReport {
     /// Entries with weak passwords.
     weak: Vec<String>,
 }
-/// Auto-match path: the FIRST (sorted) vault entry whose NAME matches `host`
-/// exactly (or its `www.` twin) — strict on purpose: the user didn't choose,
-/// so no base-domain fuzz here. Blocking; call from spawn_blocking.
-/// Does entry NAME auto-match `host`? Exact host, its `www.`-stripped twin, or
-/// that twin re-prefixed with `www.`. Deliberately STRICTER than
-/// `vault_entry_applies_to_host` (which only *suggests* sidebar rows): no
-/// base-domain suffix match, because an auto path fills without anyone
-/// confirming the choice.
-fn vault_entry_auto_matches_host(entry_name: &str, host: &str) -> bool {
-    let name = entry_name.trim().to_lowercase();
-    if name.is_empty() {
-        return false;
-    }
-    let host = host.trim().to_lowercase();
-    let bare_host = host.strip_prefix("www.").unwrap_or(&host);
-    name == host || name == bare_host || name == format!("www.{bare_host}")
-}
-/// Auto-match a page host to one vault entry `(name, username)`; first sorted
-/// wins when several accounts share a name. SSOT for every auto path (password
-/// fill, TOTP); a user-CHOSEN entry skips it because they already decided.
+/// The ONE vault entry an auto path (password fill, TOTP) may use for `host`,
+/// with its credential. The STRICT rule — exact host or its `www.` twin, on the
+/// item name or any of its URIs — lives in `ychrome-vault`, which owns it. It is
+/// deliberately stricter than the sidebar's `suggest`: an auto path commits a
+/// secret to a page with nobody confirming the choice, so a base-domain entry
+/// must never auto-fill a subdomain.
 /// Blocking; call from spawn_blocking.
-fn vault_auto_match_for_host(host: &str) -> Result<(String, String), String> {
+fn vault_match_for_host(host: &str) -> Result<WebLoginCredential, String> {
     let host = host.trim().to_lowercase();
     if host.is_empty() {
         return Err("page has no host".to_string());
     }
-    let mut candidates: Vec<(String, String)> = rbw_vault_entries()?
-        .into_iter()
-        .filter(|entry| vault_entry_auto_matches_host(&entry.name, &host))
-        .map(|entry| (entry.name, entry.user))
-        .collect();
-    candidates.sort();
-    candidates
-        .into_iter()
-        .next()
-        .ok_or_else(|| format!("no vault entry named for host {host}"))
+    let json = vault_cli_output(&["match", &host])?;
+    let entry: Value = serde_json::from_str(&json)
+        .map_err(|error| format!("ychrome-vault match returned malformed JSON: {error}"))?;
+    let password = entry["password"].as_str().unwrap_or_default().to_string();
+    if password.is_empty() {
+        return Err(format!("no vault entry with a password for host {host}"));
+    }
+    Ok(WebLoginCredential {
+        entry_name: entry["name"].as_str().unwrap_or_default().to_string(),
+        username: entry["username"].as_str().unwrap_or_default().to_string(),
+        password,
+    })
 }
+
 fn web_surface_password_lookup(host: &str) -> Result<WebLoginCredential, String> {
-    let (entry_name, username) = vault_auto_match_for_host(host)?;
-    rbw_vault_password(&entry_name, Some(&username))
+    vault_match_for_host(host)
 }
 /// PATH lookup without shelling out (deterministic, no shell parsing).
 fn which_binary(name: &str) -> Option<std::path::PathBuf> {
@@ -36634,7 +36567,7 @@ async fn web_surface_fill_for(
     let chosen_entry = entry.map(str::to_string);
     let chosen_user = user.map(str::to_string);
     let credential = match task::spawn_blocking(move || match chosen_entry {
-        Some(entry) => rbw_vault_password(&entry, chosen_user.as_deref()),
+        Some(entry) => vault_password(&entry, chosen_user.as_deref()),
         None => web_surface_password_lookup(&lookup_host),
     })
     .await
@@ -76318,7 +76251,7 @@ fn AppSidebarRailBody(
                     RailSectionTitle { title: "Passwords".to_string(), muted_color: palette.muted.to_string() }
                     div {
                         style: format!("font-size:10px; line-height:1.5; color:{};", palette.muted),
-                        "Fills the visible login form from your Bitwarden/Vaultwarden vault (rbw), matched to the page's exact host."
+                        "Fills the visible login form from your Bitwarden/Vaultwarden vault, matched to the page's exact host."
                     }
                     button {
                         r#type: "button",
@@ -76362,7 +76295,7 @@ enum VaultPaneTab {
     Add,
     Tools,
 }
-/// ychrome's shipped Bitwarden UX (Keyguard-inspired): search the rbw vault,
+/// ychrome's shipped Bitwarden UX (Keyguard-inspired): search the vault,
 /// site-applicable logins float to the top for the active tab's host, and
 /// clicking ANY entry fills it into the page — the user's multi-account
 /// override path. Metadata only in the pane (name/user/folder); the password
@@ -76378,6 +76311,10 @@ fn VaultRailBody(
     let mut tab = use_signal(|| VaultPaneTab::Fill);
     let mut query = use_signal(String::new);
     let mut entries = use_signal(|| None::<Result<Vec<VaultEntryMeta>, String>>);
+    // Rows the vault suggests for the active page host. Fetched from the CLI
+    // (which owns the matching rules) rather than filtered here, so the
+    // sidebar's suggestions and an auto-fill's refusals cannot disagree.
+    let mut site_matches = use_signal(Vec::<VaultEntryMeta>::new);
     let mut reload_nonce = use_signal(|| 0u32);
     // Add-form drafts.
     let mut add_name = use_signal(String::new);
@@ -76392,17 +76329,32 @@ fn VaultRailBody(
     let mut watchtower = use_signal(|| None::<VaultWatchtowerReport>);
     let mut watchtower_progress = use_signal(|| None::<(usize, usize)>);
     // (Re)read the vault list off the UI loop whenever the nonce bumps.
-    use_effect(move || {
-        let _ = reload_nonce();
-        entries.set(None);
-        spawn(async move {
-            let result = task::spawn_blocking(rbw_vault_entries)
-                .await
-                .unwrap_or_else(|join| Err(format!("vault task failed: {join}")));
-            entries.set(Some(result));
-        });
-    });
     let host = snapshot.active_web_surface_host.clone();
+    use_effect({
+        let host = host.clone();
+        move || {
+            let _ = reload_nonce();
+            entries.set(None);
+            let host = host.clone();
+            spawn(async move {
+                let result = task::spawn_blocking(vault_entries)
+                    .await
+                    .unwrap_or_else(|join| Err(format!("vault task failed: {join}")));
+                entries.set(Some(result));
+
+                // A host with no suggestions is an empty list, not an error:
+                // the pane still shows every item below it.
+                let suggested = match host {
+                    Some(host) => task::spawn_blocking(move || vault_suggest_for_host(&host))
+                        .await
+                        .unwrap_or_else(|join| Err(format!("vault task failed: {join}")))
+                        .unwrap_or_default(),
+                    None => Vec::new(),
+                };
+                site_matches.set(suggested);
+            });
+        }
+    });
     let q = query().trim().to_lowercase();
     let muted_style = format!("font-size:10px; line-height:1.5; color:{};", palette.muted);
     let field_style = format!(
@@ -76424,6 +76376,7 @@ fn VaultRailBody(
         let fill_user = user.clone();
         let totp_name = name.clone();
         let totp_user = user.clone();
+        let has_totp = entry.has_totp;
         rsx! {
             div {
                 key: "{key}",
@@ -76446,9 +76399,9 @@ fn VaultRailBody(
                         }
                     }
                 }
-                // TOTP is per-ROW rather than gated on "has an authenticator
-                // secret": rbw's list can't tell us, so the button reports
-                // "no authenticator secret" if the entry has none.
+                // Only where there is a code to fill: the item list says
+                // which entries carry an authenticator secret.
+                if has_totp {
                 button {
                     r#type: "button",
                     "data-vault-totp": "1",
@@ -76462,6 +76415,7 @@ fn VaultRailBody(
                         on_totp_vault_entry.call((totp_name.clone(), totp_user.clone()));
                     },
                     "⏱"
+                }
                 }
             }
         }
@@ -76554,7 +76508,7 @@ fn VaultRailBody(
                                     let no_symbols = generate_no_symbols();
                                     spawn(async move {
                                         let generated = task::spawn_blocking(move || {
-                                            rbw_generate_password(length, no_symbols)
+                                            vault_generate_password(length, no_symbols)
                                         })
                                         .await
                                         .unwrap_or_else(|join| Err(format!("generate task failed: {join}")));
@@ -76624,7 +76578,7 @@ fn VaultRailBody(
                                     spawn(async move {
                                         let save_name = name.clone();
                                         let result = task::spawn_blocking(move || {
-                                            rbw_add_login(&save_name, &user, &password, &uri, &folder)
+                                            vault_add_login(&save_name, &user, &password, &uri, &folder)
                                         })
                                         .await
                                         .unwrap_or_else(|join| Err(format!("add task failed: {join}")));
@@ -76682,14 +76636,14 @@ fn VaultRailBody(
                                 watchtower_progress.set(Some((0, total)));
                                 spawn(async move {
                                     // Chunked so progress updates and the UI
-                                    // never blocks on one long rbw sweep.
+                                    // never blocks on one long vault sweep.
                                     let mut by_password: HashMap<String, Vec<String>> = HashMap::new();
                                     let mut weak: Vec<String> = Vec::new();
                                     let mut scanned = 0usize;
                                     for chunk in list.chunks(25) {
                                         let chunk = chunk.to_vec();
                                         let batch = task::spawn_blocking(move || {
-                                            rbw_watchtower_batch(chunk)
+                                            vault_watchtower_batch(chunk)
                                         })
                                         .await
                                         .unwrap_or_default();
@@ -76805,15 +76759,7 @@ fn VaultRailBody(
                     Some(Ok(list)) => {
                         const MAX_ROWS: usize = 80;
                         if q.is_empty() {
-                            let site_matches: Vec<VaultEntryMeta> = host
-                                .as_deref()
-                                .map(|host| {
-                                    list.iter()
-                                        .filter(|entry| vault_entry_applies_to_host(&entry.name, host))
-                                        .cloned()
-                                        .collect()
-                                })
-                                .unwrap_or_default();
+                            let site_matches = site_matches();
                             let total = list.len();
                             let shown: Vec<VaultEntryMeta> =
                                 list.iter().take(MAX_ROWS).cloned().collect();
@@ -82219,67 +82165,6 @@ mod tests {
             .collect();
         let plan = keep_alive_plan_for(&live, &selected, &rows, |_| false).expect("plan");
         assert_eq!(plan.paths, vec!["local://one"]);
-    }
-
-    // The two vault matchers are deliberately asymmetric. The sidebar SUGGESTS
-    // rows with the loose rule (a human then clicks one); the auto paths (fill,
-    // TOTP) commit a secret to the page with nobody confirming, so they take
-    // the strict rule. A base-domain entry must never auto-fill a subdomain.
-    #[test]
-    fn vault_auto_match_is_stricter_than_the_sidebar_suggestion_rule() {
-        // Both agree on the host and its www twin, in either direction.
-        for (name, host) in [
-            ("example.com", "example.com"),
-            ("example.com", "www.example.com"),
-            ("www.example.com", "example.com"),
-            ("EXAMPLE.com", "example.com"),
-        ] {
-            assert!(
-                vault_entry_auto_matches_host(name, host),
-                "auto: {name} should match {host}"
-            );
-            assert!(
-                vault_entry_applies_to_host(name, host),
-                "applies: {name} should match {host}"
-            );
-        }
-        // Base-domain suffix: the sidebar suggests it, the auto path refuses.
-        assert!(vault_entry_applies_to_host("gour.top", "chat.example.com"));
-        assert!(!vault_entry_auto_matches_host("gour.top", "chat.example.com"));
-        // Neither matches an unrelated host, an empty name, or a lookalike
-        // that merely ends with the host's text.
-        for name in ["", "  ", "other.com", "notexample.com"] {
-            assert!(!vault_entry_auto_matches_host(name, "example.com"));
-            assert!(!vault_entry_applies_to_host(name, "example.com"));
-        }
-    }
-
-    // A CONTROL endpoint is fetched by the GUI itself over a plain socket, so
-    // it can never be resolved the way a webview URL is: the webview gets an
-    // `ssh -D` SOCKS proxy and the URL untouched, which would send the GUI's
-    // own GET to `127.0.0.1:<port>` on the GUI's machine — the wrong host,
-    // silently. Only a loopback URL on a REMOTE session needs a forward; the
-    // cases below need no ssh and assert we never spawn one.
-    #[test]
-    fn control_endpoint_resolution_only_forwards_remote_loopback_urls() {
-        let loopback = "http://127.0.0.1:45231/sidebar";
-
-        // Local session: the daemon models it as an ssh target on loopback.
-        for target in [None, Some("localhost"), Some("127.0.0.1")] {
-            let (url, child) = resolve_control_endpoint_url(loopback, target);
-            assert_eq!(url, loopback, "local target {target:?} needs no forward");
-            assert!(child.is_none());
-        }
-
-        // Remote session, but the endpoint is publicly reachable already.
-        let (url, child) = resolve_control_endpoint_url("https://example.com/sidebar", Some("guihost"));
-        assert_eq!(url, "https://example.com/sidebar");
-        assert!(child.is_none());
-
-        // Unparseable input is passed through rather than dropped.
-        let (url, child) = resolve_control_endpoint_url("not a url", Some("guihost"));
-        assert_eq!(url, "not a url");
-        assert!(child.is_none());
     }
 
     // Heartbeats re-deliver the app's URL every few seconds; they must NOT
