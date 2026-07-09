@@ -2597,6 +2597,10 @@ enum RightPanelMode {
     /// sidebar-contribution surface). First consumer: ychrome settings
     /// (adblock + userscripts config, all GUI-host-owned files).
     AppSidebar,
+    /// ychrome's shipped Bitwarden/vault browser: search the rbw vault,
+    /// site-applicable logins float to the top, click any entry to fill it
+    /// into the active surface (the user's multi-account override path).
+    Vault,
 }
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum PreviewLayoutMode {
@@ -2664,6 +2668,9 @@ struct RenderSnapshot {
     /// The active session's live web-surface profile (app tab), if it has a
     /// surface — drives the app-sidebar's per-profile settings.
     active_web_surface_profile: Option<String>,
+    /// Host of the active surface's ACTIVE tab URL (vault pane's "for this
+    /// site" filter). None when no surface / no navigated tab.
+    active_web_surface_host: Option<String>,
     active_view_mode: WorkspaceViewMode,
     retained_terminal_sessions: Vec<ManagedSessionView>,
     terminal_mount_epochs: HashMap<String, u64>,
@@ -4387,6 +4394,16 @@ impl ShellState {
                     .and_then(|surface| surface.tabs.first())
                     .map(|app_tab| app_tab.profile.clone())
             }),
+            active_web_surface_host: active_session_path.as_deref().and_then(|path| {
+                let surface = self.web_surfaces.get(path)?;
+                let tab = surface
+                    .tabs
+                    .iter()
+                    .find(|tab| tab.id == surface.active_tab)?;
+                let host = web_surface_tab_host_label(&tab.url);
+                (!host.is_empty() && host != "New Tab")
+                    .then(|| host.split(':').next().unwrap_or(&host).to_lowercase())
+            }),
             active_session_path,
             active_view_mode: render_active_view_mode,
             retained_terminal_sessions,
@@ -5122,6 +5139,7 @@ impl ShellState {
             RightPanelMode::Connect => "ssh connect opened".to_string(),
             RightPanelMode::Notifications => "notifications opened".to_string(),
             RightPanelMode::AppSidebar => "app sidebar opened".to_string(),
+            RightPanelMode::Vault => "vault opened".to_string(),
         };
     }
     fn toggle_app_sidebar_panel(&mut self) {
@@ -5129,6 +5147,14 @@ impl ShellState {
             RightPanelMode::Hidden
         } else {
             RightPanelMode::AppSidebar
+        };
+        self.set_right_panel_mode(next_mode);
+    }
+    fn toggle_vault_panel(&mut self) {
+        let next_mode = if self.right_panel_mode == RightPanelMode::Vault {
+            RightPanelMode::Hidden
+        } else {
+            RightPanelMode::Vault
         };
         self.set_right_panel_mode(next_mode);
     }
@@ -27791,6 +27817,7 @@ fn right_panel_mode_label(mode: RightPanelMode) -> &'static str {
         RightPanelMode::Connect => "connect",
         RightPanelMode::Notifications => "notifications",
         RightPanelMode::AppSidebar => "app_sidebar",
+        RightPanelMode::Vault => "vault",
     }
 }
 
@@ -27802,6 +27829,7 @@ fn app_control_right_panel_mode(mode: AppControlRightPanelMode) -> RightPanelMod
         AppControlRightPanelMode::Settings => RightPanelMode::Settings,
         AppControlRightPanelMode::Metadata => RightPanelMode::Metadata,
         AppControlRightPanelMode::AppSidebar => RightPanelMode::AppSidebar,
+        AppControlRightPanelMode::Vault => RightPanelMode::Vault,
     }
 }
 
@@ -35822,22 +35850,28 @@ struct WebLoginCredential {
     username: String,
     password: String,
 }
-/// Query the LOCAL vault CLI for a login matching `host` exactly (or its
-/// `www.`-stripped twin). Backend: `rbw` (agent-cached, Vaultwarden-friendly);
-/// `bw` is deliberately NOT shelled out to here — without a cached session it
-/// would prompt, and a GUI process must never sit on an interactive prompt.
-/// Matching is by entry NAME (rbw's list has no URI field): exact host,
-/// host-without-www, or www.+name — origin-exact in spirit, documented in
-/// docs/ychrome-password-manager.md. Blocking; call from spawn_blocking.
-fn web_surface_password_lookup(host: &str) -> Result<WebLoginCredential, String> {
-    let host = host.trim().to_lowercase();
-    if host.is_empty() {
-        return Err("page has no host".to_string());
-    }
-    let rbw = which_binary("rbw").ok_or(
+/// One vault entry's metadata (no secrets) as the vault pane lists it.
+#[derive(Clone, PartialEq)]
+struct VaultEntryMeta {
+    name: String,
+    user: String,
+    folder: String,
+}
+/// The rbw binary, or the setup hint. Backend: `rbw` (agent-cached,
+/// Vaultwarden-friendly); `bw` is deliberately NOT shelled out to — without a
+/// cached session it would prompt, and a GUI process must never sit on an
+/// interactive prompt.
+fn rbw_binary() -> Result<std::path::PathBuf, String> {
+    which_binary("rbw").ok_or_else(|| {
         "no vault CLI: install `rbw` (Bitwarden/Vaultwarden agent CLI) and run \
-         `rbw config set base_url <vaultwarden-url>` + `rbw register` + `rbw login`",
-    )?;
+         `rbw config set base_url <vaultwarden-url>` + `rbw register` + `rbw login`"
+            .to_string()
+    })
+}
+/// List the unlocked vault's entries (name/user/folder — no secrets).
+/// Blocking; call from spawn_blocking.
+fn rbw_vault_entries() -> Result<Vec<VaultEntryMeta>, String> {
+    let rbw = rbw_binary()?;
     let unlocked = std::process::Command::new(&rbw)
         .arg("unlocked")
         .output()
@@ -35846,7 +35880,7 @@ fn web_surface_password_lookup(host: &str) -> Result<WebLoginCredential, String>
         return Err("vault locked: run `rbw unlock` in a terminal first".to_string());
     }
     let list = std::process::Command::new(&rbw)
-        .args(["list", "--fields", "name,user"])
+        .args(["list", "--fields", "name,user,folder"])
         .output()
         .map_err(|error| format!("run rbw list: {error}"))?;
     if !list.status.success() {
@@ -35855,26 +35889,54 @@ fn web_surface_password_lookup(host: &str) -> Result<WebLoginCredential, String>
             String::from_utf8_lossy(&list.stderr).trim()
         ));
     }
-    let bare_host = host.strip_prefix("www.").unwrap_or(&host);
-    let mut candidates: Vec<(String, String)> = String::from_utf8_lossy(&list.stdout)
+    Ok(String::from_utf8_lossy(&list.stdout)
         .lines()
-        .filter_map(|line| {
-            let (name, user) = match line.split_once('\t') {
-                Some((name, user)) => (name.trim(), user.trim()),
-                None => (line.trim(), ""),
-            };
-            let lowered = name.to_lowercase();
-            (lowered == host || lowered == bare_host || lowered == format!("www.{bare_host}"))
-                .then(|| (name.to_string(), user.to_string()))
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| {
+            let mut cols = line.split('\t');
+            VaultEntryMeta {
+                name: cols.next().unwrap_or("").trim().to_string(),
+                user: cols.next().unwrap_or("").trim().to_string(),
+                folder: cols.next().unwrap_or("").trim().to_string(),
+            }
         })
-        .collect();
-    candidates.sort();
-    let (entry_name, username) = candidates
-        .into_iter()
-        .next()
-        .ok_or_else(|| format!("no vault entry named for host {host}"))?;
+        .collect())
+}
+/// Does a vault entry NAME apply to `host`? Exact host, `www.`-stripped twin,
+/// or base-domain suffix (entry "gour.top" applies to "chat.example.com") —
+/// Bitwarden's default base-domain URI match, transposed onto names (rbw's
+/// list has no URI field; entry naming is the contract).
+fn vault_entry_applies_to_host(entry_name: &str, host: &str) -> bool {
+    let name = entry_name.trim().to_lowercase();
+    if name.is_empty() {
+        return false;
+    }
+    let bare_host = host.strip_prefix("www.").unwrap_or(host);
+    name == host
+        || name == bare_host
+        || name == format!("www.{bare_host}")
+        || bare_host.ends_with(&format!(".{name}"))
+}
+/// Fetch the password for a NAMED entry (user disambiguates same-name
+/// entries). Blocking; call from spawn_blocking.
+fn rbw_vault_password(entry_name: &str, user: Option<&str>) -> Result<WebLoginCredential, String> {
+    let rbw = rbw_binary()?;
+    // Resolve the username when not given (the form fill needs it): first
+    // sorted entry with this name.
+    let username = match user {
+        Some(user) => user.to_string(),
+        None => {
+            let mut users: Vec<String> = rbw_vault_entries()?
+                .into_iter()
+                .filter(|entry| entry.name == entry_name)
+                .map(|entry| entry.user)
+                .collect();
+            users.sort();
+            users.into_iter().next().unwrap_or_default()
+        }
+    };
     let mut get = std::process::Command::new(&rbw);
-    get.args(["get", "--field", "password", &entry_name]);
+    get.args(["get", "--field", "password", entry_name]);
     if !username.is_empty() {
         get.arg(&username);
     }
@@ -35892,10 +35954,34 @@ fn web_surface_password_lookup(host: &str) -> Result<WebLoginCredential, String>
         return Err(format!("vault entry {entry_name} has no password"));
     }
     Ok(WebLoginCredential {
-        entry_name,
+        entry_name: entry_name.to_string(),
         username,
         password,
     })
+}
+/// Auto-match path: the FIRST (sorted) vault entry whose NAME matches `host`
+/// exactly (or its `www.` twin) — strict on purpose: the user didn't choose,
+/// so no base-domain fuzz here. Blocking; call from spawn_blocking.
+fn web_surface_password_lookup(host: &str) -> Result<WebLoginCredential, String> {
+    let host = host.trim().to_lowercase();
+    if host.is_empty() {
+        return Err("page has no host".to_string());
+    }
+    let bare_host = host.strip_prefix("www.").unwrap_or(&host).to_string();
+    let mut candidates: Vec<(String, String)> = rbw_vault_entries()?
+        .into_iter()
+        .filter(|entry| {
+            let lowered = entry.name.to_lowercase();
+            lowered == host || lowered == bare_host || lowered == format!("www.{bare_host}")
+        })
+        .map(|entry| (entry.name, entry.user))
+        .collect();
+    candidates.sort();
+    let (entry_name, username) = candidates
+        .into_iter()
+        .next()
+        .ok_or_else(|| format!("no vault entry named for host {host}"))?;
+    rbw_vault_password(&entry_name, Some(&username))
 }
 /// PATH lookup without shelling out (deterministic, no shell parsing).
 fn which_binary(name: &str) -> Option<std::path::PathBuf> {
@@ -35964,6 +36050,8 @@ async fn web_surface_fill_for(
     state: &Signal<ShellState>,
     desktop: &dioxus::desktop::DesktopContext,
     session_path: Option<&str>,
+    entry: Option<&str>,
+    user: Option<&str>,
 ) -> Value {
     let (session, native_id) = match resolve_live_web_surface(state, session_path) {
         Ok(resolved) => resolved,
@@ -35984,7 +36072,8 @@ async fn web_surface_fill_for(
         });
     }
     let host = web_surface_tab_host_label(&page_url);
-    if host.is_empty() || host == "New Tab" {
+    // Auto-match needs a host; a user-CHOSEN entry doesn't (they decided).
+    if entry.is_none() && (host.is_empty() || host == "New Tab") {
         return json!({
             "accepted": false,
             "session_path": session,
@@ -35992,8 +36081,11 @@ async fn web_surface_fill_for(
         });
     }
     let lookup_host = host.split(':').next().unwrap_or(&host).to_string();
-    let credential = match task::spawn_blocking(move || {
-        web_surface_password_lookup(&lookup_host)
+    let chosen_entry = entry.map(str::to_string);
+    let chosen_user = user.map(str::to_string);
+    let credential = match task::spawn_blocking(move || match chosen_entry {
+        Some(entry) => rbw_vault_password(&entry, chosen_user.as_deref()),
+        None => web_surface_password_lookup(&lookup_host),
     })
     .await
     .unwrap_or_else(|join| Err(format!("lookup task failed: {join}")))
@@ -39922,8 +40014,19 @@ async fn process_pending_app_control_requests(
                 data: Some(result),
             }
         }
-        AppControlCommand::WebSurfaceFill { session_path } => {
-            let result = web_surface_fill_for(&state, &desktop, session_path.as_deref()).await;
+        AppControlCommand::WebSurfaceFill {
+            session_path,
+            entry,
+            user,
+        } => {
+            let result = web_surface_fill_for(
+                &state,
+                &desktop,
+                session_path.as_deref(),
+                entry.as_deref(),
+                user.as_deref(),
+            )
+            .await;
             AppControlResponse {
                 request_id: request.request_id.clone(),
                 handled_by_pid: std::process::id(),
@@ -44387,6 +44490,10 @@ fn app() -> Element {
                             state.with_mut(|shell| shell.toggle_app_sidebar_panel());
                             sync_active_terminal_input_policy(state);
                             },
+                            on_toggle_vault: move || {
+                            state.with_mut(|shell| shell.toggle_vault_panel());
+                            sync_active_terminal_input_policy(state);
+                            },
                             on_restart_update: move || restart_into_pending_update(state),
                             on_request_window_drag: move || {
                             state.with_mut(|shell| shell.note_titlebar_drag_request());
@@ -44760,8 +44867,10 @@ fn app() -> Element {
                                 move |_| {
                                     let desktop = desktop.clone();
                                     spawn(async move {
-                                        let result =
-                                            web_surface_fill_for(&state, &desktop, None).await;
+                                        let result = web_surface_fill_for(
+                                            &state, &desktop, None, None, None,
+                                        )
+                                        .await;
                                         let accepted = result
                                             .get("accepted")
                                             .and_then(Value::as_bool)
@@ -44777,6 +44886,43 @@ fn app() -> Element {
                                                 shell.push_notification(
                                                     NotificationTone::Error,
                                                     "Autofill failed",
+                                                    reason,
+                                                );
+                                            });
+                                        }
+                                    });
+                                }
+                            },
+                            on_fill_vault_entry: {
+                                let desktop = desktop.clone();
+                                move |(entry, user): (String, String)| {
+                                    let desktop = desktop.clone();
+                                    spawn(async move {
+                                        let user_opt =
+                                            (!user.is_empty()).then_some(user.as_str());
+                                        let result = web_surface_fill_for(
+                                            &state,
+                                            &desktop,
+                                            None,
+                                            Some(entry.as_str()),
+                                            user_opt,
+                                        )
+                                        .await;
+                                        let accepted = result
+                                            .get("accepted")
+                                            .and_then(Value::as_bool)
+                                            .unwrap_or(false);
+                                        if !accepted {
+                                            let reason = result
+                                                .get("reason")
+                                                .and_then(Value::as_str)
+                                                .unwrap_or("unknown failure")
+                                                .to_string();
+                                            let mut state = state;
+                                            state.with_mut(|shell| {
+                                                shell.push_notification(
+                                                    NotificationTone::Error,
+                                                    "Vault fill failed",
                                                     reason,
                                                 );
                                             });
@@ -45204,6 +45350,7 @@ fn Titlebar(
     on_toggle_connect: EventHandler<()>,
     on_toggle_notifications: EventHandler<()>,
     on_toggle_app_sidebar: EventHandler<()>,
+    on_toggle_vault: EventHandler<()>,
     on_restart_update: EventHandler<()>,
     on_request_window_drag: EventHandler<()>,
     on_toggle_maximized: EventHandler<()>,
@@ -46025,6 +46172,30 @@ fn Titlebar(
                                 }
                             }
                             "▦"
+                        }
+                        // The vault pane is ychrome's shipped Bitwarden UX —
+                        // like the app sidebar, it's the app's property: no
+                        // live surface, no icon.
+                        button {
+                            "data-titlebar-vault-button": "1",
+                            title: "Vault (fill logins from Bitwarden)",
+                            style: utility_icon_style(
+                                snapshot.palette,
+                                snapshot.right_panel_mode == RightPanelMode::Vault
+                            ),
+                            onmousedown: |evt| {
+                                evt.prevent_default();
+                                evt.stop_propagation();
+                            },
+                            onclick: {
+                                let on_toggle_vault = on_toggle_vault.clone();
+                                move |evt| {
+                                    evt.stop_propagation();
+                                    on_toggle_vault.call(());
+                                }
+                            },
+                            ondoubleclick: |evt| evt.stop_propagation(),
+                            "🔑"
                         }
                         }
                         button {
@@ -75131,6 +75302,7 @@ fn RightRail(
     on_clear_notifications: EventHandler<MouseEvent>,
     on_reload_web_surface: EventHandler<()>,
     on_fill_web_surface_login: EventHandler<()>,
+    on_fill_vault_entry: EventHandler<(String, String)>,
 ) -> Element {
     let requested_mode = snapshot.right_panel_mode;
     let mut retained_mode = use_signal(|| requested_mode);
@@ -75148,7 +75320,8 @@ fn RightRail(
     // app is back, matching the icon's own visibility gate.
     let app_sidebar_available = snapshot.active_web_surface_profile.is_some();
     let visible = requested_mode != RightPanelMode::Hidden
-        && !(requested_mode == RightPanelMode::AppSidebar && !app_sidebar_available);
+        && !(requested_mode == RightPanelMode::AppSidebar && !app_sidebar_available)
+        && !(requested_mode == RightPanelMode::Vault && !app_sidebar_available);
     let rendered_mode = if visible {
         requested_mode
     } else {
@@ -75204,6 +75377,11 @@ fn RightRail(
                     snapshot: snapshot.clone(),
                     on_reload_web_surface,
                     on_fill_web_surface_login,
+                }
+            } else if rendered_mode == RightPanelMode::Vault {
+                VaultRailBody {
+                    snapshot: snapshot.clone(),
+                    on_fill_vault_entry,
                 }
             }
             }
@@ -75448,6 +75626,185 @@ fn AppSidebarRailBody(
                         onclick: move |_| on_reload_web_surface.call(()),
                         "Reload surface now"
                     }
+                }
+            }
+            }
+        }
+    }
+}
+/// ychrome's shipped Bitwarden UX (Keyguard-inspired): search the rbw vault,
+/// site-applicable logins float to the top for the active tab's host, and
+/// clicking ANY entry fills it into the page — the user's multi-account
+/// override path. Metadata only in the pane (name/user/folder); the password
+/// is fetched at fill time and never held in component state.
+#[component]
+fn VaultRailBody(
+    snapshot: SharedSnapshot,
+    on_fill_vault_entry: EventHandler<(String, String)>,
+) -> Element {
+    let palette = snapshot.palette;
+    let mut query = use_signal(String::new);
+    let mut entries = use_signal(|| None::<Result<Vec<VaultEntryMeta>, String>>);
+    let mut reload_nonce = use_signal(|| 0u32);
+    // (Re)read the vault list off the UI loop whenever the nonce bumps.
+    use_effect(move || {
+        let _ = reload_nonce();
+        entries.set(None);
+        spawn(async move {
+            let result = task::spawn_blocking(rbw_vault_entries)
+                .await
+                .unwrap_or_else(|join| Err(format!("vault task failed: {join}")));
+            entries.set(Some(result));
+        });
+    });
+    let host = snapshot.active_web_surface_host.clone();
+    let q = query().trim().to_lowercase();
+    let muted_style = format!("font-size:10px; line-height:1.5; color:{};", palette.muted);
+    let entry_row = |entry: &VaultEntryMeta, key: String| {
+        let name = entry.name.clone();
+        let user = entry.user.clone();
+        let folder = entry.folder.clone();
+        let fill_name = name.clone();
+        let fill_user = user.clone();
+        rsx! {
+            div {
+                key: "{key}",
+                title: "Fill this login into the page",
+                style: format!(
+                    "display:flex; flex-direction:column; gap:1px; padding:6px 8px; border-radius:8px; \
+                     cursor:pointer; background:rgba(127,127,127,0.08);",
+                ),
+                onclick: move |_| {
+                    on_fill_vault_entry.call((fill_name.clone(), fill_user.clone()));
+                },
+                div {
+                    style: format!("font-size:11px; font-weight:600; color:{}; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;", palette.text),
+                    "{name}"
+                }
+                div {
+                    style: format!("display:flex; gap:6px; font-size:10px; color:{}; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;", palette.muted),
+                    span { "{user}" }
+                    if !folder.is_empty() {
+                        span { style: "opacity:0.7;", "· {folder}" }
+                    }
+                }
+            }
+        }
+    };
+    rsx! {
+        RailHeader { title: "Vault".to_string(), color: palette.text.to_string() }
+        RailScrollBody {
+            content: rsx!{
+            div {
+                style: "display:flex; flex-direction:column; gap:10px;",
+                div {
+                    style: "display:flex; align-items:center; gap:6px;",
+                    input {
+                        r#type: "text",
+                        "data-vault-search": "1",
+                        placeholder: "Search vault…",
+                        value: "{query}",
+                        spellcheck: "false",
+                        autocomplete: "off",
+                        style: format!(
+                            "flex:1 1 auto; min-width:0; padding:6px 10px; border-radius:9px; \
+                             border:1px solid rgba(127,127,127,0.35); background:rgba(127,127,127,0.10); \
+                             color:{}; font-size:11px; outline:none;",
+                            palette.text,
+                        ),
+                        oninput: move |evt: FormEvent| query.set(evt.value()),
+                    }
+                    button {
+                        r#type: "button",
+                        title: "Re-read the vault",
+                        style: format!(
+                            "border:none; background:transparent; color:{}; cursor:pointer; font-size:13px; padding:4px;",
+                            palette.text,
+                        ),
+                        onclick: move |_| reload_nonce += 1,
+                        "⟳"
+                    }
+                }
+                match entries() {
+                    None => rsx! {
+                        div { style: "{muted_style}", "Reading vault…" }
+                    },
+                    Some(Err(reason)) => rsx! {
+                        div { style: "{muted_style}", "{reason}" }
+                    },
+                    Some(Ok(list)) => {
+                        const MAX_ROWS: usize = 80;
+                        if q.is_empty() {
+                            let site_matches: Vec<VaultEntryMeta> = host
+                                .as_deref()
+                                .map(|host| {
+                                    list.iter()
+                                        .filter(|entry| vault_entry_applies_to_host(&entry.name, host))
+                                        .cloned()
+                                        .collect()
+                                })
+                                .unwrap_or_default();
+                            let total = list.len();
+                            let shown: Vec<VaultEntryMeta> =
+                                list.iter().take(MAX_ROWS).cloned().collect();
+                            rsx! {
+                                if let Some(host) = host.clone() {
+                                    RailSectionTitle { title: format!("For {host}"), muted_color: palette.muted.to_string() }
+                                    if site_matches.is_empty() {
+                                        div { style: "{muted_style}", "No entries match this site — search or pick from all items." }
+                                    }
+                                    div {
+                                        style: "display:flex; flex-direction:column; gap:4px;",
+                                        for (index, entry) in site_matches.iter().enumerate() {
+                                            {entry_row(entry, format!("vault-site-{index}"))}
+                                        }
+                                    }
+                                }
+                                RailSectionTitle { title: "All items".to_string(), muted_color: palette.muted.to_string() }
+                                div {
+                                    style: "display:flex; flex-direction:column; gap:4px;",
+                                    for (index, entry) in shown.iter().enumerate() {
+                                        {entry_row(entry, format!("vault-all-{index}"))}
+                                    }
+                                }
+                                if total > MAX_ROWS {
+                                    div { style: "{muted_style}", "Showing {MAX_ROWS} of {total} — search to narrow." }
+                                }
+                            }
+                        } else {
+                            let matches: Vec<VaultEntryMeta> = list
+                                .iter()
+                                .filter(|entry| {
+                                    entry.name.to_lowercase().contains(&q)
+                                        || entry.user.to_lowercase().contains(&q)
+                                        || entry.folder.to_lowercase().contains(&q)
+                                })
+                                .cloned()
+                                .collect();
+                            let total = matches.len();
+                            let shown: Vec<VaultEntryMeta> =
+                                matches.into_iter().take(MAX_ROWS).collect();
+                            rsx! {
+                                RailSectionTitle { title: format!("Results ({total})"), muted_color: palette.muted.to_string() }
+                                if shown.is_empty() {
+                                    div { style: "{muted_style}", "No entries match." }
+                                }
+                                div {
+                                    style: "display:flex; flex-direction:column; gap:4px;",
+                                    for (index, entry) in shown.iter().enumerate() {
+                                        {entry_row(entry, format!("vault-hit-{index}"))}
+                                    }
+                                }
+                                if total > MAX_ROWS {
+                                    div { style: "{muted_style}", "Showing {MAX_ROWS} of {total} — refine the search." }
+                                }
+                            }
+                        }
+                    }
+                }
+                div {
+                    style: "{muted_style}",
+                    "Click an entry to fill it into the page. Site matches use the entry's name (exact host or base domain)."
                 }
             }
             }
@@ -103572,6 +103929,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             retained_terminal_sessions: vec![session.clone()],
             terminal_mount_epochs: HashMap::new(),
             active_web_surface_profile: None,
+            active_web_surface_host: None,
             ssh_targets: Vec::new(),
             remote_machines: Vec::new(),
             live_sessions: vec![session],
@@ -104145,6 +104503,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             retained_terminal_sessions: vec![stale_session.clone(), active_session.clone()],
             terminal_mount_epochs: HashMap::new(),
             active_web_surface_profile: None,
+            active_web_surface_host: None,
             ssh_targets: Vec::new(),
             remote_machines: Vec::new(),
             live_sessions: vec![stale_session, active_session],
@@ -104288,6 +104647,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             retained_terminal_sessions: vec![active_session.clone()],
             terminal_mount_epochs: HashMap::new(),
             active_web_surface_profile: None,
+            active_web_surface_host: None,
             ssh_targets: Vec::new(),
             remote_machines: Vec::new(),
             live_sessions: vec![active_session],
@@ -104431,6 +104791,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             retained_terminal_sessions: vec![active_session.clone()],
             terminal_mount_epochs: HashMap::new(),
             active_web_surface_profile: None,
+            active_web_surface_host: None,
             ssh_targets: Vec::new(),
             remote_machines: Vec::new(),
             live_sessions: vec![active_session],
@@ -104577,6 +104938,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             retained_terminal_sessions: vec![active_session.clone()],
             terminal_mount_epochs: HashMap::new(),
             active_web_surface_profile: None,
+            active_web_surface_host: None,
             ssh_targets: Vec::new(),
             remote_machines: Vec::new(),
             live_sessions: vec![active_session],
@@ -104727,6 +105089,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             retained_terminal_sessions: vec![active_session.clone()],
             terminal_mount_epochs: HashMap::new(),
             active_web_surface_profile: None,
+            active_web_surface_host: None,
             ssh_targets: Vec::new(),
             remote_machines: Vec::new(),
             live_sessions: vec![active_session],
@@ -104869,6 +105232,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             retained_terminal_sessions: vec![active_session.clone()],
             terminal_mount_epochs: HashMap::new(),
             active_web_surface_profile: None,
+            active_web_surface_host: None,
             ssh_targets: Vec::new(),
             remote_machines: Vec::new(),
             live_sessions: vec![active_session],
@@ -105011,6 +105375,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             retained_terminal_sessions: vec![active_session.clone()],
             terminal_mount_epochs: HashMap::new(),
             active_web_surface_profile: None,
+            active_web_surface_host: None,
             ssh_targets: Vec::new(),
             remote_machines: Vec::new(),
             live_sessions: vec![active_session],
@@ -105187,6 +105552,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             retained_terminal_sessions: vec![restored_remote.clone(), active_session.clone()],
             terminal_mount_epochs: HashMap::new(),
             active_web_surface_profile: None,
+            active_web_surface_host: None,
             ssh_targets: Vec::new(),
             remote_machines: Vec::new(),
             live_sessions: vec![restored_remote, active_session.clone()],
@@ -105332,6 +105698,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             retained_terminal_sessions: vec![active_session.clone()],
             terminal_mount_epochs: HashMap::new(),
             active_web_surface_profile: None,
+            active_web_surface_host: None,
             ssh_targets: Vec::new(),
             remote_machines: Vec::new(),
             live_sessions: vec![active_session],
@@ -105509,6 +105876,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             retained_terminal_sessions: vec![live_session.clone()],
             terminal_mount_epochs: HashMap::new(),
             active_web_surface_profile: None,
+            active_web_surface_host: None,
             ssh_targets: Vec::new(),
             remote_machines: Vec::new(),
             live_sessions: vec![live_session],
@@ -105863,6 +106231,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             retained_terminal_sessions: Vec::new(),
             terminal_mount_epochs: HashMap::new(),
             active_web_surface_profile: None,
+            active_web_surface_host: None,
             ssh_targets: Vec::new(),
             remote_machines: Vec::new(),
             live_sessions: Vec::new(),

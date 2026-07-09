@@ -18417,6 +18417,8 @@ pub fn run_app_control_web_surface_devtools(
 
 pub fn run_app_control_web_surface_fill(
     session_path: Option<&str>,
+    entry: Option<&str>,
+    user: Option<&str>,
     timeout_ms: u64,
 ) -> anyhow::Result<()> {
     let home = resolve_yggterm_home()?;
@@ -18424,6 +18426,8 @@ pub fn run_app_control_web_surface_fill(
         &home,
         AppControlCommand::WebSurfaceFill {
             session_path: session_path.map(str::to_string),
+            entry: entry.map(str::to_string),
+            user: user.map(str::to_string),
         },
         timeout_ms,
     )?;
