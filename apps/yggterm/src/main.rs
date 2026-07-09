@@ -47,6 +47,7 @@ use yggterm_server::{
     run_app_control_scroll_terminal_viewport, run_app_control_send_terminal_input,
     run_app_control_web_surface_devtools, run_app_control_web_surface_eval,
     run_app_control_web_surface_fill, run_app_control_web_surface_screenshot,
+    run_app_control_web_surface_totp,
     run_app_control_submit_terminal_prompt,
     run_app_control_set_clipboard_png_base64, run_app_control_set_clipboard_text,
     run_app_control_set_force_foreground, run_app_control_set_fullscreen,
@@ -805,9 +806,29 @@ fn run_sessions_regenerate_copy_cli(store: &SessionStore, args: &[String]) -> Re
     Ok(())
 }
 
+/// The daemon this CLI invocation talks to.
+///
+/// NEVER `default_endpoint` — that is OUR OWN version's socket. A CLI binary
+/// newer than the running daemon finds nothing there, and the old code then let
+/// `ensure_local_daemon_running` spawn a RIVAL daemon at our version. The rival
+/// cold-restores `server-state.json`, which resurrects sessions the user closed
+/// under the live daemon, silently drops keep-alive on every session whose
+/// terminal runtime the rival does not own, and re-seeds the row order. The GUI
+/// already avoids this via `resolve_client_daemon_endpoint`; CLI verbs must use
+/// the same resolver or a single `yggterm-headless server ...` call from a
+/// freshly built binary forks the world.
+fn cli_server_endpoint(home_dir: &std::path::Path) -> yggterm_server::ServerEndpoint {
+    yggterm_server::resolve_client_daemon_endpoint(home_dir).endpoint
+}
+
 fn ensure_local_server_ready_for_cli(store: &SessionStore) -> Result<()> {
-    let endpoint = default_endpoint(store.home_dir());
-    ensure_local_daemon_running(&endpoint)
+    let resolved = yggterm_server::resolve_client_daemon_endpoint(store.home_dir());
+    if resolved.version_mismatch.is_some() {
+        // A daemon of another version is live and owns this home's sessions.
+        // It is the source of truth; attach to it rather than spawning a peer.
+        return Ok(());
+    }
+    ensure_local_daemon_running(&resolved.endpoint)
 }
 
 /// The trailing session identifier of a session path (`.../<uuid>` → `<uuid>`),
@@ -1201,7 +1222,7 @@ fn main() -> Result<()> {
             }
             BuiltinCliCommand::ServerSnapshot => {
                 ensure_local_server_ready_for_cli(&store)?;
-                let endpoint = default_endpoint(store.home_dir());
+                let endpoint = cli_server_endpoint(store.home_dir());
                 let (snapshot, _) = snapshot(&endpoint)?;
                 println!("{}", serde_json::to_string_pretty(&snapshot)?);
                 return Ok(());
@@ -1244,7 +1265,7 @@ fn main() -> Result<()> {
             )
         };
         ensure_local_server_ready_for_cli(&store)?;
-        let endpoint = default_endpoint(store.home_dir());
+        let endpoint = cli_server_endpoint(store.home_dir());
         let Some(path) = path else {
             return run_server_connect_list(&endpoint);
         };
@@ -1273,7 +1294,7 @@ fn main() -> Result<()> {
     //   yggterm server reorder --stdin < order.txt
     if args.len() >= 2 && args[0] == "server" && args[1] == "order" {
         ensure_local_server_ready_for_cli(&store)?;
-        let endpoint = default_endpoint(store.home_dir());
+        let endpoint = cli_server_endpoint(store.home_dir());
         let (snapshot, _) = snapshot(&endpoint)?;
         let order: Vec<String> = snapshot
             .live_sessions
@@ -1305,7 +1326,7 @@ fn main() -> Result<()> {
             .and_then(|ix| args.get(ix + 1))
             .map(String::as_str);
         ensure_local_server_ready_for_cli(&store)?;
-        let endpoint = default_endpoint(store.home_dir());
+        let endpoint = cli_server_endpoint(store.home_dir());
         let report = row_order_ledger_report(&endpoint, scope)?;
         match serde_json::from_str::<serde_json::Value>(&report) {
             Ok(value) => println!("{}", serde_json::to_string_pretty(&value)?),
@@ -1350,12 +1371,12 @@ fn main() -> Result<()> {
             anyhow::bail!("usage: yggterm server reorder <session-path>... | --stdin [--scope <scope>]");
         }
         ensure_local_server_ready_for_cli(&store)?;
-        let endpoint = default_endpoint(store.home_dir());
+        let endpoint = cli_server_endpoint(store.home_dir());
         return run_server_reorder(&endpoint, &ordered, scope.as_deref());
     }
     if args.len() >= 5 && args[0] == "server" && args[1] == "terminal" && args[2] == "write" {
         ensure_local_server_ready_for_cli(&store)?;
-        let endpoint = default_endpoint(store.home_dir());
+        let endpoint = cli_server_endpoint(store.home_dir());
         let data = if args.iter().any(|arg| arg == "--stdin") {
             let mut value = String::new();
             std::io::stdin()
@@ -1392,7 +1413,7 @@ fn main() -> Result<()> {
         // Diagnostic: dump the daemon's CLEAN scrolled-off vt100 scrollback rows for
         // a session (the history that CAN load into xterm scrollback). Read-only;
         // connect directly like the other terminal-screen reads.
-        let endpoint = default_endpoint(store.home_dir());
+        let endpoint = cli_server_endpoint(store.home_dir());
         let (rows, running) = terminal_history(&endpoint, &args[3])?;
         let nonblank = rows.iter().filter(|line| !line.trim().is_empty()).count();
         println!(
@@ -1413,7 +1434,7 @@ fn main() -> Result<()> {
         // "is current" version gate would reject an older running daemon and try to
         // spawn a competing one (which fails while the socket is held), so a screen
         // dump must connect directly like `server status` / `server snapshot` do.
-        let endpoint = default_endpoint(store.home_dir());
+        let endpoint = cli_server_endpoint(store.home_dir());
         let retained = args.iter().any(|arg| arg == "--retained");
         let raw = args.iter().any(|arg| arg == "--raw");
         let (text, running, runtime_output_seen, post_resize_output_seen, last_resize_seq, _runtime_spawn_id) =
@@ -1450,7 +1471,7 @@ fn main() -> Result<()> {
     // idle program won't re-emit on its own. Read-only-ish control op; skips the
     // is-current version gate so it works against an older running daemon.
     if args.len() >= 4 && args[0] == "server" && args[1] == "terminal" && args[2] == "resize" {
-        let endpoint = default_endpoint(store.home_dir());
+        let endpoint = cli_server_endpoint(store.home_dir());
         let cols = cli_flag_value(&args, "--cols")
             .and_then(|v| v.parse::<u16>().ok())
             .context("missing/invalid --cols for server terminal resize")?;
@@ -1471,7 +1492,7 @@ fn main() -> Result<()> {
     }
     if args.len() >= 4 && args[0] == "server" && args[1] == "terminal" && args[2] == "restart" {
         ensure_local_server_ready_for_cli(&store)?;
-        let endpoint = default_endpoint(store.home_dir());
+        let endpoint = cli_server_endpoint(store.home_dir());
         let terminal_appearance = cli_flag_value(&args, "--terminal-appearance");
         let force_remote = args.iter().any(|arg| arg == "--force-remote");
         let (snapshot, message) =
@@ -2585,6 +2606,11 @@ fn main() -> Result<()> {
                         let user = cli_flag_value(&args, "--user");
                         run_app_control_web_surface_fill(session_path, entry, user, timeout_ms)
                     }
+                    "totp" | "code" => {
+                        let entry = cli_flag_value(&args, "--entry");
+                        let user = cli_flag_value(&args, "--user");
+                        run_app_control_web_surface_totp(session_path, entry, user, timeout_ms)
+                    }
                     other => anyhow::bail!("unsupported app web action: {other}"),
                 }
             }
@@ -2627,7 +2653,7 @@ fn main() -> Result<()> {
         };
     }
     if args.as_slice() == ["server", "shutdown"] {
-        let endpoint = default_endpoint(store.home_dir());
+        let endpoint = cli_server_endpoint(store.home_dir());
         if let Some(message) = shutdown(&endpoint)? {
             println!("{message}");
         }
@@ -2635,13 +2661,13 @@ fn main() -> Result<()> {
     }
     if args.as_slice() == ["server", "ping"] {
         ensure_local_server_ready_for_cli(&store)?;
-        let endpoint = default_endpoint(store.home_dir());
+        let endpoint = cli_server_endpoint(store.home_dir());
         ping(&endpoint)?;
         println!("pong");
         return Ok(());
     }
     if args.as_slice() == ["server", "status"] {
-        let endpoint = default_endpoint(store.home_dir());
+        let endpoint = cli_server_endpoint(store.home_dir());
         match status(&endpoint) {
             Ok(runtime) => println!("{}", serde_json::to_string_pretty(&runtime)?),
             Err(error) => println!(
