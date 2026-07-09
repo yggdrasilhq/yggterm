@@ -384,6 +384,77 @@ fn ensure_local_server_ready_for_cli(store: &SessionStore) -> Result<()> {
     ensure_local_daemon_running(&resolved.endpoint)
 }
 
+/// `server update-daemons [--force]` — bring every reachable local daemon onto
+/// this binary's version while PRESERVING their live terminal runtimes.
+///
+/// Each daemon is asked to hot-restart ITSELF (`ServerRequest::HotRestart`): it
+/// spawns the new-version successor, keeps its PTY fds, and lingers as the
+/// preserved owner while progressive migration drains its sessions one at a
+/// time, as each goes idle. Nothing is re-resumed; no in-flight turn is cut.
+///
+/// It never sends `ServerRequest::Shutdown`. On a daemon older than 2.9.66 that
+/// runs `shutdown_all`, which WRITES `/exit\r` into every live PTY — appending
+/// to whatever the user has typed and submitting it.
+/// (`yggterm_server::shutdown` now refuses to do that too, but the shortest path
+/// to "no slash exit" is not to ask.)
+/// See [[finding-never-type-into-a-live-prompt]].
+///
+/// `--force` bypasses the daemon's same-version target check, for a dev/agent
+/// deploy that must land. It does NOT bypass the idle gate, which now guards
+/// only the destructive cold-shutdown fallback — the handoff itself is
+/// ungated. See [[finding-hot-update-never-converges-idle-gate]].
+fn run_update_all_daemons(store: &SessionStore, force: bool) -> Result<()> {
+    let current_version = yggterm_server::SERVER_PROTOCOL_VERSION;
+    let daemon_executable = std::env::current_exe().context("locating current executable")?;
+    let mut results = Vec::new();
+
+    for (endpoint, status) in yggterm_server::reachable_versioned_daemon_statuses(store.home_dir())
+    {
+        if status.server_version == current_version {
+            results.push(serde_json::json!({
+                "pid": status.server_pid,
+                "version": status.server_version,
+                "action": "skipped_already_current",
+            }));
+            continue;
+        }
+        let outcome = yggterm_server::hot_restart(
+            &endpoint,
+            &daemon_executable,
+            Some(current_version),
+            None,
+            Some(if force { "forced_update_all" } else { "update_all" }),
+        );
+        results.push(match outcome {
+            Ok(message) => serde_json::json!({
+                "pid": status.server_pid,
+                "version": status.server_version,
+                "target_version": current_version,
+                "owned_terminal_session_count": status.owned_terminal_session_count,
+                "action": "handoff_requested",
+                "message": message,
+            }),
+            Err(error) => serde_json::json!({
+                "pid": status.server_pid,
+                "version": status.server_version,
+                "target_version": current_version,
+                "action": "failed",
+                "error": error.to_string(),
+            }),
+        });
+    }
+
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "current_version": current_version,
+            "forced": force,
+            "daemons": results,
+        }))?
+    );
+    Ok(())
+}
+
 fn discover_remote_machines_from_app_state() -> Result<Vec<RemoteMachineSnapshot>> {
     let binary = std::env::current_exe()
         .context("locating current executable")?
@@ -2277,6 +2348,11 @@ fn main() -> Result<()> {
             println!("{message}");
         }
         return Ok(());
+    }
+    if args.first().map(String::as_str) == Some("server")
+        && args.get(1).map(String::as_str) == Some("update-daemons")
+    {
+        return run_update_all_daemons(&store, args.iter().any(|arg| arg == "--force"));
     }
     if args.as_slice() == ["server", "retire-stale-daemons"] {
         // Per [[bug-class-old-daemon-never-retires]]: yggterm-headless processes
