@@ -2698,6 +2698,7 @@ struct RenderSnapshot {
     context_menu_row: Option<BrowserRow>,
     context_menu_context_row: Option<BrowserRow>,
     context_menu_position: Option<(f64, f64)>,
+    keep_alive_plan: Option<KeepAlivePlan>,
     preview_layout: PreviewLayoutMode,
     server_busy: bool,
     show_loading_tree: bool,
@@ -4432,6 +4433,7 @@ impl ShellState {
             context_menu_row: self.context_menu_row.clone(),
             context_menu_context_row: self.context_menu_context_row.clone(),
             context_menu_position: self.context_menu_position,
+            keep_alive_plan: self.context_menu_keep_alive_plan(),
             preview_layout: self.preview_layout,
             server_busy: self.server_busy,
             show_loading_tree: (self.needs_initial_server_sync && self.server_busy)
@@ -9727,6 +9729,23 @@ impl ShellState {
         );
         self.refresh_tree_debug("open_context_menu");
     }
+    /// The keep-alive item's target set: every SELECTED live session when the
+    /// right-clicked row is part of the selection (the same rule that titles
+    /// the menu "{n} selected items"), otherwise just the right-clicked row.
+    /// `None` when the row cannot be kept alive at all.
+    ///
+    /// Ordered by TREE order, never by `selected_tree_paths` (a `HashSet`):
+    /// the request order and the pending label must be deterministic. One
+    /// function serves both the label and the click handler, so what the menu
+    /// promises and what the click does cannot drift.
+    fn context_menu_keep_alive_plan(&self) -> Option<KeepAlivePlan> {
+        keep_alive_plan_for(
+            self.context_menu_row.as_ref()?,
+            &self.selected_tree_paths,
+            self.browser.rows(),
+            |path| self.server.live_session_keep_alive(path),
+        )
+    }
     fn close_context_menu(&mut self) {
         self.context_menu_row = None;
         self.context_menu_context_row = None;
@@ -13141,6 +13160,56 @@ fn mark_live_session_keep_alive_locally(
         .server
         .set_live_session_keep_alive(path, keep_alive)
         .unwrap_or(false)
+}
+
+/// Only a live runtime session row can be kept alive. SSOT for the context
+/// menu's gate and for the keep-alive plan below — they must never disagree
+/// about which rows the item applies to.
+fn row_supports_keep_alive(row: &BrowserRow) -> bool {
+    row.kind == BrowserRowKind::Session && is_hot_terminal_sidebar_path(&row.full_path)
+}
+
+/// What the context menu's keep-alive item shows and does. `paths` are the
+/// sessions it acts on, in tree order; `all_keep_alive` decides whether the
+/// item reads "Keep Alive" (set every path) or "Stop Keeping Alive" (clear
+/// every path). A MIXED selection is therefore not a per-row toggle: the item
+/// reads "Keep Alive" and turns them all on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct KeepAlivePlan {
+    paths: Vec<String>,
+    all_keep_alive: bool,
+}
+
+/// Pure core of [`ShellState::context_menu_keep_alive_plan`]: the right-clicked
+/// `row`, the tree selection, the tree's rows in display order, and a lookup of
+/// each session's current keep-alive state.
+fn keep_alive_plan_for(
+    row: &BrowserRow,
+    selected_paths: &HashSet<String>,
+    rows: &[BrowserRow],
+    keep_alive: impl Fn(&str) -> bool,
+) -> Option<KeepAlivePlan> {
+    if !row_supports_keep_alive(row) {
+        return None;
+    }
+    let acts_on_selection =
+        selected_paths.len() > 1 && selected_paths.contains(row.full_path.as_str());
+    let paths: Vec<String> = if acts_on_selection {
+        rows.iter()
+            .filter(|row| row_supports_keep_alive(row))
+            .filter(|row| selected_paths.contains(row.full_path.as_str()))
+            .map(|row| row.full_path.clone())
+            .collect()
+    } else {
+        vec![row.full_path.clone()]
+    };
+    // A selected row can outlive its session (the tree keeps the row while the
+    // daemon drops the session), so an empty target set is not "all kept alive".
+    let all_keep_alive = !paths.is_empty() && paths.iter().all(|path| keep_alive(path));
+    Some(KeepAlivePlan {
+        paths,
+        all_keep_alive,
+    })
 }
 
 fn local_keep_alive_session_paths(shell: &ShellState) -> Vec<String> {
@@ -45396,6 +45465,7 @@ fn app() -> Element {
                         window_size: context_menu_window_size,
                         selected_row: snapshot.selected_row.clone(),
                         selected_tree_paths: snapshot.selected_tree_paths.clone(),
+                        keep_alive_plan: snapshot.keep_alive_plan.clone(),
                         can_remove_saved_ssh_target: saved_ssh_target_machine_key(&row, &snapshot.ssh_targets).is_some(),
                         palette: snapshot.palette,
                         on_close: move |_| {
@@ -45540,25 +45610,52 @@ fn app() -> Element {
                         on_set_keep_alive: {
                             let row = row.clone();
                             move |keep_alive| {
-                                let path = row.full_path.clone();
-                                state.with_mut(|shell| {
-                                    mark_live_session_keep_alive_locally(
-                                        shell,
-                                        &path,
-                                        keep_alive,
-                                    );
+                                // Re-derive from the same function that labelled the
+                                // item, so the click can never write to a different
+                                // set than the menu promised.
+                                let Some(plan) = state.with_mut(|shell| {
+                                    let plan = shell.context_menu_keep_alive_plan();
+                                    if let Some(plan) = plan.as_ref() {
+                                        for path in &plan.paths {
+                                            mark_live_session_keep_alive_locally(
+                                                shell,
+                                                path,
+                                                keep_alive,
+                                            );
+                                        }
+                                    }
                                     shell.close_context_menu();
                                     shell.refresh_tree_debug("keep_alive_optimistic_toggle");
-                                });
+                                    plan
+                                }) else {
+                                    return;
+                                };
+                                let target = if plan.paths.len() > 1 {
+                                    format!("{} sessions", plan.paths.len())
+                                } else {
+                                    row.label.clone()
+                                };
+                                let paths = plan.paths.clone();
                                 spawn_server_snapshot_action(
                                     state,
                                     if keep_alive {
-                                        format!("keeping {} alive", row.label)
+                                        format!("keeping {target} alive")
                                     } else {
-                                        format!("stopping keep-alive for {}", row.label)
+                                        format!("stopping keep-alive for {target}")
                                     },
                                     move |endpoint| {
-                                        set_session_keep_alive(&endpoint, &path, keep_alive)
+                                        // Exact paths, one request each, tree order.
+                                        // The LAST snapshot is the one the UI adopts;
+                                        // a failure anywhere aborts and surfaces.
+                                        let mut result = None;
+                                        for path in &paths {
+                                            result = Some(set_session_keep_alive(
+                                                &endpoint, path, keep_alive,
+                                            )?);
+                                        }
+                                        result.ok_or_else(|| {
+                                            anyhow!("no live session to keep alive")
+                                        })
                                     },
                                 );
                             }
@@ -77336,6 +77433,7 @@ fn ContextMenuOverlay(
     window_size: (f64, f64),
     selected_row: Option<BrowserRow>,
     selected_tree_paths: Vec<String>,
+    keep_alive_plan: Option<KeepAlivePlan>,
     can_remove_saved_ssh_target: bool,
     palette: Palette,
     on_close: EventHandler<MouseEvent>,
@@ -77385,9 +77483,21 @@ fn ContextMenuOverlay(
     let can_rename = context_menu_allows_rename(&row);
     let can_regenerate_copy = !is_live_sessions_group
         && matches!(row.kind, BrowserRowKind::Session | BrowserRowKind::Group);
-    let is_live_runtime_row =
-        row.kind == BrowserRowKind::Session && is_hot_terminal_sidebar_path(&row.full_path);
-    let keep_alive_active = row.detail_label.starts_with("Kept alive");
+    let is_live_runtime_row = row_supports_keep_alive(&row);
+    // The plan is the SSOT for this item: which sessions it writes to, and
+    // whether it reads "Keep Alive" or "Stop Keeping Alive".
+    let keep_alive_active = keep_alive_plan
+        .as_ref()
+        .is_some_and(|plan| plan.all_keep_alive);
+    let keep_alive_count = keep_alive_plan
+        .as_ref()
+        .map(|plan| plan.paths.len())
+        .unwrap_or(0);
+    let keep_alive_suffix = if keep_alive_count > 1 {
+        format!(" ({keep_alive_count} sessions)")
+    } else {
+        String::new()
+    };
     let selected_count = drag_paths.len().max(1);
     let menu_title = if selected_count > 1 && drag_paths.iter().any(|path| path == &row.full_path) {
         format!("{selected_count} selected items")
@@ -77601,6 +77711,7 @@ fn ContextMenuOverlay(
                         }
                         button {
                             "data-context-menu-action": if keep_alive_active { "stop-keep-alive" } else { "keep-alive" },
+                            "data-keep-alive-count": "{keep_alive_count}",
                             class: "yggterm-menu-item",
                             style: context_menu_action_style(palette, false),
                             onmousedown: |evt| {
@@ -77611,9 +77722,9 @@ fn ContextMenuOverlay(
                                 on_set_keep_alive.call(!keep_alive_active);
                             },
                             if keep_alive_active {
-                                "Stop Keeping Alive"
+                                "Stop Keeping Alive{keep_alive_suffix}"
                             } else {
-                                "Keep Alive"
+                                "Keep Alive{keep_alive_suffix}"
                             }
                         }
                         div {
@@ -81785,6 +81896,103 @@ mod tests {
         assert!(shell
             .web_surface_overlay_for_session("local://ws", 2_500)
             .is_some());
+    }
+
+    fn keep_alive_test_row(full_path: &str, kind: BrowserRowKind) -> BrowserRow {
+        BrowserRow {
+            kind,
+            full_path: full_path.to_string(),
+            label: full_path.to_string(),
+            detail_label: String::new(),
+            document_kind: None,
+            group_kind: None,
+            session_title: None,
+            depth: 1,
+            host_label: "local".to_string(),
+            descendant_sessions: 0,
+            expanded: false,
+            session_id: None,
+            session_cwd: None,
+            session_kind: None,
+        }
+    }
+
+    // Right-clicking a row inside a MULTI-selection makes "Keep Alive" a SET,
+    // not a per-row toggle: a mixed selection reads "Keep Alive" and turns
+    // every selected session on. Only when all of them are already kept alive
+    // does the item flip to "Stop Keeping Alive".
+    #[test]
+    fn keep_alive_plan_over_a_mixed_selection_turns_every_session_on() {
+        let rows = vec![
+            keep_alive_test_row("__live_sessions__", BrowserRowKind::Group),
+            keep_alive_test_row("local://one", BrowserRowKind::Session),
+            keep_alive_test_row("local://two", BrowserRowKind::Session),
+            keep_alive_test_row("ssh://box/three", BrowserRowKind::Session),
+        ];
+        let selected: HashSet<String> = ["local://one", "local://two", "ssh://box/three"]
+            .into_iter()
+            .map(ToOwned::to_owned)
+            .collect();
+        // Mixed: only `two` is currently kept alive.
+        let plan = keep_alive_plan_for(&rows[2], &selected, &rows, |path| path == "local://two")
+            .expect("a live session row has a plan");
+        assert!(
+            !plan.all_keep_alive,
+            "a mixed selection must offer Keep Alive, not Stop Keeping Alive"
+        );
+        // Tree order, not HashSet order — the pending label and the request
+        // order must be deterministic.
+        assert_eq!(
+            plan.paths,
+            vec!["local://one", "local://two", "ssh://box/three"]
+        );
+        // All on: now the item flips.
+        let plan = keep_alive_plan_for(&rows[2], &selected, &rows, |_| true).expect("plan");
+        assert!(plan.all_keep_alive);
+    }
+
+    #[test]
+    fn keep_alive_plan_ignores_the_selection_when_the_clicked_row_is_outside_it() {
+        let rows = vec![
+            keep_alive_test_row("local://one", BrowserRowKind::Session),
+            keep_alive_test_row("local://two", BrowserRowKind::Session),
+            keep_alive_test_row("local://other", BrowserRowKind::Session),
+        ];
+        let selected: HashSet<String> = ["local://one", "local://two"]
+            .into_iter()
+            .map(ToOwned::to_owned)
+            .collect();
+        // Right-clicked a row the user never selected: act on that row alone.
+        let plan = keep_alive_plan_for(&rows[2], &selected, &rows, |_| false).expect("plan");
+        assert_eq!(plan.paths, vec!["local://other"]);
+
+        // A single selected row is not a bulk action either.
+        let single: HashSet<String> = ["local://one"].into_iter().map(ToOwned::to_owned).collect();
+        let plan = keep_alive_plan_for(&rows[0], &single, &rows, |_| false).expect("plan");
+        assert_eq!(plan.paths, vec!["local://one"]);
+    }
+
+    #[test]
+    fn keep_alive_plan_skips_rows_that_are_not_live_sessions() {
+        let group = keep_alive_test_row("__live_sessions__", BrowserRowKind::Group);
+        let saved = keep_alive_test_row("workspace/saved-note", BrowserRowKind::Session);
+        let rows = vec![group.clone(), saved.clone()];
+        let empty = HashSet::new();
+        // A group row has no keep-alive item at all...
+        assert!(keep_alive_plan_for(&group, &empty, &rows, |_| false).is_none());
+        // ...and neither does a session row that is not a live runtime path.
+        assert!(keep_alive_plan_for(&saved, &empty, &rows, |_| false).is_none());
+
+        // A selection that mixes live sessions with groups and saved rows only
+        // ever writes to the live ones.
+        let live = keep_alive_test_row("local://one", BrowserRowKind::Session);
+        let rows = vec![group, live.clone(), saved];
+        let selected: HashSet<String> = ["__live_sessions__", "local://one", "workspace/saved-note"]
+            .into_iter()
+            .map(ToOwned::to_owned)
+            .collect();
+        let plan = keep_alive_plan_for(&live, &selected, &rows, |_| false).expect("plan");
+        assert_eq!(plan.paths, vec!["local://one"]);
     }
 
     // The two vault matchers are deliberately asymmetric. The sidebar SUGGESTS
@@ -104839,6 +105047,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             context_menu_row: None,
             context_menu_context_row: None,
             context_menu_position: None,
+            keep_alive_plan: None,
             preview_layout: PreviewLayoutMode::Chat,
             server_busy: false,
             show_loading_tree: false,
@@ -105413,6 +105622,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             context_menu_row: None,
             context_menu_context_row: None,
             context_menu_position: None,
+            keep_alive_plan: None,
             preview_layout: PreviewLayoutMode::Chat,
             server_busy: false,
             show_loading_tree: false,
@@ -105557,6 +105767,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             context_menu_row: None,
             context_menu_context_row: None,
             context_menu_position: None,
+            keep_alive_plan: None,
             preview_layout: PreviewLayoutMode::Chat,
             server_busy: false,
             show_loading_tree: false,
@@ -105701,6 +105912,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             context_menu_row: None,
             context_menu_context_row: None,
             context_menu_position: None,
+            keep_alive_plan: None,
             preview_layout: PreviewLayoutMode::Chat,
             server_busy: false,
             show_loading_tree: false,
@@ -105848,6 +106060,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             context_menu_row: None,
             context_menu_context_row: None,
             context_menu_position: None,
+            keep_alive_plan: None,
             preview_layout: PreviewLayoutMode::Chat,
             server_busy: false,
             show_loading_tree: false,
@@ -105999,6 +106212,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             context_menu_row: None,
             context_menu_context_row: None,
             context_menu_position: None,
+            keep_alive_plan: None,
             preview_layout: PreviewLayoutMode::Chat,
             server_busy: false,
             show_loading_tree: false,
@@ -106142,6 +106356,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             context_menu_row: None,
             context_menu_context_row: None,
             context_menu_position: None,
+            keep_alive_plan: None,
             preview_layout: PreviewLayoutMode::Chat,
             server_busy: false,
             show_loading_tree: false,
@@ -106285,6 +106500,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             context_menu_row: None,
             context_menu_context_row: None,
             context_menu_position: None,
+            keep_alive_plan: None,
             preview_layout: PreviewLayoutMode::Chat,
             server_busy: false,
             show_loading_tree: false,
@@ -106462,6 +106678,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             context_menu_row: None,
             context_menu_context_row: None,
             context_menu_position: None,
+            keep_alive_plan: None,
             preview_layout: PreviewLayoutMode::Chat,
             server_busy: false,
             show_loading_tree: false,
@@ -106608,6 +106825,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             context_menu_row: None,
             context_menu_context_row: None,
             context_menu_position: None,
+            keep_alive_plan: None,
             preview_layout: PreviewLayoutMode::Chat,
             server_busy: false,
             show_loading_tree: false,
@@ -106786,6 +107004,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             context_menu_row: None,
             context_menu_context_row: None,
             context_menu_position: None,
+            keep_alive_plan: None,
             preview_layout: PreviewLayoutMode::Chat,
             server_busy: false,
             show_loading_tree: false,
@@ -107141,6 +107360,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             context_menu_row: None,
             context_menu_context_row: None,
             context_menu_position: None,
+            keep_alive_plan: None,
             preview_layout: PreviewLayoutMode::Chat,
             server_busy: false,
             show_loading_tree: false,
