@@ -23,7 +23,7 @@ use yggterm_server::{
     AppControlPreviewLayout, AppControlRightPanelMode, AppControlViewMode, ClientInstanceRecord,
     PersistedDaemonState, ProbeTerminalViewportInputMode, SessionKind, WorkspaceViewMode,
     focus_live_with_view, open_remote_session_with_view, open_stored_session_with_view,
-    YggtermServer,
+    reorder_live_sessions, YggtermServer,
     active_client_instance_records, default_endpoint, detect_ghostty_host,
     ensure_local_daemon_running, local_headless_companion_executable_from_current, ping,
     resolve_client_daemon_endpoint,
@@ -688,6 +688,7 @@ common server commands:
   yggterm server status
   yggterm server snapshot
   yggterm server connect <session-path> | --list
+  yggterm server reorder <session-path>... | --stdin
   yggterm server app <subcommand>"
     );
 }
@@ -699,6 +700,7 @@ fn print_server_help() {
   yggterm server attach <session> [cwd]
   yggterm server connect <session-path> [--view terminal|preview]
   yggterm server connect --list
+  yggterm server reorder <session-path>... | --stdin
   yggterm server ping
   yggterm server status
   yggterm server snapshot
@@ -947,6 +949,39 @@ fn run_server_connect(
     Ok(())
 }
 
+/// `yggterm server reorder <path>...`: set the Live Sessions row order. The
+/// daemon places the listed rows first and appends every unlisted live row after
+/// them (see `replace_live_session_order`), so a partial list only promotes the
+/// rows you name and can never drop one.
+fn run_server_reorder(
+    endpoint: &yggterm_server::ServerEndpoint,
+    ordered_paths: &[String],
+) -> Result<()> {
+    let (before, _) = snapshot(endpoint)?;
+    let before_order: Vec<String> = before
+        .live_sessions
+        .iter()
+        .map(|session| session.session_path.clone())
+        .collect();
+    let (after, message) = reorder_live_sessions(endpoint, ordered_paths)?;
+    let after_order: Vec<String> = after
+        .live_sessions
+        .iter()
+        .map(|session| session.session_path.clone())
+        .collect();
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "requested": ordered_paths.len(),
+            "live_session_count": after_order.len(),
+            "changed": before_order != after_order,
+            "message": message,
+            "order": after_order,
+        }))?
+    );
+    Ok(())
+}
+
 /// `yggterm server connect --list`: enumerate sessions that EXIST (remote scans)
 /// but are NOT currently in the live set — the connectable "void", newest first.
 fn run_server_connect_list(endpoint: &yggterm_server::ServerEndpoint) -> Result<()> {
@@ -1107,21 +1142,59 @@ fn main() -> Result<()> {
     // its terminal is attached/resumed. Recovery tool for sessions stranded out
     // of Live Sessions (e.g. demoted by a restart). See [[project-purpose]].
     if args.len() >= 2 && args[0] == "server" && args[1] == "connect" {
+        let rest = &args[2..];
+        let listing = rest.iter().any(|arg| arg == "--list" || arg == "-l");
+        // Validate the invocation BEFORE touching the daemon: `ensure_local_...`
+        // would otherwise spawn a daemon just to print a usage error.
+        let path = if listing {
+            None
+        } else {
+            Some(
+                rest.iter()
+                    .find(|arg| !arg.starts_with('-'))
+                    .context("usage: yggterm server connect <session-path> | --list")?
+                    .clone(),
+            )
+        };
         ensure_local_server_ready_for_cli(&store)?;
         let endpoint = default_endpoint(store.home_dir());
-        let rest = &args[2..];
-        if rest.iter().any(|arg| arg == "--list" || arg == "-l") {
+        let Some(path) = path else {
             return run_server_connect_list(&endpoint);
-        }
+        };
         let view = match cli_flag_value(&args, "--view") {
             Some("preview") | Some("rendered") => WorkspaceViewMode::Rendered,
             _ => WorkspaceViewMode::Terminal,
         };
-        let path = rest
-            .iter()
-            .find(|arg| !arg.starts_with('-'))
-            .context("usage: yggterm server connect <session-path> | --list")?;
-        return run_server_connect(&endpoint, path, view);
+        return run_server_connect(&endpoint, &path, view);
+    }
+    // `yggterm server reorder <path>... | --stdin` — set the Live Sessions row
+    // order. Paths are placed in the given order at the TOP; any live row not
+    // listed keeps its relative position AFTER them (the daemon appends the
+    // remainder), so a partial list is safe and never drops a row.
+    if args.len() >= 2 && args[0] == "server" && args[1] == "reorder" {
+        let ordered: Vec<String> = if args.iter().any(|arg| arg == "--stdin") {
+            let mut buf = String::new();
+            std::io::stdin()
+                .read_to_string(&mut buf)
+                .context("reading reorder stdin")?;
+            buf.lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                .map(ToOwned::to_owned)
+                .collect()
+        } else {
+            args[2..]
+                .iter()
+                .filter(|arg| !arg.starts_with('-'))
+                .cloned()
+                .collect()
+        };
+        if ordered.is_empty() {
+            anyhow::bail!("usage: yggterm server reorder <session-path>... | --stdin");
+        }
+        ensure_local_server_ready_for_cli(&store)?;
+        let endpoint = default_endpoint(store.home_dir());
+        return run_server_reorder(&endpoint, &ordered);
     }
     if args.len() >= 5 && args[0] == "server" && args[1] == "terminal" && args[2] == "write" {
         ensure_local_server_ready_for_cli(&store)?;
