@@ -82882,7 +82882,14 @@ mod tests {
     fn startup_hot_swap_reason_targets_stale_daemon_versions_only() {
         let stale = runtime_status_for_test("2.1.51", 0, 4100);
         let stale_live = runtime_status_for_test("2.1.51", 1, 4102);
-        let incompatible_live = runtime_status_for_test("2.0.51", 1, 4103);
+        // Same MAJOR, different minor. This used to be called "incompatible" and
+        // refused, which stranded every session across a minor bump — and then
+        // let the GUI spawn a rival beside the daemon holding them. The handoff
+        // preserves the PTY owner; version skew is a thing to transition across.
+        // [[spec-no-session-left-behind-protocol-aware-handoff]]
+        let minor_bump_live = runtime_status_for_test("2.0.51", 1, 4103);
+        // A MAJOR bump IS a protocol break: no handoff is written for it yet.
+        let major_bump_live = runtime_status_for_test("1.9.9", 1, 4105);
         let mut stale_preserved_only = runtime_status_for_test("2.1.51", 1, 4104);
         stale_preserved_only.preserved_terminal_owner_count = 1;
         stale_preserved_only.preserved_terminal_owner_keys =
@@ -82898,7 +82905,7 @@ mod tests {
         assert_eq!(
             startup_daemon_hot_swap_reason(&stale_live, "2.1.52"),
             Some("startup_hot_update_handoff"),
-            "patch-line live daemons should hand off while preserving the PTY owner"
+            "same-version-line live daemons hand off while preserving the PTY owner"
         );
         assert_eq!(
             startup_daemon_hot_update_pending_reason(&stale_live, "2.1.52"),
@@ -82906,9 +82913,24 @@ mod tests {
             "hot-update should be visible as pending instead of hidden as an exact match"
         );
         assert_eq!(
-            startup_daemon_hot_swap_reason(&incompatible_live, "2.1.52"),
+            startup_daemon_hot_swap_reason(&minor_bump_live, "2.1.52"),
+            Some("startup_hot_update_handoff"),
+            "a minor bump must hand off, not strand the sessions"
+        );
+        // Across a major bump we cannot hand off yet — but we must still PRESERVE,
+        // so no client ever spawns a peer beside a daemon holding live PTYs.
+        assert_eq!(
+            startup_daemon_hot_swap_reason(&major_bump_live, "2.1.52"),
             None,
-            "incompatible live daemons must not be destructively restarted"
+            "a major bump owes a transition protocol; until then, do not hand off"
+        );
+        assert!(
+            startup_daemon_should_preserve_stale_runtime(&major_bump_live, "2.1.52"),
+            "a runtime owner is preserved whatever its version — never spawn beside it"
+        );
+        assert!(
+            startup_daemon_should_preserve_stale_runtime(&minor_bump_live, "2.1.52"),
+            "and so is a minor-bump owner"
         );
         assert_eq!(
             startup_daemon_hot_swap_reason(&stale_preserved_only, "2.1.52"),
@@ -82947,28 +82969,37 @@ mod tests {
         );
     }
 
+    // A client NEVER spawns a daemon beside one that owns terminal runtimes —
+    // whatever the version relation. Preservation is about SESSIONS, not about
+    // protocol compatibility; whether we can also hand off to that owner is a
+    // separate question (`daemon_versions_can_hand_off`, keyed on major).
+    //
+    // This test used to assert that a cross-minor owner is "not protocol
+    // compatible; not preserved", which is how a 2.10.0 GUI would have spawned a
+    // rival beside a 2.9.63 daemon holding 17 PTYs.
+    // [[spec-no-session-left-behind-protocol-aware-handoff]]
     #[test]
-    fn ensure_daemon_skips_spawn_only_for_preserved_stale_owner() {
-        // Regression guard for the guihost split-brain CPU loop: ensure_daemon_running
-        // now uses this predicate to skip the futile respawn for a reachable
-        // same-minor daemon that OWNS live sessions (it serves them over the
-        // version-compatible protocol and self-retires when they drain). A stale
-        // daemon owning NOTHING, or a cross-minor daemon, must NOT be preserved
-        // (normal reconcile/spawn path).
+    fn ensure_daemon_skips_spawn_for_any_runtime_owner_whatever_its_version() {
         let stale_owner = runtime_status_for_test("2.9.24", 2, 90);
         let stale_empty = runtime_status_for_test("2.9.24", 0, 91);
         let cross_minor_owner = runtime_status_for_test("2.8.99", 2, 92);
+        let cross_major_owner = runtime_status_for_test("1.9.99", 2, 93);
+
         assert!(
             startup_daemon_should_preserve_stale_runtime(&stale_owner, "2.9.25"),
-            "same-minor stale daemon owning sessions must be preserved (skip the respawn loop)"
+            "a stale daemon owning sessions is preserved (skip the respawn loop)"
+        );
+        assert!(
+            startup_daemon_should_preserve_stale_runtime(&cross_minor_owner, "2.9.25"),
+            "a cross-MINOR owner is preserved too — its sessions are not ours to strand"
+        );
+        assert!(
+            startup_daemon_should_preserve_stale_runtime(&cross_major_owner, "2.9.25"),
+            "a cross-MAJOR owner is preserved as well; we attach and await a transition protocol"
         );
         assert!(
             !startup_daemon_should_preserve_stale_runtime(&stale_empty, "2.9.25"),
-            "stale daemon owning nothing must NOT be preserved (normal reconcile)"
-        );
-        assert!(
-            !startup_daemon_should_preserve_stale_runtime(&cross_minor_owner, "2.9.25"),
-            "cross-minor daemon is not protocol-compatible; not preserved"
+            "a daemon owning NOTHING has no sessions to protect (normal reconcile/spawn)"
         );
     }
 
