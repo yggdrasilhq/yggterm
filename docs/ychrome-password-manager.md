@@ -1,8 +1,30 @@
 # ychrome × Bitwarden/Vaultwarden: autofill + passkeys design
 
-Status: DESIGN (2026-07-07). Companion to the ychrome daily-browser campaign.
-User setup: Bitwarden clients against a self-hosted Vaultwarden, passkeys stored
-in the vault.
+Status: SLICE 1 SHIPPED (2026-07-09) — autofill MVP; TOTP/passkeys still design.
+Companion to the ychrome daily-browser campaign. User setup: Bitwarden clients
+against a self-hosted Vaultwarden, passkeys stored in the vault.
+
+## Shipped: autofill MVP (slice 1, 2.9.66)
+
+- `yggterm server app web fill [--session <path>]` + the app-sidebar
+  "Fill login from vault" button (▦ pane, visible while a surface is live).
+- Flow: the GUI reads the surface's REAL page URI from the engine
+  (`web_surface_page_state` — the page cannot lie about it), refuses non-https
+  non-loopback pages, and queries `rbw` for an entry whose NAME matches the
+  host exactly (or its `www.`-stripped twin; rbw's list has no URI field, so
+  entry naming is the matching contract). The credential is injected via the
+  engine eval path — prototype value setters + input/change events so
+  React-class forms see it — with an in-page toast naming the filled entry.
+  Key material never rides an HTTP bridge; there is no loopback server in this
+  slice (that design below remains for the passkey shim, which page JS must
+  originate).
+- Requires on the GUI host: `rbw` installed + configured
+  (`rbw config set base_url <vaultwarden>`, `rbw register`, `rbw login`) and
+  unlocked (`rbw unlock`). Errors surface as a GUI notification / CLI reason:
+  no rbw, vault locked, no entry named for host, no visible password field.
+- Deliberately NOT in slice 1: multi-match picker (first sorted match wins,
+  chosen entry+username are reported in the response), TOTP, iframe fill,
+  in-page autofill affordance (userscript detect+prompt).
 
 ## Engine reality (constrains everything)
 

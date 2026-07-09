@@ -18415,6 +18415,22 @@ pub fn run_app_control_web_surface_devtools(
     Ok(())
 }
 
+pub fn run_app_control_web_surface_fill(
+    session_path: Option<&str>,
+    timeout_ms: u64,
+) -> anyhow::Result<()> {
+    let home = resolve_yggterm_home()?;
+    let response = request_app_control(
+        &home,
+        AppControlCommand::WebSurfaceFill {
+            session_path: session_path.map(str::to_string),
+        },
+        timeout_ms,
+    )?;
+    write_stdout_payload(&serde_json::to_string_pretty(&response)?)?;
+    Ok(())
+}
+
 pub fn run_app_control_probe_terminal_viewport_scroll(
     session_path: &str,
     lines: i32,
