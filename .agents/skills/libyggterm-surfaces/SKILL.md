@@ -117,6 +117,15 @@ libyggterm work. The MVP that exists today (the app-sidebar `▦` pane and a vau
 `🔑` pane) is **hardcoded in `yggterm-shell` and is the wrong shape** — it must
 become a generic contribution the app declares.
 
+**What must migrate out of yggterm (the hardcoded chrome to delete):** the
+`RightPanelMode` enum in `yggterm-shell` today has two ychrome-specific variants
+that are the anti-pattern — `Vault` (the Bitwarden pane) and `AppSidebar`
+(ychrome's settings: adblock + userscript toggles). BOTH must become ychrome
+contributions. The adblock rulesets and userscript files are already
+host-resident ychrome-owned config; only their application to the GUI's webview
+stays host-side (like vault fill). The other variants — `Metadata`, `Settings`
+(yggterm's own), `Connect`, `Notifications` — are yggterm's own chrome and stay.
+
 Target protocol (design; not yet built):
 
 - **Declare**: the app emits an OSC 7717 verb (`sidebar`) whose payload is a
