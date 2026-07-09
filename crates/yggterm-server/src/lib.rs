@@ -2669,21 +2669,27 @@ impl YggtermServer {
             .is_some_and(|path| self.session_supports_terminal(path))
     }
 
+    /// Text to WRITE INTO the PTY to stop it — only for a session that has no
+    /// interactive prompt to collide with.
+    ///
+    /// Everything with a prompt returns `None` and is stopped by signal instead
+    /// (`PtySessionRuntime::signal_child_to_exit`). Writing `/exit\r`,
+    /// `/quit\r` or `exit\r` into a live terminal APPENDS the text to whatever
+    /// the user has already typed and submits it: a half-written Claude Code
+    /// prompt got sent with `/exit` stuck on the end, and a half-written shell
+    /// command would have been executed the same way (user-reported
+    /// 2026-07-09). It never bought a graceful exit either — the caller waited
+    /// at most 300ms before SIGKILL. Remote sessions already took the signal
+    /// path; now every prompt does.
     pub fn terminal_stop_command(&self, path: &str) -> Option<String> {
         let key = self.resolve_terminal_session_key(path)?;
         let session = self.sessions.get(&key)?;
+        // A recipe document runs a script to completion, not a prompt: there is
+        // no draft input for `exit` to concatenate with.
         if session.kind == SessionKind::Document {
             return recipe_terminal_spec(session).map(|_| "exit\r".to_string());
         }
-        if session.session_path.starts_with("remote-session://") {
-            return None;
-        }
-        match session.kind {
-            SessionKind::Codex | SessionKind::CodexLiteLlm => Some("/quit\r".to_string()),
-            SessionKind::ClaudeCode => Some("/exit\r".to_string()),
-            SessionKind::Shell | SessionKind::SshShell => Some("exit\r".to_string()),
-            SessionKind::Document => None,
-        }
+        None
     }
 
     pub fn remote_resume_seed_snapshot_for_path(
@@ -31346,7 +31352,7 @@ terminal_window_id: None,
     }
 
     #[test]
-    fn local_terminal_stop_commands_match_session_kind() {
+    fn interactive_sessions_are_never_stopped_by_typing_into_their_prompt() {
         let tree = SessionNode {
             kind: SessionNodeKind::Group,
             name: "sessions".to_string(),
@@ -31392,14 +31398,11 @@ terminal_window_id: None,
             restore_reason: None,
         });
 
-        assert_eq!(
-            server.terminal_stop_command("local://codex"),
-            Some("/quit\r".to_string())
-        );
-        assert_eq!(
-            server.terminal_stop_command("local://shell"),
-            Some("exit\r".to_string())
-        );
+        // No session with an interactive prompt may be stopped by typing into
+        // it: the text lands on the user's half-written input and submits it.
+        // These are stopped with SIGHUP/SIGTERM instead.
+        assert_eq!(server.terminal_stop_command("local://codex"), None);
+        assert_eq!(server.terminal_stop_command("local://shell"), None);
     }
 
     #[test]
