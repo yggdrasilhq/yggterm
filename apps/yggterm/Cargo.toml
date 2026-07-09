@@ -29,6 +29,7 @@ tracing-subscriber.workspace = true
 yggterm-core = { path = "../../crates/yggterm-core" }
 yggterm-platform = { path = "../../crates/yggterm-platform" }
 yggterm-server = { path = "../../crates/yggterm-server" }
+yggterm-vault = { path = "../../crates/yggterm-vault" }
 yggterm-shell = { path = "../../crates/yggterm-shell" }
 yggui = { path = "../../crates/yggui" }
 yggui-contract = { path = "../../crates/yggui-contract" }
