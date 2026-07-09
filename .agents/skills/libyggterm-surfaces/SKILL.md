@@ -178,14 +178,16 @@ surface — see [[project-alt-keytips-layer]].
 
 ## Worked example: the password vault as an ychrome-owned surface
 
-The native Bitwarden/Vaultwarden client (crate `yggterm-vault`, crypto proven
+The native Bitwarden/Vaultwarden client (crate `ychrome-vault`, crypto proven
 against a real 1107-item vault) was FIRST built inside the yggterm repo and
 wired into a hardcoded yggterm sidebar. **That was the wrong ownership.** The
-correct design, being migrated:
+crate now lives in the ychrome repo; `rbw` was purged fleet-wide 2026-07-09.
+The remaining half of the migration is the sidebar itself:
 
 - **ychrome owns** the vault crate, the vault-agent (unlock cache, host-resident,
-  auto-lock), the `ychrome vault …` CLI, and the sidebar schema it declares. The
-  crate moves into the ychrome repo.
+  auto-lock), the `ychrome-vault` CLI, and the sidebar schema it declares. DONE
+  except the schema. App-side contract: ychrome's own
+  `.claude/skills/ychrome/SKILL.md`.
 - **yggterm provides** only the generic sidebar-contribution surface that renders
   ychrome's declared schema and routes its actions — plus surface-eval for fill.
 - **Host-resident**: the vault config and unlocked session live where ychrome

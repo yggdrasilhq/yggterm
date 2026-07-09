@@ -156,10 +156,40 @@ pub(crate) enum TerminalJsEvent {
         /// Selects the surface's persistent storage jar.
         profile: Option<String>,
     },
+    /// libyggterm SIDEBAR-CONTRIBUTION control, OSC 7717 with the `sidebar`
+    /// verb. The app DECLARES which panes it offers plus a loopback control
+    /// endpoint; the GUI fetches each pane's schema from that endpoint when the
+    /// pane is opened, so a 1100-row vault never rides the PTY.
+    ///
+    /// `action` is `declare` (idempotent, re-emitted on the heartbeat cadence
+    /// as the liveness signal) or `close` (retires the contribution). An
+    /// unswept contribution expires like a web surface.
+    ///
+    /// The declaration carries NO schema and NO secret — only what the rail
+    /// needs to draw a button.
+    SidebarContribution {
+        action: String,
+        session: String,
+        /// Loopback control endpoint on the APP's host, e.g.
+        /// `http://127.0.0.1:41234`. The GUI fetches it itself over a plain
+        /// socket, so a remote session needs an `ssh -L` forward — never the
+        /// webview's SOCKS proxy. See `resolve_control_endpoint_url`.
+        control: Option<String>,
+        panes: Vec<SidebarPaneDeclaration>,
+    },
     Ignored {
         reason: String,
         value: Value,
     },
+}
+
+/// One pane an app offers, as the rail needs it: an id to fetch the schema
+/// with, an icon glyph, and a tooltip.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SidebarPaneDeclaration {
+    pub id: String,
+    pub icon: String,
+    pub title: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -255,6 +285,26 @@ enum TerminalJsEventWire {
         #[serde(default)]
         profile: Option<String>,
     },
+    SidebarContribution {
+        action: String,
+        session: String,
+        #[serde(default)]
+        control: Option<String>,
+        #[serde(default)]
+        panes: Vec<SidebarPaneDeclarationWire>,
+    },
+}
+
+/// One pane an app offers. Only what the RAIL needs to draw a button — never
+/// the pane's schema, which the GUI fetches from the control endpoint, and
+/// never a secret.
+#[derive(Debug, Clone, Deserialize)]
+pub struct SidebarPaneDeclarationWire {
+    pub id: String,
+    #[serde(default)]
+    pub icon: String,
+    #[serde(default)]
+    pub title: String,
 }
 
 impl From<TerminalJsEventWire> for TerminalJsEvent {
@@ -352,6 +402,24 @@ impl From<TerminalJsEventWire> for TerminalJsEvent {
                 url,
                 title,
                 profile,
+            },
+            TerminalJsEventWire::SidebarContribution {
+                action,
+                session,
+                control,
+                panes,
+            } => TerminalJsEvent::SidebarContribution {
+                action,
+                session,
+                control,
+                panes: panes
+                    .into_iter()
+                    .map(|pane| SidebarPaneDeclaration {
+                        id: pane.id,
+                        icon: pane.icon,
+                        title: pane.title,
+                    })
+                    .collect(),
             },
         }
     }
