@@ -21,7 +21,13 @@ This file tracks user-visible changes in `yggterm`.
   per profile at `~/.yggterm/web-profiles/<profile>/history.jsonl` from engine-observed
   navigations; the ephemeral `temp` profile records nothing.
 - **Tab strip icons aligned.** Tabs, per-tab ✕, "+" and the surface ✕ now share one vertical
-  center line (the strip previously baseline-scattered them).
+  center line (the strip previously baseline-scattered them). The app-quit buttons (app tab +
+  strip right) now wear ⏻ instead of ✕ — a ✕ there read as "close tab" and quit ychrome on a
+  misclick.
+- **Bitwarden/Vaultwarden autofill (slice 1).** `yggterm server app web fill` and an app-sidebar
+  "Fill login from vault" button fill the visible login form from `rbw`, matched to the page's
+  exact host as reported by the engine (https or loopback pages only). See
+  docs/ychrome-password-manager.md for setup and the security model.
 
 ## 2.9.65
 

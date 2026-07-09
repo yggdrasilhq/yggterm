@@ -35816,6 +35816,238 @@ fn web_surface_devtools_for(
     }
 }
 
+/// A credential resolved from the local password vault for one origin host.
+struct WebLoginCredential {
+    entry_name: String,
+    username: String,
+    password: String,
+}
+/// Query the LOCAL vault CLI for a login matching `host` exactly (or its
+/// `www.`-stripped twin). Backend: `rbw` (agent-cached, Vaultwarden-friendly);
+/// `bw` is deliberately NOT shelled out to here — without a cached session it
+/// would prompt, and a GUI process must never sit on an interactive prompt.
+/// Matching is by entry NAME (rbw's list has no URI field): exact host,
+/// host-without-www, or www.+name — origin-exact in spirit, documented in
+/// docs/ychrome-password-manager.md. Blocking; call from spawn_blocking.
+fn web_surface_password_lookup(host: &str) -> Result<WebLoginCredential, String> {
+    let host = host.trim().to_lowercase();
+    if host.is_empty() {
+        return Err("page has no host".to_string());
+    }
+    let rbw = which_binary("rbw").ok_or(
+        "no vault CLI: install `rbw` (Bitwarden/Vaultwarden agent CLI) and run \
+         `rbw config set base_url <vaultwarden-url>` + `rbw register` + `rbw login`",
+    )?;
+    let unlocked = std::process::Command::new(&rbw)
+        .arg("unlocked")
+        .output()
+        .map_err(|error| format!("run rbw: {error}"))?;
+    if !unlocked.status.success() {
+        return Err("vault locked: run `rbw unlock` in a terminal first".to_string());
+    }
+    let list = std::process::Command::new(&rbw)
+        .args(["list", "--fields", "name,user"])
+        .output()
+        .map_err(|error| format!("run rbw list: {error}"))?;
+    if !list.status.success() {
+        return Err(format!(
+            "rbw list failed: {}",
+            String::from_utf8_lossy(&list.stderr).trim()
+        ));
+    }
+    let bare_host = host.strip_prefix("www.").unwrap_or(&host);
+    let mut candidates: Vec<(String, String)> = String::from_utf8_lossy(&list.stdout)
+        .lines()
+        .filter_map(|line| {
+            let (name, user) = match line.split_once('\t') {
+                Some((name, user)) => (name.trim(), user.trim()),
+                None => (line.trim(), ""),
+            };
+            let lowered = name.to_lowercase();
+            (lowered == host || lowered == bare_host || lowered == format!("www.{bare_host}"))
+                .then(|| (name.to_string(), user.to_string()))
+        })
+        .collect();
+    candidates.sort();
+    let (entry_name, username) = candidates
+        .into_iter()
+        .next()
+        .ok_or_else(|| format!("no vault entry named for host {host}"))?;
+    let mut get = std::process::Command::new(&rbw);
+    get.args(["get", "--field", "password", &entry_name]);
+    if !username.is_empty() {
+        get.arg(&username);
+    }
+    let got = get
+        .output()
+        .map_err(|error| format!("run rbw get: {error}"))?;
+    if !got.status.success() {
+        return Err(format!(
+            "rbw get failed: {}",
+            String::from_utf8_lossy(&got.stderr).trim()
+        ));
+    }
+    let password = String::from_utf8_lossy(&got.stdout).trim_end().to_string();
+    if password.is_empty() {
+        return Err(format!("vault entry {entry_name} has no password"));
+    }
+    Ok(WebLoginCredential {
+        entry_name,
+        username,
+        password,
+    })
+}
+/// PATH lookup without shelling out (deterministic, no shell parsing).
+fn which_binary(name: &str) -> Option<std::path::PathBuf> {
+    std::env::var_os("PATH").and_then(|paths| {
+        std::env::split_paths(&paths)
+            .map(|dir| dir.join(name))
+            .find(|candidate| candidate.is_file())
+    })
+}
+/// The in-page fill script: sets the username/password inputs through the
+/// prototype value setters + input/change events (so React/Vue-class pages
+/// see the change), and shows a small toast naming the filled entry. Pure
+/// string construction; credentials enter the page exactly like a Chrome
+/// password manager fill.
+fn web_surface_fill_script(host: &str, credential: &WebLoginCredential) -> String {
+    let user_json = serde_json::to_string(&credential.username).unwrap_or_default();
+    let pass_json = serde_json::to_string(&credential.password).unwrap_or_default();
+    let label_json = serde_json::to_string(&format!(
+        "yggterm · filled \u{201c}{}\u{201d} for {host}",
+        credential.entry_name
+    ))
+    .unwrap_or_default();
+    format!(
+        r#"(function() {{
+            const user = {user_json};
+            const pass = {pass_json};
+            const visible = (el) => {{
+                const rect = el.getBoundingClientRect();
+                return rect.width > 0 && rect.height > 0;
+            }};
+            const setValue = (el, value) => {{
+                const setter = Object.getOwnPropertyDescriptor(
+                    window.HTMLInputElement.prototype, 'value').set;
+                setter.call(el, value);
+                el.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                el.dispatchEvent(new Event('change', {{ bubbles: true }}));
+            }};
+            const pw = [...document.querySelectorAll('input[type=password]')]
+                .filter(visible)[0];
+            if (!pw) return 'no-password-field';
+            const scope = pw.form || document;
+            const fields = [...scope.querySelectorAll(
+                'input[type=text],input[type=email],input:not([type])')].filter(visible);
+            const before = fields.filter((el) =>
+                el.compareDocumentPosition(pw) & Node.DOCUMENT_POSITION_FOLLOWING);
+            const userEl = before[before.length - 1] || fields[0] || null;
+            let filled = 'password';
+            if (userEl && user) {{ setValue(userEl, user); filled = 'user+password'; }}
+            setValue(pw, pass);
+            const toast = document.createElement('div');
+            toast.textContent = {label_json};
+            toast.style.cssText = 'position:fixed;right:16px;bottom:16px;z-index:2147483647;' +
+                'background:rgba(20,22,28,0.92);color:#fff;padding:8px 14px;border-radius:10px;' +
+                'font:12.5px system-ui,sans-serif;box-shadow:0 4px 18px rgba(0,0,0,0.35);';
+            document.documentElement.appendChild(toast);
+            setTimeout(() => toast.remove(), 4000);
+            return filled;
+        }})()"#
+    )
+}
+/// App-control: fill the login form on a session's active web-surface tab
+/// from the local vault. The ENGINE's current page URI is the origin truth
+/// (the shell nav model may lag in-page navigation) — the page cannot lie
+/// about it, so a credential can only ever land on its own origin.
+async fn web_surface_fill_for(
+    state: &Signal<ShellState>,
+    desktop: &dioxus::desktop::DesktopContext,
+    session_path: Option<&str>,
+) -> Value {
+    let (session, native_id) = match resolve_live_web_surface(state, session_path) {
+        Ok(resolved) => resolved,
+        Err(reason) => return json!({ "accepted": false, "reason": reason }),
+    };
+    let Some((page_url, _)) = desktop.web_surface_page_state(native_id) else {
+        return json!({
+            "accepted": false,
+            "session_path": session,
+            "reason": "surface has no page state",
+        });
+    };
+    if !page_url.starts_with("https://") && !web_surface_url_is_loopback(&page_url) {
+        return json!({
+            "accepted": false,
+            "session_path": session,
+            "reason": format!("refusing to fill a non-https page: {page_url}"),
+        });
+    }
+    let host = web_surface_tab_host_label(&page_url);
+    if host.is_empty() || host == "New Tab" {
+        return json!({
+            "accepted": false,
+            "session_path": session,
+            "reason": "page has no host to match against the vault",
+        });
+    }
+    let lookup_host = host.split(':').next().unwrap_or(&host).to_string();
+    let credential = match task::spawn_blocking(move || {
+        web_surface_password_lookup(&lookup_host)
+    })
+    .await
+    .unwrap_or_else(|join| Err(format!("lookup task failed: {join}")))
+    {
+        Ok(credential) => credential,
+        Err(reason) => {
+            return json!({ "accepted": false, "session_path": session, "reason": reason })
+        }
+    };
+    let script = web_surface_fill_script(&host, &credential);
+    let (tx, rx) = tokio::sync::oneshot::channel::<Result<String, String>>();
+    if let Err(reason) = desktop.eval_web_surface(native_id, &script, move |outcome| {
+        let _ = tx.send(outcome);
+    }) {
+        return json!({ "accepted": false, "session_path": session, "reason": reason });
+    }
+    match tokio::time::timeout(Duration::from_secs(10), rx).await {
+        Ok(Ok(Ok(value_json))) => {
+            let outcome = serde_json::from_str::<Value>(&value_json)
+                .ok()
+                .and_then(|value| value.as_str().map(ToOwned::to_owned))
+                .unwrap_or(value_json);
+            let accepted = outcome != "no-password-field";
+            json!({
+                "accepted": accepted,
+                "session_path": session,
+                "native_id": native_id,
+                "host": host,
+                "entry": credential.entry_name,
+                "username": credential.username,
+                "filled": outcome,
+                "reason": if accepted { Value::Null } else {
+                    Value::String("no visible password field on the page".to_string())
+                },
+            })
+        }
+        Ok(Ok(Err(js_error))) => json!({
+            "accepted": false,
+            "session_path": session,
+            "reason": format!("js: {js_error}"),
+        }),
+        Ok(Err(_)) => json!({
+            "accepted": false,
+            "session_path": session,
+            "reason": "fill callback dropped (surface destroyed mid-fill?)",
+        }),
+        Err(_) => json!({
+            "accepted": false,
+            "session_path": session,
+            "reason": "fill timed out (10s)",
+        }),
+    }
+}
+
 /// Read the xterm.js buffer text via the buffer API (focus-independent).
 /// `mode` = "full" (whole buffer incl scrollback) or anything else = "screen"
 /// (visible rows). Returns the rendered text + line/nonblank counts + base_y so
@@ -39675,6 +39907,23 @@ async fn process_pending_app_control_requests(
         }
         AppControlCommand::WebSurfaceDevtools { session_path, open } => {
             let result = web_surface_devtools_for(&state, &desktop, session_path.as_deref(), open);
+            AppControlResponse {
+                request_id: request.request_id.clone(),
+                handled_by_pid: std::process::id(),
+                completed_at_ms: current_millis() as u128,
+                output_path: None,
+                error: result
+                    .get("accepted")
+                    .and_then(Value::as_bool)
+                    .filter(|accepted| !accepted)
+                    .and_then(|_| result.get("reason"))
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned),
+                data: Some(result),
+            }
+        }
+        AppControlCommand::WebSurfaceFill { session_path } => {
+            let result = web_surface_fill_for(&state, &desktop, session_path.as_deref()).await;
             AppControlResponse {
                 request_id: request.request_id.clone(),
                 handled_by_pid: std::process::id(),
@@ -44505,6 +44754,35 @@ fn app() -> Element {
                                         shell.web_surface_reload_active_tab(&path);
                                     }
                                 });
+                            },
+                            on_fill_web_surface_login: {
+                                let desktop = desktop.clone();
+                                move |_| {
+                                    let desktop = desktop.clone();
+                                    spawn(async move {
+                                        let result =
+                                            web_surface_fill_for(&state, &desktop, None).await;
+                                        let accepted = result
+                                            .get("accepted")
+                                            .and_then(Value::as_bool)
+                                            .unwrap_or(false);
+                                        if !accepted {
+                                            let reason = result
+                                                .get("reason")
+                                                .and_then(Value::as_str)
+                                                .unwrap_or("unknown failure")
+                                                .to_string();
+                                            let mut state = state;
+                                            state.with_mut(|shell| {
+                                                shell.push_notification(
+                                                    NotificationTone::Error,
+                                                    "Autofill failed",
+                                                    reason,
+                                                );
+                                            });
+                                        }
+                                    });
+                                }
                             },
                         }
                     }
@@ -74852,6 +75130,7 @@ fn RightRail(
     on_clear_notification: EventHandler<u64>,
     on_clear_notifications: EventHandler<MouseEvent>,
     on_reload_web_surface: EventHandler<()>,
+    on_fill_web_surface_login: EventHandler<()>,
 ) -> Element {
     let requested_mode = snapshot.right_panel_mode;
     let mut retained_mode = use_signal(|| requested_mode);
@@ -74924,6 +75203,7 @@ fn RightRail(
                 AppSidebarRailBody {
                     snapshot: snapshot.clone(),
                     on_reload_web_surface,
+                    on_fill_web_surface_login,
                 }
             }
             }
@@ -75044,7 +75324,11 @@ fn set_userscript_enabled(stem: &str, enabled: bool) {
     let _ = std::fs::rename(dir.join(from), dir.join(to));
 }
 #[component]
-fn AppSidebarRailBody(snapshot: SharedSnapshot, on_reload_web_surface: EventHandler<()>) -> Element {
+fn AppSidebarRailBody(
+    snapshot: SharedSnapshot,
+    on_reload_web_surface: EventHandler<()>,
+    on_fill_web_surface_login: EventHandler<()>,
+) -> Element {
     let palette = snapshot.palette;
     // Bumped after every disk mutation so the panel re-reads the files.
     let mut refresh = use_signal(|| 0u32);
@@ -75128,6 +75412,24 @@ fn AppSidebarRailBody(snapshot: SharedSnapshot, on_reload_web_surface: EventHand
                                 refresh += 1;
                             }
                         },
+                    }
+                }
+                if has_surface {
+                    RailSectionTitle { title: "Passwords".to_string(), muted_color: palette.muted.to_string() }
+                    div {
+                        style: format!("font-size:10px; line-height:1.5; color:{};", palette.muted),
+                        "Fills the visible login form from your Bitwarden/Vaultwarden vault (rbw), matched to the page's exact host."
+                    }
+                    button {
+                        r#type: "button",
+                        "data-appsidebar-fill-login": "1",
+                        style: format!(
+                            "align-self:flex-start; padding:7px 14px; border:0; border-radius:9px; \
+                             background:{}; color:#fff; font-size:11px; font-weight:700; cursor:pointer;",
+                            palette.accent
+                        ),
+                        onclick: move |_| on_fill_web_surface_login.call(()),
+                        "Fill login from vault"
                     }
                 }
                 div {
