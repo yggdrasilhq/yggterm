@@ -366,6 +366,37 @@ the `force` field — `#[serde(default)]` falls back to false). For
 first-time bootstrap of this feature you'll need a natural daemon
 restart or a one-time version-patch bump.
 
+### PREFER a plain GUI restart over manual `hot-restart --all` (2026-07-09 lesson)
+
+For a dev/agent deploy (new version on disk), the SIMPLE and correct path is:
+**deploy the binaries, then restart the GUI** (SIGTERM the GUI pid, relaunch
+`~/.local/bin/yggterm` with the desktop env — `DISPLAY`/`WAYLAND_DISPLAY`/
+`XDG_RUNTIME_DIR`/`DBUS_SESSION_BUS_ADDRESS`/`XAUTHORITY` from `/proc/<gui>/environ`,
+detached via `setsid nohup … </dev/null &`). A newer GUI whose own-version socket
+is absent falls back to the running older daemon via `resolve_client_daemon_endpoint`
+(logs `gui/startup/daemon_version_mismatch`), serves every session the older daemon
+owns with **no re-resume**, and drives that daemon's cooperative hot-update *when the
+fleet next idles*. There is NO breaking protocol change between adjacent patch
+versions (new request fields are `#[serde(default)]`; new request variants the GUI
+never sends unprompted), so a 2.9.x GUI talks to a 2.9.(x-x) daemon fine.
+
+**Do NOT run `server monitor --scenario hot-restart --all` to "land" a deploy while
+a busy daemon owns the active fleet.** The idle gate correctly DEFERS the busy
+daemon's handoff (any owned agent session active within `HOT_UPDATE_IDLE_THRESHOLD_MS`
+= 300s blocks it, and you cannot set `YGGTERM_HOT_UPDATE_IGNORE_IDLE_GATE` on an
+already-running daemon — it reads its own env live), but a LESS-busy older daemon's
+handoff can still succeed, spawning a standalone newer daemon that owns **0** of the
+active PTYs. That orphan then binds `server-<newver>.sock`, so a restarted GUI picks
+the EMPTY newer daemon over the full older one — sessions show as recovery targets and
+`remote-cc://` rows (no cross-daemon proxy; that only covers `remote-session://`
+keep-alive) get re-resumed on open. Recovery if you hit this: SIGTERM the orphan
+(verify `owned_terminal_session_count == 0` first — safe, it owns no PTYs), `rm` its
+stale `.sock`, then restart the GUI so it falls back to the daemon that owns the
+sessions. Note the headless CLI's `status`/`snapshot`/`terminal screen` pin to their
+OWN-version socket (no fallback like the GUI), so after removing a newer orphan those
+probes go blind — verify via the file-based `~/.yggterm/event-trace.jsonl` and
+`server app …` (PID-routed app-control, no daemon spawn) instead.
+
 ## When to use
 
 - After any UI change: take a before screenshot, apply the fix, take an after screenshot.
