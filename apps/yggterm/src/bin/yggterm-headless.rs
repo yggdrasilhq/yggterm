@@ -366,9 +366,22 @@ fn screenshot_post_process_from_args(args: &[String]) -> Option<ScreenshotPostPr
     })
 }
 
+/// The daemon this CLI invocation talks to. See the twin in `main.rs` — never
+/// `default_endpoint` (our own version's socket), or a headless binary newer
+/// than the running daemon spawns a rival that cold-restores `server-state.json`
+/// and resurrects closed sessions.
+fn cli_server_endpoint(home_dir: &std::path::Path) -> yggterm_server::ServerEndpoint {
+    yggterm_server::resolve_client_daemon_endpoint(home_dir).endpoint
+}
+
 fn ensure_local_server_ready_for_cli(store: &SessionStore) -> Result<()> {
-    let endpoint = default_endpoint(store.home_dir());
-    ensure_local_daemon_running(&endpoint)
+    let resolved = yggterm_server::resolve_client_daemon_endpoint(store.home_dir());
+    if resolved.version_mismatch.is_some() {
+        // A daemon of another version is live and owns this home's sessions.
+        // It is the source of truth; attach to it rather than spawning a peer.
+        return Ok(());
+    }
+    ensure_local_daemon_running(&resolved.endpoint)
 }
 
 fn discover_remote_machines_from_app_state() -> Result<Vec<RemoteMachineSnapshot>> {
@@ -985,7 +998,7 @@ fn main() -> Result<()> {
             }
             BuiltinCliCommand::ServerSnapshot => {
                 ensure_local_server_ready_for_cli(&store)?;
-                let endpoint = default_endpoint(store.home_dir());
+                let endpoint = cli_server_endpoint(store.home_dir());
                 let (snapshot, _) = snapshot(&endpoint)?;
                 println!("{}", serde_json::to_string_pretty(&snapshot)?);
                 return Ok(());
@@ -1008,7 +1021,7 @@ fn main() -> Result<()> {
     }
     if args.len() >= 5 && args[0] == "server" && args[1] == "terminal" && args[2] == "write" {
         ensure_local_server_ready_for_cli(&store)?;
-        let endpoint = default_endpoint(store.home_dir());
+        let endpoint = cli_server_endpoint(store.home_dir());
         let data = if args.iter().any(|arg| arg == "--stdin") {
             let mut value = String::new();
             std::io::stdin()
@@ -1033,7 +1046,7 @@ fn main() -> Result<()> {
     }
     if args.len() >= 4 && args[0] == "server" && args[1] == "terminal" && args[2] == "restart" {
         ensure_local_server_ready_for_cli(&store)?;
-        let endpoint = default_endpoint(store.home_dir());
+        let endpoint = cli_server_endpoint(store.home_dir());
         let terminal_appearance = cli_flag_value(&args, "--terminal-appearance");
         let force_remote = args.iter().any(|arg| arg == "--force-remote");
         let (snapshot, message) =
@@ -1052,7 +1065,7 @@ fn main() -> Result<()> {
     }
     if args.len() >= 4 && args[0] == "server" && args[1] == "terminal" && args[2] == "resize" {
         ensure_local_server_ready_for_cli(&store)?;
-        let endpoint = default_endpoint(store.home_dir());
+        let endpoint = cli_server_endpoint(store.home_dir());
         let cols = cli_flag_value(&args, "--cols")
             .and_then(|v| v.parse::<u16>().ok())
             .context("missing/invalid --cols for server terminal resize")?;
@@ -1223,7 +1236,7 @@ fn main() -> Result<()> {
             }
             BuiltinCliCommand::ServerSnapshot => {
                 ensure_local_server_ready_for_cli(&store)?;
-                let endpoint = default_endpoint(store.home_dir());
+                let endpoint = cli_server_endpoint(store.home_dir());
                 let (snapshot, _) = snapshot(&endpoint)?;
                 println!("{}", serde_json::to_string_pretty(&snapshot)?);
                 return Ok(());
@@ -2220,7 +2233,7 @@ fn main() -> Result<()> {
         };
     }
     if args.as_slice() == ["server", "shutdown"] {
-        let endpoint = default_endpoint(store.home_dir());
+        let endpoint = cli_server_endpoint(store.home_dir());
         if let Some(message) = shutdown(&endpoint)? {
             println!("{message}");
         }
@@ -2283,13 +2296,13 @@ fn main() -> Result<()> {
     }
     if args.as_slice() == ["server", "ping"] {
         ensure_local_server_ready_for_cli(&store)?;
-        let endpoint = default_endpoint(store.home_dir());
+        let endpoint = cli_server_endpoint(store.home_dir());
         ping(&endpoint)?;
         println!("pong");
         return Ok(());
     }
     if args.as_slice() == ["server", "status"] {
-        let endpoint = default_endpoint(store.home_dir());
+        let endpoint = cli_server_endpoint(store.home_dir());
         match status(&endpoint) {
             Ok(runtime) => println!("{}", serde_json::to_string_pretty(&runtime)?),
             Err(error) => println!(

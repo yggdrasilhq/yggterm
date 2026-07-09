@@ -24337,8 +24337,18 @@ fn live_session_summary_with_index(
         })
         .unwrap_or_default()
 }
+/// The metadata label that carries a live session's keep-alive truth. One
+/// constant so the `ManagedSessionView` and `SnapshotSessionView` readers below
+/// cannot drift apart.
+const RUNTIME_PERSISTENCE_LABEL: &str = "Runtime Persistence";
+const RUNTIME_PERSISTENCE_KEEP_ALIVE: &str = "keep-alive";
 fn live_session_keep_alive(session: &ManagedSessionView) -> bool {
-    metadata_value(session, "Runtime Persistence") == "keep-alive"
+    metadata_value(session, RUNTIME_PERSISTENCE_LABEL) == RUNTIME_PERSISTENCE_KEEP_ALIVE
+}
+/// Keep-alive as reported by a daemon SNAPSHOT (the reply to a request), which
+/// carries `SnapshotSessionView` rather than `ManagedSessionView`.
+fn snapshot_session_keep_alive(session: &SnapshotSessionView) -> bool {
+    snapshot_metadata_value(session, RUNTIME_PERSISTENCE_LABEL) == RUNTIME_PERSISTENCE_KEEP_ALIVE
 }
 fn live_session_temporary_update_restore(session: &ManagedSessionView) -> bool {
     metadata_value(session, "Runtime Restore Reason") == "update-restart"
@@ -40753,6 +40763,21 @@ async fn process_pending_app_control_requests(
             match outcome {
                 Ok((snapshot, message)) => {
                     let active_session_path = snapshot.active_session_path.clone();
+                    // A successful ROUND TRIP is not a successful KEEP-ALIVE. The
+                    // daemon refuses a session it holds no terminal runtime for —
+                    // e.g. the runtime belongs to another daemon after a
+                    // version-mismatched restart — and reports that in `message`
+                    // while still returning Ok. Answering `accepted: true` there
+                    // made the CLI and the GUI toast claim a keep-alive that never
+                    // happened. Read the OUTCOME off the returned snapshot, which
+                    // is the SSOT for keep-alive, rather than trusting transport
+                    // success or parsing the daemon's prose.
+                    let applied = snapshot
+                        .live_sessions
+                        .iter()
+                        .find(|session| session.session_path == session_path)
+                        .map(snapshot_session_keep_alive);
+                    let accepted = applied == Some(keep_alive);
                     state.with_mut(|shell| {
                         shell.apply_interactive_snapshot_result(Ok((snapshot, message.clone())));
                     });
@@ -40762,13 +40787,19 @@ async fn process_pending_app_control_requests(
                         completed_at_ms: current_millis() as u128,
                         output_path: None,
                         data: Some(json!({
-                            "accepted": true,
+                            "accepted": accepted,
                             "session_path": session_path,
                             "keep_alive": keep_alive,
                             "active_session_path": active_session_path,
                             "message": message,
                         })),
-                        error: None,
+                        error: (!accepted).then(|| {
+                            message.clone().unwrap_or_else(|| {
+                                format!(
+                                    "daemon did not apply keep_alive={keep_alive} to {session_path}"
+                                )
+                            })
+                        }),
                     }
                 }
                 Err(error) => AppControlResponse {
