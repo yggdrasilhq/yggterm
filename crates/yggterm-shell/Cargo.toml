@@ -27,6 +27,9 @@ yggterm-platform = { path = "../yggterm-platform" }
 yggterm-server = { path = "../yggterm-server" }
 yggui = { path = "../yggui" }
 yggui-contract = { path = "../yggui-contract" }
+p256 = { version = "0.13", features = ["ecdsa"] }
+sha2 = "0.10"
+rand = "0.8"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 cairo-rs = { version = "0.18.5", features = ["png"] }

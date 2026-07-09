@@ -36034,6 +36034,202 @@ fn rbw_add_login(
     }
     Ok(())
 }
+/// Current TOTP code for a vault entry (`rbw code`). Errors when the entry
+/// carries no authenticator secret. Blocking; call from spawn_blocking.
+fn rbw_vault_totp(entry_name: &str, user: Option<&str>) -> Result<String, String> {
+    let rbw = rbw_binary()?;
+    let mut code = std::process::Command::new(&rbw);
+    code.arg("code").arg(entry_name);
+    if let Some(user) = user.filter(|user| !user.is_empty()) {
+        code.arg(user);
+    }
+    let output = code
+        .output()
+        .map_err(|error| format!("run rbw code: {error}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stderr = stderr.trim();
+        return Err(if stderr.contains("no totp") || stderr.contains("TOTP") {
+            format!("{entry_name} has no authenticator secret")
+        } else {
+            format!("rbw code failed: {stderr}")
+        });
+    }
+    let code = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if code.is_empty() {
+        return Err(format!("{entry_name} has no authenticator secret"));
+    }
+    Ok(code)
+}
+/// In-page script that drops a TOTP code into the visible one-time-code
+/// field. Detection mirrors what password managers key on: the
+/// `one-time-code` autocomplete token first (the standard), then the usual
+/// name/id/placeholder vocabulary, then a short numeric input.
+fn web_surface_totp_script(code: &str, label: &str) -> String {
+    let code_json = serde_json::to_string(code).unwrap_or_default();
+    let label_json = serde_json::to_string(label).unwrap_or_default();
+    format!(
+        r#"(function() {{
+            const code = {code_json};
+            const visible = (el) => {{
+                const rect = el.getBoundingClientRect();
+                return rect.width > 0 && rect.height > 0;
+            }};
+            const setValue = (el, value) => {{
+                const setter = Object.getOwnPropertyDescriptor(
+                    window.HTMLInputElement.prototype, 'value').set;
+                setter.call(el, value);
+                el.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                el.dispatchEvent(new Event('change', {{ bubbles: true }}));
+            }};
+            const toast = () => {{
+                const el = document.createElement('div');
+                el.textContent = {label_json};
+                el.style.cssText = 'position:fixed;right:16px;bottom:16px;z-index:2147483647;' +
+                    'background:rgba(20,22,28,0.92);color:#fff;padding:8px 14px;border-radius:10px;' +
+                    'font:12.5px system-ui,sans-serif;box-shadow:0 4px 18px rgba(0,0,0,0.35);';
+                document.documentElement.appendChild(el);
+                setTimeout(() => el.remove(), 4000);
+            }};
+            const inputs = [...document.querySelectorAll('input')].filter(visible);
+            const looksOtp = (el) => {{
+                const hay = [el.autocomplete, el.name, el.id, el.placeholder,
+                    el.getAttribute('aria-label')].join(' ').toLowerCase();
+                return /one-time-code|otp|totp|2fa|two-factor|verification|authenticator/.test(hay);
+            }};
+            const target = inputs.find((el) => (el.autocomplete || '').includes('one-time-code'))
+                || inputs.find(looksOtp)
+                || inputs.find((el) => el.inputMode === 'numeric' && Number(el.maxLength) === 6);
+            // Split digit boxes (one input per character) are common on 2FA
+            // screens: fill them left to right when the code fits exactly.
+            const boxes = inputs.filter((el) => Number(el.maxLength) === 1);
+            if (!target && boxes.length === code.length) {{
+                boxes.forEach((el, index) => setValue(el, code[index]));
+                boxes[boxes.length - 1].focus();
+                toast();
+                return 'digit-boxes';
+            }}
+            if (!target) return 'no-otp-field';
+            setValue(target, code);
+            target.focus();
+            toast();
+            return 'filled';
+        }})()"#
+    )
+}
+/// App-control: put a vault entry's current TOTP code into the page's
+/// one-time-code field, and onto the clipboard as a fallback. `entry` None =
+/// auto-match the page host (same strict rule as the password fill).
+async fn web_surface_totp_for(
+    state: &Signal<ShellState>,
+    desktop: &dioxus::desktop::DesktopContext,
+    session_path: Option<&str>,
+    entry: Option<&str>,
+    user: Option<&str>,
+) -> Value {
+    let (session, native_id) = match resolve_live_web_surface(state, session_path) {
+        Ok(resolved) => resolved,
+        Err(reason) => return json!({ "accepted": false, "reason": reason }),
+    };
+    let Some((page_url, _)) = desktop.web_surface_page_state(native_id) else {
+        return json!({
+            "accepted": false,
+            "session_path": session,
+            "reason": "surface has no page state",
+        });
+    };
+    if !page_url.starts_with("https://") && !web_surface_url_is_loopback(&page_url) {
+        return json!({
+            "accepted": false,
+            "session_path": session,
+            "reason": format!("refusing to fill a code into a non-https page: {page_url}"),
+        });
+    }
+    let host = web_surface_tab_host_label(&page_url);
+    // Auto-match needs a host; a user-CHOSEN entry doesn't (they decided).
+    if entry.is_none() && (host.is_empty() || host == "New Tab") {
+        return json!({
+            "accepted": false,
+            "session_path": session,
+            "reason": "page has no host to match against the vault",
+        });
+    }
+    let lookup_host = host.split(':').next().unwrap_or(&host).to_string();
+    let chosen_entry = entry.map(str::to_string);
+    let chosen_user = user.map(str::to_string);
+    let resolved = task::spawn_blocking(move || match chosen_entry {
+        Some(entry) => rbw_vault_totp(&entry, chosen_user.as_deref()).map(|code| (entry, code)),
+        None => {
+            let (name, user) = vault_auto_match_for_host(&lookup_host)?;
+            rbw_vault_totp(&name, Some(&user)).map(|code| (name, code))
+        }
+    })
+    .await
+    .unwrap_or_else(|join| Err(format!("totp task failed: {join}")));
+    let (entry_name, code) = match resolved {
+        Ok(resolved) => resolved,
+        Err(reason) => {
+            return json!({ "accepted": false, "session_path": session, "reason": reason })
+        }
+    };
+    // Clipboard as the escape hatch (some 2FA screens defeat scripted fills).
+    // exclude_from_history keeps clipboard managers from archiving the code.
+    let clipboard = if let Ok(home) = yggterm_core::resolve_yggterm_home() {
+        copy_terminal_selection_to_clipboard(&session, "vault_totp", code.clone(), home).is_ok()
+    } else {
+        false
+    };
+    let script = web_surface_totp_script(&code, &format!("yggterm · code for {entry_name}"));
+    let (tx, rx) = tokio::sync::oneshot::channel::<Result<String, String>>();
+    if let Err(reason) = desktop.eval_web_surface(native_id, &script, move |outcome| {
+        let _ = tx.send(outcome);
+    }) {
+        return json!({ "accepted": false, "session_path": session, "reason": reason });
+    }
+    let filled = match tokio::time::timeout(Duration::from_secs(10), rx).await {
+        Ok(Ok(Ok(value_json))) => serde_json::from_str::<Value>(&value_json)
+            .ok()
+            .and_then(|value| value.as_str().map(ToOwned::to_owned))
+            .unwrap_or(value_json),
+        Ok(Ok(Err(js_error))) => {
+            return json!({
+                "accepted": false,
+                "session_path": session,
+                "reason": format!("js: {js_error}"),
+            })
+        }
+        Ok(Err(_)) => {
+            return json!({
+                "accepted": false,
+                "session_path": session,
+                "reason": "totp callback dropped (surface destroyed mid-fill?)",
+            })
+        }
+        Err(_) => {
+            return json!({
+                "accepted": false,
+                "session_path": session,
+                "reason": "totp fill timed out (10s)",
+            })
+        }
+    };
+    // No OTP field is NOT a failure when the code reached the clipboard —
+    // many 2FA screens want a paste.
+    let accepted = filled != "no-otp-field" || clipboard;
+    json!({
+        "accepted": accepted,
+        "session_path": session,
+        "native_id": native_id,
+        "host": host,
+        "entry": entry_name,
+        "filled": filled,
+        "clipboard": clipboard,
+        "digits": code.chars().count(),
+        "reason": if accepted { Value::Null } else {
+            Value::String("no one-time-code field on the page, and the clipboard copy failed".to_string())
+        },
+    })
+}
 /// Generate a password with the vault CLI's own generator (`rbw generate`
 /// WITHOUT an entry name prints without storing). Blocking; call from
 /// spawn_blocking.
@@ -36123,25 +36319,42 @@ struct VaultWatchtowerReport {
 /// Auto-match path: the FIRST (sorted) vault entry whose NAME matches `host`
 /// exactly (or its `www.` twin) — strict on purpose: the user didn't choose,
 /// so no base-domain fuzz here. Blocking; call from spawn_blocking.
-fn web_surface_password_lookup(host: &str) -> Result<WebLoginCredential, String> {
+/// Does entry NAME auto-match `host`? Exact host, its `www.`-stripped twin, or
+/// that twin re-prefixed with `www.`. Deliberately STRICTER than
+/// `vault_entry_applies_to_host` (which only *suggests* sidebar rows): no
+/// base-domain suffix match, because an auto path fills without anyone
+/// confirming the choice.
+fn vault_entry_auto_matches_host(entry_name: &str, host: &str) -> bool {
+    let name = entry_name.trim().to_lowercase();
+    if name.is_empty() {
+        return false;
+    }
+    let host = host.trim().to_lowercase();
+    let bare_host = host.strip_prefix("www.").unwrap_or(&host);
+    name == host || name == bare_host || name == format!("www.{bare_host}")
+}
+/// Auto-match a page host to one vault entry `(name, username)`; first sorted
+/// wins when several accounts share a name. SSOT for every auto path (password
+/// fill, TOTP); a user-CHOSEN entry skips it because they already decided.
+/// Blocking; call from spawn_blocking.
+fn vault_auto_match_for_host(host: &str) -> Result<(String, String), String> {
     let host = host.trim().to_lowercase();
     if host.is_empty() {
         return Err("page has no host".to_string());
     }
-    let bare_host = host.strip_prefix("www.").unwrap_or(&host).to_string();
     let mut candidates: Vec<(String, String)> = rbw_vault_entries()?
         .into_iter()
-        .filter(|entry| {
-            let lowered = entry.name.to_lowercase();
-            lowered == host || lowered == bare_host || lowered == format!("www.{bare_host}")
-        })
+        .filter(|entry| vault_entry_auto_matches_host(&entry.name, &host))
         .map(|entry| (entry.name, entry.user))
         .collect();
     candidates.sort();
-    let (entry_name, username) = candidates
+    candidates
         .into_iter()
         .next()
-        .ok_or_else(|| format!("no vault entry named for host {host}"))?;
+        .ok_or_else(|| format!("no vault entry named for host {host}"))
+}
+fn web_surface_password_lookup(host: &str) -> Result<WebLoginCredential, String> {
+    let (entry_name, username) = vault_auto_match_for_host(host)?;
     rbw_vault_password(&entry_name, Some(&username))
 }
 /// PATH lookup without shelling out (deterministic, no shell parsing).
@@ -40181,6 +40394,34 @@ async fn process_pending_app_control_requests(
             user,
         } => {
             let result = web_surface_fill_for(
+                &state,
+                &desktop,
+                session_path.as_deref(),
+                entry.as_deref(),
+                user.as_deref(),
+            )
+            .await;
+            AppControlResponse {
+                request_id: request.request_id.clone(),
+                handled_by_pid: std::process::id(),
+                completed_at_ms: current_millis() as u128,
+                output_path: None,
+                error: result
+                    .get("accepted")
+                    .and_then(Value::as_bool)
+                    .filter(|accepted| !accepted)
+                    .and_then(|_| result.get("reason"))
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned),
+                data: Some(result),
+            }
+        }
+        AppControlCommand::WebSurfaceTotp {
+            session_path,
+            entry,
+            user,
+        } => {
+            let result = web_surface_totp_for(
                 &state,
                 &desktop,
                 session_path.as_deref(),
@@ -45084,6 +45325,60 @@ fn app() -> Element {
                                                 shell.push_notification(
                                                     NotificationTone::Error,
                                                     "Vault fill failed",
+                                                    reason,
+                                                );
+                                            });
+                                        }
+                                    });
+                                }
+                            },
+                            on_totp_vault_entry: {
+                                let desktop = desktop.clone();
+                                move |(entry, user): (String, String)| {
+                                    let desktop = desktop.clone();
+                                    spawn(async move {
+                                        let user_opt =
+                                            (!user.is_empty()).then_some(user.as_str());
+                                        let result = web_surface_totp_for(
+                                            &state,
+                                            &desktop,
+                                            None,
+                                            Some(entry.as_str()),
+                                            user_opt,
+                                        )
+                                        .await;
+                                        let accepted = result
+                                            .get("accepted")
+                                            .and_then(Value::as_bool)
+                                            .unwrap_or(false);
+                                        let mut state = state;
+                                        if accepted {
+                                            let detail = if result
+                                                .get("filled")
+                                                .and_then(Value::as_str)
+                                                == Some("no-otp-field")
+                                            {
+                                                format!("No code field on the page — {entry}'s code is on the clipboard.")
+                                            } else {
+                                                format!("Filled {entry}'s authenticator code.")
+                                            };
+                                            state.with_mut(|shell| {
+                                                shell.push_notification(
+                                                    NotificationTone::Success,
+                                                    "Authenticator code",
+                                                    detail,
+                                                );
+                                            });
+                                        } else {
+                                            let reason = result
+                                                .get("reason")
+                                                .and_then(Value::as_str)
+                                                .unwrap_or("unknown failure")
+                                                .to_string();
+                                            state.with_mut(|shell| {
+                                                shell.push_notification(
+                                                    NotificationTone::Error,
+                                                    "Authenticator code failed",
                                                     reason,
                                                 );
                                             });
@@ -75500,6 +75795,7 @@ fn RightRail(
     on_reload_web_surface: EventHandler<()>,
     on_fill_web_surface_login: EventHandler<()>,
     on_fill_vault_entry: EventHandler<(String, String)>,
+    on_totp_vault_entry: EventHandler<(String, String)>,
 ) -> Element {
     let requested_mode = snapshot.right_panel_mode;
     let mut retained_mode = use_signal(|| requested_mode);
@@ -75579,6 +75875,7 @@ fn RightRail(
                 VaultRailBody {
                     snapshot: snapshot.clone(),
                     on_fill_vault_entry,
+                    on_totp_vault_entry,
                 }
             }
             }
@@ -75847,6 +76144,7 @@ enum VaultPaneTab {
 fn VaultRailBody(
     snapshot: SharedSnapshot,
     on_fill_vault_entry: EventHandler<(String, String)>,
+    on_totp_vault_entry: EventHandler<(String, String)>,
 ) -> Element {
     let palette = snapshot.palette;
     let mut tab = use_signal(|| VaultPaneTab::Fill);
@@ -75896,27 +76194,46 @@ fn VaultRailBody(
         let folder = entry.folder.clone();
         let fill_name = name.clone();
         let fill_user = user.clone();
+        let totp_name = name.clone();
+        let totp_user = user.clone();
         rsx! {
             div {
                 key: "{key}",
-                title: "Fill this login into the page",
-                style: format!(
-                    "display:flex; flex-direction:column; gap:1px; padding:6px 8px; border-radius:8px; \
-                     cursor:pointer; background:rgba(127,127,127,0.08);",
-                ),
-                onclick: move |_| {
-                    on_fill_vault_entry.call((fill_name.clone(), fill_user.clone()));
-                },
+                style: "display:flex; align-items:center; gap:6px; padding:6px 8px; border-radius:8px; background:rgba(127,127,127,0.08);",
                 div {
-                    style: format!("font-size:11px; font-weight:600; color:{}; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;", palette.text),
-                    "{name}"
-                }
-                div {
-                    style: format!("display:flex; gap:6px; font-size:10px; color:{}; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;", palette.muted),
-                    span { "{user}" }
-                    if !folder.is_empty() {
-                        span { style: "opacity:0.7;", "· {folder}" }
+                    title: "Fill this login into the page",
+                    style: "display:flex; flex-direction:column; gap:1px; flex:1 1 auto; min-width:0; cursor:pointer;",
+                    onclick: move |_| {
+                        on_fill_vault_entry.call((fill_name.clone(), fill_user.clone()));
+                    },
+                    div {
+                        style: format!("font-size:11px; font-weight:600; color:{}; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;", palette.text),
+                        "{name}"
                     }
+                    div {
+                        style: format!("display:flex; gap:6px; font-size:10px; color:{}; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;", palette.muted),
+                        span { "{user}" }
+                        if !folder.is_empty() {
+                            span { style: "opacity:0.7;", "· {folder}" }
+                        }
+                    }
+                }
+                // TOTP is per-ROW rather than gated on "has an authenticator
+                // secret": rbw's list can't tell us, so the button reports
+                // "no authenticator secret" if the entry has none.
+                button {
+                    r#type: "button",
+                    "data-vault-totp": "1",
+                    title: "Fill the authenticator code into the page (also copied to the clipboard)",
+                    style: format!(
+                        "flex:0 0 auto; border:none; background:transparent; color:{}; cursor:pointer; font-size:12px; padding:4px 6px; border-radius:6px;",
+                        palette.muted,
+                    ),
+                    onclick: move |evt: MouseEvent| {
+                        evt.stop_propagation();
+                        on_totp_vault_entry.call((totp_name.clone(), totp_user.clone()));
+                    },
+                    "⏱"
                 }
             }
         }
@@ -81468,6 +81785,39 @@ mod tests {
         assert!(shell
             .web_surface_overlay_for_session("local://ws", 2_500)
             .is_some());
+    }
+
+    // The two vault matchers are deliberately asymmetric. The sidebar SUGGESTS
+    // rows with the loose rule (a human then clicks one); the auto paths (fill,
+    // TOTP) commit a secret to the page with nobody confirming, so they take
+    // the strict rule. A base-domain entry must never auto-fill a subdomain.
+    #[test]
+    fn vault_auto_match_is_stricter_than_the_sidebar_suggestion_rule() {
+        // Both agree on the host and its www twin, in either direction.
+        for (name, host) in [
+            ("example.com", "example.com"),
+            ("example.com", "www.example.com"),
+            ("www.example.com", "example.com"),
+            ("EXAMPLE.com", "example.com"),
+        ] {
+            assert!(
+                vault_entry_auto_matches_host(name, host),
+                "auto: {name} should match {host}"
+            );
+            assert!(
+                vault_entry_applies_to_host(name, host),
+                "applies: {name} should match {host}"
+            );
+        }
+        // Base-domain suffix: the sidebar suggests it, the auto path refuses.
+        assert!(vault_entry_applies_to_host("gour.top", "chat.example.com"));
+        assert!(!vault_entry_auto_matches_host("gour.top", "chat.example.com"));
+        // Neither matches an unrelated host, an empty name, or a lookalike
+        // that merely ends with the host's text.
+        for name in ["", "  ", "other.com", "notexample.com"] {
+            assert!(!vault_entry_auto_matches_host(name, "example.com"));
+            assert!(!vault_entry_applies_to_host(name, "example.com"));
+        }
     }
 
     // Heartbeats re-deliver the app's URL every few seconds; they must NOT
