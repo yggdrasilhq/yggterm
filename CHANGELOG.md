@@ -2,6 +2,49 @@
 
 This file tracks user-visible changes in `yggterm`.
 
+## 2.10.0
+
+**Daemons update themselves, and no session is lost doing it.** That is a spec
+now, not an aspiration — `docs/daemon-handoff.md`.
+
+- **Fixed: the hot update never converged.** jojo ran daemon 2.9.63 for a day
+  with 2.9.66 on disk. The idle gate sat in front of BOTH the session-preserving
+  handoff and the destructive cold shutdown, so ONE active agent session deferred
+  the handoff of all seventeen. Worse, progressive migration — the mechanism that
+  drains a handed-off daemon's sessions one at a time, "all but the busy few" —
+  only starts *after* a handoff, so the machinery built to tolerate a few busy
+  sessions could never start *because* a few sessions were busy. The gate now
+  guards only the cold shutdown, which is the path that actually kills PTYs.
+- **Progressive migration is on by default** (`YGGTERM_ENABLE_PROGRESSIVE_MIGRATION=0`
+  to disable). A handed-off daemon no longer lingers forever as the preserved owner.
+- **Handoff is protocol-aware.** Compatibility keys on the MAJOR version, not
+  major+minor. A minor bump used to be treated as "incompatible", which stranded
+  every session across it and then let the GUI spawn a rival daemon beside the one
+  holding them. A client now NEVER spawns beside a daemon that owns terminal
+  runtimes, whatever its version. A major bump owes a transition protocol; until
+  one ships, we attach and preserve rather than strand.
+- **Never close a session by typing into it.** `shutdown()` is now the single
+  chokepoint and refuses to make a pre-2.9.66 daemon type `/exit\r` / `/quit\r` /
+  `exit\r` into a live PTY — that text was appended to whatever the user had
+  typed and submitted. Legacy daemons get `RetireDaemon` (which never touches
+  terminals) and, if they linger, SIGTERM; closing the PTY master delivers SIGHUP
+  to the children, the way a terminal emulator closes a window.
+- **New: `yggterm-headless server update-daemons [--force]`.** Brings every
+  reachable local daemon onto this binary's version via the preserving handoff.
+  It never sends `Shutdown`.
+- **Fixed: a booting daemon could resurrect closed sessions.** It cold-restored
+  `server-state.json` unconditionally; beside a live predecessor that still owned
+  the runtimes, that brought back sessions the user had deliberately closed (19 of
+  them, 2026-07-09). It now refuses, unless it is the successor the predecessor
+  explicitly handed off to.
+- **The vault is native.** `shell.rs` no longer shells out to `rbw`: the sidebar,
+  autofill, TOTP, add and generator all go through `ychrome-vault`, which speaks
+  Bitwarden directly, caches its unlock in its own agent, reads each item's URIs,
+  and can decrypt organization ciphers (59 of them were silently invisible before).
+- **Fixed: the profile picker GET'd the wrong machine.** A control endpoint is
+  fetched by the GUI itself over a plain socket, so it needs an `ssh -L` forward,
+  not the webview's SOCKS proxy.
+
 ## 2.9.66
 
 - **Fixed: navigating a ychrome tab from the address bar "did nothing".** The app's OSC heartbeat

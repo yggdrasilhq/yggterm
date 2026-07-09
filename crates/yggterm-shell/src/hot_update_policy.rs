@@ -11,14 +11,29 @@ fn daemon_version_triplet(version: &str) -> Option<(u64, u64, u64)> {
     Some((major, minor, patch))
 }
 
-fn daemon_versions_share_patch_line(left: &str, right: &str) -> bool {
-    let Some((left_major, left_minor, _)) = daemon_version_triplet(left) else {
+/// May a daemon of version `left` hand its live PTYs off to `right`?
+///
+/// Keyed on the MAJOR version. This used to demand the same major AND minor
+/// ("patch line"), which stranded sessions across every minor bump and then let
+/// the GUI spawn a rival daemon beside the one holding them.
+///
+/// The rule existed because the handoff was assumed destructive. It is not: the
+/// old daemon KEEPS its PTY fds and lingers as the preserved owner while the
+/// successor adopts the streams. Version skew is something to transition across,
+/// never a reason to strand a session.
+///
+/// A MAJOR bump means a protocol break, and the handoff for it is not written
+/// yet — so it returns false, and the caller must PRESERVE (attach, never spawn)
+/// until a transition protocol ships in the binary.
+/// [[spec-no-session-left-behind-protocol-aware-handoff]]
+fn daemon_versions_can_hand_off(left: &str, right: &str) -> bool {
+    let Some((left_major, _, _)) = daemon_version_triplet(left) else {
         return false;
     };
-    let Some((right_major, right_minor, _)) = daemon_version_triplet(right) else {
+    let Some((right_major, _, _)) = daemon_version_triplet(right) else {
         return false;
     };
-    left_major == right_major && left_minor == right_minor
+    left_major == right_major
 }
 
 fn runtime_status_has_owned_terminal_runtime(runtime_status: &ServerRuntimeStatus) -> bool {
@@ -135,8 +150,12 @@ fn startup_daemon_should_preserve_stale_runtime_for_startup_target(
     {
         return false;
     }
-    daemon_versions_share_patch_line(runtime_version, expected_version)
-        && runtime_status_has_owned_terminal_runtime(runtime_status)
+    // NO version check. A daemon that owns terminal runtimes is preserved
+    // whatever its version: a client must never spawn a peer beside a runtime
+    // owner. Whether we can also HAND OFF to it is a separate question
+    // (`daemon_versions_can_hand_off`).
+    // [[spec-no-session-left-behind-protocol-aware-handoff]]
+    runtime_status_has_owned_terminal_runtime(runtime_status)
         && runtime_status_owned_runtime_is_authorized_for_startup_target(
             runtime_status,
             authorized_runtime_keys,
@@ -167,12 +186,28 @@ pub(crate) fn startup_daemon_hot_swap_reason_for_startup_target(
         authorized_runtime_keys,
         active_client_count,
     ) {
-        return Some("startup_hot_update_handoff");
+        return handoff_reason_for_preserved_owner(runtime_version, expected_version);
     }
     if runtime_status_has_owned_terminal_runtime(runtime_status) {
         return None;
     }
     Some("startup_version_reconcile")
+}
+
+/// A preserved runtime owner is either handed off to (same major), or merely
+/// attached to while we wait for the transition protocol a major bump owes us.
+/// Either way the client does NOT spawn beside it.
+/// [[spec-no-session-left-behind-protocol-aware-handoff]]
+fn handoff_reason_for_preserved_owner(
+    runtime_version: &str,
+    expected_version: &str,
+) -> Option<&'static str> {
+    if daemon_versions_can_hand_off(runtime_version, expected_version) {
+        return Some("startup_hot_update_handoff");
+    }
+    // Major bump: the handoff across a protocol break is not written yet. Attach
+    // and preserve; never spawn a peer beside a daemon holding live PTYs.
+    None
 }
 
 fn runtime_status_has_live_terminal_runtime(runtime_status: &ServerRuntimeStatus) -> bool {
@@ -208,8 +243,9 @@ fn startup_daemon_should_preserve_stale_runtime_with_authorized_keys(
     {
         return false;
     }
-    daemon_versions_share_patch_line(runtime_version, expected_version)
-        && runtime_status_has_owned_terminal_runtime(runtime_status)
+    // See above: preservation is unconditional on version. Never spawn beside a
+    // runtime owner. [[spec-no-session-left-behind-protocol-aware-handoff]]
+    runtime_status_has_owned_terminal_runtime(runtime_status)
         && runtime_status_owned_runtime_is_authorized(runtime_status, authorized_runtime_keys)
 }
 
@@ -258,7 +294,7 @@ pub(crate) fn startup_daemon_hot_swap_reason_with_authorized_keys(
         expected_version,
         authorized_runtime_keys,
     ) {
-        return Some("startup_hot_update_handoff");
+        return handoff_reason_for_preserved_owner(runtime_version, expected_version);
     }
     if runtime_status_has_owned_terminal_runtime(runtime_status) {
         return None;
@@ -397,7 +433,7 @@ pub(crate) fn daemon_update_state_json(runtime_status: Option<&ServerRuntimeStat
         "terminal_session_keys": &runtime_status.terminal_session_keys,
         "restored_live_sessions": runtime_status.restored_live_sessions,
         "managed_session_count": runtime_status.managed_session_count,
-        "same_patch_line": daemon_versions_share_patch_line(active_version, expected_version.as_str()),
+        "can_hand_off": daemon_versions_can_hand_off(active_version, expected_version.as_str()),
         "hot_update_pending": hot_update_pending,
         "hot_update_handoff_active": handoff_active,
         "hot_update_pending_reason": startup_daemon_hot_update_pending_reason(
