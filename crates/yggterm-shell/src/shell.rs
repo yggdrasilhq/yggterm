@@ -46,7 +46,7 @@ use crate::terminal_observe::{
 use crate::terminal_observe::{
     summarize_terminal_surface_for_app_control, terminal_chunk_is_launcher_boilerplate,
 };
-use crate::terminal_protocol::{TerminalJsCommand, TerminalJsEvent};
+use crate::terminal_protocol::{SidebarPaneDeclaration, TerminalJsCommand, TerminalJsEvent};
 use crate::terminal_retained_replay_policy::{
     RetainedRehydrateMode, blank_host_snapshot_replay_from_read_should_start,
     blank_host_snapshot_replay_should_start, daemon_retained_snapshot_replay_identity_key,
@@ -1004,6 +1004,16 @@ fn kill_web_surface_forward(surface: &WebSurfaceUiState) {
         let _ = child.wait();
     }
 }
+/// Reap the `ssh -L` forward a remote contribution's control endpoint runs on.
+/// Without this an app that comes and goes leaks one ssh per declare.
+fn kill_control_forward(contribution: &SidebarContributionState) {
+    if let Some(child) = &contribution.forward_child
+        && let Ok(mut child) = child.lock()
+    {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+}
 /// Existing host-owned web-profile jars on THIS (GUI) host, for the native
 /// picker. Mirrors ychrome's `enumerate_profiles`: directory names under
 /// `~/.yggterm/web-profiles/`, always including "default", never the reserved
@@ -1053,20 +1063,238 @@ fn delete_web_surface_profile(profile: &str) -> bool {
 /// end of an ssh forward. Hand-rolled over TcpStream: matches ychrome's
 /// dep-light control server; no HTTP client dependency for one GET.
 fn web_surface_picker_control_get(url: &str) -> Result<(), String> {
+    control_request(url, None).map(|_| ())
+}
+
+/// One request against a libyggterm app's loopback control endpoint, returning
+/// the parsed JSON body. `body` present ⇒ POST, absent ⇒ GET.
+///
+/// Hand-rolled over `TcpStream` for the same reason the picker's GET is: the
+/// app's control server is dep-light, one request at a time, and pulling an
+/// HTTP client into the GUI to talk to 127.0.0.1 buys nothing. Blocking — every
+/// caller runs it on `spawn_blocking`, never the UI event loop.
+///
+/// `url` must ALREADY be GUI-reachable (`resolve_control_endpoint_url` has
+/// turned a remote loopback into the local end of an `ssh -L` forward).
+fn control_request(url: &str, body: Option<&serde_json::Value>) -> Result<serde_json::Value, String> {
     use std::io::{Read as _, Write as _};
     let (host, port, path) = web_surface_url_parts(url).ok_or("unparseable control url")?;
     let mut stream = std::net::TcpStream::connect((host.as_str(), port))
         .map_err(|error| format!("connect {host}:{port}: {error}"))?;
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
-    let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(10)));
+    let request = match body {
+        Some(body) => {
+            let payload = body.to_string();
+            format!(
+                "POST {path} HTTP/1.1\r\nHost: {host}\r\nContent-Type: application/json\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+                payload.len(),
+            )
+        }
+        None => format!("GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n"),
+    };
     stream
-        .write_all(
-            format!("GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n").as_bytes(),
-        )
+        .write_all(request.as_bytes())
         .map_err(|error| format!("send: {error}"))?;
-    let mut drain = Vec::new();
-    let _ = stream.read_to_end(&mut drain);
-    Ok(())
+    let mut raw = Vec::new();
+    stream
+        .read_to_end(&mut raw)
+        .map_err(|error| format!("read: {error}"))?;
+    let text = String::from_utf8_lossy(&raw);
+    let (head, body) = text
+        .split_once("\r\n\r\n")
+        .ok_or_else(|| "control response has no body".to_string())?;
+    let status = head
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|code| code.parse::<u16>().ok())
+        .unwrap_or(0);
+    if !(200..300).contains(&status) {
+        return Err(format!("control endpoint returned {status}"));
+    }
+    if body.trim().is_empty() {
+        return Ok(serde_json::Value::Null);
+    }
+    serde_json::from_str(body).map_err(|error| format!("control response is not json: {error}"))
+}
+
+/// A live sidebar contribution: the app's control endpoint and the panes it
+/// offers. Expires when the app stops re-declaring, so a SIGKILLed app never
+/// leaves phantom buttons in the rail.
+#[derive(Clone)]
+struct SidebarContributionState {
+    /// GUI-reachable control endpoint. For a remote session this is the LOCAL
+    /// end of an `ssh -L` forward, not the app's own loopback address.
+    control_url: String,
+    /// Holds the `ssh -L` forward open for the contribution's lifetime; killed
+    /// when the contribution expires or closes. `Arc<Mutex<_>>` because
+    /// `ShellState` is `Clone` and a `Child` is not — the same shape the web
+    /// surface's picker forward uses.
+    forward_child: Option<std::sync::Arc<std::sync::Mutex<std::process::Child>>>,
+    panes: Vec<SidebarPaneDeclaration>,
+    last_seen_ms: u64,
+}
+
+/// The schema the app-pane renderer is currently drawing.
+#[derive(Debug, Clone, PartialEq)]
+struct AppPaneSchemaState {
+    pane_id: String,
+    schema: AppPaneSchema,
+}
+
+/// A pane, as the app describes it. yggterm renders these widgets and knows
+/// nothing about what they mean; a click POSTs the widget's `action` id back.
+///
+/// NO SECRETS EVER TRAVEL IN A SCHEMA. The app performs the action host-side
+/// and, when a value must reach the page, returns an `eval` script for the GUI
+/// to run in the surface.
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
+struct AppPaneSchema {
+    #[serde(default)]
+    title: String,
+    #[serde(default)]
+    widgets: Vec<AppPaneWidget>,
+}
+
+impl AppPaneWidget {
+    /// A key that identifies the widget by KIND and id, never by position.
+    ///
+    /// Keying on the index let Dioxus patch a `section` node into a `label`
+    /// when a tab switch changed the widget at that slot: same tag, so the old
+    /// node was reused and kept the section's `text-transform` (live-caught,
+    /// the Tools tab rendered "UNLOCKED · 1107 ITEMS").
+    fn key(&self, index: usize) -> String {
+        match self {
+            AppPaneWidget::Section { .. } => format!("section-{index}"),
+            AppPaneWidget::Label { .. } => format!("label-{index}"),
+            AppPaneWidget::Tabs { id, .. } => format!("tabs-{id}"),
+            AppPaneWidget::SearchBox { id, .. } => format!("search-{id}"),
+            AppPaneWidget::TextInput { id, .. } => format!("text-{id}"),
+            AppPaneWidget::NumberInput { id, .. } => format!("number-{id}"),
+            AppPaneWidget::Toggle { id, .. } => format!("toggle-{id}"),
+            AppPaneWidget::Button { id, .. } => format!("button-{id}"),
+            AppPaneWidget::ListRow { id, .. } => format!("row-{id}"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+enum AppPaneWidget {
+    /// A heading that groups what follows.
+    Section { text: String },
+    /// Static text. `muted` renders it as secondary prose.
+    Label {
+        text: String,
+        #[serde(default)]
+        muted: bool,
+    },
+    /// Pill tabs. Selecting one fires `action` with the tab id as its value.
+    Tabs {
+        id: String,
+        #[serde(default)]
+        action: String,
+        tabs: Vec<AppPaneTab>,
+        #[serde(default)]
+        active: String,
+    },
+    /// A search box. Typing updates the draft; `action` (if set) fires on Enter.
+    SearchBox {
+        id: String,
+        #[serde(default)]
+        placeholder: String,
+        #[serde(default)]
+        action: String,
+        #[serde(default)]
+        value: String,
+    },
+    TextInput {
+        id: String,
+        #[serde(default)]
+        label: String,
+        #[serde(default)]
+        placeholder: String,
+        #[serde(default)]
+        value: String,
+        /// Masks the field. The value still only leaves the GUI on an action.
+        #[serde(default)]
+        secret: bool,
+    },
+    NumberInput {
+        id: String,
+        #[serde(default)]
+        label: String,
+        #[serde(default)]
+        value: i64,
+        #[serde(default)]
+        min: i64,
+        #[serde(default)]
+        max: i64,
+    },
+    Toggle {
+        id: String,
+        label: String,
+        #[serde(default)]
+        action: String,
+        #[serde(default)]
+        value: bool,
+    },
+    Button {
+        id: String,
+        label: String,
+        action: String,
+        #[serde(default)]
+        primary: bool,
+    },
+    /// A row of the app's own data, with optional trailing action buttons.
+    ListRow {
+        id: String,
+        title: String,
+        #[serde(default)]
+        subtitle: String,
+        #[serde(default)]
+        actions: Vec<AppPaneRowAction>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
+struct AppPaneTab {
+    id: String,
+    label: String,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
+struct AppPaneRowAction {
+    action: String,
+    label: String,
+    #[serde(default)]
+    title: String,
+}
+
+/// What an action POST returns: any of a fresh schema to re-render, a message
+/// to toast, and a script to run in the session's web surface (how a
+/// host-resident credential reaches a client-rendered page without the secret
+/// ever living in yggterm).
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+struct AppPaneActionReply {
+    #[serde(default)]
+    schema: Option<AppPaneSchema>,
+    #[serde(default)]
+    toast: Option<String>,
+    #[serde(default)]
+    eval: Option<String>,
+}
+
+/// `<control>/pane/<id>` — where the GUI fetches a pane's schema. Kept out of
+/// the OSC so a 1100-row vault never rides the PTY.
+fn app_pane_schema_url(control_url: &str, pane_id: &str) -> String {
+    format!("{}/pane/{}", control_url.trim_end_matches('/'), pane_id)
+}
+
+fn app_pane_action_url(control_url: &str) -> String {
+    format!("{}/action", control_url.trim_end_matches('/'))
 }
 /// Render-facing view of a live web surface: tab strip + address bar +
 /// per-tab iframes.
@@ -2312,6 +2540,24 @@ struct ShellState {
     // ychrome pilot). SSOT for the viewport web overlay; entries expire when
     // the app's OSC heartbeats stop (WEB_SURFACE_STALE_AFTER_MS).
     web_surfaces: HashMap<String, WebSurfaceUiState>,
+    /// Sidebar contributions declared by libyggterm apps, keyed by GUI
+    /// session_path (OSC 7717 `sidebar;declare`). SSOT for which app panes the
+    /// rail offers; entries expire when the app's declares stop, exactly like a
+    /// web surface. yggterm knows nothing about what a pane MEANS.
+    sidebar_contributions: HashMap<String, SidebarContributionState>,
+    /// The schema currently rendered in `RightPanelMode::AppPane`, plus the
+    /// pane it belongs to. Fetched from the app's control endpoint on open and
+    /// replaced by whatever an action returns. `None` while a fetch is in
+    /// flight; `app_pane_error` explains a failure.
+    app_pane_schema: Option<AppPaneSchemaState>,
+    /// Draft values for the rendered pane's inputs, keyed by widget id. The
+    /// app never sees them until an action is fired, and they are dropped when
+    /// the pane closes — a search box or an add-form password does not persist.
+    app_pane_values: HashMap<String, String>,
+    app_pane_error: Option<String>,
+    /// Bumped on every pane open / action so a late reply from a superseded
+    /// fetch cannot overwrite a newer schema.
+    app_pane_request_seq: u64,
     titlebar_new_menu_open: bool,
     titlebar_new_menu_ignore_toggle_until_ms: u64,
     titlebar_session_menu_open: bool,
@@ -2619,20 +2865,37 @@ const SIDEBAR_RENAME_AUTOSCROLL_SUPPRESS_MS: u64 = 4_000;
 /// Minimum spacing between terminal-driven attention pings (BEL / OSC 9 / 777)
 /// per session, so a chatty TUI can't spam toasts/OS notifications.
 const TERMINAL_NOTIFY_PING_MIN_INTERVAL_MS: u64 = 2_500;
-#[derive(Clone, Copy, PartialEq, Eq)]
+/// NOT `Copy`: `AppPane` carries the app-chosen pane id, which is a `String`.
+/// The alternative — a unit `AppPane` plus a separate `active_app_pane:
+/// Option<String>` field — would be two encodings of one fact that can
+/// diverge, which `CLAUDE.md` § "Single source of truth" forbids.
+#[derive(Clone, PartialEq, Eq, Debug)]
 enum RightPanelMode {
     Hidden,
     Metadata,
     Settings,
     Connect,
     Notifications,
+    /// A pane CONTRIBUTED by the active libyggterm app (the 4-surface taxonomy's
+    /// sidebar-contribution surface), identified by the app's own pane id. The
+    /// app declares it over OSC 7717 and serves its schema from a loopback
+    /// control endpoint; yggterm renders generic widgets and knows nothing about
+    /// what the pane means.
+    ///
+    /// This variant is the reason `RightPanelMode::Vault` and `::AppSidebar` do
+    /// not exist: app chrome does not belong in yggterm.
+    AppPane(String),
     /// The ACTIVE libyggterm app's contributed sidebar (4-surface taxonomy's
     /// sidebar-contribution surface). First consumer: ychrome settings
     /// (adblock + userscripts config, all GUI-host-owned files).
+    ///
+    /// DEPRECATED: hardcoded app chrome, being migrated to `AppPane`.
     AppSidebar,
     /// ychrome's shipped Bitwarden/vault browser: search the vault,
     /// site-applicable logins float to the top, click any entry to fill it
     /// into the active surface (the user's multi-account override path).
+    ///
+    /// DEPRECATED: hardcoded app chrome, being migrated to `AppPane`.
     Vault,
 }
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -2701,6 +2964,14 @@ struct RenderSnapshot {
     /// The active session's live web-surface profile (app tab), if it has a
     /// surface — drives the app-sidebar's per-profile settings.
     active_web_surface_profile: Option<String>,
+    /// Panes the ACTIVE session's libyggterm app has declared. Empty unless an
+    /// app is live and declaring — which is what keeps app chrome out of the
+    /// rail. yggterm never invents one of these.
+    sidebar_panes: Vec<SidebarPaneDeclaration>,
+    /// The schema currently rendered for `RightPanelMode::AppPane`, and any
+    /// error from fetching it.
+    app_pane_schema: Option<AppPaneSchemaState>,
+    app_pane_error: Option<String>,
     /// Host of the active surface's ACTIVE tab URL (vault pane's "for this
     /// site" filter). None when no surface / no navigated tab.
     active_web_surface_host: Option<String>,
@@ -2800,7 +3071,7 @@ impl TerminalCanvasSnapshot {
             active_summary: snapshot.active_summary.clone(),
             active_view_mode: snapshot.active_view_mode,
             active_session_path: snapshot.active_session_path.clone(),
-            right_panel_mode: snapshot.right_panel_mode,
+            right_panel_mode: snapshot.right_panel_mode.clone(),
             search_focused: snapshot.search_focused,
             command_mode_active: snapshot.command_mode_active,
             titlebar_new_menu_open: snapshot.titlebar_new_menu_open,
@@ -3845,6 +4116,11 @@ impl ShellState {
             next_notification_id: 1,
             session_working_prev: HashMap::new(),
             web_surfaces: HashMap::new(),
+            sidebar_contributions: HashMap::new(),
+            app_pane_schema: None,
+            app_pane_values: HashMap::new(),
+            app_pane_error: None,
+            app_pane_request_seq: 0,
             titlebar_new_menu_open: false,
             titlebar_new_menu_ignore_toggle_until_ms: 0,
             titlebar_session_menu_open: false,
@@ -4427,7 +4703,7 @@ impl ShellState {
             sidebar_open: self.sidebar_open,
             sidebar_width: self.sidebar_width,
             sidebar_resizing: self.sidebar_resize_drag.is_some(),
-            right_panel_mode: self.right_panel_mode,
+            right_panel_mode: self.right_panel_mode.clone(),
             rows,
             selected_path,
             selected_row,
@@ -4438,16 +4714,15 @@ impl ShellState {
                     .and_then(|surface| surface.tabs.first())
                     .map(|app_tab| app_tab.profile.clone())
             }),
-            active_web_surface_host: active_session_path.as_deref().and_then(|path| {
-                let surface = self.web_surfaces.get(path)?;
-                let tab = surface
-                    .tabs
-                    .iter()
-                    .find(|tab| tab.id == surface.active_tab)?;
-                let host = web_surface_tab_host_label(&tab.url);
-                (!host.is_empty() && host != "New Tab")
-                    .then(|| host.split(':').next().unwrap_or(&host).to_lowercase())
-            }),
+            sidebar_panes: active_session_path
+                .as_deref()
+                .map(|path| self.active_sidebar_panes(path, current_millis()))
+                .unwrap_or_default(),
+            app_pane_schema: self.app_pane_schema.clone(),
+            app_pane_error: self.app_pane_error.clone(),
+            active_web_surface_host: active_session_path
+                .as_deref()
+                .and_then(|path| self.web_surface_host_label(path)),
             active_session_path,
             active_view_mode: render_active_view_mode,
             retained_terminal_sessions,
@@ -4761,6 +5036,89 @@ impl ShellState {
             }
             live
         });
+    }
+    /// Record (or refresh) an app's declared panes. `control_url` is only
+    /// supplied on the first declare, when the resolver has produced a
+    /// GUI-reachable URL; a re-declare (the liveness heartbeat) is idempotent
+    /// and must NOT re-resolve — that would spawn an `ssh -L` per heartbeat.
+    fn upsert_sidebar_contribution(
+        &mut self,
+        session_path: &str,
+        panes: Vec<SidebarPaneDeclaration>,
+        now_ms: u64,
+        resolved: Option<(
+            String,
+            Option<std::sync::Arc<std::sync::Mutex<std::process::Child>>>,
+        )>,
+    ) {
+        if let Some(existing) = self.sidebar_contributions.get_mut(session_path) {
+            existing.last_seen_ms = now_ms;
+            // Panes may change between declares (an app can add one); the
+            // declaration is the source of truth for what the rail draws.
+            if existing.panes != panes {
+                existing.panes = panes;
+            }
+            return;
+        }
+        let Some((control_url, forward_child)) = resolved else {
+            return;
+        };
+        self.sidebar_contributions.insert(
+            session_path.to_string(),
+            SidebarContributionState {
+                control_url,
+                forward_child,
+                panes,
+                last_seen_ms: now_ms,
+            },
+        );
+    }
+    fn close_sidebar_contribution(&mut self, session_path: &str) {
+        if let Some(contribution) = self.sidebar_contributions.remove(session_path) {
+            kill_control_forward(&contribution);
+        }
+    }
+    /// Contributions expire on the same rule as surfaces: no declare within
+    /// WEB_SURFACE_STALE_AFTER_MS and the app is presumed gone, so its buttons
+    /// leave the rail rather than dangling at a dead control endpoint.
+    fn sweep_stale_sidebar_contributions(&mut self, now_ms: u64) {
+        self.sidebar_contributions.retain(|_, contribution| {
+            let live =
+                now_ms.saturating_sub(contribution.last_seen_ms) <= WEB_SURFACE_STALE_AFTER_MS;
+            if !live {
+                kill_control_forward(contribution);
+            }
+            live
+        });
+    }
+    /// The panes the active session's app currently offers. Empty when no app
+    /// has declared, which is what keeps the rail free of app chrome.
+    fn active_sidebar_panes(&self, session_path: &str, now_ms: u64) -> Vec<SidebarPaneDeclaration> {
+        self.sidebar_contributions
+            .get(session_path)
+            .filter(|contribution| {
+                now_ms.saturating_sub(contribution.last_seen_ms) <= WEB_SURFACE_STALE_AFTER_MS
+            })
+            .map(|contribution| contribution.panes.clone())
+            .unwrap_or_default()
+    }
+    /// The bare host of the session's active web-surface tab, lowercased. One
+    /// owner: the snapshot, the vault pane and an app-pane's page context all
+    /// read it from here, so they cannot disagree about what site is open.
+    fn web_surface_host_label(&self, session_path: &str) -> Option<String> {
+        let surface = self.web_surfaces.get(session_path)?;
+        let tab = surface
+            .tabs
+            .iter()
+            .find(|tab| tab.id == surface.active_tab)?;
+        let host = web_surface_tab_host_label(&tab.url);
+        (!host.is_empty() && host != "New Tab")
+            .then(|| host.split(':').next().unwrap_or(&host).to_lowercase())
+    }
+    fn sidebar_control_url(&self, session_path: &str) -> Option<String> {
+        self.sidebar_contributions
+            .get(session_path)
+            .map(|contribution| contribution.control_url.clone())
     }
     /// Cheap liveness probe (no view construction) for the input policy.
     fn has_live_web_surface(&self, session_path: &str, now_ms: u64) -> bool {
@@ -5173,11 +5531,11 @@ impl ShellState {
         self.set_right_panel_mode(next_mode);
     }
     fn set_right_panel_mode(&mut self, mode: RightPanelMode) {
-        self.terminal_input_override_active = terminal_input_override_for_right_panel_mode(mode);
+        self.terminal_input_override_active = terminal_input_override_for_right_panel_mode(&mode);
         self.right_panel_mode = mode;
         self.settings.show_settings = self.right_panel_mode == RightPanelMode::Settings;
         self.persist_settings();
-        self.last_action = match self.right_panel_mode {
+        self.last_action = match &self.right_panel_mode {
             RightPanelMode::Settings => "settings opened".to_string(),
             RightPanelMode::Hidden => "right panel hidden".to_string(),
             RightPanelMode::Metadata => "metadata opened".to_string(),
@@ -5185,6 +5543,7 @@ impl ShellState {
             RightPanelMode::Notifications => "notifications opened".to_string(),
             RightPanelMode::AppSidebar => "app sidebar opened".to_string(),
             RightPanelMode::Vault => "vault opened".to_string(),
+            RightPanelMode::AppPane(pane) => format!("app pane {pane} opened"),
         };
     }
     fn toggle_app_sidebar_panel(&mut self) {
@@ -5202,6 +5561,60 @@ impl ShellState {
             RightPanelMode::Vault
         };
         self.set_right_panel_mode(next_mode);
+    }
+    /// Open (or close) an app-contributed pane. Returns the request sequence to
+    /// fetch the schema under, or `None` when the pane was toggled shut.
+    ///
+    /// Draft input values never survive a pane switch: a search term or an
+    /// add-form password belongs to the pane the user was looking at.
+    fn toggle_app_pane(&mut self, pane_id: &str) -> Option<u64> {
+        let already_open = self.right_panel_mode == RightPanelMode::AppPane(pane_id.to_string());
+        self.app_pane_schema = None;
+        self.app_pane_values.clear();
+        self.app_pane_error = None;
+        self.app_pane_request_seq = self.app_pane_request_seq.wrapping_add(1);
+        if already_open {
+            self.set_right_panel_mode(RightPanelMode::Hidden);
+            return None;
+        }
+        self.set_right_panel_mode(RightPanelMode::AppPane(pane_id.to_string()));
+        Some(self.app_pane_request_seq)
+    }
+    /// Claim the next request sequence. A reply carrying a stale sequence is
+    /// dropped, so a slow schema fetch cannot overwrite the newer schema an
+    /// action just returned.
+    fn app_pane_next_request(&mut self) -> u64 {
+        self.app_pane_request_seq = self.app_pane_request_seq.wrapping_add(1);
+        self.app_pane_request_seq
+    }
+    fn app_pane_apply_schema(&mut self, seq: u64, pane_id: &str, schema: AppPaneSchema) {
+        if seq != self.app_pane_request_seq {
+            return;
+        }
+        self.app_pane_error = None;
+        self.app_pane_schema = Some(AppPaneSchemaState {
+            pane_id: pane_id.to_string(),
+            schema,
+        });
+    }
+    fn app_pane_apply_error(&mut self, seq: u64, error: String) {
+        if seq != self.app_pane_request_seq {
+            return;
+        }
+        self.app_pane_error = Some(error);
+    }
+    fn set_app_pane_value(&mut self, widget_id: &str, value: String) {
+        self.app_pane_values.insert(widget_id.to_string(), value);
+    }
+    /// The pane's draft input values, as the action POST carries them. These
+    /// leave the GUI only when the user fires an action.
+    fn app_pane_values_json(&self) -> serde_json::Value {
+        serde_json::Value::Object(
+            self.app_pane_values
+                .iter()
+                .map(|(key, value)| (key.clone(), serde_json::Value::String(value.clone())))
+                .collect(),
+        )
     }
     fn toggle_connect_panel(&mut self) {
         let next_mode = if self.right_panel_mode == RightPanelMode::Connect {
@@ -27985,7 +28398,7 @@ fn client_instance_dirs_for_scan(
     }
     dirs
 }
-fn right_panel_mode_label(mode: RightPanelMode) -> &'static str {
+fn right_panel_mode_label(mode: &RightPanelMode) -> &'static str {
     match mode {
         RightPanelMode::Hidden => "hidden",
         RightPanelMode::Metadata => "metadata",
@@ -27994,6 +28407,7 @@ fn right_panel_mode_label(mode: RightPanelMode) -> &'static str {
         RightPanelMode::Notifications => "notifications",
         RightPanelMode::AppSidebar => "app_sidebar",
         RightPanelMode::Vault => "vault",
+        RightPanelMode::AppPane(_) => "app_pane",
     }
 }
 
@@ -28010,7 +28424,7 @@ fn app_control_right_panel_mode(mode: AppControlRightPanelMode) -> RightPanelMod
 }
 
 fn app_control_right_panel_mode_label(mode: AppControlRightPanelMode) -> &'static str {
-    right_panel_mode_label(app_control_right_panel_mode(mode))
+    right_panel_mode_label(&app_control_right_panel_mode(mode))
 }
 
 fn app_control_dom_rect_visible(dom: &Value, key: &str) -> bool {
@@ -28706,7 +29120,7 @@ fn describe_app_state_snapshot(
             "sidebar_open": shell.sidebar_open,
             "sidebar_width": shell.sidebar_width,
             "sidebar_resizing": shell.sidebar_resize_drag.is_some(),
-            "right_panel_mode": right_panel_mode_label(snapshot.right_panel_mode),
+            "right_panel_mode": right_panel_mode_label(&snapshot.right_panel_mode),
             "preview_layout": preview_layout_mode_label(shell.preview_layout),
             "search_query": shell.search_query,
             "search_focused": shell.search_focused,
@@ -35891,6 +36305,135 @@ fn resolve_live_web_surface(
 
 /// App-control: evaluate JS in a session's active web-surface tab and return
 /// the completion value as JSON (or the JS exception as the failure reason).
+/// GET the active app's schema for `pane_id` and render it.
+///
+/// The fetch is blocking (a plain TcpStream to a loopback endpoint, possibly
+/// the local end of an `ssh -L`), so it runs on `spawn_blocking` — never the UI
+/// event loop. `seq` guards against a slow reply overwriting a newer schema.
+async fn app_pane_fetch_schema(mut state: Signal<ShellState>, pane_id: String, seq: u64) {
+    let control_url = {
+        let shell = state.read();
+        shell
+            .server
+            .active_session_path()
+            .map(str::to_string)
+            .and_then(|path| shell.sidebar_control_url(&path))
+    };
+    let Some(control_url) = control_url else {
+        state.with_mut(|shell| {
+            shell.app_pane_apply_error(seq, "the app is no longer declaring a sidebar".to_string())
+        });
+        return;
+    };
+    let host = {
+        let shell = state.read();
+        shell
+            .server
+            .active_session_path()
+            .map(str::to_string)
+            .and_then(|path| shell.web_surface_host_label(&path))
+    };
+    // The app decides what a page host means (which logins apply to it); the
+    // GUI only tells it which host is open. Non-secret context, never a value.
+    let url = match &host {
+        Some(host) => format!("{}?host={host}", app_pane_schema_url(&control_url, &pane_id)),
+        None => app_pane_schema_url(&control_url, &pane_id),
+    };
+    let fetched = task::spawn_blocking(move || control_request(&url, None))
+        .await
+        .unwrap_or_else(|error| Err(format!("schema fetch panicked: {error}")));
+    match fetched.and_then(|value| {
+        serde_json::from_value::<AppPaneSchema>(value)
+            .map_err(|error| format!("pane schema is malformed: {error}"))
+    }) {
+        Ok(schema) => state.with_mut(|shell| shell.app_pane_apply_schema(seq, &pane_id, schema)),
+        Err(error) => state.with_mut(|shell| shell.app_pane_apply_error(seq, error)),
+    }
+}
+
+/// POST `{pane, action, values}` to the app and apply whatever comes back.
+///
+/// The reply may carry any of: a fresh `schema` to re-render, a `toast` to show,
+/// and an `eval` script to run in the session's web surface. `eval` is how a
+/// host-resident credential reaches a client-rendered page without the secret
+/// ever living in yggterm — the app computed it, the GUI only injects it.
+async fn app_pane_run_action(
+    mut state: Signal<ShellState>,
+    desktop: dioxus::desktop::DesktopContext,
+    pane_id: String,
+    action: String,
+    value: Option<String>,
+) {
+    let (control_url, mut values, host) = {
+        let shell = state.read();
+        let active = shell.server.active_session_path().map(str::to_string);
+        let control = active
+            .as_deref()
+            .and_then(|path| shell.sidebar_control_url(path));
+        let host = active
+            .as_deref()
+            .and_then(|path| shell.web_surface_host_label(path));
+        (control, shell.app_pane_values_json(), host)
+    };
+    let Some(control_url) = control_url else {
+        return;
+    };
+    if let (Some(host), Some(map)) = (host, values.as_object_mut()) {
+        map.insert("host".to_string(), serde_json::Value::String(host));
+    }
+    // A widget that carries its own value (a tab id, a row's item id) passes it
+    // alongside the pane's draft inputs rather than mutating them.
+    if let (Some(value), Some(map)) = (value, values.as_object_mut()) {
+        map.insert("value".to_string(), serde_json::Value::String(value));
+    }
+    let seq = state.with_mut(|shell| shell.app_pane_next_request());
+    let url = app_pane_action_url(&control_url);
+    let body = json!({ "pane": pane_id, "action": action, "values": values });
+    let replied = task::spawn_blocking(move || control_request(&url, Some(&body)))
+        .await
+        .unwrap_or_else(|error| Err(format!("action panicked: {error}")));
+    let reply = match replied.and_then(|value| {
+        if value.is_null() {
+            return Ok(AppPaneActionReply::default());
+        }
+        serde_json::from_value::<AppPaneActionReply>(value)
+            .map_err(|error| format!("action reply is malformed: {error}"))
+    }) {
+        Ok(reply) => reply,
+        Err(error) => {
+            state.with_mut(|shell| {
+                shell.push_notification(NotificationTone::Error, "App action failed", error);
+            });
+            return;
+        }
+    };
+    if let Some(schema) = reply.schema {
+        state.with_mut(|shell| shell.app_pane_apply_schema(seq, &pane_id, schema));
+    }
+    if let Some(toast) = reply.toast {
+        state.with_mut(|shell| {
+            shell.push_notification(NotificationTone::Info, "Vault", toast);
+        });
+    }
+    if let Some(script) = reply.eval {
+        let outcome = web_surface_eval_for(&state, &desktop, None, &script).await;
+        if !outcome
+            .get("accepted")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            let reason = outcome
+                .get("reason")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown failure")
+                .to_string();
+            state.with_mut(|shell| {
+                shell.push_notification(NotificationTone::Error, "App action failed", reason);
+            });
+        }
+    }
+}
+
 async fn web_surface_eval_for(
     state: &Signal<ShellState>,
     desktop: &dioxus::desktop::DesktopContext,
@@ -38896,7 +39439,7 @@ async fn process_pending_app_control_requests(
                 data: Some(json!({
                     "command": "scroll_right_panel",
                     "window": describe_window(&desktop),
-                    "right_panel_mode": right_panel_mode_label(state.read().right_panel_mode),
+                    "right_panel_mode": right_panel_mode_label(&state.read().right_panel_mode),
                     "scroll": scroll_result,
                     "dom": dom_snapshot,
                 })),
@@ -45026,6 +45569,16 @@ fn app() -> Element {
                             state.with_mut(|shell| shell.toggle_vault_panel());
                             sync_active_terminal_input_policy(state);
                             },
+                            on_toggle_app_pane: move |pane_id: String| {
+                            // Opening a contributed pane fetches its schema from
+                            // the app's control endpoint; closing it needs no
+                            // round trip.
+                            let opened = state.with_mut(|shell| shell.toggle_app_pane(&pane_id));
+                            sync_active_terminal_input_policy(state);
+                            if let Some(seq) = opened {
+                                spawn(app_pane_fetch_schema(state, pane_id, seq));
+                            }
+                            },
                             on_restart_update: move || restart_into_pending_update(state),
                             on_request_window_drag: move || {
                             state.with_mut(|shell| shell.note_titlebar_drag_request());
@@ -45516,6 +46069,16 @@ fn app() -> Element {
                                     });
                                 }
                             },
+                            on_app_pane_action: {
+                                let desktop = desktop.clone();
+                                move |(pane_id, action, value): (String, String, Option<String>)| {
+                                    let desktop = desktop.clone();
+                                    spawn(app_pane_run_action(state, desktop, pane_id, action, value));
+                                }
+                            },
+                            on_app_pane_value: move |(widget_id, value): (String, String)| {
+                                state.with_mut(|shell| shell.set_app_pane_value(&widget_id, value));
+                            },
                         }
                     }
                 }
@@ -45920,7 +46483,7 @@ fn app() -> Element {
                                 accent: snapshot.palette.accent,
                                 is_dark: palette_is_dark(snapshot.palette),
                             },
-                        center_offset: toast_center_offset(snapshot.right_panel_mode),
+                        center_offset: toast_center_offset(&snapshot.right_panel_mode),
                         max_age_ms: TOAST_VIEWPORT_MAX_AGE_MS,
                         max_visible: TOAST_VIEWPORT_MAX_VISIBLE,
                         now_ms: current_millis(),
@@ -45965,6 +46528,8 @@ fn Titlebar(
     on_toggle_notifications: EventHandler<()>,
     on_toggle_app_sidebar: EventHandler<()>,
     on_toggle_vault: EventHandler<()>,
+    /// Opens (or closes) a pane the active app contributed, by its pane id.
+    on_toggle_app_pane: EventHandler<String>,
     on_restart_update: EventHandler<()>,
     on_request_window_drag: EventHandler<()>,
     on_toggle_maximized: EventHandler<()>,
@@ -46811,6 +47376,34 @@ fn Titlebar(
                             ondoubleclick: |evt| evt.stop_propagation(),
                             "🔑"
                         }
+                        }
+                        // Buttons CONTRIBUTED by the active libyggterm app. The
+                        // rail draws exactly what the app declared over OSC 7717
+                        // and nothing else — no app icon is hardcoded here.
+                        for pane in snapshot.sidebar_panes.iter().cloned() {
+                            button {
+                                key: "app-pane-{pane.id}",
+                                "data-titlebar-app-pane-button": "{pane.id}",
+                                title: "{pane.title}",
+                                style: utility_icon_style(
+                                    snapshot.palette,
+                                    snapshot.right_panel_mode == RightPanelMode::AppPane(pane.id.clone())
+                                ),
+                                onmousedown: |evt| {
+                                    evt.prevent_default();
+                                    evt.stop_propagation();
+                                },
+                                onclick: {
+                                    let on_toggle_app_pane = on_toggle_app_pane.clone();
+                                    let pane_id = pane.id.clone();
+                                    move |evt: MouseEvent| {
+                                        evt.stop_propagation();
+                                        on_toggle_app_pane.call(pane_id.clone());
+                                    }
+                                },
+                                ondoubleclick: |evt| evt.stop_propagation(),
+                                "{pane.icon}"
+                            }
                         }
                         button {
                             key: "titlebar-notifications-button",
@@ -53942,7 +54535,7 @@ fn TerminalCanvas(
                     snapshot.active_session_path.as_deref(),
                     &session_path,
                     is_remote_resume_session,
-                    snapshot.right_panel_mode,
+                    &snapshot.right_panel_mode,
                     snapshot.search_focused,
                     snapshot.command_mode_active,
                     titlebar_transient_focus_blocking(
@@ -54931,6 +55524,113 @@ fn TerminalCanvas(
                                                 "claimed_session": claimed_session,
                                                 "closed": closed,
                                             }),
+                                        );
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            // libyggterm SIDEBAR CONTRIBUTION (OSC 7717
+                            // `sidebar`). Same identity rule as a web surface:
+                            // the truth is the STREAM the OSC arrived on, not
+                            // the claimed session id (a remote session's env id
+                            // lives in the remote daemon's namespace).
+                            Ok(TerminalJsEvent::SidebarContribution {
+                                action,
+                                session: claimed_session,
+                                control,
+                                panes,
+                            }) => {
+                                let now_ms = current_millis();
+                                let contribution_session_path = session_path.clone();
+                                match action.as_str() {
+                                    "declare" => {
+                                        // A re-declare is the liveness heartbeat:
+                                        // bump and refresh panes, but NEVER
+                                        // re-resolve — resolving spawns an
+                                        // `ssh -L`, and once per heartbeat would
+                                        // leak one ssh every few seconds.
+                                        let known = state.with_mut(|shell| {
+                                            shell.sweep_stale_sidebar_contributions(now_ms);
+                                            let known = shell
+                                                .sidebar_contributions
+                                                .contains_key(&contribution_session_path);
+                                            if known {
+                                                shell.upsert_sidebar_contribution(
+                                                    &contribution_session_path,
+                                                    panes.clone(),
+                                                    now_ms,
+                                                    None,
+                                                );
+                                            }
+                                            known
+                                        });
+                                        if !known && let Some(control_url) = control {
+                                            let resolve_url = control_url.clone();
+                                            let resolve_target = web_surface_ssh_target.clone();
+                                            // The GUI fetches this endpoint over
+                                            // a plain socket, so a remote loopback
+                                            // needs an `ssh -L` forward — NOT the
+                                            // webview's SOCKS proxy.
+                                            let (effective_control, forward_child) =
+                                                task::spawn_blocking(move || {
+                                                    resolve_control_endpoint_url(
+                                                        &resolve_url,
+                                                        resolve_target.as_deref(),
+                                                    )
+                                                })
+                                                .await
+                                                .unwrap_or((control_url.clone(), None));
+                                            let forward_child = forward_child.map(|child| {
+                                                std::sync::Arc::new(std::sync::Mutex::new(child))
+                                            });
+                                            let pane_ids: Vec<String> =
+                                                panes.iter().map(|pane| pane.id.clone()).collect();
+                                            state.with_mut(|shell| {
+                                                shell.upsert_sidebar_contribution(
+                                                    &contribution_session_path,
+                                                    panes.clone(),
+                                                    now_ms,
+                                                    Some((effective_control.clone(), forward_child)),
+                                                );
+                                            });
+                                            append_trace_event(
+                                                &trace_home,
+                                                "ui",
+                                                "sidebar_contribution",
+                                                "declare",
+                                                json!({
+                                                    "session_path": contribution_session_path,
+                                                    "claimed_session": claimed_session,
+                                                    "control": effective_control,
+                                                    "panes": pane_ids,
+                                                }),
+                                            );
+                                        }
+                                    }
+                                    "close" => {
+                                        state.with_mut(|shell| {
+                                            shell.close_sidebar_contribution(
+                                                &contribution_session_path,
+                                            );
+                                            // The app that served the pane is
+                                            // gone; stop painting a schema no
+                                            // control endpoint backs.
+                                            if matches!(
+                                                shell.right_panel_mode,
+                                                RightPanelMode::AppPane(_)
+                                            ) {
+                                                shell.set_right_panel_mode(RightPanelMode::Hidden);
+                                            }
+                                            shell.app_pane_schema = None;
+                                            shell.app_pane_values.clear();
+                                            shell.app_pane_error = None;
+                                        });
+                                        append_trace_event(
+                                            &trace_home,
+                                            "ui",
+                                            "sidebar_contribution",
+                                            "close",
+                                            json!({ "session_path": contribution_session_path }),
                                         );
                                     }
                                     _ => {}
@@ -58508,7 +59208,7 @@ fn TerminalCanvas(
                                                         shell.server.active_session_path(),
                                                         &session_path,
                                                         false,
-                                                        shell.right_panel_mode,
+                                                        &shell.right_panel_mode,
                                                         shell.search_focused,
                                                         command_mode_active,
                                                         titlebar_transient_focus_blocking(
@@ -63825,7 +64525,7 @@ fn active_terminal_input_policy_signature(
         active_view_mode,
         active_session_path,
         terminal_session_path,
-        right_panel_mode: shell.right_panel_mode,
+        right_panel_mode: shell.right_panel_mode.clone(),
         search_focused: shell.search_focused,
         command_mode_active: is_command_query(&shell.search_query),
         titlebar_new_menu_open: shell.titlebar_new_menu_open,
@@ -63855,7 +64555,7 @@ fn apply_active_terminal_input_policy(
         signature.active_view_mode,
         signature.active_session_path.as_deref(),
         session_path,
-        signature.right_panel_mode,
+        &signature.right_panel_mode,
         signature.search_focused,
         signature.command_mode_active,
         titlebar_transient_focus_blocking(
@@ -64277,7 +64977,7 @@ fn terminal_initial_programmatic_focus(
     active_session_path: Option<&str>,
     session_path: &str,
     is_remote_resume_session: bool,
-    right_panel_mode: RightPanelMode,
+    right_panel_mode: &RightPanelMode,
     search_focused: bool,
     command_mode_active: bool,
     titlebar_transient_open: bool,
@@ -64295,7 +64995,7 @@ fn terminal_initial_programmatic_focus(
         )
         && right_panel_allows_terminal_autofocus(right_panel_mode)
 }
-fn right_panel_allows_terminal_autofocus(right_panel_mode: RightPanelMode) -> bool {
+fn right_panel_allows_terminal_autofocus(right_panel_mode: &RightPanelMode) -> bool {
     !matches!(
         right_panel_mode,
         RightPanelMode::Settings | RightPanelMode::Connect
@@ -64305,7 +65005,7 @@ fn terminal_runtime_input_policy(
     active_view_mode: WorkspaceViewMode,
     active_session_path: Option<&str>,
     session_path: &str,
-    right_panel_mode: RightPanelMode,
+    right_panel_mode: &RightPanelMode,
     search_focused: bool,
     command_mode_active: bool,
     titlebar_transient_open: bool,
@@ -64331,10 +65031,10 @@ fn terminal_runtime_input_policy(
     let focus_input = allow_input && (window_focused || terminal_input_override_active);
     (allow_input, focus_input)
 }
-fn right_panel_allows_terminal_input(right_panel_mode: RightPanelMode) -> bool {
+fn right_panel_allows_terminal_input(right_panel_mode: &RightPanelMode) -> bool {
     !matches!(right_panel_mode, RightPanelMode::Connect)
 }
-fn terminal_input_override_for_right_panel_mode(right_panel_mode: RightPanelMode) -> bool {
+fn terminal_input_override_for_right_panel_mode(right_panel_mode: &RightPanelMode) -> bool {
     let _ = right_panel_mode;
     false
 }
@@ -65254,7 +65954,8 @@ fn terminal_eval_script_with_canvas_renderer(
                     try {{
                         const raw = typeof data === 'string' ? data : '';
                         const parts = raw.split(';');
-                        if (parts[0] !== 'web-surface') {{
+                        const verb = parts[0];
+                        if (verb !== 'web-surface' && verb !== 'sidebar') {{
                             return true;
                         }}
                         const action = parts[1] || '';
@@ -65264,6 +65965,26 @@ fn terminal_eval_script_with_canvas_renderer(
                             payload = JSON.parse(new TextDecoder().decode(bytes));
                         }}
                         if (!action || typeof payload.session !== 'string' || !payload.session) {{
+                            return true;
+                        }}
+                        if (verb === 'sidebar') {{
+                            // The declaration carries only what the rail draws:
+                            // a control endpoint and pane buttons. Never a
+                            // schema (the GUI GETs that) and never a secret.
+                            const panes = Array.isArray(payload.panes) ? payload.panes : [];
+                            sendTerminalEvent({{
+                                kind: 'sidebar_contribution',
+                                action,
+                                session: payload.session,
+                                control: typeof payload.control === 'string' ? payload.control : null,
+                                panes: panes
+                                    .filter((pane) => pane && typeof pane.id === 'string' && pane.id)
+                                    .map((pane) => ({{
+                                        id: pane.id,
+                                        icon: typeof pane.icon === 'string' ? pane.icon : '',
+                                        title: typeof pane.title === 'string' ? pane.title : '',
+                                    }})),
+                            }});
                             return true;
                         }}
                         sendTerminalEvent({{
@@ -75957,14 +76678,23 @@ fn RightRail(
     on_fill_web_surface_login: EventHandler<()>,
     on_fill_vault_entry: EventHandler<(String, String)>,
     on_totp_vault_entry: EventHandler<(String, String)>,
+    /// (pane_id, action, value) — fired by any widget in a contributed pane.
+    on_app_pane_action: EventHandler<(String, String, Option<String>)>,
+    /// (widget_id, value) — a draft input changed; stays in the GUI until an
+    /// action carries it to the app.
+    on_app_pane_value: EventHandler<(String, String)>,
 ) -> Element {
-    let requested_mode = snapshot.right_panel_mode;
-    let mut retained_mode = use_signal(|| requested_mode);
-    use_effect(move || {
-        let current_retained = retained_mode();
-        if requested_mode != RightPanelMode::Hidden {
-            if current_retained != requested_mode {
-                retained_mode.set(requested_mode);
+    let requested_mode = snapshot.right_panel_mode.clone();
+    let mut retained_mode = use_signal({
+        let initial = requested_mode.clone();
+        move || initial
+    });
+    use_effect({
+        let requested_mode = requested_mode.clone();
+        move || {
+            let current_retained = retained_mode();
+            if requested_mode != RightPanelMode::Hidden && current_retained != requested_mode {
+                retained_mode.set(requested_mode.clone());
             }
         }
     });
@@ -75973,13 +76703,29 @@ fn RightRail(
     // pane collapses — the mode stays AppSidebar so it re-reveals when the
     // app is back, matching the icon's own visibility gate.
     let app_sidebar_available = snapshot.active_web_surface_profile.is_some();
+    // A contributed pane lives and dies with its declaration: when the app stops
+    // declaring (exited, session switched, contribution swept) the pane
+    // collapses, exactly as the hardcoded panes collapse with their surface.
+    let app_pane_available = |mode: &RightPanelMode| match mode {
+        RightPanelMode::AppPane(pane_id) => {
+            snapshot.sidebar_panes.iter().any(|pane| pane.id == *pane_id)
+        }
+        _ => true,
+    };
     let visible = requested_mode != RightPanelMode::Hidden
         && !(requested_mode == RightPanelMode::AppSidebar && !app_sidebar_available)
-        && !(requested_mode == RightPanelMode::Vault && !app_sidebar_available);
+        && !(requested_mode == RightPanelMode::Vault && !app_sidebar_available)
+        && app_pane_available(&requested_mode);
     let rendered_mode = if visible {
-        requested_mode
+        requested_mode.clone()
     } else {
         retained_mode()
+    };
+    // Extracted before the rsx! chain: an `if let` arm inside it defeats the
+    // macro's branch-type inference.
+    let rendered_app_pane_id = match &rendered_mode {
+        RightPanelMode::AppPane(pane_id) => Some(pane_id.clone()),
+        _ => None,
     };
     rsx! {
         SideRailShell {
@@ -76037,6 +76783,13 @@ fn RightRail(
                     snapshot: snapshot.clone(),
                     on_fill_vault_entry,
                     on_totp_vault_entry,
+                }
+            } else if rendered_app_pane_id.is_some() {
+                AppPaneRailBody {
+                    snapshot: snapshot.clone(),
+                    pane_id: rendered_app_pane_id.clone().unwrap_or_default(),
+                    on_app_pane_action,
+                    on_app_pane_value,
                 }
             }
             }
@@ -76301,6 +77054,272 @@ enum VaultPaneTab {
 /// override path. Metadata only in the pane (name/user/folder); the password
 /// is fetched at fill time and never held in component state (the Add form's
 /// draft password is the one deliberate exception — it exists to be typed).
+/// Renders a schema an APP declared, with generic widgets. yggterm knows nothing
+/// about what any of it means: a click just POSTs the widget's action id back to
+/// the app's control endpoint, and whatever schema comes back is drawn next.
+///
+/// This component is the whole reason `RightPanelMode::Vault` and `::AppSidebar`
+/// can die. Adding an app-specific branch here defeats it.
+#[component]
+fn AppPaneRailBody(
+    snapshot: SharedSnapshot,
+    pane_id: String,
+    on_app_pane_action: EventHandler<(String, String, Option<String>)>,
+    on_app_pane_value: EventHandler<(String, String)>,
+) -> Element {
+    let palette = snapshot.palette;
+    let muted_style = format!("font-size:10px; line-height:1.5; color:{};", palette.muted);
+    let section_style = format!(
+        "font-size:11px; font-weight:800; color:{};",
+        palette.muted
+    );
+    let text_style = format!("font-size:11px; color:{};", palette.text);
+    let field_style = format!(
+        "flex:1 1 auto; min-width:0; padding:6px 10px; border-radius:9px; \
+         border:1px solid rgba(127,127,127,0.35); background:rgba(127,127,127,0.10); \
+         color:{}; font-size:11px; outline:none;",
+        palette.text,
+    );
+    let primary_button_style = format!(
+        "align-self:flex-start; padding:7px 14px; border:0; border-radius:9px; \
+         background:{}; color:#fff; font-size:11px; font-weight:700; cursor:pointer;",
+        palette.accent
+    );
+    let plain_button_style = format!(
+        "align-self:flex-start; padding:7px 14px; border:1px solid rgba(127,127,127,0.35); \
+         border-radius:9px; background:transparent; color:{}; font-size:11px; \
+         font-weight:600; cursor:pointer;",
+        palette.text
+    );
+    let row_style = format!(
+        "display:flex; align-items:center; gap:8px; padding:7px 10px; border-radius:9px; \
+         background:rgba(127,127,127,0.10); color:{};",
+        palette.text
+    );
+    let row_action_style = format!(
+        "border:0; border-radius:7px; background:transparent; color:{}; font-size:12px; \
+         cursor:pointer; padding:2px 6px;",
+        palette.muted
+    );
+
+    let schema = snapshot
+        .app_pane_schema
+        .as_ref()
+        .filter(|state| state.pane_id == pane_id)
+        .map(|state| state.schema.clone());
+    let error = snapshot.app_pane_error.clone();
+    let title = schema
+        .as_ref()
+        .map(|schema| schema.title.clone())
+        .filter(|title| !title.is_empty())
+        .unwrap_or_else(|| pane_id.clone());
+
+    rsx! {
+        RailHeader { title: title, color: palette.text.to_string() }
+        RailScrollBody {
+            content: rsx!{
+            div {
+                style: "display:flex; flex-direction:column; gap:10px;",
+                if let Some(error) = error {
+                    div { style: "{muted_style}", "{error}" }
+                } else if let Some(schema) = schema {
+                    for (index, widget) in schema.widgets.iter().cloned().enumerate() {
+                        {
+                        let widget_key = widget.key(index);
+                        match widget {
+                            AppPaneWidget::Section { text } => rsx! {
+                                div { key: "{widget_key}", style: "{section_style}", "{text}" }
+                            },
+                            AppPaneWidget::Label { text, muted } => {
+                                let style = if muted { muted_style.clone() } else { text_style.clone() };
+                                rsx! {
+                                    div { key: "{widget_key}", style: "{style}", "{text}" }
+                                }
+                            },
+                            AppPaneWidget::Tabs { id, action, tabs, active } => rsx! {
+                                div {
+                                    key: "{widget_key}",
+                                    style: segmented_control_track_style(palette),
+                                    for tab in tabs.iter().cloned() {
+                                        button {
+                                            key: "{tab.id}",
+                                            "data-app-pane-tab": "{tab.id}",
+                                            style: segmented_control_segment_style(palette, tab.id == active, true, false),
+                                            onclick: {
+                                                let (pane_id, action, id, tab_id) =
+                                                    (pane_id.clone(), action.clone(), id.clone(), tab.id.clone());
+                                                let on_app_pane_action = on_app_pane_action.clone();
+                                                let on_app_pane_value = on_app_pane_value.clone();
+                                                move |_| {
+                                                    on_app_pane_value.call((id.clone(), tab_id.clone()));
+                                                    if !action.is_empty() {
+                                                        on_app_pane_action.call((
+                                                            pane_id.clone(),
+                                                            action.clone(),
+                                                            Some(tab_id.clone()),
+                                                        ));
+                                                    }
+                                                }
+                                            },
+                                            "{tab.label}"
+                                        }
+                                    }
+                                }
+                            },
+                            AppPaneWidget::SearchBox { id, placeholder, action, value } => rsx! {
+                                input {
+                                    key: "{widget_key}",
+                                    "data-app-pane-input": "{id}",
+                                    style: "{field_style}",
+                                    r#type: "text",
+                                    placeholder: "{placeholder}",
+                                    initial_value: "{value}",
+                                    oninput: {
+                                        let id = id.clone();
+                                        let on_app_pane_value = on_app_pane_value.clone();
+                                        move |evt: FormEvent| on_app_pane_value.call((id.clone(), evt.value()))
+                                    },
+                                    onkeydown: {
+                                        let (pane_id, action) = (pane_id.clone(), action.clone());
+                                        let on_app_pane_action = on_app_pane_action.clone();
+                                        move |evt: KeyboardEvent| {
+                                            if evt.key() == Key::Enter && !action.is_empty() {
+                                                on_app_pane_action.call((pane_id.clone(), action.clone(), None));
+                                            }
+                                        }
+                                    },
+                                }
+                            },
+                            AppPaneWidget::TextInput { id, label, placeholder, value, secret } => rsx! {
+                                div {
+                                    key: "{widget_key}",
+                                    style: "display:flex; flex-direction:column; gap:4px;",
+                                    if !label.is_empty() {
+                                        div { style: "{muted_style}", "{label}" }
+                                    }
+                                    input {
+                                        "data-app-pane-input": "{id}",
+                                        style: "{field_style}",
+                                        r#type: if secret { "password" } else { "text" },
+                                        placeholder: "{placeholder}",
+                                        initial_value: "{value}",
+                                        oninput: {
+                                            let id = id.clone();
+                                            let on_app_pane_value = on_app_pane_value.clone();
+                                            move |evt: FormEvent| on_app_pane_value.call((id.clone(), evt.value()))
+                                        },
+                                    }
+                                }
+                            },
+                            AppPaneWidget::NumberInput { id, label, value, min, max } => rsx! {
+                                div {
+                                    key: "{widget_key}",
+                                    style: "display:flex; align-items:center; gap:6px;",
+                                    if !label.is_empty() {
+                                        div { style: "{muted_style}", "{label}" }
+                                    }
+                                    input {
+                                        "data-app-pane-input": "{id}",
+                                        style: "{field_style} max-width:88px;",
+                                        r#type: "number",
+                                        min: "{min}",
+                                        max: "{max}",
+                                        initial_value: "{value}",
+                                        oninput: {
+                                            let id = id.clone();
+                                            let on_app_pane_value = on_app_pane_value.clone();
+                                            move |evt: FormEvent| on_app_pane_value.call((id.clone(), evt.value()))
+                                        },
+                                    }
+                                }
+                            },
+                            AppPaneWidget::Toggle { id, label, action, value } => rsx! {
+                                label {
+                                    key: "{widget_key}",
+                                    style: "display:flex; align-items:center; gap:8px; font-size:11px; color:{palette.text}; cursor:pointer;",
+                                    input {
+                                        "data-app-pane-toggle": "{id}",
+                                        r#type: "checkbox",
+                                        checked: value,
+                                        onchange: {
+                                            let (pane_id, action, id) = (pane_id.clone(), action.clone(), id.clone());
+                                            let on_app_pane_action = on_app_pane_action.clone();
+                                            let on_app_pane_value = on_app_pane_value.clone();
+                                            move |evt: FormEvent| {
+                                                let next = evt.value();
+                                                on_app_pane_value.call((id.clone(), next.clone()));
+                                                if !action.is_empty() {
+                                                    on_app_pane_action.call((pane_id.clone(), action.clone(), Some(next)));
+                                                }
+                                            }
+                                        },
+                                    }
+                                    "{label}"
+                                }
+                            },
+                            AppPaneWidget::Button { id, label, action, primary } => rsx! {
+                                button {
+                                    key: "{widget_key}",
+                                    "data-app-pane-button": "{id}",
+                                    style: if primary { primary_button_style.clone() } else { plain_button_style.clone() },
+                                    onclick: {
+                                        let (pane_id, action) = (pane_id.clone(), action.clone());
+                                        let on_app_pane_action = on_app_pane_action.clone();
+                                        move |_| on_app_pane_action.call((pane_id.clone(), action.clone(), None))
+                                    },
+                                    "{label}"
+                                }
+                            },
+                            AppPaneWidget::ListRow { id, title, subtitle, actions } => rsx! {
+                                div {
+                                    key: "{widget_key}",
+                                    "data-app-pane-row": "{id}",
+                                    style: "{row_style}",
+                                    div {
+                                        style: "display:flex; flex-direction:column; gap:1px; min-width:0; flex:1 1 auto;",
+                                        div {
+                                            style: "font-size:11px; font-weight:700; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;",
+                                            "{title}"
+                                        }
+                                        if !subtitle.is_empty() {
+                                            div {
+                                                style: "{muted_style} overflow:hidden; text-overflow:ellipsis; white-space:nowrap;",
+                                                "{subtitle}"
+                                            }
+                                        }
+                                    }
+                                    for row_action in actions.iter().cloned() {
+                                        button {
+                                            key: "{row_action.action}",
+                                            style: "{row_action_style}",
+                                            title: "{row_action.title}",
+                                            onclick: {
+                                                let (pane_id, action, row_id) =
+                                                    (pane_id.clone(), row_action.action.clone(), id.clone());
+                                                let on_app_pane_action = on_app_pane_action.clone();
+                                                move |_| on_app_pane_action.call((
+                                                    pane_id.clone(),
+                                                    action.clone(),
+                                                    Some(row_id.clone()),
+                                                ))
+                                            },
+                                            "{row_action.label}"
+                                        }
+                                    }
+                                }
+                            },
+                        }
+                        }
+                    }
+                } else {
+                    div { style: "{muted_style}", "Loading…" }
+                }
+            }
+            }
+        }
+    }
+}
+
 #[component]
 fn VaultRailBody(
     snapshot: SharedSnapshot,
@@ -78698,7 +79717,7 @@ fn ThemeDialogButton(
         }
     }
 }
-fn toast_center_offset(right_panel_mode: RightPanelMode) -> i32 {
+fn toast_center_offset(right_panel_mode: &RightPanelMode) -> i32 {
     let _ = right_panel_mode;
     0
 }
@@ -84092,7 +85111,7 @@ mod tests {
             Some("local://shell"),
             "local://shell",
             false,
-            RightPanelMode::Hidden,
+            &RightPanelMode::Hidden,
             false,
             false,
             false,
@@ -84103,7 +85122,7 @@ mod tests {
             Some("local://shell"),
             "local://shell",
             false,
-            RightPanelMode::Metadata,
+            &RightPanelMode::Metadata,
             false,
             false,
             false,
@@ -84114,7 +85133,7 @@ mod tests {
             Some("local://shell"),
             "local://shell",
             false,
-            RightPanelMode::Hidden,
+            &RightPanelMode::Hidden,
             false,
             false,
             false,
@@ -84125,7 +85144,7 @@ mod tests {
             Some("local://other"),
             "local://shell",
             false,
-            RightPanelMode::Hidden,
+            &RightPanelMode::Hidden,
             false,
             false,
             false,
@@ -84136,7 +85155,7 @@ mod tests {
             Some("remote-session://oc/123"),
             "remote-session://oc/123",
             true,
-            RightPanelMode::Hidden,
+            &RightPanelMode::Hidden,
             false,
             false,
             false,
@@ -84147,7 +85166,7 @@ mod tests {
             Some("local://shell"),
             "local://shell",
             false,
-            RightPanelMode::Settings,
+            &RightPanelMode::Settings,
             false,
             false,
             false,
@@ -84158,7 +85177,7 @@ mod tests {
             Some("local://shell"),
             "local://shell",
             false,
-            RightPanelMode::Hidden,
+            &RightPanelMode::Hidden,
             true,
             false,
             false,
@@ -84169,7 +85188,7 @@ mod tests {
             Some("local://shell"),
             "local://shell",
             false,
-            RightPanelMode::Hidden,
+            &RightPanelMode::Hidden,
             false,
             true,
             false,
@@ -84180,7 +85199,7 @@ mod tests {
             Some("local://shell"),
             "local://shell",
             false,
-            RightPanelMode::Hidden,
+            &RightPanelMode::Hidden,
             false,
             false,
             true,
@@ -84248,7 +85267,7 @@ mod tests {
             Some("local://shell"),
             "local://shell",
             false,
-            RightPanelMode::Settings,
+            &RightPanelMode::Settings,
             false,
             false,
             false,
@@ -84280,7 +85299,7 @@ mod tests {
                 WorkspaceViewMode::Terminal,
                 Some("local://shell"),
                 "local://shell",
-                RightPanelMode::Metadata,
+                &RightPanelMode::Metadata,
                 false,
                 false,
                 false,
@@ -84296,7 +85315,7 @@ mod tests {
                 WorkspaceViewMode::Terminal,
                 Some("local://shell"),
                 "local://shell",
-                RightPanelMode::Notifications,
+                &RightPanelMode::Notifications,
                 false,
                 false,
                 false,
@@ -84315,7 +85334,7 @@ mod tests {
                 WorkspaceViewMode::Terminal,
                 Some("local://shell"),
                 "local://shell",
-                RightPanelMode::Settings,
+                &RightPanelMode::Settings,
                 false,
                 false,
                 false,
@@ -84331,7 +85350,7 @@ mod tests {
                 WorkspaceViewMode::Terminal,
                 Some("local://shell"),
                 "local://shell",
-                RightPanelMode::Settings,
+                &RightPanelMode::Settings,
                 false,
                 false,
                 false,
@@ -84347,7 +85366,7 @@ mod tests {
                 WorkspaceViewMode::Terminal,
                 Some("local://shell"),
                 "local://shell",
-                RightPanelMode::Connect,
+                &RightPanelMode::Connect,
                 false,
                 false,
                 false,
@@ -84363,7 +85382,7 @@ mod tests {
                 WorkspaceViewMode::Terminal,
                 Some("local://shell"),
                 "local://shell",
-                RightPanelMode::Connect,
+                &RightPanelMode::Connect,
                 false,
                 false,
                 false,
@@ -84379,7 +85398,7 @@ mod tests {
                 WorkspaceViewMode::Terminal,
                 Some("local://shell"),
                 "local://shell",
-                RightPanelMode::Settings,
+                &RightPanelMode::Settings,
                 true,
                 false,
                 false,
@@ -84395,7 +85414,7 @@ mod tests {
                 WorkspaceViewMode::Terminal,
                 Some("local://shell"),
                 "local://shell",
-                RightPanelMode::Hidden,
+                &RightPanelMode::Hidden,
                 false,
                 false,
                 true,
@@ -84414,7 +85433,7 @@ mod tests {
                 WorkspaceViewMode::Terminal,
                 Some("local://shell"),
                 "local://shell",
-                RightPanelMode::Hidden,
+                &RightPanelMode::Hidden,
                 false,
                 false,
                 false,
@@ -84528,7 +85547,7 @@ mod tests {
                 WorkspaceViewMode::Terminal,
                 Some("local://shell"),
                 "local://shell",
-                RightPanelMode::Hidden,
+                &RightPanelMode::Hidden,
                 false,
                 false,
                 false,
@@ -84544,7 +85563,7 @@ mod tests {
                 WorkspaceViewMode::Terminal,
                 Some("local://shell"),
                 "local://shell",
-                RightPanelMode::Hidden,
+                &RightPanelMode::Hidden,
                 true,
                 false,
                 false,
@@ -84563,7 +85582,7 @@ mod tests {
                 WorkspaceViewMode::Terminal,
                 Some("local://shell"),
                 "local://shell",
-                RightPanelMode::Hidden,
+                &RightPanelMode::Hidden,
                 false,
                 false,
                 false,
@@ -84579,7 +85598,7 @@ mod tests {
                 WorkspaceViewMode::Terminal,
                 Some("local://shell"),
                 "local://shell",
-                RightPanelMode::Hidden,
+                &RightPanelMode::Hidden,
                 false,
                 false,
                 false,
@@ -84646,16 +85665,16 @@ mod tests {
     #[test]
     fn terminal_input_override_defaults_to_no_right_panel() {
         assert!(!terminal_input_override_for_right_panel_mode(
-            RightPanelMode::Settings
+            &RightPanelMode::Settings
         ));
         assert!(!terminal_input_override_for_right_panel_mode(
-            RightPanelMode::Hidden
+            &RightPanelMode::Hidden
         ));
         assert!(!terminal_input_override_for_right_panel_mode(
-            RightPanelMode::Metadata
+            &RightPanelMode::Metadata
         ));
         assert!(!terminal_input_override_for_right_panel_mode(
-            RightPanelMode::Connect
+            &RightPanelMode::Connect
         ));
     }
     #[test]
@@ -87068,6 +88087,89 @@ mod tests {
     }
 
     #[test]
+    // A contributed pane's widgets are keyed by KIND and id, never by position.
+    // Keying on the index let Dioxus reuse a `section` node for a `label` when a
+    // tab switch changed the widget at that slot: same tag, so the section's
+    // `text-transform:uppercase` survived and the Tools tab rendered
+    // "UNLOCKED · 1107 ITEMS". Caught live, not by a test — hence this one.
+    #[test]
+    fn app_pane_widget_keys_distinguish_kinds_at_the_same_index() {
+        let section = AppPaneWidget::Section { text: "Vault".into() };
+        let label = AppPaneWidget::Label { text: "unlocked".into(), muted: true };
+        assert_ne!(section.key(1), label.key(1));
+
+        // Identity, not position: the same row keeps its key as the list moves.
+        let row = |id: &str| AppPaneWidget::ListRow {
+            id: id.to_string(),
+            title: String::new(),
+            subtitle: String::new(),
+            actions: Vec::new(),
+        };
+        assert_eq!(row("a").key(0), row("a").key(7));
+        assert_ne!(row("a").key(0), row("b").key(0));
+    }
+
+    // The GUI must parse exactly what an app emits: kebab-case tags, absent
+    // optional fields defaulting rather than failing the whole pane.
+    #[test]
+    fn app_pane_schema_parses_every_widget_kind() {
+        let schema: AppPaneSchema = serde_json::from_value(json!({
+            "title": "Vault",
+            "widgets": [
+                {"kind": "section", "text": "All items"},
+                {"kind": "label", "text": "none", "muted": true},
+                {"kind": "tabs", "id": "tab", "active": "fill",
+                 "tabs": [{"id": "fill", "label": "Fill"}]},
+                {"kind": "search-box", "id": "query"},
+                {"kind": "text-input", "id": "name"},
+                {"kind": "number-input", "id": "len", "value": 24, "min": 8, "max": 64},
+                {"kind": "toggle", "id": "adblock", "label": "Adblock", "value": true},
+                {"kind": "button", "id": "add", "label": "Add", "action": "add"},
+                {"kind": "list-row", "id": "r1", "title": "github.com",
+                 "actions": [{"action": "fill", "label": "⧉"}]},
+            ],
+        }))
+        .expect("schema parses");
+        assert_eq!(schema.title, "Vault");
+        assert_eq!(schema.widgets.len(), 9);
+        // An omitted `action` is empty, not an error: a search box need not act.
+        assert!(matches!(&schema.widgets[3], AppPaneWidget::SearchBox { action, .. } if action.is_empty()));
+        assert!(matches!(&schema.widgets[8], AppPaneWidget::ListRow { actions, .. } if actions.len() == 1));
+    }
+
+    // An unknown widget kind must fail the pane, not silently render a hole:
+    // a schema the GUI half-understands is worse than an error message.
+    #[test]
+    fn app_pane_schema_rejects_an_unknown_widget_kind() {
+        let result = serde_json::from_value::<AppPaneSchema>(json!({
+            "widgets": [{"kind": "hologram", "text": "?"}],
+        }));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn app_pane_urls_survive_a_trailing_slash() {
+        assert_eq!(
+            app_pane_schema_url("http://127.0.0.1:41234/", "vault"),
+            "http://127.0.0.1:41234/pane/vault"
+        );
+        assert_eq!(
+            app_pane_action_url("http://127.0.0.1:41234"),
+            "http://127.0.0.1:41234/action"
+        );
+    }
+
+    // `RightPanelMode::AppPane` carries the app's pane id, so two panes of the
+    // same app are different modes. (This is why the enum lost `Copy`.)
+    #[test]
+    fn app_pane_modes_are_distinguished_by_pane_id() {
+        assert_ne!(
+            RightPanelMode::AppPane("vault".into()),
+            RightPanelMode::AppPane("settings".into())
+        );
+        assert_eq!(right_panel_mode_label(&RightPanelMode::AppPane("vault".into())), "app_pane");
+    }
+
     fn live_session_keep_alive_dot_renders_in_fixed_leading_rail() {
         let source = include_str!("shell.rs");
         let row_layout_ix = source
@@ -105155,6 +106257,9 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         };
         let row = test_sidebar_row(session_path);
         let snapshot = RenderSnapshot {
+            sidebar_panes: Vec::new(),
+            app_pane_schema: None,
+            app_pane_error: None,
             palette: palette(UiTheme::ZedLight),
             search_query: String::new(),
             search_active: false,
@@ -105730,6 +106835,9 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         };
         let row = test_sidebar_row("local://stale");
         let snapshot = RenderSnapshot {
+            sidebar_panes: Vec::new(),
+            app_pane_schema: None,
+            app_pane_error: None,
             palette: palette(UiTheme::ZedLight),
             search_query: String::new(),
             search_active: false,
@@ -105875,6 +106983,9 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         };
         let row = test_sidebar_row(session_path);
         let snapshot = RenderSnapshot {
+            sidebar_panes: Vec::new(),
+            app_pane_schema: None,
+            app_pane_error: None,
             palette: palette(UiTheme::ZedLight),
             search_query: String::new(),
             search_active: false,
@@ -106020,6 +107131,9 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         };
         let row = test_sidebar_row(session_path);
         let snapshot = RenderSnapshot {
+            sidebar_panes: Vec::new(),
+            app_pane_schema: None,
+            app_pane_error: None,
             palette: palette(UiTheme::ZedLight),
             search_query: String::new(),
             search_active: false,
@@ -106168,6 +107282,9 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         };
         let row = test_sidebar_row(session_path);
         let snapshot = RenderSnapshot {
+            sidebar_panes: Vec::new(),
+            app_pane_schema: None,
+            app_pane_error: None,
             palette: palette(UiTheme::ZedLight),
             search_query: String::new(),
             search_active: false,
@@ -106320,6 +107437,9 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         };
         let row = test_sidebar_row(session_path);
         let snapshot = RenderSnapshot {
+            sidebar_panes: Vec::new(),
+            app_pane_schema: None,
+            app_pane_error: None,
             palette: palette(UiTheme::ZedLight),
             search_query: String::new(),
             search_active: false,
@@ -106464,6 +107584,9 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         };
         let row = test_sidebar_row("local://active");
         let snapshot = RenderSnapshot {
+            sidebar_panes: Vec::new(),
+            app_pane_schema: None,
+            app_pane_error: None,
             palette: palette(UiTheme::ZedLight),
             search_query: String::new(),
             search_active: false,
@@ -106608,6 +107731,9 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         };
         let row = test_sidebar_row("local://active");
         let snapshot = RenderSnapshot {
+            sidebar_panes: Vec::new(),
+            app_pane_schema: None,
+            app_pane_error: None,
             palette: palette(UiTheme::ZedLight),
             search_query: String::new(),
             search_active: false,
@@ -106786,6 +107912,9 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         };
         let row = test_sidebar_row("remote-session://guihost/idle");
         let snapshot = RenderSnapshot {
+            sidebar_panes: Vec::new(),
+            app_pane_schema: None,
+            app_pane_error: None,
             palette: palette(UiTheme::ZedLight),
             search_query: String::new(),
             search_active: false,
@@ -106933,6 +108062,9 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         };
         let row = test_sidebar_row("local://active");
         let snapshot = RenderSnapshot {
+            sidebar_panes: Vec::new(),
+            app_pane_schema: None,
+            app_pane_error: None,
             palette: palette(UiTheme::ZedLight),
             search_query: String::new(),
             search_active: false,
@@ -107112,6 +108244,9 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         };
         let row = test_sidebar_row(session_path);
         let snapshot = RenderSnapshot {
+            sidebar_panes: Vec::new(),
+            app_pane_schema: None,
+            app_pane_error: None,
             palette: palette(UiTheme::ZedLight),
             search_query: String::new(),
             search_active: false,
@@ -107468,6 +108603,9 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
     fn snapshot_terminal_mount_epoch_defaults_to_zero_until_a_real_mount_exists() {
         let session_path = "local://test";
         let snapshot = RenderSnapshot {
+            sidebar_panes: Vec::new(),
+            app_pane_schema: None,
+            app_pane_error: None,
             palette: palette(UiTheme::ZedLight),
             search_query: String::new(),
             search_active: false,
