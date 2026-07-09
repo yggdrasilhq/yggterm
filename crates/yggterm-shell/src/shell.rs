@@ -921,6 +921,16 @@ struct WebSurfaceUiState {
     last_seen_ms: u64,
     /// In-progress address-bar edit for the ACTIVE tab; None shows the tab URL.
     address_draft: Option<String>,
+    /// Keyboard-selected omnibox suggestion (index into the rendered
+    /// suggestion rows); None = plain Enter-on-draft behavior.
+    address_suggestion_index: Option<usize>,
+    /// The LAST URL the app's OSC stream delivered (open or heartbeat). This —
+    /// not the app tab's current URL — is what an incoming OSC URL is compared
+    /// against to detect a real app-side navigation: the app tab's URL is
+    /// user-navigable (address bar, in-page links), and comparing against it
+    /// made every ~4s heartbeat clobber the user's navigation back to the
+    /// app's start page.
+    osc_url: String,
     /// Profile-picker state (OSC action "pick", no-arg ychrome): the surface
     /// shows the GUI-NATIVE profile picker instead of tab bar + page; choosing
     /// GETs `/open?url=&profile=` on this (already egress-resolved, so
@@ -1076,6 +1086,14 @@ struct WebSurfaceOverlayView {
     /// renders the native profile picker (this is the GUI-reachable control
     /// endpoint to GET /open on) instead of tab bar + page.
     picker_control_url: Option<String>,
+    /// Omnibox dropdown rows for the current draft: history matches as
+    /// (url, title), most recent first. Empty when not editing.
+    address_suggestions: Vec<(String, String)>,
+    /// Keyboard-selected dropdown row: 0 = the synthesized go/search row,
+    /// 1.. = address_suggestions[i-1]. None = plain Enter-on-draft.
+    address_suggestion_index: Option<usize>,
+    /// Active tab's profile (drives which history file feeds suggestions).
+    profile: String,
 }
 #[derive(Debug, Clone, PartialEq)]
 struct WebSurfaceOverlayTabView {
@@ -1170,6 +1188,10 @@ struct AppliedWebSurface {
     /// alive detached from the overlay). Unstashed on reveal; destroyed when
     /// the background hold expires.
     stashed_at_ms: Option<u64>,
+    /// Last engine-reported page (uri, title) — the poll baseline for
+    /// observing in-page navigation (address bar follow, tab title, history).
+    page_url: String,
+    page_title: String,
 }
 /// How long a backgrounded session's surface stays alive (stashed, page state
 /// intact) before it is destroyed. `~/.yggterm/web-surface.json`
@@ -1214,6 +1236,78 @@ fn web_surface_search_url_template() -> String {
 /// Pure (no config/env read) so it is deterministically testable.
 fn web_surface_search_url_from_template(template: &str, query: &str) -> String {
     template.replace("{q}", &web_surface_query_encode(query))
+}
+/// Per-profile browsing-history file (append-only JSONL `{ts_ms, url, title}`,
+/// written by the native-surface reconciler's page observer). None for the
+/// reserved ephemeral profile — temp browsing must leave no disk trace,
+/// matching its ephemeral WebContext.
+fn web_surface_history_path(profile: &str) -> Option<std::path::PathBuf> {
+    if profile == WEB_SURFACE_TEMP_PROFILE {
+        return None;
+    }
+    let home = yggterm_core::resolve_yggterm_home().ok()?;
+    Some(home.join("web-profiles").join(profile).join("history.jsonl"))
+}
+fn append_web_surface_history(profile: &str, url: &str, title: &str) {
+    if !url.starts_with("http://") && !url.starts_with("https://") {
+        return;
+    }
+    let Some(path) = web_surface_history_path(profile) else {
+        return;
+    };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let line = json!({"ts_ms": current_millis(), "url": url, "title": title}).to_string();
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        use std::io::Write as _;
+        let _ = writeln!(file, "{line}");
+    }
+}
+/// Omnibox history suggestions for `query`: most-recent-first substring match
+/// (case-insensitive, over url + title), deduped by URL. Deterministic given
+/// the history file contents.
+fn web_surface_history_suggestions(
+    profile: &str,
+    query: &str,
+    limit: usize,
+) -> Vec<(String, String)> {
+    let query = query.trim().to_lowercase();
+    if query.is_empty() {
+        return Vec::new();
+    }
+    let Some(path) = web_surface_history_path(profile) else {
+        return Vec::new();
+    };
+    let Ok(raw) = std::fs::read_to_string(&path) else {
+        return Vec::new();
+    };
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut out = Vec::new();
+    for line in raw.lines().rev() {
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        let Some(url) = value.get("url").and_then(Value::as_str) else {
+            continue;
+        };
+        let title = value.get("title").and_then(Value::as_str).unwrap_or("");
+        if !url.to_lowercase().contains(&query) && !title.to_lowercase().contains(&query) {
+            continue;
+        }
+        if !seen.insert(url.to_string()) {
+            continue;
+        }
+        out.push((url.to_string(), title.to_string()));
+        if out.len() >= limit {
+            break;
+        }
+    }
+    out
 }
 /// Published mirror of the reconciler's applied surfaces: (session_path,
 /// tab_id) → native surface id. The reconcile loop is the ONLY writer (it
@@ -1567,6 +1661,62 @@ async fn web_surface_native_reconcile_loop(
                         desktop.set_web_surface_visible(entry.native_id, want_visible);
                         entry.visible = want_visible;
                     }
+                    // Observe engine-side page state: in-page navigations
+                    // (link clicks, redirects, form submits) never pass
+                    // through the shell's nav model, so poll the engine and
+                    // follow it — address bar, tab title, and per-profile
+                    // history all track where the page ACTUALLY is.
+                    if entry.stashed_at_ms.is_none()
+                        && let Some((page_url, page_title)) =
+                            desktop.web_surface_page_state(entry.native_id)
+                    {
+                        let url_changed =
+                            !page_url.is_empty() && page_url != entry.page_url;
+                        let title_changed =
+                            !page_title.is_empty() && page_title != entry.page_title;
+                        if url_changed || title_changed {
+                            entry.page_url = page_url.clone();
+                            entry.page_title = page_title.clone();
+                            if url_changed {
+                                // Keep the applied-URL diff baseline on the
+                                // real page so a later shell-driven navigation
+                                // (even back to the previous URL) still fires.
+                                entry.url = page_url.clone();
+                            }
+                            let mut writable = state;
+                            let record = writable.with_mut(|shell| {
+                                let Some(surface) =
+                                    shell.web_surfaces.get_mut(key.0.as_str())
+                                else {
+                                    return false;
+                                };
+                                let Some(tab) =
+                                    surface.tabs.iter_mut().find(|tab| tab.id == key.1)
+                                else {
+                                    return false;
+                                };
+                                // ssh -L rewritten tabs report the LOCAL
+                                // forward end as their URI — never surface
+                                // that in the address bar or history.
+                                let followable = tab.forward_child.is_none();
+                                if followable && url_changed {
+                                    tab.url = page_url.clone();
+                                    tab.effective_url = page_url.clone();
+                                }
+                                if !page_title.is_empty() {
+                                    tab.title = Some(page_title.clone());
+                                }
+                                followable
+                            });
+                            if record && url_changed {
+                                append_web_surface_history(
+                                    &entry.profile,
+                                    &page_url,
+                                    &page_title,
+                                );
+                            }
+                        }
+                    }
                 } else if want_visible
                     && let Some(rect) = rect
                 {
@@ -1614,13 +1764,15 @@ async fn web_surface_native_reconcile_loop(
                                 key,
                                 AppliedWebSurface {
                                     native_id,
-                                    url: effective_url,
+                                    url: effective_url.clone(),
                                     bounds: rect,
                                     visible: true,
                                     reload_nonce,
                                     socks_port,
                                     profile,
                                     stashed_at_ms: None,
+                                    page_url: effective_url,
+                                    page_title: String::new(),
                                 },
                             );
                         }
@@ -4386,8 +4538,11 @@ impl ShellState {
                     let _ = child.wait();
                 }
             }
-            if app_tab.url == url && app_tab.profile == profile {
-                if title.is_some() {
+            if existing.osc_url == url && app_tab.profile == profile {
+                // Same URL the app last delivered (a heartbeat): liveness
+                // only. The app tab may have been USER-navigated elsewhere
+                // meanwhile — that navigation must survive heartbeats.
+                if title.is_some() && app_tab.url == url {
                     app_tab.title = title;
                 }
                 // Keep the established forward; kill the redundant new one.
@@ -4398,6 +4553,7 @@ impl ShellState {
             } else {
                 // The app navigated (or switched profile): retarget the app
                 // tab, keep user tabs.
+                existing.osc_url = url.clone();
                 app_tab.kill_forward();
                 app_tab.url = url.clone();
                 app_tab.effective_url = effective_url;
@@ -4423,7 +4579,7 @@ impl ShellState {
             socks_port,
             title,
             forward_child: forward_child.map(|child| Arc::new(Mutex::new(child))),
-            history: vec![url],
+            history: vec![url.clone()],
             history_index: 0,
             reload_nonce: 0,
             profile,
@@ -4437,6 +4593,8 @@ impl ShellState {
                 opened_at_ms: now_ms,
                 last_seen_ms: now_ms,
                 address_draft: None,
+                address_suggestion_index: None,
+                osc_url: url,
                 picker: None,
             },
         ) {
@@ -4503,6 +4661,8 @@ impl ShellState {
                 opened_at_ms: now_ms,
                 last_seen_ms: now_ms,
                 address_draft: None,
+                address_suggestion_index: None,
+                osc_url: control_url.clone(),
                 picker: Some(WebSurfacePickerState {
                     control_url,
                     forward_child: forward_child.map(|child| Arc::new(Mutex::new(child))),
@@ -4612,9 +4772,34 @@ impl ShellState {
         }
     }
     /// Address-bar edit state for the active tab (None = show the tab URL).
+    /// Any draft change resets the dropdown selection — the row list is about
+    /// to change under it.
     fn web_surface_set_address_draft(&mut self, session_path: &str, draft: Option<String>) {
         if let Some(surface) = self.web_surfaces.get_mut(session_path) {
             surface.address_draft = draft;
+            surface.address_suggestion_index = None;
+        }
+    }
+    /// Move the omnibox dropdown selection by `delta` over `row_count` rows
+    /// (row 0 = the synthesized go/search row). Wraps around.
+    fn web_surface_move_address_suggestion(
+        &mut self,
+        session_path: &str,
+        delta: i64,
+        row_count: usize,
+    ) {
+        if row_count == 0 {
+            return;
+        }
+        if let Some(surface) = self.web_surfaces.get_mut(session_path) {
+            let count = row_count as i64;
+            let next = match surface.address_suggestion_index {
+                Some(index) => (index as i64 + delta).rem_euclid(count),
+                // From no selection: down enters at the top, up at the bottom.
+                None if delta >= 0 => 0,
+                None => count - 1,
+            };
+            surface.address_suggestion_index = Some(next as usize);
         }
     }
     /// Commit a resolved navigation onto a tab. `history_index` Some = a
@@ -4702,6 +4887,11 @@ impl ShellState {
             .history
             .get(active.history_index + 1)
             .map(|url| (active.history_index + 1, url.clone()));
+        let address_suggestions = surface
+            .address_draft
+            .as_deref()
+            .map(|draft| web_surface_history_suggestions(&active.profile, draft, 6))
+            .unwrap_or_default();
         Some(WebSurfaceOverlayView {
             tabs,
             active_tab_id,
@@ -4716,6 +4906,9 @@ impl ShellState {
                 .picker
                 .as_ref()
                 .map(|picker| picker.control_url.clone()),
+            address_suggestions,
+            address_suggestion_index: surface.address_suggestion_index,
+            profile: active.profile.clone(),
         })
     }
     fn set_window_focused(&mut self, focused: bool) {
@@ -53573,7 +53766,16 @@ fn TerminalCanvas(
                                             shell.sweep_stale_web_surfaces(now_ms);
                                             shell.touch_web_surface(&surface_session_path, now_ms)
                                         });
+                                        // A heartbeat is LIVENESS, not intent: it may
+                                        // refresh/retarget an existing surface but must
+                                        // never CREATE one — after a GUI-side close
+                                        // (Ctrl+C sent, app dying), an in-flight
+                                        // heartbeat resurrected a ghost overlay until
+                                        // the app's own close OSC landed.
+                                        let heartbeat_for_gone_surface =
+                                            !touched && action == "heartbeat";
                                         let fresh_url = url
+                                            .filter(|_| !heartbeat_for_gone_surface)
                                             .filter(|url| web_surface_url_scheme_allowed(url))
                                             .filter(|url| {
                                                 !touched
@@ -53582,12 +53784,15 @@ fn TerminalCanvas(
                                                             .web_surfaces
                                                             .get(&surface_session_path)
                                                             .is_none_or(|surface| {
-                                                                surface
-                                                                    .tabs
-                                                                    .first()
-                                                                    .is_none_or(|app_tab| {
-                                                                        app_tab.url != *url
-                                                                    })
+                                                                // Compare against the app's
+                                                                // last OSC URL, NOT the app
+                                                                // tab's current URL: the tab
+                                                                // is user-navigable, and
+                                                                // heartbeats must not clobber
+                                                                // a user navigation back to
+                                                                // the app's page.
+                                                                surface.picker.is_some()
+                                                                    || surface.osc_url != *url
                                                             })
                                                     })
                                             });
@@ -58760,7 +58965,10 @@ fn TerminalCanvas(
                         // inactive tabs recede (Chrome-like). Tabs share
                         // width equally and shrink together when crowded.
                         div {
-                            style: "display:flex; align-items:flex-end; gap:2px; padding:6px 8px 0; background:rgba(127,127,127,0.16); user-select:none; overflow:hidden;",
+                            // align-items:stretch + centered content in every
+                            // child = tabs, per-tab ✕, "+" and the surface ✕
+                            // all share ONE vertical center line.
+                            style: "display:flex; align-items:stretch; gap:2px; padding:6px 8px 0; min-height:35px; box-sizing:border-box; background:rgba(127,127,127,0.16); user-select:none; overflow:hidden;",
                             {web_overlay.tabs.iter().map(|tab| {
                                 let tab_id = tab.id;
                                 let tab_label = tab.label.clone();
@@ -58777,7 +58985,7 @@ fn TerminalCanvas(
                                     div {
                                         key: "ws-tab-{tab_id}",
                                         style: format!(
-                                            "display:flex; align-items:center; gap:6px; flex:1 1 0; max-width:200px; min-width:0; padding:6px 10px; \
+                                            "display:flex; align-items:center; gap:6px; flex:1 1 0; max-width:200px; min-width:0; padding:0 10px; \
                                              border-radius:8px 8px 0 0; background:{}; color:{}; opacity:{}; cursor:pointer; font-size:12px;",
                                             tab_background, theme.foreground, tab_opacity,
                                         ),
@@ -58832,14 +59040,19 @@ fn TerminalCanvas(
                                                     });
                                                 }
                                             },
-                                            "✕"
+                                            // The app tab's button QUITS ychrome
+                                            // (Ctrl+C) — a ✕ there read as "close
+                                            // tab" and killed the whole app on a
+                                            // misclick, so it wears the power
+                                            // glyph instead.
+                                            if is_app_tab { "⏻" } else { "✕" }
                                         }
                                     }
                                 }
                             })}
                             button {
                                 style: format!(
-                                    "border:none; background:transparent; color:{}; cursor:pointer; font-size:15px; line-height:1; padding:4px 8px; opacity:0.75; flex:0 0 auto;",
+                                    "display:flex; align-items:center; border:none; background:transparent; color:{}; cursor:pointer; font-size:15px; line-height:1; padding:0 8px; opacity:0.75; flex:0 0 auto;",
                                     theme.foreground,
                                 ),
                                 title: "New tab",
@@ -58863,7 +59076,7 @@ fn TerminalCanvas(
                             span { style: "flex:1 1 auto;" }
                             button {
                                 style: format!(
-                                    "border:none; background:transparent; color:{}; cursor:pointer; font-size:14px; line-height:1; padding:4px 8px; opacity:0.75;",
+                                    "display:flex; align-items:center; border:none; background:transparent; color:{}; cursor:pointer; font-size:14px; line-height:1; padding:0 8px; opacity:0.75;",
                                     theme.foreground,
                                 ),
                                 title: "Close web surface (sends Ctrl+C to the app)",
@@ -58885,7 +59098,7 @@ fn TerminalCanvas(
                                         });
                                     }
                                 },
-                                "✕"
+                                "⏻"
                             }
                         }
                         // Nav bar: back / forward / reload over the
@@ -58897,6 +59110,18 @@ fn TerminalCanvas(
                             let back_target = web_overlay.back_target.clone();
                             let forward_target = web_overlay.forward_target.clone();
                             let address_text = web_overlay.address_text.clone();
+                            let address_editing = web_overlay.address_editing;
+                            let suggestions = web_overlay.address_suggestions.clone();
+                            let suggestion_index = web_overlay.address_suggestion_index;
+                            // Dropdown rows: 0 = the synthesized go/search row
+                            // (what plain Enter does), 1.. = history matches.
+                            let dropdown_rows = if address_editing
+                                && !address_text.trim().is_empty()
+                            {
+                                1 + suggestions.len()
+                            } else {
+                                0
+                            };
                             let nav_button_style = |enabled: bool| {
                                 format!(
                                     "border:none; background:transparent; color:{}; font-size:14px; line-height:1; padding:4px 7px; border-radius:6px; cursor:{}; opacity:{};",
@@ -59000,9 +59225,65 @@ fn TerminalCanvas(
                                         onkeydown: {
                                             let nav_path = nav_path.clone();
                                             let nav_ssh = nav_ssh.clone();
+                                            let suggestions = suggestions.clone();
                                             move |evt: KeyboardEvent| {
-                                                if evt.key() == Key::Enter {
+                                                if evt.key() == Key::ArrowDown
+                                                    || evt.key() == Key::ArrowUp
+                                                {
+                                                    if dropdown_rows > 0 {
+                                                        evt.prevent_default();
+                                                        let delta = if evt.key()
+                                                            == Key::ArrowDown
+                                                        {
+                                                            1
+                                                        } else {
+                                                            -1
+                                                        };
+                                                        state.with_mut(|shell| {
+                                                            shell
+                                                                .web_surface_move_address_suggestion(
+                                                                    &nav_path,
+                                                                    delta,
+                                                                    dropdown_rows,
+                                                                );
+                                                        });
+                                                    }
+                                                } else if evt.key() == Key::Enter {
                                                     evt.prevent_default();
+                                                    // A selected history row navigates
+                                                    // to that URL directly; row 0 (or no
+                                                    // selection) commits the draft.
+                                                    let selected = state.with(|shell| {
+                                                        shell
+                                                            .web_surfaces
+                                                            .get(&nav_path)
+                                                            .and_then(|surface| {
+                                                                surface.address_suggestion_index
+                                                            })
+                                                    });
+                                                    if let Some(index) = selected
+                                                        && index >= 1
+                                                        && let Some((url, _)) =
+                                                            suggestions.get(index - 1)
+                                                    {
+                                                        let tab_id = state.with(|shell| {
+                                                            shell
+                                                                .web_surfaces
+                                                                .get(&nav_path)
+                                                                .map(|surface| surface.active_tab)
+                                                        });
+                                                        if let Some(tab_id) = tab_id {
+                                                            navigate_web_surface_tab(
+                                                                state,
+                                                                nav_path.clone(),
+                                                                tab_id,
+                                                                url.clone(),
+                                                                nav_ssh.clone(),
+                                                                None,
+                                                            );
+                                                        }
+                                                        return;
+                                                    }
                                                     // Read draft + active tab at commit
                                                     // time (the render snapshot may lag).
                                                     let target = state.with(|shell| {
@@ -59044,6 +59325,123 @@ fn TerminalCanvas(
                                                 }
                                             }
                                         },
+                                    }
+                                }
+                                // Omnibox dropdown: in NORMAL FLOW below the nav
+                                // bar (not position:absolute) — the page area is
+                                // a NATIVE child webview layered over the main
+                                // DOM, so an overlay dropdown would be occluded.
+                                // Flow-push shrinks the [data-ws-page] rect and
+                                // the native surface follows within a reconcile
+                                // tick.
+                                if dropdown_rows > 0 {
+                                    div {
+                                        style: format!(
+                                            "display:flex; flex-direction:column; padding:2px 10px 8px; background:{}; \
+                                             border-bottom:1px solid rgba(127,127,127,0.25); user-select:none;",
+                                            theme.background,
+                                        ),
+                                        {
+                                            let draft = address_text.trim().to_string();
+                                            let go_label = match web_surface_address_to_url(&draft) {
+                                                Some(url) if !url.contains("{q}")
+                                                    && (url == draft
+                                                        || url == format!("https://{draft}")
+                                                        || url == format!("http://{draft}")) => {
+                                                    format!("Go to {url}")
+                                                }
+                                                _ => format!("Search for \"{draft}\""),
+                                            };
+                                            let row_style = |selected: bool| {
+                                                format!(
+                                                    "display:flex; align-items:center; gap:8px; padding:5px 12px; border-radius:8px; \
+                                                     cursor:pointer; font-size:12.5px; color:{}; background:{};",
+                                                    theme.foreground,
+                                                    if selected {
+                                                        "rgba(127,127,127,0.22)".to_string()
+                                                    } else {
+                                                        "transparent".to_string()
+                                                    },
+                                                )
+                                            };
+                                            let go_row_style = row_style(suggestion_index == Some(0));
+                                            let commit_path = nav_path.clone();
+                                            let commit_ssh = nav_ssh.clone();
+                                            rsx! {
+                                                div {
+                                                    style: "{go_row_style}",
+                                                    onclick: {
+                                                        let draft = draft.clone();
+                                                        move |_| {
+                                                            let tab_id = state.with(|shell| {
+                                                                shell
+                                                                    .web_surfaces
+                                                                    .get(&commit_path)
+                                                                    .map(|surface| surface.active_tab)
+                                                            });
+                                                            if let Some(tab_id) = tab_id
+                                                                && let Some(url) =
+                                                                    web_surface_address_to_url(&draft)
+                                                            {
+                                                                navigate_web_surface_tab(
+                                                                    state,
+                                                                    commit_path.clone(),
+                                                                    tab_id,
+                                                                    url,
+                                                                    commit_ssh.clone(),
+                                                                    None,
+                                                                );
+                                                            }
+                                                        }
+                                                    },
+                                                    span { style: "opacity:0.6; flex:0 0 auto;", "→" }
+                                                    span {
+                                                        style: "white-space:nowrap; overflow:hidden; text-overflow:ellipsis;",
+                                                        "{go_label}"
+                                                    }
+                                                }
+                                                for (row, (sug_url, sug_title)) in suggestions.iter().enumerate() {
+                                                    div {
+                                                        key: "ws-sug-{row}",
+                                                        style: row_style(suggestion_index == Some(row + 1)),
+                                                        onclick: {
+                                                            let nav_path = nav_path.clone();
+                                                            let nav_ssh = nav_ssh.clone();
+                                                            let sug_url = sug_url.clone();
+                                                            move |_| {
+                                                                let tab_id = state.with(|shell| {
+                                                                    shell
+                                                                        .web_surfaces
+                                                                        .get(&nav_path)
+                                                                        .map(|surface| surface.active_tab)
+                                                                });
+                                                                if let Some(tab_id) = tab_id {
+                                                                    navigate_web_surface_tab(
+                                                                        state,
+                                                                        nav_path.clone(),
+                                                                        tab_id,
+                                                                        sug_url.clone(),
+                                                                        nav_ssh.clone(),
+                                                                        None,
+                                                                    );
+                                                                }
+                                                            }
+                                                        },
+                                                        span { style: "opacity:0.6; flex:0 0 auto;", "🕘" }
+                                                        if !sug_title.is_empty() {
+                                                            span {
+                                                                style: "white-space:nowrap; overflow:hidden; text-overflow:ellipsis; flex:0 1 auto;",
+                                                                "{sug_title}"
+                                                            }
+                                                        }
+                                                        span {
+                                                            style: "white-space:nowrap; overflow:hidden; text-overflow:ellipsis; opacity:0.55; flex:0 1 auto;",
+                                                            "{sug_url}"
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -79885,6 +80283,106 @@ mod tests {
         assert!(shell
             .web_surface_overlay_for_session("local://ws", 2_500)
             .is_some());
+    }
+
+    // Heartbeats re-deliver the app's URL every few seconds; they must NOT
+    // clobber a USER navigation on the app tab back to the app's start page
+    // (the "typing chat.example.com reverts to Brave" bug). Only a NEW OSC url —
+    // a real app-side navigation — retargets the app tab.
+    #[test]
+    fn web_surface_heartbeat_does_not_clobber_user_navigation_on_app_tab() {
+        let bootstrap = test_shell_bootstrap_with_active_session("local://ws");
+        let mut shell = ShellState::new(bootstrap);
+        shell.upsert_web_surface(
+            "local://ws",
+            "https://search.brave.com/".to_string(),
+            None,
+            "https://search.brave.com/".to_string(),
+            None,
+            None,
+            "default".to_string(),
+            1_000,
+        );
+        // User navigates the app tab via the address bar.
+        shell.apply_web_surface_tab_navigation(
+            "local://ws",
+            0,
+            "https://chat.example.com".to_string(),
+            "https://chat.example.com".to_string(),
+            None,
+            None,
+            None,
+        );
+        // Heartbeat re-delivers the app's (unchanged) URL: liveness only.
+        shell.upsert_web_surface(
+            "local://ws",
+            "https://search.brave.com/".to_string(),
+            None,
+            "https://search.brave.com/".to_string(),
+            None,
+            None,
+            "default".to_string(),
+            2_000,
+        );
+        let overlay = shell
+            .web_surface_overlay_for_session("local://ws", 2_500)
+            .unwrap();
+        assert_eq!(overlay.address_text, "https://chat.example.com");
+        // A real app navigation (NEW osc url) still retargets the app tab.
+        shell.upsert_web_surface(
+            "local://ws",
+            "https://app.example/next".to_string(),
+            None,
+            "https://app.example/next".to_string(),
+            None,
+            None,
+            "default".to_string(),
+            3_000,
+        );
+        let overlay = shell
+            .web_surface_overlay_for_session("local://ws", 3_500)
+            .unwrap();
+        assert_eq!(overlay.address_text, "https://app.example/next");
+    }
+
+    // Omnibox dropdown selection: wraps over rows, enters at top going down
+    // and at the bottom going up, and resets when the draft changes.
+    #[test]
+    fn web_surface_address_suggestion_selection_moves_and_resets() {
+        let bootstrap = test_shell_bootstrap_with_active_session("local://ws");
+        let mut shell = ShellState::new(bootstrap);
+        shell.upsert_web_surface(
+            "local://ws",
+            "https://search.brave.com/".to_string(),
+            None,
+            "https://search.brave.com/".to_string(),
+            None,
+            None,
+            "default".to_string(),
+            1_000,
+        );
+        shell.web_surface_set_address_draft("local://ws", Some("oi".to_string()));
+        shell.web_surface_move_address_suggestion("local://ws", 1, 3);
+        assert_eq!(
+            shell.web_surfaces["local://ws"].address_suggestion_index,
+            Some(0)
+        );
+        shell.web_surface_move_address_suggestion("local://ws", -1, 3);
+        assert_eq!(
+            shell.web_surfaces["local://ws"].address_suggestion_index,
+            Some(2)
+        );
+        shell.web_surface_move_address_suggestion("local://ws", 1, 3);
+        assert_eq!(
+            shell.web_surfaces["local://ws"].address_suggestion_index,
+            Some(0)
+        );
+        // Draft edit resets the selection (row list changes under it).
+        shell.web_surface_set_address_draft("local://ws", Some("oi.g".to_string()));
+        assert_eq!(
+            shell.web_surfaces["local://ws"].address_suggestion_index,
+            None
+        );
     }
 
     // PERF memo gate: set_sidebar_search_context must NOT rebuild when its inputs
