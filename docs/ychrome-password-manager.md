@@ -26,6 +26,28 @@ against a self-hosted Vaultwarden, passkeys stored in the vault.
   chosen entry+username are reported in the response), TOTP, iframe fill,
   in-page autofill affordance (userscript detect+prompt).
 
+## Shipped: vault sidebar pane (2026-07-09, same release line)
+
+The multi-account answer and the "our Bitwarden UX" surface: 🔑 titlebar icon
+(gated on a live surface) opens `RightPanelMode::Vault` with pilled tabs:
+
+- **Fill** — search bar; "For <host>" section (entry-NAME match: exact host,
+  `www.` twin, or base-domain suffix); All items; click ANY row to fill that
+  specific login (`app web fill --entry <name> [--user <u>]` is the CLI twin).
+- **Add** — new-login form (name pre-hinted with the current host; the URI
+  field is set to `https://<host>` so real Bitwarden clients match it too) +
+  `rbw generate` password generator (length stepper, no-symbols). Save path:
+  `rbw add` reads the password from $VISUAL — we point it at a one-shot 0700
+  helper that cats a 0600 staging file under `~/.yggterm/tmp`, so the secret
+  never appears in argv or the environment.
+- **Tools** — Watchtower: chunked scan (25/batch) of every login for
+  reused-password groups and weak passwords (<10 chars or <2 character
+  classes). Passwords live only inside the scan pass; the report holds entry
+  labels only.
+
+Pane-wide invariant: component state never holds fetched passwords (the Add
+form's typed/generated draft is the one deliberate exception).
+
 ## Engine reality (constrains everything)
 
 - ychrome surfaces are WebKitGTK. **WebKitGTK has no WebAuthn implementation**
