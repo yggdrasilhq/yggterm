@@ -121,16 +121,27 @@ ssh "$LIVE_HOST" "~/.local/bin/yggterm server connect --list"
 # A busy host has HUNDREDS of scanned sessions; recency ordering surfaces what the
 # user was just working on. Do NOT bulk-connect the whole list.
 
-# Pull one back into Live Sessions and attach/resume its terminal
+# Pull one back into Live Sessions and attach/resume its terminal.
+# ORDER-PRESERVING by default: existing rows keep their exact positions and the
+# connected row lands LAST. --after <path> places it under an anchor; --top
+# restores the daemon-native prepend.
 ssh "$LIVE_HOST" "~/.local/bin/yggterm server connect 'remote-cc://dev/<uuid>'"
-# -> {connected:true, active_session_path, live_session_count, message}
+# -> {connected:true, row_placement:"end", order_preserved:true, active_session_path, ...}
+ssh "$LIVE_HOST" "~/.local/bin/yggterm server connect '<path>' --after '<anchor-path>'"
 ssh "$LIVE_HOST" "~/.local/bin/yggterm server connect '<path>' --view preview"  # don't launch a terminal
 
-# Set the Live Sessions row order (listed rows go to the TOP)
-ssh "$LIVE_HOST" "~/.local/bin/yggterm server reorder '<path1>' '<path2>'"
-printf '%s\n' "${PATHS[@]}" | ssh "$LIVE_HOST" "~/.local/bin/yggterm server reorder --stdin"
+# Capture / restore the Live Sessions row order (these round-trip)
+ssh "$LIVE_HOST" "~/.local/bin/yggterm server order" > /tmp/order.bak      # one path per line
+ssh "$LIVE_HOST" "~/.local/bin/yggterm server reorder --stdin" < /tmp/order.bak
+ssh "$LIVE_HOST" "~/.local/bin/yggterm server reorder '<path1>' '<path2>'" # listed rows -> TOP
 # -> {requested, live_session_count, changed, order:[...]}
 ```
+
+**Row order is durable but only for rows that are LIVE.** Since 2.9.62 the daemon
+persists non-keep-alive rows in order, so ordering survives a restart. `server order`
++ `server reorder --stdin` snapshot and restore it at any time — **take a backup before
+any batch operation.** A row that LEAVES the live set still forgets its slot: reconnect
+it and it lands at the end (or wherever you place it), not its old position.
 
 **What `connect` does** — the headless twin of clicking a row, issuing the SAME
 daemon requests as the GUI (one source of truth):
@@ -146,8 +157,8 @@ daemon requests as the GUI (one source of truth):
   `remote-session://` row*. `connect` handles the branch for you — don't hand-roll it.
 - Always let `connect` pass the scanned **cwd**: the resume runs `claude -r` /
   `codex resume` inside the session's directory.
-- `connect` **prepends** each new row. After a batch, the user's row order is buried —
-  restore it with `server reorder` (capture the order *before* you connect).
+- `connect` is order-preserving since 2.9.63; with `--top` (or on any older build) it
+  **prepends** and buries the user's ordering. Capture `server order` before a batch.
 - `reorder` never drops a row: listed paths go first, every unlisted live row is
   appended after, so a partial list is safe.
 - Verify a reconnect with the session's `status_line`/`last_launch_error` from
