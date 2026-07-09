@@ -514,6 +514,16 @@ pub enum AppControlCommand {
         #[serde(default)]
         user: Option<String>,
     },
+    /// Put a vault entry's current TOTP code into the page's one-time-code
+    /// field (and onto the clipboard). Same entry/user semantics as fill.
+    WebSurfaceTotp {
+        #[serde(default)]
+        session_path: Option<String>,
+        #[serde(default)]
+        entry: Option<String>,
+        #[serde(default)]
+        user: Option<String>,
+    },
     DescribeRows,
     OpenPath {
         session_path: String,
@@ -605,6 +615,7 @@ impl AppControlCommand {
             Self::WebSurfaceScreenshot { .. } => "web_surface_screenshot",
             Self::WebSurfaceDevtools { .. } => "web_surface_devtools",
             Self::WebSurfaceFill { .. } => "web_surface_fill",
+            Self::WebSurfaceTotp { .. } => "web_surface_totp",
             Self::DescribeRows => "describe_rows",
             Self::OpenPath { .. } => "open_path",
             Self::FocusWindow => "focus_window",
