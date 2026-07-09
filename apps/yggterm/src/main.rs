@@ -47,6 +47,7 @@ use yggterm_server::{
     run_app_control_scroll_terminal_viewport, run_app_control_send_terminal_input,
     run_app_control_web_surface_devtools, run_app_control_web_surface_eval,
     run_app_control_web_surface_fill, run_app_control_web_surface_screenshot,
+    run_app_control_web_surface_totp,
     run_app_control_submit_terminal_prompt,
     run_app_control_set_clipboard_png_base64, run_app_control_set_clipboard_text,
     run_app_control_set_force_foreground, run_app_control_set_fullscreen,
@@ -2584,6 +2585,11 @@ fn main() -> Result<()> {
                         let entry = cli_flag_value(&args, "--entry");
                         let user = cli_flag_value(&args, "--user");
                         run_app_control_web_surface_fill(session_path, entry, user, timeout_ms)
+                    }
+                    "totp" | "code" => {
+                        let entry = cli_flag_value(&args, "--entry");
+                        let user = cli_flag_value(&args, "--user");
+                        run_app_control_web_surface_totp(session_path, entry, user, timeout_ms)
                     }
                     other => anyhow::bail!("unsupported app web action: {other}"),
                 }
