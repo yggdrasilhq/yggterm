@@ -688,6 +688,7 @@ common server commands:
   yggterm server status
   yggterm server snapshot
   yggterm server connect <session-path> | --list
+  yggterm server order [--json]
   yggterm server reorder <session-path>... | --stdin
   yggterm server app <subcommand>"
     );
@@ -698,8 +699,9 @@ fn print_server_help() {
         "usage:
   yggterm server daemon
   yggterm server attach <session> [cwd]
-  yggterm server connect <session-path> [--view terminal|preview]
+  yggterm server connect <session-path> [--view terminal|preview] [--top|--after <path>]
   yggterm server connect --list
+  yggterm server order [--json]
   yggterm server reorder <session-path>... | --stdin
   yggterm server ping
   yggterm server status
@@ -881,13 +883,79 @@ fn connect_session_key_is_known(snapshot: &yggterm_server::ServerUiSnapshot, pat
         })
 }
 
+/// Where a freshly connected row lands in the Live Sessions order.
+enum ConnectPlacement {
+    /// Preserve the existing order; put the connected row last. Default: a
+    /// connect must never rewrite an ordering the user arranged.
+    End,
+    /// Preserve the existing order; put the connected row directly after `anchor`.
+    After(String),
+    /// Daemon-native behavior: the row is prepended to the top.
+    Top,
+}
+
+/// Restore `before` as the Live Sessions order, with `connected` placed per
+/// `placement`. The daemon appends any live row we omit, so this can never drop
+/// a row; rows in `before` that are no longer live simply resolve to nothing.
+fn connect_desired_order(
+    before: &[String],
+    connected: &str,
+    placement: &ConnectPlacement,
+) -> Vec<String> {
+    let want = connect_path_session_uuid(connected);
+    let same = |candidate: &str| {
+        candidate == connected || connect_path_session_uuid(candidate) == want
+    };
+    // If the row was already live, leave it exactly where the user had it.
+    if before.iter().any(|path| same(path)) {
+        return before.to_vec();
+    }
+    let mut order = Vec::with_capacity(before.len() + 1);
+    match placement {
+        ConnectPlacement::Top => {
+            order.push(connected.to_string());
+            order.extend(before.iter().cloned());
+        }
+        ConnectPlacement::End => {
+            order.extend(before.iter().cloned());
+            order.push(connected.to_string());
+        }
+        ConnectPlacement::After(anchor) => {
+            let anchor_uuid = connect_path_session_uuid(anchor);
+            let mut placed = false;
+            for path in before {
+                order.push(path.clone());
+                if !placed
+                    && (path == anchor || connect_path_session_uuid(path) == anchor_uuid)
+                {
+                    order.push(connected.to_string());
+                    placed = true;
+                }
+            }
+            if !placed {
+                order.push(connected.to_string());
+            }
+        }
+    }
+    order
+}
+
 /// `yggterm server connect <session-path>`: connect an existing session into the
 /// live set + GUI. Reuses the same daemon requests the GUI issues on a click.
 fn run_server_connect(
     endpoint: &yggterm_server::ServerEndpoint,
     path: &str,
     view: WorkspaceViewMode,
+    placement: ConnectPlacement,
 ) -> Result<()> {
+    // Capture the row order BEFORE anything opens/focuses — both paths prepend a
+    // newly-live row, so this is the only chance to know where the user's rows sat.
+    let before_order: Vec<String> = snapshot(endpoint)?
+        .0
+        .live_sessions
+        .iter()
+        .map(|session| session.session_path.clone())
+        .collect();
     // FocusLive reveals + resumes any session the daemon already tracks — even a
     // row the runtime-truth filter is currently suppressing, since launching its
     // runtime un-hides it — and is kind-agnostic (it uses the row the daemon
@@ -927,6 +995,20 @@ fn run_server_connect(
     }
     let connected =
         connect_session_is_active(&snapshot, path) || connect_session_key_is_known(&snapshot, path);
+    // Put the user's rows back where they were. The daemon prepended the new row;
+    // unless the caller asked for --top, restore `before_order` and place the
+    // connected row per `placement`. Reorder never drops a row (unlisted live
+    // rows are appended), so this is safe even if the scan added rows meanwhile.
+    let mut placed_at = "top";
+    if connected && !matches!(placement, ConnectPlacement::Top) && !before_order.is_empty() {
+        let desired = connect_desired_order(&before_order, path, &placement);
+        let (reordered, _) = reorder_live_sessions(endpoint, &desired)?;
+        snapshot = reordered;
+        placed_at = match placement {
+            ConnectPlacement::After(_) => "after_anchor",
+            _ => "end",
+        };
+    }
     println!(
         "{}",
         serde_json::to_string_pretty(&serde_json::json!({
@@ -937,6 +1019,8 @@ fn run_server_connect(
                 WorkspaceViewMode::Terminal => "terminal",
                 WorkspaceViewMode::Rendered => "preview",
             },
+            "row_placement": placed_at,
+            "order_preserved": placed_at != "top",
             "live_session_count": snapshot.live_sessions.len(),
             "message": message,
         }))?
@@ -1165,7 +1249,48 @@ fn main() -> Result<()> {
             Some("preview") | Some("rendered") => WorkspaceViewMode::Rendered,
             _ => WorkspaceViewMode::Terminal,
         };
-        return run_server_connect(&endpoint, &path, view);
+        // Row placement. The daemon's open/focus path PREPENDS a newly-live row,
+        // which silently rewrites the user's Live Sessions ordering on every
+        // connect (live-caught: a 15-session batch buried a 28-row list). Default
+        // to preserving the existing order and placing the row LAST; `--top`
+        // restores the old prepend, `--after <path>` places it under an anchor.
+        let placement = if args.iter().any(|arg| arg == "--top") {
+            ConnectPlacement::Top
+        } else if let Some(anchor) = cli_flag_value(&args, "--after") {
+            ConnectPlacement::After(anchor.to_string())
+        } else {
+            ConnectPlacement::End
+        };
+        return run_server_connect(&endpoint, &path, view, placement);
+    }
+    // `yggterm server order [--json]` — dump the Live Sessions row order, one
+    // path per line. Round-trips with `server reorder --stdin`, so an order can
+    // always be captured before a disruptive operation and restored after:
+    //   yggterm server order > order.txt
+    //   yggterm server reorder --stdin < order.txt
+    if args.len() >= 2 && args[0] == "server" && args[1] == "order" {
+        ensure_local_server_ready_for_cli(&store)?;
+        let endpoint = default_endpoint(store.home_dir());
+        let (snapshot, _) = snapshot(&endpoint)?;
+        let order: Vec<String> = snapshot
+            .live_sessions
+            .iter()
+            .map(|session| session.session_path.clone())
+            .collect();
+        if args.iter().any(|arg| arg == "--json") {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "live_session_count": order.len(),
+                    "order": order,
+                }))?
+            );
+        } else {
+            for path in &order {
+                println!("{path}");
+            }
+        }
+        return Ok(());
     }
     // `yggterm server reorder <path>... | --stdin` — set the Live Sessions row
     // order. Paths are placed in the given order at the TOP; any live row not
