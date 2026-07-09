@@ -28,6 +28,13 @@ This file tracks user-visible changes in `yggterm`.
   "Fill login from vault" button fill the visible login form from `rbw`, matched to the page's
   exact host as reported by the engine (https or loopback pages only). See
   docs/ychrome-password-manager.md for setup and the security model.
+- **Vault sidebar pane — ychrome's shipped Bitwarden UX.** New 🔑 titlebar icon (visible while a
+  web surface is live) opens a vault browser: search bar on top, entries applicable to the current
+  site float into a "For <host>" section (exact host or base-domain match on entry names), and
+  clicking ANY entry fills that specific login into the page — the multi-account override the
+  auto-fill's first-match rule can't express. `server app web fill --entry <name> [--user <u>]`
+  is the CLI/agent equivalent; `server app panel vault` opens the pane. Only entry metadata is
+  listed; passwords are fetched per fill and never held in UI state.
 
 ## 2.9.65
 
