@@ -80,6 +80,18 @@ pass `--backend os`:
 ssh "$LIVE_HOST" "~/.local/bin/yggterm server app screenshot /tmp/surface.png --backend os"
 ```
 
+**The capture now tells you when it is blind** (2026-07-10). If a native surface
+is visible and you did not pass `--backend os`, the response carries
+`capture_native_web_surface_visible: true` and `capture_faithful: false`, with a
+reason saying so. **Read those fields before reasoning from the pixels.**
+
+⚠️ **`capture_faithful: true` was never a claim about native surfaces.** It means
+"the xterm canvas in this frame is real". An agent once cropped the right rail
+from a default-backend frame, saw a perfect vault pane, and called the feature
+live-verified — while the native page was in fact painted straight across that
+rail (a native child draws above ALL DOM). The crop was faithful; the screen was
+broken. If a web surface is on screen, `--backend os` is the ONLY honest eye.
+
 - Forces an OS-compositor grab of the yggterm window (Spectacle on KDE Wayland,
   X11 window grab on X11) — native surfaces AND the accelerated xterm canvas are
   both in the frame; `capture_faithful` is true by construction.

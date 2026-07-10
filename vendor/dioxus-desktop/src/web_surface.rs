@@ -174,6 +174,31 @@ fn rect_logical(w: i32, h: i32) -> Rect {
     }
 }
 
+/// Place a surface at `(x, y)` and size it to `w × h`.
+///
+/// The webview's own **size request** must be updated, not just the container's.
+/// `wry`'s `WebView::set_bounds` on a `GtkFixed` parent only `size_allocate`s the
+/// webview; it never touches the size request that `add_to_container` set when the
+/// webview was built. `GtkFixed` allocates children at their natural size, and the
+/// natural size of a widget with a size request IS that request — so the very next
+/// layout pass (the `queue_resize` every caller issues right after) snapped the
+/// webview straight back to the size it was born with.
+///
+/// The surface could therefore be MOVED but never RESIZED. Opening the right rail
+/// over a live web surface left the page painted across it, because a native child
+/// widget draws above all DOM; closing the rail left a gap. Neither was visible to
+/// `app screenshot`'s default backend, which composites the DOM and is blind to
+/// native children — only `--backend os` shows it.
+fn apply_bounds(surface: &Surface, x: i32, y: i32, w: i32, h: i32) {
+    use wry::WebViewExtUnix as _;
+    let (w, h) = (w.max(1), h.max(1));
+    surface.container.set_margin_start(x.max(0));
+    surface.container.set_margin_top(y.max(0));
+    surface.container.set_size_request(w, h);
+    surface.webview.webview().set_size_request(w, h);
+    let _ = surface.webview.set_bounds(rect_logical(w, h));
+}
+
 impl WebSurfaceHost {
     pub(crate) fn new(overlay: gtk::Overlay) -> Self {
         Self {
@@ -277,10 +302,7 @@ impl WebSurfaceHost {
 
     pub fn set_bounds(&self, id: u64, x: i32, y: i32, w: i32, h: i32) {
         if let Some(s) = self.surfaces.borrow().get(&id) {
-            s.container.set_margin_start(x.max(0));
-            s.container.set_margin_top(y.max(0));
-            s.container.set_size_request(w.max(1), h.max(1));
-            let _ = s.webview.set_bounds(rect_logical(w, h));
+            apply_bounds(s, x, y, w, h);
             self.overlay.queue_resize();
         }
     }
@@ -353,10 +375,7 @@ impl WebSurfaceHost {
         if s.container.parent().is_none() {
             self.overlay.add_overlay(&s.container);
         }
-        s.container.set_margin_start(x.max(0));
-        s.container.set_margin_top(y.max(0));
-        s.container.set_size_request(w.max(1), h.max(1));
-        let _ = s.webview.set_bounds(rect_logical(w, h));
+        apply_bounds(s, x, y, w, h);
         let _ = s.webview.set_visible(true);
         s.container.show_all();
         self.overlay.queue_resize();
