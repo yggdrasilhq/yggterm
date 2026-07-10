@@ -2587,6 +2587,13 @@ struct ShellState {
     /// app never sees them until an action is fired, and they are dropped when
     /// the pane closes — a search box or an add-form password does not persist.
     app_pane_values: HashMap<String, String>,
+    /// What the rail was showing before an app's pane took it over.
+    ///
+    /// A contributed pane is a TENANT of the right panel, not its owner. When the
+    /// app retires (exits, is killed, stops declaring), the panel must go back to
+    /// the user's own view — collapsing the whole rail throws away state the user
+    /// never asked to lose.
+    right_panel_mode_before_app_pane: Option<RightPanelMode>,
     app_pane_error: Option<String>,
     /// Bumped on every pane open / action so a late reply from a superseded
     /// fetch cannot overwrite a newer schema.
@@ -4147,6 +4154,7 @@ impl ShellState {
             sidebar_contributions: HashMap::new(),
             app_pane_schema: None,
             app_pane_values: HashMap::new(),
+            right_panel_mode_before_app_pane: None,
             app_pane_error: None,
             app_pane_request_seq: 0,
             titlebar_new_menu_open: false,
@@ -5105,6 +5113,7 @@ impl ShellState {
         if let Some(contribution) = self.sidebar_contributions.remove(session_path) {
             kill_control_forward(&contribution);
         }
+        self.restore_right_panel_if_app_pane_retired();
     }
     /// Contributions expire on the same rule as surfaces: no declare within
     /// WEB_SURFACE_STALE_AFTER_MS and the app is presumed gone, so its buttons
@@ -5118,6 +5127,7 @@ impl ShellState {
             }
             live
         });
+        self.restore_right_panel_if_app_pane_retired();
     }
     /// The panes the active session's app currently offers. Empty when no app
     /// has declared, which is what keeps the rail free of app chrome.
@@ -5588,8 +5598,7 @@ impl ShellState {
     /// add-form password belongs to the pane the user was looking at.
     fn toggle_app_pane(&mut self, pane_id: &str) -> Option<u64> {
         if self.right_panel_mode == RightPanelMode::AppPane(pane_id.to_string()) {
-            self.clear_app_pane_draft();
-            self.set_right_panel_mode(RightPanelMode::Hidden);
+            self.close_app_pane();
             return None;
         }
         Some(self.open_app_pane(pane_id))
@@ -5599,9 +5608,43 @@ impl ShellState {
     /// so `app right-panel pane:<id>` means the same thing however many times
     /// an agent runs it.
     fn open_app_pane(&mut self, pane_id: &str) -> u64 {
+        // Remember the user's own view exactly once, so a pane→pane hop cannot
+        // overwrite it with another app's pane.
+        if !matches!(self.right_panel_mode, RightPanelMode::AppPane(_)) {
+            self.right_panel_mode_before_app_pane = Some(self.right_panel_mode.clone());
+        }
         self.clear_app_pane_draft();
         self.set_right_panel_mode(RightPanelMode::AppPane(pane_id.to_string()));
         self.app_pane_request_seq
+    }
+    /// Give the right panel back to whatever the user had open before an app's
+    /// pane borrowed it — `Hidden` only if that is what they had.
+    fn close_app_pane(&mut self) {
+        self.clear_app_pane_draft();
+        let restored = self
+            .right_panel_mode_before_app_pane
+            .take()
+            .unwrap_or(RightPanelMode::Hidden);
+        self.set_right_panel_mode(restored);
+    }
+    /// An app's pane vanished with its declaration (the app exited, was killed,
+    /// or stopped declaring). Hand the panel back instead of collapsing the rail:
+    /// the user was working with it open and never asked to close it.
+    ///
+    /// A pane some OTHER live contribution still offers is left alone — that is
+    /// the session-switch case, where the pane collapses and re-reveals on return.
+    fn restore_right_panel_if_app_pane_retired(&mut self) {
+        let RightPanelMode::AppPane(pane_id) = &self.right_panel_mode else {
+            return;
+        };
+        let pane_id = pane_id.clone();
+        let still_offered = self
+            .sidebar_contributions
+            .values()
+            .any(|contribution| contribution.panes.iter().any(|pane| pane.id == pane_id));
+        if !still_offered {
+            self.close_app_pane();
+        }
     }
     /// Draft input values never survive a pane switch: a search term or an
     /// add-form password belongs to the pane the user was looking at.
@@ -39336,6 +39379,23 @@ async fn process_pending_app_control_requests(
 
             match success {
                 Some((backend, faithful, faithful_reason, terminal_region, attempts, out)) => {
+                    // A visible native child webview is drawn ABOVE all DOM by the
+                    // compositor and appears in NO composite/DOM frame. Calling such
+                    // a frame `capture_faithful: true` is a lie about what is on
+                    // screen, and it is exactly how "the page paints across the right
+                    // rail" hid for so long: every rail crop looked perfect.
+                    let native_surface_visible = native_web_surface_visible(&state.read());
+                    let blind_to_native = native_surface_visible && !compositor;
+                    let faithful = faithful && !blind_to_native;
+                    let faithful_reason = if blind_to_native {
+                        format!(
+                            "{faithful_reason} — but a native web surface is visible and draws \
+                             above all DOM, so it is ABSENT from this frame. Re-capture with \
+                             `--backend os` to see it."
+                        )
+                    } else {
+                        faithful_reason
+                    };
                     AppControlResponse {
                         request_id: request.request_id.clone(),
                         handled_by_pid: std::process::id(),
@@ -39351,6 +39411,7 @@ async fn process_pending_app_control_requests(
                             "capture_backend_attempts": attempts,
                             "capture_faithful": faithful,
                             "capture_faithful_reason": faithful_reason,
+                            "capture_native_web_surface_visible": native_surface_visible,
                             "capture_is_terminal_region": terminal_region,
                             "dom": dom_snapshot,
                         })),
@@ -64300,6 +64361,22 @@ fn terminal_active_visible_for_session(shell: &ShellState, session_path: &str) -
         && shell.server.active_view_mode() == WorkspaceViewMode::Terminal
         && shell.server.active_session_path() == Some(session_path)
 }
+/// Is a NATIVE child webview currently painted over the window?
+///
+/// Same authority the native-surface reconciler uses for visibility, and for the
+/// same reason: the DOM `[data-ws-page]` rect is starvable, this is not. A picker
+/// surface renders as a Dioxus overlay, not a native child, so it does not count.
+///
+/// Callers care because a native child draws above ALL DOM and is invisible to
+/// every capture backend except the compositor's.
+fn native_web_surface_visible(shell: &ShellState) -> bool {
+    shell
+        .web_surfaces
+        .iter()
+        .any(|(session_path, surface)| {
+            surface.picker.is_none() && terminal_active_visible_for_session(shell, session_path)
+        })
+}
 fn current_millis() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -87631,6 +87708,95 @@ mod tests {
         assert_eq!(shell.app_pane_values["query"], "gh");
         let posted = shell.app_pane_values_json().to_string();
         assert!(!posted.contains("hunter2"), "secret leaked into an action POST");
+    }
+
+    fn declare_pane(shell: &mut ShellState, session: &str, pane_id: &str, now_ms: u64) {
+        shell.upsert_sidebar_contribution(
+            session,
+            vec![SidebarPaneDeclaration {
+                id: pane_id.to_string(),
+                icon: "🔑".to_string(),
+                title: "Vault".to_string(),
+            }],
+            now_ms,
+            Some(("http://127.0.0.1:1".to_string(), None)),
+        );
+    }
+
+    // An app's pane is a TENANT of the right panel. When the app dies, the panel
+    // goes back to what the user had open — collapsing the whole rail throws away
+    // state they never asked to lose.
+    #[test]
+    fn a_dead_app_gives_the_right_panel_back_to_the_user() {
+        let mut shell = ShellState::new(test_shell_bootstrap_with_active_session("local://pane"));
+        shell.set_right_panel_mode(RightPanelMode::Metadata);
+        declare_pane(&mut shell, "local://pane", "vault", 1_000);
+
+        shell.open_app_pane("vault");
+        assert_eq!(shell.right_panel_mode, RightPanelMode::AppPane("vault".into()));
+
+        // ychrome exits and emits `sidebar ; close`.
+        shell.close_sidebar_contribution("local://pane");
+        assert_eq!(
+            shell.right_panel_mode,
+            RightPanelMode::Metadata,
+            "the user's panel was collapsed instead of restored"
+        );
+
+        // Same for an app that is SIGKILLed and simply stops declaring.
+        declare_pane(&mut shell, "local://pane", "vault", 2_000);
+        shell.open_app_pane("vault");
+        shell.sweep_stale_sidebar_contributions(2_000 + WEB_SURFACE_STALE_AFTER_MS + 1);
+        assert_eq!(shell.right_panel_mode, RightPanelMode::Metadata);
+    }
+
+    // A pane the user opened from a hidden rail returns to hidden, not to some
+    // panel they never had open.
+    #[test]
+    fn a_dead_app_restores_hidden_when_that_is_what_the_user_had() {
+        let mut shell = ShellState::new(test_shell_bootstrap_with_active_session("local://pane"));
+        shell.set_right_panel_mode(RightPanelMode::Hidden);
+        declare_pane(&mut shell, "local://pane", "vault", 1_000);
+        shell.open_app_pane("vault");
+        shell.close_sidebar_contribution("local://pane");
+        assert_eq!(shell.right_panel_mode, RightPanelMode::Hidden);
+    }
+
+    // A live contribution elsewhere means the pane merely collapsed for THIS
+    // session (session switch) and must re-reveal on return — do not restore.
+    #[test]
+    fn a_pane_still_offered_by_another_session_is_not_retired() {
+        let mut shell = ShellState::new(test_shell_bootstrap_with_active_session("local://a"));
+        shell.set_right_panel_mode(RightPanelMode::Metadata);
+        declare_pane(&mut shell, "local://a", "vault", 1_000);
+        declare_pane(&mut shell, "local://b", "vault", 1_000);
+        shell.open_app_pane("vault");
+
+        shell.close_sidebar_contribution("local://a");
+        assert_eq!(
+            shell.right_panel_mode,
+            RightPanelMode::AppPane("vault".into()),
+            "another live ychrome still offers this pane"
+        );
+        shell.close_sidebar_contribution("local://b");
+        assert_eq!(shell.right_panel_mode, RightPanelMode::Metadata);
+    }
+
+    // Hopping pane→pane must not overwrite the memory of the user's own view.
+    #[test]
+    fn a_pane_to_pane_hop_keeps_the_users_view_remembered() {
+        let mut shell = ShellState::new(test_shell_bootstrap_with_active_session("local://pane"));
+        shell.set_right_panel_mode(RightPanelMode::Notifications);
+        declare_pane(&mut shell, "local://pane", "vault", 1_000);
+        shell.open_app_pane("vault");
+        shell.open_app_pane("settings");
+        assert_eq!(
+            shell.right_panel_mode_before_app_pane,
+            Some(RightPanelMode::Notifications)
+        );
+        // Toggling the pane shut returns to the user's view, not to Hidden.
+        shell.toggle_app_pane("settings");
+        assert_eq!(shell.right_panel_mode, RightPanelMode::Notifications);
     }
 
     // yggterm must not name another app's pane. The title comes from the schema.
