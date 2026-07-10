@@ -2853,6 +2853,9 @@ struct ShellState {
     viewport_history: VecDeque<ViewportHistoryEntry>,
     show_start_page_when_no_live_sessions: bool,
     closing_app: bool,
+    /// A libyggterm app's passkey ceremony awaiting the user's presence, or
+    /// `None`. At most one dialog at a time — WebAuthn ceremonies are serial.
+    pending_fido2: Option<PendingFido2Dialog>,
 }
 #[derive(Clone, PartialEq, Eq)]
 struct DockSignature {
@@ -3022,6 +3025,29 @@ struct DeleteConfirmDialogText {
     copy: &'static str,
     action_label: String,
 }
+/// A WebAuthn passkey ceremony awaiting the user's presence. A libyggterm app
+/// (ychrome) emitted `OSC 7717 ; fido2 ; request` on a session's stream; the GUI
+/// shows this as a modal naming the site and account. Approve POSTs the grant to
+/// the app's control endpoint (declared on the same stream); Decline POSTs a
+/// deny. It carries no challenge and no key — only what the human needs to
+/// decide, exactly as the OSC did.
+#[derive(Clone, PartialEq, Eq)]
+struct PendingFido2Dialog {
+    /// The stream the request arrived on — the key to the app's control endpoint
+    /// (its `sidebar` declaration) that the grant/deny is POSTed back to.
+    session_path: String,
+    /// The opaque id the app is blocking on; echoed in the grant so the app can
+    /// match it to the right parked ceremony.
+    request_id: String,
+    /// The relying party, e.g. `github.com`.
+    rp_id: String,
+    /// A human label for the account (userName / displayName / vault item name).
+    account: String,
+    /// `get` (sign in) or `create` (register) — changes the dialog wording.
+    ceremony: String,
+    /// The page origin the ceremony runs on, shown so the user sees who is asking.
+    origin: String,
+}
 #[derive(Clone, Debug)]
 struct PreviewSyncFailure {
     message: String,
@@ -3119,6 +3145,7 @@ struct RenderSnapshot {
     optimistic_drag_target: Option<DragDropTarget>,
     drag_pointer: Option<(f64, f64)>,
     pending_delete: Option<PendingDeleteDialog>,
+    pending_fido2: Option<PendingFido2Dialog>,
     copy_edit_dialog: Option<CopyEditDialog>,
     tree_rename_path: Option<String>,
     tree_rename_value: String,
@@ -4331,6 +4358,7 @@ impl ShellState {
             suppress_tree_click_until_ms: 0,
             suppress_sidebar_autoscroll_until_ms: 0,
             pending_delete: None,
+            pending_fido2: None,
             copy_edit_dialog: None,
             tree_rename_path: None,
             tree_rename_depth: None,
@@ -4886,6 +4914,7 @@ impl ShellState {
             optimistic_drag_target: self.optimistic_drag_target.clone(),
             drag_pointer: self.drag_pointer,
             pending_delete: self.pending_delete.clone(),
+            pending_fido2: self.pending_fido2.clone(),
             copy_edit_dialog: self.copy_edit_dialog.clone(),
             tree_rename_path: self.tree_rename_path.clone(),
             tree_rename_value: self.tree_rename_value.clone(),
@@ -36623,6 +36652,42 @@ async fn app_policy_fetch(
     }
 }
 
+/// Answer a passkey presence dialog: POST the grant (or deny) to the app's
+/// control endpoint, over the SAME `ssh -L` forward its `sidebar` declaration
+/// opened, then clear the dialog. The app is parked on `/fido2/get` waiting for
+/// this; the `request_id` is what it matches the reply to.
+///
+/// The control endpoint is keyed by the ceremony's OWN session (the stream the
+/// OSC arrived on), not the active session — a background surface can run a
+/// ceremony while the user looks at another row.
+fn resolve_fido2_dialog(mut state: Signal<ShellState>, dialog: PendingFido2Dialog, approved: bool) {
+    let control_url = state.with_mut(|shell| {
+        // Clear it whichever way the user answered, so a second click can't
+        // double-POST and the modal closes immediately.
+        if shell
+            .pending_fido2
+            .as_ref()
+            .is_some_and(|pending| pending.request_id == dialog.request_id)
+        {
+            shell.pending_fido2 = None;
+        }
+        shell.sidebar_control_url(&dialog.session_path)
+    });
+    let Some(control_url) = control_url else {
+        // The app's contribution expired between the request and the answer;
+        // nothing to grant to. The app's own ceremony timeout cleans it up.
+        return;
+    };
+    let route = if approved { "grant" } else { "deny" };
+    let url = format!("{}/fido2/{route}", control_url.trim_end_matches('/'));
+    // `user_verified` stays false: yggterm shows a presence dialog, not a
+    // biometric/PIN verification gate, so the assertion sets UP but not UV.
+    let body = json!({ "request_id": dialog.request_id, "user_verified": false });
+    spawn(async move {
+        let _ = task::spawn_blocking(move || control_request(&url, Some(&body))).await;
+    });
+}
+
 /// POST `{pane, action, values}` to the app and apply whatever comes back.
 ///
 /// The reply may carry any of: a fresh `schema` to re-render, a `toast` to show,
@@ -46585,6 +46650,21 @@ fn app() -> Element {
                         on_save: move |_| commit_copy_edit(state),
                     }
                 }
+                if let Some(dialog) = snapshot.pending_fido2.clone() {
+                    Fido2PresenceOverlay {
+                        dialog: dialog.clone(),
+                        palette: snapshot.palette,
+                        on_approve: move |_| resolve_fido2_dialog(state, dialog.clone(), true),
+                        on_decline: {
+                            let dialog = snapshot.pending_fido2.clone();
+                            move |_| {
+                                if let Some(dialog) = dialog.clone() {
+                                    resolve_fido2_dialog(state, dialog, false);
+                                }
+                            }
+                        },
+                    }
+                }
                 if snapshot.theme_editor_open {
                     ThemeEditorOverlay {
                         snapshot: snapshot.clone(),
@@ -55752,6 +55832,59 @@ fn TerminalCanvas(
                                             "close",
                                             json!({ "session_path": contribution_session_path }),
                                         );
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            Ok(TerminalJsEvent::Fido2Request {
+                                action,
+                                session: claimed_session,
+                                request_id,
+                                rp_id,
+                                account,
+                                ceremony,
+                                origin,
+                            }) => {
+                                let fido2_session_path = session_path.clone();
+                                match action.as_str() {
+                                    "request" if !request_id.is_empty() && !rp_id.is_empty() => {
+                                        state.with_mut(|shell| {
+                                            shell.pending_fido2 = Some(PendingFido2Dialog {
+                                                session_path: fido2_session_path.clone(),
+                                                request_id: request_id.clone(),
+                                                rp_id: rp_id.clone(),
+                                                account: account.clone(),
+                                                ceremony: ceremony.clone(),
+                                                origin: origin.clone(),
+                                            });
+                                        });
+                                        append_trace_event(
+                                            &trace_home,
+                                            "ui",
+                                            "fido2",
+                                            "request",
+                                            json!({
+                                                "session_path": fido2_session_path,
+                                                "claimed_session": claimed_session,
+                                                "request_id": request_id,
+                                                "rp_id": rp_id,
+                                                "ceremony": ceremony,
+                                            }),
+                                        );
+                                    }
+                                    // An app can retract a ceremony (e.g. it timed
+                                    // out on its side) — drop the dialog if it is
+                                    // still the one showing.
+                                    "cancel" => {
+                                        state.with_mut(|shell| {
+                                            if shell
+                                                .pending_fido2
+                                                .as_ref()
+                                                .is_some_and(|dialog| dialog.request_id == request_id)
+                                            {
+                                                shell.pending_fido2 = None;
+                                            }
+                                        });
                                     }
                                     _ => {}
                                 }
@@ -66185,7 +66318,7 @@ fn terminal_eval_script_with_canvas_renderer(
                         const raw = typeof data === 'string' ? data : '';
                         const parts = raw.split(';');
                         const verb = parts[0];
-                        if (verb !== 'web-surface' && verb !== 'sidebar') {{
+                        if (verb !== 'web-surface' && verb !== 'sidebar' && verb !== 'fido2') {{
                             return true;
                         }}
                         const action = parts[1] || '';
@@ -66222,6 +66355,25 @@ fn terminal_eval_script_with_canvas_renderer(
                                         icon: typeof pane.icon === 'string' ? pane.icon : '',
                                         title: typeof pane.title === 'string' ? pane.title : '',
                                     }})),
+                            }});
+                            return true;
+                        }}
+                        if (verb === 'fido2') {{
+                            // A WebAuthn ceremony wants the user's presence. The
+                            // app names only the rpId + a display label — never a
+                            // challenge, never a key. The GUI shows a dialog and,
+                            // on approval, POSTs the grant back to the app's
+                            // control endpoint (the one the sidebar declared on
+                            // this same stream).
+                            sendTerminalEvent({{
+                                kind: 'fido2_request',
+                                action,
+                                session: payload.session,
+                                request_id: typeof payload.request_id === 'string' ? payload.request_id : '',
+                                rp_id: typeof payload.rp_id === 'string' ? payload.rp_id : '',
+                                account: typeof payload.account === 'string' ? payload.account : '',
+                                ceremony: typeof payload.kind === 'string' ? payload.kind : 'get',
+                                origin: typeof payload.origin === 'string' ? payload.origin : '',
                             }});
                             return true;
                         }}
@@ -78961,6 +79113,113 @@ fn DeleteConfirmOverlay(
         }
     }
 }
+/// The WebAuthn presence dialog. A libyggterm app (ychrome) asks the user to
+/// approve a passkey ceremony; the app carries only the site and account, never
+/// a challenge or a key. Approve POSTs the grant to the app's control endpoint,
+/// which then mints consent and signs; Decline POSTs a deny.
+///
+/// This is deliberately a plain modal, not a "type to confirm" gate: the strong
+/// boundary is that the PAGE cannot reach the grant channel (it never learns the
+/// request id, and the grant route is GUI→app over `ssh -L`), so a site can make
+/// this appear but can never answer it. Approving is a deliberate operator
+/// action at the GUI.
+#[component]
+fn Fido2PresenceOverlay(
+    dialog: PendingFido2Dialog,
+    palette: Palette,
+    on_approve: EventHandler<MouseEvent>,
+    on_decline: EventHandler<MouseEvent>,
+) -> Element {
+    let overlay_blur = overlay_backdrop_style("blur(18px) saturate(130%)");
+    let (title, verb) = if dialog.ceremony == "create" {
+        ("Register a passkey?", "Register")
+    } else {
+        ("Sign in with a passkey?", "Approve")
+    };
+    let account = if dialog.account.is_empty() {
+        "this account".to_string()
+    } else {
+        dialog.account.clone()
+    };
+    rsx! {
+        div {
+            "data-fido2-overlay": "1",
+            style: format!(
+                "position:fixed; inset:0; z-index:96; display:flex; align-items:center; justify-content:center; \
+                 background:rgba(230,239,248,0.28); backdrop-filter:{}; -webkit-backdrop-filter:{};",
+                overlay_blur,
+                overlay_blur
+            ),
+            // A backdrop click declines — never approves.
+            onclick: move |evt| on_decline.call(evt),
+            div {
+                "data-fido2-dialog": "1",
+                style: format!(
+                    "width:min(440px, calc(100vw - 40px)); display:flex; flex-direction:column; gap:16px; \
+                     padding:22px; border-radius:18px; background:rgba(250,252,255,0.96); color:{}; \
+                     box-shadow:0 24px 54px rgba(55,83,112,0.18), inset 0 0 0 1px rgba(214,223,232,0.9); \
+                     font-family:{};",
+                    palette.text,
+                    interface_font_family()
+                ),
+                onmousedown: |evt| evt.stop_propagation(),
+                onclick: |evt| evt.stop_propagation(),
+                div {
+                    style: "display:flex; align-items:center; gap:10px;",
+                    div {
+                        style: "font-size:22px; line-height:1;",
+                        "\u{1f511}\u{fe0e}"
+                    }
+                    div {
+                        "data-fido2-title": "1",
+                        style: format!(
+                            "font-size:18px; font-weight:700; letter-spacing:-0.01em; color:{};",
+                            palette.text
+                        ),
+                        "{title}"
+                    }
+                }
+                div {
+                    style: "display:flex; flex-direction:column; gap:8px;",
+                    div {
+                        style: format!("font-size:13px; line-height:1.5; color:{};", palette.text),
+                        "{account}"
+                    }
+                    div {
+                        "data-fido2-rp": "1",
+                        style: format!(
+                            "font-size:12px; line-height:1.5; color:{}; \
+                             font-family:'JetBrains Mono', ui-monospace, monospace;",
+                            palette.muted
+                        ),
+                        "{dialog.rp_id}"
+                    }
+                    if !dialog.origin.is_empty() && dialog.origin != dialog.rp_id {
+                        div {
+                            style: format!("font-size:11px; line-height:1.5; color:{};", palette.muted),
+                            "requested by {dialog.origin}"
+                        }
+                    }
+                }
+                div {
+                    style: "display:flex; justify-content:flex-end; gap:10px;",
+                    button {
+                        "data-fido2-decline": "1",
+                        style: cancel_confirm_button_style(palette),
+                        onclick: move |evt| on_decline.call(evt),
+                        "Not now"
+                    }
+                    button {
+                        "data-fido2-approve": "1",
+                        style: delete_confirm_button_style(palette, false),
+                        onclick: move |evt| on_approve.call(evt),
+                        "{verb}"
+                    }
+                }
+            }
+        }
+    }
+}
 #[component]
 fn ThemeEditorOverlay(
     snapshot: SharedSnapshot,
@@ -87169,6 +87428,41 @@ mod tests {
             read_nudge,
             TerminalJsEvent::ReadNudge { reason } if reason == "app_control_send"
         ));
+    }
+
+    #[test]
+    fn fido2_request_event_deserializes_from_the_osc_forwarder() {
+        // The shape the OSC 7717 `fido2;request` JS forwarder emits.
+        let event: TerminalJsEvent = serde_json::from_value(json!({
+            "kind": "fido2_request",
+            "action": "request",
+            "session": "remote-cc://dev/abc",
+            "request_id": "deadbeef",
+            "rp_id": "github.com",
+            "account": "octocat",
+            "ceremony": "get",
+            "origin": "https://github.com",
+        }))
+        .expect("a fido2 request must deserialize");
+        match event {
+            TerminalJsEvent::Fido2Request {
+                action,
+                request_id,
+                rp_id,
+                account,
+                ceremony,
+                origin,
+                ..
+            } => {
+                assert_eq!(action, "request");
+                assert_eq!(request_id, "deadbeef");
+                assert_eq!(rp_id, "github.com");
+                assert_eq!(account, "octocat");
+                assert_eq!(ceremony, "get");
+                assert_eq!(origin, "https://github.com");
+            }
+            other => panic!("expected Fido2Request, got {other:?}"),
+        }
     }
 
     #[test]
@@ -106615,6 +106909,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             optimistic_drag_target: None,
             drag_pointer: None,
             pending_delete: None,
+            pending_fido2: None,
             copy_edit_dialog: None,
             tree_rename_path: None,
             tree_rename_input_focused_once: false,
@@ -107229,6 +107524,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             optimistic_drag_target: None,
             drag_pointer: None,
             pending_delete: None,
+            pending_fido2: None,
             copy_edit_dialog: None,
             tree_rename_path: None,
             tree_rename_input_focused_once: false,
@@ -107378,6 +107674,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             optimistic_drag_target: None,
             drag_pointer: None,
             pending_delete: None,
+            pending_fido2: None,
             copy_edit_dialog: None,
             tree_rename_path: None,
             tree_rename_input_focused_once: false,
@@ -107527,6 +107824,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             optimistic_drag_target: None,
             drag_pointer: None,
             pending_delete: None,
+            pending_fido2: None,
             copy_edit_dialog: None,
             tree_rename_path: None,
             tree_rename_input_focused_once: false,
@@ -107679,6 +107977,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             optimistic_drag_target: None,
             drag_pointer: None,
             pending_delete: None,
+            pending_fido2: None,
             copy_edit_dialog: None,
             tree_rename_path: None,
             tree_rename_input_focused_once: false,
@@ -107835,6 +108134,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             optimistic_drag_target: None,
             drag_pointer: None,
             pending_delete: None,
+            pending_fido2: None,
             copy_edit_dialog: None,
             tree_rename_path: None,
             tree_rename_input_focused_once: false,
@@ -107983,6 +108283,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             optimistic_drag_target: None,
             drag_pointer: None,
             pending_delete: None,
+            pending_fido2: None,
             copy_edit_dialog: None,
             tree_rename_path: None,
             tree_rename_input_focused_once: false,
@@ -108131,6 +108432,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             optimistic_drag_target: None,
             drag_pointer: None,
             pending_delete: None,
+            pending_fido2: None,
             copy_edit_dialog: None,
             tree_rename_path: None,
             tree_rename_input_focused_once: false,
@@ -108313,6 +108615,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             optimistic_drag_target: None,
             drag_pointer: None,
             pending_delete: None,
+            pending_fido2: None,
             copy_edit_dialog: None,
             tree_rename_path: None,
             tree_rename_input_focused_once: false,
@@ -108464,6 +108767,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             optimistic_drag_target: None,
             drag_pointer: None,
             pending_delete: None,
+            pending_fido2: None,
             copy_edit_dialog: None,
             tree_rename_path: None,
             tree_rename_input_focused_once: false,
@@ -108647,6 +108951,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             optimistic_drag_target: None,
             drag_pointer: None,
             pending_delete: None,
+            pending_fido2: None,
             copy_edit_dialog: None,
             tree_rename_path: None,
             tree_rename_input_focused_once: false,
@@ -109007,6 +109312,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             optimistic_drag_target: None,
             drag_pointer: None,
             pending_delete: None,
+            pending_fido2: None,
             copy_edit_dialog: None,
             tree_rename_path: None,
             tree_rename_input_focused_once: false,

@@ -323,6 +323,34 @@ The hardcoded "New Paper" entries are **deleted** — Paper was never a libyggte
 app, just a stub the shell knew about. It comes back as a registry entry when a
 Paper app ships one. Full design: [[project-libyggterm-app-menu-contribution]].
 
+### Passkey presence surface — SHIPPED 2026-07-10 (yggterm 2.10.4)
+
+A libyggterm browser can answer `navigator.credentials` from its own vault
+(WebKitGTK has no WebAuthn). The one thing it cannot do host-side is get the
+user's consent — the human is at the GUI. So a *fourth* thing crosses OSC 7717:
+`fido2 ; request`, payload `{session, request_id, rp_id, account, kind, origin}`.
+
+- The app carries only the rpId and a display label — **never a challenge, never
+  a key**. yggterm shows a native presence dialog (`Fido2PresenceOverlay`) naming
+  the site and account.
+- Approve POSTs `<control>/fido2/grant {request_id}` over the app's existing
+  `ssh -L` control channel; Decline POSTs `/fido2/deny`. The app is parked on its
+  own `/fido2/get` and matches the reply by `request_id`, then mints consent and
+  signs.
+- **The boundary that matters is against the web.** A page can *trigger* a
+  ceremony (its `navigator.credentials.get` shim reaches the app's signer over the
+  surface's SOCKS-loopback) but can never *answer* one: the `request_id` is
+  128 bits of CSPRNG never exposed to the page, and the grant route is GUI→app
+  over `ssh -L`, not page-reachable. On a same-uid host the grant is not
+  cryptographically isolated from another same-uid process — the same truth as
+  the vault's `get` op returning a plaintext password — so passkeys are no weaker
+  than the vault already is. The human gate is the dialog; a grant is a deliberate
+  operator action, never a silent socket call.
+- yggterm owns the OSC + the dialog; the app owns the crypto (`ychrome-vault`'s
+  `fido2.rs`), the keys, and the consent type (`UserPresence`, mintable only after
+  a grant). Anti-pattern to avoid: a "sign this passkey" agent/CLI op — it would
+  be a silent auto-consent path. The signer lives behind the dialog.
+
 ## Worked example: the password vault as an ychrome-owned surface
 
 The native Bitwarden/Vaultwarden client (crate `ychrome-vault`, crypto proven
