@@ -184,7 +184,7 @@ use yggterm_server::{
     persist_remote_generated_copy, ping, prepare_client_close, prepare_update_restart,
     reachable_versioned_daemon_statuses, refresh_local_managed_cli_now, refresh_managed_cli,
     refresh_preview, refresh_remote_machine, remove_session, remove_ssh_target,
-    reorder_live_sessions, request_terminal_launch, request_terminal_launch_for_path,
+    request_terminal_launch, request_terminal_launch_for_path,
     set_all_preview_blocks_folded, set_session_keep_alive, set_view_mode as daemon_set_view_mode,
     shutdown as daemon_shutdown, snapshot as daemon_snapshot, snapshot_session_view_for_ui,
     stage_remote_clipboard_png, start_command_session_with_terminal_appearance,
@@ -28234,13 +28234,24 @@ fn group_launch_cwd_for(
         skipped_generated_leaf = true;
     }
     if skipped_generated_leaf {
-        // The title is the name the user gave the folder. Accept it only as a
-        // single path segment — never let a label traverse the filesystem.
+        // The title is the name the user gave the folder. Accept it as a
+        // RELATIVE path under the ancestor — one or more validated segments
+        // (users title folders "gh/yggterm" to mirror nested directories) —
+        // but never let a label escape it: no leading '/', no "..", and the
+        // joined directory must actually exist.
         let title = title.trim();
-        let title_is_a_plain_name =
-            !title.is_empty() && !title.contains('/') && title != "." && title != "..";
-        if title_is_a_plain_name {
-            let candidate = format!("{}/{title}", base.trim_end_matches('/'));
+        let segments: Vec<&str> = title
+            .split('/')
+            .map(str::trim)
+            .filter(|segment| !segment.is_empty() && *segment != ".")
+            .collect();
+        let title_is_a_safe_relative_path = !title.starts_with('/')
+            && !segments.is_empty()
+            && segments
+                .iter()
+                .all(|segment| *segment != ".." && !segment.contains('\0'));
+        if title_is_a_safe_relative_path {
+            let candidate = format!("{}/{}", base.trim_end_matches('/'), segments.join("/"));
             if dir_exists(&candidate) {
                 return Some(candidate);
             }
@@ -43271,6 +43282,28 @@ fn app() -> Element {
                     "renders_per_sec": (per_sec * 10.0).round() / 10.0,
                 }),
             );
+            // A sustained app() render rate this high is never output-driven
+            // (steady agent streaming sits ~1/s, bursts ~16/s): it is the wake
+            // storm implicated in the CPU-spin incidents. Surface it through
+            // the same fail-pattern channel the client anomalies use so
+            // scripts/render_fail_patterns.py groups it with the rest.
+            if window_ms > 0 && per_sec >= 20.0 {
+                append_trace_event(
+                    &trace_home,
+                    "ui",
+                    "render_fail_pattern",
+                    "detected",
+                    json!({
+                        "session_path": "",
+                        "anomaly": {
+                            "pattern": "app_render_storm",
+                            "renders_in_window": count,
+                            "window_ms": window_ms,
+                            "renders_per_sec": (per_sec * 10.0).round() / 10.0,
+                        },
+                    }),
+                );
+            }
             RENDER_COUNT.store(0, AtomicOrdering::Relaxed);
         }
     }
@@ -46384,17 +46417,35 @@ fn app() -> Element {
                                     },
                                     move |endpoint| {
                                         // Exact paths, one request each, tree order.
-                                        // The LAST snapshot is the one the UI adopts;
-                                        // a failure anywhere aborts and surfaces.
+                                        // The LAST snapshot is the one the UI adopts.
+                                        // A failure must NOT abort the batch — the
+                                        // remaining sessions still get their request
+                                        // (a bulk keep-alive that stops at the first
+                                        // bad row silently strands the rest); errors
+                                        // aggregate and surface once, and any success
+                                        // still adopts a snapshot so the tree shows
+                                        // the daemon's truth for the rows that took.
                                         let mut result = None;
+                                        let mut errors = Vec::new();
                                         for path in &paths {
-                                            result = Some(set_session_keep_alive(
+                                            match set_session_keep_alive(
                                                 &endpoint, path, keep_alive,
-                                            )?);
+                                            ) {
+                                                Ok(snapshot) => result = Some(snapshot),
+                                                Err(error) => {
+                                                    errors.push(format!("{path}: {error}"));
+                                                }
+                                            }
                                         }
-                                        result.ok_or_else(|| {
-                                            anyhow!("no live session to keep alive")
-                                        })
+                                        match result {
+                                            Some(snapshot) => Ok(snapshot),
+                                            None if !errors.is_empty() => {
+                                                Err(anyhow!(errors.join("; ")))
+                                            }
+                                            None => Err(anyhow!(
+                                                "no live session to keep alive"
+                                            )),
+                                        }
                                     },
                                 );
                             }
@@ -68051,8 +68102,20 @@ fn terminal_eval_script_with_canvas_renderer(
         let lastAtlasClearAtMs = 0;
         let lastStaleAtlasHealGapEndMs = 0;
         let staleAtlasHealCount = 0;
+        // XTERM-BUG: blank-rendering-region — per-row glyph-gap detector state.
+        // Rows whose BUFFER holds text but whose text-layer pixels hold no ink
+        // are the partial variant of canvas_blank_with_buffer_text (a blank
+        // band / dropped glyphs inside an otherwise painted viewport).
+        let lastGlyphGapScanAtMs = 0;
+        let lastGlyphGapHealAtMs = 0;
+        let glyphGapHealCount = 0;
         let renderHealthRecoveryCount = 0;
         let lastRenderHealthRecoveryAtMs = 0;
+        // Escalating cooldown between render-health recovery repaints. A canvas
+        // that keeps re-blanking (compositor-side, heal does not stick) used to
+        // re-repaint on a fixed 2s cadence indefinitely — each repaint clears
+        // the glyph atlas and refreshes every row, which reads as a CPU storm.
+        let renderHealthRecoveryBackoffMs = 2000;
         let lastRenderHealthCheckedAtMs = 0;
         let renderHealthStatus = 'unknown';
         let renderHealthReason = '';
@@ -69943,6 +70006,124 @@ fn terminal_eval_script_with_canvas_renderer(
                 alpha_sum: alphaSum,
             }};
         }};
+        // XTERM-BUG: blank-rendering-region — detect the PArecordsAL variant of
+        // canvas_blank_with_buffer_text: individual viewport rows whose buffer
+        // holds text but whose text-layer band holds no ink (a blank band or
+        // heavy glyph dropping inside an otherwise painted viewport). The full
+        // ink sample cannot see it (other rows keep the aggregate nonzero).
+        // One bulk getImageData per scan (a single GPU sync) instead of
+        // hundreds of 1px reads; scans are throttled to one per 5s per host
+        // and only run on the active host with a healthy aggregate sample.
+        // Heals like the stale-atlas path: targeted atlas clear + row refresh,
+        // latched to at most one heal per 10s so it can never form a loop.
+        const detectAndHealGlyphGapRows = (reason = '') => {{
+            const now = Date.now();
+            if (now - lastGlyphGapScanAtMs < 5000) {{
+                return null;
+            }}
+            lastGlyphGapScanAtMs = now;
+            const buffer = term && term.buffer && term.buffer.active ? term.buffer.active : null;
+            const rowCount = Math.max(0, Number(term && term.rows ? term.rows : 0));
+            if (!buffer || rowCount < 4) {{
+                return null;
+            }}
+            const textCanvas = Array.from(host.querySelectorAll('.xterm-screen canvas'))
+                .find((canvas) => canvasLayerRole(canvas) === 'text'
+                    && Number(canvas.width || 0) > 0
+                    && Number(canvas.height || 0) > 0);
+            if (!textCanvas) {{
+                return null;
+            }}
+            let image = null;
+            try {{
+                const context = textCanvas.getContext('2d', {{ willReadFrequently: true }});
+                if (!context) {{
+                    return null;
+                }}
+                image = context.getImageData(0, 0, textCanvas.width, textCanvas.height);
+            }} catch (_error) {{
+                return null;
+            }}
+            const width = Number(textCanvas.width || 0);
+            const height = Number(textCanvas.height || 0);
+            const cellHeight = height / rowCount;
+            if (!(cellHeight > 1) || width < 8) {{
+                return null;
+            }}
+            const data = image.data;
+            const gapRows = [];
+            let inkedRows = 0;
+            let textRows = 0;
+            const stepX = Math.max(1, Math.floor(width / 24));
+            for (let row = 0; row < rowCount; row += 1) {{
+                let lineText = '';
+                try {{
+                    const line = buffer.getLine(Math.max(0, Number(buffer.viewportY || 0)) + row);
+                    lineText = line && typeof line.translateToString === 'function'
+                        ? line.translateToString(true)
+                        : '';
+                }} catch (_error) {{}}
+                if (!/[A-Za-z0-9]/.test(String(lineText || ''))) {{
+                    continue;
+                }}
+                textRows += 1;
+                const yStart = Math.max(0, Math.floor(row * cellHeight)) + 1;
+                const yEnd = Math.min(height, Math.ceil((row + 1) * cellHeight)) - 1;
+                let rowHasInk = false;
+                for (let y = yStart; y < yEnd && !rowHasInk; y += 2) {{
+                    const rowBase = y * width * 4;
+                    for (let x = Math.floor(stepX / 2); x < width; x += stepX) {{
+                        if (Number(data[rowBase + x * 4 + 3] || 0) > 8) {{
+                            rowHasInk = true;
+                            break;
+                        }}
+                    }}
+                }}
+                if (rowHasInk) {{
+                    inkedRows += 1;
+                }} else {{
+                    gapRows.push(row);
+                }}
+            }}
+            if (gapRows.length < 3 || inkedRows === 0) {{
+                return null;
+            }}
+            const healAllowed = now - lastGlyphGapHealAtMs > 10000;
+            if (healAllowed) {{
+                lastGlyphGapHealAtMs = now;
+                glyphGapHealCount += 1;
+                const refreshStart = Math.max(0, gapRows[0]);
+                const refreshEnd = Math.min(rowCount - 1, gapRows[gapRows.length - 1]);
+                window.setTimeout(() => {{
+                    try {{
+                        clearTerminalTextureAtlas();
+                        if (term.refresh) {{
+                            term.refresh(refreshStart, refreshEnd);
+                        }}
+                    }} catch (_error) {{}}
+                }}, 0);
+            }}
+            const glyphGapEntry = window.__yggtermXtermHosts && window.__yggtermXtermHosts[hostId]
+                ? window.__yggtermXtermHosts[hostId]
+                : null;
+            if (glyphGapEntry) {{
+                glyphGapEntry.glyphGapHealCount = glyphGapHealCount;
+                glyphGapEntry.lastGlyphGapRows = gapRows.slice(0, 12);
+                glyphGapEntry.lastGlyphGapDetectedAtMs = now;
+            }}
+            return {{
+                pattern: 'glyph_gap_rows',
+                gap_row_count: gapRows.length,
+                gap_rows_sample: gapRows.slice(0, 12),
+                text_rows: textRows,
+                inked_rows: inkedRows,
+                heal_count: glyphGapHealCount,
+                healed: healAllowed,
+                window_focused: document.hasFocus(),
+                visibility: String(document.visibilityState || ''),
+                source: String(reason || ''),
+            }};
+        }};
         const updateRenderHealth = (reason, cursorLineText = '', textTail = '', options = {{}}) => {{
             const now = Date.now();
             lastRenderHealthCheckedAtMs = now;
@@ -69989,6 +70170,18 @@ fn terminal_eval_script_with_canvas_renderer(
                         ? 'canvas_blank_with_buffer_text'
                         : 'canvas_blank_with_buffer_text_background')
                     : '');
+            // Partial-blank / glyph-drop scan: only worth running when the
+            // aggregate sample looks healthy (a fully blank canvas is already
+            // handled above) and only for the active host (background WebGL
+            // canvases sample blank legitimately).
+            if (!skipInkSample && !unhealthy && hasBufferText && hostIsActive) {{
+                try {{
+                    const glyphGapAnomaly = detectAndHealGlyphGapRows(reason);
+                    if (glyphGapAnomaly) {{
+                        pendingRenderAnomaly = JSON.stringify(glyphGapAnomaly);
+                    }}
+                }} catch (_error) {{}}
+            }}
             const entry = window.__yggtermXtermHosts && window.__yggtermXtermHosts[hostId]
                 ? window.__yggtermXtermHosts[hostId]
                 : null;
@@ -70024,8 +70217,19 @@ fn terminal_eval_script_with_canvas_renderer(
                 && hostIsActive
                 && !renderHealthRecoveryPending
                 && renderHealthRecoveryCount < 2
-                && now - lastRenderHealthRecoveryAtMs > 2000
+                && now - lastRenderHealthRecoveryAtMs > renderHealthRecoveryBackoffMs
             ) {{
+                // Escalate the cooldown when the previous heal did not stick
+                // (the canvas re-blanked within 30s): 2s → 4s → … → 60s. A
+                // fresh episode long after the last recovery re-arms the fast
+                // 2s heal. This keeps first-heal latency identical while
+                // preventing an endless repaint cadence (each recovery clears
+                // the glyph atlas + refreshes every row — the CPU-swing driver
+                // when the blanking is compositor-side and healing cannot win).
+                renderHealthRecoveryBackoffMs =
+                    lastRenderHealthRecoveryAtMs > 0 && now - lastRenderHealthRecoveryAtMs < 30000
+                        ? Math.min(60000, renderHealthRecoveryBackoffMs * 2)
+                        : 2000;
                 renderHealthRecoveryPending = true;
                 renderHealthRecoveryCount += 1;
                 lastRenderHealthRecoveryAtMs = now;
@@ -70033,6 +70237,7 @@ fn terminal_eval_script_with_canvas_renderer(
                     entry.renderHealthRecoveryCount = renderHealthRecoveryCount;
                     entry.lastRenderHealthRecoveryAtMs = lastRenderHealthRecoveryAtMs;
                     entry.pendingRenderHealthRecovery = true;
+                    entry.renderHealthRecoveryBackoffMs = renderHealthRecoveryBackoffMs;
                 }}
                 window.setTimeout(() => {{
                     renderHealthRecoveryPending = false;
@@ -82603,8 +82808,27 @@ mod tests {
             group_launch_cwd_for("/home/user/gh/yggterm", "yggterm", |_| true).as_deref(),
             Some("/home/user/gh/yggterm"),
         );
-        // A title must never traverse: it is one path segment or nothing.
-        for hostile in ["../../etc", "a/b", "", "  ", ".", ".."] {
+        // A multi-segment RELATIVE title mirrors nested directories: a folder
+        // titled "gh/yggterm" under /home/user launches in /home/user/gh/yggterm
+        // (reported 2026-07-10: it silently fell back to /home/user).
+        let generated_home = "/home/user/folder-1783594131281231525";
+        let on_disk = |path: &str| path == "/home/user/gh/yggterm";
+        assert_eq!(
+            group_launch_cwd_for(generated_home, "gh/yggterm", on_disk).as_deref(),
+            Some("/home/user/gh/yggterm"),
+        );
+        // Sloppy but unambiguous titles normalize: extra slashes, spaces, ".".
+        assert_eq!(
+            group_launch_cwd_for(generated_home, " gh // ./ yggterm ", on_disk).as_deref(),
+            Some("/home/user/gh/yggterm"),
+        );
+        // A relative title whose directory does not exist still falls back.
+        assert_eq!(
+            group_launch_cwd_for(generated_home, "gh/nonexistent", on_disk).as_deref(),
+            Some("/home/user"),
+        );
+        // A title must never ESCAPE the ancestor: no "..", no absolute paths.
+        for hostile in ["../../etc", "a/../../b", "/etc", "", "  ", ".", ".."] {
             assert_eq!(
                 group_launch_cwd_for(generated, hostile, |_| true).as_deref(),
                 Some("/home/user/git"),
@@ -88233,6 +88457,41 @@ mod tests {
         assert!(script.contains("xtermInputLineDecorationElementVisible"));
         assert!(script.contains("xtermInputLineDecorationVisible"));
         assert!(script.contains("xtermInputLineDecorationBackground"));
+    }
+
+    #[test]
+    fn terminal_eval_script_wires_glyph_gap_rows_detector() {
+        // XTERM-BUG: blank-rendering-region — a blank band / dropped glyphs
+        // inside an otherwise painted viewport is invisible to the aggregate
+        // ink sample (other rows keep it nonzero). The per-row detector
+        // compares buffer text rows against text-layer ink bands, traces a
+        // glyph_gap_rows render anomaly, and heals with a targeted atlas
+        // clear + row-range refresh, latched so it can never loop.
+        let theme = terminal_theme(UiTheme::ZedDark, palette(UiTheme::ZedDark), 13.0, "");
+        let script = terminal_eval_script_with_canvas_renderer(
+            "yggterm-terminal-test",
+            &theme,
+            true,
+            true,
+            "test_reason",
+        );
+        assert!(script.contains("pattern: 'glyph_gap_rows'"));
+        assert!(
+            script.contains("detectAndHealGlyphGapRows(reason)"),
+            "the render-health pass must run the per-row scan when the aggregate sample is healthy"
+        );
+        assert!(
+            script.contains("now - lastGlyphGapScanAtMs < 5000"),
+            "the per-row scan must stay throttled — it does a full-canvas readback"
+        );
+        assert!(
+            script.contains("now - lastGlyphGapHealAtMs > 10000"),
+            "the glyph-gap heal must be latched so its own refresh cannot loop"
+        );
+        assert!(
+            script.contains("renderHealthRecoveryBackoffMs * 2"),
+            "render-health recovery must escalate its cooldown when a heal does not stick"
+        );
     }
 
     #[test]
