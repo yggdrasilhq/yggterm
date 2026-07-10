@@ -1254,6 +1254,13 @@ enum AppPaneWidget {
         /// Masks the field. The value still only leaves the GUI on an action.
         #[serde(default)]
         secret: bool,
+        /// Render a multi-line `<textarea>` (user-resizable) instead of a single
+        /// line. `rows` is its initial height in lines; 0 falls back to a default.
+        /// A `secret` field is never multi-line (a masked textarea is nonsense).
+        #[serde(default)]
+        multiline: bool,
+        #[serde(default)]
+        rows: u32,
     },
     NumberInput {
         id: String,
@@ -4716,6 +4723,12 @@ impl ShellState {
                 .is_some_and(|request| {
                     active_surface_request_matches_session(request, active_session_path.as_deref())
                 });
+        // The active session's contributed panes: SSOT for both the rail's
+        // buttons and whether the current app-pane mode still has a home.
+        let sidebar_panes = active_session_path
+            .as_deref()
+            .map(|path| self.active_sidebar_panes(path, current_millis()))
+            .unwrap_or_default();
         RenderSnapshot {
             palette: palette,
             search_query: self.search_query.clone(),
@@ -4739,7 +4752,19 @@ impl ShellState {
             sidebar_open: self.sidebar_open,
             sidebar_width: self.sidebar_width,
             sidebar_resizing: self.sidebar_resize_drag.is_some(),
-            right_panel_mode: self.right_panel_mode.clone(),
+            right_panel_mode: {
+                // A contributed pane the active session no longer offers (session
+                // switch, or the app died) falls back to the user's own view
+                // rather than blanking the rail. Uses the same `sidebar_panes`
+                // the field below carries, so the two cannot disagree.
+                let offers_pane = match &self.right_panel_mode {
+                    RightPanelMode::AppPane(pane_id) => {
+                        sidebar_panes.iter().any(|pane| pane.id == *pane_id)
+                    }
+                    _ => true,
+                };
+                self.effective_right_panel_mode(offers_pane)
+            },
             rows,
             selected_path,
             selected_row,
@@ -4750,10 +4775,7 @@ impl ShellState {
                     .and_then(|surface| surface.tabs.first())
                     .map(|app_tab| app_tab.profile.clone())
             }),
-            sidebar_panes: active_session_path
-                .as_deref()
-                .map(|path| self.active_sidebar_panes(path, current_millis()))
-                .unwrap_or_default(),
+            sidebar_panes,
             app_pane_schema: self.app_pane_schema.clone(),
             app_pane_error: self.app_pane_error.clone(),
             active_web_surface_host: active_session_path
@@ -5113,7 +5135,6 @@ impl ShellState {
         if let Some(contribution) = self.sidebar_contributions.remove(session_path) {
             kill_control_forward(&contribution);
         }
-        self.restore_right_panel_if_app_pane_retired();
     }
     /// Contributions expire on the same rule as surfaces: no declare within
     /// WEB_SURFACE_STALE_AFTER_MS and the app is presumed gone, so its buttons
@@ -5127,7 +5148,6 @@ impl ShellState {
             }
             live
         });
-        self.restore_right_panel_if_app_pane_retired();
     }
     /// The panes the active session's app currently offers. Empty when no app
     /// has declared, which is what keeps the rail free of app chrome.
@@ -5633,17 +5653,22 @@ impl ShellState {
     ///
     /// A pane some OTHER live contribution still offers is left alone — that is
     /// the session-switch case, where the pane collapses and re-reveals on return.
-    fn restore_right_panel_if_app_pane_retired(&mut self) {
-        let RightPanelMode::AppPane(pane_id) = &self.right_panel_mode else {
-            return;
-        };
-        let pane_id = pane_id.clone();
-        let still_offered = self
-            .sidebar_contributions
-            .values()
-            .any(|contribution| contribution.panes.iter().any(|pane| pane.id == pane_id));
-        if !still_offered {
-            self.close_app_pane();
+    /// The right-panel mode to DISPLAY, which differs from `right_panel_mode`
+    /// only when an app's pane is selected but the ACTIVE session's app does not
+    /// offer it — a switch to a session with no such app, or the app having died.
+    ///
+    /// A contributed pane is a tenant of the session that declared it: when the
+    /// active session cannot serve it, the panel falls back to the user's own
+    /// remembered view instead of blanking. This is a pure derivation, not a
+    /// mutation, so switching BACK to the app's session re-reveals the pane for
+    /// free — the user who works with the sidebar open never sees it vanish.
+    fn effective_right_panel_mode(&self, active_session_offers_pane: bool) -> RightPanelMode {
+        match &self.right_panel_mode {
+            RightPanelMode::AppPane(_) if !active_session_offers_pane => self
+                .right_panel_mode_before_app_pane
+                .clone()
+                .unwrap_or(RightPanelMode::Hidden),
+            mode => mode.clone(),
         }
     }
     /// Draft input values never survive a pane switch: a search term or an
@@ -77184,24 +77209,43 @@ fn AppPaneRailBody(
                                     },
                                 }
                             },
-                            AppPaneWidget::TextInput { id, label, placeholder, value, secret } => rsx! {
+                            AppPaneWidget::TextInput { id, label, placeholder, value, secret, multiline, rows } => rsx! {
                                 div {
                                     key: "{widget_key}",
                                     style: "display:flex; flex-direction:column; gap:4px;",
                                     if !label.is_empty() {
                                         div { style: "{muted_style}", "{label}" }
                                     }
-                                    input {
-                                        "data-app-pane-input": "{id}",
-                                        style: "{field_style}",
-                                        r#type: if secret { "password" } else { "text" },
-                                        placeholder: "{placeholder}",
-                                        initial_value: "{value}",
-                                        oninput: {
-                                            let id = id.clone();
-                                            let on_app_pane_value = on_app_pane_value.clone();
-                                            move |evt: FormEvent| on_app_pane_value.call((id.clone(), evt.value()))
-                                        },
+                                    // A masked textarea is nonsense, so `secret`
+                                    // always wins and forces a single-line input.
+                                    if multiline && !secret {
+                                        textarea {
+                                            "data-app-pane-input": "{id}",
+                                            // `resize:vertical` is the drag-to-expand handle;
+                                            // `field_style` gives it the same skin as an input.
+                                            style: "{field_style} resize:vertical; min-height:1.6em; line-height:1.4; font-family:inherit;",
+                                            rows: "{rows.max(1)}",
+                                            placeholder: "{placeholder}",
+                                            initial_value: "{value}",
+                                            oninput: {
+                                                let id = id.clone();
+                                                let on_app_pane_value = on_app_pane_value.clone();
+                                                move |evt: FormEvent| on_app_pane_value.call((id.clone(), evt.value()))
+                                            },
+                                        }
+                                    } else {
+                                        input {
+                                            "data-app-pane-input": "{id}",
+                                            style: "{field_style}",
+                                            r#type: if secret { "password" } else { "text" },
+                                            placeholder: "{placeholder}",
+                                            initial_value: "{value}",
+                                            oninput: {
+                                                let id = id.clone();
+                                                let on_app_pane_value = on_app_pane_value.clone();
+                                                move |evt: FormEvent| on_app_pane_value.call((id.clone(), evt.value()))
+                                            },
+                                        }
                                     }
                                 }
                             },
@@ -87584,6 +87628,8 @@ mod tests {
             placeholder: String::new(),
             value: String::new(),
             secret: true,
+            multiline: false,
+            rows: 0,
         };
         let bumped = HashMap::from([("password".to_string(), 1u64)]);
         assert_ne!(field.key(0, &epochs), field.key(0, &bumped));
@@ -87602,6 +87648,7 @@ mod tests {
                  "tabs": [{"id": "fill", "label": "Fill"}]},
                 {"kind": "search-box", "id": "query"},
                 {"kind": "text-input", "id": "name"},
+                {"kind": "text-input", "id": "notes", "multiline": true, "rows": 10},
                 {"kind": "number-input", "id": "len", "value": 24, "min": 8, "max": 64},
                 {"kind": "toggle", "id": "adblock", "label": "Adblock", "value": true},
                 {"kind": "button", "id": "add", "label": "Add", "action": "add"},
@@ -87611,10 +87658,13 @@ mod tests {
         }))
         .expect("schema parses");
         assert_eq!(schema.title, "Vault");
-        assert_eq!(schema.widgets.len(), 9);
+        assert_eq!(schema.widgets.len(), 10);
         // An omitted `action` is empty, not an error: a search box need not act.
         assert!(matches!(&schema.widgets[3], AppPaneWidget::SearchBox { action, .. } if action.is_empty()));
-        assert!(matches!(&schema.widgets[8], AppPaneWidget::ListRow { actions, .. } if actions.len() == 1));
+        // A plain text-input is single-line; the notes field opts into multiline.
+        assert!(matches!(&schema.widgets[4], AppPaneWidget::TextInput { multiline: false, .. }));
+        assert!(matches!(&schema.widgets[5], AppPaneWidget::TextInput { multiline: true, rows: 10, .. }));
+        assert!(matches!(&schema.widgets[9], AppPaneWidget::ListRow { actions, .. } if actions.len() == 1));
     }
 
     // An unknown widget kind must fail the pane, not silently render a hole:
@@ -87723,63 +87773,69 @@ mod tests {
         );
     }
 
-    // An app's pane is a TENANT of the right panel. When the app dies, the panel
-    // goes back to what the user had open — collapsing the whole rail throws away
-    // state they never asked to lose.
+    // An app's pane is a TENANT of the right panel. On a session the app no
+    // longer serves — switched away, or the app died — the DISPLAYED panel falls
+    // back to the user's own view rather than blanking the rail. It is a pure
+    // derivation, so the underlying mode is untouched and the pane re-reveals
+    // when its session serves it again.
     #[test]
-    fn a_dead_app_gives_the_right_panel_back_to_the_user() {
+    fn an_unserved_app_pane_displays_the_users_own_view() {
         let mut shell = ShellState::new(test_shell_bootstrap_with_active_session("local://pane"));
         shell.set_right_panel_mode(RightPanelMode::Metadata);
-        declare_pane(&mut shell, "local://pane", "vault", 1_000);
-
         shell.open_app_pane("vault");
         assert_eq!(shell.right_panel_mode, RightPanelMode::AppPane("vault".into()));
 
-        // ychrome exits and emits `sidebar ; close`.
-        shell.close_sidebar_contribution("local://pane");
+        // Active session offers the pane → it shows.
         assert_eq!(
-            shell.right_panel_mode,
-            RightPanelMode::Metadata,
-            "the user's panel was collapsed instead of restored"
+            shell.effective_right_panel_mode(true),
+            RightPanelMode::AppPane("vault".into())
         );
-
-        // Same for an app that is SIGKILLed and simply stops declaring.
-        declare_pane(&mut shell, "local://pane", "vault", 2_000);
-        shell.open_app_pane("vault");
-        shell.sweep_stale_sidebar_contributions(2_000 + WEB_SURFACE_STALE_AFTER_MS + 1);
-        assert_eq!(shell.right_panel_mode, RightPanelMode::Metadata);
+        // Active session does NOT offer it (switched to a non-app session, or the
+        // app died) → the user's remembered view, not a blank rail.
+        assert_eq!(shell.effective_right_panel_mode(false), RightPanelMode::Metadata);
+        // The underlying mode is untouched — switching back re-reveals the pane.
+        assert_eq!(shell.right_panel_mode, RightPanelMode::AppPane("vault".into()));
     }
 
-    // A pane the user opened from a hidden rail returns to hidden, not to some
-    // panel they never had open.
+    // A pane opened from a hidden rail falls back to hidden, not to a panel the
+    // user never had open.
     #[test]
-    fn a_dead_app_restores_hidden_when_that_is_what_the_user_had() {
+    fn an_unserved_app_pane_falls_back_to_hidden_when_that_is_what_the_user_had() {
         let mut shell = ShellState::new(test_shell_bootstrap_with_active_session("local://pane"));
         shell.set_right_panel_mode(RightPanelMode::Hidden);
-        declare_pane(&mut shell, "local://pane", "vault", 1_000);
         shell.open_app_pane("vault");
-        shell.close_sidebar_contribution("local://pane");
-        assert_eq!(shell.right_panel_mode, RightPanelMode::Hidden);
+        assert_eq!(shell.effective_right_panel_mode(false), RightPanelMode::Hidden);
     }
 
-    // A live contribution elsewhere means the pane merely collapsed for THIS
-    // session (session switch) and must re-reveal on return — do not restore.
+    // The end-to-end path the renderer reads: the snapshot shows the vault pane
+    // while the active session offers it, the user's own view once it does not,
+    // and the pane again when it is re-offered — all without touching the
+    // underlying mode. This is the reported bug (the rail blanked instead).
     #[test]
-    fn a_pane_still_offered_by_another_session_is_not_retired() {
-        let mut shell = ShellState::new(test_shell_bootstrap_with_active_session("local://a"));
+    fn snapshot_right_panel_falls_back_when_the_pane_stops_being_offered() {
+        let mut shell = ShellState::new(test_shell_bootstrap_with_active_session("local://web"));
         shell.set_right_panel_mode(RightPanelMode::Metadata);
-        declare_pane(&mut shell, "local://a", "vault", 1_000);
-        declare_pane(&mut shell, "local://b", "vault", 1_000);
+        declare_pane(&mut shell, "local://web", "vault", current_millis());
         shell.open_app_pane("vault");
-
-        shell.close_sidebar_contribution("local://a");
         assert_eq!(
-            shell.right_panel_mode,
-            RightPanelMode::AppPane("vault".into()),
-            "another live ychrome still offers this pane"
+            shell.snapshot().right_panel_mode,
+            RightPanelMode::AppPane("vault".into())
         );
-        shell.close_sidebar_contribution("local://b");
-        assert_eq!(shell.right_panel_mode, RightPanelMode::Metadata);
+
+        // The app goes away (died, or the user switched to a session without it).
+        shell.close_sidebar_contribution("local://web");
+        assert_eq!(
+            shell.snapshot().right_panel_mode,
+            RightPanelMode::Metadata,
+            "the rail blanked instead of showing the user's own view"
+        );
+
+        // Re-offered → the pane returns for free, no re-open.
+        declare_pane(&mut shell, "local://web", "vault", current_millis());
+        assert_eq!(
+            shell.snapshot().right_panel_mode,
+            RightPanelMode::AppPane("vault".into())
+        );
     }
 
     // Hopping pane→pane must not overwrite the memory of the user's own view.
