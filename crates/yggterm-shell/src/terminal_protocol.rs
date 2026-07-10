@@ -195,8 +195,13 @@ pub(crate) enum TerminalJsEvent {
         request_id: String,
         /// The relying party the credential is for, e.g. `github.com`.
         rp_id: String,
-        /// A human label for the account (userName / displayName / item name).
+        /// A human label for the FIRST matched account. Kept for a single-account
+        /// ceremony and as a fallback; the picker uses `accounts`.
         account: String,
+        /// Every stored passkey that answers this `get()` — one entry ⇒ a plain
+        /// Approve dialog, several ⇒ a picker. A `create()` always has one. The
+        /// grant carries the chosen `credential_id`.
+        accounts: Vec<Fido2Account>,
         /// `get` (sign in) or `create` (register) — changes the dialog wording.
         ceremony: String,
         /// The page origin the ceremony runs on, shown so the user can see the
@@ -207,6 +212,14 @@ pub(crate) enum TerminalJsEvent {
         reason: String,
         value: Value,
     },
+}
+
+/// One passkey the user may pick in the presence dialog. Secret-free: a stable
+/// `credential_id` to echo back in the grant, and a human `label`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Fido2Account {
+    pub credential_id: String,
+    pub label: String,
 }
 
 /// One pane an app offers, as the rail needs it: an id to fetch the schema
@@ -331,10 +344,20 @@ enum TerminalJsEventWire {
         #[serde(default)]
         account: String,
         #[serde(default)]
+        accounts: Vec<Fido2AccountWire>,
+        #[serde(default)]
         ceremony: String,
         #[serde(default)]
         origin: String,
     },
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct Fido2AccountWire {
+    #[serde(default)]
+    pub credential_id: String,
+    #[serde(default)]
+    pub label: String,
 }
 
 /// One pane an app offers. Only what the RAIL needs to draw a button — never
@@ -471,6 +494,7 @@ impl From<TerminalJsEventWire> for TerminalJsEvent {
                 request_id,
                 rp_id,
                 account,
+                accounts,
                 ceremony,
                 origin,
             } => TerminalJsEvent::Fido2Request {
@@ -479,6 +503,13 @@ impl From<TerminalJsEventWire> for TerminalJsEvent {
                 request_id,
                 rp_id,
                 account,
+                accounts: accounts
+                    .into_iter()
+                    .map(|account| Fido2Account {
+                        credential_id: account.credential_id,
+                        label: account.label,
+                    })
+                    .collect(),
                 ceremony,
                 origin,
             },
