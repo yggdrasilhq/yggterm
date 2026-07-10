@@ -176,6 +176,11 @@ pub(crate) enum TerminalJsEvent {
         /// webview's SOCKS proxy. See `resolve_control_endpoint_url`.
         control: Option<String>,
         panes: Vec<SidebarPaneDeclaration>,
+        /// Opaque stamp over the app's web-surface policy (adblock ruleset +
+        /// userscripts). The GUI refetches `<control>/policy` only when this
+        /// changes, so a ~4s heartbeat never drags the ruleset across the wire.
+        /// Absent ⇒ the app ships no policy and its surfaces get none.
+        policy_version: Option<String>,
     },
     Ignored {
         reason: String,
@@ -292,6 +297,8 @@ enum TerminalJsEventWire {
         control: Option<String>,
         #[serde(default)]
         panes: Vec<SidebarPaneDeclarationWire>,
+        #[serde(default)]
+        policy_version: Option<String>,
     },
 }
 
@@ -408,10 +415,12 @@ impl From<TerminalJsEventWire> for TerminalJsEvent {
                 session,
                 control,
                 panes,
+                policy_version,
             } => TerminalJsEvent::SidebarContribution {
                 action,
                 session,
                 control,
+                policy_version,
                 panes: panes
                     .into_iter()
                     .map(|pane| SidebarPaneDeclaration {
