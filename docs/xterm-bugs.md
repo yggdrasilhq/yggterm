@@ -579,12 +579,17 @@ when consecutive frames show inconsistent yDisp vs scroll-bottom expectation.
 
 ## blank-rendering-region
 
-**STATUS:** OPEN — symptom observed, root cause unknown.
+**STATUS:** OPEN (root cause unknown) — DETECTION + HEAL WIRED 2026-07-10
+(`glyph_gap_rows` render fail pattern).
 
 ### Symptom
 A rectangular region inside an active session viewport renders blank
 (theme background color, no glyphs) even though buffer rows exist for
 those rows. A forced redraw (resize, focus toggle, scroll) fills it in.
+The same detector also catches heavy glyph DROPPING (whole rows painted
+empty while neighbours paint — the 2.9.63 jojo screenshot with letters
+missing from words is the sub-row variant when it degrades far enough
+to blank entire rows).
 
 ### Reproduction
 Not yet captured deterministically. Anecdotal during long sessions or
@@ -599,20 +604,31 @@ Unknown. Hypotheses:
   internal expectation
 
 ### Workaround / fix
-None yet. Current escape hatches that work but are expensive:
-- Resize event triggers full redraw
-- Focus toggle (alt-tab) often clears it
+Detection + targeted heal shipped 2026-07-10: `detectAndHealGlyphGapRows`
+in the terminal eval script compares buffer text rows against text-layer
+ink bands (ONE bulk `getImageData` per scan — a single GPU sync — instead
+of hundreds of 1px reads). ≥3 text rows with zero ink while other rows
+have ink → traces a `glyph_gap_rows` render anomaly and heals with a
+targeted atlas clear + row-range `term.refresh`, latched to one heal per
+10s so it can never loop. Scans run at most every 5s, active host only,
+and only when the aggregate ink sample is healthy (the fully blank case
+is `canvas_blank_with_buffer_text`, handled by render health recovery).
+Escape hatches that also work but are expensive: resize, focus toggle.
 
 ### Code locations
-TBD.
+- `crates/yggterm-shell/src/shell.rs` — `detectAndHealGlyphGapRows` (next
+  to `sampleCanvasInk`), called from `updateRenderHealth`.
 
 ### Tests
-None yet.
+- `terminal_eval_script_wires_glyph_gap_rows_detector` (shell.rs) — guards
+  the detector wiring, the scan throttle, the heal latch, and the
+  render-health recovery backoff.
 
 ### Telemetry
-Proposed: `xterm_blank_region` event emitted when an app-control probe
-detects DOM `.xterm-rows` children with no rendered glyphs while the
-buffer reports non-empty content at those row indices.
+`render_fail_pattern` / `detected` with `anomaly.pattern = "glyph_gap_rows"`
+(gap row count + sample, text/inked row counts, heal count). Grouped by
+`scripts/render_fail_patterns.py` alongside `stale_atlas_paint`,
+`redraw_burst`, and `app_render_storm`.
 
 ---
 
