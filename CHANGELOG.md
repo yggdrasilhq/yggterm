@@ -2,6 +2,25 @@
 
 This file tracks user-visible changes in `yggterm`.
 
+## 2.10.6
+
+- **A backgrounded web surface survives.** Switching away from a ychrome session
+  and back showed the bare terminal instead of the page, and the titlebar profile
+  pill stopped tracking. Cause: the 15s "the app stopped heart-beating, drop its
+  overlay" sweep is a *dead-app* detector, but a backgrounded session's terminal
+  reads pause, so a perfectly live browser's heartbeats piled up unread and it
+  looked dead — the surface was swept, and a heartbeat can never re-create a swept
+  surface. The sweep now only judges the session you are actually looking at
+  (whose reads are live); a backgrounded surface is stashed alive and governed by
+  the background-hold timer, so switch-back is instant. The sidebar contribution
+  gets the same fix, so the rail no longer flickers away on every background cycle.
+- **"New Ychrome" from a live-session right-click.** The cwd-tree folder menu, the
+  titlebar `+` and the start page all offered the installed apps, but the
+  right-click menu on a *live session* row did not — so you could not open a
+  browser rooted in a running session's own directory. It now lists the same app
+  verbs ("New Ychrome Here", and any other installed app), launching in that
+  session's cwd and host.
+
 ## 2.10.5
 
 - **Passkeys work in web surfaces.** WebKitGTK has no WebAuthn, so a libyggterm
