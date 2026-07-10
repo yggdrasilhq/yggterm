@@ -241,6 +241,32 @@ A surface opened by a **non-browser** app gets no adblock and no userscripts.
 That is correct, not a gap: adblock is browsing config, and a dashboard is not
 browsing.
 
+### `reload_surface`, not `eval: "location.reload()"`
+
+An action reply may set `reload_surface: true`. The GUI then drops the policy it
+holds, refetches `/policy`, and **destroys and recreates** the webview.
+
+Do not reach for `eval: "location.reload()"` here. A content filter and its
+userscripts are bound to the WEBVIEW at creation, so reloading the *document*
+leaves both attached — an app that just turned ad blocking off would watch the
+toggle flip and nothing change. Only destroy-and-create applies a new policy, and
+the policy must be refetched *before* the recreate or the surface comes back
+under the rules the user just retired.
+
+### ⚠ Trap: verifying ad blocking on a host with DNS-level ad blocking
+
+`doubleclick.net`, `googlesyndication.com` and ~28 other names in jojo's ruleset
+resolve to `::` / `0.0.0.0` — the network blackholes them. A `fetch()` to any of
+them fails **whether or not the content filter is attached**, so probing them
+proves nothing and reads as a pass. I "confirmed" adblock twice off that lie.
+
+Check with `getent hosts <domain>` first. On jojo only two blocked domains
+resolve for real: `c.amazon-adsystem.com` and `connect.facebook.net`. Also avoid
+CSP-bearing pages (theguardian.com blocks the fetch by policy) — probe from
+`example.com`. The honest test is an **A/B on one page**: toggle adblock, reload,
+and require a neutral third-party (e.g. `cdn.jsdelivr.net`) to keep loading in
+both states.
+
 ### Where an app's config lives when the app is remote (SHIPPED 2026-07-10)
 
 The app's host owns the config, always — including ychrome's adblock rulesets
