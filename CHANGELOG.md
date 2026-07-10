@@ -2,6 +2,36 @@
 
 This file tracks user-visible changes in `yggterm`.
 
+## 2.10.1
+
+- **Fixed: a cwd-tree folder named with a nested path launches where it points.**
+  A folder created in the tree and titled `gh/yggterm` under `/home/pi` used to
+  silently fall back to `/home/pi` for its start page scope AND for every session
+  launched from it — the title-to-directory recovery only accepted single-segment
+  names. A relative multi-segment title now resolves under the nearest real
+  ancestor (validated segments, no `..`, no absolute paths, directory must exist).
+- **Fixed: bulk "Keep Alive (N sessions)" applies to every selected session.**
+  The daemon refused keep-alive for any live session without a local terminal
+  runtime (i.e. every selected row not opened this GUI run) — and refused it as a
+  NON-error ack, so the batch silently skipped those rows and only the opened ones
+  turned green. Keep-alive is now set as the session's persistence preference
+  regardless of runtime attachment, and the client batch no longer aborts the
+  remaining rows when one request fails.
+- **New render fail pattern: `glyph_gap_rows`** — detects the partial variant of
+  the blank-canvas jam: viewport rows whose buffer holds text but whose text-layer
+  pixels hold no ink (blank band / heavy glyph dropping), then heals with a
+  targeted atlas clear + row-range refresh, latched so it can never loop. One bulk
+  canvas readback per scan, at most every 5s, active host only.
+- **New render fail pattern: `app_render_storm`** — the unpinned high app-render
+  rate (≥20 renders/s sustained over the probe window) implicated in CPU-spin
+  incidents now surfaces through the same `render_fail_pattern` channel that
+  `scripts/render_fail_patterns.py` summarizes.
+- **Render-health recovery backs off when healing does not stick.** A canvas that
+  keeps re-blanking used to be repainted (atlas clear + full refresh) on a fixed
+  2s cadence indefinitely — the "CPU swings get angry" driver. The recovery
+  cooldown now escalates 2s → 4s → … → 60s while episodes recur within 30s, and
+  re-arms to 2s for a genuinely fresh episode.
+
 ## 2.10.0
 
 **Daemons update themselves, and no session is lost doing it.** That is a spec

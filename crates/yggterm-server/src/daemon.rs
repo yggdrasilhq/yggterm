@@ -5042,25 +5042,36 @@ impl DaemonRuntime {
                 }
             }
             ServerRequest::SetSessionKeepAlive { path, keep_alive } => {
-                if keep_alive {
+                // Keep-alive is the session's declared persistence PREFERENCE,
+                // not a statement that a terminal runtime currently exists. A
+                // live session with no local runtime yet (a scanned remote
+                // session the user never opened this GUI run) is a valid
+                // keep-alive target — the snapshot layer already preserves that
+                // exact state for restore (see
+                // daemon_snapshot_preserves_keep_alive_remote_live_without_runtime_for_restore).
+                // The old runtime gate refused those with a NON-ERROR ack, so a
+                // bulk "Keep Alive (N sessions)" silently skipped every
+                // unopened row (reported 2026-07-10: only the opened rows
+                // turned green).
+                let runtime_pending = keep_alive && {
                     let runtime_path = self.server.terminal_runtime_key_for_path(&path);
-                    let runtime_is_available = self.terminals.has_session(&runtime_path)
-                        || self
+                    !self.terminals.has_session(&runtime_path)
+                        && self
                             .preserved_owner_for_runtime_key(&runtime_path)
-                            .is_some();
-                    if !runtime_is_available {
-                        self.persist()?;
-                        return Ok(self.snapshot_response(Some(format!(
-                            "cannot keep {path} alive without terminal runtime {runtime_path}"
-                        ))));
-                    }
-                }
+                            .is_none()
+                };
                 let updated = self.server.set_live_session_keep_alive(&path, keep_alive)?;
                 self.prune_unrepresented_preserved_owners("keep_alive_updated");
                 self.persist()?;
                 self.snapshot_response(Some(if updated {
                     if keep_alive {
-                        format!("kept {path} alive")
+                        if runtime_pending {
+                            format!(
+                                "kept {path} alive (no terminal runtime yet; persistence applies when it attaches)"
+                            )
+                        } else {
+                            format!("kept {path} alive")
+                        }
                     } else {
                         format!("stopped keeping {path} alive")
                     }
