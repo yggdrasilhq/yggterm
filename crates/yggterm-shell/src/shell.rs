@@ -1134,8 +1134,60 @@ struct SidebarContributionState {
     /// surface's picker forward uses.
     forward_child: Option<std::sync::Arc<std::sync::Mutex<std::process::Child>>>,
     panes: Vec<SidebarPaneDeclaration>,
+    /// The app's stamp over its web-surface policy. Empty ⇒ the app ships no
+    /// policy. A refetch happens only when this changes, so the ~4s re-declare
+    /// never drags a ruleset over the wire.
+    policy_version: String,
+    /// `None` while a declared policy is still in flight. The surface reconciler
+    /// WAITS on that: userscripts inject at document-start, so a surface created
+    /// before the policy arrives would silently run without them, forever.
+    policy: Option<WebSurfacePolicy>,
+    /// Failed fetches for the current `policy_version`. After
+    /// `MAX_POLICY_FETCH_ATTEMPTS` the gate opens anyway — a page with no
+    /// adblock beats no page — and the failure is surfaced to the user.
+    policy_attempts: u32,
     last_seen_ms: u64,
 }
+
+/// The web-content policy an app ships for its own surfaces.
+///
+/// The APP's host owns both halves: an ychrome running over ssh reads ITS
+/// `~/.yggterm/web-adblock/*` and `~/.yggterm/web-userscripts/*`, decides what
+/// is enabled, and hands the GUI the *effective* result. The GUI applies it to
+/// the webview and persists nothing but the compiled-filter cache WebKit
+/// demands. Same shape as vault fill: the app computes, the GUI injects.
+#[derive(Debug, Clone, Default, PartialEq, serde::Deserialize)]
+struct WebSurfacePolicy {
+    /// WebKit content-blocker JSON. `None` = adblock off for this surface,
+    /// because the APP said so (master switch off, profile opted out, or no
+    /// ruleset installed). yggterm never second-guesses it.
+    #[serde(default)]
+    adblock_rules: Option<String>,
+    /// Injected at document-start, in the order the app declared.
+    #[serde(default)]
+    userscripts: Vec<String>,
+}
+
+/// What the surface reconciler knows about a session's app-supplied policy when
+/// it is about to lazily create the webview.
+#[derive(Debug, Clone, PartialEq)]
+enum SurfacePolicyGate {
+    /// No app declared a sidebar for this session, or it ships no policy.
+    /// Create now, with no adblock and no userscripts. A web surface opened by a
+    /// non-browser app gets no ad blocking, and that is correct: adblock is
+    /// browsing config, and a dashboard is not browsing.
+    Absent,
+    /// Declared, still in flight. Skip this pass; the fetch completing mutates
+    /// state, which re-renders, which runs the loop again. Deterministic, not a
+    /// race — and the app declares BEFORE it opens, so this normally resolves
+    /// before a rect ever exists.
+    Pending,
+    Ready(WebSurfacePolicy),
+}
+
+/// Attempts at `<control>/policy` for one `policy_version` before the reconciler
+/// gives up waiting and creates the surface unprotected.
+const MAX_POLICY_FETCH_ATTEMPTS: u32 = 3;
 
 /// The schema the app-pane renderer is currently drawing.
 #[derive(Debug, Clone, PartialEq)]
@@ -1341,6 +1393,33 @@ fn app_pane_schema_url(control_url: &str, pane_id: &str) -> String {
 
 fn app_pane_action_url(control_url: &str) -> String {
     format!("{}/action", control_url.trim_end_matches('/'))
+}
+
+/// `<control>/policy` — the app's effective web-surface policy for the profile
+/// it is running. No query param: the app already knows its own profile, unlike
+/// `/pane/<id>?host=`, where the page host is the GUI's to report.
+fn app_policy_url(control_url: &str) -> String {
+    format!("{}/policy", control_url.trim_end_matches('/'))
+}
+
+/// Spill an app-supplied adblock ruleset to a file on the GUI host, because
+/// WebKit's `UserContentFilterStore` compiles from a path, not from memory.
+///
+/// This is a CACHE, not state: content-addressed, so a changed ruleset lands at
+/// a new path and an unchanged one is never rewritten, and deleting the whole
+/// directory only costs one recompile. The app's host still owns the rules —
+/// see `WebSurfacePolicy`.
+fn web_surface_adblock_cache(rules: &str) -> Option<std::path::PathBuf> {
+    use sha2::{Digest as _, Sha256};
+    let dir = yggterm_core::resolve_yggterm_home()
+        .ok()?
+        .join("web-adblock-cache");
+    std::fs::create_dir_all(&dir).ok()?;
+    let path = dir.join(format!("{:x}.json", Sha256::digest(rules.as_bytes())));
+    if !path.is_file() {
+        std::fs::write(&path, rules).ok()?;
+    }
+    Some(path)
 }
 /// Render-facing view of a live web surface: tab strip + address bar +
 /// per-tab iframes.
@@ -1630,9 +1709,15 @@ async fn web_surface_native_reconcile_loop(
     let mut next_native_id: u64 = 1;
     loop {
         // Desired: (session, active_tab,
-        //           [(tab, effective_url, reload_nonce, socks_port, profile)]).
+        //           [(tab, effective_url, reload_nonce, socks_port, profile)],
+        //           policy gate).
         let (desired, active_visible_sessions): (
-            Vec<(String, u64, Vec<(u64, String, u64, Option<u16>, String)>)>,
+            Vec<(
+                String,
+                u64,
+                Vec<(u64, String, u64, Option<u16>, String)>,
+                SurfacePolicyGate,
+            )>,
             std::collections::HashSet<String>,
         ) = {
             let shell = state.peek();
@@ -1666,6 +1751,7 @@ async fn web_surface_native_reconcile_loop(
                                 )
                             })
                             .collect(),
+                        shell_ref.web_surface_policy_gate(session_path),
                     )
                 })
                 .collect();
@@ -1690,7 +1776,7 @@ async fn web_surface_native_reconcile_loop(
         // their webview (and WebContext) even when the DOM oracle is gone.
         let live_keys: std::collections::HashSet<(String, u64)> = desired
             .iter()
-            .flat_map(|(session, _, tabs)| {
+            .flat_map(|(session, _, tabs, _)| {
                 tabs.iter()
                     .map(|(tab_id, _, _, _, _)| (session.clone(), *tab_id))
             })
@@ -1834,7 +1920,7 @@ async fn web_surface_native_reconcile_loop(
                 continue;
             }
         };
-        for (session_path, active_tab, tabs) in desired {
+        for (session_path, active_tab, tabs, policy_gate) in desired {
             let rect = rects.get(&session_path).copied();
             for (tab_id, effective_url, reload_nonce, socks_port, profile) in tabs {
                 let key = (session_path.clone(), tab_id);
@@ -1994,6 +2080,14 @@ async fn web_surface_native_reconcile_loop(
                 } else if want_visible
                     && let Some(rect) = rect
                 {
+                    // The app's policy has not landed yet. Userscripts only
+                    // inject at document-start, so a surface created now would
+                    // run without them for its whole life. Skip the pass: the
+                    // fetch completing mutates state, which re-renders, which
+                    // runs this loop again.
+                    if policy_gate == SurfacePolicyGate::Pending {
+                        continue;
+                    }
                     // Lazy-create on first visibility: no hidden-create flash,
                     // and background tabs cost nothing until viewed.
                     let native_id = next_native_id;
@@ -2002,8 +2096,20 @@ async fn web_surface_native_reconcile_loop(
                     // host. None => engine-native ephemeral context (the
                     // reserved "temp" profile; also home-resolve failure).
                     let profile_dir = web_surface_profile_dir(&profile);
-                    let userscripts = load_web_surface_userscripts(&profile);
-                    let adblock_ruleset = web_surface_adblock_ruleset(&profile);
+                    // Adblock + userscripts belong to the APP, which serves the
+                    // effective policy from its own host. No contribution ⇒ no
+                    // policy, and that is right: adblock is browsing config, and
+                    // a dashboard app is not browsing.
+                    let (userscripts, adblock_ruleset) = match &policy_gate {
+                        SurfacePolicyGate::Ready(policy) => (
+                            policy.userscripts.clone(),
+                            policy
+                                .adblock_rules
+                                .as_deref()
+                                .and_then(web_surface_adblock_cache),
+                        ),
+                        _ => (Vec::new(), None),
+                    };
                     match desktop.open_web_surface(
                         native_id,
                         &effective_url,
@@ -2031,6 +2137,7 @@ async fn web_surface_native_reconcile_loop(
                                     "profile": profile,
                                     "userscripts": userscripts.len(),
                                     "adblock": adblock_ruleset.is_some(),
+                                    "policy": matches!(policy_gate, SurfacePolicyGate::Ready(_)),
                                     "rect": [rect.0, rect.1, rect.2, rect.3],
                                 }),
                             );
@@ -2150,73 +2257,6 @@ fn web_surface_profile_dir(profile: &str) -> Option<std::path::PathBuf> {
     yggterm_core::resolve_yggterm_home()
         .ok()
         .map(|home| home.join("web-profiles").join(profile))
-}
-/// Userscripts injected into a surface's pages at document-start (top frame):
-/// shared `~/.yggterm/web-userscripts/*.js` (every profile, incl. temp) then
-/// per-profile `~/.yggterm/web-profiles/<p>/userscripts/*.js`, each dir sorted
-/// by filename — deterministic order. Only `*.js` files load; disabling a
-/// script = rename away from `.js` (e.g. `.js.disabled`; the settings pane
-/// drives this). Read fresh at every surface (re)create, so a reload picks up
-/// script changes (surfaces recreate on reload by design).
-fn load_web_surface_userscripts(profile: &str) -> Vec<String> {
-    let Ok(home) = yggterm_core::resolve_yggterm_home() else {
-        return Vec::new();
-    };
-    let mut dirs = vec![home.join("web-userscripts")];
-    if profile != WEB_SURFACE_TEMP_PROFILE {
-        dirs.push(home.join("web-profiles").join(profile).join("userscripts"));
-    }
-    let mut scripts = Vec::new();
-    for dir in dirs {
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            continue;
-        };
-        let mut paths: Vec<std::path::PathBuf> = entries
-            .flatten()
-            .map(|entry| entry.path())
-            .filter(|path| {
-                path.extension().and_then(|ext| ext.to_str()) == Some("js")
-                    && path.is_file()
-            })
-            .collect();
-        paths.sort();
-        for path in paths {
-            if let Ok(source) = std::fs::read_to_string(&path) {
-                scripts.push(source);
-            }
-        }
-    }
-    scripts
-}
-/// The adblock ruleset a surface of `profile` loads under, or None = adblock
-/// off for it. Source of truth: `~/.yggterm/web-adblock/rules.json` (WebKit
-/// content-blocker JSON; compiled bytecode cached in `compiled/` next to it)
-/// + `~/.yggterm/web-adblock/config.json`:
-/// `{"enabled": bool, "disabled_profiles": ["name", ...]}`. Defaults: enabled
-/// whenever rules.json exists (missing/broken config = enabled — adblock is a
-/// daily-browser table stake), no per-profile opt-outs. The ychrome settings
-/// pane drives this file.
-fn web_surface_adblock_ruleset(profile: &str) -> Option<std::path::PathBuf> {
-    let dir = yggterm_core::resolve_yggterm_home().ok()?.join("web-adblock");
-    let rules = dir.join("rules.json");
-    if !rules.is_file() {
-        return None;
-    }
-    if let Ok(raw) = std::fs::read_to_string(dir.join("config.json"))
-        && let Ok(config) = serde_json::from_str::<Value>(&raw)
-    {
-        if config.get("enabled").and_then(Value::as_bool) == Some(false) {
-            return None;
-        }
-        let disabled = config
-            .get("disabled_profiles")
-            .and_then(Value::as_array)
-            .is_some_and(|list| list.iter().any(|p| p.as_str() == Some(profile)));
-        if disabled {
-            return None;
-        }
-    }
-    Some(rules)
 }
 /// Split an http(s) URL into (host, port, path-and-after) for forward
 /// construction. Returns None when the URL is not parseable enough.
@@ -2936,16 +2976,10 @@ enum RightPanelMode {
     /// control endpoint; yggterm renders generic widgets and knows nothing about
     /// what the pane means.
     ///
-    /// This variant is the reason `RightPanelMode::Vault` no longer exists, and
-    /// the reason `::AppSidebar` is going the same way: app chrome does not
-    /// belong in yggterm.
+    /// This variant is the reason `RightPanelMode::Vault` and `::AppSidebar` no
+    /// longer exist: app chrome does not belong in yggterm. Every remaining
+    /// variant above is yggterm's own.
     AppPane(String),
-    /// The ACTIVE libyggterm app's contributed sidebar (4-surface taxonomy's
-    /// sidebar-contribution surface). First consumer: ychrome settings
-    /// (adblock + userscripts config, all GUI-host-owned files).
-    ///
-    /// DEPRECATED: hardcoded app chrome, being migrated to `AppPane`.
-    AppSidebar,
 }
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum PreviewLayoutMode {
@@ -3011,7 +3045,7 @@ struct RenderSnapshot {
     active_session: Option<ManagedSessionView>,
     active_session_path: Option<String>,
     /// The active session's live web-surface profile (app tab), if it has a
-    /// surface — drives the app-sidebar's per-profile settings.
+    /// surface.
     active_web_surface_profile: Option<String>,
     /// Panes the ACTIVE session's libyggterm app has declared. Empty unless an
     /// app is live and declaring — which is what keeps app chrome out of the
@@ -5107,16 +5141,21 @@ impl ShellState {
     /// supplied on the first declare, when the resolver has produced a
     /// GUI-reachable URL; a re-declare (the liveness heartbeat) is idempotent
     /// and must NOT re-resolve — that would spawn an `ssh -L` per heartbeat.
+    ///
+    /// Returns true when the caller must fetch `<control>/policy`: the app
+    /// declared a `policy_version` this session has not fetched yet.
     fn upsert_sidebar_contribution(
         &mut self,
         session_path: &str,
         panes: Vec<SidebarPaneDeclaration>,
+        policy_version: Option<String>,
         now_ms: u64,
         resolved: Option<(
             String,
             Option<std::sync::Arc<std::sync::Mutex<std::process::Child>>>,
         )>,
-    ) {
+    ) -> bool {
+        let policy_version = policy_version.unwrap_or_default();
         if let Some(existing) = self.sidebar_contributions.get_mut(session_path) {
             existing.last_seen_ms = now_ms;
             // Panes may change between declares (an app can add one); the
@@ -5124,10 +5163,23 @@ impl ShellState {
             if existing.panes != panes {
                 existing.panes = panes;
             }
-            return;
+            // A changed stamp means the app's rules or userscripts changed on
+            // its own host: drop what we hold and refetch. An unchanged stamp
+            // is the common case and costs nothing.
+            if existing.policy_version != policy_version {
+                existing.policy_version = policy_version.clone();
+                existing.policy = None;
+                existing.policy_attempts = 0;
+            }
+            // Retry a failed fetch on the next heartbeat, but only until the
+            // attempts run out — a permanently broken endpoint must not mean one
+            // fetch every 4s for the life of the session.
+            return !policy_version.is_empty()
+                && existing.policy.is_none()
+                && existing.policy_attempts < MAX_POLICY_FETCH_ATTEMPTS;
         }
         let Some((control_url, forward_child)) = resolved else {
-            return;
+            return false;
         };
         self.sidebar_contributions.insert(
             session_path.to_string(),
@@ -5135,9 +5187,58 @@ impl ShellState {
                 control_url,
                 forward_child,
                 panes,
+                policy_version: policy_version.clone(),
+                policy: None,
+                policy_attempts: 0,
                 last_seen_ms: now_ms,
             },
         );
+        !policy_version.is_empty()
+    }
+    /// Store the policy the app served for `policy_version`. A reply for a stale
+    /// version is dropped: the app has already moved on and a newer fetch is in
+    /// flight, so applying this one would install rules the app retired.
+    fn apply_sidebar_policy(
+        &mut self,
+        session_path: &str,
+        policy_version: &str,
+        policy: WebSurfacePolicy,
+    ) {
+        if let Some(contribution) = self.sidebar_contributions.get_mut(session_path)
+            && contribution.policy_version == policy_version
+        {
+            contribution.policy = Some(policy);
+            contribution.policy_attempts = 0;
+        }
+    }
+    /// Count a failed `<control>/policy` fetch. Returns true once the reconciler
+    /// should stop waiting and create the surface with no policy at all.
+    fn fail_sidebar_policy(&mut self, session_path: &str, policy_version: &str) -> bool {
+        let Some(contribution) = self.sidebar_contributions.get_mut(session_path) else {
+            return false;
+        };
+        if contribution.policy_version != policy_version {
+            return false;
+        }
+        contribution.policy_attempts += 1;
+        contribution.policy_attempts >= MAX_POLICY_FETCH_ATTEMPTS
+    }
+    /// What the surface reconciler should do about `session_path`'s policy right
+    /// now. One owner for the whole rule, so the gate and the create path cannot
+    /// disagree about whether a policy is coming.
+    fn web_surface_policy_gate(&self, session_path: &str) -> SurfacePolicyGate {
+        let Some(contribution) = self.sidebar_contributions.get(session_path) else {
+            return SurfacePolicyGate::Absent;
+        };
+        match &contribution.policy {
+            Some(policy) => SurfacePolicyGate::Ready(policy.clone()),
+            // Gave up after MAX_POLICY_FETCH_ATTEMPTS: show the page.
+            None if contribution.policy_attempts >= MAX_POLICY_FETCH_ATTEMPTS => {
+                SurfacePolicyGate::Absent
+            }
+            None if contribution.policy_version.is_empty() => SurfacePolicyGate::Absent,
+            None => SurfacePolicyGate::Pending,
+        }
     }
     fn close_sidebar_contribution(&mut self, session_path: &str) {
         if let Some(contribution) = self.sidebar_contributions.remove(session_path) {
@@ -5607,17 +5708,8 @@ impl ShellState {
             RightPanelMode::Metadata => "metadata opened".to_string(),
             RightPanelMode::Connect => "ssh connect opened".to_string(),
             RightPanelMode::Notifications => "notifications opened".to_string(),
-            RightPanelMode::AppSidebar => "app sidebar opened".to_string(),
             RightPanelMode::AppPane(pane) => format!("app pane {pane} opened"),
         };
-    }
-    fn toggle_app_sidebar_panel(&mut self) {
-        let next_mode = if self.right_panel_mode == RightPanelMode::AppSidebar {
-            RightPanelMode::Hidden
-        } else {
-            RightPanelMode::AppSidebar
-        };
-        self.set_right_panel_mode(next_mode);
     }
     /// Open (or close) an app-contributed pane. Returns the request sequence to
     /// fetch the schema under, or `None` when the pane was toggled shut.
@@ -28680,7 +28772,6 @@ fn right_panel_mode_label(mode: &RightPanelMode) -> &'static str {
         RightPanelMode::Settings => "settings",
         RightPanelMode::Connect => "connect",
         RightPanelMode::Notifications => "notifications",
-        RightPanelMode::AppSidebar => "app_sidebar",
         RightPanelMode::AppPane(_) => "app_pane",
     }
 }
@@ -28692,7 +28783,6 @@ fn app_control_right_panel_mode(mode: &AppControlRightPanelMode) -> RightPanelMo
         AppControlRightPanelMode::Notifications => RightPanelMode::Notifications,
         AppControlRightPanelMode::Settings => RightPanelMode::Settings,
         AppControlRightPanelMode::Metadata => RightPanelMode::Metadata,
-        AppControlRightPanelMode::AppSidebar => RightPanelMode::AppSidebar,
         AppControlRightPanelMode::AppPane { id } => RightPanelMode::AppPane(id.clone()),
     }
 }
@@ -36622,6 +36712,79 @@ async fn app_pane_fetch_schema(mut state: Signal<ShellState>, pane_id: String, s
     }) {
         Ok(schema) => state.with_mut(|shell| shell.app_pane_apply_schema(seq, &pane_id, schema)),
         Err(error) => state.with_mut(|shell| shell.app_pane_apply_error(seq, error)),
+    }
+}
+
+/// GET `<control>/policy` — the app's effective adblock ruleset + userscripts
+/// for the profile it is running — and hand it to the surface reconciler, which
+/// is blocking a lazy create until it lands.
+///
+/// The app's host owns this config. yggterm applies it and keeps nothing but the
+/// compiled-filter cache WebKit requires. A failed fetch is retried on the next
+/// ~4s re-declare; after `MAX_POLICY_FETCH_ATTEMPTS` the surface opens with no
+/// policy rather than never opening, and the user is told adblock is off.
+async fn app_policy_fetch(
+    mut state: Signal<ShellState>,
+    session_path: String,
+    policy_version: String,
+    trace_home: std::path::PathBuf,
+) {
+    let Some(control_url) = state.peek().sidebar_control_url(&session_path) else {
+        return;
+    };
+    let url = app_policy_url(&control_url);
+    let fetched = task::spawn_blocking(move || control_request(&url, None))
+        .await
+        .unwrap_or_else(|error| Err(format!("policy fetch panicked: {error}")));
+    match fetched.and_then(|value| {
+        serde_json::from_value::<WebSurfacePolicy>(value)
+            .map_err(|error| format!("policy is malformed: {error}"))
+    }) {
+        Ok(policy) => {
+            append_trace_event(
+                &trace_home,
+                "ui",
+                "sidebar_contribution",
+                "policy",
+                json!({
+                    "session_path": session_path,
+                    "policy_version": policy_version,
+                    "adblock": policy.adblock_rules.is_some(),
+                    "userscripts": policy.userscripts.len(),
+                }),
+            );
+            state.with_mut(|shell| {
+                shell.apply_sidebar_policy(&session_path, &policy_version, policy)
+            });
+        }
+        Err(error) => {
+            let exhausted =
+                state.with_mut(|shell| shell.fail_sidebar_policy(&session_path, &policy_version));
+            append_trace_event(
+                &trace_home,
+                "ui",
+                "sidebar_contribution",
+                "policy_failed",
+                json!({
+                    "session_path": session_path,
+                    "policy_version": policy_version,
+                    "error": error,
+                    "exhausted": exhausted,
+                }),
+            );
+            if exhausted {
+                state.with_mut(|shell| {
+                    shell.push_notification(
+                        NotificationTone::Error,
+                        "Web policy unavailable",
+                        format!(
+                            "The app did not serve its ad-block and userscript policy \
+                             ({error}). Its surfaces open unprotected."
+                        ),
+                    );
+                });
+            }
+        }
     }
 }
 
@@ -45791,10 +45954,6 @@ fn app() -> Element {
                             state.with_mut(|shell| shell.toggle_notifications_panel());
                             sync_active_terminal_input_policy(state);
                             },
-                            on_toggle_app_sidebar: move || {
-                            state.with_mut(|shell| shell.toggle_app_sidebar_panel());
-                            sync_active_terminal_input_policy(state);
-                            },
                             on_toggle_app_pane: move |pane_id: String| {
                             // Opening a contributed pane fetches its schema from
                             // the app's control endpoint; closing it needs no
@@ -46166,135 +46325,6 @@ fn app() -> Element {
                             on_ssh_prefix_change: move |value: String| state.with_mut(|shell| shell.update_ssh_connect_prefix(value)),
                             on_clear_notification: move |id: u64| state.with_mut(|shell| shell.clear_notification(id)),
                             on_clear_notifications: move |_| state.with_mut(|shell| shell.clear_notifications()),
-                            on_reload_web_surface: move |_| {
-                                state.with_mut(|shell| {
-                                    if let Some(path) = shell.server.active_session_path().map(str::to_string) {
-                                        shell.web_surface_reload_active_tab(&path);
-                                    }
-                                });
-                            },
-                            on_fill_web_surface_login: {
-                                let desktop = desktop.clone();
-                                move |_| {
-                                    let desktop = desktop.clone();
-                                    spawn(async move {
-                                        let result = web_surface_fill_for(
-                                            &state, &desktop, None, None, None,
-                                        )
-                                        .await;
-                                        let accepted = result
-                                            .get("accepted")
-                                            .and_then(Value::as_bool)
-                                            .unwrap_or(false);
-                                        if !accepted {
-                                            let reason = result
-                                                .get("reason")
-                                                .and_then(Value::as_str)
-                                                .unwrap_or("unknown failure")
-                                                .to_string();
-                                            let mut state = state;
-                                            state.with_mut(|shell| {
-                                                shell.push_notification(
-                                                    NotificationTone::Error,
-                                                    "Autofill failed",
-                                                    reason,
-                                                );
-                                            });
-                                        }
-                                    });
-                                }
-                            },
-                            on_fill_vault_entry: {
-                                let desktop = desktop.clone();
-                                move |(entry, user): (String, String)| {
-                                    let desktop = desktop.clone();
-                                    spawn(async move {
-                                        let user_opt =
-                                            (!user.is_empty()).then_some(user.as_str());
-                                        let result = web_surface_fill_for(
-                                            &state,
-                                            &desktop,
-                                            None,
-                                            Some(entry.as_str()),
-                                            user_opt,
-                                        )
-                                        .await;
-                                        let accepted = result
-                                            .get("accepted")
-                                            .and_then(Value::as_bool)
-                                            .unwrap_or(false);
-                                        if !accepted {
-                                            let reason = result
-                                                .get("reason")
-                                                .and_then(Value::as_str)
-                                                .unwrap_or("unknown failure")
-                                                .to_string();
-                                            let mut state = state;
-                                            state.with_mut(|shell| {
-                                                shell.push_notification(
-                                                    NotificationTone::Error,
-                                                    "Vault fill failed",
-                                                    reason,
-                                                );
-                                            });
-                                        }
-                                    });
-                                }
-                            },
-                            on_totp_vault_entry: {
-                                let desktop = desktop.clone();
-                                move |(entry, user): (String, String)| {
-                                    let desktop = desktop.clone();
-                                    spawn(async move {
-                                        let user_opt =
-                                            (!user.is_empty()).then_some(user.as_str());
-                                        let result = web_surface_totp_for(
-                                            &state,
-                                            &desktop,
-                                            None,
-                                            Some(entry.as_str()),
-                                            user_opt,
-                                        )
-                                        .await;
-                                        let accepted = result
-                                            .get("accepted")
-                                            .and_then(Value::as_bool)
-                                            .unwrap_or(false);
-                                        let mut state = state;
-                                        if accepted {
-                                            let detail = if result
-                                                .get("filled")
-                                                .and_then(Value::as_str)
-                                                == Some("no-otp-field")
-                                            {
-                                                format!("No code field on the page — {entry}'s code is on the clipboard.")
-                                            } else {
-                                                format!("Filled {entry}'s authenticator code.")
-                                            };
-                                            state.with_mut(|shell| {
-                                                shell.push_notification(
-                                                    NotificationTone::Success,
-                                                    "Authenticator code",
-                                                    detail,
-                                                );
-                                            });
-                                        } else {
-                                            let reason = result
-                                                .get("reason")
-                                                .and_then(Value::as_str)
-                                                .unwrap_or("unknown failure")
-                                                .to_string();
-                                            state.with_mut(|shell| {
-                                                shell.push_notification(
-                                                    NotificationTone::Error,
-                                                    "Authenticator code failed",
-                                                    reason,
-                                                );
-                                            });
-                                        }
-                                    });
-                                }
-                            },
                             on_app_pane_action: {
                                 let desktop = desktop.clone();
                                 move |(pane_id, action, value): (String, String, Option<String>)| {
@@ -46770,7 +46800,6 @@ fn Titlebar(
     on_toggle_settings: EventHandler<()>,
     on_toggle_connect: EventHandler<()>,
     on_toggle_notifications: EventHandler<()>,
-    on_toggle_app_sidebar: EventHandler<()>,
     /// Opens (or closes) a pane the active app contributed, by its pane id.
     on_toggle_app_pane: EventHandler<String>,
     on_restart_update: EventHandler<()>,
@@ -47564,38 +47593,6 @@ fn Titlebar(
                     div {
                         class: "yggterm-titlebar-inline-secondary",
                         style: "display:flex; align-items:center; gap:8px;",
-                        // The app-sidebar is the ACTIVE app's property, not
-                        // yggterm's: no live web surface on the active session
-                        // means no icon (and RightRail hides the pane).
-                        if snapshot.active_web_surface_profile.is_some() {
-                        button {
-                            "data-titlebar-appsidebar-button": "1",
-                            title: "App settings (active app's sidebar)",
-                            style: utility_icon_style(
-                                snapshot.palette,
-                                snapshot.right_panel_mode == RightPanelMode::AppSidebar
-                            ),
-                            onmousedown: |evt| {
-                                evt.prevent_default();
-                                evt.stop_propagation();
-                            },
-                            onclick: {
-                                let on_toggle_app_sidebar = on_toggle_app_sidebar.clone();
-                                move |evt| {
-                                    evt.stop_propagation();
-                                    on_toggle_app_sidebar.call(());
-                                }
-                            },
-                            ondoubleclick: |evt| evt.stop_propagation(),
-                            if alt_overlay_badge_visible(&snapshot, "") {
-                                span {
-                                    style: "display:inline-flex; align-items:center; justify-content:center; min-width:16px; height:16px; padding:0 4px; border-radius:6px; background:rgba(95,168,255,0.14); color:#2667a9; font-size:9px; font-weight:800; margin-right:6px;",
-                                    "A"
-                                }
-                            }
-                            "▦"
-                        }
-                        }
                         // Buttons CONTRIBUTED by the active libyggterm app. The
                         // rail draws exactly what the app declared over OSC 7717
                         // and nothing else — no app icon is hardcoded here.
@@ -55770,6 +55767,7 @@ fn TerminalCanvas(
                                 session: claimed_session,
                                 control,
                                 panes,
+                                policy_version,
                             }) => {
                                 let now_ms = current_millis();
                                 let contribution_session_path = session_path.clone();
@@ -55780,20 +55778,20 @@ fn TerminalCanvas(
                                         // re-resolve — resolving spawns an
                                         // `ssh -L`, and once per heartbeat would
                                         // leak one ssh every few seconds.
-                                        let known = state.with_mut(|shell| {
+                                        let (known, mut fetch_policy) = state.with_mut(|shell| {
                                             shell.sweep_stale_sidebar_contributions(now_ms);
                                             let known = shell
                                                 .sidebar_contributions
                                                 .contains_key(&contribution_session_path);
-                                            if known {
-                                                shell.upsert_sidebar_contribution(
+                                            let fetch = known
+                                                && shell.upsert_sidebar_contribution(
                                                     &contribution_session_path,
                                                     panes.clone(),
+                                                    policy_version.clone(),
                                                     now_ms,
                                                     None,
                                                 );
-                                            }
-                                            known
+                                            (known, fetch)
                                         });
                                         if !known && let Some(control_url) = control {
                                             let resolve_url = control_url.clone();
@@ -55816,13 +55814,14 @@ fn TerminalCanvas(
                                             });
                                             let pane_ids: Vec<String> =
                                                 panes.iter().map(|pane| pane.id.clone()).collect();
-                                            state.with_mut(|shell| {
+                                            fetch_policy = state.with_mut(|shell| {
                                                 shell.upsert_sidebar_contribution(
                                                     &contribution_session_path,
                                                     panes.clone(),
+                                                    policy_version.clone(),
                                                     now_ms,
                                                     Some((effective_control.clone(), forward_child)),
-                                                );
+                                                )
                                             });
                                             append_trace_event(
                                                 &trace_home,
@@ -55834,8 +55833,21 @@ fn TerminalCanvas(
                                                     "claimed_session": claimed_session,
                                                     "control": effective_control,
                                                     "panes": pane_ids,
+                                                    "policy_version": policy_version,
                                                 }),
                                             );
+                                        }
+                                        // The app's web-surface policy changed (or
+                                        // this is its first declare). Fetch it
+                                        // before any surface is created: a
+                                        // userscript that misses document-start
+                                        // never runs.
+                                        if fetch_policy
+                                            && let Some(version) = policy_version.clone()
+                                        {
+                                            let trace_home = trace_home.clone();
+                                            let session = contribution_session_path.clone();
+                                            spawn(app_policy_fetch(state, session, version, trace_home));
                                         }
                                     }
                                     "close" => {
@@ -77075,10 +77087,6 @@ fn RightRail(
     on_ssh_prefix_change: EventHandler<String>,
     on_clear_notification: EventHandler<u64>,
     on_clear_notifications: EventHandler<MouseEvent>,
-    on_reload_web_surface: EventHandler<()>,
-    on_fill_web_surface_login: EventHandler<()>,
-    on_fill_vault_entry: EventHandler<(String, String)>,
-    on_totp_vault_entry: EventHandler<(String, String)>,
     /// (pane_id, action, value) — fired by any widget in a contributed pane.
     on_app_pane_action: EventHandler<(String, String, Option<String>)>,
     /// (widget_id, value) — a draft input changed; stays in the GUI until an
@@ -77099,23 +77107,16 @@ fn RightRail(
             }
         }
     });
-    // The app-sidebar belongs to the active app: with no live web surface on
-    // the active session (app exited, session switched, surface swept) the
-    // pane collapses — the mode stays AppSidebar so it re-reveals when the
-    // app is back, matching the icon's own visibility gate.
-    let app_sidebar_available = snapshot.active_web_surface_profile.is_some();
     // A contributed pane lives and dies with its declaration: when the app stops
     // declaring (exited, session switched, contribution swept) the pane
-    // collapses, exactly as the hardcoded panes collapse with their surface.
+    // collapses, and it re-reveals when the app is back.
     let app_pane_available = |mode: &RightPanelMode| match mode {
         RightPanelMode::AppPane(pane_id) => {
             snapshot.sidebar_panes.iter().any(|pane| pane.id == *pane_id)
         }
         _ => true,
     };
-    let visible = requested_mode != RightPanelMode::Hidden
-        && !(requested_mode == RightPanelMode::AppSidebar && !app_sidebar_available)
-        && app_pane_available(&requested_mode);
+    let visible = requested_mode != RightPanelMode::Hidden && app_pane_available(&requested_mode);
     let rendered_mode = if visible {
         requested_mode.clone()
     } else {
@@ -77172,12 +77173,6 @@ fn RightRail(
                     on_clear_notification,
                     on_clear_notifications,
                 }
-            } else if rendered_mode == RightPanelMode::AppSidebar {
-                AppSidebarRailBody {
-                    snapshot: snapshot.clone(),
-                    on_reload_web_surface,
-                    on_fill_web_surface_login,
-                }
             } else if rendered_app_pane_id.is_some() {
                 AppPaneRailBody {
                     snapshot: snapshot.clone(),
@@ -77190,256 +77185,12 @@ fn RightRail(
         }
     }
 }
-/// On-disk state the app-sidebar (ychrome settings) panel renders: the
-/// GUI-host-owned web content policy. Source of truth is the files themselves
-/// (~/.yggterm/web-adblock/*, ~/.yggterm/web-userscripts/*) — the panel reads
-/// them at render and mutates them directly; surfaces pick changes up on
-/// recreate (reload / switch-back).
-struct YchromeSidebarState {
-    adblock_rules_present: bool,
-    adblock_rule_count: usize,
-    adblock_enabled: bool,
-    adblock_disabled_profiles: Vec<String>,
-    /// (file stem, enabled) for shared userscripts: `name.js` = enabled,
-    /// `name.js.disabled` = disabled.
-    userscripts: Vec<(String, bool)>,
-}
-fn ychrome_sidebar_state() -> YchromeSidebarState {
-    let home = yggterm_core::resolve_yggterm_home().ok();
-    let adblock_dir = home.as_ref().map(|h| h.join("web-adblock"));
-    let rules = adblock_dir.as_ref().map(|d| d.join("rules.json"));
-    let adblock_rules_present = rules.as_ref().is_some_and(|p| p.is_file());
-    let adblock_rule_count = rules
-        .as_ref()
-        .and_then(|p| std::fs::read_to_string(p).ok())
-        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
-        .and_then(|v| v.as_array().map(Vec::len))
-        .unwrap_or(0);
-    let config = adblock_dir
-        .as_ref()
-        .and_then(|d| std::fs::read_to_string(d.join("config.json")).ok())
-        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok());
-    let adblock_enabled = config
-        .as_ref()
-        .and_then(|c| c.get("enabled"))
-        .and_then(Value::as_bool)
-        .unwrap_or(true);
-    let adblock_disabled_profiles = config
-        .as_ref()
-        .and_then(|c| c.get("disabled_profiles"))
-        .and_then(Value::as_array)
-        .map(|list| {
-            list.iter()
-                .filter_map(|p| p.as_str().map(str::to_string))
-                .collect()
-        })
-        .unwrap_or_default();
-    let mut userscripts: Vec<(String, bool)> = Vec::new();
-    if let Some(home) = &home
-        && let Ok(entries) = std::fs::read_dir(home.join("web-userscripts"))
-    {
-        for entry in entries.flatten() {
-            let name = entry.file_name().to_string_lossy().to_string();
-            if let Some(stem) = name.strip_suffix(".js") {
-                userscripts.push((stem.to_string(), true));
-            } else if let Some(stem) = name.strip_suffix(".js.disabled") {
-                userscripts.push((stem.to_string(), false));
-            }
-        }
-    }
-    userscripts.sort();
-    YchromeSidebarState {
-        adblock_rules_present,
-        adblock_rule_count,
-        adblock_enabled,
-        adblock_disabled_profiles,
-        userscripts,
-    }
-}
-/// Rewrite ~/.yggterm/web-adblock/config.json with `mutate` applied to the
-/// current (or default) config object.
-fn mutate_adblock_config(mutate: impl FnOnce(&mut serde_json::Map<String, Value>)) {
-    let Ok(home) = yggterm_core::resolve_yggterm_home() else {
-        return;
-    };
-    let dir = home.join("web-adblock");
-    let _ = std::fs::create_dir_all(&dir);
-    let path = dir.join("config.json");
-    let mut config = std::fs::read_to_string(&path)
-        .ok()
-        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
-        .and_then(|v| v.as_object().cloned())
-        .unwrap_or_default();
-    mutate(&mut config);
-    if let Ok(raw) = serde_json::to_string_pretty(&Value::Object(config)) {
-        let _ = std::fs::write(&path, raw);
-    }
-}
-fn set_adblock_profile_disabled(profile: &str, disabled: bool) {
-    mutate_adblock_config(|config| {
-        let mut list: Vec<Value> = config
-            .get("disabled_profiles")
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default();
-        list.retain(|p| p.as_str() != Some(profile));
-        if disabled {
-            list.push(Value::String(profile.to_string()));
-        }
-        config.insert("disabled_profiles".to_string(), Value::Array(list));
-    });
-}
-/// Enable/disable a shared userscript by renaming `<stem>.js` ⇄
-/// `<stem>.js.disabled` (the loader only reads `*.js`).
-fn set_userscript_enabled(stem: &str, enabled: bool) {
-    let Ok(home) = yggterm_core::resolve_yggterm_home() else {
-        return;
-    };
-    let dir = home.join("web-userscripts");
-    let (from, to) = if enabled {
-        (format!("{stem}.js.disabled"), format!("{stem}.js"))
-    } else {
-        (format!("{stem}.js"), format!("{stem}.js.disabled"))
-    };
-    let _ = std::fs::rename(dir.join(from), dir.join(to));
-}
-#[component]
-fn AppSidebarRailBody(
-    snapshot: SharedSnapshot,
-    on_reload_web_surface: EventHandler<()>,
-    on_fill_web_surface_login: EventHandler<()>,
-) -> Element {
-    let palette = snapshot.palette;
-    // Bumped after every disk mutation so the panel re-reads the files.
-    let mut refresh = use_signal(|| 0u32);
-    let _ = refresh();
-    let sidebar = ychrome_sidebar_state();
-    let profile = snapshot.active_web_surface_profile.clone();
-    let has_surface = profile.is_some();
-    let profile_label = profile.clone().unwrap_or_else(|| "default".to_string());
-    let profile_adblock_disabled = sidebar
-        .adblock_disabled_profiles
-        .iter()
-        .any(|p| p == &profile_label);
-    let adblock_description = if sidebar.adblock_rules_present {
-        format!(
-            "Engine-native content filter ({} rules) — network blocks + cosmetic hiding.",
-            sidebar.adblock_rule_count
-        )
-    } else {
-        "No ruleset installed (~/.yggterm/web-adblock/rules.json missing).".to_string()
-    };
-    rsx! {
-        RailHeader { title: "ychrome".to_string(), color: palette.text.to_string() }
-        RailScrollBody {
-            content: rsx!{
-            div {
-                style: "display:flex; flex-direction:column; gap:14px;",
-                if !has_surface {
-                    div {
-                        style: format!("font-size:10px; line-height:1.5; color:{};", palette.muted),
-                        "No web app active — settings below apply to every ychrome surface."
-                    }
-                }
-                RailSectionTitle { title: "Ad blocking".to_string(), muted_color: palette.muted.to_string() }
-                InlineSettingsToggleRow {
-                    field_key: "ychrome-adblock-enabled".to_string(),
-                    label: "Block ads & trackers".to_string(),
-                    description: adblock_description,
-                    enabled: sidebar.adblock_enabled && sidebar.adblock_rules_present,
-                    palette,
-                    on_change: move |enabled: bool| {
-                        mutate_adblock_config(|config| {
-                            config.insert("enabled".to_string(), Value::Bool(enabled));
-                        });
-                        refresh += 1;
-                    },
-                }
-                if has_surface {
-                    InlineSettingsToggleRow {
-                        field_key: "ychrome-adblock-profile".to_string(),
-                        label: format!("Enabled for “{profile_label}”"),
-                        description: "Per-profile override for the active surface's profile.".to_string(),
-                        enabled: !profile_adblock_disabled,
-                        palette,
-                        on_change: {
-                            let profile_label = profile_label.clone();
-                            move |enabled: bool| {
-                                set_adblock_profile_disabled(&profile_label, !enabled);
-                                refresh += 1;
-                            }
-                        },
-                    }
-                }
-                RailSectionTitle { title: "Userscripts".to_string(), muted_color: palette.muted.to_string() }
-                if sidebar.userscripts.is_empty() {
-                    div {
-                        style: format!("font-size:10px; line-height:1.5; color:{};", palette.muted),
-                        "None installed. Drop *.js files into ~/.yggterm/web-userscripts/ (all profiles) or a profile's userscripts/ dir."
-                    }
-                }
-                for (stem, enabled) in sidebar.userscripts.clone() {
-                    InlineSettingsToggleRow {
-                        field_key: format!("ychrome-userscript-{stem}"),
-                        label: stem.clone(),
-                        description: "Injected at document-start on every page.".to_string(),
-                        enabled,
-                        palette,
-                        on_change: {
-                            let stem = stem.clone();
-                            move |enabled: bool| {
-                                set_userscript_enabled(&stem, enabled);
-                                refresh += 1;
-                            }
-                        },
-                    }
-                }
-                if has_surface {
-                    RailSectionTitle { title: "Passwords".to_string(), muted_color: palette.muted.to_string() }
-                    div {
-                        style: format!("font-size:10px; line-height:1.5; color:{};", palette.muted),
-                        "Fills the visible login form from your Bitwarden/Vaultwarden vault, matched to the page's exact host."
-                    }
-                    button {
-                        r#type: "button",
-                        "data-appsidebar-fill-login": "1",
-                        style: format!(
-                            "align-self:flex-start; padding:7px 14px; border:0; border-radius:9px; \
-                             background:{}; color:#fff; font-size:11px; font-weight:700; cursor:pointer;",
-                            palette.accent
-                        ),
-                        onclick: move |_| on_fill_web_surface_login.call(()),
-                        "Fill login from vault"
-                    }
-                }
-                div {
-                    style: format!("font-size:10px; line-height:1.5; color:{};", palette.muted),
-                    "Changes apply when a surface (re)creates — reload the page or switch away and back."
-                }
-                if has_surface {
-                    button {
-                        r#type: "button",
-                        "data-appsidebar-reload-surface": "1",
-                        style: format!(
-                            "align-self:flex-start; padding:7px 14px; border:0; border-radius:9px; \
-                             background:{}; color:#fff; font-size:11px; font-weight:700; cursor:pointer;",
-                            palette.accent
-                        ),
-                        onclick: move |_| on_reload_web_surface.call(()),
-                        "Reload surface now"
-                    }
-                }
-            }
-            }
-        }
-    }
-}
 /// Renders a schema an APP declared, with generic widgets. yggterm knows nothing
 /// about what any of it means: a click just POSTs the widget's action id back to
 /// the app's control endpoint, and whatever schema comes back is drawn next.
 ///
-/// This component is the whole reason `RightPanelMode::Vault` is gone and
-/// `::AppSidebar` can follow. Adding an app-specific branch here defeats it.
+/// This component is the whole reason `RightPanelMode::Vault` and `::AppSidebar`
+/// are gone. Adding an app-specific branch here defeats it.
 #[component]
 fn AppPaneRailBody(
     snapshot: SharedSnapshot,
@@ -88201,8 +87952,168 @@ mod tests {
                 icon: "🔑".to_string(),
                 title: "Vault".to_string(),
             }],
+            None,
             now_ms,
             Some(("http://127.0.0.1:1".to_string(), None)),
+        );
+    }
+
+    fn declare_with_policy(
+        shell: &mut ShellState,
+        session: &str,
+        policy_version: Option<&str>,
+        now_ms: u64,
+    ) -> bool {
+        shell.upsert_sidebar_contribution(
+            session,
+            vec![SidebarPaneDeclaration {
+                id: "settings".to_string(),
+                icon: "⚙".to_string(),
+                title: "Settings".to_string(),
+            }],
+            policy_version.map(str::to_string),
+            now_ms,
+            Some(("http://127.0.0.1:1".to_string(), None)),
+        )
+    }
+
+    // A session with no contribution creates its surface immediately: a web
+    // surface opened by a non-browser app gets no adblock and no userscripts,
+    // and never waits for a policy nobody is going to serve.
+    #[test]
+    fn a_session_without_a_contribution_never_waits_for_a_policy() {
+        let shell = ShellState::new(test_shell_bootstrap_with_active_session("local://p"));
+        assert_eq!(
+            shell.web_surface_policy_gate("local://p"),
+            SurfacePolicyGate::Absent
+        );
+    }
+
+    // A declared policy GATES the surface create until it lands. Userscripts
+    // only inject at document-start, so a surface built before the policy
+    // arrives would run without them for its whole life.
+    #[test]
+    fn a_declared_policy_gates_the_surface_until_it_lands() {
+        let mut shell = ShellState::new(test_shell_bootstrap_with_active_session("local://p"));
+        assert!(declare_with_policy(&mut shell, "local://p", Some("v1"), 1_000));
+        assert_eq!(
+            shell.web_surface_policy_gate("local://p"),
+            SurfacePolicyGate::Pending
+        );
+
+        shell.apply_sidebar_policy(
+            "local://p",
+            "v1",
+            WebSurfacePolicy {
+                adblock_rules: Some("[]".to_string()),
+                userscripts: vec!["console.log(1)".to_string()],
+            },
+        );
+        let SurfacePolicyGate::Ready(policy) = shell.web_surface_policy_gate("local://p") else {
+            panic!("policy did not become ready");
+        };
+        assert_eq!(policy.userscripts.len(), 1);
+        assert_eq!(policy.adblock_rules.as_deref(), Some("[]"));
+    }
+
+    // An app that declares no policy_version ships no policy: it must not gate.
+    #[test]
+    fn a_contribution_without_a_policy_version_does_not_gate() {
+        let mut shell = ShellState::new(test_shell_bootstrap_with_active_session("local://p"));
+        assert!(!declare_with_policy(&mut shell, "local://p", None, 1_000));
+        assert_eq!(
+            shell.web_surface_policy_gate("local://p"),
+            SurfacePolicyGate::Absent
+        );
+    }
+
+    // A stamp change is the app saying "my rules changed on my host": drop what
+    // we hold and refetch. An unchanged stamp — the ~4s re-declare — must NOT
+    // refetch, or the ruleset rides the wire every heartbeat.
+    #[test]
+    fn only_a_changed_policy_version_refetches() {
+        let mut shell = ShellState::new(test_shell_bootstrap_with_active_session("local://p"));
+        declare_with_policy(&mut shell, "local://p", Some("v1"), 1_000);
+        shell.apply_sidebar_policy("local://p", "v1", WebSurfacePolicy::default());
+
+        assert!(
+            !declare_with_policy(&mut shell, "local://p", Some("v1"), 2_000),
+            "an unchanged stamp refetched the policy"
+        );
+        assert!(matches!(
+            shell.web_surface_policy_gate("local://p"),
+            SurfacePolicyGate::Ready(_)
+        ));
+
+        assert!(
+            declare_with_policy(&mut shell, "local://p", Some("v2"), 3_000),
+            "a changed stamp did not refetch"
+        );
+        assert_eq!(
+            shell.web_surface_policy_gate("local://p"),
+            SurfacePolicyGate::Pending
+        );
+    }
+
+    // A reply for a version the app has already moved past must not install
+    // rules the app retired.
+    #[test]
+    fn a_stale_policy_reply_is_dropped() {
+        let mut shell = ShellState::new(test_shell_bootstrap_with_active_session("local://p"));
+        declare_with_policy(&mut shell, "local://p", Some("v1"), 1_000);
+        declare_with_policy(&mut shell, "local://p", Some("v2"), 2_000);
+
+        shell.apply_sidebar_policy(
+            "local://p",
+            "v1",
+            WebSurfacePolicy {
+                adblock_rules: Some("[retired]".to_string()),
+                userscripts: Vec::new(),
+            },
+        );
+        assert_eq!(
+            shell.web_surface_policy_gate("local://p"),
+            SurfacePolicyGate::Pending,
+            "a stale policy reply was applied"
+        );
+    }
+
+    // A broken control endpoint must not mean a permanently blank viewport: the
+    // gate opens after MAX_POLICY_FETCH_ATTEMPTS, unprotected but visible. And
+    // the retry signal stops, so a dead endpoint is not polled every heartbeat
+    // for the life of the session.
+    #[test]
+    fn an_unreachable_policy_endpoint_eventually_opens_the_gate() {
+        let mut shell = ShellState::new(test_shell_bootstrap_with_active_session("local://p"));
+        declare_with_policy(&mut shell, "local://p", Some("v1"), 1_000);
+
+        for attempt in 1..MAX_POLICY_FETCH_ATTEMPTS {
+            assert!(!shell.fail_sidebar_policy("local://p", "v1"), "gave up early");
+            assert_eq!(
+                shell.web_surface_policy_gate("local://p"),
+                SurfacePolicyGate::Pending
+            );
+            assert!(
+                declare_with_policy(&mut shell, "local://p", Some("v1"), 1_000 + attempt as u64),
+                "stopped retrying while attempts remained"
+            );
+        }
+        assert!(shell.fail_sidebar_policy("local://p", "v1"), "never gave up");
+        assert_eq!(
+            shell.web_surface_policy_gate("local://p"),
+            SurfacePolicyGate::Absent,
+            "the surface stayed gated behind a dead endpoint"
+        );
+        assert!(
+            !declare_with_policy(&mut shell, "local://p", Some("v1"), 9_000),
+            "kept polling a dead endpoint after giving up"
+        );
+
+        // A new stamp is a fresh chance: the app may have fixed itself.
+        assert!(declare_with_policy(&mut shell, "local://p", Some("v2"), 10_000));
+        assert_eq!(
+            shell.web_surface_policy_gate("local://p"),
+            SurfacePolicyGate::Pending
         );
     }
 
