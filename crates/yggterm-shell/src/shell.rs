@@ -1383,6 +1383,15 @@ struct AppPaneActionReply {
     toast: Option<String>,
     #[serde(default)]
     eval: Option<String>,
+    /// Recreate the session's web surface, refetching the app's policy first.
+    ///
+    /// NOT the same as `eval: "location.reload()"`, which reloads the DOCUMENT.
+    /// A content filter and its userscripts are attached to the WEBVIEW when it
+    /// is created, so an in-page reload cannot add or remove them — an app that
+    /// just turned ad blocking off would see it stay on. Only destroy-and-create
+    /// applies a new policy, and this is how an app asks for one.
+    #[serde(default)]
+    reload_surface: bool,
 }
 
 /// `<control>/pane/<id>` — where the GUI fetches a pane's schema. Kept out of
@@ -5210,6 +5219,23 @@ impl ShellState {
             contribution.policy = Some(policy);
             contribution.policy_attempts = 0;
         }
+    }
+    /// Drop the policy we hold for a session, without touching its stamp. The
+    /// gate goes `Pending`, so a surface recreated right now waits for the fresh
+    /// policy instead of coming back under the rules the app just changed.
+    fn invalidate_sidebar_policy(&mut self, session_path: &str) {
+        if let Some(contribution) = self.sidebar_contributions.get_mut(session_path) {
+            contribution.policy = None;
+            contribution.policy_attempts = 0;
+        }
+    }
+    /// The stamp a policy fetch for this session should be filed under. `None`
+    /// when the app ships no policy, so there is nothing to fetch.
+    fn sidebar_policy_version(&self, session_path: &str) -> Option<String> {
+        self.sidebar_contributions
+            .get(session_path)
+            .map(|contribution| contribution.policy_version.clone())
+            .filter(|version| !version.is_empty())
     }
     /// Count a failed `<control>/policy` fetch. Returns true once the reconciler
     /// should stop waiting and create the surface with no policy at all.
@@ -36872,6 +36898,28 @@ async fn app_pane_run_action(
             });
         }
     }
+    if reply.reload_surface {
+        // The app changed something only a fresh webview can pick up (its
+        // adblock ruleset, its userscripts). Drop the policy we hold FIRST: the
+        // reconciler's gate then makes the recreate wait for the new one, so the
+        // surface cannot come back under the rules the user just turned off.
+        let session = state.peek().server.active_session_path().map(str::to_string);
+        let Some(session) = session else {
+            return;
+        };
+        let version = state.with_mut(|shell| {
+            shell.invalidate_sidebar_policy(&session);
+            shell.web_surface_reload_active_tab(&session);
+            shell.sidebar_policy_version(&session)
+        });
+        // Refetch immediately rather than waiting up to a heartbeat for the next
+        // declare. The stamp is only a change DETECTOR — the body a GET returns
+        // now is the app's current truth whatever stamp it is filed under.
+        if let Some(version) = version {
+            let trace_home = resolve_yggterm_home().unwrap_or_else(|_| PathBuf::from("."));
+            spawn(app_policy_fetch(state, session, version, trace_home));
+        }
+    }
 }
 
 async fn web_surface_eval_for(
@@ -66228,14 +66276,22 @@ fn terminal_eval_script_with_canvas_renderer(
                         }}
                         if (verb === 'sidebar') {{
                             // The declaration carries only what the rail draws:
-                            // a control endpoint and pane buttons. Never a
-                            // schema (the GUI GETs that) and never a secret.
+                            // a control endpoint, pane buttons, and a stamp over
+                            // the app's web-content policy. Never a schema (the
+                            // GUI GETs that), never a ruleset, never a secret.
+                            //
+                            // This object is built field by field, so anything a
+                            // new app declares must be copied ACROSS here too — a
+                            // field added only to the Rust wire type arrives null.
                             const panes = Array.isArray(payload.panes) ? payload.panes : [];
                             sendTerminalEvent({{
                                 kind: 'sidebar_contribution',
                                 action,
                                 session: payload.session,
                                 control: typeof payload.control === 'string' ? payload.control : null,
+                                policy_version: typeof payload.policy_version === 'string'
+                                    ? payload.policy_version
+                                    : null,
                                 panes: panes
                                     .filter((pane) => pane && typeof pane.id === 'string' && pane.id)
                                     .map((pane) => ({{
@@ -88055,6 +88111,41 @@ mod tests {
         );
     }
 
+    // `reload_surface` exists because `eval: "location.reload()"` cannot detach a
+    // content filter: it is bound to the webview, not the document. Recreating
+    // must therefore refetch — otherwise the surface comes back under exactly the
+    // rules the user just turned off.
+    #[test]
+    fn invalidating_a_policy_regates_the_surface_and_keeps_its_stamp() {
+        let mut shell = ShellState::new(test_shell_bootstrap_with_active_session("local://p"));
+        declare_with_policy(&mut shell, "local://p", Some("v1"), 1_000);
+        shell.apply_sidebar_policy("local://p", "v1", WebSurfacePolicy::default());
+        assert!(matches!(
+            shell.web_surface_policy_gate("local://p"),
+            SurfacePolicyGate::Ready(_)
+        ));
+
+        shell.invalidate_sidebar_policy("local://p");
+        assert_eq!(
+            shell.web_surface_policy_gate("local://p"),
+            SurfacePolicyGate::Pending,
+            "a recreate could run under the policy the app just replaced"
+        );
+        // The stamp survives, so the immediate refetch has a key to file under.
+        assert_eq!(
+            shell.sidebar_policy_version("local://p").as_deref(),
+            Some("v1")
+        );
+    }
+
+    // An app that ships no policy has nothing to refetch on reload.
+    #[test]
+    fn a_policyless_app_has_no_version_to_refetch() {
+        let mut shell = ShellState::new(test_shell_bootstrap_with_active_session("local://p"));
+        declare_with_policy(&mut shell, "local://p", None, 1_000);
+        assert_eq!(shell.sidebar_policy_version("local://p"), None);
+    }
+
     // A reply for a version the app has already moved past must not install
     // rules the app retired.
     #[test]
@@ -88913,6 +89004,22 @@ mod tests {
         assert!(script.contains("return true;"));
         assert!(script.contains("window.__yggtermSidebarKeyboardOwner = false;"));
         assert!(script.contains("target.closest('[id^=\"yggterm-terminal-\"]')"));
+    }
+    // The OSC forwarder rebuilds the declaration field by field, so a field added
+    // only to the Rust wire type silently arrives as null and the policy gate
+    // reads "this app ships no policy" — the surface then opens with no adblock
+    // and no userscripts. That is exactly what shipped before a live probe caught
+    // it; this test is the tripwire.
+    #[test]
+    fn terminal_eval_script_forwards_every_sidebar_declaration_field() {
+        let theme = terminal_theme(UiTheme::ZedLight, palette(UiTheme::ZedLight), 13.0, "");
+        let script = terminal_eval_script("yggterm-terminal-test", &theme, true);
+        for field in ["session:", "control:", "policy_version:", "panes:"] {
+            assert!(
+                script.contains(field),
+                "the sidebar OSC forwarder drops `{field}` — it will arrive null"
+            );
+        }
     }
     #[test]
     fn terminal_eval_script_hides_accessibility_selection_artifacts() {
