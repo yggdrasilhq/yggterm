@@ -161,6 +161,96 @@ pub enum AgentSessionProfile {
     CodexLiteLlm,
 }
 
+/// How the two panes of a [`SplitGroup`] are arranged in the viewport, and
+/// therefore how the compound sidebar row mirrors that geometry
+/// ([[campaign-split-view-groups]]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SplitAxis {
+    /// Left | Right. Panes sit side by side; the compound row shows cells
+    /// separated by a vertical `|`; the divider is vertical.
+    SideBySide,
+    /// Top / Bottom. Panes are stacked; the compound row shows two stacked
+    /// lines; the divider is horizontal.
+    Stacked,
+}
+
+impl Default for SplitAxis {
+    fn default() -> Self {
+        SplitAxis::SideBySide
+    }
+}
+
+/// A GUI-level split-view group — the single source of truth for a split
+/// ([[campaign-split-view-groups]]). Members keep their own daemon-owned PTYs
+/// (possibly on different machines: cross-host split is the differentiator tmux
+/// cannot match); only the GUI composes them into one surface. The compound
+/// sidebar row, the viewport layout, and persistence all DERIVE from this
+/// object — there are no per-session split flags anywhere.
+///
+/// MVP is 2 panes (`members.len() == 2`); 2×2 via drop-onto-cell is phase 2.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SplitGroup {
+    /// Stable identity, also the synthetic sidebar path (`split://<id>`).
+    pub group_id: String,
+    /// Pane arrangement (drives both viewport rects and the compound row).
+    #[serde(default)]
+    pub axis: SplitAxis,
+    /// Fraction of the split axis the FIRST member occupies (0.0..1.0). The
+    /// draggable divider writes this; persisted so a workspace reopens as built.
+    #[serde(default = "default_split_ratio")]
+    pub ratio: f32,
+    /// Member session paths in pane order. MVP length is 2.
+    pub members: Vec<String>,
+    /// The last-focused pane index — which member gets input focus when the
+    /// group is (re)activated. When the group is the active surface this stays
+    /// in sync with `active_session_path`; it is genuinely distinct state only
+    /// while the group is backgrounded.
+    #[serde(default)]
+    pub active_pane: usize,
+    /// Each member's keep-alive setting BEFORE it was grouped. Grouping forces
+    /// keep-alive on every member (the group is the keep-alive declaration);
+    /// ungrouping restores these so a throwaway shell does not stay immortal
+    /// after a brief split.
+    #[serde(default)]
+    pub prior_keep_alive: BTreeMap<String, bool>,
+}
+
+fn default_split_ratio() -> f32 {
+    0.5
+}
+
+impl SplitGroup {
+    /// Synthetic sidebar/tree path for a group id.
+    pub fn path_for_id(group_id: &str) -> String {
+        format!("split://{group_id}")
+    }
+
+    /// This group's synthetic sidebar path.
+    pub fn synthetic_path(&self) -> String {
+        Self::path_for_id(&self.group_id)
+    }
+
+    pub fn contains(&self, session_path: &str) -> bool {
+        self.members.iter().any(|member| member == session_path)
+    }
+
+    /// Clamp `active_pane` and `ratio` into valid ranges (defensive against a
+    /// persisted file from a newer/older build or a removed member).
+    pub fn normalized(mut self) -> Self {
+        if self.members.is_empty() {
+            self.active_pane = 0;
+        } else if self.active_pane >= self.members.len() {
+            self.active_pane = self.members.len() - 1;
+        }
+        if !self.ratio.is_finite() {
+            self.ratio = 0.5;
+        }
+        self.ratio = self.ratio.clamp(0.15, 0.85);
+        self
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct AppSettings {
@@ -200,6 +290,10 @@ pub struct AppSettings {
     /// top-level seeding) must respect this set across processes, not just
     /// within one.
     pub collapsed_synthetic_paths: Vec<String>,
+    /// GUI-level split-view groups ([[campaign-split-view-groups]]). Persisted
+    /// so a built workspace reopens as an intentional artifact; members resume
+    /// via the normal per-pane handoff on restore.
+    pub split_groups: Vec<SplitGroup>,
 }
 
 impl Default for AppSettings {
@@ -232,6 +326,7 @@ impl Default for AppSettings {
             selected_browser_path: None,
             expanded_browser_paths: Vec::new(),
             collapsed_synthetic_paths: Vec::new(),
+            split_groups: Vec::new(),
         }
     }
 }
@@ -943,6 +1038,13 @@ fn parse_settings_value(value: &Value) -> Result<AppSettings> {
         settings.collapsed_synthetic_paths = serde_json::from_value(value.clone())
             .context("failed to parse collapsed_synthetic_paths")?;
     }
+    if let Some(value) = object.get("split_groups") {
+        settings.split_groups = serde_json::from_value::<Vec<SplitGroup>>(value.clone())
+            .context("failed to parse split_groups")?
+            .into_iter()
+            .map(SplitGroup::normalized)
+            .collect();
+    }
     Ok(settings)
 }
 
@@ -975,6 +1077,7 @@ fn serialize_settings_value(settings: &AppSettings) -> Value {
         "selected_browser_path": settings.selected_browser_path,
         "expanded_browser_paths": settings.expanded_browser_paths,
         "collapsed_synthetic_paths": settings.collapsed_synthetic_paths,
+        "split_groups": settings.split_groups,
     })
 }
 
@@ -2079,6 +2182,63 @@ fn short_session_id(session_id: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn split_group_survives_settings_round_trip() {
+        // A built split-view workspace must reopen as the intentional artifact
+        // the user shaped ([[campaign-split-view-groups]] persistence).
+        let mut prior = BTreeMap::new();
+        prior.insert("local://a".to_string(), false);
+        prior.insert("local://b".to_string(), true);
+        let mut settings = AppSettings::default();
+        settings.split_groups = vec![SplitGroup {
+            group_id: "g1".to_string(),
+            axis: SplitAxis::Stacked,
+            ratio: 0.42,
+            members: vec!["local://a".to_string(), "local://b".to_string()],
+            active_pane: 1,
+            prior_keep_alive: prior.clone(),
+        }];
+        let value = serialize_settings_value(&settings);
+        let parsed = parse_settings_value(&value).expect("parse split_groups");
+        assert_eq!(parsed.split_groups.len(), 1);
+        let group = &parsed.split_groups[0];
+        assert_eq!(group.group_id, "g1");
+        assert_eq!(group.axis, SplitAxis::Stacked);
+        assert!((group.ratio - 0.42).abs() < 1e-4);
+        assert_eq!(group.members, vec!["local://a", "local://b"]);
+        assert_eq!(group.active_pane, 1);
+        assert_eq!(group.prior_keep_alive, prior);
+    }
+
+    #[test]
+    fn split_group_normalized_clamps_ratio_and_active_pane() {
+        // Defensive against a persisted file from a divergent build or a removed
+        // member — the SSOT stays valid rather than panicking a render.
+        let group = SplitGroup {
+            group_id: "g".to_string(),
+            axis: SplitAxis::SideBySide,
+            ratio: 5.0,
+            members: vec!["a".to_string(), "b".to_string()],
+            active_pane: 9,
+            prior_keep_alive: BTreeMap::new(),
+        }
+        .normalized();
+        assert!(group.ratio <= 0.85 && group.ratio >= 0.15);
+        assert_eq!(group.active_pane, 1);
+
+        let empty = SplitGroup {
+            group_id: "e".to_string(),
+            axis: SplitAxis::SideBySide,
+            ratio: f32::NAN,
+            members: vec![],
+            active_pane: 3,
+            prior_keep_alive: BTreeMap::new(),
+        }
+        .normalized();
+        assert_eq!(empty.active_pane, 0);
+        assert!(empty.ratio.is_finite());
+    }
 
     #[test]
     fn input_draft_sets_on_typed_text_and_clears_on_submit() {
