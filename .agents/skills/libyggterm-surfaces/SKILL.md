@@ -228,7 +228,10 @@ like any other.
 Menu contributions (the titlebar `+` menu) are the same idea for a different
 surface: an app-registry the shell reads instead of hardcoded arms — see
 [[project-libyggterm-app-menu-contribution]]. ALT+/KeyTips is the keyboard
-surface — see [[project-alt-keytips-layer]].
+surface — spec finalized 2026-07-10, see [[campaign-alt-keytips-layer]]
+(reserved-letters namespace: shell KeyTips use only non-Excel letters; apps
+claim Excel's F,H,N,P,M,A,R,W,X,Y,Q; command-registry SSOT, contributions
+ride OSC 7717 ids).
 
 ## Worked example: the password vault as an ychrome-owned surface
 
