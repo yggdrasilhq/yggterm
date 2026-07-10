@@ -37,7 +37,10 @@ pub enum AppControlPreviewLayout {
     Graph,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// NOT `Copy`: `AppPane` carries the app's own pane id. The same reasoning as
+/// `yggterm-shell`'s `RightPanelMode` — a unit variant plus a separate id field
+/// would be two encodings of one fact.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AppControlRightPanelMode {
     Hidden,
@@ -46,8 +49,10 @@ pub enum AppControlRightPanelMode {
     Settings,
     Metadata,
     AppSidebar,
-    /// The ychrome-shipped Bitwarden/vault browser (search + fill any login).
-    Vault,
+    /// A pane CONTRIBUTED by the active libyggterm app, by the app's pane id.
+    /// This is how an agent drives ychrome's vault pane headlessly; before it
+    /// existed the only way in was to click the button with `app dom-eval`.
+    AppPane { id: String },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]

@@ -53,8 +53,7 @@ Build each only when an app truly needs it.
 3. **Sidebar-contribution surface** — the app contributes a right-hand panel of
    icons/controls/metadata. This is where a password-manager sidebar, an ytop
    signal panel, or a Cellulose ribbon lives. SHIPPED 2026-07-09 (ychrome's vault
-   pane); the two hardcoded variants it replaces are not deleted yet. Protocol
-   below.
+   pane); `RightPanelMode::Vault` DELETED 2026-07-10. Protocol below.
 4. **Chooser / identity surface** — a picker before launch (profile, workspace,
    vault account). SHIPPED for ychrome's no-arg profile picker.
 
@@ -164,15 +163,52 @@ a `label` when a tab switch changed the widget at that slot — same tag, so the
 node was reused and kept the section's `text-transform`. The Tools tab rendered
 "UNLOCKED · 1107 ITEMS". Key on kind + id. Caught live, not by a test.
 
+### Who owns a widget's value (settled 2026-07-10)
+
+**The app owns every field's value.** A schema declares what each field holds;
+yggterm's `app_pane_values` is only the user's edits *since that schema arrived*,
+and applying a schema REPLACES it. Two consequences the implementation depends on:
+
+- An app must **echo a draft back** in the schema it returns, or the field blanks.
+  ychrome keeps the Add-tab draft in its own `PaneState` — host-resident, like
+  everything else the app owns.
+- A value the app stops declaring is **dropped**, which is what stops a typed
+  password riding along on the next unrelated action's POST.
+
+Inputs render with `initial_value` (uncontrolled), so a pushed value would be
+silently ignored. Each widget id carries a **value epoch** that bumps only when an
+applied schema declares a value the field is not already showing; the epoch rides
+the Dioxus key, so a prefill rebuilds the node while an app echoing back what the
+user typed leaves the caret alone.
+
+### Secrets: the rule, precisely
+
+The flow is **one-way**. A `secret` text-input carries what the user TYPED up to
+the app on an action; the app declares it back **empty**. Never put a secret in a
+schema, a declaration, or any OSC payload. An app that wants to hand the user a
+generated secret does not echo it — ychrome's Add tab generates on save
+(`--generate`), so the password is rolled on the app's host, encrypted, and stored
+without ever entering yggterm. When a value must reach the *page*, use `eval`:
+the app computes, the GUI injects, yggterm stores nothing.
+
+### Driving a contributed pane headlessly
+
+`server app right-panel pane:<id>` opens a pane the active app declared (e.g.
+`pane:vault`) and fetches its schema — idempotent, unlike the titlebar button's
+toggle. Before this existed the only way in was to click the button with
+`app dom-eval`. yggterm does not know the pane ids; the app declares them.
+
 ### Still hardcoded (the next slice)
 
-`RightPanelMode::Vault` and `::AppSidebar` still exist and still work. The
-contributed vault pane does not yet cover the **password generator** or
-**watchtower**, so deleting `::Vault` now would regress the user's UI. Port
-those, move `vault_password_is_weak` out of `shell.rs`, migrate `::AppSidebar`
-(ychrome's adblock/userscript settings), then delete both variants and move
-`docs/ychrome-password-manager.md` into the ychrome repo. The other variants —
-`Metadata`, `Settings`, `Connect`, `Notifications` — are yggterm's own and stay.
+`RightPanelMode::Vault` is **DELETED** (2026-07-10): the contributed pane now
+covers the password generator and the watchtower, `vault_password_is_weak` moved
+to `ychrome-vault::watchtower`, and `docs/ychrome-password-manager.md` moved to
+the ychrome repo as `docs/password-manager.md`.
+
+`RightPanelMode::AppSidebar` still exists. Migrate it (ychrome's adblock +
+userscript settings, per "the app's host owns its config"), then delete it. The
+other variants — `Metadata`, `Settings`, `Connect`, `Notifications` — are
+yggterm's own and stay.
 
 ### Where an app's config lives when the app is remote (DECIDED 2026-07-09)
 
@@ -199,12 +235,12 @@ surface — see [[project-alt-keytips-layer]].
 The native Bitwarden/Vaultwarden client (crate `ychrome-vault`, crypto proven
 against a real 1107-item vault) was FIRST built inside the yggterm repo and
 wired into a hardcoded yggterm sidebar. **That was the wrong ownership.** The
-crate now lives in the ychrome repo; `rbw` was purged fleet-wide 2026-07-09.
-The remaining half of the migration is the sidebar itself:
+crate now lives in the ychrome repo, `rbw` was purged fleet-wide 2026-07-09,
+and the hardcoded pane was deleted 2026-07-10. The migration is COMPLETE:
 
 - **ychrome owns** the vault crate, the vault-agent (unlock cache, host-resident,
-  auto-lock), the `ychrome-vault` CLI, and the sidebar schema it declares. DONE
-  except the schema. App-side contract: ychrome's own
+  auto-lock), the `ychrome-vault` CLI, the watchtower analysis, and the sidebar
+  schema it declares. App-side contract: ychrome's own
   `.claude/skills/ychrome/SKILL.md`.
 - **yggterm provides** only the generic sidebar-contribution surface that renders
   ychrome's declared schema and routes its actions — plus surface-eval for fill.
@@ -214,7 +250,7 @@ The remaining half of the migration is the sidebar itself:
   so the host owns the browsing identity, so the host owns the vault.
 
 Full vault execution plan (agent, writes/EncString-encrypt, passkeys, rbw
-retirement): [[campaign-native-vault-client]] and `docs/ychrome-password-manager.md`.
+retirement): [[campaign-native-vault-client]] and ychrome's `docs/password-manager.md`.
 
 ## Anti-patterns (things this skill exists to prevent)
 

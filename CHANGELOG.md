@@ -70,7 +70,7 @@ now, not an aspiration — `docs/daemon-handoff.md`.
 - **Bitwarden/Vaultwarden autofill (slice 1).** `yggterm server app web fill` and an app-sidebar
   "Fill login from vault" button fill the visible login form from `rbw`, matched to the page's
   exact host as reported by the engine (https or loopback pages only). See
-  docs/ychrome-password-manager.md for setup and the security model.
+  the ychrome repo's docs/password-manager.md for setup and the security model.
 - **Standard libyggterm app chrome: Zzz + ⏻.** The web-surface strip's right cluster now carries
   the standardized app-lifecycle buttons: **Zzz** suspends the app to its terminal (sends Ctrl+Z
   and closes the overlay immediately; `fg` brings the page back — ychrome ≥f3ad350 re-announces

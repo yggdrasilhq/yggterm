@@ -1648,7 +1648,16 @@ fn main() -> Result<()> {
                     "notifications" | "notification" => AppControlRightPanelMode::Notifications,
                     "settings" => AppControlRightPanelMode::Settings,
                     "metadata" | "session-metadata" => AppControlRightPanelMode::Metadata,
-                    other => anyhow::bail!("unsupported app right panel mode: {other}"),
+                    // `pane:<id>` opens a pane the ACTIVE APP contributed over
+                    // OSC 7717 (e.g. `pane:vault`). yggterm does not know the
+                    // ids; the app declares them.
+                    pane if pane.starts_with("pane:") => AppControlRightPanelMode::AppPane {
+                        id: pane.trim_start_matches("pane:").to_string(),
+                    },
+                    other => anyhow::bail!(
+                        "unsupported app right panel mode: {other} \
+                         (try hidden|connect|notifications|settings|metadata|pane:<id>)"
+                    ),
                 };
                 run_app_control_set_right_panel_mode(mode, timeout_ms)
             }
