@@ -93,8 +93,9 @@ use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
 use time::{OffsetDateTime, UtcOffset, macros::format_description};
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 use uuid::Uuid;
+use yggterm_core::AppManifest;
 use yggterm_core::{
     PerfSpan, SessionNode, SessionStore, SessionTitleStore, TranscriptRole, WorkspaceDocument,
     WorkspaceDocumentKind, YGGTERM_DESKTOP_APP_ID, append_trace_event, detect_install_context,
@@ -1805,6 +1806,48 @@ pub struct ServerUiSnapshot {
     pub ssh_targets: Vec<SshConnectTarget>,
     #[serde(default)]
     pub live_sessions: Vec<SnapshotSessionView>,
+    /// libyggterm apps installed on THIS daemon's host, from
+    /// `~/.yggterm/apps/*.json`. The one source the launcher family reads: the
+    /// titlebar `+` menu, the cwd-tree context menu and the start page all draw
+    /// their app entries from here, and none of them hardcodes an app.
+    #[serde(default)]
+    pub apps: Vec<AppManifest>,
+}
+
+/// How long a scanned app registry is trusted before the daemon looks at the
+/// directory again. Installing an app therefore shows up within a few seconds,
+/// while a snapshot (which the GUI takes constantly) costs no `readdir`.
+const APP_REGISTRY_RESCAN_AFTER_MS: u64 = 5_000;
+
+/// The host's app registry, rescanned at most every `APP_REGISTRY_RESCAN_AFTER_MS`.
+///
+/// This is where the daemon **prunes** the manifests of apps whose binary is
+/// gone (see `yggterm_core::scan_app_registry`), so an uninstall cleans itself
+/// up as a side effect of the GUI simply being open.
+fn cached_app_registry() -> Vec<AppManifest> {
+    use std::sync::Mutex;
+    use std::sync::OnceLock;
+    static CACHE: OnceLock<Mutex<(u64, Vec<AppManifest>)>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new((0, Vec::new())));
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since| since.as_millis() as u64)
+        .unwrap_or(0);
+    let Ok(mut cache) = cache.lock() else {
+        return Vec::new();
+    };
+    if cache.0 != 0 && now_ms.saturating_sub(cache.0) < APP_REGISTRY_RESCAN_AFTER_MS {
+        return cache.1.clone();
+    }
+    let Ok(home) = yggterm_core::resolve_yggterm_home() else {
+        return Vec::new();
+    };
+    let (apps, pruned) = yggterm_core::scan_app_registry(&home);
+    if !pruned.is_empty() {
+        info!(pruned = ?pruned, "pruned app manifests whose binary no longer resolves");
+    }
+    *cache = (now_ms.max(1), apps.clone());
+    apps
 }
 
 pub fn validate_server_ui_snapshot(snapshot: &ServerUiSnapshot) -> Vec<String> {
@@ -2078,6 +2121,10 @@ pub struct YggtermServer {
     theme: UiTheme,
     ghostty_host: GhosttyHostSupport,
     ssh_targets: Vec<SshConnectTarget>,
+    /// libyggterm apps on the host this server's DAEMON runs on. Producer:
+    /// `snapshot()` (which also prunes). Consumer: `apply_snapshot`. The GUI
+    /// never scans for itself — one owner, so no menu can disagree with another.
+    apps: Vec<AppManifest>,
     remote_machines: Vec<RemoteMachineSnapshot>,
     live_session_order: Vec<String>,
     local_cc_sessions: Vec<LocalCcSession>,
@@ -2126,6 +2173,7 @@ impl YggtermServer {
             theme,
             ghostty_host,
             ssh_targets: Vec::new(),
+            apps: Vec::new(),
             remote_machines: Vec::new(),
             live_session_order: Vec::new(),
             local_cc_sessions,
@@ -3230,6 +3278,11 @@ impl YggtermServer {
         true
     }
 
+    /// The launcher registry for this host: every menu that offers to launch
+    /// something reads THIS, and none of them hardcodes an app.
+    pub fn apps(&self) -> &[AppManifest] {
+        &self.apps
+    }
     pub fn remote_machines(&self) -> &[RemoteMachineSnapshot] {
         &self.remote_machines
     }
@@ -3559,6 +3612,7 @@ impl YggtermServer {
             remote_machines: self.remote_machines.clone(),
             ssh_targets: self.ssh_targets.clone(),
             live_sessions,
+            apps: cached_app_registry(),
         };
         let invariant_violations = validate_server_ui_snapshot(&snapshot);
         if !invariant_violations.is_empty() {
@@ -3648,6 +3702,7 @@ impl YggtermServer {
         self.active_session_path = snapshot.active_session_path.clone();
         self.remote_machines = snapshot.remote_machines;
         self.ssh_targets = snapshot.ssh_targets;
+        self.apps = snapshot.apps;
         for target in self.ssh_targets.clone() {
             self.ensure_remote_machine_stub(&target);
         }
@@ -22386,6 +22441,7 @@ mod tests {
         remote_machines: Vec<RemoteMachineSnapshot>,
     ) -> ServerUiSnapshot {
         ServerUiSnapshot {
+            apps: Vec::new(),
             active_session_path,
             active_session,
             active_view_mode,
@@ -27550,6 +27606,7 @@ terminal_window_id: None,
         );
         let active_path = remote_scanned_session_path("dev", "abc123");
         server.apply_snapshot(ServerUiSnapshot {
+            apps: Vec::new(),
             active_session_path: Some(active_path.clone()),
             active_session: None,
             active_view_mode: WorkspaceViewMode::Terminal,
@@ -29986,6 +30043,7 @@ terminal_window_id: None,
             remote_machines: Vec::new(),
             ssh_targets: Vec::new(),
             live_sessions: Vec::new(),
+            apps: Vec::new(),
         });
 
         assert_eq!(server.active_session_path(), None);
@@ -30033,6 +30091,7 @@ terminal_window_id: None,
         });
 
         server.apply_snapshot(ServerUiSnapshot {
+            apps: Vec::new(),
             active_session_path: None,
             active_session: None,
             active_view_mode: WorkspaceViewMode::Rendered,

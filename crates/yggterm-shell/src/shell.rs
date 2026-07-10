@@ -148,7 +148,8 @@ use tokio::task;
 use tokio::time::sleep;
 use tracing::{info, warn};
 use yggterm_core::{
-    AgentSessionProfile, AppSettings, BrowserRow, BrowserRowKind, InstallContext, PerfSpan,
+    AgentSessionProfile, AppManifest, AppSettings, AppVerb, BrowserRow, BrowserRowKind,
+    InstallContext, PerfSpan,
     ReleaseUpdateInstallProgress, ReleaseUpdateInstallStage, SessionBrowserState, SessionNode,
     SessionStore, SessionSummaryTimelineEntry, TerminalTelemetryEvent, WorkspaceDocumentInput,
     WorkspaceDocumentKind, WorkspaceGroupKind, YGGTERM_DESKTOP_APP_ID, append_perf_event,
@@ -3060,6 +3061,10 @@ struct RenderSnapshot {
     /// app is live and declaring — which is what keeps app chrome out of the
     /// rail. yggterm never invents one of these.
     sidebar_panes: Vec<SidebarPaneDeclaration>,
+    /// The host's libyggterm app registry. THE source for every launcher
+    /// surface: the titlebar `+` menu, the cwd-tree context menu, and the start
+    /// page. No surface may hardcode an app entry, and none may keep its own list.
+    apps: Vec<AppManifest>,
     /// The schema currently rendered for `RightPanelMode::AppPane`, and any
     /// error from fetching it.
     app_pane_schema: Option<AppPaneSchemaState>,
@@ -3739,7 +3744,6 @@ enum AltOverlayAction {
     OpenInsertMenu,
     StartSession,
     StartTerminal,
-    CreatePaper,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum AltOverlayResolution {
@@ -4827,6 +4831,7 @@ impl ShellState {
                     .map(|app_tab| app_tab.profile.clone())
             }),
             sidebar_panes,
+            apps: self.server.apps().to_vec(),
             app_pane_schema: self.app_pane_schema.clone(),
             app_pane_error: self.app_pane_error.clone(),
             active_web_surface_host: active_session_path
@@ -17225,6 +17230,103 @@ where
 {
     spawn_targeted_server_snapshot_action(state, pending_label, YggTarget::App, request);
 }
+/// Where an app verb should launch when the surface offering it has a selected
+/// row (start page, cwd-tree context menu) — and where it should launch when it
+/// does not (fall back to the active session's host and cwd).
+fn launch_context_for_optional_row(
+    state: Signal<ShellState>,
+    row: Option<BrowserRow>,
+) -> TerminalLaunchContext {
+    state.with(|shell| match row {
+        Some(row) => terminal_launch_context_for_row(shell, &row),
+        None => terminal_launch_context(shell),
+    })
+}
+/// Flatten the host's app registry into the entries a launcher menu draws, in a
+/// stable order (apps by name, verbs as the app declared them).
+///
+/// Every launcher surface calls THIS — the titlebar `+` menu, the cwd-tree
+/// context menu, the start page. One derivation, so they cannot show different
+/// apps, and adding a surface never means copying a list.
+fn app_launcher_entries(apps: &[AppManifest]) -> Vec<(AppManifest, AppVerb)> {
+    apps.iter()
+        .flat_map(|app| app.verbs.iter().map(move |verb| (app.clone(), verb.clone())))
+        .collect()
+}
+/// Launch a libyggterm app's verb: open a terminal session wherever the user
+/// asked, then type the app's command into it.
+///
+/// This is deliberately the same thing the user would do by hand, and it is why
+/// a manifest's `binary` must be ABSOLUTE — a non-interactive session's PATH is
+/// not the login shell's. The session is brand new, so this never types into a
+/// prompt someone is using (see [[finding-never-type-into-a-live-prompt]]).
+///
+/// One function for every launcher surface. The titlebar `+` menu, the cwd-tree
+/// context menu and the start page all call THIS, so they cannot drift.
+fn spawn_launch_app_verb(
+    state: Signal<ShellState>,
+    app: AppManifest,
+    verb: AppVerb,
+    launch_context: TerminalLaunchContext,
+) {
+    let command = app.command_for(&verb);
+    let title_hint = verb.label.clone();
+    let pending = format!("starting {}", verb.label);
+    let terminal_appearance =
+        state.with(|shell| shell.effective_terminal_identity_appearance().to_string());
+    clear_sidebar_keyboard_owner();
+    match launch_context {
+        TerminalLaunchContext::Local { cwd, .. } => {
+            spawn_server_snapshot_action(state, pending, move |endpoint| {
+                if let Some(cwd) = cwd.as_deref() {
+                    ensure_home_scoped_workspace_dir(cwd)?;
+                }
+                let (snapshot, message) = start_local_session_at_with_terminal_appearance(
+                    &endpoint,
+                    SessionKind::Shell,
+                    cwd.as_deref(),
+                    Some(&title_hint),
+                    Some(&terminal_appearance),
+                )?;
+                write_app_verb_command(&endpoint, &snapshot, message.as_deref(), &command);
+                Ok((snapshot, message))
+            });
+        }
+        TerminalLaunchContext::Remote {
+            ssh_target,
+            prefix,
+            cwd,
+            ..
+        } => {
+            spawn_server_snapshot_action(state, pending, move |endpoint| {
+                let (snapshot, message) = start_ssh_session_at_with_terminal_appearance(
+                    &endpoint,
+                    &ssh_target,
+                    prefix.as_deref(),
+                    cwd.as_deref(),
+                    Some(&title_hint),
+                    Some(&terminal_appearance),
+                )?;
+                write_app_verb_command(&endpoint, &snapshot, message.as_deref(), &command);
+                Ok((snapshot, message))
+            });
+        }
+    }
+}
+/// Type an app's command into the session that was just started for it. The PTY
+/// exists before the shell has read from it, so a write cannot be lost — the
+/// line discipline buffers it.
+fn write_app_verb_command(
+    endpoint: &ServerEndpoint,
+    snapshot: &ServerUiSnapshot,
+    message: Option<&str>,
+    command: &str,
+) {
+    let Some(path) = app_control_created_session_path(snapshot, message) else {
+        return;
+    };
+    let _ = terminal_write(endpoint, &path, &format!("{command}\n"));
+}
 fn spawn_targeted_server_snapshot_action<F>(
     state: Signal<ShellState>,
     pending_label: String,
@@ -22890,7 +22992,6 @@ fn resolve_alt_overlay_sequence(sequence: &str) -> AltOverlayResolution {
         "i" => AltOverlayResolution::Action(AltOverlayAction::OpenInsertMenu),
         "is" => AltOverlayResolution::Action(AltOverlayAction::StartSession),
         "it" => AltOverlayResolution::Action(AltOverlayAction::StartTerminal),
-        "ip" => AltOverlayResolution::Action(AltOverlayAction::CreatePaper),
         _ => AltOverlayResolution::Invalid,
     }
 }
@@ -22942,13 +23043,6 @@ fn execute_alt_overlay_action(mut state: Signal<ShellState>, action: AltOverlayA
         }
         AltOverlayAction::StartTerminal => {
             spawn_start_terminal_session(state);
-        }
-        AltOverlayAction::CreatePaper => {
-            state.with_mut(|shell| {
-                shell.clear_alt_overlay();
-                shell.close_titlebar_new_menu();
-            });
-            queue_new_document(state);
         }
     }
 }
@@ -26174,241 +26268,6 @@ fn apply_machine_health_suffix(label: &str, health: MachineHealth) -> String {
         }
     )
 }
-fn queue_session_note_creation(mut state: Signal<ShellState>, row: BrowserRow) {
-    if row.kind != BrowserRowKind::Session {
-        return;
-    }
-    state.with_mut(|shell| {
-        shell.last_action = format!("creating note for {}", row.label);
-        shell.server_busy = true;
-    });
-    spawn(async move {
-        let row_for_task = row.clone();
-        let settings = state.read().settings.clone();
-        let outcome = task::spawn_blocking(
-            move || -> Result<(yggterm_core::WorkspaceDocument, yggterm_core::SessionNode)> {
-                let store = SessionStore::open_or_init()?;
-                let document = store.save_document(
-                    &session_note_virtual_path(&row_for_task),
-                    Some(&format!("{} notes", row_for_task.label)),
-                    &session_note_template(&row_for_task),
-                )?;
-                let browser_tree = store.load_codex_tree(&settings)?;
-                Ok((document, browser_tree))
-            },
-        )
-        .await;
-        state.with_mut(|shell| match outcome {
-            Ok(Ok((document, browser_tree))) => {
-                let expanded_paths = shell.browser.expanded_paths();
-                shell.replace_browser_tree(browser_tree);
-                shell
-                    .browser
-                    .restore_ui_state(&expanded_paths, Some(&document.virtual_path));
-                shell.browser.select_path(document.virtual_path.clone());
-                shell.selected_tree_paths.clear();
-                shell
-                    .selected_tree_paths
-                    .insert(document.virtual_path.clone());
-                shell.selection_anchor = Some(document.virtual_path.clone());
-                shell.sync_browser_settings();
-                shell.apply_daemon_snapshot_result(open_stored_session(
-                    &shell.bootstrap.server_endpoint,
-                    SessionKind::Document,
-                    &document.virtual_path,
-                    Some(&document.id),
-                    Some(&document.virtual_path),
-                    Some(&document.title),
-                ));
-                shell.last_action = format!("created note for {}", row.label);
-                shell.push_notification(
-                    NotificationTone::Success,
-                    "Session Note Created",
-                    format!("Opened {}.", document.title),
-                );
-            }
-            Ok(Err(error)) => {
-                shell.server_busy = false;
-                shell.last_action = format!("note creation failed: {error}");
-                shell.push_notification(
-                    NotificationTone::Error,
-                    "Note Creation Failed",
-                    error.to_string(),
-                );
-            }
-            Err(error) => {
-                shell.server_busy = false;
-                shell.last_action = format!("note task failed: {error}");
-                shell.push_notification(
-                    NotificationTone::Error,
-                    "Note Task Failed",
-                    error.to_string(),
-                );
-            }
-        });
-    });
-}
-fn queue_new_document(mut state: Signal<ShellState>) {
-    state.with_mut(|shell| {
-        shell.server_busy = true;
-        shell.last_action = "creating document".to_string();
-    });
-    let selected_row = state.read().browser.selected_row().cloned();
-    let active_session = state.read().server.active_session().cloned();
-    let settings = state.read().settings.clone();
-    spawn(async move {
-        let outcome = task::spawn_blocking(
-            move || -> Result<(yggterm_core::WorkspaceDocument, yggterm_core::SessionNode)> {
-                let store = SessionStore::open_or_init()?;
-                let virtual_path =
-                    new_document_virtual_path(selected_row.as_ref(), active_session.as_ref());
-                let document = store.save_document(
-                    &virtual_path,
-                    Some("Untitled note"),
-                    "# Untitled note\n\nStart writing here.\n",
-                )?;
-                let browser_tree = store.load_codex_tree(&settings)?;
-                Ok((document, browser_tree))
-            },
-        )
-        .await;
-        state.with_mut(|shell| match outcome {
-            Ok(Ok((document, browser_tree))) => {
-                let expanded_paths = shell.browser.expanded_paths();
-                shell.replace_browser_tree(browser_tree);
-                shell
-                    .browser
-                    .restore_ui_state(&expanded_paths, Some(&document.virtual_path));
-                shell.browser.select_path(document.virtual_path.clone());
-                shell.sync_browser_settings();
-                shell.apply_daemon_snapshot_result(open_stored_session(
-                    &shell.bootstrap.server_endpoint,
-                    SessionKind::Document,
-                    &document.virtual_path,
-                    Some(&document.id),
-                    Some(&document.virtual_path),
-                    Some(&document.title),
-                ));
-                shell.last_action = format!("created {}", document.title);
-                shell.refresh_tree_debug("created_document");
-            }
-            Ok(Err(error)) => {
-                shell.server_busy = false;
-                shell.last_action = format!("document creation failed: {error}");
-                shell.push_notification(
-                    NotificationTone::Error,
-                    "Document Creation Failed",
-                    error.to_string(),
-                );
-            }
-            Err(error) => {
-                shell.server_busy = false;
-                shell.last_action = format!("document task failed: {error}");
-                shell.push_notification(
-                    NotificationTone::Error,
-                    "Document Task Failed",
-                    error.to_string(),
-                );
-            }
-        });
-    });
-}
-fn queue_new_document_for_row(state: Signal<ShellState>, row: BrowserRow) {
-    queue_new_workspace_document_for_row(
-        state,
-        row,
-        WorkspaceDocumentKind::Note,
-        "Untitled note",
-        "# Untitled note\n\nStart writing here.\n".to_string(),
-        None,
-    );
-}
-fn queue_new_workspace_document_for_row(
-    mut state: Signal<ShellState>,
-    row: BrowserRow,
-    kind: WorkspaceDocumentKind,
-    title: &str,
-    body: String,
-    replay_commands: Option<Vec<String>>,
-) {
-    let action_label = match kind {
-        WorkspaceDocumentKind::Note => "document",
-        WorkspaceDocumentKind::TerminalRecipe => "recipe",
-    };
-    state.with_mut(|shell| {
-        shell.server_busy = true;
-        shell.last_action = format!("creating {action_label} in {}", row.label);
-        shell.close_context_menu();
-    });
-    let settings = state.read().settings.clone();
-    let title = title.to_string();
-    spawn(async move {
-        let row_for_task = row.clone();
-        let outcome = task::spawn_blocking(
-            move || -> Result<(yggterm_core::WorkspaceDocument, yggterm_core::SessionNode)> {
-                let store = SessionStore::open_or_init()?;
-                let virtual_path = new_document_virtual_path_for_row(&row_for_task);
-                let document = store.save_document_input(
-                    &virtual_path,
-                    WorkspaceDocumentInput {
-                        title: Some(title),
-                        kind,
-                        body,
-                        replay_commands: replay_commands.unwrap_or_default(),
-                        ..WorkspaceDocumentInput::default()
-                    },
-                )?;
-                let browser_tree = store.load_codex_tree(&settings)?;
-                Ok((document, browser_tree))
-            },
-        )
-        .await;
-        state.with_mut(|shell| match outcome {
-            Ok(Ok((document, browser_tree))) => {
-                let expanded_paths = shell.browser.expanded_paths();
-                shell.replace_browser_tree(browser_tree);
-                shell
-                    .browser
-                    .restore_ui_state(&expanded_paths, Some(&document.virtual_path));
-                shell.browser.select_path(document.virtual_path.clone());
-                shell.selected_tree_paths.clear();
-                shell
-                    .selected_tree_paths
-                    .insert(document.virtual_path.clone());
-                shell.selection_anchor = Some(document.virtual_path.clone());
-                shell.sync_browser_settings();
-                shell.apply_daemon_snapshot_result(open_stored_session(
-                    &shell.bootstrap.server_endpoint,
-                    SessionKind::Document,
-                    &document.virtual_path,
-                    Some(&document.id),
-                    Some(&document.virtual_path),
-                    Some(&document.title),
-                ));
-                shell.last_action = format!("created {}", document.title);
-                shell.refresh_tree_debug("created_workspace_document");
-            }
-            Ok(Err(error)) => {
-                shell.server_busy = false;
-                shell.last_action = format!("{action_label} creation failed: {error}");
-                shell.push_notification(
-                    NotificationTone::Error,
-                    "Workspace Create Failed",
-                    error.to_string(),
-                );
-            }
-            Err(error) => {
-                shell.server_busy = false;
-                shell.last_action = format!("{action_label} task failed: {error}");
-                shell.push_notification(
-                    NotificationTone::Error,
-                    "Workspace Task Failed",
-                    error.to_string(),
-                );
-            }
-        });
-    });
-}
 fn queue_new_group_for_row(mut state: Signal<ShellState>, row: BrowserRow) {
     state.with_mut(|shell| {
         shell.server_busy = true;
@@ -27787,40 +27646,6 @@ fn queue_document_save(
         }
     });
 }
-fn session_note_virtual_path(row: &BrowserRow) -> String {
-    let base = row
-        .session_cwd
-        .clone()
-        .unwrap_or_else(|| "/documents".to_string());
-    let slug = row
-        .label
-        .to_ascii_lowercase()
-        .chars()
-        .map(|ch| match ch {
-            'a'..='z' | '0'..='9' => ch,
-            _ => '-',
-        })
-        .collect::<String>()
-        .trim_matches('-')
-        .to_string();
-    let slug = if slug.is_empty() {
-        "session-note".to_string()
-    } else {
-        slug
-    };
-    format!("{}/notes/{}", base.trim_end_matches('/'), slug)
-}
-fn session_note_template(row: &BrowserRow) -> String {
-    let location = row
-        .session_cwd
-        .clone()
-        .unwrap_or_else(|| row.full_path.clone());
-    format!(
-        "# {title}\n\nSession: {title}\nLocation: {location}\n\n## Goals\n- \n\n## Commands\n- \n\n## Notes\n- \n",
-        title = row.label,
-        location = location,
-    )
-}
 fn session_recipe_template(row: &BrowserRow) -> String {
     let location = row
         .session_cwd
@@ -27859,28 +27684,6 @@ fn initial_replay_commands_for_row(row: &BrowserRow) -> Vec<String> {
     } else {
         Vec::new()
     }
-}
-fn new_document_virtual_path(
-    selected_row: Option<&BrowserRow>,
-    active_session: Option<&ManagedSessionView>,
-) -> String {
-    let base = selected_row
-        .and_then(document_parent_base)
-        .or_else(|| active_session.and_then(active_session_document_base))
-        .unwrap_or_else(|| "/papers".to_string());
-    format!(
-        "{}/paper-{}",
-        base.trim_end_matches('/'),
-        unique_workspace_leaf_suffix()
-    )
-}
-fn new_document_virtual_path_for_row(row: &BrowserRow) -> String {
-    let base = document_parent_base(row).unwrap_or_else(|| "/papers".to_string());
-    format!(
-        "{}/paper-{}",
-        base.trim_end_matches('/'),
-        unique_workspace_leaf_suffix()
-    )
 }
 fn new_group_virtual_path_for_row(row: &BrowserRow) -> String {
     let base = match row.kind {
@@ -28684,17 +28487,6 @@ fn nearest_workspace_group_row(rows: &[BrowserRow], path: &str) -> Option<Browse
     }
     None
 }
-fn active_session_document_base(session: &ManagedSessionView) -> Option<String> {
-    if session.kind == SessionKind::Document {
-        parent_virtual_path(&session.session_path)
-    } else {
-        session
-            .metadata
-            .iter()
-            .find(|entry| entry.label == "Cwd")
-            .map(|entry| entry.value.clone())
-    }
-}
 fn parent_virtual_path(path: &str) -> Option<String> {
     let normalized = path.trim_end_matches('/');
     let parent = normalized.rsplit_once('/')?.0;
@@ -29133,6 +28925,9 @@ fn render_snapshot_session_view_contract_violations(
         active_view_mode: snapshot.active_view_mode,
         remote_machines: shell.server.remote_machines().to_vec(),
         ssh_targets: shell.server.ssh_targets().to_vec(),
+        // The contract validator only inspects sessions; the launcher registry
+        // has no session invariants to violate.
+        apps: Vec::new(),
         live_sessions: snapshot
             .live_sessions
             .iter()
@@ -45957,9 +45752,12 @@ fn app() -> Element {
                                 }
                             }
                             },
-                            on_create_paper: move |_| {
-                            state.with_mut(|shell| shell.close_titlebar_new_menu());
-                            queue_new_document(state)
+                            on_launch_app_verb: move |(app, verb): (AppManifest, AppVerb)| {
+                            let launch_context = state.with_mut(|shell| {
+                                shell.close_titlebar_new_menu();
+                                terminal_launch_context(shell)
+                            });
+                            spawn_launch_app_verb(state, app, verb, launch_context);
                             },
                             on_refresh_summary: move |_| {
                             let active_session = { state.read().server.active_session().cloned() };
@@ -46396,6 +46194,7 @@ fn app() -> Element {
                         keep_alive_plan: snapshot.keep_alive_plan.clone(),
                         can_remove_saved_ssh_target: saved_ssh_target_machine_key(&row, &snapshot.ssh_targets).is_some(),
                         palette: snapshot.palette,
+                        apps: snapshot.apps.clone(),
                         on_close: move |_| {
                             let active_terminal_session = state.with_mut(|shell| {
                                 shell.close_context_menu();
@@ -46446,9 +46245,13 @@ fn app() -> Element {
                             let row = row.clone();
                             move |_| spawn_start_group_session(state, row.clone(), SessionKind::ClaudeCode)
                         },
-                        on_create_group_document: {
+                        on_launch_app_verb: {
                             let row = context_row.clone();
-                            move |_| queue_new_document_for_row(state, row.clone())
+                            move |(app, verb): (AppManifest, AppVerb)| {
+                                state.with_mut(|shell| shell.close_context_menu());
+                                let launch_context = launch_context_for_optional_row(state, Some(row.clone()));
+                                spawn_launch_app_verb(state, app, verb, launch_context);
+                            }
                         },
                         on_create_group_recipe: {
                             let row = row.clone();
@@ -46464,13 +46267,6 @@ fn app() -> Element {
                                         format!("near {}", row.label),
                                     );
                                 }
-                            }
-                        },
-                        on_create_note: {
-                            let row = row.clone();
-                            move |_| {
-                                state.with_mut(|shell| shell.close_context_menu());
-                                queue_session_note_creation(state, row.clone());
                             }
                         },
                         on_regenerate_title: {
@@ -46840,7 +46636,9 @@ fn Titlebar(
     on_start_session: EventHandler<()>,
     on_start_claude_code: EventHandler<()>,
     on_start_terminal: EventHandler<()>,
-    on_create_paper: EventHandler<()>,
+    /// Launch a verb an installed libyggterm app contributed. yggterm knows
+    /// nothing about the app beyond its manifest.
+    on_launch_app_verb: EventHandler<(AppManifest, AppVerb)>,
     on_refresh_summary: EventHandler<()>,
     on_begin_active_rename: EventHandler<()>,
     on_edit_active_summary: EventHandler<()>,
@@ -47199,18 +46997,31 @@ fn Titlebar(
                                                 }
                                                 "New Terminal"
                                             }
-                                            button {
-                                                "data-titlebar-new-menu-action": "1",
-                                                class: "yggterm-menu-item",
-                                                style: titlebar_new_action_style(snapshot.palette),
-                                                onclick: move |_| on_create_paper.call(()),
-                                                if alt_overlay_badge_visible(&snapshot, "i") {
-                                                    span {
-                                                        style: "display:inline-flex; align-items:center; justify-content:center; min-width:16px; height:16px; padding:0 4px; border-radius:6px; background:rgba(95,168,255,0.14); color:#2667a9; font-size:9px; font-weight:800; margin-right:8px;",
-                                                        "P"
+                                            // Entries CONTRIBUTED by the libyggterm apps
+                                            // installed on this host (~/.yggterm/apps/*.json).
+                                            // No app is hardcoded here, and an app whose
+                                            // binary was purged is pruned by the daemon
+                                            // before it ever reaches this list.
+                                            for (app, verb) in app_launcher_entries(&snapshot.apps) {
+                                                button {
+                                                    key: "app-verb-{app.name}-{verb.id}",
+                                                    "data-titlebar-new-menu-action": "1",
+                                                    "data-app-verb": "{app.name}:{verb.id}",
+                                                    class: "yggterm-menu-item",
+                                                    style: titlebar_new_action_style(snapshot.palette),
+                                                    onclick: {
+                                                        let on_launch_app_verb = on_launch_app_verb.clone();
+                                                        let entry = (app.clone(), verb.clone());
+                                                        move |_| on_launch_app_verb.call(entry.clone())
+                                                    },
+                                                    if !app.icon.is_empty() {
+                                                        span {
+                                                            style: "margin-right:8px;",
+                                                            "{app.icon}"
+                                                        }
                                                     }
+                                                    "{verb.label}"
                                                 }
-                                                "New Paper"
                                             }
                                         }
                                     }
@@ -76761,6 +76572,7 @@ fn StartPage(snapshot: SharedSnapshot, state: Signal<ShellState>) -> Element {
     let selected_agent_action_row = selected_action_row.clone();
     let selected_claude_code_action_row = selected_action_row.clone();
     let selected_terminal_action_row = selected_action_row.clone();
+    let selected_app_action_row = selected_action_row.clone();
     let can_create_folder_in_selected = selected_action_row
         .as_ref()
         .is_some_and(|row| row.full_path == "local" || is_workspace_row(row));
@@ -76892,6 +76704,43 @@ fn StartPage(snapshot: SharedSnapshot, state: Signal<ShellState>) -> Element {
                             );
                         },
                         "New Terminal"
+                    }
+                    // Contributed by the libyggterm apps installed on this host.
+                    // Same registry the titlebar `+` menu and the cwd-tree
+                    // context menu read — one list, three surfaces.
+                    for (app, verb) in app_launcher_entries(&snapshot.apps) {
+                        button {
+                            key: "start-app-{app.name}-{verb.id}",
+                            r#type: "button",
+                            "data-yggterm-start-action": "app:{app.name}:{verb.id}",
+                            style: "{quick_button_style}",
+                            onmousedown: |evt| {
+                                evt.prevent_default();
+                                evt.stop_propagation();
+                            },
+                            onclick: {
+                                let entry = (app.clone(), verb.clone());
+                                let row = selected_app_action_row.clone();
+                                move |evt: MouseEvent| {
+                                    evt.prevent_default();
+                                    evt.stop_propagation();
+                                    if !start_page_is_current_surface(&state) {
+                                        suppress_phantom_start_action(
+                                            "start_page_launch_app_verb",
+                                            json!({ "app": entry.0.name, "verb": entry.1.id }),
+                                        );
+                                        return;
+                                    }
+                                    let launch_context = launch_context_for_optional_row(state, row.clone());
+                                    let (app, verb) = entry.clone();
+                                    spawn_launch_app_verb(state, app, verb, launch_context);
+                                }
+                            },
+                            if !app.icon.is_empty() {
+                                span { "{app.icon}" }
+                            }
+                            "{verb.label}"
+                        }
                     }
                     if can_create_folder_in_selected {
                         if let Some(row) = selected_action_row.clone() {
@@ -78223,15 +78072,18 @@ fn ContextMenuOverlay(
     keep_alive_plan: Option<KeepAlivePlan>,
     can_remove_saved_ssh_target: bool,
     palette: Palette,
+    /// This host's libyggterm app registry — the same list the titlebar `+` menu
+    /// and the start page draw from.
+    apps: Vec<AppManifest>,
     on_close: EventHandler<MouseEvent>,
     on_create_group: EventHandler<MouseEvent>,
     on_create_group_codex: EventHandler<MouseEvent>,
     on_create_group_claude_code: EventHandler<MouseEvent>,
     on_create_group_shell: EventHandler<MouseEvent>,
-    on_create_group_document: EventHandler<MouseEvent>,
     on_create_group_recipe: EventHandler<MouseEvent>,
     on_move_selected_document_here: EventHandler<MouseEvent>,
-    on_create_note: EventHandler<MouseEvent>,
+    /// Launch a verb an installed app contributed, in the right-clicked row's cwd.
+    on_launch_app_verb: EventHandler<(AppManifest, AppVerb)>,
     on_regenerate_title: EventHandler<MouseEvent>,
     on_regenerate_summary: EventHandler<MouseEvent>,
     on_regenerate_copy: EventHandler<MouseEvent>,
@@ -78439,18 +78291,28 @@ fn ContextMenuOverlay(
                         },
                         "New Terminal"
                     }
-                    button {
-                        "data-context-menu-action": "new-paper",
-                        class: "yggterm-menu-item",
-                        style: context_menu_action_style(palette, true),
-                        onmousedown: |evt| {
-                            evt.stop_propagation();
-                        },
-                        onclick: move |evt| {
-                            evt.stop_propagation();
-                            on_create_group_document.call(evt);
-                        },
-                        "New Paper"
+                    // Verbs CONTRIBUTED by the libyggterm apps on this row's
+                    // host. Same registry as the titlebar `+` menu and the start
+                    // page; a purged app leaves all three at once.
+                    for (app, verb) in app_launcher_entries(&apps) {
+                        button {
+                            key: "ctx-app-{app.name}-{verb.id}",
+                            "data-context-menu-action": "app:{app.name}:{verb.id}",
+                            class: "yggterm-menu-item",
+                            style: context_menu_action_style(palette, false),
+                            onmousedown: |evt| {
+                                evt.stop_propagation();
+                            },
+                            onclick: {
+                                let on_launch_app_verb = on_launch_app_verb.clone();
+                                let entry = (app.clone(), verb.clone());
+                                move |evt: MouseEvent| {
+                                    evt.stop_propagation();
+                                    on_launch_app_verb.call(entry.clone());
+                                }
+                            },
+                            "{verb.label} Here"
+                        }
                     }
                     div {
                         style: format!("height:1px; margin:6px 4px; background:{}; opacity:0.7;", palette.border),
@@ -78586,19 +78448,6 @@ fn ContextMenuOverlay(
                             on_edit_summary.call(evt);
                         },
                         "Edit Summary"
-                    }
-                    button {
-                        "data-context-menu-action": "new-paper",
-                        class: "yggterm-menu-item",
-                        style: context_menu_action_style(palette, false),
-                        onmousedown: |evt| {
-                            evt.stop_propagation();
-                        },
-                        onclick: move |evt| {
-                            evt.stop_propagation();
-                            on_create_note.call(evt);
-                        },
-                        "New Paper"
                     }
                     div {
                         style: format!("height:1px; margin:6px 4px; background:{}; opacity:0.7;", palette.border),
@@ -82785,6 +82634,7 @@ mod tests {
             remote_machines: Vec::new(),
             ssh_targets: Vec::new(),
             live_sessions: sessions,
+            apps: Vec::new(),
         });
         shell.selected_tree_paths = [first.to_string(), second.to_string()]
             .into_iter()
@@ -83361,6 +83211,7 @@ mod tests {
             remote_machines: Vec::new(),
             ssh_targets: Vec::new(),
             live_sessions: Vec::new(),
+            apps: Vec::new(),
         };
 
         assert_eq!(
@@ -83389,6 +83240,7 @@ mod tests {
             remote_machines: Vec::new(),
             ssh_targets: Vec::new(),
             live_sessions: Vec::new(),
+            apps: Vec::new(),
         };
 
         assert_eq!(
@@ -83461,6 +83313,7 @@ mod tests {
         let mut unkept = test_live_shell_session("local://unkept");
         unkept.title = "Unkept Shell".to_string();
         shell.server.apply_snapshot(ServerUiSnapshot {
+            apps: Vec::new(),
             active_session_path: Some("local://unkept".to_string()),
             active_session: Some(snapshot_session_view_for_ui(unkept.clone())),
             active_view_mode: WorkspaceViewMode::Terminal,
@@ -88033,6 +87886,47 @@ mod tests {
         )
     }
 
+    // Every launcher surface (titlebar `+`, cwd-tree context menu, start page)
+    // renders `app_launcher_entries`. One derivation ⇒ they cannot disagree, and
+    // adding a surface never means copying a list.
+    #[test]
+    fn launcher_entries_flatten_every_app_verb_in_registry_order() {
+        let apps = vec![
+            AppManifest {
+                name: "alpha".into(),
+                label: "Alpha".into(),
+                icon: "A".into(),
+                binary: "/bin/sh".into(),
+                verbs: vec![
+                    AppVerb { id: "new".into(), label: "New Alpha".into(), args: vec![] },
+                    AppVerb {
+                        id: "incognito".into(),
+                        label: "New Alpha (Incognito)".into(),
+                        args: vec!["--profile".into(), "temp".into()],
+                    },
+                ],
+            },
+            AppManifest {
+                name: "beta".into(),
+                label: "Beta".into(),
+                icon: String::new(),
+                binary: "/bin/sh".into(),
+                verbs: vec![AppVerb { id: "new".into(), label: "New Beta".into(), args: vec![] }],
+            },
+        ];
+        let entries = app_launcher_entries(&apps);
+        let labels: Vec<&str> = entries.iter().map(|(_, verb)| verb.label.as_str()).collect();
+        assert_eq!(labels, vec!["New Alpha", "New Alpha (Incognito)", "New Beta"]);
+        assert_eq!(entries[1].0.command_for(&entries[1].1), "/bin/sh --profile temp");
+    }
+
+    // An empty registry contributes nothing anywhere — and since the hardcoded
+    // "New Paper" is gone, no launcher shows an app yggterm invented.
+    #[test]
+    fn an_empty_registry_contributes_nothing() {
+        assert!(app_launcher_entries(&[]).is_empty());
+    }
+
     // A session with no contribution creates its surface immediately: a web
     // surface opened by a non-browser app gets no adblock and no userscripts,
     // and never waits for a policy nobody is going to serve.
@@ -90519,6 +90413,7 @@ mod tests {
 
         let mut shell = ShellState::new(test_shell_bootstrap_with_active_session(path_a));
         shell.server.apply_snapshot(ServerUiSnapshot {
+            apps: Vec::new(),
             active_session_path: Some(path_a.to_string()),
             active_session: Some(snapshot_session_view_for_ui(session_a.clone())),
             active_view_mode: WorkspaceViewMode::Terminal,
@@ -90666,6 +90561,7 @@ mod tests {
             remote_machines: Vec::new(),
             ssh_targets: Vec::new(),
             live_sessions: vec![snapshot_session_view_for_ui(live_session)],
+            apps: Vec::new(),
         });
         shell.selected_tree_paths = HashSet::from([path.to_string()]);
         let selected_rows = shell.selected_tree_drag_rows();
@@ -90796,6 +90692,7 @@ mod tests {
         session_b.host_label = "dev".to_string();
         let mut shell = ShellState::new(test_shell_bootstrap_with_start_page());
         shell.server.apply_snapshot(ServerUiSnapshot {
+            apps: Vec::new(),
             active_session_path: None,
             active_session: None,
             active_view_mode: WorkspaceViewMode::Rendered,
@@ -94757,6 +94654,7 @@ mod tests {
     fn remote_folder_new_session_context_uses_remote_cwd() {
         let mut shell = ShellState::new(test_shell_bootstrap_with_active_session("local://test"));
         shell.server.apply_snapshot(ServerUiSnapshot {
+            apps: Vec::new(),
             active_session_path: None,
             active_session: None,
             active_view_mode: WorkspaceViewMode::Rendered,
@@ -94894,6 +94792,7 @@ mod tests {
     fn remote_saved_folder_launch_context_uses_projected_cwd() {
         let mut shell = ShellState::new(test_shell_bootstrap_with_active_session("local://test"));
         shell.server.apply_snapshot(ServerUiSnapshot {
+            apps: Vec::new(),
             active_session_path: None,
             active_session: None,
             active_view_mode: WorkspaceViewMode::Rendered,
@@ -94963,6 +94862,7 @@ mod tests {
             value: "/home/user/git/samplenotes".to_string(),
         }];
         shell.server.apply_snapshot(ServerUiSnapshot {
+            apps: Vec::new(),
             active_session_path: Some(session_path.to_string()),
             active_session: Some(snapshot_session_view_for_ui(live_session.clone())),
             active_view_mode: WorkspaceViewMode::Terminal,
@@ -95028,9 +94928,11 @@ mod tests {
             resolve_alt_overlay_sequence("it"),
             AltOverlayResolution::Action(AltOverlayAction::StartTerminal)
         );
+        // "ip" was "New Paper", a hardcoded app entry. The launcher family is
+        // registry-driven now: a Paper app claims its own KeyTip when it ships.
         assert_eq!(
             resolve_alt_overlay_sequence("ip"),
-            AltOverlayResolution::Action(AltOverlayAction::CreatePaper)
+            AltOverlayResolution::Invalid
         );
         assert_eq!(
             resolve_alt_overlay_sequence("iz"),
@@ -95588,6 +95490,7 @@ mod tests {
             remote_machines: Vec::new(),
             ssh_targets: Vec::new(),
             live_sessions: vec![snapshot_session_view_for_ui(live_session)],
+            apps: Vec::new(),
         });
         shell.next_live_session_snapshot_after_ms = 0;
 
@@ -95657,6 +95560,7 @@ mod tests {
         let previous = test_live_shell_session(previous_path);
         let active = test_live_shell_session(active_path);
         shell.server.apply_snapshot(ServerUiSnapshot {
+            apps: Vec::new(),
             active_session_path: Some(active_path.to_string()),
             active_session: Some(snapshot_session_view_for_ui(active.clone())),
             active_view_mode: WorkspaceViewMode::Terminal,
@@ -95707,6 +95611,7 @@ mod tests {
         let previous = test_live_shell_session(previous_path);
         let active = test_live_shell_session(active_path);
         shell.server.apply_snapshot(ServerUiSnapshot {
+            apps: Vec::new(),
             active_session_path: Some(active_path.to_string()),
             active_session: Some(snapshot_session_view_for_ui(active.clone())),
             active_view_mode: WorkspaceViewMode::Terminal,
@@ -95746,6 +95651,7 @@ mod tests {
         let background = test_live_shell_session(background_path);
         let active = test_live_shell_session(active_path);
         shell.server.apply_snapshot(ServerUiSnapshot {
+            apps: Vec::new(),
             active_session_path: Some(active_path.to_string()),
             active_session: Some(snapshot_session_view_for_ui(active.clone())),
             active_view_mode: WorkspaceViewMode::Terminal,
@@ -95793,6 +95699,7 @@ mod tests {
         let background = test_live_shell_session(background_path);
         let active = test_live_shell_session(active_path);
         shell.server.apply_snapshot(ServerUiSnapshot {
+            apps: Vec::new(),
             active_session_path: Some(active_path.to_string()),
             active_session: Some(snapshot_session_view_for_ui(active.clone())),
             active_view_mode: WorkspaceViewMode::Terminal,
@@ -95857,6 +95764,7 @@ mod tests {
             remote_machines: Vec::new(),
             ssh_targets: Vec::new(),
             live_sessions: vec![snapshot_session_view_for_ui(live_session)],
+            apps: Vec::new(),
         });
 
         assert!(local_keep_alive_session_paths(&shell).is_empty());
@@ -95912,6 +95820,7 @@ mod tests {
         let active_session = test_live_shell_session(active_path);
         let closing_session = test_live_shell_session(session_path);
         shell.server.apply_snapshot(ServerUiSnapshot {
+            apps: Vec::new(),
             active_session_path: Some(active_path.to_string()),
             active_session: Some(snapshot_session_view_for_ui(active_session.clone())),
             active_view_mode: WorkspaceViewMode::Terminal,
@@ -96016,6 +95925,7 @@ mod tests {
             remote_machines: Vec::new(),
             ssh_targets: Vec::new(),
             live_sessions: Vec::new(),
+            apps: Vec::new(),
         });
         assert!(shell.delete_shortcut_should_target_tree());
         shell.tree_rename_path = Some(session_path.to_string());
@@ -96513,6 +96423,7 @@ mod tests {
             remote_machines: Vec::new(),
             ssh_targets: Vec::new(),
             live_sessions: Vec::new(),
+            apps: Vec::new(),
         });
         shell.background_refresh_after_ms = current_millis().saturating_add(60_000);
 
@@ -96526,6 +96437,7 @@ mod tests {
             remote_machines: Vec::new(),
             ssh_targets: Vec::new(),
             live_sessions: vec![snapshot_session_view_for_ui(live_session)],
+            apps: Vec::new(),
         });
 
         assert!(remote_machine_refreshes_deferred(&shell));
@@ -104138,6 +104050,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             remote_machines: Vec::new(),
             ssh_targets: Vec::new(),
             live_sessions: vec![snapshot_session_view_for_ui(inactive_session)],
+            apps: Vec::new(),
         });
         shell.retain_terminal_session_path(inactive_session_path);
         assert!(!terminal_session_should_bootstrap_host(
@@ -104692,6 +104605,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             remote_machines: Vec::new(),
             ssh_targets: Vec::new(),
             live_sessions: vec![session],
+            apps: Vec::new(),
         }
     }
 
@@ -104708,6 +104622,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             remote_machines: Vec::new(),
             ssh_targets: Vec::new(),
             live_sessions: vec![stale, outgoing.clone()],
+            apps: Vec::new(),
         };
         let active_state = SupersededClientActiveState {
             pid: 42,
@@ -104742,6 +104657,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             remote_machines: Vec::new(),
             ssh_targets: Vec::new(),
             live_sessions: vec![stale],
+            apps: Vec::new(),
         };
         let active_state = SupersededClientActiveState {
             pid: 42,
@@ -104768,6 +104684,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             remote_machines: Vec::new(),
             ssh_targets: Vec::new(),
             live_sessions: Vec::new(),
+            apps: Vec::new(),
         }
     }
 
@@ -104859,6 +104776,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             remote_machines: Vec::new(),
             ssh_targets: Vec::new(),
             live_sessions: Vec::new(),
+            apps: Vec::new(),
         });
         bootstrap
     }
@@ -104936,6 +104854,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             remote_machines: Vec::new(),
             ssh_targets: Vec::new(),
             live_sessions: vec![snapshot_session_view_for_ui(live_session)],
+            apps: Vec::new(),
         });
         shell.set_window_focused(true);
 
@@ -104971,6 +104890,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             remote_machines: Vec::new(),
             ssh_targets: Vec::new(),
             live_sessions: vec![snapshot_session_view_for_ui(live_session)],
+            apps: Vec::new(),
         });
 
         assert_eq!(
@@ -104985,6 +104905,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             remote_machines: Vec::new(),
             ssh_targets: Vec::new(),
             live_sessions: Vec::new(),
+            apps: Vec::new(),
         });
         assert_eq!(
             shell_browser_tree_refresh_poll_ms(&shell),
@@ -104992,6 +104913,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         );
 
         shell.server.apply_snapshot(ServerUiSnapshot {
+            apps: Vec::new(),
             active_session_path: None,
             active_session: None,
             active_view_mode: WorkspaceViewMode::Rendered,
@@ -105065,6 +104987,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             remote_machines: Vec::new(),
             ssh_targets: Vec::new(),
             live_sessions: vec![snapshot_session_view_for_ui(live_session)],
+            apps: Vec::new(),
         });
         shell.next_browser_tree_refresh_after_ms = now_ms;
 
@@ -105095,6 +105018,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             remote_machines: Vec::new(),
             ssh_targets: Vec::new(),
             live_sessions: vec![snapshot_session_view_for_ui(live_session)],
+            apps: Vec::new(),
         });
         shell.next_live_session_snapshot_after_ms = now_ms + 2_000;
         assert_eq!(
@@ -105121,6 +105045,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             remote_machines: Vec::new(),
             ssh_targets: Vec::new(),
             live_sessions: vec![snapshot_session_view_for_ui(live_session)],
+            apps: Vec::new(),
         };
         shell.server.apply_snapshot(snapshot.clone());
 
@@ -105148,6 +105073,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             remote_machines: Vec::new(),
             ssh_targets: Vec::new(),
             live_sessions: vec![snapshot_session_view_for_ui(live_session)],
+            apps: Vec::new(),
         };
         shell.server.apply_snapshot(snapshot.clone());
         assert!(background_live_session_snapshot_is_noop(&shell, &snapshot));
@@ -105183,6 +105109,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             remote_machines: Vec::new(),
             ssh_targets: Vec::new(),
             live_sessions: vec![snapshot_session_view_for_ui(live_session)],
+            apps: Vec::new(),
         };
         shell.server.apply_snapshot(snapshot.clone());
         assert!(background_live_session_snapshot_is_noop(&shell, &snapshot));
@@ -105211,6 +105138,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             remote_machines: Vec::new(),
             ssh_targets: Vec::new(),
             live_sessions: vec![snapshot_session_view_for_ui(live_session)],
+            apps: Vec::new(),
         });
         shell.set_window_focused(false);
         let now_ms = current_millis();
@@ -105242,6 +105170,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             remote_machines: Vec::new(),
             ssh_targets: Vec::new(),
             live_sessions: vec![snapshot_session_view_for_ui(live_session)],
+            apps: Vec::new(),
         });
         shell.set_window_focused(false);
         let now_ms = current_millis();
@@ -105361,6 +105290,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             remote_machines: Vec::new(),
             ssh_targets: Vec::new(),
             live_sessions: vec![busy_session],
+            apps: Vec::new(),
         });
 
         shell.set_window_focused(true);
@@ -105691,6 +105621,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             ..Default::default()
         }));
         shell.server.apply_snapshot(ServerUiSnapshot {
+            apps: Vec::new(),
             active_session_path: None,
             active_session: None,
             active_view_mode: WorkspaceViewMode::Terminal,
@@ -105836,6 +105767,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             remote_machines: Vec::new(),
             ssh_targets: Vec::new(),
             live_sessions: vec![snapshot_session_view_for_ui(live_session)],
+            apps: Vec::new(),
         };
         preserve_client_focus_for_background_snapshot(&shell, &mut snapshot);
         assert_eq!(
@@ -105900,6 +105832,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             remote_machines: Vec::new(),
             ssh_targets: Vec::new(),
             live_sessions: vec![snapshot_session_view_for_ui(stale_active)],
+            apps: Vec::new(),
         });
         let fresh_live = ManagedSessionView {
             id: "fresh-shell-id".to_string(),
@@ -105945,6 +105878,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             remote_machines: Vec::new(),
             ssh_targets: Vec::new(),
             live_sessions: vec![snapshot_session_view_for_ui(fresh_live)],
+            apps: Vec::new(),
         };
         preserve_client_focus_for_background_snapshot(&shell, &mut snapshot);
         let active = snapshot
@@ -105969,6 +105903,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             remote_machines: Vec::new(),
             ssh_targets: Vec::new(),
             live_sessions: vec![snapshot_session_view_for_ui(live_session.clone())],
+            apps: Vec::new(),
         });
         let mut stale_active = snapshot_session_view_for_ui(live_session.clone());
         stale_active.title = "Stale Active Copy".to_string();
@@ -105979,6 +105914,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             remote_machines: Vec::new(),
             ssh_targets: Vec::new(),
             live_sessions: vec![snapshot_session_view_for_ui(live_session)],
+            apps: Vec::new(),
         };
 
         assert!(
@@ -106003,6 +105939,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
                 remote_machines: Vec::new(),
                 ssh_targets: Vec::new(),
                 live_sessions: Vec::new(),
+                apps: Vec::new(),
             },
             Some("snapshot applied".to_string()),
         )));
@@ -106110,6 +106047,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             remote_machines: Vec::new(),
             ssh_targets: Vec::new(),
             live_sessions: vec![snapshot_session_view_for_ui(live_session.clone())],
+            apps: Vec::new(),
         });
         shell.needs_initial_server_sync = false;
         shell.selected_tree_paths.clear();
@@ -106124,6 +106062,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
                 remote_machines: Vec::new(),
                 ssh_targets: Vec::new(),
                 live_sessions: vec![snapshot_session_view_for_ui(live_session)],
+                apps: Vec::new(),
             },
             Some("snapshot applied".to_string()),
         )));
@@ -106184,6 +106123,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             remote_machines: Vec::new(),
             ssh_targets: Vec::new(),
             live_sessions: vec![snapshot_session_view_for_ui(live_session.clone())],
+            apps: Vec::new(),
         });
         shell.needs_initial_server_sync = false;
         shell.browser.ensure_visible_path(recipe_path);
@@ -106200,6 +106140,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
                 remote_machines: Vec::new(),
                 ssh_targets: Vec::new(),
                 live_sessions: Vec::new(),
+                apps: Vec::new(),
             },
             Some("snapshot applied".to_string()),
         )));
@@ -106272,6 +106213,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             remote_machines: Vec::new(),
             ssh_targets: Vec::new(),
             live_sessions: vec![snapshot_session_view_for_ui(live_session.clone())],
+            apps: Vec::new(),
         });
         shell.needs_initial_server_sync = false;
         shell.browser.ensure_visible_path(rename_path);
@@ -106293,6 +106235,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
                 remote_machines: Vec::new(),
                 ssh_targets: Vec::new(),
                 live_sessions: Vec::new(),
+                apps: Vec::new(),
             },
             Some("snapshot applied".to_string()),
         )));
@@ -106395,6 +106338,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             remote_machines: Vec::new(),
             ssh_targets: Vec::new(),
             live_sessions: vec![snapshot_session_view_for_ui(active_session.clone())],
+            apps: Vec::new(),
         });
         shell.needs_initial_server_sync = false;
         shell.selected_tree_paths.clear();
@@ -106412,6 +106356,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
                 remote_machines: Vec::new(),
                 ssh_targets: Vec::new(),
                 live_sessions: Vec::new(),
+                apps: Vec::new(),
             },
             Some("snapshot applied".to_string()),
         )));
@@ -106466,6 +106411,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         };
         let row = test_sidebar_row(session_path);
         let snapshot = RenderSnapshot {
+            apps: Vec::new(),
             sidebar_panes: Vec::new(),
             app_pane_schema: None,
             app_pane_error: None,
@@ -106601,6 +106547,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             remote_machines: Vec::new(),
             ssh_targets: Vec::new(),
             live_sessions: vec![snapshot_session_view_for_ui(live_session)],
+            apps: Vec::new(),
         });
         shell.needs_initial_server_sync = false;
         shell.browser.select_path(session_path.to_string());
@@ -106645,6 +106592,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             remote_machines: Vec::new(),
             ssh_targets: Vec::new(),
             live_sessions: vec![snapshot_session_view_for_ui(live_session)],
+            apps: Vec::new(),
         });
         shell.needs_initial_server_sync = false;
         shell.browser.select_path(session_path.to_string());
@@ -106686,6 +106634,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         working_session.working = Some(true);
         active_session.working = Some(false);
         shell.server.apply_snapshot(ServerUiSnapshot {
+            apps: Vec::new(),
             active_session_path: Some(active_path.to_string()),
             active_session: Some(snapshot_session_view_for_ui(active_session.clone())),
             active_view_mode: WorkspaceViewMode::Terminal,
@@ -106741,6 +106690,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
                 remote_machines: Vec::new(),
                 ssh_targets: Vec::new(),
                 live_sessions: vec![snapshot_session_view_for_ui(live_session.clone())],
+                apps: Vec::new(),
             });
             shell.needs_initial_server_sync = false;
             let snapshot = shell.snapshot();
@@ -106781,6 +106731,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
                 remote_machines: Vec::new(),
                 ssh_targets: Vec::new(),
                 live_sessions: vec![snapshot_session_view_for_ui(live_session.clone())],
+                apps: Vec::new(),
             });
             shell.needs_initial_server_sync = false;
             let snapshot = shell.snapshot();
@@ -106821,6 +106772,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
                 remote_machines: Vec::new(),
                 ssh_targets: Vec::new(),
                 live_sessions: vec![snapshot_session_view_for_ui(live_session.clone())],
+                apps: Vec::new(),
             });
             shell.needs_initial_server_sync = false;
             let snapshot = shell.snapshot();
@@ -106939,6 +106891,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             remote_machines: Vec::new(),
             ssh_targets: Vec::new(),
             live_sessions: vec![snapshot_session_view_for_ui(session)],
+            apps: Vec::new(),
         });
         assert!(
             !start_page_is_current_surface_state(&shell),
@@ -106979,6 +106932,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             remote_machines: Vec::new(),
             ssh_targets: Vec::new(),
             live_sessions: vec![snapshot_session_view_for_ui(attached)],
+            apps: Vec::new(),
         });
         shell.needs_initial_server_sync = false;
         shell.browser.select_path(attached_path.to_string());
@@ -107071,6 +107025,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         };
         let row = test_sidebar_row("local://stale");
         let snapshot = RenderSnapshot {
+            apps: Vec::new(),
             sidebar_panes: Vec::new(),
             app_pane_schema: None,
             app_pane_error: None,
@@ -107219,6 +107174,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         };
         let row = test_sidebar_row(session_path);
         let snapshot = RenderSnapshot {
+            apps: Vec::new(),
             sidebar_panes: Vec::new(),
             app_pane_schema: None,
             app_pane_error: None,
@@ -107367,6 +107323,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         };
         let row = test_sidebar_row(session_path);
         let snapshot = RenderSnapshot {
+            apps: Vec::new(),
             sidebar_panes: Vec::new(),
             app_pane_schema: None,
             app_pane_error: None,
@@ -107518,6 +107475,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         };
         let row = test_sidebar_row(session_path);
         let snapshot = RenderSnapshot {
+            apps: Vec::new(),
             sidebar_panes: Vec::new(),
             app_pane_schema: None,
             app_pane_error: None,
@@ -107673,6 +107631,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         };
         let row = test_sidebar_row(session_path);
         let snapshot = RenderSnapshot {
+            apps: Vec::new(),
             sidebar_panes: Vec::new(),
             app_pane_schema: None,
             app_pane_error: None,
@@ -107820,6 +107779,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         };
         let row = test_sidebar_row("local://active");
         let snapshot = RenderSnapshot {
+            apps: Vec::new(),
             sidebar_panes: Vec::new(),
             app_pane_schema: None,
             app_pane_error: None,
@@ -107967,6 +107927,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         };
         let row = test_sidebar_row("local://active");
         let snapshot = RenderSnapshot {
+            apps: Vec::new(),
             sidebar_panes: Vec::new(),
             app_pane_schema: None,
             app_pane_error: None,
@@ -108148,6 +108109,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         };
         let row = test_sidebar_row("remote-session://guihost/idle");
         let snapshot = RenderSnapshot {
+            apps: Vec::new(),
             sidebar_panes: Vec::new(),
             app_pane_schema: None,
             app_pane_error: None,
@@ -108298,6 +108260,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         };
         let row = test_sidebar_row("local://active");
         let snapshot = RenderSnapshot {
+            apps: Vec::new(),
             sidebar_panes: Vec::new(),
             app_pane_schema: None,
             app_pane_error: None,
@@ -108480,6 +108443,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         };
         let row = test_sidebar_row(session_path);
         let snapshot = RenderSnapshot {
+            apps: Vec::new(),
             sidebar_panes: Vec::new(),
             app_pane_schema: None,
             app_pane_error: None,
@@ -108839,6 +108803,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
     fn snapshot_terminal_mount_epoch_defaults_to_zero_until_a_real_mount_exists() {
         let session_path = "local://test";
         let snapshot = RenderSnapshot {
+            apps: Vec::new(),
             sidebar_panes: Vec::new(),
             app_pane_schema: None,
             app_pane_error: None,
@@ -108996,6 +108961,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             remote_machines: Vec::new(),
             ssh_targets: Vec::new(),
             live_sessions: Vec::new(),
+            apps: Vec::new(),
         });
         let snapshot = shell.snapshot();
         assert!(snapshot.retained_terminal_sessions.is_empty());
@@ -109044,6 +109010,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
                 storage_path: format!("/home/user/.codex/sessions/{name}.jsonl"),
             };
         shell.server.apply_snapshot(ServerUiSnapshot {
+            apps: Vec::new(),
             active_session_path: None,
             active_session: None,
             active_view_mode: WorkspaceViewMode::Rendered,
@@ -109119,6 +109086,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
                 storage_path: format!("/home/user/.codex/sessions/{name}.jsonl"),
             };
         shell.server.apply_snapshot(ServerUiSnapshot {
+            apps: Vec::new(),
             active_session_path: None,
             active_session: None,
             active_view_mode: WorkspaceViewMode::Rendered,
@@ -109212,6 +109180,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
                 storage_path: format!("/home/user/.codex/sessions/{name}.jsonl"),
             };
         shell.server.apply_snapshot(ServerUiSnapshot {
+            apps: Vec::new(),
             active_session_path: None,
             active_session: None,
             active_view_mode: WorkspaceViewMode::Rendered,
@@ -109337,6 +109306,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             remote_machines: Vec::new(),
             ssh_targets: Vec::new(),
             live_sessions: vec![snapshot_session_view_for_ui(live_terminal.clone())],
+            apps: Vec::new(),
         });
         let mut snapshot = shell.snapshot();
         snapshot.selected_row = Some(BrowserRow {
@@ -109414,6 +109384,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             storage_path: format!("/home/user/.codex/sessions/{name}.jsonl"),
         };
         shell.server.apply_snapshot(ServerUiSnapshot {
+            apps: Vec::new(),
             active_session_path: Some(active_path.to_string()),
             active_session: Some(snapshot_session_view_for_ui(live_session.clone())),
             active_view_mode: WorkspaceViewMode::Terminal,
@@ -109558,6 +109529,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             remote_machines: Vec::new(),
             ssh_targets: Vec::new(),
             live_sessions: Vec::new(),
+            apps: Vec::new(),
         });
         bootstrap.refresh_server_after_launch = true;
         let mut shell = ShellState::new(bootstrap);
@@ -109584,6 +109556,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             remote_machines: Vec::new(),
             ssh_targets: Vec::new(),
             live_sessions: Vec::new(),
+            apps: Vec::new(),
         });
         bootstrap.refresh_server_after_launch = true;
         let mut shell = ShellState::new(bootstrap);
@@ -109611,6 +109584,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             remote_machines: Vec::new(),
             ssh_targets: Vec::new(),
             live_sessions: Vec::new(),
+            apps: Vec::new(),
         });
         bootstrap.refresh_server_after_launch = true;
         let mut shell = ShellState::new(bootstrap);
@@ -109628,6 +109602,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
                 remote_machines: Vec::new(),
                 ssh_targets: Vec::new(),
                 live_sessions: vec![live],
+                apps: Vec::new(),
             },
             Some("live snapshot applied".to_string()),
         )));
@@ -109686,6 +109661,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
                 remote_machines: Vec::new(),
                 ssh_targets: Vec::new(),
                 live_sessions: vec![live],
+                apps: Vec::new(),
             },
         );
 
@@ -109732,6 +109708,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             remote_machines: Vec::new(),
             ssh_targets: Vec::new(),
             live_sessions: Vec::new(),
+            apps: Vec::new(),
         });
         shell.active_surface_requests.insert(
             YggSurface::PreviewSync,
@@ -109766,6 +109743,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
                 remote_machines: Vec::new(),
                 ssh_targets: Vec::new(),
                 live_sessions: Vec::new(),
+                apps: Vec::new(),
             },
         );
 
@@ -109821,6 +109799,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
                 remote_machines: Vec::new(),
                 ssh_targets: Vec::new(),
                 live_sessions: vec![live],
+                apps: Vec::new(),
             },
         );
 
@@ -110278,6 +110257,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             remote_machines: Vec::new(),
             ssh_targets: Vec::new(),
             live_sessions: vec![snapshot_session_view_for_ui(live_session)],
+            apps: Vec::new(),
         });
 
         let candidates = terminal_runtime_key_candidates_for_session_path(&shell, session_path);
@@ -110489,6 +110469,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             remote_machines: Vec::new(),
             ssh_targets: Vec::new(),
             live_sessions: vec![snapshot_session_view_for_ui(session)],
+            apps: Vec::new(),
         });
 
         shell.seed_dynamic_top_level_expansions();
@@ -110709,6 +110690,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             remote_machines: Vec::new(),
             ssh_targets: Vec::new(),
             live_sessions: vec![snapshot_session_view_for_ui(session)],
+            apps: Vec::new(),
         });
 
         let paths = shell.active_session_visibility_paths();
@@ -110742,6 +110724,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             },
         ];
         shell.server.apply_snapshot(ServerUiSnapshot {
+            apps: Vec::new(),
             active_session_path: Some(session_path.to_string()),
             active_session: Some(snapshot_session_view_for_ui(session.clone())),
             active_view_mode: WorkspaceViewMode::Terminal,
@@ -110843,6 +110826,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             remote_machines: Vec::new(),
             ssh_targets: Vec::new(),
             live_sessions: vec![snapshot_session_view_for_ui(session)],
+            apps: Vec::new(),
         });
 
         let snapshot = shell.snapshot();
@@ -110900,6 +110884,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             value: "/home/user/gh/yggterm".to_string(),
         }];
         shell.server.apply_snapshot(ServerUiSnapshot {
+            apps: Vec::new(),
             active_session_path: Some(session_path.to_string()),
             active_session: Some(snapshot_session_view_for_ui(session.clone())),
             active_view_mode: WorkspaceViewMode::Terminal,
@@ -110964,6 +110949,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             remote_machines: Vec::new(),
             ssh_targets: Vec::new(),
             live_sessions: Vec::new(),
+            apps: Vec::new(),
         });
 
         assert!(!session_is_hot_terminal_row(
@@ -110988,6 +110974,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             remote_machines: Vec::new(),
             ssh_targets: Vec::new(),
             live_sessions: vec![snapshot_session_view_for_ui(session)],
+            apps: Vec::new(),
         });
 
         assert!(session_is_hot_terminal_row(
@@ -111012,6 +110999,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             remote_machines: Vec::new(),
             ssh_targets: Vec::new(),
             live_sessions: vec![snapshot_session_view_for_ui(session)],
+            apps: Vec::new(),
         });
 
         assert!(session_is_hot_terminal_row(
@@ -111430,6 +111418,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             working: None,
         };
         shell.server.apply_snapshot(ServerUiSnapshot {
+            apps: Vec::new(),
             active_session_path: Some(active_path.to_string()),
             active_session: Some(snapshot_session_view_for_ui(active_session.clone())),
             active_view_mode: WorkspaceViewMode::Terminal,
@@ -111476,6 +111465,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         inactive_session.host_label = "dev".to_string();
         inactive_session.ssh_target = Some("dev".to_string());
         shell.server.apply_snapshot(ServerUiSnapshot {
+            apps: Vec::new(),
             active_session_path: Some(active_path.to_string()),
             active_session: Some(snapshot_session_view_for_ui(active_session.clone())),
             active_view_mode: WorkspaceViewMode::Terminal,
@@ -111546,6 +111536,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             remote_machines: Vec::new(),
             ssh_targets: Vec::new(),
             live_sessions: vec![snapshot_session_view_for_ui(remote_session.clone())],
+            apps: Vec::new(),
         });
         shell.refresh_cached_hot_session_views();
         let attempt_id =
@@ -111570,6 +111561,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             remote_machines: Vec::new(),
             ssh_targets: Vec::new(),
             live_sessions: vec![snapshot_session_view_for_ui(local_session)],
+            apps: Vec::new(),
         });
         shell.refresh_cached_hot_session_views();
         shell.sync_live_terminal_retention();
@@ -111636,6 +111628,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             remote_machines: Vec::new(),
             ssh_targets: Vec::new(),
             live_sessions: Vec::new(),
+            apps: Vec::new(),
         });
         let snapshot = shell.snapshot();
         assert_eq!(snapshot.retained_terminal_sessions.len(), 1);
@@ -111693,6 +111686,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             remote_machines: Vec::new(),
             ssh_targets: Vec::new(),
             live_sessions: vec![snapshot_session_view_for_ui(session.clone())],
+            apps: Vec::new(),
         });
         shell.refresh_cached_hot_session_views();
         shell.sync_live_terminal_retention();
@@ -111704,6 +111698,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
                 remote_machines: Vec::new(),
                 ssh_targets: Vec::new(),
                 live_sessions: Vec::new(),
+                apps: Vec::new(),
             },
             Some("snapshot regressed".to_string()),
         )));
@@ -111756,6 +111751,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             remote_machines: Vec::new(),
             ssh_targets: Vec::new(),
             live_sessions: vec![snapshot_session_view_for_ui(live)],
+            apps: Vec::new(),
         });
 
         let snapshot = shell.snapshot();
@@ -111816,6 +111812,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             remote_machines: Vec::new(),
             ssh_targets: Vec::new(),
             live_sessions: vec![snapshot_session_view_for_ui(session.clone())],
+            apps: Vec::new(),
         });
         shell.server.apply_snapshot(ServerUiSnapshot {
             active_session_path: Some(session_path.to_string()),
@@ -111824,6 +111821,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             remote_machines: Vec::new(),
             ssh_targets: Vec::new(),
             live_sessions: Vec::new(),
+            apps: Vec::new(),
         });
         assert_eq!(shell.server.active_session_path(), None);
         assert!(
@@ -111946,6 +111944,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             working: None,
         };
         shell.server.apply_snapshot(ServerUiSnapshot {
+            apps: Vec::new(),
             active_session_path: Some(active_path.to_string()),
             active_session: Some(snapshot_session_view_for_ui(active_session.clone())),
             active_view_mode: WorkspaceViewMode::Terminal,
