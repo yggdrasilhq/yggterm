@@ -1566,6 +1566,7 @@ pub struct TerminalStreamChunk {
 pub enum ServerRequest {
     Ping,
     Status,
+    WorkingFlags,
     Snapshot,
     PrepareUpdateRestart,
     PrepareClientClose,
@@ -1842,6 +1843,9 @@ pub enum ServerRequest {
 pub enum ServerResponse {
     Pong,
     Status(ServerRuntimeStatus),
+    WorkingFlags {
+        flags: Vec<(String, bool)>,
+    },
     Snapshot {
         snapshot: ServerUiSnapshot,
         message: Option<String>,
@@ -2164,6 +2168,37 @@ impl DaemonRuntime {
         keys.sort();
         keys.dedup();
         keys
+    }
+
+    /// Lightweight per-session working verdicts for the GUI's fast dot poll
+    /// (the working-dot lag fix): EXACTLY the same SSOT the snapshot path
+    /// assigns to `session.working` — agent kinds scrape the live vt100 footer,
+    /// shells use the OS foreground-process fact. Sessions with no definite
+    /// verdict (`None`: no live screen / not owned) are simply absent, so the
+    /// GUI can never blink a frozen last frame. Orders of magnitude cheaper
+    /// than a full snapshot, so the GUI may poll it even while a focused
+    /// terminal defers background refreshes.
+    fn working_flags(&self) -> Vec<(String, bool)> {
+        self.server
+            .live_sessions()
+            .iter()
+            .filter_map(|session| {
+                let runtime_path = self.terminal_runtime_key_for_path(&session.session_path);
+                let working = match session.kind {
+                    SessionKind::Codex | SessionKind::CodexLiteLlm | SessionKind::ClaudeCode => {
+                        self.terminals
+                            .session_screen_snapshot(&runtime_path)
+                            .as_deref()
+                            .map(yggterm_core::screen_text_shows_agent_working)
+                    }
+                    SessionKind::Shell => self
+                        .terminals
+                        .session_foreground_process_active(&runtime_path),
+                    _ => None,
+                }?;
+                Some((session.session_path.clone(), working))
+            })
+            .collect()
     }
 
     fn status(&self) -> ServerRuntimeStatus {
@@ -4278,6 +4313,9 @@ impl DaemonRuntime {
         let response = match request {
             ServerRequest::Ping => ServerResponse::Pong,
             ServerRequest::Status => ServerResponse::Status(self.status()),
+            ServerRequest::WorkingFlags => ServerResponse::WorkingFlags {
+                flags: self.working_flags(),
+            },
             ServerRequest::Snapshot => self.snapshot_response(None),
             ServerRequest::PrepareUpdateRestart => {
                 // The snapshot write is BEST-EFFORT: it lets the relaunched GUI
@@ -7303,6 +7341,7 @@ fn server_request_name(request: &ServerRequest) -> &'static str {
     match request {
         ServerRequest::Ping => "ping",
         ServerRequest::Status => "status",
+        ServerRequest::WorkingFlags => "working_flags",
         ServerRequest::Snapshot => "snapshot",
         ServerRequest::PrepareUpdateRestart => "prepare_update_restart",
         ServerRequest::PrepareClientClose => "prepare_client_close",
@@ -7591,6 +7630,14 @@ pub fn status(endpoint: &ServerEndpoint) -> Result<ServerRuntimeStatus> {
         ServerResponse::Status(status) => Ok(status),
         ServerResponse::Error { message } => bail!(message),
         other => bail!("unexpected status response: {:?}", other),
+    }
+}
+
+pub fn working_flags(endpoint: &ServerEndpoint) -> Result<Vec<(String, bool)>> {
+    match send_request(endpoint, &ServerRequest::WorkingFlags)? {
+        ServerResponse::WorkingFlags { flags } => Ok(flags),
+        ServerResponse::Error { message } => bail!(message),
+        other => bail!("unexpected working-flags response: {:?}", other),
     }
 }
 

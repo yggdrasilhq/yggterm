@@ -4,6 +4,24 @@ This file tracks user-visible changes in `yggterm`.
 
 ## 2.10.2
 
+- **Fixed: the working dot no longer lags 10–45 s behind a finished agent.**
+  While a focused terminal defers background refreshes (the normal state), the
+  GUI's only source of `working` flags was the full snapshot apply — so a
+  background agent finishing kept its sidebar dot blinking until the next
+  deferred refresh. The GUI now polls a new lightweight `WorkingFlags` daemon
+  request every 2.5 s (a handful of vt100 footer scrapes, tiny reply — exempt
+  from the defer because it cannot cause jank) and patches only the `working`
+  field in place; the finished-working notification rides the same edge. Every
+  observed edge is traced (`working_edge` in ui-telemetry/event-trace with a
+  `source` tag), so the daemon→GUI dot latency is finally measurable without
+  the probe-refresh observer effect.
+- **Fixed: a collapsed local machine row now blinks while a session inside is
+  working.** Local AGENT sessions persist with the canonical loopback
+  `ssh_target: "localhost"` (so restore works), but the local root's working
+  aggregation only accepted `ssh_target: None` — so the collapsed local row
+  never blinked for a working Codex/CC session (ssh machine rows were fine).
+  Loopback targets now count as local via the server's `is_loopback_ssh_target`
+  SSOT.
 - **New telemetry: agent session resume errors are counted.** Claude Code and
   codex sporadically refuse to resume — "Session `<uuid>` is already in use",
   "No conversation found with session ID `<uuid>`", "session not found / does
