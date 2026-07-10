@@ -17424,6 +17424,71 @@ pub fn run_app_control_set_session_keep_alive(
     Ok(())
 }
 
+pub fn run_app_control_create_split_group(
+    members: Vec<String>,
+    axis: Option<String>,
+    timeout_ms: u64,
+) -> anyhow::Result<()> {
+    let home = resolve_yggterm_home()?;
+    let response = request_app_control(
+        &home,
+        AppControlCommand::CreateSplitGroup { members, axis },
+        timeout_ms,
+    )?;
+    write_stdout_payload(&serde_json::to_string_pretty(&response)?)?;
+    Ok(())
+}
+
+pub fn run_app_control_ungroup_split_group(
+    group_id: &str,
+    timeout_ms: u64,
+) -> anyhow::Result<()> {
+    let home = resolve_yggterm_home()?;
+    let response = request_app_control(
+        &home,
+        AppControlCommand::UngroupSplitGroup {
+            group_id: group_id.to_string(),
+        },
+        timeout_ms,
+    )?;
+    write_stdout_payload(&serde_json::to_string_pretty(&response)?)?;
+    Ok(())
+}
+
+pub fn run_app_control_set_split_group_ratio(
+    group_id: &str,
+    ratio: f32,
+    timeout_ms: u64,
+) -> anyhow::Result<()> {
+    let home = resolve_yggterm_home()?;
+    let response = request_app_control(
+        &home,
+        AppControlCommand::SetSplitGroupRatio {
+            group_id: group_id.to_string(),
+            ratio,
+        },
+        timeout_ms,
+    )?;
+    write_stdout_payload(&serde_json::to_string_pretty(&response)?)?;
+    Ok(())
+}
+
+pub fn run_app_control_focus_split_pane(
+    session_path: &str,
+    timeout_ms: u64,
+) -> anyhow::Result<()> {
+    let home = resolve_yggterm_home()?;
+    let response = request_app_control(
+        &home,
+        AppControlCommand::FocusSplitPane {
+            session_path: session_path.to_string(),
+        },
+        timeout_ms,
+    )?;
+    write_stdout_payload(&serde_json::to_string_pretty(&response)?)?;
+    Ok(())
+}
+
 fn parse_app_control_session_kind(kind: &str) -> anyhow::Result<SessionKind> {
     match kind.trim().to_ascii_lowercase().as_str() {
         "shell" | "terminal" | "plain" => Ok(SessionKind::Shell),

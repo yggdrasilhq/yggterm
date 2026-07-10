@@ -128,6 +128,15 @@ these over screenshots.
   suspect region (composer row, right edge) since a full frame reads small. The composite is
   at devicePixelRatio so it's legible even without upscale. Spectacle remains a last-resort
   fallback (needs yggterm focused — fails over SSH, the old trap).
+  - **Split view (v2.10.7):** the composite draws EVERY visible terminal pane over the
+    main-surface frame, so a split renders both panes in one faithful frame — not just the
+    focused one (that was the pre-split behavior). `server app state` → `data.split_view`
+    reports the group SSOT (`active_group_id`, `groups[].{axis,ratio,members,active_pane}`);
+    per-pane cols/rows off `active_terminal_hosts[].cols` prove the reflow (side-by-side ≈
+    half cols, stacked ≈ half rows). Drive splits headlessly with `server app split
+    create|focus|ratio|ungroup` ([[campaign-split-view-groups]], `docs/split-view.md`). A
+    non-active pane can flash stale-atlas garble right after the split reflow; the group heal
+    clears it, and focusing the pane always re-renders it crisp.
 - `server status` — daemon version/uptime. `server monitor --scenario panic-report|
   server-list|latency-check|wait-session|hot-restart` — incident triage (see AGENTS.md).
 

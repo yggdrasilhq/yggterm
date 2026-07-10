@@ -39,6 +39,8 @@ use yggterm_server::{
     run_app_control_set_maximized,
     run_app_control_set_right_panel_mode, run_app_control_set_row_expanded,
     run_app_control_set_search, run_app_control_set_session_keep_alive,
+    run_app_control_create_split_group, run_app_control_ungroup_split_group,
+    run_app_control_set_split_group_ratio, run_app_control_focus_split_pane,
     run_app_control_set_theme_editor_open, run_app_control_set_theme_editor_values,
     run_app_control_set_tree_selection, run_app_control_set_window_chrome_hover,
     run_app_control_show_start_page, run_app_control_start_action,
@@ -1766,6 +1768,69 @@ fn main() -> Result<()> {
                     other => anyhow::bail!("unsupported force-foreground action: {other}"),
                 };
                 run_app_control_set_force_foreground(enabled, timeout_ms)
+            }
+            "split" => {
+                // server app split create [--axis side-by-side|stacked] <path> <path> [...]
+                // server app split ungroup <group_id>
+                // server app split ratio <group_id> <0.0..1.0>
+                // server app split focus <session_path>
+                let action = args
+                    .get(3)
+                    .map(String::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("missing action for server app split (create|ungroup|ratio|focus)"))?;
+                match action {
+                    "create" => {
+                        let axis = args.windows(2).find_map(|window| {
+                            (window[0] == "--axis").then(|| window[1].clone())
+                        });
+                        let members: Vec<String> = cli_positional_args(&args, 4)
+                            .into_iter()
+                            .filter(|arg| !arg.starts_with("--"))
+                            .map(|arg| arg.to_string())
+                            .collect();
+                        if members.len() < 2 {
+                            anyhow::bail!(
+                                "server app split create needs at least 2 session paths"
+                            );
+                        }
+                        run_app_control_create_split_group(members, axis, timeout_ms)
+                    }
+                    "ungroup" | "dissolve" => {
+                        let group_id = cli_positional_args(&args, 4)
+                            .into_iter()
+                            .next()
+                            .ok_or_else(|| {
+                                anyhow::anyhow!("missing group id for server app split ungroup")
+                            })?;
+                        run_app_control_ungroup_split_group(&group_id, timeout_ms)
+                    }
+                    "ratio" => {
+                        let mut positionals = cli_positional_args(&args, 4).into_iter();
+                        let group_id = positionals.next().ok_or_else(|| {
+                            anyhow::anyhow!("missing group id for server app split ratio")
+                        })?;
+                        let ratio: f32 = positionals
+                            .next()
+                            .ok_or_else(|| {
+                                anyhow::anyhow!("missing ratio for server app split ratio")
+                            })?
+                            .parse()
+                            .map_err(|_| anyhow::anyhow!("ratio must be a number in 0.0..1.0"))?;
+                        run_app_control_set_split_group_ratio(&group_id, ratio, timeout_ms)
+                    }
+                    "focus" => {
+                        let session_path = cli_positional_args(&args, 4)
+                            .into_iter()
+                            .next()
+                            .ok_or_else(|| {
+                                anyhow::anyhow!("missing session path for server app split focus")
+                            })?;
+                        run_app_control_focus_split_pane(&session_path, timeout_ms)
+                    }
+                    other => anyhow::bail!(
+                        "unknown server app split action {other:?} (create|ungroup|ratio|focus)"
+                    ),
+                }
             }
             "open" => {
                 let session_path = cli_positional_args(&args, 3)

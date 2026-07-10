@@ -2,6 +2,36 @@
 
 This file tracks user-visible changes in `yggterm`.
 
+## 2.10.8
+
+- **Split view.** Two sessions can now share the viewport as a single surface —
+  side by side or stacked — and the sidebar row becomes a miniature map of that
+  geometry. Select two live sessions and right-click → **Split side by side** or
+  **Split stacked** (or drive it headlessly with `server app split create`). In
+  Live Sessions the two rows collapse into one compound row: `PaneOne | PaneTwo`
+  for a side-by-side split, two stacked lines for a stacked one. Click a cell to
+  focus that pane; hover for the full title. There is deliberately **no ×** on the
+  compound row — a built workspace is an intentional artifact, so every structural
+  op (ungroup, close a pane, close all) lives behind the right-click menu. A
+  dragged divider re-balances the panes and the ratio is remembered.
+  - **Cross-host by design.** Each pane keeps its own daemon-owned PTY, so a split
+    can span machines (a codex on one host beside a shell on another) — something
+    tmux cannot structurally do. The split is a GUI-level composition; the daemons
+    are untouched.
+  - **Grouping keeps sessions alive.** Putting a session in a split marks it
+    keep-alive (the compound row's dot is always green); ungrouping restores each
+    member's prior setting, so a throwaway shell does not stay immortal after a
+    brief split.
+  - **Survives restart.** Split groups persist in GUI state and are restored on
+    relaunch, with the focused pane remembered; the member sessions resume through
+    the normal per-pane handoff.
+  - **Both panes stay live.** A co-visible pane reads and recovers as a foreground
+    surface (never a throttled background host), and the faithful screenshot now
+    composites every visible pane — so `server app screenshot` shows the whole
+    split, not just the focused pane. A one-shot heal after the split's reflow
+    clears the stale-atlas garble the simultaneous half-width resize used to leave
+    on the pane that is not the input target.
+
 ## 2.10.7
 
 - **A web surface comes back after a GUI restart** instead of leaving the
