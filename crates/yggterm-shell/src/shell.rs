@@ -1142,14 +1142,24 @@ struct SidebarContributionState {
 struct AppPaneSchemaState {
     pane_id: String,
     schema: AppPaneSchema,
+    /// Per-widget-id counter, bumped only when an applied schema declares a
+    /// value the field is not already showing. It rides the widget's Dioxus key
+    /// so that node is rebuilt and picks up the new `initial_value`, which is
+    /// uncontrolled and would otherwise ignore it. An unchanged echo leaves the
+    /// key alone, so typing into a search box never loses the caret.
+    value_epochs: HashMap<String, u64>,
 }
 
 /// A pane, as the app describes it. yggterm renders these widgets and knows
 /// nothing about what they mean; a click POSTs the widget's `action` id back.
 ///
-/// NO SECRETS EVER TRAVEL IN A SCHEMA. The app performs the action host-side
-/// and, when a value must reach the page, returns an `eval` script for the GUI
-/// to run in the surface.
+/// NO SECRETS EVER TRAVEL IN A SCHEMA — the flow is one-way. A `secret` field
+/// carries what the user TYPED up to the app on an action, and the app declares
+/// it back empty; nothing else would let the GUI drop it again. An app that
+/// wants to hand the user a generated secret stages it host-side rather than
+/// echoing it into a schema. When a value must reach the page, the app returns
+/// an `eval` script for the GUI to run in the surface: the app computes, the GUI
+/// injects, and yggterm stores nothing.
 #[derive(Debug, Clone, PartialEq, serde::Deserialize)]
 struct AppPaneSchema {
     #[serde(default)]
@@ -1165,17 +1175,40 @@ impl AppPaneWidget {
     /// when a tab switch changed the widget at that slot: same tag, so the old
     /// node was reused and kept the section's `text-transform` (live-caught,
     /// the Tools tab rendered "UNLOCKED · 1107 ITEMS").
-    fn key(&self, index: usize) -> String {
+    ///
+    /// Fields whose DOM value is uncontrolled (`initial_value`) also carry the
+    /// widget's value epoch, so an app pushing a new value rebuilds the node.
+    fn key(&self, index: usize, value_epochs: &HashMap<String, u64>) -> String {
+        let epoch = |id: &str| value_epochs.get(id).copied().unwrap_or(0);
         match self {
             AppPaneWidget::Section { .. } => format!("section-{index}"),
             AppPaneWidget::Label { .. } => format!("label-{index}"),
             AppPaneWidget::Tabs { id, .. } => format!("tabs-{id}"),
-            AppPaneWidget::SearchBox { id, .. } => format!("search-{id}"),
-            AppPaneWidget::TextInput { id, .. } => format!("text-{id}"),
-            AppPaneWidget::NumberInput { id, .. } => format!("number-{id}"),
+            AppPaneWidget::SearchBox { id, .. } => format!("search-{id}-{}", epoch(id)),
+            AppPaneWidget::TextInput { id, .. } => format!("text-{id}-{}", epoch(id)),
+            AppPaneWidget::NumberInput { id, .. } => format!("number-{id}-{}", epoch(id)),
             AppPaneWidget::Toggle { id, .. } => format!("toggle-{id}"),
             AppPaneWidget::Button { id, .. } => format!("button-{id}"),
             AppPaneWidget::ListRow { id, .. } => format!("row-{id}"),
+        }
+    }
+
+    /// `(id, value)` for a widget whose value the action POST carries back.
+    ///
+    /// The APP owns these: a schema declares what every field holds, and the
+    /// GUI's copy is only the user's edits since that schema arrived. Widgets
+    /// with nothing to echo (a button, a section) answer `None`.
+    fn declared_value(&self) -> Option<(&str, String)> {
+        match self {
+            AppPaneWidget::Tabs { id, active, .. } => Some((id, active.clone())),
+            AppPaneWidget::SearchBox { id, value, .. } => Some((id, value.clone())),
+            AppPaneWidget::TextInput { id, value, .. } => Some((id, value.clone())),
+            AppPaneWidget::NumberInput { id, value, .. } => Some((id, value.to_string())),
+            AppPaneWidget::Toggle { id, value, .. } => Some((id, value.to_string())),
+            AppPaneWidget::Section { .. }
+            | AppPaneWidget::Label { .. }
+            | AppPaneWidget::Button { .. }
+            | AppPaneWidget::ListRow { .. } => None,
         }
     }
 }
@@ -2882,8 +2915,9 @@ enum RightPanelMode {
     /// control endpoint; yggterm renders generic widgets and knows nothing about
     /// what the pane means.
     ///
-    /// This variant is the reason `RightPanelMode::Vault` and `::AppSidebar` do
-    /// not exist: app chrome does not belong in yggterm.
+    /// This variant is the reason `RightPanelMode::Vault` no longer exists, and
+    /// the reason `::AppSidebar` is going the same way: app chrome does not
+    /// belong in yggterm.
     AppPane(String),
     /// The ACTIVE libyggterm app's contributed sidebar (4-surface taxonomy's
     /// sidebar-contribution surface). First consumer: ychrome settings
@@ -2891,12 +2925,6 @@ enum RightPanelMode {
     ///
     /// DEPRECATED: hardcoded app chrome, being migrated to `AppPane`.
     AppSidebar,
-    /// ychrome's shipped Bitwarden/vault browser: search the vault,
-    /// site-applicable logins float to the top, click any entry to fill it
-    /// into the active surface (the user's multi-account override path).
-    ///
-    /// DEPRECATED: hardcoded app chrome, being migrated to `AppPane`.
-    Vault,
 }
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum PreviewLayoutMode {
@@ -5542,7 +5570,6 @@ impl ShellState {
             RightPanelMode::Connect => "ssh connect opened".to_string(),
             RightPanelMode::Notifications => "notifications opened".to_string(),
             RightPanelMode::AppSidebar => "app sidebar opened".to_string(),
-            RightPanelMode::Vault => "vault opened".to_string(),
             RightPanelMode::AppPane(pane) => format!("app pane {pane} opened"),
         };
     }
@@ -5554,31 +5581,35 @@ impl ShellState {
         };
         self.set_right_panel_mode(next_mode);
     }
-    fn toggle_vault_panel(&mut self) {
-        let next_mode = if self.right_panel_mode == RightPanelMode::Vault {
-            RightPanelMode::Hidden
-        } else {
-            RightPanelMode::Vault
-        };
-        self.set_right_panel_mode(next_mode);
-    }
     /// Open (or close) an app-contributed pane. Returns the request sequence to
     /// fetch the schema under, or `None` when the pane was toggled shut.
     ///
     /// Draft input values never survive a pane switch: a search term or an
     /// add-form password belongs to the pane the user was looking at.
     fn toggle_app_pane(&mut self, pane_id: &str) -> Option<u64> {
-        let already_open = self.right_panel_mode == RightPanelMode::AppPane(pane_id.to_string());
+        if self.right_panel_mode == RightPanelMode::AppPane(pane_id.to_string()) {
+            self.clear_app_pane_draft();
+            self.set_right_panel_mode(RightPanelMode::Hidden);
+            return None;
+        }
+        Some(self.open_app_pane(pane_id))
+    }
+    /// Open an app-contributed pane, idempotently. Returns the request sequence
+    /// to fetch the schema under. Unlike `toggle_app_pane` this never closes,
+    /// so `app right-panel pane:<id>` means the same thing however many times
+    /// an agent runs it.
+    fn open_app_pane(&mut self, pane_id: &str) -> u64 {
+        self.clear_app_pane_draft();
+        self.set_right_panel_mode(RightPanelMode::AppPane(pane_id.to_string()));
+        self.app_pane_request_seq
+    }
+    /// Draft input values never survive a pane switch: a search term or an
+    /// add-form password belongs to the pane the user was looking at.
+    fn clear_app_pane_draft(&mut self) {
         self.app_pane_schema = None;
         self.app_pane_values.clear();
         self.app_pane_error = None;
         self.app_pane_request_seq = self.app_pane_request_seq.wrapping_add(1);
-        if already_open {
-            self.set_right_panel_mode(RightPanelMode::Hidden);
-            return None;
-        }
-        self.set_right_panel_mode(RightPanelMode::AppPane(pane_id.to_string()));
-        Some(self.app_pane_request_seq)
     }
     /// Claim the next request sequence. A reply carrying a stale sequence is
     /// dropped, so a slow schema fetch cannot overwrite the newer schema an
@@ -5587,15 +5618,58 @@ impl ShellState {
         self.app_pane_request_seq = self.app_pane_request_seq.wrapping_add(1);
         self.app_pane_request_seq
     }
+    /// Adopt a schema the app just handed us, and with it the values it declares.
+    ///
+    /// The app owns every field's value; the GUI's copy is only the user's edits
+    /// since the last schema arrived. So a schema REPLACES `app_pane_values`
+    /// wholesale — anything the app no longer declares is dropped, which is what
+    /// keeps a typed-then-abandoned password from riding along on the next
+    /// unrelated action.
     fn app_pane_apply_schema(&mut self, seq: u64, pane_id: &str, schema: AppPaneSchema) {
         if seq != self.app_pane_request_seq {
             return;
         }
+        let previous_epochs = self
+            .app_pane_schema
+            .as_ref()
+            .filter(|state| state.pane_id == pane_id)
+            .map(|state| state.value_epochs.clone())
+            .unwrap_or_default();
+        let mut value_epochs: HashMap<String, u64> = HashMap::new();
+        let mut values: HashMap<String, String> = HashMap::new();
+        for widget in &schema.widgets {
+            let Some((id, declared)) = widget.declared_value() else {
+                continue;
+            };
+            let epoch = previous_epochs.get(id).copied().unwrap_or(0);
+            // Bump ONLY when the app pushes a value the field is not already
+            // showing. An app that merely echoes back what the user typed (the
+            // search box does exactly this) must not rebuild the node, or the
+            // caret jumps out from under them mid-search.
+            let unchanged = self.app_pane_values.get(id).is_some_and(|shown| *shown == declared);
+            value_epochs.insert(
+                id.to_string(),
+                if unchanged { epoch } else { epoch.wrapping_add(1) },
+            );
+            values.insert(id.to_string(), declared);
+        }
+        self.app_pane_values = values;
         self.app_pane_error = None;
         self.app_pane_schema = Some(AppPaneSchemaState {
             pane_id: pane_id.to_string(),
             schema,
+            value_epochs,
         });
+    }
+    /// The heading a pane's toast carries. The app named the pane; yggterm must
+    /// not have an opinion about what it is called.
+    fn app_pane_toast_title(&self, pane_id: &str) -> String {
+        self.app_pane_schema
+            .as_ref()
+            .filter(|state| state.pane_id == pane_id)
+            .map(|state| state.schema.title.clone())
+            .filter(|title| !title.is_empty())
+            .unwrap_or_else(|| pane_id.to_string())
     }
     fn app_pane_apply_error(&mut self, seq: u64, error: String) {
         if seq != self.app_pane_request_seq {
@@ -28406,12 +28480,11 @@ fn right_panel_mode_label(mode: &RightPanelMode) -> &'static str {
         RightPanelMode::Connect => "connect",
         RightPanelMode::Notifications => "notifications",
         RightPanelMode::AppSidebar => "app_sidebar",
-        RightPanelMode::Vault => "vault",
         RightPanelMode::AppPane(_) => "app_pane",
     }
 }
 
-fn app_control_right_panel_mode(mode: AppControlRightPanelMode) -> RightPanelMode {
+fn app_control_right_panel_mode(mode: &AppControlRightPanelMode) -> RightPanelMode {
     match mode {
         AppControlRightPanelMode::Hidden => RightPanelMode::Hidden,
         AppControlRightPanelMode::Connect => RightPanelMode::Connect,
@@ -28419,11 +28492,11 @@ fn app_control_right_panel_mode(mode: AppControlRightPanelMode) -> RightPanelMod
         AppControlRightPanelMode::Settings => RightPanelMode::Settings,
         AppControlRightPanelMode::Metadata => RightPanelMode::Metadata,
         AppControlRightPanelMode::AppSidebar => RightPanelMode::AppSidebar,
-        AppControlRightPanelMode::Vault => RightPanelMode::Vault,
+        AppControlRightPanelMode::AppPane { id } => RightPanelMode::AppPane(id.clone()),
     }
 }
 
-fn app_control_right_panel_mode_label(mode: AppControlRightPanelMode) -> &'static str {
+fn app_control_right_panel_mode_label(mode: &AppControlRightPanelMode) -> &'static str {
     right_panel_mode_label(&app_control_right_panel_mode(mode))
 }
 
@@ -36412,7 +36485,10 @@ async fn app_pane_run_action(
     }
     if let Some(toast) = reply.toast {
         state.with_mut(|shell| {
-            shell.push_notification(NotificationTone::Info, "Vault", toast);
+            // The APP named this pane. yggterm hardcoding "Vault" here was the
+            // same app-chrome-in-the-platform mistake `AppPane` exists to end.
+            let title = shell.app_pane_toast_title(&pane_id);
+            shell.push_notification(NotificationTone::Info, title, toast);
         });
     }
     if let Some(script) = reply.eval {
@@ -36624,13 +36700,6 @@ fn vault_entries() -> Result<Vec<VaultEntryMeta>, String> {
     vault_entries_from_json(&vault_cli_output(&["list", "--json"])?)
 }
 
-/// Rows the vault suggests for a page host (the CLI's LOOSE rule). The matching
-/// rules live in `ychrome-vault`, not here: they are vault domain logic, they
-/// read each item's URIs (which `rbw list` never exposed), and one owner means
-/// the sidebar's suggestions and an auto-fill's refusals can never disagree.
-fn vault_suggest_for_host(host: &str) -> Result<Vec<VaultEntryMeta>, String> {
-    vault_entries_from_json(&vault_cli_output(&["suggest", host])?)
-}
 
 /// `[{name, username, folder, ...}]` — the secret-free item shape both `list
 /// --json` and `suggest` emit.
@@ -36680,62 +36749,6 @@ fn vault_password(entry_name: &str, user: Option<&str>) -> Result<WebLoginCreden
     })
 }
 
-/// Add a login to the vault. The password goes in on STDIN — never argv, never
-/// the environment. (`rbw add` read it from `$VISUAL`, so this used to stage the
-/// password in a 0600 tempfile and point a one-shot editor script at it.)
-/// Blocking; call from spawn_blocking.
-fn vault_add_login(
-    name: &str,
-    user: &str,
-    password: &str,
-    uri: &str,
-    folder: &str,
-) -> Result<(), String> {
-    use std::io::Write as _;
-
-    let cli = vault_cli()?;
-    if name.trim().is_empty() {
-        return Err("entry name is required".to_string());
-    }
-    if password.is_empty() {
-        return Err("password is empty — generate or type one".to_string());
-    }
-    let mut add = std::process::Command::new(&cli);
-    add.arg("add").arg(name.trim());
-    if !user.trim().is_empty() {
-        add.arg(user.trim());
-    }
-    if !uri.trim().is_empty() {
-        add.args(["--uri", uri.trim()]);
-    }
-    if !folder.trim().is_empty() {
-        add.args(["--folder", folder.trim()]);
-    }
-    let mut child = add
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .map_err(|error| format!("run ychrome-vault add: {error}"))?;
-    child
-        .stdin
-        .take()
-        .ok_or("no stdin on ychrome-vault add")?
-        .write_all(password.as_bytes())
-        .map_err(|error| format!("send password to ychrome-vault: {error}"))?;
-    let output = child
-        .wait_with_output()
-        .map_err(|error| format!("ychrome-vault add: {error}"))?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let stderr = stderr.trim();
-        if stderr.contains("vault locked") || stderr.contains("no agent") {
-            return Err("vault locked: run `ychrome-vault unlock` in a terminal first".to_string());
-        }
-        return Err(format!("ychrome-vault add failed: {stderr}"));
-    }
-    Ok(())
-}
 /// Current TOTP code for a vault entry. Errors when the entry
 /// carries no authenticator secret. Blocking; call from spawn_blocking.
 fn vault_totp(entry_name: &str, user: Option<&str>) -> Result<String, String> {
@@ -36919,66 +36932,6 @@ async fn web_surface_totp_for(
             Value::String("no one-time-code field on the page, and the clipboard copy failed".to_string())
         },
     })
-}
-/// Generate a password with the vault CLI's own generator (local dice — no
-/// vault touched, no network). Blocking; call from spawn_blocking.
-fn vault_generate_password(length: usize, no_symbols: bool) -> Result<String, String> {
-    let length = length.clamp(8, 128).to_string();
-    let mut args = vec!["generate", length.as_str()];
-    if no_symbols {
-        args.push("--no-symbols");
-    }
-    let password = vault_cli_output(&args)?;
-    if password.is_empty() {
-        return Err("ychrome-vault generate produced nothing".to_string());
-    }
-    Ok(password)
-}
-/// One watchtower batch: passwords for a chunk of entries, labeled. Secrets
-/// live only inside the analysis pass and are dropped with the map.
-fn vault_watchtower_batch(chunk: Vec<VaultEntryMeta>) -> Vec<(String, String)> {
-    if vault_cli().is_err() {
-        return Vec::new();
-    }
-    chunk
-        .into_iter()
-        .filter_map(|entry| {
-            let user = (!entry.user.is_empty()).then_some(entry.user.as_str());
-            let credential = vault_password(&entry.name, user).ok()?;
-            let label = if entry.user.is_empty() {
-                entry.name
-            } else {
-                format!("{} ({})", entry.name, entry.user)
-            };
-            Some((label, credential.password))
-        })
-        .collect()
-}
-/// Watchtower verdicts for one password (no secrets retained): weak = short
-/// or single-character-class.
-fn vault_password_is_weak(password: &str) -> bool {
-    if password.chars().count() < 10 {
-        return true;
-    }
-    let classes = [
-        password.chars().any(|c| c.is_ascii_lowercase()),
-        password.chars().any(|c| c.is_ascii_uppercase()),
-        password.chars().any(|c| c.is_ascii_digit()),
-        password.chars().any(|c| !c.is_ascii_alphanumeric()),
-    ]
-    .iter()
-    .filter(|present| **present)
-    .count();
-    classes < 2
-}
-/// Aggregated watchtower results — labels only, never passwords.
-#[derive(Clone, PartialEq, Default)]
-struct VaultWatchtowerReport {
-    scanned: usize,
-    /// Groups of entry labels sharing one password (size ≥ 2).
-    reused: Vec<Vec<String>>,
-    /// Entries with weak passwords.
-    weak: Vec<String>,
 }
 /// The ONE vault entry an auto path (password fill, TOTP) may use for `host`,
 /// with its credential. The STRICT rule — exact host or its `www.` twin, on the
@@ -39032,10 +38985,21 @@ async fn process_pending_app_control_requests(
             }
         }
         AppControlCommand::SetRightPanelMode { mode } => {
-            let requested_mode = app_control_right_panel_mode(mode);
-            let _ = safe_shell_mut(state, "app_control_set_right_panel_mode", |shell| {
-                shell.set_right_panel_mode(requested_mode);
-            });
+            // An app pane needs its schema fetched, not just its mode set —
+            // otherwise the rail renders "Loading…" forever. Same path the
+            // titlebar button takes.
+            if let AppControlRightPanelMode::AppPane { id } = &mode {
+                if let Ok(seq) = safe_shell_mut(state, "app_control_open_app_pane", |shell| {
+                    shell.open_app_pane(id)
+                }) {
+                    app_pane_fetch_schema(state, id.clone(), seq).await;
+                }
+            } else {
+                let requested_mode = app_control_right_panel_mode(&mode);
+                let _ = safe_shell_mut(state, "app_control_set_right_panel_mode", |shell| {
+                    shell.set_right_panel_mode(requested_mode);
+                });
+            }
             sleep(Duration::from_millis(40)).await;
             let dom_snapshot =
                 capture_dom_debug_snapshot_for_or_empty(active_session_path.as_deref()).await;
@@ -39053,7 +39017,7 @@ async fn process_pending_app_control_requests(
                 output_path: None,
                 data: Some(json!({
                     "command": "set_right_panel_mode",
-                    "requested_mode": app_control_right_panel_mode_label(mode),
+                    "requested_mode": app_control_right_panel_mode_label(&mode),
                     "window": describe_window(&desktop),
                     "active_view_mode": format!("{:?}", state.read().server.active_view_mode()),
                     "active_session_path": state.read().server.active_session_path(),
@@ -45565,10 +45529,6 @@ fn app() -> Element {
                             state.with_mut(|shell| shell.toggle_app_sidebar_panel());
                             sync_active_terminal_input_policy(state);
                             },
-                            on_toggle_vault: move || {
-                            state.with_mut(|shell| shell.toggle_vault_panel());
-                            sync_active_terminal_input_policy(state);
-                            },
                             on_toggle_app_pane: move |pane_id: String| {
                             // Opening a contributed pane fetches its schema from
                             // the app's control endpoint; closing it needs no
@@ -46527,7 +46487,6 @@ fn Titlebar(
     on_toggle_connect: EventHandler<()>,
     on_toggle_notifications: EventHandler<()>,
     on_toggle_app_sidebar: EventHandler<()>,
-    on_toggle_vault: EventHandler<()>,
     /// Opens (or closes) a pane the active app contributed, by its pane id.
     on_toggle_app_pane: EventHandler<String>,
     on_restart_update: EventHandler<()>,
@@ -47351,30 +47310,6 @@ fn Titlebar(
                                 }
                             }
                             "▦"
-                        }
-                        // The vault pane is ychrome's shipped Bitwarden UX —
-                        // like the app sidebar, it's the app's property: no
-                        // live surface, no icon.
-                        button {
-                            "data-titlebar-vault-button": "1",
-                            title: "Vault (fill logins from Bitwarden)",
-                            style: utility_icon_style(
-                                snapshot.palette,
-                                snapshot.right_panel_mode == RightPanelMode::Vault
-                            ),
-                            onmousedown: |evt| {
-                                evt.prevent_default();
-                                evt.stop_propagation();
-                            },
-                            onclick: {
-                                let on_toggle_vault = on_toggle_vault.clone();
-                                move |evt| {
-                                    evt.stop_propagation();
-                                    on_toggle_vault.call(());
-                                }
-                            },
-                            ondoubleclick: |evt| evt.stop_propagation(),
-                            "🔑"
                         }
                         }
                         // Buttons CONTRIBUTED by the active libyggterm app. The
@@ -76714,7 +76649,6 @@ fn RightRail(
     };
     let visible = requested_mode != RightPanelMode::Hidden
         && !(requested_mode == RightPanelMode::AppSidebar && !app_sidebar_available)
-        && !(requested_mode == RightPanelMode::Vault && !app_sidebar_available)
         && app_pane_available(&requested_mode);
     let rendered_mode = if visible {
         requested_mode.clone()
@@ -76777,12 +76711,6 @@ fn RightRail(
                     snapshot: snapshot.clone(),
                     on_reload_web_surface,
                     on_fill_web_surface_login,
-                }
-            } else if rendered_mode == RightPanelMode::Vault {
-                VaultRailBody {
-                    snapshot: snapshot.clone(),
-                    on_fill_vault_entry,
-                    on_totp_vault_entry,
                 }
             } else if rendered_app_pane_id.is_some() {
                 AppPaneRailBody {
@@ -77040,26 +76968,12 @@ fn AppSidebarRailBody(
         }
     }
 }
-/// Vault pane tabs — the Keyguard/Bitwarden UX split: Fill (browse + fill),
-/// Add (new login + generator), Tools (watchtower).
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum VaultPaneTab {
-    Fill,
-    Add,
-    Tools,
-}
-/// ychrome's shipped Bitwarden UX (Keyguard-inspired): search the vault,
-/// site-applicable logins float to the top for the active tab's host, and
-/// clicking ANY entry fills it into the page — the user's multi-account
-/// override path. Metadata only in the pane (name/user/folder); the password
-/// is fetched at fill time and never held in component state (the Add form's
-/// draft password is the one deliberate exception — it exists to be typed).
 /// Renders a schema an APP declared, with generic widgets. yggterm knows nothing
 /// about what any of it means: a click just POSTs the widget's action id back to
 /// the app's control endpoint, and whatever schema comes back is drawn next.
 ///
-/// This component is the whole reason `RightPanelMode::Vault` and `::AppSidebar`
-/// can die. Adding an app-specific branch here defeats it.
+/// This component is the whole reason `RightPanelMode::Vault` is gone and
+/// `::AppSidebar` can follow. Adding an app-specific branch here defeats it.
 #[component]
 fn AppPaneRailBody(
     snapshot: SharedSnapshot,
@@ -77102,11 +77016,14 @@ fn AppPaneRailBody(
         palette.muted
     );
 
-    let schema = snapshot
+    let pane_state = snapshot
         .app_pane_schema
         .as_ref()
-        .filter(|state| state.pane_id == pane_id)
-        .map(|state| state.schema.clone());
+        .filter(|state| state.pane_id == pane_id);
+    let value_epochs = pane_state
+        .map(|state| state.value_epochs.clone())
+        .unwrap_or_default();
+    let schema = pane_state.map(|state| state.schema.clone());
     let error = snapshot.app_pane_error.clone();
     let title = schema
         .as_ref()
@@ -77125,7 +77042,7 @@ fn AppPaneRailBody(
                 } else if let Some(schema) = schema {
                     for (index, widget) in schema.widgets.iter().cloned().enumerate() {
                         {
-                        let widget_key = widget.key(index);
+                        let widget_key = widget.key(index, &value_epochs);
                         match widget {
                             AppPaneWidget::Section { text } => rsx! {
                                 div { key: "{widget_key}", style: "{section_style}", "{text}" }
@@ -77320,533 +77237,6 @@ fn AppPaneRailBody(
     }
 }
 
-#[component]
-fn VaultRailBody(
-    snapshot: SharedSnapshot,
-    on_fill_vault_entry: EventHandler<(String, String)>,
-    on_totp_vault_entry: EventHandler<(String, String)>,
-) -> Element {
-    let palette = snapshot.palette;
-    let mut tab = use_signal(|| VaultPaneTab::Fill);
-    let mut query = use_signal(String::new);
-    let mut entries = use_signal(|| None::<Result<Vec<VaultEntryMeta>, String>>);
-    // Rows the vault suggests for the active page host. Fetched from the CLI
-    // (which owns the matching rules) rather than filtered here, so the
-    // sidebar's suggestions and an auto-fill's refusals cannot disagree.
-    let mut site_matches = use_signal(Vec::<VaultEntryMeta>::new);
-    let mut reload_nonce = use_signal(|| 0u32);
-    // Add-form drafts.
-    let mut add_name = use_signal(String::new);
-    let mut add_user = use_signal(String::new);
-    let mut add_password = use_signal(String::new);
-    let mut add_folder = use_signal(String::new);
-    let mut add_status = use_signal(|| None::<Result<String, String>>);
-    let mut add_busy = use_signal(|| false);
-    let mut generate_no_symbols = use_signal(|| false);
-    let mut generate_length = use_signal(|| 24usize);
-    // Watchtower.
-    let mut watchtower = use_signal(|| None::<VaultWatchtowerReport>);
-    let mut watchtower_progress = use_signal(|| None::<(usize, usize)>);
-    // (Re)read the vault list off the UI loop whenever the nonce bumps.
-    let host = snapshot.active_web_surface_host.clone();
-    use_effect({
-        let host = host.clone();
-        move || {
-            let _ = reload_nonce();
-            entries.set(None);
-            let host = host.clone();
-            spawn(async move {
-                let result = task::spawn_blocking(vault_entries)
-                    .await
-                    .unwrap_or_else(|join| Err(format!("vault task failed: {join}")));
-                entries.set(Some(result));
-
-                // A host with no suggestions is an empty list, not an error:
-                // the pane still shows every item below it.
-                let suggested = match host {
-                    Some(host) => task::spawn_blocking(move || vault_suggest_for_host(&host))
-                        .await
-                        .unwrap_or_else(|join| Err(format!("vault task failed: {join}")))
-                        .unwrap_or_default(),
-                    None => Vec::new(),
-                };
-                site_matches.set(suggested);
-            });
-        }
-    });
-    let q = query().trim().to_lowercase();
-    let muted_style = format!("font-size:10px; line-height:1.5; color:{};", palette.muted);
-    let field_style = format!(
-        "flex:1 1 auto; min-width:0; padding:6px 10px; border-radius:9px; \
-         border:1px solid rgba(127,127,127,0.35); background:rgba(127,127,127,0.10); \
-         color:{}; font-size:11px; outline:none;",
-        palette.text,
-    );
-    let action_button_style = format!(
-        "align-self:flex-start; padding:7px 14px; border:0; border-radius:9px; \
-         background:{}; color:#fff; font-size:11px; font-weight:700; cursor:pointer;",
-        palette.accent
-    );
-    let entry_row = |entry: &VaultEntryMeta, key: String| {
-        let name = entry.name.clone();
-        let user = entry.user.clone();
-        let folder = entry.folder.clone();
-        let fill_name = name.clone();
-        let fill_user = user.clone();
-        let totp_name = name.clone();
-        let totp_user = user.clone();
-        let has_totp = entry.has_totp;
-        rsx! {
-            div {
-                key: "{key}",
-                style: "display:flex; align-items:center; gap:6px; padding:6px 8px; border-radius:8px; background:rgba(127,127,127,0.08);",
-                div {
-                    title: "Fill this login into the page",
-                    style: "display:flex; flex-direction:column; gap:1px; flex:1 1 auto; min-width:0; cursor:pointer;",
-                    onclick: move |_| {
-                        on_fill_vault_entry.call((fill_name.clone(), fill_user.clone()));
-                    },
-                    div {
-                        style: format!("font-size:11px; font-weight:600; color:{}; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;", palette.text),
-                        "{name}"
-                    }
-                    div {
-                        style: format!("display:flex; gap:6px; font-size:10px; color:{}; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;", palette.muted),
-                        span { "{user}" }
-                        if !folder.is_empty() {
-                            span { style: "opacity:0.7;", "· {folder}" }
-                        }
-                    }
-                }
-                // Only where there is a code to fill: the item list says
-                // which entries carry an authenticator secret.
-                if has_totp {
-                button {
-                    r#type: "button",
-                    "data-vault-totp": "1",
-                    title: "Fill the authenticator code into the page (also copied to the clipboard)",
-                    style: format!(
-                        "flex:0 0 auto; border:none; background:transparent; color:{}; cursor:pointer; font-size:12px; padding:4px 6px; border-radius:6px;",
-                        palette.muted,
-                    ),
-                    onclick: move |evt: MouseEvent| {
-                        evt.stop_propagation();
-                        on_totp_vault_entry.call((totp_name.clone(), totp_user.clone()));
-                    },
-                    "⏱"
-                }
-                }
-            }
-        }
-    };
-    rsx! {
-        RailHeader { title: "Vault".to_string(), color: palette.text.to_string() }
-        RailScrollBody {
-            content: rsx!{
-            div {
-                style: "display:flex; flex-direction:column; gap:10px;",
-                // Pilled tab selector (the settings segmented control reused
-                // as tabs — Keyguard's top-tab grammar).
-                div {
-                    style: segmented_control_track_style(palette),
-                    button {
-                        "data-vault-tab": "fill",
-                        style: segmented_control_segment_style(palette, tab() == VaultPaneTab::Fill, true, false),
-                        onclick: move |_| tab.set(VaultPaneTab::Fill),
-                        "Fill"
-                    }
-                    button {
-                        "data-vault-tab": "add",
-                        style: segmented_control_segment_style(palette, tab() == VaultPaneTab::Add, true, false),
-                        onclick: move |_| tab.set(VaultPaneTab::Add),
-                        "Add"
-                    }
-                    button {
-                        "data-vault-tab": "tools",
-                        style: segmented_control_segment_style(palette, tab() == VaultPaneTab::Tools, true, false),
-                        onclick: move |_| tab.set(VaultPaneTab::Tools),
-                        "Tools"
-                    }
-                }
-                if tab() == VaultPaneTab::Add {
-                    div {
-                        style: "display:flex; flex-direction:column; gap:8px;",
-                        RailSectionTitle { title: "New login".to_string(), muted_color: palette.muted.to_string() }
-                        input {
-                            r#type: "text",
-                            "data-vault-add-name": "1",
-                            placeholder: if let Some(host) = host.clone() { format!("Name (e.g. {host})") } else { "Name (site host)".to_string() },
-                            value: "{add_name}",
-                            spellcheck: "false",
-                            autocomplete: "off",
-                            style: "{field_style}",
-                            oninput: move |evt: FormEvent| add_name.set(evt.value()),
-                        }
-                        input {
-                            r#type: "text",
-                            "data-vault-add-user": "1",
-                            placeholder: "Username / email",
-                            value: "{add_user}",
-                            spellcheck: "false",
-                            autocomplete: "off",
-                            style: "{field_style}",
-                            oninput: move |evt: FormEvent| add_user.set(evt.value()),
-                        }
-                        div {
-                            style: "display:flex; align-items:center; gap:6px;",
-                            input {
-                                r#type: "text",
-                                "data-vault-add-password": "1",
-                                placeholder: "Password (type or generate)",
-                                value: "{add_password}",
-                                spellcheck: "false",
-                                autocomplete: "off",
-                                style: "{field_style} font-family:monospace;",
-                                oninput: move |evt: FormEvent| add_password.set(evt.value()),
-                            }
-                        }
-                        input {
-                            r#type: "text",
-                            "data-vault-add-folder": "1",
-                            placeholder: "Folder (optional)",
-                            value: "{add_folder}",
-                            spellcheck: "false",
-                            autocomplete: "off",
-                            style: "{field_style}",
-                            oninput: move |evt: FormEvent| add_folder.set(evt.value()),
-                        }
-                        RailSectionTitle { title: "Generator".to_string(), muted_color: palette.muted.to_string() }
-                        div {
-                            style: "display:flex; align-items:center; gap:8px; flex-wrap:wrap;",
-                            button {
-                                r#type: "button",
-                                "data-vault-generate": "1",
-                                style: "{action_button_style}",
-                                onclick: move |_| {
-                                    let length = generate_length();
-                                    let no_symbols = generate_no_symbols();
-                                    spawn(async move {
-                                        let generated = task::spawn_blocking(move || {
-                                            vault_generate_password(length, no_symbols)
-                                        })
-                                        .await
-                                        .unwrap_or_else(|join| Err(format!("generate task failed: {join}")));
-                                        match generated {
-                                            Ok(password) => add_password.set(password),
-                                            Err(reason) => add_status.set(Some(Err(reason))),
-                                        }
-                                    });
-                                },
-                                "Generate"
-                            }
-                            div {
-                                style: format!("display:flex; align-items:center; gap:4px; font-size:10px; color:{};", palette.muted),
-                                button {
-                                    r#type: "button",
-                                    style: format!("border:none; background:transparent; color:{}; cursor:pointer; font-size:12px; padding:2px 4px;", palette.text),
-                                    onclick: move |_| {
-                                        let next = generate_length().saturating_sub(4).max(8);
-                                        generate_length.set(next);
-                                    },
-                                    "−"
-                                }
-                                span { "{generate_length} chars" }
-                                button {
-                                    r#type: "button",
-                                    style: format!("border:none; background:transparent; color:{}; cursor:pointer; font-size:12px; padding:2px 4px;", palette.text),
-                                    onclick: move |_| {
-                                        let next = (generate_length() + 4).min(128);
-                                        generate_length.set(next);
-                                    },
-                                    "+"
-                                }
-                            }
-                            label {
-                                style: format!("display:flex; align-items:center; gap:4px; font-size:10px; color:{}; cursor:pointer;", palette.muted),
-                                input {
-                                    r#type: "checkbox",
-                                    checked: generate_no_symbols(),
-                                    onchange: move |evt: FormEvent| generate_no_symbols.set(evt.checked()),
-                                }
-                                "no symbols"
-                            }
-                        }
-                        button {
-                            r#type: "button",
-                            "data-vault-add-save": "1",
-                            disabled: add_busy(),
-                            style: "{action_button_style}",
-                            onclick: {
-                                let host = host.clone();
-                                move |_| {
-                                    if add_busy() {
-                                        return;
-                                    }
-                                    let name = add_name().trim().to_string();
-                                    let user = add_user().trim().to_string();
-                                    let password = add_password();
-                                    let folder = add_folder().trim().to_string();
-                                    // The URI field keeps Bitwarden's own
-                                    // apps/extensions matching this entry too.
-                                    let uri = host
-                                        .clone()
-                                        .map(|host| format!("https://{host}"))
-                                        .unwrap_or_default();
-                                    add_status.set(None);
-                                    add_busy.set(true);
-                                    spawn(async move {
-                                        let save_name = name.clone();
-                                        let result = task::spawn_blocking(move || {
-                                            vault_add_login(&save_name, &user, &password, &uri, &folder)
-                                        })
-                                        .await
-                                        .unwrap_or_else(|join| Err(format!("add task failed: {join}")));
-                                        add_busy.set(false);
-                                        match result {
-                                            Ok(()) => {
-                                                add_status.set(Some(Ok(format!("Saved “{name}” to the vault."))));
-                                                add_password.set(String::new());
-                                                reload_nonce += 1;
-                                            }
-                                            Err(reason) => add_status.set(Some(Err(reason))),
-                                        }
-                                    });
-                                }
-                            },
-                            if add_busy() { "Saving…" } else { "Save to vault" }
-                        }
-                        match add_status() {
-                            Some(Ok(message)) => rsx! {
-                                div { style: format!("font-size:10px; color:{};", palette.accent), "{message}" }
-                            },
-                            Some(Err(reason)) => rsx! {
-                                div { style: "font-size:10px; color:#c0392b;", "{reason}" }
-                            },
-                            None => rsx! {},
-                        }
-                        div {
-                            style: "{muted_style}",
-                            "Name the entry after the site's host so fill matching finds it. The password is staged in a 0600 file under ~/.yggterm/tmp for the moment of the save, never in a command line."
-                        }
-                    }
-                } else if tab() == VaultPaneTab::Tools {
-                    div {
-                        style: "display:flex; flex-direction:column; gap:8px;",
-                        RailSectionTitle { title: "Watchtower".to_string(), muted_color: palette.muted.to_string() }
-                        div {
-                            style: "{muted_style}",
-                            "Scans every login for reused and weak passwords. Passwords are read in memory for the scan and dropped; only entry names are reported."
-                        }
-                        button {
-                            r#type: "button",
-                            "data-vault-watchtower-run": "1",
-                            disabled: watchtower_progress().is_some(),
-                            style: "{action_button_style}",
-                            onclick: move |_| {
-                                if watchtower_progress().is_some() {
-                                    return;
-                                }
-                                let list = match entries() {
-                                    Some(Ok(list)) => list,
-                                    _ => return,
-                                };
-                                watchtower.set(None);
-                                let total = list.len();
-                                watchtower_progress.set(Some((0, total)));
-                                spawn(async move {
-                                    // Chunked so progress updates and the UI
-                                    // never blocks on one long vault sweep.
-                                    let mut by_password: HashMap<String, Vec<String>> = HashMap::new();
-                                    let mut weak: Vec<String> = Vec::new();
-                                    let mut scanned = 0usize;
-                                    for chunk in list.chunks(25) {
-                                        let chunk = chunk.to_vec();
-                                        let batch = task::spawn_blocking(move || {
-                                            vault_watchtower_batch(chunk)
-                                        })
-                                        .await
-                                        .unwrap_or_default();
-                                        for (label, password) in batch {
-                                            scanned += 1;
-                                            if vault_password_is_weak(&password) {
-                                                weak.push(label.clone());
-                                            }
-                                            by_password.entry(password).or_default().push(label);
-                                        }
-                                        watchtower_progress.set(Some((scanned, total)));
-                                    }
-                                    let mut reused: Vec<Vec<String>> = by_password
-                                        .into_values()
-                                        .filter(|labels| labels.len() >= 2)
-                                        .collect();
-                                    reused.sort_by(|a, b| b.len().cmp(&a.len()).then(a.cmp(b)));
-                                    weak.sort();
-                                    watchtower_progress.set(None);
-                                    watchtower.set(Some(VaultWatchtowerReport { scanned, reused, weak }));
-                                });
-                            },
-                            if let Some((done, total)) = watchtower_progress() {
-                                "Scanning {done}/{total}…"
-                            } else {
-                                "Run watchtower scan"
-                            }
-                        }
-                        if let Some(report) = watchtower() {
-                            div {
-                                style: "{muted_style}",
-                                "Scanned {report.scanned} logins: {report.reused.len()} reused-password groups, {report.weak.len()} weak."
-                            }
-                            if !report.reused.is_empty() {
-                                RailSectionTitle { title: format!("Reused passwords ({})", report.reused.len()), muted_color: palette.muted.to_string() }
-                                div {
-                                    style: "display:flex; flex-direction:column; gap:6px;",
-                                    for (group_index, group) in report.reused.iter().take(30).enumerate() {
-                                        div {
-                                            key: "wt-reuse-{group_index}",
-                                            style: "display:flex; flex-direction:column; gap:1px; padding:6px 8px; border-radius:8px; background:rgba(192,57,43,0.10);",
-                                            div {
-                                                style: format!("font-size:10px; font-weight:700; color:{};", palette.text),
-                                                "Shared by {group.len()} logins"
-                                            }
-                                            for (label_index, label) in group.iter().take(8).enumerate() {
-                                                div {
-                                                    key: "wt-reuse-{group_index}-{label_index}",
-                                                    style: format!("font-size:10px; color:{}; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;", palette.muted),
-                                                    "{label}"
-                                                }
-                                            }
-                                            if group.len() > 8 {
-                                                div { style: "{muted_style}", "… and {group.len() - 8} more" }
-                                            }
-                                        }
-                                    }
-                                    if report.reused.len() > 30 {
-                                        div { style: "{muted_style}", "Showing 30 groups of {report.reused.len()}." }
-                                    }
-                                }
-                            }
-                            if !report.weak.is_empty() {
-                                RailSectionTitle { title: format!("Weak passwords ({})", report.weak.len()), muted_color: palette.muted.to_string() }
-                                div {
-                                    style: "display:flex; flex-direction:column; gap:2px;",
-                                    for (weak_index, label) in report.weak.iter().take(60).enumerate() {
-                                        div {
-                                            key: "wt-weak-{weak_index}",
-                                            style: format!("font-size:10px; color:{}; padding:2px 8px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;", palette.muted),
-                                            "{label}"
-                                        }
-                                    }
-                                    if report.weak.len() > 60 {
-                                        div { style: "{muted_style}", "Showing 60 of {report.weak.len()}." }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                if tab() == VaultPaneTab::Fill {
-                div {
-                    style: "display:flex; align-items:center; gap:6px;",
-                    input {
-                        r#type: "text",
-                        "data-vault-search": "1",
-                        placeholder: "Search vault…",
-                        value: "{query}",
-                        spellcheck: "false",
-                        autocomplete: "off",
-                        style: "{field_style}",
-                        oninput: move |evt: FormEvent| query.set(evt.value()),
-                    }
-                    button {
-                        r#type: "button",
-                        title: "Re-read the vault",
-                        style: format!(
-                            "border:none; background:transparent; color:{}; cursor:pointer; font-size:13px; padding:4px;",
-                            palette.text,
-                        ),
-                        onclick: move |_| reload_nonce += 1,
-                        "⟳"
-                    }
-                }
-                match entries() {
-                    None => rsx! {
-                        div { style: "{muted_style}", "Reading vault…" }
-                    },
-                    Some(Err(reason)) => rsx! {
-                        div { style: "{muted_style}", "{reason}" }
-                    },
-                    Some(Ok(list)) => {
-                        const MAX_ROWS: usize = 80;
-                        if q.is_empty() {
-                            let site_matches = site_matches();
-                            let total = list.len();
-                            let shown: Vec<VaultEntryMeta> =
-                                list.iter().take(MAX_ROWS).cloned().collect();
-                            rsx! {
-                                if let Some(host) = host.clone() {
-                                    RailSectionTitle { title: format!("For {host}"), muted_color: palette.muted.to_string() }
-                                    if site_matches.is_empty() {
-                                        div { style: "{muted_style}", "No entries match this site — search or pick from all items." }
-                                    }
-                                    div {
-                                        style: "display:flex; flex-direction:column; gap:4px;",
-                                        for (index, entry) in site_matches.iter().enumerate() {
-                                            {entry_row(entry, format!("vault-site-{index}"))}
-                                        }
-                                    }
-                                }
-                                RailSectionTitle { title: "All items".to_string(), muted_color: palette.muted.to_string() }
-                                div {
-                                    style: "display:flex; flex-direction:column; gap:4px;",
-                                    for (index, entry) in shown.iter().enumerate() {
-                                        {entry_row(entry, format!("vault-all-{index}"))}
-                                    }
-                                }
-                                if total > MAX_ROWS {
-                                    div { style: "{muted_style}", "Showing {MAX_ROWS} of {total} — search to narrow." }
-                                }
-                            }
-                        } else {
-                            let matches: Vec<VaultEntryMeta> = list
-                                .iter()
-                                .filter(|entry| {
-                                    entry.name.to_lowercase().contains(&q)
-                                        || entry.user.to_lowercase().contains(&q)
-                                        || entry.folder.to_lowercase().contains(&q)
-                                })
-                                .cloned()
-                                .collect();
-                            let total = matches.len();
-                            let shown: Vec<VaultEntryMeta> =
-                                matches.into_iter().take(MAX_ROWS).collect();
-                            rsx! {
-                                RailSectionTitle { title: format!("Results ({total})"), muted_color: palette.muted.to_string() }
-                                if shown.is_empty() {
-                                    div { style: "{muted_style}", "No entries match." }
-                                }
-                                div {
-                                    style: "display:flex; flex-direction:column; gap:4px;",
-                                    for (index, entry) in shown.iter().enumerate() {
-                                        {entry_row(entry, format!("vault-hit-{index}"))}
-                                    }
-                                }
-                                if total > MAX_ROWS {
-                                    div { style: "{muted_style}", "Showing {MAX_ROWS} of {total} — refine the search." }
-                                }
-                            }
-                        }
-                    }
-                }
-                div {
-                    style: "{muted_style}",
-                    "Click an entry to fill it into the page. Site matches use the entry's name (exact host or base domain)."
-                }
-                }
-            }
-            }
-        }
-    }
-}
 #[component]
 fn MetadataRailBody(snapshot: SharedSnapshot) -> Element {
     let session = snapshot.active_session.clone();
@@ -88094,9 +87484,10 @@ mod tests {
     // "UNLOCKED · 1107 ITEMS". Caught live, not by a test — hence this one.
     #[test]
     fn app_pane_widget_keys_distinguish_kinds_at_the_same_index() {
+        let epochs = HashMap::new();
         let section = AppPaneWidget::Section { text: "Vault".into() };
         let label = AppPaneWidget::Label { text: "unlocked".into(), muted: true };
-        assert_ne!(section.key(1), label.key(1));
+        assert_ne!(section.key(1, &epochs), label.key(1, &epochs));
 
         // Identity, not position: the same row keeps its key as the list moves.
         let row = |id: &str| AppPaneWidget::ListRow {
@@ -88105,8 +87496,20 @@ mod tests {
             subtitle: String::new(),
             actions: Vec::new(),
         };
-        assert_eq!(row("a").key(0), row("a").key(7));
-        assert_ne!(row("a").key(0), row("b").key(0));
+        assert_eq!(row("a").key(0, &epochs), row("a").key(7, &epochs));
+        assert_ne!(row("a").key(0, &epochs), row("b").key(0, &epochs));
+
+        // An input's key carries its value epoch, so an app pushing a new value
+        // rebuilds the node whose DOM value is otherwise uncontrolled.
+        let field = AppPaneWidget::TextInput {
+            id: "password".into(),
+            label: String::new(),
+            placeholder: String::new(),
+            value: String::new(),
+            secret: true,
+        };
+        let bumped = HashMap::from([("password".to_string(), 1u64)]);
+        assert_ne!(field.key(0, &epochs), field.key(0, &bumped));
     }
 
     // The GUI must parse exactly what an app emits: kebab-case tags, absent
@@ -88145,6 +87548,104 @@ mod tests {
             "widgets": [{"kind": "hologram", "text": "?"}],
         }));
         assert!(result.is_err());
+    }
+
+    // A value-bearing widget must rebuild its node when the app pushes a value
+    // the field is not already showing — `initial_value` is uncontrolled, so a
+    // stable key would silently ignore the new value. Equally, an app echoing
+    // back what the user typed must NOT rebuild it, or the caret jumps out of
+    // the search box mid-search.
+    #[test]
+    fn app_pane_value_epoch_bumps_only_on_a_pushed_value() {
+        let widget = |value: &str| {
+            json!({"kind": "text-input", "id": "password", "value": value, "secret": true})
+        };
+        let schema = |value: &str| -> AppPaneSchema {
+            serde_json::from_value(json!({"widgets": [widget(value)]})).expect("schema parses")
+        };
+        let mut shell = ShellState::new(test_shell_bootstrap_with_active_session("local://pane"));
+        let seq = shell.app_pane_next_request();
+
+        shell.app_pane_apply_schema(seq, "vault", schema(""));
+        let first = shell.app_pane_schema.as_ref().unwrap().value_epochs["password"];
+        // The app owns the value: an empty declaration seeds an empty draft.
+        assert_eq!(shell.app_pane_values["password"], "");
+
+        // The user types. No schema applied, so the epoch cannot move.
+        shell.set_app_pane_value("password", "typed".to_string());
+        assert_eq!(
+            shell.app_pane_schema.as_ref().unwrap().value_epochs["password"],
+            first
+        );
+
+        // The app echoes the typed value back: same as displayed, no rebuild.
+        let seq = shell.app_pane_next_request();
+        shell.app_pane_apply_schema(seq, "vault", schema("typed"));
+        assert_eq!(
+            shell.app_pane_schema.as_ref().unwrap().value_epochs["password"],
+            first,
+            "an unchanged echo must not rebuild the node"
+        );
+
+        // The app pushes something else: rebuild, and the draft follows it.
+        let seq = shell.app_pane_next_request();
+        shell.app_pane_apply_schema(seq, "vault", schema(""));
+        assert_ne!(
+            shell.app_pane_schema.as_ref().unwrap().value_epochs["password"],
+            first,
+            "a pushed value must rebuild the node"
+        );
+        assert_eq!(shell.app_pane_values["password"], "");
+    }
+
+    // A draft the app stops declaring is dropped, so a password typed into the
+    // Add tab cannot ride along on a later search or tab switch.
+    #[test]
+    fn app_pane_schema_drops_values_it_no_longer_declares() {
+        let mut shell = ShellState::new(test_shell_bootstrap_with_active_session("local://pane"));
+        let seq = shell.app_pane_next_request();
+        shell.app_pane_apply_schema(
+            seq,
+            "vault",
+            serde_json::from_value(json!({
+                "widgets": [{"kind": "text-input", "id": "password", "secret": true}],
+            }))
+            .expect("schema parses"),
+        );
+        shell.set_app_pane_value("password", "hunter2".to_string());
+
+        // Switching to a tab that has no password field.
+        let seq = shell.app_pane_next_request();
+        shell.app_pane_apply_schema(
+            seq,
+            "vault",
+            serde_json::from_value(json!({
+                "widgets": [{"kind": "search-box", "id": "query", "value": "gh"}],
+            }))
+            .expect("schema parses"),
+        );
+        assert!(
+            !shell.app_pane_values.contains_key("password"),
+            "an undeclared draft secret survived into the next action's POST"
+        );
+        assert_eq!(shell.app_pane_values["query"], "gh");
+        let posted = shell.app_pane_values_json().to_string();
+        assert!(!posted.contains("hunter2"), "secret leaked into an action POST");
+    }
+
+    // yggterm must not name another app's pane. The title comes from the schema.
+    #[test]
+    fn app_pane_toast_title_comes_from_the_app() {
+        let mut shell = ShellState::new(test_shell_bootstrap_with_active_session("local://pane"));
+        assert_eq!(shell.app_pane_toast_title("vault"), "vault");
+        let seq = shell.app_pane_next_request();
+        shell.app_pane_apply_schema(
+            seq,
+            "vault",
+            serde_json::from_value(json!({"title": "Vault", "widgets": []}))
+                .expect("schema parses"),
+        );
+        assert_eq!(shell.app_pane_toast_title("vault"), "Vault");
     }
 
     #[test]
