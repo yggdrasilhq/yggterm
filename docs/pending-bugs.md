@@ -4,7 +4,23 @@ Open, user-confirmed bugs that are NOT yet fixed. An agent asked to "finish the
 pending bugs" should start here. Remove an entry (in the same commit as the
 fix) once the fix is verified live on jojo.
 
-_No open entries right now._
+- **Live-path frame corruption on busy CC sessions (jojo, 2026-07-10).** While
+  an agent streams heavily, the CLIENT xterm buffer accumulates single-cell
+  holes (`t ik` for `think`, including the user's own composer echo), merged
+  rows, and whole frames interleaved at wrong positions — while the daemon
+  vt100 screen stays clean and no `resync_required`/`cursor_rewound` events
+  fire. So bytes are lost/mutated between the daemon read and `term.write` in
+  the GUI. The ATTACH-seed variant of this class is fixed in 2.10.4 (viewport
+  reconcile chunk); the live-path variant is still open. Prime suspects:
+  (a) `batch_terminal_chunks` sanitizers rewriting live frames (the
+  `observation` rejoin converts `\r\n`→`\n` and strips "noise" lines whenever
+  a batch lacks alt-screen/hide-cursor/high-volume markers — content-triggered,
+  so yggterm-dev sessions whose transcripts CONTAIN transport-noise phrases are
+  hit hardest); (b) `terminal_write_bridge.stage_or_immediate` ordering under
+  frame-budget mode. 2.10.4 ships the probes to convict: mine
+  `terminal_forward_divergence` + `terminal_write_send_failed` in
+  `event-trace.jsonl` and run the client-buffer vs daemon-screen diff recipe in
+  `.agents/skills/yggui-app-control/SKILL.md` while a session streams.
 
 ## Fixed in 2.10.2 — confirm live, then delete this section
 

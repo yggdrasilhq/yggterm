@@ -230,6 +230,45 @@ ssh "$LIVE_HOST" "~/.local/bin/yggterm server app grid hide"
   InputEvent (dom-eval), or the signal never updates and a re-render wipes
   the text.
 
+## Client-buffer read + daemon diff (rendering-corruption probe, 2026-07-10)
+
+THE instrument for the client-buffer garble class (holes, merged rows,
+interleaved frames): the daemon vt100 screen is clean while the CLIENT xterm
+buffer is corrupt, so a daemon-only probe proves nothing (CLAUDE.md misstep
+#3). `window.__yggtermXtermHosts[hostId].term` is exposed — read the client
+viewport rows directly via dom-eval, focus-independent:
+
+```bash
+LIVE_HOST=$(cat .agents/config/live-host)
+# 1. Client xterm viewport rows (the ACTIVE host), via translateToString
+ssh "$LIVE_HOST" "~/.local/bin/yggterm server app dom-eval '
+  const hosts = window.__yggtermXtermHosts || {};
+  const path = String(window.__yggtermActiveTerminalSessionPath || \"\");
+  const entry = Object.values(hosts).find(e => e && e.sessionPath === path && e.term);
+  if (!entry) return { error: \"no active host entry\", path };
+  const buf = entry.term.buffer.active;
+  const rows = [];
+  for (let i = 0; i < entry.term.rows; i++) {
+    const ln = buf.getLine(Number(buf.viewportY || 0) + i);
+    rows.push(ln && ln.translateToString ? ln.translateToString(true) : \"\");
+  }
+  return { path, rows };'"
+# 2. Daemon truth for the same session
+ssh "$LIVE_HOST" "~/.local/bin/yggterm-headless server snapshot" # -> active_session.terminal_lines
+# 3. Diff row-by-row. Client rows with single-cell holes / merged content that
+#    the daemon does NOT have = client write-path corruption, NOT a PTY bug.
+```
+
+Companion trace events (mine `~/.yggterm/event-trace.jsonl`):
+- `terminal_forward_divergence` — the GUI forwarded FEWER/DIFFERENT bytes to
+  xterm than the daemon sent (batch sanitizers rewrote or dropped a live
+  chunk). `dropped_entirely: true` = a whole batch vanished.
+- `terminal_write_send_failed` — an `eval.send(Write)` failed; those bytes are
+  permanently lost to the client buffer (cursor already advanced).
+- `terminal_render_health_unhealthy` — canvas/paint layer only; its
+  `cursor_line_text` IS a client-buffer read (translateToString), so holes in
+  it are buffer corruption evidence, not just paint.
+
 ## DOM Eval (main-webview JS probe)
 
 ```bash

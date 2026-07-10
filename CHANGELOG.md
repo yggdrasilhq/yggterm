@@ -2,6 +2,37 @@
 
 This file tracks user-visible changes in `yggterm`.
 
+## 2.10.4
+
+- **Attach no longer leaves a garbled viewport on busy Claude Code sessions.**
+  Every GUI restart/remount seeded the client terminal with a budget-truncated
+  raw chunk tail — a replay that starts mid-stream, so a TUI painting with
+  relative cursor motion landed rows at wrong positions and left cells
+  blank/stale, and its subsequent diff-only repaints preserved the garble
+  (holes like `t ik` for `think`, merged rows, interleaved old/new frames).
+  The initial seed now ends with a viewport-reconcile chunk: the daemon's
+  authoritative vt100 screen + cursor, so live diffs anchor correctly while
+  the tail still populates scrollback. Codex resume attaches are excluded
+  (their runtime repaints in full and their restored screen can be staler
+  than the tail).
+- **Attach seed consistency race fixed.** The PTY reader now commits the vt100
+  screen update, the sequence bump, and the ring append under one lock, so an
+  attach snapshot can never include a chunk the cursor says is still pending
+  (which double-applied a relative-cursor frame).
+- **GUI no longer dies with `AlreadyBorrowed` on a view-mode click.** The
+  focus-after-activation chain read shell state with a raw borrow inside an
+  event handler; it now goes through the panic-suppressing funnel
+  (panic.log 2026-06-22 / 2026-07-07).
+- **Hot-update-pending trace flood throttled.** While a hot update is pending,
+  every ~150 ms daemon poll logged `hot_update_pending_preserve_live_daemon`
+  (433 events in 28 min on jojo); now at most one per 10 s.
+- **New rendering-corruption probes.** `terminal_forward_divergence` traces
+  whenever the GUI forwards fewer/different bytes to xterm than the daemon
+  sent (batch sanitizers rewriting live frames); `terminal_write_send_failed`
+  traces a failed webview write (previously silently discarded bytes). A
+  client-buffer vs daemon-screen diff recipe is documented in the yggui
+  skill.
+
 ## 2.10.3
 
 - **yggterm now contains zero app-specific chrome.** `RightPanelMode::AppSidebar`

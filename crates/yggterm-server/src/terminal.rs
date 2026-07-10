@@ -1206,6 +1206,34 @@ impl TerminalScreenState {
         payload.push_str(&formatted);
         Some(payload)
     }
+
+    /// Viewport-only reconcile payload: clear the visible screen and repaint
+    /// it from the daemon's authoritative vt100 state (which restores modes
+    /// AND the cursor position). Appended after a raw retained-chunk initial
+    /// seed: a budget-truncated chunk tail starts mid-stream, so a TUI that
+    /// paints with relative cursor motion (Claude Code frames are `\r\x1b[nB`
+    /// moves + `\x1b[K` erases) replays against the wrong origin and leaves
+    /// shifted/merged rows and blanked cells that persist — the TUI then
+    /// diffs against a screen it never actually drew. Ending the seed with
+    /// this payload pins the client viewport and cursor to daemon truth so
+    /// every subsequent live diff anchors correctly, while the replayed tail
+    /// still populates scrollback. No history here — the tail already carries
+    /// it, and normal-buffer history must never be injected under an
+    /// alternate-screen TUI (see the reverted chunk-ring-gap resync).
+    /// The payload deliberately LEADS with `\x1b[?25l`: the GUI's batch
+    /// sanitizers only forward a chunk verbatim when it carries a control
+    /// marker (alt-screen switch, hide-cursor, high-volume frame), and vt100's
+    /// `state_formatted` starts with `\x1b[?25h` when the cursor is visible —
+    /// without the lead-in the reconcile itself could be line-rejoined.
+    /// `state_formatted` re-asserts the true visibility immediately after, so
+    /// the final cursor state is the daemon's.
+    fn viewport_reconcile_replay(&self) -> Option<String> {
+        let formatted = self.formatted.trim_matches('\0');
+        if !terminal_chunk_has_visible_text(formatted) {
+            return None;
+        }
+        Some(format!("\x1b[?25l\x1b[2J\x1b[H{formatted}"))
+    }
 }
 
 fn spawn_terminal_writer_thread(
@@ -1474,6 +1502,10 @@ impl PtySessionRuntime {
                             protocol_filter.discard_pending();
                             let data = protocol_result.data;
                             if !data.is_empty() {
+                                // Same commit-lock discipline as the streaming
+                                // branch: screen + seq + ring move together.
+                                let mut chunks =
+                                    reader_chunks.lock().expect("pty chunk lock poisoned");
                                 if let Ok(mut screen_state) = reader_screen_state.lock() {
                                     screen_state.process(data.as_bytes());
                                 }
@@ -1489,8 +1521,6 @@ impl PtySessionRuntime {
                                 reader_runtime_output_seen.store(true, Ordering::SeqCst);
                                 reader_activity.store(now_millis(), Ordering::SeqCst);
                                 let seq_value = reader_seq.fetch_add(1, Ordering::SeqCst) + 1;
-                                let mut chunks =
-                                    reader_chunks.lock().expect("pty chunk lock poisoned");
                                 let mut retained =
                                     reader_retained_bytes.load(Ordering::SeqCst);
                                 chunks.push_back(TerminalChunk {
@@ -1545,6 +1575,15 @@ impl PtySessionRuntime {
                                 }
                                 continue;
                             }
+                            // Hold the chunks lock across the vt100 update AND
+                            // the seq+ring commit. `read(0)` holds the same lock
+                            // while it snapshots the screen against `seq`, so
+                            // this keeps "screen state == chunks 1..=seq"
+                            // invariant — without it an attach mid-chunk could
+                            // seed a screen that already contains a chunk the
+                            // cursor says is still pending, double-applying a
+                            // relative-cursor frame (row-shift garble).
+                            let mut chunks = reader_chunks.lock().expect("pty chunk lock poisoned");
                             if let Ok(mut screen_state) = reader_screen_state.lock() {
                                 screen_state.process(data.as_bytes());
                             }
@@ -1569,7 +1608,6 @@ impl PtySessionRuntime {
                             reader_runtime_output_seen.store(true, Ordering::SeqCst);
                             reader_activity.store(now_millis(), Ordering::SeqCst);
                             let seq_value = reader_seq.fetch_add(1, Ordering::SeqCst) + 1;
-                            let mut chunks = reader_chunks.lock().expect("pty chunk lock poisoned");
                             let mut retained = reader_retained_bytes.load(Ordering::SeqCst);
                             chunks.push_back(TerminalChunk {
                                 seq: seq_value,
@@ -1791,6 +1829,18 @@ impl PtySessionRuntime {
         })
     }
 
+    fn screen_reconcile_chunk(&self, next_cursor: u64) -> Option<TerminalChunk> {
+        let screen_state = self
+            .screen_state
+            .lock()
+            .expect("pty screen state lock poisoned");
+        let payload = screen_state.viewport_reconcile_replay()?;
+        Some(TerminalChunk {
+            seq: next_cursor.saturating_add(1),
+            data: payload,
+        })
+    }
+
     fn read(&self, cursor: u64) -> TerminalReadResult {
         let retained_chunks = self.chunks.lock().expect("pty chunk lock poisoned");
         let next_cursor = self.seq.load(Ordering::SeqCst);
@@ -1848,6 +1898,7 @@ impl PtySessionRuntime {
             chunks =
                 select_initial_attach_chunks_for_launch(&retained_chunks, &self.launch_command);
         }
+        let mut seeded_from_screen_snapshot = false;
         if effective_cursor == 0
             && let Some(snapshot_chunk) = self.screen_snapshot_chunk(next_cursor)
             && initial_attach_should_replay_screen_snapshot(
@@ -1858,8 +1909,10 @@ impl PtySessionRuntime {
             )
         {
             chunks = vec![snapshot_chunk];
+            seeded_from_screen_snapshot = true;
         }
         if effective_cursor == 0
+            && !seeded_from_screen_snapshot
             && !prefer_initial_screen_snapshot
             && !chunks
                 .iter()
@@ -1867,6 +1920,29 @@ impl PtySessionRuntime {
             && let Some(snapshot_chunk) = self.screen_snapshot_chunk(next_cursor)
         {
             chunks = vec![snapshot_chunk];
+            seeded_from_screen_snapshot = true;
+        }
+        // A raw retained-chunk seed is a budget-truncated mid-stream replay:
+        // faithful for scrollback, WRONG for the final viewport of a TUI that
+        // paints with relative cursor motion (the persistent hole/interleave
+        // garble a GUI restart used to leave on busy Claude Code sessions —
+        // jojo 2026-07-10). Pin the viewport + cursor to the daemon's vt100
+        // truth so subsequent live diffs anchor correctly. Snapshot seeds
+        // already end at daemon truth. Codex resume attaches
+        // (`prefer_initial_screen_snapshot`) are excluded: their runtime
+        // re-runs `codex resume` and repaints in full, and their restored
+        // vt100 screen can be STALER than the retained tail (an idle-prompt
+        // frame painted over newer prose would fabricate readiness — see the
+        // stale-prose-tail attach test).
+        if effective_cursor == 0
+            && !seeded_from_screen_snapshot
+            && !prefer_initial_screen_snapshot
+            && chunks
+                .iter()
+                .any(|chunk| terminal_chunk_has_visible_text(&chunk.data))
+            && let Some(reconcile_chunk) = self.screen_reconcile_chunk(next_cursor)
+        {
+            chunks.push(reconcile_chunk);
         }
         if effective_cursor == 0
             && self.is_running()
@@ -1929,13 +2005,15 @@ impl PtySessionRuntime {
         if data.is_empty() {
             return;
         }
+        // Same commit-lock discipline as the reader thread: chunks lock first,
+        // then screen — screen state and the ring stay consistent under `read`.
+        let mut chunks = self.chunks.lock().expect("pty chunk lock poisoned");
         if let Ok(mut screen_state) = self.screen_state.lock() {
             screen_state.process(data.as_bytes());
         }
         self.runtime_output_seen.store(true, Ordering::SeqCst);
         self.last_activity_ms.store(now_millis(), Ordering::SeqCst);
         let seq_value = self.seq.fetch_add(1, Ordering::SeqCst) + 1;
-        let mut chunks = self.chunks.lock().expect("pty chunk lock poisoned");
         let mut retained = self.retained_bytes.load(Ordering::SeqCst);
         chunks.push_back(TerminalChunk {
             seq: seq_value,
@@ -3119,6 +3197,54 @@ mod tests {
             hist3_idx < clear_idx,
             "history rows must appear before the clear-screen-and-home escape"
         );
+    }
+
+    #[test]
+    fn viewport_reconcile_replay_restores_daemon_screen_and_cursor_on_desynced_client() {
+        // Daemon sees the FULL stream: absolute positioning plus the
+        // relative-cursor frame style Claude Code paints with.
+        let full_stream = "\x1b[2J\x1b[H\
+line-one on the real screen\r\n\
+line-two on the real screen\r\n\
+\x1b[5;1Hstatus row painted absolutely\
+\x1b[1;10H\x1b[K\r\x1b[1Bmid-frame relative move\x1b[K";
+        let mut daemon = TerminalScreenState::new(24, 80);
+        daemon.process(full_stream.as_bytes());
+
+        // Client attaches from a budget-truncated MID-STREAM tail (the raw
+        // retained-chunk seed): relative moves replay against the wrong
+        // origin — the pre-fix persistent hole/interleave garble.
+        let tail_start = full_stream.find("\x1b[1;10H").expect("tail marker");
+        let mut client = Vt100Parser::new(24, 80, 0);
+        client.process(full_stream[tail_start..].as_bytes());
+        assert_ne!(
+            client.screen().contents(),
+            daemon.parser.screen().contents(),
+            "a mid-stream tail replay must actually desync the client for this test to prove anything"
+        );
+
+        // The appended reconcile payload must pin the client viewport AND
+        // cursor to the daemon's authoritative screen.
+        let payload = daemon
+            .viewport_reconcile_replay()
+            .expect("reconcile payload for a non-empty screen");
+        client.process(payload.as_bytes());
+        assert_eq!(
+            client.screen().contents(),
+            daemon.parser.screen().contents(),
+            "reconcile must repaint the client viewport to daemon truth"
+        );
+        assert_eq!(
+            client.screen().cursor_position(),
+            daemon.parser.screen().cursor_position(),
+            "reconcile must restore the daemon cursor so subsequent relative diffs anchor correctly"
+        );
+    }
+
+    #[test]
+    fn viewport_reconcile_replay_is_none_for_blank_screen() {
+        let state = TerminalScreenState::new(24, 80);
+        assert!(state.viewport_reconcile_replay().is_none());
     }
 
     #[test]
@@ -4415,7 +4541,10 @@ PY"#,
             None => unsafe { std::env::remove_var("NO_COLOR") },
         }
         assert!(combined.contains("<unset>"));
-        assert!(!combined.contains("1"));
+        // Visible text only: the appended viewport-reconcile chunk carries
+        // escape params with digits; the guard is that the CHILD never saw
+        // NO_COLOR=1, i.e. no visible "1" was printed.
+        assert!(!strip_terminal_control_sequences(&combined).contains('1'));
     }
 
     #[test]
