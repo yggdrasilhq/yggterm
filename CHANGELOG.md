@@ -2,6 +2,19 @@
 
 This file tracks user-visible changes in `yggterm`.
 
+## 2.10.5
+
+- **Passkeys work in web surfaces.** WebKitGTK has no WebAuthn, so a libyggterm
+  browser (ychrome) answers `navigator.credentials` from its own vault. When a
+  site asks for a passkey, yggterm shows a native presence dialog naming the site
+  and account; approving it lets the app sign, declining refuses. The dialog is
+  the ONLY way a ceremony is answered — a page can make the prompt appear but can
+  never approve it (it never learns the request id, and the grant travels GUI→app
+  over the app's `ssh -L` control channel, not the page's network). This is a new
+  generic surface: yggterm carries the OSC `fido2 ; request` and renders the
+  dialog; the app owns the crypto, the keys, and the consent type. No challenge
+  and no key ever cross into yggterm.
+
 ## 2.10.4
 
 - **Attach no longer leaves a garbled viewport on busy Claude Code sessions.**

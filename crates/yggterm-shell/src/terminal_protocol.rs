@@ -182,6 +182,27 @@ pub(crate) enum TerminalJsEvent {
         /// Absent ⇒ the app ships no policy and its surfaces get none.
         policy_version: Option<String>,
     },
+    /// A WebAuthn passkey ceremony (OSC 7717 `fido2 ; request`) asking for the
+    /// user's presence. The app carries only the rpId and a display label — no
+    /// challenge, no key. The GUI shows a native presence dialog and, on
+    /// approval, POSTs the grant to the app's control endpoint (declared over
+    /// `sidebar` on this same stream). See `Signer` in ychrome's `passkey.rs`.
+    Fido2Request {
+        /// `request` today; room for `cancel` if an app ever retracts one.
+        action: String,
+        session: String,
+        /// Opaque per-ceremony id the app is blocking on; the grant echoes it.
+        request_id: String,
+        /// The relying party the credential is for, e.g. `github.com`.
+        rp_id: String,
+        /// A human label for the account (userName / displayName / item name).
+        account: String,
+        /// `get` (sign in) or `create` (register) — changes the dialog wording.
+        ceremony: String,
+        /// The page origin the ceremony runs on, shown so the user can see the
+        /// site asking. Diagnostic; the app already validated it against rpId.
+        origin: String,
+    },
     Ignored {
         reason: String,
         value: Value,
@@ -299,6 +320,20 @@ enum TerminalJsEventWire {
         panes: Vec<SidebarPaneDeclarationWire>,
         #[serde(default)]
         policy_version: Option<String>,
+    },
+    Fido2Request {
+        action: String,
+        session: String,
+        #[serde(default)]
+        request_id: String,
+        #[serde(default)]
+        rp_id: String,
+        #[serde(default)]
+        account: String,
+        #[serde(default)]
+        ceremony: String,
+        #[serde(default)]
+        origin: String,
     },
 }
 
@@ -429,6 +464,23 @@ impl From<TerminalJsEventWire> for TerminalJsEvent {
                         title: pane.title,
                     })
                     .collect(),
+            },
+            TerminalJsEventWire::Fido2Request {
+                action,
+                session,
+                request_id,
+                rp_id,
+                account,
+                ceremony,
+                origin,
+            } => TerminalJsEvent::Fido2Request {
+                action,
+                session,
+                request_id,
+                rp_id,
+                account,
+                ceremony,
+                origin,
             },
         }
     }
