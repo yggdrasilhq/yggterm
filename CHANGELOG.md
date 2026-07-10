@@ -7,13 +7,22 @@ This file tracks user-visible changes in `yggterm`.
 - **Passkeys work in web surfaces.** WebKitGTK has no WebAuthn, so a libyggterm
   browser (ychrome) answers `navigator.credentials` from its own vault. When a
   site asks for a passkey, yggterm shows a native presence dialog naming the site
-  and account; approving it lets the app sign, declining refuses. The dialog is
-  the ONLY way a ceremony is answered — a page can make the prompt appear but can
-  never approve it (it never learns the request id, and the grant travels GUI→app
-  over the app's `ssh -L` control channel, not the page's network). This is a new
-  generic surface: yggterm carries the OSC `fido2 ; request` and renders the
-  dialog; the app owns the crypto, the keys, and the consent type. No challenge
-  and no key ever cross into yggterm.
+  and account; approving it lets the app sign, declining refuses. When you have
+  **several passkeys for a site** (two GitHub accounts, say), the dialog is a
+  picker — it lists every account and you choose which to sign in as. The dialog
+  is the ONLY way a ceremony is answered — a page can make the prompt appear but
+  can never approve it (it never learns the request id, and the grant travels
+  GUI→app over the app's `ssh -L` control channel, not the page's network). While
+  it is up, the web surface is hidden so the prompt is actually visible (a native
+  surface otherwise draws over the dialog). This is a new generic surface:
+  yggterm carries the OSC `fido2 ; request` and renders the dialog; the app owns
+  the crypto, the keys, and the consent type. No challenge and no key ever cross
+  into yggterm. Proven end-to-end against webauthn.io: register, then sign in.
+- **New `yggterm-appctl://` bridge.** WebKitGTK blocks an https page from
+  fetching `http://127.0.0.1`, so an app's in-page shim could not reach its own
+  control endpoint. yggterm now registers a secure custom scheme per surface and
+  proxies it (asynchronously) to the app's control endpoint — the mechanism the
+  passkey shim rides.
 
 ## 2.10.4
 
