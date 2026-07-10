@@ -65,6 +65,7 @@ pub fn perf_span_is_high_frequency_noise(category: &str, name: &str) -> bool {
             | ("daemon_request", "terminal_read")
             | ("daemon_request", "terminal_write")
             | ("daemon_request", "terminal_snapshot")
+            | ("daemon_request", "working_flags")
     )
 }
 
