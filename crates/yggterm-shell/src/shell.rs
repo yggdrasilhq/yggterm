@@ -2120,6 +2120,12 @@ async fn web_surface_native_reconcile_loop(
                         ),
                         _ => (Vec::new(), None),
                     };
+                    // The app's GUI-reachable control endpoint (ssh -L-resolved
+                    // for a remote app), so an in-page shim can reach it through
+                    // the `yggterm-appctl://` bridge without tripping WebKit's
+                    // https→http mixed-content block. None ⇒ no app contribution,
+                    // so no bridge (a plain web page needs none).
+                    let signer_base = state.peek().sidebar_control_url(&session_path);
                     match desktop.open_web_surface(
                         native_id,
                         &effective_url,
@@ -2127,6 +2133,7 @@ async fn web_surface_native_reconcile_loop(
                         profile_dir.as_deref(),
                         &userscripts,
                         adblock_ruleset.as_deref(),
+                        signer_base.as_deref(),
                         rect.0,
                         rect.1,
                         rect.2,
