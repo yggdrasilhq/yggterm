@@ -282,13 +282,46 @@ injects, and yggterm persists none of it. A `RightPanelMode` for an app's
 settings is still the anti-pattern; the settings pane is an app contribution
 like any other. Mechanics: "Shipping a policy the GUI must apply", above.
 
-Menu contributions (the titlebar `+` menu) are the same idea for a different
-surface: an app-registry the shell reads instead of hardcoded arms — see
-[[project-libyggterm-app-menu-contribution]]. ALT+/KeyTips is the keyboard
-surface — spec finalized 2026-07-10, see [[campaign-alt-keytips-layer]]
-(reserved-letters namespace: shell KeyTips use only non-Excel letters; apps
-claim Excel's F,H,N,P,M,A,R,W,X,Y,Q; command-registry SSOT, contributions
-ride OSC 7717 ids).
+ALT+/KeyTips is the keyboard surface — spec finalized 2026-07-10, see
+[[campaign-alt-keytips-layer]] (reserved-letters namespace: shell KeyTips use
+only non-Excel letters; apps claim Excel's F,H,N,P,M,A,R,W,X,Y,Q;
+command-registry SSOT, contributions ride OSC 7717 ids).
+
+## The launcher registry — SHIPPED 2026-07-10
+
+A fifth surface, and the only one that does NOT ride OSC 7717: an app that is
+merely *installed* must appear in the menus, whether or not it is running.
+
+An app writes a manifest to **its own host** on every run:
+
+```text
+~/.yggterm/apps/<name>.json
+{ "name": "ychrome", "label": "Ychrome", "icon": "",
+  "binary": "/home/pi/.local/bin/ychrome",
+  "verbs": [ { "id": "new", "label": "New Ychrome", "args": [] } ] }
+```
+
+- The host's **daemon** scans the directory, checks each `binary` still resolves,
+  and **deletes the manifests of apps that are gone**. That is the entire
+  uninstall story; the GUI keeps no registry of its own. It rides
+  `ServerUiSnapshot::apps`, so menus are per-host by construction — an app on
+  `dev` but not `jojo` appears on `dev` viewports only.
+- `binary` must be **absolute**. A verb is launched by opening a terminal session
+  and typing the command, and a fresh PTY has no login shell's `PATH` (the same
+  trap that makes `ychrome` "not found" over `terminal send`).
+- `name` must equal the file stem, or the manifest is ignored — one app cannot
+  squat another's entry. A malformed manifest is ignored, never deleted: it may
+  belong to a newer yggterm.
+- Writing on **every run** is what repairs the recorded path after an upgrade.
+
+GUI side: `app_launcher_entries(&snapshot.apps)` is the ONE derivation. The
+titlebar `+` menu, the cwd-tree context menu and the start page all render it,
+and `spawn_launch_app_verb` is the one launcher. Adding a surface must never mean
+copying the list. The split-group compound-row menu joins them when it ships.
+
+The hardcoded "New Paper" entries are **deleted** — Paper was never a libyggterm
+app, just a stub the shell knew about. It comes back as a registry entry when a
+Paper app ships one. Full design: [[project-libyggterm-app-menu-contribution]].
 
 ## Worked example: the password vault as an ychrome-owned surface
 

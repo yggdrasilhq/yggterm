@@ -2,6 +2,34 @@
 
 This file tracks user-visible changes in `yggterm`.
 
+## 2.10.3
+
+- **yggterm now contains zero app-specific chrome.** `RightPanelMode::AppSidebar`
+  is deleted, following `::Vault`. Ad blocking and userscripts belonged to
+  ychrome all along: the GUI used to read `~/.yggterm/web-adblock/*` and
+  `web-userscripts/*` off **its own** disk, which meant an ychrome running over
+  ssh was editing files nothing ever read. The app now serves its effective
+  policy from its control endpoint (`GET /policy`, refetched only when a
+  stat-only `policy_version` stamp moves), and the GUI applies it. A surface's
+  creation waits for that policy, because a userscript only injects at
+  document-start. yggterm persists nothing but a content-addressed
+  compiled-filter cache, which WebKit requires.
+- **New: an action reply may ask for `reload_surface`.** A content filter and its
+  userscripts bind to the webview at creation, so `location.reload()` cannot
+  detach them — turning ad blocking off appeared to do nothing. The GUI now
+  refetches the policy and recreates the surface.
+- **The launcher menus are registry-driven.** The titlebar `+` menu, the cwd-tree
+  context menu and the start page's "New …" buttons now read one registry:
+  `~/.yggterm/apps/*.json`, written by each libyggterm app on its own host. The
+  daemon scans it, checks each binary still resolves, and **prunes the manifests
+  of apps that are gone** — so uninstalling an app removes it from every menu.
+  Menus are therefore per-host: an app installed on `dev` but not `jojo` appears
+  on `dev` viewports only. ychrome ships the first manifest ("New Ychrome", "New
+  Ychrome (Incognito)").
+- **Removed: the hardcoded "New Paper" entries** (titlebar, both context menus,
+  the ALT+I,P KeyTip). Paper was never a libyggterm app; it was a stub the shell
+  knew about. It returns as a registry entry when a Paper app ships one.
+
 ## 2.10.2
 
 - **Fixed: the working dot no longer lags 10–45 s behind a finished agent.**
