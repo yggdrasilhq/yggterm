@@ -350,6 +350,33 @@ user's consent — the human is at the GUI. So a *fourth* thing crosses OSC 7717
   `fido2.rs`), the keys, and the consent type (`UserPresence`, mintable only after
   a grant). Anti-pattern to avoid: a "sign this passkey" agent/CLI op — it would
   be a silent auto-consent path. The signer lives behind the dialog.
+- **Account picker.** A `get()` where several stored passkeys match the RP is a
+  CHOICE, not an auto-pick (the vault's alphabetical auto-match footgun must not
+  reach passkeys). The OSC carries `accounts:[{credential_id,label}]`; one entry ⇒
+  a plain Approve, several ⇒ the dialog lists them and the grant echoes the chosen
+  `credential_id`, which the signer signs. A chosen id the resolver did not offer
+  is refused.
+- **The dialog must HIDE the web surface** while it is up. A native child webview
+  draws above ALL DOM (`finding-native-web-surface-cannot-resize-and-screenshot-lied`),
+  so a Dioxus modal renders *behind* the page — invisible to the user, who then
+  reports "no prompt appeared." The reconciler gates surface visibility on
+  `pending_fido2.is_some()`; the ceremony takes over the viewport like a real OS
+  passkey prompt, and the surface returns when the dialog clears. Verify this with
+  an `--backend os` capture, not `app screenshot` (which is blind to the surface).
+
+### The `yggterm-appctl://` bridge — an in-page shim reaching its own app
+
+WebKitGTK blocks an https page from `fetch`-ing `http://127.0.0.1` (mixed
+content), so an app's in-page shim (the passkey `navigator.credentials` polyfill)
+cannot reach its control endpoint directly — every call dies with "Load failed",
+a failure ONLY live E2E surfaces (unit tests never load an https origin). yggterm
+registers a **secure custom scheme** `yggterm-appctl://` per surface and proxies
+it — *asynchronously*, off the GTK main thread — to the app's GUI-reachable
+control endpoint (the ssh -L-resolved `sidebar_control_url`). Async is
+load-bearing: a `/fido2/get` blocks up to two minutes for the presence dialog,
+which lives on that same thread. The app's shim fetches `yggterm-appctl://signer/…`
+instead of a raw loopback URL; the bearer token still gates. Mechanism:
+`app_control_proxy` in vendored `dioxus-desktop/web_surface.rs`.
 
 ## Worked example: the password vault as an ychrome-owned surface
 
