@@ -805,9 +805,6 @@ const SELF_UPDATE_JOB_KEY: &str = "self-update";
 const UPDATE_RESTART_STALE_AFTER_MS: u64 = 2 * 24 * 60 * 60 * 1000;
 const TITLEBAR_AUTOHIDE_SENSOR_HEIGHT_PX: f64 = 6.0;
 const TITLEBAR_AUTOHIDE_LINGER_MS: u64 = 420;
-/// Narrowest reveal zone the auto-hide sensor ever offers, so a web surface that
-/// owns the top edge can never make the titlebar unreachable.
-const TITLEBAR_AUTOHIDE_SENSOR_MIN_REVEAL_PX: f64 = 56.0;
 const UPDATE_CTA_CSS: &str = r#"
 @keyframes yggterm-update-ellipsis-pulse {
   0%, 20% { opacity: 0.28; }
@@ -21380,32 +21377,19 @@ fn titlebar_autohide_revealed(
 ) -> bool {
     !auto_hide_enabled || hover_active || pinned || linger_active
 }
-/// How far right of the window edge the auto-hide sensor may still reveal the
-/// titlebar while a web surface owns the top edge.
+/// Reveal the auto-hidden titlebar and cancel any pending hide.
 ///
-/// Normally that is the left sidebar's columns. With the sidebar CLOSED there
-/// are none, and returning 0 made the titlebar UNREACHABLE for as long as a
-/// surface was active (every `x > 0` counted as the app's page area). Keep a
-/// small gutter so there is always somewhere to grab it; it sits left of the
-/// first tab, and aiming at a tab never reaches the 6px sensor anyway.
-fn titlebar_autohide_reveal_limit_px(sidebar_open: bool, sidebar_width: f64) -> f64 {
-    if sidebar_open {
-        sidebar_width.max(TITLEBAR_AUTOHIDE_SENSOR_MIN_REVEAL_PX)
-    } else {
-        TITLEBAR_AUTOHIDE_SENSOR_MIN_REVEAL_PX
-    }
-}
-/// May a pointer at `pointer_x` reveal the auto-hidden titlebar?
-///
-/// A visible web surface owns the top edge over its page area (its tab bar sits
-/// exactly where the revealed titlebar would overlay), so only the columns left
-/// of `reveal_limit_px` reveal there. With no surface, the whole edge reveals.
-fn titlebar_autohide_pointer_may_reveal(
-    web_surface_owns_top_edge: bool,
-    pointer_x: f64,
-    reveal_limit_px: f64,
-) -> bool {
-    !web_surface_owns_top_edge || pointer_x <= reveal_limit_px
+/// The ONE writer of "the pointer is on the top edge". Bumping the generation
+/// retires the in-flight linger task so a re-entry during the grace window is not
+/// hidden out from under the pointer 420ms later.
+fn titlebar_autohide_reveal(
+    mut hovered: Signal<bool>,
+    mut lingering: Signal<bool>,
+    mut linger_generation: Signal<u64>,
+) {
+    linger_generation.set(linger_generation() + 1);
+    hovered.set(true);
+    lingering.set(false);
 }
 fn titlebar_autohide_chrome_background_color(
     palette: Palette,
@@ -45036,16 +45020,6 @@ fn app() -> Element {
         titlebar_reveal_pinned,
         titlebar_autohide_lingering(),
     );
-    // A visible web surface owns the top edge: its tab bar sits exactly where
-    // the revealed titlebar overlays, so an auto-hide reveal there makes tabs
-    // unclickable (aiming at a tab overshoots into the 6px sensor, the
-    // titlebar slides over the tab bar, and the click lands on the titlebar).
-    // While a surface is active the sensor only reveals over the LEFT SIDEBAR
-    // columns — the page-area top edge belongs to the app.
-    let web_surface_owns_top_edge = snapshot.active_web_surface_profile.is_some()
-        && snapshot.active_view_mode == WorkspaceViewMode::Terminal;
-    let titlebar_reveal_limit_px =
-        titlebar_autohide_reveal_limit_px(snapshot.sidebar_open, snapshot.sidebar_width as f64);
     let preferred_agent_kind = preferred_agent_session_kind(&snapshot.settings);
     let maximized = snapshot.maximized;
     let fullscreen = snapshot.fullscreen;
@@ -45445,53 +45419,49 @@ fn app() -> Element {
                             evt.prevent_default();
                             evt.stop_propagation();
                         },
-                        onmouseenter: move |evt| {
-                            if titlebar_auto_hide_enabled
-                                && titlebar_autohide_pointer_may_reveal(
-                                    web_surface_owns_top_edge,
-                                    evt.client_coordinates().x,
-                                    titlebar_reveal_limit_px,
-                                )
-                            {
-                                titlebar_autohide_linger_generation
-                                    .set(titlebar_autohide_linger_generation() + 1);
-                                titlebar_autohide_hovered.set(true);
-                                titlebar_autohide_lingering.set(false);
+                        // The whole top edge reveals, over every viewport — the
+                        // titlebar is yggterm's chrome and un-hiding it is an
+                        // explicit user intent. A libyggterm app's viewport is not
+                        // special: whoever reaches for the top edge wants the
+                        // titlebar, and whoever wants the app's tab bar simply does
+                        // not go there. (ychrome's page area used to be exempt,
+                        // which made the titlebar unreachable over it and produced
+                        // a reveal that depended on where along the edge you
+                        // entered — user-rejected 2026-07-10.)
+                        onmouseenter: move |_| {
+                            if titlebar_auto_hide_enabled {
+                                titlebar_autohide_reveal(
+                                    titlebar_autohide_hovered,
+                                    titlebar_autohide_lingering,
+                                    titlebar_autohide_linger_generation,
+                                );
                             }
                         },
-                        // `mouseenter` fires ONCE, at the point of entry. Sliding
-                        // along the 6px sensor from the app's page area into the
-                        // sidebar columns therefore never revealed the titlebar —
-                        // you had to leave the strip and re-enter it. Re-evaluate
-                        // on move, but only while still hidden, so a revealed
-                        // titlebar costs no signal writes as the pointer crosses it.
-                        onmousemove: move |evt| {
-                            if !titlebar_auto_hide_enabled || titlebar_autohide_hovered() {
-                                return;
-                            }
-                            if titlebar_autohide_pointer_may_reveal(
-                                web_surface_owns_top_edge,
-                                evt.client_coordinates().x,
-                                titlebar_reveal_limit_px,
-                            ) {
-                                titlebar_autohide_linger_generation
-                                    .set(titlebar_autohide_linger_generation() + 1);
-                                titlebar_autohide_hovered.set(true);
-                                titlebar_autohide_lingering.set(false);
+                        // `mouseenter` fires ONCE, at the point of entry. If the
+                        // collapsing titlebar shrinks out from under a resting
+                        // pointer, no further enter ever arrives — so a move inside
+                        // the sensor re-reveals. Early-returns once revealed, so a
+                        // revealed titlebar costs no signal writes as the pointer
+                        // crosses it.
+                        onmousemove: move |_| {
+                            if titlebar_auto_hide_enabled && !titlebar_autohide_hovered() {
+                                titlebar_autohide_reveal(
+                                    titlebar_autohide_hovered,
+                                    titlebar_autohide_lingering,
+                                    titlebar_autohide_linger_generation,
+                                );
                             }
                         },
                         onmouseleave: move |_| {
                             if !titlebar_auto_hide_enabled {
                                 return;
                             }
-                            // The pointer can cross the sensor without ever
-                            // revealing the titlebar: over a web surface the page
-                            // area owns the top edge, so `onmouseenter` refuses to
-                            // reveal there. Leaving must then be a NO-OP. `linger`
-                            // ALONE satisfies `titlebar_autohide_revealed`, so
-                            // starting the grace here flashed the titlebar open for
-                            // 420ms every time the cursor crossed the top edge of a
-                            // ychrome page — the reported hide/unhide loop.
+                            // Leaving without ever having revealed must be a
+                            // NO-OP. `linger` ALONE satisfies
+                            // `titlebar_autohide_revealed`, so starting the grace
+                            // here flashed the titlebar open for 420ms whenever the
+                            // pointer merely crossed the sensor — the reported
+                            // hide/unhide loop.
                             if !titlebar_autohide_hovered() {
                                 if titlebar_autohide_lingering() {
                                     titlebar_autohide_lingering.set(false);
@@ -85596,10 +85566,9 @@ mod tests {
         ));
     }
     // `linger` ALONE reveals the titlebar. That is why `onmouseleave` must never
-    // start the linger grace unless the titlebar was actually hover-revealed:
-    // over a ychrome page the top edge belongs to the app, `onmouseenter` refuses
-    // to reveal there, and lingering on the way out flashed the titlebar open for
-    // 420ms every time the cursor crossed it (user-reported hide/unhide loop).
+    // start the linger grace unless the titlebar was actually hover-revealed —
+    // otherwise a pointer that merely crosses the sensor flashes it open for
+    // 420ms on the way out (the user-reported hide/unhide loop).
     #[test]
     fn titlebar_autohide_linger_alone_reveals() {
         let (hovered, pinned, lingering) = (false, false, true);
@@ -85609,34 +85578,27 @@ mod tests {
         assert!(titlebar_autohide_revealed(false, false, false, false));
     }
 
-    // The app owns the top edge over its page area, but never ALL of it: a
-    // sidebar-less web surface used to leave `reveal_limit = 0`, so every
-    // `x > 0` counted as the page area and the titlebar became unreachable.
+    // The titlebar is yggterm's chrome, and reaching for the top edge is an
+    // explicit user intent. NO viewport is exempt — a libyggterm app's page area
+    // is not special. The reveal predicate takes no pointer position at all, so a
+    // position-dependent exemption cannot be reintroduced without changing this
+    // signature. (ychrome's page area was once exempt: it made the titlebar
+    // unreachable over the app and made reveal depend on where along the edge you
+    // entered. User-rejected 2026-07-10.)
     #[test]
-    fn titlebar_autohide_reveal_zone_is_never_empty() {
-        // Sidebar open: its columns are the reveal zone.
-        assert_eq!(titlebar_autohide_reveal_limit_px(true, 273.0), 273.0);
-        // Sidebar closed: a minimum gutter remains, never zero.
-        assert_eq!(
-            titlebar_autohide_reveal_limit_px(false, 273.0),
-            TITLEBAR_AUTOHIDE_SENSOR_MIN_REVEAL_PX
-        );
-        // A pathologically narrow sidebar still leaves something to grab.
-        assert_eq!(
-            titlebar_autohide_reveal_limit_px(true, 4.0),
-            TITLEBAR_AUTOHIDE_SENSOR_MIN_REVEAL_PX
-        );
-    }
-
-    #[test]
-    fn titlebar_autohide_reveal_zone_respects_the_apps_page_area() {
-        // No web surface: the whole top edge reveals.
-        assert!(titlebar_autohide_pointer_may_reveal(false, 1_600.0, 273.0));
-        // Web surface: the sidebar columns reveal, its page area does not.
-        assert!(titlebar_autohide_pointer_may_reveal(true, 100.0, 273.0));
-        assert!(titlebar_autohide_pointer_may_reveal(true, 273.0, 273.0));
-        assert!(!titlebar_autohide_pointer_may_reveal(true, 274.0, 273.0));
-        assert!(!titlebar_autohide_pointer_may_reveal(true, 1_600.0, 273.0));
+    fn titlebar_autohide_reveal_is_not_gated_on_where_the_pointer_entered() {
+        let source = include_str!("shell.rs");
+        let implementation = source.split("\nmod tests {").next().unwrap_or(source);
+        for banned in [
+            "web_surface_owns_top_edge",
+            "titlebar_autohide_pointer_may_reveal",
+            "titlebar_autohide_reveal_limit_px",
+        ] {
+            assert!(
+                !implementation.contains(banned),
+                "{banned} re-introduces a viewport-dependent titlebar reveal",
+            );
+        }
     }
 
     #[test]
