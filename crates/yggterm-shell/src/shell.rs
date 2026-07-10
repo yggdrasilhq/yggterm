@@ -15079,6 +15079,21 @@ fn current_daemon_is_reachable(endpoint: &ServerEndpoint, stage: &'static str) -
                 current_version().as_str(),
             ) =>
         {
+            // This branch is hit by EVERY daemon request while a hot update is
+            // pending (the GUI polls at ~150ms), and an unthrottled emission
+            // flooded event-trace.jsonl at ~7Hz for the whole pending window
+            // (guihost 2026-07-10: 433 events in 28 min). The state is constant
+            // while pending, so one trace per 10s per process loses nothing.
+            static LAST_PENDING_TRACE_MS: AtomicU64 = AtomicU64::new(0);
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|elapsed| elapsed.as_millis() as u64)
+                .unwrap_or(0);
+            let last_ms = LAST_PENDING_TRACE_MS.load(Ordering::Relaxed);
+            if now_ms.saturating_sub(last_ms) < 10_000 {
+                return false;
+            }
+            LAST_PENDING_TRACE_MS.store(now_ms, Ordering::Relaxed);
             trace_daemon_step(
                 endpoint,
                 "hot_update_pending_preserve_live_daemon",
@@ -17448,11 +17463,10 @@ fn spawn_set_view_mode(mut state: Signal<ShellState>, mode: WorkspaceViewMode) {
     });
     if mode == WorkspaceViewMode::Terminal {
         apply_active_terminal_zoom(state);
-        if let Some(session_path) = state
-            .read()
-            .server
-            .active_session_path()
-            .map(str::to_string)
+        if let Some(session_path) = safe_shell_read(state, "set_view_mode_focus_path", |shell| {
+            shell.server.active_session_path().map(str::to_string)
+        })
+        .flatten()
         {
             schedule_terminal_focus_after_activation(state, session_path);
         }
@@ -54826,6 +54840,10 @@ fn TerminalCanvas(
             let mut traced_first_meaningful_output = false;
             let mut traced_attach_ready = false;
             let mut traced_terminal_control_output = false;
+            // PROBE state: throttle for terminal_forward_divergence (see the
+            // batch_terminal_chunks call site) and write-send failure traces.
+            let mut last_forward_divergence_trace_ms = 0u64;
+            let mut last_write_send_failure_trace_ms = 0u64;
             let mut remote_resume_meaningful_observations = 0_u64;
             let mut remote_resume_prompt_only_observed = false;
             let mut remote_resume_codex_rejected_surface_observed = false;
@@ -58277,6 +58295,8 @@ fn TerminalCanvas(
                                     input_echo_read_burst_remaining = next_burst_remaining;
                                     next_poll_ms
                                 };
+                                let raw_batch_bytes: usize =
+                                    chunks.iter().map(|chunk| chunk.data.len()).sum();
                                 let (
                                     batched_output,
                                     saw_visible_output,
@@ -58287,6 +58307,47 @@ fn TerminalCanvas(
                                     saw_attach_ready_marker,
                                 ) =
                                     batch_terminal_chunks(chunks);
+                                // PROBE terminal_forward_divergence: the batch
+                                // sanitizers (transport-noise strip, resume-banner
+                                // strip, low-signal strip, `lines()`-rejoin) can
+                                // REWRITE or fully DROP live PTY bytes before they
+                                // reach xterm. Byte-loss here is invisible in every
+                                // other instrument (daemon screen stays correct, no
+                                // resync flags) and is a candidate mechanism for the
+                                // client-buffer hole/interleave garble (guihost
+                                // 2026-07-10). Trace whenever forwarded bytes differ
+                                // from raw daemon bytes so the next investigation
+                                // can correlate divergence with garble moments.
+                                {
+                                    let forwarded_bytes =
+                                        batched_output.as_deref().map(str::len).unwrap_or(0);
+                                    let diverged = match batched_output.as_deref() {
+                                        Some(data) => data.len() != raw_batch_bytes,
+                                        None => raw_batch_bytes > 0,
+                                    };
+                                    let now_ms = current_millis();
+                                    if diverged
+                                        && !saw_attach_ready_marker
+                                        && now_ms.saturating_sub(
+                                            last_forward_divergence_trace_ms,
+                                        ) >= 2_000
+                                    {
+                                        last_forward_divergence_trace_ms = now_ms;
+                                        append_trace_event(
+                                            &trace_home,
+                                            "ui",
+                                            "terminal_mount",
+                                            "terminal_forward_divergence",
+                                            json!({
+                                                "session_path": session_path.clone(),
+                                                "cursor": cursor,
+                                                "raw_bytes": raw_batch_bytes,
+                                                "forwarded_bytes": forwarded_bytes,
+                                                "dropped_entirely": batched_output.is_none(),
+                                            }),
+                                        );
+                                    }
+                                }
                                 if let Some(excerpt) = batched_output
                                     .as_deref()
                                     .and_then(terminal_resume_output_excerpt)
@@ -59018,8 +59079,18 @@ fn TerminalCanvas(
                                                     write.len(),
                                                     current_millis(),
                                                 );
-                                                let _ =
-                                                    eval.send(TerminalJsCommand::Write { data: write });
+                                                let write_len = write.len();
+                                                if eval
+                                                    .send(TerminalJsCommand::Write { data: write })
+                                                    .is_err()
+                                                {
+                                                    trace_terminal_write_send_failure(
+                                                        &trace_home,
+                                                        &session_path,
+                                                        write_len,
+                                                        &mut last_write_send_failure_trace_ms,
+                                                    );
+                                                }
                                             }
                                             set_signal_if_changed(
                                                 terminal_resume_surface_staged,
@@ -59104,9 +59175,20 @@ fn TerminalCanvas(
                                                         write.len(),
                                                         current_millis(),
                                                     );
-                                                    let _ = eval.send(TerminalJsCommand::Write {
-                                                        data: write,
-                                                    });
+                                                    let write_len = write.len();
+                                                    if eval
+                                                        .send(TerminalJsCommand::Write {
+                                                            data: write,
+                                                        })
+                                                        .is_err()
+                                                    {
+                                                        trace_terminal_write_send_failure(
+                                                            &trace_home,
+                                                            &session_path,
+                                                            write_len,
+                                                            &mut last_write_send_failure_trace_ms,
+                                                        );
+                                                    }
                                                 }
                                                 frame_budgeted_terminal_output =
                                                     frame_budgeted_terminal_output
@@ -61920,6 +62002,31 @@ fn strip_orphaned_terminal_replay_transport_close_lines(data: &str) -> String {
     }
 }
 
+/// PROBE terminal_write_send_failed: an `eval.send(Write)` failure silently
+/// loses PTY bytes the cursor has already advanced past — a permanent client
+/// buffer hole with zero telemetry. Throttled to one trace per 2s per mount.
+fn trace_terminal_write_send_failure(
+    trace_home: &std::path::Path,
+    session_path: &str,
+    write_len: usize,
+    last_trace_ms: &mut u64,
+) {
+    let now_ms = current_millis();
+    if now_ms.saturating_sub(*last_trace_ms) < 2_000 {
+        return;
+    }
+    *last_trace_ms = now_ms;
+    append_trace_event(
+        trace_home,
+        "ui",
+        "terminal_mount",
+        "terminal_write_send_failed",
+        json!({
+            "session_path": session_path,
+            "bytes_lost": write_len,
+        }),
+    );
+}
 fn strip_internal_terminal_transport_noise_lines(data: &str) -> String {
     let lower = data.to_ascii_lowercase();
     if !lower.contains("terminal session not found")
@@ -64703,9 +64810,14 @@ fn apply_active_terminal_input_policy(
     ));
 }
 fn sync_active_terminal_input_policy(state: Signal<ShellState>) {
-    let signature = {
-        let shell = state.read();
-        active_terminal_input_policy_signature(&shell)
+    // safe_shell_read, not a raw borrow: this runs inside click handlers
+    // (schedule_terminal_focus_after_activation) that can re-enter while a
+    // write borrow is live — a raw read here panicked the GUI with
+    // AlreadyBorrowed (panic.log 2026-06-22 / 2026-07-07).
+    let Some(signature) = safe_shell_read(state, "sync_active_terminal_input_policy", |shell| {
+        active_terminal_input_policy_signature(shell)
+    }) else {
+        return;
     };
     // Manual resync (titlebar dismiss, etc.) is not a foreground transition.
     apply_active_terminal_input_policy(&signature, false);
