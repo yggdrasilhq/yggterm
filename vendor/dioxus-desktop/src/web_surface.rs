@@ -19,12 +19,20 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::io::{Read as _, Write as _};
 
 use gtk::prelude::*;
 use wry::{
     dpi::{LogicalPosition, LogicalSize, Position, Size},
-    ProxyConfig, ProxyEndpoint, Rect, WebContext, WebViewBuilder,
+    http::{Request, Response},
+    ProxyConfig, ProxyEndpoint, Rect, RequestAsyncResponder, WebContext, WebViewBuilder,
 };
+
+/// The custom URI scheme an app's in-page shim uses to reach its own control
+/// endpoint from inside a surface, bypassing WebKit's https→http mixed-content
+/// block. The GUI registers it as SECURE and proxies it to the app's
+/// GUI-reachable control endpoint. See `app_control_proxy`.
+const APP_CONTROL_SCHEME: &str = "yggterm-appctl";
 
 struct Surface {
     // The overlay child that positions the webview. wry `build_gtk`s the webview
@@ -227,6 +235,7 @@ impl WebSurfaceHost {
         profile_dir: Option<&std::path::Path>,
         userscripts: &[String],
         adblock_ruleset: Option<&std::path::Path>,
+        signer_base: Option<&str>,
         x: i32,
         y: i32,
         w: i32,
@@ -271,6 +280,25 @@ impl WebSurfaceHost {
         }
         for script in userscripts {
             builder = builder.with_initialization_script_for_main_only(script.as_str(), true);
+        }
+
+        // App-control bridge from inside a surface. WebKitGTK blocks an https
+        // page from `fetch`-ing `http://127.0.0.1` (mixed content), so an app's
+        // in-page shim (e.g. the passkey `navigator.credentials` polyfill) cannot
+        // reach its own control endpoint directly. This registers a SECURE custom
+        // scheme `yggterm-appctl://` that the GUI proxies to the app's
+        // GUI-reachable control endpoint (already `ssh -L`-resolved for a remote
+        // app). Async: a `/fido2/get` blocks up to two minutes for the presence
+        // dialog, so the forward runs off the GTK main thread — a blocking handler
+        // would freeze the very dialog it is waiting on.
+        if let Some(base) = signer_base {
+            let base = base.trim_end_matches('/').to_string();
+            builder = builder.with_asynchronous_custom_protocol(
+                APP_CONTROL_SCHEME.to_string(),
+                move |_webview_id, request, responder| {
+                    app_control_proxy(base.clone(), request, responder);
+                },
+            );
         }
 
         let webview = {
@@ -470,4 +498,122 @@ impl WebSurfaceHost {
         );
         Ok(())
     }
+}
+
+/// Proxy one `yggterm-appctl://` request to the app's control endpoint `base`
+/// (e.g. `http://127.0.0.1:38749`, already GUI-reachable). Runs on the GTK main
+/// thread when called, so the blocking forward is moved to its own thread and
+/// answers through the async `responder` — a `/fido2/get` blocks up to two
+/// minutes waiting for the presence dialog, which lives on this very thread.
+fn app_control_proxy(base: String, request: Request<Vec<u8>>, responder: RequestAsyncResponder) {
+    // A cross-origin fetch from the RP's https page preflights; answer OPTIONS
+    // ourselves rather than forwarding it.
+    if request.method() == "OPTIONS" {
+        responder.respond(cors_response(204, Vec::new()));
+        return;
+    }
+    // Path (+ query) is what the app's control server routes on; the scheme host
+    // is ignored (the app is identified by `base`, one per surface).
+    let mut path = request.uri().path().to_string();
+    if let Some(query) = request.uri().query() {
+        path.push('?');
+        path.push_str(query);
+    }
+    let method = request.method().as_str().to_string();
+    // Forward only the headers the signer cares about — the bearer token gate and
+    // the content type. Everything else (Origin, Sec-*, etc.) is browser noise.
+    let token = request
+        .headers()
+        .get("X-Ychrome-Fido2")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
+    let content_type = request
+        .headers()
+        .get("Content-Type")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("application/json")
+        .to_string();
+    let body = request.into_body();
+
+    std::thread::spawn(move || {
+        let (status, payload) = match forward_to_control(&base, &method, &path, &content_type, token.as_deref(), &body) {
+            Ok(result) => result,
+            Err(error) => (
+                502,
+                format!("{{\"error\":\"app control unreachable: {error}\"}}").into_bytes(),
+            ),
+        };
+        responder.respond(cors_response(status, payload));
+    });
+}
+
+/// One blocking HTTP request to `base` (`http://host:port`), returning the status
+/// and body. Hand-rolled over `TcpStream` — the app's control server is dep-light
+/// and one request at a time, and this mirrors the shell's own `control_request`.
+fn forward_to_control(
+    base: &str,
+    method: &str,
+    path: &str,
+    content_type: &str,
+    token: Option<&str>,
+    body: &[u8],
+) -> Result<(u16, Vec<u8>), String> {
+    let authority = base
+        .strip_prefix("http://")
+        .ok_or_else(|| "control base must be http://".to_string())?;
+    let (host, port) = match authority.split_once(':') {
+        Some((host, port)) => (host, port.parse::<u16>().map_err(|_| "bad port".to_string())?),
+        None => (authority, 80),
+    };
+    let mut stream = std::net::TcpStream::connect((host, port)).map_err(|e| e.to_string())?;
+    // A get() ceremony can wait two minutes for the user; give the read room.
+    let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(180)));
+    let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(30)));
+
+    let mut head = format!(
+        "{method} {path} HTTP/1.1\r\nHost: {host}:{port}\r\nConnection: close\r\n"
+    );
+    if !body.is_empty() || method == "POST" {
+        head.push_str(&format!("Content-Type: {content_type}\r\n"));
+        head.push_str(&format!("Content-Length: {}\r\n", body.len()));
+    }
+    if let Some(token) = token {
+        head.push_str(&format!("X-Ychrome-Fido2: {token}\r\n"));
+    }
+    head.push_str("\r\n");
+
+    stream.write_all(head.as_bytes()).map_err(|e| e.to_string())?;
+    stream.write_all(body).map_err(|e| e.to_string())?;
+    stream.flush().map_err(|e| e.to_string())?;
+
+    let mut raw = Vec::new();
+    stream.read_to_end(&mut raw).map_err(|e| e.to_string())?;
+    let split = raw
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .ok_or_else(|| "no header/body split".to_string())?;
+    let head = String::from_utf8_lossy(&raw[..split]);
+    let status = head
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|code| code.parse::<u16>().ok())
+        .unwrap_or(502);
+    Ok((status, raw[split + 4..].to_vec()))
+}
+
+/// A JSON response with the CORS headers the RP's https page needs to read a
+/// cross-origin custom-scheme reply. CORS is not the security boundary here (the
+/// bearer token and the request-id are), and the shim sends no credentials, so
+/// `*` is safe.
+fn cors_response(status: u16, body: Vec<u8>) -> Response<Vec<u8>> {
+    Response::builder()
+        .status(status)
+        .header("Content-Type", "application/json")
+        .header("Access-Control-Allow-Origin", "*")
+        .header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        .header("Access-Control-Allow-Headers", "Content-Type, X-Ychrome-Fido2")
+        .header("Cache-Control", "no-store")
+        .body(body)
+        .unwrap_or_else(|_| Response::new(Vec::new()))
 }
