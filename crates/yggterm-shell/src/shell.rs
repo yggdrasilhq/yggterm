@@ -1251,6 +1251,12 @@ enum AppPaneWidget {
         placeholder: String,
         #[serde(default)]
         value: String,
+        /// Fired when the user presses Enter in the field, exactly as `search-box`
+        /// does. A password field declares its submit action here so the vault
+        /// unlocks without reaching for the mouse. NEVER fires for `multiline` —
+        /// there Enter is a newline.
+        #[serde(default)]
+        action: String,
         /// Masks the field. The value still only leaves the GUI on an action.
         #[serde(default)]
         secret: bool,
@@ -77567,7 +77573,7 @@ fn AppPaneRailBody(
                                     },
                                 }
                             },
-                            AppPaneWidget::TextInput { id, label, placeholder, value, secret, multiline, rows } => rsx! {
+                            AppPaneWidget::TextInput { id, label, placeholder, value, action, secret, multiline, rows } => rsx! {
                                 div {
                                     key: "{widget_key}",
                                     style: "display:flex; flex-direction:column; gap:4px;",
@@ -77602,6 +77608,15 @@ fn AppPaneRailBody(
                                                 let id = id.clone();
                                                 let on_app_pane_value = on_app_pane_value.clone();
                                                 move |evt: FormEvent| on_app_pane_value.call((id.clone(), evt.value()))
+                                            },
+                                            onkeydown: {
+                                                let (pane_id, action) = (pane_id.clone(), action.clone());
+                                                let on_app_pane_action = on_app_pane_action.clone();
+                                                move |evt: KeyboardEvent| {
+                                                    if evt.key() == Key::Enter && !action.is_empty() {
+                                                        on_app_pane_action.call((pane_id.clone(), action.clone(), None));
+                                                    }
+                                                }
                                             },
                                         }
                                     }
@@ -88040,6 +88055,7 @@ mod tests {
             label: String::new(),
             placeholder: String::new(),
             value: String::new(),
+            action: String::new(),
             secret: true,
             multiline: false,
             rows: 0,
@@ -88062,6 +88078,7 @@ mod tests {
                 {"kind": "search-box", "id": "query"},
                 {"kind": "text-input", "id": "name"},
                 {"kind": "text-input", "id": "notes", "multiline": true, "rows": 10},
+                {"kind": "text-input", "id": "pw", "secret": true, "action": "unlock"},
                 {"kind": "number-input", "id": "len", "value": 24, "min": 8, "max": 64},
                 {"kind": "toggle", "id": "adblock", "label": "Adblock", "value": true},
                 {"kind": "button", "id": "add", "label": "Add", "action": "add"},
@@ -88071,13 +88088,16 @@ mod tests {
         }))
         .expect("schema parses");
         assert_eq!(schema.title, "Vault");
-        assert_eq!(schema.widgets.len(), 10);
+        assert_eq!(schema.widgets.len(), 11);
         // An omitted `action` is empty, not an error: a search box need not act.
         assert!(matches!(&schema.widgets[3], AppPaneWidget::SearchBox { action, .. } if action.is_empty()));
         // A plain text-input is single-line; the notes field opts into multiline.
         assert!(matches!(&schema.widgets[4], AppPaneWidget::TextInput { multiline: false, .. }));
         assert!(matches!(&schema.widgets[5], AppPaneWidget::TextInput { multiline: true, rows: 10, .. }));
-        assert!(matches!(&schema.widgets[9], AppPaneWidget::ListRow { actions, .. } if actions.len() == 1));
+        // A field submits on Enter only when it declares an action.
+        assert!(matches!(&schema.widgets[4], AppPaneWidget::TextInput { action, .. } if action.is_empty()));
+        assert!(matches!(&schema.widgets[6], AppPaneWidget::TextInput { action, secret: true, .. } if action == "unlock"));
+        assert!(matches!(&schema.widgets[10], AppPaneWidget::ListRow { actions, .. } if actions.len() == 1));
     }
 
     // An unknown widget kind must fail the pane, not silently render a hole:
