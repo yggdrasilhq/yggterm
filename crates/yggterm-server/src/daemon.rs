@@ -12705,6 +12705,7 @@ mod tests {
             },
         ];
         let owner_snapshot = ServerUiSnapshot {
+            apps: Vec::new(),
             active_session_path: Some(session_path.clone()),
             active_session: Some(owner_session.clone()),
             active_view_mode: WorkspaceViewMode::Terminal,
@@ -12756,6 +12757,7 @@ mod tests {
         let mut ghost = daemon_test_snapshot_session(&ghost_path, SessionSource::LiveSsh);
         ghost.ssh_target = Some("practice".to_string());
         let owner_snapshot = ServerUiSnapshot {
+            apps: Vec::new(),
             active_session_path: None,
             active_session: None,
             active_view_mode: WorkspaceViewMode::Terminal,
@@ -12898,6 +12900,7 @@ mod tests {
             .map(|session| session.session_path.clone())
             .collect::<HashSet<_>>();
         let mut snapshot = ServerUiSnapshot {
+            apps: Vec::new(),
             active_session_path: Some(live_sessions[0].session_path.clone()),
             active_session: Some(live_sessions[0].clone()),
             active_view_mode: WorkspaceViewMode::Terminal,
@@ -12991,6 +12994,7 @@ mod tests {
             session
         };
         let mut snapshot = ServerUiSnapshot {
+            apps: Vec::new(),
             active_session_path: Some(codex.session_path.clone()),
             active_session: Some(codex.clone()),
             active_view_mode: WorkspaceViewMode::Terminal,
@@ -13047,6 +13051,7 @@ mod tests {
         active.kind = SessionKind::ClaudeCode;
         active.launch_phase = TerminalLaunchPhase::RemoteBootstrap;
         let mut snapshot = ServerUiSnapshot {
+            apps: Vec::new(),
             active_session_path: Some(active_path.clone()),
             active_session: Some(active.clone()),
             active_view_mode: WorkspaceViewMode::Terminal,
@@ -13109,6 +13114,7 @@ mod tests {
             }],
         };
         server.apply_snapshot(ServerUiSnapshot {
+            apps: Vec::new(),
             active_session_path: None,
             active_session: None,
             active_view_mode: WorkspaceViewMode::Rendered,
@@ -13118,6 +13124,7 @@ mod tests {
         });
         let active = daemon_test_snapshot_session(&active_path, SessionSource::LiveSsh);
         let mut snapshot = ServerUiSnapshot {
+            apps: Vec::new(),
             active_session_path: Some(active_path.clone()),
             active_session: Some(active.clone()),
             active_view_mode: WorkspaceViewMode::Terminal,
@@ -13176,6 +13183,7 @@ mod tests {
             value: "keep-alive".to_string(),
         });
         let mut snapshot = ServerUiSnapshot {
+            apps: Vec::new(),
             active_session_path: Some(active_path.clone()),
             active_session: Some(active.clone()),
             active_view_mode: WorkspaceViewMode::Terminal,
@@ -13245,6 +13253,7 @@ mod tests {
         stale.kind = SessionKind::Shell;
         stale.launch_phase = TerminalLaunchPhase::Running;
         let mut snapshot = ServerUiSnapshot {
+            apps: Vec::new(),
             active_session_path: Some(active_path.to_string()),
             active_session: Some(active.clone()),
             active_view_mode: WorkspaceViewMode::Terminal,
@@ -14547,6 +14556,7 @@ mod tests {
             value: "/home/pi/git/samplers".to_string(),
         }];
         let owner_snapshot = ServerUiSnapshot {
+            apps: Vec::new(),
             active_session_path: Some(running_path.clone()),
             active_session: Some(running.clone()),
             active_view_mode: WorkspaceViewMode::Terminal,

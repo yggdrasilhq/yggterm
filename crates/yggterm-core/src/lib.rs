@@ -1,3 +1,4 @@
+pub mod app_registry;
 mod browser;
 mod icon;
 mod install;
@@ -22,6 +23,10 @@ use time::OffsetDateTime;
 use titles::{SessionTitleResolver, settings_ready as litellm_settings_ready};
 pub use yggui_contract::{UiTheme, YgguiThemeColorStop, YgguiThemeSpec};
 
+pub use app_registry::{
+    APP_REGISTRY_DIRNAME, AppManifest, AppVerb, app_registry_dir, scan_app_registry,
+    write_app_manifest,
+};
 pub use browser::{
     BrowserMetrics, BrowserRow, BrowserRowKind, SessionBrowserState,
     unique_session_short_ids_for_pairs,
