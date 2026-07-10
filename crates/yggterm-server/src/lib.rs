@@ -33,7 +33,7 @@ pub use daemon::{
     resolve_client_daemon_endpoint,
     ensure_remote_runtime_codex_session as daemon_ensure_remote_runtime_codex_session, focus_live,
     focus_live_with_view, hot_restart, hot_restart_detailed, open_remote_session,
-    open_remote_session_with_view, open_stored_session, open_stored_session_with_view, ping,
+    open_remote_session_with_view, open_stored_session, open_stored_session_with_view, ping, working_flags,
     prepare_client_close, prepare_update_restart, raise_external_window,
     reachable_versioned_daemon_statuses, refresh_managed_cli, refresh_preview,
     refresh_remote_machine, remove_session, remove_ssh_target, reorder_live_sessions,
@@ -3265,6 +3265,26 @@ impl YggtermServer {
                     .filter(|session| managed_session_is_live_runtime_session(key, session))
             })
             .collect()
+    }
+
+    /// Fast-path update from the WorkingFlags poll: patch ONLY the `working`
+    /// field of matching live sessions in place, between full snapshot applies.
+    /// Returns the (path, working) pairs that actually CHANGED so the caller
+    /// can trace the edges and fire finished-working notifications.
+    pub fn apply_live_session_working_flags(
+        &mut self,
+        flags: &[(String, bool)],
+    ) -> Vec<(String, bool)> {
+        let mut changed = Vec::new();
+        for (path, working) in flags {
+            if let Some(session) = self.sessions.get_mut(path)
+                && session.working != Some(*working)
+            {
+                session.working = Some(*working);
+                changed.push((path.clone(), *working));
+            }
+        }
+        changed
     }
 
     pub fn live_session_order_keys(&self) -> &[String] {
@@ -7619,7 +7639,7 @@ fn canonicalize_ssh_target_alias(ssh_target: &str) -> String {
     }
 }
 
-fn is_loopback_ssh_target(ssh_target: &str) -> bool {
+pub fn is_loopback_ssh_target(ssh_target: &str) -> bool {
     matches!(
         ssh_host_from_target(ssh_target),
         "localhost" | "127.0.0.1" | "::1"
@@ -22985,6 +23005,42 @@ mod tests {
             GhosttyHostSupport::shadow("test".to_string(), false, false),
             UiTheme::ZedLight,
         )
+    }
+
+    #[test]
+    fn apply_live_session_working_flags_patches_in_place_and_reports_edges() {
+        // The WorkingFlags poll (working-dot lag fix) must patch ONLY the
+        // working field, only report REAL changes, and ignore unknown paths.
+        let mut server = test_server();
+        let path = server.start_local_session(SessionKind::ClaudeCode, Some("/home/pi"), None);
+        let flags = vec![(path.clone(), true)];
+        assert_eq!(
+            server.apply_live_session_working_flags(&flags),
+            vec![(path.clone(), true)],
+            "first true flag is an edge"
+        );
+        assert!(
+            server.apply_live_session_working_flags(&flags).is_empty(),
+            "re-applying the same value is not an edge"
+        );
+        assert_eq!(
+            server.apply_live_session_working_flags(&[(path.clone(), false)]),
+            vec![(path.clone(), false)],
+            "true -> false is the finished-working edge"
+        );
+        assert!(
+            server
+                .apply_live_session_working_flags(&[("local://nope".to_string(), true)])
+                .is_empty(),
+            "unknown session paths are ignored"
+        );
+        let session = server
+            .live_sessions()
+            .iter()
+            .find(|session| session.session_path == path)
+            .cloned()
+            .expect("session");
+        assert_eq!(session.working, Some(false));
     }
 
     #[test]
