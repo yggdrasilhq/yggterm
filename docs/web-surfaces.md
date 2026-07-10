@@ -193,3 +193,29 @@ DOM snapshot — a native GTK widget is in NEITHER layer). Verifying a web
 surface needs a compositor-level grab: `server app screenshot --backend os`
 (KWin/Spectacle path, v2.9.57+), or the `web_surface` trace events (`open` /
 `close` / `native_open` / `native_close` in event-trace.jsonl).
+
+**The response now says so itself.** When a native surface is visible and the
+backend is not the compositor, the capture reports
+`capture_native_web_surface_visible: true` and forces `capture_faithful: false`
+with a reason naming `--backend os`. It used to answer `capture_faithful: true`,
+which is how the resize bug below survived a "live-verified" review: every crop of
+the right rail looked perfect because the page painted over it was not in the frame.
+
+## Native surfaces can be moved AND resized (fixed 2026-07-10)
+
+A surface's geometry is driven by the `[data-ws-page]` placeholder rect. Applying
+it must update the **webview's GTK size request**, not just the container's —
+see `apply_bounds` in `vendor/dioxus-desktop/src/web_surface.rs`.
+
+`wry`'s `WebView::set_bounds` on a `GtkFixed` parent only `size_allocate`s the
+webview; it never touches the size request that `add_to_container` set when the
+webview was built. `GtkFixed` allocates children at their natural size, and a
+widget's natural size IS its size request — so the next layout pass (the
+`queue_resize` every caller issues immediately afterwards) snapped the webview
+straight back to the size it was born with.
+
+The surface could therefore be moved but never resized. Opening the right rail
+over a live web surface left the page painted across the rail (a native child
+draws above all DOM); closing the rail left a blank gap. Recreating the surface
+(reload, profile or proxy change) hid the bug, because a fresh webview is born at
+the current rect.
