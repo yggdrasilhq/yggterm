@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use vt100::Parser as Vt100Parser;
-use yggterm_core::{append_trace_event, resolve_yggterm_home};
+use yggterm_core::{append_bounded_jsonl_record, append_trace_event, resolve_yggterm_home};
 
 const DEFAULT_COLS: u16 = 120;
 const DEFAULT_ROWS: u16 = 36;
@@ -1457,6 +1457,7 @@ impl PtySessionRuntime {
                 let mut buffer = [0u8; 8192];
                 let mut pending_utf8 = Vec::<u8>::new();
                 let mut protocol_filter = TerminalProtocolFilter::default();
+                let mut agent_error_scanner = AgentSessionErrorScanner::default();
                 let mut saw_any_output = false;
                 loop {
                     match reader.read(&mut buffer) {
@@ -1475,6 +1476,15 @@ impl PtySessionRuntime {
                             if !data.is_empty() {
                                 if let Ok(mut screen_state) = reader_screen_state.lock() {
                                     screen_state.process(data.as_bytes());
+                                }
+                                for hit in agent_error_scanner
+                                    .scan(&strip_terminal_control_sequences(&data), now_millis())
+                                {
+                                    record_agent_session_error(
+                                        &key_label,
+                                        &launch_command_label,
+                                        &hit,
+                                    );
                                 }
                                 reader_runtime_output_seen.store(true, Ordering::SeqCst);
                                 reader_activity.store(now_millis(), Ordering::SeqCst);
@@ -1537,6 +1547,11 @@ impl PtySessionRuntime {
                             }
                             if let Ok(mut screen_state) = reader_screen_state.lock() {
                                 screen_state.process(data.as_bytes());
+                            }
+                            for hit in agent_error_scanner
+                                .scan(&strip_terminal_control_sequences(&data), now_millis())
+                            {
+                                record_agent_session_error(&key_label, &launch_command_label, &hit);
                             }
                             if !saw_any_output {
                                 saw_any_output = true;
@@ -2190,6 +2205,175 @@ fn now_millis() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+// ---- agent session resume-error telemetry ----------------------------------
+// Claude Code and codex sporadically refuse to resume a conversation with
+// errors like "Error: Session <uuid> is already in use", "No conversation
+// found with session ID <uuid>", or "session ... not found / does not exist".
+// The user hits these often enough to hurt but we had NO record of how many or
+// when. Every PTY reader scans its control-stripped output for these shapes
+// and records a throttled `agent_session_error` trace event plus a durable row
+// in `agent-incidents.jsonl` — a tiny stream that outlives event-trace
+// rotation by months, so occurrences can be counted across weeks.
+// This is observation only: nothing about session behavior changes.
+
+const AGENT_INCIDENT_FILENAME: &str = "agent-incidents.jsonl";
+const AGENT_INCIDENT_ROTATED_FILENAME: &str = "agent-incidents.previous.jsonl";
+const AGENT_INCIDENT_MAX_BYTES: u64 = 4 * 1024 * 1024;
+/// A TUI redraws its error screen on every resize/frame; one event per pattern
+/// per minute per session is plenty to count occurrences without spam.
+const AGENT_SESSION_ERROR_THROTTLE_MS: u64 = 60_000;
+/// Unterminated tail kept between chunks so a phrase split across PTY reads
+/// still matches. Bounded so a newline-free TUI stream cannot grow it.
+const AGENT_SESSION_ERROR_CARRY_MAX_CHARS: usize = 400;
+
+#[derive(Debug, PartialEq)]
+struct AgentSessionErrorHit {
+    pattern: &'static str,
+    uuid: Option<String>,
+    sample: String,
+}
+
+#[derive(Default)]
+struct AgentSessionErrorScanner {
+    carry: String,
+    last_hit_ms: HashMap<&'static str, u64>,
+}
+
+impl AgentSessionErrorScanner {
+    fn scan(&mut self, stripped: &str, now_ms: u64) -> Vec<AgentSessionErrorHit> {
+        let combined = if self.carry.is_empty() {
+            stripped.to_string()
+        } else {
+            format!("{}{}", self.carry, stripped)
+        };
+        let mut hits = Vec::new();
+        for line in combined.split(['\n', '\r']) {
+            let Some(hit) = agent_session_error_in_line(line) else {
+                continue;
+            };
+            let due = self
+                .last_hit_ms
+                .get(hit.pattern)
+                .copied()
+                .map_or(true, |last| {
+                    now_ms.saturating_sub(last) >= AGENT_SESSION_ERROR_THROTTLE_MS
+                });
+            if due {
+                self.last_hit_ms.insert(hit.pattern, now_ms);
+                hits.push(hit);
+            }
+        }
+        let tail = combined.rsplit(['\n', '\r']).next().unwrap_or("");
+        self.carry = if tail.chars().count() > AGENT_SESSION_ERROR_CARRY_MAX_CHARS {
+            let skip = tail.chars().count() - AGENT_SESSION_ERROR_CARRY_MAX_CHARS;
+            tail.chars().skip(skip).collect()
+        } else {
+            tail.to_string()
+        };
+        hits
+    }
+}
+
+fn agent_session_error_in_line(line: &str) -> Option<AgentSessionErrorHit> {
+    let normalized = line
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase();
+    if normalized.is_empty() {
+        return None;
+    }
+    // yggterm's own missing-runtime error — traced through its own channel.
+    if normalized.contains("terminal session not found") {
+        return None;
+    }
+    let uuid = find_uuid_in_text(&normalized);
+    let mentions_session = normalized.contains("session") || normalized.contains("conversation");
+    let pattern = if normalized.contains("already in use") && (mentions_session || uuid.is_some())
+    {
+        "session_already_in_use"
+    } else if normalized.contains("already active") && (mentions_session || uuid.is_some()) {
+        "session_already_active"
+    } else if normalized.contains("no conversation found") || normalized.contains("no rollout found")
+    {
+        "session_not_found"
+    } else if mentions_session
+        && (normalized.contains("not found")
+            || normalized.contains("does not exist")
+            || normalized.contains("doesn't exist"))
+    {
+        "session_not_found"
+    } else if uuid.is_some()
+        && (normalized.contains("not found")
+            || normalized.contains("does not exist")
+            || normalized.contains("doesn't exist")
+            || normalized.contains("in use"))
+    {
+        "session_uuid_error"
+    } else {
+        return None;
+    };
+    Some(AgentSessionErrorHit {
+        pattern,
+        uuid,
+        sample: truncate_terminal_trace_sample(&normalized),
+    })
+}
+
+/// First canonical 8-4-4-4-12 UUID in the text, if any. Byte-safe: every
+/// matched byte is ASCII hex or a dash, so slicing at the match is valid UTF-8.
+fn find_uuid_in_text(text: &str) -> Option<String> {
+    const UUID_LEN: usize = 36;
+    const DASH_OFFSETS: [usize; 4] = [8, 13, 18, 23];
+    let bytes = text.as_bytes();
+    if bytes.len() < UUID_LEN {
+        return None;
+    }
+    'outer: for start in 0..=bytes.len() - UUID_LEN {
+        for offset in 0..UUID_LEN {
+            let byte = bytes[start + offset];
+            let ok = if DASH_OFFSETS.contains(&offset) {
+                byte == b'-'
+            } else {
+                byte.is_ascii_hexdigit()
+            };
+            if !ok {
+                continue 'outer;
+            }
+        }
+        return Some(text[start..start + UUID_LEN].to_string());
+    }
+    None
+}
+
+fn record_agent_session_error(path: &str, launch_command: &str, hit: &AgentSessionErrorHit) {
+    let payload = serde_json::json!({
+        "path": path,
+        "pattern": hit.pattern,
+        "uuid": hit.uuid,
+        "sample": hit.sample,
+        "launch_command": launch_command,
+    });
+    trace_terminal_event("agent_session_error", payload.clone());
+    if let Ok(home) = resolve_yggterm_home() {
+        let record = serde_json::json!({
+            "ts_ms": now_millis(),
+            "kind": "agent_session_error",
+            "path": path,
+            "pattern": hit.pattern,
+            "uuid": hit.uuid,
+            "sample": hit.sample,
+            "launch_command": launch_command,
+        });
+        append_bounded_jsonl_record(
+            &home.join(AGENT_INCIDENT_FILENAME),
+            AGENT_INCIDENT_ROTATED_FILENAME,
+            AGENT_INCIDENT_MAX_BYTES,
+            &record,
+        );
+    }
 }
 
 /// Session-identity handshake for libyggterm apps (the `$TMUX` pattern):
@@ -4360,5 +4544,86 @@ PY"#,
             .expect("write should finish after writer flushes")
             .expect("write should succeed");
         drop(writer_tx);
+    }
+
+    #[test]
+    fn agent_session_error_detects_claude_session_already_in_use() {
+        let mut scanner = AgentSessionErrorScanner::default();
+        let hits = scanner.scan(
+            "Error: Session 52317975-9c66-40ef-8028-901b6415250e is already in use\n",
+            1_000,
+        );
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].pattern, "session_already_in_use");
+        assert_eq!(
+            hits[0].uuid.as_deref(),
+            Some("52317975-9c66-40ef-8028-901b6415250e")
+        );
+    }
+
+    #[test]
+    fn agent_session_error_detects_missing_conversation_and_codex_rollout() {
+        assert_eq!(
+            agent_session_error_in_line(
+                "No conversation found with session ID 47919c4a-92f4-4edd-bc11-ab6a250d947f"
+            )
+            .expect("hit")
+            .pattern,
+            "session_not_found"
+        );
+        assert_eq!(
+            agent_session_error_in_line("error: no rollout found for the requested session")
+                .expect("hit")
+                .pattern,
+            "session_not_found"
+        );
+        assert_eq!(
+            agent_session_error_in_line("that session does not exist anymore")
+                .expect("hit")
+                .pattern,
+            "session_not_found"
+        );
+    }
+
+    #[test]
+    fn agent_session_error_ignores_yggterm_internal_and_plain_output() {
+        assert!(
+            agent_session_error_in_line(
+                "Error: terminal session not found: local://52317975-9c66-40ef-8028-901b6415250e"
+            )
+            .is_none(),
+            "yggterm's own missing-runtime error has its own trace channel"
+        );
+        assert!(agent_session_error_in_line("cargo build finished in 3.2s").is_none());
+        assert!(agent_session_error_in_line("file not found: ./missing.txt").is_none());
+    }
+
+    #[test]
+    fn agent_session_error_matches_phrase_split_across_chunks() {
+        let mut scanner = AgentSessionErrorScanner::default();
+        assert!(
+            scanner
+                .scan("Error: Session 52317975-9c66-40ef-8028-901b64", 1_000)
+                .is_empty()
+        );
+        let hits = scanner.scan("15250e is already in use", 2_000);
+        assert_eq!(hits.len(), 1, "carry must join the split phrase");
+        assert_eq!(hits[0].pattern, "session_already_in_use");
+    }
+
+    #[test]
+    fn agent_session_error_throttles_tui_redraw_repeats() {
+        let mut scanner = AgentSessionErrorScanner::default();
+        let line = "Session 52317975-9c66-40ef-8028-901b6415250e is already in use\n";
+        assert_eq!(scanner.scan(line, 1_000).len(), 1);
+        assert!(
+            scanner.scan(line, 30_000).is_empty(),
+            "redraw within the throttle window must not re-fire"
+        );
+        assert_eq!(
+            scanner.scan(line, 62_000).len(),
+            1,
+            "a hit after the window counts again"
+        );
     }
 }
