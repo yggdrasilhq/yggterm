@@ -53,7 +53,8 @@ Build each only when an app truly needs it.
 3. **Sidebar-contribution surface** — the app contributes a right-hand panel of
    icons/controls/metadata. This is where a password-manager sidebar, an ytop
    signal panel, or a Cellulose ribbon lives. SHIPPED 2026-07-09 (ychrome's vault
-   pane); `RightPanelMode::Vault` DELETED 2026-07-10. Protocol below.
+   pane); `RightPanelMode::Vault` and `::AppSidebar` both DELETED 2026-07-10.
+   Protocol below.
 4. **Chooser / identity surface** — a picker before launch (profile, workspace,
    vault account). SHIPPED for ychrome's no-arg profile picker.
 
@@ -75,7 +76,8 @@ Two verbs ship today:
 - `web-surface` — actions `open`, `heartbeat` (~4s, full payload), `close`.
   Payload `{"session": $YGGTERM_SESSION_ID, "url": "...", "title": "..."}`.
 - `sidebar` — actions `declare` (idempotent, re-emitted on the heartbeat
-  cadence), `close`. Payload `{"session", "control", "panes":[{id,icon,title}]}`.
+  cadence), `close`. Payload
+  `{"session", "control", "panes":[{id,icon,title}], "policy_version"?}`.
 
 The GUI keys surface AND contribution state by the *stream* the OSC arrived on;
 the `session` field is diagnostic (a remote session's env id lives in the remote
@@ -198,24 +200,53 @@ the app computes, the GUI injects, yggterm stores nothing.
 toggle. Before this existed the only way in was to click the button with
 `app dom-eval`. yggterm does not know the pane ids; the app declares them.
 
-### Still hardcoded (the next slice)
+### No app chrome remains (2026-07-10)
 
-`RightPanelMode::Vault` is **DELETED** (2026-07-10): the contributed pane now
-covers the password generator and the watchtower, `vault_password_is_weak` moved
-to `ychrome-vault::watchtower`, and `docs/ychrome-password-manager.md` moved to
-the ychrome repo as `docs/password-manager.md`.
+`RightPanelMode::Vault` and `RightPanelMode::AppSidebar` are both **DELETED**.
+The contributed vault pane covers the password generator and the watchtower
+(`vault_password_is_weak` moved to `ychrome-vault::watchtower`), and ychrome's
+adblock + userscript settings are a second contributed pane (`pane:settings`).
+`Metadata`, `Settings`, `Connect`, `Notifications`, `Hidden` and `AppPane(id)`
+are all that is left, and every one of them is yggterm's own.
 
-`RightPanelMode::AppSidebar` still exists. Migrate it (ychrome's adblock +
-userscript settings, per "the app's host owns its config"), then delete it. The
-other variants — `Metadata`, `Settings`, `Connect`, `Notifications` — are
-yggterm's own and stay.
+**If you are about to add a `RightPanelMode` variant, you are wrong.** Declare a
+pane from the app.
 
-### Where an app's config lives when the app is remote (DECIDED 2026-07-09)
+### Shipping a policy the GUI must apply (adblock, userscripts)
+
+Some app config cannot be applied host-side: ad blocking and userscripts act on
+the GUI's webview. The app still OWNS them — it serves the *effective* policy and
+the GUI applies it, the same shape as vault fill (app computes, GUI injects).
+
+- `declare` carries `policy_version`: a **stat-only** stamp (paths + lengths +
+  mtimes + the enabled/disabled decision), never the content. The GUI refetches
+  `GET <control>/policy` only when the stamp moves, so a 10 KB ruleset does not
+  ride the ~4s heartbeat.
+- `/policy` answers `{adblock_rules: string|null, userscripts: [string]}` with
+  every enable/disable decision already made. `null` means "no ad blocking",
+  and the GUI never asks why.
+- yggterm persists nothing but a content-addressed compiled-filter cache
+  (`~/.yggterm/web-adblock-cache/<sha256>.json`), because WebKit's
+  `UserContentFilterStore` compiles from a path rather than from memory.
+
+**DECLARE BEFORE YOU OPEN.** A userscript only injects at document-start, so the
+surface reconciler *holds* the lazy create while a declared policy is in flight
+(`SurfacePolicyGate::Pending`). Emit `sidebar ; declare` before `web-surface ;
+open` — including in the post-suspend re-emit — or the first apply pass sees a
+surface with no contribution, creates it unblocked, and it runs without
+userscripts forever. The gate opens after `MAX_POLICY_FETCH_ATTEMPTS` failures
+(a page with no adblock beats no page) and the user is notified.
+
+A surface opened by a **non-browser** app gets no adblock and no userscripts.
+That is correct, not a gap: adblock is browsing config, and a dashboard is not
+browsing.
+
+### Where an app's config lives when the app is remote (SHIPPED 2026-07-10)
 
 The app's host owns the config, always — including ychrome's adblock rulesets
 and userscripts. This was previously fudged ("only their application to the
 GUI's webview stays host-side"), and it had no consistent meaning: the GUI's
-webview reads `~/.yggterm/web-adblock/*` **on the GUI host**, so an ychrome
+webview read `~/.yggterm/web-adblock/*` **on the GUI host**, so an ychrome
 running over ssh was editing files nothing read.
 
 The rule: the app mutates its own host's config, and the control-endpoint
@@ -223,7 +254,7 @@ response **ships the effective ruleset/userscripts to the GUI**, which applies
 them to the webview. Same shape as vault fill — the app computes, the GUI
 injects, and yggterm persists none of it. A `RightPanelMode` for an app's
 settings is still the anti-pattern; the settings pane is an app contribution
-like any other.
+like any other. Mechanics: "Shipping a policy the GUI must apply", above.
 
 Menu contributions (the titlebar `+` menu) are the same idea for a different
 surface: an app-registry the shell reads instead of hardcoded arms — see

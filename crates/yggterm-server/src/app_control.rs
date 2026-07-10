@@ -48,7 +48,6 @@ pub enum AppControlRightPanelMode {
     Notifications,
     Settings,
     Metadata,
-    AppSidebar,
     /// A pane CONTRIBUTED by the active libyggterm app, by the app's pane id.
     /// This is how an agent drives ychrome's vault pane headlessly; before it
     /// existed the only way in was to click the button with `app dom-eval`.
