@@ -5194,9 +5194,34 @@ impl ShellState {
         closed
     }
     fn sweep_stale_web_surfaces(&mut self, now_ms: u64) {
-        self.web_surfaces.retain(|_, surface| {
-            let live =
-                now_ms.saturating_sub(surface.last_seen_ms) <= WEB_SURFACE_STALE_AFTER_MS;
+        // The stale sweep is a DEAD-APP detector: an app whose OSC heartbeats
+        // stopped for WEB_SURFACE_STALE_AFTER_MS is gone, so drop its surface
+        // before it leaks a full-screen overlay. But `last_seen_ms` is only a
+        // trustworthy liveness signal while the GUI is actually READING that
+        // session's stream. A BACKGROUNDED session's terminal bridge pauses (or
+        // only trickles) reads, so a live app's heartbeats pile up unread and
+        // last_seen goes stale even though the app is fine — and because a
+        // `heartbeat`/`open` for a gone surface deliberately cannot recreate it,
+        // sweeping a backgrounded-but-live surface lost it permanently: switch
+        // back and the bare terminal showed instead of the page ([[finding-
+        // ychrome-terminal-switch-surface-linger]] is the inverse; this is the
+        // surface vanishing, not lingering). Backgrounded surfaces are governed
+        // by the reconciler's background hold (web_surface_background_hold_ms),
+        // which keeps them stashed-alive and reclaims memory on its own timer.
+        // Only the ACTIVE-VISIBLE session's reads are live, so only it is a
+        // reliable dead-app signal here.
+        let active_visible_path = (!self.app_control_backgrounded
+            && self.server.active_view_mode() == WorkspaceViewMode::Terminal)
+            .then(|| self.server.active_session_path().map(str::to_string))
+            .flatten();
+        self.web_surfaces.retain(|session_path, surface| {
+            let reads_live = active_visible_path.as_deref() == Some(session_path.as_str());
+            if !reads_live {
+                // Backgrounded: not a dead-app signal. Keep; the reconciler's
+                // background hold owns its lifetime.
+                return true;
+            }
+            let live = now_ms.saturating_sub(surface.last_seen_ms) <= WEB_SURFACE_STALE_AFTER_MS;
             if !live {
                 kill_web_surface_forward(surface);
             }
@@ -5332,7 +5357,23 @@ impl ShellState {
     /// WEB_SURFACE_STALE_AFTER_MS and the app is presumed gone, so its buttons
     /// leave the rail rather than dangling at a dead control endpoint.
     fn sweep_stale_sidebar_contributions(&mut self, now_ms: u64) {
-        self.sidebar_contributions.retain(|_, contribution| {
+        // Same background-read caveat as sweep_stale_web_surfaces: a backgrounded
+        // session's declares stop being read, so its contribution goes stale even
+        // while the app lives. Sweeping it there tears down the control forward
+        // (an `ssh -L` for a remote app) every background cycle and drops the
+        // cached policy, so a rail that returns has to re-resolve and re-fetch.
+        // Only the active-visible session's reads are a reliable liveness signal.
+        // `active_sidebar_panes` still gates DISPLAY on freshness, so a truly
+        // dead app's rail hides within the stale window regardless.
+        let active_visible_path = (!self.app_control_backgrounded
+            && self.server.active_view_mode() == WorkspaceViewMode::Terminal)
+            .then(|| self.server.active_session_path().map(str::to_string))
+            .flatten();
+        self.sidebar_contributions.retain(|session_path, contribution| {
+            let reads_live = active_visible_path.as_deref() == Some(session_path.as_str());
+            if !reads_live {
+                return true;
+            }
             let live =
                 now_ms.saturating_sub(contribution.last_seen_ms) <= WEB_SURFACE_STALE_AFTER_MS;
             if !live {
@@ -78730,6 +78771,33 @@ fn ContextMenuOverlay(
                                 on_new_claude_here.call(evt);
                             },
                             "New Claude Code Session Here"
+                        }
+                        // App verbs CONTRIBUTED by this host's libyggterm apps
+                        // (e.g. "New Ychrome Here"), same registry the folder
+                        // menu, the titlebar `+` and the start page render — so a
+                        // live-session row can launch a browser in its own cwd
+                        // without hunting the cwd tree. on_launch_app_verb routes
+                        // through the session's creation-context row (its cwd +
+                        // host), matching the "… Here" agent actions above.
+                        for (app, verb) in app_launcher_entries(&apps) {
+                            button {
+                                key: "ctx-session-app-{app.name}-{verb.id}",
+                                "data-context-menu-action": "app:{app.name}:{verb.id}",
+                                class: "yggterm-menu-item",
+                                style: context_menu_action_style(palette, false),
+                                onmousedown: |evt| {
+                                    evt.stop_propagation();
+                                },
+                                onclick: {
+                                    let on_launch_app_verb = on_launch_app_verb.clone();
+                                    let entry = (app.clone(), verb.clone());
+                                    move |evt: MouseEvent| {
+                                        evt.stop_propagation();
+                                        on_launch_app_verb.call(entry.clone());
+                                    }
+                                },
+                                "{verb.label} Here"
+                            }
                         }
                     }
                     button {
