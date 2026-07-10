@@ -1938,7 +1938,6 @@ fn main() -> Result<()> {
                     "notifications" | "notification" => AppControlRightPanelMode::Notifications,
                     "settings" => AppControlRightPanelMode::Settings,
                     "metadata" | "session-metadata" => AppControlRightPanelMode::Metadata,
-                    "app-sidebar" | "app_sidebar" | "app" => AppControlRightPanelMode::AppSidebar,
                     // `pane:<id>` opens a pane the ACTIVE APP contributed over
                     // OSC 7717 (e.g. `pane:vault`). yggterm does not know the
                     // ids; the app declares them.

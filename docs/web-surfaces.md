@@ -101,14 +101,60 @@ Because each tab is a real top-level webview (not an iframe), sites that
 refuse framing (X-Frame-Options / frame-ancestors: google.com, most login
 pages) render normally.
 
-## Sidebars (decision, 2026-07-04)
+## Sidebars (decision, 2026-07-04; contribution shipped 2026-07-09)
 
 Web surfaces keep the generic yggterm sidebars: settings (zoom controls are
 named "Viewport Zoom", not "Terminal Zoom", for exactly this reason),
 notifications (pan-yggterm), and metadata (already per-session-type by
-design). libyggterm apps may later contribute *additional* per-app sidebars
-and their own app icon — Cellulose is the first expected consumer (one
-unified scrollable ribbon sidebar to pair with ALT+ navigation).
+design). Those four — plus Connect — are yggterm's own and are the only
+`RightPanelMode` variants left.
+
+Everything app-specific is a **contribution**: the app declares its panes over
+`OSC 7717 ; sidebar` and serves each schema from a loopback control endpoint.
+ychrome contributes two (vault, settings). `RightPanelMode::Vault` and
+`::AppSidebar` were both deleted once the contribution covered them. See
+`.agents/skills/libyggterm-surfaces/SKILL.md`.
+
+## Ad blocking and userscripts belong to the APP (2026-07-10)
+
+The GUI no longer reads `~/.yggterm/web-adblock/*` or
+`~/.yggterm/web-userscripts/*`. Those files live on the host the app RUNS on,
+which over ssh is not the GUI's host — the old arrangement had an ychrome
+editing remote files that nothing ever read.
+
+Instead the app ships its *effective* policy:
+
+```
+declare  { ..., policy_version: "<stamp>" }     # OSC, ~4s heartbeat
+GET <control>/policy -> { adblock_rules, userscripts }
+```
+
+- `policy_version` is a stat-only stamp (paths + lengths + mtimes + the
+  enabled/disabled decision). The GUI refetches `/policy` only when it moves,
+  so a 10 KB ruleset never rides a 4s heartbeat.
+- `adblock_rules` is `null` when the app says no — master switch off, profile
+  opted out, or no ruleset installed. Three reasons, one answer; the GUI never
+  re-derives it.
+- The GUI spills the rules to a content-addressed cache under
+  `~/.yggterm/web-adblock-cache/<sha256>.json` because WebKit's
+  `UserContentFilterStore` compiles from a path. That cache is the ONLY thing
+  yggterm persists, and deleting it costs one recompile.
+
+**The app must declare before it opens.** Userscripts inject at
+document-start, so the reconciler *holds* a surface's lazy create until the
+policy lands (`SurfacePolicyGate::Pending`). A surface opened before its
+contribution exists is created unblocked and runs without userscripts for its
+whole life. After `MAX_POLICY_FETCH_ATTEMPTS` failed fetches the gate opens
+anyway — a page with no adblock beats no page — and the user is notified.
+
+A web surface opened by a **non-browser** app gets no adblock and no
+userscripts. That is correct: adblock is browsing config, and a dashboard is
+not browsing.
+
+Changing the adblock *ruleset content* still needs a GUI restart: WebKit
+compiles the filter once per process (`ensure_compiled`'s `started` flag).
+Toggling it off, and every userscript change, take effect on the next surface
+(re)create — reload the page.
 
 ## Renderer and security
 
