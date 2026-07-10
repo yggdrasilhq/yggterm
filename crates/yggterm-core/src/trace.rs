@@ -8,9 +8,22 @@ use std::sync::{Mutex, OnceLock};
 use std::thread::sleep;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use crate::retention::{
+    DIAGNOSTIC_RETENTION_MAX_AGE_MS, JsonlRetention, now_epoch_ms, prune_jsonl_generations,
+    rotate_jsonl_with_retention,
+};
+
 pub const EVENT_TRACE_FILENAME: &str = "event-trace.jsonl";
-const EVENT_TRACE_ROTATED_FILENAME: &str = "event-trace.previous.jsonl";
 const EVENT_TRACE_MAX_BYTES: u64 = 8 * 1024 * 1024;
+/// Rotated event-trace generations: up to 3 days of history, hard-capped at
+/// 256 MiB total so a trace flood (a reveal loop, a render storm) cannot eat
+/// the disk. On a heavy day that budget still holds ~3 days at the observed
+/// ~80 MiB/day write rate.
+const EVENT_TRACE_RETENTION: JsonlRetention = JsonlRetention {
+    live_max_bytes: EVENT_TRACE_MAX_BYTES,
+    generations_max_bytes: 256 * 1024 * 1024,
+    max_age_ms: DIAGNOSTIC_RETENTION_MAX_AGE_MS,
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EventTraceRecord {
@@ -92,6 +105,10 @@ fn write_trace_line(home: &Path, line: &[u8]) {
 
     if !writers.contains_key(&path) {
         let _ = fs::create_dir_all(home);
+        // First write through this process: sweep expired generations once so
+        // the "at most 3 days" cap holds even across idle stretches where the
+        // live file never reaches the rotation size.
+        prune_jsonl_generations(&path, EVENT_TRACE_RETENTION, now_epoch_ms());
         match open_trace_writer(&path) {
             Some(writer) => {
                 writers.insert(path.clone(), writer);
@@ -110,7 +127,7 @@ fn write_trace_line(home: &Path, line: &[u8]) {
         // Close the handle before renaming the inode, otherwise we would keep
         // appending to the rotated-away file.
         writers.remove(&path);
-        rotate_trace_file_if_needed(&path);
+        rotate_jsonl_with_retention(&path, EVENT_TRACE_RETENTION, now_epoch_ms());
         let _ = fs::create_dir_all(home);
         match open_trace_writer(&path) {
             Some(writer) => {
@@ -129,18 +146,6 @@ fn write_trace_line(home: &Path, line: &[u8]) {
             writers.remove(&path);
         }
     }
-}
-
-fn rotate_trace_file_if_needed(path: &Path) {
-    let Ok(metadata) = fs::metadata(path) else {
-        return;
-    };
-    if metadata.len() < EVENT_TRACE_MAX_BYTES {
-        return;
-    }
-    let rotated_path = path.with_file_name(EVENT_TRACE_ROTATED_FILENAME);
-    let _ = fs::remove_file(&rotated_path);
-    let _ = fs::rename(path, rotated_path);
 }
 
 pub struct EventTraceSpan {
@@ -290,7 +295,6 @@ mod tests {
         // Use a dedicated home so the global cache entry is isolated.
         let home = unique_home("rotate");
         let path = event_trace_path(&home);
-        let rotated = path.with_file_name(EVENT_TRACE_ROTATED_FILENAME);
 
         // Pre-seed the live file just past the cap, then force the cache to
         // adopt it by writing once (open picks up the existing size).
@@ -304,7 +308,14 @@ mod tests {
 
         append_trace_event(&home, "test", "unit", "after-cap", json!({ "k": 1 }));
 
-        assert!(rotated.exists(), "previous file should exist after rotation");
+        let has_generation = fs::read_dir(&home).unwrap().flatten().any(|entry| {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            name.starts_with("event-trace.g") && name.ends_with(".jsonl")
+        });
+        assert!(
+            has_generation,
+            "a timestamped generation should exist after rotation"
+        );
         // The fresh live file holds only the post-rotation record.
         let lines = read_trace_tail(&path, 100);
         assert_eq!(lines.len(), 1, "fresh file should hold one record");

@@ -15487,11 +15487,7 @@ fn truthy_env_value(value: Option<&str>) -> bool {
 }
 
 fn linux_desktop_identity_trace_paths(home: &Path) -> Vec<PathBuf> {
-    let current = event_trace_path(home);
-    vec![
-        current.with_file_name("event-trace.previous.jsonl"),
-        current,
-    ]
+    yggterm_core::jsonl_read_paths(&event_trace_path(home))
 }
 
 fn linux_desktop_app_id_from_trace_event(event: &Value) -> Option<Value> {

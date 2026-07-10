@@ -28,7 +28,8 @@ def iter_lines(paths):
         return
     if not paths:
         home = Path.home() / ".yggterm"
-        paths = [str(home / "event-trace.previous.jsonl"), str(home / "event-trace.jsonl")]
+        paths = sorted(str(p) for p in home.glob("event-trace.g*.jsonl"))
+        paths += [str(home / "event-trace.previous.jsonl"), str(home / "event-trace.jsonl")]
     for p in paths:
         try:
             with open(p, "r", errors="replace") as fh:

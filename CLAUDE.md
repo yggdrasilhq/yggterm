@@ -23,6 +23,12 @@ The web view (separate surface) is where JSONL gets pretty-formatted into a chat
 
 Full mission statement: `[[project-purpose]]` in `~/.claude/projects/-home-pi-gh-yggterm/memory/project-purpose.md`.
 
+## Pending bugs
+
+Open, user-confirmed bugs live in `docs/pending-bugs.md`. When the user says
+"finish the pending bugs" (or similar), that file is the work queue. Remove an
+entry in the same commit as its verified fix.
+
 ## Core working rules
 
 ### Single source of truth — no exceptions
