@@ -2,6 +2,32 @@
 
 This file tracks user-visible changes in `yggterm`.
 
+## 2.10.7
+
+- **A web surface comes back after a GUI restart** instead of leaving the
+  session showing a bare terminal. On re-attach the daemon replays the terminal
+  screen but not the already-consumed OSC that opened the surface, and a plain
+  heartbeat was barred from recreating one (so it couldn't resurrect a ghost
+  overlay right after a close). That bar now applies ONLY inside a short grace
+  window after a deliberate close; a restart forgets the record, so a live app's
+  heartbeat rebuilds its surface.
+- **Web surfaces stop churning on every navigation (the chat.example.com "login
+  loop").** A remote session's surface egresses through an `ssh -D` SOCKS tunnel,
+  and every address-bar navigation was opening a NEW tunnel — a changed proxy
+  port forces the webview to be destroyed and recreated (the proxy is fixed per
+  WebContext). That recreate dropped the WebContext mid-session, so a just-set
+  login cookie never flushed to the persistent profile jar and the site bounced
+  straight back to its login page. The tunnel is the session's egress, not a
+  per-URL thing, so navigation now REUSES the live SOCKS tunnel: the page
+  navigates in place, the cookie jar survives, and logins stick.
+- **App launches from a live-session right-click land next to the row**, like
+  "New Terminal/Codex/Claude Here" — not at the top of Live Sessions. Every
+  launcher surface now places the new row consistently.
+- **Omnibox feels like Chrome.** Focusing the address bar selects the whole URL
+  so you type over it immediately, and typing now inline-completes from history
+  (the matched tail is highlighted — press → or Enter to accept, keep typing to
+  replace, Backspace to dismiss).
+
 ## 2.10.6
 
 - **A backgrounded web surface survives.** Switching away from a ychrome session

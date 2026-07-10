@@ -923,7 +923,15 @@ struct WebSurfaceUiState {
     opened_at_ms: u64,
     last_seen_ms: u64,
     /// In-progress address-bar edit for the ACTIVE tab; None shows the tab URL.
+    /// When an inline completion is active this holds the COMPLETED text (what
+    /// the input shows), and `address_typed_len` marks where the user's typing
+    /// ends and the auto-completed tail begins.
     address_draft: Option<String>,
+    /// Chrome-style inline autocomplete boundary: the number of leading chars in
+    /// `address_draft` the user actually typed; the rest is the history
+    /// completion, shown selected so it is typed-over or accepted with Enter.
+    /// `None` = no active completion (the whole draft is user input).
+    address_typed_len: Option<usize>,
     /// Keyboard-selected omnibox suggestion (index into the rendered
     /// suggestion rows); None = plain Enter-on-draft behavior.
     address_suggestion_index: Option<usize>,
@@ -1490,6 +1498,55 @@ fn navigate_web_surface_tab(
         let remote = ssh_target
             .as_deref()
             .is_some_and(|t| !ssh_target_host_is_loopback(t));
+        // REUSE the tab's live SOCKS egress across navigations. The `ssh -D`
+        // tunnel is the SESSION's egress (its host), NOT a property of the URL —
+        // every page this tab visits egresses the same way. Re-spawning it per
+        // navigation churns the local port, and a changed `socks_port` forces the
+        // reconciler to DESTROY+RECREATE the webview (the proxy is fixed per
+        // WebContext). That recreate drops the WebContext mid-session, so a
+        // just-set login cookie never flushes to the persistent jar and the site
+        // bounces back to its login page — the chat.example.com "login loop", and the
+        // general surface instability on every address-bar navigation. A loopback
+        // `ssh -L` rewrite (socks_port None, forward present) is per-URL and
+        // cannot be reused, so this only reuses a real SOCKS tunnel.
+        let reuse_socks = remote
+            && state.with(|shell| {
+                shell
+                    .web_surfaces
+                    .get(&session_path)
+                    .and_then(|surface| surface.tabs.iter().find(|tab| tab.id == tab_id))
+                    .is_some_and(|tab| tab.socks_port.is_some())
+            });
+        if reuse_socks {
+            // SOCKS passes the real URL unchanged, so effective_url == url and
+            // socks_port stays put: the reconciler NAVIGATES the live webview
+            // (no recreate), and the WebContext + its cookie jar survive.
+            if let Ok(home) = yggterm_core::resolve_yggterm_home() {
+                append_trace_event(
+                    &home,
+                    "ui",
+                    "web_surface",
+                    "tab_navigate",
+                    json!({
+                        "session_path": session_path,
+                        "tab_id": tab_id,
+                        "url": url,
+                        "effective_url": url,
+                        "reused_socks": true,
+                        "history_index": history_index,
+                    }),
+                );
+            }
+            state.with_mut(|shell| {
+                shell.apply_web_surface_tab_navigation_keep_egress(
+                    &session_path,
+                    tab_id,
+                    url,
+                    history_index,
+                );
+            });
+            return;
+        }
         let (effective_url, forward_child, socks_port) = task::spawn_blocking(move || {
             resolve_web_surface_effective_url(&resolve_url, ssh_target.as_deref())
         })
@@ -1528,6 +1585,13 @@ fn navigate_web_surface_tab(
 }
 /// Heartbeats arrive every ~4s from a live app; 3 missed beats = gone.
 const WEB_SURFACE_STALE_AFTER_MS: u64 = 15_000;
+/// How long after a DELIBERATE close (✕ / suspend / the app's own close OSC) a
+/// heartbeat is still barred from recreating the surface — long enough to cover
+/// the app's own close OSC arriving after the GUI sent Ctrl+C, short enough that
+/// a live app which ignored the Ctrl+C gets its surface back rather than being
+/// stuck as a bare terminal. A GUI restart forgets the record entirely, so it
+/// never blocks the post-restart rebuild.
+const WEB_SURFACE_CLOSE_GHOST_GRACE_MS: u64 = 5_000;
 /// Reconcile cadence while any surface exists; geometry follows layout
 /// changes (sidebar resize, window resize, tab/session switch) within a tick.
 const WEB_SURFACE_RECONCILE_TICK_MS: u64 = 300;
@@ -1636,6 +1700,48 @@ fn append_web_surface_history(profile: &str, url: &str, title: &str) {
 /// Omnibox history suggestions for `query`: most-recent-first substring match
 /// (case-insensitive, over url + title), deduped by URL. Deterministic given
 /// the history file contents.
+/// Best inline autocomplete for `typed`: the most-recent history URL whose
+/// display form (scheme- and `www.`-stripped, the way Chrome shows it) BEGINS
+/// with what the user typed. Returns that completion in the user's typing form
+/// (their prefix casing kept, the history tail appended), or `None`. Only a
+/// strict case-insensitive prefix that EXTENDS `typed` completes — so a full
+/// match (nothing left to add) offers no ghost text.
+fn web_surface_inline_completion(profile: &str, typed: &str) -> Option<String> {
+    let typed = typed.trim_start();
+    // A path/query is fine (it still prefix-matches a full history URL); only
+    // whitespace or an empty query can never be a URL prefix.
+    if typed.is_empty() || typed.contains(char::is_whitespace) {
+        return None;
+    }
+    let typed_lc = typed.to_lowercase();
+    let path = web_surface_history_path(profile)?;
+    let raw = std::fs::read_to_string(&path).ok()?;
+    for line in raw.lines().rev() {
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        let Some(url) = value.get("url").and_then(Value::as_str) else {
+            continue;
+        };
+        let stripped = url
+            .strip_prefix("https://")
+            .or_else(|| url.strip_prefix("http://"))
+            .unwrap_or(url);
+        let no_www = stripped.strip_prefix("www.").unwrap_or(stripped);
+        // Most-specific display form first, so "oi.g" completes to the bare host
+        // form the user is typing rather than re-adding a scheme.
+        for candidate in [no_www, stripped, url] {
+            if candidate.len() > typed.len()
+                && candidate.is_char_boundary(typed.len())
+                && candidate[..typed.len()].eq_ignore_ascii_case(typed)
+                && candidate.to_lowercase().starts_with(&typed_lc)
+            {
+                return Some(format!("{}{}", typed, &candidate[typed.len()..]));
+            }
+        }
+    }
+    None
+}
 fn web_surface_history_suggestions(
     profile: &str,
     query: &str,
@@ -2656,6 +2762,15 @@ struct ShellState {
     // ychrome pilot). SSOT for the viewport web overlay; entries expire when
     // the app's OSC heartbeats stop (WEB_SURFACE_STALE_AFTER_MS).
     web_surfaces: HashMap<String, WebSurfaceUiState>,
+    /// Session paths this GUI DELIBERATELY closed (✕ / suspend / the app's own
+    /// close OSC), with the time it happened. The heartbeat guard consults this
+    /// so a racing heartbeat right after a close cannot resurrect a ghost
+    /// overlay — BUT it lives only in this GUI process, so after a GUI restart
+    /// it is empty and a live app's heartbeat is allowed to REBUILD the surface
+    /// the restart tore down (the "ychrome comes back as a bare terminal after a
+    /// restart" bug: the daemon replays the vt100 screen on re-attach, never the
+    /// consumed OSC `open`, and heartbeats alone used to refuse to recreate).
+    web_surface_deliberate_close_ms: HashMap<String, u64>,
     /// Sidebar contributions declared by libyggterm apps, keyed by GUI
     /// session_path (OSC 7717 `sidebar;declare`). SSOT for which app panes the
     /// rail offers; entries expire when the app's declares stop, exactly like a
@@ -4262,6 +4377,7 @@ impl ShellState {
             next_notification_id: 1,
             session_working_prev: HashMap::new(),
             web_surfaces: HashMap::new(),
+            web_surface_deliberate_close_ms: HashMap::new(),
             sidebar_contributions: HashMap::new(),
             app_pane_schema: None,
             app_pane_values: HashMap::new(),
@@ -5087,6 +5203,9 @@ impl ShellState {
             reload_nonce: 0,
             profile,
         };
+        // The surface is live again: forget any prior deliberate-close record so
+        // it neither lingers nor blocks a future heartbeat rebuild.
+        self.web_surface_deliberate_close_ms.remove(session_path);
         if let Some(replaced) = self.web_surfaces.insert(
             session_path.to_string(),
             WebSurfaceUiState {
@@ -5096,6 +5215,7 @@ impl ShellState {
                 opened_at_ms: now_ms,
                 last_seen_ms: now_ms,
                 address_draft: None,
+                address_typed_len: None,
                 address_suggestion_index: None,
                 osc_url: url,
                 picker: None,
@@ -5155,6 +5275,7 @@ impl ShellState {
             reload_nonce: 0,
             profile: "default".to_string(),
         };
+        self.web_surface_deliberate_close_ms.remove(session_path);
         if let Some(replaced) = self.web_surfaces.insert(
             session_path.to_string(),
             WebSurfaceUiState {
@@ -5164,6 +5285,7 @@ impl ShellState {
                 opened_at_ms: now_ms,
                 last_seen_ms: now_ms,
                 address_draft: None,
+                address_typed_len: None,
                 address_suggestion_index: None,
                 osc_url: control_url.clone(),
                 picker: Some(WebSurfacePickerState {
@@ -5185,6 +5307,12 @@ impl ShellState {
         }
     }
     fn close_web_surface(&mut self, session_path: &str) -> bool {
+        // Record the deliberate close so a heartbeat racing in right after it
+        // cannot resurrect a ghost overlay (see `web_surface_deliberate_close_ms`).
+        // This map is process-local, so a GUI restart forgets it and lets a live
+        // app's heartbeat rebuild the surface.
+        self.web_surface_deliberate_close_ms
+            .insert(session_path.to_string(), current_millis());
         let closed = if let Some(removed) = self.web_surfaces.remove(session_path) {
             kill_web_surface_forward(&removed);
             true
@@ -5192,6 +5320,15 @@ impl ShellState {
             false
         };
         closed
+    }
+    /// True while a heartbeat must NOT recreate a gone surface: the GUI closed it
+    /// deliberately within the last few seconds and the app's own close OSC may
+    /// still be in flight. Outside that window (and always after a GUI restart,
+    /// which forgets the record) a heartbeat MAY rebuild the surface.
+    fn web_surface_recently_deliberately_closed(&self, session_path: &str, now_ms: u64) -> bool {
+        self.web_surface_deliberate_close_ms
+            .get(session_path)
+            .is_some_and(|closed_at| now_ms.saturating_sub(*closed_at) < WEB_SURFACE_CLOSE_GHOST_GRACE_MS)
     }
     fn sweep_stale_web_surfaces(&mut self, now_ms: u64) {
         // The stale sweep is a DEAD-APP detector: an app whose OSC heartbeats
@@ -5488,8 +5625,48 @@ impl ShellState {
     fn web_surface_set_address_draft(&mut self, session_path: &str, draft: Option<String>) {
         if let Some(surface) = self.web_surfaces.get_mut(session_path) {
             surface.address_draft = draft;
+            surface.address_typed_len = None;
             surface.address_suggestion_index = None;
         }
+    }
+    /// Handle a keystroke in the omnibox with Chrome-style inline autocomplete.
+    /// `value` is the input's current text (the selected completion tail, if any,
+    /// was already replaced by the browser). Returns `Some((completed, typed_len,
+    /// completed_len))` when a history completion was applied, so the caller can
+    /// select the auto-completed tail in the DOM; `None` for plain user text.
+    fn web_surface_type_address(
+        &mut self,
+        session_path: &str,
+        value: String,
+    ) -> Option<(String, usize, usize)> {
+        let surface = self.web_surfaces.get_mut(session_path)?;
+        surface.address_suggestion_index = None;
+        // Insertion vs deletion: `address_typed_len` is where the user's typing
+        // ended last time (draft length when no completion was active). Only a
+        // genuine insertion beyond it may auto-complete; a deletion (backspace
+        // over the selected tail, or shortening) must NOT re-complete — Chrome's
+        // first backspace clears the inline completion.
+        let prev_typed_len = surface.address_typed_len.unwrap_or_else(|| {
+            surface.address_draft.as_deref().map(str::len).unwrap_or(0)
+        });
+        let is_insertion = value.len() > prev_typed_len;
+        let profile = surface
+            .tabs
+            .first()
+            .map(|tab| tab.profile.clone())
+            .unwrap_or_else(|| "default".to_string());
+        if is_insertion
+            && let Some(completion) = web_surface_inline_completion(&profile, &value)
+        {
+            let typed_len = value.len();
+            let completed_len = completion.len();
+            surface.address_draft = Some(completion.clone());
+            surface.address_typed_len = Some(typed_len);
+            return Some((completion, typed_len, completed_len));
+        }
+        surface.address_draft = Some(value);
+        surface.address_typed_len = None;
+        None
     }
     /// Move the omnibox dropdown selection by `delta` over `row_count` rows
     /// (row 0 = the synthesized go/search row). Wraps around.
@@ -5555,6 +5732,39 @@ impl ShellState {
             let _ = child.wait();
         }
     }
+    /// Navigate a tab that KEEPS its existing SOCKS egress (see
+    /// `navigate_web_surface_tab`): update the URL + history but leave
+    /// `socks_port` and the `ssh -D` forward child untouched, so the reconciler
+    /// navigates the live webview instead of recreating it. `effective_url` for a
+    /// SOCKS surface is the real URL (the proxy resolves it), so no re-resolution
+    /// is needed.
+    fn apply_web_surface_tab_navigation_keep_egress(
+        &mut self,
+        session_path: &str,
+        tab_id: u64,
+        url: String,
+        history_index: Option<usize>,
+    ) {
+        if let Some(surface) = self.web_surfaces.get_mut(session_path)
+            && let Some(tab) = surface.tabs.iter_mut().find(|tab| tab.id == tab_id)
+        {
+            tab.url = url.clone();
+            tab.effective_url = url.clone();
+            match history_index {
+                Some(index) if index < tab.history.len() => tab.history_index = index,
+                _ => {
+                    if !tab.history.is_empty() {
+                        tab.history.truncate(tab.history_index + 1);
+                    }
+                    tab.history.push(url);
+                    tab.history_index = tab.history.len() - 1;
+                }
+            }
+            if surface.active_tab == tab_id {
+                surface.address_draft = None;
+            }
+        }
+    }
     /// The viewport overlay view for a live (non-stale) surface: tab strip,
     /// address bar, and per-tab iframe targets.
     fn web_surface_overlay_for_session(
@@ -5598,10 +5808,17 @@ impl ShellState {
             .history
             .get(active.history_index + 1)
             .map(|url| (active.history_index + 1, url.clone()));
-        let address_suggestions = surface
-            .address_draft
-            .as_deref()
-            .map(|draft| web_surface_history_suggestions(&active.profile, draft, 6))
+        // The dropdown matches what the USER TYPED, not the inline-completed
+        // draft: when a completion is active `address_draft` holds the full
+        // completed URL, so slice back to `address_typed_len` for the query.
+        let suggestion_query = surface.address_draft.as_deref().map(|draft| {
+            match surface.address_typed_len {
+                Some(len) if len <= draft.len() && draft.is_char_boundary(len) => &draft[..len],
+                _ => draft,
+            }
+        });
+        let address_suggestions = suggestion_query
+            .map(|query| web_surface_history_suggestions(&active.profile, query, 6))
             .unwrap_or_default();
         Some(WebSurfaceOverlayView {
             tabs,
@@ -17376,6 +17593,7 @@ fn spawn_launch_app_verb(
     app: AppManifest,
     verb: AppVerb,
     launch_context: TerminalLaunchContext,
+    insert_after: Option<String>,
 ) {
     let command = app.command_for(&verb);
     let title_hint = verb.label.clone();
@@ -17389,12 +17607,18 @@ fn spawn_launch_app_verb(
                 if let Some(cwd) = cwd.as_deref() {
                     ensure_home_scoped_workspace_dir(cwd)?;
                 }
-                let (snapshot, message) = start_local_session_at_with_terminal_appearance(
+                // `_placed` so an app launched from a live-session row lands
+                // directly below it, exactly like "New Terminal/Codex/Claude
+                // Here". The daemon fails open (top insert) when the anchor is
+                // not a live session (a cwd-tree folder, or the titlebar `+`
+                // which passes None) — so every launcher surface stays uniform.
+                let (snapshot, message) = start_local_session_placed(
                     &endpoint,
                     SessionKind::Shell,
                     cwd.as_deref(),
                     Some(&title_hint),
                     Some(&terminal_appearance),
+                    insert_after.as_deref(),
                 )?;
                 write_app_verb_command(&endpoint, &snapshot, message.as_deref(), &command);
                 Ok((snapshot, message))
@@ -17407,13 +17631,14 @@ fn spawn_launch_app_verb(
             ..
         } => {
             spawn_server_snapshot_action(state, pending, move |endpoint| {
-                let (snapshot, message) = start_ssh_session_at_with_terminal_appearance(
+                let (snapshot, message) = start_ssh_session_placed(
                     &endpoint,
                     &ssh_target,
                     prefix.as_deref(),
                     cwd.as_deref(),
                     Some(&title_hint),
                     Some(&terminal_appearance),
+                    insert_after.as_deref(),
                 )?;
                 write_app_verb_command(&endpoint, &snapshot, message.as_deref(), &command);
                 Ok((snapshot, message))
@@ -45912,7 +46137,8 @@ fn app() -> Element {
                                 shell.close_titlebar_new_menu();
                                 terminal_launch_context(shell)
                             });
-                            spawn_launch_app_verb(state, app, verb, launch_context);
+                            // Titlebar `+` is a global "new" with no anchor row: top insert.
+                            spawn_launch_app_verb(state, app, verb, launch_context, None);
                             },
                             on_refresh_summary: move |_| {
                             let active_session = { state.read().server.active_session().cloned() };
@@ -46401,11 +46627,23 @@ fn app() -> Element {
                             move |_| spawn_start_group_session(state, row.clone(), SessionKind::ClaudeCode)
                         },
                         on_launch_app_verb: {
-                            let row = context_row.clone();
+                            let context_row = context_row.clone();
+                            let clicked_row = row.clone();
                             move |(app, verb): (AppManifest, AppVerb)| {
                                 state.with_mut(|shell| shell.close_context_menu());
-                                let launch_context = launch_context_for_optional_row(state, Some(row.clone()));
-                                spawn_launch_app_verb(state, app, verb, launch_context);
+                                // cwd/host from the creation-context row (a
+                                // session's own dir); ANCHOR from the RAW clicked
+                                // row so the new row lands adjacent below it, like
+                                // the "New … Here" agent actions.
+                                let launch_context =
+                                    launch_context_for_optional_row(state, Some(context_row.clone()));
+                                spawn_launch_app_verb(
+                                    state,
+                                    app,
+                                    verb,
+                                    launch_context,
+                                    Some(clicked_row.full_path.clone()),
+                                );
                             }
                         },
                         on_create_group_recipe: {
@@ -55683,18 +55921,31 @@ fn TerminalCanvas(
                                         }
                                     }
                                     "open" | "heartbeat" => {
-                                        let touched = state.with_mut(|shell| {
+                                        let (touched, recently_closed) = state.with_mut(|shell| {
                                             shell.sweep_stale_web_surfaces(now_ms);
-                                            shell.touch_web_surface(&surface_session_path, now_ms)
+                                            (
+                                                shell.touch_web_surface(&surface_session_path, now_ms),
+                                                shell.web_surface_recently_deliberately_closed(
+                                                    &surface_session_path,
+                                                    now_ms,
+                                                ),
+                                            )
                                         });
-                                        // A heartbeat is LIVENESS, not intent: it may
-                                        // refresh/retarget an existing surface but must
-                                        // never CREATE one — after a GUI-side close
-                                        // (Ctrl+C sent, app dying), an in-flight
-                                        // heartbeat resurrected a ghost overlay until
-                                        // the app's own close OSC landed.
+                                        // A heartbeat is LIVENESS, not intent: normally it
+                                        // may refresh an existing surface but must not
+                                        // CREATE one, so an in-flight heartbeat racing a
+                                        // GUI-side close (Ctrl+C sent, app dying) cannot
+                                        // resurrect a ghost overlay. But that ban only
+                                        // holds inside the close-ghost grace window: after
+                                        // a GUI RESTART the surface is gone with NO recent
+                                        // deliberate close on record, so the heartbeat is
+                                        // allowed to REBUILD it (the daemon replays the
+                                        // vt100 screen on re-attach, never the consumed
+                                        // OSC `open`, so a heartbeat is the only signal
+                                        // that comes — without this, ychrome came back as a
+                                        // bare terminal after every restart).
                                         let heartbeat_for_gone_surface =
-                                            !touched && action == "heartbeat";
+                                            !touched && action == "heartbeat" && recently_closed;
                                         let fresh_url = url
                                             .filter(|_| !heartbeat_for_gone_surface)
                                             .filter(|url| web_surface_url_scheme_allowed(url))
@@ -61409,15 +61660,70 @@ fn TerminalCanvas(
                                         spellcheck: "false",
                                         autocomplete: "off",
                                         placeholder: "Search or enter address",
+                                        onfocus: {
+                                            // Chrome-like: focusing the omnibox selects the
+                                            // whole URL so the user types over it immediately.
+                                            // A one-shot mouseup guard stops the click that
+                                            // focused the field from collapsing the selection
+                                            // to a caret; later clicks position the caret
+                                            // normally (no new focus event fires).
+                                            let address_input_id =
+                                                format!("{web_surface_host_id}-ws-address");
+                                            move |_| {
+                                                let _ = document::eval(&format!(
+                                                    r#"(function(){{
+                                                        var el = document.getElementById('{id}');
+                                                        if (!el || !el.select) return;
+                                                        el.select();
+                                                        var guard = function(e){{
+                                                            e.preventDefault();
+                                                            el.removeEventListener('mouseup', guard);
+                                                        }};
+                                                        el.addEventListener('mouseup', guard);
+                                                    }})();"#,
+                                                    id = address_input_id,
+                                                ));
+                                            }
+                                        },
                                         oninput: {
                                             let nav_path = nav_path.clone();
+                                            let address_input_id =
+                                                format!("{web_surface_host_id}-ws-address");
                                             move |evt: FormEvent| {
-                                                state.with_mut(|shell| {
-                                                    shell.web_surface_set_address_draft(
+                                                let completion = state.with_mut(|shell| {
+                                                    shell.web_surface_type_address(
                                                         &nav_path,
-                                                        Some(evt.value()),
-                                                    );
+                                                        evt.value(),
+                                                    )
                                                 });
+                                                // Inline completion applied: show the
+                                                // completed text with the auto-completed tail
+                                                // selected, so it is typed-over or accepted
+                                                // with Enter/→. Deferred to the next frame AND
+                                                // it sets the value itself — the controlled
+                                                // re-render may not have landed yet, and
+                                                // selecting a range past the still-short value
+                                                // would clamp to a caret (the completion draft
+                                                // equals this value, so the reconcile is a
+                                                // no-op and the selection sticks).
+                                                if let Some((completed, typed_len, completed_len)) =
+                                                    completion
+                                                {
+                                                    let completed_js = serde_json::to_string(&completed)
+                                                        .unwrap_or_else(|_| "\"\"".to_string());
+                                                    let _ = document::eval(&format!(
+                                                        r#"requestAnimationFrame(function(){{
+                                                            var el = document.getElementById('{id}');
+                                                            if (!el) return;
+                                                            if (el.value !== {completed}) el.value = {completed};
+                                                            if (el.setSelectionRange) el.setSelectionRange({start}, {end});
+                                                        }});"#,
+                                                        id = address_input_id,
+                                                        completed = completed_js,
+                                                        start = typed_len,
+                                                        end = completed_len,
+                                                    ));
+                                                }
                                             }
                                         },
                                         onkeydown: {
@@ -77081,9 +77387,10 @@ fn StartPage(snapshot: SharedSnapshot, state: Signal<ShellState>) -> Element {
                                         );
                                         return;
                                     }
+                                    let insert_after = row.as_ref().map(|r| r.full_path.clone());
                                     let launch_context = launch_context_for_optional_row(state, row.clone());
                                     let (app, verb) = entry.clone();
-                                    spawn_launch_app_verb(state, app, verb, launch_context);
+                                    spawn_launch_app_verb(state, app, verb, launch_context, insert_after);
                                 }
                             },
                             if !app.icon.is_empty() {
