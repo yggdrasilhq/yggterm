@@ -1,11 +1,19 @@
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
-use yggterm_core::{SessionStore, append_bounded_jsonl_record, append_trace_event};
+use yggterm_core::{
+    DIAGNOSTIC_RETENTION_MAX_AGE_MS, JsonlRetention, SessionStore, append_retained_jsonl_record,
+    append_trace_event,
+};
 
 const UI_TELEMETRY_FILENAME: &str = "ui-telemetry.jsonl";
-const UI_TELEMETRY_ROTATED_FILENAME: &str = "ui-telemetry.previous.jsonl";
 const UI_TELEMETRY_MAX_BYTES: u64 = 8 * 1024 * 1024;
+/// Rotated ui-telemetry generations: at most 3 days, 96 MiB total.
+const UI_TELEMETRY_RETENTION: JsonlRetention = JsonlRetention {
+    live_max_bytes: UI_TELEMETRY_MAX_BYTES,
+    generations_max_bytes: 96 * 1024 * 1024,
+    max_age_ms: DIAGNOSTIC_RETENTION_MAX_AGE_MS,
+};
 const UI_TELEMETRY_DUPLICATE_THROTTLE_MS: u64 = 2_000;
 
 pub(crate) fn ui_telemetry_should_record(
@@ -36,12 +44,7 @@ pub(crate) fn append_ui_telemetry_event(event: &str, payload: Value) {
     });
     if let Ok(store) = SessionStore::open_or_init() {
         let path = store.home_dir().join(UI_TELEMETRY_FILENAME);
-        append_bounded_jsonl_record(
-            &path,
-            UI_TELEMETRY_ROTATED_FILENAME,
-            UI_TELEMETRY_MAX_BYTES,
-            &telemetry,
-        );
+        append_retained_jsonl_record(&path, UI_TELEMETRY_RETENTION, &telemetry);
         append_trace_event(store.home_dir(), "ui", "ui_telemetry", event, telemetry);
     }
 }

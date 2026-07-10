@@ -2,6 +2,30 @@
 
 This file tracks user-visible changes in `yggterm`.
 
+## 2.10.2
+
+- **New telemetry: agent session resume errors are counted.** Claude Code and
+  codex sporadically refuse to resume — "Session `<uuid>` is already in use",
+  "No conversation found with session ID `<uuid>`", "session not found / does
+  not exist" — and there was no record of how many or when. Every daemon PTY
+  reader now scans its (control-stripped) output for these shapes and records
+  a throttled `agent_session_error` trace event (pattern, uuid, sample line,
+  session path) plus a durable row in `~/.yggterm/agent-incidents.jsonl`, a
+  tiny stream that survives trace rotation for months. Observation only — no
+  behavior change. Count them with:
+  `jq -r 'select(.kind=="agent_session_error") | [.ts_ms, .pattern, .uuid] | @tsv' ~/.yggterm/agent-incidents.jsonl`
+- **Diagnostics now cover up to 3 days instead of ~13 hours.** The noisy
+  streams (`event-trace`, `ui-telemetry`, `perf-telemetry`) used to keep one
+  8–16 MiB live file plus one `.previous` — busy days rotated history away in
+  hours. A full live file is now renamed to a timestamped generation
+  (`<stem>.g<epoch-ms>.jsonl`) and generations are pruned by age (anything
+  older than 3 days is deleted — the window is a cap, not a floor) and by a
+  per-stream byte budget (event-trace 256 MiB, perf 128 MiB, ui 96 MiB) so a
+  flood cannot eat the disk. Per-event I/O is unchanged: one append; pruning
+  runs only at rotation and once per process start. Legacy `.previous.jsonl`
+  files drain out under the same rules. `scripts/render_fail_patterns.py` and
+  the smoke suite read the generations automatically.
+
 ## 2.10.1
 
 - **Fixed: a cwd-tree folder named with a nested path launches where it points.**

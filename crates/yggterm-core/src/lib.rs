@@ -2,6 +2,7 @@ mod browser;
 mod icon;
 mod install;
 mod perf;
+mod retention;
 mod session_kind;
 mod telemetry;
 mod titles;
@@ -38,11 +39,14 @@ pub use install::{
     refresh_desktop_integration, update_command_hint, write_direct_install_state,
 };
 pub use perf::{
-    PERF_INCIDENT_FILENAME, PERF_TELEMETRY_FILENAME, PERF_TELEMETRY_MAX_BYTES,
-    PERF_TELEMETRY_ROTATED_FILENAME, PerfGuard,
+    PERF_INCIDENT_FILENAME, PERF_TELEMETRY_FILENAME, PERF_TELEMETRY_MAX_BYTES, PerfGuard,
     PerfSpan, PerfSpanSummary, append_bounded_jsonl_record, append_perf_event, detect_perf_incident,
     perf_profiling_enabled, perf_telemetry_path, record_perf_incident_if_hot,
     set_perf_profiling_enabled, summarize_perf_telemetry,
+};
+pub use retention::{
+    DIAGNOSTIC_RETENTION_MAX_AGE_MS, JsonlRetention, append_retained_jsonl_record,
+    jsonl_read_paths, prune_jsonl_generations, rotate_jsonl_with_retention,
 };
 pub use session_kind::SessionKind;
 pub use telemetry::{

@@ -34,9 +34,19 @@ fn main() {
     let elapsed = started.elapsed();
 
     let path = event_trace_path(&home);
-    let rotated = path.with_file_name("event-trace.previous.jsonl");
     let live_len = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-    let rotated_len = std::fs::metadata(&rotated).map(|m| m.len()).unwrap_or(0);
+    let rotated_len: u64 = std::fs::read_dir(&home)
+        .map(|entries| {
+            entries
+                .flatten()
+                .filter(|entry| {
+                    let name = entry.file_name().to_string_lossy().into_owned();
+                    name.starts_with("event-trace.g") && name.ends_with(".jsonl")
+                })
+                .filter_map(|entry| entry.metadata().ok().map(|meta| meta.len()))
+                .sum()
+        })
+        .unwrap_or(0);
 
     // Validate the freshest records round-trip as real EventTraceRecords.
     let tail = read_trace_tail(&path, 3);
