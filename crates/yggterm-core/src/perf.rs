@@ -27,8 +27,16 @@ pub fn perf_profiling_enabled() -> bool {
 }
 
 pub const PERF_TELEMETRY_FILENAME: &str = "perf-telemetry.jsonl";
-pub const PERF_TELEMETRY_ROTATED_FILENAME: &str = "perf-telemetry.previous.jsonl";
 pub const PERF_TELEMETRY_MAX_BYTES: u64 = 16 * 1024 * 1024;
+/// Rotated perf-telemetry generations: at most 3 days, 128 MiB total. The
+/// floor+sampling policy below already shrinks the stream ~10x, so this budget
+/// comfortably holds the full window.
+const PERF_TELEMETRY_RETENTION: crate::retention::JsonlRetention =
+    crate::retention::JsonlRetention {
+        live_max_bytes: PERF_TELEMETRY_MAX_BYTES,
+        generations_max_bytes: 128 * 1024 * 1024,
+        max_age_ms: crate::retention::DIAGNOSTIC_RETENTION_MAX_AGE_MS,
+    };
 
 pub fn perf_telemetry_path(home: &Path) -> PathBuf {
     home.join(PERF_TELEMETRY_FILENAME)
@@ -107,12 +115,7 @@ pub fn append_perf_event(home: &Path, category: &str, name: &str, payload: Value
         "name": name,
         "payload": payload,
     });
-    append_bounded_jsonl_record(
-        &path,
-        PERF_TELEMETRY_ROTATED_FILENAME,
-        PERF_TELEMETRY_MAX_BYTES,
-        &event,
-    );
+    crate::retention::append_retained_jsonl_record(&path, PERF_TELEMETRY_RETENTION, &event);
 }
 
 fn rotate_jsonl_if_needed(path: &Path, rotated_filename: &str, max_bytes: u64, incoming_len: u64) {
@@ -252,9 +255,7 @@ pub fn summarize_perf_telemetry(
     category_filter: Option<&str>,
 ) -> Vec<PerfSpanSummary> {
     let mut durations: BTreeMap<(String, String), Vec<f64>> = BTreeMap::new();
-    let primary = perf_telemetry_path(home);
-    let rotated = primary.with_file_name(PERF_TELEMETRY_ROTATED_FILENAME);
-    for path in [rotated, primary] {
+    for path in crate::retention::jsonl_read_paths(&perf_telemetry_path(home)) {
         let Ok(text) = fs::read_to_string(&path) else {
             continue;
         };

@@ -101,7 +101,9 @@ def numeric(value) -> float | None:
 
 def event_trace_paths() -> list[Path]:
     home = current_yggterm_home()
+    generations = sorted(home.glob("event-trace.g*.jsonl"))
     return [
+        *generations,
         home / "event-trace.jsonl",
         home / "event-trace.previous.jsonl",
     ]
