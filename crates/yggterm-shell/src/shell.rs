@@ -2768,6 +2768,7 @@ struct ShellState {
     background_live_session_snapshot_skipped_input_hot_count: u64,
     background_live_session_snapshot_skipped_noop_count: u64,
     latest_runtime_status: Option<ServerRuntimeStatus>,
+    working_flags_poll_started: bool,
     drag_paths: Vec<String>,
     drag_hover_target: Option<DragDropTarget>,
     optimistic_drag_paths: Vec<String>,
@@ -4270,6 +4271,7 @@ impl ShellState {
             background_live_session_snapshot_skipped_input_hot_count: 0,
             background_live_session_snapshot_skipped_noop_count: 0,
             latest_runtime_status: None,
+            working_flags_poll_started: false,
             drag_paths: Vec::new(),
             drag_hover_target: None,
             optimistic_drag_paths: Vec::new(),
@@ -6957,7 +6959,7 @@ impl ShellState {
     /// never fire on a stale/frozen frame. A `None` (no live screen) does NOT
     /// update the remembered verdict, so a transient ownership gap can't drop the
     /// "was working" memory and mis-fire on return.
-    fn notify_finished_working_sessions(&mut self) {
+    fn notify_finished_working_sessions(&mut self, source: &str) {
         if !self.settings.in_app_notifications
             && !self.settings.system_notifications
             && !self.settings.notification_sound
@@ -6966,8 +6968,10 @@ impl ShellState {
             // don't fire a backlog of edges the moment notifications are enabled.
             for session in self.server.live_sessions() {
                 if let Some(working) = session.working {
-                    self.session_working_prev
+                    let previous = self
+                        .session_working_prev
                         .insert(session.session_path.clone(), working);
+                    trace_working_edge_if_changed(&session.session_path, previous, working, source);
                 }
             }
             return;
@@ -6981,10 +6985,11 @@ impl ShellState {
                 // Unknown (no live screen): leave the remembered verdict intact.
                 continue;
             };
-            let was_working = self
+            let previous = self
                 .session_working_prev
-                .insert(session.session_path.clone(), working)
-                == Some(true);
+                .insert(session.session_path.clone(), working);
+            trace_working_edge_if_changed(&session.session_path, previous, working, source);
+            let was_working = previous == Some(true);
             let is_background = active_path.as_deref() != Some(session.session_path.as_str());
             if was_working && !working && is_background {
                 finished.push((session.title.clone(), session.kind));
@@ -7499,7 +7504,7 @@ impl ShellState {
                 self.show_start_page_when_no_live_sessions =
                     snapshot.active_session_path.is_none() && snapshot.live_sessions.is_empty();
                 self.server.apply_snapshot(snapshot);
-                self.notify_finished_working_sessions();
+                self.notify_finished_working_sessions("snapshot_apply");
                 self.refresh_cached_hot_session_views();
                 self.restore_active_preview_if_snapshot_regressed(previous_active_session);
                 self.mark_active_remote_preview_dirty_if_needed();
@@ -7592,7 +7597,7 @@ impl ShellState {
                 self.show_start_page_when_no_live_sessions =
                     snapshot.active_session_path.is_none() && snapshot.live_sessions.is_empty();
                 self.server.apply_snapshot(snapshot);
-                self.notify_finished_working_sessions();
+                self.notify_finished_working_sessions("snapshot_apply");
                 self.refresh_cached_hot_session_views();
                 self.restore_active_preview_if_snapshot_regressed(previous_active_session);
                 self.mark_active_remote_preview_dirty_if_needed();
@@ -7661,7 +7666,7 @@ impl ShellState {
                 self.show_start_page_when_no_live_sessions =
                     snapshot.active_session_path.is_none() && snapshot.live_sessions.is_empty();
                 self.server.apply_snapshot(snapshot);
-                self.notify_finished_working_sessions();
+                self.notify_finished_working_sessions("snapshot_apply");
                 self.refresh_cached_hot_session_views();
                 self.restore_active_preview_if_snapshot_regressed(previous_active_session);
                 self.mark_active_remote_preview_dirty_if_needed();
@@ -7861,6 +7866,20 @@ impl ShellState {
                 session.session_path == session_path
                     && is_live_local_stored_codex_terminal_session(session)
             })
+    }
+    /// Apply a WorkingFlags poll result (the working-dot lag fix): patch the
+    /// live sessions' `working` in place and run the same finished-working edge
+    /// detection the snapshot applies use. Returns true when anything changed
+    /// (so the caller re-renders). Full snapshot applies remain the SSOT for
+    /// everything else; this only keeps ONE field fresh while a focused
+    /// terminal defers background refreshes for 10-45s at a time.
+    fn apply_working_flags_poll(&mut self, flags: &[(String, bool)]) -> bool {
+        let changed = self.server.apply_live_session_working_flags(flags);
+        if changed.is_empty() {
+            return false;
+        }
+        self.notify_finished_working_sessions("working_flags_poll");
+        true
     }
     fn refresh_cached_hot_session_views(&mut self) {
         for session in self.server.live_session_views().iter() {
@@ -13512,11 +13531,94 @@ fn spawn_summary_generation_for_target(
         maybe_spawn_background_copy_generation(state);
     });
 }
+/// One trace line per observed working edge, tagged with which apply path saw
+/// it first. `jq 'select(.name=="working_edge")'` over event-trace gives the
+/// daemon->GUI dot latency directly — the probe-free instrumentation the
+/// working-dot lag investigation called for.
+fn trace_working_edge_if_changed(
+    session_path: &str,
+    previous: Option<bool>,
+    working: bool,
+    source: &str,
+) {
+    if previous == Some(working) {
+        return;
+    }
+    append_ui_telemetry_event(
+        "working_edge",
+        json!({
+            "session_path": session_path,
+            "working": working,
+            "previous": previous,
+            "source": source,
+        }),
+    );
+}
+
+/// How often the GUI asks the daemon for bare working flags. Cheap on both
+/// sides (a handful of vt100 footer scrapes, a tiny reply), and NOT subject to
+/// the focused-terminal background-refresh defer — that defer is exactly why
+/// the sidebar dot used to keep blinking 10-45s after an agent finished.
+const WORKING_FLAGS_POLL_INTERVAL_MS: u64 = 2_500;
+const WORKING_FLAGS_POLL_ERROR_BACKOFF_MS: u64 = 30_000;
+
+fn spawn_working_flags_poll_loop(state: Signal<ShellState>) {
+    let endpoint = state.read().bootstrap.server_endpoint.clone();
+    spawn(async move {
+        loop {
+            sleep(Duration::from_millis(WORKING_FLAGS_POLL_INTERVAL_MS)).await;
+            let (closing, has_flagged_sessions) = state.with(|shell| {
+                (
+                    shell.closing_app,
+                    shell.server.live_session_views().iter().any(|session| {
+                        matches!(
+                            session.kind,
+                            SessionKind::Codex
+                                | SessionKind::CodexLiteLlm
+                                | SessionKind::ClaudeCode
+                                | SessionKind::Shell
+                        )
+                    }),
+                )
+            });
+            if closing {
+                return;
+            }
+            if !has_flagged_sessions {
+                continue;
+            }
+            let request_endpoint = endpoint.clone();
+            let outcome =
+                task::spawn_blocking(move || yggterm_server::working_flags(&request_endpoint))
+                    .await;
+            match outcome {
+                Ok(Ok(flags)) => {
+                    let _ = safe_shell_mut(state, "working_flags_apply", |shell| {
+                        shell.apply_working_flags_poll(&flags)
+                    });
+                }
+                _ => {
+                    // Old daemon (unknown request) or transient socket error —
+                    // back off instead of hammering an endpoint that can't answer.
+                    sleep(Duration::from_millis(WORKING_FLAGS_POLL_ERROR_BACKOFF_MS)).await;
+                }
+            }
+        }
+    });
+}
+
 fn spawn_initial_server_sync(
     state: Signal<ShellState>,
     schedule_ui: std::sync::Arc<dyn Fn() + Send + Sync>,
     mut async_render_epoch: Signal<u64>,
 ) {
+    let start_working_flags_poll = state.with(|shell| !shell.working_flags_poll_started);
+    if start_working_flags_poll {
+        let _ = safe_shell_mut(state, "working_flags_poll_started", |shell| {
+            shell.working_flags_poll_started = true;
+        });
+        spawn_working_flags_poll_loop(state);
+    }
     let endpoint = state.read().bootstrap.server_endpoint.clone();
     let terminal_appearance =
         state.with(|shell| shell.effective_terminal_identity_appearance().to_string());
@@ -48590,9 +48692,21 @@ fn sidebar_machine_row_has_working_live_session(
     row: &BrowserRow,
 ) -> bool {
     if row.full_path == "local" {
+        // Locality has TWO encodings on a live session and both must be
+        // honored: `ssh_target` is None for a plain local shell, but a local
+        // AGENT session (Codex/CC) persists with the canonical loopback target
+        // "localhost" so restore works (see persist_live_sessions). The old
+        // `is_none()` check silently excluded every local agent session, so a
+        // COLLAPSED local root never blinked while one was working (2026-07-10
+        // report) — expanded rows were fine because the session row itself
+        // blinks. Reuse the server-side loopback SSOT instead of a second
+        // string compare.
         return snapshot.live_sessions.iter().any(|session| {
             session.working == Some(true)
-                && session.ssh_target.is_none()
+                && session
+                    .ssh_target
+                    .as_deref()
+                    .is_none_or(yggterm_server::is_loopback_ssh_target)
                 && is_local_live_session_path(&session.session_path)
         });
     }
@@ -106726,6 +106840,33 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
                 "group aggregate working state mismatch for working={verdict:?}"
             );
         }
+    }
+
+    #[test]
+    fn local_machine_root_blinks_for_working_local_agent_session() {
+        // Field-shape replica of the real guihost session that did NOT blink the
+        // collapsed local root (2026-07-10): kind ClaudeCode, source LiveLocal,
+        // host_label "claude-code", local:// path, working Some(true).
+        let shell = ShellState::new(test_shell_bootstrap_with_start_page());
+        let mut snapshot = shell.snapshot();
+        let mut local_root = test_sidebar_group_row("local");
+        local_root.expanded = false;
+        snapshot.rows = vec![local_root.clone()];
+
+        let mut agent = test_live_shell_session(
+            "local://52317975-9c66-40ef-8028-901b6415250e",
+        );
+        agent.id = "52317975-9c66-40ef-8028-901b6415250e".to_string();
+        agent.kind = SessionKind::ClaudeCode;
+        agent.host_label = "claude-code".to_string();
+        agent.ssh_target = Some("localhost".to_string());
+        agent.working = Some(true);
+        snapshot.live_sessions = vec![agent];
+
+        assert!(
+            sidebar_machine_row_has_working_live_session(&snapshot, &local_root),
+            "a working local agent session must blink the collapsed local root"
+        );
     }
 
     #[test]
