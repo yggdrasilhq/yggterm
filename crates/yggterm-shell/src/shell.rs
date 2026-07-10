@@ -153,7 +153,8 @@ use yggterm_core::{
     AgentSessionProfile, AppManifest, AppSettings, AppVerb, BrowserRow, BrowserRowKind,
     InstallContext, PerfSpan,
     ReleaseUpdateInstallProgress, ReleaseUpdateInstallStage, SessionBrowserState, SessionNode,
-    SessionStore, SessionSummaryTimelineEntry, TerminalTelemetryEvent, WorkspaceDocumentInput,
+    SessionStore, SessionSummaryTimelineEntry, SplitAxis, SplitGroup, TerminalTelemetryEvent,
+    WorkspaceDocumentInput,
     WorkspaceDocumentKind, WorkspaceGroupKind, YGGTERM_DESKTOP_APP_ID, append_perf_event,
     append_trace_event, best_effort_precis_from_context, best_effort_summary_from_context,
     best_effort_title_from_context, check_for_update, current_version, detect_install_context,
@@ -274,6 +275,11 @@ static LINUX_X11_COMPOSITOR_BLUR_REVERIFY_GENERATION: AtomicU64 = AtomicU64::new
 static APP_ROOT_WINDOW_FOCUS_REQUESTED: AtomicBool = AtomicBool::new(false);
 static APP_ROOT_RENDER_COUNT: AtomicU64 = AtomicU64::new(0);
 static NEXT_TERMINAL_BOOTSTRAP_OWNER_ID: AtomicU64 = AtomicU64::new(1);
+/// Monotonic counter for split-group ids ([[campaign-split-view-groups]]).
+/// `Date::now`-style entropy is unavailable in some contexts and would collide
+/// on two splits made in the same millisecond, so ids are `current_millis`
+/// prefixed with a process-lifetime counter.
+static NEXT_SPLIT_GROUP_SEQ: AtomicU64 = AtomicU64::new(1);
 static ALLOCATOR_TRIM_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
 static LAST_ALLOCATOR_TRIM_CHECK_MS: AtomicU64 = AtomicU64::new(0);
 static LAST_ALLOCATOR_TRIM_MS: AtomicU64 = AtomicU64::new(0);
@@ -2808,6 +2814,11 @@ struct ShellState {
     alt_overlay_sequence: String,
     selected_tree_paths: HashSet<String>,
     user_collapsed_synthetic_paths: HashSet<String>,
+    /// GUI-level split-view groups ([[campaign-split-view-groups]]). The single
+    /// source of truth for splits: the compound sidebar row, the viewport pane
+    /// layout, keep-alive, and persistence all derive from this list. No
+    /// per-session split flag exists anywhere else.
+    split_groups: Vec<SplitGroup>,
     selection_anchor: Option<String>,
     context_menu_row: Option<BrowserRow>,
     context_menu_context_row: Option<BrowserRow>,
@@ -3238,6 +3249,14 @@ struct RenderSnapshot {
     active_web_surface_host: Option<String>,
     active_view_mode: WorkspaceViewMode,
     retained_terminal_sessions: Vec<ManagedSessionView>,
+    /// All GUI-level split-view groups ([[campaign-split-view-groups]]). Drives
+    /// the compound sidebar rows and the cwd-tree split-glyph badges.
+    split_groups: Vec<SplitGroup>,
+    /// The group that owns the active (focused) session, if the active surface
+    /// is a split. A convenience projection of `split_groups` +
+    /// `active_session_path` so the viewport does not re-derive it; the SSOT
+    /// remains `split_groups`.
+    active_split_group: Option<SplitGroup>,
     terminal_mount_epochs: HashMap<String, u64>,
     ssh_targets: Vec<SshConnectTarget>,
     remote_machines: Vec<RemoteMachineSnapshot>,
@@ -4298,6 +4317,9 @@ impl ShellState {
         };
         let sidebar_open = settings.show_tree;
         let sidebar_width = clamp_sidebar_width(settings.tree_width);
+        // Captured before `settings` is moved into the ShellState struct below
+        // ([[campaign-split-view-groups]] persistence restore).
+        let restored_split_groups = settings.split_groups.clone();
         let mut browser = SessionBrowserState::new(bootstrap.browser_tree.clone());
         // A persisted user collapse outranks a stale expanded entry for the
         // same synthetic path (the two can disagree when an auto-reveal
@@ -4399,6 +4421,11 @@ impl ShellState {
             // Live Sessions group survives GUI restarts (the auto-reveal
             // lanes consult this set before re-expanding).
             user_collapsed_synthetic_paths: restored_collapsed_synthetic_paths,
+            // Restored from settings so a built split-view workspace reopens as
+            // the intentional artifact the user shaped ([[campaign-split-view-groups]]).
+            // Normalized on parse; a group whose members no longer exist is
+            // pruned lazily by `prune_stale_split_groups` on the first snapshot.
+            split_groups: restored_split_groups,
             selection_anchor: None,
             context_menu_row: None,
             context_menu_context_row: None,
@@ -4809,6 +4836,35 @@ impl ShellState {
                 };
                 retained_terminal_sessions.push(snapshot_retained_terminal_session_view(&session));
             }
+            // Every co-visible pane of the ACTIVE split group must be mounted so
+            // both panes paint at once ([[campaign-split-view-groups]]). The
+            // focused pane is already retained above; this guarantees the
+            // sibling is too, independent of the activation-MRU keep-set.
+            if let Some(group) = self.active_split_group() {
+                for member_path in group.members.clone() {
+                    if retained_terminal_sessions
+                        .iter()
+                        .any(|session| session.session_path == member_path)
+                    {
+                        continue;
+                    }
+                    let Some(session) = live_runtime_sessions
+                        .iter()
+                        .find(|session| session.session_path == member_path)
+                        .cloned()
+                        .or_else(|| self.cached_hot_session_view(&member_path))
+                    else {
+                        continue;
+                    };
+                    if !self.server.session_supports_terminal(&member_path)
+                        && !self.cached_hot_session_views.contains_key(&member_path)
+                    {
+                        continue;
+                    }
+                    retained_terminal_sessions
+                        .push(snapshot_retained_terminal_session_view(&session));
+                }
+            }
         }
         let sidebar_hot_sessions =
             merge_hot_sidebar_sessions(&live_sessions, &retained_terminal_sessions);
@@ -4854,7 +4910,15 @@ impl ShellState {
                 self.server.live_session_keep_alive(path)
             })
         });
-        let rows = sidebar_rows_for_render(&merged_rows, effective_search_query);
+        let mut rows = sidebar_rows_for_render(&merged_rows, effective_search_query);
+        // Mirror the split geometry in the sidebar: within Live Sessions, a
+        // group's member rows collapse to one compound row
+        // ([[campaign-split-view-groups]]). Skipped while searching so a query
+        // still finds the individual member rows. The cwd-tree member rows are
+        // untouched (dual presence) and get a split-glyph badge at render time.
+        if !search_active {
+            collapse_live_sessions_into_split_rows(&mut rows, &self.split_groups);
+        }
         let search_sidebar_matches = search_sidebar_matches(&merged_rows, effective_search_query);
         let active_title = active_session
             .as_ref()
@@ -5007,6 +5071,8 @@ impl ShellState {
             active_session_path,
             active_view_mode: render_active_view_mode,
             retained_terminal_sessions,
+            split_groups: self.split_groups.clone(),
+            active_split_group: self.active_split_group().cloned(),
             terminal_mount_epochs: self.terminal_mount_epochs.clone(),
             ssh_targets: self.server.ssh_targets().to_vec(),
             remote_machines: self.server.remote_machines().to_vec(),
@@ -8044,6 +8110,7 @@ impl ShellState {
                 self.prune_terminal_resume_ready_paths();
                 self.prune_terminal_bootstrap_owners();
                 self.prune_terminal_resume_notifications();
+                self.prune_split_groups_against_live();
                 self.hydrate_generated_copy_from_remote_cache();
                 self.finish_busy_request_for(request_id);
                 self.needs_initial_server_sync = false;
@@ -8113,6 +8180,7 @@ impl ShellState {
                 self.prune_terminal_resume_ready_paths();
                 self.prune_terminal_bootstrap_owners();
                 self.prune_terminal_resume_notifications();
+                self.prune_split_groups_against_live();
                 self.hydrate_generated_copy_from_remote_cache();
                 self.finish_busy_request_for(request_id);
                 self.needs_initial_server_sync = false;
@@ -8583,6 +8651,133 @@ impl ShellState {
             && self.terminal_session_was_ever_ready(session_path)
             && self.daemon_owns_session_runtime(session_path)
     }
+    // ---- Split-view groups ([[campaign-split-view-groups]]) ----
+    //
+    // The `split_groups` field is the SSOT. Everything below DERIVES from it;
+    // there is no per-session split flag. `active_session_path` keeps its exact
+    // single-focus meaning — it names the FOCUSED pane. A group merely declares
+    // which sessions are co-visible with it. That split of duties is what lets
+    // the whole delicate single-active-session render machinery stay intact:
+    // the focused pane behaves exactly as today, and only two predicates widen
+    // to cover its co-visible siblings (`terminal_active_visible_for_session`
+    // for reads/recovery, and the viewport's pane-rect layout).
+
+    /// The group a session belongs to, if any. A session is in at most one
+    /// group (enforced at creation: a member already in a group is refused).
+    fn split_group_for_session(&self, session_path: &str) -> Option<&SplitGroup> {
+        self.split_groups
+            .iter()
+            .find(|group| group.contains(session_path))
+    }
+
+    /// The group that owns the currently active (focused) session — i.e. the
+    /// split is the active surface. `None` when the active surface is a lone
+    /// session or not a terminal. This is the gate that turns the viewport into
+    /// a multi-pane surface.
+    fn active_split_group(&self) -> Option<&SplitGroup> {
+        if self.server.active_view_mode() != WorkspaceViewMode::Terminal {
+            return None;
+        }
+        let active = self.server.active_session_path()?;
+        self.split_group_for_session(active)
+    }
+
+    /// Is `session_path` a co-visible pane of the ACTIVE split group? True for
+    /// the focused pane and its siblings alike. Promotes a retained host into
+    /// the VISIBLE tier (full reads, foreground recovery — never a background
+    /// host) so a split never reintroduces the killed blink class.
+    fn session_is_visible_split_pane(&self, session_path: &str) -> bool {
+        self.active_split_group()
+            .is_some_and(|group| group.contains(session_path))
+    }
+
+    fn split_group_by_id_mut(&mut self, group_id: &str) -> Option<&mut SplitGroup> {
+        self.split_groups
+            .iter_mut()
+            .find(|group| group.group_id == group_id)
+    }
+
+    /// Persist the split-group SSOT into settings and write to disk. Called
+    /// after every structural or ratio change so a built workspace survives a
+    /// restart ([[campaign-split-view-groups]] persistence).
+    fn persist_split_groups(&mut self) {
+        self.settings.split_groups = self.split_groups.clone();
+        self.persist_settings();
+    }
+
+    /// Drop groups whose members no longer resolve to a known session (a member
+    /// was closed elsewhere, or the persisted file references a session this
+    /// host does not have). A group is kept only while it still binds ≥2 live
+    /// members; a group collapsing to one member is dissolved back to a lone
+    /// session (its survivor's pre-group keep-alive restored). Returns true if
+    /// anything changed.
+    fn prune_stale_split_groups(&mut self, known_paths: &HashSet<String>) -> bool {
+        if self.split_groups.is_empty() {
+            return false;
+        }
+        let mut changed = false;
+        let mut restore: Vec<(String, bool)> = Vec::new();
+        self.split_groups.retain_mut(|group| {
+            let before = group.members.len();
+            group.members.retain(|member| known_paths.contains(member));
+            if group.members.len() != before {
+                changed = true;
+                if group.active_pane >= group.members.len() {
+                    group.active_pane = group.members.len().saturating_sub(1);
+                }
+            }
+            if group.members.len() >= 2 {
+                true
+            } else {
+                // Dissolving: hand back the survivor's pre-group keep-alive.
+                for member in &group.members {
+                    if let Some(prior) = group.prior_keep_alive.get(member) {
+                        restore.push((member.clone(), *prior));
+                    }
+                }
+                changed = true;
+                false
+            }
+        });
+        for (path, prior) in restore {
+            // Only step DOWN — never revoke a keep-alive the daemon still holds
+            // for another reason; grouping only ever forced it on.
+            if !prior {
+                mark_live_session_keep_alive_locally(self, &path, false);
+            }
+        }
+        if changed {
+            self.persist_split_groups();
+        }
+        changed
+    }
+
+    /// Prune split groups against the sessions this GUI currently knows about.
+    /// The "known" set is generous on purpose — live + retained + cached-hot +
+    /// active — so a member merely absent from ONE partial snapshot is not
+    /// mistaken for a closed session (the transient-gap false-prune the render
+    /// rules warn about). Only a member gone from ALL of them is dropped.
+    fn prune_split_groups_against_live(&mut self) {
+        if self.split_groups.is_empty() {
+            return;
+        }
+        let mut known: HashSet<String> = HashSet::new();
+        for session in self.server.live_sessions() {
+            known.insert(normalize_live_session_path(&session.session_path));
+            known.insert(session.session_path.clone());
+        }
+        for path in &self.retained_terminal_session_paths {
+            known.insert(path.clone());
+        }
+        for path in self.cached_hot_session_views.keys() {
+            known.insert(path.clone());
+        }
+        if let Some(active) = self.server.active_session_path() {
+            known.insert(active.to_string());
+        }
+        self.prune_stale_split_groups(&known);
+    }
+
     fn terminal_session_is_retained_live(&self, session_path: &str) -> bool {
         let retained = self.retained_terminal_session_paths.contains(session_path);
         let active_remote_terminal_session = self.server.active_view_mode()
@@ -14298,6 +14493,305 @@ fn mark_live_session_keep_alive_locally(
         .server
         .set_live_session_keep_alive(path, keep_alive)
         .unwrap_or(false)
+}
+
+/// Fire the daemon keep-alive RPC for `path` off the UI thread. The local mark
+/// ([`mark_live_session_keep_alive_locally`]) is the in-GUI SSOT; this makes the
+/// daemon durably hold the runtime so a grouped session survives GUI death, not
+/// only a clean close-flush.
+fn spawn_persist_keep_alive(state: Signal<ShellState>, path: String, keep_alive: bool) {
+    let endpoint = state.read().bootstrap.server_endpoint.clone();
+    spawn(async move {
+        let _ = task::spawn_blocking(move || set_session_keep_alive(&endpoint, &path, keep_alive))
+            .await;
+    });
+}
+
+/// Heal the WebGL stale-atlas garble that a split's reflow leaves on a
+/// co-visible pane ([[campaign-split-view-groups]]). Splitting resizes BOTH
+/// members to half-width at once; the pane that is not the active render host
+/// repaints its glyphs from a stale GPU atlas and comes back garbled
+/// (docs/xterm-bugs.md#webgl-stale-atlas-garble). A `redrawTerminal` per member
+/// after the resize settles (clearTextureAtlas + refit + refresh) heals it. Two
+/// passes catch a late reflow repaint. One-shot: rAF is not gapping (the sibling
+/// pane is visible), so the garble does not recur once cleared.
+fn spawn_heal_split_panes(members: Vec<String>) {
+    if members.is_empty() {
+        return;
+    }
+    spawn(async move {
+        // Several passes over a widening window catch a late reflow repaint on
+        // the non-active pane (its resize→daemon-reflow→repaint can land after
+        // the first passes).
+        for delay in [400_u64, 800, 1400, 2400] {
+            sleep(Duration::from_millis(delay)).await;
+            for member in &members {
+                let _ = redraw_terminal_viewport_for(member).await;
+            }
+        }
+    });
+}
+
+/// Close a session's runtime off the UI thread ("close this pane" / "close all
+/// panes"). The next daemon snapshot refresh drops it from the live set and
+/// `prune_split_groups_against_live` reconciles the group SSOT
+/// ([[campaign-split-view-groups]]).
+fn spawn_close_session_runtime(state: Signal<ShellState>, path: String) {
+    let endpoint = state.read().bootstrap.server_endpoint.clone();
+    spawn(async move {
+        let _ = task::spawn_blocking(move || remove_session(&endpoint, &path)).await;
+    });
+}
+
+/// Create a split-view group from `members` (session paths in pane order),
+/// arranged along `axis` ([[campaign-split-view-groups]]). Returns the new
+/// group id, or `None` if the request is invalid: fewer than 2 distinct
+/// members, or any member already belongs to a group. Grouping forces
+/// keep-alive on every member (the group IS the keep-alive declaration) and
+/// remembers each member's prior setting for ungroup; the new group becomes the
+/// active surface, focused on its first pane.
+fn create_split_group(
+    mut state: Signal<ShellState>,
+    members: Vec<String>,
+    axis: SplitAxis,
+) -> Option<String> {
+    let outcome = state.with_mut(|shell| {
+        let mut seen = HashSet::new();
+        let members: Vec<String> = members
+            .into_iter()
+            .filter(|path| seen.insert(path.clone()))
+            .collect();
+        if members.len() < 2 {
+            return None;
+        }
+        if members
+            .iter()
+            .any(|member| shell.split_group_for_session(member).is_some())
+        {
+            return None;
+        }
+        let live = shell.server.live_sessions();
+        let mut prior_keep_alive = BTreeMap::new();
+        let mut keep_alive_calls: Vec<String> = Vec::new();
+        for member in &members {
+            let was = live
+                .iter()
+                .find(|session| &session.session_path == member)
+                .map(live_session_keep_alive)
+                .unwrap_or(false);
+            prior_keep_alive.insert(member.clone(), was);
+            if !was {
+                mark_live_session_keep_alive_locally(shell, member, true);
+                keep_alive_calls.push(member.clone());
+            }
+        }
+        let seq = NEXT_SPLIT_GROUP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let group_id = format!("{}-{seq}", current_millis());
+        let first_member = members[0].clone();
+        shell.split_groups.push(SplitGroup {
+            group_id: group_id.clone(),
+            axis,
+            ratio: 0.5,
+            members,
+            active_pane: 0,
+            prior_keep_alive,
+        });
+        shell.persist_split_groups();
+        shell.close_context_menu();
+        shell.last_action = format!("split group ({}) created", axis_label(axis));
+        Some((group_id, keep_alive_calls, first_member))
+    })?;
+    let (group_id, keep_alive_calls, first_member) = outcome;
+    for path in keep_alive_calls {
+        spawn_persist_keep_alive(state, path, true);
+    }
+    focus_split_pane(state, &first_member);
+    // Heal the stale-atlas garble the simultaneous reflow to half-width leaves
+    // on the co-visible pane(s).
+    let members = state.with(|shell| {
+        shell
+            .split_group_for_session(&first_member)
+            .map(|group| group.members.clone())
+            .unwrap_or_default()
+    });
+    spawn_heal_split_panes(members);
+    Some(group_id)
+}
+
+fn axis_label(axis: SplitAxis) -> &'static str {
+    match axis {
+        SplitAxis::SideBySide => "side by side",
+        SplitAxis::Stacked => "stacked",
+    }
+}
+
+/// Parse an app-control / menu axis token into a [`SplitAxis`]. Defaults to
+/// side-by-side (left | right) — the sketch's primary arrangement.
+fn parse_split_axis(raw: Option<&str>) -> SplitAxis {
+    match raw.map(|value| value.trim().to_ascii_lowercase()).as_deref() {
+        Some("stacked") | Some("vertical") | Some("v") | Some("top-bottom") | Some("rows") => {
+            SplitAxis::Stacked
+        }
+        _ => SplitAxis::SideBySide,
+    }
+}
+
+/// A JSON view of the split-group SSOT for app-control responses / `server app
+/// state`, so the yggui surface is drivable + verifiable headlessly.
+fn split_groups_debug_json(shell: &ShellState) -> Value {
+    let active = shell.active_split_group().map(|group| group.group_id.clone());
+    json!({
+        "active_group_id": active,
+        "groups": shell
+            .split_groups
+            .iter()
+            .map(|group| json!({
+                "group_id": group.group_id,
+                "axis": axis_label(group.axis),
+                "ratio": group.ratio,
+                "members": group.members,
+                "active_pane": group.active_pane,
+            }))
+            .collect::<Vec<_>>(),
+    })
+}
+
+/// Focus a pane: make `member` the active (input) session, remembering it as
+/// its group's `active_pane`. Both panes are already mounted, so activating an
+/// in-group member is a cheap reveal/focus flip, not a remount.
+fn focus_split_pane(mut state: Signal<ShellState>, member: &str) {
+    let row = state.with_mut(|shell| {
+        if let Some(group) = shell
+            .split_groups
+            .iter_mut()
+            .find(|group| group.contains(member))
+        {
+            if let Some(index) = group.members.iter().position(|m| m == member) {
+                if group.active_pane != index {
+                    group.active_pane = index;
+                    shell.settings.split_groups = shell.split_groups.clone();
+                    // active_pane is remembered-focus state; persist lazily on
+                    // the next structural change rather than thrashing disk on
+                    // every focus flip. (Kept in settings mirror for the current
+                    // process; disk write happens on create/ungroup/ratio.)
+                }
+            }
+        }
+        resolve_app_control_row(shell, member)
+    });
+    if let Some(row) = row {
+        spawn_open_session_row(state, row);
+    }
+}
+
+/// Set the divider ratio for a group (fraction the first pane occupies).
+fn set_split_group_ratio(mut state: Signal<ShellState>, group_id: &str, ratio: f32) {
+    let mut changed_members: Vec<String> = Vec::new();
+    state.with_mut(|shell| {
+        if let Some(group) = shell.split_group_by_id_mut(group_id) {
+            let clamped = if ratio.is_finite() {
+                ratio.clamp(0.15, 0.85)
+            } else {
+                0.5
+            };
+            if (group.ratio - clamped).abs() > f32::EPSILON {
+                group.ratio = clamped;
+                changed_members = group.members.clone();
+                shell.persist_split_groups();
+            }
+        }
+    });
+    // A ratio change reflows both panes; heal the same garble a create does.
+    spawn_heal_split_panes(changed_members);
+}
+
+/// Dissolve a group back into individual sessions, restoring each member's
+/// pre-group keep-alive so a throwaway shell does not stay immortal after a
+/// brief split. The survivor sessions remain open; the active one stays active.
+fn ungroup_split_group(mut state: Signal<ShellState>, group_id: &str) {
+    let restore = state.with_mut(|shell| {
+        let Some(pos) = shell
+            .split_groups
+            .iter()
+            .position(|group| group.group_id == group_id)
+        else {
+            return Vec::new();
+        };
+        let group = shell.split_groups.remove(pos);
+        let mut restore: Vec<(String, bool)> = Vec::new();
+        for member in &group.members {
+            let prior = group.prior_keep_alive.get(member).copied().unwrap_or(true);
+            if !prior {
+                mark_live_session_keep_alive_locally(shell, member, false);
+                restore.push((member.clone(), false));
+            }
+        }
+        shell.persist_split_groups();
+        shell.close_context_menu();
+        shell.last_action = "ungrouped split".to_string();
+        restore
+    });
+    for (path, keep_alive) in restore {
+        spawn_persist_keep_alive(state, path, keep_alive);
+    }
+}
+
+/// Remove a single pane from a group. If ≥2 panes remain the group survives
+/// (with the removed member's prior keep-alive restored); if only one remains
+/// the group dissolves. Does NOT close the removed session — "close this pane"
+/// is a separate, explicit action.
+fn remove_split_pane(mut state: Signal<ShellState>, group_id: &str, member: &str) {
+    let restore = state.with_mut(|shell| {
+        let Some(group) = shell.split_group_by_id_mut(group_id) else {
+            return Vec::new();
+        };
+        let Some(index) = group.members.iter().position(|m| m == member) else {
+            return Vec::new();
+        };
+        let prior = group.prior_keep_alive.get(member).copied().unwrap_or(true);
+        group.members.remove(index);
+        group.prior_keep_alive.remove(member);
+        if group.active_pane >= group.members.len() {
+            group.active_pane = group.members.len().saturating_sub(1);
+        }
+        let mut restore: Vec<(String, bool)> = Vec::new();
+        if !prior {
+            restore.push((member.to_string(), false));
+        }
+        // Collapsing to a single member dissolves the group.
+        if shell
+            .split_group_by_id_mut(group_id)
+            .is_some_and(|group| group.members.len() < 2)
+        {
+            if let Some(pos) = shell
+                .split_groups
+                .iter()
+                .position(|group| group.group_id == group_id)
+            {
+                let dissolved = shell.split_groups.remove(pos);
+                for survivor in &dissolved.members {
+                    let survivor_prior = dissolved
+                        .prior_keep_alive
+                        .get(survivor)
+                        .copied()
+                        .unwrap_or(true);
+                    if !survivor_prior {
+                        restore.push((survivor.clone(), false));
+                    }
+                }
+            }
+        }
+        for (path, keep_alive) in &restore {
+            mark_live_session_keep_alive_locally(shell, path, *keep_alive);
+        }
+        shell.persist_split_groups();
+        shell.close_context_menu();
+        shell.last_action = "removed split pane".to_string();
+        restore
+    });
+    for (path, keep_alive) in restore {
+        spawn_persist_keep_alive(state, path, keep_alive);
+    }
 }
 
 /// Only a live runtime session row can be kept alive. SSOT for the context
@@ -25336,6 +25830,136 @@ fn push_live_session_rows(
         });
     }
 }
+/// A synthetic compound sidebar row for a split group — a miniature map of the
+/// split geometry ([[campaign-split-view-groups]]). `full_path` is `split://<id>`
+/// so the renderer can recognise it and pull geometry from the group SSOT;
+/// `session_id` carries the group id.
+fn split_compound_row(group: &SplitGroup, depth: usize, host_label: String) -> BrowserRow {
+    BrowserRow {
+        kind: BrowserRowKind::Session,
+        full_path: group.synthetic_path(),
+        label: format!("Split · {} panes", group.members.len()),
+        detail_label: String::new(),
+        document_kind: None,
+        group_kind: None,
+        session_title: None,
+        depth,
+        host_label,
+        descendant_sessions: group.members.len(),
+        expanded: true,
+        session_id: Some(group.group_id.clone()),
+        session_cwd: None,
+        session_kind: None,
+    }
+}
+
+/// A short fallback label for a split pane cell when the live session has no
+/// title yet (the last path segment).
+fn split_pane_fallback_label(member: &str) -> String {
+    member
+        .trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .filter(|segment| !segment.is_empty())
+        .unwrap_or(member)
+        .to_string()
+}
+
+/// If `row` is a compound split row, build its pane cells (title + focus state)
+/// from the group SSOT and the live sessions, plus whether it is side-by-side.
+/// `None` for every ordinary row ([[campaign-split-view-groups]]).
+fn split_group_cells_for_row(
+    snapshot: &RenderSnapshot,
+    row: &BrowserRow,
+) -> Option<(Vec<SplitPaneCell>, bool)> {
+    if !row.full_path.starts_with("split://") {
+        return None;
+    }
+    let group_id = row.session_id.as_deref()?;
+    let group = snapshot
+        .split_groups
+        .iter()
+        .find(|group| group.group_id == group_id)?;
+    let cells = group
+        .members
+        .iter()
+        .map(|member| {
+            let label = snapshot
+                .live_sessions
+                .iter()
+                .find(|session| &session.session_path == member)
+                .map(|session| session.title.clone())
+                .filter(|title| !title.trim().is_empty())
+                .unwrap_or_else(|| split_pane_fallback_label(member));
+            SplitPaneCell {
+                path: member.clone(),
+                label,
+                focused: snapshot.active_session_path.as_deref() == Some(member.as_str()),
+            }
+        })
+        .collect();
+    Some((cells, matches!(group.axis, SplitAxis::SideBySide)))
+}
+
+/// Collapse each split group's Live-Sessions member rows into ONE compound row
+/// that mirrors the split geometry ([[campaign-split-view-groups]]). Bounded to
+/// the Live Sessions region of the render rows; the cwd-tree member rows (dual
+/// presence) are left intact and get a split-glyph badge at render time. The
+/// compound row takes the position of the group's earliest member so row order
+/// stays stable.
+fn collapse_live_sessions_into_split_rows(rows: &mut Vec<BrowserRow>, groups: &[SplitGroup]) {
+    if groups.is_empty() {
+        return;
+    }
+    let Some(start) = rows
+        .iter()
+        .position(|row| row.full_path == "__live_sessions__")
+    else {
+        return;
+    };
+    let region_end = rows
+        .iter()
+        .enumerate()
+        .skip(start + 1)
+        .find(|(_, row)| row.depth == 0)
+        .map(|(idx, _)| idx)
+        .unwrap_or(rows.len());
+    let mut compound_at: HashMap<usize, BrowserRow> = HashMap::new();
+    let mut drop_indices: HashSet<usize> = HashSet::new();
+    for group in groups {
+        let member_positions: Vec<usize> = ((start + 1)..region_end)
+            .filter(|idx| !drop_indices.contains(idx))
+            .filter(|idx| group.members.iter().any(|member| member == &rows[*idx].full_path))
+            .collect();
+        // Only compound when at least two members are actually present in Live
+        // Sessions; a partial group falls back to plain rows.
+        if member_positions.len() < 2 {
+            continue;
+        }
+        let first = member_positions[0];
+        let compound =
+            split_compound_row(group, rows[first].depth, rows[first].host_label.clone());
+        compound_at.insert(first, compound);
+        for idx in member_positions {
+            drop_indices.insert(idx);
+        }
+    }
+    if compound_at.is_empty() {
+        return;
+    }
+    let mut rebuilt: Vec<BrowserRow> = Vec::with_capacity(rows.len());
+    for (idx, row) in std::mem::take(rows).into_iter().enumerate() {
+        if let Some(compound) = compound_at.remove(&idx) {
+            rebuilt.push(compound);
+        } else if drop_indices.contains(&idx) {
+            // Dropped member — already represented by its compound row.
+        } else {
+            rebuilt.push(row);
+        }
+    }
+    *rows = rebuilt;
+}
+
 fn local_live_session_group_paths(cwd: &str) -> Vec<String> {
     let mut paths = vec!["local".to_string()];
     let trimmed = cwd.trim();
@@ -29540,6 +30164,9 @@ fn describe_app_state_snapshot(
         },
         "active_view_mode": format!("{:?}", snapshot.active_view_mode),
         "active_session_path": snapshot.active_session_path.clone(),
+        // Split-view SSOT ([[campaign-split-view-groups]]): groups + which one is
+        // active, so the split surface is verifiable headlessly.
+        "split_view": split_groups_debug_json(&shell),
         "active_session_source": snapshot.active_session.as_ref().map(|session| format!("{:?}", session.source)),
         "active_session_terminal_foreground_active": snapshot.active_session.as_ref().and_then(|session| session.terminal_foreground_active),
         "active_title": snapshot.active_title.clone(),
@@ -39196,57 +39823,80 @@ async fn eval_active_terminal_canvas_composite() -> Value {
                     if (!h) { return false; }
                     const r = h.getBoundingClientRect();
                     const s = window.getComputedStyle(h);
-                    return r.width > 0 && r.height > 0 && s.display !== 'none' && s.visibility !== 'hidden';
+                    return r.width > 0 && r.height > 0 && s.display !== 'none'
+                        && s.visibility !== 'hidden' && Number(s.opacity || '1') > 0.01;
                 };
-                const entry = entries.filter(isVisible).sort((a, b) => (b.mountedAt || 0) - (a.mountedAt || 0))[0]
-                    || entries[0];
-                if (!entry) { send({ ok: false, reason: 'no_terminal_host' }); return; }
-                const host = document.getElementById(entry.hostId);
-                if (!host) { send({ ok: false, reason: 'host_element_missing' }); return; }
-                const screen = host.querySelector('.xterm-screen') || host;
-                let rect = screen.getBoundingClientRect();
-                // xterm.js 6: `.xterm-screen` carries no explicit height (its canvas
-                // layers are position:absolute and it no longer gets the renderer's
-                // pixel height the way xterm 5 did), so its getBoundingClientRect
-                // collapses to ~0 — which sized the output canvas to 1px and made
-                // every faithful screenshot read back BLANK. Fall back to the
-                // viewport (full-height scroll container) for sizing AND for the
-                // per-canvas draw offsets; the canvas layers sit at the viewport's
-                // top-left, so their offsets relative to it are correct. The screen
-                // rect is still preferred when it is valid (older renderer / DOM).
-                if (!(rect.width > 1 && rect.height > 1)) {
-                    const fallback = host.querySelector('.xterm-viewport') || host;
-                    rect = fallback.getBoundingClientRect();
+                // ALL visible terminal hosts, newest first. In a split-view group
+                // ([[campaign-split-view-groups]]) two panes are co-visible, so
+                // the faithful composite must draw every one of them — not just
+                // the active host — over the whole main-surface frame.
+                const visible = entries.filter(isVisible)
+                    .sort((a, b) => (b.mountedAt || 0) - (a.mountedAt || 0));
+                if (!visible.length) { send({ ok: false, reason: 'no_terminal_host' }); return; }
+                // Frame = the main-surface body, which holds every pane. Falls
+                // back to the union of visible host rects, then to the single host.
+                let frame = null;
+                const body = document.querySelector('[data-yggterm-main-surface-body]');
+                if (body) {
+                    const br = body.getBoundingClientRect();
+                    if (br.width > 1 && br.height > 1) { frame = br; }
                 }
+                if (!frame) {
+                    let l = Infinity, t = Infinity, r = -Infinity, b = -Infinity;
+                    for (const e of visible) {
+                        const h = document.getElementById(e.hostId);
+                        if (!h) { continue; }
+                        const vp = h.querySelector('.xterm-viewport') || h;
+                        const hr = vp.getBoundingClientRect();
+                        l = Math.min(l, hr.left); t = Math.min(t, hr.top);
+                        r = Math.max(r, hr.right); b = Math.max(b, hr.bottom);
+                    }
+                    if (r > l && b > t) { frame = { left: l, top: t, width: r - l, height: b - t }; }
+                }
+                if (!frame) { send({ ok: false, reason: 'no_frame_rect' }); return; }
                 const dpr = window.devicePixelRatio || 1;
-                const W = Math.max(1, Math.round(rect.width * dpr));
-                const H = Math.max(1, Math.round(rect.height * dpr));
+                const W = Math.max(1, Math.round(frame.width * dpr));
+                const H = Math.max(1, Math.round(frame.height * dpr));
                 const out = document.createElement('canvas');
                 out.width = W; out.height = H;
                 const ctx = out.getContext('2d');
                 if (!ctx) { send({ ok: false, reason: 'no_2d_context' }); return; }
+                // Background from the first (top) visible host.
                 let bg = '';
-                try { bg = window.getComputedStyle(screen).backgroundColor || ''; } catch (_e) {}
-                if (!bg || bg === 'rgba(0, 0, 0, 0)' || bg === 'transparent') {
-                    try { bg = window.getComputedStyle(host).backgroundColor || ''; } catch (_e) {}
-                }
+                try {
+                    const h0 = document.getElementById(visible[0].hostId);
+                    const scr0 = h0.querySelector('.xterm-screen') || h0;
+                    bg = window.getComputedStyle(scr0).backgroundColor || '';
+                    if (!bg || bg === 'rgba(0, 0, 0, 0)' || bg === 'transparent') {
+                        bg = window.getComputedStyle(h0).backgroundColor || '';
+                    }
+                } catch (_e) {}
                 ctx.fillStyle = (bg && bg !== 'rgba(0, 0, 0, 0)' && bg !== 'transparent') ? bg : '#000000';
                 ctx.fillRect(0, 0, W, H);
-                // Draw every canvas layer (xterm text/selection/link/cursor + our
-                // software overlays) in DOM order at its offset within the screen.
-                const canvases = Array.from(host.querySelectorAll('canvas'));
+                // Draw every visible pane's canvas layers at their offset within
+                // the frame. Oldest last so the newest (focused) pane wins any
+                // overlap, matching z-order.
                 let drawn = 0;
-                for (const c of canvases) {
-                    try {
-                        if (!c.width || !c.height) { continue; }
-                        const cr = c.getBoundingClientRect();
-                        const dx = (cr.left - rect.left) * dpr;
-                        const dy = (cr.top - rect.top) * dpr;
-                        const dw = cr.width * dpr;
-                        const dh = cr.height * dpr;
-                        ctx.drawImage(c, dx, dy, dw, dh);
-                        drawn += 1;
-                    } catch (_e) {}
+                let canvasCount = 0;
+                const paths = [];
+                for (const e of Array.from(visible).reverse()) {
+                    const host = document.getElementById(e.hostId);
+                    if (!host) { continue; }
+                    paths.push(String(e.sessionPath || ''));
+                    const canvases = Array.from(host.querySelectorAll('canvas'));
+                    canvasCount += canvases.length;
+                    for (const c of canvases) {
+                        try {
+                            if (!c.width || !c.height) { continue; }
+                            const cr = c.getBoundingClientRect();
+                            const dx = (cr.left - frame.left) * dpr;
+                            const dy = (cr.top - frame.top) * dpr;
+                            const dw = cr.width * dpr;
+                            const dh = cr.height * dpr;
+                            ctx.drawImage(c, dx, dy, dw, dh);
+                            drawn += 1;
+                        } catch (_e) {}
+                    }
                 }
                 const dataUrl = out.toDataURL('image/png');
                 send({
@@ -39254,15 +39904,17 @@ async fn eval_active_terminal_canvas_composite() -> Value {
                     dataUrl,
                     width: W,
                     height: H,
-                    css_left: rect.left,
-                    css_top: rect.top,
-                    css_width: rect.width,
-                    css_height: rect.height,
+                    css_left: frame.left,
+                    css_top: frame.top,
+                    css_width: frame.width,
+                    css_height: frame.height,
                     win_w: window.innerWidth,
                     win_h: window.innerHeight,
                     layers: drawn,
-                    canvas_count: canvases.length,
-                    session_path: String(entry.sessionPath || ''),
+                    canvas_count: canvasCount,
+                    host_count: visible.length,
+                    session_path: String(visible[0].sessionPath || ''),
+                    session_paths: paths,
                 });
             } catch (error) {
                 send({ ok: false, reason: (error && error.message) ? error.message : String(error) });
@@ -41956,6 +42608,94 @@ async fn process_pending_app_control_requests(
                     })),
                     error: Some(error.to_string()),
                 },
+            }
+        }
+        AppControlCommand::CreateSplitGroup { members, axis } => {
+            let axis = parse_split_axis(axis.as_deref());
+            let group_id = create_split_group(state, members.clone(), axis);
+            let split_groups = state.with(|shell| split_groups_debug_json(shell));
+            AppControlResponse {
+                request_id: request.request_id.clone(),
+                handled_by_pid: std::process::id(),
+                completed_at_ms: current_millis() as u128,
+                output_path: None,
+                data: Some(json!({
+                    "accepted": group_id.is_some(),
+                    "group_id": group_id,
+                    "members": members,
+                    "axis": axis_label(axis),
+                    "split_groups": split_groups,
+                })),
+                error: group_id.is_none().then(|| {
+                    "could not create split group (need >=2 distinct, ungrouped members)".to_string()
+                }),
+            }
+        }
+        AppControlCommand::UngroupSplitGroup { group_id } => {
+            let existed = state.with(|shell| {
+                shell
+                    .split_groups
+                    .iter()
+                    .any(|group| group.group_id == group_id)
+            });
+            ungroup_split_group(state, &group_id);
+            let split_groups = state.with(|shell| split_groups_debug_json(shell));
+            AppControlResponse {
+                request_id: request.request_id.clone(),
+                handled_by_pid: std::process::id(),
+                completed_at_ms: current_millis() as u128,
+                output_path: None,
+                data: Some(json!({
+                    "accepted": existed,
+                    "group_id": group_id,
+                    "split_groups": split_groups,
+                })),
+                error: (!existed).then(|| format!("no split group with id {group_id}")),
+            }
+        }
+        AppControlCommand::SetSplitGroupRatio { group_id, ratio } => {
+            let existed = state.with(|shell| {
+                shell
+                    .split_groups
+                    .iter()
+                    .any(|group| group.group_id == group_id)
+            });
+            set_split_group_ratio(state, &group_id, ratio);
+            let split_groups = state.with(|shell| split_groups_debug_json(shell));
+            AppControlResponse {
+                request_id: request.request_id.clone(),
+                handled_by_pid: std::process::id(),
+                completed_at_ms: current_millis() as u128,
+                output_path: None,
+                data: Some(json!({
+                    "accepted": existed,
+                    "group_id": group_id,
+                    "ratio": ratio,
+                    "split_groups": split_groups,
+                })),
+                error: (!existed).then(|| format!("no split group with id {group_id}")),
+            }
+        }
+        AppControlCommand::FocusSplitPane { session_path } => {
+            let grouped = state.with(|shell| {
+                shell.split_group_for_session(&session_path).is_some()
+            });
+            if grouped {
+                focus_split_pane(state, &session_path);
+            }
+            let split_groups = state.with(|shell| split_groups_debug_json(shell));
+            AppControlResponse {
+                request_id: request.request_id.clone(),
+                handled_by_pid: std::process::id(),
+                completed_at_ms: current_millis() as u128,
+                output_path: None,
+                data: Some(json!({
+                    "accepted": grouped,
+                    "session_path": session_path,
+                    "split_groups": split_groups,
+                })),
+                error: (!grouped)
+                    .then(|| format!("session {session_path} is not in a split group")),
             }
         }
         AppControlCommand::SetRowExpanded { row_path, expanded } => {
@@ -46283,6 +47023,9 @@ fn app() -> Element {
                         on_start_sidebar_resize: move |client_x: f64| {
                             state.with_mut(|shell| shell.start_sidebar_resize(client_x))
                         },
+                        on_focus_split_pane: move |path: String| {
+                            focus_split_pane(state, &path);
+                        },
                         on_select_row: move |(row, mode): (BrowserRow, TreeSelectionMode)| {
                             let row_for_log = row.clone();
                             if let Err(error) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -46625,6 +47368,88 @@ fn app() -> Element {
                         on_new_claude_here: {
                             let row = row.clone();
                             move |_| spawn_start_group_session(state, row.clone(), SessionKind::ClaudeCode)
+                        },
+                        split_candidate_paths: {
+                            // Selected live-terminal rows that are not already
+                            // grouped — the sessions "Split …" would compound.
+                            let selected = if snapshot.selected_tree_paths.is_empty() {
+                                vec![row.full_path.clone()]
+                            } else {
+                                snapshot.selected_tree_paths.clone()
+                            };
+                            selected
+                                .into_iter()
+                                .filter(|path| is_hot_terminal_sidebar_path(path))
+                                .filter(|path| {
+                                    !snapshot.split_groups.iter().any(|group| group.contains(path))
+                                })
+                                .collect::<Vec<_>>()
+                        },
+                        split_group_members: split_group_cells_for_row(&snapshot, &row)
+                            .map(|(cells, _)| {
+                                cells
+                                    .into_iter()
+                                    .map(|cell| (cell.path, cell.label))
+                                    .collect::<Vec<_>>()
+                            })
+                            .unwrap_or_default(),
+                        on_split_selected: {
+                            let selected = if snapshot.selected_tree_paths.is_empty() {
+                                vec![row.full_path.clone()]
+                            } else {
+                                snapshot.selected_tree_paths.clone()
+                            };
+                            let split_groups = snapshot.split_groups.clone();
+                            let candidate_paths: Vec<String> = selected
+                                .into_iter()
+                                .filter(|path| is_hot_terminal_sidebar_path(path))
+                                .filter(|path| {
+                                    !split_groups.iter().any(|group| group.contains(path))
+                                })
+                                .collect();
+                            move |side_by_side: bool| {
+                                let axis = if side_by_side {
+                                    SplitAxis::SideBySide
+                                } else {
+                                    SplitAxis::Stacked
+                                };
+                                state.with_mut(|shell| shell.close_context_menu());
+                                create_split_group(state, candidate_paths.clone(), axis);
+                            }
+                        },
+                        on_ungroup_split: {
+                            let group_id = row.session_id.clone();
+                            move |_| {
+                                if let Some(id) = group_id.clone() {
+                                    ungroup_split_group(state, &id);
+                                }
+                            }
+                        },
+                        on_close_split_pane: {
+                            let group_id = row.session_id.clone();
+                            move |path: String| {
+                                if let Some(id) = group_id.clone() {
+                                    remove_split_pane(state, &id, &path);
+                                }
+                                spawn_close_session_runtime(state, path);
+                            }
+                        },
+                        on_close_split_group: {
+                            let group_id = row.session_id.clone();
+                            let members: Vec<String> = split_group_cells_for_row(&snapshot, &row)
+                                .map(|(cells, _)| {
+                                    cells.into_iter().map(|cell| cell.path).collect()
+                                })
+                                .unwrap_or_default();
+                            move |_| {
+                                state.with_mut(|shell| shell.close_context_menu());
+                                if let Some(id) = group_id.clone() {
+                                    ungroup_split_group(state, &id);
+                                }
+                                for path in members.iter() {
+                                    spawn_close_session_runtime(state, path.clone());
+                                }
+                            }
                         },
                         on_launch_app_verb: {
                             let context_row = context_row.clone();
@@ -48173,6 +48998,9 @@ fn Sidebar(
     on_start_sidebar_resize: EventHandler<f64>,
     on_select_row: EventHandler<(BrowserRow, TreeSelectionMode)>,
     on_press_highlight_row: EventHandler<(BrowserRow, TreeSelectionMode)>,
+    /// Focus a pane (by member session path) from a compound split row's cell
+    /// click ([[campaign-split-view-groups]]).
+    on_focus_split_pane: EventHandler<String>,
     on_set_row_expanded: EventHandler<(BrowserRow, bool)>,
     on_delete_selected_items: EventHandler<bool>,
     on_delete_row: EventHandler<BrowserRow>,
@@ -48481,7 +49309,27 @@ fn Sidebar(
                             row.session_id.as_deref().unwrap_or(""),
                             if live_group_member { "live" } else { "tree" }
                         );
+                        // A compound split row renders its own miniature-map
+                        // widget ([[campaign-split-view-groups]]); every other
+                        // row uses the normal SidebarRow.
+                        let split_group_cells = split_group_cells_for_row(&snapshot, &row);
+                        let split_context_row = row.clone();
                         rsx! {
+                            if let Some((cells, axis_side_by_side)) = split_group_cells.clone() {
+                                SplitGroupRow {
+                                    key: "{sidebar_row_key}",
+                                    axis_side_by_side,
+                                    cells,
+                                    palette: snapshot.palette,
+                                    accent: snapshot.theme_accent.clone(),
+                                    selected: row_selected,
+                                    depth: row.depth,
+                                    on_focus_pane: move |path: String| on_focus_split_pane.call(path),
+                                    on_open_context_menu: move |coords: (f64, f64)| {
+                                        on_open_context_menu.call(((*split_context_row).clone(), coords))
+                                    },
+                                }
+                            } else {
                             SidebarRow {
                                 key: "{sidebar_row_key}",
                                 row: (*row).clone(),
@@ -48559,6 +49407,7 @@ fn Sidebar(
                                 },
                                 on_drop_into_row: move |_| on_drop_into_row.call(()),
                                 on_end_drag: move |_| on_end_drag.call(()),
+                            }
                             }
                         }
                     }
@@ -49221,6 +50070,103 @@ fn sidebar_row_primary_click_action(
             SidebarRowPrimaryClickAction::ToggleExpanded
         }
         _ => SidebarRowPrimaryClickAction::Select,
+    }
+}
+
+/// One pane cell of a compound split row ([[campaign-split-view-groups]]).
+#[derive(Clone, PartialEq)]
+struct SplitPaneCell {
+    path: String,
+    label: String,
+    focused: bool,
+}
+
+/// The compound sidebar row for a split group — a miniature map of the split
+/// geometry ([[campaign-split-view-groups]]). Side-by-side splits show cells
+/// separated by a `|`; stacked splits show two stacked lines. Clicking a cell
+/// focuses that pane; hovering shows the full title. There is deliberately NO
+/// `×` on the row: all structural ops (ungroup, close a pane, close all) live
+/// behind the right-click menu, so a built workspace is hard to lose by
+/// accident.
+#[component]
+fn SplitGroupRow(
+    axis_side_by_side: bool,
+    cells: Vec<SplitPaneCell>,
+    palette: Palette,
+    accent: String,
+    selected: bool,
+    depth: usize,
+    on_focus_pane: EventHandler<String>,
+    on_open_context_menu: EventHandler<(f64, f64)>,
+) -> Element {
+    let indent = 12 + depth * 14;
+    let row_background = if selected { palette.accent_soft } else { "transparent" };
+    let separator = if axis_side_by_side { "row" } else { "column" };
+    let cell_min_height = if axis_side_by_side { 34 } else { 18 };
+    let dot_style = live_session_keep_alive_dot_style(palette);
+    rsx! {
+        div {
+            "data-split-group-row": "1",
+            style: format!(
+                "display:flex; align-items:stretch; gap:8px; padding:5px 8px 5px {indent}px; \
+                 border-radius:9px; background:{row_background}; cursor:default; user-select:none;"
+            ),
+            oncontextmenu: move |evt: MouseEvent| {
+                evt.prevent_default();
+                let coords = evt.client_coordinates();
+                on_open_context_menu.call((coords.x, coords.y));
+            },
+            // Always-green traffic signal: grouping IS the keep-alive declaration.
+            div {
+                style: format!("flex:0 0 auto; align-self:center; {dot_style}"),
+                title: "Split group · kept alive",
+            }
+            // The mini-map: cells laid out along the split axis.
+            div {
+                style: format!(
+                    "flex:1 1 auto; min-width:0; display:flex; flex-direction:{separator}; \
+                     gap:3px; align-items:stretch;"
+                ),
+                for (index, cell) in cells.iter().cloned().enumerate() {
+                    {
+                        let border = if cell.focused {
+                            format!("box-shadow: inset 0 0 0 1.5px {accent};")
+                        } else {
+                            format!("box-shadow: inset 0 0 0 1px {}55;", palette.muted)
+                        };
+                        let text_color = if cell.focused { palette.text } else { palette.muted };
+                        let cell_path = cell.path.clone();
+                        let cell_label = cell.label.clone();
+                        rsx! {
+                            if index > 0 && axis_side_by_side {
+                                span {
+                                    style: format!("flex:0 0 auto; align-self:center; color:{}; font-size:12px;", palette.muted),
+                                    "|"
+                                }
+                            }
+                            div {
+                                key: "{cell_path}",
+                                title: "{cell_label}",
+                                style: format!(
+                                    "flex:1 1 0; min-width:0; min-height:{cell_min_height}px; display:flex; align-items:center; \
+                                     padding:2px 7px; border-radius:6px; cursor:pointer; overflow:hidden; \
+                                     white-space:nowrap; text-overflow:ellipsis; font-size:12px; \
+                                     color:{text_color}; {border}"
+                                ),
+                                onclick: move |evt: MouseEvent| {
+                                    evt.stop_propagation();
+                                    on_focus_pane.call(cell_path.clone());
+                                },
+                                span {
+                                    style: "overflow:hidden; text-overflow:ellipsis; white-space:nowrap;",
+                                    "{cell_label}"
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -50213,6 +51159,90 @@ fn BellIcon() -> Element {
         }
     }
 }
+/// CSS geometry (`position`/`left`/`top`/`width`/`height`) for pane `index` of
+/// a 2-pane split ([[campaign-split-view-groups]] MVP). `ratio` is the fraction
+/// the first pane occupies along the split axis. Index 0 is the first pane; any
+/// other index is treated as the second — 2×2 (drop-onto-cell) is phase 2.
+fn split_pane_rect_css(axis: SplitAxis, ratio: f32, index: usize) -> String {
+    let ratio = ratio.clamp(0.05, 0.95);
+    let first_pct = ratio * 100.0;
+    let second_pct = 100.0 - first_pct;
+    match (axis, index) {
+        (SplitAxis::SideBySide, 0) => {
+            format!("position:absolute; left:0; top:0; width:{first_pct:.4}%; height:100%;")
+        }
+        (SplitAxis::SideBySide, _) => {
+            format!("position:absolute; left:{first_pct:.4}%; top:0; width:{second_pct:.4}%; height:100%;")
+        }
+        (SplitAxis::Stacked, 0) => {
+            format!("position:absolute; left:0; top:0; width:100%; height:{first_pct:.4}%;")
+        }
+        (SplitAxis::Stacked, _) => {
+            format!("position:absolute; left:0; top:{first_pct:.4}%; width:100%; height:{second_pct:.4}%;")
+        }
+    }
+}
+
+/// The JS that drives a live divider drag ([[campaign-split-view-groups]]).
+/// Doing the geometry in JS avoids the GUI needing the container's pixel size
+/// and keeps the drag smooth: JS resizes the pane elements AND the divider in
+/// place on every move (no per-frame Rust re-render / disk write), then posts
+/// the final ratio ONCE on release so Rust commits+persists exactly once. Panes
+/// carry `data-split-pane-index`; the container carries `data-split-layer`; the
+/// divider carries `data-split-divider`.
+fn split_divider_drag_script(axis: SplitAxis, ratio: f32) -> String {
+    let vertical = matches!(axis, SplitAxis::Stacked);
+    format!(
+        r#"
+        (async () => {{
+            const layer = document.querySelector('[data-split-layer]');
+            if (!layer) {{ dioxus.send(-1); return; }}
+            const first = layer.querySelector('[data-split-pane-index="0"]');
+            const second = layer.querySelector('[data-split-pane-index="1"]');
+            const divider = layer.querySelector('[data-split-divider]');
+            const vertical = {vertical};
+            let ratio = {ratio};
+            const clamp = (v) => Math.max(0.15, Math.min(0.85, v));
+            const apply = (r) => {{
+                const pct = (r * 100).toFixed(3) + '%';
+                const rest = ((1 - r) * 100).toFixed(3) + '%';
+                if (first) {{
+                    if (vertical) {{ first.style.height = pct; first.style.top = '0px'; }}
+                    else {{ first.style.width = pct; first.style.left = '0px'; }}
+                }}
+                if (second) {{
+                    if (vertical) {{ second.style.height = rest; second.style.top = pct; }}
+                    else {{ second.style.width = rest; second.style.left = pct; }}
+                }}
+                if (divider) {{
+                    const seam = 'calc(' + pct + ' - 3px)';
+                    if (vertical) {{ divider.style.top = seam; }}
+                    else {{ divider.style.left = seam; }}
+                }}
+            }};
+            const onMove = (ev) => {{
+                const rect = layer.getBoundingClientRect();
+                const size = vertical ? rect.height : rect.width;
+                if (size <= 0) {{ return; }}
+                const pos = vertical ? (ev.clientY - rect.top) : (ev.clientX - rect.left);
+                ratio = clamp(pos / size);
+                apply(ratio);
+                if (ev.preventDefault) {{ ev.preventDefault(); }}
+            }};
+            const onUp = () => {{
+                window.removeEventListener('pointermove', onMove, true);
+                window.removeEventListener('pointerup', onUp, true);
+                window.removeEventListener('pointercancel', onUp, true);
+                dioxus.send(ratio);
+            }};
+            window.addEventListener('pointermove', onMove, true);
+            window.addEventListener('pointerup', onUp, true);
+            window.addEventListener('pointercancel', onUp, true);
+        }})();
+        "#
+    )
+}
+
 #[component]
 fn MainSurface(
     state: Signal<ShellState>,
@@ -50405,6 +51435,12 @@ fn MainSurface(
         terminal_layer_transition,
     );
     let retained_terminal_sessions = snapshot.retained_terminal_sessions.clone();
+    // The active split group turns the terminal layer into a multi-pane surface
+    // ([[campaign-split-view-groups]]). When Some, its members are laid into
+    // pane rects (all co-visible); when None the layer paints one full-bleed
+    // session exactly as before.
+    let active_split_group = snapshot.active_split_group.clone();
+    let split_focus_accent = snapshot.theme_accent.clone();
     let body = if let Some(session) = snapshot.active_session.clone() {
         if session.kind == SessionKind::Document {
             rsx! {
@@ -50476,29 +51512,83 @@ fn MainSurface(
                 div {
                     style: "position:relative; flex:1; min-width:0; min-height:0; overflow:hidden;",
                     div {
+                        "data-split-layer": if active_split_group.is_some() { "1" },
                         style: "{terminal_layer_style}",
                         for terminal_session in retained_terminal_sessions.iter().cloned() {
                             {
+                                let session_path_str = terminal_session.session_path.clone();
                                 let session_mount_epoch =
                                     snapshot_terminal_mount_epoch(
                                         snapshot.as_ref(),
-                                        &terminal_session.session_path,
+                                        &session_path_str,
                                     );
-                                let terminal_visible = terminal_surface_visible
-                                    && snapshot.active_session_path.as_deref()
-                                        == Some(terminal_session.session_path.as_str());
+                                let is_focused_session = snapshot.active_session_path.as_deref()
+                                    == Some(session_path_str.as_str());
+                                let pane_index = active_split_group
+                                    .as_ref()
+                                    .and_then(|group| {
+                                        group
+                                            .members
+                                            .iter()
+                                            .position(|member| member == &session_path_str)
+                                    });
+                                let is_split_pane = pane_index.is_some();
+                                // A split pane is always co-visible; a lone
+                                // session shows only when it is the focused one.
+                                let terminal_visible = if is_split_pane {
+                                    terminal_surface_visible
+                                } else {
+                                    terminal_surface_visible && is_focused_session
+                                };
+                                let geometry_css = match (active_split_group.as_ref(), pane_index) {
+                                    (Some(group), Some(idx)) => {
+                                        split_pane_rect_css(group.axis, group.ratio, idx)
+                                    }
+                                    _ => "position:absolute; inset:0; width:100%;".to_string(),
+                                };
+                                let z_index = if is_split_pane {
+                                    if is_focused_session { "3" } else { "2" }
+                                } else if terminal_visible {
+                                    "2"
+                                } else {
+                                    "0"
+                                };
+                                // Focus ring: a bright inset border on the
+                                // focused pane, a hairline on the sibling, so the
+                                // input target reads at a glance.
+                                let focus_ring = if is_split_pane {
+                                    if is_focused_session {
+                                        format!("box-shadow: inset 0 0 0 2px {};", split_focus_accent)
+                                    } else {
+                                        "box-shadow: inset 0 0 0 1px rgba(128,128,128,0.35);"
+                                            .to_string()
+                                    }
+                                } else {
+                                    String::new()
+                                };
                                 let terminal_canvas_style = format!(
-                                    "position:absolute; inset:0; display:flex; flex-direction:column; flex:1 1 auto; min-width:0; min-height:0; width:100%; \
-                                     overflow:hidden; contain:layout style; z-index:{}; opacity:{}; visibility:{}; pointer-events:{};",
-                                    if terminal_visible { "2" } else { "0" },
+                                    "{geometry_css} display:flex; flex-direction:column; min-width:0; min-height:0; \
+                                     overflow:hidden; contain:layout style; z-index:{z_index}; opacity:{}; visibility:{}; pointer-events:{}; {focus_ring}",
                                     if terminal_visible { "1" } else { "0" },
                                     if terminal_visible { "visible" } else { "hidden" },
                                     if terminal_visible { "auto" } else { "none" },
                                 );
+                                let focus_session_path = session_path_str.clone();
                                 rsx! {
                                     div {
                                         key: "{terminal_session.session_path}:{session_mount_epoch}",
+                                        "data-split-pane-index": if let Some(idx) = pane_index { "{idx}" },
+                                        "data-split-session": "{session_path_str}",
                                         style: "{terminal_canvas_style}",
+                                        // Click-to-focus a co-visible pane. Only
+                                        // acts when this is NOT already the focused
+                                        // pane, so a click inside the active
+                                        // terminal (selection, scroll) is untouched.
+                                        onmousedown: move |_| {
+                                            if is_split_pane && !is_focused_session {
+                                                focus_split_pane(state, &focus_session_path);
+                                            }
+                                        },
                                         TerminalCanvas {
                                             key: "{terminal_instance_key(&terminal_session.session_path)}:{session_mount_epoch}",
                                             session: terminal_session.clone(),
@@ -50506,6 +51596,50 @@ fn MainSurface(
                                             state,
                                             mount_epoch: session_mount_epoch,
                                         }
+                                    }
+                                }
+                            }
+                        }
+                        if let Some(group) = active_split_group.clone() {
+                            {
+                                let axis = group.axis;
+                                let ratio = group.ratio;
+                                let group_id = group.group_id.clone();
+                                let first_pct = (ratio.clamp(0.05, 0.95)) * 100.0;
+                                let divider_style = match axis {
+                                    SplitAxis::SideBySide => format!(
+                                        "position:absolute; top:0; height:100%; left:calc({first_pct:.4}% - 3px); width:6px; \
+                                         z-index:5; cursor:col-resize; background:transparent;"
+                                    ),
+                                    SplitAxis::Stacked => format!(
+                                        "position:absolute; left:0; width:100%; top:calc({first_pct:.4}% - 3px); height:6px; \
+                                         z-index:5; cursor:row-resize; background:transparent;"
+                                    ),
+                                };
+                                rsx! {
+                                    div {
+                                        key: "split-divider:{group_id}",
+                                        "data-split-divider": "1",
+                                        style: "{divider_style}",
+                                        onpointerdown: move |evt| {
+                                            evt.stop_propagation();
+                                            let group_id = group_id.clone();
+                                            spawn(async move {
+                                                let mut eval = document::eval(
+                                                    &split_divider_drag_script(axis, ratio),
+                                                );
+                                                while let Ok(value) = eval.recv::<f64>().await {
+                                                    if value < 0.0 {
+                                                        break;
+                                                    }
+                                                    set_split_group_ratio(
+                                                        state,
+                                                        &group_id,
+                                                        value as f32,
+                                                    );
+                                                }
+                                            });
+                                        },
                                     }
                                 }
                             }
@@ -51836,6 +52970,13 @@ fn terminal_session_bridge_read_policy(
     session_path: &str,
 ) -> TerminalBridgeReadPolicy {
     if !terminal_session_bridge_should_pause_reads(shell, session_path) {
+        // A co-visible split pane reads at FULL cadence, focused or not
+        // ([[campaign-split-view-groups]] decision c: visible panes are ALL
+        // foreground for paint). An earlier attempt to throttle the unfocused
+        // pane to the background trickle starved its reflow repaint, so it came
+        // back garbled/staircased until focused — the exact "still updating on
+        // screen" guarantee the spec requires. Crispness wins over the throttle
+        // nicety; a cadence reduction that preserves crispness can come later.
         return TerminalBridgeReadPolicy::Active;
     }
     // The ACTIVE session under an UNFOCUSED window must also trickle: a fully
@@ -65090,7 +66231,13 @@ fn terminal_instance_key(session_path: &str) -> String {
 fn terminal_active_visible_for_session(shell: &ShellState, session_path: &str) -> bool {
     !shell.app_control_backgrounded
         && shell.server.active_view_mode() == WorkspaceViewMode::Terminal
-        && shell.server.active_session_path() == Some(session_path)
+        // A session is active-visible when it is the focused pane OR a
+        // co-visible sibling in the active split group. The sibling clause is
+        // what keeps a split's unfocused pane in the VISIBLE tier — full reads
+        // and foreground recovery, never a background host — so a split never
+        // reintroduces the killed blink class ([[campaign-split-view-groups]]).
+        && (shell.server.active_session_path() == Some(session_path)
+            || shell.session_is_visible_split_pane(session_path))
 }
 /// Is a NATIVE child webview currently painted over the window?
 ///
@@ -78756,6 +79903,17 @@ fn ContextMenuOverlay(
     on_open_terminal_here: EventHandler<MouseEvent>,
     on_new_codex_here: EventHandler<MouseEvent>,
     on_new_claude_here: EventHandler<MouseEvent>,
+    /// Selected live-session paths eligible to be split-grouped
+    /// ([[campaign-split-view-groups]]); `>= 2` offers the Split items.
+    split_candidate_paths: Vec<String>,
+    /// `(path, label)` per pane when the right-clicked row IS a compound split
+    /// row; empty otherwise. Drives ungroup / close-pane / close-all.
+    split_group_members: Vec<(String, String)>,
+    /// Create a split group from `split_candidate_paths`; `true` = side by side.
+    on_split_selected: EventHandler<bool>,
+    on_ungroup_split: EventHandler<MouseEvent>,
+    on_close_split_pane: EventHandler<String>,
+    on_close_split_group: EventHandler<MouseEvent>,
 ) -> Element {
     let placement = context_menu_placement(position, window_size, (224.0, 420.0));
     let placement_style = context_menu_position_style(placement);
@@ -78814,6 +79972,69 @@ fn ContextMenuOverlay(
                 div {
                     style: format!("padding:6px 12px 8px 12px; font-size:11px; font-weight:700; color:{}; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;", palette.muted),
                     "{menu_title}"
+                }
+                // Split-view group actions ([[campaign-split-view-groups]]).
+                if !split_group_members.is_empty() {
+                    // Compound split row: structural ops only — there is no × on
+                    // the row itself, so a built workspace is hard to lose.
+                    button {
+                        "data-context-menu-action": "ungroup-split",
+                        class: "yggterm-menu-item",
+                        style: context_menu_action_style(palette, false),
+                        onmousedown: |evt| evt.stop_propagation(),
+                        onclick: move |evt| {
+                            evt.stop_propagation();
+                            on_ungroup_split.call(evt);
+                        },
+                        "Ungroup"
+                    }
+                    for (pane_path, pane_label) in split_group_members.iter().cloned() {
+                        button {
+                            "data-context-menu-action": "close-split-pane",
+                            class: "yggterm-menu-item",
+                            style: context_menu_action_style(palette, false),
+                            onmousedown: |evt| evt.stop_propagation(),
+                            onclick: move |evt| {
+                                evt.stop_propagation();
+                                on_close_split_pane.call(pane_path.clone());
+                            },
+                            "Close pane: {pane_label}"
+                        }
+                    }
+                    button {
+                        "data-context-menu-action": "close-split-group",
+                        class: "yggterm-menu-item",
+                        style: context_menu_action_style_destructive(palette),
+                        onmousedown: |evt| evt.stop_propagation(),
+                        onclick: move |evt| {
+                            evt.stop_propagation();
+                            on_close_split_group.call(evt);
+                        },
+                        "Close all panes"
+                    }
+                } else if split_candidate_paths.len() >= 2 {
+                    button {
+                        "data-context-menu-action": "split-side-by-side",
+                        class: "yggterm-menu-item",
+                        style: context_menu_action_style(palette, false),
+                        onmousedown: |evt| evt.stop_propagation(),
+                        onclick: move |evt| {
+                            evt.stop_propagation();
+                            on_split_selected.call(true);
+                        },
+                        {format!("Split side by side ({} panes)", split_candidate_paths.len())}
+                    }
+                    button {
+                        "data-context-menu-action": "split-stacked",
+                        class: "yggterm-menu-item",
+                        style: context_menu_action_style(palette, false),
+                        onmousedown: |evt| evt.stop_propagation(),
+                        onclick: move |evt| {
+                            evt.stop_propagation();
+                            on_split_selected.call(false);
+                        },
+                        {format!("Split stacked ({} panes)", split_candidate_paths.len())}
+                    }
                 }
                 if can_rename {
                     button {
@@ -83233,6 +84454,99 @@ mod tests {
     use crate::terminal_observe::MemoryPressureSnapshot;
     use yggterm_core::SessionNodeKind;
     use yggterm_server::SessionPreview;
+
+    fn split_test_row(kind: BrowserRowKind, full_path: &str, depth: usize) -> BrowserRow {
+        BrowserRow {
+            kind,
+            full_path: full_path.to_string(),
+            label: full_path.to_string(),
+            detail_label: String::new(),
+            document_kind: None,
+            group_kind: None,
+            session_title: None,
+            depth,
+            host_label: "live".to_string(),
+            descendant_sessions: 0,
+            expanded: true,
+            session_id: None,
+            session_cwd: None,
+            session_kind: None,
+        }
+    }
+
+    #[test]
+    fn split_pane_rect_css_mirrors_axis_and_ratio() {
+        // Side-by-side: pane 0 takes `ratio` of the WIDTH; pane 1 takes the rest.
+        let left = split_pane_rect_css(SplitAxis::SideBySide, 0.3, 0);
+        assert!(left.contains("width:30"), "left width: {left}");
+        assert!(left.contains("height:100%"), "left full height: {left}");
+        assert!(left.contains("left:0"));
+        let right = split_pane_rect_css(SplitAxis::SideBySide, 0.3, 1);
+        assert!(right.contains("width:70"), "right width: {right}");
+        assert!(right.contains("left:30"), "right offset: {right}");
+        // Stacked: pane 0 takes `ratio` of the HEIGHT, full width.
+        let top = split_pane_rect_css(SplitAxis::Stacked, 0.3, 0);
+        assert!(top.contains("width:100%") && top.contains("height:30"), "top: {top}");
+        let bottom = split_pane_rect_css(SplitAxis::Stacked, 0.3, 1);
+        assert!(bottom.contains("height:70") && bottom.contains("top:30"), "bottom: {bottom}");
+    }
+
+    #[test]
+    fn collapse_live_sessions_replaces_members_with_one_compound_row() {
+        // Live Sessions region: group row + two member rows; a cwd folder after.
+        let mut rows = vec![
+            split_test_row(BrowserRowKind::Group, "__live_sessions__", 0),
+            split_test_row(BrowserRowKind::Session, "local://a", 1),
+            split_test_row(BrowserRowKind::Session, "local://b", 1),
+            // cwd-tree occurrence of the SAME session (dual presence) — must survive.
+            split_test_row(BrowserRowKind::Group, "local", 0),
+            split_test_row(BrowserRowKind::Session, "local://a", 1),
+        ];
+        let group = SplitGroup {
+            group_id: "g1".to_string(),
+            axis: SplitAxis::SideBySide,
+            ratio: 0.5,
+            members: vec!["local://a".to_string(), "local://b".to_string()],
+            active_pane: 0,
+            prior_keep_alive: std::collections::BTreeMap::new(),
+        };
+        collapse_live_sessions_into_split_rows(&mut rows, std::slice::from_ref(&group));
+        // Live region: group row, then ONE compound row (split://g1), no members.
+        assert_eq!(rows[0].full_path, "__live_sessions__");
+        assert_eq!(rows[1].full_path, "split://g1");
+        assert_eq!(rows[1].session_id.as_deref(), Some("g1"));
+        // The cwd-tree region is untouched: the `local` folder and its member row.
+        assert!(rows.iter().any(|row| row.full_path == "local"));
+        assert!(
+            rows.iter().filter(|row| row.full_path == "local://a").count() == 1,
+            "cwd-tree occurrence of local://a preserved, live one collapsed"
+        );
+        // No compound row appears in the cwd-tree region.
+        assert_eq!(
+            rows.iter().filter(|row| row.full_path == "split://g1").count(),
+            1
+        );
+    }
+
+    #[test]
+    fn collapse_live_sessions_leaves_partial_group_uncompounded() {
+        // Only one member present in Live Sessions -> no compound row.
+        let mut rows = vec![
+            split_test_row(BrowserRowKind::Group, "__live_sessions__", 0),
+            split_test_row(BrowserRowKind::Session, "local://a", 1),
+        ];
+        let group = SplitGroup {
+            group_id: "g1".to_string(),
+            axis: SplitAxis::SideBySide,
+            ratio: 0.5,
+            members: vec!["local://a".to_string(), "local://b".to_string()],
+            active_pane: 0,
+            prior_keep_alive: std::collections::BTreeMap::new(),
+        };
+        collapse_live_sessions_into_split_rows(&mut rows, std::slice::from_ref(&group));
+        assert!(rows.iter().all(|row| !row.full_path.starts_with("split://")));
+        assert!(rows.iter().any(|row| row.full_path == "local://a"));
+    }
 
     #[test]
     fn web_surface_address_input_resolves_to_urls() {
@@ -107325,6 +108639,8 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             active_session_path: Some(session_path.to_string()),
             active_view_mode: WorkspaceViewMode::Terminal,
             retained_terminal_sessions: vec![session.clone()],
+            split_groups: Vec::new(),
+            active_split_group: None,
             terminal_mount_epochs: HashMap::new(),
             active_web_surface_profile: None,
             active_web_surface_host: None,
@@ -107940,6 +109256,8 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             active_session_path: Some(active_session.session_path.clone()),
             active_view_mode: WorkspaceViewMode::Terminal,
             retained_terminal_sessions: vec![stale_session.clone(), active_session.clone()],
+            split_groups: Vec::new(),
+            active_split_group: None,
             terminal_mount_epochs: HashMap::new(),
             active_web_surface_profile: None,
             active_web_surface_host: None,
@@ -108090,6 +109408,8 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             active_session_path: Some(session_path.to_string()),
             active_view_mode: WorkspaceViewMode::Rendered,
             retained_terminal_sessions: vec![active_session.clone()],
+            split_groups: Vec::new(),
+            active_split_group: None,
             terminal_mount_epochs: HashMap::new(),
             active_web_surface_profile: None,
             active_web_surface_host: None,
@@ -108240,6 +109560,8 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             active_session_path: Some(session_path.to_string()),
             active_view_mode: WorkspaceViewMode::Rendered,
             retained_terminal_sessions: vec![active_session.clone()],
+            split_groups: Vec::new(),
+            active_split_group: None,
             terminal_mount_epochs: HashMap::new(),
             active_web_surface_profile: None,
             active_web_surface_host: None,
@@ -108393,6 +109715,8 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             active_session_path: Some(session_path.to_string()),
             active_view_mode: WorkspaceViewMode::Rendered,
             retained_terminal_sessions: vec![active_session.clone()],
+            split_groups: Vec::new(),
+            active_split_group: None,
             terminal_mount_epochs: HashMap::new(),
             active_web_surface_profile: None,
             active_web_surface_host: None,
@@ -108550,6 +109874,8 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             active_session_path: Some(session_path.to_string()),
             active_view_mode: WorkspaceViewMode::Rendered,
             retained_terminal_sessions: vec![active_session.clone()],
+            split_groups: Vec::new(),
+            active_split_group: None,
             terminal_mount_epochs: HashMap::new(),
             active_web_surface_profile: None,
             active_web_surface_host: None,
@@ -108699,6 +110025,8 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             active_session_path: Some(active_session.session_path.clone()),
             active_view_mode: WorkspaceViewMode::Terminal,
             retained_terminal_sessions: vec![active_session.clone()],
+            split_groups: Vec::new(),
+            active_split_group: None,
             terminal_mount_epochs: HashMap::new(),
             active_web_surface_profile: None,
             active_web_surface_host: None,
@@ -108848,6 +110176,8 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             active_session_path: Some(active_session.session_path.clone()),
             active_view_mode: WorkspaceViewMode::Terminal,
             retained_terminal_sessions: vec![active_session.clone()],
+            split_groups: Vec::new(),
+            active_split_group: None,
             terminal_mount_epochs: HashMap::new(),
             active_web_surface_profile: None,
             active_web_surface_host: None,
@@ -109031,6 +110361,8 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             active_session_path: Some(active_session.session_path.clone()),
             active_view_mode: WorkspaceViewMode::Terminal,
             retained_terminal_sessions: vec![restored_remote.clone(), active_session.clone()],
+            split_groups: Vec::new(),
+            active_split_group: None,
             terminal_mount_epochs: HashMap::new(),
             active_web_surface_profile: None,
             active_web_surface_host: None,
@@ -109183,6 +110515,8 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             active_session_path: Some(active_session.session_path.clone()),
             active_view_mode: WorkspaceViewMode::Terminal,
             retained_terminal_sessions: vec![active_session.clone()],
+            split_groups: Vec::new(),
+            active_split_group: None,
             terminal_mount_epochs: HashMap::new(),
             active_web_surface_profile: None,
             active_web_surface_host: None,
@@ -109367,6 +110701,8 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             active_session_path: Some(session_path.to_string()),
             active_view_mode: WorkspaceViewMode::Terminal,
             retained_terminal_sessions: vec![live_session.clone()],
+            split_groups: Vec::new(),
+            active_split_group: None,
             terminal_mount_epochs: HashMap::new(),
             active_web_surface_profile: None,
             active_web_surface_host: None,
@@ -109728,6 +111064,8 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             active_session_path: None,
             active_view_mode: WorkspaceViewMode::Rendered,
             retained_terminal_sessions: Vec::new(),
+            split_groups: Vec::new(),
+            active_split_group: None,
             terminal_mount_epochs: HashMap::new(),
             active_web_surface_profile: None,
             active_web_surface_host: None,

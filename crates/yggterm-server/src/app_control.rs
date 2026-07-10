@@ -469,6 +469,28 @@ pub enum AppControlCommand {
         session_path: String,
         keep_alive: bool,
     },
+    /// Create a split-view group ([[campaign-split-view-groups]]) from `members`
+    /// (session paths in pane order), arranged along `axis`. Grouping forces
+    /// keep-alive on every member. Drives the yggui split surface end to end.
+    CreateSplitGroup {
+        members: Vec<String>,
+        /// "side-by-side" (default) or "stacked".
+        #[serde(default)]
+        axis: Option<String>,
+    },
+    /// Dissolve a split-view group, restoring each member's pre-group keep-alive.
+    UngroupSplitGroup {
+        group_id: String,
+    },
+    /// Move a split group's divider ratio (fraction the first pane occupies).
+    SetSplitGroupRatio {
+        group_id: String,
+        ratio: f32,
+    },
+    /// Focus a pane (make its session the input target) within its split group.
+    FocusSplitPane {
+        session_path: String,
+    },
     SetRowExpanded {
         row_path: String,
         expanded: bool,
@@ -613,6 +635,10 @@ impl AppControlCommand {
             Self::RenameSession { .. } => "rename_session",
             Self::RestartSession { .. } => "restart_session",
             Self::SetSessionKeepAlive { .. } => "set_session_keep_alive",
+            Self::CreateSplitGroup { .. } => "create_split_group",
+            Self::UngroupSplitGroup { .. } => "ungroup_split_group",
+            Self::SetSplitGroupRatio { .. } => "set_split_group_ratio",
+            Self::FocusSplitPane { .. } => "focus_split_pane",
             Self::SetRowExpanded { .. } => "set_row_expanded",
             Self::SetTreeSelection { .. } => "set_tree_selection",
             Self::WebSurfaceEval { .. } => "web_surface_eval",
