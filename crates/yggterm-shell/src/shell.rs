@@ -46,7 +46,9 @@ use crate::terminal_observe::{
 use crate::terminal_observe::{
     summarize_terminal_surface_for_app_control, terminal_chunk_is_launcher_boilerplate,
 };
-use crate::terminal_protocol::{SidebarPaneDeclaration, TerminalJsCommand, TerminalJsEvent};
+use crate::terminal_protocol::{
+    Fido2Account, SidebarPaneDeclaration, TerminalJsCommand, TerminalJsEvent,
+};
 use crate::terminal_retained_replay_policy::{
     RetainedRehydrateMode, blank_host_snapshot_replay_from_read_should_start,
     blank_host_snapshot_replay_should_start, daemon_retained_snapshot_replay_identity_key,
@@ -1721,7 +1723,7 @@ async fn web_surface_native_reconcile_loop(
         // Desired: (session, active_tab,
         //           [(tab, effective_url, reload_nonce, socks_port, profile)],
         //           policy gate).
-        let (desired, active_visible_sessions): (
+        let (desired, active_visible_sessions, fido2_dialog_open): (
             Vec<(
                 String,
                 u64,
@@ -1729,6 +1731,7 @@ async fn web_surface_native_reconcile_loop(
                 SurfacePolicyGate,
             )>,
             std::collections::HashSet<String>,
+            bool,
         ) = {
             let shell = state.peek();
             let shell_ref: &ShellState = &shell;
@@ -1780,7 +1783,13 @@ async fn web_surface_native_reconcile_loop(
                 })
                 .cloned()
                 .collect();
-            (desired, active_visible_sessions)
+            // A passkey presence dialog is a Dioxus overlay in the MAIN webview,
+            // but a native web surface (a gtk overlay child) draws ABOVE all DOM —
+            // so while the dialog is up, the surface must be HIDDEN or the user
+            // never sees the prompt (they just see the page, which is exactly the
+            // "no popup appeared" report). Like a real OS passkey prompt, the
+            // ceremony takes over the viewport.
+            (desired, active_visible_sessions, shell_ref.pending_fido2.is_some())
         };
         // Destroy first: closed/swept surfaces and closed tabs must release
         // their webview (and WebContext) even when the DOM oracle is gone.
@@ -1940,7 +1949,11 @@ async fn web_surface_native_reconcile_loop(
                 // backgrounded surface shown. Positioning still uses the rect.
                 let want_visible = rect.is_some()
                     && tab_id == active_tab
-                    && active_visible_sessions.contains(session_path.as_str());
+                    && active_visible_sessions.contains(session_path.as_str())
+                    // Hide the surface under a passkey dialog (it draws over the
+                    // DOM the dialog lives in). The reconciler re-shows it when the
+                    // dialog clears, since pending_fido2 flips back to None.
+                    && !fido2_dialog_open;
                 // Destroy-and-recreate cases (close + remove here; the
                 // lazy-create branch rebuilds a fresh webview the same tick):
                 //   - proxy or profile change: both are fixed per WebContext,
@@ -3048,8 +3061,11 @@ struct PendingFido2Dialog {
     request_id: String,
     /// The relying party, e.g. `github.com`.
     rp_id: String,
-    /// A human label for the account (userName / displayName / vault item name).
+    /// A human label for the first/only account (fallback for the single case).
     account: String,
+    /// Every matched account the user may pick. One ⇒ a plain Approve, several ⇒
+    /// a picker. Each carries the `credential_id` echoed back in the grant.
+    accounts: Vec<Fido2Account>,
     /// `get` (sign in) or `create` (register) — changes the dialog wording.
     ceremony: String,
     /// The page origin the ceremony runs on, shown so the user sees who is asking.
@@ -36667,7 +36683,14 @@ async fn app_policy_fetch(
 /// The control endpoint is keyed by the ceremony's OWN session (the stream the
 /// OSC arrived on), not the active session — a background surface can run a
 /// ceremony while the user looks at another row.
-fn resolve_fido2_dialog(mut state: Signal<ShellState>, dialog: PendingFido2Dialog, approved: bool) {
+/// `credential_id` names the account the user picked (from the dialog's picker),
+/// or `None` for a decline or a single-account Approve.
+fn resolve_fido2_dialog(
+    mut state: Signal<ShellState>,
+    dialog: PendingFido2Dialog,
+    approved: bool,
+    credential_id: Option<String>,
+) {
     let control_url = state.with_mut(|shell| {
         // Clear it whichever way the user answered, so a second click can't
         // double-POST and the modal closes immediately.
@@ -36688,8 +36711,13 @@ fn resolve_fido2_dialog(mut state: Signal<ShellState>, dialog: PendingFido2Dialo
     let route = if approved { "grant" } else { "deny" };
     let url = format!("{}/fido2/{route}", control_url.trim_end_matches('/'));
     // `user_verified` stays false: yggterm shows a presence dialog, not a
-    // biometric/PIN verification gate, so the assertion sets UP but not UV.
-    let body = json!({ "request_id": dialog.request_id, "user_verified": false });
+    // biometric/PIN verification gate, so the assertion sets UP but not UV. The
+    // chosen account rides along so the app signs the one the user picked.
+    let body = json!({
+        "request_id": dialog.request_id,
+        "user_verified": false,
+        "credential_id": credential_id,
+    });
     spawn(async move {
         let _ = task::spawn_blocking(move || control_request(&url, Some(&body))).await;
     });
@@ -46661,15 +46689,16 @@ fn app() -> Element {
                     Fido2PresenceOverlay {
                         dialog: dialog.clone(),
                         palette: snapshot.palette,
-                        on_approve: move |_| resolve_fido2_dialog(state, dialog.clone(), true),
-                        on_decline: {
-                            let dialog = snapshot.pending_fido2.clone();
-                            move |_| {
-                                if let Some(dialog) = dialog.clone() {
-                                    resolve_fido2_dialog(state, dialog, false);
-                                }
+                        // The picker passes the chosen account's credential_id; a
+                        // single-account Approve passes None (the app signs the
+                        // only match).
+                        on_approve: {
+                            let dialog = dialog.clone();
+                            move |credential_id: Option<String>| {
+                                resolve_fido2_dialog(state, dialog.clone(), true, credential_id)
                             }
                         },
+                        on_decline: move |_| resolve_fido2_dialog(state, dialog.clone(), false, None),
                     }
                 }
                 if snapshot.theme_editor_open {
@@ -55849,6 +55878,7 @@ fn TerminalCanvas(
                                 request_id,
                                 rp_id,
                                 account,
+                                accounts,
                                 ceremony,
                                 origin,
                             }) => {
@@ -55861,6 +55891,7 @@ fn TerminalCanvas(
                                                 request_id: request_id.clone(),
                                                 rp_id: rp_id.clone(),
                                                 account: account.clone(),
+                                                accounts: accounts.clone(),
                                                 ceremony: ceremony.clone(),
                                                 origin: origin.clone(),
                                             });
@@ -66372,6 +66403,7 @@ fn terminal_eval_script_with_canvas_renderer(
                             // on approval, POSTs the grant back to the app's
                             // control endpoint (the one the sidebar declared on
                             // this same stream).
+                            const fido2Accounts = Array.isArray(payload.accounts) ? payload.accounts : [];
                             sendTerminalEvent({{
                                 kind: 'fido2_request',
                                 action,
@@ -66379,6 +66411,12 @@ fn terminal_eval_script_with_canvas_renderer(
                                 request_id: typeof payload.request_id === 'string' ? payload.request_id : '',
                                 rp_id: typeof payload.rp_id === 'string' ? payload.rp_id : '',
                                 account: typeof payload.account === 'string' ? payload.account : '',
+                                accounts: fido2Accounts
+                                    .filter((a) => a && typeof a.label === 'string')
+                                    .map((a) => ({{
+                                        credential_id: typeof a.credential_id === 'string' ? a.credential_id : '',
+                                        label: a.label,
+                                    }})),
                                 ceremony: typeof payload.kind === 'string' ? payload.kind : 'get',
                                 origin: typeof payload.origin === 'string' ? payload.origin : '',
                             }});
@@ -79134,20 +79172,30 @@ fn DeleteConfirmOverlay(
 fn Fido2PresenceOverlay(
     dialog: PendingFido2Dialog,
     palette: Palette,
-    on_approve: EventHandler<MouseEvent>,
+    /// `Some(credential_id)` = the picked account (multi-account picker);
+    /// `None` = a single-account Approve (the app signs the only match).
+    on_approve: EventHandler<Option<String>>,
     on_decline: EventHandler<MouseEvent>,
 ) -> Element {
     let overlay_blur = overlay_backdrop_style("blur(18px) saturate(130%)");
-    let (title, verb) = if dialog.ceremony == "create" {
-        ("Register a passkey?", "Register")
+    // A create() is always one account. A get() with several stored passkeys is a
+    // PICKER — the user chooses which account to sign in as, the way the Bitwarden
+    // extension offers a list.
+    let is_picker = dialog.ceremony != "create" && dialog.accounts.len() > 1;
+    let title = if dialog.ceremony == "create" {
+        "Register a passkey?"
+    } else if is_picker {
+        "Choose a passkey"
     } else {
-        ("Sign in with a passkey?", "Approve")
+        "Sign in with a passkey?"
     };
+    let verb = if dialog.ceremony == "create" { "Register" } else { "Approve" };
     let account = if dialog.account.is_empty() {
         "this account".to_string()
     } else {
         dialog.account.clone()
     };
+    let accounts = dialog.accounts.clone();
     rsx! {
         div {
             "data-fido2-overlay": "1",
@@ -79188,9 +79236,13 @@ fn Fido2PresenceOverlay(
                 }
                 div {
                     style: "display:flex; flex-direction:column; gap:8px;",
-                    div {
-                        style: format!("font-size:13px; line-height:1.5; color:{};", palette.text),
-                        "{account}"
+                    // A single-account ceremony names the one account inline; a
+                    // picker lists them as buttons below instead.
+                    if !is_picker {
+                        div {
+                            style: format!("font-size:13px; line-height:1.5; color:{};", palette.text),
+                            "{account}"
+                        }
                     }
                     div {
                         "data-fido2-rp": "1",
@@ -79208,6 +79260,37 @@ fn Fido2PresenceOverlay(
                         }
                     }
                 }
+                // The picker: one button per matched account. Clicking a row IS
+                // the choice AND the consent for that credential.
+                if is_picker {
+                    div {
+                        "data-fido2-accounts": "1",
+                        style: "display:flex; flex-direction:column; gap:8px; max-height:260px; overflow:auto;",
+                        for account in accounts.iter().cloned() {
+                            button {
+                                "data-fido2-account": "{account.credential_id}",
+                                style: format!(
+                                    "display:flex; align-items:center; gap:8px; width:100%; text-align:left; \
+                                     padding:11px 13px; border-radius:12px; border:none; cursor:pointer; \
+                                     background:{}; color:{}; font-size:13px; font-weight:600; font-family:{}; \
+                                     box-shadow: inset 0 0 0 1px rgba(196,210,224,0.9);",
+                                    chrome_chip_fill(palette, false),
+                                    palette.text,
+                                    interface_font_family()
+                                ),
+                                onclick: {
+                                    let credential_id = account.credential_id.clone();
+                                    move |_| on_approve.call(Some(credential_id.clone()))
+                                },
+                                span {
+                                    style: "font-size:15px; line-height:1;",
+                                    "\u{1f511}\u{fe0e}"
+                                }
+                                "{account.label}"
+                            }
+                        }
+                    }
+                }
                 div {
                     style: "display:flex; justify-content:flex-end; gap:10px;",
                     button {
@@ -79216,11 +79299,15 @@ fn Fido2PresenceOverlay(
                         onclick: move |evt| on_decline.call(evt),
                         "Not now"
                     }
-                    button {
-                        "data-fido2-approve": "1",
-                        style: delete_confirm_button_style(palette, false),
-                        onclick: move |evt| on_approve.call(evt),
-                        "{verb}"
+                    // The single-account Approve. A picker has no blanket Approve —
+                    // the user must name an account.
+                    if !is_picker {
+                        button {
+                            "data-fido2-approve": "1",
+                            style: delete_confirm_button_style(palette, false),
+                            onclick: move |_| on_approve.call(None),
+                            "{verb}"
+                        }
                     }
                 }
             }
@@ -87447,6 +87534,10 @@ mod tests {
             "request_id": "deadbeef",
             "rp_id": "github.com",
             "account": "octocat",
+            "accounts": [
+                {"credential_id": "cred-a", "label": "octocat"},
+                {"credential_id": "cred-b", "label": "hubot"},
+            ],
             "ceremony": "get",
             "origin": "https://github.com",
         }))
@@ -87457,6 +87548,7 @@ mod tests {
                 request_id,
                 rp_id,
                 account,
+                accounts,
                 ceremony,
                 origin,
                 ..
@@ -87465,6 +87557,10 @@ mod tests {
                 assert_eq!(request_id, "deadbeef");
                 assert_eq!(rp_id, "github.com");
                 assert_eq!(account, "octocat");
+                // The multi-account picker payload round-trips.
+                assert_eq!(accounts.len(), 2);
+                assert_eq!(accounts[0].credential_id, "cred-a");
+                assert_eq!(accounts[1].label, "hubot");
                 assert_eq!(ceremony, "get");
                 assert_eq!(origin, "https://github.com");
             }
