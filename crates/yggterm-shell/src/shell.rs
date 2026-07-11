@@ -934,6 +934,14 @@ struct DaemonPanelStatus {
     /// Why a hot-restart is being deferred, in the daemon's own words. `None` = nothing
     /// is blocking one.
     hot_restart_block_reason: Option<String>,
+    /// EVERY session deferring the restart. The summary line above names only the first,
+    /// which is why a deferral used to read as an unexplained wait: clear that session and
+    /// the panel names another. Expanding the Daemon group lists them all.
+    hot_restart_blockers: Vec<yggterm_server::HotRestartBlocker>,
+    /// The version of THIS GUI process. The daemon and the client are separate programs
+    /// that upgrade separately, and the whole stale-daemon trap is that they can silently
+    /// disagree — so both versions belong side by side, in one place, always.
+    client_version: String,
 }
 /// "19h 44m" / "3m 12s" / "8s" — a daemon's age at a glance. A raw millisecond count
 /// tells the user nothing, and the whole point of this row is that they can tell a
@@ -5138,6 +5146,8 @@ impl ShellState {
             preserved_owners: status.preserved_terminal_owner_count,
             hot_restart_pending: status.hot_restart_pending,
             hot_restart_block_reason: status.hot_restart_block_reason.clone(),
+            hot_restart_blockers: status.hot_restart_blockers.clone(),
+            client_version: current_version(),
         })
     }
 
@@ -15177,8 +15187,44 @@ fn spawn_browser_tree_refresh(
 /// exactly why the rail prints the block reason next to this button: a deferred
 /// restart must read as "waiting, because X", never as a click into silence.
 fn spawn_manual_daemon_hot_restart(mut state: Signal<ShellState>) {
+    // The handoff is a BLOCKING round-trip (spawn the successor, migrate every live PTY),
+    // and it used to run in total silence: the first notification fired only when it had
+    // already finished. So the button read as a click into nothing, and the user could not
+    // tell "working on it" from "did that even register". Announce BEFORE the work starts.
+    let trace_home = resolve_yggterm_home().ok();
     state.with_mut(|shell| {
         shell.last_action = "hot-restarting daemon".to_string();
+        shell.push_notification(
+            NotificationTone::Info,
+            "Daemon Hot-Restart",
+            "Preparing hot-restart — handing live sessions to the new daemon. Sessions stay alive.",
+        );
+        // PROBE daemon_hot_restart_requested: the manual path left NO trace at all, so the
+        // one action a user takes to escape a stale daemon was the one action we could not
+        // see afterwards. Record what they were looking at when they pressed it — which
+        // daemon, how old, and what it said was blocking — so a restart that does not stick
+        // can be reconstructed instead of re-enacted.
+        if let Some(home) = trace_home.as_deref() {
+            let daemon = shell.daemon_panel_status();
+            append_trace_event(
+                home,
+                "gui",
+                "lifecycle",
+                "daemon_hot_restart_requested",
+                json!({
+                    "source": "manual_metadata_rail",
+                    "client_version": current_version(),
+                    "daemon_version": daemon.as_ref().map(|d| d.version.clone()),
+                    "daemon_pid": daemon.as_ref().map(|d| d.pid),
+                    "daemon_uptime_ms": daemon.as_ref().map(|d| d.uptime_ms),
+                    "hot_restart_pending": daemon.as_ref().map(|d| d.hot_restart_pending),
+                    "block_reason": daemon
+                        .as_ref()
+                        .and_then(|d| d.hot_restart_block_reason.clone()),
+                    "blocker_count": daemon.as_ref().map(|d| d.hot_restart_blockers.len()),
+                }),
+            );
+        }
     });
     spawn(async move {
         let endpoint = state.read().bootstrap.server_endpoint.clone();
@@ -15197,6 +15243,7 @@ fn spawn_manual_daemon_hot_restart(mut state: Signal<ShellState>) {
             )
         })
         .await;
+        let succeeded = matches!(outcome, Ok(Ok(_)));
         state.with_mut(|shell| match outcome {
             Ok(Ok(result)) => shell.push_notification(
                 NotificationTone::Success,
@@ -15216,6 +15263,32 @@ fn spawn_manual_daemon_hot_restart(mut state: Signal<ShellState>) {
                 &error.to_string(),
             ),
         });
+        // The panel is fed by `latest_runtime_status`, which only refreshed on its own poll
+        // tick — so after a successful swap the rail kept printing the OLD daemon's version,
+        // pid and uptime, and the user was left staring at stale numbers wondering whether
+        // the restart had done anything. Re-read the daemon's status immediately, and the
+        // metadata the user is watching lands with the notification instead of minutes after.
+        if succeeded {
+            let refreshed =
+                refresh_runtime_status_for_app_control(state, "manual_hot_restart").await;
+            // The OUTCOME, in the same stream as the request. A hot-restart that "succeeds"
+            // but leaves the same pid/version running is the stale-daemon trap wearing a
+            // success notification; recording what the daemon looked like AFTER the swap is
+            // what makes that distinguishable without the user noticing it themselves.
+            if let Some(home) = trace_home.as_deref() {
+                append_trace_event(
+                    home,
+                    "gui",
+                    "lifecycle",
+                    "daemon_hot_restart_settled",
+                    json!({
+                        "source": "manual_metadata_rail",
+                        "client_version": current_version(),
+                        "daemon_after": refreshed,
+                    }),
+                );
+            }
+        }
     });
 }
 fn restart_into_pending_update(mut state: Signal<ShellState>) {
@@ -81014,13 +81087,28 @@ fn DaemonMetadataGroup(
     palette: Palette,
     on_daemon_hot_restart: EventHandler<MouseEvent>,
 ) -> Element {
-    let entries = vec![
+    // The GUI and the daemon are separate programs that upgrade separately, and the whole
+    // stale-daemon trap is that they silently DISAGREE. Showing the client version in its
+    // own line immediately above the Daemon group puts both numbers in one glance, so a
+    // mismatch is something the user trips over rather than something they must go looking
+    // for. See [[finding-stale-daemon-trap]].
+    let versions_agree = daemon.client_version == daemon.version;
+    let client_entries = vec![SessionMetadataEntry {
+        label: "Version",
+        value: if versions_agree {
+            daemon.client_version.clone()
+        } else {
+            format!("{} · daemon is on {}", daemon.client_version, daemon.version)
+        },
+    }];
+
+    let mut entries = vec![
         SessionMetadataEntry {
             label: "Version",
-            value: if daemon.hot_restart_pending {
-                format!("{} · newer build on disk", daemon.version)
-            } else {
-                daemon.version.clone()
+            value: match (daemon.hot_restart_pending, versions_agree) {
+                (true, _) => format!("{} · newer build on disk", daemon.version),
+                (false, false) => format!("{} · older than this client", daemon.version),
+                (false, true) => daemon.version.clone(),
             },
         },
         SessionMetadataEntry {
@@ -81049,7 +81137,29 @@ fn DaemonMetadataGroup(
             },
         },
     ];
+    // Expanding the group lists EVERY blocker. The summary above names one; a swap pinned
+    // by three agents used to read as an endless unexplained wait, because clearing the
+    // named session just surfaced another. Now the user can see the whole set, and what
+    // each one is doing, so "when will this land" has an answer.
+    for blocker in &daemon.hot_restart_blockers {
+        entries.push(SessionMetadataEntry {
+            label: "Blocking",
+            value: match (blocker.kind.as_str(), blocker.idle_ms) {
+                (yggterm_server::HOT_RESTART_BLOCKER_WORKING, _) => {
+                    format!("{} — working now", blocker.session_key)
+                }
+                (_, Some(idle_ms)) => format!(
+                    "{} — active {} ago (idle window {})",
+                    blocker.session_key,
+                    friendly_duration_ms(idle_ms),
+                    friendly_duration_ms(blocker.threshold_ms),
+                ),
+                (_, None) => format!("{} — recently active", blocker.session_key),
+            },
+        });
+    }
     rsx! {
+        MetadataGroup { title: "Client".to_string(), entries: client_entries, palette }
         MetadataGroup { title: "Daemon".to_string(), entries, palette }
         button {
             "data-daemon-hot-restart-button": "1",
@@ -84033,10 +84143,42 @@ fn filter_terminal_theme_options(options: &[String], query: &str) -> Vec<String>
 }
 #[component]
 fn MetadataGroup(title: String, entries: Vec<SessionMetadataEntry>, palette: Palette) -> Element {
+    // Every group collapses. The rail stacks Session + Runtime + History + Client + Daemon,
+    // and the Daemon group in particular now carries per-blocker detail — enough that a
+    // reader hunting one fact had to scroll past everything else. Collapse state is local
+    // to the group and survives re-renders (hook state is keyed by position), so a user who
+    // folds "History" away keeps it folded while they switch sessions.
+    let mut expanded = use_signal(|| true);
+    let is_expanded = expanded();
+    let entry_count = entries.len();
     rsx! {
         div {
             style: "display:flex; flex-direction:column; gap:6px; padding-bottom:4px;",
-            RailSectionTitle { title: title, muted_color: palette.muted.to_string() }
+            div {
+                style: "display:flex; align-items:center; gap:6px; cursor:pointer; user-select:none;",
+                "data-metadata-group-toggle": "{title}",
+                "data-metadata-group-expanded": if is_expanded { "1" } else { "0" },
+                onclick: move |_| expanded.toggle(),
+                span {
+                    style: format!(
+                        "font-size:9px; line-height:1; color:{}; transform:rotate({}deg); \
+                         transition:transform 120ms ease;",
+                        palette.muted,
+                        if is_expanded { 90 } else { 0 },
+                    ),
+                    "▶"
+                }
+                RailSectionTitle { title: title.clone(), muted_color: palette.muted.to_string() }
+                // Collapsed, the group must still say how much it is hiding — a bare title
+                // with no affordance reads as an empty section, not a folded one.
+                if !is_expanded {
+                    span {
+                        style: format!("font-size:10px; font-weight:600; color:{};", palette.muted),
+                        "{entry_count}"
+                    }
+                }
+            }
+            if is_expanded {
             for entry in entries.into_iter() {
                 div {
                     style: "display:flex; flex-direction:column; gap:2px;",
@@ -84057,6 +84199,7 @@ fn MetadataGroup(title: String, entries: Vec<SessionMetadataEntry>, palette: Pal
                         "{entry.value}"
                     }
                 }
+            }
             }
         }
     }
