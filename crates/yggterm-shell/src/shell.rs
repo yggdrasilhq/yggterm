@@ -5875,6 +5875,20 @@ impl ShellState {
             .and_then(|host| self.web_surface_zoom_override(&session_path, host));
         Some(override_pct.unwrap_or(global))
     }
+    /// Whether the active web surface's current page loaded over HTTPS. `None`
+    /// when no web surface is active or the URL has no clear scheme. Non-secret
+    /// page context the settings pane shows as a connection indicator.
+    fn active_web_surface_secure(&self) -> Option<bool> {
+        let session_path = self.server.active_session_path()?.to_string();
+        let surface = self.web_surfaces.get(&session_path)?;
+        let tab = surface.tabs.iter().find(|tab| tab.id == surface.active_tab)?;
+        let scheme = tab.url.split_once("://").map(|(scheme, _)| scheme)?;
+        match scheme.to_ascii_lowercase().as_str() {
+            "https" => Some(true),
+            "http" => Some(false),
+            _ => None,
+        }
+    }
     /// What the surface reconciler should do about `session_path`'s policy right
     /// now. One owner for the whole rule, so the gate and the create path cannot
     /// disagree about whether a policy is coming.
@@ -38031,20 +38045,36 @@ async fn app_pane_fetch_schema(mut state: Signal<ShellState>, pane_id: String, s
         });
         return;
     };
-    let host = {
+    let (host, zoom, secure) = {
         let shell = state.read();
-        shell
+        let host = shell
             .server
             .active_session_path()
             .map(str::to_string)
-            .and_then(|path| shell.web_surface_host_label(&path))
+            .and_then(|path| shell.web_surface_host_label(&path));
+        (
+            host,
+            shell.active_web_surface_effective_zoom_percent(),
+            shell.active_web_surface_secure(),
+        )
     };
-    // The app decides what a page host means (which logins apply to it); the
-    // GUI only tells it which host is open. Non-secret context, never a value.
-    let url = match &host {
-        Some(host) => format!("{}?host={host}", app_pane_schema_url(&control_url, &pane_id)),
-        None => app_pane_schema_url(&control_url, &pane_id),
-    };
+    // The app decides what a page host means (which logins apply to it); the GUI
+    // only reports the page context — host, live zoom, HTTPS. All non-secret,
+    // never a value the app must trust for auth.
+    let mut url = app_pane_schema_url(&control_url, &pane_id);
+    let mut query: Vec<String> = Vec::new();
+    if let Some(host) = &host {
+        query.push(format!("host={host}"));
+    }
+    if let Some(zoom) = zoom {
+        query.push(format!("zoom={zoom}"));
+    }
+    if let Some(secure) = secure {
+        query.push(format!("secure={secure}"));
+    }
+    if !query.is_empty() {
+        url = format!("{url}?{}", query.join("&"));
+    }
     let fetched = task::spawn_blocking(move || control_request(&url, None))
         .await
         .unwrap_or_else(|error| Err(format!("schema fetch panicked: {error}")));
@@ -38242,7 +38272,7 @@ async fn app_pane_run_action(
     action: String,
     value: Option<String>,
 ) {
-    let (control_url, mut values, host, live_zoom) = {
+    let (control_url, mut values, host, live_zoom, secure) = {
         let shell = state.read();
         let active = shell.server.active_session_path().map(str::to_string);
         let control = active
@@ -38252,13 +38282,18 @@ async fn app_pane_run_action(
             .as_deref()
             .and_then(|path| shell.web_surface_host_label(path));
         let live_zoom = shell.active_web_surface_effective_zoom_percent();
-        (control, shell.app_pane_values_json(), host, live_zoom)
+        let secure = shell.active_web_surface_secure();
+        (control, shell.app_pane_values_json(), host, live_zoom, secure)
     };
     let Some(control_url) = control_url else {
         return;
     };
     if let (Some(host), Some(map)) = (host, values.as_object_mut()) {
         map.insert("host".to_string(), serde_json::Value::String(host));
+    }
+    // The active surface's HTTPS state, for a settings pane's connection line.
+    if let (Some(secure), Some(map)) = (secure, values.as_object_mut()) {
+        map.insert("secure".to_string(), serde_json::json!(secure));
     }
     // The live effective zoom of the active surface, so an app's zoom control can
     // step from what is actually on screen (see `web_surface_zoom_percent`). Non-
