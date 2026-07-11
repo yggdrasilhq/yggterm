@@ -2,6 +2,33 @@
 
 This file tracks user-visible changes in `yggterm`.
 
+## 2.10.12
+
+- **ALT+ KeyTips — an Excel-style keyboard accelerator layer.** Tap **ALT** (a
+  clean press+release, no other key) and hint letters pop onto the chrome:
+  **B** sidebar, **C** connect, **G** settings, **L** notifications, **D** session
+  metadata, **V**/**T** the web/terminal view toggle, **I** the New… menu (then
+  **S** new session, **T** new terminal). Press a letter to fire it or descend a
+  level, Excel-style; a breadcrumb shows the chord so far; **Esc**, a click, or
+  switching windows exits. Holding **ALT+<key>** inside a terminal still passes
+  straight through to the shell as a Meta prefix (readline/emacs/helix are
+  untouched) — only the clean tap opens the overlay.
+  - **One command registry is the source of truth.** The KeyTips, the keymap
+    file, the settings editor, and a new `server app command invoke <id>` probe
+    are all views of the same table — so an agent (or you) can drive a shell
+    command by id instead of hunting for its button, the keyboard analogue of the
+    click grid. `server app command list` enumerates every id, title, and chord.
+  - **Reserved-letters namespace.** Shell KeyTips draw only from letters Excel's
+    ribbon does not use; Excel's own top-level letters (F, H, N, P, M, A, R, W, X,
+    Y, Q) are held in reserve for future in-app keymaps (a focused spreadsheet can
+    be 100% Excel-faithful while the shell chrome stays reachable).
+  - **Live-session switching** moves to **Ctrl+Alt+PageUp/PageDown**, leaving the
+    plain Ctrl+PageUp/PageDown pair for a focused app's own tab layer.
+  - **Editable & resettable.** Settings ▸ **ALT+ Keys** opens a modal to explore
+    every shortcut, rebind any letter (rejecting reserved letters and clashes), or
+    reset to the Excel preset. Bindings persist to `~/.yggterm/keymap.json`, a
+    small hand-editable diff over the default.
+
 ## 2.10.11
 
 - **A page that redirects itself no longer loops on a remote (SOCKS) surface.**

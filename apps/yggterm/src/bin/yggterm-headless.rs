@@ -27,6 +27,7 @@ use yggterm_server::{
     run_app_control_probe_terminal_primary_selection_paste,
     run_app_control_probe_terminal_viewport_input, run_app_control_probe_terminal_viewport_scroll,
     run_app_control_probe_terminal_viewport_select, run_app_control_reclaim_terminal_focus,
+    run_app_control_invoke_command, run_app_control_list_commands,
     run_app_control_reconcile_terminal_from_daemon, run_app_control_redraw_terminal,
     run_app_control_remove_session,
     run_app_control_rename_session, run_app_control_restart_session,
@@ -1672,6 +1673,28 @@ fn main() -> Result<()> {
                     "check" | "trigger" => run_app_control_trigger_update_check(timeout_ms),
                     "restart" => run_app_control_restart_pending_update(timeout_ms),
                     other => anyhow::bail!("unsupported app update action: {other}"),
+                }
+            }
+            // The keyboard analogue of the click grid: drive shell commands by
+            // their registry id instead of pixel-hunting. `command list`
+            // enumerates ids + KeyTips; `command invoke <id>` fires one.
+            "command" | "commands" => {
+                let positional = cli_positional_args(&args, 3);
+                let action = positional.first().copied().unwrap_or("list");
+                match action {
+                    "list" | "ls" => run_app_control_list_commands(timeout_ms),
+                    "invoke" | "run" => {
+                        let id = positional.get(1).copied().ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "missing <id> for server app command invoke \
+                                 (try `command list` to see ids)"
+                            )
+                        })?;
+                        run_app_control_invoke_command(id.to_string(), timeout_ms)
+                    }
+                    other => anyhow::bail!(
+                        "unsupported app command action: {other} (try list|invoke <id>)"
+                    ),
                 }
             }
             "theme-editor" => {
