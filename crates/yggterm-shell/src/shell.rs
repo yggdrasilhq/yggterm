@@ -166,7 +166,7 @@ use yggterm_core::{
 };
 use crate::command_registry::{self, Keymap, ShellCommand, spec_for_id};
 use crate::keytip::{
-    ChordResolution, KeyTipDecl, KeyTipTree, KeymapConfig, ScopeId as KtScope, Target,
+    self, Chord, ChordResolution, KeyTipDecl, KeyTipTree, KeymapConfig, ScopeId as KtScope, Target,
 };
 use yggterm_platform::{DockRect, configure_background_service_command, send_user_notification};
 #[cfg(unix)]
@@ -24851,7 +24851,7 @@ fn search_command_suggestions(query: &str) -> Vec<SearchCommandSuggestion> {
 /// only a keyless press+release is ever intercepted. `__yggtermAltTapSend` is
 /// re-bound on every (re)install so a listener that survived a webview reload
 /// always posts to the LIVE eval channel.
-const ALT_TAP_LISTENER_JS: &str = r#"(function(){
+const ALT_TAP_LISTENER_JS_TEMPLATE: &str = r#"(function(){
   window.__yggtermAltTapSend = function(m){ try { dioxus.send(m); } catch(_e){} };
   if (window.__yggtermAltTapInstalled) { return; }
   window.__yggtermAltTapInstalled = true;
@@ -24859,7 +24859,34 @@ const ALT_TAP_LISTENER_JS: &str = r#"(function(){
   function isAlt(e){ return e.key === 'Alt' || e.code === 'AltLeft' || e.code === 'AltRight'; }
   // Authoritative overlay state: the breadcrumb is rendered iff the overlay is up.
   function overlayOpen(){ return !!document.querySelector('[data-yggterm-keytip-breadcrumb]'); }
+  // Direct accelerators (§11): a small PTY-safe set the shell captures below the
+  // webview so they fire even from a focused terminal. The set is baked from
+  // Rust's DEFAULT_ACCELERATORS (SSOT); each entry is {ctrl,alt,shift,meta,key}.
+  var ACCELS = __ACCELS__;
+  function accelKey(e){
+    var c = e.code || '';
+    if (c.indexOf('Key') === 0) { return c.slice(3).toLowerCase(); }
+    if (c.indexOf('Digit') === 0) { return c.slice(5); }
+    return c.toLowerCase(); // pageup, pagedown, f11, ...
+  }
+  function matchAccel(e){
+    var k = accelKey(e);
+    for (var i = 0; i < ACCELS.length; i++) {
+      var a = ACCELS[i];
+      if (a.ctrl === e.ctrlKey && a.alt === e.altKey && a.shift === e.shiftKey
+          && a.meta === e.metaKey && a.key === k) { return a; }
+    }
+    return null;
+  }
   window.addEventListener('keydown', function(e){
+    // Accelerators win first, at any focus. PTY-safe by construction, so a bare
+    // Ctrl+<letter> the terminal wants is never in this set (§11.2).
+    var acc = matchAccel(e);
+    if (acc) {
+      e.preventDefault(); e.stopPropagation();
+      if (window.__yggtermAltTapSend) { window.__yggtermAltTapSend({ accel: acc }); }
+      return;
+    }
     if (isAlt(e)) {
       // Arm on a lone ALT down; an autorepeat (held ALT) leaves the arm as-is.
       if (!e.repeat && !e.ctrlKey && !e.metaKey && !e.shiftKey) { armed = true; }
@@ -24939,14 +24966,36 @@ const ALT_TAP_LISTENER_JS: &str = r#"(function(){
   }
   window.setInterval(ktPaint, 90);
 })();"#;
+/// The accelerator intercept set as a JS array literal `[{ctrl,alt,shift,meta,key},…]`,
+/// generated from [`keytip::DEFAULT_ACCELERATORS`] so the SSOT is Rust and the JS
+/// cannot drift.
+fn keytip_accel_js_array() -> String {
+    let entries: Vec<String> = keytip::DEFAULT_ACCELERATORS
+        .iter()
+        .filter_map(|(_, spec)| Chord::parse(spec))
+        .map(|chord| {
+            format!(
+                "{{ctrl:{},alt:{},shift:{},meta:{},key:{:?}}}",
+                chord.ctrl, chord.alt, chord.shift, chord.meta, chord.key
+            )
+        })
+        .collect();
+    format!("[{}]", entries.join(","))
+}
+/// The fully-assembled bridge script (ALT tap + chord walk + accelerators + badge
+/// painter), with the accelerator set baked in.
+fn keytip_bridge_js() -> String {
+    ALT_TAP_LISTENER_JS_TEMPLATE.replace("__ACCELS__", &keytip_accel_js_array())
+}
 /// Keep the below-the-webview ALT key bridge installed for the GUI's lifetime
 /// and act on each message it reports. The eval is held open so its `recv()`
 /// drains messages as they arrive; if the channel closes (a webview reload), the
 /// outer loop reinstalls — and the JS guard makes reinstall a cheap no-op that
 /// only re-binds the live sender.
 async fn keytip_alt_tap_install_loop(state: Signal<ShellState>) {
+    let bridge_js = keytip_bridge_js();
     loop {
-        let mut eval = document::eval(ALT_TAP_LISTENER_JS);
+        let mut eval = document::eval(&bridge_js);
         loop {
             match eval.recv::<serde_json::Value>().await {
                 Ok(msg) => keytip_apply_bridge_message(state, &msg),
@@ -24969,6 +25018,28 @@ fn keytip_apply_bridge_message(mut state: Signal<ShellState>, msg: &serde_json::
                 shell.activate_alt_overlay();
             }
         });
+        return;
+    }
+    // A direct accelerator (§11): resolve the pressed chord to its command and
+    // dispatch it — the same terminus dispatch the ALT layer uses, so both layers
+    // are two views of one command (no second encoding).
+    if let Some(accel) = msg.get("accel") {
+        let chord = Chord {
+            ctrl: accel.get("ctrl").and_then(|v| v.as_bool()).unwrap_or(false),
+            alt: accel.get("alt").and_then(|v| v.as_bool()).unwrap_or(false),
+            shift: accel.get("shift").and_then(|v| v.as_bool()).unwrap_or(false),
+            meta: accel.get("meta").and_then(|v| v.as_bool()).unwrap_or(false),
+            key: accel
+                .get("key")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string(),
+        };
+        let config = keytip_config_from_keymap(&state.read().keymap);
+        if let Some(command) = keytip::accel_command_for(&chord, &config) {
+            state.with_mut(|shell| shell.clear_alt_overlay());
+            dispatch_keytip_node(state, &command);
+        }
         return;
     }
     let Some(key) = msg.get("key").and_then(|value| value.as_str()) else {
@@ -47895,19 +47966,9 @@ fn app() -> Element {
                 // direct accelerators below.
                 let is_accel = evt.modifiers().contains(Modifiers::CONTROL)
                     || evt.modifiers().contains(Modifiers::META);
-                // Ctrl+Alt+PageUp/PageDown switches LIVE SESSIONS (spec decision
-                // b). The plain Ctrl+PageUp/PageDown pair is deliberately NOT
-                // taken here — it belongs to the focused app's tab layer (ychrome
-                // tabs, Cellulose sheets) and may fall through to a plain
-                // terminal. Only the Alt-qualified pair is a session accelerator.
-                if is_accel
-                    && evt.modifiers().contains(Modifiers::ALT)
-                    && matches!(evt.key(), Key::PageUp | Key::PageDown)
-                {
-                    evt.prevent_default();
-                    spawn_switch_live_session(state, matches!(evt.key(), Key::PageDown));
-                    return;
-                }
+                // Ctrl+Alt+PageUp/PageDown (session nav) is now a registered direct
+                // accelerator handled by the below-the-webview bridge (§11.1), so it
+                // fires from a focused terminal too and is no longer hardcoded here.
                 if is_accel
                     && evt.modifiers().contains(Modifiers::SHIFT)
                     && matches!(evt.key(), Key::Character(ref key) if key.eq_ignore_ascii_case("p"))
