@@ -71,6 +71,39 @@ use yggterm_shell::{
 };
 use yggui_contract::UiTheme;
 
+/// The no-orphan-affordance audit (spec §12, `docs/alt-keytips.md`). Walks the
+/// visible DOM interactables and reports every one carrying neither a
+/// `data-keytip-node` marker (declared) nor `data-keytip-exempt`. The KeyTip
+/// tree is built in Rust; this only reads the DOM to MEASURE coverage, which is
+/// what makes "wire the whole UI" a number that must be zero. Runs through the
+/// existing dom-eval channel (`return`s its report).
+const KEYTIPS_AUDIT_JS: &str = r#"
+    const SEL = 'button, [role=button], a[href], input, select, [data-sidebar-row-path], [data-app-verb]';
+    function vis(el){
+        if (!el.getClientRects().length) return false;
+        const r = el.getBoundingClientRect();
+        if (r.width < 2 || r.height < 2) return false;      // 1px shortcut proxies are not affordances
+        const cs = window.getComputedStyle(el);
+        if (!cs) return true;
+        if (cs.visibility === 'hidden' || cs.display === 'none') return false;
+        if (parseFloat(cs.opacity || '1') === 0) return false;
+        if (cs.pointerEvents === 'none') return false;      // cannot be clicked -> not an affordance
+        return true;
+    }
+    const all = Array.prototype.slice.call(document.querySelectorAll(SEL));
+    const visible = all.filter(vis);
+    const orphans = [];
+    visible.forEach(function(el){
+        if (el.hasAttribute('data-keytip-node')) return;      // declared
+        if (el.hasAttribute('data-keytip-exempt')) return;    // explicitly exempt
+        if (el.closest('[data-keytip-exempt]')) return;       // under an exempt subtree
+        if (el.querySelector('[data-keytip-node], [data-keytip-exempt]')) return; // marker inside
+        const label = (el.getAttribute('aria-label') || el.textContent || el.getAttribute('data-app-verb') || el.id || '')
+            .replace(/\s+/g, ' ').trim().slice(0, 60);
+        orphans.push({ tag: el.tagName.toLowerCase(), id: el.id || '', cls: (el.className && el.className.baseVal !== undefined ? el.className.baseVal : String(el.className || '')).slice(0, 60), label: label });
+    });
+    return { visible_interactables: visible.length, orphan_count: orphans.length, orphans: orphans.slice(0, 300) };
+"#;
 const DEBUG_DISABLE_CACHED_SERVER_SNAPSHOT_ENV: &str =
     "YGGTERM_DEBUG_DISABLE_CACHED_SERVER_SNAPSHOT";
 const ENV_YGGTERM_SKIP_ACTIVE_EXEC_HANDOFF: &str = "YGGTERM_SKIP_ACTIVE_EXEC_HANDOFF";
@@ -740,6 +773,7 @@ fn print_server_app_help() {
   yggterm server app terminal scroll <session> --to <top|bottom|±N>
   yggterm server app terminal read-buffer <session> [--mode screen|full|cells]
   yggterm server app terminal send <session> (--data <data>|--stdin)
+  yggterm server app keytips audit
   yggterm server app web eval (<script>|--script <js>|--stdin) [--session <path>]
   yggterm server app web screenshot [output.png] [--session <path>]
   yggterm server app web devtools [--close] [--session <path>]"
@@ -2224,6 +2258,17 @@ fn main() -> Result<()> {
                     .map(String::as_str)
                     .context("missing script for server app dom-eval")?;
                 run_app_control_dom_eval(script, timeout_ms)
+            }
+            "keytips" => {
+                let action = args.get(3).map(String::as_str).unwrap_or("audit");
+                match action {
+                    // The no-orphan-affordance audit (spec §12): walk the visible
+                    // DOM interactables and report every one carrying neither
+                    // `data-keytip-node` nor `data-keytip-exempt`. The definition of
+                    // done for the ALT+ layer is `orphan_count: 0`.
+                    "audit" => run_app_control_dom_eval(KEYTIPS_AUDIT_JS, timeout_ms),
+                    other => anyhow::bail!("unsupported app keytips action: {other}"),
+                }
             }
             "start-action" | "start" => {
                 let action = args

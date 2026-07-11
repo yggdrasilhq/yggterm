@@ -307,6 +307,10 @@ fn WindowControlButton(
         button {
             "aria-label": label,
             "data-yggterm-window-control": control_name,
+            // Window-manager chrome, not a KeyTip target: exempt from the orphan
+            // audit (docs/alt-keytips.md §12). Fullscreen and Always-on-top remain
+            // reachable via their ALT chords and are listed in the Keymaps modal.
+            "data-keytip-exempt": "window-control",
             style: button_style,
             onmousedown: |evt| evt.stop_propagation(),
             ondoubleclick: |evt| evt.stop_propagation(),
