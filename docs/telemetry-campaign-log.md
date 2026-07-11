@@ -247,3 +247,102 @@ interrupted).
 - Broken bottom on every switch — SIGWINCH-nudge hypothesis remains DEAD.
 - 4 `yggterm-server` tests fail on clean HEAD `4cce722` (codex-litellm, remote-resume,
   legacy-daemon) — pre-existing, environment-dependent, NOT introduced by this run.
+
+---
+
+## Run 3 — 2026-07-11 (user: "jojo's second row live session — nothing is fixing this rendering dance")
+
+**The headline: it was never a rendering bug.** The second-row session
+(`remote-cc://dev/33abb204`, a live Claude Code session) was rendering a frame
+built for a screen that no longer existed. Its `claude` PTY on dev was **147x50**
+while the client viewport was **167x63**. Claude Code was painting exactly what it
+was told it had — composer at row 50, nothing below, content stopping at column
+147 — and yggterm's client was faithfully rendering those bytes. **No client-side
+fix could ever have worked**, which is precisely why none of them did.
+
+### 1. ★★ ROOT-CAUSED + FIXED + LIVE-PROVEN — remote CC PTY has no size writer after birth
+
+Measured, hop by hop:
+
+| hop | grid |
+|---|---|
+| client xterm (jojo) | 167x63 ✅ |
+| jojo daemon's local ssh PTY | 167x63 ✅ |
+| ssh → bridge tty on dev (pts/5) | 167x63 ✅ |
+| **`claude --resume 33abb204` PTY (pts/25)** | **147x50** ❌ |
+
+The remote PTY grid has exactly ONE writer — `forward_remote_pty_resize` — and it
+was **Codex-only in two independent places**:
+
+1. It resolved its target through `remote_shutdown_target_for_path`, which parses
+   `remote-session://` only → a `remote-cc://` path returns `None` → the function
+   returned before doing anything at all.
+2. Its delivery fn hardcoded `codex-runtime://<id>`. A CC runtime is keyed
+   `cc-runtime://<id>`. Proven live on dev's CLI:
+   `server terminal resize cc-runtime://33abb204 …` → `{"accepted":true}`;
+   `… codex-runtime://33abb204 …` → `Error: terminal session not found`.
+   And the caller discarded that error (`let _ = …`) — a **silent** no-op.
+
+So a CC session's PTY was sized once at spawn and never again. Only a session
+*born* at the wrong grid is affected, which is why it looked intermittent: the
+other 8 agent PTYs on dev were all born at 167x63 and are fine.
+
+**Why every daemon-side instrument called it healthy:** the daemon resizes its own
+vt100 mirror and its local ssh PTY correctly, so `pty_cols/pty_rows`, the daemon
+screen, and the contract checks all report the client's real grid. The truth lived
+only in the remote `claude` process's actual PTY. (CLAUDE.md misstep #3, exactly.)
+
+**Falsification / live proof:** `TIOCSWINSZ` on the remote PTY → 167x63. Claude
+Code SIGWINCH-repainted itself; faithful before/after screenshots show the composer
+snapping to the true bottom, the diff blocks extending to full width, and the
+13-row dead zone gone. Session kept working throughout (`Roosting… 12m 25s`).
+
+**Fix:** `remote_agent_pty_target_for_path` (resolves BOTH remote agent schemes;
+the Codex branch delegates to the old resolver, so codex is byte-identical) +
+`resize_remote_agent_session_pty` (runtime key owned by `SessionKind`, not a
+hardcoded prefix). No second writer — the size-war lesson still holds. Test:
+`remote_cc_session_pty_has_a_resize_target_and_uses_the_cc_runtime_key`.
+Registry: `docs/xterm-bugs.md#remote-cc-pty-never-resized`.
+
+**This is `campaign-render-pipeline-parity-rework`'s thesis confirmed with a
+number**: `remote` (meaning codex) is the NAMED concept; everything else inherits
+the unnamed fallback. Here the axis was Codex-vs-CC rather than remote-vs-local.
+
+### 2. Probes — added / found blind
+
+- **ADDED `remote_pty_resize_failed`** (daemon/terminal_resize). The forward
+  failing was previously swallowed by `let _ =`. `remote_pty_resize_forwarded` now
+  also carries `kind`.
+- **BLIND SPOT FOUND — daemon PTY-geometry events do not reach `terminal.sqlite3`.**
+  dev's `terminal_events` table carries `source=gui` rows ONLY, so a query for
+  resize events there returns empty *whether or not any resize happened*. I nearly
+  cited that emptiness as evidence. Daemon-side `trace_terminal_event` goes to
+  `event-trace.jsonl` (`component=server`, `category=terminal_runtime`) instead.
+  **Worth fixing: route daemon terminal lifecycle events into the DB too**, or the
+  next agent will read `terminal.sqlite3` and conclude "no resizes" from a table
+  that structurally cannot hold them.
+- **Signal worth watching:** `remote_pty_resize_forwarded` totalling **zero** on a
+  host means no remote PTY has ever been resized there. That was true on jojo and
+  is the cheapest possible detector for this whole bug class.
+
+### Carried forward (unchanged from run 2)
+
+- Harness tier 2 still needs `server terminal raw-stream`. Still the NEXT STEP for
+  the parity campaign.
+- Char drops / whole-line excision by `strip_internal_terminal_transport_noise_lines`
+  (run 2 #2) — root-caused, NOT fixed; needs the per-session attach-phase state from
+  the fork-collapse step.
+- CC "already in use" (the reap half) — still open.
+- Broken bottom on *switch* (as distinct from this bug) — SIGWINCH-nudge hypothesis
+  remains DEAD.
+- The 4 `yggterm-server` tests that failed on clean HEAD in run 2 now PASS
+  (519 + 20 green on this branch); they were environment-dependent as suspected.
+
+### Deploy status (honest)
+
+The live session is **fixed right now** by the direct PTY correction — that is a
+real, live-verified repair, not a claim. The *code* fix is daemon-side and jojo's
+daemon has 4 sessions working (including another agent's campaign on the very
+session that surfaced this), so per the shared-host guardrail it is committed and
+pushed but **NOT deployed**; it activates on the next daemon changeover. Until then
+a newly-born CC session can still inherit a stale grid if the viewport changes.
