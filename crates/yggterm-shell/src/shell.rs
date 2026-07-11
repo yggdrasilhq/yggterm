@@ -164,7 +164,10 @@ use yggterm_core::{
     resolve_yggterm_home, save_settings_file, spawn_terminal_telemetry_event,
     terminal_telemetry_db_path, unique_session_short_ids_for_pairs, update_command_hint,
 };
-use crate::command_registry::{self, Keymap, Resolution, ShellCommand, spec_for_id};
+use crate::command_registry::{self, Keymap, ShellCommand, spec_for_id};
+use crate::keytip::{
+    ChordResolution, KeyTipDecl, KeyTipTree, KeymapConfig, ScopeId as KtScope, Target,
+};
 use yggterm_platform::{DockRect, configure_background_service_command, send_user_notification};
 #[cfg(unix)]
 use yggterm_server::local_daemon_socket_should_be_removed_for_spawn;
@@ -3818,6 +3821,9 @@ struct RenderSnapshot {
     /// The ALT+ keymap in force, so KeyTip badges read their letter from the
     /// SSOT instead of hardcoding it — a remap moves badge and binding together.
     keymap: Keymap,
+    /// The resolved KeyTip tree for this frame (shell chrome + app contributions),
+    /// the single source the badge painter and chord walker both read.
+    keytip_tree: KeyTipTree,
     keymap_editor_open: bool,
     keymap_editor_error: Option<String>,
     selected_tree_paths: Vec<String>,
@@ -5691,6 +5697,7 @@ impl ShellState {
             titlebar_overflow_menu_open: self.titlebar_overflow_menu_open,
             alt_overlay_active: self.alt_overlay_active,
             alt_overlay_sequence: self.alt_overlay_sequence.clone(),
+            keytip_tree: build_keytip_tree(&self.keymap, self.server.apps()),
             keymap: self.keymap.clone(),
             keymap_editor_open: self.keymap_editor_open,
             keymap_editor_error: self.keymap_editor_error.clone(),
@@ -25029,49 +25036,120 @@ fn save_keymap_to_disk(keymap: &Keymap) {
         let _ = std::fs::write(&path, text);
     }
 }
-/// The KeyTip letter (uppercased for display) to paint on the affordance for
-/// `command_id`, or `None` when the overlay is not showing this command's level.
-///
-/// A command's badge appears exactly when the overlay is active AND the typed
-/// chord so far equals the command's PARENT chord — so top-level badges show at
-/// the root (`""`) and the insert submenu's badges show once `i` is pressed.
-/// The letter itself comes from the in-force keymap, so a user remap moves the
-/// badge and the binding together (SSOT).
-fn keytip_badge(snapshot: &RenderSnapshot, command_id: &str) -> Option<char> {
-    if !snapshot.alt_overlay_active {
-        return None;
-    }
-    let spec = spec_for_id(command_id)?;
-    let parent_chord = match spec.parent {
-        Some(parent) => snapshot.keymap.chord_for_id(parent)?,
-        None => String::new(),
-    };
-    if snapshot.alt_overlay_sequence != parent_chord {
-        return None;
-    }
-    snapshot
-        .keymap
-        .keytip_for_id(command_id)
-        .map(|letter| letter.to_ascii_uppercase())
+/// The node key for a libyggterm app's verb in the New… scope. This is the
+/// declaration key the resolver assigns a letter to and the marker/dispatch key,
+/// so a chord like `ALT, I, N` reaches exactly this verb.
+fn app_verb_node_key(app: &str, verb: &str) -> String {
+    format!("appverb:{app}:{verb}")
 }
-/// The stable `data-keytip-node` id (`<scope>/<command-id>`) for a command, used
-/// as the floating-badge painter's measurement anchor and the orphan audit's
-/// proof that this interactable is declared (spec §9, §12). The scope is derived
-/// from the command's parent: a top-level command lives in the root scope, a
-/// submenu child in its parent's scope.
-fn keytip_node_id(command_id: &str) -> String {
-    let scope = spec_for_id(command_id)
+/// Build every open scope's KeyTip declarations for this frame (spec §1, §4).
+/// The tree is assembled in Rust during render — never scraped from the DOM. The
+/// shell chrome comes from [`command_registry::SHELL_COMMANDS`] (its letters,
+/// titles, and structure stay the SSOT); the New… scope additionally carries the
+/// first-class "New Claude Code" item and one node per installed app verb
+/// (`~/.yggterm/apps/*.json`, spec §10), so an app the shell never heard of
+/// extends the layer without the shell changing.
+fn build_keytip_scopes(apps: &[AppManifest]) -> Vec<(KtScope, Vec<KeyTipDecl>)> {
+    let mut root: Vec<KeyTipDecl> = Vec::new();
+    let mut insert: Vec<KeyTipDecl> = Vec::new();
+    for spec in command_registry::SHELL_COMMANDS {
+        let Some(hint) = spec.default_keytip else {
+            continue; // accel-only commands (session nav) have no ALT letter
+        };
+        let target = if spec.opens_submenu {
+            Target::Descend(KtScope::Insert)
+        } else {
+            Target::Run
+        };
+        let decl = KeyTipDecl::shell(spec.id, spec.title, hint, target);
+        match spec.parent {
+            None => root.push(decl),
+            Some("insert.menu") => insert.push(decl),
+            Some(_) => root.push(decl),
+        }
+    }
+    // "New Claude Code" is a first-class agent launch (not in the enum registry
+    // yet) but belongs in the New… scope between session and terminal.
+    if let Some(pos) = insert
+        .iter()
+        .position(|decl| decl.key == "insert.terminal")
+    {
+        insert.insert(
+            pos,
+            KeyTipDecl::shell("insert.claude", "New Claude Code", 'c', Target::Run),
+        );
+    } else {
+        insert.push(KeyTipDecl::shell(
+            "insert.claude",
+            "New Claude Code",
+            'c',
+            Target::Run,
+        ));
+    }
+    // App verbs — the dynamic feed. Origin::App, so they may be denied a hint or
+    // folded into a numbered group when two apps want the same letter.
+    for (app, verb) in app_launcher_entries(apps) {
+        let hint = verb
+            .keytip
+            .chars()
+            .next()
+            .or_else(|| app.keytip.chars().next());
+        insert.push(KeyTipDecl::app(
+            app_verb_node_key(&app.name, &verb.id),
+            verb.label.clone(),
+            hint,
+            Target::Run,
+        ));
+    }
+    vec![(KtScope::Root, root), (KtScope::Insert, insert)]
+}
+/// Derive the pure [`KeymapConfig`] the resolver needs from the in-force
+/// [`Keymap`], so the user's letter overrides feed BOTH the legacy editor and the
+/// new tree from one source (no second disk read, no drift). Pins and
+/// accelerators are empty until their own config sections land (tasks §6/§11).
+fn keytip_config_from_keymap(keymap: &Keymap) -> KeymapConfig {
+    let mut cfg = KeymapConfig::default();
+    for (id, letter) in keymap.overrides() {
+        cfg.set_keytip(id.clone(), *letter);
+    }
+    cfg
+}
+/// The resolved KeyTip tree for a snapshot: the single source both the badge
+/// painter and the chord walker read.
+fn build_keytip_tree(keymap: &Keymap, apps: &[AppManifest]) -> KeyTipTree {
+    KeyTipTree::build(&build_keytip_scopes(apps), &keytip_config_from_keymap(keymap))
+}
+/// The stable `data-keytip-node` id for a declaration key, used as the floating-
+/// badge painter's measurement anchor and the orphan audit's proof that this
+/// interactable is declared (spec §9, §12). Shell commands derive their scope
+/// from the registry; other keys (app verbs, `insert.claude`) live in the New…
+/// scope.
+fn keytip_node_id(node_key: &str) -> String {
+    let scope = spec_for_id(node_key)
         .and_then(|spec| spec.parent)
-        .unwrap_or("root");
-    format!("{scope}/{command_id}")
+        .unwrap_or_else(|| {
+            if node_key.starts_with("appverb:") || node_key == "insert.claude" {
+                "insert.menu"
+            } else {
+                "root"
+            }
+        });
+    format!("{scope}/{node_key}")
 }
-/// The `data-keytip-tip` value for a command: the assigned letter (uppercased)
-/// when the overlay is up and this command's scope is the one being shown, else
-/// an empty string. The floating painter skips empty tips; the marker carries
-/// `data-keytip-node` regardless so the audit always sees it.
-fn keytip_tip_attr(snapshot: &RenderSnapshot, command_id: &str) -> String {
-    keytip_badge(snapshot, command_id)
-        .map(|letter| letter.to_string())
+/// The `data-keytip-tip` value for a node: the assigned letter (or group number),
+/// uppercased, when the overlay is up and this node's scope is the one being
+/// shown; else an empty string. The floating painter skips empty tips; the marker
+/// carries `data-keytip-node` regardless so the audit always sees it. Reads only
+/// the resolved tree — SSOT with the chord walker.
+fn keytip_tip_attr(snapshot: &RenderSnapshot, node_key: &str) -> String {
+    if !snapshot.alt_overlay_active {
+        return String::new();
+    }
+    let seq = &snapshot.alt_overlay_sequence;
+    snapshot
+        .keytip_tree
+        .tip_for(seq, node_key)
+        .or_else(|| snapshot.keytip_tree.group_member_tip(seq, node_key))
         .unwrap_or_default()
 }
 /// Dispatch a registry command. Every ALT+ KeyTip, the `command invoke <id>`
@@ -25154,8 +25232,8 @@ fn execute_shell_command(mut state: Signal<ShellState>, command: ShellCommand) {
 }
 /// Feed one character into the open KeyTips chord (fed by the below-the-webview
 /// bridge, [`keytip_apply_bridge_message`]). Mirrors the Excel walk: extend the
-/// sequence, resolve it against the keymap, then act — descend (Pending), run
-/// (Command), or dismiss (Invalid).
+/// sequence, resolve it against the resolved tree, then act — wait (Pending),
+/// descend into a scope/group, run a node's action, or dismiss (Invalid).
 fn feed_alt_overlay_char(mut state: Signal<ShellState>, ch: char) {
     if !state.read().alt_overlay_active {
         return;
@@ -25163,17 +25241,84 @@ fn feed_alt_overlay_char(mut state: Signal<ShellState>, ch: char) {
     let (next_sequence, resolution) = {
         let shell = state.read();
         let next = format!("{}{}", shell.alt_overlay_sequence, ch.to_ascii_lowercase());
-        let resolution = shell.keymap.resolve(&next);
-        (next, resolution)
+        let tree = build_keytip_tree(&shell.keymap, shell.server.apps());
+        (next.clone(), tree.resolve(&next))
     };
     match resolution {
-        Resolution::Pending => state.with_mut(|shell| {
+        ChordResolution::Pending => state.with_mut(|shell| {
             shell.alt_overlay_active = true;
             shell.alt_overlay_sequence = next_sequence;
         }),
-        Resolution::Command(command) => execute_shell_command(state, command),
-        Resolution::Invalid => state.with_mut(|shell| shell.clear_alt_overlay()),
+        ChordResolution::Descend { key, scope: _ } => {
+            // Open the container this node governs (e.g. the New… menu), then park
+            // the overlay at the typed sequence so the child scope's badges paint.
+            if !key.is_empty() {
+                dispatch_keytip_open(state, &key);
+            }
+            state.with_mut(|shell| {
+                shell.alt_overlay_active = true;
+                shell.alt_overlay_sequence = next_sequence;
+            });
+        }
+        ChordResolution::Run(key) => dispatch_keytip_node(state, &key),
+        ChordResolution::Invalid => state.with_mut(|shell| shell.clear_alt_overlay()),
     }
+}
+/// Run a container-opening node's side effect (a `Descend` target) without
+/// dismissing the overlay: it stays up so the descended scope's badges show.
+fn dispatch_keytip_open(mut state: Signal<ShellState>, key: &str) {
+    if key == "insert.menu" {
+        state.with_mut(|shell| {
+            shell.titlebar_session_menu_open = false;
+            shell.titlebar_new_menu_open = true;
+        });
+    }
+    // Other openers (Settings, its theme scope) attach here as those scopes land.
+}
+/// Run a leaf node's action and dismiss the overlay. One dispatch for every ALT+
+/// chord terminus: a shell command funnels through [`execute_shell_command`], the
+/// first-class Claude Code launch and any app verb launch route to their spawn
+/// helpers. The node key is the resolver's SSOT identity for the target.
+fn dispatch_keytip_node(mut state: Signal<ShellState>, key: &str) {
+    if let Some(spec) = spec_for_id(key) {
+        execute_shell_command(state, spec.command);
+        return;
+    }
+    if key == "insert.claude" {
+        // Clears the overlay + closes the menu itself.
+        spawn_start_claude_code_session_for_row(state, None);
+        return;
+    }
+    if let Some(rest) = key.strip_prefix("appverb:") {
+        let Some((app_name, verb_id)) = rest.split_once(':') else {
+            state.with_mut(|shell| shell.clear_alt_overlay());
+            return;
+        };
+        let entry = state.read().server.apps().iter().find_map(|app| {
+            if app.name != app_name {
+                return None;
+            }
+            app.verbs
+                .iter()
+                .find(|verb| verb.id == verb_id)
+                .map(|verb| (app.clone(), verb.clone()))
+        });
+        let Some((app, verb)) = entry else {
+            state.with_mut(|shell| shell.clear_alt_overlay());
+            return;
+        };
+        // "Here" resolves the same way the +-menu launch does (active session's
+        // host + cwd); the sidebar-focus refinement (spec §8) lands with §5.
+        let launch_context = state.with_mut(|shell| {
+            shell.clear_alt_overlay();
+            shell.close_titlebar_new_menu();
+            terminal_launch_context(shell)
+        });
+        spawn_launch_app_verb(state, app, verb, launch_context, None);
+        return;
+    }
+    // Unknown key: fail safe by dismissing rather than acting on nothing.
+    state.with_mut(|shell| shell.clear_alt_overlay());
 }
 fn execute_search_command(mut state: Signal<ShellState>, query: String) {
     let command = query.trim().to_ascii_lowercase();
@@ -49853,6 +49998,11 @@ fn Titlebar(
                                                 class: "yggterm-menu-item",
                                                 style: titlebar_new_action_style(snapshot.palette),
                                                 onclick: move |_| on_start_claude_code.call(()),
+                                                span {
+                                                    "data-keytip-node": keytip_node_id("insert.claude"),
+                                                    "data-keytip-tip": keytip_tip_attr(&snapshot, "insert.claude"),
+                                                    style: "display:none;",
+                                                }
                                                 "New Claude Code"
                                             }
                                             button {
@@ -49884,6 +50034,11 @@ fn Titlebar(
                                                         let entry = (app.clone(), verb.clone());
                                                         move |_| on_launch_app_verb.call(entry.clone())
                                                     },
+                                                    span {
+                                                        "data-keytip-node": keytip_node_id(&app_verb_node_key(&app.name, &verb.id)),
+                                                        "data-keytip-tip": keytip_tip_attr(&snapshot, &app_verb_node_key(&app.name, &verb.id)),
+                                                        style: "display:none;",
+                                                    }
                                                     if !app.icon.is_empty() {
                                                         span {
                                                             style: "margin-right:8px;",
@@ -92638,20 +92793,23 @@ mod tests {
                 icon: "A".into(),
                 binary: "/bin/sh".into(),
                 verbs: vec![
-                    AppVerb { id: "new".into(), label: "New Alpha".into(), args: vec![] },
+                    AppVerb { id: "new".into(), label: "New Alpha".into(), args: vec![], ..Default::default() },
                     AppVerb {
                         id: "incognito".into(),
                         label: "New Alpha (Incognito)".into(),
                         args: vec!["--profile".into(), "temp".into()],
+                        ..Default::default()
                     },
                 ],
+                ..Default::default()
             },
             AppManifest {
                 name: "beta".into(),
                 label: "Beta".into(),
                 icon: String::new(),
                 binary: "/bin/sh".into(),
-                verbs: vec![AppVerb { id: "new".into(), label: "New Beta".into(), args: vec![] }],
+                verbs: vec![AppVerb { id: "new".into(), label: "New Beta".into(), args: vec![], ..Default::default() }],
+                ..Default::default()
             },
         ];
         let entries = app_launcher_entries(&apps);
@@ -99666,20 +99824,20 @@ mod tests {
         let keymap = Keymap::defaults();
         assert_eq!(
             keymap.resolve("i"),
-            Resolution::Command(ShellCommand::OpenInsertMenu)
+            command_registry::Resolution::Command(ShellCommand::OpenInsertMenu)
         );
         assert_eq!(
             keymap.resolve("is"),
-            Resolution::Command(ShellCommand::InsertSession)
+            command_registry::Resolution::Command(ShellCommand::InsertSession)
         );
         assert_eq!(
             keymap.resolve("it"),
-            Resolution::Command(ShellCommand::InsertTerminal)
+            command_registry::Resolution::Command(ShellCommand::InsertTerminal)
         );
         // "ip" was "New Paper", a hardcoded app entry. The launcher family is
         // registry-driven now: a Paper app claims its own KeyTip when it ships.
-        assert_eq!(keymap.resolve("ip"), Resolution::Invalid);
-        assert_eq!(keymap.resolve("iz"), Resolution::Invalid);
+        assert_eq!(keymap.resolve("ip"), command_registry::Resolution::Invalid);
+        assert_eq!(keymap.resolve("iz"), command_registry::Resolution::Invalid);
     }
     #[test]
     fn keymap_config_parses_bindings_and_ignores_junk() {
@@ -111233,6 +111391,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             alt_overlay_active: false,
             alt_overlay_sequence: String::new(),
             keymap: Keymap::defaults(),
+            keytip_tree: KeyTipTree::default(),
             keymap_editor_open: false,
             keymap_editor_error: None,
             selected_tree_paths: vec![session_path.to_string()],
@@ -111855,6 +112014,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             alt_overlay_active: false,
             alt_overlay_sequence: String::new(),
             keymap: Keymap::defaults(),
+            keytip_tree: KeyTipTree::default(),
             keymap_editor_open: false,
             keymap_editor_error: None,
             selected_tree_paths: vec!["local://active".to_string()],
@@ -112012,6 +112172,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             alt_overlay_active: false,
             alt_overlay_sequence: String::new(),
             keymap: Keymap::defaults(),
+            keytip_tree: KeyTipTree::default(),
             keymap_editor_open: false,
             keymap_editor_error: None,
             selected_tree_paths: vec![session_path.to_string()],
@@ -112169,6 +112330,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             alt_overlay_active: false,
             alt_overlay_sequence: String::new(),
             keymap: Keymap::defaults(),
+            keytip_tree: KeyTipTree::default(),
             keymap_editor_open: false,
             keymap_editor_error: None,
             selected_tree_paths: vec![session_path.to_string()],
@@ -112329,6 +112491,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             alt_overlay_active: false,
             alt_overlay_sequence: String::new(),
             keymap: Keymap::defaults(),
+            keytip_tree: KeyTipTree::default(),
             keymap_editor_open: false,
             keymap_editor_error: None,
             selected_tree_paths: vec![session_path.to_string()],
@@ -112493,6 +112656,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             alt_overlay_active: false,
             alt_overlay_sequence: String::new(),
             keymap: Keymap::defaults(),
+            keytip_tree: KeyTipTree::default(),
             keymap_editor_open: false,
             keymap_editor_error: None,
             selected_tree_paths: vec![session_path.to_string()],
@@ -112649,6 +112813,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             alt_overlay_active: false,
             alt_overlay_sequence: String::new(),
             keymap: Keymap::defaults(),
+            keytip_tree: KeyTipTree::default(),
             keymap_editor_open: false,
             keymap_editor_error: None,
             selected_tree_paths: vec!["local://active".to_string()],
@@ -112805,6 +112970,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             alt_overlay_active: false,
             alt_overlay_sequence: String::new(),
             keymap: Keymap::defaults(),
+            keytip_tree: KeyTipTree::default(),
             keymap_editor_open: false,
             keymap_editor_error: None,
             selected_tree_paths: vec!["local://active".to_string()],
@@ -112995,6 +113161,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             alt_overlay_active: false,
             alt_overlay_sequence: String::new(),
             keymap: Keymap::defaults(),
+            keytip_tree: KeyTipTree::default(),
             keymap_editor_open: false,
             keymap_editor_error: None,
             selected_tree_paths: vec![active_session.session_path.clone()],
@@ -113154,6 +113321,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             alt_overlay_active: false,
             alt_overlay_sequence: String::new(),
             keymap: Keymap::defaults(),
+            keytip_tree: KeyTipTree::default(),
             keymap_editor_open: false,
             keymap_editor_error: None,
             selected_tree_paths: vec!["local://active".to_string()],
@@ -113345,6 +113513,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             alt_overlay_active: false,
             alt_overlay_sequence: String::new(),
             keymap: Keymap::defaults(),
+            keytip_tree: KeyTipTree::default(),
             keymap_editor_open: false,
             keymap_editor_error: None,
             selected_tree_paths: vec![session_path.to_string()],
@@ -113713,6 +113882,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             alt_overlay_active: false,
             alt_overlay_sequence: String::new(),
             keymap: Keymap::defaults(),
+            keytip_tree: KeyTipTree::default(),
             keymap_editor_open: false,
             keymap_editor_error: None,
             selected_tree_paths: Vec::new(),
