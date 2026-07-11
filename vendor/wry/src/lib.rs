@@ -535,6 +535,13 @@ pub struct NewWindowFeatures {
   pub position: Option<dpi::LogicalPosition<f64>>,
   /// Information about the webview opener containing data that must be used when creating the new webview.
   pub opener: NewWindowOpener,
+  /// Whether the request came from a gesture that opens WITHOUT stealing focus
+  /// (a middle-click or ctrl/cmd-click on a link), as opposed to `window.open`
+  /// / a `target="_blank"` primary click. Embedders that route new-window
+  /// requests into their own tab model use this to match browser behaviour:
+  /// background tab for the former, foreground for the latter. Only the
+  /// WebKitGTK backend populates it today; other backends leave it `false`.
+  pub background: bool,
 }
 
 /// An id for a webview
