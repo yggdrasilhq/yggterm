@@ -587,6 +587,55 @@ fn pick_letter(
         .unwrap_or('z')
 }
 
+/// The shipping direct accelerators (spec §11.4): `command-id → chord`. Sparse on
+/// purpose — a command earns an accelerator by being used constantly, not by
+/// existing; everything else is reachable through the ALT layer. Every chord here
+/// is PTY-safe by construction (§11.2), enforced by `assert_accels_pty_safe`.
+///
+/// Copy/paste (`Ctrl+Shift+C/V`) are intentionally absent: they are handled inside
+/// the terminal's own selection layer, not as shell chrome, so intercepting them
+/// here would fight xterm. They migrate into this table only once the shell owns
+/// that path.
+pub const DEFAULT_ACCELERATORS: &[(&str, &str)] = &[
+    ("insert.terminal", "Ctrl+Shift+T"),
+    ("insert.session", "Ctrl+Shift+N"),
+    ("sidebar.toggle", "Ctrl+Shift+B"),
+    ("session.next", "Ctrl+Alt+PageDown"),
+    ("session.prev", "Ctrl+Alt+PageUp"),
+    ("window.fullscreen", "F11"),
+];
+
+/// The effective accelerators in force: the shipping defaults with the user's
+/// `keymap.json` overrides applied, as `(command-id, chord)`. A command the user
+/// cleared (override to empty) drops out.
+pub fn effective_accelerators(cfg: &KeymapConfig) -> Vec<(String, Chord)> {
+    let mut out: Vec<(String, Chord)> = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    for (id, chord) in cfg.accelerators() {
+        if let Some(parsed) = Some(chord.clone()) {
+            out.push((id.clone(), parsed));
+            seen.insert(id.clone());
+        }
+    }
+    for (id, spec) in DEFAULT_ACCELERATORS {
+        if seen.contains(*id) {
+            continue;
+        }
+        if let Some(chord) = Chord::parse(spec) {
+            out.push((id.to_string(), chord));
+        }
+    }
+    out
+}
+
+/// The command a pressed chord fires, if any (user overrides then defaults).
+pub fn accel_command_for(chord: &Chord, cfg: &KeymapConfig) -> Option<String> {
+    effective_accelerators(cfg)
+        .into_iter()
+        .find(|(_, c)| c == chord)
+        .map(|(id, _)| id)
+}
+
 /// The resolved KeyTip tree for a whole frame (spec §1): every open scope's
 /// assigned nodes, keyed by `ScopeId::as_str`. Built in Rust during render from
 /// the per-scope declarations, never scraped from the DOM. It is the one source
@@ -888,6 +937,50 @@ mod tests {
         assert!(!Chord::parse("Ctrl+T").unwrap().is_pty_safe());
         assert!(!Chord::parse("T").unwrap().is_pty_safe());
         assert!(Chord::parse("").is_none());
+    }
+
+    #[test]
+    fn assert_accels_pty_safe() {
+        // The build-time counterpart of assert_shell_namespace_clean (spec §11.2):
+        // no shipping accelerator may be a bare Ctrl+<letter> the PTY owns.
+        for (id, spec) in DEFAULT_ACCELERATORS {
+            let chord = Chord::parse(spec)
+                .unwrap_or_else(|| panic!("accelerator `{spec}` for `{id}` does not parse"));
+            assert!(
+                chord.is_pty_safe(),
+                "accelerator `{spec}` for `{id}` is not PTY-safe"
+            );
+        }
+    }
+
+    #[test]
+    fn default_accelerators_are_unique() {
+        let mut seen = std::collections::BTreeMap::new();
+        for (id, spec) in DEFAULT_ACCELERATORS {
+            let chord = Chord::parse(spec).unwrap();
+            if let Some(prev) = seen.insert(chord.display(), *id) {
+                panic!("accelerator `{spec}` claimed by both `{prev}` and `{id}`");
+            }
+        }
+    }
+
+    #[test]
+    fn accel_resolves_default_and_override() {
+        let mut cfg = KeymapConfig::default();
+        assert_eq!(
+            accel_command_for(&Chord::parse("Ctrl+Shift+T").unwrap(), &cfg).as_deref(),
+            Some("insert.terminal")
+        );
+        // A user override wins and the default chord for that command stops firing.
+        cfg.set_accel("insert.terminal", Chord::parse("Ctrl+Shift+Y").unwrap());
+        assert_eq!(
+            accel_command_for(&Chord::parse("Ctrl+Shift+Y").unwrap(), &cfg).as_deref(),
+            Some("insert.terminal")
+        );
+        assert_eq!(
+            accel_command_for(&Chord::parse("Ctrl+Shift+T").unwrap(), &cfg),
+            None
+        );
     }
 
     #[test]
