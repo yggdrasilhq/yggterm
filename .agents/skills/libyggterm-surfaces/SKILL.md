@@ -271,6 +271,43 @@ drags the ruleset over the wire:
   there too or they arrive null. `terminal_eval_script_forwards_every_sidebar_declaration_field`
   is the tripwire.
 
+### The line between app config and yggterm chrome (settled 2026-07-11)
+
+An app owns its **content** and its **browsing config** (ruleset, userscripts,
+per-site zoom, User-Agent). yggterm owns the **chrome**: the tabs, the tab tree
+and its virtual folders, the omnibox, history, and the per-tab webviews. That is
+not a concession — it is forced: WebKit runs in the GUI process, so the tabs, the
+cookie jar and the history are GUI-side by construction. An app declaring tabs
+would be a second encoding of state it cannot hold, and every tab click would be
+an ssh round trip.
+
+But a browser's SETTINGS belong in the browser's settings pane, which is an app
+contribution. Both are satisfied by making the pane a **view + controller** over
+yggterm's pref, never a second owner:
+
+- The GUI injects its own web-surface prefs as page context, exactly like
+  `values.zoom` / `values.host` — `?vertical_tabs=&restore_tabs=` on the schema
+  GET, `values.*` on an action.
+- An action reply may carry `surface_prefs: {vertical_tabs?, restore_tabs?}`; the
+  GUI applies it to `AppSettings` (the SSOT) and persists. An absent field is
+  "leave it alone", never "set false".
+- The app echoes the requested state back in its schema so the switch lands under
+  the finger, and stores nothing. The next GET re-reads the truth.
+
+`RightPanelMode::WebTabs` (the tab tree rail) is therefore yggterm's OWN variant,
+not an app pane, and it does not violate the "no new RightPanelMode" rule — that
+rule is about APP chrome. If you are about to let an app declare a `tabs` pane,
+you are re-encoding state the app cannot own. Full mechanics: `docs/web-surfaces.md`.
+
+### The User-Agent is browsing config too
+
+Add it to `/policy`, not to a GUI setting: the app decides, the GUI applies it at
+webview creation (the only moment WebKit will take it). WebKitGTK's default UA
+names *Safari on Linux* — a browser that does not exist — and UA-allowlisting
+edges 403 it (claude.ai: `{"error":{"type":"forbidden","message":"Request not
+allowed"}}`). A browser app must ship a real identity; ychrome defaults to
+macOS Safari, the smallest lie for a WebKit engine.
+
 ### `reload_surface`, not `eval: "location.reload()"`
 
 An action reply may set `reload_surface: true`. The GUI then drops the policy it

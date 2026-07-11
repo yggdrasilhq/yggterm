@@ -269,11 +269,22 @@ pub struct AppSettings {
     /// `WebView::zoom`), because a native web surface is an overlaid WebKit
     /// view, not DOM the shell can style. Per-site zoom (ychrome) overrides it.
     pub web_surface_zoom_percent: f32,
-    /// Vertical-tabs browsing mode for web surfaces: tabs move to a left-hand
-    /// pane (mini-omnibox + a domain-grouped tree) and the top tab-bar + address
-    /// bar are hidden. A persisted per-user preference; the surface chrome reads
-    /// it, so it applies to every web-surface app (ychrome and future ones).
+    /// Vertical-tabs browsing mode for web surfaces: the tabs move OUT of the
+    /// viewport into a side rail (the tab tree, with virtual folders — the cwd
+    /// tree's organizational grammar applied to tabs) and the top tab bar
+    /// collapses. A persisted per-user preference; the surface chrome reads it,
+    /// so it applies to every web-surface app (ychrome and future ones). The
+    /// control for it is drawn by the app's own settings pane (page context in,
+    /// `surface_prefs` out) — yggterm owns the tabs, so yggterm owns the pref.
     pub web_surface_vertical_tabs: bool,
+    /// Reopen the previous visit's tabs when a web surface opens ("continue where
+    /// you left off"). OFF by default: a fresh visit starts on the app's page.
+    ///
+    /// The saved structure is never lost either way. A tab FILED IN A FOLDER is
+    /// organization, like a cwd-tree folder, and survives both modes; only the
+    /// unfiled root tabs are the browsing session, and those are what a fresh
+    /// start purges.
+    pub web_surface_restore_tabs: bool,
     pub terminal_light_theme_name: String,
     pub terminal_dark_theme_name: String,
     pub ui_font_size: f32,
@@ -321,6 +332,7 @@ impl Default for AppSettings {
             terminal_font_size: 14.0,
             web_surface_zoom_percent: 100.0,
             web_surface_vertical_tabs: false,
+            web_surface_restore_tabs: false,
             terminal_light_theme_name: "VS Code Light+".to_string(),
             terminal_dark_theme_name: "Dark+".to_string(),
             ui_font_size: 14.0,
