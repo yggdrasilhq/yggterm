@@ -2777,6 +2777,51 @@ async fn web_surface_native_reconcile_loop(
                 }
             }
         }
+        // Open tabs for links the pages asked to open in a new window
+        // (middle-click / ctrl-click / target="_blank" / window.open). The
+        // surface's create handler denied WebKit's detached window and recorded
+        // the URL against its native id; map that back to the session + tab it
+        // came from, mint a tab, and navigate it exactly as the address bar
+        // would (so egress is resolved the same way).
+        for (native_id, url, background) in desktop.take_web_surface_new_tab_requests() {
+            let Some((session_path, origin_tab_id)) = applied
+                .iter()
+                .find(|(_, entry)| entry.native_id == native_id)
+                .map(|(key, _)| key.clone())
+            else {
+                continue;
+            };
+            let mut writable = state;
+            let opened = writable.with_mut(|shell| {
+                let new_tab_id = shell.web_surface_open_tab_from_link(&session_path, background)?;
+                let ssh_target = shell.web_surface_session_ssh_target(&session_path);
+                Some((new_tab_id, ssh_target))
+            });
+            let Some((new_tab_id, ssh_target)) = opened else {
+                continue;
+            };
+            append_trace_event(
+                &trace_home,
+                "ui",
+                "web_surface",
+                "new_tab_from_link",
+                json!({
+                    "session_path": session_path,
+                    "origin_tab_id": origin_tab_id,
+                    "new_tab_id": new_tab_id,
+                    "url": url,
+                    "background": background,
+                }),
+            );
+            navigate_web_surface_tab(
+                state,
+                session_path,
+                new_tab_id,
+                url,
+                ssh_target,
+                None,
+            );
+        }
         publish_web_surface_native_ids(&applied);
         sleep(Duration::from_millis(WEB_SURFACE_RECONCILE_TICK_MS)).await;
     }
@@ -6340,6 +6385,64 @@ impl ShellState {
             surface.active_tab = id;
             surface.address_draft = Some(String::new());
         }
+    }
+    /// Open a tab for a link the page asked to open in a new window
+    /// (middle-click / ctrl-click / `target="_blank"` / `window.open`). Unlike
+    /// the `+` new tab, the tab is created pointed at a URL (not blank, no
+    /// omnibox edit) and its selection follows browser grammar: a `background`
+    /// request (middle/ctrl-click) leaves the current tab focused, otherwise the
+    /// new tab is brought to the front. Returns the new tab id so the caller can
+    /// resolve egress and navigate it. `None` if the surface vanished.
+    fn web_surface_open_tab_from_link(
+        &mut self,
+        session_path: &str,
+        background: bool,
+    ) -> Option<u64> {
+        let surface = self.web_surfaces.get_mut(session_path)?;
+        // Inherit the surface's (app-tab) profile so every tab of one ychrome
+        // invocation shares one identity/storage — same rule as `+` new tab.
+        let profile = surface
+            .tabs
+            .first()
+            .map(|tab| tab.profile.clone())
+            .unwrap_or_else(|| "default".to_string());
+        let id = surface.next_tab_id;
+        surface.next_tab_id += 1;
+        surface.tabs.push(WebSurfaceTab {
+            id,
+            url: String::new(),
+            effective_url: "about:blank".to_string(),
+            socks_port: None,
+            title: None,
+            forward_child: None,
+            history: Vec::new(),
+            history_index: 0,
+            reload_nonce: 0,
+            profile,
+        });
+        if !background {
+            surface.active_tab = id;
+            surface.address_draft = None;
+        }
+        Some(id)
+    }
+    /// The ssh target (egress host) of a session by path, for resolving a web
+    /// surface's egress the same way the address bar does. Searches the live
+    /// session views in the same order as the rest of the shell: active first,
+    /// then the hot-view cache, then the live-session list.
+    fn web_surface_session_ssh_target(&self, session_path: &str) -> Option<String> {
+        self.server
+            .active_session()
+            .filter(|view| view.session_path == session_path)
+            .cloned()
+            .or_else(|| self.cached_hot_session_view(session_path))
+            .or_else(|| {
+                self.server
+                    .live_sessions()
+                    .into_iter()
+                    .find(|view| view.session_path == session_path)
+            })
+            .and_then(|view| view.ssh_target)
     }
     /// Close a user tab. The app tab (tabs[0]) is not closable here — closing
     /// the app is the overlay ✕, which sends a real Ctrl+C.
@@ -86890,6 +86993,55 @@ mod tests {
         assert!(shell
             .web_surface_overlay_for_session("local://ws", 2_500)
             .is_some());
+    }
+
+    // A link opened in a new window from inside a surface (middle-click,
+    // ctrl-click, target="_blank", window.open) mints a tab. `background`
+    // (middle/ctrl-click) leaves the current tab focused, matching Chrome; a
+    // foreground request selects the new tab. The tab inherits the app tab's
+    // profile so one ychrome invocation shares its identity across tabs.
+    #[test]
+    fn web_surface_open_tab_from_link_respects_background() {
+        let bootstrap = test_shell_bootstrap_with_active_session("local://ws");
+        let mut shell = ShellState::new(bootstrap);
+        shell.upsert_web_surface(
+            "local://ws",
+            "http://localhost:8000/".to_string(),
+            Some("app".to_string()),
+            "http://localhost:8000/".to_string(),
+            None,
+            None,
+            "work".to_string(),
+            1_000,
+        );
+        // Background (middle-click): tab added, focus stays on the app tab.
+        let bg_id = shell
+            .web_surface_open_tab_from_link("local://ws", true)
+            .expect("surface is live");
+        {
+            let surface = &shell.web_surfaces["local://ws"];
+            assert_eq!(surface.tabs.len(), 2);
+            assert_eq!(surface.active_tab, 0, "background tab must not steal focus");
+            let opened = surface.tabs.iter().find(|tab| tab.id == bg_id).unwrap();
+            assert_eq!(opened.profile, "work", "inherits the app tab's profile");
+        }
+        // Foreground (target=_blank / window.open): the new tab is selected.
+        let fg_id = shell
+            .web_surface_open_tab_from_link("local://ws", false)
+            .expect("surface is live");
+        {
+            let surface = &shell.web_surfaces["local://ws"];
+            assert_eq!(surface.tabs.len(), 3);
+            assert_eq!(surface.active_tab, fg_id, "foreground tab is selected");
+            // No omnibox edit draft — the tab is navigated to a URL, not opened
+            // blank for typing (the `+` new tab's behaviour differs on purpose).
+            assert_eq!(surface.address_draft, None);
+        }
+        // A vanished surface yields None instead of panicking.
+        assert_eq!(
+            shell.web_surface_open_tab_from_link("local://gone", false),
+            None
+        );
     }
 
     // Creating a folder in the cwd tree mints `<parent>/folder-<nanos>`, and

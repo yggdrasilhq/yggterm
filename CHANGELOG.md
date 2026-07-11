@@ -2,6 +2,17 @@
 
 This file tracks user-visible changes in `yggterm`.
 
+## 2.10.16
+
+- **Middle-click a link in a web surface to open it in a new background tab.**
+  A native web surface is a bare WebKit view with no browser chrome, so a
+  middle-click, a ctrl/cmd-click, a `target="_blank"` link, or `window.open`
+  used to silently do nothing — WebKit asked for a new window and yggterm never
+  answered. Now those requests open a tab in the SAME surface's session instead:
+  a middle-click or ctrl/cmd-click opens it in the background (the current tab
+  keeps focus, matching Chrome), while `target="_blank"` and `window.open` bring
+  the new tab to the front. The tab inherits the surface's profile and egress.
+
 ## 2.10.15
 
 - **The metadata rail now shows the GUI client version next to the daemon's.** They
