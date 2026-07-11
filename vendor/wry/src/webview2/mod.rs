@@ -747,6 +747,7 @@ impl InnerWebView {
                   webview: webview.clone(),
                   environment: env_.clone(),
                 },
+                background: false,
               }
             })
             .unwrap_or_else(|_| NewWindowFeatures {
@@ -756,6 +757,7 @@ impl InnerWebView {
                 webview: webview.clone(),
                 environment: env_.clone(),
               },
+              background: false,
             });
 
           let new_window_req_handler = new_window_req_handler.clone();

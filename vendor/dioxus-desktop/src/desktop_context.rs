@@ -330,6 +330,36 @@ impl DesktopService {
         }
     }
 
+    /// Drain new-tab requests raised from inside surfaces (a link opened with
+    /// middle-click / ctrl-click / `target="_blank"` / `window.open`). Each is
+    /// `(surface_id, url, background)`; the shell opens the URL as a tab in the
+    /// originating surface's session. See `WebSurfaceHost::take_new_tab_requests`.
+    pub fn take_web_surface_new_tab_requests(&self) -> Vec<(u64, String, bool)> {
+        #[cfg(not(any(
+            target_os = "windows",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "android"
+        )))]
+        {
+            return self
+                .web_surface_host
+                .borrow()
+                .as_ref()
+                .map(|host| host.take_new_tab_requests())
+                .unwrap_or_default();
+        }
+        #[cfg(any(
+            target_os = "windows",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "android"
+        ))]
+        {
+            Vec::new()
+        }
+    }
+
     /// Destroy an open web surface.
     pub fn close_web_surface(&self, id: u64) {
         #[cfg(not(any(
