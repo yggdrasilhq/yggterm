@@ -25173,6 +25173,10 @@ fn build_keytip_scopes(apps: &[AppManifest]) -> Vec<(KtScope, Vec<KeyTipDecl>)> 
         };
         let target = if spec.opens_submenu {
             Target::Descend(KtScope::Insert)
+        } else if spec.id == "settings.toggle" {
+            // Settings opens AND descends into its own scope (spec §4), so
+            // ALT,G then a theme letter switches theme.
+            Target::Descend(KtScope::Settings)
         } else {
             Target::Run
         };
@@ -25216,7 +25220,18 @@ fn build_keytip_scopes(apps: &[AppManifest]) -> Vec<(KtScope, Vec<KeyTipDecl>)> 
             Target::Run,
         ));
     }
-    vec![(KtScope::Root, root), (KtScope::Insert, insert)]
+    // The Settings scope (spec §4): the theme options are flat in the panel, so
+    // they get direct letters (ALT,G then L/D) — one key shorter than the spec's
+    // ALT,G,T,<letter> nesting, which the flat panel makes redundant.
+    let settings = vec![
+        KeyTipDecl::shell("theme.light", "Light theme", 'l', Target::Run),
+        KeyTipDecl::shell("theme.dark", "Dark theme", 'd', Target::Run),
+    ];
+    vec![
+        (KtScope::Root, root),
+        (KtScope::Insert, insert),
+        (KtScope::Settings, settings),
+    ]
 }
 /// Derive the pure [`KeymapConfig`] the resolver needs from the in-force
 /// [`Keymap`], so the user's letter overrides feed BOTH the legacy editor and the
@@ -25245,6 +25260,8 @@ fn keytip_node_id(node_key: &str) -> String {
         .unwrap_or_else(|| {
             if node_key.starts_with("appverb:") || node_key == "insert.claude" {
                 "insert.menu"
+            } else if node_key.starts_with("theme.") {
+                "settings"
             } else {
                 "root"
             }
@@ -25404,8 +25421,11 @@ fn dispatch_keytip_open(mut state: Signal<ShellState>, key: &str) {
             shell.titlebar_session_menu_open = false;
             shell.titlebar_new_menu_open = true;
         });
+    } else if key == "settings.toggle" {
+        // Descending into Settings OPENS the panel (never toggles it shut), so the
+        // theme options are on screen to badge (spec §4).
+        state.with_mut(|shell| shell.set_right_panel_mode(RightPanelMode::Settings));
     }
-    // Other openers (Settings, its theme scope) attach here as those scopes land.
 }
 /// Run a leaf node's action and dismiss the overlay. One dispatch for every ALT+
 /// chord terminus: a shell command funnels through [`execute_shell_command`], the
@@ -25419,6 +25439,17 @@ fn dispatch_keytip_node(mut state: Signal<ShellState>, key: &str) {
     if key == "insert.claude" {
         // Clears the overlay + closes the menu itself.
         spawn_start_claude_code_session_for_row(state, None);
+        return;
+    }
+    if let Some(theme) = match key {
+        "theme.light" => Some(UiTheme::ZedLight),
+        "theme.dark" => Some(UiTheme::ZedDark),
+        _ => None,
+    } {
+        state.with_mut(|shell| {
+            shell.clear_alt_overlay();
+            shell.set_ui_theme(theme);
+        });
         return;
     }
     if let Some(rest) = key.strip_prefix("appverb:") {
@@ -82134,6 +82165,8 @@ fn SettingsRailBody(
                 selected_theme: snapshot.settings.theme,
                 accent: snapshot.theme_accent.clone(),
                 custom_stop_count: snapshot.settings.yggui_theme.colors.len(),
+                light_tip: keytip_tip_attr(&snapshot, "theme.light"),
+                dark_tip: keytip_tip_attr(&snapshot, "theme.dark"),
                 on_select: on_set_ui_theme,
                 on_open_editor: on_open_theme_editor,
             }
@@ -83965,6 +83998,10 @@ fn ThemeSettingsSection(
     selected_theme: UiTheme,
     accent: String,
     custom_stop_count: usize,
+    /// The ALT+ KeyTip letters for the theme options while the Settings scope is
+    /// open (empty otherwise) — the §4 "ALT,G then a letter" theme switch.
+    light_tip: String,
+    dark_tip: String,
     on_select: EventHandler<UiTheme>,
     on_open_editor: EventHandler<MouseEvent>,
 ) -> Element {
@@ -84002,11 +84039,21 @@ fn ThemeSettingsSection(
                     button {
                         style: segmented_control_segment_style(palette, selected_theme == UiTheme::ZedLight, true, false),
                         onclick: move |_| on_select.call(UiTheme::ZedLight),
+                        span {
+                            "data-keytip-node": "settings/theme.light",
+                            "data-keytip-tip": "{light_tip}",
+                            style: "display:none;",
+                        }
                         "Light"
                     }
                     button {
                         style: segmented_control_segment_style(palette, selected_theme == UiTheme::ZedDark, true, false),
                         onclick: move |_| on_select.call(UiTheme::ZedDark),
+                        span {
+                            "data-keytip-node": "settings/theme.dark",
+                            "data-keytip-tip": "{dark_tip}",
+                            style: "display:none;",
+                        }
                         "Dark"
                     }
                 }
