@@ -3345,6 +3345,10 @@ struct ShellState {
     /// (`command_registry`) is SSOT for the command structure. See
     /// `[[campaign-alt-keytips-layer]]`.
     keymap: Keymap,
+    /// The unified keymap-v2 config (letters + group pins + accelerator overrides),
+    /// the disk SSOT for `~/.yggterm/keymap.json`. `keymap` above is a derived
+    /// letters-only view of this. Drives the resolved KeyTip tree + accelerators.
+    keytip_config: KeymapConfig,
     /// The ALT+ keymap editor modal (Settings ▸ "Edit ALT+ keys") is open.
     keymap_editor_open: bool,
     /// A validation message from the last rejected rebind, shown in the modal.
@@ -3824,6 +3828,8 @@ struct RenderSnapshot {
     /// The resolved KeyTip tree for this frame (shell chrome + app contributions),
     /// the single source the badge painter and chord walker both read.
     keytip_tree: KeyTipTree,
+    /// The unified keymap-v2 config, so the editor can show + rebind accelerators.
+    keytip_config: KeymapConfig,
     keymap_editor_open: bool,
     keymap_editor_error: Option<String>,
     selected_tree_paths: Vec<String>,
@@ -4994,6 +5000,7 @@ impl ShellState {
             alt_overlay_active: false,
             alt_overlay_sequence: String::new(),
             keymap: load_keymap_from_disk(),
+            keytip_config: load_keytip_config_from_disk(),
             keymap_editor_open: false,
             keymap_editor_error: None,
             selected_tree_paths: HashSet::new(),
@@ -5697,7 +5704,8 @@ impl ShellState {
             titlebar_overflow_menu_open: self.titlebar_overflow_menu_open,
             alt_overlay_active: self.alt_overlay_active,
             alt_overlay_sequence: self.alt_overlay_sequence.clone(),
-            keytip_tree: build_keytip_tree(&self.keymap, self.server.apps()),
+            keytip_tree: build_keytip_tree(&self.keytip_config, self.server.apps()),
+            keytip_config: self.keytip_config.clone(),
             keymap: self.keymap.clone(),
             keymap_editor_open: self.keymap_editor_open,
             keymap_editor_error: self.keymap_editor_error.clone(),
@@ -12811,26 +12819,66 @@ impl ShellState {
             ));
             return;
         }
-        let mut overrides: Vec<(String, char)> = self
-            .keymap
-            .overrides()
-            .iter()
-            .map(|(id, ch)| (id.clone(), *ch))
-            .collect();
-        overrides.retain(|(id, _)| id != command_id);
-        // Only record an override when it differs from the default.
+        // Write the letter through the unified config (SSOT) — record an override
+        // only when it differs from the default — then re-derive the legacy view.
+        self.keytip_config.clear_keytip(command_id);
         if spec.default_keytip != Some(letter) {
-            overrides.push((command_id.to_string(), letter));
+            self.keytip_config.set_keytip(command_id.to_string(), letter);
         }
-        self.keymap = Keymap::from_overrides(overrides);
+        self.keymap = keymap_from_keytip_config(&self.keytip_config);
         self.keymap_editor_error = None;
-        save_keymap_to_disk(&self.keymap);
+        save_keytip_config_to_disk(&self.keytip_config);
     }
-    /// Reset the whole ALT+ layer to the Excel-familiar preset.
+    /// Rebind one command's DIRECT ACCELERATOR (spec §11.5). Validated in place:
+    /// the chord must parse, must be PTY-safe (§11.2 — a bare `Ctrl+<letter>`
+    /// belongs to the PTY forever), and must not duplicate another command's
+    /// chord. An empty spec CLEARS the override back to the shipping default.
+    /// Rejections surface in the modal rather than being silently dropped.
+    fn set_accel_override(&mut self, command_id: &str, spec: &str) {
+        let spec = spec.trim();
+        if spec.is_empty() {
+            self.keytip_config.clear_accel(command_id);
+            self.keymap_editor_error = None;
+            save_keytip_config_to_disk(&self.keytip_config);
+            push_accels_to_bridge(&self.keytip_config);
+            return;
+        }
+        let Some(chord) = Chord::parse(spec) else {
+            self.keymap_editor_error =
+                Some(format!("‘{spec}’ is not a chord. Try Ctrl+Shift+T."));
+            return;
+        };
+        if !chord.is_pty_safe() {
+            self.keymap_editor_error = Some(format!(
+                "‘{}’ belongs to the terminal. Use Ctrl+Shift+…, Ctrl+Alt+…, Super+…, or an F-key.",
+                chord.display()
+            ));
+            return;
+        }
+        // Reject a duplicate of another command's effective chord.
+        let clash = keytip::effective_accelerators(&self.keytip_config)
+            .into_iter()
+            .find(|(id, other)| id != command_id && *other == chord);
+        if let Some((other_id, _)) = clash {
+            self.keymap_editor_error = Some(format!(
+                "‘{}’ is already bound to {other_id}.",
+                chord.display()
+            ));
+            return;
+        }
+        self.keytip_config.set_accel(command_id.to_string(), chord);
+        self.keymap_editor_error = None;
+        save_keytip_config_to_disk(&self.keytip_config);
+        push_accels_to_bridge(&self.keytip_config);
+    }
+    /// Reset the whole ALT+ layer to the Excel-familiar preset. Pins and
+    /// accelerator overrides are cleared too — a full reset to shipping defaults.
     fn reset_keymap(&mut self) {
+        self.keytip_config = KeymapConfig::default();
         self.keymap = Keymap::defaults();
         self.keymap_editor_error = None;
-        save_keymap_to_disk(&self.keymap);
+        save_keytip_config_to_disk(&self.keytip_config);
+        push_accels_to_bridge(&self.keytip_config);
     }
     fn push_notification(
         &mut self,
@@ -24897,6 +24945,9 @@ fn search_command_suggestions(query: &str) -> Vec<SearchCommandSuggestion> {
 /// always posts to the LIVE eval channel.
 const ALT_TAP_LISTENER_JS_TEMPLATE: &str = r#"(function(){
   window.__yggtermAltTapSend = function(m){ try { dioxus.send(m); } catch(_e){} };
+  // The accelerator intercept set is a live global so a rebind can refresh it by
+  // re-evaluating this line without re-adding the listeners below.
+  window.__yggtermAltAccels = __ACCELS__;
   if (window.__yggtermAltTapInstalled) { return; }
   window.__yggtermAltTapInstalled = true;
   var armed = false;
@@ -24904,9 +24955,9 @@ const ALT_TAP_LISTENER_JS_TEMPLATE: &str = r#"(function(){
   // Authoritative overlay state: the breadcrumb is rendered iff the overlay is up.
   function overlayOpen(){ return !!document.querySelector('[data-yggterm-keytip-breadcrumb]'); }
   // Direct accelerators (§11): a small PTY-safe set the shell captures below the
-  // webview so they fire even from a focused terminal. The set is baked from
-  // Rust's DEFAULT_ACCELERATORS (SSOT); each entry is {ctrl,alt,shift,meta,key}.
-  var ACCELS = __ACCELS__;
+  // webview so they fire even from a focused terminal. The effective set (defaults
+  // + keymap.json overrides) lives in window.__yggtermAltAccels; each entry is
+  // {ctrl,alt,shift,meta,key}.
   function accelKey(e){
     var c = e.code || '';
     if (c.indexOf('Key') === 0) { return c.slice(3).toLowerCase(); }
@@ -24914,9 +24965,10 @@ const ALT_TAP_LISTENER_JS_TEMPLATE: &str = r#"(function(){
     return c.toLowerCase(); // pageup, pagedown, f11, ...
   }
   function matchAccel(e){
+    var accels = window.__yggtermAltAccels || [];
     var k = accelKey(e);
-    for (var i = 0; i < ACCELS.length; i++) {
-      var a = ACCELS[i];
+    for (var i = 0; i < accels.length; i++) {
+      var a = accels[i];
       if (a.ctrl === e.ctrlKey && a.alt === e.altKey && a.shift === e.shiftKey
           && a.meta === e.metaKey && a.key === k) { return a; }
     }
@@ -25011,13 +25063,13 @@ const ALT_TAP_LISTENER_JS_TEMPLATE: &str = r#"(function(){
   window.setInterval(ktPaint, 90);
 })();"#;
 /// The accelerator intercept set as a JS array literal `[{ctrl,alt,shift,meta,key},…]`,
-/// generated from [`keytip::DEFAULT_ACCELERATORS`] so the SSOT is Rust and the JS
-/// cannot drift.
-fn keytip_accel_js_array() -> String {
-    let entries: Vec<String> = keytip::DEFAULT_ACCELERATORS
-        .iter()
-        .filter_map(|(_, spec)| Chord::parse(spec))
-        .map(|chord| {
+/// generated from the EFFECTIVE accelerators (shipping defaults + the user's
+/// keymap.json overrides) so a rebound chord is intercepted too, and the SSOT
+/// stays in Rust.
+fn keytip_accel_js_array(config: &KeymapConfig) -> String {
+    let entries: Vec<String> = keytip::effective_accelerators(config)
+        .into_iter()
+        .map(|(_, chord)| {
             format!(
                 "{{ctrl:{},alt:{},shift:{},meta:{},key:{:?}}}",
                 chord.ctrl, chord.alt, chord.shift, chord.meta, chord.key
@@ -25028,16 +25080,27 @@ fn keytip_accel_js_array() -> String {
 }
 /// The fully-assembled bridge script (ALT tap + chord walk + accelerators + badge
 /// painter), with the accelerator set baked in.
-fn keytip_bridge_js() -> String {
-    ALT_TAP_LISTENER_JS_TEMPLATE.replace("__ACCELS__", &keytip_accel_js_array())
+fn keytip_bridge_js(config: &KeymapConfig) -> String {
+    ALT_TAP_LISTENER_JS_TEMPLATE.replace("__ACCELS__", &keytip_accel_js_array(config))
+}
+/// Refresh the LIVE accelerator intercept set in the page after a rebind, without
+/// re-installing the listeners. Without this the JS would keep intercepting the
+/// OLD chord (which no longer maps to a command) and ignore the new one, so a
+/// rebind would silently do nothing until the next GUI restart.
+fn push_accels_to_bridge(config: &KeymapConfig) {
+    let _ = document::eval(&format!(
+        "window.__yggtermAltAccels = {};",
+        keytip_accel_js_array(config)
+    ));
 }
 /// Keep the below-the-webview ALT key bridge installed for the GUI's lifetime
 /// and act on each message it reports. The eval is held open so its `recv()`
 /// drains messages as they arrive; if the channel closes (a webview reload), the
 /// outer loop reinstalls — and the JS guard makes reinstall a cheap no-op that
-/// only re-binds the live sender.
+/// only re-binds the live sender. The intercept set is rebuilt each (re)install
+/// from the live config, so an accelerator rebind takes effect on the next cycle.
 async fn keytip_alt_tap_install_loop(state: Signal<ShellState>) {
-    let bridge_js = keytip_bridge_js();
+    let bridge_js = keytip_bridge_js(&state.peek().keytip_config);
     loop {
         let mut eval = document::eval(&bridge_js);
         loop {
@@ -25079,8 +25142,8 @@ fn keytip_apply_bridge_message(mut state: Signal<ShellState>, msg: &serde_json::
                 .unwrap_or_default()
                 .to_string(),
         };
-        let config = keytip_config_from_keymap(&state.read().keymap);
-        if let Some(command) = keytip::accel_command_for(&chord, &config) {
+        let command = keytip::accel_command_for(&chord, &state.read().keytip_config);
+        if let Some(command) = command {
             state.with_mut(|shell| shell.clear_alt_overlay());
             dispatch_keytip_node(state, &command);
         }
@@ -25122,31 +25185,98 @@ fn load_keymap_from_disk() -> Keymap {
 }
 /// Parse `{ "version": 1, "bindings": { "<command-id>": "<letter>" } }`.
 fn parse_keymap_config(text: &str) -> Keymap {
+    keymap_from_keytip_config(&parse_keytip_config(text))
+}
+/// The keymap-v2 config on disk (spec §11.5):
+///
+/// ```jsonc
+/// { "version": 2,
+///   "keytips":      { "sidebar.toggle": "b" },              // ALT letters
+///   "pinned":       { "insert.menu/n/ychrome": 1 },         // group numbers (§6)
+///   "accelerators": { "insert.terminal": "Ctrl+Shift+T" } } // direct chords
+/// ```
+///
+/// v1's `bindings` is still read as a legacy alias for `keytips`. A corrupt file
+/// falls back to defaults so it never bricks the accelerators.
+fn parse_keytip_config(text: &str) -> KeymapConfig {
     let Ok(value) = serde_json::from_str::<serde_json::Value>(text) else {
-        return Keymap::defaults();
+        return KeymapConfig::default();
     };
-    let mut entries: Vec<(String, char)> = Vec::new();
-    if let Some(bindings) = value.get("bindings").and_then(|b| b.as_object()) {
-        for (id, letter) in bindings {
-            if let Some(ch) = letter.as_str().and_then(|s| s.chars().next()) {
-                entries.push((id.clone(), ch));
+    let mut config = KeymapConfig::default();
+    // keytips (v2) with `bindings` (v1) as an alias.
+    for section in ["keytips", "bindings"] {
+        if let Some(map) = value.get(section).and_then(|v| v.as_object()) {
+            for (id, letter) in map {
+                if let Some(ch) = letter.as_str().and_then(|s| s.chars().next()) {
+                    if ch.is_ascii_alphanumeric() {
+                        config.set_keytip(id.clone(), ch);
+                    }
+                }
             }
         }
     }
-    Keymap::from_overrides(entries)
+    if let Some(map) = value.get("pinned").and_then(|v| v.as_object()) {
+        for (key, number) in map {
+            if let Some(n) = number.as_u64() {
+                config.pin_number(key.clone(), n as u32);
+            }
+        }
+    }
+    if let Some(map) = value.get("accelerators").and_then(|v| v.as_object()) {
+        for (id, chord) in map {
+            if let Some(spec) = chord.as_str() {
+                if let Some(parsed) = keytip::Chord::parse(spec) {
+                    if parsed.is_pty_safe() {
+                        config.set_accel(id.clone(), parsed);
+                    }
+                }
+            }
+        }
+    }
+    config
 }
-/// Persist the keymap's overrides (sparse — only the letters that differ from
-/// the preset) so the config stays a small, hand-editable diff over the default.
-fn save_keymap_to_disk(keymap: &Keymap) {
+/// Derive the legacy [`Keymap`] view (letters only) from the unified config, so
+/// the existing editor + resolver keep working off one disk source.
+fn keymap_from_keytip_config(config: &KeymapConfig) -> Keymap {
+    Keymap::from_overrides(config.keytips().iter().map(|(id, ch)| (id.clone(), *ch)))
+}
+/// Load the unified keymap-v2 config from `~/.yggterm/keymap.json` (v1-compatible).
+fn load_keytip_config_from_disk() -> KeymapConfig {
+    let Some(path) = keymap_config_path() else {
+        return KeymapConfig::default();
+    };
+    match std::fs::read_to_string(&path) {
+        Ok(text) => parse_keytip_config(&text),
+        Err(_) => KeymapConfig::default(),
+    }
+}
+/// Persist the unified config as keymap-v2 (sparse — only overrides, pins, and
+/// accelerator overrides, so the file stays a small hand-editable diff).
+fn save_keytip_config_to_disk(config: &KeymapConfig) {
     let Some(path) = keymap_config_path() else {
         return;
     };
-    let bindings: serde_json::Map<String, serde_json::Value> = keymap
-        .overrides()
+    let keytips: serde_json::Map<String, serde_json::Value> = config
+        .keytips()
         .iter()
         .map(|(id, ch)| (id.clone(), serde_json::Value::String(ch.to_string())))
         .collect();
-    let doc = serde_json::json!({ "version": 1, "bindings": bindings });
+    let pinned: serde_json::Map<String, serde_json::Value> = config
+        .pinned()
+        .iter()
+        .map(|(key, n)| (key.clone(), serde_json::Value::from(*n)))
+        .collect();
+    let accelerators: serde_json::Map<String, serde_json::Value> = config
+        .accelerators()
+        .iter()
+        .map(|(id, chord)| (id.clone(), serde_json::Value::String(chord.display())))
+        .collect();
+    let doc = serde_json::json!({
+        "version": 2,
+        "keytips": keytips,
+        "pinned": pinned,
+        "accelerators": accelerators,
+    });
     if let Ok(text) = serde_json::to_string_pretty(&doc) {
         let _ = std::fs::write(&path, text);
     }
@@ -25233,21 +25363,11 @@ fn build_keytip_scopes(apps: &[AppManifest]) -> Vec<(KtScope, Vec<KeyTipDecl>)> 
         (KtScope::Settings, settings),
     ]
 }
-/// Derive the pure [`KeymapConfig`] the resolver needs from the in-force
-/// [`Keymap`], so the user's letter overrides feed BOTH the legacy editor and the
-/// new tree from one source (no second disk read, no drift). Pins and
-/// accelerators are empty until their own config sections land (tasks §6/§11).
-fn keytip_config_from_keymap(keymap: &Keymap) -> KeymapConfig {
-    let mut cfg = KeymapConfig::default();
-    for (id, letter) in keymap.overrides() {
-        cfg.set_keytip(id.clone(), *letter);
-    }
-    cfg
-}
 /// The resolved KeyTip tree for a snapshot: the single source both the badge
-/// painter and the chord walker read.
-fn build_keytip_tree(keymap: &Keymap, apps: &[AppManifest]) -> KeyTipTree {
-    KeyTipTree::build(&build_keytip_scopes(apps), &keytip_config_from_keymap(keymap))
+/// painter and the chord walker read. Driven by the unified keymap-v2 config
+/// (letters + pins + accelerator overrides), the disk SSOT.
+fn build_keytip_tree(config: &KeymapConfig, apps: &[AppManifest]) -> KeyTipTree {
+    KeyTipTree::build(&build_keytip_scopes(apps), config)
 }
 /// The stable `data-keytip-node` id for a declaration key, used as the floating-
 /// badge painter's measurement anchor and the orphan audit's proof that this
@@ -25390,7 +25510,7 @@ fn feed_alt_overlay_char(mut state: Signal<ShellState>, ch: char) {
     let (next_sequence, resolution) = {
         let shell = state.read();
         let next = format!("{}{}", shell.alt_overlay_sequence, ch.to_ascii_lowercase());
-        let tree = build_keytip_tree(&shell.keymap, shell.server.apps());
+        let tree = build_keytip_tree(&shell.keytip_config, shell.server.apps());
         (next.clone(), tree.resolve(&next))
     };
     match resolution {
@@ -48269,10 +48389,11 @@ fn app() -> Element {
                     let keymap = snapshot.keymap.clone();
                     let error = snapshot.keymap_editor_error.clone();
                     // The direct-accelerator column (§11.5): command-id → its chord,
-                    // from the registry defaults. Read-only for now — the second
-                    // door to each command, shown beside its ALT chord.
+                    // from the EFFECTIVE set (shipping defaults + the user's
+                    // keymap.json overrides). Rebindable — the second door to each
+                    // command, shown beside its ALT chord.
                     let accels: std::collections::BTreeMap<String, String> =
-                        keytip::effective_accelerators(&KeymapConfig::default())
+                        keytip::effective_accelerators(&snapshot.keytip_config)
                             .into_iter()
                             .map(|(id, chord)| (id, chord.display()))
                             .collect();
@@ -48420,21 +48541,41 @@ fn app() -> Element {
                                                         div {
                                                             "data-keytips-accel": "{id}",
                                                             style: "display:flex; align-items:center; justify-content:flex-end; width:118px;",
-                                                            if let Some(chord) = accel {
-                                                                span {
-                                                                    style: format!(
-                                                                        "font-size:10px; font-weight:800; font-family:monospace; color:{}; padding:4px 8px; \
-                                                                         border-radius:7px; background:rgba(120,140,160,0.12); white-space:nowrap; \
-                                                                         box-shadow: inset 0 0 0 1px {};",
-                                                                        palette.text, chrome_chip_border(palette),
-                                                                    ),
-                                                                    "{chord}"
-                                                                }
-                                                            } else {
-                                                                span {
-                                                                    style: format!("font-size:11px; color:{};", palette.muted),
-                                                                    "—"
-                                                                }
+                                                            input {
+                                                                // Uncontrolled + keyed by the current chord: a successful
+                                                                // rebind rebuilds the row so the field shows the new
+                                                                // value, and a controlled `value:` never fights typing.
+                                                                key: "accel-{id}-{accel.clone().unwrap_or_default()}",
+                                                                r#type: "text",
+                                                                initial_value: accel.clone().unwrap_or_default(),
+                                                                placeholder: "—",
+                                                                title: "Type a PTY-safe chord (Ctrl+Shift+T, Ctrl+Alt+PageDown, F11). Empty resets to the default.",
+                                                                style: format!(
+                                                                    "width:112px; height:26px; text-align:right; font-size:10px; font-weight:800; \
+                                                                     font-family:monospace; border:none; border-radius:7px; padding:0 8px; \
+                                                                     background:rgba(120,140,160,0.12); color:{}; outline:none; \
+                                                                     box-shadow: inset 0 0 0 1px {};",
+                                                                    palette.text, chrome_chip_border(palette),
+                                                                ),
+                                                                onclick: move |evt| evt.stop_propagation(),
+                                                                // The field is typed a character at a time, so only a
+                                                                // COMPLETE chord commits: a partial spec ("Ctrl+", "Ctrl+S")
+                                                                // is left alone rather than rejected mid-typing. An
+                                                                // emptied field clears the override back to the default.
+                                                                oninput: move |evt| {
+                                                                    let value = evt.value();
+                                                                    let trimmed = value.trim().to_string();
+                                                                    let complete = trimmed.is_empty()
+                                                                        || (!trimmed.ends_with('+')
+                                                                            && Chord::parse(&trimmed)
+                                                                                .is_some_and(|chord| chord.is_pty_safe()));
+                                                                    if complete {
+                                                                        state.with_mut(|shell| {
+                                                                            shell.set_accel_override(id, &trimmed)
+                                                                        });
+                                                                    }
+                                                                },
+                                                                onkeydown: move |evt| evt.stop_propagation(),
                                                             }
                                                         }
                                                     }
@@ -100126,6 +100267,43 @@ mod tests {
         );
     }
     #[test]
+    fn keymap_v2_parses_all_three_sections() {
+        let config = parse_keytip_config(
+            r#"{ "version": 2,
+                 "keytips": { "sidebar.toggle": "z" },
+                 "pinned": { "insert.menu/n/ychrome": 2 },
+                 "accelerators": { "insert.terminal": "Ctrl+Shift+Y" } }"#,
+        );
+        assert_eq!(config.keytip_override("sidebar.toggle"), Some('z'));
+        assert_eq!(config.pinned().get("insert.menu/n/ychrome").copied(), Some(2));
+        assert_eq!(
+            config.accel_override("insert.terminal").map(Chord::display),
+            Some("Ctrl+Shift+Y".to_string())
+        );
+    }
+    #[test]
+    fn keymap_v2_reads_v1_bindings_as_a_legacy_alias() {
+        let config =
+            parse_keytip_config(r#"{ "version": 1, "bindings": { "sidebar.toggle": "z" } }"#);
+        assert_eq!(config.keytip_override("sidebar.toggle"), Some('z'));
+        // …and the derived letters-only view carries it, so the editor still works.
+        let keymap = keymap_from_keytip_config(&config);
+        assert_eq!(keymap.keytip_for_id("sidebar.toggle"), Some('z'));
+    }
+    #[test]
+    fn keymap_v2_rejects_a_pty_unsafe_accelerator_on_disk() {
+        // A hand-edited config must not be able to steal a bare Ctrl+<letter> from
+        // the PTY (invariant 8) — it is dropped on load, not honored.
+        let config = parse_keytip_config(
+            r#"{ "version": 2, "accelerators": { "insert.terminal": "Ctrl+T" } }"#,
+        );
+        assert!(config.accel_override("insert.terminal").is_none());
+    }
+    #[test]
+    fn keymap_v2_survives_a_corrupt_file() {
+        assert_eq!(parse_keytip_config("not json"), KeymapConfig::default());
+    }
+    #[test]
     fn alt_overlay_sequence_supports_insert_submenu() {
         let keymap = Keymap::defaults();
         assert_eq!(
@@ -111698,6 +111876,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             alt_overlay_sequence: String::new(),
             keymap: Keymap::defaults(),
             keytip_tree: KeyTipTree::default(),
+            keytip_config: KeymapConfig::default(),
             keymap_editor_open: false,
             keymap_editor_error: None,
             selected_tree_paths: vec![session_path.to_string()],
@@ -112321,6 +112500,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             alt_overlay_sequence: String::new(),
             keymap: Keymap::defaults(),
             keytip_tree: KeyTipTree::default(),
+            keytip_config: KeymapConfig::default(),
             keymap_editor_open: false,
             keymap_editor_error: None,
             selected_tree_paths: vec!["local://active".to_string()],
@@ -112479,6 +112659,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             alt_overlay_sequence: String::new(),
             keymap: Keymap::defaults(),
             keytip_tree: KeyTipTree::default(),
+            keytip_config: KeymapConfig::default(),
             keymap_editor_open: false,
             keymap_editor_error: None,
             selected_tree_paths: vec![session_path.to_string()],
@@ -112637,6 +112818,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             alt_overlay_sequence: String::new(),
             keymap: Keymap::defaults(),
             keytip_tree: KeyTipTree::default(),
+            keytip_config: KeymapConfig::default(),
             keymap_editor_open: false,
             keymap_editor_error: None,
             selected_tree_paths: vec![session_path.to_string()],
@@ -112798,6 +112980,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             alt_overlay_sequence: String::new(),
             keymap: Keymap::defaults(),
             keytip_tree: KeyTipTree::default(),
+            keytip_config: KeymapConfig::default(),
             keymap_editor_open: false,
             keymap_editor_error: None,
             selected_tree_paths: vec![session_path.to_string()],
@@ -112963,6 +113146,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             alt_overlay_sequence: String::new(),
             keymap: Keymap::defaults(),
             keytip_tree: KeyTipTree::default(),
+            keytip_config: KeymapConfig::default(),
             keymap_editor_open: false,
             keymap_editor_error: None,
             selected_tree_paths: vec![session_path.to_string()],
@@ -113120,6 +113304,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             alt_overlay_sequence: String::new(),
             keymap: Keymap::defaults(),
             keytip_tree: KeyTipTree::default(),
+            keytip_config: KeymapConfig::default(),
             keymap_editor_open: false,
             keymap_editor_error: None,
             selected_tree_paths: vec!["local://active".to_string()],
@@ -113277,6 +113462,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             alt_overlay_sequence: String::new(),
             keymap: Keymap::defaults(),
             keytip_tree: KeyTipTree::default(),
+            keytip_config: KeymapConfig::default(),
             keymap_editor_open: false,
             keymap_editor_error: None,
             selected_tree_paths: vec!["local://active".to_string()],
@@ -113468,6 +113654,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             alt_overlay_sequence: String::new(),
             keymap: Keymap::defaults(),
             keytip_tree: KeyTipTree::default(),
+            keytip_config: KeymapConfig::default(),
             keymap_editor_open: false,
             keymap_editor_error: None,
             selected_tree_paths: vec![active_session.session_path.clone()],
@@ -113628,6 +113815,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             alt_overlay_sequence: String::new(),
             keymap: Keymap::defaults(),
             keytip_tree: KeyTipTree::default(),
+            keytip_config: KeymapConfig::default(),
             keymap_editor_open: false,
             keymap_editor_error: None,
             selected_tree_paths: vec!["local://active".to_string()],
@@ -113820,6 +114008,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             alt_overlay_sequence: String::new(),
             keymap: Keymap::defaults(),
             keytip_tree: KeyTipTree::default(),
+            keytip_config: KeymapConfig::default(),
             keymap_editor_open: false,
             keymap_editor_error: None,
             selected_tree_paths: vec![session_path.to_string()],
@@ -114189,6 +114378,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             alt_overlay_sequence: String::new(),
             keymap: Keymap::defaults(),
             keytip_tree: KeyTipTree::default(),
+            keytip_config: KeymapConfig::default(),
             keymap_editor_open: false,
             keymap_editor_error: None,
             selected_tree_paths: Vec::new(),
