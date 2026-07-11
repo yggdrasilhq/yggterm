@@ -2,6 +2,23 @@
 
 This file tracks user-visible changes in `yggterm`.
 
+## 2.10.9
+
+- **A web surface no longer reverts to the app's start page (and drops your
+  login) when you switch back to it.** Backgrounding pauses a session's reads, so
+  its surface's liveness clock goes stale; on switch-back the app's buffered
+  heartbeat arrived and the surface was swept as "stale" a moment before it could
+  be revealed, then rebuilt at the app's LAUNCH url (ychrome's Brave start page)
+  with a fresh network context — losing your navigation to the page you were on
+  AND its cookies. The heartbeat now refreshes the surface's liveness BEFORE the
+  stale-sweep runs, so switching back reveals the same page, cookies intact.
+- **The Web View ↔ Terminal titlebar toggle only appears where it means
+  something.** It is a libyggterm-spec affordance for sessions that truly have
+  both surfaces — the agent CLIs (Codex, Claude Code) that render a transcript
+  Web View over their PTY. A plain shell (terminal only) and a libyggterm app
+  like ychrome (which owns its own surface) no longer show the toggle; an app can
+  opt back in through the spec in a future release.
+
 ## 2.10.8
 
 - **Split view.** Two sessions can now share the viewport as a single surface —
