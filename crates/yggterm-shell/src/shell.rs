@@ -3346,12 +3346,6 @@ struct ShellState {
     keymap_editor_open: bool,
     /// A validation message from the last rejected rebind, shown in the modal.
     keymap_editor_error: Option<String>,
-    /// A clean ALT tap (press+release with no intervening key) enters KeyTips.
-    /// This flags that an ALT press is still tap-eligible; any other key while
-    /// ALT is held clears it so a held ALT+key chord (readline Meta in a
-    /// terminal, an Excel-style direct chord on a GUI surface) never trips the
-    /// overlay. Window-level state, set from the tao keyboard handler.
-    alt_tap_candidate: bool,
     selected_tree_paths: HashSet<String>,
     user_collapsed_synthetic_paths: HashSet<String>,
     /// GUI-level split-view groups ([[campaign-split-view-groups]]). The single
@@ -4996,7 +4990,6 @@ impl ShellState {
             keymap: load_keymap_from_disk(),
             keymap_editor_open: false,
             keymap_editor_error: None,
-            alt_tap_candidate: false,
             selected_tree_paths: HashSet::new(),
             // Restored from settings so a user collapse of a machine/folder/
             // Live Sessions group survives GUI restarts (the auto-reveal
@@ -12722,7 +12715,6 @@ impl ShellState {
     fn clear_alt_overlay(&mut self) {
         self.alt_overlay_active = false;
         self.alt_overlay_sequence.clear();
-        self.alt_tap_candidate = false;
     }
     /// Open the ALT+ keymap editor modal (Settings ▸ "Edit ALT+ keys").
     fn open_keymap_editor(&mut self) {
@@ -24839,11 +24831,110 @@ fn search_command_suggestions(query: &str) -> Vec<SearchCommandSuggestion> {
 /// land on the root `onkeydown` (which can `prevent_default`) instead of a
 /// focused terminal's helper textarea — otherwise a chord letter would both walk
 /// the overlay AND get typed into the PTY.
-fn focus_shell_root_for_keytips() {
-    let _ = document::eval(
-        "(function(){ const root = document.getElementById('yggterm-shell-root'); \
-         if (root && root.focus) { try { root.focus({preventScroll:true}); } catch(_e){} } })();",
-    );
+/// The clean-ALT-tap detector, installed below the webview's keyboard focus. A
+/// capture-phase keydown/keyup pair on `window` runs the tap state machine
+/// ENTIRELY in the page, so it fires no matter which element (shell chrome, or a
+/// focused xterm.js textarea) owns focus — the window-level tao key handlers do
+/// NOT fire when WebKitGTK's web content holds focus, which is the focused-
+/// terminal-eats-the-tap defect (§13.1). On a clean tap it calls back into Rust
+/// over the eval channel (`dioxus.send`), which the install loop `recv()`s.
+///
+/// Invariant 7 (held ALT+key reaches the PTY) is preserved two ways: it never
+/// calls `preventDefault`, and ANY intervening non-ALT key cancels the tap, so
+/// only a keyless press+release is ever intercepted. `__yggtermAltTapSend` is
+/// re-bound on every (re)install so a listener that survived a webview reload
+/// always posts to the LIVE eval channel.
+const ALT_TAP_LISTENER_JS: &str = r#"(function(){
+  window.__yggtermAltTapSend = function(m){ try { dioxus.send(m); } catch(_e){} };
+  if (window.__yggtermAltTapInstalled) { return; }
+  window.__yggtermAltTapInstalled = true;
+  var armed = false;
+  function isAlt(e){ return e.key === 'Alt' || e.code === 'AltLeft' || e.code === 'AltRight'; }
+  // Authoritative overlay state: the breadcrumb is rendered iff the overlay is up.
+  function overlayOpen(){ return !!document.querySelector('[data-yggterm-keytip-breadcrumb]'); }
+  window.addEventListener('keydown', function(e){
+    if (isAlt(e)) {
+      // Arm on a lone ALT down; an autorepeat (held ALT) leaves the arm as-is.
+      if (!e.repeat && !e.ctrlKey && !e.metaKey && !e.shiftKey) { armed = true; }
+      return; // never intercept ALT itself; the keyup decides the tap
+    }
+    armed = false; // any non-ALT key cancels tap candidacy
+    if (!overlayOpen()) {
+      return; // overlay closed: keys flow to the app/PTY untouched (invariant 7)
+    }
+    // Overlay open: this key belongs to the chord. Capture it here — below the
+    // webview's focus — so a focused terminal never sees it, and forward it to
+    // the resolver. preventDefault+stopPropagation keep it off the PTY.
+    var send = window.__yggtermAltTapSend;
+    if (e.ctrlKey || e.metaKey) { return; } // let real accelerators through
+    if (e.key === 'Escape' || e.key === 'Backspace') {
+      e.preventDefault(); e.stopPropagation();
+      if (send) { send({ key: e.key }); }
+      return;
+    }
+    if (e.key && e.key.length === 1 && /[A-Za-z0-9]/.test(e.key)) {
+      e.preventDefault(); e.stopPropagation();
+      if (send) { send({ key: e.key.toLowerCase() }); }
+      return;
+    }
+    // Any other key while the overlay is up (arrows, Tab, …): swallow it so it
+    // cannot reach the PTY behind the overlay, but take no chord action.
+    e.preventDefault(); e.stopPropagation();
+  }, true);
+  window.addEventListener('keyup', function(e){
+    if (!isAlt(e) || !armed) { return; }
+    armed = false;
+    if (window.__yggtermAltTapSend) { window.__yggtermAltTapSend({ tap: true }); }
+  }, true);
+  window.addEventListener('blur', function(){ armed = false; }, true);
+})();"#;
+/// Keep the below-the-webview ALT key bridge installed for the GUI's lifetime
+/// and act on each message it reports. The eval is held open so its `recv()`
+/// drains messages as they arrive; if the channel closes (a webview reload), the
+/// outer loop reinstalls — and the JS guard makes reinstall a cheap no-op that
+/// only re-binds the live sender.
+async fn keytip_alt_tap_install_loop(state: Signal<ShellState>) {
+    loop {
+        let mut eval = document::eval(ALT_TAP_LISTENER_JS);
+        loop {
+            match eval.recv::<serde_json::Value>().await {
+                Ok(msg) => keytip_apply_bridge_message(state, &msg),
+                Err(_) => break,
+            }
+        }
+        sleep(Duration::from_millis(500)).await;
+    }
+}
+/// Apply one message from the ALT key bridge. A clean tap (`{tap:true}`) toggles
+/// the overlay; a chord key (`{key:"b"}` / `{key:"Escape"}` / `{key:"Backspace"}`)
+/// walks the open chord. Routing every ALT interaction through here is what makes
+/// it independent of which surface holds DOM focus (§13.1, invariant 11).
+fn keytip_apply_bridge_message(mut state: Signal<ShellState>, msg: &serde_json::Value) {
+    if msg.get("tap").and_then(|value| value.as_bool()) == Some(true) {
+        state.with_mut(|shell| {
+            if shell.alt_overlay_active {
+                shell.clear_alt_overlay();
+            } else {
+                shell.activate_alt_overlay();
+            }
+        });
+        return;
+    }
+    let Some(key) = msg.get("key").and_then(|value| value.as_str()) else {
+        return;
+    };
+    match key {
+        "Escape" => state.with_mut(|shell| shell.clear_alt_overlay()),
+        "Backspace" => state.with_mut(|shell| {
+            shell.alt_overlay_sequence.pop();
+        }),
+        other => {
+            let mut chars = other.chars();
+            if let (Some(ch), None) = (chars.next(), chars.next()) {
+                feed_alt_overlay_char(state, ch);
+            }
+        }
+    }
 }
 /// `~/.yggterm/keymap.json` — the directly-editable ALT+ keymap override file.
 fn keymap_config_path() -> Option<std::path::PathBuf> {
@@ -24997,42 +25088,27 @@ fn execute_shell_command(mut state: Signal<ShellState>, command: ShellCommand) {
         }
     }
 }
-fn handle_alt_overlay_key(mut state: Signal<ShellState>, key: Key) -> bool {
-    // Clean-tap activation lives in the window-level keyboard handler; this DOM
-    // handler only WALKS the chord once the overlay is already up, so it never
-    // swallows an ALT press that a terminal wants as Meta.
+/// Feed one character into the open KeyTips chord (fed by the below-the-webview
+/// bridge, [`keytip_apply_bridge_message`]). Mirrors the Excel walk: extend the
+/// sequence, resolve it against the keymap, then act — descend (Pending), run
+/// (Command), or dismiss (Invalid).
+fn feed_alt_overlay_char(mut state: Signal<ShellState>, ch: char) {
     if !state.read().alt_overlay_active {
-        return false;
+        return;
     }
-    if key == Key::Escape {
-        state.with_mut(|shell| shell.clear_alt_overlay());
-        return true;
-    }
-    let Key::Character(chars) = key else {
-        return false;
-    };
     let (next_sequence, resolution) = {
         let shell = state.read();
-        let next = format!("{}{}", shell.alt_overlay_sequence, chars.to_ascii_lowercase());
+        let next = format!("{}{}", shell.alt_overlay_sequence, ch.to_ascii_lowercase());
         let resolution = shell.keymap.resolve(&next);
         (next, resolution)
     };
     match resolution {
-        Resolution::Pending => {
-            state.with_mut(|shell| {
-                shell.alt_overlay_active = true;
-                shell.alt_overlay_sequence = next_sequence;
-            });
-            true
-        }
-        Resolution::Command(command) => {
-            execute_shell_command(state, command);
-            true
-        }
-        Resolution::Invalid => {
-            state.with_mut(|shell| shell.clear_alt_overlay());
-            true
-        }
+        Resolution::Pending => state.with_mut(|shell| {
+            shell.alt_overlay_active = true;
+            shell.alt_overlay_sequence = next_sequence;
+        }),
+        Resolution::Command(command) => execute_shell_command(state, command),
+        Resolution::Invalid => state.with_mut(|shell| shell.clear_alt_overlay()),
     }
 }
 fn execute_search_command(mut state: Signal<ShellState>, query: String) {
@@ -45973,6 +46049,12 @@ fn app() -> Element {
             web_surface_native_reconcile_loop(state, desktop, trace_home).await;
         });
     }
+    let keytip_alt_tap_loop_started = use_hook(|| Arc::new(AtomicBool::new(false))).clone();
+    if !keytip_alt_tap_loop_started.swap(true, Ordering::SeqCst) {
+        spawn_forever(async move {
+            keytip_alt_tap_install_loop(state).await;
+        });
+    }
     if !browser_tree_refresh_loop_started.swap(true, Ordering::SeqCst) {
         spawn_forever(async move {
             loop {
@@ -46569,53 +46651,15 @@ fn app() -> Element {
         if let TaoEvent::WindowEvent { event, .. } = event {
             match event {
                 DesktopWindowEvent::KeyboardInput { event, .. } => {
-                    let is_alt = event.logical_key == TaoKey::Alt
-                        || matches!(
-                            event.physical_key,
-                            TaoKeyCode::AltLeft | TaoKeyCode::AltRight
-                        );
-                    // Only a key that drives an APP-LEVEL action (alt overlay,
-                    // escape-cancel-delete, delete-from-tree) needs to re-render
-                    // the root. Plain character input is handled entirely by
-                    // xterm/the PTY — bumping `window_epoch` on every keystroke
-                    // forced a whole-shell re-render per character (render-cause
-                    // trace: ~half of the ~23 whole-tree renders/s while a key is
-                    // held). Gate the bump on a real action.
+                    // Only a key that drives an APP-LEVEL action (escape-cancel-
+                    // delete, delete-from-tree) needs to re-render the root. Plain
+                    // character input is handled entirely by xterm/the PTY, and the
+                    // clean ALT tap + KeyTips chord walk live in the below-the-
+                    // webview JS bridge (keytip_alt_tap_install_loop) — the window-
+                    // level tao key events here do NOT fire while the xterm.js
+                    // webview holds focus, which is the whole §13.1 defect. Gate the
+                    // window_epoch bump on a real action.
                     let mut app_action_handled = false;
-                    // Clean-tap KeyTips (spec decision c): a press+release of ALT
-                    // with NO intervening key opens the overlay. Opening on the
-                    // RELEASE (not the press) is what lets a held ALT+<key> chord
-                    // — a terminal's Meta prefix (readline/emacs/helix), a future
-                    // app's direct chord — pass through untouched: the first
-                    // non-ALT key cancels tap candidacy, so the overlay never trips.
-                    match event.state {
-                        ElementState::Pressed if is_alt => {
-                            if !state.read().alt_overlay_active
-                                && !state.read().alt_tap_candidate
-                            {
-                                state.with_mut(|shell| shell.alt_tap_candidate = true);
-                            }
-                        }
-                        ElementState::Pressed => {
-                            if state.read().alt_tap_candidate {
-                                state.with_mut(|shell| shell.alt_tap_candidate = false);
-                            }
-                        }
-                        ElementState::Released if is_alt => {
-                            let fire = state.with_mut(|shell| {
-                                let fire =
-                                    shell.alt_tap_candidate && !shell.alt_overlay_active;
-                                shell.alt_tap_candidate = false;
-                                fire
-                            });
-                            if fire {
-                                state.with_mut(|shell| shell.activate_alt_overlay());
-                                focus_shell_root_for_keytips();
-                                app_action_handled = true;
-                            }
-                        }
-                        _ => {}
-                    }
                     if event.state == ElementState::Pressed
                         && (event.logical_key == TaoKey::Escape
                             || event.physical_key == TaoKeyCode::Escape)
@@ -46649,35 +46693,11 @@ fn app() -> Element {
                         // KeyTips exit on focus change (spec decision c): a mode
                         // that survived an Alt+Tab away would paint hints over a
                         // window the user is no longer driving.
-                        if !*focused && (shell.alt_overlay_active || shell.alt_tap_candidate) {
+                        if !*focused && shell.alt_overlay_active {
                             shell.clear_alt_overlay();
                         }
                     });
                     sync_active_terminal_input_policy(state);
-                    window_epoch.with_mut(|epoch| *epoch += 1);
-                }
-                DesktopWindowEvent::ModifiersChanged(modifiers) => {
-                    // On GTK the ALT key arrives here (a modifier change), not as a
-                    // `KeyboardInput` event, so this is the PRIMARY clean-tap
-                    // driver: arm candidacy on alt-down, fire on alt-up if it
-                    // survived. A held ALT+<key> chord still cancels because the
-                    // intervening key IS a `KeyboardInput` press (it clears the
-                    // candidate) — so the terminal Meta passthrough is preserved.
-                    if modifiers.alt_key() {
-                        if !state.read().alt_overlay_active && !state.read().alt_tap_candidate {
-                            state.with_mut(|shell| shell.alt_tap_candidate = true);
-                        }
-                    } else {
-                        let fire = state.with_mut(|shell| {
-                            let fire = shell.alt_tap_candidate && !shell.alt_overlay_active;
-                            shell.alt_tap_candidate = false;
-                            fire
-                        });
-                        if fire {
-                            state.with_mut(|shell| shell.activate_alt_overlay());
-                            focus_shell_root_for_keytips();
-                        }
-                    }
                     window_epoch.with_mut(|epoch| *epoch += 1);
                 }
                 DesktopWindowEvent::CloseRequested => {
@@ -47660,10 +47680,10 @@ fn app() -> Element {
                 }
             },
             onkeydown: move |evt| {
-                if handle_alt_overlay_key(state, evt.key()) {
-                    evt.prevent_default();
-                    return;
-                }
+                // KeyTips chord walking now lives in the below-the-webview JS
+                // bridge (keytip_apply_bridge_message), so it works from a
+                // focused terminal too; this DOM handler only carries the
+                // direct accelerators below.
                 let is_accel = evt.modifiers().contains(Modifiers::CONTROL)
                     || evt.modifiers().contains(Modifiers::META);
                 // Ctrl+Alt+PageUp/PageDown switches LIVE SESSIONS (spec decision
