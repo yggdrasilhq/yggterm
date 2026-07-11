@@ -222,6 +222,26 @@ impl DesktopService {
         let _ = (id, x, y, w, h);
     }
 
+    /// Set the WebKit page-zoom factor for an open web surface (1.0 == 100%).
+    pub fn set_web_surface_zoom(&self, id: u64, factor: f64) {
+        #[cfg(not(any(
+            target_os = "windows",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "android"
+        )))]
+        if let Some(host) = self.web_surface_host.borrow().as_ref() {
+            host.set_zoom(id, factor);
+        }
+        #[cfg(any(
+            target_os = "windows",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "android"
+        ))]
+        let _ = (id, factor);
+    }
+
     /// Show/hide an open web surface without destroying it (tab/session switch).
     pub fn set_web_surface_visible(&self, id: u64, visible: bool) {
         #[cfg(not(any(
