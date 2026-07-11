@@ -2200,10 +2200,22 @@ async fn web_surface_native_reconcile_loop(
                                 else {
                                     return false;
                                 };
-                                // ssh -L rewritten tabs report the LOCAL
-                                // forward end as their URI — never surface
-                                // that in the address bar or history.
-                                let followable = tab.forward_child.is_none();
+                                // Follow the engine's real URL EXCEPT for an
+                                // ssh -L rewritten tab, which reports the LOCAL
+                                // 127.0.0.1 forward end as its URI — that must
+                                // never reach the address bar or history. A SOCKS
+                                // tab ALSO has a forward_child (the `ssh -D`) but
+                                // reports the REAL url, so it IS followable. Not
+                                // distinguishing them left `tab.effective_url`
+                                // pinned to the original url while `entry.url`
+                                // followed the page's redirect (chat.example.com -> its
+                                // /auth), so every reconcile tick navigated the
+                                // webview BACK to the original url — a redirect
+                                // loop that only a real browser (which just
+                                // follows the redirect) avoided. socks_port.is_some
+                                // ⇒ SOCKS ⇒ followable.
+                                let followable =
+                                    tab.socks_port.is_some() || tab.forward_child.is_none();
                                 if followable && url_changed {
                                     tab.url = page_url.clone();
                                     tab.effective_url = page_url.clone();
@@ -2213,12 +2225,21 @@ async fn web_surface_native_reconcile_loop(
                                 }
                                 followable
                             });
+                            // Record history keyed on the url, but NEVER pair a
+                            // new url with a STALE title: the title lags a url
+                            // change (still the previous page's until the new page
+                            // sets <title>), so recording it here mislabeled
+                            // entries — Brave Search's title pinned to an
+                            // chat.example.com row in the omnibox. Only use the title
+                            // when it changed in THIS poll (fresh for this url);
+                            // otherwise record an empty title now and let the
+                            // title-settled poll below fill it in. Suggestions
+                            // dedupe by url, keeping the titled row.
                             if record && url_changed {
-                                append_web_surface_history(
-                                    &entry.profile,
-                                    &page_url,
-                                    &page_title,
-                                );
+                                let fresh_title = if title_changed { page_title.as_str() } else { "" };
+                                append_web_surface_history(&entry.profile, &page_url, fresh_title);
+                            } else if record && title_changed {
+                                append_web_surface_history(&entry.profile, &page_url, &page_title);
                             }
                         }
                     }
