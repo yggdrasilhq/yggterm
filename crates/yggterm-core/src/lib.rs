@@ -1584,16 +1584,55 @@ pub fn read_codex_session_identity_fields(path: &Path) -> Result<Option<(String,
 /// `~/.claude/projects/<encoded-cwd>/`, so a glob on the id avoids reproducing
 /// CC's cwd-encoding. Returns the first match (ids are UUIDs → unique).
 pub fn local_cc_session_jsonl_path(session_id: &str) -> Option<PathBuf> {
-    let home = dirs::home_dir()?;
-    let projects_dir = home.join(".claude").join("projects");
+    local_cc_session_jsonl_path_in(&local_cc_projects_dir()?, session_id)
+}
+
+fn local_cc_projects_dir() -> Option<PathBuf> {
+    Some(dirs::home_dir()?.join(".claude").join("projects"))
+}
+
+/// `local_cc_session_jsonl_path` against an explicit projects dir — the seam the
+/// cwd regression test drives, so it need not mutate the process `$HOME`.
+pub fn local_cc_session_jsonl_path_in(projects_dir: &Path, session_id: &str) -> Option<PathBuf> {
     let file_name = format!("{session_id}.jsonl");
-    for project_entry in fs::read_dir(&projects_dir).ok()?.flatten() {
+    for project_entry in fs::read_dir(projects_dir).ok()?.flatten() {
         let candidate = project_entry.path().join(&file_name);
         if candidate.is_file() {
             return Some(candidate);
         }
     }
     None
+}
+
+/// The CWD a local Claude Code session must be resumed in, read from its own
+/// transcript.
+///
+/// CC derives its project directory FROM THE PROCESS CWD
+/// (`~/.claude/projects/<encoded-cwd>/<id>.jsonl`), so `claude --resume <id>` run
+/// from the wrong directory searches the wrong project dir and refuses with
+/// "No conversation found with session ID <id>" — even though the transcript
+/// exists. The transcript is therefore the SINGLE SOURCE OF TRUTH for this cwd:
+/// a session row's own cwd field must never be trusted for a resume, because a
+/// relaunch path that rebuilds the row can default it to `$HOME`.
+///
+/// Live-evidenced on jojo 2026-07-11: `20e56a8b-…` was BORN in
+/// `/home/pi/gh/yggterm` (spawn cwd correct, transcript written under
+/// `-home-pi-gh-yggterm`), but every relaunch from the start page spawned in
+/// `/home/pi`, so CC looked in `-home-pi`, found nothing, and refused. The
+/// session was never lost — yggterm was knocking on the wrong door.
+///
+/// Returns `None` when the session has no transcript at all (quit before its
+/// first turn), which is the caller's signal that there is nothing to resume.
+pub fn local_cc_session_cwd(session_id: &str) -> Option<String> {
+    local_cc_session_cwd_in(&local_cc_projects_dir()?, session_id)
+}
+
+/// `local_cc_session_cwd` against an explicit projects dir (test seam).
+pub fn local_cc_session_cwd_in(projects_dir: &Path, session_id: &str) -> Option<String> {
+    let path = local_cc_session_jsonl_path_in(projects_dir, session_id)?;
+    let (_id, cwd) = read_cc_session_identity_fields(&path).ok().flatten()?;
+    let cwd = cwd.trim();
+    (!cwd.is_empty()).then(|| cwd.to_string())
 }
 
 /// Append a Claude Code user-rename to a session's JSONL — byte-compatible with
@@ -2195,6 +2234,55 @@ fn short_session_id(session_id: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A local CC session's cwd comes from its TRANSCRIPT, not from the row.
+    ///
+    /// Regression lock for the jojo 2026-07-11 "No conversation found with session ID"
+    /// bug: `20e56a8b-…` was born in `/home/pi/gh/yggterm` but every relaunch spawned
+    /// `claude --resume` in `/home/pi`, so CC resolved its project dir to `-home-pi`,
+    /// looked for the transcript there, and refused a session that existed. CC keys its
+    /// project dir on the process cwd, so resuming in the wrong dir is indistinguishable
+    /// from the session not existing. The transcript records the true cwd — read it.
+    #[test]
+    fn local_cc_session_cwd_comes_from_the_transcript_not_the_row() {
+        let root = std::env::temp_dir().join(format!(
+            "yggterm-cc-cwd-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let projects = root.join("projects");
+        // CC encodes the cwd into the project dir name; the transcript states it exactly.
+        let project = projects.join("-home-pi-gh-yggterm");
+        fs::create_dir_all(&project).expect("create project dir");
+        let session_id = "20e56a8b-90f7-4c44-baee-b230e11f65f1";
+        let transcript = project.join(format!("{session_id}.jsonl"));
+        fs::write(
+            &transcript,
+            format!(
+                "{}\n",
+                serde_json::json!({
+                    "type": "user",
+                    "sessionId": session_id,
+                    "cwd": "/home/pi/gh/yggterm",
+                })
+            ),
+        )
+        .expect("write transcript");
+
+        assert_eq!(
+            local_cc_session_cwd_in(&projects, session_id).as_deref(),
+            Some("/home/pi/gh/yggterm"),
+            "the resume cwd must be read from the transcript, never defaulted to $HOME"
+        );
+        // A session with no transcript has nothing to resume — the caller's signal to
+        // re-birth it rather than hand the user CC's refusal.
+        assert_eq!(
+            local_cc_session_cwd_in(&projects, "ffffffff-0000-0000-0000-000000000000"),
+            None
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
 
     #[test]
     fn split_group_survives_settings_round_trip() {

@@ -150,3 +150,100 @@ Regression test `batch_terminal_chunks_preserves_carriage_returns_in_kept_lines`
   reduces the `canvas_blank_with_buffer_text` sub-reason.
 - `terminal.sqlite3` fault-event query not yet run.
 - Blank-viewport (screenshot 1) not yet independently root-caused (may share cause).
+
+---
+
+## Run 2 — 2026-07-11 (user-reported: relaunch refusal, char drops, daemon opacity)
+
+**The headline: RUN 1'S FIXES WERE NEVER RUNNING.** jojo's daemon was on **2.10.3
+with 19h44m uptime** while **2.10.13 sat on disk**. The CR-faithful sanitizer fix and
+the CC re-birth fix were compiled, deployed, and simply never executed — so both bugs
+run 1 called "fixed on branch, live-verify pending" were still live for the user. The
+idle gate defers the daemon's own retirement while any owned session is actively
+working, and on a campaign machine an agent session is ~always working, so the daemon
+can stay pinned indefinitely. Nothing in the product said so.
+
+**This is now a permanent lesson, not a footnote:** check
+`server status → server_version` against the on-disk binary BEFORE reasoning about any
+fix. Added to `docs/pending-bugs.md` as THE STALE-DAEMON TRAP.
+
+### 1. ★ ROOT-CAUSED + FIXED — "No conversation found with session ID <uuid>"
+
+Not the transcript-less case run 1 fixed (`e6ffc31`). The transcript for `20e56a8b`
+EXISTS (4.8 MB, internal `sessionId` and `cwd` both correct). The bug is the **cwd**:
+
+| event  | cwd                    | command                       |
+|--------|------------------------|-------------------------------|
+| birth  | `/home/pi/gh/yggterm` ✅ | `claude --session-id 20e56a8b` |
+| resume | `/home/pi` ❌           | `claude --resume 20e56a8b`     |
+
+CC derives its project dir FROM THE PROCESS CWD, so a resume from `$HOME` searches
+`-home-pi`, finds no transcript with that id, and **correctly refuses**. Running the
+identical command by hand in the real cwd resumes it fine → wrapper-vs-manual parity
+rule → yggterm bug. Mechanism: the relaunch path rebuilt the row through
+`session_metadata_value(_, "Cwd").unwrap_or_else(local_default_cwd)` — a silent `$HOME`
+fallback, the exact "fallback layer that can silently diverge" the SSOT rule forbids.
+
+**Fix (`c3eece7`):** the TRANSCRIPT owns a local CC session's resume cwd
+(`local_cc_session_cwd`). One lookup now answers both questions a relaunch asks — "is
+there anything to resume?" and "where?" — collapsing two sources that could disagree
+into one. Regression test `local_cc_session_cwd_comes_from_the_transcript_not_the_row`.
+
+### 2. ★ ROOT-CAUSED, NOT FIXED — char drops / "rendering replaced with spaces"
+
+Run 1 sized the forward-path drops at **1–11 bytes** and assumed CR-loss was the whole
+mechanism. Re-mining `terminal_forward_divergence` on the user's OWN session shows the
+real magnitude:
+
+    local://20e56a8b   raw 9153  → forwarded 8474   = 679 bytes dropped
+    local://20e56a8b   raw 23991 → forwarded 23312  = 679 bytes dropped
+
+679 bytes is a whole-line **excision**, not a lost `\r`.
+`strip_internal_terminal_transport_noise_lines` content-matches three transport phrases
+and on a hit ALSO sets `drop_following_transport_tail_lines = 3` — deleting the matched
+line **plus the next three lines** of whatever the CLI was painting. An agent session
+whose conversation quotes those phrases (one working on this bug does) loses four lines
+mid-frame. The daemon vt100 screen stays clean, so every daemon-side instrument calls
+the session healthy — which is how this survived a whole run.
+
+**Why not fixed here:** it cannot just be deleted. `ssh` writes
+`Shared connection to <ip> closed.` into the PTY and yggterm's remote helper prints
+`Error: terminal session not found: <key>` to its stdout, which IS the PTY — both
+arrive inside cursor-hide control batches, so no content- or branch-based rule separates
+them from CLI output (5 existing tests lock this; a blanket faithful-pipe attempt failed
+all 5 and was reverted rather than shipped as a regression). The real fix is
+**per-session attach-phase state** — sanitize only while the launch wrapper owns the
+PTY, be a faithful pipe once the CLI does. That is the fork-collapse step of
+`campaign-render-pipeline-parity-rework`, which the user sequenced AFTER the harness.
+**Deliberately not rushed into a deploy. This is the next thing to do on that campaign.**
+
+### 3. ★ SHIPPED — the daemon is visible now (user request)
+
+Metadata sidebar gains a **Daemon** group: version, uptime, pid, session counts
+(owned/total/preserved), a newer-build-on-disk flag, and — the transparency the user
+asked for — **the daemon's OWN reason for deferring a hot-restart**, reported verbatim
+from `hot_update_idle_gate_block_reason`, the same predicate the retire loop acts on (so
+what the user reads cannot drift from what the daemon does). Plus a manual
+**Hot-restart daemon** button (session-preserving handoff; `force` waives only the
+same-version check and never overrides the idle gate, so a working agent is never
+interrupted).
+
+### Probe notes
+
+- **`agent_session_error.sample` IS NOT EVIDENCE OF SCREEN CORRUPTION.** Its samples
+  showed `terminl`/`sesson`/`isclaude` and I nearly cited them as proof of the char-drop
+  bug. They are an artifact: the probe's `strip_terminal_control_sequences` is
+  *per-chunk stateless*, and TUIs diff-paint with cursor-forward jumps, so linearizing
+  that stream MANUFACTURES missing letters and jammed-together words. The honest
+  instrument for byte loss is `terminal_forward_divergence` (raw vs forwarded).
+- Two independent copies of `strip_terminal_control_sequences` exist
+  (`yggterm-server/terminal.rs`, `yggterm-shell/terminal_observe.rs`) — an SSOT
+  violation, noted for the parity campaign.
+
+### Carried forward
+
+- Harness tier 2 still needs `server terminal raw-stream` (from run 1). NEXT STEP.
+- CC "already in use" (the reap half) — still open.
+- Broken bottom on every switch — SIGWINCH-nudge hypothesis remains DEAD.
+- 4 `yggterm-server` tests fail on clean HEAD `4cce722` (codex-litellm, remote-resume,
+  legacy-daemon) — pre-existing, environment-dependent, NOT introduced by this run.
