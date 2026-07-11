@@ -632,6 +632,9 @@ const TREE_SPINNER_CSS: &str = ".yggterm-tree-spinner { animation: none !importa
 // animation so the keyframe values jump instead of interpolating (user
 // decision 2026-06-26: "blinking means full off and full on, no fading").
 const STATUS_DOT_BLINK_CSS: &str = "@keyframes yggterm-status-dot-blink { 0%, 100% { opacity: 1; } 50% { opacity: 0; } }";
+/// The vertical-tabs left pane slides in from the edge as the top chrome
+/// collapses (max-height transition on the tab bar + nav bar).
+const WEB_SURFACE_VTAB_CSS: &str = "@keyframes ygg-vtab-slide-in { from { transform: translateX(-14px); opacity: 0; } to { transform: translateX(0); opacity: 1; } }";
 // Live-session close [x] visibility + hover (user decision 2026-06-26): the X is
 // HIDDEN at rest and only appears when its row is hovered or selected (not always
 // on). On hover it "burns" in — a soft danger tint + a faint backing — to read as
@@ -1540,6 +1543,10 @@ struct WebSurfaceOverlayView {
     address_suggestion_index: Option<usize>,
     /// Active tab's profile (drives which history file feeds suggestions).
     profile: String,
+    /// Vertical-tabs browsing mode: tabs move to a left pane (mini-omnibox + a
+    /// domain-grouped tree) and the top tab-bar + address bar are hidden. A
+    /// persisted user preference (`AppSettings::web_surface_vertical_tabs`).
+    vertical_tabs: bool,
 }
 #[derive(Debug, Clone, PartialEq)]
 struct WebSurfaceOverlayTabView {
@@ -1550,6 +1557,34 @@ struct WebSurfaceOverlayTabView {
     is_app_tab: bool,
     effective_url: String,
     active: bool,
+}
+/// A domain group in the vertical-tabs tree: the host and the tabs on it, in tab
+/// order. Grouping is by registrable host label, domains in first-appearance
+/// order — the same cwd-tree visual vocabulary applied to browser tabs.
+#[derive(Debug, Clone, PartialEq)]
+struct WebSurfaceTabGroup {
+    domain: String,
+    tabs: Vec<WebSurfaceOverlayTabView>,
+}
+/// Group a flat tab list into the vertical tree. Deterministic: domains appear
+/// in the order their first tab does, and tabs keep their order within a domain.
+fn web_surface_tab_tree(tabs: &[WebSurfaceOverlayTabView]) -> Vec<WebSurfaceTabGroup> {
+    let mut order: Vec<String> = Vec::new();
+    let mut groups: HashMap<String, Vec<WebSurfaceOverlayTabView>> = HashMap::new();
+    for tab in tabs {
+        let domain = web_surface_tab_host_label(&tab.effective_url);
+        if !groups.contains_key(&domain) {
+            order.push(domain.clone());
+        }
+        groups.entry(domain).or_default().push(tab.clone());
+    }
+    order
+        .into_iter()
+        .map(|domain| {
+            let tabs = groups.remove(&domain).unwrap_or_default();
+            WebSurfaceTabGroup { domain, tabs }
+        })
+        .collect()
 }
 /// Resolve and commit a user-driven tab navigation (address bar, back,
 /// forward). The blocking egress resolution (possible `ssh -L` setup) runs
@@ -6486,7 +6521,19 @@ impl ShellState {
             address_suggestions,
             address_suggestion_index: surface.address_suggestion_index,
             profile: active.profile.clone(),
+            vertical_tabs: self.settings.web_surface_vertical_tabs,
         })
+    }
+    /// Flip the vertical-tabs browsing mode and persist it. A per-user chrome
+    /// preference, so it applies to every web surface, not one session.
+    fn toggle_web_surface_vertical_tabs(&mut self) {
+        self.settings.web_surface_vertical_tabs = !self.settings.web_surface_vertical_tabs;
+        self.persist_settings();
+        self.last_action = if self.settings.web_surface_vertical_tabs {
+            "vertical tabs on".to_string()
+        } else {
+            "vertical tabs off".to_string()
+        };
     }
     fn set_window_focused(&mut self, focused: bool) {
         let was_focused = self.window_focused;
@@ -30820,6 +30867,7 @@ fn describe_app_state_snapshot(
         "terminal_font_size": shell.settings.terminal_font_size,
         "terminal_zoom_percent": zoom_percent_f32(shell.settings.terminal_font_size, TERMINAL_ZOOM_BASE),
         "web_surface_zoom_percent": zoom_percent_f32(shell.settings.web_surface_zoom_percent, WEB_SURFACE_ZOOM_BASE),
+        "web_surface_vertical_tabs": shell.settings.web_surface_vertical_tabs,
         "terminal_light_theme_name": shell.terminal_theme_name_for(UiTheme::ZedLight),
         "terminal_dark_theme_name": shell.terminal_theme_name_for(UiTheme::ZedDark),
         "effective_terminal_theme_name": shell.effective_terminal_theme_name(),
@@ -47519,6 +47567,7 @@ fn app() -> Element {
             },
             style { "{TOAST_CSS}" }
             style { "{MENU_SURFACE_CSS}" }
+            style { "{WEB_SURFACE_VTAB_CSS}" }
             style { "{shell_document_css}" }
             // KeyTips chord breadcrumb: shows the leader + the chord typed so far
             // while the ALT+ overlay is up (Excel's "ALT, then H, then …" trail).
@@ -63790,9 +63839,216 @@ fn TerminalCanvas(
                     } else {
                     div {
                         style: format!(
-                            "position:absolute; inset:0; z-index:40; display:flex; flex-direction:column; background:{}; border-radius:{};",
+                            "position:absolute; inset:0; z-index:40; display:flex; flex-direction:{}; background:{}; border-radius:{};",
+                            if web_overlay.vertical_tabs { "row" } else { "column" },
                             theme.background, terminal_shell_radius,
                         ),
+                        // Vertical-tabs mode: a left pane replaces the top tab
+                        // bar + address bar (both collapsed below). Tabs become a
+                        // domain-grouped tree, with a mini-omnibox on top and an
+                        // extension slot at the foot.
+                        {web_overlay.vertical_tabs.then(|| {
+                            let tree = web_surface_tab_tree(&web_overlay.tabs);
+                            let pane_path = web_surface_session_path.clone();
+                            let pane_ssh = web_surface_nav_ssh_target.clone();
+                            let pane_profile = web_overlay.profile.clone();
+                            let active_tab_id = web_overlay.active_tab_id;
+                            let mini_id = format!("{web_surface_host_id}-ws-vtab-omni");
+                            let address_text = web_overlay.address_text.clone();
+                            rsx! {
+                                div {
+                                    // The left pane. Fixed width; its own column.
+                                    style: format!(
+                                        "flex:0 0 224px; min-width:0; display:flex; flex-direction:column; \
+                                         background:rgba(127,127,127,0.10); border-right:1px solid rgba(127,127,127,0.22); \
+                                         animation:ygg-vtab-slide-in 0.18s ease;",
+                                    ),
+                                    // Mini-omnibox row + a return-to-classic toggle.
+                                    div {
+                                        style: "display:flex; gap:5px; padding:8px 8px 6px; align-items:center;",
+                                        input {
+                                            id: "{mini_id}",
+                                            style: format!(
+                                                "flex:1 1 auto; min-width:0; padding:5px 11px; border-radius:12px; \
+                                                 border:1px solid rgba(127,127,127,0.35); background:rgba(127,127,127,0.14); \
+                                                 color:{}; font-size:12px; outline:none;",
+                                                theme.foreground,
+                                            ),
+                                            value: "{address_text}",
+                                            spellcheck: "false",
+                                            autocomplete: "off",
+                                            placeholder: "Search or enter address",
+                                            oninput: {
+                                                let pane_path = pane_path.clone();
+                                                move |evt: FormEvent| {
+                                                    let value = evt.value();
+                                                    state.with_mut(|shell| {
+                                                        shell.web_surface_set_address_draft(&pane_path, Some(value));
+                                                    });
+                                                }
+                                            },
+                                            onkeydown: {
+                                                let pane_path = pane_path.clone();
+                                                let pane_ssh = pane_ssh.clone();
+                                                move |evt: KeyboardEvent| {
+                                                    if evt.key() == Key::Enter {
+                                                        let target = state.with(|shell| {
+                                                            let surface = shell.web_surfaces.get(&pane_path)?;
+                                                            let text = surface.address_draft.clone().or_else(|| {
+                                                                surface.tabs.iter()
+                                                                    .find(|tab| tab.id == surface.active_tab)
+                                                                    .map(|tab| tab.url.clone())
+                                                            })?;
+                                                            Some((surface.active_tab, text))
+                                                        });
+                                                        if let Some((tab_id, text)) = target
+                                                            && let Some(url) = web_surface_address_to_url(&text)
+                                                        {
+                                                            navigate_web_surface_tab(
+                                                                state, pane_path.clone(), tab_id, url,
+                                                                pane_ssh.clone(), None,
+                                                            );
+                                                        }
+                                                    } else if evt.key() == Key::Escape {
+                                                        state.with_mut(|shell| {
+                                                            shell.web_surface_set_address_draft(&pane_path, None);
+                                                        });
+                                                    }
+                                                }
+                                            },
+                                        }
+                                        button {
+                                            style: format!(
+                                                "border:none; background:transparent; color:{}; cursor:pointer; \
+                                                 font-size:14px; line-height:1; padding:4px 6px; border-radius:6px; flex:0 0 auto;",
+                                                theme.foreground,
+                                            ),
+                                            title: "Switch to classic top tabs",
+                                            onclick: move |_| {
+                                                state.with_mut(|shell| shell.toggle_web_surface_vertical_tabs());
+                                            },
+                                            "▭"
+                                        }
+                                    }
+                                    // The tab tree: a domain header per group, its
+                                    // tabs beneath — the cwd-tree grammar for tabs.
+                                    div {
+                                        style: "flex:1 1 auto; overflow-y:auto; overflow-x:hidden; padding:2px 6px 6px;",
+                                        {tree.iter().map(|group| {
+                                            let domain = group.domain.clone();
+                                            rsx! {
+                                                div {
+                                                    key: "vgrp-{domain}",
+                                                    div {
+                                                        style: "font-size:10.5px; text-transform:uppercase; letter-spacing:0.03em; \
+                                                                opacity:0.6; padding:8px 8px 3px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;",
+                                                        "▾ {domain}"
+                                                    }
+                                                    {group.tabs.iter().map(|tab| {
+                                                        let tab_id = tab.id;
+                                                        let tab_label = tab.label.clone();
+                                                        let tab_active = tab.active;
+                                                        let is_app_tab = tab.is_app_tab;
+                                                        let select_path = pane_path.clone();
+                                                        let close_path = pane_path.clone();
+                                                        let (row_bg, row_op) = if tab_active {
+                                                            ("rgba(127,127,127,0.22)".to_string(), "1")
+                                                        } else {
+                                                            ("transparent".to_string(), "0.8")
+                                                        };
+                                                        rsx! {
+                                                            div {
+                                                                key: "vtab-{tab_id}",
+                                                                style: format!(
+                                                                    "display:flex; align-items:center; gap:6px; margin:1px 0; padding:5px 8px 5px 18px; \
+                                                                     border-radius:7px; cursor:pointer; font-size:12px; color:{}; background:{}; opacity:{};",
+                                                                    theme.foreground, row_bg, row_op,
+                                                                ),
+                                                                onclick: move |_| {
+                                                                    state.with_mut(|shell| {
+                                                                        shell.web_surface_select_tab(&select_path, tab_id);
+                                                                    });
+                                                                },
+                                                                span {
+                                                                    style: "flex:1 1 auto; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; min-width:0;",
+                                                                    "{tab_label}"
+                                                                }
+                                                                button {
+                                                                    style: format!(
+                                                                        "border:none; background:transparent; color:{}; cursor:pointer; \
+                                                                         font-size:11px; line-height:1; padding:2px 4px; border-radius:5px; flex:0 0 auto; opacity:0.7;",
+                                                                        theme.foreground,
+                                                                    ),
+                                                                    title: if is_app_tab { "Close web surface (Ctrl+C to the app)" } else { "Close tab" },
+                                                                    onclick: move |evt| {
+                                                                        evt.stop_propagation();
+                                                                        if is_app_tab {
+                                                                            let close_path = close_path.clone();
+                                                                            let endpoint = state.read().bootstrap.server_endpoint.clone();
+                                                                            state.with_mut(|shell| { shell.close_web_surface(&close_path); });
+                                                                            spawn(async move {
+                                                                                let _ = terminal_write_async(endpoint, close_path, "\u{3}".to_string()).await;
+                                                                            });
+                                                                        } else {
+                                                                            state.with_mut(|shell| { shell.web_surface_close_tab(&close_path, tab_id); });
+                                                                        }
+                                                                    },
+                                                                    "✕"
+                                                                }
+                                                            }
+                                                        }
+                                                    })}
+                                                }
+                                            }
+                                        })}
+                                        button {
+                                            style: format!(
+                                                "display:flex; align-items:center; gap:6px; width:100%; margin-top:4px; padding:6px 8px 6px 18px; \
+                                                 border:none; background:transparent; color:{}; cursor:pointer; font-size:12px; opacity:0.8; border-radius:7px;",
+                                                theme.foreground,
+                                            ),
+                                            title: "New tab",
+                                            onclick: {
+                                                let new_path = pane_path.clone();
+                                                let mini_id = mini_id.clone();
+                                                move |_| {
+                                                    state.with_mut(|shell| { shell.web_surface_new_tab(&new_path); });
+                                                    let _ = document::eval(&format!(
+                                                        "setTimeout(() => {{ const el = document.getElementById({mini_id:?}); if (el) {{ el.focus(); if (el.select) el.select(); }} }}, 60);"
+                                                    ));
+                                                }
+                                            },
+                                            "+ New tab"
+                                        }
+                                    }
+                                    // Extension slot: the browser affordances that
+                                    // are not tabs. History today; room for more.
+                                    div {
+                                        style: "display:flex; gap:4px; align-items:center; padding:7px 10px; border-top:1px solid rgba(127,127,127,0.2);",
+                                        button {
+                                            style: format!(
+                                                "border:none; background:transparent; color:{}; cursor:pointer; font-size:14px; line-height:1; padding:4px 7px; border-radius:6px;",
+                                                theme.foreground,
+                                            ),
+                                            title: "History",
+                                            onclick: {
+                                                let hist_path = pane_path.clone();
+                                                let hist_ssh = pane_ssh.clone();
+                                                let hist_profile = pane_profile.clone();
+                                                move |_| {
+                                                    navigate_web_surface_tab(
+                                                        state, hist_path.clone(), active_tab_id,
+                                                        web_history_data_url(&hist_profile), hist_ssh.clone(), None,
+                                                    );
+                                                }
+                                            },
+                                            "🕘"
+                                        }
+                                        span { style: "font-size:10.5px; opacity:0.5; letter-spacing:0.03em;", "EXTENSIONS" }
+                                    }
+                                }
+                            }
+                        })}
                         // Tab strip: a translucent tint over the page
                         // background so the ACTIVE tab (painted solid page
                         // color) visibly merges into the nav bar below while
@@ -63802,7 +64058,15 @@ fn TerminalCanvas(
                             // align-items:stretch + centered content in every
                             // child = tabs, per-tab ✕, "+" and the surface ✕
                             // all share ONE vertical center line.
-                            style: "display:flex; align-items:stretch; gap:2px; padding:6px 8px 0; min-height:35px; box-sizing:border-box; background:rgba(127,127,127,0.16); user-select:none; overflow:hidden;",
+                            // Top tab bar. In vertical-tabs mode it collapses
+                            // away (max-height→0) — the tabs live in the left pane.
+                            style: format!(
+                                "display:flex; align-items:stretch; gap:2px; padding:{}; {} box-sizing:border-box; \
+                                 background:rgba(127,127,127,0.16); user-select:none; overflow:hidden; \
+                                 transition:max-height 0.18s ease, padding 0.18s ease;",
+                                if web_overlay.vertical_tabs { "0 8px" } else { "6px 8px 0" },
+                                if web_overlay.vertical_tabs { "max-height:0; min-height:0;" } else { "max-height:60px; min-height:35px;" },
+                            ),
                             {web_overlay.tabs.iter().map(|tab| {
                                 let tab_id = tab.id;
                                 let tab_label = tab.label.clone();
@@ -63908,6 +64172,20 @@ fn TerminalCanvas(
                                 "+"
                             }
                             span { style: "flex:1 1 auto;" }
+                            // Switch to vertical tabs: tabs move to a left pane
+                            // and this top bar collapses. Persisted preference.
+                            button {
+                                style: format!(
+                                    "display:flex; align-items:center; border:none; background:transparent; color:{}; cursor:pointer; \
+                                     font-size:13px; line-height:1; padding:0 7px; opacity:0.75; flex:0 0 auto;",
+                                    theme.foreground,
+                                ),
+                                title: "Vertical tabs",
+                                onclick: move |_| {
+                                    state.with_mut(|shell| shell.toggle_web_surface_vertical_tabs());
+                                },
+                                "⊟"
+                            }
                             // Standard libyggterm app chrome (top-right
                             // cluster): Zzz suspends the app to its terminal
                             // (Ctrl+Z — `fg` re-opens the surface, the app
@@ -63982,6 +64260,7 @@ fn TerminalCanvas(
                             let forward_target = web_overlay.forward_target.clone();
                             let address_text = web_overlay.address_text.clone();
                             let address_editing = web_overlay.address_editing;
+                            let vertical_tabs = web_overlay.vertical_tabs;
                             let suggestions = web_overlay.address_suggestions.clone();
                             let suggestion_index = web_overlay.address_suggestion_index;
                             // Dropdown rows: 0 = the synthesized go/search row
@@ -64006,9 +64285,15 @@ fn TerminalCanvas(
                             let reload_style = nav_button_style(true);
                             rsx! {
                                 div {
+                                    // The address/nav bar. Collapses in vertical
+                                    // mode — the mini-omnibox in the left pane
+                                    // takes over.
                                     style: format!(
-                                        "display:flex; align-items:center; gap:4px; padding:6px 10px; background:{}; user-select:none;",
+                                        "display:flex; align-items:center; gap:4px; padding:{}; background:{}; user-select:none; \
+                                         overflow:hidden; transition:max-height 0.18s ease, padding 0.18s ease; {}",
+                                        if vertical_tabs { "0 10px" } else { "6px 10px" },
                                         theme.background,
+                                        if vertical_tabs { "max-height:0;" } else { "max-height:60px;" },
                                     ),
                                     button {
                                         style: "{back_style}",
@@ -86108,6 +86393,36 @@ mod tests {
         ];
         std::fs::write(&path, render_web_history_page(&entries)).expect("write dump");
         println!("wrote history page to {path}");
+    }
+
+    // The vertical-tabs tree groups by domain in first-appearance order, tabs
+    // keeping their order within a domain — deterministic, cwd-tree grammar.
+    #[test]
+    fn web_surface_tab_tree_groups_by_domain_in_order() {
+        let tab = |id: u64, url: &str, active: bool| WebSurfaceOverlayTabView {
+            id,
+            label: url.to_string(),
+            is_app_tab: id == 1,
+            effective_url: url.to_string(),
+            active,
+        };
+        let tabs = vec![
+            tab(1, "https://github.com/a", true),
+            tab(2, "https://news.ycombinator.com/", false),
+            tab(3, "https://github.com/b", false),
+            tab(4, "https://github.com/c", false),
+        ];
+        let tree = web_surface_tab_tree(&tabs);
+        // github.com appears first (its first tab is tab 1), then HN.
+        assert_eq!(tree.len(), 2);
+        assert_eq!(tree[0].domain, "github.com");
+        assert_eq!(
+            tree[0].tabs.iter().map(|t| t.id).collect::<Vec<_>>(),
+            vec![1, 3, 4],
+            "tabs keep their order within a domain"
+        );
+        assert_eq!(tree[1].domain, "news.ycombinator.com");
+        assert_eq!(tree[1].tabs.len(), 1);
     }
 
     // The omnibox must relabel the internal page, never show the base64 blob.
