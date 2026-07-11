@@ -164,6 +164,7 @@ use yggterm_core::{
     resolve_yggterm_home, save_settings_file, spawn_terminal_telemetry_event,
     terminal_telemetry_db_path, unique_session_short_ids_for_pairs, update_command_hint,
 };
+use crate::command_registry::{self, Keymap, Resolution, ShellCommand, spec_for_id};
 use yggterm_platform::{DockRect, configure_background_service_command, send_user_notification};
 #[cfg(unix)]
 use yggterm_server::local_daemon_socket_should_be_removed_for_spawn;
@@ -2843,6 +2844,21 @@ struct ShellState {
     titlebar_maximize_toggle_request_at_ms: u64,
     alt_overlay_active: bool,
     alt_overlay_sequence: String,
+    /// The ALT+ KeyTips keymap in force (Excel-familiar defaults ∪ the user's
+    /// `~/.yggterm/keymap.json` overrides). SSOT for the letters; the registry
+    /// (`command_registry`) is SSOT for the command structure. See
+    /// `[[campaign-alt-keytips-layer]]`.
+    keymap: Keymap,
+    /// The ALT+ keymap editor modal (Settings ▸ "Edit ALT+ keys") is open.
+    keymap_editor_open: bool,
+    /// A validation message from the last rejected rebind, shown in the modal.
+    keymap_editor_error: Option<String>,
+    /// A clean ALT tap (press+release with no intervening key) enters KeyTips.
+    /// This flags that an ALT press is still tap-eligible; any other key while
+    /// ALT is held clears it so a held ALT+key chord (readline Meta in a
+    /// terminal, an Excel-style direct chord on a GUI surface) never trips the
+    /// overlay. Window-level state, set from the tao keyboard handler.
+    alt_tap_candidate: bool,
     selected_tree_paths: HashSet<String>,
     user_collapsed_synthetic_paths: HashSet<String>,
     /// GUI-level split-view groups ([[campaign-split-view-groups]]). The single
@@ -3309,6 +3325,11 @@ struct RenderSnapshot {
     titlebar_overflow_menu_open: bool,
     alt_overlay_active: bool,
     alt_overlay_sequence: String,
+    /// The ALT+ keymap in force, so KeyTip badges read their letter from the
+    /// SSOT instead of hardcoding it — a remap moves badge and binding together.
+    keymap: Keymap,
+    keymap_editor_open: bool,
+    keymap_editor_error: Option<String>,
     selected_tree_paths: Vec<String>,
     context_menu_row: Option<BrowserRow>,
     context_menu_context_row: Option<BrowserRow>,
@@ -3960,26 +3981,10 @@ struct SearchCommandSuggestion {
     command: String,
     description: String,
 }
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum AltOverlayAction {
-    ToggleSidebar,
-    SetViewMode(WorkspaceViewMode),
-    ToggleConnect,
-    ToggleNotifications,
-    ToggleSettings,
-    ToggleMetadata,
-    ToggleFullscreen,
-    ToggleAlwaysOnTop,
-    OpenInsertMenu,
-    StartSession,
-    StartTerminal,
-}
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum AltOverlayResolution {
-    Pending(String),
-    Action(AltOverlayAction),
-    Invalid,
-}
+// The ALT+ KeyTips accelerator map is owned by `command_registry`; the shell
+// resolves a typed sequence through the in-force `Keymap` and dispatches the
+// resulting `ShellCommand` via `execute_shell_command`. There is no shell-local
+// copy of the letter→action table (SSOT = the registry).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TreeSelectionMode {
     Replace,
@@ -4461,6 +4466,10 @@ impl ShellState {
             titlebar_maximize_toggle_request_at_ms: 0,
             alt_overlay_active: false,
             alt_overlay_sequence: String::new(),
+            keymap: load_keymap_from_disk(),
+            keymap_editor_open: false,
+            keymap_editor_error: None,
+            alt_tap_candidate: false,
             selected_tree_paths: HashSet::new(),
             // Restored from settings so a user collapse of a machine/folder/
             // Live Sessions group survives GUI restarts (the auto-reveal
@@ -5139,6 +5148,9 @@ impl ShellState {
             titlebar_overflow_menu_open: self.titlebar_overflow_menu_open,
             alt_overlay_active: self.alt_overlay_active,
             alt_overlay_sequence: self.alt_overlay_sequence.clone(),
+            keymap: self.keymap.clone(),
+            keymap_editor_open: self.keymap_editor_open,
+            keymap_editor_error: self.keymap_editor_error.clone(),
             selected_tree_paths: self.selected_tree_paths.iter().cloned().collect(),
             context_menu_row: self.context_menu_row.clone(),
             context_menu_context_row: self.context_menu_context_row.clone(),
@@ -11977,6 +11989,72 @@ impl ShellState {
     fn clear_alt_overlay(&mut self) {
         self.alt_overlay_active = false;
         self.alt_overlay_sequence.clear();
+        self.alt_tap_candidate = false;
+    }
+    /// Open the ALT+ keymap editor modal (Settings ▸ "Edit ALT+ keys").
+    fn open_keymap_editor(&mut self) {
+        self.keymap_editor_open = true;
+        self.keymap_editor_error = None;
+    }
+    fn close_keymap_editor(&mut self) {
+        self.keymap_editor_open = false;
+        self.keymap_editor_error = None;
+    }
+    /// Rebind one command's KeyTip letter, writing through to the config file.
+    /// Rejects letters that collide with another command at the same chord level
+    /// or (for a top-level command) fall in Excel's reserved namespace; the
+    /// rejection is surfaced in the modal rather than silently dropped.
+    fn set_keymap_override(&mut self, command_id: &str, letter: char) {
+        let letter = letter.to_ascii_lowercase();
+        let Some(spec) = spec_for_id(command_id) else {
+            return;
+        };
+        if !letter.is_ascii_alphanumeric() {
+            self.keymap_editor_error =
+                Some("KeyTips must be a letter or digit.".to_string());
+            return;
+        }
+        if spec.parent.is_none() && command_registry::reserved_letter(letter) {
+            self.keymap_editor_error = Some(format!(
+                "‘{}’ is reserved for apps (Excel's ribbon). Pick another.",
+                letter.to_ascii_uppercase()
+            ));
+            return;
+        }
+        // Reject a clash with a sibling at the same chord level.
+        let parent = spec.parent;
+        let clash = command_registry::SHELL_COMMANDS.iter().any(|other| {
+            other.id != command_id
+                && other.parent == parent
+                && self.keymap.keytip_for_id(other.id) == Some(letter)
+        });
+        if clash {
+            self.keymap_editor_error = Some(format!(
+                "‘{}’ is already used at this level.",
+                letter.to_ascii_uppercase()
+            ));
+            return;
+        }
+        let mut overrides: Vec<(String, char)> = self
+            .keymap
+            .overrides()
+            .iter()
+            .map(|(id, ch)| (id.clone(), *ch))
+            .collect();
+        overrides.retain(|(id, _)| id != command_id);
+        // Only record an override when it differs from the default.
+        if spec.default_keytip != Some(letter) {
+            overrides.push((command_id.to_string(), letter));
+        }
+        self.keymap = Keymap::from_overrides(overrides);
+        self.keymap_editor_error = None;
+        save_keymap_to_disk(&self.keymap);
+    }
+    /// Reset the whole ALT+ layer to the Excel-familiar preset.
+    fn reset_keymap(&mut self) {
+        self.keymap = Keymap::defaults();
+        self.keymap_editor_error = None;
+        save_keymap_to_disk(&self.keymap);
     }
     fn push_notification(
         &mut self,
@@ -20455,6 +20533,56 @@ fn spawn_start_terminal_session(state: Signal<ShellState>) {
     spawn_start_terminal_session_for_row(state, None);
 }
 
+/// Cycle the active viewport to the next/previous LIVE session, wrapping at the
+/// ends. This is `session.next` / `session.prev` (Ctrl+Alt+PgDn / Ctrl+Alt+PgUp
+/// — the session layer of the nav pair; Ctrl+PgUp/PgDn belongs to the focused
+/// app's own tab layer). The live-session order matches the Live Sessions
+/// sidebar group. A no-op when there is nowhere else to go.
+fn spawn_switch_live_session(state: Signal<ShellState>, forward: bool) {
+    let target_row = state.with(|shell| {
+        let paths: Vec<String> = shell
+            .server
+            .live_session_views()
+            .iter()
+            .map(|session| normalize_live_session_path(&session.session_path))
+            .collect();
+        if paths.is_empty() {
+            return None;
+        }
+        let active = shell
+            .server
+            .active_session_path()
+            .map(normalize_live_session_path);
+        let current = active
+            .as_ref()
+            .and_then(|active| paths.iter().position(|path| path == active));
+        let count = paths.len() as isize;
+        let next_index = match current {
+            Some(index) => {
+                let delta = if forward { 1 } else { -1 };
+                (((index as isize + delta) % count + count) % count) as usize
+            }
+            // Not currently on a live session (e.g. start page): step onto the
+            // first (forward) or last (backward) one.
+            None => {
+                if forward {
+                    0
+                } else {
+                    paths.len() - 1
+                }
+            }
+        };
+        let target = paths[next_index].clone();
+        if active.as_deref() == Some(target.as_str()) {
+            return None;
+        }
+        synthesize_app_control_row(shell, &target)
+    });
+    if let Some(row) = target_row {
+        spawn_open_session_row(state, row);
+    }
+}
+
 fn spawn_start_terminal_session_for_row(
     mut state: Signal<ShellState>,
     explicit_row: Option<BrowserRow>,
@@ -22470,13 +22598,18 @@ fn titlebar_autohide_pinned_flags(
         || titlebar_overflow_menu_open
 }
 fn titlebar_autohide_pinned(snapshot: &RenderSnapshot) -> bool {
-    titlebar_autohide_pinned_flags(
-        snapshot.search_focused,
-        titlebar_search_dropdown_open(snapshot),
-        snapshot.titlebar_new_menu_open,
-        snapshot.titlebar_session_menu_open,
-        snapshot.titlebar_overflow_menu_open,
-    )
+    // KeyTips need the affordances they annotate on screen: when the overlay is
+    // up, pin the auto-hidden titlebar in so its `+`/sidebar/utility hints are
+    // visible (spec decision c — "titlebar auto-hide must pop in when the mode
+    // engages"; hints on an invisible affordance are useless).
+    snapshot.alt_overlay_active
+        || titlebar_autohide_pinned_flags(
+            snapshot.search_focused,
+            titlebar_search_dropdown_open(snapshot),
+            snapshot.titlebar_new_menu_open,
+            snapshot.titlebar_session_menu_open,
+            snapshot.titlebar_overflow_menu_open,
+        )
 }
 fn titlebar_autohide_revealed(
     auto_hide_enabled: bool,
@@ -23856,84 +23989,172 @@ fn search_command_suggestions(query: &str) -> Vec<SearchCommandSuggestion> {
         })
         .collect()
 }
-fn resolve_alt_overlay_sequence(sequence: &str) -> AltOverlayResolution {
-    match sequence {
-        "" => AltOverlayResolution::Pending(String::new()),
-        "b" => AltOverlayResolution::Action(AltOverlayAction::ToggleSidebar),
-        "v" => {
-            AltOverlayResolution::Action(AltOverlayAction::SetViewMode(WorkspaceViewMode::Rendered))
-        }
-        "t" => {
-            AltOverlayResolution::Action(AltOverlayAction::SetViewMode(WorkspaceViewMode::Terminal))
-        }
-        "c" => AltOverlayResolution::Action(AltOverlayAction::ToggleConnect),
-        "n" => AltOverlayResolution::Action(AltOverlayAction::ToggleNotifications),
-        "g" => AltOverlayResolution::Action(AltOverlayAction::ToggleSettings),
-        "m" => AltOverlayResolution::Action(AltOverlayAction::ToggleMetadata),
-        "f" => AltOverlayResolution::Action(AltOverlayAction::ToggleFullscreen),
-        "a" => AltOverlayResolution::Action(AltOverlayAction::ToggleAlwaysOnTop),
-        "i" => AltOverlayResolution::Action(AltOverlayAction::OpenInsertMenu),
-        "is" => AltOverlayResolution::Action(AltOverlayAction::StartSession),
-        "it" => AltOverlayResolution::Action(AltOverlayAction::StartTerminal),
-        _ => AltOverlayResolution::Invalid,
+/// Move keyboard focus to the shell root when KeyTips open so the chord keys
+/// land on the root `onkeydown` (which can `prevent_default`) instead of a
+/// focused terminal's helper textarea — otherwise a chord letter would both walk
+/// the overlay AND get typed into the PTY.
+fn focus_shell_root_for_keytips() {
+    let _ = document::eval(
+        "(function(){ const root = document.getElementById('yggterm-shell-root'); \
+         if (root && root.focus) { try { root.focus({preventScroll:true}); } catch(_e){} } })();",
+    );
+}
+/// `~/.yggterm/keymap.json` — the directly-editable ALT+ keymap override file.
+fn keymap_config_path() -> Option<std::path::PathBuf> {
+    yggterm_core::resolve_yggterm_home()
+        .ok()
+        .map(|home| home.join("keymap.json"))
+}
+/// Load the in-force keymap: the Excel-familiar preset with the user's overrides
+/// from `~/.yggterm/keymap.json` applied. Any read/parse failure falls back to
+/// the pure preset — a corrupt config never bricks the accelerators.
+fn load_keymap_from_disk() -> Keymap {
+    let Some(path) = keymap_config_path() else {
+        return Keymap::defaults();
+    };
+    match std::fs::read_to_string(&path) {
+        Ok(text) => parse_keymap_config(&text),
+        Err(_) => Keymap::defaults(),
     }
 }
-fn alt_overlay_badge_visible(snapshot: &RenderSnapshot, prefix: &str) -> bool {
-    snapshot.alt_overlay_active && snapshot.alt_overlay_sequence == prefix
+/// Parse `{ "version": 1, "bindings": { "<command-id>": "<letter>" } }`.
+fn parse_keymap_config(text: &str) -> Keymap {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(text) else {
+        return Keymap::defaults();
+    };
+    let mut entries: Vec<(String, char)> = Vec::new();
+    if let Some(bindings) = value.get("bindings").and_then(|b| b.as_object()) {
+        for (id, letter) in bindings {
+            if let Some(ch) = letter.as_str().and_then(|s| s.chars().next()) {
+                entries.push((id.clone(), ch));
+            }
+        }
+    }
+    Keymap::from_overrides(entries)
 }
-fn execute_alt_overlay_action(mut state: Signal<ShellState>, action: AltOverlayAction) {
-    match action {
-        AltOverlayAction::ToggleSidebar => state.with_mut(|shell| {
+/// Persist the keymap's overrides (sparse — only the letters that differ from
+/// the preset) so the config stays a small, hand-editable diff over the default.
+fn save_keymap_to_disk(keymap: &Keymap) {
+    let Some(path) = keymap_config_path() else {
+        return;
+    };
+    let bindings: serde_json::Map<String, serde_json::Value> = keymap
+        .overrides()
+        .iter()
+        .map(|(id, ch)| (id.clone(), serde_json::Value::String(ch.to_string())))
+        .collect();
+    let doc = serde_json::json!({ "version": 1, "bindings": bindings });
+    if let Ok(text) = serde_json::to_string_pretty(&doc) {
+        let _ = std::fs::write(&path, text);
+    }
+}
+/// The KeyTip letter (uppercased for display) to paint on the affordance for
+/// `command_id`, or `None` when the overlay is not showing this command's level.
+///
+/// A command's badge appears exactly when the overlay is active AND the typed
+/// chord so far equals the command's PARENT chord — so top-level badges show at
+/// the root (`""`) and the insert submenu's badges show once `i` is pressed.
+/// The letter itself comes from the in-force keymap, so a user remap moves the
+/// badge and the binding together (SSOT).
+fn keytip_badge(snapshot: &RenderSnapshot, command_id: &str) -> Option<char> {
+    if !snapshot.alt_overlay_active {
+        return None;
+    }
+    let spec = spec_for_id(command_id)?;
+    let parent_chord = match spec.parent {
+        Some(parent) => snapshot.keymap.chord_for_id(parent)?,
+        None => String::new(),
+    };
+    if snapshot.alt_overlay_sequence != parent_chord {
+        return None;
+    }
+    snapshot
+        .keymap
+        .keytip_for_id(command_id)
+        .map(|letter| letter.to_ascii_uppercase())
+}
+/// Dispatch a registry command. Every ALT+ KeyTip, the `command invoke <id>`
+/// probe, and the settings modal funnel through here — one action per command.
+fn execute_shell_command(mut state: Signal<ShellState>, command: ShellCommand) {
+    match command {
+        ShellCommand::ToggleSidebar => state.with_mut(|shell| {
             shell.clear_alt_overlay();
             shell.toggle_sidebar();
         }),
-        AltOverlayAction::SetViewMode(mode) => {
+        ShellCommand::ViewWeb => {
             state.with_mut(|shell| shell.clear_alt_overlay());
-            spawn_set_view_mode(state, mode);
+            spawn_set_view_mode(state, WorkspaceViewMode::Rendered);
         }
-        AltOverlayAction::ToggleConnect => state.with_mut(|shell| {
+        ShellCommand::ViewTerminal => {
+            state.with_mut(|shell| shell.clear_alt_overlay());
+            spawn_set_view_mode(state, WorkspaceViewMode::Terminal);
+        }
+        ShellCommand::ToggleConnect => state.with_mut(|shell| {
             shell.clear_alt_overlay();
             shell.toggle_connect_panel();
         }),
-        AltOverlayAction::ToggleNotifications => state.with_mut(|shell| {
+        ShellCommand::ToggleNotifications => state.with_mut(|shell| {
             shell.clear_alt_overlay();
             shell.toggle_notifications_panel();
         }),
-        AltOverlayAction::ToggleSettings => state.with_mut(|shell| {
+        ShellCommand::ToggleSettings => state.with_mut(|shell| {
             shell.clear_alt_overlay();
             shell.toggle_settings_panel();
         }),
-        AltOverlayAction::ToggleMetadata => state.with_mut(|shell| {
+        ShellCommand::ToggleMetadata => state.with_mut(|shell| {
             shell.clear_alt_overlay();
             shell.toggle_metadata_panel();
         }),
-        AltOverlayAction::ToggleFullscreen => state.with_mut(|shell| {
+        ShellCommand::ToggleFullscreen => state.with_mut(|shell| {
             shell.clear_alt_overlay();
             shell.toggle_fullscreen();
         }),
-        AltOverlayAction::ToggleAlwaysOnTop => state.with_mut(|shell| {
+        ShellCommand::ToggleAlwaysOnTop => state.with_mut(|shell| {
             shell.clear_alt_overlay();
             shell.toggle_always_on_top();
         }),
-        AltOverlayAction::OpenInsertMenu => state.with_mut(|shell| {
-            shell.alt_overlay_active = true;
-            shell.alt_overlay_sequence = "i".to_string();
-            shell.titlebar_session_menu_open = false;
-            shell.titlebar_new_menu_open = true;
+        ShellCommand::OpenKeymapEditor => state.with_mut(|shell| {
+            shell.clear_alt_overlay();
+            shell.open_keymap_editor();
         }),
-        AltOverlayAction::StartSession => {
+        ShellCommand::OpenInsertMenu => {
+            // Both an action and a chord node: open the New… menu AND descend a
+            // level so the submenu's KeyTips paint. Park the overlay at the
+            // insert chord (keymap-derived, not the hardcoded "i").
+            let insert_chord = state
+                .read()
+                .keymap
+                .chord_for_id("insert.menu")
+                .unwrap_or_default();
+            state.with_mut(|shell| {
+                shell.alt_overlay_active = true;
+                shell.alt_overlay_sequence = insert_chord;
+                shell.titlebar_session_menu_open = false;
+                shell.titlebar_new_menu_open = true;
+            });
+        }
+        ShellCommand::InsertSession => {
+            state.with_mut(|shell| shell.clear_alt_overlay());
             spawn_start_preferred_agent_session(state);
         }
-        AltOverlayAction::StartTerminal => {
+        ShellCommand::InsertTerminal => {
+            state.with_mut(|shell| shell.clear_alt_overlay());
             spawn_start_terminal_session(state);
+        }
+        ShellCommand::NextSession => {
+            state.with_mut(|shell| shell.clear_alt_overlay());
+            spawn_switch_live_session(state, true);
+        }
+        ShellCommand::PrevSession => {
+            state.with_mut(|shell| shell.clear_alt_overlay());
+            spawn_switch_live_session(state, false);
         }
     }
 }
 fn handle_alt_overlay_key(mut state: Signal<ShellState>, key: Key) -> bool {
-    if key == Key::Alt {
-        state.with_mut(|shell| shell.activate_alt_overlay());
-        return true;
-    }
+    // Clean-tap activation lives in the window-level keyboard handler; this DOM
+    // handler only WALKS the chord once the overlay is already up, so it never
+    // swallows an ALT press that a terminal wants as Meta.
     if !state.read().alt_overlay_active {
         return false;
     }
@@ -23944,27 +24165,25 @@ fn handle_alt_overlay_key(mut state: Signal<ShellState>, key: Key) -> bool {
     let Key::Character(chars) = key else {
         return false;
     };
-    let next_sequence = {
+    let (next_sequence, resolution) = {
         let shell = state.read();
-        format!(
-            "{}{}",
-            shell.alt_overlay_sequence,
-            chars.to_ascii_lowercase()
-        )
+        let next = format!("{}{}", shell.alt_overlay_sequence, chars.to_ascii_lowercase());
+        let resolution = shell.keymap.resolve(&next);
+        (next, resolution)
     };
-    match resolve_alt_overlay_sequence(&next_sequence) {
-        AltOverlayResolution::Pending(sequence) => {
+    match resolution {
+        Resolution::Pending => {
             state.with_mut(|shell| {
                 shell.alt_overlay_active = true;
-                shell.alt_overlay_sequence = sequence;
+                shell.alt_overlay_sequence = next_sequence;
             });
             true
         }
-        AltOverlayResolution::Action(action) => {
-            execute_alt_overlay_action(state, action);
+        Resolution::Command(command) => {
+            execute_shell_command(state, command);
             true
         }
-        AltOverlayResolution::Invalid => {
+        Resolution::Invalid => {
             state.with_mut(|shell| shell.clear_alt_overlay());
             true
         }
@@ -43030,6 +43249,59 @@ async fn process_pending_app_control_requests(
             data: Some(describe_app_rows_snapshot(&state)),
             error: None,
         },
+        AppControlCommand::ListCommands => {
+            let keymap = state.read().keymap.clone();
+            let commands: Vec<Value> = command_registry::SHELL_COMMANDS
+                .iter()
+                .map(|spec| {
+                    json!({
+                        "id": spec.id,
+                        "title": spec.title,
+                        "keytip": spec.default_keytip.map(|c| c.to_string()),
+                        "chord": keymap.chord_for_id(spec.id),
+                        "parent": spec.parent,
+                    })
+                })
+                .collect();
+            AppControlResponse {
+                request_id: request.request_id.clone(),
+                handled_by_pid: std::process::id(),
+                completed_at_ms: current_millis() as u128,
+                output_path: None,
+                data: Some(json!({
+                    "command": "list_commands",
+                    "commands": commands,
+                })),
+                error: None,
+            }
+        }
+        AppControlCommand::InvokeCommand { id } => {
+            let resolved = spec_for_id(&id).map(|spec| spec.command);
+            let error = match resolved {
+                Some(command) => {
+                    execute_shell_command(state, command);
+                    None
+                }
+                None => Some(format!(
+                    "unknown command id `{id}` (try `server app command list`)"
+                )),
+            };
+            sleep(Duration::from_millis(40)).await;
+            AppControlResponse {
+                request_id: request.request_id.clone(),
+                handled_by_pid: std::process::id(),
+                completed_at_ms: current_millis() as u128,
+                output_path: None,
+                data: Some(json!({
+                    "command": "invoke_command",
+                    "id": id,
+                    "invoked": resolved.is_some(),
+                    "right_panel_mode": right_panel_mode_label(&state.read().right_panel_mode),
+                    "active_view_mode": format!("{:?}", state.read().server.active_view_mode()),
+                })),
+                error,
+            }
+        }
         AppControlCommand::DescribeState => AppControlResponse {
             request_id: request.request_id.clone(),
             handled_by_pid: std::process::id(),
@@ -45345,12 +45617,11 @@ fn app() -> Element {
         if let TaoEvent::WindowEvent { event, .. } = event {
             match event {
                 DesktopWindowEvent::KeyboardInput { event, .. } => {
-                    let is_alt_press = event.state == ElementState::Pressed
-                        && (event.logical_key == TaoKey::Alt
-                            || matches!(
-                                event.physical_key,
-                                TaoKeyCode::AltLeft | TaoKeyCode::AltRight
-                            ));
+                    let is_alt = event.logical_key == TaoKey::Alt
+                        || matches!(
+                            event.physical_key,
+                            TaoKeyCode::AltLeft | TaoKeyCode::AltRight
+                        );
                     // Only a key that drives an APP-LEVEL action (alt overlay,
                     // escape-cancel-delete, delete-from-tree) needs to re-render
                     // the root. Plain character input is handled entirely by
@@ -45359,9 +45630,39 @@ fn app() -> Element {
                     // trace: ~half of the ~23 whole-tree renders/s while a key is
                     // held). Gate the bump on a real action.
                     let mut app_action_handled = false;
-                    if is_alt_press {
-                        state.with_mut(|shell| shell.activate_alt_overlay());
-                        app_action_handled = true;
+                    // Clean-tap KeyTips (spec decision c): a press+release of ALT
+                    // with NO intervening key opens the overlay. Opening on the
+                    // RELEASE (not the press) is what lets a held ALT+<key> chord
+                    // — a terminal's Meta prefix (readline/emacs/helix), a future
+                    // app's direct chord — pass through untouched: the first
+                    // non-ALT key cancels tap candidacy, so the overlay never trips.
+                    match event.state {
+                        ElementState::Pressed if is_alt => {
+                            if !state.read().alt_overlay_active
+                                && !state.read().alt_tap_candidate
+                            {
+                                state.with_mut(|shell| shell.alt_tap_candidate = true);
+                            }
+                        }
+                        ElementState::Pressed => {
+                            if state.read().alt_tap_candidate {
+                                state.with_mut(|shell| shell.alt_tap_candidate = false);
+                            }
+                        }
+                        ElementState::Released if is_alt => {
+                            let fire = state.with_mut(|shell| {
+                                let fire =
+                                    shell.alt_tap_candidate && !shell.alt_overlay_active;
+                                shell.alt_tap_candidate = false;
+                                fire
+                            });
+                            if fire {
+                                state.with_mut(|shell| shell.activate_alt_overlay());
+                                focus_shell_root_for_keytips();
+                                app_action_handled = true;
+                            }
+                        }
+                        _ => {}
                     }
                     if event.state == ElementState::Pressed
                         && (event.logical_key == TaoKey::Escape
@@ -45393,13 +45694,37 @@ fn app() -> Element {
                     state.with_mut(|shell| {
                         sync_window_frame_state(shell);
                         shell.set_window_focused(*focused);
+                        // KeyTips exit on focus change (spec decision c): a mode
+                        // that survived an Alt+Tab away would paint hints over a
+                        // window the user is no longer driving.
+                        if !*focused && (shell.alt_overlay_active || shell.alt_tap_candidate) {
+                            shell.clear_alt_overlay();
+                        }
                     });
                     sync_active_terminal_input_policy(state);
                     window_epoch.with_mut(|epoch| *epoch += 1);
                 }
                 DesktopWindowEvent::ModifiersChanged(modifiers) => {
+                    // On GTK the ALT key arrives here (a modifier change), not as a
+                    // `KeyboardInput` event, so this is the PRIMARY clean-tap
+                    // driver: arm candidacy on alt-down, fire on alt-up if it
+                    // survived. A held ALT+<key> chord still cancels because the
+                    // intervening key IS a `KeyboardInput` press (it clears the
+                    // candidate) — so the terminal Meta passthrough is preserved.
                     if modifiers.alt_key() {
-                        state.with_mut(|shell| shell.activate_alt_overlay());
+                        if !state.read().alt_overlay_active && !state.read().alt_tap_candidate {
+                            state.with_mut(|shell| shell.alt_tap_candidate = true);
+                        }
+                    } else {
+                        let fire = state.with_mut(|shell| {
+                            let fire = shell.alt_tap_candidate && !shell.alt_overlay_active;
+                            shell.alt_tap_candidate = false;
+                            fire
+                        });
+                        if fire {
+                            state.with_mut(|shell| shell.activate_alt_overlay());
+                            focus_shell_root_for_keytips();
+                        }
                     }
                     window_epoch.with_mut(|epoch| *epoch += 1);
                 }
@@ -46389,6 +46714,19 @@ fn app() -> Element {
                 }
                 let is_accel = evt.modifiers().contains(Modifiers::CONTROL)
                     || evt.modifiers().contains(Modifiers::META);
+                // Ctrl+Alt+PageUp/PageDown switches LIVE SESSIONS (spec decision
+                // b). The plain Ctrl+PageUp/PageDown pair is deliberately NOT
+                // taken here — it belongs to the focused app's tab layer (ychrome
+                // tabs, Cellulose sheets) and may fall through to a plain
+                // terminal. Only the Alt-qualified pair is a session accelerator.
+                if is_accel
+                    && evt.modifiers().contains(Modifiers::ALT)
+                    && matches!(evt.key(), Key::PageUp | Key::PageDown)
+                {
+                    evt.prevent_default();
+                    spawn_switch_live_session(state, matches!(evt.key(), Key::PageDown));
+                    return;
+                }
                 if is_accel
                     && evt.modifiers().contains(Modifiers::SHIFT)
                     && matches!(evt.key(), Key::Character(ref key) if key.eq_ignore_ascii_case("p"))
@@ -46482,6 +46820,11 @@ fn app() -> Element {
                     return;
                 }
                 if evt.key() == Key::Escape {
+                    if state.read().keymap_editor_open {
+                        evt.prevent_default();
+                        state.with_mut(|shell| shell.close_keymap_editor());
+                        return;
+                    }
                     if state.read().pending_delete.is_some() {
                         evt.prevent_default();
                         state.with_mut(|shell| shell.cancel_delete_dialog());
@@ -46557,6 +46900,197 @@ fn app() -> Element {
             style { "{TOAST_CSS}" }
             style { "{MENU_SURFACE_CSS}" }
             style { "{shell_document_css}" }
+            // KeyTips chord breadcrumb: shows the leader + the chord typed so far
+            // while the ALT+ overlay is up (Excel's "ALT, then H, then …" trail).
+            if snapshot.alt_overlay_active {
+                div {
+                    "data-yggterm-keytip-breadcrumb": "1",
+                    style: format!(
+                        "position:absolute; top:8px; left:50%; transform:translateX(-50%); z-index:400; \
+                         display:flex; align-items:center; gap:8px; padding:5px 13px; border-radius:999px; \
+                         background:rgba(95,168,255,0.16); box-shadow: inset 0 0 0 1px rgba(95,168,255,0.42); \
+                         color:{}; font-size:11px; font-weight:800; letter-spacing:0.3px; pointer-events:none; \
+                         white-space:nowrap;",
+                        snapshot.palette.accent,
+                    ),
+                    span { "⌨ ALT" }
+                    if !snapshot.alt_overlay_sequence.is_empty() {
+                        span { style: "opacity:0.55;", "›" }
+                        span { "{snapshot.alt_overlay_sequence.to_uppercase()}" }
+                    }
+                    span {
+                        style: format!("opacity:0.62; font-weight:600; color:{};", snapshot.palette.muted),
+                        "· press a highlighted key · Esc to exit"
+                    }
+                }
+            }
+            // The ALT+ keymap editor modal (Settings ▸ "Explore & edit KeyTips").
+            // Another VIEW of the command registry: rebinds write through to
+            // `~/.yggterm/keymap.json` and re-render every KeyTip badge.
+            if snapshot.keymap_editor_open {
+                {
+                    let palette = snapshot.palette;
+                    let dark = palette_is_dark(palette);
+                    let keymap = snapshot.keymap.clone();
+                    let error = snapshot.keymap_editor_error.clone();
+                    rsx! {
+                        div {
+                            "data-keytips-editor-modal": "1",
+                            style: "position:absolute; inset:0; z-index:500; display:flex; align-items:center; \
+                                    justify-content:center; background:rgba(6,10,14,0.5); backdrop-filter:blur(2px);",
+                            onclick: move |_| state.with_mut(|shell| shell.close_keymap_editor()),
+                            div {
+                                style: format!(
+                                    "width:min(460px, 92vw); max-height:82vh; overflow:auto; display:flex; \
+                                     flex-direction:column; gap:12px; padding:18px; border-radius:16px; background:{}; \
+                                     box-shadow: 0 24px 60px rgba(0,0,0,0.32), inset 0 0 0 1px {};",
+                                    if dark { "rgba(18,24,30,0.99)" } else { "rgba(252,253,255,0.99)" },
+                                    if dark { "rgba(120,140,158,0.24)" } else { "rgba(198,212,224,0.7)" },
+                                ),
+                                onclick: move |evt| evt.stop_propagation(),
+                                div {
+                                    style: "display:flex; align-items:flex-start; justify-content:space-between; gap:12px;",
+                                    div {
+                                        style: "display:flex; flex-direction:column; gap:3px;",
+                                        div {
+                                            style: format!("font-size:15px; font-weight:800; color:{};", palette.text),
+                                            "ALT+ KeyTips"
+                                        }
+                                        div {
+                                            style: format!("font-size:11px; line-height:1.4; color:{};", palette.muted),
+                                            "Tap ALT, then a highlighted letter. Type a new letter to rebind."
+                                        }
+                                    }
+                                    button {
+                                        style: format!(
+                                            "border:none; background:transparent; color:{}; font-size:18px; \
+                                             cursor:pointer; line-height:1; padding:2px 6px;",
+                                            palette.muted
+                                        ),
+                                        onclick: move |_| state.with_mut(|shell| shell.close_keymap_editor()),
+                                        "✕"
+                                    }
+                                }
+                                if let Some(message) = error {
+                                    div {
+                                        style: "font-size:11px; font-weight:700; color:#c0433a; padding:7px 10px; \
+                                                border-radius:9px; background:rgba(214,90,80,0.12); \
+                                                box-shadow: inset 0 0 0 1px rgba(214,90,80,0.32);",
+                                        "{message}"
+                                    }
+                                }
+                                div {
+                                    style: "display:flex; flex-direction:column; gap:4px;",
+                                    for spec in command_registry::SHELL_COMMANDS.iter() {
+                                        {
+                                            let id = spec.id;
+                                            let chord = keymap.chord_for_id(id);
+                                            let leaf = keymap.keytip_for_id(id);
+                                            let nav_hint = match id {
+                                                "session.next" => Some("Ctrl+Alt+PgDn"),
+                                                "session.prev" => Some("Ctrl+Alt+PgUp"),
+                                                _ => None,
+                                            };
+                                            let row_letter = leaf.map(|c| c.to_string()).unwrap_or_default();
+                                            rsx! {
+                                                div {
+                                                    // Key includes the letter so a successful rebind REBUILDS the
+                                                    // row — its uncontrolled `initial_value` input then shows the
+                                                    // new letter without a controlled `value:` fighting the typing.
+                                                    key: "keytip-row-{id}-{row_letter}",
+                                                    style: format!(
+                                                        "display:flex; align-items:center; justify-content:space-between; gap:10px; \
+                                                         padding:7px 10px; border-radius:10px; background:{};",
+                                                        if dark { "rgba(255,255,255,0.03)" } else { "rgba(120,140,160,0.05)" },
+                                                    ),
+                                                    div {
+                                                        style: "display:flex; flex-direction:column; gap:1px; min-width:0;",
+                                                        span {
+                                                            style: format!("font-size:12px; font-weight:700; color:{};", palette.text),
+                                                            "{spec.title}"
+                                                        }
+                                                        span {
+                                                            style: format!("font-size:10px; color:{}; font-family:monospace;", palette.muted),
+                                                            "{id}"
+                                                        }
+                                                    }
+                                                    if let Some(hint) = nav_hint {
+                                                        span {
+                                                            style: format!(
+                                                                "font-size:10px; font-weight:700; color:{}; padding:3px 8px; border-radius:7px; \
+                                                                 background:rgba(95,168,255,0.12); white-space:nowrap;",
+                                                                palette.accent
+                                                            ),
+                                                            "{hint}"
+                                                        }
+                                                    } else if let Some(letter) = leaf {
+                                                        div {
+                                                            style: "display:flex; align-items:center; gap:6px;",
+                                                            if let Some(prefix) = chord.as_ref().and_then(|c| c.get(..c.len().saturating_sub(1))).filter(|p| !p.is_empty()) {
+                                                                span {
+                                                                    style: format!("font-size:10px; color:{}; font-weight:700;", palette.muted),
+                                                                    "ALT {prefix.to_uppercase()} ›"
+                                                                }
+                                                            } else {
+                                                                span {
+                                                                    style: format!("font-size:10px; color:{}; font-weight:700;", palette.muted),
+                                                                    "ALT ›"
+                                                                }
+                                                            }
+                                                            input {
+                                                                r#type: "text",
+                                                                initial_value: "{letter.to_ascii_uppercase()}",
+                                                                style: format!(
+                                                                    "width:34px; height:30px; text-align:center; text-transform:uppercase; \
+                                                                     font-size:14px; font-weight:800; border-radius:8px; border:none; \
+                                                                     background:rgba(95,168,255,0.14); color:{}; \
+                                                                     box-shadow: inset 0 0 0 1px rgba(95,168,255,0.42);",
+                                                                    palette.accent
+                                                                ),
+                                                                onclick: move |evt| evt.stop_propagation(),
+                                                                // Select the existing letter on focus so a keystroke
+                                                                // REPLACES it (the field holds one letter at a time).
+                                                                onfocus: move |_| { let _ = document::eval("if(document.activeElement&&document.activeElement.select)document.activeElement.select();"); },
+                                                                oninput: move |evt| {
+                                                                    if let Some(ch) = evt.value().chars().rev().find(|c| c.is_ascii_alphanumeric()) {
+                                                                        state.with_mut(|shell| shell.set_keymap_override(id, ch));
+                                                                    }
+                                                                },
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                div {
+                                    style: "display:flex; align-items:center; justify-content:space-between; gap:10px; margin-top:2px;",
+                                    span {
+                                        style: format!("font-size:10px; color:{};", palette.muted),
+                                        "Saved to ~/.yggterm/keymap.json"
+                                    }
+                                    button {
+                                        "data-keytips-reset-button": "1",
+                                        style: format!(
+                                            "border:none; border-radius:9px; padding:7px 14px; font-size:11px; font-weight:800; \
+                                             cursor:pointer; background:{}; color:{}; box-shadow: inset 0 0 0 1px {};",
+                                            if dark { "rgba(21,28,35,0.94)" } else { "rgba(255,255,255,0.86)" },
+                                            palette.text,
+                                            if dark { "rgba(93,116,134,0.56)" } else { "rgba(208,219,229,0.85)" },
+                                        ),
+                                        onclick: move |evt| {
+                                            evt.stop_propagation();
+                                            state.with_mut(|shell| shell.reset_keymap());
+                                        },
+                                        "Reset to Excel preset"
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
             button {
                 id: TREE_DELETE_BUTTON_ID,
                 tabindex: "-1",
@@ -47305,6 +47839,7 @@ fn app() -> Element {
                                 apply_active_terminal_zoom(state);
                             },
                             on_open_theme_editor: move |_| state.with_mut(|shell| shell.open_theme_editor()),
+                            on_open_keymap_editor: move |_| state.with_mut(|shell| shell.open_keymap_editor()),
                             on_set_notification_delivery: move |mode: NotificationDeliveryMode| {
                                 state.with_mut(|shell| shell.update_notification_delivery(mode))
                             },
@@ -48119,10 +48654,10 @@ fn Titlebar(
                         },
                         ondoubleclick: |evt| evt.stop_propagation(),
                         onclick: move |_| on_toggle_sidebar.call(()),
-                        if alt_overlay_badge_visible(&snapshot, "") {
+                        if let Some(letter) = keytip_badge(&snapshot, "sidebar.toggle") {
                             span {
                                 style: "display:inline-flex; align-items:center; justify-content:center; min-width:16px; height:16px; padding:0 4px; border-radius:6px; background:rgba(95,168,255,0.14); color:#2667a9; font-size:9px; font-weight:800; margin-right:2px;",
-                                "B"
+                                "{letter}"
                             }
                         }
                         "☰"
@@ -48152,10 +48687,10 @@ fn Titlebar(
                             ),
                             ondoubleclick: |evt| evt.stop_propagation(),
                             onclick: move |_| on_set_view_mode.call(WorkspaceViewMode::Rendered),
-                            if alt_overlay_badge_visible(&snapshot, "") {
+                            if let Some(letter) = keytip_badge(&snapshot, "view.web") {
                                 span {
                                     style: "display:inline-flex; align-items:center; justify-content:center; min-width:16px; height:16px; padding:0 4px; border-radius:6px; background:rgba(95,168,255,0.14); color:#2667a9; font-size:9px; font-weight:800; margin-right:5px;",
-                                    "V"
+                                    "{letter}"
                                 }
                             }
                             "Web View"
@@ -48169,10 +48704,10 @@ fn Titlebar(
                             ),
                             ondoubleclick: |evt| evt.stop_propagation(),
                             onclick: move |_| on_set_view_mode.call(WorkspaceViewMode::Terminal),
-                            if alt_overlay_badge_visible(&snapshot, "") {
+                            if let Some(letter) = keytip_badge(&snapshot, "view.terminal") {
                                 span {
                                     style: "display:inline-flex; align-items:center; justify-content:center; min-width:16px; height:16px; padding:0 4px; border-radius:6px; background:rgba(95,168,255,0.14); color:#2667a9; font-size:9px; font-weight:800; margin-right:5px;",
-                                    "T"
+                                    "{letter}"
                                 }
                             }
                             "Terminal"
@@ -48206,10 +48741,10 @@ fn Titlebar(
                                         ),
                                     onmousedown: |evt| evt.stop_propagation(),
                                     onclick: move |_| on_toggle_new_menu.call(()),
-                                    if alt_overlay_badge_visible(&snapshot, "") {
+                                    if let Some(letter) = keytip_badge(&snapshot, "insert.menu") {
                                         span {
                                             style: "display:inline-flex; align-items:center; justify-content:center; min-width:16px; height:16px; padding:0 4px; border-radius:6px; background:rgba(95,168,255,0.14); color:#2667a9; font-size:9px; font-weight:800;",
-                                            "I"
+                                            "{letter}"
                                         }
                                     }
                                     "+"
@@ -48272,10 +48807,10 @@ fn Titlebar(
                                                 class: "yggterm-menu-item",
                                                 style: titlebar_new_action_style(snapshot.palette),
                                                 onclick: move |_| on_start_session.call(()),
-                                                if alt_overlay_badge_visible(&snapshot, "i") {
+                                                if let Some(letter) = keytip_badge(&snapshot, "insert.session") {
                                                     span {
                                                         style: "display:inline-flex; align-items:center; justify-content:center; min-width:16px; height:16px; padding:0 4px; border-radius:6px; background:rgba(95,168,255,0.14); color:#2667a9; font-size:9px; font-weight:800; margin-right:8px;",
-                                                        "S"
+                                                        "{letter}"
                                                     }
                                                 }
                                                 "New Session"
@@ -48292,10 +48827,10 @@ fn Titlebar(
                                                 class: "yggterm-menu-item",
                                                 style: titlebar_new_action_style(snapshot.palette),
                                                 onclick: move |_| on_start_terminal.call(()),
-                                                if alt_overlay_badge_visible(&snapshot, "i") {
+                                                if let Some(letter) = keytip_badge(&snapshot, "insert.terminal") {
                                                     span {
                                                         style: "display:inline-flex; align-items:center; justify-content:center; min-width:16px; height:16px; padding:0 4px; border-radius:6px; background:rgba(95,168,255,0.14); color:#2667a9; font-size:9px; font-weight:800; margin-right:8px;",
-                                                        "T"
+                                                        "{letter}"
                                                     }
                                                 }
                                                 "New Terminal"
@@ -48744,10 +49279,10 @@ fn Titlebar(
                                 on_toggle_connect.call(());
                             }
                         },
-                        if alt_overlay_badge_visible(&snapshot, "") {
+                        if let Some(letter) = keytip_badge(&snapshot, "connect.toggle") {
                             span {
                                 style: "display:inline-flex; align-items:center; justify-content:center; min-width:16px; height:16px; padding:0 4px; border-radius:6px; background:rgba(95,168,255,0.14); color:#2667a9; font-size:9px; font-weight:800; margin-right:6px;",
-                                "C"
+                                "{letter}"
                             }
                         }
                         "Connect SSH"
@@ -48802,10 +49337,10 @@ fn Titlebar(
                                 }
                             },
                             ondoubleclick: |evt| evt.stop_propagation(),
-                            if alt_overlay_badge_visible(&snapshot, "") {
+                            if let Some(letter) = keytip_badge(&snapshot, "notifications.toggle") {
                                 span {
                                     style: "display:inline-flex; align-items:center; justify-content:center; min-width:16px; height:16px; padding:0 4px; border-radius:6px; background:rgba(95,168,255,0.14); color:#2667a9; font-size:9px; font-weight:800; margin-right:6px;",
-                                    "N"
+                                    "{letter}"
                                 }
                             }
                             BellIcon {}
@@ -48830,10 +49365,10 @@ fn Titlebar(
                                 }
                             },
                             ondoubleclick: |evt| evt.stop_propagation(),
-                            if alt_overlay_badge_visible(&snapshot, "") {
+                            if let Some(letter) = keytip_badge(&snapshot, "settings.toggle") {
                                 span {
                                     style: "display:inline-flex; align-items:center; justify-content:center; min-width:16px; height:16px; padding:0 4px; border-radius:6px; background:rgba(95,168,255,0.14); color:#2667a9; font-size:9px; font-weight:800; margin-right:6px;",
-                                    "G"
+                                    "{letter}"
                                 }
                             }
                             "⚙"
@@ -48857,10 +49392,10 @@ fn Titlebar(
                                 }
                             },
                             ondoubleclick: |evt| evt.stop_propagation(),
-                            if alt_overlay_badge_visible(&snapshot, "") {
+                            if let Some(letter) = keytip_badge(&snapshot, "metadata.toggle") {
                                 span {
                                     style: "display:inline-flex; align-items:center; justify-content:center; min-width:16px; height:16px; padding:0 4px; border-radius:6px; background:rgba(95,168,255,0.14); color:#2667a9; font-size:9px; font-weight:800; margin-right:6px;",
-                                    "M"
+                                    "{letter}"
                                 }
                             }
                             "ⓘ"
@@ -78864,6 +79399,7 @@ fn RightRail(
     on_blur_input: EventHandler<()>,
     on_set_ui_theme: EventHandler<UiTheme>,
     on_open_theme_editor: EventHandler<MouseEvent>,
+    on_open_keymap_editor: EventHandler<MouseEvent>,
     on_set_notification_delivery: EventHandler<NotificationDeliveryMode>,
     on_set_notification_sound: EventHandler<bool>,
     on_set_terminal_telemetry: EventHandler<bool>,
@@ -78941,6 +79477,7 @@ fn RightRail(
                     on_blur_input,
                     on_set_ui_theme,
                     on_open_theme_editor,
+                    on_open_keymap_editor,
                     on_set_notification_delivery,
                     on_set_notification_sound,
                     on_set_terminal_telemetry,
@@ -79516,6 +80053,7 @@ fn SettingsRailBody(
     on_blur_input: EventHandler<()>,
     on_set_ui_theme: EventHandler<UiTheme>,
     on_open_theme_editor: EventHandler<MouseEvent>,
+    on_open_keymap_editor: EventHandler<MouseEvent>,
     on_set_notification_delivery: EventHandler<NotificationDeliveryMode>,
     on_set_notification_sound: EventHandler<bool>,
     on_set_terminal_telemetry: EventHandler<bool>,
@@ -79653,6 +80191,12 @@ fn SettingsRailBody(
                 custom_stop_count: snapshot.settings.yggui_theme.colors.len(),
                 on_select: on_set_ui_theme,
                 on_open_editor: on_open_theme_editor,
+            }
+            KeytipsSettingsSection {
+                palette: snapshot.palette,
+                accent: snapshot.theme_accent.clone(),
+                customized: !snapshot.keymap.overrides().is_empty(),
+                on_open_editor: on_open_keymap_editor,
             }
             NotificationSettingsSection {
                 palette: snapshot.palette,
@@ -81533,6 +82077,59 @@ fn ThemeSettingsSection(
                     onclick: move |evt| on_open_editor.call(evt),
                     span { "Edit Theme" }
                     span { style: format!("color:{};", accent), "↗" }
+                }
+            }
+        }
+    }
+}
+#[component]
+fn KeytipsSettingsSection(
+    palette: Palette,
+    accent: String,
+    customized: bool,
+    on_open_editor: EventHandler<MouseEvent>,
+) -> Element {
+    rsx! {
+        div {
+            style: "display:flex; flex-direction:column; gap:6px;",
+            div {
+                style: "display:flex; align-items:center; justify-content:space-between; gap:8px;",
+                div {
+                    style: format!("font-size:11px; font-weight:700; letter-spacing:0.02em; color:{};", palette.muted),
+                    "ALT+ Keys"
+                }
+                span {
+                    style: format!("font-size:10px; font-weight:700; color:{};", accent),
+                    if customized { "Customized" } else { "Excel preset" }
+                }
+            }
+            div {
+                style: settings_section_card_style(palette),
+                button {
+                    "data-keytips-editor-open-button": "1",
+                    style: format!(
+                        "display:flex; align-items:center; justify-content:space-between; height:34px; padding:0 12px; \
+                         border:none; border-radius:11px; background:{}; color:{}; \
+                         box-shadow: inset 0 0 0 1px {}; font-size:12px; font-weight:700; cursor:pointer;",
+                        if palette_is_dark(palette) {
+                            "rgba(21,28,35,0.94)"
+                        } else {
+                            "rgba(255,255,255,0.86)"
+                        },
+                        palette.text,
+                        if palette_is_dark(palette) {
+                            "rgba(93,116,134,0.56)"
+                        } else {
+                            "rgba(208,219,229,0.85)"
+                        }
+                    ),
+                    onclick: move |evt| on_open_editor.call(evt),
+                    span { "Explore & edit KeyTips" }
+                    span { style: format!("color:{};", accent), "↗" }
+                }
+                div {
+                    style: format!("font-size:11px; line-height:1.45; color:{};", palette.muted),
+                    "Tap ALT to show the KeyTips overlay, then press a highlighted letter. Rebind or reset the shortcuts here."
                 }
             }
         }
@@ -97198,28 +97795,36 @@ mod tests {
     }
     #[test]
     fn alt_overlay_sequence_supports_insert_submenu() {
+        let keymap = Keymap::defaults();
         assert_eq!(
-            resolve_alt_overlay_sequence("i"),
-            AltOverlayResolution::Action(AltOverlayAction::OpenInsertMenu)
+            keymap.resolve("i"),
+            Resolution::Command(ShellCommand::OpenInsertMenu)
         );
         assert_eq!(
-            resolve_alt_overlay_sequence("is"),
-            AltOverlayResolution::Action(AltOverlayAction::StartSession)
+            keymap.resolve("is"),
+            Resolution::Command(ShellCommand::InsertSession)
         );
         assert_eq!(
-            resolve_alt_overlay_sequence("it"),
-            AltOverlayResolution::Action(AltOverlayAction::StartTerminal)
+            keymap.resolve("it"),
+            Resolution::Command(ShellCommand::InsertTerminal)
         );
         // "ip" was "New Paper", a hardcoded app entry. The launcher family is
         // registry-driven now: a Paper app claims its own KeyTip when it ships.
-        assert_eq!(
-            resolve_alt_overlay_sequence("ip"),
-            AltOverlayResolution::Invalid
+        assert_eq!(keymap.resolve("ip"), Resolution::Invalid);
+        assert_eq!(keymap.resolve("iz"), Resolution::Invalid);
+    }
+    #[test]
+    fn keymap_config_parses_bindings_and_ignores_junk() {
+        // A well-formed override applies…
+        let keymap = parse_keymap_config(
+            r#"{ "version": 1, "bindings": { "notifications.toggle": "j" } }"#,
         );
-        assert_eq!(
-            resolve_alt_overlay_sequence("iz"),
-            AltOverlayResolution::Invalid
-        );
+        assert_eq!(keymap.keytip_for(ShellCommand::ToggleNotifications), Some('j'));
+        // …an unknown id or a malformed doc falls back to the preset, never panics.
+        let junk = parse_keymap_config("not json at all");
+        assert_eq!(junk.keytip_for(ShellCommand::ToggleNotifications), Some('l'));
+        let unknown = parse_keymap_config(r#"{ "bindings": { "no.such.command": "q" } }"#);
+        assert!(unknown.overrides().is_empty());
     }
     #[test]
     fn filtered_sidebar_rows_keep_matching_ancestors() {
@@ -108757,6 +109362,9 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             titlebar_overflow_menu_open: false,
             alt_overlay_active: false,
             alt_overlay_sequence: String::new(),
+            keymap: Keymap::defaults(),
+            keymap_editor_open: false,
+            keymap_editor_error: None,
             selected_tree_paths: vec![session_path.to_string()],
             context_menu_row: None,
             context_menu_context_row: None,
@@ -109374,6 +109982,9 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             titlebar_overflow_menu_open: false,
             alt_overlay_active: false,
             alt_overlay_sequence: String::new(),
+            keymap: Keymap::defaults(),
+            keymap_editor_open: false,
+            keymap_editor_error: None,
             selected_tree_paths: vec!["local://active".to_string()],
             context_menu_row: None,
             context_menu_context_row: None,
@@ -109526,6 +110137,9 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             titlebar_overflow_menu_open: false,
             alt_overlay_active: false,
             alt_overlay_sequence: String::new(),
+            keymap: Keymap::defaults(),
+            keymap_editor_open: false,
+            keymap_editor_error: None,
             selected_tree_paths: vec![session_path.to_string()],
             context_menu_row: None,
             context_menu_context_row: None,
@@ -109678,6 +110292,9 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             titlebar_overflow_menu_open: false,
             alt_overlay_active: false,
             alt_overlay_sequence: String::new(),
+            keymap: Keymap::defaults(),
+            keymap_editor_open: false,
+            keymap_editor_error: None,
             selected_tree_paths: vec![session_path.to_string()],
             context_menu_row: None,
             context_menu_context_row: None,
@@ -109833,6 +110450,9 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             titlebar_overflow_menu_open: false,
             alt_overlay_active: false,
             alt_overlay_sequence: String::new(),
+            keymap: Keymap::defaults(),
+            keymap_editor_open: false,
+            keymap_editor_error: None,
             selected_tree_paths: vec![session_path.to_string()],
             context_menu_row: None,
             context_menu_context_row: None,
@@ -109992,6 +110612,9 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             titlebar_overflow_menu_open: false,
             alt_overlay_active: false,
             alt_overlay_sequence: String::new(),
+            keymap: Keymap::defaults(),
+            keymap_editor_open: false,
+            keymap_editor_error: None,
             selected_tree_paths: vec![session_path.to_string()],
             context_menu_row: None,
             context_menu_context_row: None,
@@ -110143,6 +110766,9 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             titlebar_overflow_menu_open: false,
             alt_overlay_active: false,
             alt_overlay_sequence: String::new(),
+            keymap: Keymap::defaults(),
+            keymap_editor_open: false,
+            keymap_editor_error: None,
             selected_tree_paths: vec!["local://active".to_string()],
             context_menu_row: None,
             context_menu_context_row: None,
@@ -110294,6 +110920,9 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             titlebar_overflow_menu_open: false,
             alt_overlay_active: false,
             alt_overlay_sequence: String::new(),
+            keymap: Keymap::defaults(),
+            keymap_editor_open: false,
+            keymap_editor_error: None,
             selected_tree_paths: vec!["local://active".to_string()],
             context_menu_row: None,
             context_menu_context_row: None,
@@ -110479,6 +111108,9 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             titlebar_overflow_menu_open: false,
             alt_overlay_active: false,
             alt_overlay_sequence: String::new(),
+            keymap: Keymap::defaults(),
+            keymap_editor_open: false,
+            keymap_editor_error: None,
             selected_tree_paths: vec![active_session.session_path.clone()],
             context_menu_row: None,
             context_menu_context_row: None,
@@ -110633,6 +111265,9 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             titlebar_overflow_menu_open: false,
             alt_overlay_active: false,
             alt_overlay_sequence: String::new(),
+            keymap: Keymap::defaults(),
+            keymap_editor_open: false,
+            keymap_editor_error: None,
             selected_tree_paths: vec!["local://active".to_string()],
             context_menu_row: None,
             context_menu_context_row: None,
@@ -110819,6 +111454,9 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             titlebar_overflow_menu_open: false,
             alt_overlay_active: false,
             alt_overlay_sequence: String::new(),
+            keymap: Keymap::defaults(),
+            keymap_editor_open: false,
+            keymap_editor_error: None,
             selected_tree_paths: vec![session_path.to_string()],
             context_menu_row: None,
             context_menu_context_row: None,
@@ -111182,6 +111820,9 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             titlebar_overflow_menu_open: false,
             alt_overlay_active: false,
             alt_overlay_sequence: String::new(),
+            keymap: Keymap::defaults(),
+            keymap_editor_open: false,
+            keymap_editor_error: None,
             selected_tree_paths: Vec::new(),
             context_menu_row: None,
             context_menu_context_row: None,
