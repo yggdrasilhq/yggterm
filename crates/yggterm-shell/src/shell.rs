@@ -4954,6 +4954,10 @@ impl ShellState {
         let passive_copy_suspended = !implicit_copy_generation_enabled();
         PASSIVE_COPY_SUSPENDED.store(passive_copy_suspended, Ordering::Relaxed);
         let initial_yggui_theme = clamp_theme_spec(&bootstrap.settings.yggui_theme);
+        // ONE disk read of keymap.json: the unified v2 config is the SSOT and the
+        // letters-only `keymap` view is derived from it (no second read, no drift).
+        let keytip_config = load_keytip_config_from_disk();
+        let keymap = keymap_from_keytip_config(&keytip_config);
         let mut state = Self {
             settings,
             bootstrap,
@@ -4999,8 +5003,8 @@ impl ShellState {
             titlebar_maximize_toggle_request_at_ms: 0,
             alt_overlay_active: false,
             alt_overlay_sequence: String::new(),
-            keymap: load_keymap_from_disk(),
-            keytip_config: load_keytip_config_from_disk(),
+            keymap,
+            keytip_config,
             keymap_editor_open: false,
             keymap_editor_error: None,
             selected_tree_paths: HashSet::new(),
@@ -25170,22 +25174,6 @@ fn keymap_config_path() -> Option<std::path::PathBuf> {
     yggterm_core::resolve_yggterm_home()
         .ok()
         .map(|home| home.join("keymap.json"))
-}
-/// Load the in-force keymap: the Excel-familiar preset with the user's overrides
-/// from `~/.yggterm/keymap.json` applied. Any read/parse failure falls back to
-/// the pure preset — a corrupt config never bricks the accelerators.
-fn load_keymap_from_disk() -> Keymap {
-    let Some(path) = keymap_config_path() else {
-        return Keymap::defaults();
-    };
-    match std::fs::read_to_string(&path) {
-        Ok(text) => parse_keymap_config(&text),
-        Err(_) => Keymap::defaults(),
-    }
-}
-/// Parse `{ "version": 1, "bindings": { "<command-id>": "<letter>" } }`.
-fn parse_keymap_config(text: &str) -> Keymap {
-    keymap_from_keytip_config(&parse_keytip_config(text))
 }
 /// The keymap-v2 config on disk (spec §11.5):
 ///
@@ -100305,35 +100293,47 @@ mod tests {
     }
     #[test]
     fn alt_overlay_sequence_supports_insert_submenu() {
-        let keymap = Keymap::defaults();
+        // The real shell tree (no apps installed): ALT,I descends into the New…
+        // scope, then S / T / C reach its items. Resolution is KeyTipTree's job now.
+        let tree = build_keytip_tree(&KeymapConfig::default(), &[]);
         assert_eq!(
-            keymap.resolve("i"),
-            command_registry::Resolution::Command(ShellCommand::OpenInsertMenu)
+            tree.resolve("i"),
+            ChordResolution::Descend {
+                key: "insert.menu".to_string(),
+                scope: "insert.menu".to_string()
+            }
         );
         assert_eq!(
-            keymap.resolve("is"),
-            command_registry::Resolution::Command(ShellCommand::InsertSession)
+            tree.resolve("is"),
+            ChordResolution::Run("insert.session".to_string())
         );
         assert_eq!(
-            keymap.resolve("it"),
-            command_registry::Resolution::Command(ShellCommand::InsertTerminal)
+            tree.resolve("it"),
+            ChordResolution::Run("insert.terminal".to_string())
+        );
+        assert_eq!(
+            tree.resolve("ic"),
+            ChordResolution::Run("insert.claude".to_string())
         );
         // "ip" was "New Paper", a hardcoded app entry. The launcher family is
         // registry-driven now: a Paper app claims its own KeyTip when it ships.
-        assert_eq!(keymap.resolve("ip"), command_registry::Resolution::Invalid);
-        assert_eq!(keymap.resolve("iz"), command_registry::Resolution::Invalid);
+        assert_eq!(tree.resolve("ip"), ChordResolution::Invalid);
+        assert_eq!(tree.resolve("iz"), ChordResolution::Invalid);
     }
     #[test]
     fn keymap_config_parses_bindings_and_ignores_junk() {
-        // A well-formed override applies…
-        let keymap = parse_keymap_config(
+        // A well-formed override applies (through the derived letters view)…
+        let keymap = keymap_from_keytip_config(&parse_keytip_config(
             r#"{ "version": 1, "bindings": { "notifications.toggle": "j" } }"#,
-        );
+        ));
         assert_eq!(keymap.keytip_for(ShellCommand::ToggleNotifications), Some('j'));
-        // …an unknown id or a malformed doc falls back to the preset, never panics.
-        let junk = parse_keymap_config("not json at all");
+        // …a malformed doc falls back to the preset, never panics.
+        let junk = keymap_from_keytip_config(&parse_keytip_config("not json at all"));
         assert_eq!(junk.keytip_for(ShellCommand::ToggleNotifications), Some('l'));
-        let unknown = parse_keymap_config(r#"{ "bindings": { "no.such.command": "q" } }"#);
+        // …and an unknown command id is dropped by the letters view.
+        let unknown = keymap_from_keytip_config(&parse_keytip_config(
+            r#"{ "bindings": { "no.such.command": "q" } }"#,
+        ));
         assert!(unknown.overrides().is_empty());
     }
     #[test]
