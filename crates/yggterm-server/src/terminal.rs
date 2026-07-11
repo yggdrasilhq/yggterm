@@ -2354,6 +2354,26 @@ impl AgentSessionErrorScanner {
     }
 }
 
+/// Whether a control-stripped, whitespace-normalized, lowercased line has the SHAPE of
+/// a CLI session refusal rather than prose that merely mentions one.
+///
+/// TERSENESS is the discriminator. A real refusal is a short status line
+/// (`error: session id <uuid> is already in use.` = 8 words; `that session does not
+/// exist anymore` = 6). A rendered conversation line that MENTIONS a refusal is a
+/// sentence (the user's "…greeted with session already in use or does not exist" = 28
+/// words; the agent's reply explaining the bug = 30). Prefix-matching cannot separate
+/// them — real CLI errors do not all lead with `error:` — but length does, cleanly.
+///
+/// Residual gap (accepted, documented for the next campaign run): prose terse enough to
+/// fit the budget still counts. If that shows up in `agent-incidents.jsonl`, tighten by
+/// requiring a uuid or a leading error token.
+fn agent_session_error_line_looks_like_cli_error(normalized: &str) -> bool {
+    const CLI_ERROR_LINE_MAX_WORDS: usize = 16;
+    const CLI_ERROR_LINE_MAX_CHARS: usize = 200;
+    normalized.chars().count() <= CLI_ERROR_LINE_MAX_CHARS
+        && normalized.split_whitespace().count() <= CLI_ERROR_LINE_MAX_WORDS
+}
+
 fn agent_session_error_in_line(line: &str) -> Option<AgentSessionErrorHit> {
     let normalized = line
         .split_whitespace()
@@ -2365,6 +2385,17 @@ fn agent_session_error_in_line(line: &str) -> Option<AgentSessionErrorHit> {
     }
     // yggterm's own missing-runtime error — traced through its own channel.
     if normalized.contains("terminal session not found") {
+        return None;
+    }
+    // The PTY stream we scan CONTAINS the agent's rendered conversation, so a plain
+    // substring match fires on any prose that merely MENTIONS these errors — the
+    // user typing "greeted with session already in use or does not exist", or the
+    // agent's own reply explaining the bug. Three of jojo's 21 recorded incidents
+    // were exactly this self-inflicted noise (2026-07-11 telemetry campaign), which
+    // corrupts the very count the probe exists to produce. A real CLI refusal is a
+    // terse line that STARTS with the error; prose mentions it mid-sentence. Gate on
+    // that shape before classifying.
+    if !agent_session_error_line_looks_like_cli_error(&normalized) {
         return None;
     }
     let uuid = find_uuid_in_text(&normalized);
@@ -4725,6 +4756,57 @@ PY"#,
         );
         assert!(agent_session_error_in_line("cargo build finished in 3.2s").is_none());
         assert!(agent_session_error_in_line("file not found: ./missing.txt").is_none());
+    }
+
+    #[test]
+    fn agent_session_error_ignores_conversation_prose_mentioning_the_error() {
+        // The scanned PTY stream contains the agent's RENDERED CONVERSATION, so prose
+        // that merely mentions a refusal used to be counted as one. These three samples
+        // are verbatim from jojo's agent-incidents.jsonl (2026-07-11 telemetry campaign):
+        // the user describing the bug, and the agent's own reply explaining it. Counting
+        // them corrupts the incident count the probe exists to produce.
+        assert!(
+            agent_session_error_in_line(
+                "so broken, tui not recognized, that i quit it and launched it from the startpge to be only greeted with session alreay in use or does not exist. i"
+            )
+            .is_none(),
+            "the user's own prose about the bug is not an incident"
+        );
+        assert!(
+            agent_session_error_in_line(
+                "\"error: session <uuid> is already in use\" is claude code's own lock error - meaning when you quit the broken tui and relaunched from the startpage, yggterm ran claude -r"
+            )
+            .is_none(),
+            "the agent's own explanation of the bug is not an incident"
+        );
+        assert!(
+            agent_session_error_in_line(
+                "i think the session 1965f8d5-bc71-432d-b9e5-398aff2815ef does not exist because we never wrote it, but let me verify that against the transcript first"
+            )
+            .is_none(),
+            "prose that quotes a real uuid mid-sentence is not an incident"
+        );
+
+        // ...while the genuine refusals (also verbatim from jojo, same session) still count.
+        let real_in_use = agent_session_error_in_line(
+            "error: session id 1965f8d5-bc71-432d-b9e5-398aff2815ef is already in use.",
+        )
+        .expect("the real CLI lock refusal must still be detected");
+        assert_eq!(real_in_use.pattern, "session_already_in_use");
+        let real_missing = agent_session_error_in_line(
+            "no conversation found with session id: 1965f8d5-bc71-432d-b9e5-398aff2815ef",
+        )
+        .expect("the real CLI missing-conversation refusal must still be detected");
+        assert_eq!(real_missing.pattern, "session_not_found");
+
+        // A TUI gutter glyph in front of the error must not hide it.
+        assert!(
+            agent_session_error_in_line(
+                "⎿ Error: Session 52317975-9c66-40ef-8028-901b6415250e is already in use"
+            )
+            .is_some(),
+            "leading TUI gutter glyphs are trimmed before the shape test"
+        );
     }
 
     #[test]
