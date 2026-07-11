@@ -221,8 +221,17 @@ sidebar, not in the viewport.
 
 The rail IS the mode: opening it turns `web_surface_vertical_tabs` on, closing it
 turns it off (`toggle_web_tabs_panel` → `request_web_surface_vertical_tabs`), so
-there is no way to have vertical tabs with nowhere to put them. The address/nav
-bar stays in the viewport in BOTH modes — only the tabs move. Folder affordances:
+there is no way to have vertical tabs with nowhere to put them. Two live restarts
+proved how easily that invariant breaks, and both paths are now tested:
+
+- A GUI that STARTS with the pref already on collapsed the strip and opened
+  nothing. `upsert_web_surface` raises the rail when the pref is on.
+- Opening the app's settings pane EVICTED the rail (one slot), and closing it left
+  the tabs homeless. In vertical mode the rail's resting state is the tab tree: a
+  pane borrows the slot and hands it back (`set_right_panel_mode`).
+
+The address/nav bar stays in the viewport in BOTH modes — only the tabs move.
+Folder affordances:
 create, inline rename (double-click), collapse, delete (**the tabs return to the
 root; deleting organization never deletes content**), "+" for a new tab inside a
 folder, and mouse-drag a tab onto a folder to file it (the same mouse-driven drag
@@ -273,6 +282,22 @@ immediately, so a GUI kill cannot resurrect it. The app tab is never saved — i
 belongs to the app, which supplies it on the next `open`. A restored tab carries
 no live handle: it is a URL in the tree until it is activated, so restoring thirty
 tabs costs thirty rows, not thirty webviews.
+
+A tab's URL IS what the tree saves, so **navigation is a tree change**: the store
+is written when a tab navigates, when the page reports its real (redirected) URL
+and title, when a tab is closed, and on every folder edit. Filing used to be the
+only thing that persisted a tab, which meant a tab you opened and browsed was
+saved as the page you started on — or, at the root, never saved at all.
+
+### The settings file had a hand-written writer (fixed 2026-07-11)
+
+`web_surface_restore_tabs` did not persist, and neither did `vertical_tabs` — nor
+`web_surface_zoom_percent`, which had shipped as "a persisted preference" for
+weeks and never was. `serialize_settings_value` in `yggterm-core` lists its fields
+BY HAND, beside a parser that also lists them by hand, so a field added to
+`AppSettings` alone is silently never saved.
+`every_settings_field_is_written_to_the_file` compares the writer's keys against
+the struct's own and fails the build the next time it happens.
 
 ## History viewer — an internal "chrome://history" page (2026-07-11)
 
