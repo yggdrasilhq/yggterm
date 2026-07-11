@@ -798,6 +798,10 @@ const TREE_DELETE_BUTTON_ID: &str = "yggterm-tree-delete-button";
 const TREE_HARD_DELETE_BUTTON_ID: &str = "yggterm-tree-hard-delete-button";
 const PREVIEW_ZOOM_BASE: f32 = 10.0;
 const TERMINAL_ZOOM_BASE: f32 = 14.0;
+/// Web-surface zoom is a percent value (100.0 == 100%), so its base is 100.0:
+/// `zoom_percent(value, base)` is the identity and the wry zoom factor is
+/// `value / 100`.
+const WEB_SURFACE_ZOOM_BASE: f32 = 100.0;
 const PREVIEW_HEADER_SEARCH_HIT_ID: &str = "__preview_header__";
 const DEBUG_REQUEST_DELAY_ENV: &str = "YGGTERM_DEBUG_REQUEST_DELAY_MS";
 const APP_CONTROL_ACTIVE_POLL_MS: u64 = 100;
@@ -1620,6 +1624,10 @@ struct AppliedWebSurface {
     /// Profile (storage jar) the surface's WebContext was created with. Also
     /// fixed per WebContext — a change means destroy + recreate.
     profile: String,
+    /// WebKit page-zoom factor (1.0 == 100%) last pushed to this surface. The
+    /// reconciler re-applies whenever the desired factor (the global "Web View"
+    /// zoom setting; per-site overrides land later) diverges from this.
+    zoom_factor: f64,
     /// Set while the surface is STASHED (session backgrounded, webview kept
     /// alive detached from the overlay). Unstashed on reveal; destroyed when
     /// the background hold expires.
@@ -1836,7 +1844,7 @@ async fn web_surface_native_reconcile_loop(
         // Desired: (session, active_tab,
         //           [(tab, effective_url, reload_nonce, socks_port, profile)],
         //           policy gate).
-        let (desired, active_visible_sessions, modal_over_viewport): (
+        let (desired, active_visible_sessions, modal_over_viewport, desired_zoom_factor): (
             Vec<(
                 String,
                 u64,
@@ -1845,6 +1853,7 @@ async fn web_surface_native_reconcile_loop(
             )>,
             std::collections::HashSet<String>,
             bool,
+            f64,
         ) = {
             let shell = state.peek();
             let shell_ref: &ShellState = &shell;
@@ -1912,7 +1921,17 @@ async fn web_surface_native_reconcile_loop(
                     .cloned()
                     .collect()
             };
-            (desired, active_visible_sessions, modal_over_viewport)
+            // Global "Web View" zoom, as a WebKit factor (100% -> 1.0). One
+            // value for every surface this tick; per-site overrides (ychrome)
+            // will refine this later.
+            let desired_zoom_factor =
+                (shell_ref.settings.web_surface_zoom_percent / 100.0).clamp(0.25, 5.0) as f64;
+            (
+                desired,
+                active_visible_sessions,
+                modal_over_viewport,
+                desired_zoom_factor,
+            )
         };
         // Destroy first: closed/swept surfaces and closed tabs must release
         // their webview (and WebContext) even when the DOM oracle is gone.
@@ -2167,6 +2186,13 @@ async fn web_surface_native_reconcile_loop(
                         desktop.set_web_surface_visible(entry.native_id, want_visible);
                         entry.visible = want_visible;
                     }
+                    // Web View zoom: re-push whenever the global setting moves
+                    // (the "Web View" / "Ychrome Global" zoom control). Only
+                    // touches the FFI when the factor actually diverges.
+                    if (entry.zoom_factor - desired_zoom_factor).abs() > f64::EPSILON {
+                        desktop.set_web_surface_zoom(entry.native_id, desired_zoom_factor);
+                        entry.zoom_factor = desired_zoom_factor;
+                    }
                     // Observe engine-side page state: in-page navigations
                     // (link clicks, redirects, form submits) never pass
                     // through the shell's nav model, so poll the engine and
@@ -2315,6 +2341,10 @@ async fn web_surface_native_reconcile_loop(
                                     "rect": [rect.0, rect.1, rect.2, rect.3],
                                 }),
                             );
+                            // Seed the page zoom to the current "Web View" setting
+                            // so a surface opened while zoomed comes up scaled,
+                            // not at 100% until the setting is next touched.
+                            desktop.set_web_surface_zoom(native_id, desired_zoom_factor);
                             applied.insert(
                                 key,
                                 AppliedWebSurface {
@@ -2325,6 +2355,7 @@ async fn web_surface_native_reconcile_loop(
                                     reload_nonce,
                                     socks_port,
                                     profile,
+                                    zoom_factor: desired_zoom_factor,
                                     stashed_at_ms: None,
                                     page_url: effective_url,
                                     page_title: String::new(),
@@ -3754,10 +3785,34 @@ fn snapshot_retained_terminal_session_view(session: &ManagedSessionView) -> Mana
     }
 }
 
-fn active_viewport_zoom_label(snapshot: &RenderSnapshot) -> String {
+/// Which surface the single "main zoom" control acts on. A native web surface
+/// (ychrome / libyggterm web app) is composited OVER the Terminal view mode, so
+/// `active_view_mode` alone cannot tell it apart from a plain terminal — it
+/// carries its own target and its own setting (`web_surface_zoom_percent`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MainZoomTarget {
+    Terminal,
+    Rendered,
+    WebSurface,
+}
+/// The zoom target for the active viewport. A live web surface on the active
+/// session owns the viewport — ychrome/libyggterm apps carry no view toggle
+/// ([`active_session_offers_view_toggle`]), so a present surface wins over the
+/// underlying Terminal view mode.
+fn active_main_zoom_target(snapshot: &RenderSnapshot) -> MainZoomTarget {
+    if snapshot.active_web_surface_profile.is_some() {
+        return MainZoomTarget::WebSurface;
+    }
     match snapshot.active_view_mode {
-        WorkspaceViewMode::Terminal => "Terminal Zoom".to_string(),
-        WorkspaceViewMode::Rendered => snapshot
+        WorkspaceViewMode::Terminal => MainZoomTarget::Terminal,
+        WorkspaceViewMode::Rendered => MainZoomTarget::Rendered,
+    }
+}
+fn active_viewport_zoom_label(snapshot: &RenderSnapshot) -> String {
+    match active_main_zoom_target(snapshot) {
+        MainZoomTarget::Terminal => "Terminal Zoom".to_string(),
+        MainZoomTarget::WebSurface => "Web View Zoom".to_string(),
+        MainZoomTarget::Rendered => snapshot
             .selected_row
             .as_ref()
             .and_then(|row| row.document_kind)
@@ -3769,59 +3824,57 @@ fn active_viewport_zoom_label(snapshot: &RenderSnapshot) -> String {
     }
 }
 fn active_viewport_zoom_value(snapshot: &RenderSnapshot) -> f32 {
-    match snapshot.active_view_mode {
-        WorkspaceViewMode::Terminal => snapshot.settings.terminal_font_size,
-        WorkspaceViewMode::Rendered => snapshot.settings.rendered_font_size,
+    main_zoom_value_for_target(&snapshot.settings, active_main_zoom_target(snapshot))
+}
+fn main_zoom_value_for_target(settings: &AppSettings, target: MainZoomTarget) -> f32 {
+    match target {
+        MainZoomTarget::Terminal => settings.terminal_font_size,
+        MainZoomTarget::Rendered => settings.rendered_font_size,
+        MainZoomTarget::WebSurface => settings.web_surface_zoom_percent,
     }
 }
-fn main_zoom_base(view_mode: WorkspaceViewMode) -> f32 {
-    match view_mode {
-        WorkspaceViewMode::Terminal => TERMINAL_ZOOM_BASE,
-        WorkspaceViewMode::Rendered => PREVIEW_ZOOM_BASE,
+fn main_zoom_base(target: MainZoomTarget) -> f32 {
+    match target {
+        MainZoomTarget::Terminal => TERMINAL_ZOOM_BASE,
+        MainZoomTarget::Rendered => PREVIEW_ZOOM_BASE,
+        MainZoomTarget::WebSurface => WEB_SURFACE_ZOOM_BASE,
     }
 }
-fn adjust_main_zoom_settings_for_view(
+fn adjust_main_zoom_settings_for_target(
     settings: &mut AppSettings,
-    view_mode: WorkspaceViewMode,
+    target: MainZoomTarget,
     delta_steps: i32,
 ) -> (f32, f32) {
-    match view_mode {
-        WorkspaceViewMode::Terminal => {
-            let before = settings.terminal_font_size;
-            settings.terminal_font_size =
-                clamp_zoom_value_main(settings.terminal_font_size + delta_steps as f32, view_mode);
-            (before, settings.terminal_font_size)
-        }
-        WorkspaceViewMode::Rendered => {
-            let before = settings.rendered_font_size;
-            settings.rendered_font_size =
-                clamp_zoom_value_main(settings.rendered_font_size + delta_steps as f32, view_mode);
-            (before, settings.rendered_font_size)
-        }
-    }
+    let next = main_zoom_value_for_target(settings, target) + delta_steps as f32;
+    set_main_zoom_settings_for_target(settings, target, next)
 }
-fn set_main_zoom_settings_for_view(
+fn set_main_zoom_settings_for_target(
     settings: &mut AppSettings,
-    view_mode: WorkspaceViewMode,
+    target: MainZoomTarget,
     value: f32,
 ) -> (f32, f32) {
-    let clamped = clamp_zoom_value_main(value, view_mode);
-    match view_mode {
-        WorkspaceViewMode::Terminal => {
+    let clamped = clamp_zoom_value_main(value, target);
+    match target {
+        MainZoomTarget::Terminal => {
             let before = settings.terminal_font_size;
             settings.terminal_font_size = clamped;
             (before, settings.terminal_font_size)
         }
-        WorkspaceViewMode::Rendered => {
+        MainZoomTarget::Rendered => {
             let before = settings.rendered_font_size;
             settings.rendered_font_size = clamped;
             (before, settings.rendered_font_size)
         }
+        MainZoomTarget::WebSurface => {
+            let before = settings.web_surface_zoom_percent;
+            settings.web_surface_zoom_percent = clamped;
+            (before, settings.web_surface_zoom_percent)
+        }
     }
 }
-fn normalize_app_control_main_zoom_value(value: f32, view_mode: WorkspaceViewMode) -> f32 {
+fn normalize_app_control_main_zoom_value(value: f32, target: MainZoomTarget) -> f32 {
     if value > 20.0 {
-        (((value / 100.0) * main_zoom_base(view_mode)) * 10.0).round() / 10.0
+        (((value / 100.0) * main_zoom_base(target)) * 10.0).round() / 10.0
     } else {
         value
     }
@@ -10627,10 +10680,10 @@ impl ShellState {
     }
     fn adjust_main_zoom(&mut self, delta_steps: i32) {
         let active_snapshot = self.snapshot();
-        let active_view_mode = active_snapshot.active_view_mode;
+        let target = active_main_zoom_target(&active_snapshot);
         let active_label = active_viewport_zoom_label(&active_snapshot);
         let (before, after) =
-            adjust_main_zoom_settings_for_view(&mut self.settings, active_view_mode, delta_steps);
+            adjust_main_zoom_settings_for_target(&mut self.settings, target, delta_steps);
         self.persist_settings();
         self.last_terminal_debug = if let Some(session) = self.server.active_session() {
             format!(
@@ -10647,15 +10700,16 @@ impl ShellState {
         self.last_action = format!(
             "{} {}%",
             active_label.to_ascii_lowercase(),
-            zoom_percent(after, main_zoom_base(active_view_mode))
+            zoom_percent(after, main_zoom_base(target))
         );
     }
-    fn set_main_zoom(&mut self, view_mode: WorkspaceViewMode, value: f32) {
-        let label = match view_mode {
-            WorkspaceViewMode::Terminal => "terminal zoom",
-            WorkspaceViewMode::Rendered => "preview zoom",
+    fn set_main_zoom(&mut self, target: MainZoomTarget, value: f32) {
+        let label = match target {
+            MainZoomTarget::Terminal => "terminal zoom",
+            MainZoomTarget::Rendered => "preview zoom",
+            MainZoomTarget::WebSurface => "web view zoom",
         };
-        let (before, after) = set_main_zoom_settings_for_view(&mut self.settings, view_mode, value);
+        let (before, after) = set_main_zoom_settings_for_target(&mut self.settings, target, value);
         self.persist_settings();
         self.last_terminal_debug = if let Some(session) = self.server.active_session() {
             format!(
@@ -10670,14 +10724,14 @@ impl ShellState {
         };
         self.last_action = format!(
             "{label} {}%",
-            zoom_percent(after, main_zoom_base(view_mode))
+            zoom_percent(after, main_zoom_base(target))
         );
     }
     fn set_main_zoom_percent(&mut self, percent: i32) {
         let active_snapshot = self.snapshot();
-        let view_mode = active_snapshot.active_view_mode;
-        let normalized = (percent.clamp(50, 250) as f32 / 100.0) * main_zoom_base(view_mode);
-        self.set_main_zoom(view_mode, normalized);
+        let target = active_main_zoom_target(&active_snapshot);
+        let normalized = (percent.clamp(50, 250) as f32 / 100.0) * main_zoom_base(target);
+        self.set_main_zoom(target, normalized);
     }
     fn set_terminal_theme_name_for(&mut self, theme: UiTheme, value: String) {
         match theme {
@@ -30304,6 +30358,7 @@ fn describe_app_state_snapshot(
         "rendered_surface_zoom": zoom_percent_f32(shell.settings.rendered_font_size, PREVIEW_ZOOM_BASE),
         "terminal_font_size": shell.settings.terminal_font_size,
         "terminal_zoom_percent": zoom_percent_f32(shell.settings.terminal_font_size, TERMINAL_ZOOM_BASE),
+        "web_surface_zoom_percent": zoom_percent_f32(shell.settings.web_surface_zoom_percent, WEB_SURFACE_ZOOM_BASE),
         "terminal_light_theme_name": shell.terminal_theme_name_for(UiTheme::ZedLight),
         "terminal_dark_theme_name": shell.terminal_theme_name_for(UiTheme::ZedDark),
         "effective_terminal_theme_name": shell.effective_terminal_theme_name(),
@@ -40354,16 +40409,19 @@ async fn process_pending_app_control_requests(
         .map(str::to_string);
     let response = match command {
         AppControlCommand::SetMainZoom { value, view_mode } => {
-            let target_view = match view_mode {
-                Some(AppControlViewMode::Preview) => WorkspaceViewMode::Rendered,
-                Some(AppControlViewMode::Terminal) => WorkspaceViewMode::Terminal,
-                None => state.read().snapshot().active_view_mode,
+            let target = match view_mode {
+                Some(AppControlViewMode::Preview) => MainZoomTarget::Rendered,
+                Some(AppControlViewMode::Terminal) => MainZoomTarget::Terminal,
+                None => {
+                    let snapshot = state.read().snapshot();
+                    active_main_zoom_target(&snapshot)
+                }
             };
-            let normalized_value = normalize_app_control_main_zoom_value(value, target_view);
+            let normalized_value = normalize_app_control_main_zoom_value(value, target);
             let _ = safe_shell_mut(state, "app_control_set_main_zoom", |shell| {
-                shell.set_main_zoom(target_view, normalized_value);
+                shell.set_main_zoom(target, normalized_value);
             });
-            if target_view == WorkspaceViewMode::Terminal {
+            if target == MainZoomTarget::Terminal {
                 apply_active_terminal_zoom(state);
             }
             sleep(Duration::from_millis(40)).await;
@@ -40379,9 +40437,10 @@ async fn process_pending_app_control_requests(
                     "command": "set_main_zoom",
                     "requested_value": value,
                     "applied_value": normalized_value,
-                    "target_view_mode": match target_view {
-                        WorkspaceViewMode::Rendered => "preview",
-                        WorkspaceViewMode::Terminal => "terminal",
+                    "target_view_mode": match target {
+                        MainZoomTarget::Rendered => "preview",
+                        MainZoomTarget::Terminal => "terminal",
+                        MainZoomTarget::WebSurface => "web",
                     },
                     "window": describe_window(&desktop),
                     "active_view_mode": format!("{:?}", state.read().server.active_view_mode()),
@@ -80232,7 +80291,7 @@ fn SettingsRailBody(
                 label: main_zoom_label,
                 percent: zoom_percent(
                     active_viewport_zoom_value(&snapshot),
-                    main_zoom_base(snapshot.active_view_mode),
+                    main_zoom_base(active_main_zoom_target(&snapshot)),
                 ),
                 palette: snapshot.palette,
                 on_focus_input,
@@ -85104,8 +85163,8 @@ fn clamp_zoom_value_for_base(value: f32, base: f32) -> f32 {
 fn clamp_zoom_value(value: f32) -> f32 {
     clamp_zoom_value_for_base(value, 14.0)
 }
-fn clamp_zoom_value_main(value: f32, view_mode: WorkspaceViewMode) -> f32 {
-    clamp_zoom_value_for_base(value, main_zoom_base(view_mode))
+fn clamp_zoom_value_main(value: f32, target: MainZoomTarget) -> f32 {
+    clamp_zoom_value_for_base(value, main_zoom_base(target))
 }
 fn zoom_percent(value: f32, base: f32) -> i32 {
     ((value / base) * 100.0).round() as i32
@@ -85875,16 +85934,16 @@ mod tests {
 
     #[test]
     fn terminal_zoom_clamps_to_fifty_percent_floor() {
-        assert_eq!(clamp_zoom_value_main(0.0, WorkspaceViewMode::Terminal), 7.0);
-        assert_eq!(clamp_zoom_value_main(4.0, WorkspaceViewMode::Terminal), 7.0);
+        assert_eq!(clamp_zoom_value_main(0.0, MainZoomTarget::Terminal), 7.0);
+        assert_eq!(clamp_zoom_value_main(4.0, MainZoomTarget::Terminal), 7.0);
         assert_eq!(
             zoom_percent(
-                clamp_zoom_value_main(4.0, WorkspaceViewMode::Terminal),
+                clamp_zoom_value_main(4.0, MainZoomTarget::Terminal),
                 TERMINAL_ZOOM_BASE
             ),
             50
         );
-        assert_eq!(clamp_zoom_value_main(4.0, WorkspaceViewMode::Rendered), 5.0);
+        assert_eq!(clamp_zoom_value_main(4.0, MainZoomTarget::Rendered), 5.0);
     }
     #[test]
     fn zoom_percent_text_input_sanitizes_and_clamps() {
@@ -85916,11 +85975,33 @@ mod tests {
         settings.rendered_font_size = 9.0;
         settings.terminal_font_size = 13.0;
         let (before, after) =
-            adjust_main_zoom_settings_for_view(&mut settings, WorkspaceViewMode::Rendered, 1);
+            adjust_main_zoom_settings_for_target(&mut settings, MainZoomTarget::Rendered, 1);
         assert_eq!(before, 9.0);
         assert_eq!(after, 10.0);
         assert_eq!(settings.rendered_font_size, 10.0);
         assert_eq!(settings.terminal_font_size, 13.0);
+    }
+    #[test]
+    fn web_surface_zoom_updates_only_web_surface_percent() {
+        let mut settings = AppSettings::default();
+        settings.terminal_font_size = 13.0;
+        settings.rendered_font_size = 9.0;
+        settings.web_surface_zoom_percent = 100.0;
+        // A +10 step on a web surface must move only the web zoom percent and
+        // clamp within [50, 250] (base 100).
+        let (before, after) =
+            adjust_main_zoom_settings_for_target(&mut settings, MainZoomTarget::WebSurface, 10);
+        assert_eq!(before, 100.0);
+        assert_eq!(after, 110.0);
+        assert_eq!(settings.web_surface_zoom_percent, 110.0);
+        assert_eq!(settings.terminal_font_size, 13.0);
+        assert_eq!(settings.rendered_font_size, 9.0);
+        let (_, clamped_high) =
+            set_main_zoom_settings_for_target(&mut settings, MainZoomTarget::WebSurface, 999.0);
+        assert_eq!(clamped_high, 250.0);
+        let (_, clamped_low) =
+            set_main_zoom_settings_for_target(&mut settings, MainZoomTarget::WebSurface, 5.0);
+        assert_eq!(clamped_low, 50.0);
     }
     #[test]
     fn terminal_zoom_updates_only_terminal_font_size() {
@@ -85928,7 +86009,7 @@ mod tests {
         settings.rendered_font_size = 9.0;
         settings.terminal_font_size = 13.0;
         let (before, after) =
-            adjust_main_zoom_settings_for_view(&mut settings, WorkspaceViewMode::Terminal, -1);
+            adjust_main_zoom_settings_for_target(&mut settings, MainZoomTarget::Terminal, -1);
         assert_eq!(before, 13.0);
         assert_eq!(after, 12.0);
         assert_eq!(settings.rendered_font_size, 9.0);
@@ -85999,7 +86080,7 @@ mod tests {
         settings.rendered_font_size = 10.0;
         settings.terminal_font_size = 13.0;
         let (before, after) =
-            set_main_zoom_settings_for_view(&mut settings, WorkspaceViewMode::Rendered, 9.0);
+            set_main_zoom_settings_for_target(&mut settings, MainZoomTarget::Rendered, 9.0);
         assert_eq!(before, 10.0);
         assert_eq!(after, 9.0);
         assert_eq!(settings.rendered_font_size, 9.0);
@@ -86011,7 +86092,7 @@ mod tests {
         settings.rendered_font_size = 9.0;
         settings.terminal_font_size = 13.0;
         let (before, after) =
-            set_main_zoom_settings_for_view(&mut settings, WorkspaceViewMode::Terminal, 14.0);
+            set_main_zoom_settings_for_target(&mut settings, MainZoomTarget::Terminal, 14.0);
         assert_eq!(before, 13.0);
         assert_eq!(after, 14.0);
         assert_eq!(settings.rendered_font_size, 9.0);
@@ -86020,30 +86101,30 @@ mod tests {
     #[test]
     fn app_control_zoom_values_over_twenty_are_treated_as_percent() {
         assert_eq!(
-            normalize_app_control_main_zoom_value(90.0, WorkspaceViewMode::Terminal),
+            normalize_app_control_main_zoom_value(90.0, MainZoomTarget::Terminal),
             12.6
         );
         assert_eq!(
-            normalize_app_control_main_zoom_value(140.0, WorkspaceViewMode::Terminal),
+            normalize_app_control_main_zoom_value(140.0, MainZoomTarget::Terminal),
             19.6
         );
         assert_eq!(
-            normalize_app_control_main_zoom_value(200.0, WorkspaceViewMode::Rendered),
+            normalize_app_control_main_zoom_value(200.0, MainZoomTarget::Rendered),
             20.0
         );
     }
     #[test]
     fn app_control_zoom_values_up_to_twenty_stay_as_font_size() {
         assert_eq!(
-            normalize_app_control_main_zoom_value(9.0, WorkspaceViewMode::Terminal),
+            normalize_app_control_main_zoom_value(9.0, MainZoomTarget::Terminal),
             9.0
         );
         assert_eq!(
-            normalize_app_control_main_zoom_value(13.0, WorkspaceViewMode::Rendered),
+            normalize_app_control_main_zoom_value(13.0, MainZoomTarget::Rendered),
             13.0
         );
         assert_eq!(
-            normalize_app_control_main_zoom_value(20.0, WorkspaceViewMode::Terminal),
+            normalize_app_control_main_zoom_value(20.0, MainZoomTarget::Terminal),
             20.0
         );
     }
