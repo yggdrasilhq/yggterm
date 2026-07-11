@@ -1168,8 +1168,39 @@ struct SidebarContributionState {
     /// `MAX_POLICY_FETCH_ATTEMPTS` the gate opens anyway — a page with no
     /// adblock beats no page — and the failure is surfaced to the user.
     policy_attempts: u32,
+    /// The app's display name for the zoom control ("Ychrome Global Zoom"). The
+    /// app declares it; the shell never hardcodes an app's name.
+    app_name: Option<String>,
+    /// The app's stamp over its per-site zoom overrides. Empty ⇒ no per-site
+    /// zoom. Refetched only when it moves, exactly like `policy_version`.
+    zoom_version: String,
+    /// Per-site zoom overrides the app serves, host -> percent. The reconciler
+    /// applies the entry for the live page's host (longest-suffix match) and
+    /// falls back to the global `web_surface_zoom_percent`. Unlike `policy`, this
+    /// never gates surface creation — zoom is cosmetic, so a slow fetch just
+    /// leaves a surface at the global until the map lands, and the OLD map stays
+    /// applied while a new one is in flight (no flicker to global and back).
+    zoom_overrides: HashMap<String, f32>,
+    /// Whether `zoom_overrides` corresponds to the current `zoom_version`. False
+    /// after a stamp change until the refetch lands.
+    zoom_loaded: bool,
+    /// Failed `<control>/zoom` fetches for the current stamp. Capped so a broken
+    /// endpoint is not polled forever; the surfaces just keep the global zoom.
+    zoom_attempts: u32,
     last_seen_ms: u64,
 }
+
+/// What a re-declare tells the reconciler to refetch. Two independent stamps
+/// (policy, zoom) so a zoom edit does not drag the ruleset over the wire.
+#[derive(Debug, Clone, Copy, Default)]
+struct SidebarRefetch {
+    policy: bool,
+    zoom: bool,
+}
+
+/// Attempts at `<control>/zoom` for one stamp before the reconciler stops asking
+/// and leaves the surfaces on the global zoom.
+const MAX_ZOOM_FETCH_ATTEMPTS: u32 = 3;
 
 /// The web-content policy an app ships for its own surfaces.
 ///
@@ -1414,6 +1445,11 @@ struct AppPaneActionReply {
     /// applies a new policy, and this is how an app asks for one.
     #[serde(default)]
     reload_surface: bool,
+    /// Re-read `<control>/zoom` now: the app changed a per-site override and
+    /// wants it on the live page at once, rather than waiting for the next ~4s
+    /// declare to move `zoom_version`. The reconciler applies the fresh map.
+    #[serde(default)]
+    refetch_zoom: bool,
 }
 
 /// `<control>/pane/<id>` — where the GUI fetches a pane's schema. Kept out of
@@ -1431,6 +1467,32 @@ fn app_pane_action_url(control_url: &str) -> String {
 /// `/pane/<id>?host=`, where the page host is the GUI's to report.
 fn app_policy_url(control_url: &str) -> String {
     format!("{}/policy", control_url.trim_end_matches('/'))
+}
+
+/// `<control>/zoom` — the app's per-site zoom overrides, `{ "sites": { host:
+/// percent } }`. No query param, like `/policy`: the whole map is small and the
+/// GUI does the per-host matching itself.
+fn app_zoom_url(control_url: &str) -> String {
+    format!("{}/zoom", control_url.trim_end_matches('/'))
+}
+
+/// Parse `<control>/zoom`'s `{ "sites": { host: percent } }` into the host ->
+/// percent map the reconciler applies. Non-numeric or empty-host entries are
+/// dropped; the app already clamped, but we never trust a wire value blindly.
+fn parse_web_surface_zoom(value: &serde_json::Value) -> HashMap<String, f32> {
+    let mut out = HashMap::new();
+    if let Some(sites) = value.get("sites").and_then(|sites| sites.as_object()) {
+        for (host, percent) in sites {
+            let host = host.split(':').next().unwrap_or(host).trim().to_lowercase();
+            if host.is_empty() {
+                continue;
+            }
+            if let Some(percent) = percent.as_f64() {
+                out.insert(host, (percent as f32).clamp(25.0, 500.0));
+            }
+        }
+    }
+    out
 }
 
 /// Spill an app-supplied adblock ruleset to a file on the GUI host, because
@@ -1844,7 +1906,13 @@ async fn web_surface_native_reconcile_loop(
         // Desired: (session, active_tab,
         //           [(tab, effective_url, reload_nonce, socks_port, profile)],
         //           policy gate).
-        let (desired, active_visible_sessions, modal_over_viewport, desired_zoom_factor): (
+        let (
+            desired,
+            active_visible_sessions,
+            modal_over_viewport,
+            global_zoom_factor,
+            zoom_overrides,
+        ): (
             Vec<(
                 String,
                 u64,
@@ -1854,6 +1922,7 @@ async fn web_surface_native_reconcile_loop(
             std::collections::HashSet<String>,
             bool,
             f64,
+            HashMap<String, HashMap<String, f32>>,
         ) = {
             let shell = state.peek();
             let shell_ref: &ShellState = &shell;
@@ -1921,17 +1990,43 @@ async fn web_surface_native_reconcile_loop(
                     .cloned()
                     .collect()
             };
-            // Global "Web View" zoom, as a WebKit factor (100% -> 1.0). One
-            // value for every surface this tick; per-site overrides (ychrome)
-            // will refine this later.
-            let desired_zoom_factor =
+            // Global "Web View" / "Ychrome Global" zoom, as a WebKit factor
+            // (100% -> 1.0). The fallback for every surface with no per-site
+            // override for the host it is on.
+            let global_zoom_factor =
                 (shell_ref.settings.web_surface_zoom_percent / 100.0).clamp(0.25, 5.0) as f64;
+            // The per-site overrides the app declared, per session, so the loop
+            // below can refine each surface by the host it is actually on.
+            let zoom_overrides: HashMap<String, HashMap<String, f32>> = shell_ref
+                .web_surfaces
+                .keys()
+                .filter_map(|session_path| {
+                    let overrides = shell_ref
+                        .sidebar_contributions
+                        .get(session_path)
+                        .map(|contribution| contribution.zoom_overrides.clone())
+                        .filter(|overrides| !overrides.is_empty())?;
+                    Some((session_path.clone(), overrides))
+                })
+                .collect();
             (
                 desired,
                 active_visible_sessions,
                 modal_over_viewport,
-                desired_zoom_factor,
+                global_zoom_factor,
+                zoom_overrides,
             )
+        };
+        // The WebKit zoom factor for one surface: the per-site override for the
+        // host it is on (longest-suffix), else the global. One rule, used both
+        // when a surface is placed and when it is created.
+        let surface_zoom_factor = |session_path: &str, url: &str| -> f64 {
+            let host = web_surface_tab_host_label(url);
+            zoom_overrides
+                .get(session_path)
+                .and_then(|overrides| zoom_override_for_host(overrides, &host))
+                .map(|percent| (percent as f64 / 100.0).clamp(0.25, 5.0))
+                .unwrap_or(global_zoom_factor)
         };
         // Destroy first: closed/swept surfaces and closed tabs must release
         // their webview (and WebContext) even when the DOM oracle is gone.
@@ -2186,13 +2281,6 @@ async fn web_surface_native_reconcile_loop(
                         desktop.set_web_surface_visible(entry.native_id, want_visible);
                         entry.visible = want_visible;
                     }
-                    // Web View zoom: re-push whenever the global setting moves
-                    // (the "Web View" / "Ychrome Global" zoom control). Only
-                    // touches the FFI when the factor actually diverges.
-                    if (entry.zoom_factor - desired_zoom_factor).abs() > f64::EPSILON {
-                        desktop.set_web_surface_zoom(entry.native_id, desired_zoom_factor);
-                        entry.zoom_factor = desired_zoom_factor;
-                    }
                     // Observe engine-side page state: in-page navigations
                     // (link clicks, redirects, form submits) never pass
                     // through the shell's nav model, so poll the engine and
@@ -2270,6 +2358,17 @@ async fn web_surface_native_reconcile_loop(
                             }
                         }
                     }
+                    // Web View zoom, AFTER the page poll so a same-tick in-page
+                    // navigation already shows in `entry.page_url`: the per-site
+                    // override for the host now on screen ("Ychrome" per-site),
+                    // else the global "Ychrome Global Zoom". Also re-applies when
+                    // the app's zoom map or the global setting moves. Only touches
+                    // the FFI on a real change.
+                    let want_zoom = surface_zoom_factor(&key.0, &entry.page_url);
+                    if (entry.zoom_factor - want_zoom).abs() > f64::EPSILON {
+                        desktop.set_web_surface_zoom(entry.native_id, want_zoom);
+                        entry.zoom_factor = want_zoom;
+                    }
                 } else if want_visible
                     && let Some(rect) = rect
                 {
@@ -2341,10 +2440,12 @@ async fn web_surface_native_reconcile_loop(
                                     "rect": [rect.0, rect.1, rect.2, rect.3],
                                 }),
                             );
-                            // Seed the page zoom to the current "Web View" setting
-                            // so a surface opened while zoomed comes up scaled,
-                            // not at 100% until the setting is next touched.
-                            desktop.set_web_surface_zoom(native_id, desired_zoom_factor);
+                            // Seed the page zoom so a surface opened while zoomed
+                            // comes up scaled, not at 100% until the setting is
+                            // next touched — the per-site override for the URL it
+                            // opens on, else the global.
+                            let open_zoom = surface_zoom_factor(&session_path, &effective_url);
+                            desktop.set_web_surface_zoom(native_id, open_zoom);
                             applied.insert(
                                 key,
                                 AppliedWebSurface {
@@ -2355,7 +2456,7 @@ async fn web_surface_native_reconcile_loop(
                                     reload_nonce,
                                     socks_port,
                                     profile,
-                                    zoom_factor: desired_zoom_factor,
+                                    zoom_factor: open_zoom,
                                     stashed_at_ms: None,
                                     page_url: effective_url,
                                     page_title: String::new(),
@@ -2736,6 +2837,30 @@ fn web_surface_tab_host_label(url: &str) -> String {
         "New Tab".to_string()
     } else {
         host.to_string()
+    }
+}
+/// The per-site zoom override for a host, most specific first: an exact
+/// `music.youtube.com` entry beats a `youtube.com` entry (which covers all its
+/// sub-domains), which beats none. A bare TLD (`com`) is never consulted. This is
+/// the GUI twin of ychrome's `webzoom::zoom_for_host`; both must agree, or a
+/// zoom set in the pane would apply to a different set of pages than it names.
+fn zoom_override_for_host(overrides: &HashMap<String, f32>, host: &str) -> Option<f32> {
+    if overrides.is_empty() {
+        return None;
+    }
+    let host = host.split(':').next().unwrap_or(host).trim().to_lowercase();
+    if host.is_empty() || host == "new tab" {
+        return None;
+    }
+    let mut candidate = host.as_str();
+    loop {
+        if let Some(percent) = overrides.get(candidate) {
+            return Some(*percent);
+        }
+        match candidate.split_once('.') {
+            Some((_, rest)) if rest.contains('.') => candidate = rest,
+            _ => return None,
+        }
     }
 }
 #[derive(Clone, PartialEq, Eq)]
@@ -3310,6 +3435,9 @@ struct RenderSnapshot {
     /// The active session's live web-surface profile (app tab), if it has a
     /// surface.
     active_web_surface_profile: Option<String>,
+    /// The active app's declared display name, for the zoom control's label
+    /// ("Ychrome Global Zoom"). The app names itself over `sidebar ; declare`.
+    active_web_surface_app_name: Option<String>,
     /// Panes the ACTIVE session's libyggterm app has declared. Empty unless an
     /// app is live and declaring — which is what keeps app chrome out of the
     /// rail. yggterm never invents one of these.
@@ -3811,7 +3939,13 @@ fn active_main_zoom_target(snapshot: &RenderSnapshot) -> MainZoomTarget {
 fn active_viewport_zoom_label(snapshot: &RenderSnapshot) -> String {
     match active_main_zoom_target(snapshot) {
         MainZoomTarget::Terminal => "Terminal Zoom".to_string(),
-        MainZoomTarget::WebSurface => "Web View Zoom".to_string(),
+        // A live web surface's app names its own zoom control ("Ychrome Global
+        // Zoom"), so the user knows the number is the fallback the per-site
+        // overrides refine. No app name declared ⇒ the generic "Web View Zoom".
+        MainZoomTarget::WebSurface => match &snapshot.active_web_surface_app_name {
+            Some(app) => format!("{app} Global Zoom"),
+            None => "Web View Zoom".to_string(),
+        },
         MainZoomTarget::Rendered => snapshot
             .selected_row
             .as_ref()
@@ -5168,6 +5302,9 @@ impl ShellState {
                     .and_then(|surface| surface.tabs.first())
                     .map(|app_tab| app_tab.profile.clone())
             }),
+            active_web_surface_app_name: active_session_path
+                .as_deref()
+                .and_then(|path| self.web_surface_app_name(path)),
             sidebar_panes,
             apps: self.server.apps().to_vec(),
             app_pane_schema: self.app_pane_schema.clone(),
@@ -5546,20 +5683,25 @@ impl ShellState {
     /// GUI-reachable URL; a re-declare (the liveness heartbeat) is idempotent
     /// and must NOT re-resolve — that would spawn an `ssh -L` per heartbeat.
     ///
-    /// Returns true when the caller must fetch `<control>/policy`: the app
-    /// declared a `policy_version` this session has not fetched yet.
+    /// Returns which endpoints the caller must fetch: `<control>/policy` when the
+    /// app declared a `policy_version` this session has not fetched, and
+    /// `<control>/zoom` likewise for `zoom_version`. Two stamps, so a zoom edit
+    /// never drags the ruleset over the wire.
     fn upsert_sidebar_contribution(
         &mut self,
         session_path: &str,
         panes: Vec<SidebarPaneDeclaration>,
         policy_version: Option<String>,
+        app_name: Option<String>,
+        zoom_version: Option<String>,
         now_ms: u64,
         resolved: Option<(
             String,
             Option<std::sync::Arc<std::sync::Mutex<std::process::Child>>>,
         )>,
-    ) -> bool {
+    ) -> SidebarRefetch {
         let policy_version = policy_version.unwrap_or_default();
+        let zoom_version = zoom_version.unwrap_or_default();
         if let Some(existing) = self.sidebar_contributions.get_mut(session_path) {
             existing.last_seen_ms = now_ms;
             // Panes may change between declares (an app can add one); the
@@ -5567,6 +5709,9 @@ impl ShellState {
             if existing.panes != panes {
                 existing.panes = panes;
             }
+            // The app's display name is cheap and can change (unlikely, but the
+            // declaration owns it).
+            existing.app_name = app_name;
             // A changed stamp means the app's rules or userscripts changed on
             // its own host: drop what we hold and refetch. An unchanged stamp
             // is the common case and costs nothing.
@@ -5575,15 +5720,28 @@ impl ShellState {
                 existing.policy = None;
                 existing.policy_attempts = 0;
             }
+            // Zoom is non-gating: on a stamp change keep the OLD overrides
+            // applied (no flicker to global) and just mark them stale until the
+            // refetch lands.
+            if existing.zoom_version != zoom_version {
+                existing.zoom_version = zoom_version.clone();
+                existing.zoom_loaded = false;
+                existing.zoom_attempts = 0;
+            }
             // Retry a failed fetch on the next heartbeat, but only until the
             // attempts run out — a permanently broken endpoint must not mean one
             // fetch every 4s for the life of the session.
-            return !policy_version.is_empty()
-                && existing.policy.is_none()
-                && existing.policy_attempts < MAX_POLICY_FETCH_ATTEMPTS;
+            return SidebarRefetch {
+                policy: !policy_version.is_empty()
+                    && existing.policy.is_none()
+                    && existing.policy_attempts < MAX_POLICY_FETCH_ATTEMPTS,
+                zoom: !zoom_version.is_empty()
+                    && !existing.zoom_loaded
+                    && existing.zoom_attempts < MAX_ZOOM_FETCH_ATTEMPTS,
+            };
         }
         let Some((control_url, forward_child)) = resolved else {
-            return false;
+            return SidebarRefetch::default();
         };
         self.sidebar_contributions.insert(
             session_path.to_string(),
@@ -5594,10 +5752,18 @@ impl ShellState {
                 policy_version: policy_version.clone(),
                 policy: None,
                 policy_attempts: 0,
+                app_name,
+                zoom_version: zoom_version.clone(),
+                zoom_overrides: HashMap::new(),
+                zoom_loaded: false,
+                zoom_attempts: 0,
                 last_seen_ms: now_ms,
             },
         );
-        !policy_version.is_empty()
+        SidebarRefetch {
+            policy: !policy_version.is_empty(),
+            zoom: !zoom_version.is_empty(),
+        }
     }
     /// Store the policy the app served for `policy_version`. A reply for a stale
     /// version is dropped: the app has already moved on and a newer fetch is in
@@ -5643,6 +5809,71 @@ impl ShellState {
         }
         contribution.policy_attempts += 1;
         contribution.policy_attempts >= MAX_POLICY_FETCH_ATTEMPTS
+    }
+    /// The stamp a zoom fetch for this session should be filed under. `None` when
+    /// the app ships no per-site zoom.
+    fn sidebar_zoom_version(&self, session_path: &str) -> Option<String> {
+        self.sidebar_contributions
+            .get(session_path)
+            .map(|contribution| contribution.zoom_version.clone())
+            .filter(|version| !version.is_empty())
+    }
+    /// Store the per-site zoom map the app served for `zoom_version`. A reply for
+    /// a stale stamp is dropped: a newer fetch is already in flight.
+    fn apply_sidebar_zoom(
+        &mut self,
+        session_path: &str,
+        zoom_version: &str,
+        overrides: HashMap<String, f32>,
+    ) {
+        if let Some(contribution) = self.sidebar_contributions.get_mut(session_path)
+            && contribution.zoom_version == zoom_version
+        {
+            contribution.zoom_overrides = overrides;
+            contribution.zoom_loaded = true;
+            contribution.zoom_attempts = 0;
+        }
+    }
+    /// Count a failed `<control>/zoom` fetch. Returns true once the reconciler
+    /// should stop asking and leave the surfaces on the global zoom.
+    fn fail_sidebar_zoom(&mut self, session_path: &str, zoom_version: &str) -> bool {
+        let Some(contribution) = self.sidebar_contributions.get_mut(session_path) else {
+            return false;
+        };
+        if contribution.zoom_version != zoom_version {
+            return false;
+        }
+        contribution.zoom_attempts += 1;
+        contribution.zoom_attempts >= MAX_ZOOM_FETCH_ATTEMPTS
+    }
+    /// The app's per-site zoom override for `host`, most specific first (an exact
+    /// `music.youtube.com` beats a `youtube.com` entry, which beats none). One
+    /// owner for the match rule, so the reconciler and the pane's live-zoom
+    /// context agree; mirrors ychrome's `webzoom::zoom_for_host`.
+    fn web_surface_zoom_override(&self, session_path: &str, host: &str) -> Option<f32> {
+        let overrides = &self.sidebar_contributions.get(session_path)?.zoom_overrides;
+        zoom_override_for_host(overrides, host)
+    }
+    /// The app's declared display name for the zoom control ("Ychrome"), if any.
+    fn web_surface_app_name(&self, session_path: &str) -> Option<String> {
+        self.sidebar_contributions
+            .get(session_path)
+            .and_then(|contribution| contribution.app_name.clone())
+            .filter(|name| !name.is_empty())
+    }
+    /// The live effective web-surface zoom percent for the active session: the
+    /// per-site override for the page it is on, else the global. `None` when no
+    /// web surface is active. This is what the app's settings pane is told so its
+    /// `+`/`-` step from what is actually on screen.
+    fn active_web_surface_effective_zoom_percent(&self) -> Option<f32> {
+        let session_path = self.server.active_session_path()?.to_string();
+        self.web_surfaces.get(&session_path)?;
+        let global = self.settings.web_surface_zoom_percent;
+        let host = self.web_surface_host_label(&session_path);
+        let override_pct = host
+            .as_deref()
+            .and_then(|host| self.web_surface_zoom_override(&session_path, host));
+        Some(override_pct.unwrap_or(global))
     }
     /// What the surface reconciler should do about `session_path`'s policy right
     /// now. One owner for the whole rule, so the gate and the create path cannot
@@ -37899,6 +38130,57 @@ async fn app_policy_fetch(
     }
 }
 
+/// Fetch `<control>/zoom` and store the per-site overrides for the session.
+/// Mirrors [`app_policy_fetch`] but non-gating: a slow or failed fetch just
+/// leaves the surfaces on the global zoom, never holds a surface's creation.
+async fn app_zoom_fetch(
+    mut state: Signal<ShellState>,
+    session_path: String,
+    zoom_version: String,
+    trace_home: std::path::PathBuf,
+) {
+    let Some(control_url) = state.peek().sidebar_control_url(&session_path) else {
+        return;
+    };
+    let url = app_zoom_url(&control_url);
+    let fetched = task::spawn_blocking(move || control_request(&url, None))
+        .await
+        .unwrap_or_else(|error| Err(format!("zoom fetch panicked: {error}")));
+    match fetched {
+        Ok(value) => {
+            let overrides = parse_web_surface_zoom(&value);
+            append_trace_event(
+                &trace_home,
+                "ui",
+                "sidebar_contribution",
+                "zoom",
+                json!({
+                    "session_path": session_path,
+                    "zoom_version": zoom_version,
+                    "sites": overrides.len(),
+                }),
+            );
+            state.with_mut(|shell| shell.apply_sidebar_zoom(&session_path, &zoom_version, overrides));
+        }
+        Err(error) => {
+            let exhausted =
+                state.with_mut(|shell| shell.fail_sidebar_zoom(&session_path, &zoom_version));
+            append_trace_event(
+                &trace_home,
+                "ui",
+                "sidebar_contribution",
+                "zoom_failed",
+                json!({
+                    "session_path": session_path,
+                    "zoom_version": zoom_version,
+                    "error": error,
+                    "exhausted": exhausted,
+                }),
+            );
+        }
+    }
+}
+
 /// Answer a passkey presence dialog: POST the grant (or deny) to the app's
 /// control endpoint, over the SAME `ssh -L` forward its `sidebar` declaration
 /// opened, then clear the dialog. The app is parked on `/fido2/get` waiting for
@@ -37960,7 +38242,7 @@ async fn app_pane_run_action(
     action: String,
     value: Option<String>,
 ) {
-    let (control_url, mut values, host) = {
+    let (control_url, mut values, host, live_zoom) = {
         let shell = state.read();
         let active = shell.server.active_session_path().map(str::to_string);
         let control = active
@@ -37969,13 +38251,20 @@ async fn app_pane_run_action(
         let host = active
             .as_deref()
             .and_then(|path| shell.web_surface_host_label(path));
-        (control, shell.app_pane_values_json(), host)
+        let live_zoom = shell.active_web_surface_effective_zoom_percent();
+        (control, shell.app_pane_values_json(), host, live_zoom)
     };
     let Some(control_url) = control_url else {
         return;
     };
     if let (Some(host), Some(map)) = (host, values.as_object_mut()) {
         map.insert("host".to_string(), serde_json::Value::String(host));
+    }
+    // The live effective zoom of the active surface, so an app's zoom control can
+    // step from what is actually on screen (see `web_surface_zoom_percent`). Non-
+    // secret page context, exactly like `host`.
+    if let (Some(zoom), Some(map)) = (live_zoom, values.as_object_mut()) {
+        map.insert("zoom".to_string(), serde_json::json!(zoom));
     }
     // A widget that carries its own value (a tab id, a row's item id) passes it
     // alongside the pane's draft inputs rather than mutating them.
@@ -38051,6 +38340,27 @@ async fn app_pane_run_action(
         if let Some(version) = version {
             let trace_home = resolve_yggterm_home().unwrap_or_else(|_| PathBuf::from("."));
             spawn(app_policy_fetch(state, session, version, trace_home));
+        }
+    }
+    if reply.refetch_zoom {
+        // A per-site zoom action wants its change on the live page NOW, not at
+        // the next declare. Re-read `/zoom` under the current stamp; the
+        // reconciler applies it to the surface on its next tick.
+        let session = state.peek().server.active_session_path().map(str::to_string);
+        if let Some(session) = session {
+            // Force the next fetch: the stamp has not moved yet (the ~4s declare
+            // will catch up), so clear `zoom_loaded` to make the refetch land.
+            let version = state.with_mut(|shell| {
+                if let Some(contribution) = shell.sidebar_contributions.get_mut(&session) {
+                    contribution.zoom_loaded = false;
+                    contribution.zoom_attempts = 0;
+                }
+                shell.sidebar_zoom_version(&session)
+            });
+            if let Some(version) = version {
+                let trace_home = resolve_yggterm_home().unwrap_or_else(|_| PathBuf::from("."));
+                spawn(app_zoom_fetch(state, session, version, trace_home));
+            }
         }
     }
 }
@@ -57872,6 +58182,8 @@ fn TerminalCanvas(
                                 control,
                                 panes,
                                 policy_version,
+                                app_name,
+                                zoom_version,
                             }) => {
                                 let now_ms = current_millis();
                                 let contribution_session_path = session_path.clone();
@@ -57882,20 +58194,25 @@ fn TerminalCanvas(
                                         // re-resolve — resolving spawns an
                                         // `ssh -L`, and once per heartbeat would
                                         // leak one ssh every few seconds.
-                                        let (known, mut fetch_policy) = state.with_mut(|shell| {
+                                        let (known, mut refetch) = state.with_mut(|shell| {
                                             shell.sweep_stale_sidebar_contributions(now_ms);
                                             let known = shell
                                                 .sidebar_contributions
                                                 .contains_key(&contribution_session_path);
-                                            let fetch = known
-                                                && shell.upsert_sidebar_contribution(
+                                            let refetch = if known {
+                                                shell.upsert_sidebar_contribution(
                                                     &contribution_session_path,
                                                     panes.clone(),
                                                     policy_version.clone(),
+                                                    app_name.clone(),
+                                                    zoom_version.clone(),
                                                     now_ms,
                                                     None,
-                                                );
-                                            (known, fetch)
+                                                )
+                                            } else {
+                                                SidebarRefetch::default()
+                                            };
+                                            (known, refetch)
                                         });
                                         if !known && let Some(control_url) = control {
                                             let resolve_url = control_url.clone();
@@ -57918,11 +58235,13 @@ fn TerminalCanvas(
                                             });
                                             let pane_ids: Vec<String> =
                                                 panes.iter().map(|pane| pane.id.clone()).collect();
-                                            fetch_policy = state.with_mut(|shell| {
+                                            refetch = state.with_mut(|shell| {
                                                 shell.upsert_sidebar_contribution(
                                                     &contribution_session_path,
                                                     panes.clone(),
                                                     policy_version.clone(),
+                                                    app_name.clone(),
+                                                    zoom_version.clone(),
                                                     now_ms,
                                                     Some((effective_control.clone(), forward_child)),
                                                 )
@@ -57938,6 +58257,8 @@ fn TerminalCanvas(
                                                     "control": effective_control,
                                                     "panes": pane_ids,
                                                     "policy_version": policy_version,
+                                                    "zoom_version": zoom_version,
+                                                    "app_name": app_name,
                                                 }),
                                             );
                                         }
@@ -57946,12 +58267,22 @@ fn TerminalCanvas(
                                         // before any surface is created: a
                                         // userscript that misses document-start
                                         // never runs.
-                                        if fetch_policy
+                                        if refetch.policy
                                             && let Some(version) = policy_version.clone()
                                         {
                                             let trace_home = trace_home.clone();
                                             let session = contribution_session_path.clone();
                                             spawn(app_policy_fetch(state, session, version, trace_home));
+                                        }
+                                        // Per-site zoom moved (or first declare).
+                                        // Non-gating: fetched off the render path,
+                                        // applied by the reconciler when it lands.
+                                        if refetch.zoom
+                                            && let Some(version) = zoom_version.clone()
+                                        {
+                                            let trace_home = trace_home.clone();
+                                            let session = contribution_session_path.clone();
+                                            spawn(app_zoom_fetch(state, session, version, trace_home));
                                         }
                                     }
                                     "close" => {
@@ -68557,6 +68888,12 @@ fn terminal_eval_script_with_canvas_renderer(
                                 control: typeof payload.control === 'string' ? payload.control : null,
                                 policy_version: typeof payload.policy_version === 'string'
                                     ? payload.policy_version
+                                    : null,
+                                app_name: typeof payload.app_name === 'string'
+                                    ? payload.app_name
+                                    : null,
+                                zoom_version: typeof payload.zoom_version === 'string'
+                                    ? payload.zoom_version
                                     : null,
                                 panes: panes
                                     .filter((pane) => pane && typeof pane.id === 'string' && pane.id)
@@ -86003,6 +86340,45 @@ mod tests {
             set_main_zoom_settings_for_target(&mut settings, MainZoomTarget::WebSurface, 5.0);
         assert_eq!(clamped_low, 50.0);
     }
+    // The per-site override match must agree with ychrome's `webzoom::zoom_for_host`:
+    // exact host wins, a parent domain covers its sub-domains, a bare TLD never
+    // matches across the web. If these two drift, a zoom set in the pane applies
+    // to a different set of pages than the pane names.
+    #[test]
+    fn per_site_zoom_override_matches_most_specific_host() {
+        let mut overrides = HashMap::new();
+        overrides.insert("youtube.com".to_string(), 130.0f32);
+        overrides.insert("music.youtube.com".to_string(), 90.0f32);
+        assert_eq!(zoom_override_for_host(&overrides, "music.youtube.com"), Some(90.0));
+        assert_eq!(zoom_override_for_host(&overrides, "www.youtube.com"), Some(130.0));
+        assert_eq!(zoom_override_for_host(&overrides, "YouTube.com:443"), Some(130.0));
+        assert_eq!(zoom_override_for_host(&overrides, "example.com"), None);
+
+        let mut tld = HashMap::new();
+        tld.insert("com".to_string(), 130.0f32);
+        assert_eq!(
+            zoom_override_for_host(&tld, "example.com"),
+            None,
+            "a bare-TLD override must never swallow the whole web"
+        );
+
+        let empty: HashMap<String, f32> = HashMap::new();
+        assert_eq!(zoom_override_for_host(&empty, "youtube.com"), None);
+    }
+    // `/zoom` is a wire boundary: drop non-numeric and empty-host entries, clamp,
+    // and lowercase the host so the reconciler's match (also lowercased) hits.
+    #[test]
+    fn parse_web_surface_zoom_sanitizes_the_wire() {
+        let value = json!({
+            "sites": { "YouTube.com": 130, "b.com": 9999, "c.com": "nope", "": 120 }
+        });
+        let parsed = parse_web_surface_zoom(&value);
+        assert_eq!(parsed.get("youtube.com"), Some(&130.0));
+        assert_eq!(parsed.get("b.com"), Some(&500.0), "clamped to the factor ceiling");
+        assert_eq!(parsed.get("c.com"), None);
+        assert!(!parsed.keys().any(|k| k.is_empty()));
+        assert_eq!(parse_web_surface_zoom(&json!({})).len(), 0);
+    }
     #[test]
     fn terminal_zoom_updates_only_terminal_font_size() {
         let mut settings = AppSettings::default();
@@ -90832,6 +91208,8 @@ mod tests {
                 title: "Vault".to_string(),
             }],
             None,
+            None,
+            None,
             now_ms,
             Some(("http://127.0.0.1:1".to_string(), None)),
         );
@@ -90843,17 +91221,21 @@ mod tests {
         policy_version: Option<&str>,
         now_ms: u64,
     ) -> bool {
-        shell.upsert_sidebar_contribution(
-            session,
-            vec![SidebarPaneDeclaration {
-                id: "settings".to_string(),
-                icon: "⚙".to_string(),
-                title: "Settings".to_string(),
-            }],
-            policy_version.map(str::to_string),
-            now_ms,
-            Some(("http://127.0.0.1:1".to_string(), None)),
-        )
+        shell
+            .upsert_sidebar_contribution(
+                session,
+                vec![SidebarPaneDeclaration {
+                    id: "settings".to_string(),
+                    icon: "⚙".to_string(),
+                    title: "Settings".to_string(),
+                }],
+                policy_version.map(str::to_string),
+                None,
+                None,
+                now_ms,
+                Some(("http://127.0.0.1:1".to_string(), None)),
+            )
+            .policy
     }
 
     // Every launcher surface (titlebar `+`, cwd-tree context menu, start page)
@@ -91878,7 +92260,14 @@ mod tests {
     fn terminal_eval_script_forwards_every_sidebar_declaration_field() {
         let theme = terminal_theme(UiTheme::ZedLight, palette(UiTheme::ZedLight), 13.0, "");
         let script = terminal_eval_script("yggterm-terminal-test", &theme, true);
-        for field in ["session:", "control:", "policy_version:", "panes:"] {
+        for field in [
+            "session:",
+            "control:",
+            "policy_version:",
+            "app_name:",
+            "zoom_version:",
+            "panes:",
+        ] {
             assert!(
                 script.contains(field),
                 "the sidebar OSC forwarder drops `{field}` — it will arrive null"
@@ -109423,6 +109812,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             active_split_group: None,
             terminal_mount_epochs: HashMap::new(),
             active_web_surface_profile: None,
+            active_web_surface_app_name: None,
             active_web_surface_host: None,
             ssh_targets: Vec::new(),
             remote_machines: Vec::new(),
@@ -110043,6 +110433,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             active_split_group: None,
             terminal_mount_epochs: HashMap::new(),
             active_web_surface_profile: None,
+            active_web_surface_app_name: None,
             active_web_surface_host: None,
             ssh_targets: Vec::new(),
             remote_machines: Vec::new(),
@@ -110198,6 +110589,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             active_split_group: None,
             terminal_mount_epochs: HashMap::new(),
             active_web_surface_profile: None,
+            active_web_surface_app_name: None,
             active_web_surface_host: None,
             ssh_targets: Vec::new(),
             remote_machines: Vec::new(),
@@ -110353,6 +110745,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             active_split_group: None,
             terminal_mount_epochs: HashMap::new(),
             active_web_surface_profile: None,
+            active_web_surface_app_name: None,
             active_web_surface_host: None,
             ssh_targets: Vec::new(),
             remote_machines: Vec::new(),
@@ -110511,6 +110904,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             active_split_group: None,
             terminal_mount_epochs: HashMap::new(),
             active_web_surface_profile: None,
+            active_web_surface_app_name: None,
             active_web_surface_host: None,
             ssh_targets: Vec::new(),
             remote_machines: Vec::new(),
@@ -110673,6 +111067,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             active_split_group: None,
             terminal_mount_epochs: HashMap::new(),
             active_web_surface_profile: None,
+            active_web_surface_app_name: None,
             active_web_surface_host: None,
             ssh_targets: Vec::new(),
             remote_machines: Vec::new(),
@@ -110827,6 +111222,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             active_split_group: None,
             terminal_mount_epochs: HashMap::new(),
             active_web_surface_profile: None,
+            active_web_surface_app_name: None,
             active_web_surface_host: None,
             ssh_targets: Vec::new(),
             remote_machines: Vec::new(),
@@ -110981,6 +111377,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             active_split_group: None,
             terminal_mount_epochs: HashMap::new(),
             active_web_surface_profile: None,
+            active_web_surface_app_name: None,
             active_web_surface_host: None,
             ssh_targets: Vec::new(),
             remote_machines: Vec::new(),
@@ -111169,6 +111566,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             active_split_group: None,
             terminal_mount_epochs: HashMap::new(),
             active_web_surface_profile: None,
+            active_web_surface_app_name: None,
             active_web_surface_host: None,
             ssh_targets: Vec::new(),
             remote_machines: Vec::new(),
@@ -111326,6 +111724,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             active_split_group: None,
             terminal_mount_epochs: HashMap::new(),
             active_web_surface_profile: None,
+            active_web_surface_app_name: None,
             active_web_surface_host: None,
             ssh_targets: Vec::new(),
             remote_machines: Vec::new(),
@@ -111515,6 +111914,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             active_split_group: None,
             terminal_mount_epochs: HashMap::new(),
             active_web_surface_profile: None,
+            active_web_surface_app_name: None,
             active_web_surface_host: None,
             ssh_targets: Vec::new(),
             remote_machines: Vec::new(),
@@ -111881,6 +112281,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             active_split_group: None,
             terminal_mount_epochs: HashMap::new(),
             active_web_surface_profile: None,
+            active_web_surface_app_name: None,
             active_web_surface_host: None,
             ssh_targets: Vec::new(),
             remote_machines: Vec::new(),
