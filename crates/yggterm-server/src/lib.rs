@@ -6424,7 +6424,22 @@ impl YggtermServer {
             let _ = refresh_restored_remote_runtime_codex_launch_command(&key, session);
             if let Some(storage_path) = storage_path.as_deref() {
                 upsert_session_metadata(&mut session.metadata, "Storage", storage_path.to_string());
-                let cwd = session_metadata_value(session, "Cwd").unwrap_or_else(local_default_cwd);
+                // For a LOCAL Claude Code row the TRANSCRIPT owns the cwd — see
+                // `local_cc_resume_cwd`. This restore path reaches rows whose cwd has
+                // already been defaulted to $HOME, and a bare `Cwd` read would then bake
+                // $HOME into the resume command AND file the row under the wrong
+                // directory in the tree. The transcript cannot lie about where the
+                // session ran, so it wins whenever it exists.
+                let is_local_cc = session.kind == SessionKind::ClaudeCode
+                    && is_loopback_ssh_target(&target.ssh_target);
+                let cwd = is_local_cc
+                    .then(|| local_cc_resume_cwd(&id))
+                    .flatten()
+                    .or_else(|| session_metadata_value(session, "Cwd"))
+                    .unwrap_or_else(local_default_cwd);
+                if is_local_cc {
+                    upsert_session_metadata(&mut session.metadata, "Cwd", cwd.clone());
+                }
                 // The stored_session_launch_command overwrite builds a LOCAL
                 // resume command; a restored REMOTE session (remote-cc://, now
                 // recoverable) must keep the ssh-wrapped launch that
@@ -21029,8 +21044,13 @@ fn persistent_agent_resume_command_with_terminal_appearance(
 /// same id (`--session-id`), not resume it. LOCAL ONLY — the lookup reads this machine's
 /// `~/.claude/projects`, so a remote CC session must never be routed through it (it would
 /// wrongly look transcript-less and get re-birthed on top of a live remote rollout).
-fn local_cc_session_is_resumable(session_id: &str) -> bool {
-    yggterm_core::local_cc_session_jsonl_path(session_id).is_some()
+///
+/// The SAME transcript lookup answers BOTH questions a local CC relaunch must ask —
+/// "is there anything to resume?" and "which directory must I resume it in?" — so it is
+/// resolved once, here, rather than twice from two sources that can disagree.
+/// `Some(cwd)` = resumable, in that cwd. `None` = nothing to resume, re-birth it.
+fn local_cc_resume_cwd(session_id: &str) -> Option<String> {
+    yggterm_core::local_cc_session_cwd(session_id)
 }
 
 /// Launch command for a stored session. `is_local` says whether the row lives on THIS
@@ -21046,11 +21066,17 @@ fn stored_session_launch_command_for_locality(
         SessionKind::Codex | SessionKind::CodexLiteLlm => {
             agent_launch_command(kind, Some(cwd), Some(session_id))
         }
-        // A local CC row with no transcript yet cannot be resumed — re-birth it with its
-        // own id instead of handing the user CC's "no conversation found" refusal.
-        SessionKind::ClaudeCode if is_local && !local_cc_session_is_resumable(session_id) => {
-            claude_code_fresh_launch_command(Some(cwd), session_id)
-        }
+        SessionKind::ClaudeCode if is_local => match local_cc_resume_cwd(session_id) {
+            // Resume in the cwd the TRANSCRIPT records, never the row's cwd: CC keys its
+            // project dir on the process cwd, and a relaunch path can hand us a row whose
+            // cwd has been defaulted to $HOME — which makes CC search the wrong project
+            // dir and refuse a session that is sitting right there.
+            Some(transcript_cwd) => {
+                agent_launch_command(kind, Some(&transcript_cwd), Some(session_id))
+            }
+            // No transcript: nothing to resume. Re-birth the row with its own id.
+            None => claude_code_fresh_launch_command(Some(cwd), session_id),
+        },
         SessionKind::ClaudeCode => agent_launch_command(kind, Some(cwd), Some(session_id)),
         SessionKind::Document => "document web view".to_string(),
         SessionKind::Shell | SessionKind::SshShell => format!(
@@ -22627,6 +22653,12 @@ mod tests {
         terminal_session_keys: Vec<String>,
     ) -> ServerRuntimeStatus {
         ServerRuntimeStatus {
+            daemon_started_at_ms: 0,
+            daemon_uptime_ms: 0,
+            running_build_id: 0,
+            on_disk_build_id: 0,
+            hot_restart_pending: false,
+            hot_restart_block_reason: None,
             server_version: server_version.to_string(),
             server_build_id: 0,
             server_pid: 0,
@@ -32515,6 +32547,12 @@ terminal_window_id: None,
         std::os::unix::fs::symlink(&legacy_socket, &current_socket).expect("link current socket");
         let endpoint = ServerEndpoint::UnixSocket(current_socket.clone());
         let status = ServerRuntimeStatus {
+            daemon_started_at_ms: 0,
+            daemon_uptime_ms: 0,
+            running_build_id: 0,
+            on_disk_build_id: 0,
+            hot_restart_pending: false,
+            hot_restart_block_reason: None,
             server_version: "2.1.41".to_string(),
             server_build_id: 41,
             server_pid: 0,

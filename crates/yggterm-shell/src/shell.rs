@@ -183,7 +183,7 @@ use yggterm_server::{
     YggtermServer, app_control_pending_render_needed_for_worker,
     app_control_requests_pending_for_worker, cleanup_legacy_daemons,
     complete_app_control_request, connect_ssh_custom, enqueue_app_control_request,
-    fetch_remote_generation_context, focus_live_with_view, hot_restart,
+    fetch_remote_generation_context, focus_live_with_view, hot_restart, hot_restart_detailed,
     local_headless_companion_executable_from_current, managed_cli_refresh_ttl_ms,
     open_remote_session_with_view, open_stored_session, open_stored_session_with_view,
     persist_remote_generated_copy, ping, prepare_client_close, prepare_update_restart,
@@ -909,6 +909,42 @@ struct UpdateCallToAction {
     progress_percent: Option<u8>,
     detail: String,
     disabled: bool,
+}
+/// The daemon behind this window, as the metadata rail renders it.
+///
+/// yggterm's whole persistence story runs through a daemon the user never sees, and
+/// when it gets PINNED — an agent session is mid-turn, so the idle gate defers the
+/// swap — the product looked identical to a healthy one. On guihost 2026-07-11 that let a
+/// 2.10.3 daemon run for 19h44m with 2.10.13 sitting on disk: two shipped fixes were
+/// compiled, deployed, and simply not running, with nothing on screen saying so.
+/// Surfacing version + uptime + what is blocking a restart is the fix for that class.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DaemonPanelStatus {
+    version: String,
+    pid: u32,
+    uptime_ms: u64,
+    owned_sessions: usize,
+    total_sessions: usize,
+    preserved_owners: usize,
+    /// A newer build is on disk that this daemon is not running.
+    hot_restart_pending: bool,
+    /// Why a hot-restart is being deferred, in the daemon's own words. `None` = nothing
+    /// is blocking one.
+    hot_restart_block_reason: Option<String>,
+}
+/// "19h 44m" / "3m 12s" / "8s" — a daemon's age at a glance. A raw millisecond count
+/// tells the user nothing, and the whole point of this row is that they can tell a
+/// daemon that swapped a minute ago from one that has been pinned overnight.
+fn friendly_duration_ms(ms: u64) -> String {
+    let secs = ms / 1_000;
+    let (h, m, s) = (secs / 3_600, (secs % 3_600) / 60, secs % 60);
+    if h > 0 {
+        format!("{h}h {m}m")
+    } else if m > 0 {
+        format!("{m}m {s}s")
+    } else {
+        format!("{s}s")
+    }
 }
 #[derive(Debug, Clone, Default)]
 struct LiveTerminalSidebarSample {
@@ -3714,6 +3750,9 @@ struct RenderSnapshot {
     ssh_connect_prefix: String,
     pending_update_restart: Option<PendingUpdateRestart>,
     update_call_to_action: UpdateCallToAction,
+    /// The daemon behind this window, as the metadata rail shows it. `None` until the
+    /// first status poll lands.
+    daemon: Option<DaemonPanelStatus>,
     last_terminal_debug: String,
     last_tree_debug: String,
     active_title: Option<String>,
@@ -5049,6 +5088,24 @@ impl ShellState {
         }
         context
     }
+    /// Project the daemon's own status into what the metadata rail renders. The daemon
+    /// remains the single source of truth for every one of these facts — this narrows
+    /// it to the panel's fields so the render snapshot need not clone the full
+    /// session-key vectors on every frame.
+    fn daemon_panel_status(&self) -> Option<DaemonPanelStatus> {
+        let status = self.latest_runtime_status.as_ref()?;
+        Some(DaemonPanelStatus {
+            version: status.server_version.clone(),
+            pid: status.server_pid,
+            uptime_ms: status.daemon_uptime_ms,
+            owned_sessions: status.owned_terminal_session_count,
+            total_sessions: status.terminal_session_count,
+            preserved_owners: status.preserved_terminal_owner_count,
+            hot_restart_pending: status.hot_restart_pending,
+            hot_restart_block_reason: status.hot_restart_block_reason.clone(),
+        })
+    }
+
     fn update_call_to_action(&self) -> UpdateCallToAction {
         match &self.update_workflow {
             UpdateWorkflowState::Checking => UpdateCallToAction {
@@ -5567,6 +5624,7 @@ impl ShellState {
             ssh_connect_prefix: self.ssh_connect_prefix.clone(),
             pending_update_restart: self.pending_update_restart.clone(),
             update_call_to_action: self.update_call_to_action(),
+            daemon: self.daemon_panel_status(),
             last_terminal_debug: self.last_terminal_debug.clone(),
             last_tree_debug: self.last_tree_debug.clone(),
             active_title,
@@ -15060,6 +15118,56 @@ fn spawn_browser_tree_refresh(
                         current_millis() + BROWSER_TREE_REFRESH_RETRY_MS;
                 }
             }
+        });
+    });
+}
+/// The user asked, by hand, for the daemon to hot-restart (metadata rail button).
+///
+/// This is a HANDOFF, not a kill: the daemon spawns its successor from the on-disk
+/// binary and migrates the live PTYs, so sessions survive (`docs/daemon-handoff.md`).
+/// `force` waives only the "target must be a different version" check — it does NOT
+/// override the idle gate, so an agent mid-turn is still never interrupted. That is
+/// exactly why the rail prints the block reason next to this button: a deferred
+/// restart must read as "waiting, because X", never as a click into silence.
+fn spawn_manual_daemon_hot_restart(mut state: Signal<ShellState>) {
+    state.with_mut(|shell| {
+        shell.last_action = "hot-restarting daemon".to_string();
+    });
+    spawn(async move {
+        let endpoint = state.read().bootstrap.server_endpoint.clone();
+        let daemon_executable = std::env::current_exe()
+            .map(|exe| startup_hot_swap_daemon_executable(&exe))
+            .unwrap_or_default();
+        let expected_version = current_version();
+        let outcome = task::spawn_blocking(move || {
+            hot_restart_detailed(
+                &endpoint,
+                &daemon_executable,
+                Some(expected_version.as_str()),
+                None,
+                Some("manual_metadata_rail"),
+                true,
+            )
+        })
+        .await;
+        state.with_mut(|shell| match outcome {
+            Ok(Ok(result)) => shell.push_notification(
+                NotificationTone::Success,
+                "Daemon Hot-Restart",
+                &result
+                    .message()
+                    .unwrap_or_else(|| "Hot-restart requested.".to_string()),
+            ),
+            Ok(Err(error)) => shell.push_notification(
+                NotificationTone::Warning,
+                "Daemon Hot-Restart Failed",
+                &error.to_string(),
+            ),
+            Err(error) => shell.push_notification(
+                NotificationTone::Warning,
+                "Daemon Hot-Restart Failed",
+                &error.to_string(),
+            ),
         });
     });
 }
@@ -48502,6 +48610,7 @@ fn app() -> Element {
                                     spawn_update_workflow(state, UpdateWorkflowTrigger::Manual);
                                 }
                             },
+                            on_daemon_hot_restart: move |_| spawn_manual_daemon_hot_restart(state),
                             on_connect_ssh_custom: move |_| spawn_connect_ssh_custom(state),
                             on_ssh_target_change: move |value: String| state.with_mut(|shell| shell.update_ssh_connect_target(value)),
                             on_ssh_prefix_change: move |value: String| state.with_mut(|shell| shell.update_ssh_connect_prefix(value)),
@@ -64736,6 +64845,27 @@ fn batch_terminal_chunks(
         combined.push_str(&chunk.data);
     }
     let (combined, saw_attach_ready_marker) = strip_terminal_attach_ready_marker(&combined);
+    // ⚠ KNOWN LIVE BUG — the head of [[campaign-render-pipeline-parity-rework]].
+    //
+    // These sanitizers excise lines by CONTENT-MATCHING three transport phrases, and a
+    // match also drops the THREE FOLLOWING LINES. No content match can tell yggterm's own
+    // transport error from an agent CLI that merely PRINTS that string, so a Claude Code
+    // session whose conversation quotes those phrases has four lines of its real output
+    // deleted mid-frame — the user sees text replaced by blanks.
+    //
+    // MEASURED on guihost 2026-07-11: `terminal_forward_divergence` recorded 679 bytes
+    // dropped per batch from `local://20e56a8b-…` (raw 9153 → forwarded 8474; raw 23991 →
+    // forwarded 23312) while the daemon's vt100 screen stayed clean, which is why every
+    // daemon-side instrument called the session healthy. 2.10.13 made the excision
+    // carriage-return-faithful (killing the staircase garble) but it still DELETES.
+    //
+    // It cannot simply be removed: ssh writes "Shared connection to <ip> closed." into the
+    // PTY and yggterm's remote helper prints "Error: terminal session not found: <key>" to
+    // its stdout, which IS the PTY — both arrive inside cursor-hide control batches, so
+    // there is no content- or branch-based split that separates them from CLI output. The
+    // real fix is per-session attach-phase state (sanitize only before the CLI owns the
+    // PTY), which is the "collapse the forks / delete the accreted fixes" step of the
+    // parity campaign — deliberately NOT rushed ahead of the harness.
     let terminal_payload = strip_internal_terminal_transport_noise_lines(&combined);
     let sanitized = sanitize_terminal_resume_runtime_output(&terminal_payload);
     let observation = strip_low_signal_terminal_noise_lines(&sanitized);
@@ -80162,6 +80292,8 @@ fn RightRail(
     on_ssh_prefix_change: EventHandler<String>,
     on_clear_notification: EventHandler<u64>,
     on_clear_notifications: EventHandler<MouseEvent>,
+    /// User asked for a daemon hot-restart by hand, from the metadata rail.
+    on_daemon_hot_restart: EventHandler<MouseEvent>,
     /// (pane_id, action, value) — fired by any widget in a contributed pane.
     on_app_pane_action: EventHandler<(String, String, Option<String>)>,
     /// (widget_id, value) — a draft input changed; stays in the GUI until an
@@ -80210,7 +80342,7 @@ fn RightRail(
             zoom_percent: zoom_percent_f32(snapshot.settings.ui_font_size, 14.0),
             body: rsx!{
             if rendered_mode == RightPanelMode::Metadata {
-                MetadataRailBody { snapshot: snapshot.clone() }
+                MetadataRailBody { snapshot: snapshot.clone(), on_daemon_hot_restart }
             } else if rendered_mode == RightPanelMode::Settings {
                 SettingsRailBody {
                     snapshot: snapshot.clone(),
@@ -80559,9 +80691,13 @@ fn AppPaneRailBody(
 }
 
 #[component]
-fn MetadataRailBody(snapshot: SharedSnapshot) -> Element {
+fn MetadataRailBody(
+    snapshot: SharedSnapshot,
+    on_daemon_hot_restart: EventHandler<MouseEvent>,
+) -> Element {
     let session = snapshot.active_session.clone();
     let palette = snapshot.palette;
+    let daemon = snapshot.daemon.clone();
     rsx! {
         RailHeader { title: "Session Metadata".to_string(), color: palette.text.to_string() }
         RailScrollBody {
@@ -80578,7 +80714,71 @@ fn MetadataRailBody(snapshot: SharedSnapshot) -> Element {
                     palette,
                 }
             }
+            if let Some(daemon) = daemon {
+                DaemonMetadataGroup { daemon, palette, on_daemon_hot_restart }
             }
+            }
+        }
+    }
+}
+/// The daemon group: who is actually serving this window, and why a restart is (or
+/// is not) being deferred. See [`DaemonPanelStatus`] for why this exists.
+#[component]
+fn DaemonMetadataGroup(
+    daemon: DaemonPanelStatus,
+    palette: Palette,
+    on_daemon_hot_restart: EventHandler<MouseEvent>,
+) -> Element {
+    let entries = vec![
+        SessionMetadataEntry {
+            label: "Version",
+            value: if daemon.hot_restart_pending {
+                format!("{} · newer build on disk", daemon.version)
+            } else {
+                daemon.version.clone()
+            },
+        },
+        SessionMetadataEntry {
+            label: "Uptime",
+            value: friendly_duration_ms(daemon.uptime_ms),
+        },
+        SessionMetadataEntry {
+            label: "PID",
+            value: daemon.pid.to_string(),
+        },
+        SessionMetadataEntry {
+            label: "Sessions",
+            value: format!(
+                "{} owned · {} total · {} preserved",
+                daemon.owned_sessions, daemon.total_sessions, daemon.preserved_owners
+            ),
+        },
+        // The transparency the whole group exists for: the daemon's OWN words for why
+        // it is holding off, not a guess reconstructed in the UI.
+        SessionMetadataEntry {
+            label: "Restart",
+            value: match (&daemon.hot_restart_block_reason, daemon.hot_restart_pending) {
+                (Some(reason), _) => format!("deferred — {reason}"),
+                (None, true) => "ready — newer build waiting".to_string(),
+                (None, false) => "nothing pending".to_string(),
+            },
+        },
+    ];
+    rsx! {
+        MetadataGroup { title: "Daemon".to_string(), entries, palette }
+        button {
+            "data-daemon-hot-restart-button": "1",
+            style: format!(
+                "display:inline-flex; align-items:center; justify-content:center; min-height:30px; \
+                 margin-bottom:8px; padding:0 12px; border:none; border-radius:10px; background:{}; \
+                 color:{}; font-size:11px; font-weight:700; box-shadow: inset 0 0 0 1px {}; \
+                 cursor:pointer; white-space:nowrap;",
+                palette.panel_alt,
+                palette.text,
+                chrome_chip_border(palette),
+            ),
+            onclick: move |evt| on_daemon_hot_restart.call(evt),
+            "Hot-restart daemon"
         }
     }
 }
@@ -110215,6 +110415,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         };
         let row = test_sidebar_row(session_path);
         let snapshot = RenderSnapshot {
+            daemon: None,
             apps: Vec::new(),
             sidebar_panes: Vec::new(),
             app_pane_schema: None,
@@ -110836,6 +111037,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         };
         let row = test_sidebar_row("local://stale");
         let snapshot = RenderSnapshot {
+            daemon: None,
             apps: Vec::new(),
             sidebar_panes: Vec::new(),
             app_pane_schema: None,
@@ -110992,6 +111194,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         };
         let row = test_sidebar_row(session_path);
         let snapshot = RenderSnapshot {
+            daemon: None,
             apps: Vec::new(),
             sidebar_panes: Vec::new(),
             app_pane_schema: None,
@@ -111148,6 +111351,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         };
         let row = test_sidebar_row(session_path);
         let snapshot = RenderSnapshot {
+            daemon: None,
             apps: Vec::new(),
             sidebar_panes: Vec::new(),
             app_pane_schema: None,
@@ -111307,6 +111511,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         };
         let row = test_sidebar_row(session_path);
         let snapshot = RenderSnapshot {
+            daemon: None,
             apps: Vec::new(),
             sidebar_panes: Vec::new(),
             app_pane_schema: None,
@@ -111470,6 +111675,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         };
         let row = test_sidebar_row(session_path);
         let snapshot = RenderSnapshot {
+            daemon: None,
             apps: Vec::new(),
             sidebar_panes: Vec::new(),
             app_pane_schema: None,
@@ -111625,6 +111831,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         };
         let row = test_sidebar_row("local://active");
         let snapshot = RenderSnapshot {
+            daemon: None,
             apps: Vec::new(),
             sidebar_panes: Vec::new(),
             app_pane_schema: None,
@@ -111780,6 +111987,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         };
         let row = test_sidebar_row("local://active");
         let snapshot = RenderSnapshot {
+            daemon: None,
             apps: Vec::new(),
             sidebar_panes: Vec::new(),
             app_pane_schema: None,
@@ -111969,6 +112177,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         };
         let row = test_sidebar_row("remote-session://guihost/idle");
         let snapshot = RenderSnapshot {
+            daemon: None,
             apps: Vec::new(),
             sidebar_panes: Vec::new(),
             app_pane_schema: None,
@@ -112127,6 +112336,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         };
         let row = test_sidebar_row("local://active");
         let snapshot = RenderSnapshot {
+            daemon: None,
             apps: Vec::new(),
             sidebar_panes: Vec::new(),
             app_pane_schema: None,
@@ -112317,6 +112527,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         };
         let row = test_sidebar_row(session_path);
         let snapshot = RenderSnapshot {
+            daemon: None,
             apps: Vec::new(),
             sidebar_panes: Vec::new(),
             app_pane_schema: None,
@@ -112684,6 +112895,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
     fn snapshot_terminal_mount_epoch_defaults_to_zero_until_a_real_mount_exists() {
         let session_path = "local://test";
         let snapshot = RenderSnapshot {
+            daemon: None,
             apps: Vec::new(),
             sidebar_panes: Vec::new(),
             app_pane_schema: None,
@@ -115992,6 +116204,11 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         // When the internal transport-error sanitizer DOES fire (content-gated on the
         // phrase, the mechanism that hit local dev sessions), the good CRLF lines
         // before the excised error line keep their carriage returns.
+        //
+        // NOTE: the excision itself is a KNOWN LIVE BUG (see `batch_terminal_chunks`) —
+        // it also deletes the three lines that follow a match, which measurably ate 679
+        // bytes per batch from a real guihost session. This test locks the CR-faithfulness
+        // of 2.10.13 only; it does NOT bless the excision.
         let with_error = "keep one\r\nkeep two\r\n\
                           Error: terminal session not found: local://019d0000-0000-7000-8000-000000000001\r\n";
         let (combined2, ..) = batch_terminal_chunks(vec![yggterm_server::TerminalStreamChunk {
@@ -116018,6 +116235,13 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
     /// transport-error line, no low-signal noise line — the only two things the
     /// sanitizers are ALLOWED to excise), `batch_terminal_chunks` must forward it
     /// BYTE-FOR-BYTE.
+    ///
+    /// That carve-out is itself the KNOWN LIVE BUG this invariant cannot yet close: the
+    /// excision is content-matched and also drops the three lines after a hit, which
+    /// measurably ate 679 bytes per batch from `local://20e56a8b-…` on guihost 2026-07-11.
+    /// Closing it needs per-session attach-phase state (sanitize only before the CLI owns
+    /// the PTY) — the parity campaign's fork-collapse step. Until then this corpus locks
+    /// everything OUTSIDE the carve-out.
     ///
     /// This is the cheap tier of the parity harness. It would have caught the
     /// carriage-return drop that produced the interleaved-frame garble on guihost. Every
