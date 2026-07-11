@@ -2,6 +2,27 @@
 
 This file tracks user-visible changes in `yggterm`.
 
+## 2.10.14
+
+- **Fixed: "No conversation found with session ID …" when relaunching a Claude
+  Code session from the start page.** The session was never lost — yggterm was
+  looking in the wrong place. Claude Code derives its project directory from the
+  process working directory, and while a session was BORN in its real cwd, every
+  relaunch resumed it from `$HOME`. CC therefore searched the wrong project
+  directory, found no transcript with that id, and correctly refused. The resume
+  cwd is now read from the session's own transcript, which is the one thing that
+  cannot be wrong about where the session ran.
+- **New: a Daemon section in the metadata sidebar, with a manual hot-restart.**
+  It shows the daemon's version, uptime, pid, and session counts — and, when a
+  restart is being held off, **the daemon's own reason for deferring it** (for
+  example, "session … is actively working"). yggterm's persistence runs through a
+  daemon you never see; when an agent session pinned it, a daemon running an old
+  build looked exactly like a healthy one. On jojo this let a 2.10.3 daemon run
+  for 19h44m with 2.10.13 on disk — two shipped fixes compiled, deployed, and
+  simply not running, with nothing on screen saying so. The section also flags
+  when a newer build is waiting on disk, and the button requests a
+  session-preserving handoff restart.
+
 ## 2.10.13
 
 - **Fixed: garbled, interleaved terminal frames on busy sessions.** Live output

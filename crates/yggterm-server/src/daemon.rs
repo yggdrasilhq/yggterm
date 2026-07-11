@@ -28,6 +28,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
 use std::sync::MutexGuard;
 use std::sync::{
     Arc, Mutex,
@@ -1553,6 +1554,27 @@ pub struct ServerRuntimeStatus {
     pub session_terminal_bytes: usize,
     #[serde(default)]
     pub session_payload_total_bytes: usize,
+    /// Epoch-ms this daemon process started, and how long it has been up. The user
+    /// cannot otherwise tell a daemon that swapped 30s ago from one that has been
+    /// pinned for 19 hours — and that difference is usually the whole story.
+    #[serde(default)]
+    pub daemon_started_at_ms: u64,
+    #[serde(default)]
+    pub daemon_uptime_ms: u64,
+    /// Build id of the binary this process is RUNNING vs the one on DISK. When they
+    /// differ, a deploy has landed a newer build that this daemon has not picked up.
+    #[serde(default)]
+    pub running_build_id: u64,
+    #[serde(default)]
+    pub on_disk_build_id: u64,
+    #[serde(default)]
+    pub hot_restart_pending: bool,
+    /// Why a hot-restart is being DEFERRED right now, in the daemon's own words —
+    /// `None` means nothing is blocking it. The daemon has always computed this to
+    /// decide whether to retire; it just never told anyone, so a pinned daemon looked
+    /// identical to a healthy one.
+    #[serde(default)]
+    pub hot_restart_block_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2210,6 +2232,14 @@ impl DaemonRuntime {
         terminal_session_keys.extend(preserved_owner_keys.iter().cloned());
         terminal_session_keys.sort();
         terminal_session_keys.dedup();
+        // The SAME predicate the cold-retire loop consults, reported verbatim — so what
+        // the user reads is the reason the daemon is actually acting on, not a parallel
+        // explanation that can drift from it.
+        let hot_restart_block_reason =
+            self.hot_update_idle_gate_block_reason(&owned_terminal_session_keys);
+        let running_build_id = *DAEMON_RUNNING_BUILD_ID;
+        let on_disk_build_id = current_build_id();
+        let started_at_ms = *DAEMON_STARTED_AT_MS;
         ServerRuntimeStatus {
             server_version: SERVER_PROTOCOL_VERSION.to_string(),
             server_build_id: current_build_id(),
@@ -2244,6 +2274,16 @@ impl DaemonRuntime {
             session_terminal_line_count: payload_stats.terminal_lines,
             session_terminal_bytes: payload_stats.terminal_bytes,
             session_payload_total_bytes: payload_stats.total_bytes,
+            daemon_started_at_ms: started_at_ms,
+            daemon_uptime_ms: current_millis_u64().saturating_sub(started_at_ms),
+            running_build_id,
+            on_disk_build_id,
+            // A build id of 0 means the exe mtime was unreadable; "pending" would then be
+            // a coin flip, so report no pending update rather than a confident wrong one.
+            hot_restart_pending: running_build_id != 0
+                && on_disk_build_id != 0
+                && running_build_id != on_disk_build_id,
+            hot_restart_block_reason,
         }
     }
 
@@ -7408,6 +7448,19 @@ fn current_build_id() -> u64 {
         .unwrap_or_default()
 }
 
+/// Epoch-ms at which THIS daemon process started. Forced during `run_daemon` so it is
+/// the process's real age, not the age of whenever something first asked for status.
+static DAEMON_STARTED_AT_MS: LazyLock<u64> = LazyLock::new(current_millis_u64);
+
+/// Build id (exe mtime) of the binary this process was LAUNCHED from, captured at boot.
+///
+/// `current_build_id()` re-stats the executable PATH, so once a deploy overwrites the
+/// binary in place the two diverge — and that divergence is precisely "a newer build is
+/// sitting on disk waiting for a hot-restart". That state was previously invisible: on
+/// jojo 2026-07-11 the daemon ran 2.10.3 for 19h44m while 2.10.13 sat on disk, and
+/// nothing in the product said so. Surfacing it is the point.
+static DAEMON_RUNNING_BUILD_ID: LazyLock<u64> = LazyLock::new(current_build_id);
+
 #[cfg(unix)]
 struct DaemonSocketLock {
     file: fs::File,
@@ -9819,6 +9872,11 @@ fn suspend_clock_gap_ms() -> Option<i64> {
 }
 
 pub fn run_daemon(endpoint: &ServerEndpoint, runtime: GhosttyHostSupport) -> Result<()> {
+    // Force both boot-time statics HERE, so uptime measures the process and the running
+    // build id is the binary we were launched from — before any deploy can overwrite it
+    // on disk underneath us.
+    LazyLock::force(&DAEMON_STARTED_AT_MS);
+    LazyLock::force(&DAEMON_RUNNING_BUILD_ID);
     let runtime = Arc::new(Mutex::new(DaemonRuntime::load(runtime)?));
     let last_activity_ms = Arc::new(AtomicU64::new(current_millis_u64()));
     let idle_shutdown_ms = daemon_idle_shutdown_ms();
