@@ -2,6 +2,58 @@
 
 This file tracks user-visible changes in `yggterm`.
 
+## 2.11.0
+
+- **The ALT+ layer is real: tap ALT, and every affordance shows you its key.**
+  Tapping ALT paints a KeyTip on the chrome — its own little block floating beside
+  each control, the way Excel's ribbon does it — and the letter runs the thing.
+  `ALT, B` toggles the sidebar, `ALT, I` opens the New… menu and *descends into it*
+  so `ALT, I, T` is a new terminal, `ALT, G, D` switches to the dark theme. The
+  badges float in an overlay layer, so tapping ALT no longer shoves the titlebar
+  around: nothing under them moves.
+
+- **Fixed: a focused terminal used to eat the ALT tap.** With a terminal focused —
+  which is most of the time — tapping ALT did nothing at all, because the trigger
+  was a window-level key handler that never fires while the webview holds focus.
+  The whole ALT interaction now lives below the webview, so it opens from any
+  surface. A *held* `ALT+key` still passes through to the PTY untouched: readline,
+  emacs, and helix keep their Meta prefix, which is not negotiable.
+
+- **An installed app can now extend the keymap without yggterm knowing it exists.**
+  An app's manifest (`~/.yggterm/apps/<name>.json`) can name the KeyTip letter it
+  wants, and the shell resolves it into the New… menu alongside the built-ins —
+  badge, chord, and launch. Two apps that want the same letter do not fight over
+  it: the letter becomes a numbered picker, so a chord you have learned can never
+  silently launch the wrong app; it only ever grows one disambiguation step. Those
+  numbers are pinned, so installing or removing an app never moves them.
+
+- **Direct accelerators, for the things you do constantly.** `Ctrl+Shift+T` for a
+  new terminal, `Ctrl+Shift+N` for a session, `Ctrl+Shift+B` for the sidebar,
+  `Ctrl+Alt+PageUp/PageDown` to walk live sessions, `F11` for fullscreen. They fire
+  from a focused terminal too, and they are PTY-safe by construction: a shell
+  accelerator may never be a bare `Ctrl+<letter>`, because those belong to the
+  terminal forever (`Ctrl+T` is readline's transpose). The build fails if one ever
+  sneaks in — even a hand-edited config cannot bind one.
+
+- **The sidebar has real keyboard focus.** Arrow keys walk the rows, Home/End jump
+  to the ends, and the focused row shows a focus ring. `ALT, B` opens the sidebar
+  *and* focuses it, so the whole flow is keyboard-first. Everything that acts
+  "here" — a new terminal, a launched app — now lands in the focused row's
+  directory, so navigating the tree steers where the next thing opens.
+
+- **Settings ▸ Keymaps shows both doors to every command.** One row per command
+  with its ALT chord and its direct accelerator side by side, each rebindable and
+  validated in place: a KeyTip letter is rejected if it collides or lands in the
+  namespace reserved for apps, and an accelerator is rejected if it is not PTY-safe
+  or duplicates another command's chord. `~/.yggterm/keymap.json` gains the letters,
+  the pinned numbers, and the accelerators in one file; the old format still loads.
+
+- **Under the hood: `server app keytips audit` counts the affordances the keyboard
+  cannot reach, and it reads zero.** "Every affordance carries a char" is now a
+  number that must stay at zero rather than a promise, across the chrome, the
+  sidebar, and the Settings, Connect, and Notifications panels. Full spec:
+  `docs/alt-keytips.md`.
+
 ## 2.10.16
 
 - **Fixed: a remote Claude Code session could render a frame built for a screen
