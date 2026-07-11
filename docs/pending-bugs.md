@@ -21,6 +21,19 @@ fix) once the fix is verified live on jojo.
   `terminal_forward_divergence` + `terminal_write_send_failed` in
   `event-trace.jsonl` and run the client-buffer vs daemon-screen diff recipe in
   `.agents/skills/yggui-app-control/SKILL.md` while a session streams.
+  **UPDATE 2026-07-11 (telemetry campaign run 1): suspect (a) CONFIRMED.**
+  `terminal_forward_divergence` fired on jojo (4/5 events on `local://`/`live::`
+  sessions, drops of 1-11 bytes), and code trace convicted the sanitizers:
+  `strip_internal_terminal_transport_noise_lines` did `.replace("\r\n","\n")` over
+  the whole batch (content-gated on transport phrases, so it hits local dev
+  sessions), and `strip_low_signal_terminal_noise_lines` used `str::lines().join`
+  - both drop carriage returns, so xterm paints the next line at the wrong column
+  (the staircase/interleave garble). Fixed on branch: both now `split('\n')`
+  (CR-faithful); regression test
+  `batch_terminal_chunks_preserves_carriage_returns_in_kept_lines`; the probe now
+  emits `cr_dropped`. **Delete this entry once the fix is live-verified on jojo**
+  (gated on the shared-GUI deploy guardrail). Suspect (b) not yet investigated.
+  See `docs/telemetry-campaign-log.md` run 1.
 
 ## Fixed in 2.10.2 — confirm live, then delete this section
 
