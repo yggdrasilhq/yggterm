@@ -1510,6 +1510,16 @@ fn remote_scanned_session_from_live_codex(
     })
 }
 
+/// Whether a session path names a row that lives on ANOTHER machine. Remote rows carry an
+/// explicit `remote-*` scheme; everything else (`local://`, `codex://`, a stored file path)
+/// is this machine's. Used to keep machine-local lookups (e.g. the Claude Code transcript
+/// store) off remote rows.
+fn session_path_is_remote(path: &str) -> bool {
+    path.starts_with("remote-cc://")
+        || path.starts_with("remote-session://")
+        || path.starts_with("remote-runtime://")
+}
+
 fn local_runtime_id_from_key(key: &str) -> Option<&str> {
     key.strip_prefix("local://")
         .or_else(|| key.strip_prefix("local::"))
@@ -19768,7 +19778,15 @@ fn build_session(
     let cwd = cwd
         .map(ToOwned::to_owned)
         .unwrap_or_else(|| session_preview_cwd(path));
-    let launch_command = stored_session_launch_command(kind, &cwd, &session_id);
+    // `build_session` serves BOTH local and remote rows, so locality is derived from the
+    // session path rather than defaulted — the Claude Code arm consults this machine's
+    // transcript store and must not do so for a remote row.
+    let launch_command = stored_session_launch_command_for_locality(
+        kind,
+        &cwd,
+        &session_id,
+        !session_path_is_remote(path),
+    );
     let should_hydrate_stored_preview = kind == SessionKind::Document
         || matches!(hydration_mode, StoredPreviewHydrationMode::Eager);
     let transcript = if !should_hydrate_stored_preview {
@@ -20993,10 +21011,45 @@ fn persistent_agent_resume_command_with_terminal_appearance(
     .unwrap_or_else(|_| legacy_agent_launch_command(kind, cwd, Some(session_id)))
 }
 
-fn stored_session_launch_command(kind: SessionKind, cwd: &str, session_id: &str) -> String {
+/// Whether a LOCAL Claude Code session can actually be resumed — i.e. CC wrote its
+/// `<session-id>.jsonl` transcript.
+///
+/// A session that the user quit before its first turn has NO transcript: yggterm minted
+/// the id and launched `claude --session-id <uuid>`, but CC only persists the rollout once
+/// a turn completes. Relaunching such a row with `claude --resume <uuid>` makes CC refuse,
+/// **correctly**, with "No conversation found with session ID <uuid>" — and the user reads
+/// that as yggterm losing their session.
+///
+/// Live-evidenced on jojo 2026-07-11 (`agent-incidents.jsonl`, session `1965f8d5-…`): the
+/// user's broken CC session was quit and relaunched from the start page, producing
+/// `session already in use` and then, 28s later, `no conversation found with session id`.
+/// 8 of the 21 recorded incidents are this `session_not_found` shape.
+///
+/// So the row is real but there is nothing to resume: relaunch must RE-BIRTH it with the
+/// same id (`--session-id`), not resume it. LOCAL ONLY — the lookup reads this machine's
+/// `~/.claude/projects`, so a remote CC session must never be routed through it (it would
+/// wrongly look transcript-less and get re-birthed on top of a live remote rollout).
+fn local_cc_session_is_resumable(session_id: &str) -> bool {
+    yggterm_core::local_cc_session_jsonl_path(session_id).is_some()
+}
+
+/// Launch command for a stored session. `is_local` says whether the row lives on THIS
+/// machine; it is passed explicitly rather than inferred, because the Claude Code arm
+/// consults the local transcript store and must not do so for a remote row.
+fn stored_session_launch_command_for_locality(
+    kind: SessionKind,
+    cwd: &str,
+    session_id: &str,
+    is_local: bool,
+) -> String {
     match kind {
         SessionKind::Codex | SessionKind::CodexLiteLlm => {
             agent_launch_command(kind, Some(cwd), Some(session_id))
+        }
+        // A local CC row with no transcript yet cannot be resumed — re-birth it with its
+        // own id instead of handing the user CC's "no conversation found" refusal.
+        SessionKind::ClaudeCode if is_local && !local_cc_session_is_resumable(session_id) => {
+            claude_code_fresh_launch_command(Some(cwd), session_id)
         }
         SessionKind::ClaudeCode => agent_launch_command(kind, Some(cwd), Some(session_id)),
         SessionKind::Document => "document web view".to_string(),
@@ -21006,6 +21059,11 @@ fn stored_session_launch_command(kind: SessionKind, cwd: &str, session_id: &str)
             session_id
         ),
     }
+}
+
+/// Launch command for a stored session whose row lives on THIS machine.
+fn stored_session_launch_command(kind: SessionKind, cwd: &str, session_id: &str) -> String {
+    stored_session_launch_command_for_locality(kind, cwd, session_id, true)
 }
 
 fn local_default_cwd() -> String {
@@ -21549,7 +21607,8 @@ mod tests {
         remote_snapshot_looks_like_shell_prompt, remote_ssh_launch_command,
         remote_summary_for_path, sanitize_recent_context_payload,
         session_metadata_value, should_fallback_to_python,
-        should_remove_local_daemon_socket_for_spawn_state, stored_session_launch_command,
+        session_path_is_remote, should_remove_local_daemon_socket_for_spawn_state,
+        stored_session_launch_command, stored_session_launch_command_for_locality,
         strip_remote_payload_noise, synthesize_remote_scanned_session_view,
         try_acquire_remote_scan_lock, upsert_session_metadata, validate_server_ui_snapshot,
         wait_remote_command_with_timeout, windows_local_interactive_shell_launch_command,
@@ -24154,6 +24213,65 @@ mod tests {
         assert!(command.contains("export NPM_CONFIG_PREFIX="));
         assert!(command.contains("export CODEX_HOME="));
         assert!(command.contains("codex-litellm resume"));
+    }
+
+    #[test]
+    fn local_cc_session_without_transcript_relaunches_fresh_instead_of_resuming() {
+        // The jojo incident (2026-07-11, session 1965f8d5-…): the user quit a broken CC
+        // session before turn 1, relaunched it from the start page, and CC refused with
+        // "no conversation found with session id" — because there IS no transcript to
+        // resume. A transcript-less LOCAL row must be re-born with its own id.
+        let orphan_id = "00000000-0000-4000-8000-00000cc0ffee";
+        assert!(
+            yggterm_core::local_cc_session_jsonl_path(orphan_id).is_none(),
+            "test fixture must not collide with a real local CC transcript"
+        );
+
+        let command = stored_session_launch_command_for_locality(
+            SessionKind::ClaudeCode,
+            "/tmp/workspace",
+            orphan_id,
+            true,
+        );
+        assert!(
+            command.contains(&format!("--session-id '{orphan_id}'")),
+            "a transcript-less local CC row must be re-born with its own id: {command}"
+        );
+        assert!(
+            !command.contains("--resume"),
+            "resuming a transcript-less session is exactly the refusal the user hit: {command}"
+        );
+
+        // A REMOTE CC row must never consult this machine's transcript store — its
+        // transcript lives on the other machine, so it always resumes.
+        let remote = stored_session_launch_command_for_locality(
+            SessionKind::ClaudeCode,
+            "/tmp/workspace",
+            orphan_id,
+            false,
+        );
+        assert!(
+            remote.contains("--resume"),
+            "a remote CC row resumes regardless of THIS machine's transcript store: {remote}"
+        );
+    }
+
+    #[test]
+    fn session_path_is_remote_covers_every_remote_scheme() {
+        for path in [
+            "remote-cc://dev/019caa6f-b32c-7a73-b4d3-db83225663dc",
+            "remote-session://dev/019caa6f-b32c-7a73-b4d3-db83225663dc",
+            "remote-runtime://dev/019caa6f-b32c-7a73-b4d3-db83225663dc",
+        ] {
+            assert!(session_path_is_remote(path), "{path} is a remote row");
+        }
+        for path in [
+            "local://019caa6f-b32c-7a73-b4d3-db83225663dc",
+            "codex://019caa6f-b32c-7a73-b4d3-db83225663dc",
+            "/home/pi/.codex/sessions/rollout.jsonl",
+        ] {
+            assert!(!session_path_is_remote(path), "{path} is this machine's row");
+        }
     }
 
     #[test]
