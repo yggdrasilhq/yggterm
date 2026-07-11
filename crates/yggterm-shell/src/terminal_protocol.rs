@@ -737,4 +737,52 @@ mod tests {
             assert!(matches!(event, TerminalJsEvent::Input { data } if data == payload));
         }
     }
+
+    // A libyggterm sidebar declaration must carry the app's display name and its
+    // per-site zoom stamp through to the shell — the label ("Ychrome Global
+    // Zoom") and the zoom refetch both depend on them arriving non-null.
+    #[test]
+    fn sidebar_declaration_carries_app_name_and_zoom_version() {
+        let event: TerminalJsEvent = serde_json::from_value(json!({
+            "kind": "sidebar_contribution",
+            "action": "declare",
+            "session": "s1",
+            "control": "http://127.0.0.1:41225",
+            "app_name": "Ychrome",
+            "policy_version": "abc",
+            "zoom_version": "def",
+            "panes": [{"id": "settings", "icon": "⚙", "title": "Settings"}],
+        }))
+        .expect("a full sidebar declaration should deserialize");
+        match event {
+            TerminalJsEvent::SidebarContribution {
+                app_name,
+                zoom_version,
+                policy_version,
+                ..
+            } => {
+                assert_eq!(app_name.as_deref(), Some("Ychrome"));
+                assert_eq!(zoom_version.as_deref(), Some("def"));
+                assert_eq!(policy_version.as_deref(), Some("abc"));
+            }
+            other => panic!("expected a sidebar contribution, got {other:?}"),
+        }
+    }
+
+    // An older app that ships neither field must still parse — they are optional,
+    // and their absence means "no display name / no per-site zoom", not an error.
+    #[test]
+    fn sidebar_declaration_without_the_new_fields_still_parses() {
+        let event: TerminalJsEvent = serde_json::from_value(json!({
+            "kind": "sidebar_contribution",
+            "action": "declare",
+            "session": "s1",
+            "panes": [],
+        }))
+        .expect("a minimal declaration should still deserialize");
+        assert!(matches!(
+            event,
+            TerminalJsEvent::SidebarContribution { app_name: None, zoom_version: None, .. }
+        ));
+    }
 }
