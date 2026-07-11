@@ -4,6 +4,23 @@ Open, user-confirmed bugs that are NOT yet fixed. An agent asked to "finish the
 pending bugs" should start here. Remove an entry (in the same commit as the
 fix) once the fix is verified live on jojo.
 
+- **THE STALE-DAEMON TRAP — read before diagnosing ANY "the fix didn't work".**
+  A deploy that lands new binaries does NOT mean the new code is running. The
+  daemon's idle gate defers its own retirement while any owned session is
+  actively working — and on a campaign machine an agent session is ~always
+  working, so the daemon can stay pinned indefinitely. On jojo 2026-07-11 the
+  daemon ran **2.10.3 for 19h44m while 2.10.13 sat on disk**: the CR-faithful
+  sanitizer fix and the CC re-birth fix from campaign run 1 were compiled,
+  deployed, and never executed. Both bugs were still live for the user, and run 1
+  had recorded them as "fixed on branch, live-verify pending" — the gap was
+  invisible.
+  **Always check `yggterm-headless server status → server_version` against the
+  on-disk binary BEFORE concluding anything about a fix.** As of 2.10.14 the
+  metadata sidebar's Daemon section surfaces version, uptime, a
+  newer-build-on-disk flag, and the daemon's own deferral reason, plus a manual
+  hot-restart button — so this is visible in the product rather than only to an
+  agent who thinks to look.
+
 - **Live-path frame corruption on busy CC sessions (jojo, 2026-07-10).** While
   an agent streams heavily, the CLIENT xterm buffer accumulates single-cell
   holes (`t ik` for `think`, including the user's own composer echo), merged
@@ -28,12 +45,43 @@ fix) once the fix is verified live on jojo.
   the whole batch (content-gated on transport phrases, so it hits local dev
   sessions), and `strip_low_signal_terminal_noise_lines` used `str::lines().join`
   - both drop carriage returns, so xterm paints the next line at the wrong column
-  (the staircase/interleave garble). Fixed on branch: both now `split('\n')`
+  (the staircase/interleave garble). Fixed in 2.10.13: both now `split('\n')`
   (CR-faithful); regression test
   `batch_terminal_chunks_preserves_carriage_returns_in_kept_lines`; the probe now
-  emits `cr_dropped`. **Delete this entry once the fix is live-verified on jojo**
-  (gated on the shared-GUI deploy guardrail). Suspect (b) not yet investigated.
-  See `docs/telemetry-campaign-log.md` run 1.
+  emits `cr_dropped`. Suspect (b) not yet investigated.
+
+  **UPDATE 2026-07-11 (run 2): the CR fix was NOT the whole bug — the excision
+  itself is.** User re-reported (in different words): "local sessions are dropping
+  chars sometimes and replacing the rendering with spaces." Run 1 sized the drops
+  at 1-11 bytes and assumed CR loss was the entire mechanism. Re-mining
+  `terminal_forward_divergence` found the real magnitude on the user's OWN session:
+
+      local://20e56a8b   raw 9153  → forwarded 8474   = 679 bytes dropped
+      local://20e56a8b   raw 23991 → forwarded 23312  = 679 bytes dropped
+
+  679 bytes is a whole-line EXCISION, not a lost `\r`. Mechanism:
+  `strip_internal_terminal_transport_noise_lines` content-matches three phrases
+  (`terminal session not found`, `ignoring stale yggterm daemon…`, `hot update
+  failed…`) and on a hit ALSO sets `drop_following_transport_tail_lines = 3` —
+  deleting the matched line **plus the next three lines** of whatever the CLI was
+  painting. A Claude Code session whose conversation quotes those phrases (an agent
+  working on this very bug does) has four lines removed mid-frame. The daemon vt100
+  screen stays clean, so every daemon-side instrument reports the session healthy —
+  which is why this survived a run. Making the excision CR-faithful stopped the
+  staircase garble but not the deletion.
+
+  **Why it was NOT fixed in 2.10.14:** the excision cannot simply be removed. `ssh`
+  writes `Shared connection to <ip> closed.` into the PTY, and yggterm's remote
+  helper prints `Error: terminal session not found: <key>` to its stdout, which IS
+  the PTY. Both arrive inside cursor-hide control batches, so no content-based or
+  branch-based rule separates them from CLI output (5 existing tests lock this).
+  The real fix is **per-session attach-phase state** — sanitize only while the
+  launch wrapper owns the PTY, be a faithful pipe once the CLI does. That is the
+  "collapse the forks / delete the accreted fixes" step of
+  `campaign-render-pipeline-parity-rework`, which the user sequenced AFTER the
+  parity harness. Deliberately not rushed into a deploy. The measurement, the
+  mechanism, and the reason it can't be a one-liner are recorded in code at
+  `batch_terminal_chunks`. **This is the next thing to do on that campaign.**
 
 ## Fixed in 2.10.2 — confirm live, then delete this section
 
