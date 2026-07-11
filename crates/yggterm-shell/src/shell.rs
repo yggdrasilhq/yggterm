@@ -1565,6 +1565,21 @@ fn navigate_web_surface_tab(
     history_index: Option<usize>,
 ) {
     spawn(async move {
+        // An internal page (the history viewer) rides the tab as a `data:` URL:
+        // it loads directly in the webview, egresses nothing, and must not go
+        // through URL resolution (no `ssh -L`/SOCKS) or the ~KB blob into the
+        // trace. Keep the tab's existing egress for when the user navigates away.
+        if url.starts_with("data:") {
+            state.with_mut(|shell| {
+                shell.apply_web_surface_tab_navigation_keep_egress(
+                    &session_path,
+                    tab_id,
+                    url,
+                    history_index,
+                );
+            });
+            return;
+        }
         let resolve_url = url.clone();
         // Loopback ssh_target == a LOCAL session (direct egress); only a real
         // remote can have an egress gap.
@@ -1856,6 +1871,204 @@ fn web_surface_history_suggestions(
         }
     }
     out
+}
+
+/// A visited page, as the internal history viewer needs it.
+#[derive(Debug, Clone, PartialEq)]
+struct WebHistoryEntry {
+    ts_ms: u64,
+    url: String,
+    title: String,
+}
+
+/// How many history entries the internal viewer renders. A cap bounds the
+/// `data:` URL the page is carried in (it rides the tab model), and a browser
+/// history viewer showing the last N visits is the norm.
+const WEB_HISTORY_PAGE_LIMIT: usize = 1000;
+
+/// Read a profile's history newest-first, deduped by URL (keeping the most
+/// recent visit), capped. The same file the omnibox reads, so the viewer and the
+/// suggestions never disagree about what was visited.
+fn web_surface_history_entries(profile: &str, limit: usize) -> Vec<WebHistoryEntry> {
+    let Some(path) = web_surface_history_path(profile) else {
+        return Vec::new();
+    };
+    let Ok(raw) = std::fs::read_to_string(&path) else {
+        return Vec::new();
+    };
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut out = Vec::new();
+    for line in raw.lines().rev() {
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        let Some(url) = value.get("url").and_then(Value::as_str) else {
+            continue;
+        };
+        if !seen.insert(url.to_string()) {
+            continue;
+        }
+        out.push(WebHistoryEntry {
+            ts_ms: value.get("ts_ms").and_then(Value::as_u64).unwrap_or(0),
+            url: url.to_string(),
+            title: value.get("title").and_then(Value::as_str).unwrap_or("").to_string(),
+        });
+        if out.len() >= limit {
+            break;
+        }
+    }
+    out
+}
+
+/// Civil date (year, month, day) from days since the Unix epoch — Howard
+/// Hinnant's algorithm, no chrono dependency and no timezone (history is grouped
+/// by UTC day, which is deterministic and good enough for a viewer).
+fn civil_from_days(days: i64) -> (i64, u32, u32) {
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as i64;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = (if mp < 10 { mp + 3 } else { mp - 9 }) as u32;
+    (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
+/// `ts_ms` -> `("YYYY-MM-DD", "HH:MM")` in UTC. Deterministic; used only for
+/// display grouping in the history viewer.
+fn web_history_day_and_time(ts_ms: u64) -> (String, String) {
+    let secs = (ts_ms / 1000) as i64;
+    let days = secs.div_euclid(86_400);
+    let sod = secs.rem_euclid(86_400);
+    let (y, m, d) = civil_from_days(days);
+    (
+        format!("{y:04}-{m:02}-{d:02}"),
+        format!("{:02}:{:02}", sod / 3600, (sod % 3600) / 60),
+    )
+}
+
+/// Minimal HTML-text escaper for user-controlled strings (page titles, URLs)
+/// embedded in the viewer. Covers the five characters that break out of text or
+/// an attribute value.
+fn html_escape(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for ch in text.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
+/// Render a self-contained "chrome://history"-style page for the surface's
+/// webview: entries grouped by day, newest first, each a clickable link, with a
+/// client-side search filter. No external resources (it loads as a `data:` URL),
+/// theme-aware, every user string escaped.
+fn render_web_history_page(entries: &[WebHistoryEntry]) -> String {
+    let count = entries.len();
+    let mut rows = String::new();
+    let mut current_day: Option<String> = None;
+    for entry in entries {
+        let (day, time) = web_history_day_and_time(entry.ts_ms);
+        if current_day.as_deref() != Some(day.as_str()) {
+            rows.push_str(&format!(
+                "<h2 class=\"day\">{}</h2>",
+                if entry.ts_ms == 0 { "Earlier".to_string() } else { html_escape(&day) }
+            ));
+            current_day = Some(day);
+        }
+        let title = if entry.title.trim().is_empty() {
+            entry.url.clone()
+        } else {
+            entry.title.clone()
+        };
+        // The whole row is a search key (data-k) the filter matches against.
+        let key = format!("{} {}", title, entry.url).to_lowercase();
+        rows.push_str(&format!(
+            "<a class=\"row\" href=\"{url}\" data-k=\"{key}\">\
+               <span class=\"t\">{time}</span>\
+               <span class=\"ttl\">{ttl}</span>\
+               <span class=\"u\">{disp}</span>\
+             </a>",
+            url = html_escape(&entry.url),
+            key = html_escape(&key),
+            time = html_escape(&time),
+            ttl = html_escape(&title),
+            disp = html_escape(&web_surface_tab_host_label(&entry.url)),
+        ));
+    }
+    if entries.is_empty() {
+        rows.push_str("<p class=\"empty\">No history yet. Pages you visit in this profile appear here.</p>");
+    }
+    // Inline CSS + a tiny filter script; nothing external so it loads as data:.
+    format!(
+        "<!doctype html><html><head><meta charset=\"utf-8\">\
+         <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
+         <title>History</title><style>\
+         :root{{color-scheme:light dark}}\
+         body{{font:14px/1.5 system-ui,sans-serif;margin:0;padding:0 16px 40px;\
+           background:Canvas;color:CanvasText}}\
+         header{{position:sticky;top:0;background:Canvas;padding:16px 0 10px;\
+           border-bottom:1px solid rgba(127,127,127,.25);display:flex;gap:12px;align-items:baseline}}\
+         h1{{font-size:18px;margin:0;font-weight:600}}\
+         .count{{color:rgba(127,127,127,.9);font-size:12px}}\
+         #q{{margin-left:auto;flex:0 1 280px;padding:6px 12px;border-radius:12px;\
+           border:1px solid rgba(127,127,127,.4);background:rgba(127,127,127,.1);\
+           color:inherit;font-size:13px;outline:none}}\
+         h2.day{{font-size:12px;text-transform:uppercase;letter-spacing:.04em;\
+           color:rgba(127,127,127,.9);margin:22px 0 6px}}\
+         a.row{{display:flex;gap:12px;align-items:baseline;padding:5px 8px;\
+           border-radius:8px;text-decoration:none;color:inherit}}\
+         a.row:hover{{background:rgba(127,127,127,.14)}}\
+         .t{{color:rgba(127,127,127,.85);font-variant-numeric:tabular-nums;flex:0 0 44px}}\
+         .ttl{{flex:1 1 auto;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}}\
+         .u{{color:rgba(127,127,127,.8);flex:0 0 auto;max-width:34%;overflow:hidden;\
+           text-overflow:ellipsis;white-space:nowrap}}\
+         .empty{{color:rgba(127,127,127,.9);margin-top:40px}}\
+         .hidden{{display:none}}\
+         </style></head><body>\
+         <header><h1>History</h1><span class=\"count\">{count} pages</span>\
+           <input id=\"q\" type=\"search\" placeholder=\"Search history\" autofocus></header>\
+         <main id=\"list\">{rows}</main>\
+         <script>\
+         var q=document.getElementById('q');\
+         q.addEventListener('input',function(){{\
+           var v=q.value.trim().toLowerCase();\
+           document.querySelectorAll('a.row').forEach(function(r){{\
+             r.classList.toggle('hidden', v && r.getAttribute('data-k').indexOf(v)<0);}});\
+           document.querySelectorAll('h2.day').forEach(function(h){{\
+             var n=h.nextElementSibling,any=false;\
+             while(n && n.classList.contains('row')){{if(!n.classList.contains('hidden'))any=true;n=n.nextElementSibling;}}\
+             h.classList.toggle('hidden', !any);}});\
+         }});\
+         </script></body></html>",
+    )
+}
+
+/// The internal history page as a `data:` URL the surface's webview loads. Kept
+/// short-lived in the tab model; the address bar shows a clean label instead (see
+/// `web_surface_internal_page_label`).
+fn web_history_data_url(profile: &str) -> String {
+    let entries = web_surface_history_entries(profile, WEB_HISTORY_PAGE_LIMIT);
+    let html = render_web_history_page(&entries);
+    format!(
+        "data:text/html;charset=utf-8;base64,{}",
+        BASE64_STANDARD.encode(html.as_bytes())
+    )
+}
+
+/// The clean address-bar label for an internal page `data:` URL (the history
+/// viewer), so the omnibox never shows a multi-kilobyte base64 blob. `None` for
+/// any ordinary URL.
+fn web_surface_internal_page_label(url: &str) -> Option<&'static str> {
+    url.starts_with("data:text/html").then_some("History")
 }
 /// Published mirror of the reconciler's applied surfaces: (session_path,
 /// tab_id) → native surface id. The reconcile loop is the ONLY writer (it
@@ -6256,10 +6469,13 @@ impl ShellState {
         Some(WebSurfaceOverlayView {
             tabs,
             active_tab_id,
-            address_text: surface
-                .address_draft
-                .clone()
-                .unwrap_or_else(|| active.url.clone()),
+            address_text: surface.address_draft.clone().unwrap_or_else(|| {
+                // An internal page (history viewer) rides the tab as a multi-KB
+                // `data:` URL; the omnibox shows a clean label, never the blob.
+                web_surface_internal_page_label(&active.url)
+                    .map(str::to_string)
+                    .unwrap_or_else(|| active.url.clone())
+            }),
             address_editing: surface.address_draft.is_some(),
             back_target,
             forward_target,
@@ -63761,6 +63977,7 @@ fn TerminalCanvas(
                             let nav_path = web_surface_session_path.clone();
                             let nav_ssh = web_surface_nav_ssh_target.clone();
                             let active_tab_id = web_overlay.active_tab_id;
+                            let nav_profile = web_overlay.profile.clone();
                             let back_target = web_overlay.back_target.clone();
                             let forward_target = web_overlay.forward_target.clone();
                             let address_text = web_overlay.address_text.clone();
@@ -64034,6 +64251,31 @@ fn TerminalCanvas(
                                                 }
                                             }
                                         },
+                                    }
+                                    // Beside the omnibox: open the internal history
+                                    // viewer (a "chrome://history"-style page) in
+                                    // this tab's webview. Same nav path as any URL —
+                                    // it rides the tab as a `data:` page the omnibox
+                                    // relabels "History".
+                                    button {
+                                        style: "{reload_style}",
+                                        title: "History",
+                                        onclick: {
+                                            let nav_path = nav_path.clone();
+                                            let nav_ssh = nav_ssh.clone();
+                                            let nav_profile = nav_profile.clone();
+                                            move |_| {
+                                                navigate_web_surface_tab(
+                                                    state,
+                                                    nav_path.clone(),
+                                                    active_tab_id,
+                                                    web_history_data_url(&nav_profile),
+                                                    nav_ssh.clone(),
+                                                    None,
+                                                );
+                                            }
+                                        },
+                                        "🕘"
                                     }
                                 }
                                 // Omnibox dropdown: in NORMAL FLOW below the nav
@@ -85789,6 +86031,93 @@ mod tests {
             web_surface_tab_host_label("http://user@host:8000/x"),
             "host:8000"
         );
+    }
+
+    // 2021-01-01 00:00:00 UTC == 1_609_459_200_000 ms. Locks the no-chrono civil
+    // date + the time-of-day split the history viewer groups by.
+    #[test]
+    fn web_history_day_and_time_is_correct_utc() {
+        assert_eq!(
+            web_history_day_and_time(1_609_459_200_000),
+            ("2021-01-01".to_string(), "00:00".to_string())
+        );
+        // + 13h 37m 05s
+        assert_eq!(
+            web_history_day_and_time(1_609_459_200_000 + (13 * 3600 + 37 * 60 + 5) * 1000),
+            ("2021-01-01".to_string(), "13:37".to_string())
+        );
+        // A leap-year boundary the civil algorithm must get right.
+        assert_eq!(
+            web_history_day_and_time(1_583_020_800_000).0, // 2020-03-01
+            "2020-03-01"
+        );
+    }
+
+    #[test]
+    fn web_history_page_escapes_and_groups() {
+        let entries = vec![
+            WebHistoryEntry {
+                ts_ms: 1_609_459_200_000,
+                url: "https://example.com/a?x=1&y=2".to_string(),
+                title: "First <b>page</b>".to_string(),
+            },
+            WebHistoryEntry {
+                ts_ms: 1_609_459_200_000 + 3_600_000,
+                url: "https://ex.com/\"quote\"".to_string(),
+                title: String::new(),
+            },
+        ];
+        let html = render_web_history_page(&entries);
+        // A hostile title/url can never break out into markup.
+        assert!(!html.contains("<b>page</b>"), "title was not escaped");
+        assert!(html.contains("First &lt;b&gt;page&lt;/b&gt;"));
+        assert!(html.contains("x=1&amp;y=2"));
+        assert!(html.contains("&quot;quote&quot;"));
+        // Grouped under one day header; a titleless row falls back to its URL.
+        assert_eq!(html.matches("class=\"day\"").count(), 1);
+        assert!(html.contains(">example.com<") && html.contains(">ex.com<"));
+        // Self-contained: no external resource references.
+        assert!(!html.contains("http://") || html.contains("https://example.com"));
+        assert!(!html.contains("src=\"http"));
+    }
+
+    #[test]
+    fn web_history_empty_page_says_so() {
+        let html = render_web_history_page(&[]);
+        assert!(html.contains("No history yet"));
+    }
+
+    // Dump a realistic history page to a file for visual inspection in a browser
+    // (the page is self-contained, so it renders there exactly as in the surface
+    // webview). Run: `YGG_HISTORY_DUMP=/tmp/history.html cargo test --release -p
+    // yggterm-shell dump_web_history_page -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn dump_web_history_page() {
+        let Ok(path) = std::env::var("YGG_HISTORY_DUMP") else {
+            return;
+        };
+        let day0 = 1_609_459_200_000u64; // 2021-01-01 UTC
+        let entries = vec![
+            WebHistoryEntry { ts_ms: day0 + 86_400_000 + 55_000_000, url: "https://github.com/yggdrasilhq/yggterm/pulls".into(), title: "Pull requests · yggdrasilhq/yggterm".into() },
+            WebHistoryEntry { ts_ms: day0 + 86_400_000 + 40_000_000, url: "https://news.ycombinator.com/".into(), title: "Hacker News".into() },
+            WebHistoryEntry { ts_ms: day0 + 86_400_000 + 20_000_000, url: "https://www.rust-lang.org/".into(), title: "Rust Programming Language".into() },
+            WebHistoryEntry { ts_ms: day0 + 70_000_000, url: "https://en.wikipedia.org/wiki/WebKit".into(), title: "WebKit - Wikipedia".into() },
+            WebHistoryEntry { ts_ms: day0 + 55_000_000, url: "https://developer.mozilla.org/en-US/docs/Web/CSS/color-scheme".into(), title: "color-scheme - CSS: Cascading Style Sheets | MDN".into() },
+            WebHistoryEntry { ts_ms: day0 + 30_000_000, url: "https://example.com/a?x=1&y=<b>".into(), title: "Escaping & <tags> test".into() },
+        ];
+        std::fs::write(&path, render_web_history_page(&entries)).expect("write dump");
+        println!("wrote history page to {path}");
+    }
+
+    // The omnibox must relabel the internal page, never show the base64 blob.
+    #[test]
+    fn internal_page_label_hides_the_data_url() {
+        assert_eq!(
+            web_surface_internal_page_label("data:text/html;base64,AAAA"),
+            Some("History")
+        );
+        assert_eq!(web_surface_internal_page_label("https://example.com"), None);
     }
 
     #[test]
