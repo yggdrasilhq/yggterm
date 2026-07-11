@@ -354,6 +354,16 @@ impl WebSurfaceHost {
         }
     }
 
+    /// Set the WebKit zoom factor for surface `id` (1.0 == 100%). This is the
+    /// page zoom the shell's "Web View" / "Ychrome Global" zoom control drives;
+    /// a native web surface is an overlaid WebKit view, so it cannot be scaled
+    /// with the DOM `zoom:` the rendered document surface uses.
+    pub fn set_zoom(&self, id: u64, factor: f64) {
+        if let Some(s) = self.surfaces.borrow().get(&id) {
+            let _ = s.webview.zoom(factor);
+        }
+    }
+
     /// Current page (uri, title) as the ENGINE reports them. In-page
     /// navigations (link clicks, redirects, pushState) never pass through the
     /// shell's nav model, so this is the only truth for "where is this tab
