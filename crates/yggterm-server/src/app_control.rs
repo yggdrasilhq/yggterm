@@ -558,6 +558,18 @@ pub enum AppControlCommand {
     },
     FocusWindow,
     DescribeState,
+    /// Invoke a registry command by its stable id (e.g. `sidebar.toggle`,
+    /// `notifications.toggle`, `session.next`) — the keyboard analogue of the
+    /// click grid. The ALT+ KeyTips layer, this probe, and the settings modal
+    /// are all VIEWS of the one command registry, so an agent drives shell
+    /// commands by id instead of pixel-hunting a button. See
+    /// `[[campaign-alt-keytips-layer]]`.
+    InvokeCommand {
+        id: String,
+    },
+    /// Enumerate the command registry: every command's id, title, and in-force
+    /// KeyTip chord. Read-only; the discovery half of `InvokeCommand`.
+    ListCommands,
 }
 
 impl AppControlCommand {
@@ -578,6 +590,7 @@ impl AppControlCommand {
                 | Self::DescribeState
                 | Self::ReadTerminalBuffer { .. }
                 | Self::WebSurfaceScreenshot { .. }
+                | Self::ListCommands
         )
     }
 
@@ -650,6 +663,8 @@ impl AppControlCommand {
             Self::OpenPath { .. } => "open_path",
             Self::FocusWindow => "focus_window",
             Self::DescribeState => "describe_state",
+            Self::InvokeCommand { .. } => "invoke_command",
+            Self::ListCommands => "list_commands",
         }
     }
 }

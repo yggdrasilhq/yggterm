@@ -1,6 +1,7 @@
 #![recursion_limit = "512"]
 
 mod app_capture;
+mod command_registry;
 mod hot_update_policy;
 // Phase 1 of the consolidated scroll-controller: the canonical, regression-locked
 // DECISION spec (mode + transitions). The JS wiring (Phase 2) mirrors it. Marked

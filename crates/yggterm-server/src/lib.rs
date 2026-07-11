@@ -16398,6 +16398,20 @@ pub fn run_app_control_reset_theme_editor(timeout_ms: u64) -> anyhow::Result<()>
     Ok(())
 }
 
+pub fn run_app_control_invoke_command(id: String, timeout_ms: u64) -> anyhow::Result<()> {
+    let home = resolve_yggterm_home()?;
+    let response = request_app_control(&home, AppControlCommand::InvokeCommand { id }, timeout_ms)?;
+    write_stdout_payload(&serde_json::to_string_pretty(&response)?)?;
+    Ok(())
+}
+
+pub fn run_app_control_list_commands(timeout_ms: u64) -> anyhow::Result<()> {
+    let home = resolve_yggterm_home()?;
+    let response = request_app_control(&home, AppControlCommand::ListCommands, timeout_ms)?;
+    write_stdout_payload(&serde_json::to_string_pretty(&response)?)?;
+    Ok(())
+}
+
 pub fn run_app_control_set_theme_editor_values(
     brightness: Option<f32>,
     alpha: Option<f32>,
