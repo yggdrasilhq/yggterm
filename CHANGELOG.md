@@ -2,6 +2,19 @@
 
 This file tracks user-visible changes in `yggterm`.
 
+## 2.10.10
+
+- **Modals now appear over a web surface.** A native web surface draws above all
+  DOM, so a confirmation modal (closing a ychrome session, a passkey prompt, edit
+  summary) was invisible behind the page — you saw only the dimmed backdrop.
+  Hiding the surface with `visible=false` never cleared it (a WebKitGTK quirk), so
+  the surface is now STASHED (detached) while any over-viewport modal is up and
+  restored, page intact, when it closes.
+- **The Web View ↔ Terminal toggle keeps its slot** when it does not apply
+  (non-agent sessions): it is hidden but still occupies its space, so the rest of
+  the titlebar no longer shifts position when you move between an agent and a
+  shell/ychrome session.
+
 ## 2.10.9
 
 - **A web surface no longer reverts to the app's start page (and drops your
