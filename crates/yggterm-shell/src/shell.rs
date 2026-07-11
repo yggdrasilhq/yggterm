@@ -81072,12 +81072,46 @@ fn MetadataRailBody(
                     palette,
                 }
             }
+            // The CLIENT version is always knowable — it is this process. Rendering it
+            // only when the daemon answers meant the one moment you most need to know
+            // which build you are running (the daemon is unreachable / not answering) is
+            // exactly the moment the rail went blank. So Client renders unconditionally,
+            // and a missing daemon becomes a VISIBLE "unreachable" row rather than an
+            // absent section that reads as "nothing to see here".
+            MetadataGroup {
+                title: "Client".to_string(),
+                entries: client_metadata_entries(daemon.as_ref()),
+                palette,
+            }
             if let Some(daemon) = daemon {
                 DaemonMetadataGroup { daemon, palette, on_daemon_hot_restart }
+            } else {
+                MetadataGroup {
+                    title: "Daemon".to_string(),
+                    entries: vec![SessionMetadataEntry {
+                        label: "Status",
+                        value: "not answering — this window has no daemon status yet".to_string(),
+                    }],
+                    palette,
+                }
             }
             }
         }
     }
+}
+/// The Client group: which build THIS window is, and whether the daemon agrees.
+/// Separate from the daemon group because it must survive the daemon being silent.
+fn client_metadata_entries(daemon: Option<&DaemonPanelStatus>) -> Vec<SessionMetadataEntry> {
+    let client_version = current_version();
+    let value = match daemon {
+        Some(daemon) if daemon.version == client_version => client_version,
+        Some(daemon) => format!("{client_version} · daemon is on {}", daemon.version),
+        None => format!("{client_version} · daemon not answering"),
+    };
+    vec![SessionMetadataEntry {
+        label: "Version",
+        value,
+    }]
 }
 /// The daemon group: who is actually serving this window, and why a restart is (or
 /// is not) being deferred. See [`DaemonPanelStatus`] for why this exists.
@@ -81087,21 +81121,10 @@ fn DaemonMetadataGroup(
     palette: Palette,
     on_daemon_hot_restart: EventHandler<MouseEvent>,
 ) -> Element {
-    // The GUI and the daemon are separate programs that upgrade separately, and the whole
-    // stale-daemon trap is that they silently DISAGREE. Showing the client version in its
-    // own line immediately above the Daemon group puts both numbers in one glance, so a
-    // mismatch is something the user trips over rather than something they must go looking
-    // for. See [[finding-stale-daemon-trap]].
+    // The Client group is rendered by the parent, immediately above this one, so both
+    // versions read in a single glance and a mismatch is something the user trips over
+    // rather than goes looking for. See [[finding-stale-daemon-trap]].
     let versions_agree = daemon.client_version == daemon.version;
-    let client_entries = vec![SessionMetadataEntry {
-        label: "Version",
-        value: if versions_agree {
-            daemon.client_version.clone()
-        } else {
-            format!("{} · daemon is on {}", daemon.client_version, daemon.version)
-        },
-    }];
-
     let mut entries = vec![
         SessionMetadataEntry {
             label: "Version",
@@ -81159,7 +81182,6 @@ fn DaemonMetadataGroup(
         });
     }
     rsx! {
-        MetadataGroup { title: "Client".to_string(), entries: client_entries, palette }
         MetadataGroup { title: "Daemon".to_string(), entries, palette }
         button {
             "data-daemon-hot-restart-button": "1",
@@ -87336,6 +87358,51 @@ mod tests {
                 before,
                 "icon spec must not change when only non-icon fields churn"
             );
+        }
+    }
+
+    /// The client version must survive the daemon going silent. Rendering it only when the
+    /// daemon answered meant the rail went BLANK at exactly the moment you most need to know
+    /// which build this window is — a daemon that is not answering. (Caught live on guihost
+    /// 2026-07-11: the Client+Daemon groups vanished entirely from the metadata rail.)
+    #[test]
+    fn client_version_is_shown_even_when_the_daemon_is_silent() {
+        let entries = client_metadata_entries(None);
+        let value = &entries.first().expect("a Client row always renders").value;
+        assert!(
+            value.contains(&current_version()),
+            "this window's build must be readable with no daemon: {value}"
+        );
+        assert!(value.contains("not answering"), "and it must say why: {value}");
+    }
+
+    #[test]
+    fn client_version_calls_out_a_daemon_running_a_different_build() {
+        let mut daemon = daemon_panel_status_for_test("2.10.3");
+        let entries = client_metadata_entries(Some(&daemon));
+        let value = &entries.first().expect("a Client row always renders").value;
+        assert!(value.contains("2.10.3"), "the disagreeing daemon is named: {value}");
+        assert!(value.contains(&current_version()), "{value}");
+
+        // Agreement reads clean — no scary mismatch text when there is no mismatch.
+        daemon.version = current_version();
+        let agreed = client_metadata_entries(Some(&daemon));
+        let value = &agreed.first().expect("a Client row always renders").value;
+        assert_eq!(value, &current_version(), "agreement must be quiet: {value}");
+    }
+
+    fn daemon_panel_status_for_test(version: &str) -> DaemonPanelStatus {
+        DaemonPanelStatus {
+            version: version.to_string(),
+            pid: 4242,
+            uptime_ms: 60_000,
+            owned_sessions: 1,
+            total_sessions: 1,
+            preserved_owners: 0,
+            hot_restart_pending: false,
+            hot_restart_block_reason: None,
+            hot_restart_blockers: Vec::new(),
+            client_version: current_version(),
         }
     }
 
