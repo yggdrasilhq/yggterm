@@ -2752,6 +2752,11 @@ async fn web_surface_native_reconcile_loop(
                                 if !page_title.is_empty() {
                                     tab.title = Some(page_title.clone());
                                 }
+                                // The page just told us what this tab really is
+                                // (its redirected URL, its title). That is what the
+                                // tree must save, or a restored tab comes back
+                                // wearing the name of the page it started on.
+                                shell.persist_web_tabs(key.0.as_str());
                                 followable
                             });
                             // Record history keyed on the url, but NEVER pair a
@@ -6106,6 +6111,16 @@ impl ShellState {
         // the root tabs in memory would resurrect every one of them if the GUI
         // died before the next tab edit.
         self.persist_web_tabs(session_path);
+        // Vertical mode IS the rail, so a surface opening under a pref that is
+        // already on must RAISE it. Toggling the pref opened the rail, but a GUI
+        // that started with the pref already true collapsed the tab strip and
+        // opened nothing — the tabs had nowhere to live, which is precisely the
+        // state the "one home for tabs" invariant exists to forbid.
+        if self.settings.web_surface_vertical_tabs
+            && self.right_panel_mode != RightPanelMode::WebTabs
+        {
+            self.set_right_panel_mode(RightPanelMode::WebTabs);
+        }
     }
     /// Upsert a surface in PICKER state (OSC action "pick"): no page, no tab
     /// bar — the viewport renders the GUI-native profile picker; choosing
@@ -6692,6 +6707,9 @@ impl ShellState {
                 surface.address_draft = None;
             }
         }
+        // Closing a FILED tab removes it from the saved tree — a folder must not
+        // resurrect a tab the user closed on the next visit.
+        self.persist_web_tabs(session_path);
     }
     /// Request a reload of the active tab's page (native surface ⟳).
     fn web_surface_reload_active_tab(&mut self, session_path: &str) {
@@ -6809,6 +6827,11 @@ impl ShellState {
                 surface.address_draft = None;
             }
         }
+        // A tab's URL IS what the tree saves, so a navigation is a tree change.
+        // Filing a tab used to be the only thing that persisted one, which meant
+        // a tab you opened and browsed was still saved as the page you started on
+        // — or, at the root, not saved at all.
+        self.persist_web_tabs(session_path);
         // Tab or surface vanished while the forward resolved: don't leak it.
         if let Some(mut child) = orphaned_forward {
             let _ = child.kill();
@@ -6847,6 +6870,7 @@ impl ShellState {
                 surface.address_draft = None;
             }
         }
+        self.persist_web_tabs(session_path);
     }
     /// The viewport overlay view for a live (non-stale) surface: tab strip,
     /// address bar, and per-tab iframe targets.
@@ -7386,6 +7410,20 @@ impl ShellState {
         self.set_right_panel_mode(next_mode);
     }
     fn set_right_panel_mode(&mut self, mode: RightPanelMode) {
+        // While vertical tabs are on, the rail's RESTING state is the tab tree —
+        // that is where the tabs live, and the strip is collapsed. Another pane
+        // (the app's settings, the vault) BORROWS the slot; when it leaves, the
+        // tabs come back. Without this, closing the settings pane left the tabs
+        // with no home at all: strip collapsed AND rail hidden. To hide the rail
+        // outright, turn vertical tabs off — the ⊟ button does exactly that.
+        let mode = if mode == RightPanelMode::Hidden
+            && self.settings.web_surface_vertical_tabs
+            && self.active_web_surface().is_some()
+        {
+            RightPanelMode::WebTabs
+        } else {
+            mode
+        };
         self.terminal_input_override_active = terminal_input_override_for_right_panel_mode(&mode);
         self.right_panel_mode = mode;
         self.settings.show_settings = self.right_panel_mode == RightPanelMode::Settings;
@@ -7465,6 +7503,12 @@ impl ShellState {
                 .right_panel_mode_before_app_pane
                 .clone()
                 .unwrap_or(RightPanelMode::Hidden),
+            // The tab rail is a tenant of the surface, exactly like a contributed
+            // pane is a tenant of its app: a session with no web surface has no
+            // tabs, so the rail stands down instead of showing an empty tree.
+            RightPanelMode::WebTabs if self.active_web_surface().is_none() => {
+                RightPanelMode::Hidden
+            }
             mode => mode.clone(),
         }
     }
@@ -87841,6 +87885,86 @@ mod tests {
         );
     }
 
+    // Vertical mode IS the rail. A GUI that starts with the pref already on used
+    // to collapse the tab strip and open nothing, so the tabs had NO home — the
+    // invariant this test exists to hold. Caught live, on a restart, not by code
+    // review.
+    #[test]
+    fn a_surface_opening_under_vertical_tabs_raises_the_rail() {
+        let bootstrap = test_shell_bootstrap_with_active_session("local://ws");
+        let mut shell = ShellState::new(bootstrap);
+        shell.settings.web_surface_vertical_tabs = true;
+        shell.right_panel_mode = RightPanelMode::Hidden;
+
+        shell.upsert_web_surface(
+            "local://ws",
+            "https://example.com/".to_string(),
+            None,
+            "https://example.com/".to_string(),
+            None,
+            None,
+            // The ephemeral profile: this test must not read or write the user's
+            // real tab store.
+            WEB_SURFACE_TEMP_PROFILE.to_string(),
+            1_000,
+        );
+
+        assert_eq!(
+            shell.right_panel_mode,
+            RightPanelMode::WebTabs,
+            "the tabs must have somewhere to live the moment the surface exists"
+        );
+    }
+
+    // A pane BORROWS the rail; the tabs get it back. Closing the app's settings
+    // pane in vertical mode used to hide the rail, and with the strip collapsed
+    // the tabs had nowhere at all to be.
+    #[test]
+    fn closing_a_pane_returns_the_rail_to_the_tabs_in_vertical_mode() {
+        let bootstrap = test_shell_bootstrap_with_active_session("local://ws");
+        let mut shell = ShellState::new(bootstrap);
+        shell.settings.web_surface_vertical_tabs = true;
+        shell.upsert_web_surface(
+            "local://ws",
+            "https://example.com/".to_string(),
+            None,
+            "https://example.com/".to_string(),
+            None,
+            None,
+            WEB_SURFACE_TEMP_PROFILE.to_string(),
+            1_000,
+        );
+        assert_eq!(shell.right_panel_mode, RightPanelMode::WebTabs);
+
+        shell.set_right_panel_mode(RightPanelMode::AppPane("settings".to_string()));
+        assert_eq!(
+            shell.right_panel_mode,
+            RightPanelMode::AppPane("settings".to_string()),
+            "a pane may borrow the slot"
+        );
+
+        shell.set_right_panel_mode(RightPanelMode::Hidden);
+        assert_eq!(
+            shell.right_panel_mode,
+            RightPanelMode::WebTabs,
+            "and hiding it hands the rail back to the tabs, not to nothing"
+        );
+    }
+
+    // And a session with no surface has no tabs, so the rail stands down rather
+    // than showing an empty tree next to a terminal.
+    #[test]
+    fn the_tab_rail_stands_down_when_the_active_session_has_no_surface() {
+        let bootstrap = test_shell_bootstrap_with_active_session("local://ws");
+        let mut shell = ShellState::new(bootstrap);
+        shell.right_panel_mode = RightPanelMode::WebTabs;
+        assert_eq!(
+            shell.effective_right_panel_mode(false),
+            RightPanelMode::Hidden,
+            "a terminal session must not show an empty tab tree"
+        );
+    }
+
     // A tab pointing at a folder that is gone (a hand-edited file, a half-written
     // one) must land at the root, not in a folder the tree never draws — that tab
     // would be invisible in BOTH modes.
@@ -87880,7 +88004,7 @@ mod tests {
             "http://localhost:8000/".to_string(),
             None,
             None,
-            "default".to_string(),
+            WEB_SURFACE_TEMP_PROFILE.to_string(),
             1_000,
         );
         shell.web_surface_new_tab("local://ws");
@@ -87901,7 +88025,7 @@ mod tests {
             "http://localhost:8000/next".to_string(),
             None,
             None,
-            "default".to_string(),
+            WEB_SURFACE_TEMP_PROFILE.to_string(),
             2_000,
         );
         let overlay = shell
@@ -88237,7 +88361,7 @@ mod tests {
             "https://search.brave.com/".to_string(),
             None,
             None,
-            "default".to_string(),
+            WEB_SURFACE_TEMP_PROFILE.to_string(),
             1_000,
         );
         // User navigates the app tab via the address bar.
@@ -88258,7 +88382,7 @@ mod tests {
             "https://search.brave.com/".to_string(),
             None,
             None,
-            "default".to_string(),
+            WEB_SURFACE_TEMP_PROFILE.to_string(),
             2_000,
         );
         let overlay = shell
@@ -88273,7 +88397,7 @@ mod tests {
             "https://app.example/next".to_string(),
             None,
             None,
-            "default".to_string(),
+            WEB_SURFACE_TEMP_PROFILE.to_string(),
             3_000,
         );
         let overlay = shell
@@ -88295,7 +88419,7 @@ mod tests {
             "https://search.brave.com/".to_string(),
             None,
             None,
-            "default".to_string(),
+            WEB_SURFACE_TEMP_PROFILE.to_string(),
             1_000,
         );
         shell.web_surface_set_address_draft("local://ws", Some("oi".to_string()));
@@ -106847,7 +106971,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             "http://127.0.0.1:45975/".to_string(),
             None,
             None,
-            "default".to_string(),
+            WEB_SURFACE_TEMP_PROFILE.to_string(),
             current_millis(),
         );
         assert!(
@@ -108611,7 +108735,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             "http://127.0.0.1:45975/".to_string(),
             None,
             None,
-            "default".to_string(),
+            WEB_SURFACE_TEMP_PROFILE.to_string(),
             current_millis(),
         );
         shell.observe_terminal_open_attempt_from_viewport(&json!({
