@@ -2885,6 +2885,40 @@ impl YggtermServer {
         Some((remote_shutdown_machine_ref(machine), session_id))
     }
 
+    /// Resolve the host + session id + agent kind for a session whose PTY is
+    /// owned by ANOTHER machine's daemon. Accepts BOTH remote agent schemes,
+    /// per [`session_path_is_remote_agent`]: the scheme alone implies the kind.
+    ///
+    /// [`Self::remote_shutdown_target_for_path`] is Codex-only by construction
+    /// (it parses `remote-session://`), and the remote PTY's grid has exactly
+    /// ONE writer — `forward_remote_pty_resize` — which resolved its target
+    /// through that Codex-only lookup. So a Claude Code session had NO writer
+    /// of its remote PTY size after birth: the PTY kept whatever grid it was
+    /// born with while the client viewport moved on, and CC kept authoring
+    /// frames for the old grid (composer painted mid-screen, dead rows below,
+    /// dead columns right). Every daemon-side instrument called it healthy
+    /// because they read the LOCAL vt100 mirror, which *was* the client's grid.
+    /// See docs/xterm-bugs.md#remote-cc-pty-never-resized.
+    pub fn remote_agent_pty_target_for_path(
+        &self,
+        path: &str,
+    ) -> Option<(RemoteMachineSnapshot, String, SessionKind)> {
+        if let Some((machine, session_id)) = self.remote_shutdown_target_for_path(path) {
+            return Some((machine, session_id, SessionKind::Codex));
+        }
+        let (raw_machine_key, session_id) = parse_remote_cc_session_path(path)?;
+        let machine_key = normalize_machine_key(raw_machine_key);
+        let machine = self
+            .remote_machines
+            .iter()
+            .find(|machine| machine.machine_key == machine_key)?;
+        Some((
+            remote_shutdown_machine_ref(machine),
+            session_id.to_string(),
+            SessionKind::ClaudeCode,
+        ))
+    }
+
     pub fn refresh_terminal_identity_launch_commands(&mut self) -> usize {
         let remote_machines = self.remote_machines.clone();
         let mut refreshed = 0usize;
@@ -19398,13 +19432,23 @@ pub fn terminate_remote_codex_session(
 /// while the client rendered 159×63. When the local daemon resizes a remote
 /// session's attachment, ALSO pin the remote daemon's PTY explicitly through
 /// the same daemon-native command path the terminate flow uses.
-pub fn resize_remote_codex_session_pty(
+/// Pin a remote agent session's PTY to the client's grid. The runtime key is
+/// owned by the session KIND (`cc-runtime://` for Claude Code,
+/// `codex-runtime://` for codex) — hardcoding the codex key here sent the
+/// remote daemon a key that does not exist for a CC session, which it rejected
+/// with `terminal session not found`. That error was then discarded by the
+/// caller, so the failure was completely silent.
+pub fn resize_remote_agent_session_pty(
     machine: &RemoteMachineSnapshot,
     session_id: &str,
+    kind: SessionKind,
     cols: u16,
     rows: u16,
 ) -> anyhow::Result<()> {
-    let runtime_key = remote_runtime_codex_session_key(session_id);
+    let runtime_key = match kind {
+        SessionKind::ClaudeCode => remote_runtime_cc_session_key(session_id),
+        _ => remote_runtime_codex_session_key(session_id),
+    };
     let cols = cols.to_string();
     let rows = rows.to_string();
     run_remote_yggterm_command(
@@ -31608,6 +31652,90 @@ terminal_window_id: None,
             server
                 .remote_shutdown_target_for_path("remote-session://unknown/live-2")
                 .is_none()
+        );
+    }
+
+    /// A remote Claude Code session's PTY must have a size writer.
+    ///
+    /// The remote PTY grid has exactly ONE writer (`forward_remote_pty_resize`),
+    /// and it resolved its target through `remote_shutdown_target_for_path`,
+    /// which parses `remote-session://` only. So every `remote-cc://` session
+    /// resolved to None and its PTY kept the grid it was BORN with for its whole
+    /// life: Claude Code went on painting frames sized for a screen that no
+    /// longer existed (composer stranded mid-viewport, dead rows below it, dead
+    /// columns to the right), while every daemon-side probe reported a healthy
+    /// session — they read the local vt100 mirror, which already held the
+    /// client's real grid. Live-caught on jojo: client 167x63, `claude` PTY on
+    /// dev pinned at 147x50.
+    #[test]
+    fn remote_cc_session_pty_has_a_resize_target_and_uses_the_cc_runtime_key() {
+        let tree = SessionNode {
+            kind: SessionNodeKind::Group,
+            name: "sessions".to_string(),
+            title: None,
+            document_kind: None,
+            group_kind: None,
+            path: PathBuf::from("/"),
+            children: Vec::new(),
+            session_id: None,
+            cwd: None,
+            ..Default::default()
+        };
+        let mut server = YggtermServer::new(
+            &tree,
+            false,
+            GhosttyHostSupport::shadow("test".to_string(), false, false),
+            UiTheme::ZedLight,
+        );
+        server.remote_machines.push(RemoteMachineSnapshot {
+            machine_key: "dev".to_string(),
+            label: "dev".to_string(),
+            ssh_target: "dev".to_string(),
+            prefix: None,
+            remote_binary_expr: Some("$HOME/.yggterm/bin/yggterm".to_string()),
+            remote_deploy_state: RemoteDeployState::Ready,
+            health: RemoteMachineHealth::Healthy,
+            sessions: Vec::new(),
+        });
+
+        let (machine, session_id, kind) = server
+            .remote_agent_pty_target_for_path("remote-cc://dev/33abb204")
+            .expect("a remote Claude Code PTY must have a resize target");
+        assert_eq!(machine.machine_key, "dev");
+        assert_eq!(session_id, "33abb204");
+        assert_eq!(kind, SessionKind::ClaudeCode);
+
+        // The runtime key is owned by the KIND. Sending the codex key for a CC
+        // session made the remote daemon answer `terminal session not found`,
+        // and the caller discarded that error — a silent no-op.
+        assert_eq!(
+            crate::remote_runtime_cc_session_key(&session_id),
+            "cc-runtime://33abb204",
+            "a Claude Code runtime is keyed cc-runtime://, never codex-runtime://"
+        );
+
+        // Codex keeps resolving exactly as before.
+        let (_, codex_id, codex_kind) = server
+            .remote_agent_pty_target_for_path("remote-session://dev/019ebfee")
+            .expect("codex target");
+        assert_eq!(codex_id, "019ebfee");
+        assert_eq!(codex_kind, SessionKind::Codex);
+
+        // A non-remote path has no remote PTY to resize.
+        assert!(
+            server
+                .remote_agent_pty_target_for_path("local://33abb204")
+                .is_none()
+        );
+
+        // THE BUG, pinned: the shutdown resolver is Codex-only and cannot see a
+        // Claude Code path. `forward_remote_pty_resize` must never route through
+        // it again, or CC loses its PTY size writer a second time.
+        assert!(
+            server
+                .remote_shutdown_target_for_path("remote-cc://dev/33abb204")
+                .is_none(),
+            "remote_shutdown_target_for_path is codex-only by construction"
         );
     }
 
