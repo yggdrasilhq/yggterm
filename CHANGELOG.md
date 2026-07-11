@@ -2,6 +2,33 @@
 
 This file tracks user-visible changes in `yggterm`.
 
+## 2.10.13
+
+- **Fixed: garbled, interleaved terminal frames on busy sessions.** Live output
+  reaching the terminal could have its **carriage returns stripped**, which left
+  the cursor mid-row so the next line painted at the wrong column — you saw two
+  frames woven together cell-by-cell, with colour blocks that never reset. The
+  batch sanitizers were re-encoding real CLI output (`str::lines()` and a
+  `\r\n`→`\n` rewrite) instead of passing it through. They now excise only the
+  lines they are meant to excise and forward every other byte verbatim. The
+  rewrite was triggered by *content* (internal transport phrases), which is why
+  **local sessions — especially yggterm-dev ones — were hit hardest.**
+
+- **Fixed: relaunching a never-used Claude Code session said "no conversation
+  found".** A session quit before its first turn has no transcript on disk, so
+  `claude --resume <id>` correctly refuses. yggterm now **re-births** such a row
+  with its own id (`--session-id`) instead of trying to resume nothing.
+
+- **Fixed: the agent-incident log counted conversations about errors as errors.**
+  The scanner reads the PTY stream, which contains the agent's rendered chat, so
+  prose merely *mentioning* "session already in use" was recorded as an incident.
+  It now matches only terse CLI refusals.
+
+- **New: the faithful-pipe invariant.** yggterm is a pipe, not a renderer. A test
+  suite now asserts that real TUI output (CRLF frames, alt-screen, synchronized
+  frames, spinners, wide unicode) reaches the terminal **byte-for-byte**, including
+  across chunk splits — so no future fix can silently mutate live output again.
+
 ## 2.10.12
 
 - **ALT+ KeyTips — an Excel-style keyboard accelerator layer.** Tap **ALT** (a

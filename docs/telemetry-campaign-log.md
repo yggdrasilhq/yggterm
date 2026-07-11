@@ -111,14 +111,39 @@ Regression test `batch_terminal_chunks_preserves_carriage_returns_in_kept_lines`
   teeth — the pre-fix pipeline failed it (it was withholding trailing newlines).
 - **Retuned** `agent_session_error_in_line` (terseness gate, above).
 
-**Open (carried forward):**
-- Parity harness **tier 2 (live)**: spawn `claude -r <uuid>` in a raw PTY vs through yggterm
-  and diff the byte stream + final screen. Tier 1 guards the batch seam only; tier 2 is what
-  catches launch/env/PTY-size divergence and the "TUI not recognized" class.
-- CC reap + turn-0 relaunch fix (finding 4) — NOT yet fixed.
-- Broken bottom on every switch: hypothesis = make the TUI repaint itself (SIGWINCH nudge)
-  instead of replaying a reconstructed snapshot; `/usage` works precisely because it forces a
-  TUI repaint. Not yet fixed.
+**Shipped in 2.10.13 (this run):**
+- CR-faithful sanitizers (`38844e9`) — the interleaved-frame garble.
+- Agent-incident probe shape gate (`7d26936`) — stopped it counting its own conversation.
+- Faithful-pipe invariant, harness tier 1 (`ca9d6c3`).
+- Transcript-less local CC row now re-births with `--session-id` instead of resuming
+  nothing (`e6ffc31`) — the `no conversation found` half of the user's relaunch incident.
+- `scripts/parity_harness.py` — harness tier 2 (manual PTY vs yggterm). **Control side
+  works; wrapper side deliberately FAILS LOUD**: the headless CLI exposes no raw-stream
+  read, so capturing the wrapper's byte stream would mean reimplementing the read path
+  (i.e. measuring the harness, not the product). Refusing to fake it is the point.
+
+**Open (carried forward) — honestly not done:**
+- **Harness tier 2 needs a product affordance**: `yggterm-headless server terminal
+  raw-stream --session <path> --for <secs>`, emitting the exact bytes the GUI forwards to
+  `term.write`. That single command turns the wrapper-vs-manual rule into a CI gate. NEXT STEP.
+- **CC "already in use" (the reap half)** — still open. The `no conversation found` half is
+  fixed; the lock-held-by-a-live-process half is not. Suspected collision between keep-alive
+  (yggterm keeps the CC process running after the user closes the view) and relaunch (which
+  spawns a SECOND `claude` on the same id). Correct fix is likely "attach to the live runtime
+  instead of spawning a second CLI", which touches the launch path — not rushed into a deploy.
+- **Broken bottom on every switch** — my SIGWINCH-nudge hypothesis is DEAD. The nudge already
+  exists (`remote_prompt_gap_resize_nudge_allowed`) and is **hard-disabled**, returning `false`
+  with every parameter unused: a previous attempt resized the PTY and made live Codex TUIs
+  redraw into broken prompt regions. Also, Linux only delivers SIGWINCH when the winsize
+  actually CHANGES, so a same-size nudge is a no-op — the idea cannot work as stated. The
+  function is accreted dead code and a deletion candidate. Real fix must come from the parity
+  harness (what does the manual case do on switch that we don't?), not another guess.
+- **The 171-fork collapse** — the core of the parity campaign; a large refactor deliberately
+  NOT rushed ahead of this deploy.
+- `stale_atlas_paint` (38 events) — watch whether the CR fix reduces the
+  `canvas_blank_with_buffer_text` sub-reason.
+- `terminal.sqlite3` fault-event query not yet run; blank-viewport (screenshot 1) not
+  independently root-caused.
 - Live-verify the CR-fix on jojo (blocked on the shared-GUI deploy guardrail — jojo
   may be mid another agent's campaign; coordinate before deploy).
 - `stale_atlas_paint` (38 events) — known self-healing class; watch whether the CR-fix
