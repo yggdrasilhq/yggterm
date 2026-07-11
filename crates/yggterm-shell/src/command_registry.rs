@@ -288,55 +288,16 @@ impl Keymap {
         Some(chord)
     }
 
-    /// The command a full chord string resolves to, if any.
-    fn command_for_chord(&self, chord: &str) -> Option<ShellCommand> {
-        SHELL_COMMANDS
-            .iter()
-            .find(|spec| self.chord_for_id(spec.id).as_deref() == Some(chord))
-            .map(|spec| spec.command)
-    }
-
-    /// True if `prefix` is a strict prefix of some command's chord (so more
-    /// keys could still complete a binding).
-    fn is_prefix(&self, prefix: &str) -> bool {
-        if prefix.is_empty() {
-            return true;
-        }
-        SHELL_COMMANDS.iter().any(|spec| {
-            self.chord_for_id(spec.id)
-                .is_some_and(|chord| chord.len() > prefix.len() && chord.starts_with(prefix))
-        })
-    }
-
-    /// Resolve a typed KeyTips sequence.
-    pub fn resolve(&self, sequence: &str) -> Resolution {
-        let sequence = sequence.to_ascii_lowercase();
-        if sequence.is_empty() {
-            return Resolution::Pending;
-        }
-        // An exact command wins even when it is also a prefix of a longer chord
-        // (the insert menu on `i` is both an action — open the submenu — and the
-        // `is`/`it` prefix). `opens_submenu` disambiguates the behaviour.
-        if let Some(command) = self.command_for_chord(&sequence) {
-            return Resolution::Command(command);
-        }
-        if self.is_prefix(&sequence) {
-            return Resolution::Pending;
-        }
-        Resolution::Invalid
-    }
 }
 
-/// The outcome of feeding a KeyTips sequence to the keymap.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Resolution {
-    /// A valid prefix; wait for more keys.
-    Pending,
-    /// The sequence maps to this command.
-    Command(ShellCommand),
-    /// No binding and no prefix — dismiss the overlay.
-    Invalid,
-}
+// NOTE: the flat chord resolver that once lived here (`resolve` / `Resolution` /
+// `command_for_chord` / `is_prefix`) is GONE. It was the trial run's model — one
+// static table of global commands, one flat chord space — and it structurally
+// could not express instances, dynamic sets, or app contributions
+// (docs/alt-keytips.md §2). Chord resolution now belongs to `keytip::KeyTipTree`,
+// which resolves over the per-scope declaration tree. What survives here is the
+// COMMAND TABLE itself: `SHELL_COMMANDS` (structure + default letters + titles),
+// the `ShellCommand` action enum, and the `Keymap` letters view the editor uses.
 
 #[cfg(test)]
 mod tests {
@@ -377,68 +338,34 @@ mod tests {
         }
     }
 
+    // Chord RESOLUTION is `keytip::KeyTipTree`'s job now (see its tests). What this
+    // module still owns is the command table's letters, so that is what these test.
     #[test]
-    fn resolves_default_chords() {
+    fn default_letters_are_the_documented_ones() {
         let keymap = Keymap::defaults();
-        assert_eq!(
-            keymap.resolve("b"),
-            Resolution::Command(ShellCommand::ToggleSidebar)
-        );
-        assert_eq!(
-            keymap.resolve("i"),
-            Resolution::Command(ShellCommand::OpenInsertMenu)
-        );
-        assert_eq!(
-            keymap.resolve("is"),
-            Resolution::Command(ShellCommand::InsertSession)
-        );
-        assert_eq!(
-            keymap.resolve("it"),
-            Resolution::Command(ShellCommand::InsertTerminal)
-        );
-        assert_eq!(keymap.resolve("i"), Resolution::Command(ShellCommand::OpenInsertMenu));
-        assert_eq!(keymap.resolve("z"), Resolution::Invalid);
-        assert_eq!(keymap.resolve("ip"), Resolution::Invalid);
+        assert_eq!(keymap.keytip_for(ShellCommand::ToggleSidebar), Some('b'));
+        assert_eq!(keymap.keytip_for(ShellCommand::OpenInsertMenu), Some('i'));
+        assert_eq!(keymap.keytip_for(ShellCommand::InsertSession), Some('s'));
+        assert_eq!(keymap.keytip_for(ShellCommand::InsertTerminal), Some('t'));
     }
 
     #[test]
     fn reassigned_letters_replace_excel_ones() {
         let keymap = Keymap::defaults();
-        // The four pre-spec violations are gone from their old letters…
-        assert_eq!(keymap.resolve("n"), Resolution::Invalid);
-        assert_eq!(keymap.resolve("m"), Resolution::Invalid);
-        assert_eq!(keymap.resolve("f"), Resolution::Invalid);
-        assert_eq!(keymap.resolve("a"), Resolution::Invalid);
-        // …and reachable on their new, namespace-clean letters.
-        assert_eq!(
-            keymap.resolve("l"),
-            Resolution::Command(ShellCommand::ToggleNotifications)
-        );
-        assert_eq!(
-            keymap.resolve("d"),
-            Resolution::Command(ShellCommand::ToggleMetadata)
-        );
-        assert_eq!(
-            keymap.resolve("u"),
-            Resolution::Command(ShellCommand::ToggleFullscreen)
-        );
-        assert_eq!(
-            keymap.resolve("o"),
-            Resolution::Command(ShellCommand::ToggleAlwaysOnTop)
-        );
+        // The four pre-spec violations moved OFF Excel's reserved letters (n/m/f/a)
+        // onto namespace-clean ones — the reserved set stays free for apps (§7).
+        assert_eq!(keymap.keytip_for(ShellCommand::ToggleNotifications), Some('l'));
+        assert_eq!(keymap.keytip_for(ShellCommand::ToggleMetadata), Some('d'));
+        assert_eq!(keymap.keytip_for(ShellCommand::ToggleFullscreen), Some('u'));
+        assert_eq!(keymap.keytip_for(ShellCommand::ToggleAlwaysOnTop), Some('o'));
     }
 
     #[test]
     fn overrides_move_the_binding_and_the_badge() {
-        // Rebind notifications from `l` to `j`.
+        // Rebind notifications from `l` to `j`: one source moves both.
         let keymap = Keymap::from_overrides([("notifications.toggle", 'j')]);
         assert_eq!(keymap.keytip_for(ShellCommand::ToggleNotifications), Some('j'));
-        assert_eq!(
-            keymap.resolve("j"),
-            Resolution::Command(ShellCommand::ToggleNotifications)
-        );
-        // The old letter no longer resolves.
-        assert_eq!(keymap.resolve("l"), Resolution::Invalid);
+        assert!(keymap.is_overridden("notifications.toggle"));
     }
 
     #[test]
