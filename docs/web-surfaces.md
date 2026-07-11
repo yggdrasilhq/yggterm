@@ -187,6 +187,26 @@ GET <control>/zoom -> { sites: { host: percent } }
   the active surface's live effective zoom as `values.zoom` on every action so a
   pane control steps from what is on screen.
 
+## History viewer — an internal "chrome://history" page (2026-07-11)
+
+Browsing history is generic web-surface chrome, not app-specific: yggterm already
+writes it (`~/.yggterm/web-profiles/<profile>/history.jsonl`, on the GUI host, as
+the reconciler follows in-page navigation) and the omnibox already reads it. The
+🕘 button beside the omnibox opens a Session-Buddy-style viewer of it — entries
+grouped by day, newest first, each a clickable link, with a client-side search
+filter.
+
+- The page is rendered by `render_web_history_page` (pure, unit-tested) as
+  self-contained HTML (inline CSS/JS, theme-aware, every user string escaped) and
+  carried to the surface's webview as a **`data:` URL**. No custom URI scheme, no
+  vendored-webkit change: it loads like any URL through `navigate_web_surface_tab`.
+- That nav has an internal-page guard: a `data:` URL skips egress resolution (it
+  loads locally, tunnels nothing) and keeps the tab's existing egress, and is
+  elided from the trace (it would otherwise write a multi-KB blob per navigation).
+- The omnibox relabels it "History" (`web_surface_internal_page_label`) rather
+  than showing the base64 blob; clicking a row navigates to the real URL normally.
+- Capped at `WEB_HISTORY_PAGE_LIMIT` entries so the `data:` URL stays bounded.
+
 ## Renderer and security
 
 Each tab's page is a **native child webview** (wry `build_gtk` into the main
