@@ -187,6 +187,26 @@ GET <control>/zoom -> { sites: { host: percent } }
   the active surface's live effective zoom as `values.zoom` on every action so a
   pane control steps from what is on screen.
 
+## Vertical tabs — a browsing-mode toggle (2026-07-11)
+
+A per-user preference (`AppSettings::web_surface_vertical_tabs`, persisted) that
+flips the web-surface chrome between classic top tabs and a left-hand pane. The
+⊟ button in the top strip turns it on; the ▭ button in the pane turns it off.
+
+In vertical mode the overlay's outer flex direction becomes `row`: a fixed 224px
+left pane holds a mini-omnibox, the tabs as a **domain-grouped tree**
+(`web_surface_tab_tree`, unit-tested — domains in first-appearance order, tabs in
+order within), a "+ New tab", and an extension slot (history today). The top tab
+bar and address bar collapse away (`max-height`→0 transition), and the pane
+slides in (`ygg-vtab-slide-in`). The native page rect (`[data-ws-page]`, still
+`flex:1`) simply fills the space right of the pane, so the reconciler follows
+without any surface-placement change. All tab actions reuse the same state
+methods as the classic strip (`web_surface_select_tab` / `_close_tab` / `_new_tab`).
+
+Because it is generic web-surface chrome, it applies to every web-surface app.
+The mini-omnibox is intentionally minimal (type-and-Enter, no dropdown yet). The
+setting is exposed in `app state` as `web_surface_vertical_tabs`.
+
 ## History viewer — an internal "chrome://history" page (2026-07-11)
 
 Browsing history is generic web-surface chrome, not app-specific: yggterm already
