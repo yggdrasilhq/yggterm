@@ -282,10 +282,34 @@ injects, and yggterm persists none of it. A `RightPanelMode` for an app's
 settings is still the anti-pattern; the settings pane is an app contribution
 like any other. Mechanics: "Shipping a policy the GUI must apply", above.
 
-ALT+/KeyTips is the keyboard surface — spec finalized 2026-07-10, see
-[[campaign-alt-keytips-layer]] (reserved-letters namespace: shell KeyTips use
-only non-Excel letters; apps claim Excel's F,H,N,P,M,A,R,W,X,Y,Q;
-command-registry SSOT, contributions ride OSC 7717 ids).
+## The keyboard surface — ALT+ KeyTips (SHIPPED 2.10.10, shell chrome only)
+
+The keyboard analogue of the four visual surfaces. Spec: [[campaign-alt-keytips-layer]];
+reference doc `docs/alt-keytips.md`.
+
+- **`command_registry` (in `yggterm-shell`) is the SSOT.** `ShellCommand` + the
+  `SHELL_COMMANDS` table map command id → title → default KeyTip → chord parent.
+  The KeyTip badges, the resolver, the `~/.yggterm/keymap.json` override file, the
+  Settings ▸ "ALT+ Keys" modal, and the `server app command invoke <id>` /
+  `command list` probes are ALL views of it. Never hardcode a letter at a
+  callsite — `keytip_badge(&snapshot, "<id>")` reads it from the in-force keymap
+  so a remap moves badge and binding together.
+- **Reserved-letters namespace (enforced by a test).** Shell top-level KeyTips
+  draw only from `B,C,D,E,G,I,J,K,L,O,S,T,U,V,Z`+digits;
+  `command_registry::EXCEL_RESERVED_LETTERS` (F,H,N,P,M,A,R,W,X,Y,Q) is held for
+  app contributions. `assert_shell_namespace_clean` fails the build if a shell
+  default lands on an Excel letter.
+- **Clean-tap trigger.** A press+release of ALT with no intervening key opens the
+  overlay (window-level tao handler, `alt_tap_candidate`); a held ALT+<key> in a
+  terminal passes through to the PTY as Meta. Opening on RELEASE is what makes
+  the passthrough safe.
+- **Live-session nav = Ctrl+Alt+PgUp/PgDn**; plain Ctrl+PgUp/PgDn is reserved for
+  a focused app's tab layer.
+- **NOT built yet (lands with app contribution at 3.0.0):** the app-side
+  KeyTip-contribution path (an app claiming Excel's letters over OSC 7717) and
+  held-ALT+key DIRECT chords on a focused native web surface. yggterm is the
+  first and only consumer of the registry in 2.x, per the campaign's
+  extraction-not-construction sequencing.
 
 ## The launcher registry — SHIPPED 2026-07-10
 
