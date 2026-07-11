@@ -25271,10 +25271,27 @@ fn keytip_tip_attr(snapshot: &RenderSnapshot, node_key: &str) -> String {
 /// probe, and the settings modal funnel through here — one action per command.
 fn execute_shell_command(mut state: Signal<ShellState>, command: ShellCommand) {
     match command {
-        ShellCommand::ToggleSidebar => state.with_mut(|shell| {
-            shell.clear_alt_overlay();
-            shell.toggle_sidebar();
-        }),
+        ShellCommand::ToggleSidebar => {
+            // Opening the sidebar from the keyboard (ALT,B) also focuses a row so
+            // arrow-key navigation works without a mouse click first (§8). Keeps an
+            // existing selection; otherwise focuses the first navigable row.
+            let focus_path = state.with_mut(|shell| {
+                shell.clear_alt_overlay();
+                shell.toggle_sidebar();
+                if !shell.sidebar_open {
+                    return None;
+                }
+                // Focus the existing selection if there is one, else the first row —
+                // either way the sidebar gains DOM focus so arrows route to it.
+                match current_selected_sidebar_row(shell) {
+                    Some(row) => Some(row.full_path),
+                    None => shell.navigate_sidebar_selection(-1, true),
+                }
+            });
+            if let Some(path) = focus_path {
+                scroll_sidebar_row_into_view(&path);
+            }
+        }
         ShellCommand::ViewWeb => {
             state.with_mut(|shell| shell.clear_alt_overlay());
             spawn_set_view_mode(state, WorkspaceViewMode::Rendered);
