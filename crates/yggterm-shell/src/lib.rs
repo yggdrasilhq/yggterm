@@ -3,6 +3,11 @@
 mod app_capture;
 mod command_registry;
 mod hot_update_policy;
+// The ALT+ KeyTips declaration model + assignment resolver (docs/alt-keytips.md).
+// Pure logic, unit-tested in isolation; the shell renders and drives it. Marked
+// allow(dead_code) while the render/chord integration is wired in incrementally.
+#[allow(dead_code)]
+mod keytip;
 // Phase 1 of the consolidated scroll-controller: the canonical, regression-locked
 // DECISION spec (mode + transitions). The JS wiring (Phase 2) mirrors it. Marked
 // allow(dead_code) until the JS migration consults it. See scroll_mode.rs.
