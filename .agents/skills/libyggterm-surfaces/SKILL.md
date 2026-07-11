@@ -241,6 +241,36 @@ A surface opened by a **non-browser** app gets no adblock and no userscripts.
 That is correct, not a gap: adblock is browsing config, and a dashboard is not
 browsing.
 
+### Per-site zoom — a second stamped map, non-gating (SHIPPED 2026-07-11)
+
+yggterm owns ONE global web-surface zoom (`web_surface_zoom_percent`, the Settings
+main-zoom control). A per-site number is browsing config, so it is an app
+contribution, declared like the policy but with its OWN stamp so a zoom edit never
+drags the ruleset over the wire:
+
+- `declare` carries `app_name` (labels the main zoom control — "Ychrome Global
+  Zoom"; yggterm hardcodes no app name) and `zoom_version` (a change-detector over
+  the app's site map). The GUI refetches `GET <control>/zoom` →
+  `{sites:{host:percent}}` only when the stamp moves.
+- **Non-gating, unlike the policy.** Zoom is cosmetic, so the fetch never holds a
+  surface's creation, and the OLD map stays applied while a refetch is in flight
+  (no flicker to global and back). This is why it is a separate mechanism from
+  `SurfacePolicyGate`, not another gate state.
+- The GUI does the host match (`zoom_override_for_host`): longest-suffix, so
+  `youtube.com` covers `music.youtube.com`; a bare TLD is never consulted. It is
+  the twin of the app's own matcher — **both must agree**, or a zoom set in the
+  pane applies to a different set of pages than it names. On each navigation the
+  reconciler applies the override (or the global) via `WebView::zoom`.
+- An action reply may set `refetch_zoom: true` so a pane's zoom control lands on
+  the live page at once (the GUI re-reads `/zoom`), the zoom analogue of
+  `reload_surface`. The GUI injects the surface's live effective zoom as
+  `values.zoom` on every action, so the control steps from what is on screen —
+  non-secret page context, like `values.host`.
+- **Same forwarder trap as the policy.** The sidebar OSC is rebuilt field-by-field
+  in `terminal_eval_script`'s JS; `app_name` and `zoom_version` had to be copied
+  there too or they arrive null. `terminal_eval_script_forwards_every_sidebar_declaration_field`
+  is the tripwire.
+
 ### `reload_surface`, not `eval: "location.reload()"`
 
 An action reply may set `reload_surface: true`. The GUI then drops the policy it
