@@ -48176,6 +48176,14 @@ fn app() -> Element {
                     let dark = palette_is_dark(palette);
                     let keymap = snapshot.keymap.clone();
                     let error = snapshot.keymap_editor_error.clone();
+                    // The direct-accelerator column (§11.5): command-id → its chord,
+                    // from the registry defaults. Read-only for now — the second
+                    // door to each command, shown beside its ALT chord.
+                    let accels: std::collections::BTreeMap<String, String> =
+                        keytip::effective_accelerators(&KeymapConfig::default())
+                            .into_iter()
+                            .map(|(id, chord)| (id, chord.display()))
+                            .collect();
                     rsx! {
                         div {
                             "data-keytips-editor-modal": "1",
@@ -48201,7 +48209,7 @@ fn app() -> Element {
                                         }
                                         div {
                                             style: format!("font-size:11px; line-height:1.4; color:{};", palette.muted),
-                                            "Tap ALT, then a highlighted letter. Type a new letter to rebind."
+                                            "Two doors to every command: tap ALT then its letter (type a new letter to rebind), or its direct accelerator."
                                         }
                                     }
                                     button {
@@ -48224,16 +48232,30 @@ fn app() -> Element {
                                 }
                                 div {
                                     style: "display:flex; flex-direction:column; gap:4px;",
+                                    div {
+                                        style: "display:flex; align-items:center; justify-content:space-between; gap:10px; padding:2px 10px 4px 10px;",
+                                        span {
+                                            style: format!("font-size:10px; font-weight:800; letter-spacing:0.4px; text-transform:uppercase; color:{};", palette.muted),
+                                            "Command"
+                                        }
+                                        div {
+                                            style: "display:flex; align-items:center; gap:10px;",
+                                            span {
+                                                style: format!("font-size:10px; font-weight:800; letter-spacing:0.4px; text-transform:uppercase; text-align:right; width:118px; color:{};", palette.muted),
+                                                "ALT KeyTip"
+                                            }
+                                            span {
+                                                style: format!("font-size:10px; font-weight:800; letter-spacing:0.4px; text-transform:uppercase; text-align:right; width:118px; color:{};", palette.muted),
+                                                "Accelerator"
+                                            }
+                                        }
+                                    }
                                     for spec in command_registry::SHELL_COMMANDS.iter() {
                                         {
                                             let id = spec.id;
                                             let chord = keymap.chord_for_id(id);
                                             let leaf = keymap.keytip_for_id(id);
-                                            let nav_hint = match id {
-                                                "session.next" => Some("Ctrl+Alt+PgDn"),
-                                                "session.prev" => Some("Ctrl+Alt+PgUp"),
-                                                _ => None,
-                                            };
+                                            let accel = accels.get(id).cloned();
                                             let row_letter = leaf.map(|c| c.to_string()).unwrap_or_default();
                                             rsx! {
                                                 div {
@@ -48257,48 +48279,70 @@ fn app() -> Element {
                                                             "{id}"
                                                         }
                                                     }
-                                                    if let Some(hint) = nav_hint {
-                                                        span {
-                                                            style: format!(
-                                                                "font-size:10px; font-weight:700; color:{}; padding:3px 8px; border-radius:7px; \
-                                                                 background:rgba(95,168,255,0.12); white-space:nowrap;",
-                                                                palette.accent
-                                                            ),
-                                                            "{hint}"
-                                                        }
-                                                    } else if let Some(letter) = leaf {
+                                                    div {
+                                                        // Two columns: the ALT chord (rebindable) and the direct
+                                                        // accelerator (read-only). Fixed widths so the columns line
+                                                        // up down the list like a real keymap table.
+                                                        style: "display:flex; align-items:center; gap:10px;",
                                                         div {
-                                                            style: "display:flex; align-items:center; gap:6px;",
-                                                            if let Some(prefix) = chord.as_ref().and_then(|c| c.get(..c.len().saturating_sub(1))).filter(|p| !p.is_empty()) {
-                                                                span {
-                                                                    style: format!("font-size:10px; color:{}; font-weight:700;", palette.muted),
-                                                                    "ALT {prefix.to_uppercase()} ›"
+                                                            style: "display:flex; align-items:center; justify-content:flex-end; gap:6px; width:118px;",
+                                                            if let Some(letter) = leaf {
+                                                                if let Some(prefix) = chord.as_ref().and_then(|c| c.get(..c.len().saturating_sub(1))).filter(|p| !p.is_empty()) {
+                                                                    span {
+                                                                        style: format!("font-size:10px; color:{}; font-weight:700;", palette.muted),
+                                                                        "ALT {prefix.to_uppercase()} ›"
+                                                                    }
+                                                                } else {
+                                                                    span {
+                                                                        style: format!("font-size:10px; color:{}; font-weight:700;", palette.muted),
+                                                                        "ALT ›"
+                                                                    }
+                                                                }
+                                                                input {
+                                                                    r#type: "text",
+                                                                    initial_value: "{letter.to_ascii_uppercase()}",
+                                                                    style: format!(
+                                                                        "width:34px; height:30px; text-align:center; text-transform:uppercase; \
+                                                                         font-size:14px; font-weight:800; border-radius:8px; border:none; \
+                                                                         background:rgba(95,168,255,0.14); color:{}; \
+                                                                         box-shadow: inset 0 0 0 1px rgba(95,168,255,0.42);",
+                                                                        palette.accent
+                                                                    ),
+                                                                    onclick: move |evt| evt.stop_propagation(),
+                                                                    // Select the existing letter on focus so a keystroke
+                                                                    // REPLACES it (the field holds one letter at a time).
+                                                                    onfocus: move |_| { let _ = document::eval("if(document.activeElement&&document.activeElement.select)document.activeElement.select();"); },
+                                                                    oninput: move |evt| {
+                                                                        if let Some(ch) = evt.value().chars().rev().find(|c| c.is_ascii_alphanumeric()) {
+                                                                            state.with_mut(|shell| shell.set_keymap_override(id, ch));
+                                                                        }
+                                                                    },
                                                                 }
                                                             } else {
                                                                 span {
-                                                                    style: format!("font-size:10px; color:{}; font-weight:700;", palette.muted),
-                                                                    "ALT ›"
+                                                                    style: format!("font-size:11px; color:{};", palette.muted),
+                                                                    "—"
                                                                 }
                                                             }
-                                                            input {
-                                                                r#type: "text",
-                                                                initial_value: "{letter.to_ascii_uppercase()}",
-                                                                style: format!(
-                                                                    "width:34px; height:30px; text-align:center; text-transform:uppercase; \
-                                                                     font-size:14px; font-weight:800; border-radius:8px; border:none; \
-                                                                     background:rgba(95,168,255,0.14); color:{}; \
-                                                                     box-shadow: inset 0 0 0 1px rgba(95,168,255,0.42);",
-                                                                    palette.accent
-                                                                ),
-                                                                onclick: move |evt| evt.stop_propagation(),
-                                                                // Select the existing letter on focus so a keystroke
-                                                                // REPLACES it (the field holds one letter at a time).
-                                                                onfocus: move |_| { let _ = document::eval("if(document.activeElement&&document.activeElement.select)document.activeElement.select();"); },
-                                                                oninput: move |evt| {
-                                                                    if let Some(ch) = evt.value().chars().rev().find(|c| c.is_ascii_alphanumeric()) {
-                                                                        state.with_mut(|shell| shell.set_keymap_override(id, ch));
-                                                                    }
-                                                                },
+                                                        }
+                                                        div {
+                                                            "data-keytips-accel": "{id}",
+                                                            style: "display:flex; align-items:center; justify-content:flex-end; width:118px;",
+                                                            if let Some(chord) = accel {
+                                                                span {
+                                                                    style: format!(
+                                                                        "font-size:10px; font-weight:800; font-family:monospace; color:{}; padding:4px 8px; \
+                                                                         border-radius:7px; background:rgba(120,140,160,0.12); white-space:nowrap; \
+                                                                         box-shadow: inset 0 0 0 1px {};",
+                                                                        palette.text, chrome_chip_border(palette),
+                                                                    ),
+                                                                    "{chord}"
+                                                                }
+                                                            } else {
+                                                                span {
+                                                                    style: format!("font-size:11px; color:{};", palette.muted),
+                                                                    "—"
+                                                                }
                                                             }
                                                         }
                                                     }
