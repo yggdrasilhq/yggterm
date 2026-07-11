@@ -24887,6 +24887,50 @@ const ALT_TAP_LISTENER_JS: &str = r#"(function(){
     if (window.__yggtermAltTapSend) { window.__yggtermAltTapSend({ tap: true }); }
   }, true);
   window.addEventListener('blur', function(){ armed = false; }, true);
+  // --- KeyTip floating-badge painter (§9): central assignment in Rust (each
+  // interactable carries data-keytip-tip = its assigned letter while the overlay
+  // is up), local painting here. Badges are their own little blocks in a
+  // position:fixed overlay appended to <body>, so nothing under them reflows and
+  // the titlebar cannot clip them. No scrim. ---
+  var KT_CONT = '__yggterm_keytip_badges';
+  function ktContainer(){
+    var c = document.getElementById(KT_CONT);
+    if (!c){
+      c = document.createElement('div');
+      c.id = KT_CONT;
+      c.style.cssText = 'position:fixed; left:0; top:0; right:0; bottom:0; z-index:2147483000; pointer-events:none;';
+      (document.body || document.documentElement).appendChild(c);
+    }
+    return c;
+  }
+  function ktClear(){ var c = document.getElementById(KT_CONT); if (c){ c.textContent = ''; } }
+  var KT_BADGE_CSS = 'position:fixed; display:flex; align-items:center; justify-content:center; min-width:16px; height:16px; padding:0 4px; box-sizing:border-box; border-radius:5px; background:#f3f7fc; color:#1f5fa8; font:800 10px/1 ui-sans-serif,system-ui,sans-serif; letter-spacing:0.4px; box-shadow:0 2px 6px rgba(8,20,40,0.30), inset 0 0 0 1px rgba(95,168,255,0.60); pointer-events:none; white-space:nowrap;';
+  function ktPaint(){
+    if (!overlayOpen()){ if (window.__ktPainted){ ktClear(); window.__ktPainted = false; } return; }
+    window.__ktPainted = true;
+    var c = ktContainer();
+    var live = {};
+    document.querySelectorAll('[data-keytip-tip]').forEach(function(marker){
+      var tip = (marker.getAttribute('data-keytip-tip') || '').trim();
+      if (!tip){ return; }
+      var host = marker.parentElement || marker;
+      var r = host.getBoundingClientRect();
+      if (r.width < 1 || r.height < 1){ return; }
+      var node = marker.getAttribute('data-keytip-node') || tip;
+      var id = 'ktb__' + node;
+      var b = document.getElementById(id);
+      if (!b){ b = document.createElement('div'); b.id = id; c.appendChild(b); }
+      b.textContent = tip;
+      // Lower-leading corner, overlapping the host; nudged inward at edges.
+      var bx = Math.max(2, Math.min(r.left - 5, window.innerWidth - 24));
+      var by = Math.max(2, Math.min(r.bottom - 11, window.innerHeight - 20));
+      b.style.cssText = KT_BADGE_CSS + 'left:' + Math.round(bx) + 'px; top:' + Math.round(by) + 'px;';
+      live[id] = true;
+    });
+    var cont = document.getElementById(KT_CONT);
+    if (cont){ Array.prototype.slice.call(cont.children).forEach(function(ch){ if (!live[ch.id]){ ch.remove(); } }); }
+  }
+  window.setInterval(ktPaint, 90);
 })();"#;
 /// Keep the below-the-webview ALT key bridge installed for the GUI's lifetime
 /// and act on each message it reports. The eval is held open so its `recv()`
@@ -25009,6 +25053,26 @@ fn keytip_badge(snapshot: &RenderSnapshot, command_id: &str) -> Option<char> {
         .keymap
         .keytip_for_id(command_id)
         .map(|letter| letter.to_ascii_uppercase())
+}
+/// The stable `data-keytip-node` id (`<scope>/<command-id>`) for a command, used
+/// as the floating-badge painter's measurement anchor and the orphan audit's
+/// proof that this interactable is declared (spec §9, §12). The scope is derived
+/// from the command's parent: a top-level command lives in the root scope, a
+/// submenu child in its parent's scope.
+fn keytip_node_id(command_id: &str) -> String {
+    let scope = spec_for_id(command_id)
+        .and_then(|spec| spec.parent)
+        .unwrap_or("root");
+    format!("{scope}/{command_id}")
+}
+/// The `data-keytip-tip` value for a command: the assigned letter (uppercased)
+/// when the overlay is up and this command's scope is the one being shown, else
+/// an empty string. The floating painter skips empty tips; the marker carries
+/// `data-keytip-node` regardless so the audit always sees it.
+fn keytip_tip_attr(snapshot: &RenderSnapshot, command_id: &str) -> String {
+    keytip_badge(snapshot, command_id)
+        .map(|letter| letter.to_string())
+        .unwrap_or_default()
 }
 /// Dispatch a registry command. Every ALT+ KeyTip, the `command invoke <id>`
 /// probe, and the settings modal funnel through here — one action per command.
@@ -49628,11 +49692,10 @@ fn Titlebar(
                         },
                         ondoubleclick: |evt| evt.stop_propagation(),
                         onclick: move |_| on_toggle_sidebar.call(()),
-                        if let Some(letter) = keytip_badge(&snapshot, "sidebar.toggle") {
-                            span {
-                                style: "display:inline-flex; align-items:center; justify-content:center; min-width:16px; height:16px; padding:0 4px; border-radius:6px; background:rgba(95,168,255,0.14); color:#2667a9; font-size:9px; font-weight:800; margin-right:2px;",
-                                "{letter}"
-                            }
+                        span {
+                            "data-keytip-node": keytip_node_id("sidebar.toggle"),
+                            "data-keytip-tip": keytip_tip_attr(&snapshot, "sidebar.toggle"),
+                            style: "display:none;",
                         }
                         "☰"
                     }
@@ -49661,11 +49724,10 @@ fn Titlebar(
                             ),
                             ondoubleclick: |evt| evt.stop_propagation(),
                             onclick: move |_| on_set_view_mode.call(WorkspaceViewMode::Rendered),
-                            if let Some(letter) = keytip_badge(&snapshot, "view.web") {
-                                span {
-                                    style: "display:inline-flex; align-items:center; justify-content:center; min-width:16px; height:16px; padding:0 4px; border-radius:6px; background:rgba(95,168,255,0.14); color:#2667a9; font-size:9px; font-weight:800; margin-right:5px;",
-                                    "{letter}"
-                                }
+                            span {
+                                "data-keytip-node": keytip_node_id("view.web"),
+                                "data-keytip-tip": keytip_tip_attr(&snapshot, "view.web"),
+                                style: "display:none;",
                             }
                             "Web View"
                         }
@@ -49678,11 +49740,10 @@ fn Titlebar(
                             ),
                             ondoubleclick: |evt| evt.stop_propagation(),
                             onclick: move |_| on_set_view_mode.call(WorkspaceViewMode::Terminal),
-                            if let Some(letter) = keytip_badge(&snapshot, "view.terminal") {
-                                span {
-                                    style: "display:inline-flex; align-items:center; justify-content:center; min-width:16px; height:16px; padding:0 4px; border-radius:6px; background:rgba(95,168,255,0.14); color:#2667a9; font-size:9px; font-weight:800; margin-right:5px;",
-                                    "{letter}"
-                                }
+                            span {
+                                "data-keytip-node": keytip_node_id("view.terminal"),
+                                "data-keytip-tip": keytip_tip_attr(&snapshot, "view.terminal"),
+                                style: "display:none;",
                             }
                             "Terminal"
                         }
@@ -49715,11 +49776,10 @@ fn Titlebar(
                                         ),
                                     onmousedown: |evt| evt.stop_propagation(),
                                     onclick: move |_| on_toggle_new_menu.call(()),
-                                    if let Some(letter) = keytip_badge(&snapshot, "insert.menu") {
-                                        span {
-                                            style: "display:inline-flex; align-items:center; justify-content:center; min-width:16px; height:16px; padding:0 4px; border-radius:6px; background:rgba(95,168,255,0.14); color:#2667a9; font-size:9px; font-weight:800;",
-                                            "{letter}"
-                                        }
+                                    span {
+                                        "data-keytip-node": keytip_node_id("insert.menu"),
+                                        "data-keytip-tip": keytip_tip_attr(&snapshot, "insert.menu"),
+                                        style: "display:none;",
                                     }
                                     "+"
                                     span {
@@ -49781,11 +49841,10 @@ fn Titlebar(
                                                 class: "yggterm-menu-item",
                                                 style: titlebar_new_action_style(snapshot.palette),
                                                 onclick: move |_| on_start_session.call(()),
-                                                if let Some(letter) = keytip_badge(&snapshot, "insert.session") {
-                                                    span {
-                                                        style: "display:inline-flex; align-items:center; justify-content:center; min-width:16px; height:16px; padding:0 4px; border-radius:6px; background:rgba(95,168,255,0.14); color:#2667a9; font-size:9px; font-weight:800; margin-right:8px;",
-                                                        "{letter}"
-                                                    }
+                                                span {
+                                                    "data-keytip-node": keytip_node_id("insert.session"),
+                                                    "data-keytip-tip": keytip_tip_attr(&snapshot, "insert.session"),
+                                                    style: "display:none;",
                                                 }
                                                 "New Session"
                                             }
@@ -49801,11 +49860,10 @@ fn Titlebar(
                                                 class: "yggterm-menu-item",
                                                 style: titlebar_new_action_style(snapshot.palette),
                                                 onclick: move |_| on_start_terminal.call(()),
-                                                if let Some(letter) = keytip_badge(&snapshot, "insert.terminal") {
-                                                    span {
-                                                        style: "display:inline-flex; align-items:center; justify-content:center; min-width:16px; height:16px; padding:0 4px; border-radius:6px; background:rgba(95,168,255,0.14); color:#2667a9; font-size:9px; font-weight:800; margin-right:8px;",
-                                                        "{letter}"
-                                                    }
+                                                span {
+                                                    "data-keytip-node": keytip_node_id("insert.terminal"),
+                                                    "data-keytip-tip": keytip_tip_attr(&snapshot, "insert.terminal"),
+                                                    style: "display:none;",
                                                 }
                                                 "New Terminal"
                                             }
@@ -50253,11 +50311,10 @@ fn Titlebar(
                                 on_toggle_connect.call(());
                             }
                         },
-                        if let Some(letter) = keytip_badge(&snapshot, "connect.toggle") {
-                            span {
-                                style: "display:inline-flex; align-items:center; justify-content:center; min-width:16px; height:16px; padding:0 4px; border-radius:6px; background:rgba(95,168,255,0.14); color:#2667a9; font-size:9px; font-weight:800; margin-right:6px;",
-                                "{letter}"
-                            }
+                        span {
+                            "data-keytip-node": keytip_node_id("connect.toggle"),
+                            "data-keytip-tip": keytip_tip_attr(&snapshot, "connect.toggle"),
+                            style: "display:none;",
                         }
                         "Connect SSH"
                     }
@@ -50311,11 +50368,10 @@ fn Titlebar(
                                 }
                             },
                             ondoubleclick: |evt| evt.stop_propagation(),
-                            if let Some(letter) = keytip_badge(&snapshot, "notifications.toggle") {
-                                span {
-                                    style: "display:inline-flex; align-items:center; justify-content:center; min-width:16px; height:16px; padding:0 4px; border-radius:6px; background:rgba(95,168,255,0.14); color:#2667a9; font-size:9px; font-weight:800; margin-right:6px;",
-                                    "{letter}"
-                                }
+                            span {
+                                "data-keytip-node": keytip_node_id("notifications.toggle"),
+                                "data-keytip-tip": keytip_tip_attr(&snapshot, "notifications.toggle"),
+                                style: "display:none;",
                             }
                             BellIcon {}
                         }
@@ -50339,11 +50395,10 @@ fn Titlebar(
                                 }
                             },
                             ondoubleclick: |evt| evt.stop_propagation(),
-                            if let Some(letter) = keytip_badge(&snapshot, "settings.toggle") {
-                                span {
-                                    style: "display:inline-flex; align-items:center; justify-content:center; min-width:16px; height:16px; padding:0 4px; border-radius:6px; background:rgba(95,168,255,0.14); color:#2667a9; font-size:9px; font-weight:800; margin-right:6px;",
-                                    "{letter}"
-                                }
+                            span {
+                                "data-keytip-node": keytip_node_id("settings.toggle"),
+                                "data-keytip-tip": keytip_tip_attr(&snapshot, "settings.toggle"),
+                                style: "display:none;",
                             }
                             "⚙"
                         }
@@ -50366,11 +50421,10 @@ fn Titlebar(
                                 }
                             },
                             ondoubleclick: |evt| evt.stop_propagation(),
-                            if let Some(letter) = keytip_badge(&snapshot, "metadata.toggle") {
-                                span {
-                                    style: "display:inline-flex; align-items:center; justify-content:center; min-width:16px; height:16px; padding:0 4px; border-radius:6px; background:rgba(95,168,255,0.14); color:#2667a9; font-size:9px; font-weight:800; margin-right:6px;",
-                                    "{letter}"
-                                }
+                            span {
+                                "data-keytip-node": keytip_node_id("metadata.toggle"),
+                                "data-keytip-tip": keytip_tip_attr(&snapshot, "metadata.toggle"),
+                                style: "display:none;",
                             }
                             "ⓘ"
                         }
