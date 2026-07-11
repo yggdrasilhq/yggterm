@@ -50133,6 +50133,10 @@ fn Titlebar(
                             ondoubleclick: |evt| evt.stop_propagation(),
                             button {
                                 "data-titlebar-session-button": "1",
+                                // Active-session affordance: its details open with
+                                // ALT,D (metadata) and its title renames on double-
+                                // click, so it needs no ALT badge of its own (§12).
+                                "data-keytip-exempt": "active-session-menu",
                                 title: if titlebar_session_menu_open { "Close session details" } else { "Session details" },
                                 style: format!(
                                     "display:flex; align-items:center; gap:8px; width:100%; height:{}px; padding:0 12px; border:none; \
@@ -50321,6 +50325,9 @@ fn Titlebar(
                                 button {
                                     key: "titlebar-search-activator",
                                     "data-titlebar-search-activator": "1",
+                                    // The invisible click target that focuses the
+                                    // search field; shares the input's exemption (§12).
+                                    "data-keytip-exempt": "search",
                                     style: format!(
                                         "position:absolute; inset:0; z-index:2; border:none; background:transparent; cursor:text; padding:0; margin:0; \
                                          opacity:{}; pointer-events:{};",
@@ -50346,6 +50353,10 @@ fn Titlebar(
                                     input {
                                         key: "titlebar-search-input",
                                         id: SEARCH_INPUT_ID,
+                                        // Focus-search is reachable by `/` and the
+                                        // planned Ctrl+Shift+F accelerator, so the
+                                        // input needs no ALT badge (§12 exempt).
+                                        "data-keytip-exempt": "search",
                                         r#type: "text",
                                         value: "{snapshot.search_query}",
                                         placeholder: "{search_placeholder}",
@@ -52071,6 +52082,9 @@ fn SidebarRow(
             div {
                 id: "{sidebar_row_dom_id(&row.full_path)}",
                 "data-sidebar-row-path": "{row.full_path}",
+                // Unbounded list: navigated, not badged (§8). Exempt covers the
+                // row's own count/toggle children via the audit's ancestor check.
+                "data-keytip-exempt": "list-item",
                 "data-sidebar-row-kind": "Separator",
                 "data-sidebar-row-label": "{row.label}",
                 "data-sidebar-row-depth": "{row.depth}",
@@ -52263,6 +52277,9 @@ fn SidebarRow(
         div {
             id: "{sidebar_row_dom_id(&row.full_path)}",
             "data-sidebar-row-path": "{row.full_path}",
+            // Unbounded list: navigated, not badged (§8). The ALT layer acts on the
+            // FOCUSED row; the exempt covers the row's count/toggle children too.
+            "data-keytip-exempt": "list-item",
             "data-sidebar-row-kind": "{row_kind_label}",
             "data-sidebar-row-label": "{visible_label}",
             "data-sidebar-row-detail": "{row.detail_label}",
@@ -81578,6 +81595,9 @@ fn DaemonMetadataGroup(
         MetadataGroup { title: "Daemon".to_string(), entries, palette }
         button {
             "data-daemon-hot-restart-button": "1",
+            // Deep daemon/dev affordance in the metadata rail, not top-level chrome:
+            // exempt from the KeyTip orphan audit (§12).
+            "data-keytip-exempt": "daemon-control",
             style: format!(
                 "display:inline-flex; align-items:center; justify-content:center; min-height:30px; \
                  margin-bottom:8px; padding:0 12px; border:none; border-radius:10px; background:{}; \
