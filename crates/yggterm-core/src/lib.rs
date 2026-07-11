@@ -263,6 +263,12 @@ pub struct AppSettings {
     pub tree_width: f32,
     pub rendered_font_size: f32,
     pub terminal_font_size: f32,
+    /// Global zoom for native web surfaces (ychrome / libyggterm web apps),
+    /// as percent points where 100.0 == 100%. Unlike the terminal/rendered
+    /// font sizes this is a webview zoom factor (value / 100 handed to
+    /// `WebView::zoom`), because a native web surface is an overlaid WebKit
+    /// view, not DOM the shell can style. Per-site zoom (ychrome) overrides it.
+    pub web_surface_zoom_percent: f32,
     pub terminal_light_theme_name: String,
     pub terminal_dark_theme_name: String,
     pub ui_font_size: f32,
@@ -308,6 +314,7 @@ impl Default for AppSettings {
             tree_width: 300.0,
             rendered_font_size: 10.0,
             terminal_font_size: 14.0,
+            web_surface_zoom_percent: 100.0,
             terminal_light_theme_name: "VS Code Light+".to_string(),
             terminal_dark_theme_name: "Dark+".to_string(),
             ui_font_size: 14.0,
