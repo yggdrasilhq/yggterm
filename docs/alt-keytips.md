@@ -1,13 +1,15 @@
 # ALT+ KeyTips — the keyboard accelerator layer
 
-**Spec v2, agreed 2026-07-11.** Supersedes the v1 spec that shipped in 2.10.12.
-Campaign memory: `campaign-alt-keytips-layer`. Source of truth in code:
-`crates/yggterm-shell/src/command_registry.rs`.
+**This is *the* ALT+ KeyTips spec.** Campaign memory: `campaign-alt-keytips-layer`.
+Source of truth in code: `crates/yggterm-shell/src/keytip.rs` (the declaration
+model + assignment resolver) and its render/chord integration in `shell.rs`.
 
-v1 shipped a static registry of 15 shell-chrome commands with inline badges. It
-proved the trigger, the reserved-letter namespace, the keymap file, and the
-`command invoke` probe. It cannot grow into the layer this project needs, for
-reasons set out in §2. v2 is that layer.
+An earlier throwaway trial run shipped a static registry of 15 shell-chrome
+commands with inline badges (2.10.12). It proved the trigger, the reserved-letter
+namespace, the keymap file, and the `command invoke` probe, but it could not grow
+into the layer this project needs — for the reasons set out in §2 — so it is being
+**replaced** by this spec, not extended. Where the sections below contrast with
+"the trial run" they mean that shipped experiment; there is no versioned "v1/v2".
 
 ## 0. Thesis
 
