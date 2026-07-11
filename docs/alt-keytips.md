@@ -378,6 +378,33 @@ rule honest.
 8. No shell accelerator is a bare `Ctrl+<letter>` — the PTY keeps them (§11.2).
 9. No chord is hardcoded at a callsite; the registry owns every binding in both layers.
 10. "Here" resolves identically for a KeyTip and for an accelerator.
+11. **A clean ALT tap opens the overlay regardless of which surface has focus.** A
+    focused terminal must NOT swallow the tap — see §13.1.
+
+## 13.1 Known defect at handoff — a focused terminal eats the ALT tap
+
+Reported by the user 2026-07-11; open. **Symptom:** with a terminal focused, tapping
+ALT does not open the overlay; the tap is consumed by the terminal. The overlay
+works when focus is on shell chrome.
+
+**Root-cause hypothesis (well-founded, not yet falsified live):** both clean-tap
+drivers — `DesktopWindowEvent::ModifiersChanged` (the primary GTK path) and
+`KeyboardInput` — are **tao window-level** events (`shell.rs:45766` and `:45678`).
+When the xterm.js webview holds keyboard focus, WebKitGTK consumes the ALT key
+events inside the webview and the window-level tao handlers never fire (or fire
+inconsistently). This is precisely the risk the original spec flagged: *webviews
+consume keys, so tap detection must sit at the GTK/window level.* The v1 Xvfb proof
+missed it because the test's focus sat on the shell root, not a live xterm textarea
+with a running PTY.
+
+**Fix direction (Phase 1):** move tap detection BELOW the webview. Either a
+GTK-level key event controller / capture-phase filter on the `GtkWindow` that sees
+ALT before the webview does, or an xterm.js-side forwarder (the JS bridge already
+used elsewhere) that reports a bare-ALT keyup to the shell. Whichever is chosen,
+invariant 7 must survive it: a **held** ALT+key in a terminal still reaches the PTY;
+only the clean, keyless tap is intercepted. Falsify the hypothesis first with a
+key-event trace on a live focused terminal before building the fix (CLAUDE.md
+investigate discipline: no fix without root cause).
 
 ## 14. Phasing
 
