@@ -60910,6 +60910,17 @@ fn TerminalCanvas(
                                 };
                                 let raw_batch_bytes: usize =
                                     chunks.iter().map(|chunk| chunk.data.len()).sum();
+                                // Carriage returns are the byte class whose loss
+                                // produces the wrong-column staircase/interleave
+                                // garble, so track them separately from raw byte
+                                // count: after the byte-faithful sanitizer fix, a
+                                // legitimate whole-line excision still shrinks
+                                // raw_bytes but must NOT drop a `\r`. `cr_dropped`
+                                // isolates the corruption signal from benign strips.
+                                let raw_batch_cr: usize = chunks
+                                    .iter()
+                                    .map(|chunk| chunk.data.matches('\r').count())
+                                    .sum();
                                 let (
                                     batched_output,
                                     saw_visible_output,
@@ -60934,6 +60945,12 @@ fn TerminalCanvas(
                                 {
                                     let forwarded_bytes =
                                         batched_output.as_deref().map(str::len).unwrap_or(0);
+                                    let forwarded_cr = batched_output
+                                        .as_deref()
+                                        .map(|data| data.matches('\r').count())
+                                        .unwrap_or(0);
+                                    let cr_dropped =
+                                        batched_output.is_some() && forwarded_cr < raw_batch_cr;
                                     let diverged = match batched_output.as_deref() {
                                         Some(data) => data.len() != raw_batch_bytes,
                                         None => raw_batch_bytes > 0,
@@ -60956,6 +60973,9 @@ fn TerminalCanvas(
                                                 "cursor": cursor,
                                                 "raw_bytes": raw_batch_bytes,
                                                 "forwarded_bytes": forwarded_bytes,
+                                                "raw_cr": raw_batch_cr,
+                                                "forwarded_cr": forwarded_cr,
+                                                "cr_dropped": cr_dropped,
                                                 "dropped_entirely": batched_output.is_none(),
                                             }),
                                         );
@@ -64703,19 +64723,25 @@ fn strip_internal_terminal_transport_noise_lines(data: &str) -> String {
     {
         return data.to_string();
     }
-    let normalized_data = data.replace("\r\n", "\n").replace('\r', "\n");
-    let mut kept = Vec::new();
+    // Excise the internal transport-error lines WITHOUT re-encoding the surrounding
+    // live output. `str::lines()` / `.replace("\r\n","\n")` (the old approach) discard
+    // the `\r` of every `\r\n`, leaving the cursor mid-row so the next line paints at
+    // the wrong column — the guihost staircase/interleave garble. `terminal_line_segments`
+    // classifies on the terminator-free content but re-emits every KEPT line with its
+    // exact original terminator, so `\r\n`, bare `\r`, and `\n` all survive byte-faithfully.
+    let mut cleaned = String::with_capacity(data.len());
     let mut drop_following_transport_tail_lines = 0usize;
     let mut saw_internal_transport_error = false;
     let mut preserved_control_tail_after_transport_error = false;
-    for line in normalized_data.lines() {
+    for (line, terminator) in terminal_line_segments(data) {
         if let Some(error_ix) = terminal_line_internal_transport_error_index(line) {
             saw_internal_transport_error = true;
             drop_following_transport_tail_lines = 3;
             preserved_control_tail_after_transport_error = false;
             let prefix = &line[..error_ix];
             if terminal_line_prefix_has_meaningful_replay_content(prefix) {
-                kept.push(prefix);
+                cleaned.push_str(prefix);
+                cleaned.push_str(terminator);
             }
             continue;
         }
@@ -64732,12 +64758,14 @@ fn strip_internal_terminal_transport_noise_lines(data: &str) -> String {
         }
         if drop_following_transport_tail_lines > 0 {
             if terminal_line_is_control_only(line) {
-                kept.push(line);
+                cleaned.push_str(line);
+                cleaned.push_str(terminator);
                 preserved_control_tail_after_transport_error = true;
                 continue;
             }
             if preserved_control_tail_after_transport_error && line.trim().is_empty() {
-                kept.push(line);
+                cleaned.push_str(line);
+                cleaned.push_str(terminator);
                 continue;
             }
             if terminal_line_is_shared_connection_notice(line) {
@@ -64754,9 +64782,9 @@ fn strip_internal_terminal_transport_noise_lines(data: &str) -> String {
                 continue;
             }
         }
-        kept.push(line);
+        cleaned.push_str(line);
+        cleaned.push_str(terminator);
     }
-    let cleaned = kept.join("\n");
     if cleaned.trim().is_empty() {
         String::new()
     } else {
@@ -64810,16 +64838,61 @@ fn normalized_terminal_transport_line(line: &str) -> String {
         .to_ascii_lowercase()
 }
 fn strip_low_signal_terminal_noise_lines(data: &str) -> String {
-    let kept = data
-        .lines()
-        .filter(|line| !terminal_chunk_is_low_signal_terminal_noise(line))
-        .collect::<Vec<_>>();
-    let cleaned = kept.join("\n");
+    // Excise low-signal noise lines while forwarding every kept byte verbatim.
+    // `terminal_line_segments` re-emits kept lines with their exact terminator, so a
+    // live PTY frame's `\r\n` (and bare `\r`) reach xterm intact — `str::lines()`
+    // dropped the `\r`, leaving the cursor mid-row (the guihost staircase/interleave garble).
+    let mut cleaned = String::with_capacity(data.len());
+    for (line, terminator) in terminal_line_segments(data) {
+        if !terminal_chunk_is_low_signal_terminal_noise(line) {
+            cleaned.push_str(line);
+            cleaned.push_str(terminator);
+        }
+    }
     if cleaned.trim().is_empty() {
         String::new()
     } else {
         cleaned
     }
+}
+
+/// Split `data` into `(line_content, terminator)` pairs where `terminator` is exactly
+/// one of `"\r\n"`, `"\r"`, `"\n"`, or `""` (final segment with no trailing newline).
+/// Concatenating every `content + terminator` in order reproduces `data` byte-for-byte,
+/// so a sanitizer that keeps whole segments verbatim never mutates a surviving byte —
+/// unlike `str::lines()` / `.replace("\r\n","\n")`, which discard carriage returns and
+/// desync xterm from the daemon vt100 (the guihost staircase/interleave garble). Bare `\r`
+/// is treated as a line boundary too, so `\r`-separated transport-noise captures still
+/// classify line-by-line, but a kept line's bare `\r` is re-emitted unchanged.
+fn terminal_line_segments(data: &str) -> Vec<(&str, &str)> {
+    let bytes = data.as_bytes();
+    let mut segments = Vec::new();
+    let mut start = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\n' => {
+                segments.push((&data[start..i], "\n"));
+                i += 1;
+                start = i;
+            }
+            b'\r' => {
+                if bytes.get(i + 1) == Some(&b'\n') {
+                    segments.push((&data[start..i], "\r\n"));
+                    i += 2;
+                } else {
+                    segments.push((&data[start..i], "\r"));
+                    i += 1;
+                }
+                start = i;
+            }
+            _ => i += 1,
+        }
+    }
+    if start < bytes.len() {
+        segments.push((&data[start..], ""));
+    }
+    segments
 }
 fn sanitize_terminal_resume_runtime_output(data: &str) -> String {
     if !data.contains("OpenAI Codex") || !data.contains("/model to change") {
@@ -115522,14 +115595,149 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
                     data: "After reboot, I'll immediately re-check whether 83:00.0 now exposes sriov_numvfs.\n".to_string(),
                 },
             ]);
+        // Byte-faithful: the noise line is excised, but the kept line reaches xterm
+        // with its real trailing newline intact (the old `.lines().join()` withheld
+        // it, desyncing the GUI from the daemon vt100 by one `\n` every batch).
         assert_eq!(
             combined.as_deref(),
             Some(
-                "After reboot, I'll immediately re-check whether 83:00.0 now exposes sriov_numvfs."
+                "After reboot, I'll immediately re-check whether 83:00.0 now exposes sriov_numvfs.\n"
             )
         );
         assert!(saw_visible_output);
         assert!(!saw_meaningful_output);
+    }
+
+    #[test]
+    fn batch_terminal_chunks_preserves_carriage_returns_in_kept_lines() {
+        // Regression for the guihost staircase/interleave garble: the batch sanitizers
+        // must reach xterm byte-faithfully. `str::lines()` used to strip the `\r` of
+        // every `\r\n`, leaving the cursor mid-row so the next line painted at the
+        // wrong column. A plain multi-line frame with no noise forwards verbatim.
+        let raw = "fn parse_keymap_config() {\r\n    let entries = Vec::new();\r\n}\r\n";
+        let (combined, ..) = batch_terminal_chunks(vec![yggterm_server::TerminalStreamChunk {
+            seq: 1,
+            data: raw.to_string(),
+        }]);
+        assert_eq!(
+            combined.as_deref(),
+            Some(raw),
+            "a plain CRLF frame must forward byte-for-byte, carriage returns intact"
+        );
+
+        // When the internal transport-error sanitizer DOES fire (content-gated on the
+        // phrase, the mechanism that hit local dev sessions), the good CRLF lines
+        // before the excised error line keep their carriage returns.
+        let with_error = "keep one\r\nkeep two\r\n\
+                          Error: terminal session not found: local://019d0000-0000-7000-8000-000000000001\r\n";
+        let (combined2, ..) = batch_terminal_chunks(vec![yggterm_server::TerminalStreamChunk {
+            seq: 1,
+            data: with_error.to_string(),
+        }]);
+        let forwarded = combined2.expect("kept lines must forward");
+        assert!(
+            forwarded.contains("keep one\r\nkeep two"),
+            "the CRLF between kept lines survives the transport-noise strip (not bare LF): {forwarded:?}"
+        );
+        assert!(!forwarded.contains("terminal session not found"));
+    }
+
+    /// THE FAITHFUL-PIPE INVARIANT (parity-rework gate, campaign 2026-07-11).
+    ///
+    /// yggterm's job is to be a PIPE: bytes the agent CLI writes to the PTY must reach
+    /// xterm unmodified. It is NOT a renderer and must never rewrite, re-encode, strip,
+    /// or reconstruct a real TUI frame — an ordinary terminal doesn't, which is why
+    /// `claude -r` typed into a plain shell never breaks while yggterm's wrapper did
+    /// (CLAUDE.md's wrapper-vs-manual parity rule).
+    ///
+    /// So: for any chunk stream carrying only genuine CLI output (no internal
+    /// transport-error line, no low-signal noise line — the only two things the
+    /// sanitizers are ALLOWED to excise), `batch_terminal_chunks` must forward it
+    /// BYTE-FOR-BYTE.
+    ///
+    /// This is the cheap tier of the parity harness. It would have caught the
+    /// carriage-return drop that produced the interleaved-frame garble on guihost. Every
+    /// future "fix" that mutates live bytes now dies here instead of on the user's screen.
+    #[test]
+    fn batch_terminal_chunks_is_a_faithful_pipe_for_real_tui_output() {
+        let corpus: [(&str, &str); 8] = [
+            (
+                "crlf code frame with SGR colors",
+                "\x1b[32m+ fn parse(text: &str) -> Keymap {\x1b[0m\r\n\x1b[31m-   todo!()\x1b[0m\r\n",
+            ),
+            (
+                "alt-screen enter, paint, exit",
+                "\x1b[?1049h\x1b[2J\x1b[H\x1b[1mheader\x1b[0m\r\nbody\r\n\x1b[?1049l",
+            ),
+            (
+                "synchronized-output frame (DEC 2026)",
+                "\x1b[?2026h\x1b[H\x1b[2Krow one\r\n\x1b[2Krow two\r\n\x1b[?2026l",
+            ),
+            (
+                "inline spinner rewriting its own row with bare CR",
+                "\rWorking... \x1b[?25l\rWorking.. \rWorking.  \x1b[?25h",
+            ),
+            (
+                "cursor-addressed repaint with erase",
+                "\x1b[10;1H\x1b[Krepainted\x1b[11;1H\x1b[Ksecond\r\n",
+            ),
+            (
+                "box drawing + wide unicode",
+                "╭──────────╮\r\n│ 日本語 ✅ │\r\n╰──────────╯\r\n",
+            ),
+            (
+                "bare LF only (unix-style stream)",
+                "line one\nline two\nline three\n",
+            ),
+            (
+                "real agent output that MENTIONS a session error",
+                "I think the session does not exist because we never wrote it.\r\n",
+            ),
+        ];
+
+        for (label, raw) in corpus {
+            let (forwarded, ..) =
+                batch_terminal_chunks(vec![yggterm_server::TerminalStreamChunk {
+                    seq: 1,
+                    data: raw.to_string(),
+                }]);
+            assert_eq!(
+                forwarded.as_deref(),
+                Some(raw),
+                "FAITHFUL-PIPE VIOLATION [{label}]: yggterm mutated real CLI output on its way \
+                 to xterm. yggterm is a pipe, not a renderer — see campaign-render-pipeline-parity-rework."
+            );
+        }
+    }
+
+    /// The same invariant across a CHUNK SPLIT: the daemon hands the GUI whatever slices
+    /// the PTY read happened to produce, so a frame split mid-escape-sequence must still
+    /// reassemble byte-for-byte. A sanitizer that classifies per-chunk can corrupt a split
+    /// frame even when it handles the whole frame correctly.
+    #[test]
+    fn batch_terminal_chunks_is_a_faithful_pipe_across_chunk_splits() {
+        let raw =
+            "\x1b[?2026h\x1b[H\x1b[32m+ added line\x1b[0m\r\n\x1b[31m- removed\x1b[0m\r\n\x1b[?2026l";
+        for split in 1..raw.len() {
+            if !raw.is_char_boundary(split) {
+                continue;
+            }
+            let (forwarded, ..) = batch_terminal_chunks(vec![
+                yggterm_server::TerminalStreamChunk {
+                    seq: 1,
+                    data: raw[..split].to_string(),
+                },
+                yggterm_server::TerminalStreamChunk {
+                    seq: 2,
+                    data: raw[split..].to_string(),
+                },
+            ]);
+            assert_eq!(
+                forwarded.as_deref(),
+                Some(raw),
+                "FAITHFUL-PIPE VIOLATION: frame split at byte {split} was not reassembled verbatim"
+            );
+        }
     }
 
     #[test]
@@ -115560,7 +115768,10 @@ Shared connection to 192.0.2.14 closed.
 "
                 .to_string(),
             }]);
-        assert_eq!(combined.as_deref(), Some("OpenAI Codex ready.\n›"));
+        // Byte-faithful: the two transport-error/notice lines are excised, but the
+        // real trailing newline after the `›` prompt is preserved (was dropped by
+        // the old `.lines().join()` re-encode).
+        assert_eq!(combined.as_deref(), Some("OpenAI Codex ready.\n›\n"));
         assert!(saw_visible_output);
     }
 
@@ -115629,7 +115840,9 @@ Caused by:
                 seq: 1,
                 data: data.to_string(),
             }]);
-        assert_eq!(combined.as_deref(), Some(data.trim_end_matches('\n')));
+        // Byte-faithful: prose that merely mentions the phrase is kept, and its real
+        // trailing newline is forwarded verbatim (the old `.lines().join()` withheld it).
+        assert_eq!(combined.as_deref(), Some(data));
     }
 
     #[test]

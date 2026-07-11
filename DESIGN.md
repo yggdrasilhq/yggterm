@@ -254,6 +254,28 @@ Avoid:
 - labels that invent confusing product language
 - hard-coded light styling in dark mode
 
+#### KeyTip badges
+
+A KeyTip badge is a context menu containing nothing but one letter. It inherits
+the context-menu treatment above at badge scale: modest radius, clean theme-aware
+surface, subtle shadow, strong glyph clarity.
+
+That means:
+
+- its own little block, floating above the chrome — never inline text inside a button
+- painted in an absolutely-positioned overlay, so showing the badges moves nothing underneath
+- anchored to the affordance it names, overlapping its lower-leading corner, nudged inward at viewport edges
+- one block per node, even when the tip is two glyphs (`AL`, or a contested group's `N`)
+- uppercase, tabular, high contrast against the badge surface
+
+Avoid:
+
+- a scrim or dimming pass over the app (Excel does not dim to show keytips)
+- badges that reflow the titlebar or any other chrome when the layer opens
+- low-contrast pills that read as decoration rather than as a key to press
+
+Spec: `docs/alt-keytips.md`.
+
 ### Motion and interaction
 
 Motion should be functional, not decorative.
