@@ -269,6 +269,11 @@ pub struct AppSettings {
     /// `WebView::zoom`), because a native web surface is an overlaid WebKit
     /// view, not DOM the shell can style. Per-site zoom (ychrome) overrides it.
     pub web_surface_zoom_percent: f32,
+    /// Vertical-tabs browsing mode for web surfaces: tabs move to a left-hand
+    /// pane (mini-omnibox + a domain-grouped tree) and the top tab-bar + address
+    /// bar are hidden. A persisted per-user preference; the surface chrome reads
+    /// it, so it applies to every web-surface app (ychrome and future ones).
+    pub web_surface_vertical_tabs: bool,
     pub terminal_light_theme_name: String,
     pub terminal_dark_theme_name: String,
     pub ui_font_size: f32,
@@ -315,6 +320,7 @@ impl Default for AppSettings {
             rendered_font_size: 10.0,
             terminal_font_size: 14.0,
             web_surface_zoom_percent: 100.0,
+            web_surface_vertical_tabs: false,
             terminal_light_theme_name: "VS Code Light+".to_string(),
             terminal_dark_theme_name: "Dark+".to_string(),
             ui_font_size: 14.0,
