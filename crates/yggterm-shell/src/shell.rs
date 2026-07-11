@@ -81902,6 +81902,13 @@ fn SettingsRailBody(
         RailScrollBody {
             content: rsx!{
             div {
+                // A Tab-navigable configuration surface reached by ALT,G: toggles,
+                // steppers, text inputs, and theme/notification selectors. Its
+                // widgets are form controls, exempt from per-widget ALT badges
+                // (§12). NOTE: the spec's richer Settings->theme keytip sub-scope
+                // (§4, ALT,G,T,<letter>) is tracked future work and will REPLACE
+                // this blanket exemption for the theme area when built.
+                "data-keytip-exempt": "settings-panel",
                 style: "display:flex; flex-direction:column; gap:12px; padding-bottom:8px;",
             ChromeBehaviorSettingsSection {
                 palette: snapshot.palette,
@@ -82150,6 +82157,9 @@ fn NotificationsRailBody(
     rsx! {
         RailHeader { title: "Notifications".to_string(), color: snapshot.palette.text.to_string() }
         div {
+            // A notifications list + its single Clear-All action: list is navigated
+            // (§8), Clear-All is Tab-reachable — exempt (§12). Panel opens via ALT,L.
+            "data-keytip-exempt": "notifications-panel",
             style: "padding:0 16px 8px 16px; display:flex; justify-content:flex-end;",
             button {
                 style: chip_style(snapshot.palette, false),
@@ -82193,6 +82203,11 @@ fn ConnectRailBody(
         RailHeader { title: "Connect SSH".to_string(), color: snapshot.palette.text.to_string() }
         RailScrollBody {
             content: rsx!{
+            div {
+            // The whole Connect surface is a Tab/Enter-driven SSH form + guide,
+            // reached by ALT,C: exempt from per-widget ALT badges (§12).
+            "data-keytip-exempt": "connect-form",
+            style: "display:flex; flex-direction:column; gap:10px;",
             div {
                 style: "display:flex; flex-direction:column; gap:10px; padding-bottom:10px;",
                 div {
@@ -82309,6 +82324,7 @@ fn ConnectRailBody(
                         }
                     }
                 }
+            }
             }
             }
         }
