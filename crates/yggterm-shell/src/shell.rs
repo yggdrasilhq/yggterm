@@ -11983,6 +11983,50 @@ impl ShellState {
         );
         self.refresh_tree_debug("select_tree_row");
     }
+    /// Move the sidebar's single selection to an adjacent visible row for
+    /// arrow-key navigation (spec §8: the tree needs real keyboard focus, and the
+    /// ALT layer acts on the FOCUSED row). `delta` is -1 (up) / +1 (down); when
+    /// `to_edge` is set it jumps to the first (delta<0) or last (delta>0) row.
+    /// Separators are skipped. Selection follows the cursor, so the focus ring
+    /// (selection highlight) and "here" (`current_selected_sidebar_row`, used by
+    /// `terminal_launch_context`) both track it. Returns the newly-focused path.
+    fn navigate_sidebar_selection(&mut self, delta: i32, to_edge: bool) -> Option<String> {
+        let navigable: Vec<BrowserRow> = self
+            .snapshot()
+            .rows
+            .into_iter()
+            .filter(|row| row.kind != BrowserRowKind::Separator)
+            .collect();
+        if navigable.is_empty() {
+            return None;
+        }
+        let target = if to_edge {
+            if delta < 0 {
+                navigable.first()
+            } else {
+                navigable.last()
+            }
+        } else {
+            let current = current_selected_sidebar_row(self);
+            let cur_idx = current
+                .as_ref()
+                .and_then(|c| navigable.iter().position(|r| r.full_path == c.full_path));
+            let new_idx = match cur_idx {
+                Some(i) => (i as i32 + delta).clamp(0, navigable.len() as i32 - 1) as usize,
+                None => {
+                    if delta < 0 {
+                        navigable.len() - 1
+                    } else {
+                        0
+                    }
+                }
+            };
+            navigable.get(new_idx)
+        };
+        let target = target.cloned()?;
+        self.select_tree_row(&target, TreeSelectionMode::Replace);
+        Some(target.full_path)
+    }
     fn extend_tree_selection(&mut self, row: &BrowserRow) {
         let rows = self.all_sidebar_rows_for_selection();
         let anchor = self
@@ -48898,6 +48942,16 @@ fn app() -> Element {
                         on_select_all_rows: move |_| {
                             state.with_mut(|shell| shell.select_all_tree_rows())
                         },
+                        on_navigate_rows: move |(delta, to_edge): (i32, bool)| {
+                            let focused = state.with_mut(|shell| {
+                                shell.navigate_sidebar_selection(delta, to_edge)
+                            });
+                            // Keep the keyboard cursor visible + the sidebar the
+                            // keyboard owner so the next arrow key lands here too.
+                            if let Some(path) = focused {
+                                scroll_sidebar_row_into_view(&path);
+                            }
+                        },
                         on_start_sidebar_resize: move |client_x: f64| {
                             state.with_mut(|shell| shell.start_sidebar_resize(client_x))
                         },
@@ -50898,6 +50952,9 @@ fn Sidebar(
     on_prev_search_row: EventHandler<()>,
     on_next_search_row: EventHandler<()>,
     on_select_all_rows: EventHandler<()>,
+    /// Arrow-key row navigation (spec §8): `(delta, to_edge)` — delta -1/+1 for
+    /// up/down, `to_edge` for Home/End.
+    on_navigate_rows: EventHandler<(i32, bool)>,
     on_start_sidebar_resize: EventHandler<f64>,
     on_select_row: EventHandler<(BrowserRow, TreeSelectionMode)>,
     on_press_highlight_row: EventHandler<(BrowserRow, TreeSelectionMode)>,
@@ -51111,6 +51168,28 @@ fn Sidebar(
                 if evt.key() == Key::Delete {
                     evt.prevent_default();
                     on_delete_selected_items.call(evt.modifiers().contains(Modifiers::SHIFT));
+                    return;
+                }
+                // Arrow-key row navigation (§8). The selection follows the cursor,
+                // so the focus ring and "here" both track it.
+                match evt.key() {
+                    Key::ArrowDown => {
+                        evt.prevent_default();
+                        on_navigate_rows.call((1, false));
+                    }
+                    Key::ArrowUp => {
+                        evt.prevent_default();
+                        on_navigate_rows.call((-1, false));
+                    }
+                    Key::Home => {
+                        evt.prevent_default();
+                        on_navigate_rows.call((-1, true));
+                    }
+                    Key::End => {
+                        evt.prevent_default();
+                        on_navigate_rows.call((1, true));
+                    }
+                    _ => {}
                 }
             },
             if snapshot.search_active {
@@ -68282,6 +68361,28 @@ fn sidebar_row_dom_id(path: &str) -> String {
         }
     }
     id
+}
+/// Scroll a sidebar row into view and keep the sidebar the keyboard owner, so a
+/// keyboard-navigated selection stays visible and the next arrow key routes to
+/// the sidebar's `onkeydown` (spec §8). Focuses the row element without opening
+/// the session (focus, not activation).
+fn scroll_sidebar_row_into_view(path: &str) {
+    let row_id = sidebar_row_dom_id(path);
+    let _ = document::eval(&format!(
+        r#"(function(){{
+          try {{
+            window.__yggtermSidebarKeyboardOwner = true;
+            window.__yggtermFocusedSidebarRowPath = {path:?};
+            window.__yggtermUiFocusClaimUntilMs = Math.max(
+              Number(window.__yggtermUiFocusClaimUntilMs || 0), Date.now() + 1400);
+          }} catch(_e){{}}
+          var row = document.getElementById({row_id:?});
+          if (row) {{
+            try {{ row.scrollIntoView({{ block: 'nearest' }}); }} catch(_e){{}}
+            try {{ row.focus({{ preventScroll: true }}); }} catch(_e){{}}
+          }}
+        }})();"#,
+    ));
 }
 fn sidebar_autoscroll_script(row_id: &str) -> String {
     format!(
