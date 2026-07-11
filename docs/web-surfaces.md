@@ -157,6 +157,29 @@ compiles the filter once per process (`ensure_compiled`'s `started` flag).
 Toggling it off, and every userscript change, take effect on the next surface
 (re)create — reload the page.
 
+## The User-Agent rides the same policy (2026-07-11)
+
+`/policy` also answers `user_agent: string|null`, and the GUI hands it to
+`WebViewBuilder::with_user_agent` at surface creation. Same ownership as the
+ruleset: browsing config, so the app decides; only the GUI can apply it (WebKit
+fixes the UA when the webview is built), so it must ride the policy. It is part
+of `policy_version`'s stamp, and changing it needs `reload_surface` — an in-page
+reload cannot change what the browser says it is.
+
+**Why it exists.** WebKitGTK's default UA describes *Safari on X11/Linux*, a
+browser that does not exist, and UA-allowlisting edges refuse it outright.
+Verified against the live edge: claude.ai answers that UA
+`403 {"error":{"type":"forbidden","message":"Request not allowed"}}` — the exact
+error the user reported — while the SAME request from a macOS-Safari UA is served,
+and so is Chrome-on-Linux. Only the nonexistent pair is denied, so a modern
+`Version/` does not help; the platform token is the thing.
+
+ychrome (`src/useragent.rs`) defaults to **Safari on macOS**: the engine really is
+WebKit, so a site that sniffs serves WebKit-compatible code and anti-bot
+fingerprinting finds an engine matching the claim. A Chrome UA over a WebKit
+engine is the inconsistent one. Chrome and the raw engine default remain as
+presets in YChrome Settings ▸ Browser identity.
+
 ## Per-site zoom belongs to the APP (2026-07-11)
 
 yggterm owns one global web-surface zoom (`AppSettings.web_surface_zoom_percent`,
@@ -187,25 +210,94 @@ GET <control>/zoom -> { sites: { host: percent } }
   the active surface's live effective zoom as `values.zoom` on every action so a
   pane control steps from what is on screen.
 
-## Vertical tabs — a browsing-mode toggle (2026-07-11)
+## Vertical tabs — the TAB TREE rail (reworked 2026-07-11)
 
-A per-user preference (`AppSettings::web_surface_vertical_tabs`, persisted) that
-flips the web-surface chrome between classic top tabs and a left-hand pane. The
-⊟ button in the top strip turns it on; the ▭ button in the pane turns it off.
+Vertical mode moves the tabs OUT of the viewport into a real side rail
+(`RightPanelMode::WebTabs`, titlebar button ⊟), where they are a tree with the
+user's own **virtual folders** — the cwd tree's organizational grammar applied to
+tabs. The first cut of this feature put the tree in a pane *inside* the page
+overlay; that pane is deleted. A tree that behaves like the cwd tree belongs in a
+sidebar, not in the viewport.
 
-In vertical mode the overlay's outer flex direction becomes `row`: a fixed 224px
-left pane holds a mini-omnibox, the tabs as a **domain-grouped tree**
-(`web_surface_tab_tree`, unit-tested — domains in first-appearance order, tabs in
-order within), a "+ New tab", and an extension slot (history today). The top tab
-bar and address bar collapse away (`max-height`→0 transition), and the pane
-slides in (`ygg-vtab-slide-in`). The native page rect (`[data-ws-page]`, still
-`flex:1`) simply fills the space right of the pane, so the reconciler follows
-without any surface-placement change. All tab actions reuse the same state
-methods as the classic strip (`web_surface_select_tab` / `_close_tab` / `_new_tab`).
+The rail IS the mode: opening it turns `web_surface_vertical_tabs` on, closing it
+turns it off (`toggle_web_tabs_panel` → `request_web_surface_vertical_tabs`), so
+there is no way to have vertical tabs with nowhere to put them. Two live restarts
+proved how easily that invariant breaks, and both paths are now tested:
 
-Because it is generic web-surface chrome, it applies to every web-surface app.
-The mini-omnibox is intentionally minimal (type-and-Enter, no dropdown yet). The
-setting is exposed in `app state` as `web_surface_vertical_tabs`.
+- A GUI that STARTS with the pref already on collapsed the strip and opened
+  nothing. `upsert_web_surface` raises the rail when the pref is on.
+- Opening the app's settings pane EVICTED the rail (one slot), and closing it left
+  the tabs homeless. In vertical mode the rail's resting state is the tab tree: a
+  pane borrows the slot and hands it back (`set_right_panel_mode`).
+
+The address/nav bar stays in the viewport in BOTH modes — only the tabs move.
+Folder affordances:
+create, inline rename (double-click), collapse, delete (**the tabs return to the
+root; deleting organization never deletes content**), "+" for a new tab inside a
+folder, and mouse-drag a tab onto a folder to file it (the same mouse-driven drag
+the cwd tree uses, not HTML5 DnD).
+
+### Who owns what
+
+yggterm owns the tabs, the tree, the folders and this chrome — it always did (the
+tab strip, the omnibox, the history and the per-tab webviews are all GUI-side,
+because WebKit runs in the GUI process). An app owns browsing *config* (ruleset,
+userscripts, per-site zoom, UA) and contributes it through `/policy`.
+
+The two **controls** nevertheless live in the app's own settings pane, because
+that is where a user looks for a browser setting. The mechanism is generic, not
+ychrome-specific:
+
+- The GUI injects its prefs as page context — `?vertical_tabs=&restore_tabs=` on
+  the schema GET, `values.vertical_tabs` / `values.restore_tabs` on an action —
+  exactly like `values.zoom` and `values.host`.
+- An action reply may carry `surface_prefs: {vertical_tabs?, restore_tabs?}`, and
+  the GUI applies it to its own `AppSettings`. An absent field means "leave it
+  alone", never "set it false".
+- The app keeps NO copy: it renders the injected values and echoes the requested
+  state back in its reply schema so the switch lands under the finger. The next
+  GET re-reads the truth from the GUI.
+
+### Classic mode, and the switch out of vertical
+
+The classic strip has nowhere to draw a folder, so it renders **root tabs only**;
+the filed ones go into an overflow menu (`🗂 N ⌄`, grouped by folder) that sits
+where the old ⊟ toggle was, and appears only when something is in it. Leaving
+vertical mode while folders exist raises `ClassicTabsSwitchOverlay` first, which
+says exactly that. The dialog counts in `has_modal_over_viewport`: a native
+surface draws above ALL DOM, so a modal over a browsing session is invisible
+unless the reconciler stashes the surface.
+
+### Tab persistence — "continue tabs from last time"
+
+`~/.yggterm/web-profiles/<profile>/tabs.json` (GUI-side, beside `history.jsonl`
+and the cookie jar) holds `{folders, tabs:[{url,title,folder}]}`. `folder: null`
+is a ROOT tab.
+
+**The rule:** a tab filed in a folder is *organization* and survives; a root tab
+is the *browsing session* and does not. `AppSettings::web_surface_restore_tabs`
+(default OFF = start fresh) decides which set a new surface reopens
+(`WebTabStore::tabs_to_open`, unit-tested). A fresh start writes the purge through
+immediately, so a GUI kill cannot resurrect it. The app tab is never saved — it
+belongs to the app, which supplies it on the next `open`. A restored tab carries
+no live handle: it is a URL in the tree until it is activated, so restoring thirty
+tabs costs thirty rows, not thirty webviews.
+
+A tab's URL IS what the tree saves, so **navigation is a tree change**: the store
+is written when a tab navigates, when the page reports its real (redirected) URL
+and title, when a tab is closed, and on every folder edit. Filing used to be the
+only thing that persisted a tab, which meant a tab you opened and browsed was
+saved as the page you started on — or, at the root, never saved at all.
+
+### The settings file had a hand-written writer (fixed 2026-07-11)
+
+`web_surface_restore_tabs` did not persist, and neither did `vertical_tabs` — nor
+`web_surface_zoom_percent`, which had shipped as "a persisted preference" for
+weeks and never was. `serialize_settings_value` in `yggterm-core` lists its fields
+BY HAND, beside a parser that also lists them by hand, so a field added to
+`AppSettings` alone is silently never saved.
+`every_settings_field_is_written_to_the_file` compares the writer's keys against
+the struct's own and fails the build the next time it happens.
 
 ## History viewer — an internal "chrome://history" page (2026-07-11)
 

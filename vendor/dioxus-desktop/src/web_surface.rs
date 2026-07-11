@@ -241,8 +241,12 @@ impl WebSurfaceHost {
     /// userscript/content-policy substrate: SponsorBlock-class scripts,
     /// cosmetic filters, autofill). `adblock_ruleset` = path to a WebKit
     /// content-blocker JSON; when set, the compiled filter (network blocks +
-    /// cosmetic hiding, engine-native) is attached to this surface. Bounds are
-    /// logical pixels relative to the window's top-left.
+    /// cosmetic hiding, engine-native) is attached to this surface. `user_agent`
+    /// overrides WebKitGTK's default UA, whose "Safari on X11/Linux" shape names
+    /// a browser that does not exist and is 403'd outright by UA-allowlisting
+    /// edges (claude.ai answers it "Request not allowed"); `None` keeps the
+    /// engine default. Bounds are logical pixels relative to the window's
+    /// top-left.
     #[allow(clippy::too_many_arguments)]
     pub fn open(
         &self,
@@ -252,6 +256,7 @@ impl WebSurfaceHost {
         profile_dir: Option<&std::path::Path>,
         userscripts: &[String],
         adblock_ruleset: Option<&std::path::Path>,
+        user_agent: Option<&str>,
         signer_base: Option<&str>,
         x: i32,
         y: i32,
@@ -297,6 +302,9 @@ impl WebSurfaceHost {
         }
         for script in userscripts {
             builder = builder.with_initialization_script_for_main_only(script.as_str(), true);
+        }
+        if let Some(user_agent) = user_agent.filter(|value| !value.trim().is_empty()) {
+            builder = builder.with_user_agent(user_agent);
         }
 
         // Route in-page "new window" requests (a link middle-clicked,

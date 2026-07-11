@@ -975,6 +975,10 @@ struct WebSurfaceUiState {
     /// URL follows the app's open payload; it has no per-tab close button).
     /// Later tabs are user-opened from the tab strip.
     tabs: Vec<WebSurfaceTab>,
+    /// The user's virtual folders, in display order — the cwd tree's grammar
+    /// applied to tabs. A tab names one by id; a folder holds no tab list, so a
+    /// tab can never be in two folders, and there is nothing to keep in sync.
+    folders: Vec<WebTabFolder>,
     /// Id (not index) of the visible tab, stable across tab closes.
     active_tab: u64,
     next_tab_id: u64,
@@ -1013,6 +1017,16 @@ struct WebSurfacePickerState {
     control_url: String,
     forward_child: Option<Arc<Mutex<std::process::Child>>>,
 }
+/// A virtual folder in the tab tree. Purely organizational, exactly like a cwd
+/// tree folder: it has an identity, a name the user can rename, and a collapsed
+/// state. It owns no tabs — the TABS name the folder.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+struct WebTabFolder {
+    id: String,
+    name: String,
+    #[serde(default)]
+    collapsed: bool,
+}
 #[derive(Debug, Clone)]
 struct WebSurfaceTab {
     id: u64,
@@ -1050,6 +1064,10 @@ struct WebSurfaceTab {
     /// (`~/.yggterm/web-profiles/<profile>/`). A change recreates the webview
     /// (storage is fixed per WebContext). All tabs of one surface share it.
     profile: String,
+    /// The virtual folder this tab is filed in (`WebTabFolder::id`), or `None`
+    /// for a root tab. Filed = saved organization; root = the browsing session.
+    /// The app tab (id 0) is always root: it belongs to the app, not the tree.
+    folder: Option<String>,
 }
 impl WebSurfaceTab {
     fn kill_forward(&self) {
@@ -1266,6 +1284,15 @@ struct WebSurfacePolicy {
     /// Injected at document-start, in the order the app declared.
     #[serde(default)]
     userscripts: Vec<String>,
+    /// The UA string the app's surfaces identify as. Browsing config, so the app
+    /// owns it; only the GUI can apply it (WebKit fixes the UA at webview
+    /// creation), the same shape as the ruleset. `None` = WebKitGTK's default,
+    /// whose "Safari on X11/Linux" shape names a browser that does not exist:
+    /// UA-allowlisting edges 403 it outright (claude.ai answers exactly
+    /// `{"error":{"type":"forbidden","message":"Request not allowed"}}`, while
+    /// the same request from a macOS-Safari UA is served).
+    #[serde(default)]
+    user_agent: Option<String>,
 }
 
 /// What the surface reconciler knows about a session's app-supplied policy when
@@ -1497,6 +1524,28 @@ struct AppPaneActionReply {
     /// declare to move `zoom_version`. The reconciler applies the fresh map.
     #[serde(default)]
     refetch_zoom: bool,
+    /// Set one of yggterm's own web-surface preferences from the app's pane.
+    ///
+    /// These are NOT app config: yggterm owns the tabs, the tab tree and the
+    /// chrome that draws them, so it owns the prefs that shape them, and its
+    /// `AppSettings` is the single source of truth. The pane is a VIEW and a
+    /// CONTROLLER — it renders the values the GUI injects as page context
+    /// (`values.vertical_tabs`, `values.restore_tabs`, exactly like
+    /// `values.zoom`) and asks for a change here. That is what lets the browser's
+    /// own settings pane hold browser settings without yggterm growing an app's
+    /// chrome or the app growing a second copy of yggterm's state.
+    #[serde(default)]
+    surface_prefs: Option<WebSurfacePrefsPatch>,
+}
+
+/// A pane's request to change yggterm's web-surface preferences. Every field is
+/// optional: an absent field is "leave it alone", never "set it to false".
+#[derive(Debug, Clone, Default, PartialEq, serde::Deserialize)]
+struct WebSurfacePrefsPatch {
+    #[serde(default)]
+    vertical_tabs: Option<bool>,
+    #[serde(default)]
+    restore_tabs: Option<bool>,
 }
 
 /// `<control>/pane/<id>` — where the GUI fetches a pane's schema. Kept out of
@@ -1587,10 +1636,14 @@ struct WebSurfaceOverlayView {
     address_suggestion_index: Option<usize>,
     /// Active tab's profile (drives which history file feeds suggestions).
     profile: String,
-    /// Vertical-tabs browsing mode: tabs move to a left pane (mini-omnibox + a
-    /// domain-grouped tree) and the top tab-bar + address bar are hidden. A
-    /// persisted user preference (`AppSettings::web_surface_vertical_tabs`).
+    /// Vertical-tabs browsing mode: the tabs leave the viewport for the tab-tree
+    /// rail and the top tab bar collapses. A persisted user preference
+    /// (`AppSettings::web_surface_vertical_tabs`), flipped from the app's own
+    /// settings pane.
     vertical_tabs: bool,
+    /// The user's virtual folders, in display order. Drawn by the rail in
+    /// vertical mode and by the classic strip's overflow menu otherwise.
+    folders: Vec<WebTabFolder>,
 }
 #[derive(Debug, Clone, PartialEq)]
 struct WebSurfaceOverlayTabView {
@@ -1601,34 +1654,10 @@ struct WebSurfaceOverlayTabView {
     is_app_tab: bool,
     effective_url: String,
     active: bool,
-}
-/// A domain group in the vertical-tabs tree: the host and the tabs on it, in tab
-/// order. Grouping is by registrable host label, domains in first-appearance
-/// order — the same cwd-tree visual vocabulary applied to browser tabs.
-#[derive(Debug, Clone, PartialEq)]
-struct WebSurfaceTabGroup {
-    domain: String,
-    tabs: Vec<WebSurfaceOverlayTabView>,
-}
-/// Group a flat tab list into the vertical tree. Deterministic: domains appear
-/// in the order their first tab does, and tabs keep their order within a domain.
-fn web_surface_tab_tree(tabs: &[WebSurfaceOverlayTabView]) -> Vec<WebSurfaceTabGroup> {
-    let mut order: Vec<String> = Vec::new();
-    let mut groups: HashMap<String, Vec<WebSurfaceOverlayTabView>> = HashMap::new();
-    for tab in tabs {
-        let domain = web_surface_tab_host_label(&tab.effective_url);
-        if !groups.contains_key(&domain) {
-            order.push(domain.clone());
-        }
-        groups.entry(domain).or_default().push(tab.clone());
-    }
-    order
-        .into_iter()
-        .map(|domain| {
-            let tabs = groups.remove(&domain).unwrap_or_default();
-            WebSurfaceTabGroup { domain, tabs }
-        })
-        .collect()
+    /// The virtual folder it is filed in. The classic tab bar shows only the
+    /// tabs with `None` (the root path); the filed ones live in its overflow
+    /// menu, because a strip has nowhere to draw a folder.
+    folder: Option<String>,
 }
 /// Resolve and commit a user-driven tab navigation (address bar, back,
 /// forward). The blocking egress resolution (possible `ssh -L` setup) runs
@@ -1836,6 +1865,99 @@ fn web_surface_search_url_template() -> String {
 /// Pure (no config/env read) so it is deterministically testable.
 fn web_surface_search_url_from_template(template: &str, query: &str) -> String {
     template.replace("{q}", &web_surface_query_encode(query))
+}
+/// Per-profile TAB TREE file: the folders the user made and the tabs filed into
+/// them, plus the tabs that were open. None for the ephemeral profile, like the
+/// history — temp browsing leaves no trace.
+///
+/// It lives beside `history.jsonl` in the profile's jar because that is where a
+/// profile's browsing state already lives, and it must: the cookies, the
+/// localStorage and the webviews themselves are GUI-side (WebKit runs in the GUI
+/// process), so the tabs are too. This is yggterm's own chrome, not an app's
+/// data — the app owns browsing CONFIG (ruleset, userscripts, zoom, UA), yggterm
+/// owns the tabs it renders. See `.agents/skills/libyggterm-surfaces/SKILL.md`.
+fn web_surface_tab_store_path(profile: &str) -> Option<std::path::PathBuf> {
+    if profile == WEB_SURFACE_TEMP_PROFILE {
+        return None;
+    }
+    let home = yggterm_core::resolve_yggterm_home().ok()?;
+    Some(home.join("web-profiles").join(profile).join("tabs.json"))
+}
+/// One saved tab. The app tab is never saved (the app supplies it on open), and
+/// no live handle (webview id, ssh forward, socks port) is: those belong to a
+/// run, not to the tree.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+struct SavedWebTab {
+    url: String,
+    #[serde(default)]
+    title: String,
+    /// The folder this tab is filed in; `None` = a root tab.
+    ///
+    /// This is the whole persistence rule: a FILED tab is organization and
+    /// survives a fresh start, a ROOT tab is the browsing session and does not.
+    #[serde(default)]
+    folder: Option<String>,
+}
+/// The persisted tab tree for one profile.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+struct WebTabStore {
+    #[serde(default)]
+    folders: Vec<WebTabFolder>,
+    #[serde(default)]
+    tabs: Vec<SavedWebTab>,
+}
+impl WebTabStore {
+    /// What to reopen on the next visit. `restore` is the user's "continue where
+    /// you left off": OFF (the default) keeps only the filed tabs, so the folders
+    /// and everything organized into them come back and the loose session does
+    /// not. Order is preserved either way — the tree must not shuffle.
+    fn tabs_to_open(&self, restore: bool) -> Vec<SavedWebTab> {
+        self.tabs
+            .iter()
+            .filter(|tab| restore || tab.folder.is_some())
+            .filter(|tab| !tab.url.trim().is_empty())
+            .cloned()
+            .collect()
+    }
+    /// Drop folder references that name a folder that no longer exists, so a
+    /// hand-edited or half-written file cannot strand a tab in a folder the tree
+    /// never draws.
+    fn reconcile(&mut self) {
+        let known: std::collections::HashSet<String> = self
+            .folders
+            .iter()
+            .map(|folder| folder.id.clone())
+            .collect();
+        for tab in &mut self.tabs {
+            if let Some(folder) = &tab.folder
+                && !known.contains(folder)
+            {
+                tab.folder = None;
+            }
+        }
+    }
+}
+fn load_web_tab_store(profile: &str) -> WebTabStore {
+    let Some(path) = web_surface_tab_store_path(profile) else {
+        return WebTabStore::default();
+    };
+    let mut store = std::fs::read_to_string(path)
+        .ok()
+        .and_then(|raw| serde_json::from_str::<WebTabStore>(&raw).ok())
+        .unwrap_or_default();
+    store.reconcile();
+    store
+}
+fn save_web_tab_store(profile: &str, store: &WebTabStore) {
+    let Some(path) = web_surface_tab_store_path(profile) else {
+        return;
+    };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(body) = serde_json::to_string_pretty(store) {
+        let _ = std::fs::write(path, body);
+    }
 }
 /// Per-profile browsing-history file (append-only JSONL `{ts_ms, url, title}`,
 /// written by the native-surface reconciler's page observer). None for the
@@ -2630,6 +2752,11 @@ async fn web_surface_native_reconcile_loop(
                                 if !page_title.is_empty() {
                                     tab.title = Some(page_title.clone());
                                 }
+                                // The page just told us what this tab really is
+                                // (its redirected URL, its title). That is what the
+                                // tree must save, or a restored tab comes back
+                                // wearing the name of the page it started on.
+                                shell.persist_web_tabs(key.0.as_str());
                                 followable
                             });
                             // Record history keyed on the url, but NEVER pair a
@@ -2684,15 +2811,16 @@ async fn web_surface_native_reconcile_loop(
                     // effective policy from its own host. No contribution ⇒ no
                     // policy, and that is right: adblock is browsing config, and
                     // a dashboard app is not browsing.
-                    let (userscripts, adblock_ruleset) = match &policy_gate {
+                    let (userscripts, adblock_ruleset, user_agent) = match &policy_gate {
                         SurfacePolicyGate::Ready(policy) => (
                             policy.userscripts.clone(),
                             policy
                                 .adblock_rules
                                 .as_deref()
                                 .and_then(web_surface_adblock_cache),
+                            policy.user_agent.clone(),
                         ),
-                        _ => (Vec::new(), None),
+                        _ => (Vec::new(), None, None),
                     };
                     // The app's GUI-reachable control endpoint (ssh -L-resolved
                     // for a remote app), so an in-page shim can reach it through
@@ -2707,6 +2835,7 @@ async fn web_surface_native_reconcile_loop(
                         profile_dir.as_deref(),
                         &userscripts,
                         adblock_ruleset.as_deref(),
+                        user_agent.as_deref(),
                         signer_base.as_deref(),
                         rect.0,
                         rect.1,
@@ -2728,6 +2857,7 @@ async fn web_surface_native_reconcile_loop(
                                     "profile": profile,
                                     "userscripts": userscripts.len(),
                                     "adblock": adblock_ruleset.is_some(),
+                                    "user_agent": user_agent,
                                     "policy": matches!(policy_gate, SurfacePolicyGate::Ready(_)),
                                     "rect": [rect.0, rect.1, rect.2, rect.3],
                                 }),
@@ -3518,6 +3648,19 @@ struct ShellState {
     suppress_sidebar_autoscroll_until_ms: u64,
     pending_delete: Option<PendingDeleteDialog>,
     copy_edit_dialog: Option<CopyEditDialog>,
+    /// The user asked to leave vertical tabs while folders exist. The classic tab
+    /// bar cannot draw a folder, so the modal says what will happen before the
+    /// organization disappears behind an overflow menu.
+    pending_classic_tabs_switch: bool,
+    /// `(folder id, draft name)` while a tab-tree folder is being renamed.
+    web_tab_folder_rename: Option<(String, String)>,
+    /// The tab being dragged in the tab tree, and the row it is over:
+    /// `Some(Some(folder))` = file it there, `Some(None)` = the root, `None` =
+    /// over nothing, which is a no-op on release.
+    web_tab_drag: Option<u64>,
+    web_tab_drop_target: Option<Option<String>>,
+    /// The classic strip's overflow menu (the tabs that live in folders) is open.
+    web_tab_overflow_open: bool,
     tree_rename_path: Option<String>,
     tree_rename_depth: Option<usize>,
     tree_rename_value: String,
@@ -3669,6 +3812,15 @@ enum RightPanelMode {
     Settings,
     Connect,
     Notifications,
+    /// The TAB TREE of the active web surface: the tabs, the user's virtual
+    /// folders, and the organizational grammar the cwd tree already speaks.
+    ///
+    /// yggterm's OWN chrome, not an app contribution — it renders the tabs
+    /// yggterm creates, places and owns (the tab strip, the omnibox, history and
+    /// per-tab webviews are all already yggterm's). An app cannot declare this
+    /// pane, and does not need to: it declares nothing about tabs, it only asks
+    /// for the vertical MODE via `surface_prefs`. Vertical tabs IS this rail.
+    WebTabs,
     /// A pane CONTRIBUTED by the active libyggterm app (the 4-surface taxonomy's
     /// sidebar-contribution surface), identified by the app's own pane id. The
     /// app declares it over OSC 7717 and serves its schema from a loopback
@@ -3772,6 +3924,10 @@ struct RenderSnapshot {
     /// The active session's live web-surface profile (app tab), if it has a
     /// surface.
     active_web_surface_profile: Option<String>,
+    /// The active session's surface, as the chrome sees it — the same view the
+    /// viewport's tab strip draws from, so the tab rail and the strip can never
+    /// disagree about what tabs exist. None when the active session has none.
+    active_web_surface_overlay: Option<WebSurfaceOverlayView>,
     /// The active app's declared display name, for the zoom control's label
     /// ("Ychrome Global Zoom"). The app names itself over `sidebar ; declare`.
     active_web_surface_app_name: Option<String>,
@@ -3855,6 +4011,11 @@ struct RenderSnapshot {
     pending_delete: Option<PendingDeleteDialog>,
     pending_fido2: Option<PendingFido2Dialog>,
     copy_edit_dialog: Option<CopyEditDialog>,
+    pending_classic_tabs_switch: bool,
+    web_tab_folder_rename: Option<(String, String)>,
+    web_tab_drag: Option<u64>,
+    web_tab_drop_target: Option<Option<String>>,
+    web_tab_overflow_open: bool,
     tree_rename_path: Option<String>,
     tree_rename_value: String,
     tree_rename_input_focused_once: bool,
@@ -5107,6 +5268,11 @@ impl ShellState {
             pending_delete: None,
             pending_fido2: None,
             copy_edit_dialog: None,
+            pending_classic_tabs_switch: false,
+            web_tab_folder_rename: None,
+            web_tab_drag: None,
+            web_tab_drop_target: None,
+            web_tab_overflow_open: false,
             tree_rename_path: None,
             tree_rename_depth: None,
             tree_rename_input_focused_once: false,
@@ -5665,6 +5831,9 @@ impl ShellState {
             active_web_surface_app_name: active_session_path
                 .as_deref()
                 .and_then(|path| self.web_surface_app_name(path)),
+            active_web_surface_overlay: active_session_path
+                .as_deref()
+                .and_then(|path| self.web_surface_overlay_for_session(path, current_millis())),
             sidebar_panes,
             apps: self.server.apps().to_vec(),
             app_pane_schema: self.app_pane_schema.clone(),
@@ -5729,6 +5898,11 @@ impl ShellState {
             pending_delete: self.pending_delete.clone(),
             pending_fido2: self.pending_fido2.clone(),
             copy_edit_dialog: self.copy_edit_dialog.clone(),
+            pending_classic_tabs_switch: self.pending_classic_tabs_switch,
+            web_tab_folder_rename: self.web_tab_folder_rename.clone(),
+            web_tab_drag: self.web_tab_drag,
+            web_tab_drop_target: self.web_tab_drop_target.clone(),
+            web_tab_overflow_open: self.web_tab_overflow_open,
             tree_rename_path: self.tree_rename_path.clone(),
             tree_rename_value: self.tree_rename_value.clone(),
             tree_rename_input_focused_once: self.tree_rename_input_focused_once,
@@ -5875,17 +6049,53 @@ impl ShellState {
             history: vec![url.clone()],
             history_index: 0,
             reload_nonce: 0,
-            profile,
+            profile: profile.clone(),
+            folder: None,
         };
+        // Rehydrate the profile's tab tree. The folders and everything filed in
+        // them always come back — that is saved organization, like a cwd-tree
+        // folder. The loose ROOT tabs are the browsing session, and they come
+        // back only when the user asked to continue where they left off.
+        //
+        // A restored tab carries no live handle: it is a URL in the tree until
+        // it is activated, at which point the reconciler creates its webview and
+        // resolves its egress like any other tab. So restoring thirty tabs costs
+        // thirty rows, not thirty webviews.
+        let store = load_web_tab_store(&profile);
+        let restore = self.settings.web_surface_restore_tabs;
+        let mut tabs = vec![app_tab];
+        let mut next_tab_id = 1;
+        for saved in store.tabs_to_open(restore) {
+            tabs.push(WebSurfaceTab {
+                id: next_tab_id,
+                url: saved.url.clone(),
+                // Not resolved for egress yet — a restored tab has never been
+                // shown. Selecting it navigates, which resolves it properly.
+                effective_url: String::new(),
+                socks_port: None,
+                title: Some(saved.title).filter(|title| !title.is_empty()),
+                forward_child: None,
+                history: vec![saved.url],
+                history_index: 0,
+                reload_nonce: 0,
+                profile: profile.clone(),
+                folder: saved.folder,
+            });
+            next_tab_id += 1;
+        }
         // The surface is live again: forget any prior deliberate-close record so
         // it neither lingers nor blocks a future heartbeat rebuild.
         self.web_surface_deliberate_close_ms.remove(session_path);
         if let Some(replaced) = self.web_surfaces.insert(
             session_path.to_string(),
             WebSurfaceUiState {
-                tabs: vec![app_tab],
+                tabs,
+                folders: store.folders,
+                // The app's own page, always. Even when continuing a session, the
+                // surface was just opened BY the app: landing the user on a
+                // restored background tab would hide the thing they launched.
                 active_tab: 0,
-                next_tab_id: 1,
+                next_tab_id,
                 opened_at_ms: now_ms,
                 last_seen_ms: now_ms,
                 address_draft: None,
@@ -5896,6 +6106,20 @@ impl ShellState {
             },
         ) {
             kill_web_surface_forward(&replaced);
+        }
+        // Write the purge through immediately. A fresh start that only DROPPED
+        // the root tabs in memory would resurrect every one of them if the GUI
+        // died before the next tab edit.
+        self.persist_web_tabs(session_path);
+        // Vertical mode IS the rail, so a surface opening under a pref that is
+        // already on must RAISE it. Toggling the pref opened the rail, but a GUI
+        // that started with the pref already true collapsed the tab strip and
+        // opened nothing — the tabs had nowhere to live, which is precisely the
+        // state the "one home for tabs" invariant exists to forbid.
+        if self.settings.web_surface_vertical_tabs
+            && self.right_panel_mode != RightPanelMode::WebTabs
+        {
+            self.set_right_panel_mode(RightPanelMode::WebTabs);
         }
     }
     /// Upsert a surface in PICKER state (OSC action "pick"): no page, no tab
@@ -5948,12 +6172,16 @@ impl ShellState {
             history_index: 0,
             reload_nonce: 0,
             profile: "default".to_string(),
+            folder: None,
         };
         self.web_surface_deliberate_close_ms.remove(session_path);
         if let Some(replaced) = self.web_surfaces.insert(
             session_path.to_string(),
             WebSurfaceUiState {
                 tabs: vec![app_tab],
+                // The picker has no profile yet, so it has no tree to show. The
+                // real `open` that follows the choice loads the chosen profile's.
+                folders: Vec::new(),
                 active_tab: 0,
                 next_tab_id: 1,
                 opened_at_ms: now_ms,
@@ -6349,6 +6577,10 @@ impl ShellState {
         self.pending_fido2.is_some()
             || self.pending_delete.is_some()
             || self.copy_edit_dialog.is_some()
+            // A native web surface draws above ALL DOM, so a modal raised over a
+            // browsing session is invisible unless the reconciler stashes the
+            // surface first. This one is ALWAYS raised over a web surface.
+            || self.pending_classic_tabs_switch
     }
     fn web_surface_select_tab(&mut self, session_path: &str, tab_id: u64) {
         if let Some(surface) = self.web_surfaces.get_mut(session_path)
@@ -6381,10 +6613,23 @@ impl ShellState {
                 history_index: 0,
                 reload_nonce: 0,
                 profile,
+                folder: None,
             });
             surface.active_tab = id;
             surface.address_draft = Some(String::new());
         }
+    }
+    /// Open a fresh tab already filed in `folder` — the tree's "+" on a folder
+    /// row. Same tab as any other; it is born organized instead of at the root.
+    fn web_surface_new_tab_in_folder(&mut self, session_path: &str, folder_id: &str) {
+        self.web_surface_new_tab(session_path);
+        if let Some(surface) = self.web_surfaces.get_mut(session_path) {
+            let active = surface.active_tab;
+            if let Some(tab) = surface.tabs.iter_mut().find(|tab| tab.id == active) {
+                tab.folder = Some(folder_id.to_string());
+            }
+        }
+        self.persist_web_tabs(session_path);
     }
     /// Open a tab for a link the page asked to open in a new window
     /// (middle-click / ctrl-click / `target="_blank"` / `window.open`). Unlike
@@ -6419,6 +6664,7 @@ impl ShellState {
             history_index: 0,
             reload_nonce: 0,
             profile,
+            folder: None,
         });
         if !background {
             surface.active_tab = id;
@@ -6461,6 +6707,9 @@ impl ShellState {
                 surface.address_draft = None;
             }
         }
+        // Closing a FILED tab removes it from the saved tree — a folder must not
+        // resurrect a tab the user closed on the next visit.
+        self.persist_web_tabs(session_path);
     }
     /// Request a reload of the active tab's page (native surface ⟳).
     fn web_surface_reload_active_tab(&mut self, session_path: &str) {
@@ -6578,6 +6827,11 @@ impl ShellState {
                 surface.address_draft = None;
             }
         }
+        // A tab's URL IS what the tree saves, so a navigation is a tree change.
+        // Filing a tab used to be the only thing that persisted one, which meant
+        // a tab you opened and browsed was still saved as the page you started on
+        // — or, at the root, not saved at all.
+        self.persist_web_tabs(session_path);
         // Tab or surface vanished while the forward resolved: don't leak it.
         if let Some(mut child) = orphaned_forward {
             let _ = child.kill();
@@ -6616,6 +6870,7 @@ impl ShellState {
                 surface.address_draft = None;
             }
         }
+        self.persist_web_tabs(session_path);
     }
     /// The viewport overlay view for a live (non-stale) surface: tab strip,
     /// address bar, and per-tab iframe targets.
@@ -6650,6 +6905,7 @@ impl ShellState {
                 is_app_tab: index == 0,
                 effective_url: tab.effective_url.clone(),
                 active: tab.id == active_tab_id,
+                folder: tab.folder.clone(),
             })
             .collect();
         let back_target = active
@@ -6693,18 +6949,266 @@ impl ShellState {
             address_suggestion_index: surface.address_suggestion_index,
             profile: active.profile.clone(),
             vertical_tabs: self.settings.web_surface_vertical_tabs,
+            folders: surface.folders.clone(),
         })
     }
-    /// Flip the vertical-tabs browsing mode and persist it. A per-user chrome
-    /// preference, so it applies to every web surface, not one session.
-    fn toggle_web_surface_vertical_tabs(&mut self) {
-        self.settings.web_surface_vertical_tabs = !self.settings.web_surface_vertical_tabs;
+    /// Ask for a vertical-tabs mode change — the entry point for every control
+    /// that offers one (today: the app's settings pane).
+    ///
+    /// Turning it OFF while folders exist raises the modal first. The classic tab
+    /// bar has no place to draw a folder, so leaving vertical mode HIDES the
+    /// user's organization behind an overflow menu; that is a surprise worth one
+    /// dialog, and it is the only path that can produce it (turning vertical mode
+    /// ON never hides anything).
+    fn request_web_surface_vertical_tabs(&mut self, vertical: bool) {
+        if !vertical
+            && self.settings.web_surface_vertical_tabs
+            && self.active_web_surface_has_folders()
+        {
+            self.pending_classic_tabs_switch = true;
+            return;
+        }
+        self.set_web_surface_vertical_tabs(vertical);
+    }
+    /// Apply the mode. The rail follows: vertical mode IS the tab rail, so it
+    /// opens with the mode and stands down with it — the pref and the panel can
+    /// never disagree about whether the tabs have somewhere to live.
+    fn set_web_surface_vertical_tabs(&mut self, vertical: bool) {
+        self.pending_classic_tabs_switch = false;
+        if self.settings.web_surface_vertical_tabs == vertical {
+            return;
+        }
+        self.settings.web_surface_vertical_tabs = vertical;
         self.persist_settings();
-        self.last_action = if self.settings.web_surface_vertical_tabs {
+        if vertical {
+            self.set_right_panel_mode(RightPanelMode::WebTabs);
+        } else if self.right_panel_mode == RightPanelMode::WebTabs {
+            self.set_right_panel_mode(RightPanelMode::Hidden);
+        }
+        self.last_action = if vertical {
             "vertical tabs on".to_string()
         } else {
             "vertical tabs off".to_string()
         };
+    }
+    fn cancel_classic_tabs_switch(&mut self) {
+        self.pending_classic_tabs_switch = false;
+    }
+    fn toggle_web_tab_overflow(&mut self) {
+        self.web_tab_overflow_open = !self.web_tab_overflow_open;
+    }
+    fn close_web_tab_overflow(&mut self) {
+        self.web_tab_overflow_open = false;
+    }
+    fn confirm_classic_tabs_switch(&mut self) {
+        self.pending_classic_tabs_switch = false;
+        self.set_web_surface_vertical_tabs(false);
+    }
+    /// "Continue where you left off". Purely a persistence policy — it changes
+    /// nothing on screen now, only what the NEXT surface opens with.
+    fn set_web_surface_restore_tabs(&mut self, restore: bool) {
+        if self.settings.web_surface_restore_tabs == restore {
+            return;
+        }
+        self.settings.web_surface_restore_tabs = restore;
+        self.persist_settings();
+        self.last_action = if restore {
+            "tabs restore on".to_string()
+        } else {
+            "tabs restore off".to_string()
+        };
+    }
+    fn active_web_surface(&self) -> Option<&WebSurfaceUiState> {
+        let session = self.server.active_session_path()?;
+        self.web_surfaces.get(session)
+    }
+    fn active_web_surface_has_folders(&self) -> bool {
+        self.active_web_surface()
+            .is_some_and(|surface| !surface.folders.is_empty())
+    }
+    /// The active session, if a web surface is what it is showing. Every tab-tree
+    /// mutation routes through this: the tree edits the surface the user is
+    /// looking at, never a background one.
+    fn active_web_surface_session(&self) -> Option<String> {
+        let session = self.server.active_session_path()?.to_string();
+        self.web_surfaces.contains_key(&session).then_some(session)
+    }
+    /// Write the surface's tree to its profile's `tabs.json`. Called after every
+    /// mutation — a tab opened, closed, navigated, filed, a folder made or gone.
+    /// The file is small (URLs and names), and writing it eagerly is what makes
+    /// the tree survive a GUI kill, which is the whole promise of a saved folder.
+    ///
+    /// The app tab is deliberately NOT saved: it belongs to the app, which
+    /// supplies it on the next `open`. Saving it would resurrect a stale copy of
+    /// the app's start page as a user tab.
+    fn persist_web_tabs(&self, session_path: &str) {
+        let Some(surface) = self.web_surfaces.get(session_path) else {
+            return;
+        };
+        // The picker has no profile decided yet — nothing to file it under.
+        if surface.picker.is_some() {
+            return;
+        }
+        let Some(profile) = surface.tabs.first().map(|tab| tab.profile.clone()) else {
+            return;
+        };
+        let store = WebTabStore {
+            folders: surface.folders.clone(),
+            tabs: surface
+                .tabs
+                .iter()
+                .skip(1)
+                .filter(|tab| !tab.url.trim().is_empty())
+                .map(|tab| SavedWebTab {
+                    url: tab.url.clone(),
+                    title: tab.title.clone().unwrap_or_default(),
+                    folder: tab.folder.clone(),
+                })
+                .collect(),
+        };
+        save_web_tab_store(&profile, &store);
+    }
+    /// A new virtual folder, opened straight into rename — a folder with no name
+    /// is not organization, so the tree asks for one at birth (the cwd tree's
+    /// grammar).
+    fn web_tab_new_folder(&mut self, session_path: &str) {
+        let id = format!("f{}", current_millis());
+        if let Some(surface) = self.web_surfaces.get_mut(session_path) {
+            if surface.folders.iter().any(|folder| folder.id == id) {
+                return;
+            }
+            surface.folders.push(WebTabFolder {
+                id: id.clone(),
+                name: "New folder".to_string(),
+                collapsed: false,
+            });
+        } else {
+            return;
+        }
+        self.web_tab_folder_rename = Some((id, "New folder".to_string()));
+        self.persist_web_tabs(session_path);
+    }
+    fn web_tab_begin_rename(&mut self, folder_id: &str) {
+        let name = self
+            .active_web_surface()
+            .and_then(|surface| {
+                surface
+                    .folders
+                    .iter()
+                    .find(|folder| folder.id == folder_id)
+                    .map(|folder| folder.name.clone())
+            })
+            .unwrap_or_default();
+        self.web_tab_folder_rename = Some((folder_id.to_string(), name));
+    }
+    fn web_tab_set_rename_draft(&mut self, draft: String) {
+        if let Some((_, name)) = self.web_tab_folder_rename.as_mut() {
+            *name = draft;
+        }
+    }
+    fn web_tab_commit_rename(&mut self, session_path: &str) {
+        let Some((folder_id, name)) = self.web_tab_folder_rename.take() else {
+            return;
+        };
+        let name = name.trim().to_string();
+        if name.is_empty() {
+            return;
+        }
+        if let Some(surface) = self.web_surfaces.get_mut(session_path)
+            && let Some(folder) = surface
+                .folders
+                .iter_mut()
+                .find(|folder| folder.id == folder_id)
+        {
+            folder.name = name;
+        }
+        self.persist_web_tabs(session_path);
+    }
+    fn web_tab_cancel_rename(&mut self) {
+        self.web_tab_folder_rename = None;
+    }
+    /// Delete a folder. Its tabs are NOT closed — they return to the root, the
+    /// same as removing a cwd-tree group. Deleting organization must never
+    /// destroy content.
+    fn web_tab_delete_folder(&mut self, session_path: &str, folder_id: &str) {
+        if let Some(surface) = self.web_surfaces.get_mut(session_path) {
+            surface.folders.retain(|folder| folder.id != folder_id);
+            for tab in &mut surface.tabs {
+                if tab.folder.as_deref() == Some(folder_id) {
+                    tab.folder = None;
+                }
+            }
+        }
+        if self
+            .web_tab_folder_rename
+            .as_ref()
+            .is_some_and(|(id, _)| id == folder_id)
+        {
+            self.web_tab_folder_rename = None;
+        }
+        self.persist_web_tabs(session_path);
+    }
+    fn web_tab_toggle_folder(&mut self, session_path: &str, folder_id: &str) {
+        if let Some(surface) = self.web_surfaces.get_mut(session_path)
+            && let Some(folder) = surface
+                .folders
+                .iter_mut()
+                .find(|folder| folder.id == folder_id)
+        {
+            folder.collapsed = !folder.collapsed;
+        }
+        self.persist_web_tabs(session_path);
+    }
+    /// File a tab into a folder, or back to the root with `None`. The app tab
+    /// cannot be filed: it is the app's, and it is gone when the app is.
+    fn web_tab_move_to_folder(
+        &mut self,
+        session_path: &str,
+        tab_id: u64,
+        folder_id: Option<String>,
+    ) {
+        if tab_id == 0 {
+            return;
+        }
+        if let Some(surface) = self.web_surfaces.get_mut(session_path) {
+            let exists = folder_id
+                .as_ref()
+                .is_none_or(|id| surface.folders.iter().any(|folder| &folder.id == id));
+            if !exists {
+                return;
+            }
+            if let Some(tab) = surface.tabs.iter_mut().find(|tab| tab.id == tab_id) {
+                tab.folder = folder_id;
+            }
+        }
+        self.persist_web_tabs(session_path);
+    }
+    /// Drag state for the tab tree. Mouse-driven, like the cwd tree's (HTML5 DnD
+    /// is not what that tree uses, and one drag grammar beats two).
+    fn web_tab_start_drag(&mut self, tab_id: u64) {
+        if tab_id != 0 {
+            self.web_tab_drag = Some(tab_id);
+        }
+    }
+    fn web_tab_hover_folder(&mut self, target: Option<Option<String>>) {
+        if self.web_tab_drag.is_some() {
+            self.web_tab_drop_target = target;
+        }
+    }
+    /// Commit the drag onto whatever row it is hovering. A drag that ends over
+    /// nothing is a no-op, not a move to the root: dropping in the void must not
+    /// silently unfile a tab.
+    fn web_tab_end_drag(&mut self) {
+        let (Some(tab_id), Some(target)) =
+            (self.web_tab_drag.take(), self.web_tab_drop_target.take())
+        else {
+            self.web_tab_drop_target = None;
+            return;
+        };
+        let Some(session) = self.active_web_surface_session() else {
+            return;
+        };
+        self.web_tab_move_to_folder(&session, tab_id, target);
     }
     fn set_window_focused(&mut self, focused: bool) {
         let was_focused = self.window_focused;
@@ -6906,6 +7410,20 @@ impl ShellState {
         self.set_right_panel_mode(next_mode);
     }
     fn set_right_panel_mode(&mut self, mode: RightPanelMode) {
+        // While vertical tabs are on, the rail's RESTING state is the tab tree —
+        // that is where the tabs live, and the strip is collapsed. Another pane
+        // (the app's settings, the vault) BORROWS the slot; when it leaves, the
+        // tabs come back. Without this, closing the settings pane left the tabs
+        // with no home at all: strip collapsed AND rail hidden. To hide the rail
+        // outright, turn vertical tabs off — the ⊟ button does exactly that.
+        let mode = if mode == RightPanelMode::Hidden
+            && self.settings.web_surface_vertical_tabs
+            && self.active_web_surface().is_some()
+        {
+            RightPanelMode::WebTabs
+        } else {
+            mode
+        };
         self.terminal_input_override_active = terminal_input_override_for_right_panel_mode(&mode);
         self.right_panel_mode = mode;
         self.settings.show_settings = self.right_panel_mode == RightPanelMode::Settings;
@@ -6916,8 +7434,17 @@ impl ShellState {
             RightPanelMode::Metadata => "metadata opened".to_string(),
             RightPanelMode::Connect => "ssh connect opened".to_string(),
             RightPanelMode::Notifications => "notifications opened".to_string(),
+            RightPanelMode::WebTabs => "web tabs opened".to_string(),
             RightPanelMode::AppPane(pane) => format!("app pane {pane} opened"),
         };
+    }
+    /// The tab-tree rail's titlebar button. Vertical mode is what the rail is
+    /// FOR, so opening it turns the mode on and closing it turns the mode off —
+    /// one fact, one control, no way to have vertical tabs with nowhere to put
+    /// them (or a rail nobody asked for).
+    fn toggle_web_tabs_panel(&mut self) {
+        let vertical = !(self.right_panel_mode == RightPanelMode::WebTabs);
+        self.request_web_surface_vertical_tabs(vertical);
     }
     /// Open (or close) an app-contributed pane. Returns the request sequence to
     /// fetch the schema under, or `None` when the pane was toggled shut.
@@ -6976,6 +7503,12 @@ impl ShellState {
                 .right_panel_mode_before_app_pane
                 .clone()
                 .unwrap_or(RightPanelMode::Hidden),
+            // The tab rail is a tenant of the surface, exactly like a contributed
+            // pane is a tenant of its app: a session with no web surface has no
+            // tabs, so the rail stands down instead of showing an empty tree.
+            RightPanelMode::WebTabs if self.active_web_surface().is_none() => {
+                RightPanelMode::Hidden
+            }
             mode => mode.clone(),
         }
     }
@@ -30668,6 +31201,7 @@ fn right_panel_mode_label(mode: &RightPanelMode) -> &'static str {
         RightPanelMode::Settings => "settings",
         RightPanelMode::Connect => "connect",
         RightPanelMode::Notifications => "notifications",
+        RightPanelMode::WebTabs => "web_tabs",
         RightPanelMode::AppPane(_) => "app_pane",
     }
 }
@@ -38593,7 +39127,7 @@ async fn app_pane_fetch_schema(mut state: Signal<ShellState>, pane_id: String, s
         });
         return;
     };
-    let (host, zoom, secure) = {
+    let (host, zoom, secure, vertical_tabs, restore_tabs) = {
         let shell = state.read();
         let host = shell
             .server
@@ -38604,6 +39138,8 @@ async fn app_pane_fetch_schema(mut state: Signal<ShellState>, pane_id: String, s
             host,
             shell.active_web_surface_effective_zoom_percent(),
             shell.active_web_surface_secure(),
+            shell.settings.web_surface_vertical_tabs,
+            shell.settings.web_surface_restore_tabs,
         )
     };
     // The app decides what a page host means (which logins apply to it); the GUI
@@ -38620,6 +39156,11 @@ async fn app_pane_fetch_schema(mut state: Signal<ShellState>, pane_id: String, s
     if let Some(secure) = secure {
         query.push(format!("secure={secure}"));
     }
+    // yggterm's own web-surface prefs, so a browser app's settings pane can draw
+    // the controls for them. Page context like the rest: the GUI reports, the app
+    // renders, and `surface_prefs` on an action reply asks for a change.
+    query.push(format!("vertical_tabs={vertical_tabs}"));
+    query.push(format!("restore_tabs={restore_tabs}"));
     if !query.is_empty() {
         url = format!("{url}?{}", query.join("&"));
     }
@@ -38671,6 +39212,7 @@ async fn app_policy_fetch(
                     "policy_version": policy_version,
                     "adblock": policy.adblock_rules.is_some(),
                     "userscripts": policy.userscripts.len(),
+                    "user_agent": policy.user_agent,
                 }),
             );
             state.with_mut(|shell| {
@@ -38820,7 +39362,7 @@ async fn app_pane_run_action(
     action: String,
     value: Option<String>,
 ) {
-    let (control_url, mut values, host, live_zoom, secure) = {
+    let (control_url, mut values, host, live_zoom, secure, prefs) = {
         let shell = state.read();
         let active = shell.server.active_session_path().map(str::to_string);
         let control = active
@@ -38831,7 +39373,18 @@ async fn app_pane_run_action(
             .and_then(|path| shell.web_surface_host_label(path));
         let live_zoom = shell.active_web_surface_effective_zoom_percent();
         let secure = shell.active_web_surface_secure();
-        (control, shell.app_pane_values_json(), host, live_zoom, secure)
+        let prefs = (
+            shell.settings.web_surface_vertical_tabs,
+            shell.settings.web_surface_restore_tabs,
+        );
+        (
+            control,
+            shell.app_pane_values_json(),
+            host,
+            live_zoom,
+            secure,
+            prefs,
+        )
     };
     let Some(control_url) = control_url else {
         return;
@@ -38848,6 +39401,12 @@ async fn app_pane_run_action(
     // secret page context, exactly like `host`.
     if let (Some(zoom), Some(map)) = (live_zoom, values.as_object_mut()) {
         map.insert("zoom".to_string(), serde_json::json!(zoom));
+    }
+    // yggterm's web-surface prefs, so the pane that drew the toggles knows what
+    // they currently are without keeping a second copy of them.
+    if let Some(map) = values.as_object_mut() {
+        map.insert("vertical_tabs".to_string(), serde_json::json!(prefs.0));
+        map.insert("restore_tabs".to_string(), serde_json::json!(prefs.1));
     }
     // A widget that carries its own value (a tab id, a row's item id) passes it
     // alongside the pane's draft inputs rather than mutating them.
@@ -38924,6 +39483,20 @@ async fn app_pane_run_action(
             let trace_home = resolve_yggterm_home().unwrap_or_else(|_| PathBuf::from("."));
             spawn(app_policy_fetch(state, session, version, trace_home));
         }
+    }
+    if let Some(prefs) = reply.surface_prefs {
+        // The pane asked yggterm to change one of ITS prefs. yggterm applies it to
+        // its own settings (the SSOT) and persists; the pane's next schema reads
+        // the new value back out of the injected page context, so the two can
+        // never disagree.
+        state.with_mut(|shell| {
+            if let Some(vertical) = prefs.vertical_tabs {
+                shell.request_web_surface_vertical_tabs(vertical);
+            }
+            if let Some(restore) = prefs.restore_tabs {
+                shell.set_web_surface_restore_tabs(restore);
+            }
+        });
     }
     if reply.refetch_zoom {
         // A per-site zoom action wants its change on the live page NOW, not at
@@ -48475,6 +49048,10 @@ fn app() -> Element {
                                 spawn(app_pane_fetch_schema(state, pane_id, seq));
                             }
                             },
+                            on_toggle_web_tabs: move || {
+                            state.with_mut(|shell| shell.toggle_web_tabs_panel());
+                            sync_active_terminal_input_policy(state);
+                            },
                             on_restart_update: move || restart_into_pending_update(state),
                             on_request_window_drag: move || {
                             state.with_mut(|shell| shell.note_titlebar_drag_request());
@@ -48776,6 +49353,7 @@ fn app() -> Element {
                     if !fullscreen {
                         RightRail {
                             snapshot: metadata_snapshot,
+                            state,
                             on_endpoint_change: move |value: String| state.with_mut(|shell| shell.update_litellm_endpoint(value)),
                             on_api_key_change: move |value: String| state.with_mut(|shell| shell.update_litellm_api_key(value)),
                             on_model_change: move |value: String| state.with_mut(|shell| shell.update_interface_llm_model(value)),
@@ -49326,6 +49904,23 @@ fn app() -> Element {
                         on_confirm_unkept: move |_| queue_delete_unkept_live_sessions(state),
                     }
                 }
+                if snapshot.pending_classic_tabs_switch {
+                    ClassicTabsSwitchOverlay {
+                        palette: snapshot.palette,
+                        folder_count: snapshot
+                            .active_web_surface_overlay
+                            .as_ref()
+                            .map(|overlay| overlay.folders.len())
+                            .unwrap_or(0),
+                        filed_count: snapshot
+                            .active_web_surface_overlay
+                            .as_ref()
+                            .map(|overlay| overlay.tabs.iter().filter(|tab| tab.folder.is_some()).count())
+                            .unwrap_or(0),
+                        on_cancel: move |_| state.with_mut(|shell| shell.cancel_classic_tabs_switch()),
+                        on_confirm: move |_| state.with_mut(|shell| shell.confirm_classic_tabs_switch()),
+                    }
+                }
                 if let Some(dialog) = snapshot.copy_edit_dialog.clone() {
                     CopyEditOverlay {
                         dialog,
@@ -49428,6 +50023,8 @@ fn Titlebar(
     on_toggle_notifications: EventHandler<()>,
     /// Opens (or closes) a pane the active app contributed, by its pane id.
     on_toggle_app_pane: EventHandler<String>,
+    /// Open/close the tab tree rail — which IS vertical-tabs mode.
+    on_toggle_web_tabs: EventHandler<()>,
     on_restart_update: EventHandler<()>,
     on_request_window_drag: EventHandler<()>,
     on_toggle_maximized: EventHandler<()>,
@@ -50244,6 +50841,34 @@ fn Titlebar(
                     div {
                         class: "yggterm-titlebar-inline-secondary",
                         style: "display:flex; align-items:center; gap:8px;",
+                        // The TAB TREE of the active web surface. yggterm's own
+                        // button (it owns the tabs), so unlike the contributed
+                        // buttons below it is not declared by anyone — it simply
+                        // appears when the session HAS a surface, and vanishes
+                        // with it. It is the same fact as vertical-tabs mode.
+                        if snapshot.active_web_surface_overlay.is_some() {
+                            button {
+                                "data-titlebar-web-tabs-button": "1",
+                                title: "Tabs (vertical tab tree)",
+                                style: utility_icon_style(
+                                    snapshot.palette,
+                                    snapshot.right_panel_mode == RightPanelMode::WebTabs,
+                                ),
+                                onmousedown: |evt| {
+                                    evt.prevent_default();
+                                    evt.stop_propagation();
+                                },
+                                onclick: {
+                                    let on_toggle_web_tabs = on_toggle_web_tabs.clone();
+                                    move |evt: MouseEvent| {
+                                        evt.stop_propagation();
+                                        on_toggle_web_tabs.call(());
+                                    }
+                                },
+                                ondoubleclick: |evt| evt.stop_propagation(),
+                                "⊟"
+                            }
+                        }
                         // Buttons CONTRIBUTED by the active libyggterm app. The
                         // rail draws exactly what the app declared over OSC 7717
                         // and nothing else — no app icon is hardcoded here.
@@ -63996,6 +64621,9 @@ fn TerminalCanvas(
     });
     let web_surface_close_session_path = session.session_path.clone();
     let web_surface_session_path = session.session_path.clone();
+    // The classic strip's folder-overflow menu. GUI-only state, read here so the
+    // strip renders it without reaching back into the signal mid-tree.
+    let web_tab_overflow_open = state.with(|shell| shell.web_tab_overflow_open);
     // Address-bar/back/forward navigations honor the same egress rule as OSC
     // opens: loopback URLs on a remote session resolve through the session
     // host's sshd.
@@ -64124,216 +64752,9 @@ fn TerminalCanvas(
                     } else {
                     div {
                         style: format!(
-                            "position:absolute; inset:0; z-index:40; display:flex; flex-direction:{}; background:{}; border-radius:{};",
-                            if web_overlay.vertical_tabs { "row" } else { "column" },
+                            "position:absolute; inset:0; z-index:40; display:flex; flex-direction:column; background:{}; border-radius:{};",
                             theme.background, terminal_shell_radius,
                         ),
-                        // Vertical-tabs mode: a left pane replaces the top tab
-                        // bar + address bar (both collapsed below). Tabs become a
-                        // domain-grouped tree, with a mini-omnibox on top and an
-                        // extension slot at the foot.
-                        {web_overlay.vertical_tabs.then(|| {
-                            let tree = web_surface_tab_tree(&web_overlay.tabs);
-                            let pane_path = web_surface_session_path.clone();
-                            let pane_ssh = web_surface_nav_ssh_target.clone();
-                            let pane_profile = web_overlay.profile.clone();
-                            let active_tab_id = web_overlay.active_tab_id;
-                            let mini_id = format!("{web_surface_host_id}-ws-vtab-omni");
-                            let address_text = web_overlay.address_text.clone();
-                            rsx! {
-                                div {
-                                    // The left pane. Fixed width; its own column.
-                                    style: format!(
-                                        "flex:0 0 224px; min-width:0; display:flex; flex-direction:column; \
-                                         background:rgba(127,127,127,0.10); border-right:1px solid rgba(127,127,127,0.22); \
-                                         animation:ygg-vtab-slide-in 0.18s ease;",
-                                    ),
-                                    // Mini-omnibox row + a return-to-classic toggle.
-                                    div {
-                                        style: "display:flex; gap:5px; padding:8px 8px 6px; align-items:center;",
-                                        input {
-                                            id: "{mini_id}",
-                                            style: format!(
-                                                "flex:1 1 auto; min-width:0; padding:5px 11px; border-radius:12px; \
-                                                 border:1px solid rgba(127,127,127,0.35); background:rgba(127,127,127,0.14); \
-                                                 color:{}; font-size:12px; outline:none;",
-                                                theme.foreground,
-                                            ),
-                                            value: "{address_text}",
-                                            spellcheck: "false",
-                                            autocomplete: "off",
-                                            placeholder: "Search or enter address",
-                                            oninput: {
-                                                let pane_path = pane_path.clone();
-                                                move |evt: FormEvent| {
-                                                    let value = evt.value();
-                                                    state.with_mut(|shell| {
-                                                        shell.web_surface_set_address_draft(&pane_path, Some(value));
-                                                    });
-                                                }
-                                            },
-                                            onkeydown: {
-                                                let pane_path = pane_path.clone();
-                                                let pane_ssh = pane_ssh.clone();
-                                                move |evt: KeyboardEvent| {
-                                                    if evt.key() == Key::Enter {
-                                                        let target = state.with(|shell| {
-                                                            let surface = shell.web_surfaces.get(&pane_path)?;
-                                                            let text = surface.address_draft.clone().or_else(|| {
-                                                                surface.tabs.iter()
-                                                                    .find(|tab| tab.id == surface.active_tab)
-                                                                    .map(|tab| tab.url.clone())
-                                                            })?;
-                                                            Some((surface.active_tab, text))
-                                                        });
-                                                        if let Some((tab_id, text)) = target
-                                                            && let Some(url) = web_surface_address_to_url(&text)
-                                                        {
-                                                            navigate_web_surface_tab(
-                                                                state, pane_path.clone(), tab_id, url,
-                                                                pane_ssh.clone(), None,
-                                                            );
-                                                        }
-                                                    } else if evt.key() == Key::Escape {
-                                                        state.with_mut(|shell| {
-                                                            shell.web_surface_set_address_draft(&pane_path, None);
-                                                        });
-                                                    }
-                                                }
-                                            },
-                                        }
-                                        button {
-                                            style: format!(
-                                                "border:none; background:transparent; color:{}; cursor:pointer; \
-                                                 font-size:14px; line-height:1; padding:4px 6px; border-radius:6px; flex:0 0 auto;",
-                                                theme.foreground,
-                                            ),
-                                            title: "Switch to classic top tabs",
-                                            onclick: move |_| {
-                                                state.with_mut(|shell| shell.toggle_web_surface_vertical_tabs());
-                                            },
-                                            "▭"
-                                        }
-                                    }
-                                    // The tab tree: a domain header per group, its
-                                    // tabs beneath — the cwd-tree grammar for tabs.
-                                    div {
-                                        style: "flex:1 1 auto; overflow-y:auto; overflow-x:hidden; padding:2px 6px 6px;",
-                                        {tree.iter().map(|group| {
-                                            let domain = group.domain.clone();
-                                            rsx! {
-                                                div {
-                                                    key: "vgrp-{domain}",
-                                                    div {
-                                                        style: "font-size:10.5px; text-transform:uppercase; letter-spacing:0.03em; \
-                                                                opacity:0.6; padding:8px 8px 3px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;",
-                                                        "▾ {domain}"
-                                                    }
-                                                    {group.tabs.iter().map(|tab| {
-                                                        let tab_id = tab.id;
-                                                        let tab_label = tab.label.clone();
-                                                        let tab_active = tab.active;
-                                                        let is_app_tab = tab.is_app_tab;
-                                                        let select_path = pane_path.clone();
-                                                        let close_path = pane_path.clone();
-                                                        let (row_bg, row_op) = if tab_active {
-                                                            ("rgba(127,127,127,0.22)".to_string(), "1")
-                                                        } else {
-                                                            ("transparent".to_string(), "0.8")
-                                                        };
-                                                        rsx! {
-                                                            div {
-                                                                key: "vtab-{tab_id}",
-                                                                style: format!(
-                                                                    "display:flex; align-items:center; gap:6px; margin:1px 0; padding:5px 8px 5px 18px; \
-                                                                     border-radius:7px; cursor:pointer; font-size:12px; color:{}; background:{}; opacity:{};",
-                                                                    theme.foreground, row_bg, row_op,
-                                                                ),
-                                                                onclick: move |_| {
-                                                                    state.with_mut(|shell| {
-                                                                        shell.web_surface_select_tab(&select_path, tab_id);
-                                                                    });
-                                                                },
-                                                                span {
-                                                                    style: "flex:1 1 auto; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; min-width:0;",
-                                                                    "{tab_label}"
-                                                                }
-                                                                button {
-                                                                    style: format!(
-                                                                        "border:none; background:transparent; color:{}; cursor:pointer; \
-                                                                         font-size:11px; line-height:1; padding:2px 4px; border-radius:5px; flex:0 0 auto; opacity:0.7;",
-                                                                        theme.foreground,
-                                                                    ),
-                                                                    title: if is_app_tab { "Close web surface (Ctrl+C to the app)" } else { "Close tab" },
-                                                                    onclick: move |evt| {
-                                                                        evt.stop_propagation();
-                                                                        if is_app_tab {
-                                                                            let close_path = close_path.clone();
-                                                                            let endpoint = state.read().bootstrap.server_endpoint.clone();
-                                                                            state.with_mut(|shell| { shell.close_web_surface(&close_path); });
-                                                                            spawn(async move {
-                                                                                let _ = terminal_write_async(endpoint, close_path, "\u{3}".to_string()).await;
-                                                                            });
-                                                                        } else {
-                                                                            state.with_mut(|shell| { shell.web_surface_close_tab(&close_path, tab_id); });
-                                                                        }
-                                                                    },
-                                                                    "✕"
-                                                                }
-                                                            }
-                                                        }
-                                                    })}
-                                                }
-                                            }
-                                        })}
-                                        button {
-                                            style: format!(
-                                                "display:flex; align-items:center; gap:6px; width:100%; margin-top:4px; padding:6px 8px 6px 18px; \
-                                                 border:none; background:transparent; color:{}; cursor:pointer; font-size:12px; opacity:0.8; border-radius:7px;",
-                                                theme.foreground,
-                                            ),
-                                            title: "New tab",
-                                            onclick: {
-                                                let new_path = pane_path.clone();
-                                                let mini_id = mini_id.clone();
-                                                move |_| {
-                                                    state.with_mut(|shell| { shell.web_surface_new_tab(&new_path); });
-                                                    let _ = document::eval(&format!(
-                                                        "setTimeout(() => {{ const el = document.getElementById({mini_id:?}); if (el) {{ el.focus(); if (el.select) el.select(); }} }}, 60);"
-                                                    ));
-                                                }
-                                            },
-                                            "+ New tab"
-                                        }
-                                    }
-                                    // Extension slot: the browser affordances that
-                                    // are not tabs. History today; room for more.
-                                    div {
-                                        style: "display:flex; gap:4px; align-items:center; padding:7px 10px; border-top:1px solid rgba(127,127,127,0.2);",
-                                        button {
-                                            style: format!(
-                                                "border:none; background:transparent; color:{}; cursor:pointer; font-size:14px; line-height:1; padding:4px 7px; border-radius:6px;",
-                                                theme.foreground,
-                                            ),
-                                            title: "History",
-                                            onclick: {
-                                                let hist_path = pane_path.clone();
-                                                let hist_ssh = pane_ssh.clone();
-                                                let hist_profile = pane_profile.clone();
-                                                move |_| {
-                                                    navigate_web_surface_tab(
-                                                        state, hist_path.clone(), active_tab_id,
-                                                        web_history_data_url(&hist_profile), hist_ssh.clone(), None,
-                                                    );
-                                                }
-                                            },
-                                            "🕘"
-                                        }
-                                        span { style: "font-size:10.5px; opacity:0.5; letter-spacing:0.03em;", "EXTENSIONS" }
-                                    }
-                                }
-                            }
-                        })}
                         // Tab strip: a translucent tint over the page
                         // background so the ACTIVE tab (painted solid page
                         // color) visibly merges into the nav bar below while
@@ -64344,7 +64765,7 @@ fn TerminalCanvas(
                             // child = tabs, per-tab ✕, "+" and the surface ✕
                             // all share ONE vertical center line.
                             // Top tab bar. In vertical-tabs mode it collapses
-                            // away (max-height→0) — the tabs live in the left pane.
+                            // away (max-height→0) — the tabs live in the rail.
                             style: format!(
                                 "display:flex; align-items:stretch; gap:2px; padding:{}; {} box-sizing:border-box; \
                                  background:rgba(127,127,127,0.16); user-select:none; overflow:hidden; \
@@ -64352,7 +64773,12 @@ fn TerminalCanvas(
                                 if web_overlay.vertical_tabs { "0 8px" } else { "6px 8px 0" },
                                 if web_overlay.vertical_tabs { "max-height:0; min-height:0;" } else { "max-height:60px; min-height:35px;" },
                             ),
-                            {web_overlay.tabs.iter().map(|tab| {
+                            // ROOT TABS ONLY. A strip has nowhere to draw a
+                            // folder, so a filed tab is not here — it is in the
+                            // overflow menu at the end of the strip. The modal
+                            // that guards the switch out of vertical mode says
+                            // exactly this, so it is never a silent loss.
+                            {web_overlay.tabs.iter().filter(|tab| tab.folder.is_none()).map(|tab| {
                                 let tab_id = tab.id;
                                 let tab_label = tab.label.clone();
                                 let tab_active = tab.active;
@@ -64457,19 +64883,89 @@ fn TerminalCanvas(
                                 "+"
                             }
                             span { style: "flex:1 1 auto;" }
-                            // Switch to vertical tabs: tabs move to a left pane
-                            // and this top bar collapses. Persisted preference.
-                            button {
-                                style: format!(
-                                    "display:flex; align-items:center; border:none; background:transparent; color:{}; cursor:pointer; \
-                                     font-size:13px; line-height:1; padding:0 7px; opacity:0.75; flex:0 0 auto;",
-                                    theme.foreground,
-                                ),
-                                title: "Vertical tabs",
-                                onclick: move |_| {
-                                    state.with_mut(|shell| shell.toggle_web_surface_vertical_tabs());
-                                },
-                                "⊟"
+                            // The overflow menu, where the vertical-tabs toggle
+                            // used to be (that toggle now lives in the app's own
+                            // settings pane, which is where a browser setting
+                            // belongs). It holds the tabs the strip cannot draw:
+                            // the ones filed in folders, grouped by folder. It
+                            // exists only when there is something in it — a user
+                            // who never made a folder never sees it.
+                            {
+                                let filed: Vec<WebSurfaceOverlayTabView> = web_overlay
+                                    .tabs
+                                    .iter()
+                                    .filter(|tab| tab.folder.is_some())
+                                    .cloned()
+                                    .collect();
+                                let folders = web_overlay.folders.clone();
+                                let overflow_open = web_tab_overflow_open;
+                                (!filed.is_empty()).then(|| rsx! {
+                                    div {
+                                        style: "position:relative; display:flex; align-items:center; flex:0 0 auto;",
+                                        button {
+                                            "data-ws-tab-overflow": "1",
+                                            style: format!(
+                                                "display:flex; align-items:center; gap:3px; border:none; background:transparent; color:{}; \
+                                                 cursor:pointer; font-size:13px; line-height:1; padding:0 7px; opacity:{}; flex:0 0 auto;",
+                                                theme.foreground,
+                                                if overflow_open { "1" } else { "0.75" },
+                                            ),
+                                            title: "Tabs in folders ({filed.len()})",
+                                            onclick: move |_| {
+                                                state.with_mut(|shell| shell.toggle_web_tab_overflow());
+                                            },
+                                            "🗂 {filed.len()} ⌄"
+                                        }
+                                        if overflow_open {
+                                            div {
+                                                "data-ws-tab-overflow-menu": "1",
+                                                style: format!(
+                                                    "position:absolute; top:100%; right:0; z-index:60; min-width:230px; max-height:340px; \
+                                                     overflow-y:auto; padding:6px; border-radius:10px; background:{}; color:{}; \
+                                                     box-shadow:0 12px 30px rgba(0,0,0,0.28), inset 0 0 0 1px rgba(127,127,127,0.30);",
+                                                    theme.background, theme.foreground,
+                                                ),
+                                                for folder in folders.iter() {
+                                                    div {
+                                                        key: "ovf-{folder.id}",
+                                                        div {
+                                                            style: "font-size:10px; font-weight:700; letter-spacing:0.04em; text-transform:uppercase; \
+                                                                    opacity:0.55; padding:6px 8px 3px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;",
+                                                            "▸ {folder.name}"
+                                                        }
+                                                        for tab in filed.iter().filter(|tab| tab.folder.as_deref() == Some(folder.id.as_str())) {
+                                                            {
+                                                                let tab_id = tab.id;
+                                                                let tab_label = tab.label.clone();
+                                                                let tab_active = tab.active;
+                                                                let select_path = web_surface_session_path.clone();
+                                                                rsx! {
+                                                                    button {
+                                                                        key: "ovf-tab-{tab_id}",
+                                                                        style: format!(
+                                                                            "display:block; width:100%; text-align:left; border:none; border-radius:7px; \
+                                                                             padding:6px 8px 6px 18px; font-size:12px; cursor:pointer; color:{}; \
+                                                                             background:{}; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;",
+                                                                            theme.foreground,
+                                                                            if tab_active { "rgba(127,127,127,0.22)" } else { "transparent" },
+                                                                        ),
+                                                                        onclick: move |_| {
+                                                                            state.with_mut(|shell| {
+                                                                                shell.web_surface_select_tab(&select_path, tab_id);
+                                                                                shell.close_web_tab_overflow();
+                                                                            });
+                                                                        },
+                                                                        "{tab_label}"
+                                                                    }
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                })
                             }
                             // Standard libyggterm app chrome (top-right
                             // cluster): Zzz suspends the app to its terminal
@@ -64545,7 +65041,6 @@ fn TerminalCanvas(
                             let forward_target = web_overlay.forward_target.clone();
                             let address_text = web_overlay.address_text.clone();
                             let address_editing = web_overlay.address_editing;
-                            let vertical_tabs = web_overlay.vertical_tabs;
                             let suggestions = web_overlay.address_suggestions.clone();
                             let suggestion_index = web_overlay.address_suggestion_index;
                             // Dropdown rows: 0 = the synthesized go/search row
@@ -64570,15 +65065,15 @@ fn TerminalCanvas(
                             let reload_style = nav_button_style(true);
                             rsx! {
                                 div {
-                                    // The address/nav bar. Collapses in vertical
-                                    // mode — the mini-omnibox in the left pane
-                                    // takes over.
+                                    // The address/nav bar stays in BOTH modes. Only
+                                    // the tabs move to the rail; back/forward/reload
+                                    // and the omnibox (with its history completion
+                                    // and suggestion dropdown) are page controls, and
+                                    // a 300px rail is no place for them.
                                     style: format!(
-                                        "display:flex; align-items:center; gap:4px; padding:{}; background:{}; user-select:none; \
-                                         overflow:hidden; transition:max-height 0.18s ease, padding 0.18s ease; {}",
-                                        if vertical_tabs { "0 10px" } else { "6px 10px" },
+                                        "display:flex; align-items:center; gap:4px; padding:6px 10px; background:{}; user-select:none; \
+                                         overflow:hidden; max-height:60px;",
                                         theme.background,
-                                        if vertical_tabs { "max-height:0;" } else { "max-height:60px;" },
                                     ),
                                     button {
                                         style: "{back_style}",
@@ -80760,6 +81255,10 @@ fn RightRail(
     /// (widget_id, value) — a draft input changed; stays in the GUI until an
     /// action carries it to the app.
     on_app_pane_value: EventHandler<(String, String)>,
+    /// The tab rail edits live tab state directly (select, close, file, rename a
+    /// folder) — a dozen event handlers threaded as props would be noise, and
+    /// these are yggterm's OWN tabs, not an app's contributed schema.
+    state: Signal<ShellState>,
 ) -> Element {
     let requested_mode = snapshot.right_panel_mode.clone();
     let mut retained_mode = use_signal({
@@ -80842,6 +81341,8 @@ fn RightRail(
                     on_clear_notification,
                     on_clear_notifications,
                 }
+            } else if rendered_mode == RightPanelMode::WebTabs {
+                WebTabsRailBody { snapshot: snapshot.clone(), state }
             } else if rendered_app_pane_id.is_some() {
                 AppPaneRailBody {
                     snapshot: snapshot.clone(),
@@ -80850,6 +81351,352 @@ fn RightRail(
                     on_app_pane_value,
                 }
             }
+            }
+        }
+    }
+}
+/// The TAB TREE: the active web surface's tabs and the user's virtual folders.
+/// yggterm's own chrome (it owns the tabs), rendered with the cwd tree's
+/// grammar — disclosure triangles, an inline rename, drag a row into a folder,
+/// and a delete that removes the ORGANIZATION and never the content.
+///
+/// Vertical-tabs mode IS this rail: the viewport's tab strip collapses and the
+/// tabs live here. Turning the mode off retires the rail (see
+/// `set_web_surface_vertical_tabs`), so tabs always have exactly one home.
+#[component]
+fn WebTabsRailBody(snapshot: SharedSnapshot, state: Signal<ShellState>) -> Element {
+    let palette = snapshot.palette;
+    let Some(overlay) = snapshot.active_web_surface_overlay.clone() else {
+        return rsx! {
+            RailHeader { title: "Tabs".to_string(), color: palette.text.to_string() }
+            div {
+                style: format!("font-size:11px; line-height:1.5; color:{}; padding:0 2px;", palette.muted),
+                "No web surface is open in this session."
+            }
+        };
+    };
+    let session_path = snapshot.active_session_path.clone().unwrap_or_default();
+    let rename = snapshot.web_tab_folder_rename.clone();
+    let dragging = snapshot.web_tab_drag;
+    let drop_target = snapshot.web_tab_drop_target.clone();
+    let root_tabs: Vec<WebSurfaceOverlayTabView> = overlay
+        .tabs
+        .iter()
+        .filter(|tab| tab.folder.is_none())
+        .cloned()
+        .collect();
+    // One row renderer for a tab wherever it sits — root or filed. A tab is the
+    // same thing in both places; only its indent differs.
+    let tab_row = {
+        let session_path = session_path.clone();
+        move |tab: WebSurfaceOverlayTabView, indent: u32| {
+            let tab_id = tab.id;
+            let is_app_tab = tab.is_app_tab;
+            let label = tab.label.clone();
+            let active = tab.active;
+            let being_dragged = dragging == Some(tab_id);
+            let hover_folder = tab.folder.clone();
+            let (select_path, close_path) = (session_path.clone(), session_path.clone());
+            rsx! {
+                div {
+                    key: "webtab-{tab_id}",
+                    "data-web-tab-row": "{tab_id}",
+                    "data-web-tab-active": if active { "true" } else { "false" },
+                    style: format!(
+                        "display:flex; align-items:center; gap:6px; margin:1px 0; padding:6px 8px 6px {}px; \
+                         border-radius:8px; cursor:pointer; font-size:11px; color:{}; background:{}; opacity:{};",
+                        10 + indent * 12,
+                        palette.text,
+                        if active { palette.accent_soft } else { "transparent" },
+                        if being_dragged { "0.55" } else { "1" },
+                    ),
+                    onmousedown: move |_| {
+                        state.with_mut(|shell| shell.web_tab_start_drag(tab_id));
+                    },
+                    onmouseenter: {
+                        let hover_folder = hover_folder.clone();
+                        move |_| {
+                            // Hovering a tab means "put it where THIS tab lives",
+                            // so a drop onto a folder's contents files it there.
+                            let hover_folder = hover_folder.clone();
+                            state.with_mut(|shell| shell.web_tab_hover_folder(Some(hover_folder)));
+                        }
+                    },
+                    onclick: move |_| {
+                        state.with_mut(|shell| shell.web_surface_select_tab(&select_path, tab_id));
+                    },
+                    span {
+                        style: "flex:1 1 auto; min-width:0; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;",
+                        "{label}"
+                    }
+                    button {
+                        "data-web-tab-close": "{tab_id}",
+                        style: format!(
+                            "border:none; background:transparent; color:{}; cursor:pointer; font-size:11px; \
+                             line-height:1; padding:2px 4px; border-radius:5px; flex:0 0 auto; opacity:0.7;",
+                            palette.text,
+                        ),
+                        title: if is_app_tab { "Close the app (Ctrl+C)" } else { "Close tab" },
+                        onclick: move |evt: MouseEvent| {
+                            evt.stop_propagation();
+                            if is_app_tab {
+                                // The app tab IS the app: closing it ends the
+                                // surface the terminal-native way.
+                                let close_path = close_path.clone();
+                                let endpoint = state.read().bootstrap.server_endpoint.clone();
+                                state.with_mut(|shell| shell.close_web_surface(&close_path));
+                                spawn(async move {
+                                    let _ = terminal_write_async(endpoint, close_path, "\u{3}".to_string()).await;
+                                });
+                            } else {
+                                let close_path = close_path.clone();
+                                state.with_mut(|shell| {
+                                    shell.web_surface_close_tab(&close_path, tab_id);
+                                    shell.persist_web_tabs(&close_path);
+                                });
+                            }
+                        },
+                        "✕"
+                    }
+                }
+            }
+        }
+    };
+    let new_tab_path = session_path.clone();
+    let new_folder_path = session_path.clone();
+    rsx! {
+        div {
+            "data-web-tabs-rail": "1",
+            style: "display:flex; flex-direction:column; gap:8px; min-height:0; flex:1 1 auto;",
+            // A drag that ends anywhere in the rail commits against whatever row
+            // it was last over; ending over nothing is a no-op, never a silent
+            // move to the root.
+            onmouseup: move |_| {
+                state.with_mut(|shell| shell.web_tab_end_drag());
+            },
+            RailHeader { title: "Tabs".to_string(), color: palette.text.to_string() }
+            div {
+                style: "display:flex; gap:6px;",
+                button {
+                    "data-web-tab-new": "1",
+                    style: format!(
+                        "flex:1 1 auto; padding:6px 10px; border:0; border-radius:9px; background:{}; color:#fff; \
+                         font-size:11px; font-weight:700; cursor:pointer;",
+                        palette.accent,
+                    ),
+                    onclick: move |_| {
+                        state.with_mut(|shell| shell.web_surface_new_tab(&new_tab_path));
+                    },
+                    "+ New tab"
+                }
+                button {
+                    "data-web-tab-new-folder": "1",
+                    style: format!(
+                        "flex:0 0 auto; padding:6px 10px; border:1px solid rgba(127,127,127,0.35); border-radius:9px; \
+                         background:transparent; color:{}; font-size:11px; font-weight:600; cursor:pointer;",
+                        palette.text,
+                    ),
+                    title: "New folder",
+                    onclick: move |_| {
+                        state.with_mut(|shell| shell.web_tab_new_folder(&new_folder_path));
+                    },
+                    "🗂 Folder"
+                }
+            }
+            div {
+                style: "flex:1 1 auto; min-height:0; overflow-y:auto; overflow-x:hidden; padding-right:2px;",
+                // The root path: the live, unfiled tabs. In classic mode these
+                // are exactly the tabs the strip draws, which is why the modal
+                // can promise the strip keeps them.
+                div {
+                    "data-web-tab-root-drop": "1",
+                    style: format!(
+                        "font-size:10px; font-weight:700; letter-spacing:0.04em; text-transform:uppercase; \
+                         color:{}; padding:6px 8px 4px; border-radius:8px; background:{};",
+                        palette.muted,
+                        if dragging.is_some() && drop_target == Some(None) { palette.accent_soft } else { "transparent" },
+                    ),
+                    onmouseenter: move |_| {
+                        state.with_mut(|shell| shell.web_tab_hover_folder(Some(None)));
+                    },
+                    "Root"
+                }
+                for tab in root_tabs.iter().cloned() {
+                    {tab_row(tab, 0)}
+                }
+                for folder in overlay.folders.iter().cloned() {
+                    {
+                        let folder_id = folder.id.clone();
+                        let folder_tabs: Vec<WebSurfaceOverlayTabView> = overlay
+                            .tabs
+                            .iter()
+                            .filter(|tab| tab.folder.as_deref() == Some(folder_id.as_str()))
+                            .cloned()
+                            .collect();
+                        let renaming = rename
+                            .as_ref()
+                            .filter(|(id, _)| id == &folder_id)
+                            .map(|(_, draft)| draft.clone());
+                        let is_drop_target =
+                            dragging.is_some() && drop_target == Some(Some(folder_id.clone()));
+                        let collapsed = folder.collapsed;
+                        let name = folder.name.clone();
+                        let count = folder_tabs.len();
+                        let (toggle_path, rename_path, delete_path, add_path, hover_id) = (
+                            session_path.clone(),
+                            session_path.clone(),
+                            session_path.clone(),
+                            session_path.clone(),
+                            folder_id.clone(),
+                        );
+                        let (toggle_id, delete_id, add_id, rename_id) = (
+                            folder_id.clone(),
+                            folder_id.clone(),
+                            folder_id.clone(),
+                            folder_id.clone(),
+                        );
+                        rsx! {
+                            div {
+                                key: "webfolder-{folder_id}",
+                                div {
+                                    "data-web-tab-folder": "{folder_id}",
+                                    "data-web-tab-folder-collapsed": if collapsed { "true" } else { "false" },
+                                    style: format!(
+                                        "display:flex; align-items:center; gap:6px; margin-top:6px; padding:6px 8px; \
+                                         border-radius:8px; cursor:pointer; font-size:11px; font-weight:700; color:{}; background:{};",
+                                        palette.text,
+                                        if is_drop_target { palette.accent_soft } else { "transparent" },
+                                    ),
+                                    onmouseenter: {
+                                        let hover_id = hover_id.clone();
+                                        move |_| {
+                                            let hover_id = hover_id.clone();
+                                            state.with_mut(|shell| shell.web_tab_hover_folder(Some(Some(hover_id))));
+                                        }
+                                    },
+                                    onclick: {
+                                        let toggle_path = toggle_path.clone();
+                                        let toggle_id = toggle_id.clone();
+                                        move |_| {
+                                            let (toggle_path, toggle_id) = (toggle_path.clone(), toggle_id.clone());
+                                            state.with_mut(|shell| shell.web_tab_toggle_folder(&toggle_path, &toggle_id));
+                                        }
+                                    },
+                                    ondoubleclick: {
+                                        let rename_id = rename_id.clone();
+                                        move |_| {
+                                            let rename_id = rename_id.clone();
+                                            state.with_mut(|shell| shell.web_tab_begin_rename(&rename_id));
+                                        }
+                                    },
+                                    span {
+                                        style: "flex:0 0 auto; opacity:0.7; font-size:9px;",
+                                        if collapsed { "▸" } else { "▾" }
+                                    }
+                                    if let Some(draft) = renaming {
+                                        input {
+                                            "data-web-tab-folder-rename": "{folder_id}",
+                                            style: format!(
+                                                "flex:1 1 auto; min-width:0; padding:3px 6px; border-radius:6px; \
+                                                 border:1px solid {}; background:rgba(127,127,127,0.12); color:{}; \
+                                                 font-size:11px; font-weight:600; outline:none;",
+                                                palette.accent, palette.text,
+                                            ),
+                                            autofocus: true,
+                                            initial_value: "{draft}",
+                                            onclick: move |evt: MouseEvent| evt.stop_propagation(),
+                                            oninput: move |evt: FormEvent| {
+                                                let value = evt.value();
+                                                state.with_mut(|shell| shell.web_tab_set_rename_draft(value));
+                                            },
+                                            onkeydown: {
+                                                let rename_path = rename_path.clone();
+                                                move |evt: KeyboardEvent| {
+                                                    let rename_path = rename_path.clone();
+                                                    match evt.key() {
+                                                        Key::Enter => state.with_mut(|shell| shell.web_tab_commit_rename(&rename_path)),
+                                                        Key::Escape => state.with_mut(|shell| shell.web_tab_cancel_rename()),
+                                                        _ => {}
+                                                    }
+                                                }
+                                            },
+                                            onblur: {
+                                                let rename_path = rename_path.clone();
+                                                move |_| {
+                                                    let rename_path = rename_path.clone();
+                                                    state.with_mut(|shell| shell.web_tab_commit_rename(&rename_path));
+                                                }
+                                            },
+                                        }
+                                    } else {
+                                        span {
+                                            style: "flex:1 1 auto; min-width:0; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;",
+                                            "{name}"
+                                        }
+                                        span {
+                                            style: format!("flex:0 0 auto; font-size:10px; font-weight:600; color:{};", palette.muted),
+                                            "{count}"
+                                        }
+                                    }
+                                    button {
+                                        "data-web-tab-folder-add": "{folder_id}",
+                                        style: format!(
+                                            "border:none; background:transparent; color:{}; cursor:pointer; font-size:12px; \
+                                             line-height:1; padding:2px 4px; border-radius:5px; flex:0 0 auto; opacity:0.7;",
+                                            palette.text,
+                                        ),
+                                        title: "New tab in this folder",
+                                        onclick: {
+                                            let add_path = add_path.clone();
+                                            let add_id = add_id.clone();
+                                            move |evt: MouseEvent| {
+                                                evt.stop_propagation();
+                                                let (add_path, add_id) = (add_path.clone(), add_id.clone());
+                                                state.with_mut(|shell| shell.web_surface_new_tab_in_folder(&add_path, &add_id));
+                                            }
+                                        },
+                                        "+"
+                                    }
+                                    button {
+                                        "data-web-tab-folder-delete": "{folder_id}",
+                                        style: format!(
+                                            "border:none; background:transparent; color:{}; cursor:pointer; font-size:11px; \
+                                             line-height:1; padding:2px 4px; border-radius:5px; flex:0 0 auto; opacity:0.6;",
+                                            palette.text,
+                                        ),
+                                        // Says what it does: the folder goes, the
+                                        // tabs come back to the root. Deleting
+                                        // organization must never delete content.
+                                        title: "Delete folder (its tabs return to the root)",
+                                        onclick: {
+                                            let delete_path = delete_path.clone();
+                                            let delete_id = delete_id.clone();
+                                            move |evt: MouseEvent| {
+                                                evt.stop_propagation();
+                                                let (delete_path, delete_id) = (delete_path.clone(), delete_id.clone());
+                                                state.with_mut(|shell| shell.web_tab_delete_folder(&delete_path, &delete_id));
+                                            }
+                                        },
+                                        "🗑"
+                                    }
+                                }
+                                if !collapsed {
+                                    for tab in folder_tabs.iter().cloned() {
+                                        {tab_row(tab, 1)}
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            div {
+                style: format!(
+                    "flex:0 0 auto; padding-top:8px; border-top:1px solid rgba(127,127,127,0.2); \
+                     font-size:10px; line-height:1.5; color:{};",
+                    palette.muted,
+                ),
+                "Drag a tab onto a folder to file it. Folders and the tabs in them are saved for this profile; the root tabs are this visit's session."
             }
         }
     }
@@ -81064,28 +81911,40 @@ fn AppPaneRailBody(
                                     }
                                 }
                             },
+                            // A contributed toggle wears the SAME switch as yggterm's own
+                            // settings (`InlineSettingsToggleRow`) — one toggle vocabulary
+                            // across the app, no checkbox anywhere. It is a button, not an
+                            // <input type=checkbox>: the whole row is the hit target, and
+                            // the value the app receives is the string it declared values
+                            // in ("true"/"false"), unchanged from the checkbox era.
                             AppPaneWidget::Toggle { id, label, action, value } => rsx! {
-                                label {
+                                button {
                                     key: "{widget_key}",
-                                    style: "display:flex; align-items:center; gap:8px; font-size:11px; color:{palette.text}; cursor:pointer;",
-                                    input {
-                                        "data-app-pane-toggle": "{id}",
-                                        r#type: "checkbox",
-                                        checked: value,
-                                        onchange: {
-                                            let (pane_id, action, id) = (pane_id.clone(), action.clone(), id.clone());
-                                            let on_app_pane_action = on_app_pane_action.clone();
-                                            let on_app_pane_value = on_app_pane_value.clone();
-                                            move |evt: FormEvent| {
-                                                let next = evt.value();
-                                                on_app_pane_value.call((id.clone(), next.clone()));
-                                                if !action.is_empty() {
-                                                    on_app_pane_action.call((pane_id.clone(), action.clone(), Some(next)));
-                                                }
+                                    r#type: "button",
+                                    "data-app-pane-toggle": "{id}",
+                                    "data-app-pane-toggle-enabled": if value { "true" } else { "false" },
+                                    aria_pressed: if value { "true" } else { "false" },
+                                    style: app_pane_toggle_row_style(palette, value),
+                                    onclick: {
+                                        let (pane_id, action, id) = (pane_id.clone(), action.clone(), id.clone());
+                                        let on_app_pane_action = on_app_pane_action.clone();
+                                        let on_app_pane_value = on_app_pane_value.clone();
+                                        move |_| {
+                                            let next = (!value).to_string();
+                                            on_app_pane_value.call((id.clone(), next.clone()));
+                                            if !action.is_empty() {
+                                                on_app_pane_action.call((pane_id.clone(), action.clone(), Some(next.clone())));
                                             }
-                                        },
+                                        }
+                                    },
+                                    div {
+                                        style: "flex:1 1 auto; min-width:0; text-align:left; pointer-events:none; text-wrap:pretty;",
+                                        "{label}"
                                     }
-                                    "{label}"
+                                    div {
+                                        style: inline_toggle_track_style(palette, value),
+                                        div { style: inline_toggle_thumb_style(value) }
+                                    }
                                 }
                             },
                             AppPaneWidget::Button { id, label, action, primary } => rsx! {
@@ -82737,6 +83596,91 @@ fn CopyEditOverlay(
                         style: delete_confirm_button_style(palette, false),
                         onclick: move |evt| on_save.call(evt),
                         "Save"
+                    }
+                }
+            }
+        }
+    }
+}
+#[component]
+/// Leaving vertical tabs while folders exist. The classic tab bar has no place
+/// to draw a folder, so the user's organization is about to move behind an
+/// overflow menu. Nothing is deleted — but a tab silently vanishing from the
+/// strip reads as data loss, and that is the surprise this dialog exists to
+/// prevent. It is raised over a native web surface, so `has_modal_over_viewport`
+/// counts it: without that the surface would paint straight over the dialog.
+#[component]
+fn ClassicTabsSwitchOverlay(
+    palette: Palette,
+    folder_count: usize,
+    filed_count: usize,
+    on_cancel: EventHandler<MouseEvent>,
+    on_confirm: EventHandler<MouseEvent>,
+) -> Element {
+    let overlay_blur = overlay_backdrop_style("blur(18px) saturate(130%)");
+    let folders = if folder_count == 1 {
+        "1 folder".to_string()
+    } else {
+        format!("{folder_count} folders")
+    };
+    let tabs = if filed_count == 1 {
+        "1 tab".to_string()
+    } else {
+        format!("{filed_count} tabs")
+    };
+    rsx! {
+        div {
+            "data-classic-tabs-overlay": "1",
+            style: format!(
+                "position:fixed; inset:0; z-index:95; display:flex; align-items:center; justify-content:center; \
+                 background:rgba(230,239,248,0.28); backdrop-filter:{}; -webkit-backdrop-filter:{};",
+                overlay_blur, overlay_blur,
+            ),
+            onclick: move |evt| on_cancel.call(evt),
+            div {
+                "data-classic-tabs-dialog": "1",
+                style: format!(
+                    "width:min(460px, calc(100vw - 40px)); display:flex; flex-direction:column; gap:14px; \
+                     padding:22px; border-radius:18px; background:rgba(250,252,255,0.96); color:{}; \
+                     box-shadow:0 24px 54px rgba(55,83,112,0.18), inset 0 0 0 1px rgba(214,223,232,0.9); \
+                     font-family:{};",
+                    palette.text,
+                    interface_font_family(),
+                ),
+                onmousedown: |evt| evt.stop_propagation(),
+                onclick: |evt| evt.stop_propagation(),
+                div {
+                    style: "display:flex; flex-direction:column; gap:6px;",
+                    div {
+                        "data-classic-tabs-title": "1",
+                        style: format!(
+                            "font-size:18px; font-weight:700; letter-spacing:-0.01em; color:{};",
+                            palette.text,
+                        ),
+                        "The tab bar cannot show folders"
+                    }
+                    div {
+                        "data-classic-tabs-copy": "1",
+                        style: format!("font-size:12px; line-height:1.6; color:{};", palette.muted),
+                        "Classic tabs are a single strip, so no folder is populated into it. \
+                         Only the root tabs stay in the bar; {tabs} in your {folders} move into a \
+                         dropdown at the end of the strip, where the vertical-tabs control used to be. \
+                         Nothing is closed or deleted, and switching back to vertical tabs restores the tree."
+                    }
+                }
+                div {
+                    style: "display:flex; justify-content:flex-end; gap:10px;",
+                    button {
+                        "data-classic-tabs-cancel": "1",
+                        style: cancel_confirm_button_style(palette),
+                        onclick: move |evt| on_cancel.call(evt),
+                        "Keep vertical tabs"
+                    }
+                    button {
+                        "data-classic-tabs-action": "1",
+                        style: delete_confirm_button_style(palette, false),
+                        onclick: move |evt| on_confirm.call(evt),
+                        "Switch to classic"
                     }
                 }
             }
@@ -86538,6 +87482,26 @@ fn inline_toggle_row_button_style(palette: Palette, enabled: bool) -> String {
         standard_transition(&["background-color", "opacity"])
     )
 }
+/// The row an app-contributed `toggle` widget draws in. Narrower than
+/// `inline_toggle_row_button_style` (a 300px rail, no description line) but the
+/// same switch, so a contributed pane and yggterm's own settings speak one
+/// visual language.
+fn app_pane_toggle_row_style(palette: Palette, enabled: bool) -> String {
+    format!(
+        "display:flex; align-items:center; justify-content:space-between; gap:10px; width:100%; \
+         padding:8px 10px; border:none; border-radius:10px; background:{}; color:{}; \
+         font-size:11px; font-weight:600; text-align:left; cursor:pointer; opacity:{}; \
+         transition:{};",
+        if palette_is_dark(palette) {
+            "rgba(255,255,255,0.03)"
+        } else {
+            "rgba(255,255,255,0.22)"
+        },
+        palette.text,
+        if enabled { "1" } else { "0.94" },
+        standard_transition(&["background-color", "opacity"])
+    )
+}
 fn inline_toggle_affordance_style(enabled: bool) -> String {
     format!(
         "display:flex; align-items:center; gap:10px; justify-content:flex-end; flex:0 0 auto; pointer-events:none; opacity:{}; transition:{};",
@@ -86863,34 +87827,160 @@ mod tests {
         println!("wrote history page to {path}");
     }
 
-    // The vertical-tabs tree groups by domain in first-appearance order, tabs
-    // keeping their order within a domain — deterministic, cwd-tree grammar.
+    fn saved_tab(url: &str, folder: Option<&str>) -> SavedWebTab {
+        SavedWebTab {
+            url: url.to_string(),
+            title: String::new(),
+            folder: folder.map(str::to_string),
+        }
+    }
+
+    // THE persistence rule, and the one the user's "start fresh" depends on: a
+    // tab FILED in a folder is organization and survives a fresh start; a ROOT
+    // tab is the browsing session and does not. Order is preserved either way.
     #[test]
-    fn web_surface_tab_tree_groups_by_domain_in_order() {
-        let tab = |id: u64, url: &str, active: bool| WebSurfaceOverlayTabView {
-            id,
-            label: url.to_string(),
-            is_app_tab: id == 1,
-            effective_url: url.to_string(),
-            active,
+    fn a_fresh_start_purges_the_root_tabs_and_keeps_the_filed_ones() {
+        let store = WebTabStore {
+            folders: vec![WebTabFolder {
+                id: "f1".to_string(),
+                name: "Work".to_string(),
+                collapsed: false,
+            }],
+            tabs: vec![
+                saved_tab("https://a.example/", None),
+                saved_tab("https://b.example/", Some("f1")),
+                saved_tab("https://c.example/", None),
+                saved_tab("https://d.example/", Some("f1")),
+            ],
         };
-        let tabs = vec![
-            tab(1, "https://github.com/a", true),
-            tab(2, "https://news.ycombinator.com/", false),
-            tab(3, "https://github.com/b", false),
-            tab(4, "https://github.com/c", false),
-        ];
-        let tree = web_surface_tab_tree(&tabs);
-        // github.com appears first (its first tab is tab 1), then HN.
-        assert_eq!(tree.len(), 2);
-        assert_eq!(tree[0].domain, "github.com");
+
+        let fresh: Vec<String> = store
+            .tabs_to_open(false)
+            .into_iter()
+            .map(|tab| tab.url)
+            .collect();
         assert_eq!(
-            tree[0].tabs.iter().map(|t| t.id).collect::<Vec<_>>(),
-            vec![1, 3, 4],
-            "tabs keep their order within a domain"
+            fresh,
+            vec![
+                "https://b.example/".to_string(),
+                "https://d.example/".to_string()
+            ],
+            "a fresh start opens the filed tabs only — the folders and their contents are saved structure"
         );
-        assert_eq!(tree[1].domain, "news.ycombinator.com");
-        assert_eq!(tree[1].tabs.len(), 1);
+
+        let continued: Vec<String> = store
+            .tabs_to_open(true)
+            .into_iter()
+            .map(|tab| tab.url)
+            .collect();
+        assert_eq!(
+            continued,
+            vec![
+                "https://a.example/".to_string(),
+                "https://b.example/".to_string(),
+                "https://c.example/".to_string(),
+                "https://d.example/".to_string()
+            ],
+            "continuing reopens everything, in the order it was saved"
+        );
+    }
+
+    // Vertical mode IS the rail. A GUI that starts with the pref already on used
+    // to collapse the tab strip and open nothing, so the tabs had NO home — the
+    // invariant this test exists to hold. Caught live, on a restart, not by code
+    // review.
+    #[test]
+    fn a_surface_opening_under_vertical_tabs_raises_the_rail() {
+        let bootstrap = test_shell_bootstrap_with_active_session("local://ws");
+        let mut shell = ShellState::new(bootstrap);
+        shell.settings.web_surface_vertical_tabs = true;
+        shell.right_panel_mode = RightPanelMode::Hidden;
+
+        shell.upsert_web_surface(
+            "local://ws",
+            "https://example.com/".to_string(),
+            None,
+            "https://example.com/".to_string(),
+            None,
+            None,
+            // The ephemeral profile: this test must not read or write the user's
+            // real tab store.
+            WEB_SURFACE_TEMP_PROFILE.to_string(),
+            1_000,
+        );
+
+        assert_eq!(
+            shell.right_panel_mode,
+            RightPanelMode::WebTabs,
+            "the tabs must have somewhere to live the moment the surface exists"
+        );
+    }
+
+    // A pane BORROWS the rail; the tabs get it back. Closing the app's settings
+    // pane in vertical mode used to hide the rail, and with the strip collapsed
+    // the tabs had nowhere at all to be.
+    #[test]
+    fn closing_a_pane_returns_the_rail_to_the_tabs_in_vertical_mode() {
+        let bootstrap = test_shell_bootstrap_with_active_session("local://ws");
+        let mut shell = ShellState::new(bootstrap);
+        shell.settings.web_surface_vertical_tabs = true;
+        shell.upsert_web_surface(
+            "local://ws",
+            "https://example.com/".to_string(),
+            None,
+            "https://example.com/".to_string(),
+            None,
+            None,
+            WEB_SURFACE_TEMP_PROFILE.to_string(),
+            1_000,
+        );
+        assert_eq!(shell.right_panel_mode, RightPanelMode::WebTabs);
+
+        shell.set_right_panel_mode(RightPanelMode::AppPane("settings".to_string()));
+        assert_eq!(
+            shell.right_panel_mode,
+            RightPanelMode::AppPane("settings".to_string()),
+            "a pane may borrow the slot"
+        );
+
+        shell.set_right_panel_mode(RightPanelMode::Hidden);
+        assert_eq!(
+            shell.right_panel_mode,
+            RightPanelMode::WebTabs,
+            "and hiding it hands the rail back to the tabs, not to nothing"
+        );
+    }
+
+    // And a session with no surface has no tabs, so the rail stands down rather
+    // than showing an empty tree next to a terminal.
+    #[test]
+    fn the_tab_rail_stands_down_when_the_active_session_has_no_surface() {
+        let bootstrap = test_shell_bootstrap_with_active_session("local://ws");
+        let mut shell = ShellState::new(bootstrap);
+        shell.right_panel_mode = RightPanelMode::WebTabs;
+        assert_eq!(
+            shell.effective_right_panel_mode(false),
+            RightPanelMode::Hidden,
+            "a terminal session must not show an empty tab tree"
+        );
+    }
+
+    // A tab pointing at a folder that is gone (a hand-edited file, a half-written
+    // one) must land at the root, not in a folder the tree never draws — that tab
+    // would be invisible in BOTH modes.
+    #[test]
+    fn a_tab_filed_in_a_missing_folder_returns_to_the_root() {
+        let mut store = WebTabStore {
+            folders: Vec::new(),
+            tabs: vec![saved_tab("https://a.example/", Some("ghost"))],
+        };
+        store.reconcile();
+        assert_eq!(store.tabs[0].folder, None);
+        assert_eq!(
+            store.tabs_to_open(false).len(),
+            0,
+            "and being at the root, a fresh start purges it"
+        );
     }
 
     // The omnibox must relabel the internal page, never show the base64 blob.
@@ -86914,7 +88004,7 @@ mod tests {
             "http://localhost:8000/".to_string(),
             None,
             None,
-            "default".to_string(),
+            WEB_SURFACE_TEMP_PROFILE.to_string(),
             1_000,
         );
         shell.web_surface_new_tab("local://ws");
@@ -86935,7 +88025,7 @@ mod tests {
             "http://localhost:8000/next".to_string(),
             None,
             None,
-            "default".to_string(),
+            WEB_SURFACE_TEMP_PROFILE.to_string(),
             2_000,
         );
         let overlay = shell
@@ -87271,7 +88361,7 @@ mod tests {
             "https://search.brave.com/".to_string(),
             None,
             None,
-            "default".to_string(),
+            WEB_SURFACE_TEMP_PROFILE.to_string(),
             1_000,
         );
         // User navigates the app tab via the address bar.
@@ -87292,7 +88382,7 @@ mod tests {
             "https://search.brave.com/".to_string(),
             None,
             None,
-            "default".to_string(),
+            WEB_SURFACE_TEMP_PROFILE.to_string(),
             2_000,
         );
         let overlay = shell
@@ -87307,7 +88397,7 @@ mod tests {
             "https://app.example/next".to_string(),
             None,
             None,
-            "default".to_string(),
+            WEB_SURFACE_TEMP_PROFILE.to_string(),
             3_000,
         );
         let overlay = shell
@@ -87329,7 +88419,7 @@ mod tests {
             "https://search.brave.com/".to_string(),
             None,
             None,
-            "default".to_string(),
+            WEB_SURFACE_TEMP_PROFILE.to_string(),
             1_000,
         );
         shell.web_surface_set_address_draft("local://ws", Some("oi".to_string()));
@@ -91450,8 +92540,11 @@ mod tests {
     fn terminal_surface_wrapper_avoids_strict_compositor_containment() {
         let source = include_str!("shell.rs");
         let implementation = source.split("\nmod tests {").next().unwrap_or(source);
+        // The z-index is an INLINE format arg (`{z_index}`); this tripwire greps
+        // the source, so it must quote the source. It went stale when the arg was
+        // inlined and reported the containment as missing when it was right there.
         assert!(
-            implementation.contains("overflow:hidden; contain:layout style; z-index:{}; opacity:{}; visibility:{}; pointer-events:{};"),
+            implementation.contains("overflow:hidden; contain:layout style; z-index:{z_index}; opacity:{}; visibility:{}; pointer-events:{};"),
             "live xterm hosts should use light layout containment so WebKit does not isolate DOM-row paint behind a stale compositor layer"
         );
         assert!(
@@ -92623,6 +93716,7 @@ mod tests {
             WebSurfacePolicy {
                 adblock_rules: Some("[]".to_string()),
                 userscripts: vec!["console.log(1)".to_string()],
+                user_agent: None,
             },
         );
         let SurfacePolicyGate::Ready(policy) = shell.web_surface_policy_gate("local://p") else {
@@ -92720,6 +93814,7 @@ mod tests {
             WebSurfacePolicy {
                 adblock_rules: Some("[retired]".to_string()),
                 userscripts: Vec::new(),
+                user_agent: None,
             },
         );
         assert_eq!(
@@ -105876,7 +106971,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             "http://127.0.0.1:45975/".to_string(),
             None,
             None,
-            "default".to_string(),
+            WEB_SURFACE_TEMP_PROFILE.to_string(),
             current_millis(),
         );
         assert!(
@@ -107640,7 +108735,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             "http://127.0.0.1:45975/".to_string(),
             None,
             None,
-            "default".to_string(),
+            WEB_SURFACE_TEMP_PROFILE.to_string(),
             current_millis(),
         );
         shell.observe_terminal_open_attempt_from_viewport(&json!({
@@ -111127,6 +112222,12 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             active_split_group: None,
             terminal_mount_epochs: HashMap::new(),
             active_web_surface_profile: None,
+            active_web_surface_overlay: None,
+            pending_classic_tabs_switch: false,
+            web_tab_folder_rename: None,
+            web_tab_drag: None,
+            web_tab_drop_target: None,
+            web_tab_overflow_open: false,
             active_web_surface_app_name: None,
             active_web_surface_host: None,
             ssh_targets: Vec::new(),
@@ -111749,6 +112850,12 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             active_split_group: None,
             terminal_mount_epochs: HashMap::new(),
             active_web_surface_profile: None,
+            active_web_surface_overlay: None,
+            pending_classic_tabs_switch: false,
+            web_tab_folder_rename: None,
+            web_tab_drag: None,
+            web_tab_drop_target: None,
+            web_tab_overflow_open: false,
             active_web_surface_app_name: None,
             active_web_surface_host: None,
             ssh_targets: Vec::new(),
@@ -111906,6 +113013,12 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             active_split_group: None,
             terminal_mount_epochs: HashMap::new(),
             active_web_surface_profile: None,
+            active_web_surface_overlay: None,
+            pending_classic_tabs_switch: false,
+            web_tab_folder_rename: None,
+            web_tab_drag: None,
+            web_tab_drop_target: None,
+            web_tab_overflow_open: false,
             active_web_surface_app_name: None,
             active_web_surface_host: None,
             ssh_targets: Vec::new(),
@@ -112063,6 +113176,12 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             active_split_group: None,
             terminal_mount_epochs: HashMap::new(),
             active_web_surface_profile: None,
+            active_web_surface_overlay: None,
+            pending_classic_tabs_switch: false,
+            web_tab_folder_rename: None,
+            web_tab_drag: None,
+            web_tab_drop_target: None,
+            web_tab_overflow_open: false,
             active_web_surface_app_name: None,
             active_web_surface_host: None,
             ssh_targets: Vec::new(),
@@ -112223,6 +113342,12 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             active_split_group: None,
             terminal_mount_epochs: HashMap::new(),
             active_web_surface_profile: None,
+            active_web_surface_overlay: None,
+            pending_classic_tabs_switch: false,
+            web_tab_folder_rename: None,
+            web_tab_drag: None,
+            web_tab_drop_target: None,
+            web_tab_overflow_open: false,
             active_web_surface_app_name: None,
             active_web_surface_host: None,
             ssh_targets: Vec::new(),
@@ -112387,6 +113512,12 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             active_split_group: None,
             terminal_mount_epochs: HashMap::new(),
             active_web_surface_profile: None,
+            active_web_surface_overlay: None,
+            pending_classic_tabs_switch: false,
+            web_tab_folder_rename: None,
+            web_tab_drag: None,
+            web_tab_drop_target: None,
+            web_tab_overflow_open: false,
             active_web_surface_app_name: None,
             active_web_surface_host: None,
             ssh_targets: Vec::new(),
@@ -112543,6 +113674,12 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             active_split_group: None,
             terminal_mount_epochs: HashMap::new(),
             active_web_surface_profile: None,
+            active_web_surface_overlay: None,
+            pending_classic_tabs_switch: false,
+            web_tab_folder_rename: None,
+            web_tab_drag: None,
+            web_tab_drop_target: None,
+            web_tab_overflow_open: false,
             active_web_surface_app_name: None,
             active_web_surface_host: None,
             ssh_targets: Vec::new(),
@@ -112699,6 +113836,12 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             active_split_group: None,
             terminal_mount_epochs: HashMap::new(),
             active_web_surface_profile: None,
+            active_web_surface_overlay: None,
+            pending_classic_tabs_switch: false,
+            web_tab_folder_rename: None,
+            web_tab_drag: None,
+            web_tab_drop_target: None,
+            web_tab_overflow_open: false,
             active_web_surface_app_name: None,
             active_web_surface_host: None,
             ssh_targets: Vec::new(),
@@ -112889,6 +114032,12 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             active_split_group: None,
             terminal_mount_epochs: HashMap::new(),
             active_web_surface_profile: None,
+            active_web_surface_overlay: None,
+            pending_classic_tabs_switch: false,
+            web_tab_folder_rename: None,
+            web_tab_drag: None,
+            web_tab_drop_target: None,
+            web_tab_overflow_open: false,
             active_web_surface_app_name: None,
             active_web_surface_host: None,
             ssh_targets: Vec::new(),
@@ -113048,6 +114197,12 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             active_split_group: None,
             terminal_mount_epochs: HashMap::new(),
             active_web_surface_profile: None,
+            active_web_surface_overlay: None,
+            pending_classic_tabs_switch: false,
+            web_tab_folder_rename: None,
+            web_tab_drag: None,
+            web_tab_drop_target: None,
+            web_tab_overflow_open: false,
             active_web_surface_app_name: None,
             active_web_surface_host: None,
             ssh_targets: Vec::new(),
@@ -113239,6 +114394,12 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             active_split_group: None,
             terminal_mount_epochs: HashMap::new(),
             active_web_surface_profile: None,
+            active_web_surface_overlay: None,
+            pending_classic_tabs_switch: false,
+            web_tab_folder_rename: None,
+            web_tab_drag: None,
+            web_tab_drop_target: None,
+            web_tab_overflow_open: false,
             active_web_surface_app_name: None,
             active_web_surface_host: None,
             ssh_targets: Vec::new(),
@@ -113607,6 +114768,12 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             active_split_group: None,
             terminal_mount_epochs: HashMap::new(),
             active_web_surface_profile: None,
+            active_web_surface_overlay: None,
+            pending_classic_tabs_switch: false,
+            web_tab_folder_rename: None,
+            web_tab_drag: None,
+            web_tab_drop_target: None,
+            web_tab_overflow_open: false,
             active_web_surface_app_name: None,
             active_web_surface_host: None,
             ssh_targets: Vec::new(),

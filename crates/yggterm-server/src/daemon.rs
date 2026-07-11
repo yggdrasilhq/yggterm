@@ -2071,7 +2071,7 @@ struct DaemonRuntime {
     /// round-trip to the remote daemon runs on a background thread, never on
     /// the request loop.
     pending_remote_pty_resizes:
-        Arc<Mutex<HashMap<String, (RemoteMachineSnapshot, String, u16, u16)>>>,
+        Arc<Mutex<HashMap<String, (RemoteMachineSnapshot, String, SessionKind, u16, u16)>>>,
     remote_pty_resize_in_flight: Arc<Mutex<HashSet<String>>>,
 }
 
@@ -3424,7 +3424,11 @@ impl DaemonRuntime {
         if cols == 0 || rows == 0 {
             return;
         }
-        let Some((machine, session_id)) = self.server.remote_shutdown_target_for_path(path)
+        // BOTH remote agent kinds, not just codex. This resolver used to be
+        // `remote_shutdown_target_for_path`, which parses `remote-session://`
+        // only — so every `remote-cc://` session returned None here and its
+        // remote PTY was never resized for its whole life.
+        let Some((machine, session_id, kind)) = self.server.remote_agent_pty_target_for_path(path)
         else {
             return;
         };
@@ -3433,7 +3437,7 @@ impl DaemonRuntime {
                 .pending_remote_pty_resizes
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            pending.insert(path.to_string(), (machine, session_id, cols, rows));
+            pending.insert(path.to_string(), (machine, session_id, kind, cols, rows));
         }
         {
             let mut in_flight = self
@@ -3461,7 +3465,7 @@ impl DaemonRuntime {
                             .unwrap_or_else(|poisoned| poisoned.into_inner());
                         pending.remove(&path)
                     };
-                    let Some((machine, session_id, cols, rows)) = next else {
+                    let Some((machine, session_id, kind, cols, rows)) = next else {
                         let mut in_flight = in_flight
                             .lock()
                             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -3479,8 +3483,13 @@ impl DaemonRuntime {
                         }
                         break;
                     };
-                    let result =
-                        crate::resize_remote_codex_session_pty(&machine, &session_id, cols, rows);
+                    let result = crate::resize_remote_agent_session_pty(
+                        &machine,
+                        &session_id,
+                        kind,
+                        cols,
+                        rows,
+                    );
                     append_trace_event(
                         &home,
                         "daemon",
@@ -3488,12 +3497,33 @@ impl DaemonRuntime {
                         "remote_pty_resize_forwarded",
                         serde_json::json!({
                             "path": path,
+                            "kind": kind,
                             "cols": cols,
                             "rows": rows,
                             "ok": result.is_ok(),
-                            "error": result.err().map(|error| error.to_string()),
+                            "error": result.as_ref().err().map(|error| error.to_string()),
                         }),
                     );
+                    // A remote PTY stuck at the wrong grid is INVISIBLE to every
+                    // daemon-side instrument (they read the local vt100 mirror,
+                    // which already holds the client's grid), so the user sees a
+                    // TUI painting for a screen that no longer exists while the
+                    // telemetry reports a healthy session. Make the failure loud.
+                    if let Err(error) = result {
+                        append_trace_event(
+                            &home,
+                            "daemon",
+                            "terminal_resize",
+                            "remote_pty_resize_failed",
+                            serde_json::json!({
+                                "path": path,
+                                "kind": kind,
+                                "cols": cols,
+                                "rows": rows,
+                                "error": error.to_string(),
+                            }),
+                        );
+                    }
                 }
             });
         if spawn_result.is_err() {
