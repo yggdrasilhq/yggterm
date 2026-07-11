@@ -83,20 +83,24 @@ fix) once the fix is verified live on jojo.
   mechanism, and the reason it can't be a one-liner are recorded in code at
   `batch_terminal_chunks`. **This is the next thing to do on that campaign.**
 
-## Landed in code, live-activation OWED on jojo
+## Deployed live on jojo, faithful-gesture confirmation pending
 
-- **Middle-click a link in a web surface → new tab (2.10.16, e408acd8).** Root
+- **Middle-click a link in a web surface → new tab (2.10.15, c6542edc).** Root
   cause found + fixed: the surface's WebView wired no `new_window_req_handler`, so
   WebKit's `create` signal (middle-click, ctrl/cmd-click, `target="_blank"`,
   `window.open`) returned a null widget and the link was dropped. Now routed into
   yggterm's tab model — background tab for middle/ctrl-click, foreground for
   `window.open`/`_blank`; egress + profile inherited. Unit-tested on the tab-model
-  half. **OWED:** the WebKit create wiring needs a live surface with a real
-  middle-click to exercise, which the offscreen Xvfb harness cannot do (it is
-  native-surface-blind and app-control clicks never reach a child webview). jojo
-  was pinned by a concurrent agent campaign when this landed, so no GUI restart.
-  When jojo is free: deploy 2.10.16, open a web surface, middle-click a link, and
-  confirm a background tab opens (trace `web_surface / new_tab_from_link`).
+  half. Kept GUI-only (no protocol bump) so it deploys against a running
+  same-version daemon with no changeover. **Deployed to jojo 2026-07-11** via a
+  GUI-only restart (new `~/.local/bin/yggterm` build, SIGTERM+relaunch, the three
+  live daemons untouched — verified same PIDs before/after; new GUI pid confirmed
+  answering app-control). **Still pending:** a FAITHFUL confirmation, which needs a
+  real middle-click — the Xvfb harness is native-surface-blind, app-control clicks
+  never reach a child webview, WebKitGTK blocks synthetic `window.open` (no user
+  gesture), and jojo's Wayland input injection is unreliable (ydotoold). Ask the
+  user to middle-click a link in a ychrome surface; confirm via the
+  `web_surface / new_tab_from_link` trace event.
 
 ## Fixed in 2.10.2 — confirm live, then delete this section
 
