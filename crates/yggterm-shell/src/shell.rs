@@ -115241,6 +115241,104 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
         assert!(!forwarded.contains("terminal session not found"));
     }
 
+    /// THE FAITHFUL-PIPE INVARIANT (parity-rework gate, campaign 2026-07-11).
+    ///
+    /// yggterm's job is to be a PIPE: bytes the agent CLI writes to the PTY must reach
+    /// xterm unmodified. It is NOT a renderer and must never rewrite, re-encode, strip,
+    /// or reconstruct a real TUI frame — an ordinary terminal doesn't, which is why
+    /// `claude -r` typed into a plain shell never breaks while yggterm's wrapper did
+    /// (CLAUDE.md's wrapper-vs-manual parity rule).
+    ///
+    /// So: for any chunk stream carrying only genuine CLI output (no internal
+    /// transport-error line, no low-signal noise line — the only two things the
+    /// sanitizers are ALLOWED to excise), `batch_terminal_chunks` must forward it
+    /// BYTE-FOR-BYTE.
+    ///
+    /// This is the cheap tier of the parity harness. It would have caught the
+    /// carriage-return drop that produced the interleaved-frame garble on guihost. Every
+    /// future "fix" that mutates live bytes now dies here instead of on the user's screen.
+    #[test]
+    fn batch_terminal_chunks_is_a_faithful_pipe_for_real_tui_output() {
+        let corpus: [(&str, &str); 8] = [
+            (
+                "crlf code frame with SGR colors",
+                "\x1b[32m+ fn parse(text: &str) -> Keymap {\x1b[0m\r\n\x1b[31m-   todo!()\x1b[0m\r\n",
+            ),
+            (
+                "alt-screen enter, paint, exit",
+                "\x1b[?1049h\x1b[2J\x1b[H\x1b[1mheader\x1b[0m\r\nbody\r\n\x1b[?1049l",
+            ),
+            (
+                "synchronized-output frame (DEC 2026)",
+                "\x1b[?2026h\x1b[H\x1b[2Krow one\r\n\x1b[2Krow two\r\n\x1b[?2026l",
+            ),
+            (
+                "inline spinner rewriting its own row with bare CR",
+                "\rWorking... \x1b[?25l\rWorking.. \rWorking.  \x1b[?25h",
+            ),
+            (
+                "cursor-addressed repaint with erase",
+                "\x1b[10;1H\x1b[Krepainted\x1b[11;1H\x1b[Ksecond\r\n",
+            ),
+            (
+                "box drawing + wide unicode",
+                "╭──────────╮\r\n│ 日本語 ✅ │\r\n╰──────────╯\r\n",
+            ),
+            (
+                "bare LF only (unix-style stream)",
+                "line one\nline two\nline three\n",
+            ),
+            (
+                "real agent output that MENTIONS a session error",
+                "I think the session does not exist because we never wrote it.\r\n",
+            ),
+        ];
+
+        for (label, raw) in corpus {
+            let (forwarded, ..) =
+                batch_terminal_chunks(vec![yggterm_server::TerminalStreamChunk {
+                    seq: 1,
+                    data: raw.to_string(),
+                }]);
+            assert_eq!(
+                forwarded.as_deref(),
+                Some(raw),
+                "FAITHFUL-PIPE VIOLATION [{label}]: yggterm mutated real CLI output on its way \
+                 to xterm. yggterm is a pipe, not a renderer — see campaign-render-pipeline-parity-rework."
+            );
+        }
+    }
+
+    /// The same invariant across a CHUNK SPLIT: the daemon hands the GUI whatever slices
+    /// the PTY read happened to produce, so a frame split mid-escape-sequence must still
+    /// reassemble byte-for-byte. A sanitizer that classifies per-chunk can corrupt a split
+    /// frame even when it handles the whole frame correctly.
+    #[test]
+    fn batch_terminal_chunks_is_a_faithful_pipe_across_chunk_splits() {
+        let raw =
+            "\x1b[?2026h\x1b[H\x1b[32m+ added line\x1b[0m\r\n\x1b[31m- removed\x1b[0m\r\n\x1b[?2026l";
+        for split in 1..raw.len() {
+            if !raw.is_char_boundary(split) {
+                continue;
+            }
+            let (forwarded, ..) = batch_terminal_chunks(vec![
+                yggterm_server::TerminalStreamChunk {
+                    seq: 1,
+                    data: raw[..split].to_string(),
+                },
+                yggterm_server::TerminalStreamChunk {
+                    seq: 2,
+                    data: raw[split..].to_string(),
+                },
+            ]);
+            assert_eq!(
+                forwarded.as_deref(),
+                Some(raw),
+                "FAITHFUL-PIPE VIOLATION: frame split at byte {split} was not reassembled verbatim"
+            );
+        }
+    }
+
     #[test]
     fn batch_terminal_chunks_preserves_whitespace_only_terminal_echo() {
         for data in [" ", "  ", "\t", "\r", "\n", "\r\n"] {
