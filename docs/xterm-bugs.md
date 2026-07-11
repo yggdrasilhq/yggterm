@@ -1481,6 +1481,95 @@ job (the JSONL pretty-formatting surface).
 `[[spec-agent-cli-wrapper-render-parity]]`, `[[run8-findings-and-user-bug-batch]]` (user bug 8),
 `[[finding-codex-owns-scrollback-not-term-program]]` (same class: the CLI owns its history).
 
+## remote-cc-pty-never-resized
+
+**STATUS:** FIXED (code landed; activates on the next daemon changeover)
+
+### Symptom
+A remote **Claude Code** session renders a frame built for a *smaller screen*: the
+composer and the `bypass permissions on` status line float in the MIDDLE of the
+viewport, with a band of dead rows below them and a hard content edge short of
+the right margin. Every CC spinner tick repaints that undersized frame, so the
+screen churns in the wrong place and the bottom never fills — what the user
+called "this rendering dance." It cannot be fixed from the client, and no
+client-side fix ever helped, because **nothing is wrong on the client**: it is
+faithfully rendering bytes that Claude Code authored for a grid it genuinely has.
+
+Live-caught on jojo (2026-07-11): client viewport **167x63**, `claude` PTY on dev
+pinned at **147x50** — CC emitting `\x1b[50;1H` for its composer because, to it,
+row 50 *was* the bottom.
+
+### Reproduction
+1. Open a `remote-cc://` session while the terminal viewport is grid **A**.
+2. Change the viewport to grid **B** (resize the window, toggle a panel/sidebar).
+3. Re-open the session. It renders at grid **A** forever.
+
+Only a session *born* at the wrong grid shows this — one spawned while the
+viewport already was B is correct, which is why it looks intermittent.
+
+### Root cause
+The remote PTY's size has exactly ONE writer — `forward_remote_pty_resize` — and
+that writer was **Codex-only in two independent places**:
+
+1. It resolved its target via `remote_shutdown_target_for_path`, which parses
+   `remote-session://` only. A `remote-cc://` path returned `None`, so the
+   function returned before doing anything.
+2. Its delivery fn hardcoded `remote_runtime_codex_session_key(id)`
+   (`codex-runtime://…`). A CC runtime is keyed `cc-runtime://…`, so even when
+   reached it asked the remote daemon to resize a key that does not exist
+   (`terminal session not found`) — and the caller discarded that error
+   (`let _ = …`), making the failure completely silent.
+
+So a Claude Code session had **no writer of its remote PTY size after birth.**
+The size was set once at spawn and never again.
+
+This was invisible to every daemon-side instrument: the daemon resizes its own
+vt100 mirror and its local ssh PTY correctly, so `pty_rows`/`pty_cols`,
+`session_view_contract_violations`, and the daemon screen all report the client's
+real grid and call the session healthy. The only place the truth lives is the
+`claude` process's actual PTY on the remote host (CLAUDE.md misstep #3: the
+daemon screen is not what the CLI painted).
+
+### Workaround / fix
+Immediate, no deploy: `TIOCSWINSZ` the remote `claude` PTY to the client grid —
+CC SIGWINCH-repaints itself and the frame is correct instantly.
+
+Real fix: make the single writer kind-aware.
+- `remote_agent_pty_target_for_path` resolves BOTH remote agent schemes (the
+  scheme alone implies the kind, per `session_path_is_remote_agent`). The Codex
+  branch delegates to the old resolver, so codex behavior is byte-identical.
+- `resize_remote_agent_session_pty` builds the runtime key from `SessionKind`.
+- The forward failure is now traced (`remote_pty_resize_failed`) instead of
+  swallowed.
+
+No second writer is introduced — the size-war lesson still holds.
+
+### Code locations
+- `crates/yggterm-server/src/lib.rs` — `remote_agent_pty_target_for_path`,
+  `resize_remote_agent_session_pty`
+- `crates/yggterm-server/src/daemon.rs` — `forward_remote_pty_resize`
+
+### Tests
+- `remote_cc_session_pty_has_a_resize_target_and_uses_the_cc_runtime_key`
+  (`yggterm-server`) — asserts a `remote-cc://` path resolves to a resize target
+  with `SessionKind::ClaudeCode` + the `cc-runtime://` key, and pins that the
+  Codex-only resolver cannot see a CC path.
+- `ensure_session_keeps_existing_grid_so_reattach_must_resize_to_client_grid`
+  (pipeline integration) — already encoded this invariant; the remote forward
+  just never implemented it for CC.
+
+### Telemetry
+- `remote_pty_resize_forwarded` (daemon/terminal_resize) — now carries `kind`.
+  **Its total absence for a machine means no remote PTY has ever been resized.**
+- `remote_pty_resize_failed` (daemon/terminal_resize) — NEW; the forward failing
+  used to be silent.
+
+### Related memory
+`[[campaign-render-pipeline-parity-rework]]` (this is that campaign's thesis
+confirmed: `remote` is the NAMED concept and everything else is the unnamed
+fallback — here the axis is Codex-vs-CC), `[[campaign-telemetry-infinite]]`,
+`[[spec-unify-local-remote]]` (drive from `SessionKind`, not a URL prefix).
+
 ## Template (copy for new entries)
 
 ```markdown
