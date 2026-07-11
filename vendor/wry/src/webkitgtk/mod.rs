@@ -495,6 +495,14 @@ impl InnerWebView {
           .request()
           .and_then(|request| request.uri())
           .map(|uri| uri.as_str().to_string())?;
+        // A middle-click, or a ctrl/cmd-click, is the browser gesture for
+        // "open in a new tab WITHOUT switching to it". WebKit reports the
+        // originating mouse button and modifier state on the navigation
+        // action, so the embedder can honour that background semantics.
+        let background = action.mouse_button() == 2
+          || (action.modifiers()
+            & (gdk::ModifierType::CONTROL_MASK | gdk::ModifierType::META_MASK).bits())
+            != 0;
         match new_window_req_handler(
           url.clone(),
           NewWindowFeatures {
@@ -503,6 +511,7 @@ impl InnerWebView {
             opener: NewWindowOpener {
               webview: webview.clone(),
             },
+            background,
           },
         ) {
           NewWindowResponse::Allow => {

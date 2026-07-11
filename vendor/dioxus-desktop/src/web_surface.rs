@@ -20,6 +20,7 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::io::{Read as _, Write as _};
+use std::rc::Rc;
 
 use gtk::prelude::*;
 use wry::{
@@ -173,6 +174,15 @@ mod adblock {
 pub struct WebSurfaceHost {
     overlay: gtk::Overlay,
     surfaces: RefCell<HashMap<u64, Surface>>,
+    /// New-tab requests raised from inside a surface (a link opened with
+    /// middle-click / ctrl-click / `target="_blank"` / `window.open`). WebKit
+    /// would spawn a detached GTK window; instead the surface's create handler
+    /// pushes `(surface_id, url, background)` here and denies the native window,
+    /// and the shell drains this each reconcile tick to open the URL as a TAB
+    /// in the same surface's session. `background` (middle/ctrl-click) keeps the
+    /// current tab focused, matching Chrome. Shared with each surface's create
+    /// closure via `Rc`; GTK-main-thread only, like the rest of this module.
+    new_tab_requests: Rc<RefCell<Vec<(u64, String, bool)>>>,
 }
 
 fn rect_logical(w: i32, h: i32) -> Rect {
@@ -212,7 +222,14 @@ impl WebSurfaceHost {
         Self {
             overlay,
             surfaces: RefCell::new(HashMap::new()),
+            new_tab_requests: Rc::new(RefCell::new(Vec::new())),
         }
+    }
+
+    /// Drain the new-tab requests raised from inside surfaces since the last
+    /// call. Each is `(surface_id, url, background)` — see `new_tab_requests`.
+    pub fn take_new_tab_requests(&self) -> Vec<(u64, String, bool)> {
+        std::mem::take(&mut self.new_tab_requests.borrow_mut())
     }
 
     /// Open (or replace) surface `id` at the given page-relative bounds, loading
@@ -280,6 +297,25 @@ impl WebSurfaceHost {
         }
         for script in userscripts {
             builder = builder.with_initialization_script_for_main_only(script.as_str(), true);
+        }
+
+        // Route in-page "new window" requests (a link middle-clicked,
+        // ctrl-clicked, `target="_blank"`, or `window.open`) into yggterm's own
+        // tab model rather than a detached GTK window: record the URL for the
+        // shell to open as a tab in THIS surface's session, then deny the native
+        // window. Only real web pages (http/https) are routed — a `window.open`
+        // with no/blank URL or a custom scheme is left to WebKit's default.
+        {
+            let requests = self.new_tab_requests.clone();
+            let surface_id = id;
+            builder = builder.with_new_window_req_handler(move |url, features| {
+                if url.starts_with("http://") || url.starts_with("https://") {
+                    requests
+                        .borrow_mut()
+                        .push((surface_id, url, features.background));
+                }
+                wry::NewWindowResponse::Deny
+            });
         }
 
         // App-control bridge from inside a surface. WebKitGTK blocks an https
