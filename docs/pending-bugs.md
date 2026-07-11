@@ -83,6 +83,21 @@ fix) once the fix is verified live on jojo.
   mechanism, and the reason it can't be a one-liner are recorded in code at
   `batch_terminal_chunks`. **This is the next thing to do on that campaign.**
 
+## Landed in code, live-activation OWED on jojo
+
+- **Middle-click a link in a web surface → new tab (2.10.16, e408acd8).** Root
+  cause found + fixed: the surface's WebView wired no `new_window_req_handler`, so
+  WebKit's `create` signal (middle-click, ctrl/cmd-click, `target="_blank"`,
+  `window.open`) returned a null widget and the link was dropped. Now routed into
+  yggterm's tab model — background tab for middle/ctrl-click, foreground for
+  `window.open`/`_blank`; egress + profile inherited. Unit-tested on the tab-model
+  half. **OWED:** the WebKit create wiring needs a live surface with a real
+  middle-click to exercise, which the offscreen Xvfb harness cannot do (it is
+  native-surface-blind and app-control clicks never reach a child webview). jojo
+  was pinned by a concurrent agent campaign when this landed, so no GUI restart.
+  When jojo is free: deploy 2.10.16, open a web surface, middle-click a link, and
+  confirm a background tab opens (trace `web_surface / new_tab_from_link`).
+
 ## Fixed in 2.10.2 — confirm live, then delete this section
 
 - **Working-dot lag (10–45 s after the agent finished).** Root cause: the
