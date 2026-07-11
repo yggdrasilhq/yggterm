@@ -1835,7 +1835,7 @@ async fn web_surface_native_reconcile_loop(
         // Desired: (session, active_tab,
         //           [(tab, effective_url, reload_nonce, socks_port, profile)],
         //           policy gate).
-        let (desired, active_visible_sessions, fido2_dialog_open): (
+        let (desired, active_visible_sessions, modal_over_viewport): (
             Vec<(
                 String,
                 u64,
@@ -1887,21 +1887,31 @@ async fn web_surface_native_reconcile_loop(
             // the eval blinds out for seconds, and a backgrounded surface would
             // otherwise linger composited over the newly-revealed session (the
             // "ychrome->terminal switch broken for ~6-7s" class).
-            let active_visible_sessions = shell_ref
-                .web_surfaces
-                .keys()
-                .filter(|session_path| {
-                    terminal_active_visible_for_session(shell_ref, session_path.as_str())
-                })
-                .cloned()
-                .collect();
-            // A passkey presence dialog is a Dioxus overlay in the MAIN webview,
-            // but a native web surface (a gtk overlay child) draws ABOVE all DOM —
-            // so while the dialog is up, the surface must be HIDDEN or the user
-            // never sees the prompt (they just see the page, which is exactly the
-            // "no popup appeared" report). Like a real OS passkey prompt, the
-            // ceremony takes over the viewport.
-            (desired, active_visible_sessions, shell_ref.pending_fido2.is_some())
+            // A modal (passkey prompt, close/delete confirm, edit-summary) is a
+            // Dioxus overlay in the MAIN webview, but a native web surface (a gtk
+            // overlay child) draws ABOVE all DOM — so while a modal is up the
+            // surface must be cleared or the user only sees the dimmed backdrop,
+            // never the dialog (the "modal doesn't appear over the webview"
+            // report). Merely `set_visible(false)` does NOT clear a WebKitGTK
+            // surface (the reload-white pathology — see the stash comment below),
+            // so treat a modal as making NO surface active-visible: the active
+            // surface then joins the "backgrounded" set and is STASHED (detached
+            // from the overlay), which reliably clears it. When the modal closes
+            // it becomes active-visible again and unstashes in place — page intact.
+            let modal_over_viewport = shell_ref.has_modal_over_viewport();
+            let active_visible_sessions = if modal_over_viewport {
+                std::collections::HashSet::new()
+            } else {
+                shell_ref
+                    .web_surfaces
+                    .keys()
+                    .filter(|session_path| {
+                        terminal_active_visible_for_session(shell_ref, session_path.as_str())
+                    })
+                    .cloned()
+                    .collect()
+            };
+            (desired, active_visible_sessions, modal_over_viewport)
         };
         // Destroy first: closed/swept surfaces and closed tabs must release
         // their webview (and WebContext) even when the DOM oracle is gone.
@@ -2062,10 +2072,10 @@ async fn web_surface_native_reconcile_loop(
                 let want_visible = rect.is_some()
                     && tab_id == active_tab
                     && active_visible_sessions.contains(session_path.as_str())
-                    // Hide the surface under a passkey dialog (it draws over the
-                    // DOM the dialog lives in). The reconciler re-shows it when the
-                    // dialog clears, since pending_fido2 flips back to None.
-                    && !fido2_dialog_open;
+                    // Hide the surface under any over-viewport modal (it draws
+                    // above the DOM the modal lives in). The reconciler re-shows it
+                    // when the modal clears (has_modal_over_viewport flips back).
+                    && !modal_over_viewport;
                 // Destroy-and-recreate cases (close + remove here; the
                 // lazy-create branch rebuilds a fresh webview the same tick):
                 //   - proxy or profile change: both are fixed per WebContext,
@@ -5635,6 +5645,18 @@ impl ShellState {
             .is_some_and(|surface| {
                 now_ms.saturating_sub(surface.last_seen_ms) <= WEB_SURFACE_STALE_AFTER_MS
             })
+    }
+    /// True while a modal that must sit OVER the viewport is open. A native web
+    /// surface is a GTK overlay child that draws above ALL DOM, so any such modal
+    /// (rendered in the DOM) is invisible behind a live surface unless the surface
+    /// is hidden while it is up — the user saw only the dimmed backdrop, never the
+    /// dialog (the passkey prompt AND the close/delete confirm both hit this). The
+    /// reconciler hides the surface whenever this is true. Add every new
+    /// over-viewport modal here.
+    fn has_modal_over_viewport(&self) -> bool {
+        self.pending_fido2.is_some()
+            || self.pending_delete.is_some()
+            || self.copy_edit_dialog.is_some()
     }
     fn web_surface_select_tab(&mut self, session_path: &str, tab_id: u64) {
         if let Some(surface) = self.web_surfaces.get_mut(session_path)
@@ -48084,10 +48106,21 @@ fn Titlebar(
                         }
                         "☰"
                     }
-                    if active_session_offers_view_toggle(&snapshot) {
                     div {
                         class: "yggterm-titlebar-view-toggle",
-                        style: segmented_control_track_style(snapshot.palette),
+                        // Keep the toggle's footprint even when it does not apply
+                        // (non-agent sessions) so the other titlebar elements hold
+                        // their usual position — hidden + non-interactive, not
+                        // removed. Only agent CLIs (Codex/Claude Code) act on it.
+                        style: format!(
+                            "{}{}",
+                            segmented_control_track_style(snapshot.palette),
+                            if active_session_offers_view_toggle(&snapshot) {
+                                ""
+                            } else {
+                                " visibility:hidden; pointer-events:none;"
+                            },
+                        ),
                         onmousedown: |evt| evt.stop_propagation(),
                         button {
                             style: segmented_control_segment_style(
@@ -48123,7 +48156,6 @@ fn Titlebar(
                             }
                             "Terminal"
                         }
-                    }
                     }
                     div {
                         style: format!(
