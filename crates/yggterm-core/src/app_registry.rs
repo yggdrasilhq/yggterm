@@ -35,7 +35,7 @@ pub const APP_REGISTRY_DIRNAME: &str = "apps";
 /// comes from wherever the user invoked the verb (a cwd-tree row, the active
 /// session), never from the manifest — a launcher entry describes the app, not
 /// the place.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AppVerb {
     /// Stable id, unique within the app. Rides menu callbacks.
     pub id: String,
@@ -43,10 +43,15 @@ pub struct AppVerb {
     pub label: String,
     #[serde(default)]
     pub args: Vec<String>,
+    /// The ALT+ KeyTip letter this verb *wants* in the New… scope (spec §10). A
+    /// single character; the shell's resolver may deny it (reserved, taken, or
+    /// folded into a numbered group). Empty/absent = let the ladder choose.
+    #[serde(default)]
+    pub keytip: String,
 }
 
 /// One installed libyggterm app, as its manifest declares it.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AppManifest {
     /// Registry key. Must equal the manifest's file stem, so an app cannot
     /// squat another app's entry by writing a differently-named file.
@@ -63,6 +68,10 @@ pub struct AppManifest {
     pub binary: String,
     #[serde(default)]
     pub verbs: Vec<AppVerb>,
+    /// The ALT+ KeyTip letter this app wants where it appears as a single node
+    /// (spec §10). Same rules as [`AppVerb::keytip`]. Empty/absent = ladder.
+    #[serde(default)]
+    pub keytip: String,
 }
 
 impl AppManifest {
@@ -228,7 +237,9 @@ mod tests {
                 id: "new".to_string(),
                 label: "New Ychrome".to_string(),
                 args: Vec::new(),
+                ..Default::default()
             }],
+            ..Default::default()
         }
     }
 
@@ -349,7 +360,9 @@ mod tests {
                 id: "new".into(),
                 label: "New".into(),
                 args: vec!["--profile".into(), "work profile".into()],
+                ..Default::default()
             }],
+            ..Default::default()
         };
         assert_eq!(
             app.command_for(&app.verbs[0]),
