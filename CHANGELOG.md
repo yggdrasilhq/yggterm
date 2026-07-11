@@ -2,6 +2,33 @@
 
 This file tracks user-visible changes in `yggterm`.
 
+## 2.10.15
+
+- **The metadata rail now shows the GUI client version next to the daemon's.** They
+  are separate programs that upgrade separately, and the whole stale-daemon trap is
+  that they can silently disagree — so a new **Client** line sits directly above the
+  **Daemon** group, and each side says plainly when it is older than the other.
+
+- **A deferred hot-restart now names every session holding it open, not just one.**
+  Previously the panel reported only the *first* blocker: you would clear that
+  session, the restart would still defer, and the panel would name a session it had
+  never mentioned — so a swap pinned by three agents read as an endless, unexplained
+  wait. Expand the Daemon group to see the full list, what each session is doing
+  (working now vs. active *n* ago), and the idle window they are measured against.
+
+- **Deferrals are now recorded.** A daemon that refuses to restart writes a
+  `daemon_cold_shutdown_deferred_idle_gate` trace event carrying every blocker and
+  its own uptime, so "why is this daemon still on an old build?" is answerable after
+  the fact instead of being invisible.
+
+- **Metadata groups collapse.** Click any group heading (Session, Runtime, History,
+  Client, Daemon) to fold it away; a folded group shows how many rows it is hiding.
+
+- **The hot-restart button no longer clicks into silence.** It announces
+  "Preparing hot-restart" *before* the handoff begins (it is a blocking round-trip
+  that migrates every live PTY), and the rail's daemon version, PID and uptime now
+  refresh the moment the swap lands instead of waiting for the next poll.
+
 ## 2.10.14
 
 - **Fixed: "No conversation found with session ID …" when relaunching a Claude
