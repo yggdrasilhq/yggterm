@@ -2,6 +2,36 @@
 
 This file tracks user-visible changes in `yggterm`.
 
+## 2.10.16
+
+- **Fixed: a remote Claude Code session could render a frame built for a screen
+  that no longer existed.** The symptom was a terminal that would not settle —
+  the composer and status line stranded in the MIDDLE of the viewport, a band of
+  dead rows below them, content stopping short of the right margin, and the whole
+  thing repainting in the wrong place on every spinner tick. It looked like a
+  rendering bug, and nothing aimed at the renderer ever helped, because nothing
+  was wrong with the renderer: Claude Code's PTY on the remote host was still the
+  size it was born at (measured live: 147x50) while the viewport had moved on
+  (167x63). CC was painting a *correct* frame for the screen it had been told it
+  had, and yggterm was faithfully drawing it.
+
+  A remote agent PTY's size has exactly one writer, and it turned out to be
+  codex-only in two separate ways — it looked up its target with a parser that
+  only understands codex session paths, and it addressed the remote runtime with
+  a hardcoded codex key that does not exist for a Claude Code session (the remote
+  daemon answered "terminal session not found", and the error was discarded). So
+  a Claude Code session's PTY was sized once, at spawn, and never again. Only a
+  session *born* at the wrong grid was affected, which is why it seemed to strike
+  at random. The writer is now driven by the session kind, and a failure to resize
+  a remote PTY is traced instead of swallowed.
+
+- **The tab tree becomes a real sidebar, and web-surface settings actually
+  persist.** Tabs now live in a proper side rail with virtual folders, and the
+  app pane is a view over yggterm's own preferences. The settings serializer was
+  hand-written and had silently never saved any `web_surface_*` field — including
+  the zoom level, which had shipped as "persisted" for weeks — so those choices
+  now survive a restart.
+
 ## 2.10.15
 
 - **Middle-click a link in a web surface to open it in a new background tab.**
