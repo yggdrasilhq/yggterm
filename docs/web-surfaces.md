@@ -103,11 +103,12 @@ pages) render normally.
 
 ## Sidebars (decision, 2026-07-04; contribution shipped 2026-07-09)
 
-Web surfaces keep the generic yggterm sidebars: settings (zoom controls are
-named "Viewport Zoom", not "Terminal Zoom", for exactly this reason),
-notifications (pan-yggterm), and metadata (already per-session-type by
-design). Those four — plus Connect — are yggterm's own and are the only
-`RightPanelMode` variants left.
+Web surfaces keep the generic yggterm sidebars: settings, notifications
+(pan-yggterm), and metadata (already per-session-type by design). Those four —
+plus Connect — are yggterm's own and are the only `RightPanelMode` variants
+left. (The Settings main-zoom control auto-labels for what the viewport holds:
+"Terminal Zoom", "Paper Zoom", or an app's own name for a live web surface —
+"Ychrome Global Zoom"; see "Per-site zoom" below.)
 
 Everything app-specific is a **contribution**: the app declares its panes over
 `OSC 7717 ; sidebar` and serves each schema from a loopback control endpoint.
@@ -155,6 +156,36 @@ Changing the adblock *ruleset content* still needs a GUI restart: WebKit
 compiles the filter once per process (`ensure_compiled`'s `started` flag).
 Toggling it off, and every userscript change, take effect on the next surface
 (re)create — reload the page.
+
+## Per-site zoom belongs to the APP (2026-07-11)
+
+yggterm owns one global web-surface zoom (`AppSettings.web_surface_zoom_percent`,
+the Settings main-zoom control). A per-site number — some sites read better at
+130%, some at 80% — is browsing config, so it lives on the app's host, declared
+the same shape as the policy:
+
+```
+declare  { ..., app_name: "Ychrome", zoom_version: "<stamp>" }   # OSC, ~4s heartbeat
+GET <control>/zoom -> { sites: { host: percent } }
+```
+
+- `zoom_version` is a change-detector stamp over the site map; the GUI refetches
+  `/zoom` only when it moves, exactly like `policy_version`. Unlike the policy,
+  the zoom fetch is **non-gating**: it never holds a surface's creation, and the
+  OLD map stays applied while a refetch is in flight (no flicker to global).
+- The GUI does the match itself (`zoom_override_for_host`, the twin of ychrome's
+  `webzoom::zoom_for_host`): longest-suffix, so an entry for `youtube.com` covers
+  `music.youtube.com`; a bare TLD is never consulted. On each navigation the
+  reconciler applies the override for the page's host via `WebView::zoom`, or the
+  global when a site has none. One rule, so the pane and the reconciler agree
+  about which pages a stored zoom governs.
+- `app_name` labels the main zoom control ("Ychrome Global Zoom"), so the user
+  reads the global as the fallback the per-site overrides refine. yggterm
+  hardcodes no app name.
+- An action reply may set `refetch_zoom: true` (the pane's `−`/`+`/`Reset`): the
+  GUI re-reads `/zoom` and applies it to the live page at once. The GUI injects
+  the active surface's live effective zoom as `values.zoom` on every action so a
+  pane control steps from what is on screen.
 
 ## Renderer and security
 
