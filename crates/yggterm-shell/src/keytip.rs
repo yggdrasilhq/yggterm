@@ -587,6 +587,181 @@ fn pick_letter(
         .unwrap_or('z')
 }
 
+/// The resolved KeyTip tree for a whole frame (spec §1): every open scope's
+/// assigned nodes, keyed by `ScopeId::as_str`. Built in Rust during render from
+/// the per-scope declarations, never scraped from the DOM. It is the one source
+/// both the badge painter and the chord walker read, so a letter can never mean
+/// two things.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct KeyTipTree {
+    scopes: BTreeMap<String, Vec<AssignedNode>>,
+}
+
+/// The outcome of walking a typed chord against the tree.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ChordResolution {
+    /// A valid prefix; wait for more keys.
+    Pending,
+    /// The sequence maps to `key`'s action; act and dismiss the overlay.
+    Run(String),
+    /// A container opener (or a group letter): run `key`'s open action, if any,
+    /// and keep the overlay open showing `scope` (a real scope id, or a synthetic
+    /// group scope `"<scope>/<letter>"`). `key` is empty for a group letter.
+    Descend { key: String, scope: String },
+    /// No binding and no prefix — dismiss.
+    Invalid,
+}
+
+impl KeyTipTree {
+    /// Build a tree from `(scope, declarations)` pairs. Each scope is assigned
+    /// independently by [`assign_scope`]; the caller supplies every open scope's
+    /// declarations in render order. `scope_of` maps each [`ScopeId`] to the
+    /// declarations shown in it.
+    pub fn build(scopes: &[(ScopeId, Vec<KeyTipDecl>)], keymap: &KeymapConfig) -> Self {
+        let mut map = BTreeMap::new();
+        for (scope, decls) in scopes {
+            map.insert(scope.as_str(), assign_scope(scope, decls, keymap));
+        }
+        Self { scopes: map }
+    }
+
+    /// The assigned nodes of one scope (by its string id), if present.
+    pub fn scope_nodes(&self, scope: &str) -> Option<&[AssignedNode]> {
+        self.scopes.get(scope).map(|nodes| nodes.as_slice())
+    }
+
+    /// The tip a given node key should paint while `sequence` is the chord typed
+    /// so far — i.e. when `sequence` names the scope the node lives in. Returns the
+    /// uppercased tip, or `None` when this node's scope is not the one on screen.
+    /// This is the single lookup the badge painter uses (SSOT with the walker).
+    pub fn tip_for(&self, sequence: &str, node_key: &str) -> Option<String> {
+        let scope = self.scope_at(sequence)?;
+        for node in self.scopes.get(&scope)? {
+            match node {
+                AssignedNode::Leaf { key, tip, .. } if key == node_key => {
+                    return Some(tip.to_ascii_uppercase());
+                }
+                AssignedNode::Group { members, tip, .. } => {
+                    // The group's bare letter paints for the *first* member's key
+                    // (the node the render site anchors to); members' numbers
+                    // paint one level deeper (handled by group_member_tip).
+                    if members.iter().any(|member| member.key == node_key)
+                        && members.first().map(|m| &m.key) == Some(&node_key.to_string())
+                    {
+                        return Some(tip.to_ascii_uppercase());
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
+    /// The number a group member should paint while the group letter is open —
+    /// i.e. `sequence` names the group's scope plus its letter.
+    pub fn group_member_tip(&self, sequence: &str, node_key: &str) -> Option<String> {
+        // The synthetic group scope is "<parent-scope>/<letter>"; split it back.
+        let (parent_seq, letter) = sequence.split_at(sequence.len().checked_sub(1)?);
+        let scope = self.scope_at(parent_seq)?;
+        for node in self.scopes.get(&scope)? {
+            if let AssignedNode::Group { tip, members, .. } = node {
+                if tip == letter {
+                    if let Some(member) = members.iter().find(|m| m.key == node_key) {
+                        return Some(member.number.to_string());
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Which scope id a typed prefix lands in (walking descends). `""` → root.
+    /// Returns a synthetic `"<scope>/<letter>"` when the prefix ends on a group
+    /// letter. `None` if the prefix is not a valid path.
+    fn scope_at(&self, sequence: &str) -> Option<String> {
+        let mut scope = ScopeId::Root.as_str();
+        let mut chars = sequence.chars().peekable();
+        while let Some(c) = chars.next() {
+            let nodes = self.scopes.get(&scope)?;
+            let node = nodes.iter().find(|n| n.tip() == c.to_string())?;
+            match node {
+                AssignedNode::Leaf {
+                    target: Target::Descend(child),
+                    ..
+                } => scope = child.as_str(),
+                AssignedNode::Leaf { .. } => return None, // a Run node has no sub-scope
+                AssignedNode::Group { tip, .. } => {
+                    // Entering a group: the rest must be a digit selecting a member.
+                    return Some(format!("{scope}/{tip}"));
+                }
+            }
+        }
+        Some(scope)
+    }
+
+    /// Walk a full typed sequence and decide what to do (§4). Re-resolves from
+    /// scratch each keystroke, exactly like the shipped flat resolver, so a
+    /// `Descend` node's open-action fires once (on the keystroke that lands on it)
+    /// and never re-fires as the chord grows.
+    pub fn resolve(&self, sequence: &str) -> ChordResolution {
+        let sequence = sequence.to_ascii_lowercase();
+        if sequence.is_empty() {
+            return ChordResolution::Pending;
+        }
+        let mut scope = ScopeId::Root.as_str();
+        let mut chars = sequence.chars().peekable();
+        while let Some(c) = chars.next() {
+            let last = chars.peek().is_none();
+            let Some(nodes) = self.scopes.get(&scope) else {
+                return ChordResolution::Invalid;
+            };
+            let Some(node) = nodes.iter().find(|n| n.tip() == c.to_string()) else {
+                return ChordResolution::Invalid;
+            };
+            match node {
+                AssignedNode::Leaf { key, target, .. } => match target {
+                    Target::Run => {
+                        return if last {
+                            ChordResolution::Run(key.clone())
+                        } else {
+                            ChordResolution::Invalid
+                        };
+                    }
+                    Target::Descend(child) => {
+                        if last {
+                            return ChordResolution::Descend {
+                                key: key.clone(),
+                                scope: child.as_str(),
+                            };
+                        }
+                        scope = child.as_str();
+                    }
+                },
+                AssignedNode::Group { tip, members, .. } => {
+                    if last {
+                        return ChordResolution::Descend {
+                            key: String::new(),
+                            scope: format!("{scope}/{tip}"),
+                        };
+                    }
+                    // Next char selects a numbered member.
+                    let Some(d) = chars.next() else {
+                        return ChordResolution::Invalid;
+                    };
+                    let after_last = chars.peek().is_none();
+                    let number = d.to_digit(10);
+                    let member = number.and_then(|n| members.iter().find(|m| m.number == n));
+                    return match (member, after_last) {
+                        (Some(member), true) => ChordResolution::Run(member.key.clone()),
+                        _ => ChordResolution::Invalid,
+                    };
+                }
+            }
+        }
+        ChordResolution::Pending
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -722,5 +897,102 @@ mod tests {
             Chord::parse("ctrl+alt+pagedown").unwrap().display(),
             "Ctrl+Alt+PageDown"
         );
+    }
+
+    // --- KeyTipTree resolver ---
+
+    fn insert_tree() -> KeyTipTree {
+        // Root has the New… opener (i, descends into Insert) and a plain toggle.
+        // Insert has two shell items + two colliding apps forming a group on 'n'.
+        let root = vec![
+            KeyTipDecl::shell("sidebar.toggle", "Toggle sidebar", 'b', Target::Run),
+            KeyTipDecl::shell(
+                "insert.menu",
+                "New …",
+                'i',
+                Target::Descend(ScopeId::Insert),
+            ),
+        ];
+        let insert = vec![
+            KeyTipDecl::shell("insert.session", "New session", 's', Target::Run),
+            KeyTipDecl::shell("insert.terminal", "New terminal", 't', Target::Run),
+            KeyTipDecl::app("insert.n.ychrome", "New Ychrome", Some('n'), Target::Run),
+            KeyTipDecl::app("insert.n.cellulose", "New Cellulose", Some('n'), Target::Run),
+        ];
+        KeyTipTree::build(
+            &[(ScopeId::Root, root), (ScopeId::Insert, insert)],
+            &KeymapConfig::default(),
+        )
+    }
+
+    #[test]
+    fn resolve_root_run_and_descend() {
+        let t = insert_tree();
+        assert_eq!(t.resolve(""), ChordResolution::Pending);
+        assert_eq!(t.resolve("b"), ChordResolution::Run("sidebar.toggle".into()));
+        assert_eq!(
+            t.resolve("i"),
+            ChordResolution::Descend {
+                key: "insert.menu".into(),
+                scope: "insert.menu".into()
+            }
+        );
+        assert_eq!(t.resolve("z"), ChordResolution::Invalid);
+    }
+
+    #[test]
+    fn resolve_descend_then_run() {
+        let t = insert_tree();
+        assert_eq!(t.resolve("is"), ChordResolution::Run("insert.session".into()));
+        assert_eq!(t.resolve("it"), ChordResolution::Run("insert.terminal".into()));
+        // 'b' is not in the Insert scope.
+        assert_eq!(t.resolve("ib"), ChordResolution::Invalid);
+    }
+
+    #[test]
+    fn resolve_group_opens_then_selects_member() {
+        let t = insert_tree();
+        // 'in' lands on the group letter -> descend into the number picker.
+        assert_eq!(
+            t.resolve("in"),
+            ChordResolution::Descend {
+                key: String::new(),
+                scope: "insert.menu/n".into()
+            }
+        );
+        // 'in1' / 'in2' pick the numbered members (render-order numbering).
+        assert_eq!(t.resolve("in1"), ChordResolution::Run("insert.n.ychrome".into()));
+        assert_eq!(t.resolve("in2"), ChordResolution::Run("insert.n.cellulose".into()));
+        assert_eq!(t.resolve("in9"), ChordResolution::Invalid);
+    }
+
+    #[test]
+    fn tip_for_follows_the_open_scope() {
+        let t = insert_tree();
+        // At root, the openers paint; the Insert children do not.
+        assert_eq!(t.tip_for("", "sidebar.toggle").as_deref(), Some("B"));
+        assert_eq!(t.tip_for("", "insert.menu").as_deref(), Some("I"));
+        assert_eq!(t.tip_for("", "insert.session"), None);
+        // Once 'i' is typed, the Insert scope's children paint.
+        assert_eq!(t.tip_for("i", "insert.session").as_deref(), Some("S"));
+        assert_eq!(t.tip_for("i", "insert.terminal").as_deref(), Some("T"));
+        assert_eq!(t.tip_for("i", "sidebar.toggle"), None);
+        // The group letter paints for its first member's anchor.
+        assert_eq!(t.tip_for("i", "insert.n.ychrome").as_deref(), Some("N"));
+    }
+
+    #[test]
+    fn group_member_numbers_paint_when_group_open() {
+        let t = insert_tree();
+        assert_eq!(
+            t.group_member_tip("in", "insert.n.ychrome").as_deref(),
+            Some("1")
+        );
+        assert_eq!(
+            t.group_member_tip("in", "insert.n.cellulose").as_deref(),
+            Some("2")
+        );
+        // Not while the group is closed.
+        assert_eq!(t.group_member_tip("i", "insert.n.ychrome"), None);
     }
 }
