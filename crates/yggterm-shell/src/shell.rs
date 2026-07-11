@@ -3876,6 +3876,20 @@ fn row_supports_terminal(shell: &ShellState, row: &BrowserRow) -> bool {
 fn active_viewport_shows_terminal_theme(snapshot: &RenderSnapshot) -> bool {
     snapshot.active_view_mode == WorkspaceViewMode::Terminal
 }
+/// Whether the titlebar's Web View ↔ Terminal toggle should appear for the active
+/// session. It is a libyggterm-spec affordance shown ONLY when a session truly has
+/// BOTH surfaces: an agent CLI (Codex / Claude Code) renders its JSONL transcript
+/// as the Web View and its PTY as the Terminal, so it gets the toggle. A plain
+/// shell has only a terminal. A libyggterm app (ychrome et al.) runs inside a
+/// shell session and OWNS its own surface — no generic toggle — until an app opts
+/// in through the spec (future: an app-declared flag over OSC 7717). So the gate
+/// is simply "is the active session an agent CLI".
+fn active_session_offers_view_toggle(snapshot: &RenderSnapshot) -> bool {
+    snapshot
+        .active_session
+        .as_ref()
+        .is_some_and(|session| session.kind.is_agent())
+}
 fn rendered_surface_noun(session: &ManagedSessionView) -> &'static str {
     if session.kind == SessionKind::Document {
         match metadata_value(session, "Kind").as_str() {
@@ -48070,6 +48084,7 @@ fn Titlebar(
                         }
                         "☰"
                     }
+                    if active_session_offers_view_toggle(&snapshot) {
                     div {
                         class: "yggterm-titlebar-view-toggle",
                         style: segmented_control_track_style(snapshot.palette),
@@ -48108,6 +48123,7 @@ fn Titlebar(
                             }
                             "Terminal"
                         }
+                    }
                     }
                     div {
                         style: format!(
@@ -57063,14 +57079,29 @@ fn TerminalCanvas(
                                     }
                                     "open" | "heartbeat" => {
                                         let (touched, recently_closed) = state.with_mut(|shell| {
-                                            shell.sweep_stale_web_surfaces(now_ms);
-                                            (
-                                                shell.touch_web_surface(&surface_session_path, now_ms),
-                                                shell.web_surface_recently_deliberately_closed(
+                                            // TOUCH BEFORE SWEEP. This heartbeat is proof THIS
+                                            // session's app is alive right now, so refresh its
+                                            // last_seen first — otherwise the sweep below would
+                                            // remove it on the staleness it accrued while
+                                            // BACKGROUNDED (reads paused, no heartbeats read).
+                                            // On switch-back the session is active-visible again
+                                            // and its buffered heartbeat arrives before the
+                                            // reconciler can unstash; sweeping-then-touching
+                                            // deleted the live surface, and the same heartbeat
+                                            // then REBUILT it at the app's LAUNCH url (ychrome's
+                                            // brave start page) with a fresh socks — losing the
+                                            // user's navigation to chat.example.com AND its cookie
+                                            // jar (new WebContext). Touch first: the surface
+                                            // survives, unstashes in place, keeps its page.
+                                            let touched =
+                                                shell.touch_web_surface(&surface_session_path, now_ms);
+                                            let recently_closed = shell
+                                                .web_surface_recently_deliberately_closed(
                                                     &surface_session_path,
                                                     now_ms,
-                                                ),
-                                            )
+                                                );
+                                            shell.sweep_stale_web_surfaces(now_ms);
+                                            (touched, recently_closed)
                                         });
                                         // A heartbeat is LIVENESS, not intent: normally it
                                         // may refresh an existing surface but must not
