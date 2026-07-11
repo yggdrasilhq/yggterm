@@ -2,6 +2,21 @@
 
 This file tracks user-visible changes in `yggterm`.
 
+## 2.10.11
+
+- **A page that redirects itself no longer loops on a remote (SOCKS) surface.**
+  A site like chat.example.com redirects `/` to `/auth` when you are logged out. On a
+  remote session the surface egresses through an `ssh -D` SOCKS tunnel, and the
+  reconciler wrongly treated any tunnelled tab as "don't follow the page's real
+  URL" — so it kept navigating the webview back to `/`, which redirected again,
+  forever (the "unstable, refreshes every few seconds" report; a normal browser
+  just follows the redirect once). A SOCKS tab reports the real URL, so it now
+  follows it; only an `ssh -L` loopback rewrite stays pinned.
+- **Omnibox history no longer mislabels a page** (e.g. a "Brave Search" title
+  stuck on an chat.example.com row). A page's title lags a URL change, so recording
+  them together paired the new URL with the previous page's title; history now
+  records the title only once it belongs to that URL.
+
 ## 2.10.10
 
 - **Modals now appear over a web surface.** A native web surface draws above all
