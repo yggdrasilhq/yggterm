@@ -3735,7 +3735,7 @@ fn snapshot_retained_terminal_session_view(session: &ManagedSessionView) -> Mana
 
 fn active_viewport_zoom_label(snapshot: &RenderSnapshot) -> String {
     match snapshot.active_view_mode {
-        WorkspaceViewMode::Terminal => "Viewport Zoom".to_string(),
+        WorkspaceViewMode::Terminal => "Terminal Zoom".to_string(),
         WorkspaceViewMode::Rendered => snapshot
             .selected_row
             .as_ref()
@@ -10640,7 +10640,7 @@ impl ShellState {
     }
     fn set_main_zoom(&mut self, view_mode: WorkspaceViewMode, value: f32) {
         let label = match view_mode {
-            WorkspaceViewMode::Terminal => "viewport zoom",
+            WorkspaceViewMode::Terminal => "terminal zoom",
             WorkspaceViewMode::Rendered => "preview zoom",
         };
         let (before, after) = set_main_zoom_settings_for_view(&mut self.settings, view_mode, value);
@@ -81770,7 +81770,20 @@ fn ZoomSettingRow(
     let focus_key_on_focus = field_key.clone();
     let mut draft_percent = use_signal(|| percent.to_string());
     let mut focused = use_signal(|| false);
-    let display_percent = draft_percent();
+    // While the field is focused the user is mid-edit, so honor their draft;
+    // otherwise mirror the canonical `percent` prop directly. Deriving the
+    // display from focus state — rather than a use_effect that copies `percent`
+    // into `draft` — is what makes a +/- step (or a keyboard zoom shortcut)
+    // show up: those re-render with a fresh `percent` but touch neither
+    // `focused` nor `draft`, so the old effect (which captured `percent` by
+    // value and only re-fired on focus/draft reads) never updated the number
+    // or the width-tracking pill. Reading `percent` here re-derives on every
+    // render, so both stay in lockstep with the setting.
+    let display_percent = if focused() {
+        draft_percent()
+    } else {
+        percent.to_string()
+    };
     // The number's pill snugly tracks its content: the field grows as more digits
     // are typed / stepped up and shrinks back down for smaller values
     // (user-reported 2026-06-28). Width is digit-count driven so "50" reads
@@ -81781,14 +81794,6 @@ fn ZoomSettingRow(
         .count()
         .max(1);
     let zoom_input_width_px = 22 + zoom_input_digits as i32 * 12;
-    use_effect(move || {
-        if !focused() {
-            let canonical = percent.to_string();
-            if draft_percent() != canonical {
-                draft_percent.set(canonical);
-            }
-        }
-    });
     rsx! {
         div {
             style: "display:flex; flex-direction:column; gap:4px;",
@@ -81849,6 +81854,11 @@ fn ZoomSettingRow(
                         on_focus_input.call(focus_key_on_click.clone());
                     },
                     onfocus: move |_| {
+                        // Seed the draft from the canonical value: while unfocused the
+                        // display mirrors `percent`, so editing must begin there (the
+                        // draft may hold a stale value from a prior edit or never have
+                        // caught a +/- step).
+                        draft_percent.set(percent.to_string());
                         focused.set(true);
                         on_focus_input.call(focus_key_on_focus.clone());
                     },
