@@ -181,6 +181,13 @@ pub(crate) enum TerminalJsEvent {
         /// changes, so a ~4s heartbeat never drags the ruleset across the wire.
         /// Absent ⇒ the app ships no policy and its surfaces get none.
         policy_version: Option<String>,
+        /// The app's display name, shown on the main zoom control ("Ychrome
+        /// Global Zoom"). The app names itself; yggterm never hardcodes it.
+        app_name: Option<String>,
+        /// Opaque stamp over the app's per-site zoom overrides, the same trick as
+        /// `policy_version`: the GUI refetches `<control>/zoom` only when it
+        /// moves. Absent ⇒ the app ships no per-site zoom.
+        zoom_version: Option<String>,
     },
     /// A WebAuthn passkey ceremony (OSC 7717 `fido2 ; request`) asking for the
     /// user's presence. The app carries only the rpId and a display label — no
@@ -333,6 +340,10 @@ enum TerminalJsEventWire {
         panes: Vec<SidebarPaneDeclarationWire>,
         #[serde(default)]
         policy_version: Option<String>,
+        #[serde(default)]
+        app_name: Option<String>,
+        #[serde(default)]
+        zoom_version: Option<String>,
     },
     Fido2Request {
         action: String,
@@ -474,11 +485,15 @@ impl From<TerminalJsEventWire> for TerminalJsEvent {
                 control,
                 panes,
                 policy_version,
+                app_name,
+                zoom_version,
             } => TerminalJsEvent::SidebarContribution {
                 action,
                 session,
                 control,
                 policy_version,
+                app_name,
+                zoom_version,
                 panes: panes
                     .into_iter()
                     .map(|pane| SidebarPaneDeclaration {
