@@ -1575,6 +1575,58 @@ pub struct ServerRuntimeStatus {
     /// identical to a healthy one.
     #[serde(default)]
     pub hot_restart_block_reason: Option<String>,
+    /// EVERY session currently deferring the restart, not just the first. The one-line
+    /// `hot_restart_block_reason` above is a summary of exactly this list; a client that
+    /// wants to show the user what to clear (or an agent mining why a daemon went stale)
+    /// reads the structured form. `#[serde(default)]` so an older daemon's status still
+    /// parses — it simply reports no blockers.
+    #[serde(default)]
+    pub hot_restart_blockers: Vec<HotRestartBlocker>,
+}
+
+/// A session is working right now (`esc to interrupt` on its screen).
+pub const HOT_RESTART_BLOCKER_WORKING: &str = "working";
+/// A session was active inside the idle window, so a swap could still eat a turn.
+pub const HOT_RESTART_BLOCKER_RECENTLY_ACTIVE: &str = "recently_active";
+
+/// One session holding a hot-restart open, and why.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HotRestartBlocker {
+    pub session_key: String,
+    /// [`HOT_RESTART_BLOCKER_WORKING`] or [`HOT_RESTART_BLOCKER_RECENTLY_ACTIVE`].
+    pub kind: String,
+    /// How long since this session last produced output. `None` when unreadable.
+    #[serde(default)]
+    pub idle_ms: Option<u64>,
+    /// The idle window the session is being measured against.
+    #[serde(default)]
+    pub threshold_ms: u64,
+}
+
+/// Collapse the blocker list into the single line the metadata panel prints. Pure, so the
+/// wording is unit-testable and cannot drift from the predicate the daemon acts on.
+pub fn hot_restart_block_reason_summary(blockers: &[HotRestartBlocker]) -> Option<String> {
+    let first = blockers.first()?;
+    let head = match first.kind.as_str() {
+        HOT_RESTART_BLOCKER_WORKING => {
+            format!("{} is working (esc to interrupt)", first.session_key)
+        }
+        _ => match first.idle_ms {
+            Some(idle_ms) => format!(
+                "{} was active {}s ago (idle window {}s)",
+                first.session_key,
+                idle_ms / 1_000,
+                first.threshold_ms / 1_000
+            ),
+            None => format!("{} was recently active", first.session_key),
+        },
+    };
+    // Naming only the first blocker is what made this opaque: clear that session and the
+    // restart still defers, on a session the panel never mentioned. Say how many more.
+    match blockers.len() {
+        1 => Some(head),
+        n => Some(format!("{head} (+{} more session(s))", n - 1)),
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2235,8 +2287,9 @@ impl DaemonRuntime {
         // The SAME predicate the cold-retire loop consults, reported verbatim — so what
         // the user reads is the reason the daemon is actually acting on, not a parallel
         // explanation that can drift from it.
-        let hot_restart_block_reason =
-            self.hot_update_idle_gate_block_reason(&owned_terminal_session_keys);
+        let hot_restart_blockers =
+            self.hot_update_idle_gate_blockers(&owned_terminal_session_keys);
+        let hot_restart_block_reason = hot_restart_block_reason_summary(&hot_restart_blockers);
         let running_build_id = *DAEMON_RUNNING_BUILD_ID;
         let on_disk_build_id = current_build_id();
         let started_at_ms = *DAEMON_STARTED_AT_MS;
@@ -2284,37 +2337,60 @@ impl DaemonRuntime {
                 && on_disk_build_id != 0
                 && running_build_id != on_disk_build_id,
             hot_restart_block_reason,
+            hot_restart_blockers,
         }
     }
 
-    /// Idle gate for hot-update (#19): returns `Some(reason)` when a hot-update
-    /// should be DEFERRED to preserve agent CLI work / prompt cache, else `None`.
-    /// Blocks when any owned session is currently working (`esc to interrupt`
-    /// via the shared [`yggterm_core::screen_text_shows_agent_working`] SSOT) or
-    /// produced output more recently than the idle threshold. Fail-safe:
-    /// unknown/unreadable sessions do not block (the session-survival defer
-    /// still protects them). Overridable via `YGGTERM_HOT_UPDATE_IGNORE_IDLE_GATE`.
-    fn hot_update_idle_gate_block_reason(&self, owned_runtime_keys: &[String]) -> Option<String> {
+    /// Idle gate for hot-update (#19): every owned session currently DEFERRING a
+    /// hot-restart, in the daemon's own words.
+    ///
+    /// Blocks when a session is working (`esc to interrupt`, via the shared
+    /// [`yggterm_core::screen_text_shows_agent_working`] SSOT) or produced output more
+    /// recently than the idle threshold. Fail-safe: unknown/unreadable sessions do not
+    /// block. Overridable via `YGGTERM_HOT_UPDATE_IGNORE_IDLE_GATE`.
+    ///
+    /// Returns ALL blockers, not just the first. Reporting only the first made the
+    /// deferral opaque: the user clears the named session, the restart still defers, and
+    /// the panel names a DIFFERENT session — so a swap pinned by three agents read as an
+    /// endless unexplained wait. On jojo (2026-07-11) that opacity let a 2.10.3 daemon run
+    /// for 19h44m with 2.10.13 on disk. See [[finding-stale-daemon-trap]].
+    fn hot_update_idle_gate_blockers(&self, owned_runtime_keys: &[String]) -> Vec<HotRestartBlocker> {
         if hot_update_idle_gate_overridden() {
-            return None;
+            return Vec::new();
         }
         let threshold_ms = hot_update_idle_threshold_ms();
+        let mut blockers = Vec::new();
         for key in owned_runtime_keys {
             let runtime_path = self.terminal_runtime_key_for_path(key);
             if let Some(screen) = self.terminals.session_screen_snapshot(&runtime_path)
                 && yggterm_core::screen_text_shows_agent_working(&screen)
             {
-                return Some(format!("session {key} is actively working (esc to interrupt)"));
+                blockers.push(HotRestartBlocker {
+                    session_key: key.clone(),
+                    kind: HOT_RESTART_BLOCKER_WORKING.to_string(),
+                    idle_ms: self.terminals.session_idle_for_ms(&runtime_path),
+                    threshold_ms,
+                });
+                continue;
             }
             if let Some(idle_ms) = self.terminals.session_idle_for_ms(&runtime_path)
                 && idle_ms < threshold_ms
             {
-                return Some(format!(
-                    "session {key} was active {idle_ms}ms ago (< {threshold_ms}ms idle threshold)"
-                ));
+                blockers.push(HotRestartBlocker {
+                    session_key: key.clone(),
+                    kind: HOT_RESTART_BLOCKER_RECENTLY_ACTIVE.to_string(),
+                    idle_ms: Some(idle_ms),
+                    threshold_ms,
+                });
             }
         }
-        None
+        blockers
+    }
+
+    /// The same predicate the retire loop acts on, collapsed to one line for the panel.
+    fn hot_update_idle_gate_block_reason(&self, owned_runtime_keys: &[String]) -> Option<String> {
+        let blockers = self.hot_update_idle_gate_blockers(owned_runtime_keys);
+        hot_restart_block_reason_summary(&blockers)
     }
 
     /// Gather the live OS migration signals for a runtime key we own. Reads the
@@ -9434,6 +9510,18 @@ fn spawn_disk_binary_version_poll(
                 rt.hot_update_idle_gate_block_reason(&owned)
             };
             if let Some(reason) = block_reason {
+                // PROBE hot_update_deferred: the ONLY durable record of why a daemon is
+                // still running an old build. Without it a stale daemon is invisible
+                // after the fact — jojo ran 2.10.3 for 19h44m with 2.10.13 on disk and
+                // there was nothing to mine that said why ([[finding-stale-daemon-trap]]).
+                // Carries EVERY blocker, so "which session pinned it, for how long" is
+                // answerable from the trace alone. Once per poll is fine: the retire loop
+                // ticks slowly and a stale daemon is exactly the thing worth over-logging.
+                let blockers = {
+                    let rt = lock_daemon_runtime(&runtime, "cold_shutdown_idle_gate_blockers");
+                    let owned = rt.terminals.session_keys();
+                    rt.hot_update_idle_gate_blockers(&owned)
+                };
                 append_trace_event(
                     &home_dir,
                     "daemon",
@@ -9445,7 +9533,11 @@ fn spawn_disk_binary_version_poll(
                         "newer_daemon_version": newer_daemon_version,
                         "current_version": SERVER_PROTOCOL_VERSION,
                         "current_pid": std::process::id(),
+                        "current_uptime_ms": current_millis_u64()
+                            .saturating_sub(*DAEMON_STARTED_AT_MS),
                         "reason": reason,
+                        "blocker_count": blockers.len(),
+                        "blockers": blockers,
                     }),
                 );
                 continue;
@@ -11732,6 +11824,65 @@ fn terminal_write_strategy_for_path(
 
 #[cfg(test)]
 mod tests {
+    use super::{
+        HOT_RESTART_BLOCKER_RECENTLY_ACTIVE, HOT_RESTART_BLOCKER_WORKING, HotRestartBlocker,
+        hot_restart_block_reason_summary,
+    };
+
+    fn blocker(key: &str, kind: &str, idle_ms: Option<u64>) -> HotRestartBlocker {
+        HotRestartBlocker {
+            session_key: key.to_string(),
+            kind: kind.to_string(),
+            idle_ms,
+            threshold_ms: 300_000,
+        }
+    }
+
+    #[test]
+    fn no_blockers_means_nothing_is_deferring_the_restart() {
+        assert_eq!(hot_restart_block_reason_summary(&[]), None);
+    }
+
+    #[test]
+    fn a_working_session_is_named_with_what_it_is_doing() {
+        let reason = hot_restart_block_reason_summary(&[blocker(
+            "local://abc",
+            HOT_RESTART_BLOCKER_WORKING,
+            Some(0),
+        )])
+        .expect("a working session defers the restart");
+        assert!(reason.contains("local://abc"), "{reason}");
+        assert!(reason.contains("working"), "{reason}");
+        assert!(!reason.contains("more session"), "one blocker adds no tail: {reason}");
+    }
+
+    #[test]
+    fn a_recently_active_session_reports_idle_time_in_seconds_not_raw_ms() {
+        let reason = hot_restart_block_reason_summary(&[blocker(
+            "local://abc",
+            HOT_RESTART_BLOCKER_RECENTLY_ACTIVE,
+            Some(42_000),
+        )])
+        .expect("a recently-active session defers the restart");
+        assert!(reason.contains("42s"), "raw milliseconds tell the user nothing: {reason}");
+        assert!(reason.contains("300s"), "the idle window must be stated: {reason}");
+    }
+
+    #[test]
+    fn extra_blockers_are_counted_so_a_deferral_is_never_an_unexplained_wait() {
+        // Naming only the FIRST blocker is what made this opaque: the user clears that
+        // session, the restart still defers, and the panel names a session it never
+        // mentioned. The count is the honesty fix.
+        let reason = hot_restart_block_reason_summary(&[
+            blocker("local://a", HOT_RESTART_BLOCKER_WORKING, Some(0)),
+            blocker("local://b", HOT_RESTART_BLOCKER_WORKING, Some(0)),
+            blocker("local://c", HOT_RESTART_BLOCKER_RECENTLY_ACTIVE, Some(1_000)),
+        ])
+        .expect("three blockers defer the restart");
+        assert!(reason.contains("local://a"), "{reason}");
+        assert!(reason.contains("+2 more session(s)"), "{reason}");
+    }
+
     // `shutdown()` must never make a pre-2.9.66 daemon type `/exit` into the
     // user's prompt. An unparseable version is treated as OLD — the safe
     // direction, because guessing "new" writes into a live prompt.
