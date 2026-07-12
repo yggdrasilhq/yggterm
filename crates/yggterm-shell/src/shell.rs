@@ -3477,6 +3477,9 @@ struct ShellState {
     titlebar_maximize_toggle_request_at_ms: u64,
     alt_overlay_active: bool,
     alt_overlay_sequence: String,
+    /// The live session JUMP MODE highlight (`ALT,J`): the path the cursor is on
+    /// while the Live list is being walked, `None` when jump mode is not up.
+    alt_jump_path: Option<String>,
     /// The ALT+ KeyTips keymap in force (Excel-familiar defaults ∪ the user's
     /// `~/.yggterm/keymap.json` overrides). SSOT for the letters; the registry
     /// (`command_registry`) is SSOT for the command structure. See
@@ -3985,6 +3988,10 @@ struct RenderSnapshot {
     titlebar_overflow_menu_open: bool,
     alt_overlay_active: bool,
     alt_overlay_sequence: String,
+    /// Jump mode (`ALT,J`): `(1-based index, count, label)` of the highlighted live
+    /// session, `None` when jump mode is not up. Drives the breadcrumb — the only
+    /// feedback there is when the sidebar is closed.
+    session_jump_status: Option<(usize, usize, String)>,
     /// The ALT+ keymap in force, so KeyTip badges read their letter from the
     /// SSOT instead of hardcoding it — a remap moves badge and binding together.
     keymap: Keymap,
@@ -3996,6 +4003,10 @@ struct RenderSnapshot {
     keymap_editor_open: bool,
     keymap_editor_error: Option<String>,
     selected_tree_paths: Vec<String>,
+    /// The row menu's contents for `context_menu_row` (empty when closed) — the
+    /// SSOT the mouse menu draws and the `rowmenu` KeyTip scope declares.
+    row_menu_items: Vec<RowMenuItem>,
+    row_menu_title: String,
     context_menu_row: Option<BrowserRow>,
     context_menu_context_row: Option<BrowserRow>,
     context_menu_position: Option<(f64, f64)>,
@@ -5172,6 +5183,7 @@ impl ShellState {
             titlebar_maximize_toggle_request_at_ms: 0,
             alt_overlay_active: false,
             alt_overlay_sequence: String::new(),
+            alt_jump_path: None,
             keymap,
             keytip_config,
             keymap_editor_open: false,
@@ -5800,6 +5812,48 @@ impl ShellState {
             .as_deref()
             .map(|path| self.active_sidebar_panes(path, current_millis()))
             .unwrap_or_default();
+        // The ROW MENU, built ONCE per frame: `ContextMenuOverlay` draws this list
+        // and the KeyTip tree's `rowmenu` scope declares it, so the mouse menu and
+        // the ALT layer cannot disagree about what the menu holds.
+        let selected_tree_paths: Vec<String> = self.selected_tree_paths.iter().cloned().collect();
+        let (row_menu_items, row_menu_title) = match self.context_menu_row.as_ref() {
+            Some(row) => {
+                let drag_paths = if selected_tree_paths.is_empty() {
+                    selected_row
+                        .as_ref()
+                        .filter(|selected| is_tree_drag_source_row(selected))
+                        .map(|selected| vec![selected.full_path.clone()])
+                        .unwrap_or_default()
+                } else {
+                    selected_tree_paths.clone()
+                };
+                let split_members =
+                    split_group_member_labels(&self.split_groups, &live_sessions, row);
+                let split_candidates =
+                    split_candidate_paths_for(row, &selected_tree_paths, &self.split_groups);
+                let items = row_menu_items(
+                    row,
+                    self.server.apps(),
+                    keep_alive_plan.as_ref(),
+                    &split_members,
+                    split_candidates.len(),
+                    valid_drop_target(&drag_paths, row),
+                    saved_ssh_target_machine_key(row, self.server.ssh_targets()).is_some(),
+                );
+                let selected_count = drag_paths.len().max(1);
+                let title = if selected_count > 1
+                    && drag_paths.iter().any(|path| path == &row.full_path)
+                {
+                    format!("{selected_count} selected items")
+                } else {
+                    row.label.clone()
+                };
+                (items, title)
+            }
+            None => (Vec::new(), String::new()),
+        };
+        let keytip_tree =
+            build_keytip_tree(&self.keytip_config, self.server.apps(), &row_menu_items);
         RenderSnapshot {
             palette: palette,
             search_query: self.search_query.clone(),
@@ -5885,12 +5939,15 @@ impl ShellState {
             titlebar_overflow_menu_open: self.titlebar_overflow_menu_open,
             alt_overlay_active: self.alt_overlay_active,
             alt_overlay_sequence: self.alt_overlay_sequence.clone(),
-            keytip_tree: build_keytip_tree(&self.keytip_config, self.server.apps()),
+            session_jump_status: self.session_jump_status(),
+            keytip_tree,
             keytip_config: self.keytip_config.clone(),
             keymap: self.keymap.clone(),
             keymap_editor_open: self.keymap_editor_open,
             keymap_editor_error: self.keymap_editor_error.clone(),
-            selected_tree_paths: self.selected_tree_paths.iter().cloned().collect(),
+            selected_tree_paths,
+            row_menu_items,
+            row_menu_title,
             context_menu_row: self.context_menu_row.clone(),
             context_menu_context_row: self.context_menu_context_row.clone(),
             context_menu_position: self.context_menu_position,
@@ -12663,6 +12720,100 @@ impl ShellState {
         self.select_tree_row(&target, TreeSelectionMode::Replace);
         Some(target.full_path)
     }
+    /// The Live Sessions list, in sidebar order — the one order jump mode walks and
+    /// `session.next`/`session.prev` step through. SSOT for "the live list".
+    fn live_session_jump_paths(&self) -> Vec<String> {
+        self.server
+            .live_session_views()
+            .iter()
+            .map(|session| normalize_live_session_path(&session.session_path))
+            .collect()
+    }
+    /// Enter JUMP MODE (`ALT,J`, spec §8 — lists are navigated, not badged): the
+    /// overlay stays up over the Live list with the active session highlighted, and
+    /// the arrows / PageUp / PageDown walk it until Enter commits or Esc cancels.
+    /// The highlight IS the sidebar selection, so "here" follows the cursor exactly
+    /// as it does for arrow-navigation in the sidebar — no second highlight concept.
+    fn begin_session_jump(&mut self) {
+        let paths = self.live_session_jump_paths();
+        let Some(first) = paths.first().cloned() else {
+            self.alt_jump_path = None;
+            return;
+        };
+        let active = self
+            .server
+            .active_session_path()
+            .map(normalize_live_session_path)
+            .filter(|path| paths.contains(path));
+        self.alt_jump_path = Some(active.unwrap_or(first));
+        self.select_jump_highlight();
+    }
+    /// Move the jump highlight by `delta` rows (or to an edge), wrapping at the ends
+    /// like `session.next`/`session.prev` do. Returns the newly highlighted path.
+    fn navigate_session_jump(&mut self, delta: i32, to_edge: bool) -> Option<String> {
+        let paths = self.live_session_jump_paths();
+        if paths.is_empty() {
+            return None;
+        }
+        let count = paths.len() as i32;
+        let current = self
+            .alt_jump_path
+            .as_ref()
+            .and_then(|path| paths.iter().position(|candidate| candidate == path))
+            .map(|index| index as i32);
+        let next = if to_edge {
+            if delta < 0 { 0 } else { count - 1 }
+        } else {
+            match current {
+                Some(index) => ((index + delta) % count + count) % count,
+                None if delta < 0 => count - 1,
+                None => 0,
+            }
+        };
+        let target = paths.get(next as usize)?.clone();
+        self.alt_jump_path = Some(target.clone());
+        self.select_jump_highlight();
+        Some(target)
+    }
+    /// Mirror the jump highlight into the sidebar selection, so the row lights up
+    /// (when the sidebar is open) without stealing DOM focus from the terminal —
+    /// the ALT bridge already owns the keyboard while the overlay is up.
+    fn select_jump_highlight(&mut self) {
+        let Some(path) = self.alt_jump_path.clone() else {
+            return;
+        };
+        let Some(row) = self
+            .snapshot()
+            .rows
+            .into_iter()
+            .find(|row| row.full_path == path)
+        else {
+            return;
+        };
+        self.select_tree_row(&row, TreeSelectionMode::Replace);
+    }
+    /// The highlighted session's `(1-based index, count, label)` — the jump-mode
+    /// breadcrumb, and the only feedback there is when the sidebar is closed.
+    ///
+    /// Reads the SERVER's live views, never `snapshot()` — the snapshot calls this,
+    /// so touching it here would recurse.
+    fn session_jump_status(&self) -> Option<(usize, usize, String)> {
+        let path = self.alt_jump_path.as_ref()?;
+        let views = self.server.live_session_views();
+        let index = views
+            .iter()
+            .position(|session| &normalize_live_session_path(&session.session_path) == path)?;
+        let label = self
+            .session_title_overrides
+            .get(path)
+            .cloned()
+            .or_else(|| {
+                let title = views[index].title.clone();
+                (!title.trim().is_empty()).then_some(title)
+            })
+            .unwrap_or_else(|| path.clone());
+        Some((index + 1, views.len(), label))
+    }
     fn extend_tree_selection(&mut self, row: &BrowserRow) {
         let rows = self.all_sidebar_rows_for_selection();
         let anchor = self
@@ -13402,6 +13553,10 @@ impl ShellState {
     fn clear_alt_overlay(&mut self) {
         self.alt_overlay_active = false;
         self.alt_overlay_sequence.clear();
+        // Jump mode lives inside the overlay: dismissing the overlay ends it. The
+        // selection it moved STAYS where the cursor left it — the same contract as
+        // arrow-navigating the sidebar, so "here" is never surprising.
+        self.alt_jump_path = None;
     }
     /// Open the ALT+ keymap editor modal (Settings ▸ "Edit ALT+ keys").
     fn open_keymap_editor(&mut self) {
@@ -19761,6 +19916,31 @@ fn launch_context_for_optional_row(
         None => terminal_launch_context(shell),
     })
 }
+/// Launch an app verb at "here" — the app-verb twin of
+/// [`spawn_start_session_for_row`]. Resolves the anchor row ONCE and uses it for
+/// both the cwd and the sidebar insert position, so "New Ychrome" from the
+/// titlebar `+` lands below the active row, exactly as it does from the row menu.
+fn spawn_launch_app_verb_here(
+    mut state: Signal<ShellState>,
+    app: AppManifest,
+    verb: AppVerb,
+    explicit_row: Option<BrowserRow>,
+) {
+    let anchor = state.with_mut(|shell| {
+        shell.clear_alt_overlay();
+        shell.close_titlebar_new_menu();
+        shell.close_context_menu();
+        launch_anchor_row(shell, explicit_row)
+    });
+    let launch_context = launch_context_for_optional_row(state, anchor.clone());
+    spawn_launch_app_verb(
+        state,
+        app,
+        verb,
+        launch_context,
+        anchor.map(|row| row.full_path),
+    );
+}
 /// Flatten the host's app registry into the entries a launcher menu draws, in a
 /// stable order (apps by name, verbs as the app declared them).
 ///
@@ -21851,16 +22031,27 @@ fn spawn_start_group_session(mut state: Signal<ShellState>, row: BrowserRow, kin
         session_kind_action_label(kind),
         row.label
     );
-    let launch_context = state.with(|shell| group_session_launch_context(shell, &row, kind));
-    let terminal_appearance =
-        state.with(|shell| shell.effective_terminal_identity_appearance().to_string());
+    let (launch_context, terminal_appearance) = state.with_mut(|shell| {
+        // Every launch door lands here (see [`spawn_start_session_for_row`]), so
+        // the surface bookkeeping the `+` menu and the KeyTip layer need is done
+        // once, here: remember the viewport we are leaving, drop the start page,
+        // and dismiss whichever chrome invoked us.
+        shell.remember_current_viewport_for_history();
+        shell.show_start_page_when_no_live_sessions = false;
+        shell.clear_alt_overlay();
+        shell.close_titlebar_new_menu();
+        shell.close_context_menu();
+        (
+            group_session_launch_context(shell, &row, kind),
+            shell.effective_terminal_identity_appearance().to_string(),
+        )
+    });
     // "Open new … here" should land the new row directly below the
     // right-clicked row in Live Sessions, not at the top. The daemon
     // resolves the anchor and fails open (top insert) when the clicked
     // row is not a live session (e.g. a cwd-tree group).
     let insert_after = row.full_path.clone();
     clear_sidebar_keyboard_owner();
-    state.with_mut(|shell| shell.close_context_menu());
     match launch_context {
         TerminalLaunchContext::Local { cwd, title_hint } => {
             let terminal_appearance = terminal_appearance.clone();
@@ -21925,76 +22116,6 @@ fn spawn_start_group_session(mut state: Signal<ShellState>, row: BrowserRow, kin
         }
     }
 }
-fn current_agent_session_launch_context(
-    shell: &ShellState,
-    kind: SessionKind,
-) -> TerminalLaunchContext {
-    if let Some(row) = current_selected_sidebar_row(shell) {
-        return agent_session_launch_context_for_row(shell, &row, kind);
-    }
-    if let Some(active) = shell.server.active_session() {
-        let cwd = metadata_value(active, "Cwd");
-        let cwd = (!cwd.trim().is_empty()).then_some(cwd);
-        if active.source == SessionSource::LiveSsh {
-            if let Some(ssh_target) = active.ssh_target.clone() {
-                return TerminalLaunchContext::Remote {
-                    ssh_target,
-                    prefix: active.ssh_prefix.clone(),
-                    cwd,
-                    title_hint: if active.title.trim().is_empty() {
-                        None
-                    } else {
-                        Some(format!(
-                            "{} {}",
-                            active.title,
-                            session_kind_action_label(kind)
-                        ))
-                    },
-                };
-            }
-        }
-        return TerminalLaunchContext::Local {
-            cwd,
-            title_hint: if active.title.trim().is_empty() {
-                None
-            } else {
-                Some(format!(
-                    "{} {}",
-                    active.title,
-                    session_kind_action_label(kind)
-                ))
-            },
-        };
-    }
-    TerminalLaunchContext::Local {
-        cwd: None,
-        title_hint: None,
-    }
-}
-fn agent_session_launch_context_for_row(
-    shell: &ShellState,
-    row: &BrowserRow,
-    kind: SessionKind,
-) -> TerminalLaunchContext {
-    if let Some(machine) = remote_machine_for_sidebar_row(shell, row) {
-        let cwd = sidebar_row_launch_cwd(shell, row);
-        return TerminalLaunchContext::Remote {
-            ssh_target: machine.ssh_target.clone(),
-            prefix: machine.prefix.clone(),
-            cwd,
-            title_hint: Some(format!("{} {}", row.label, session_kind_action_label(kind))),
-        };
-    }
-    if row.kind == BrowserRowKind::Session {
-        return TerminalLaunchContext::Local {
-            cwd: row.session_cwd.clone(),
-            title_hint: Some(format!("{} {}", row.label, session_kind_action_label(kind))),
-        };
-    }
-    let snapshot = shell.snapshot();
-    let context_row = resolve_creation_context_row(&snapshot.rows, row);
-    group_session_launch_context(shell, &context_row, kind)
-}
 fn preferred_agent_session_kind(settings: &AppSettings) -> SessionKind {
     match settings.default_agent_profile {
         AgentSessionProfile::CodexLiteLlm => SessionKind::CodexLiteLlm,
@@ -22040,58 +22161,52 @@ fn spawn_start_preferred_agent_session(state: Signal<ShellState>) {
 }
 
 fn spawn_start_preferred_agent_session_for_row(
-    mut state: Signal<ShellState>,
+    state: Signal<ShellState>,
     explicit_row: Option<BrowserRow>,
 ) {
     let preferred_agent_kind = preferred_agent_session_kind(&state.read().settings);
-    let launch_context = state.with_mut(|shell| {
+    spawn_start_session_for_row(state, preferred_agent_kind, explicit_row);
+}
+
+/// **THE launch path.** Every door that starts a session — the titlebar `+`, the
+/// `ALT,I` KeyTip scope, the Ctrl+Shift accelerators, the start page, and the row
+/// menu's "… Here" items — funnels through here, so all of them land the new
+/// session in the same cwd AND at the same place in the sidebar: directly below
+/// the "here" row ([`launch_anchor_row`]).
+///
+/// Before this collapsed, the `+` menu called the un-anchored `start_*_at_*`
+/// helpers and every new row appeared at the TOP of Live Sessions, while the row
+/// menu's identical action landed it below the row you invoked it from. Two
+/// encodings of one concept; the anchored one is right.
+fn spawn_start_session_for_row(
+    mut state: Signal<ShellState>,
+    kind: SessionKind,
+    explicit_row: Option<BrowserRow>,
+) {
+    if let Some(row) = state.with(|shell| launch_anchor_row(shell, explicit_row)) {
+        spawn_start_group_session(state, row, kind);
+        return;
+    }
+    // No anchor exists at all: nothing selected in the sidebar and no active
+    // session (an empty shell). There is no cwd to inherit and nothing to insert
+    // below, so the daemon top-inserts into an empty Live list.
+    let terminal_appearance = state.with_mut(|shell| {
         shell.remember_current_viewport_for_history();
         shell.show_start_page_when_no_live_sessions = false;
         shell.clear_alt_overlay();
         shell.close_titlebar_new_menu();
-        explicit_row
-            .as_ref()
-            .map(|row| agent_session_launch_context_for_row(shell, row, preferred_agent_kind))
-            .unwrap_or_else(|| current_agent_session_launch_context(shell, preferred_agent_kind))
+        shell.effective_terminal_identity_appearance().to_string()
     });
-    let terminal_appearance =
-        state.with(|shell| shell.effective_terminal_identity_appearance().to_string());
-    match launch_context {
-        TerminalLaunchContext::Local { cwd, title_hint } => {
-            let terminal_appearance = terminal_appearance.clone();
-            spawn_server_snapshot_action(state, "starting session".to_string(), move |endpoint| {
-                start_local_session_at_with_terminal_appearance(
-                    &endpoint,
-                    preferred_agent_kind,
-                    cwd.as_deref(),
-                    title_hint.as_deref(),
-                    Some(&terminal_appearance),
-                )
-            });
-        }
-        TerminalLaunchContext::Remote {
-            ssh_target,
-            prefix,
-            cwd,
-            title_hint,
-        } => {
-            let terminal_appearance = terminal_appearance.clone();
-            spawn_server_snapshot_action(
-                state,
-                "starting remote session".to_string(),
-                move |endpoint| {
-                    start_remote_codex_session_at_with_terminal_appearance(
-                        &endpoint,
-                        &ssh_target,
-                        prefix.as_deref(),
-                        cwd.as_deref(),
-                        title_hint.as_deref(),
-                        Some(&terminal_appearance),
-                    )
-                },
-            );
-        }
-    }
+    let pending = format!("starting {}", session_kind_action_label(kind));
+    spawn_server_snapshot_action(state, pending, move |endpoint| {
+        start_local_session_at_with_terminal_appearance(
+            &endpoint,
+            kind,
+            None,
+            None,
+            Some(&terminal_appearance),
+        )
+    });
 }
 
 fn spawn_start_terminal_session(state: Signal<ShellState>) {
@@ -22149,118 +22264,17 @@ fn spawn_switch_live_session(state: Signal<ShellState>, forward: bool) {
 }
 
 fn spawn_start_terminal_session_for_row(
-    mut state: Signal<ShellState>,
+    state: Signal<ShellState>,
     explicit_row: Option<BrowserRow>,
 ) {
-    let launch_context = state.with_mut(|shell| {
-        shell.remember_current_viewport_for_history();
-        shell.show_start_page_when_no_live_sessions = false;
-        shell.clear_alt_overlay();
-        shell.close_titlebar_new_menu();
-        explicit_row
-            .as_ref()
-            .map(|row| terminal_launch_context_for_row(shell, row))
-            .unwrap_or_else(|| terminal_launch_context(shell))
-    });
-    let terminal_appearance =
-        state.with(|shell| shell.effective_terminal_identity_appearance().to_string());
-    match launch_context {
-        TerminalLaunchContext::Local { cwd, title_hint } => {
-            let terminal_appearance = terminal_appearance.clone();
-            spawn_server_snapshot_action(state, "starting terminal".to_string(), move |endpoint| {
-                start_local_session_at_with_terminal_appearance(
-                    &endpoint,
-                    SessionKind::Shell,
-                    cwd.as_deref(),
-                    title_hint.as_deref(),
-                    Some(&terminal_appearance),
-                )
-            });
-        }
-        TerminalLaunchContext::Remote {
-            ssh_target,
-            prefix,
-            cwd,
-            title_hint,
-        } => {
-            let terminal_appearance = terminal_appearance.clone();
-            spawn_server_snapshot_action(
-                state,
-                "starting ssh terminal".to_string(),
-                move |endpoint| {
-                    start_ssh_session_at_with_terminal_appearance(
-                        &endpoint,
-                        &ssh_target,
-                        prefix.as_deref(),
-                        cwd.as_deref(),
-                        title_hint.as_deref(),
-                        Some(&terminal_appearance),
-                    )
-                },
-            );
-        }
-    }
+    spawn_start_session_for_row(state, SessionKind::Shell, explicit_row);
 }
 
 fn spawn_start_claude_code_session_for_row(
-    mut state: Signal<ShellState>,
+    state: Signal<ShellState>,
     explicit_row: Option<BrowserRow>,
 ) {
-    let launch_context = state.with_mut(|shell| {
-        shell.remember_current_viewport_for_history();
-        shell.show_start_page_when_no_live_sessions = false;
-        shell.clear_alt_overlay();
-        shell.close_titlebar_new_menu();
-        explicit_row
-            .as_ref()
-            .map(|row| agent_session_launch_context_for_row(shell, row, SessionKind::ClaudeCode))
-            .unwrap_or_else(|| current_agent_session_launch_context(shell, SessionKind::ClaudeCode))
-    });
-    let terminal_appearance =
-        state.with(|shell| shell.effective_terminal_identity_appearance().to_string());
-    match launch_context {
-        TerminalLaunchContext::Local { cwd, title_hint } => {
-            let terminal_appearance = terminal_appearance.clone();
-            spawn_server_snapshot_action(
-                state,
-                "starting claude code".to_string(),
-                move |endpoint| {
-                    start_local_session_at_with_terminal_appearance(
-                        &endpoint,
-                        SessionKind::ClaudeCode,
-                        cwd.as_deref(),
-                        title_hint.as_deref(),
-                        Some(&terminal_appearance),
-                    )
-                },
-            );
-        }
-        TerminalLaunchContext::Remote {
-            ssh_target,
-            prefix,
-            cwd,
-            title_hint,
-        } => {
-            // Remote Claude Code launches over a direct SSH PTY with a
-            // caller-assigned id; the row id is the real CLI session id. See
-            // [[finding-uuidv4-codex-session-drift]].
-            let terminal_appearance = terminal_appearance.clone();
-            spawn_server_snapshot_action(
-                state,
-                "starting remote claude code".to_string(),
-                move |endpoint| {
-                    start_remote_claude_session_at_with_terminal_appearance(
-                        &endpoint,
-                        &ssh_target,
-                        prefix.as_deref(),
-                        cwd.as_deref(),
-                        title_hint.as_deref(),
-                        Some(&terminal_appearance),
-                    )
-                },
-            );
-        }
-    }
+    spawn_start_session_for_row(state, SessionKind::ClaudeCode, explicit_row);
 }
 fn is_codex_storage_session_path(path: &str) -> bool {
     path.contains("/.codex/sessions/")
@@ -25630,13 +25644,21 @@ const ALT_TAP_LISTENER_JS_TEMPLATE: &str = r#"(function(){
       if (send) { send({ key: e.key }); }
       return;
     }
+    // Navigation keys drive the LIST scopes (jump mode, §8: lists are navigated,
+    // not badged). Forwarded, not just swallowed — Rust decides whether the open
+    // scope wants them.
+    if (['ArrowUp','ArrowDown','PageUp','PageDown','Home','End','Enter'].indexOf(e.key) >= 0) {
+      e.preventDefault(); e.stopPropagation();
+      if (send) { send({ key: e.key }); }
+      return;
+    }
     if (e.key && e.key.length === 1 && /[A-Za-z0-9]/.test(e.key)) {
       e.preventDefault(); e.stopPropagation();
       if (send) { send({ key: e.key.toLowerCase() }); }
       return;
     }
-    // Any other key while the overlay is up (arrows, Tab, …): swallow it so it
-    // cannot reach the PTY behind the overlay, but take no chord action.
+    // Any other key while the overlay is up (Tab, …): swallow it so it cannot
+    // reach the PTY behind the overlay, but take no chord action.
     e.preventDefault(); e.stopPropagation();
   }, true);
   window.addEventListener('keyup', function(e){
@@ -25679,8 +25701,11 @@ const ALT_TAP_LISTENER_JS_TEMPLATE: &str = r#"(function(){
       var b = document.getElementById(id);
       if (!b){ b = document.createElement('div'); b.id = id; c.appendChild(b); }
       b.textContent = tip;
-      // Lower-leading corner, overlapping the host; nudged inward at edges.
-      var bx = Math.max(2, Math.min(r.left - 5, window.innerWidth - 24));
+      // Lower-leading corner, overlapping the host; nudged inward at edges. A
+      // slot lets two commands share one host (the active-session chip carries
+      // both "row actions" and "jump to session") without stacking their badges.
+      var slot = Number(marker.getAttribute('data-keytip-slot') || 0);
+      var bx = Math.max(2, Math.min(r.left - 5 + slot * 22, window.innerWidth - 24));
       var by = Math.max(2, Math.min(r.bottom - 11, window.innerHeight - 20));
       b.style.cssText = KT_BADGE_CSS + 'left:' + Math.round(bx) + 'px; top:' + Math.round(by) + 'px;';
       live[id] = true;
@@ -25781,10 +25806,50 @@ fn keytip_apply_bridge_message(mut state: Signal<ShellState>, msg: &serde_json::
         return;
     };
     match key {
-        "Escape" => state.with_mut(|shell| shell.clear_alt_overlay()),
+        // Esc backs all the way out: the overlay AND whatever container it opened.
+        // Leaving a keyboard-opened row menu on screen after Esc would strand a
+        // surface the keyboard can no longer reach.
+        "Escape" => state.with_mut(|shell| {
+            shell.clear_alt_overlay();
+            shell.close_context_menu();
+            shell.close_titlebar_new_menu();
+        }),
         "Backspace" => state.with_mut(|shell| {
             shell.alt_overlay_sequence.pop();
+            if shell.alt_overlay_sequence.is_empty() {
+                // Back at the root scope: the container this chord had opened is no
+                // longer the level being shown, so it closes with the level.
+                shell.close_context_menu();
+                shell.close_titlebar_new_menu();
+                shell.alt_jump_path = None;
+            }
         }),
+        // Jump mode (`ALT,J`): walk the Live list, commit with Enter. Outside jump
+        // mode these keys are inert — the bridge already swallowed them so they
+        // cannot leak to the PTY behind the overlay.
+        "ArrowUp" | "ArrowDown" | "PageUp" | "PageDown" | "Home" | "End" | "Enter"
+            if state.read().alt_jump_path.is_some() =>
+        {
+            if key == "Enter" {
+                let target = state.with_mut(|shell| {
+                    let path = shell.alt_jump_path.clone();
+                    shell.clear_alt_overlay();
+                    path.and_then(|path| synthesize_app_control_row(shell, &path))
+                });
+                if let Some(row) = target {
+                    spawn_open_session_row(state, row);
+                }
+                return;
+            }
+            let (delta, to_edge) = match key {
+                "ArrowUp" | "PageUp" => (-1, false),
+                "ArrowDown" | "PageDown" => (1, false),
+                "Home" => (-1, true),
+                _ => (1, true),
+            };
+            state.with_mut(|shell| shell.navigate_session_jump(delta, to_edge));
+            scroll_sidebar_row_into_view_quietly(state);
+        }
         other => {
             let mut chars = other.chars();
             if let (Some(ch), None) = (chars.next(), chars.next()) {
@@ -25906,21 +25971,21 @@ fn app_verb_node_key(app: &str, verb: &str) -> String {
 /// first-class "New Claude Code" item and one node per installed app verb
 /// (`~/.yggterm/apps/*.json`, spec §10), so an app the shell never heard of
 /// extends the layer without the shell changing.
-fn build_keytip_scopes(apps: &[AppManifest]) -> Vec<(KtScope, Vec<KeyTipDecl>)> {
+fn build_keytip_scopes(
+    apps: &[AppManifest],
+    row_menu: &[RowMenuItem],
+) -> Vec<(KtScope, Vec<KeyTipDecl>)> {
     let mut root: Vec<KeyTipDecl> = Vec::new();
     let mut insert: Vec<KeyTipDecl> = Vec::new();
     for spec in command_registry::SHELL_COMMANDS {
         let Some(hint) = spec.default_keytip else {
             continue; // accel-only commands (session nav) have no ALT letter
         };
-        let target = if spec.opens_submenu {
-            Target::Descend(KtScope::Insert)
-        } else if spec.id == "settings.toggle" {
-            // Settings opens AND descends into its own scope (spec §4), so
-            // ALT,G then a theme letter switches theme.
-            Target::Descend(KtScope::Settings)
-        } else {
-            Target::Run
+        // A command that opens a container descends into that container's scope
+        // (spec §4). WHICH scope is registry data, not a match arm here.
+        let target = match spec.descends_into {
+            Some(scope) => Target::Descend(keytip_scope_from_id(scope)),
+            None => Target::Run,
         };
         let decl = KeyTipDecl::shell(spec.id, spec.title, hint, target);
         match spec.parent {
@@ -25969,17 +26034,54 @@ fn build_keytip_scopes(apps: &[AppManifest]) -> Vec<(KtScope, Vec<KeyTipDecl>)> 
         KeyTipDecl::shell("theme.light", "Light theme", 'l', Target::Run),
         KeyTipDecl::shell("theme.dark", "Dark theme", 'd', Target::Run),
     ];
+    // The ROW MENU scope (ALT,E) — declared from the very list the mouse menu
+    // draws ([`row_menu_items`]), so the two can never disagree about what exists.
+    // Empty while no row menu is open, which is the only time it is unreachable.
+    let rowmenu = row_menu
+        .iter()
+        .filter(|item| !item.separator)
+        .map(|item| {
+            KeyTipDecl::shell_optional(
+                row_menu_node_key(&item.id),
+                item.label.clone(),
+                item.hint,
+                Target::Run,
+            )
+        })
+        .collect();
     vec![
         (KtScope::Root, root),
         (KtScope::Insert, insert),
         (KtScope::Settings, settings),
+        (KtScope::RowMenu, rowmenu),
+        // Jump-to-session is a NAVIGATION scope, not a badge scope (spec §8 —
+        // lists are navigated, not badged): it holds no declarations, and the
+        // arrow/PageUp/PageDown/Enter keys are handled by the bridge while it is
+        // the open scope.
+        (KtScope::SessionJump, Vec::new()),
     ]
+}
+/// Map a registry scope id (`descends_into`) to the resolver's scope. One place
+/// that knows the scope vocabulary.
+fn keytip_scope_from_id(scope: &str) -> KtScope {
+    match scope {
+        "insert.menu" => KtScope::Insert,
+        "settings" => KtScope::Settings,
+        "settings.theme" => KtScope::SettingsTheme,
+        "rowmenu" => KtScope::RowMenu,
+        "session.jump" => KtScope::SessionJump,
+        other => KtScope::App(other.to_string()),
+    }
 }
 /// The resolved KeyTip tree for a snapshot: the single source both the badge
 /// painter and the chord walker read. Driven by the unified keymap-v2 config
 /// (letters + pins + accelerator overrides), the disk SSOT.
-fn build_keytip_tree(config: &KeymapConfig, apps: &[AppManifest]) -> KeyTipTree {
-    KeyTipTree::build(&build_keytip_scopes(apps), config)
+fn build_keytip_tree(
+    config: &KeymapConfig,
+    apps: &[AppManifest],
+    row_menu: &[RowMenuItem],
+) -> KeyTipTree {
+    KeyTipTree::build(&build_keytip_scopes(apps, row_menu), config)
 }
 /// The stable `data-keytip-node` id for a declaration key, used as the floating-
 /// badge painter's measurement anchor and the orphan audit's proof that this
@@ -25994,6 +26096,8 @@ fn keytip_node_id(node_key: &str) -> String {
                 "insert.menu"
             } else if node_key.starts_with("theme.") {
                 "settings"
+            } else if node_key.starts_with("rowmenu:") {
+                "rowmenu"
             } else {
                 "root"
             }
@@ -26006,14 +26110,26 @@ fn keytip_node_id(node_key: &str) -> String {
 /// carries `data-keytip-node` regardless so the audit always sees it. Reads only
 /// the resolved tree — SSOT with the chord walker.
 fn keytip_tip_attr(snapshot: &RenderSnapshot, node_key: &str) -> String {
-    if !snapshot.alt_overlay_active {
+    keytip_tip_for(
+        &snapshot.keytip_tree,
+        snapshot.alt_overlay_active,
+        &snapshot.alt_overlay_sequence,
+        node_key,
+    )
+}
+/// The tip lookup itself, over the raw tree — so a component that holds the tree
+/// without the whole snapshot (the row menu) badges from the same SSOT.
+fn keytip_tip_for(
+    tree: &KeyTipTree,
+    alt_overlay_active: bool,
+    sequence: &str,
+    node_key: &str,
+) -> String {
+    if !alt_overlay_active {
         return String::new();
     }
-    let seq = &snapshot.alt_overlay_sequence;
-    snapshot
-        .keytip_tree
-        .tip_for(seq, node_key)
-        .or_else(|| snapshot.keytip_tree.group_member_tip(seq, node_key))
+    tree.tip_for(sequence, node_key)
+        .or_else(|| tree.group_member_tip(sequence, node_key))
         .unwrap_or_default()
 }
 /// Dispatch a registry command. Every ALT+ KeyTip, the `command invoke <id>`
@@ -26093,6 +26209,34 @@ fn execute_shell_command(mut state: Signal<ShellState>, command: ShellCommand) {
                 shell.titlebar_new_menu_open = true;
             });
         }
+        ShellCommand::OpenRowMenu => {
+            // Both an action and a chord node (like the `+` menu): open the row
+            // menu on the "here" row AND park the overlay at this command's chord
+            // so the menu's own KeyTips paint.
+            let chord = state
+                .read()
+                .keymap
+                .chord_for_id("session.menu")
+                .unwrap_or_default();
+            state.with_mut(|shell| {
+                shell.alt_overlay_active = true;
+                shell.alt_overlay_sequence = chord;
+            });
+            spawn_open_row_menu_here(state);
+        }
+        ShellCommand::JumpSession => {
+            let chord = state
+                .read()
+                .keymap
+                .chord_for_id("session.jump")
+                .unwrap_or_default();
+            state.with_mut(|shell| {
+                shell.alt_overlay_active = true;
+                shell.alt_overlay_sequence = chord;
+                shell.begin_session_jump();
+            });
+            scroll_sidebar_row_into_view_quietly(state);
+        }
         ShellCommand::InsertSession => {
             state.with_mut(|shell| shell.clear_alt_overlay());
             spawn_start_preferred_agent_session(state);
@@ -26122,7 +26266,9 @@ fn feed_alt_overlay_char(mut state: Signal<ShellState>, ch: char) {
     let (next_sequence, resolution) = {
         let shell = state.read();
         let next = format!("{}{}", shell.alt_overlay_sequence, ch.to_ascii_lowercase());
-        let tree = build_keytip_tree(&shell.keytip_config, shell.server.apps());
+        // The SAME tree the badges are painted from (it carries the open row
+        // menu's scope), so what you see is exactly what the chord resolves to.
+        let tree = shell.snapshot().keytip_tree;
         (next.clone(), tree.resolve(&next))
     };
     match resolution {
@@ -26148,15 +26294,22 @@ fn feed_alt_overlay_char(mut state: Signal<ShellState>, ch: char) {
 /// Run a container-opening node's side effect (a `Descend` target) without
 /// dismissing the overlay: it stays up so the descended scope's badges show.
 fn dispatch_keytip_open(mut state: Signal<ShellState>, key: &str) {
-    if key == "insert.menu" {
-        state.with_mut(|shell| {
+    match key {
+        "insert.menu" => state.with_mut(|shell| {
             shell.titlebar_session_menu_open = false;
             shell.titlebar_new_menu_open = true;
-        });
-    } else if key == "settings.toggle" {
-        // Descending into Settings OPENS the panel (never toggles it shut), so the
-        // theme options are on screen to badge (spec §4).
-        state.with_mut(|shell| shell.set_right_panel_mode(RightPanelMode::Settings));
+        }),
+        "settings.toggle" => {
+            // Descending into Settings OPENS the panel (never toggles it shut), so
+            // the theme options are on screen to badge (spec §4).
+            state.with_mut(|shell| shell.set_right_panel_mode(RightPanelMode::Settings));
+        }
+        // ALT,E — the row menu, on the "here" row. The menu is a positioned
+        // surface, so it opens where a right-click on that row would have put it.
+        "session.menu" => spawn_open_row_menu_here(state),
+        // ALT,J — jump mode. The live list is walked, not badged (§8).
+        "session.jump" => state.with_mut(|shell| shell.begin_session_jump()),
+        _ => {}
     }
 }
 /// Run a leaf node's action and dismiss the overlay. One dispatch for every ALT+
@@ -26166,6 +26319,19 @@ fn dispatch_keytip_open(mut state: Signal<ShellState>, key: &str) {
 fn dispatch_keytip_node(mut state: Signal<ShellState>, key: &str) {
     if let Some(spec) = spec_for_id(key) {
         execute_shell_command(state, spec.command);
+        return;
+    }
+    // A row-menu item (ALT,E,<letter>): the SAME terminus a click on that item
+    // takes, keyed by the same id (spec §3 — one command, two views).
+    if let Some(id) = key.strip_prefix("rowmenu:") {
+        let id = id.to_string();
+        let Some(row) = state.with_mut(|shell| {
+            shell.clear_alt_overlay();
+            shell.context_menu_row.clone()
+        }) else {
+            return;
+        };
+        dispatch_row_menu_action(state, row, id);
         return;
     }
     if key == "insert.claude" {
@@ -26202,14 +26368,10 @@ fn dispatch_keytip_node(mut state: Signal<ShellState>, key: &str) {
             state.with_mut(|shell| shell.clear_alt_overlay());
             return;
         };
-        // "Here" resolves the same way the +-menu launch does (active session's
-        // host + cwd); the sidebar-focus refinement (spec §8) lands with §5.
-        let launch_context = state.with_mut(|shell| {
-            shell.clear_alt_overlay();
-            shell.close_titlebar_new_menu();
-            terminal_launch_context(shell)
-        });
-        spawn_launch_app_verb(state, app, verb, launch_context, None);
+        // "Here" resolves identically for the KeyTip and for the mouse (invariant
+        // 10): the focused sidebar row, else the active session — cwd AND sidebar
+        // insert position both.
+        spawn_launch_app_verb_here(state, app, verb, None);
         return;
     }
     // Unknown key: fail safe by dismissing rather than acting on nothing.
@@ -31635,12 +31797,16 @@ fn group_session_launch_context(
     kind: SessionKind,
 ) -> TerminalLaunchContext {
     let title_hint = Some(group_session_title_hint(row, kind));
+    // Single source of truth for the launch cwd, local and remote alike:
+    // `sidebar_row_launch_cwd` (the row's own `session_cwd`, else the remote
+    // folder's path, else the live/active session's `Cwd` metadata), falling back
+    // to the folder path for cwd-tree group rows, which have no session cwd.
+    //
+    // A local LIVE-SESSION row has a `full_path` of `local://<uuid>` — a session
+    // URI, not a directory — so `group_session_cwd` alone would hand
+    // `local://<uuid>` to the local launcher and error. See [[spec-unify-local-remote]].
+    let cwd = sidebar_row_launch_cwd(shell, row).or_else(|| group_session_cwd(row));
     if let Some(machine) = remote_machine_for_sidebar_row(shell, row) {
-        let cwd = row
-            .session_cwd
-            .clone()
-            .filter(|value| !value.trim().is_empty())
-            .or_else(|| remote_folder_cwd(row));
         return TerminalLaunchContext::Remote {
             ssh_target: machine.ssh_target.clone(),
             prefix: machine.prefix.clone(),
@@ -31648,19 +31814,6 @@ fn group_session_launch_context(
             title_hint,
         };
     }
-    // Single source of truth for the launch cwd: prefer the row's own
-    // `session_cwd` (the real filesystem directory) for BOTH local and remote,
-    // exactly as the remote branch above does. A local LIVE-SESSION row has a
-    // `full_path` of `local://<uuid>` — a session URI, not a directory — so the
-    // old `group_session_cwd(row)` (which returns `full_path` for non-group
-    // rows) handed `local://<uuid>` to the local launcher and errored. Folder /
-    // group rows have no `session_cwd`, so they still fall back to
-    // `group_session_cwd`. See [[spec-unify-local-remote]].
-    let cwd = row
-        .session_cwd
-        .clone()
-        .filter(|value| !value.trim().is_empty())
-        .or_else(|| group_session_cwd(row));
     TerminalLaunchContext::Local { cwd, title_hint }
 }
 fn document_parent_base(row: &BrowserRow) -> Option<String> {
@@ -31987,6 +32140,40 @@ fn explicit_selected_sidebar_row(shell: &ShellState) -> Option<BrowserRow> {
         shell.selection_anchor.as_deref(),
         None,
     )
+}
+/// **"Here" is a binding, not a vibe** (spec §4): the sidebar's focused/selected
+/// row, else the ACTIVE session's row. One function, so every surface that can
+/// launch something — the titlebar `+`, the `ALT,I` KeyTip scope, the row menu,
+/// the Ctrl+Shift accelerators, the start page — resolves "here" identically
+/// (invariant 10).
+fn here_row(shell: &ShellState) -> Option<BrowserRow> {
+    if let Some(row) = current_selected_sidebar_row(shell) {
+        return Some(row);
+    }
+    let active = normalize_live_session_path(shell.server.active_session_path()?);
+    synthesize_app_control_row(shell, &active)
+}
+/// The row a new session is launched *against*: it fixes BOTH the launch cwd and
+/// the sidebar insert position, so a session lands directly below the row it came
+/// from — the row menu's "Open … Here" behaviour, now the behaviour of every
+/// launch door. `explicit` overrides "here" when the surface names its own row (a
+/// right-clicked row, a start-page selection).
+///
+/// A live-session row is kept RAW: its `full_path` is the live path the daemon
+/// anchors the insert to. Anything else (folder, paper, separator) resolves to
+/// its creation-context row, which is what the cwd-tree menu items already do —
+/// the resulting path is not a live session, and the daemon fails open to a top
+/// insert.
+fn launch_anchor_row(shell: &ShellState, explicit: Option<BrowserRow>) -> Option<BrowserRow> {
+    let row = match explicit {
+        Some(row) => row,
+        None => here_row(shell)?,
+    };
+    if row.kind == BrowserRowKind::Session {
+        return Some(row);
+    }
+    let snapshot = shell.snapshot();
+    Some(resolve_creation_context_row(&snapshot.rows, &row))
 }
 fn remote_machine_for_sidebar_row<'a>(
     shell: &'a ShellState,
@@ -48650,7 +48837,6 @@ fn app() -> Element {
         titlebar_reveal_pinned,
         titlebar_autohide_lingering(),
     );
-    let preferred_agent_kind = preferred_agent_session_kind(&snapshot.settings);
     let maximized = snapshot.maximized;
     let fullscreen = snapshot.fullscreen;
     let shell_radius = if maximized {
@@ -48715,10 +48901,7 @@ fn app() -> Element {
          [data-yggterm-window-focused=\"false\"] .yggterm-loading-dot, \
          [data-yggterm-window-focused=\"false\"] .yggterm-tree-spinner { animation:none !important; }"
             .to_string();
-    let context_menu_overlay = snapshot
-        .context_menu_row
-        .clone()
-        .zip(snapshot.context_menu_context_row.clone());
+    let context_menu_overlay = snapshot.context_menu_row.clone();
     rsx! {
         div {
             id: "yggterm-shell-root",
@@ -49025,9 +49208,25 @@ fn app() -> Element {
                         span { style: "opacity:0.55;", "›" }
                         span { "{snapshot.alt_overlay_sequence.to_uppercase()}" }
                     }
-                    span {
-                        style: format!("opacity:0.62; font-weight:600; color:{};", snapshot.palette.muted),
-                        "· press a highlighted key · Esc to exit"
+                    // Jump mode is a LIST scope with no badges (§8), so the
+                    // breadcrumb IS its display: where the cursor is, and out of
+                    // how many. The only feedback when the sidebar is closed.
+                    if let Some((index, count, label)) = snapshot.session_jump_status.clone() {
+                        span { style: "opacity:0.55;", "›" }
+                        span { "Live {index}/{count}" }
+                        span {
+                            style: "font-weight:700; max-width:280px; overflow:hidden; text-overflow:ellipsis;",
+                            "{label}"
+                        }
+                        span {
+                            style: format!("opacity:0.62; font-weight:600; color:{};", snapshot.palette.muted),
+                            "· ↑↓ PgUp/PgDn to move · Enter to open · Esc to exit"
+                        }
+                    } else {
+                        span {
+                            style: format!("opacity:0.62; font-weight:600; color:{};", snapshot.palette.muted),
+                            "· press a highlighted key · Esc to exit"
+                        }
                     }
                 }
             }
@@ -49545,103 +49744,27 @@ fn app() -> Element {
                                 }
                                 spawn_start_claude_code_session_for_row(state, None);
                             },
+                            // The `+` menu launches at "here" — exactly like the row
+                            // menu's "… Here" items, through the same anchored path
+                            // (`spawn_start_session_for_row`), so the new row lands
+                            // below the active/selected row instead of at the top of
+                            // Live Sessions.
                             on_start_session: move |_| {
-                            if !state.with(|shell| shell.titlebar_new_menu_open) {
-                                suppress_phantom_start_action("titlebar_new_session", json!({}));
-                                return;
-                            }
-                            let launch_context = state.with_mut(|shell| {
-                                shell.close_titlebar_new_menu();
-                                current_agent_session_launch_context(shell, preferred_agent_kind)
-                            });
-                            let terminal_appearance = state.with(|shell| {
-                                shell.effective_terminal_identity_appearance().to_string()
-                            });
-                            match launch_context {
-                                TerminalLaunchContext::Local { cwd, title_hint } => {
-                                    let terminal_appearance = terminal_appearance.clone();
-                                    spawn_server_snapshot_action(state, "starting session".to_string(), move |endpoint| {
-                                        start_local_session_at_with_terminal_appearance(
-                                            &endpoint,
-                                            preferred_agent_kind,
-                                            cwd.as_deref(),
-                                            title_hint.as_deref(),
-                                            Some(&terminal_appearance),
-                                        )
-                                    })
+                                if !state.with(|shell| shell.titlebar_new_menu_open) {
+                                    suppress_phantom_start_action("titlebar_new_session", json!({}));
+                                    return;
                                 }
-                                TerminalLaunchContext::Remote {
-                                    ssh_target,
-                                    prefix,
-                                    cwd,
-                                    title_hint,
-                                } => {
-                                    let terminal_appearance = terminal_appearance.clone();
-                                    spawn_server_snapshot_action(state, "starting remote session".to_string(), move |endpoint| {
-                                        start_remote_codex_session_at_with_terminal_appearance(
-                                            &endpoint,
-                                            &ssh_target,
-                                            prefix.as_deref(),
-                                            cwd.as_deref(),
-                                            title_hint.as_deref(),
-                                            Some(&terminal_appearance),
-                                        )
-                                    })
-                                }
-                            }
+                                spawn_start_preferred_agent_session_for_row(state, None);
                             },
                             on_start_terminal: move |_| {
-                            if !state.with(|shell| shell.titlebar_new_menu_open) {
-                                suppress_phantom_start_action("titlebar_new_terminal", json!({}));
-                                return;
-                            }
-                            let launch_context = state.with_mut(|shell| {
-                                shell.close_titlebar_new_menu();
-                                terminal_launch_context(shell)
-                            });
-                            let terminal_appearance = state.with(|shell| {
-                                shell.effective_terminal_identity_appearance().to_string()
-                            });
-                            match launch_context {
-                                TerminalLaunchContext::Local { cwd, title_hint } => {
-                                    let terminal_appearance = terminal_appearance.clone();
-                                    spawn_server_snapshot_action(state, "starting terminal".to_string(), move |endpoint| {
-                                        start_local_session_at_with_terminal_appearance(
-                                            &endpoint,
-                                            SessionKind::Shell,
-                                            cwd.as_deref(),
-                                            title_hint.as_deref(),
-                                            Some(&terminal_appearance),
-                                        )
-                                    })
+                                if !state.with(|shell| shell.titlebar_new_menu_open) {
+                                    suppress_phantom_start_action("titlebar_new_terminal", json!({}));
+                                    return;
                                 }
-                                TerminalLaunchContext::Remote {
-                                    ssh_target,
-                                    prefix,
-                                    cwd,
-                                    title_hint,
-                                } => {
-                                    let terminal_appearance = terminal_appearance.clone();
-                                    spawn_server_snapshot_action(state, "starting ssh terminal".to_string(), move |endpoint| {
-                                        start_ssh_session_at_with_terminal_appearance(
-                                            &endpoint,
-                                            &ssh_target,
-                                            prefix.as_deref(),
-                                            cwd.as_deref(),
-                                            title_hint.as_deref(),
-                                            Some(&terminal_appearance),
-                                        )
-                                    })
-                                }
-                            }
+                                spawn_start_terminal_session_for_row(state, None);
                             },
                             on_launch_app_verb: move |(app, verb): (AppManifest, AppVerb)| {
-                            let launch_context = state.with_mut(|shell| {
-                                shell.close_titlebar_new_menu();
-                                terminal_launch_context(shell)
-                            });
-                            // Titlebar `+` is a global "new" with no anchor row: top insert.
-                            spawn_launch_app_verb(state, app, verb, launch_context, None);
+                                spawn_launch_app_verb_here(state, app, verb, None);
                             },
                             on_refresh_summary: move |_| {
                             let active_session = { state.read().server.active_session().cloned() };
@@ -50088,17 +50211,17 @@ fn app() -> Element {
                         }
                     }
                 }
-                if let Some((row, context_row)) = context_menu_overlay.clone() {
+                if let Some(row) = context_menu_overlay.clone() {
                     ContextMenuOverlay {
                         row: row.clone(),
                         position: snapshot.context_menu_position.unwrap_or((18.0, 60.0)),
                         window_size: context_menu_window_size,
-                        selected_row: snapshot.selected_row.clone(),
-                        selected_tree_paths: snapshot.selected_tree_paths.clone(),
-                        keep_alive_plan: snapshot.keep_alive_plan.clone(),
-                        can_remove_saved_ssh_target: saved_ssh_target_machine_key(&row, &snapshot.ssh_targets).is_some(),
                         palette: snapshot.palette,
-                        apps: snapshot.apps.clone(),
+                        items: snapshot.row_menu_items.clone(),
+                        menu_title: snapshot.row_menu_title.clone(),
+                        keytip_tree: snapshot.keytip_tree.clone(),
+                        alt_overlay_active: snapshot.alt_overlay_active,
+                        alt_overlay_sequence: snapshot.alt_overlay_sequence.clone(),
                         on_close: move |_| {
                             let active_terminal_session = state.with_mut(|shell| {
                                 shell.close_context_menu();
@@ -50111,443 +50234,9 @@ fn app() -> Element {
                                 schedule_terminal_focus_after_activation(state, session_path);
                             }
                         },
-                        on_create_group_codex: {
-                            let row = context_row.clone();
-                            let preferred_agent_kind = preferred_agent_kind;
-                            move |_| {
-                                spawn_start_group_session(state, row.clone(), preferred_agent_kind)
-                            }
-                        },
-                        on_create_group_claude_code: {
-                            let row = context_row.clone();
-                            move |_| {
-                                spawn_start_group_session(state, row.clone(), SessionKind::ClaudeCode)
-                            }
-                        },
-                        on_create_group: {
-                            let row = context_row.clone();
-                            move |_| queue_new_group_for_row(state, row.clone())
-                        },
-                        on_create_group_shell: {
-                            let row = context_row.clone();
-                            move |_| spawn_start_group_session(state, row.clone(), SessionKind::Shell)
-                        },
-                        // The "… Here" actions on a live-session row use the RAW
-                        // selected row (not the resolved creation context), so
-                        // agent_session_launch_context_for_row opens in THAT
-                        // session's own cwd — local or remote.
-                        on_open_terminal_here: {
+                        on_action: {
                             let row = row.clone();
-                            move |_| spawn_start_group_session(state, row.clone(), SessionKind::Shell)
-                        },
-                        on_new_codex_here: {
-                            let row = row.clone();
-                            let preferred_agent_kind = preferred_agent_kind;
-                            move |_| spawn_start_group_session(state, row.clone(), preferred_agent_kind)
-                        },
-                        on_new_claude_here: {
-                            let row = row.clone();
-                            move |_| spawn_start_group_session(state, row.clone(), SessionKind::ClaudeCode)
-                        },
-                        split_candidate_paths: {
-                            // Selected live-terminal rows that are not already
-                            // grouped — the sessions "Split …" would compound.
-                            let selected = if snapshot.selected_tree_paths.is_empty() {
-                                vec![row.full_path.clone()]
-                            } else {
-                                snapshot.selected_tree_paths.clone()
-                            };
-                            selected
-                                .into_iter()
-                                .filter(|path| is_hot_terminal_sidebar_path(path))
-                                .filter(|path| {
-                                    !snapshot.split_groups.iter().any(|group| group.contains(path))
-                                })
-                                .collect::<Vec<_>>()
-                        },
-                        split_group_members: split_group_cells_for_row(&snapshot, &row)
-                            .map(|(cells, _)| {
-                                cells
-                                    .into_iter()
-                                    .map(|cell| (cell.path, cell.label))
-                                    .collect::<Vec<_>>()
-                            })
-                            .unwrap_or_default(),
-                        on_split_selected: {
-                            let selected = if snapshot.selected_tree_paths.is_empty() {
-                                vec![row.full_path.clone()]
-                            } else {
-                                snapshot.selected_tree_paths.clone()
-                            };
-                            let split_groups = snapshot.split_groups.clone();
-                            let candidate_paths: Vec<String> = selected
-                                .into_iter()
-                                .filter(|path| is_hot_terminal_sidebar_path(path))
-                                .filter(|path| {
-                                    !split_groups.iter().any(|group| group.contains(path))
-                                })
-                                .collect();
-                            move |side_by_side: bool| {
-                                let axis = if side_by_side {
-                                    SplitAxis::SideBySide
-                                } else {
-                                    SplitAxis::Stacked
-                                };
-                                state.with_mut(|shell| shell.close_context_menu());
-                                create_split_group(state, candidate_paths.clone(), axis);
-                            }
-                        },
-                        on_ungroup_split: {
-                            let group_id = row.session_id.clone();
-                            move |_| {
-                                if let Some(id) = group_id.clone() {
-                                    ungroup_split_group(state, &id);
-                                }
-                            }
-                        },
-                        on_close_split_pane: {
-                            let group_id = row.session_id.clone();
-                            move |path: String| {
-                                if let Some(id) = group_id.clone() {
-                                    remove_split_pane(state, &id, &path);
-                                }
-                                spawn_close_session_runtime(state, path);
-                            }
-                        },
-                        on_close_split_group: {
-                            let group_id = row.session_id.clone();
-                            let members: Vec<String> = split_group_cells_for_row(&snapshot, &row)
-                                .map(|(cells, _)| {
-                                    cells.into_iter().map(|cell| cell.path).collect()
-                                })
-                                .unwrap_or_default();
-                            move |_| {
-                                state.with_mut(|shell| shell.close_context_menu());
-                                if let Some(id) = group_id.clone() {
-                                    ungroup_split_group(state, &id);
-                                }
-                                for path in members.iter() {
-                                    spawn_close_session_runtime(state, path.clone());
-                                }
-                            }
-                        },
-                        on_launch_app_verb: {
-                            let context_row = context_row.clone();
-                            let clicked_row = row.clone();
-                            move |(app, verb): (AppManifest, AppVerb)| {
-                                state.with_mut(|shell| shell.close_context_menu());
-                                // cwd/host from the creation-context row (a
-                                // session's own dir); ANCHOR from the RAW clicked
-                                // row so the new row lands adjacent below it, like
-                                // the "New … Here" agent actions.
-                                let launch_context =
-                                    launch_context_for_optional_row(state, Some(context_row.clone()));
-                                spawn_launch_app_verb(
-                                    state,
-                                    app,
-                                    verb,
-                                    launch_context,
-                                    Some(clicked_row.full_path.clone()),
-                                );
-                            }
-                        },
-                        on_create_group_recipe: {
-                            let row = row.clone();
-                            move |_| queue_new_separator_for_row(state, row.clone())
-                        },
-                        on_move_selected_document_here: {
-                            let row = context_row.clone();
-                            move |_| {
-                                if let Some(placement) = context_menu_drop_placement(&row) {
-                                    queue_move_selected_items_to_group(
-                                        state,
-                                        placement,
-                                        format!("near {}", row.label),
-                                    );
-                                }
-                            }
-                        },
-                        on_regenerate_title: {
-                            let row = row.clone();
-                            move |_| spawn_selected_copy_regeneration(
-                                state,
-                                row.clone(),
-                                CopyRegenerationMode::Title,
-                            )
-                        },
-                        on_regenerate_summary: {
-                            let row = row.clone();
-                            move |_| spawn_selected_copy_regeneration(
-                                state,
-                                row.clone(),
-                                CopyRegenerationMode::Summary,
-                            )
-                        },
-                        on_regenerate_copy: {
-                            let row = row.clone();
-                            move |_| spawn_selected_copy_regeneration(
-                                state,
-                                row.clone(),
-                                CopyRegenerationMode::Copy,
-                            )
-                        },
-                        on_edit_summary: {
-                            let row = row.clone();
-                            move |_| {
-                                queue_copy_edit_for_row(state, row.clone(), CopyEditField::Summary)
-                            }
-                        },
-                        on_rename_session: {
-                            let row = row.clone();
-                            move |_| {
-                                state.with_mut(|shell| shell.begin_tree_rename(&row));
-                                sync_active_terminal_input_policy(state);
-                            }
-                        },
-                        on_refresh_remote_machine: {
-                            let row = row.clone();
-                            let machine_key = row
-                                .full_path
-                                .strip_prefix("__remote_machine__/")
-                                .map(ToOwned::to_owned);
-                            move |_| {
-                                if let Some(machine_key) = machine_key.clone() {
-                                    spawn_server_snapshot_action(
-                                        state,
-                                        format!("refreshing {}", row.label),
-                                        move |endpoint| {
-                                            refresh_remote_machine(&endpoint, &machine_key)
-                                        },
-                                    );
-                                }
-                            }
-                        },
-                        on_remove_ssh_target: {
-                            let row = row.clone();
-                            move |_| queue_remove_saved_ssh_target(state, row.clone())
-                        },
-                        on_close_live_sessions: move |_| {
-                            state.with_mut(|shell| shell.open_live_sessions_close_all_dialog())
-                        },
-                        on_set_keep_alive: {
-                            let row = row.clone();
-                            move |keep_alive| {
-                                // Re-derive from the same function that labelled the
-                                // item, so the click can never write to a different
-                                // set than the menu promised.
-                                let Some(plan) = state.with_mut(|shell| {
-                                    let plan = shell.context_menu_keep_alive_plan();
-                                    if let Some(plan) = plan.as_ref() {
-                                        for path in &plan.paths {
-                                            mark_live_session_keep_alive_locally(
-                                                shell,
-                                                path,
-                                                keep_alive,
-                                            );
-                                        }
-                                    }
-                                    shell.close_context_menu();
-                                    shell.refresh_tree_debug("keep_alive_optimistic_toggle");
-                                    plan
-                                }) else {
-                                    return;
-                                };
-                                let target = if plan.paths.len() > 1 {
-                                    format!("{} sessions", plan.paths.len())
-                                } else {
-                                    row.label.clone()
-                                };
-                                let paths = plan.paths.clone();
-                                spawn_server_snapshot_action(
-                                    state,
-                                    if keep_alive {
-                                        format!("keeping {target} alive")
-                                    } else {
-                                        format!("stopping keep-alive for {target}")
-                                    },
-                                    move |endpoint| {
-                                        // Exact paths, one request each, tree order.
-                                        // The LAST snapshot is the one the UI adopts.
-                                        // A failure must NOT abort the batch — the
-                                        // remaining sessions still get their request
-                                        // (a bulk keep-alive that stops at the first
-                                        // bad row silently strands the rest); errors
-                                        // aggregate and surface once, and any success
-                                        // still adopts a snapshot so the tree shows
-                                        // the daemon's truth for the rows that took.
-                                        let mut result = None;
-                                        let mut errors = Vec::new();
-                                        for path in &paths {
-                                            match set_session_keep_alive(
-                                                &endpoint, path, keep_alive,
-                                            ) {
-                                                Ok(snapshot) => result = Some(snapshot),
-                                                Err(error) => {
-                                                    errors.push(format!("{path}: {error}"));
-                                                }
-                                            }
-                                        }
-                                        match result {
-                                            Some(snapshot) => Ok(snapshot),
-                                            None if !errors.is_empty() => {
-                                                Err(anyhow!(errors.join("; ")))
-                                            }
-                                            None => Err(anyhow!(
-                                                "no live session to keep alive"
-                                            )),
-                                        }
-                                    },
-                                );
-                            }
-                        },
-                        on_redraw_terminal: {
-                            let row = row.clone();
-                            move |_| {
-                                let path = row.full_path.clone();
-                                let label = row.label.clone();
-                                state.with_mut(|shell| shell.close_context_menu());
-                                spawn(async move {
-                                    // FIX C: re-fetch the daemon's authoritative
-                                    // vt100 screen FIRST, then re-fit the
-                                    // renderer. The plain renderer redraw
-                                    // (`redraw_terminal_viewport_for`) only
-                                    // re-fits + `term.refresh()`s the EXISTING
-                                    // client buffer, so when that buffer is the
-                                    // stale "shadow" (a `localstorage_session_snapshot`
-                                    // painted in place of live `daemon_pty`
-                                    // content — colorless/lifeless) or a scooped
-                                    // buffer, repainting it "does nothing". The
-                                    // content reconcile replays the daemon screen
-                                    // via the `daemon_screen_snapshot` path, which
-                                    // promotes the source back to daemon_pty and
-                                    // closes the broken-bottom/shadow. This is the
-                                    // user-initiated escape hatch, so it runs
-                                    // unconditionally (no quiet/working gate — the
-                                    // gates only protect the AUTOMATIC reconcile
-                                    // from recovery-churn).
-                                    let endpoint =
-                                        state.read().bootstrap.server_endpoint.clone();
-                                    if let Ok(home) = resolve_yggterm_home() {
-                                        let _ = reconcile_terminal_from_daemon_for(
-                                            endpoint, &path, &home,
-                                        )
-                                        .await;
-                                    }
-                                    let result = redraw_terminal_viewport_for(&path).await;
-                                    let accepted = result
-                                        .get("accepted")
-                                        .and_then(Value::as_bool)
-                                        .unwrap_or(false);
-                                    if accepted {
-                                        // Successful redraw used to silently
-                                        // succeed. Surface a short toast so the
-                                        // user has feedback that the action ran
-                                        // — otherwise "nothing happens" is the
-                                        // user-perceived response when the
-                                        // viewport content didn't actually
-                                        // need changing.
-                                        state.with_mut(|shell| {
-                                            shell.push_notification(
-                                                NotificationTone::Info,
-                                                "Redraw Terminal",
-                                                format!("Re-synced {label} from daemon."),
-                                            );
-                                        });
-                                        return;
-                                    }
-                                    let reason = result
-                                        .get("reason")
-                                        .and_then(Value::as_str)
-                                        .unwrap_or("terminal host did not accept redraw");
-                                    // The most common failure path is
-                                    // `terminal_host_missing` — the user
-                                    // right-clicked a row whose xterm host
-                                    // isn't currently mounted (i.e. not the
-                                    // active viewport). Swap to a clearer
-                                    // instruction rather than the raw debug
-                                    // string.
-                                    let (title, message) = if reason == "terminal_host_missing" {
-                                        (
-                                            "Open Session Before Redrawing",
-                                            format!(
-                                                "{label} isn't the active viewport. Click the row to focus the session, then right-click → Redraw Terminal."
-                                            ),
-                                        )
-                                    } else {
-                                        (
-                                            "Redraw Failed",
-                                            format!("{label}: {reason}"),
-                                        )
-                                    };
-                                    state.with_mut(|shell| {
-                                        shell.push_notification(
-                                            NotificationTone::Error,
-                                            title,
-                                            message,
-                                        );
-                                    });
-                                });
-                            }
-                        },
-                        on_restart_session: {
-                            let row = row.clone();
-                            move |_| {
-                                let path = row.full_path.clone();
-                                let label = row.label.clone();
-                                state.with_mut(|shell| shell.close_context_menu());
-                                // Manual restart override for ANY live session.
-                                // terminal_force_remote_restart_async issues the
-                                // daemon TerminalRestart (force_remote=true): for a
-                                // remote agent it terminates the remote runtime and
-                                // re-resumes; for a local session the remote-terminate
-                                // is a no-op and the daemon re-launches the PTY. (An
-                                // earlier version no-op'd for local sessions with just
-                                // a toast — that's the bug this fixes.)
-                                let (endpoint, appearance) = state.with(|shell| {
-                                    (
-                                        shell.bootstrap.server_endpoint.clone(),
-                                        shell.effective_terminal_identity_appearance().to_string(),
-                                    )
-                                });
-                                let trace_home =
-                                    resolve_yggterm_home().unwrap_or_else(|_| PathBuf::from("."));
-                                state.with_mut(|shell| {
-                                    shell.push_notification(
-                                        NotificationTone::Warning,
-                                        "Restart Session",
-                                        format!("Restarting {label}…"),
-                                    );
-                                });
-                                spawn(async move {
-                                    if let Err(error) = terminal_force_remote_restart_async(
-                                        endpoint,
-                                        path.clone(),
-                                        Some(appearance),
-                                        None,
-                                        &trace_home,
-                                        "manual_restart_session",
-                                        0,
-                                    )
-                                    .await
-                                    {
-                                        state.with_mut(|shell| {
-                                            shell.push_notification(
-                                                NotificationTone::Error,
-                                                "Restart Failed",
-                                                format!("{label}: {error}"),
-                                            );
-                                        });
-                                    }
-                                });
-                            }
-                        },
-                        on_delete_item: {
-                            let row = row.clone();
-                            move |_| {
-                                state.with_mut(|shell| {
-                                    shell.open_context_menu_delete_for_row(&row, false)
-                                });
-                            }
+                            move |id: String| dispatch_row_menu_action(state, row.clone(), id)
                         },
                     }
                 }
@@ -51094,6 +50783,26 @@ fn Titlebar(
                                 evt.stop_propagation();
                             },
                             ondoubleclick: |evt| evt.stop_propagation(),
+                            // The active-session chip is the chrome that stands for
+                            // "the current row", so it hosts the two row-oriented
+                            // commands' badges: E = its right-click menu, J = jump
+                            // to another live session. Separate slots so the two
+                            // badges sit side by side instead of on top of each
+                            // other. The markers are hidden spans (no layout, no
+                            // interactable) — the chip's own click still opens the
+                            // session details, which is why it stays exempt below.
+                            span {
+                                "data-keytip-node": keytip_node_id("session.menu"),
+                                "data-keytip-tip": keytip_tip_attr(&snapshot, "session.menu"),
+                                "data-keytip-slot": "0",
+                                style: "display:none;",
+                            }
+                            span {
+                                "data-keytip-node": keytip_node_id("session.jump"),
+                                "data-keytip-tip": keytip_tip_attr(&snapshot, "session.jump"),
+                                "data-keytip-slot": "1",
+                                style: "display:none;",
+                            }
                             button {
                                 "data-titlebar-session-button": "1",
                                 // Active-session affordance: its details open with
@@ -68715,6 +68424,53 @@ fn sidebar_row_dom_id(path: &str) -> String {
 /// keyboard-navigated selection stays visible and the next arrow key routes to
 /// the sidebar's `onkeydown` (spec §8). Focuses the row element without opening
 /// the session (focus, not activation).
+/// Open the row menu on the "here" row from the KEYBOARD (`ALT,E`). A context menu
+/// is a POSITIONED surface, so we measure where that row actually is on screen —
+/// its sidebar row when the sidebar shows it, else the titlebar's active-session
+/// chip — and anchor the menu there. The keyboard therefore opens the menu exactly
+/// where a right-click on that row would have put it, instead of at some fixed
+/// corner. Falls back to the titlebar's leading edge when neither is on screen.
+fn spawn_open_row_menu_here(mut state: Signal<ShellState>) {
+    let Some(row) = state.with(|shell| here_row(shell)) else {
+        return;
+    };
+    let row_id = sidebar_row_dom_id(&row.full_path);
+    spawn(async move {
+        let mut eval = document::eval(&format!(
+            r#"(function(){{
+              var el = document.getElementById({row_id:?})
+                || document.querySelector('[data-titlebar-session-button="1"]');
+              var r = el ? el.getBoundingClientRect() : null;
+              dioxus.send(r && r.width > 0 && r.height > 0
+                ? {{ x: Math.round(r.left + 14), y: Math.round(r.bottom - 4) }}
+                : {{ x: 18, y: 60 }});
+            }})();"#
+        ));
+        let position = match eval.recv::<serde_json::Value>().await {
+            Ok(value) => (
+                value.get("x").and_then(Value::as_f64).unwrap_or(18.0),
+                value.get("y").and_then(Value::as_f64).unwrap_or(60.0),
+            ),
+            Err(_) => (18.0, 60.0),
+        };
+        state.with_mut(|shell| shell.open_context_menu(row, position));
+    });
+}
+/// Scroll the jump-mode highlight into view WITHOUT focusing it. Jump mode's keys
+/// arrive through the ALT bridge (a capture-phase window listener), so taking DOM
+/// focus would only strand the terminal's cursor after Esc.
+fn scroll_sidebar_row_into_view_quietly(state: Signal<ShellState>) {
+    let Some(path) = state.peek().alt_jump_path.clone() else {
+        return;
+    };
+    let row_id = sidebar_row_dom_id(&path);
+    let _ = document::eval(&format!(
+        r#"(function(){{
+          var row = document.getElementById({row_id:?});
+          if (row) {{ try {{ row.scrollIntoView({{ block: 'nearest' }}); }} catch(_e){{}} }}
+        }})();"#
+    ));
+}
 fn scroll_sidebar_row_into_view(path: &str) {
     let row_id = sidebar_row_dom_id(path);
     let _ = document::eval(&format!(
@@ -83497,98 +83253,655 @@ fn ConnectRailBody(
         }
     }
 }
-#[component]
-fn ContextMenuOverlay(
-    row: BrowserRow,
-    position: (f64, f64),
-    window_size: (f64, f64),
-    selected_row: Option<BrowserRow>,
-    selected_tree_paths: Vec<String>,
-    keep_alive_plan: Option<KeepAlivePlan>,
+/// One entry of the ROW MENU — the sidebar's right-click menu, and the ALT layer's
+/// `rowmenu` scope.
+///
+/// The ordered `Vec<RowMenuItem>` this builds is the SINGLE SOURCE OF TRUTH for
+/// what that menu contains: [`ContextMenuOverlay`] draws it and
+/// [`build_keytip_scopes`] declares it. So a chord can never name an item the menu
+/// does not show, an item can never appear without an accelerator (the §12 audit),
+/// and adding an item wires the mouse and the keyboard in one edit.
+#[derive(Clone, PartialEq, Debug)]
+struct RowMenuItem {
+    /// Stable within the menu. Doubles as the `data-context-menu-action` value and
+    /// the KeyTip node key; payload-carrying items encode the payload in it
+    /// (`close-split-pane:<path>`, `app:<app>:<verb>`).
+    id: String,
+    label: String,
+    /// The letter this item *wants*. The §5 ladder may deny it (earlier
+    /// declarations win), so a hint is a preference, never a guarantee.
+    hint: Option<char>,
+    destructive: bool,
+    emphasized: bool,
+    /// A divider: drawn, never badged, never dispatched.
+    separator: bool,
+}
+impl RowMenuItem {
+    fn new(id: impl Into<String>, label: impl Into<String>, hint: char) -> Self {
+        Self {
+            id: id.into(),
+            label: label.into(),
+            hint: Some(hint),
+            destructive: false,
+            emphasized: false,
+            separator: false,
+        }
+    }
+    fn hinted(id: impl Into<String>, label: impl Into<String>, hint: Option<char>) -> Self {
+        Self {
+            id: id.into(),
+            label: label.into(),
+            hint,
+            destructive: false,
+            emphasized: false,
+            separator: false,
+        }
+    }
+    fn destructive(mut self) -> Self {
+        self.destructive = true;
+        self
+    }
+    fn emphasized(mut self) -> Self {
+        self.emphasized = true;
+        self
+    }
+    fn divider() -> Self {
+        Self {
+            id: String::new(),
+            label: String::new(),
+            hint: None,
+            destructive: false,
+            emphasized: false,
+            separator: true,
+        }
+    }
+}
+/// The KeyTip node key for a row-menu item (`rowmenu:<id>`), so the resolver and
+/// [`dispatch_keytip_node`] agree on one identity per item.
+fn row_menu_node_key(id: &str) -> String {
+    format!("rowmenu:{id}")
+}
+/// Build the row menu for `row`. Pure: same inputs, same menu, in a stable order
+/// — which is what makes the KeyTip letters stable too (invariant 1).
+fn row_menu_items(
+    row: &BrowserRow,
+    apps: &[AppManifest],
+    keep_alive_plan: Option<&KeepAlivePlan>,
+    split_group_members: &[(String, String)],
+    split_candidate_count: usize,
+    can_move_selected_document: bool,
     can_remove_saved_ssh_target: bool,
-    palette: Palette,
-    /// This host's libyggterm app registry — the same list the titlebar `+` menu
-    /// and the start page draw from.
-    apps: Vec<AppManifest>,
-    on_close: EventHandler<MouseEvent>,
-    on_create_group: EventHandler<MouseEvent>,
-    on_create_group_codex: EventHandler<MouseEvent>,
-    on_create_group_claude_code: EventHandler<MouseEvent>,
-    on_create_group_shell: EventHandler<MouseEvent>,
-    on_create_group_recipe: EventHandler<MouseEvent>,
-    on_move_selected_document_here: EventHandler<MouseEvent>,
-    /// Launch a verb an installed app contributed, in the right-clicked row's cwd.
-    on_launch_app_verb: EventHandler<(AppManifest, AppVerb)>,
-    on_regenerate_title: EventHandler<MouseEvent>,
-    on_regenerate_summary: EventHandler<MouseEvent>,
-    on_regenerate_copy: EventHandler<MouseEvent>,
-    on_edit_summary: EventHandler<MouseEvent>,
-    on_rename_session: EventHandler<MouseEvent>,
-    on_refresh_remote_machine: EventHandler<MouseEvent>,
-    on_remove_ssh_target: EventHandler<MouseEvent>,
-    on_close_live_sessions: EventHandler<MouseEvent>,
-    on_set_keep_alive: EventHandler<bool>,
-    on_redraw_terminal: EventHandler<MouseEvent>,
-    on_restart_session: EventHandler<MouseEvent>,
-    on_delete_item: EventHandler<MouseEvent>,
-    on_open_terminal_here: EventHandler<MouseEvent>,
-    on_new_codex_here: EventHandler<MouseEvent>,
-    on_new_claude_here: EventHandler<MouseEvent>,
-    /// Selected live-session paths eligible to be split-grouped
-    /// ([[campaign-split-view-groups]]); `>= 2` offers the Split items.
-    split_candidate_paths: Vec<String>,
-    /// `(path, label)` per pane when the right-clicked row IS a compound split
-    /// row; empty otherwise. Drives ungroup / close-pane / close-all.
-    split_group_members: Vec<(String, String)>,
-    /// Create a split group from `split_candidate_paths`; `true` = side by side.
-    on_split_selected: EventHandler<bool>,
-    on_ungroup_split: EventHandler<MouseEvent>,
-    on_close_split_pane: EventHandler<String>,
-    on_close_split_group: EventHandler<MouseEvent>,
-) -> Element {
-    let placement = context_menu_placement(position, window_size, (224.0, 420.0));
-    let placement_style = context_menu_position_style(placement);
-    let menu_blur = overlay_backdrop_style("blur(20px) saturate(150%)");
-    let drag_paths = if selected_tree_paths.is_empty() {
-        selected_row
-            .as_ref()
-            .filter(|selected| is_tree_drag_source_row(selected))
-            .map(|selected| vec![selected.full_path.clone()])
-            .unwrap_or_default()
-    } else {
-        selected_tree_paths
-    };
-    let can_move_selected_document = valid_drop_target(&drag_paths, &row);
+) -> Vec<RowMenuItem> {
+    let mut items: Vec<RowMenuItem> = Vec::new();
     let is_live_sessions_group = row.full_path == "__live_sessions__";
     let can_create_in_context = !row.full_path.starts_with("__live_")
         && matches!(
             row.kind,
             BrowserRowKind::Group | BrowserRowKind::Document | BrowserRowKind::Separator
         );
-    let can_rename = context_menu_allows_rename(&row);
+    let can_rename = context_menu_allows_rename(row);
     let can_regenerate_copy = !is_live_sessions_group
         && matches!(row.kind, BrowserRowKind::Session | BrowserRowKind::Group);
-    let is_live_runtime_row = row_supports_keep_alive(&row);
-    // The plan is the SSOT for this item: which sessions it writes to, and
-    // whether it reads "Keep Alive" or "Stop Keeping Alive".
-    let keep_alive_active = keep_alive_plan
-        .as_ref()
-        .is_some_and(|plan| plan.all_keep_alive);
-    let keep_alive_count = keep_alive_plan
-        .as_ref()
-        .map(|plan| plan.paths.len())
-        .unwrap_or(0);
+    let is_live_runtime_row = row_supports_keep_alive(row);
+    let keep_alive_active = keep_alive_plan.is_some_and(|plan| plan.all_keep_alive);
+    let keep_alive_count = keep_alive_plan.map(|plan| plan.paths.len()).unwrap_or(0);
     let keep_alive_suffix = if keep_alive_count > 1 {
         format!(" ({keep_alive_count} sessions)")
     } else {
         String::new()
     };
-    let selected_count = drag_paths.len().max(1);
-    let menu_title = if selected_count > 1 && drag_paths.iter().any(|path| path == &row.full_path) {
-        format!("{selected_count} selected items")
-    } else {
-        row.label.clone()
+    // Split-view group actions ([[campaign-split-view-groups]]).
+    if !split_group_members.is_empty() {
+        // Compound split row: structural ops only — there is no × on the row
+        // itself, so a built workspace is hard to lose.
+        items.push(RowMenuItem::new("ungroup-split", "Ungroup", 'u'));
+        for (pane_path, pane_label) in split_group_members {
+            items.push(RowMenuItem::hinted(
+                format!("close-split-pane:{pane_path}"),
+                format!("Close pane: {pane_label}"),
+                None,
+            ));
+        }
+        items.push(RowMenuItem::new("close-split-group", "Close all panes", 'a').destructive());
+    } else if split_candidate_count >= 2 {
+        items.push(RowMenuItem::new(
+            "split-side-by-side",
+            format!("Split side by side ({split_candidate_count} panes)"),
+            'b',
+        ));
+        items.push(RowMenuItem::new(
+            "split-stacked",
+            format!("Split stacked ({split_candidate_count} panes)"),
+            'k',
+        ));
+    }
+    if can_rename {
+        items.push(RowMenuItem::new(
+            "rename-session",
+            if row.kind == BrowserRowKind::Session {
+                "Rename Session"
+            } else {
+                "Rename"
+            },
+            'r',
+        ));
+    }
+    if is_live_sessions_group {
+        items.push(RowMenuItem::new("close-all-live-sessions", "Close All…", 'o').destructive());
+    } else if is_remote_machine_group_row(row) {
+        items.push(RowMenuItem::new(
+            "refresh-remote-sessions",
+            "Refresh Remote Sessions",
+            'f',
+        ));
+        if can_remove_saved_ssh_target {
+            items.push(RowMenuItem::divider());
+            items.push(RowMenuItem::new("delete", "Delete…", 'x').destructive());
+        }
+    } else if can_create_in_context {
+        if can_move_selected_document {
+            items.push(
+                RowMenuItem::new("move-selected-here", "Move Selected Here", 'm').emphasized(),
+            );
+        }
+        items.push(RowMenuItem::new("add-folder", "Add Folder", 'f'));
+        items.push(RowMenuItem::new("new-session", "New Codex Session", 'c'));
+        items.push(RowMenuItem::new(
+            "new-claude-code",
+            "New Claude Code Session",
+            'l',
+        ));
+        items.push(RowMenuItem::new("new-terminal", "New Terminal", 't'));
+        // Verbs CONTRIBUTED by the libyggterm apps on this row's host. Same
+        // registry as the titlebar `+` menu and the start page; a purged app
+        // leaves all three at once. The manifest's `keytip` is the requested
+        // letter (spec §10).
+        for (app, verb) in app_launcher_entries(apps) {
+            items.push(RowMenuItem::hinted(
+                format!("app:{}:{}", app.name, verb.id),
+                format!("{} Here", verb.label),
+                verb.keytip
+                    .chars()
+                    .next()
+                    .or_else(|| app.keytip.chars().next()),
+            ));
+        }
+        items.push(RowMenuItem::divider());
+        items.push(RowMenuItem::new("add-separator", "Add Separator", 'p'));
+    } else if row.kind == BrowserRowKind::Session {
+        if is_live_runtime_row {
+            items.push(RowMenuItem::new("redraw-terminal", "Redraw Terminal", 'd'));
+            items.push(RowMenuItem::new("restart-session", "Restart Session", 'e'));
+            items.push(RowMenuItem::new(
+                if keep_alive_active {
+                    "stop-keep-alive"
+                } else {
+                    "keep-alive"
+                },
+                if keep_alive_active {
+                    format!("Stop Keeping Alive{keep_alive_suffix}")
+                } else {
+                    format!("Keep Alive{keep_alive_suffix}")
+                },
+                'k',
+            ));
+            items.push(RowMenuItem::divider());
+            // Open a sibling session in THIS session's cwd, without hunting
+            // through the cwd tree. Every one of these lands the new row directly
+            // below this one ([`spawn_start_session_for_row`]).
+            items.push(RowMenuItem::new(
+                "open-terminal-here",
+                "Open Terminal Here",
+                't',
+            ));
+            items.push(RowMenuItem::new(
+                "new-codex-here",
+                "New Codex Session Here",
+                'c',
+            ));
+            items.push(RowMenuItem::new(
+                "new-claude-here",
+                "New Claude Code Session Here",
+                'l',
+            ));
+            for (app, verb) in app_launcher_entries(apps) {
+                items.push(RowMenuItem::hinted(
+                    format!("app:{}:{}", app.name, verb.id),
+                    format!("{} Here", verb.label),
+                    verb.keytip
+                        .chars()
+                        .next()
+                        .or_else(|| app.keytip.chars().next()),
+                ));
+            }
+        }
+        items.push(RowMenuItem::new(
+            "regenerate-copy",
+            "Regenerate Title/Summary",
+            'g',
+        ));
+        items.push(RowMenuItem::new("edit-summary", "Edit Summary", 's'));
+        items.push(RowMenuItem::divider());
+        items.push(
+            RowMenuItem::new(
+                "delete-session",
+                if is_live_runtime_row {
+                    "Close Terminal…"
+                } else {
+                    "Delete…"
+                },
+                'x',
+            )
+            .destructive(),
+        );
+    }
+    if can_regenerate_copy && row.kind != BrowserRowKind::Session {
+        items.push(RowMenuItem::divider());
+        items.push(RowMenuItem::new(
+            "regenerate-copy",
+            "Regenerate Title/Summary",
+            'g',
+        ));
+        items.push(RowMenuItem::new("regenerate-title", "Regenerate Titles", 'i').emphasized());
+        items.push(
+            RowMenuItem::new("regenerate-summary", "Regenerate Summaries", 'z').emphasized(),
+        );
+    }
+    if is_workspace_row(row) {
+        items.push(RowMenuItem::divider());
+        items.push(RowMenuItem::new("delete", "Delete…", 'x').destructive());
+    }
+    items
+}
+/// The `(path, label)` pair per pane when `row` IS a compound split row; empty
+/// otherwise. Same lookup [`split_group_cells_for_row`] does, over the raw state
+/// rather than a `RenderSnapshot`, so `ShellState::snapshot` can build the row
+/// menu while it is still assembling itself.
+fn split_group_member_labels(
+    split_groups: &[SplitGroup],
+    live_sessions: &[ManagedSessionView],
+    row: &BrowserRow,
+) -> Vec<(String, String)> {
+    if !row.full_path.starts_with("split://") {
+        return Vec::new();
+    }
+    let Some(group_id) = row.session_id.as_deref() else {
+        return Vec::new();
     };
+    let Some(group) = split_groups
+        .iter()
+        .find(|group| group.group_id == group_id)
+    else {
+        return Vec::new();
+    };
+    group
+        .members
+        .iter()
+        .map(|member| {
+            let label = live_sessions
+                .iter()
+                .find(|session| &session.session_path == member)
+                .map(|session| session.title.clone())
+                .filter(|title| !title.trim().is_empty())
+                .unwrap_or_else(|| member.clone());
+            (member.clone(), label)
+        })
+        .collect()
+}
+/// The live rows a "Split …" item would compound: the selection (or the clicked
+/// row alone), minus anything already in a group. One rule, read by the menu
+/// builder (for the item's count) and by the dispatcher (for the actual paths).
+fn split_candidate_paths_for(
+    row: &BrowserRow,
+    selected_tree_paths: &[String],
+    split_groups: &[SplitGroup],
+) -> Vec<String> {
+    let selected: Vec<String> = if selected_tree_paths.is_empty() {
+        vec![row.full_path.clone()]
+    } else {
+        selected_tree_paths.to_vec()
+    };
+    selected
+        .into_iter()
+        .filter(|path| is_hot_terminal_sidebar_path(path))
+        .filter(|path| !split_groups.iter().any(|group| group.contains(path)))
+        .collect()
+}
+/// Run one row-menu item against `row`. THE terminus for the row menu: a click on
+/// the item and its ALT chord (`ALT,E,<letter>`) both arrive here with the same
+/// id, so the keyboard can never reach an action the mouse cannot, or vice versa.
+fn dispatch_row_menu_action(mut state: Signal<ShellState>, row: BrowserRow, id: String) {
+    // The creation-context row (a folder for a paper, a session's own cwd) — the
+    // same row `open_context_menu` resolved when the menu opened.
+    let context_row = state.with(|shell| {
+        shell
+            .context_menu_context_row
+            .clone()
+            .unwrap_or_else(|| resolve_creation_context_row(&shell.snapshot().rows, &row))
+    });
+    let preferred_agent_kind = preferred_agent_session_kind(&state.read().settings);
+    // Payload-carrying ids (§ `RowMenuItem::id`).
+    if let Some(pane_path) = id.strip_prefix("close-split-pane:") {
+        let pane_path = pane_path.to_string();
+        if let Some(group_id) = row.session_id.clone() {
+            remove_split_pane(state, &group_id, &pane_path);
+        }
+        spawn_close_session_runtime(state, pane_path);
+        return;
+    }
+    if id.starts_with("app:") {
+        let mut parts = id.splitn(3, ':');
+        let (Some(_), Some(app_name), Some(verb_id)) = (parts.next(), parts.next(), parts.next())
+        else {
+            return;
+        };
+        let entry = state.read().server.apps().iter().find_map(|app| {
+            (app.name == app_name).then(|| {
+                app.verbs
+                    .iter()
+                    .find(|verb| verb.id == verb_id)
+                    .map(|verb| (app.clone(), verb.clone()))
+            })?
+        });
+        if let Some((app, verb)) = entry {
+            // cwd AND sidebar anchor both from the clicked row, like the "New …
+            // Here" items above it.
+            spawn_launch_app_verb_here(state, app, verb, Some(row.clone()));
+        }
+        return;
+    }
+    match id.as_str() {
+        "ungroup-split" => {
+            if let Some(group_id) = row.session_id.clone() {
+                ungroup_split_group(state, &group_id);
+            }
+        }
+        "close-split-group" => {
+            let members: Vec<String> = state.with_mut(|shell| {
+                let members = split_group_member_labels(
+                    &shell.split_groups,
+                    &shell.server.live_sessions(),
+                    &row,
+                )
+                .into_iter()
+                .map(|(path, _)| path)
+                .collect();
+                shell.close_context_menu();
+                members
+            });
+            if let Some(group_id) = row.session_id.clone() {
+                ungroup_split_group(state, &group_id);
+            }
+            for path in members {
+                spawn_close_session_runtime(state, path);
+            }
+        }
+        "split-side-by-side" | "split-stacked" => {
+            let candidates = state.with_mut(|shell| {
+                let candidates = split_candidate_paths_for(
+                    &row,
+                    &shell.selected_tree_paths.iter().cloned().collect::<Vec<_>>(),
+                    &shell.split_groups,
+                );
+                shell.close_context_menu();
+                candidates
+            });
+            let axis = if id == "split-side-by-side" {
+                SplitAxis::SideBySide
+            } else {
+                SplitAxis::Stacked
+            };
+            create_split_group(state, candidates, axis);
+        }
+        "rename-session" => {
+            state.with_mut(|shell| shell.begin_tree_rename(&row));
+            sync_active_terminal_input_policy(state);
+        }
+        "close-all-live-sessions" => {
+            state.with_mut(|shell| shell.open_live_sessions_close_all_dialog());
+        }
+        "refresh-remote-sessions" => {
+            if let Some(machine_key) = row
+                .full_path
+                .strip_prefix("__remote_machine__/")
+                .map(ToOwned::to_owned)
+            {
+                let label = row.label.clone();
+                spawn_server_snapshot_action(state, format!("refreshing {label}"), move |endpoint| {
+                    refresh_remote_machine(&endpoint, &machine_key)
+                });
+            }
+        }
+        // One id, two rows: on a saved SSH machine row "Delete…" forgets the
+        // target; on a workspace row it opens the delete dialog. The row decides,
+        // exactly as the two mutually-exclusive render branches did.
+        "delete" => {
+            if is_remote_machine_group_row(&row) {
+                queue_remove_saved_ssh_target(state, row.clone());
+            } else {
+                state.with_mut(|shell| shell.open_context_menu_delete_for_row(&row, false));
+            }
+        }
+        "move-selected-here" => {
+            if let Some(placement) = context_menu_drop_placement(&context_row) {
+                queue_move_selected_items_to_group(
+                    state,
+                    placement,
+                    format!("near {}", context_row.label),
+                );
+            }
+        }
+        "add-folder" => queue_new_group_for_row(state, context_row),
+        "add-separator" => queue_new_separator_for_row(state, row),
+        "new-session" => spawn_start_group_session(state, context_row, preferred_agent_kind),
+        "new-claude-code" => spawn_start_group_session(state, context_row, SessionKind::ClaudeCode),
+        "new-terminal" => spawn_start_group_session(state, context_row, SessionKind::Shell),
+        // The "… Here" items on a live-session row use the RAW row, so the new
+        // session inherits THAT session's cwd and lands directly below it.
+        "open-terminal-here" => spawn_start_group_session(state, row, SessionKind::Shell),
+        "new-codex-here" => spawn_start_group_session(state, row, preferred_agent_kind),
+        "new-claude-here" => spawn_start_group_session(state, row, SessionKind::ClaudeCode),
+        "keep-alive" | "stop-keep-alive" => {
+            let keep_alive = id == "keep-alive";
+            // Re-derive from the same function that labelled the item, so the
+            // click can never write to a different set than the menu promised.
+            let Some(plan) = state.with_mut(|shell| {
+                let plan = shell.context_menu_keep_alive_plan();
+                if let Some(plan) = plan.as_ref() {
+                    for path in &plan.paths {
+                        mark_live_session_keep_alive_locally(shell, path, keep_alive);
+                    }
+                }
+                shell.close_context_menu();
+                shell.refresh_tree_debug("keep_alive_optimistic_toggle");
+                plan
+            }) else {
+                return;
+            };
+            let target = if plan.paths.len() > 1 {
+                format!("{} sessions", plan.paths.len())
+            } else {
+                row.label.clone()
+            };
+            let paths = plan.paths.clone();
+            spawn_server_snapshot_action(
+                state,
+                if keep_alive {
+                    format!("keeping {target} alive")
+                } else {
+                    format!("stopping keep-alive for {target}")
+                },
+                move |endpoint| {
+                    // Exact paths, one request each, tree order. The LAST snapshot
+                    // is the one the UI adopts. A failure must NOT abort the batch
+                    // — the remaining sessions still get their request (a bulk
+                    // keep-alive that stops at the first bad row silently strands
+                    // the rest); errors aggregate and surface once, and any
+                    // success still adopts a snapshot so the tree shows the
+                    // daemon's truth for the rows that took.
+                    let mut result = None;
+                    let mut errors = Vec::new();
+                    for path in &paths {
+                        match set_session_keep_alive(&endpoint, path, keep_alive) {
+                            Ok(snapshot) => result = Some(snapshot),
+                            Err(error) => errors.push(format!("{path}: {error}")),
+                        }
+                    }
+                    match result {
+                        Some(snapshot) => Ok(snapshot),
+                        None if !errors.is_empty() => Err(anyhow!(errors.join("; "))),
+                        None => Err(anyhow!("no live session to keep alive")),
+                    }
+                },
+            );
+        }
+        "redraw-terminal" => {
+            let path = row.full_path.clone();
+            let label = row.label.clone();
+            state.with_mut(|shell| shell.close_context_menu());
+            spawn(async move {
+                // FIX C: re-fetch the daemon's authoritative vt100 screen FIRST,
+                // then re-fit the renderer. The plain renderer redraw only re-fits
+                // + `term.refresh()`s the EXISTING client buffer, so when that
+                // buffer is a stale "shadow" or a scooped buffer, repainting it
+                // "does nothing". The content reconcile replays the daemon screen,
+                // which promotes the source back to daemon_pty and closes the
+                // broken-bottom/shadow. This is the user-initiated escape hatch,
+                // so it runs unconditionally (the quiet/working gates only protect
+                // the AUTOMATIC reconcile from recovery-churn).
+                let endpoint = state.read().bootstrap.server_endpoint.clone();
+                if let Ok(home) = resolve_yggterm_home() {
+                    let _ = reconcile_terminal_from_daemon_for(endpoint, &path, &home).await;
+                }
+                let result = redraw_terminal_viewport_for(&path).await;
+                let accepted = result
+                    .get("accepted")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                if accepted {
+                    // A successful redraw used to silently succeed; without a toast
+                    // "nothing happens" is the user-perceived response when the
+                    // viewport did not actually need changing.
+                    state.with_mut(|shell| {
+                        shell.push_notification(
+                            NotificationTone::Info,
+                            "Redraw Terminal",
+                            format!("Re-synced {label} from daemon."),
+                        );
+                    });
+                    return;
+                }
+                let reason = result
+                    .get("reason")
+                    .and_then(Value::as_str)
+                    .unwrap_or("terminal host did not accept redraw");
+                // The most common failure is `terminal_host_missing` — the row's
+                // xterm host isn't mounted (it is not the active viewport). Swap in
+                // a clearer instruction rather than the raw debug string.
+                let (title, message) = if reason == "terminal_host_missing" {
+                    (
+                        "Open Session Before Redrawing",
+                        format!(
+                            "{label} isn't the active viewport. Click the row to focus the session, then right-click → Redraw Terminal."
+                        ),
+                    )
+                } else {
+                    ("Redraw Failed", format!("{label}: {reason}"))
+                };
+                state.with_mut(|shell| {
+                    shell.push_notification(NotificationTone::Error, title, message);
+                });
+            });
+        }
+        "restart-session" => {
+            let path = row.full_path.clone();
+            let label = row.label.clone();
+            state.with_mut(|shell| shell.close_context_menu());
+            // Manual restart override for ANY live session.
+            // terminal_force_remote_restart_async issues the daemon TerminalRestart
+            // (force_remote=true): for a remote agent it terminates the remote
+            // runtime and re-resumes; for a local session the remote-terminate is a
+            // no-op and the daemon re-launches the PTY.
+            let (endpoint, appearance) = state.with(|shell| {
+                (
+                    shell.bootstrap.server_endpoint.clone(),
+                    shell.effective_terminal_identity_appearance().to_string(),
+                )
+            });
+            let trace_home = resolve_yggterm_home().unwrap_or_else(|_| PathBuf::from("."));
+            state.with_mut(|shell| {
+                shell.push_notification(
+                    NotificationTone::Warning,
+                    "Restart Session",
+                    format!("Restarting {label}…"),
+                );
+            });
+            spawn(async move {
+                if let Err(error) = terminal_force_remote_restart_async(
+                    endpoint,
+                    path.clone(),
+                    Some(appearance),
+                    None,
+                    &trace_home,
+                    "manual_restart_session",
+                    0,
+                )
+                .await
+                {
+                    state.with_mut(|shell| {
+                        shell.push_notification(
+                            NotificationTone::Error,
+                            "Restart Failed",
+                            format!("{label}: {error}"),
+                        );
+                    });
+                }
+            });
+        }
+        "regenerate-copy" => {
+            spawn_selected_copy_regeneration(state, row, CopyRegenerationMode::Copy)
+        }
+        "regenerate-title" => {
+            spawn_selected_copy_regeneration(state, row, CopyRegenerationMode::Title)
+        }
+        "regenerate-summary" => {
+            spawn_selected_copy_regeneration(state, row, CopyRegenerationMode::Summary)
+        }
+        "edit-summary" => queue_copy_edit_for_row(state, row, CopyEditField::Summary),
+        "delete-session" => {
+            state.with_mut(|shell| shell.open_context_menu_delete_for_row(&row, false));
+        }
+        _ => {
+            state.with_mut(|shell| shell.close_context_menu());
+        }
+    }
+}
+#[component]
+fn ContextMenuOverlay(
+    /// The row the menu acts on.
+    row: BrowserRow,
+    position: (f64, f64),
+    window_size: (f64, f64),
+    palette: Palette,
+    /// The menu's contents — [`row_menu_items`], resolved once in the snapshot and
+    /// shared with the ALT layer's `rowmenu` scope. This component draws exactly
+    /// this list; it decides NOTHING about what the menu contains.
+    items: Vec<RowMenuItem>,
+    menu_title: String,
+    /// The resolved KeyTip tree and the chord typed so far, so each item paints
+    /// the same letter the chord walker would act on (one assignment, two views).
+    keytip_tree: KeyTipTree,
+    alt_overlay_active: bool,
+    alt_overlay_sequence: String,
+    on_close: EventHandler<MouseEvent>,
+    /// Run the item with this id. One terminus for the mouse and the ALT layer
+    /// alike ([`dispatch_row_menu_action`]) — neither can reach an action the
+    /// other cannot.
+    on_action: EventHandler<String>,
+) -> Element {
+    let placement = context_menu_placement(position, window_size, (224.0, 420.0));
+    let placement_style = context_menu_position_style(placement);
+    let menu_blur = overlay_backdrop_style("blur(20px) saturate(150%)");
     rsx! {
         div {
             style: "position:fixed; inset:0; z-index:90; background:transparent; pointer-events:none;",
@@ -83604,468 +83917,43 @@ fn ContextMenuOverlay(
                     style: format!("padding:6px 12px 8px 12px; font-size:11px; font-weight:700; color:{}; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;", palette.muted),
                     "{menu_title}"
                 }
-                // Split-view group actions ([[campaign-split-view-groups]]).
-                if !split_group_members.is_empty() {
-                    // Compound split row: structural ops only — there is no × on
-                    // the row itself, so a built workspace is hard to lose.
-                    button {
-                        "data-context-menu-action": "ungroup-split",
-                        class: "yggterm-menu-item",
-                        style: context_menu_action_style(palette, false),
-                        onmousedown: |evt| evt.stop_propagation(),
-                        onclick: move |evt| {
-                            evt.stop_propagation();
-                            on_ungroup_split.call(evt);
-                        },
-                        "Ungroup"
-                    }
-                    for (pane_path, pane_label) in split_group_members.iter().cloned() {
-                        button {
-                            "data-context-menu-action": "close-split-pane",
-                            class: "yggterm-menu-item",
-                            style: context_menu_action_style(palette, false),
-                            onmousedown: |evt| evt.stop_propagation(),
-                            onclick: move |evt| {
-                                evt.stop_propagation();
-                                on_close_split_pane.call(pane_path.clone());
-                            },
-                            "Close pane: {pane_label}"
-                        }
-                    }
-                    button {
-                        "data-context-menu-action": "close-split-group",
-                        class: "yggterm-menu-item",
-                        style: context_menu_action_style_destructive(palette),
-                        onmousedown: |evt| evt.stop_propagation(),
-                        onclick: move |evt| {
-                            evt.stop_propagation();
-                            on_close_split_group.call(evt);
-                        },
-                        "Close all panes"
-                    }
-                } else if split_candidate_paths.len() >= 2 {
-                    button {
-                        "data-context-menu-action": "split-side-by-side",
-                        class: "yggterm-menu-item",
-                        style: context_menu_action_style(palette, false),
-                        onmousedown: |evt| evt.stop_propagation(),
-                        onclick: move |evt| {
-                            evt.stop_propagation();
-                            on_split_selected.call(true);
-                        },
-                        {format!("Split side by side ({} panes)", split_candidate_paths.len())}
-                    }
-                    button {
-                        "data-context-menu-action": "split-stacked",
-                        class: "yggterm-menu-item",
-                        style: context_menu_action_style(palette, false),
-                        onmousedown: |evt| evt.stop_propagation(),
-                        onclick: move |evt| {
-                            evt.stop_propagation();
-                            on_split_selected.call(false);
-                        },
-                        {format!("Split stacked ({} panes)", split_candidate_paths.len())}
-                    }
-                }
-                if can_rename {
-                    button {
-                        "data-context-menu-action": "rename-session",
-                        class: "yggterm-menu-item",
-                        style: context_menu_action_style(palette, false),
-                        onmousedown: |evt| {
-                            evt.stop_propagation();
-                        },
-                        onclick: move |evt| {
-                            evt.stop_propagation();
-                            on_rename_session.call(evt);
-                        },
-                        if row.kind == BrowserRowKind::Session {
-                            "Rename Session"
-                        } else {
-                            "Rename"
-                        }
-                    }
-                }
-                if is_live_sessions_group {
-                    button {
-                        "data-context-menu-action": "close-all-live-sessions",
-                        class: "yggterm-menu-item",
-                        style: context_menu_action_style_destructive(palette),
-                        onmousedown: |evt| {
-                            evt.stop_propagation();
-                        },
-                        onclick: move |evt| {
-                            evt.stop_propagation();
-                            on_close_live_sessions.call(evt);
-                        },
-                        "Close All…"
-                    }
-                } else if is_remote_machine_group_row(&row) {
-                    button {
-                        "data-context-menu-action": "refresh-remote-sessions",
-                        class: "yggterm-menu-item",
-                        style: context_menu_action_style(palette, false),
-                        onmousedown: |evt| {
-                            evt.stop_propagation();
-                        },
-                        onclick: move |evt| {
-                            evt.stop_propagation();
-                            on_refresh_remote_machine.call(evt);
-                        },
-                        "Refresh Remote Sessions"
-                    }
-                    if can_remove_saved_ssh_target {
+                for item in items.iter().cloned() {
+                    if item.separator {
                         div {
+                            key: "sep-{item.id}-{item.label}",
                             style: format!("height:1px; margin:6px 4px; background:{}; opacity:0.7;", palette.border),
                         }
+                    } else {
                         button {
-                            "data-context-menu-action": "delete",
+                            key: "item-{item.id}",
+                            "data-context-menu-action": "{item.id}",
                             class: "yggterm-menu-item",
-                            style: context_menu_action_style_destructive(palette),
-                            onmousedown: |evt| {
-                                evt.stop_propagation();
+                            style: if item.destructive {
+                                context_menu_action_style_destructive(palette)
+                            } else {
+                                context_menu_action_style(palette, item.emphasized)
                             },
-                            onclick: move |evt| {
-                                evt.stop_propagation();
-                                on_remove_ssh_target.call(evt);
-                            },
-                            "Delete…"
-                        }
-                    }
-                } else if can_create_in_context {
-                    if can_move_selected_document {
-                        button {
-                            "data-context-menu-action": "move-selected-here",
-                            class: "yggterm-menu-item",
-                            style: context_menu_action_style(palette, true),
-                            onmousedown: |evt| {
-                                evt.stop_propagation();
-                            },
-                            onclick: move |evt| {
-                                evt.stop_propagation();
-                                on_move_selected_document_here.call(evt);
-                            },
-                            "Move Selected Here"
-                        }
-                    }
-                    button {
-                        "data-context-menu-action": "add-folder",
-                        class: "yggterm-menu-item",
-                        style: context_menu_action_style(palette, false),
-                        onmousedown: |evt| {
-                            evt.stop_propagation();
-                        },
-                        onclick: move |evt| {
-                            evt.stop_propagation();
-                            on_create_group.call(evt);
-                        },
-                        "Add Folder"
-                    }
-                    button {
-                        "data-context-menu-action": "new-session",
-                        class: "yggterm-menu-item",
-                        style: context_menu_action_style(palette, false),
-                        onmousedown: |evt| {
-                            evt.stop_propagation();
-                        },
-                        onclick: move |evt| {
-                            evt.stop_propagation();
-                            on_create_group_codex.call(evt);
-                        },
-                        "New Codex Session"
-                    }
-                    button {
-                        "data-context-menu-action": "new-claude-code",
-                        class: "yggterm-menu-item",
-                        style: context_menu_action_style(palette, false),
-                        onmousedown: |evt| {
-                            evt.stop_propagation();
-                        },
-                        onclick: move |evt| {
-                            evt.stop_propagation();
-                            on_create_group_claude_code.call(evt);
-                        },
-                        "New Claude Code Session"
-                    }
-                    button {
-                        "data-context-menu-action": "new-terminal",
-                        class: "yggterm-menu-item",
-                        style: context_menu_action_style(palette, false),
-                        onmousedown: |evt| {
-                            evt.stop_propagation();
-                        },
-                        onclick: move |evt| {
-                            evt.stop_propagation();
-                            on_create_group_shell.call(evt);
-                        },
-                        "New Terminal"
-                    }
-                    // Verbs CONTRIBUTED by the libyggterm apps on this row's
-                    // host. Same registry as the titlebar `+` menu and the start
-                    // page; a purged app leaves all three at once.
-                    for (app, verb) in app_launcher_entries(&apps) {
-                        button {
-                            key: "ctx-app-{app.name}-{verb.id}",
-                            "data-context-menu-action": "app:{app.name}:{verb.id}",
-                            class: "yggterm-menu-item",
-                            style: context_menu_action_style(palette, false),
-                            onmousedown: |evt| {
-                                evt.stop_propagation();
-                            },
+                            onmousedown: |evt| evt.stop_propagation(),
                             onclick: {
-                                let on_launch_app_verb = on_launch_app_verb.clone();
-                                let entry = (app.clone(), verb.clone());
+                                let id = item.id.clone();
+                                let on_action = on_action;
                                 move |evt: MouseEvent| {
                                     evt.stop_propagation();
-                                    on_launch_app_verb.call(entry.clone());
+                                    on_action.call(id.clone());
                                 }
                             },
-                            "{verb.label} Here"
-                        }
-                    }
-                    div {
-                        style: format!("height:1px; margin:6px 4px; background:{}; opacity:0.7;", palette.border),
-                    }
-                    button {
-                        "data-context-menu-action": "add-separator",
-                        class: "yggterm-menu-item",
-                        style: context_menu_action_style(palette, false),
-                        onmousedown: |evt| {
-                            evt.stop_propagation();
-                        },
-                        onclick: move |evt| {
-                            evt.stop_propagation();
-                            on_create_group_recipe.call(evt);
-                        },
-                        "Add Separator"
-                    }
-                } else if row.kind == BrowserRowKind::Session {
-                    if is_live_runtime_row {
-                        button {
-                            "data-context-menu-action": "redraw-terminal",
-                            class: "yggterm-menu-item",
-                            style: context_menu_action_style(palette, false),
-                            onmousedown: |evt| {
-                                evt.stop_propagation();
-                            },
-                            onclick: move |evt| {
-                                evt.stop_propagation();
-                                on_redraw_terminal.call(evt);
-                            },
-                            "Redraw Terminal"
-                        }
-                        button {
-                            "data-context-menu-action": "restart-session",
-                            class: "yggterm-menu-item",
-                            style: context_menu_action_style(palette, false),
-                            onmousedown: |evt| {
-                                evt.stop_propagation();
-                            },
-                            onclick: move |evt| {
-                                evt.stop_propagation();
-                                on_restart_session.call(evt);
-                            },
-                            "Restart Session"
-                        }
-                        button {
-                            "data-context-menu-action": if keep_alive_active { "stop-keep-alive" } else { "keep-alive" },
-                            "data-keep-alive-count": "{keep_alive_count}",
-                            class: "yggterm-menu-item",
-                            style: context_menu_action_style(palette, false),
-                            onmousedown: |evt| {
-                                evt.stop_propagation();
-                            },
-                            onclick: move |evt| {
-                                evt.stop_propagation();
-                                on_set_keep_alive.call(!keep_alive_active);
-                            },
-                            if keep_alive_active {
-                                "Stop Keeping Alive{keep_alive_suffix}"
-                            } else {
-                                "Keep Alive{keep_alive_suffix}"
+                            span {
+                                "data-keytip-node": keytip_node_id(&row_menu_node_key(&item.id)),
+                                "data-keytip-tip": keytip_tip_for(
+                                    &keytip_tree,
+                                    alt_overlay_active,
+                                    &alt_overlay_sequence,
+                                    &row_menu_node_key(&item.id),
+                                ),
+                                style: "display:none;",
                             }
+                            "{item.label}"
                         }
-                        div {
-                            style: format!("height:1px; margin:6px 4px; background:{}; opacity:0.7;", palette.border),
-                        }
-                        // Open a sibling session in THIS session's cwd, without
-                        // hunting through the cwd tree. The handlers resolve the
-                        // selected live row's cwd (local or remote) via
-                        // agent_session_launch_context_for_row.
-                        button {
-                            "data-context-menu-action": "open-terminal-here",
-                            class: "yggterm-menu-item",
-                            style: context_menu_action_style(palette, false),
-                            onmousedown: |evt| {
-                                evt.stop_propagation();
-                            },
-                            onclick: move |evt| {
-                                evt.stop_propagation();
-                                on_open_terminal_here.call(evt);
-                            },
-                            "Open Terminal Here"
-                        }
-                        button {
-                            "data-context-menu-action": "new-codex-here",
-                            class: "yggterm-menu-item",
-                            style: context_menu_action_style(palette, false),
-                            onmousedown: |evt| {
-                                evt.stop_propagation();
-                            },
-                            onclick: move |evt| {
-                                evt.stop_propagation();
-                                on_new_codex_here.call(evt);
-                            },
-                            "New Codex Session Here"
-                        }
-                        button {
-                            "data-context-menu-action": "new-claude-here",
-                            class: "yggterm-menu-item",
-                            style: context_menu_action_style(palette, false),
-                            onmousedown: |evt| {
-                                evt.stop_propagation();
-                            },
-                            onclick: move |evt| {
-                                evt.stop_propagation();
-                                on_new_claude_here.call(evt);
-                            },
-                            "New Claude Code Session Here"
-                        }
-                        // App verbs CONTRIBUTED by this host's libyggterm apps
-                        // (e.g. "New Ychrome Here"), same registry the folder
-                        // menu, the titlebar `+` and the start page render — so a
-                        // live-session row can launch a browser in its own cwd
-                        // without hunting the cwd tree. on_launch_app_verb routes
-                        // through the session's creation-context row (its cwd +
-                        // host), matching the "… Here" agent actions above.
-                        for (app, verb) in app_launcher_entries(&apps) {
-                            button {
-                                key: "ctx-session-app-{app.name}-{verb.id}",
-                                "data-context-menu-action": "app:{app.name}:{verb.id}",
-                                class: "yggterm-menu-item",
-                                style: context_menu_action_style(palette, false),
-                                onmousedown: |evt| {
-                                    evt.stop_propagation();
-                                },
-                                onclick: {
-                                    let on_launch_app_verb = on_launch_app_verb.clone();
-                                    let entry = (app.clone(), verb.clone());
-                                    move |evt: MouseEvent| {
-                                        evt.stop_propagation();
-                                        on_launch_app_verb.call(entry.clone());
-                                    }
-                                },
-                                "{verb.label} Here"
-                            }
-                        }
-                    }
-                    button {
-                        "data-context-menu-action": "regenerate-copy",
-                        class: "yggterm-menu-item",
-                        style: context_menu_action_style(palette, false),
-                        onmousedown: |evt| {
-                            evt.stop_propagation();
-                        },
-                        onclick: move |evt| {
-                            evt.stop_propagation();
-                            on_regenerate_copy.call(evt);
-                        },
-                        "Regenerate Title/Summary"
-                    }
-                    button {
-                        "data-context-menu-action": "edit-summary",
-                        class: "yggterm-menu-item",
-                        style: context_menu_action_style(palette, false),
-                        onmousedown: |evt| {
-                            evt.stop_propagation();
-                        },
-                        onclick: move |evt| {
-                            evt.stop_propagation();
-                            on_edit_summary.call(evt);
-                        },
-                        "Edit Summary"
-                    }
-                    div {
-                        style: format!("height:1px; margin:6px 4px; background:{}; opacity:0.7;", palette.border),
-                    }
-                    button {
-                        "data-context-menu-action": "delete-session",
-                        class: "yggterm-menu-item",
-                        style: context_menu_action_style_destructive(palette),
-                        onmousedown: |evt| {
-                            evt.stop_propagation();
-                        },
-                        onclick: move |evt| {
-                            evt.stop_propagation();
-                            on_delete_item.call(evt);
-                        },
-                        if is_live_runtime_row {
-                            "Close Terminal…"
-                        } else {
-                            "Delete…"
-                        }
-                    }
-                }
-                if can_regenerate_copy && row.kind != BrowserRowKind::Session {
-                    div {
-                        style: format!("height:1px; margin:6px 4px; background:{}; opacity:0.7;", palette.border),
-                    }
-                    button {
-                        "data-context-menu-action": "regenerate-copy",
-                        class: "yggterm-menu-item",
-                        style: context_menu_action_style(palette, false),
-                        onmousedown: |evt| {
-                            evt.stop_propagation();
-                        },
-                        onclick: move |evt| {
-                            evt.stop_propagation();
-                            on_regenerate_copy.call(evt);
-                        },
-                        "Regenerate Title/Summary"
-                    }
-                    button {
-                        "data-context-menu-action": "regenerate-title",
-                        class: "yggterm-menu-item",
-                        style: context_menu_action_style(palette, true),
-                        onmousedown: |evt| {
-                            evt.stop_propagation();
-                        },
-                        onclick: move |evt| {
-                            evt.stop_propagation();
-                            on_regenerate_title.call(evt);
-                        },
-                        "Regenerate Titles"
-                    }
-                    button {
-                        "data-context-menu-action": "regenerate-summary",
-                        class: "yggterm-menu-item",
-                        style: context_menu_action_style(palette, true),
-                        onmousedown: |evt| {
-                            evt.stop_propagation();
-                        },
-                        onclick: move |evt| {
-                            evt.stop_propagation();
-                            on_regenerate_summary.call(evt);
-                        },
-                        "Regenerate Summaries"
-                    }
-                }
-                if is_workspace_row(&row) {
-                    div {
-                        style: format!("height:1px; margin:6px 4px; background:{}; opacity:0.7;", palette.border),
-                    }
-                        button {
-                            "data-context-menu-action": "delete",
-                            class: "yggterm-menu-item",
-                            style: context_menu_action_style_destructive(palette),
-                        onmousedown: |evt| {
-                            evt.stop_propagation();
-                        },
-                        onclick: move |evt| {
-                            evt.stop_propagation();
-                            on_delete_item.call(evt);
-                        },
-                        "Delete…"
                     }
                 }
             }
@@ -89871,9 +89759,41 @@ mod tests {
 
     #[test]
     fn live_sessions_group_context_menu_exposes_close_all_action() {
+        // The Live Sessions group row offers exactly one action: Close All. Asserted
+        // against the row-menu SSOT (which the overlay renders and the ALT layer
+        // declares) rather than by scraping the rsx for a literal — the menu is
+        // built from `row_menu_items` now, so the list IS the contract.
+        let row = BrowserRow {
+            kind: BrowserRowKind::Group,
+            full_path: "__live_sessions__".to_string(),
+            label: "Live Sessions".to_string(),
+            detail_label: String::new(),
+            document_kind: None,
+            group_kind: None,
+            session_title: None,
+            depth: 0,
+            host_label: String::new(),
+            descendant_sessions: 2,
+            expanded: true,
+            session_id: None,
+            session_cwd: None,
+            session_kind: None,
+        };
+        let items = row_menu_items(&row, &[], None, &[], 0, false, false);
+        let close_all = items
+            .iter()
+            .find(|item| item.id == "close-all-live-sessions")
+            .expect("Live Sessions offers Close All");
+        assert_eq!(close_all.label, "Close All…");
+        assert!(close_all.destructive);
+        // …and it is the ONLY action on that row (no rename, no launch, no delete).
+        let actions: Vec<&str> = items
+            .iter()
+            .filter(|item| !item.separator)
+            .map(|item| item.id.as_str())
+            .collect();
+        assert_eq!(actions, vec!["close-all-live-sessions"]);
         let source = include_str!("shell.rs");
-        assert!(source.contains("\"data-context-menu-action\": \"close-all-live-sessions\""));
-        assert!(source.contains("\"Close All…\""));
         assert!(source.contains("open_live_sessions_close_all_dialog"));
     }
 
@@ -101425,7 +101345,7 @@ mod tests {
             }
             other => panic!("expected remote terminal launch context, got {other:?}"),
         }
-        match agent_session_launch_context_for_row(&shell, &row, SessionKind::Codex) {
+        match group_session_launch_context(&shell, &row, SessionKind::Codex) {
             TerminalLaunchContext::Remote {
                 ssh_target, cwd, ..
             } => {
@@ -101472,7 +101392,12 @@ mod tests {
         shell.needs_initial_server_sync = false;
         shell.browser.select_path(session_path.to_string());
 
-        match current_agent_session_launch_context(&shell, SessionKind::Codex) {
+        // The `+` menu's launch resolves "here" through launch_anchor_row and the
+        // one launch-context rule — so an active REMOTE session starts a remote
+        // codex, not a local shell.
+        let anchor = launch_anchor_row(&shell, None).expect("active session is the anchor");
+        assert_eq!(anchor.full_path, session_path);
+        match group_session_launch_context(&shell, &anchor, SessionKind::Codex) {
             TerminalLaunchContext::Remote {
                 ssh_target,
                 prefix,
@@ -101482,7 +101407,7 @@ mod tests {
                 assert_eq!(ssh_target, "pi@dev");
                 assert_eq!(prefix.as_deref(), Some("cd /srv"));
                 assert_eq!(cwd.as_deref(), Some("/home/user/git/samplenotes"));
-                assert_eq!(title_hint.as_deref(), Some("Samplenotes Shell session"));
+                assert_eq!(title_hint.as_deref(), Some("Samplenotes Shell codex"));
             }
             other => panic!("expected remote Codex launch context, got {other:?}"),
         }
@@ -101545,7 +101470,7 @@ mod tests {
     fn alt_overlay_sequence_supports_insert_submenu() {
         // The real shell tree (no apps installed): ALT,I descends into the New…
         // scope, then S / T / C reach its items. Resolution is KeyTipTree's job now.
-        let tree = build_keytip_tree(&KeymapConfig::default(), &[]);
+        let tree = build_keytip_tree(&KeymapConfig::default(), &[], &[]);
         assert_eq!(
             tree.resolve("i"),
             ChordResolution::Descend {
@@ -101569,6 +101494,169 @@ mod tests {
         // registry-driven now: a Paper app claims its own KeyTip when it ships.
         assert_eq!(tree.resolve("ip"), ChordResolution::Invalid);
         assert_eq!(tree.resolve("iz"), ChordResolution::Invalid);
+    }
+    fn test_live_session_row(path: &str, label: &str) -> BrowserRow {
+        BrowserRow {
+            kind: BrowserRowKind::Session,
+            full_path: path.to_string(),
+            label: label.to_string(),
+            detail_label: String::new(),
+            document_kind: None,
+            group_kind: None,
+            session_title: Some(label.to_string()),
+            depth: 1,
+            host_label: "local".to_string(),
+            descendant_sessions: 0,
+            expanded: false,
+            session_id: Some("abc".to_string()),
+            session_cwd: Some("/home/user/gh/yggterm".to_string()),
+            session_kind: Some(SessionKind::Shell),
+        }
+    }
+    #[test]
+    fn row_menu_is_one_list_for_the_mouse_and_the_alt_layer() {
+        // The live-session row menu: the SAME list the overlay draws is what the
+        // `rowmenu` scope declares, so ALT,E,<letter> can only reach items the
+        // menu actually shows (spec §3).
+        let row = test_live_session_row("local://abc", "yggterm shell");
+        let items = row_menu_items(&row, &[], None, &[], 0, false, false);
+        let ids: Vec<&str> = items
+            .iter()
+            .filter(|item| !item.separator)
+            .map(|item| item.id.as_str())
+            .collect();
+        assert!(ids.contains(&"open-terminal-here"), "{ids:?}");
+        assert!(ids.contains(&"new-codex-here"), "{ids:?}");
+        assert!(ids.contains(&"keep-alive"), "{ids:?}");
+        assert!(ids.contains(&"delete-session"), "{ids:?}");
+
+        let tree = build_keytip_tree(&KeymapConfig::default(), &[], &items);
+        // ALT,E descends into the row menu…
+        assert_eq!(
+            tree.resolve("e"),
+            ChordResolution::Descend {
+                key: "session.menu".to_string(),
+                scope: "rowmenu".to_string()
+            }
+        );
+        // …and every non-separator item is reachable from it, with the tip the
+        // badge paints (one assignment, two views).
+        for item in items.iter().filter(|item| !item.separator) {
+            let node_key = row_menu_node_key(&item.id);
+            let tip = tree
+                .tip_for("e", &node_key)
+                .unwrap_or_else(|| panic!("row menu item {} got no keytip", item.id));
+            assert_eq!(
+                tree.resolve(&format!("e{}", tip.to_lowercase())),
+                ChordResolution::Run(node_key.clone()),
+                "chord for {} must run it",
+                item.id
+            );
+        }
+        // A separator is drawn, never badged, never dispatched.
+        assert!(items.iter().any(|item| item.separator));
+        assert!(tree.tip_for("e", "rowmenu:").is_none());
+    }
+    #[test]
+    fn row_menu_scope_is_empty_while_no_row_menu_is_open() {
+        // No open menu ⇒ no rowmenu declarations, so ALT,E cannot dispatch into a
+        // stale menu's items.
+        let tree = build_keytip_tree(&KeymapConfig::default(), &[], &[]);
+        assert_eq!(tree.resolve("ex"), ChordResolution::Invalid);
+    }
+    #[test]
+    fn jump_scope_is_navigated_not_badged() {
+        // ALT,J descends into a declaration-free scope (§8): the live list is
+        // walked with the arrows, never badged.
+        let tree = build_keytip_tree(&KeymapConfig::default(), &[], &[]);
+        assert_eq!(
+            tree.resolve("j"),
+            ChordResolution::Descend {
+                key: "session.jump".to_string(),
+                scope: "session.jump".to_string()
+            }
+        );
+        assert_eq!(tree.resolve("ja"), ChordResolution::Invalid);
+    }
+    #[test]
+    fn launch_anchor_row_is_the_selected_row_then_the_active_session() {
+        let session_path = "local://abc";
+        let mut shell = ShellState::new(test_shell_bootstrap_with_active_session(session_path));
+        let mut live_session = test_live_shell_session(session_path);
+        live_session.id = "abc".to_string();
+        live_session.title = "yggterm shell".to_string();
+        live_session.metadata = vec![SessionMetadataEntry {
+            label: "Cwd",
+            value: "/home/user/gh/yggterm".to_string(),
+        }];
+        shell.server.apply_snapshot(ServerUiSnapshot {
+            apps: Vec::new(),
+            active_session_path: Some(session_path.to_string()),
+            active_session: Some(snapshot_session_view_for_ui(live_session.clone())),
+            active_view_mode: WorkspaceViewMode::Terminal,
+            remote_machines: Vec::new(),
+            ssh_targets: Vec::new(),
+            live_sessions: vec![snapshot_session_view_for_ui(live_session)],
+        });
+        shell.needs_initial_server_sync = false;
+
+        // Nothing selected: "here" is the ACTIVE session, so a `+`-menu launch
+        // anchors to it (its cwd, and the sidebar slot directly below it) instead
+        // of top-inserting.
+        let anchor = launch_anchor_row(&shell, None).expect("active session anchors the launch");
+        assert_eq!(anchor.full_path, session_path);
+        assert_eq!(anchor.kind, BrowserRowKind::Session);
+        match group_session_launch_context(&shell, &anchor, SessionKind::Shell) {
+            TerminalLaunchContext::Local { cwd, .. } => {
+                assert_eq!(cwd.as_deref(), Some("/home/user/gh/yggterm"));
+            }
+            other => panic!("expected a local launch context, got {other:?}"),
+        }
+    }
+    #[test]
+    fn session_jump_walks_the_live_list_and_wraps() {
+        let mut shell = ShellState::new(test_shell_bootstrap_with_active_session("local://two"));
+        let mut first = test_live_shell_session("local://one");
+        first.id = "one".to_string();
+        first.title = "one".to_string();
+        let mut second = test_live_shell_session("local://two");
+        second.id = "two".to_string();
+        second.title = "two".to_string();
+        shell.server.apply_snapshot(ServerUiSnapshot {
+            apps: Vec::new(),
+            active_session_path: Some("local://two".to_string()),
+            active_session: Some(snapshot_session_view_for_ui(second.clone())),
+            active_view_mode: WorkspaceViewMode::Terminal,
+            remote_machines: Vec::new(),
+            ssh_targets: Vec::new(),
+            live_sessions: vec![
+                snapshot_session_view_for_ui(first),
+                snapshot_session_view_for_ui(second),
+            ],
+        });
+        shell.needs_initial_server_sync = false;
+
+        // Jump mode starts on the ACTIVE session…
+        shell.begin_session_jump();
+        assert_eq!(shell.alt_jump_path.as_deref(), Some("local://two"));
+        assert_eq!(shell.session_jump_status().map(|(i, n, _)| (i, n)), Some((2, 2)));
+        // …steps and wraps at the ends…
+        assert_eq!(
+            shell.navigate_session_jump(1, false).as_deref(),
+            Some("local://one")
+        );
+        assert_eq!(
+            shell.navigate_session_jump(-1, false).as_deref(),
+            Some("local://two")
+        );
+        assert_eq!(
+            shell.navigate_session_jump(-1, true).as_deref(),
+            Some("local://one")
+        );
+        // …and dismissing the overlay ends jump mode.
+        shell.clear_alt_overlay();
+        assert!(shell.alt_jump_path.is_none());
+        assert!(shell.session_jump_status().is_none());
     }
     #[test]
     fn keymap_config_parses_bindings_and_ignores_junk() {
@@ -113132,6 +113220,9 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             alt_overlay_sequence: String::new(),
             keymap: Keymap::defaults(),
             keytip_tree: KeyTipTree::default(),
+            row_menu_items: Vec::new(),
+            row_menu_title: String::new(),
+            session_jump_status: None,
             keytip_config: KeymapConfig::default(),
             keymap_editor_open: false,
             keymap_editor_error: None,
@@ -113762,6 +113853,9 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             alt_overlay_sequence: String::new(),
             keymap: Keymap::defaults(),
             keytip_tree: KeyTipTree::default(),
+            row_menu_items: Vec::new(),
+            row_menu_title: String::new(),
+            session_jump_status: None,
             keytip_config: KeymapConfig::default(),
             keymap_editor_open: false,
             keymap_editor_error: None,
@@ -113927,6 +114021,9 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             alt_overlay_sequence: String::new(),
             keymap: Keymap::defaults(),
             keytip_tree: KeyTipTree::default(),
+            row_menu_items: Vec::new(),
+            row_menu_title: String::new(),
+            session_jump_status: None,
             keytip_config: KeymapConfig::default(),
             keymap_editor_open: false,
             keymap_editor_error: None,
@@ -114092,6 +114189,9 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             alt_overlay_sequence: String::new(),
             keymap: Keymap::defaults(),
             keytip_tree: KeyTipTree::default(),
+            row_menu_items: Vec::new(),
+            row_menu_title: String::new(),
+            session_jump_status: None,
             keytip_config: KeymapConfig::default(),
             keymap_editor_open: false,
             keymap_editor_error: None,
@@ -114260,6 +114360,9 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             alt_overlay_sequence: String::new(),
             keymap: Keymap::defaults(),
             keytip_tree: KeyTipTree::default(),
+            row_menu_items: Vec::new(),
+            row_menu_title: String::new(),
+            session_jump_status: None,
             keytip_config: KeymapConfig::default(),
             keymap_editor_open: false,
             keymap_editor_error: None,
@@ -114432,6 +114535,9 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             alt_overlay_sequence: String::new(),
             keymap: Keymap::defaults(),
             keytip_tree: KeyTipTree::default(),
+            row_menu_items: Vec::new(),
+            row_menu_title: String::new(),
+            session_jump_status: None,
             keytip_config: KeymapConfig::default(),
             keymap_editor_open: false,
             keymap_editor_error: None,
@@ -114596,6 +114702,9 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             alt_overlay_sequence: String::new(),
             keymap: Keymap::defaults(),
             keytip_tree: KeyTipTree::default(),
+            row_menu_items: Vec::new(),
+            row_menu_title: String::new(),
+            session_jump_status: None,
             keytip_config: KeymapConfig::default(),
             keymap_editor_open: false,
             keymap_editor_error: None,
@@ -114760,6 +114869,9 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             alt_overlay_sequence: String::new(),
             keymap: Keymap::defaults(),
             keytip_tree: KeyTipTree::default(),
+            row_menu_items: Vec::new(),
+            row_menu_title: String::new(),
+            session_jump_status: None,
             keytip_config: KeymapConfig::default(),
             keymap_editor_open: false,
             keymap_editor_error: None,
@@ -114958,6 +115070,9 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             alt_overlay_sequence: String::new(),
             keymap: Keymap::defaults(),
             keytip_tree: KeyTipTree::default(),
+            row_menu_items: Vec::new(),
+            row_menu_title: String::new(),
+            session_jump_status: None,
             keytip_config: KeymapConfig::default(),
             keymap_editor_open: false,
             keymap_editor_error: None,
@@ -115125,6 +115240,9 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             alt_overlay_sequence: String::new(),
             keymap: Keymap::defaults(),
             keytip_tree: KeyTipTree::default(),
+            row_menu_items: Vec::new(),
+            row_menu_title: String::new(),
+            session_jump_status: None,
             keytip_config: KeymapConfig::default(),
             keymap_editor_open: false,
             keymap_editor_error: None,
@@ -115324,6 +115442,9 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             alt_overlay_sequence: String::new(),
             keymap: Keymap::defaults(),
             keytip_tree: KeyTipTree::default(),
+            row_menu_items: Vec::new(),
+            row_menu_title: String::new(),
+            session_jump_status: None,
             keytip_config: KeymapConfig::default(),
             keymap_editor_open: false,
             keymap_editor_error: None,
@@ -115700,6 +115821,9 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             alt_overlay_sequence: String::new(),
             keymap: Keymap::defaults(),
             keytip_tree: KeyTipTree::default(),
+            row_menu_items: Vec::new(),
+            row_menu_title: String::new(),
+            session_jump_status: None,
             keytip_config: KeymapConfig::default(),
             keymap_editor_open: false,
             keymap_editor_error: None,
