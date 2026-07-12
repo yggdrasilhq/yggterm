@@ -43,6 +43,8 @@ pub enum ShellCommand {
     ToggleFullscreen,
     ToggleAlwaysOnTop,
     OpenInsertMenu,
+    OpenRowMenu,
+    JumpSession,
     InsertSession,
     InsertTerminal,
     NextSession,
@@ -65,10 +67,14 @@ pub struct CommandSpec {
     /// command has no ALT+ accelerator (it is reached by mouse or `command
     /// invoke`, e.g. the Ctrl+Alt+PgUp/PgDn session-nav pair).
     pub default_keytip: Option<char>,
-    /// True when pressing this command's keytip should OPEN a sub-level of fresh
-    /// KeyTips rather than act-and-dismiss (Excel's ALT,H,… nesting). The insert
-    /// "+" menu is the one such node today.
-    pub opens_submenu: bool,
+    /// The scope this command DESCENDS INTO when its keytip is pressed: it acts
+    /// (opens the container) and then shows that container's fresh KeyTips rather
+    /// than dismissing (Excel's ALT,H,… nesting). `None` = act and dismiss.
+    ///
+    /// The value is a `ScopeId::as_str()` id (`"insert.menu"`, `"settings"`,
+    /// `"rowmenu"`, `"session.jump"`) — the registry, not a hardcoded `match` in
+    /// the renderer, says where a chord goes next.
+    pub descends_into: Option<&'static str>,
 }
 
 /// The registry. Order is display order in the settings modal.
@@ -82,7 +88,7 @@ pub const SHELL_COMMANDS: &[CommandSpec] = &[
         title: "Toggle sidebar",
         parent: None,
         default_keytip: Some('b'),
-        opens_submenu: false,
+        descends_into: None,
     },
     CommandSpec {
         command: ShellCommand::ViewWeb,
@@ -90,7 +96,7 @@ pub const SHELL_COMMANDS: &[CommandSpec] = &[
         title: "Web view",
         parent: None,
         default_keytip: Some('v'),
-        opens_submenu: false,
+        descends_into: None,
     },
     CommandSpec {
         command: ShellCommand::ViewTerminal,
@@ -98,7 +104,7 @@ pub const SHELL_COMMANDS: &[CommandSpec] = &[
         title: "Terminal view",
         parent: None,
         default_keytip: Some('t'),
-        opens_submenu: false,
+        descends_into: None,
     },
     CommandSpec {
         command: ShellCommand::ToggleConnect,
@@ -106,7 +112,7 @@ pub const SHELL_COMMANDS: &[CommandSpec] = &[
         title: "Connect SSH",
         parent: None,
         default_keytip: Some('c'),
-        opens_submenu: false,
+        descends_into: None,
     },
     CommandSpec {
         // Was `n` in the pre-spec draft — `n` is Excel's Insert tab, reserved.
@@ -115,7 +121,7 @@ pub const SHELL_COMMANDS: &[CommandSpec] = &[
         title: "Notifications",
         parent: None,
         default_keytip: Some('l'),
-        opens_submenu: false,
+        descends_into: None,
     },
     CommandSpec {
         command: ShellCommand::ToggleSettings,
@@ -123,7 +129,7 @@ pub const SHELL_COMMANDS: &[CommandSpec] = &[
         title: "Settings",
         parent: None,
         default_keytip: Some('g'),
-        opens_submenu: false,
+        descends_into: Some("settings"),
     },
     CommandSpec {
         // Was `m` in the pre-spec draft — `m` is Excel's Formulas tab, reserved.
@@ -132,7 +138,7 @@ pub const SHELL_COMMANDS: &[CommandSpec] = &[
         title: "Session metadata",
         parent: None,
         default_keytip: Some('d'),
-        opens_submenu: false,
+        descends_into: None,
     },
     CommandSpec {
         // Was `f` in the pre-spec draft — `f` is Excel's File tab, reserved.
@@ -141,7 +147,7 @@ pub const SHELL_COMMANDS: &[CommandSpec] = &[
         title: "Toggle fullscreen",
         parent: None,
         default_keytip: Some('u'),
-        opens_submenu: false,
+        descends_into: None,
     },
     CommandSpec {
         // Was `a` in the pre-spec draft — `a` is Excel's Data tab, reserved.
@@ -150,7 +156,7 @@ pub const SHELL_COMMANDS: &[CommandSpec] = &[
         title: "Always on top",
         parent: None,
         default_keytip: Some('o'),
-        opens_submenu: false,
+        descends_into: None,
     },
     CommandSpec {
         command: ShellCommand::OpenKeymapEditor,
@@ -158,7 +164,7 @@ pub const SHELL_COMMANDS: &[CommandSpec] = &[
         title: "Edit ALT+ keys",
         parent: None,
         default_keytip: Some('k'),
-        opens_submenu: false,
+        descends_into: None,
     },
     CommandSpec {
         command: ShellCommand::OpenInsertMenu,
@@ -166,7 +172,7 @@ pub const SHELL_COMMANDS: &[CommandSpec] = &[
         title: "New… menu",
         parent: None,
         default_keytip: Some('i'),
-        opens_submenu: true,
+        descends_into: Some("insert.menu"),
     },
     CommandSpec {
         command: ShellCommand::InsertSession,
@@ -174,7 +180,7 @@ pub const SHELL_COMMANDS: &[CommandSpec] = &[
         title: "New session",
         parent: Some("insert.menu"),
         default_keytip: Some('s'),
-        opens_submenu: false,
+        descends_into: None,
     },
     CommandSpec {
         command: ShellCommand::InsertTerminal,
@@ -182,7 +188,23 @@ pub const SHELL_COMMANDS: &[CommandSpec] = &[
         title: "New terminal",
         parent: Some("insert.menu"),
         default_keytip: Some('t'),
-        opens_submenu: false,
+        descends_into: None,
+    },
+    CommandSpec {
+        command: ShellCommand::OpenRowMenu,
+        id: "session.menu",
+        title: "Row actions",
+        parent: None,
+        default_keytip: Some('e'),
+        descends_into: Some("rowmenu"),
+    },
+    CommandSpec {
+        command: ShellCommand::JumpSession,
+        id: "session.jump",
+        title: "Jump to session",
+        parent: None,
+        default_keytip: Some('j'),
+        descends_into: Some("session.jump"),
     },
     CommandSpec {
         command: ShellCommand::NextSession,
@@ -190,7 +212,7 @@ pub const SHELL_COMMANDS: &[CommandSpec] = &[
         title: "Next live session",
         parent: None,
         default_keytip: None,
-        opens_submenu: false,
+        descends_into: None,
     },
     CommandSpec {
         command: ShellCommand::PrevSession,
@@ -198,7 +220,7 @@ pub const SHELL_COMMANDS: &[CommandSpec] = &[
         title: "Previous live session",
         parent: None,
         default_keytip: None,
-        opens_submenu: false,
+        descends_into: None,
     },
 ];
 
