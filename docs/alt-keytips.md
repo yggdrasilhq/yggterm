@@ -95,11 +95,24 @@ questions this spec was written for:
 | Unhide the titlebar | *(automatic)* | The auto-hidden titlebar already pins in while the overlay is up (`titlebar_autohide_pinned`). New: `titlebar.autohide` command so the *setting* is bindable too. |
 | Change the theme | `ALT, G, T, <letter>` | `G` opens Settings **and descends into its scope**; `T` is the theme control; each theme option is a leaf. |
 | Launch CC here | `ALT, I, C` | `I` opens the New… scope, generated from the built-in agents plus `~/.yggterm/apps/*.json`. |
+| The row's right-click menu | `ALT, E, <letter>` | `E` opens the **row menu** on the "here" row and descends into it. Its items are the `rowmenu` scope — one list (`row_menu_items`) that the mouse menu draws and the resolver declares, so the two can never disagree. |
+| Switch to another live session | `ALT, J`, then ↑/↓/PgUp/PgDn, `Enter` | `J` enters **jump mode**, a navigation scope (§8). |
 
-**"Here" is a binding, not a vibe.** The New… scope resolves its cwd as: the
-sidebar's focused row, else the active session's cwd. Deterministic, and stated on
-the overlay's breadcrumb so you can see where the thing will land before you
-commit to it.
+WHICH scope a command descends into is registry data (`CommandSpec::descends_into`),
+not a `match` arm in the renderer.
+
+**"Here" is a binding, not a vibe.** It resolves to the sidebar's focused row, else
+the ACTIVE session's row — one function (`here_row`), read by every door: the
+titlebar `+`, the New… scope, the row menu, the Ctrl+Shift accelerators and the
+start page. It fixes **two** things, not one:
+
+- the **cwd** the new session opens in, and
+- the **sidebar position** it lands in — directly below the "here" row
+  (`insert_after`), never at the top of Live Sessions.
+
+That is why `ALT, I, T`, `Ctrl+Shift+T`, the `+` menu's "New Terminal" and the row
+menu's "Open Terminal Here" all put the new row in the same place: they are one
+launch path (`spawn_start_session_for_row`), not four.
 
 ## 5. Assignment (deterministic, pure, unit-testable)
 
@@ -188,6 +201,33 @@ an unlearnable chord set. Row items declare `keytip_exempt("list-item")`.
 Consequence, and it is a real piece of work: **the sidebar tree needs proper
 keyboard focus** (a focus ring, arrow/Home/End navigation, and a focused-row
 concept the shell can read). Today it has none.
+
+### 8.1 Jump mode — the live list, navigated
+
+`ALT, J` descends into `ScopeId::SessionJump`, a scope that holds **no
+declarations at all** — the point of §8. The overlay stays up, and while it is the
+open scope the ALT bridge forwards ↑/↓, PageUp/PageDown, Home/End and Enter into
+the shell instead of merely swallowing them:
+
+```
+ALT, J          → ⌨ ALT › J › Live 3/12  yggterm shell   · ↑↓ PgUp/PgDn · Enter · Esc
+↑ ↓ PgUp PgDn   → walk the Live Sessions list (wraps at the ends)
+Enter           → open the highlighted session
+Esc             → dismiss
+```
+
+The highlight IS the sidebar selection (`select_tree_row(Replace)`), so the row
+lights up in the tree, "here" follows the cursor exactly as it does for
+arrow-navigation, and there is no second highlight concept to keep in sync. It
+never takes DOM focus: the bridge owns the keyboard while the overlay is up, so
+stealing focus would only strand the terminal's cursor after Esc.
+
+**Why not a bare `Alt+PgUp` / `Alt+PgDn` accelerator** (the obvious ask): §11.2
+forbids it. Bare ALT+key is the Meta/ESC-prefix the PTY owns — `mc`, `weechat` and
+`irssi` all read `Alt+PageUp` — so `assert_accels_pty_safe` would fail the build.
+Jump mode gets the same ergonomics with zero new global chords, because every key
+it uses is captured *inside* an overlay that is already up. `Ctrl+Alt+PgDn` /
+`Ctrl+Alt+PgUp` (PTY-safe, §11.4) remain the instant one-key switch.
 
 ## 9. Badge rendering — blocks, not inline pills
 

@@ -45,6 +45,12 @@ pub enum ScopeId {
     Settings,
     /// The theme picker inside Settings (`ALT, G, T, <letter>`).
     SettingsTheme,
+    /// The row menu — the sidebar's right-click menu, opened on the "here" row.
+    RowMenu,
+    /// Jump-to-session: a NAVIGATION scope (§8), declaration-free by design. The
+    /// live-session list is walked with the arrows / PageUp / PageDown and
+    /// committed with Enter; badging fifty rows would be unreadable.
+    SessionJump,
     /// A running/installed app's own scope, keyed by app id (Phase 2 dynamic).
     App(String),
 }
@@ -57,6 +63,8 @@ impl ScopeId {
             ScopeId::Insert => "insert.menu".to_string(),
             ScopeId::Settings => "settings".to_string(),
             ScopeId::SettingsTheme => "settings.theme".to_string(),
+            ScopeId::RowMenu => "rowmenu".to_string(),
+            ScopeId::SessionJump => "session.jump".to_string(),
             ScopeId::App(id) => format!("app.{id}"),
         }
     }
@@ -119,6 +127,26 @@ impl KeyTipDecl {
             key: key.into(),
             title: title.into(),
             hint: Some(hint),
+            accel: None,
+            origin: Origin::Shell,
+            target,
+        }
+    }
+
+    /// Shell chrome whose hint is optional — a declaration generated at the render
+    /// site (a row-menu item) rather than defaulted in the registry. Shell origin,
+    /// so it still never gets numbered (§6); the ladder picks a letter when the
+    /// hint is `None` or already taken.
+    pub fn shell_optional(
+        key: impl Into<String>,
+        title: impl Into<String>,
+        hint: Option<char>,
+        target: Target,
+    ) -> Self {
+        Self {
+            key: key.into(),
+            title: title.into(),
+            hint,
             accel: None,
             origin: Origin::Shell,
             target,
