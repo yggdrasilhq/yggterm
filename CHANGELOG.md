@@ -2,6 +2,33 @@
 
 This file tracks user-visible changes in `yggterm`.
 
+## Unreleased
+
+- **`ALT, E` opens a row's right-click menu, and every item in it has a letter.**
+  The sidebar's context menu had no keyboard path at all. Now `ALT, E` opens it on
+  the row you are on — measured onto that row, exactly where a right-click would
+  have put it — and descends into it: `ALT, E, T` is "Open Terminal Here",
+  `ALT, E, K` is "Keep Alive", `ALT, E, X` closes the terminal. Apps get their
+  letters here too, so an installed ychrome contributes "New Ychrome Here" with its
+  own badge. The menu and the KeyTip layer are now built from ONE list, so a chord
+  can never name an item the menu does not show.
+
+- **The titlebar `+` now spawns where the row menu does: *here*, not at the top.**
+  "New Terminal" from the `+` menu used to drop the session at the top of Live
+  Sessions, while the identical action in the row menu landed it directly below the
+  row you invoked it from. Every launch door — the `+` menu, `ALT, I`, the
+  `Ctrl+Shift` accelerators, the start page, the row menu — now resolves "here" the
+  same way and lands the new session in the same place: the focused row's cwd, in
+  the slot directly below it.
+
+- **`ALT, J` jumps between live sessions.** The overlay stays up over the Live list,
+  ↑/↓ and PgUp/PgDn walk it (wrapping), Enter opens the highlighted session, Esc
+  cancels. The breadcrumb reads `Live 3/12 <title>`, so it works with the sidebar
+  closed. Bare `Alt+PgUp`/`Alt+PgDn` is deliberately NOT bound: that chord belongs
+  to the PTY's Meta prefix (mc, weechat and irssi all read it), and the build fails
+  if the shell tries to steal it. `Ctrl+Alt+PgDn` / `Ctrl+Alt+PgUp` remain the
+  instant one-key switch.
+
 ## 2.11.0
 
 - **The ALT+ layer is real: tap ALT, and every affordance shows you its key.**
