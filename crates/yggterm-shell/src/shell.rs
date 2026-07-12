@@ -3456,6 +3456,13 @@ struct ShellState {
     /// the user's own view — collapsing the whole rail throws away state the user
     /// never asked to lose.
     right_panel_mode_before_app_pane: Option<RightPanelMode>,
+    /// What the rail was showing before the web tab tree (a WEB surface's tenant)
+    /// took it over. The tab rail is meaningful only on a session that has a web
+    /// surface; on any other session the panel falls back to this remembered
+    /// non-web view instead of blanking or leaking one surface's tabs into an
+    /// unrelated session. Mirror of `right_panel_mode_before_app_pane` for the
+    /// `WebTabs` tenant.
+    right_panel_mode_before_web_tabs: Option<RightPanelMode>,
     app_pane_error: Option<String>,
     /// Bumped on every pane open / action so a late reply from a superseded
     /// fetch cannot overwrite a newer schema.
@@ -5152,6 +5159,7 @@ impl ShellState {
             app_pane_schema: None,
             app_pane_values: HashMap::new(),
             right_panel_mode_before_app_pane: None,
+            right_panel_mode_before_web_tabs: None,
             app_pane_error: None,
             app_pane_request_seq: 0,
             titlebar_new_menu_open: false,
@@ -6003,6 +6011,24 @@ impl ShellState {
         profile: String,
         now_ms: u64,
     ) {
+        // A surface still in its PICKER placeholder has no chosen profile and so
+        // no tab tree. This is the normal launch path (no-arg ychrome → pick a
+        // profile → real `open`), and reusing the placeholder below would take the
+        // "existing surface" update branch, which keeps the bare tree and returns
+        // WITHOUT ever rehydrating the profile's saved tabs. That is why a normal
+        // launch never restored folders, filed tabs, or (with "continue where you
+        // left off" on) the last session. Drop the placeholder so the real open
+        // falls through to the fresh-surface path, which rehydrates the now-known
+        // profile's `tabs.json`.
+        if self
+            .web_surfaces
+            .get(session_path)
+            .is_some_and(|surface| surface.picker.is_some())
+            && let Some(placeholder) = self.web_surfaces.remove(session_path)
+        {
+            // Reaps the picker's own ssh-forward child too (see impl).
+            kill_web_surface_forward(&placeholder);
+        }
         if let Some(existing) = self.web_surfaces.get_mut(session_path)
             && let Some(app_tab) = existing.tabs.first_mut()
         {
@@ -7436,6 +7462,25 @@ impl ShellState {
         } else {
             mode
         };
+        // Entering the web tab rail: remember the user's own view so that a session
+        // with no web surface restores it, rather than blanking the rail or leaking
+        // one surface's tabs into an unrelated session. Resolved THROUGH whatever
+        // tenant currently holds the slot — the rail is routinely reclaimed from a
+        // borrowing app pane (the ⊟ button), and remembering that PANE as "the
+        // user's view" would throw the real one away. Captured once per entry: a
+        // WebTabs→WebTabs set never overwrites it.
+        if mode == RightPanelMode::WebTabs && self.right_panel_mode != RightPanelMode::WebTabs {
+            self.right_panel_mode_before_web_tabs = Some(self.user_right_panel_view());
+        }
+        // Leaving an app pane for anything else ends that pane's tenancy: drop its
+        // remembered view and its draft values (a typed password must not outlive
+        // the pane that collected it). Pane→pane hops keep both.
+        if matches!(self.right_panel_mode, RightPanelMode::AppPane(_))
+            && !matches!(mode, RightPanelMode::AppPane(_))
+        {
+            self.right_panel_mode_before_app_pane = None;
+            self.clear_app_pane_draft();
+        }
         self.terminal_input_override_active = terminal_input_override_for_right_panel_mode(&mode);
         self.right_panel_mode = mode;
         self.settings.show_settings = self.right_panel_mode == RightPanelMode::Settings;
@@ -7450,13 +7495,54 @@ impl ShellState {
             RightPanelMode::AppPane(pane) => format!("app pane {pane} opened"),
         };
     }
+    /// The user's OWN right-panel view: the one they chose, with every TENANT
+    /// resolved away. Two things borrow the slot without owning it — an app's
+    /// contributed pane (`AppPane`, tenant of its app) and the web tab rail
+    /// (`WebTabs`, tenant of its surface) — and a tenant is never the answer to
+    /// "what was the user looking at". One owner for that question, so no caller
+    /// has to re-derive it (and get it wrong).
+    ///
+    /// Tenancy nests at most two deep (a pane borrowing the slot from the rail),
+    /// so the walk is bounded; anything still a tenant after that is Hidden.
+    fn user_right_panel_view(&self) -> RightPanelMode {
+        let mut mode = self.right_panel_mode.clone();
+        for _ in 0..2 {
+            mode = match &mode {
+                RightPanelMode::AppPane(_) => self
+                    .right_panel_mode_before_app_pane
+                    .clone()
+                    .unwrap_or(RightPanelMode::Hidden),
+                RightPanelMode::WebTabs => self
+                    .right_panel_mode_before_web_tabs
+                    .clone()
+                    .unwrap_or(RightPanelMode::Hidden),
+                settled => return settled.clone(),
+            };
+        }
+        match mode {
+            RightPanelMode::AppPane(_) | RightPanelMode::WebTabs => RightPanelMode::Hidden,
+            settled => settled,
+        }
+    }
     /// The tab-tree rail's titlebar button. Vertical mode is what the rail is
     /// FOR, so opening it turns the mode on and closing it turns the mode off —
     /// one fact, one control, no way to have vertical tabs with nowhere to put
     /// them (or a rail nobody asked for).
     fn toggle_web_tabs_panel(&mut self) {
-        let vertical = !(self.right_panel_mode == RightPanelMode::WebTabs);
-        self.request_web_surface_vertical_tabs(vertical);
+        if self.right_panel_mode == RightPanelMode::WebTabs {
+            // The rail is what's showing → hide it, which is what turning vertical
+            // mode off does.
+            self.request_web_surface_vertical_tabs(false);
+        } else if self.settings.web_surface_vertical_tabs {
+            // Vertical mode is already ON, but another pane (settings, a
+            // contributed pane) borrowed the rail's slot. Requesting vertical=on
+            // would no-op (the pref is unchanged), so the button did nothing.
+            // Reclaim the slot for the tab tree directly.
+            self.set_right_panel_mode(RightPanelMode::WebTabs);
+        } else {
+            // Vertical mode is off → turn it on, which raises the rail.
+            self.request_web_surface_vertical_tabs(true);
+        }
     }
     /// Open (or close) an app-contributed pane. Returns the request sequence to
     /// fetch the schema under, or `None` when the pane was toggled shut.
@@ -7517,10 +7603,15 @@ impl ShellState {
                 .unwrap_or(RightPanelMode::Hidden),
             // The tab rail is a tenant of the surface, exactly like a contributed
             // pane is a tenant of its app: a session with no web surface has no
-            // tabs, so the rail stands down instead of showing an empty tree.
-            RightPanelMode::WebTabs if self.active_web_surface().is_none() => {
-                RightPanelMode::Hidden
-            }
+            // tabs, so the rail stands down. It does NOT collapse to Hidden — it
+            // falls back to the user's own remembered non-web view, so the ychrome
+            // tab tree never bleeds into an unrelated session and the panel the
+            // user had open before browsing comes back (Hidden only if that is
+            // what they had). Symmetric with the `AppPane` fallback above.
+            RightPanelMode::WebTabs if self.active_web_surface().is_none() => self
+                .right_panel_mode_before_web_tabs
+                .clone()
+                .unwrap_or(RightPanelMode::Hidden),
             mode => mode.clone(),
         }
     }
@@ -65637,438 +65728,24 @@ fn TerminalCanvas(
                                 "⏻"
                             }
                         }
-                        // Nav bar: back / forward / reload over the
-                        // yggterm-driven nav stack, plus the address bar.
-                        {{
-                            let nav_path = web_surface_session_path.clone();
-                            let nav_ssh = web_surface_nav_ssh_target.clone();
-                            let active_tab_id = web_overlay.active_tab_id;
-                            let nav_profile = web_overlay.profile.clone();
-                            let back_target = web_overlay.back_target.clone();
-                            let forward_target = web_overlay.forward_target.clone();
-                            let address_text = web_overlay.address_text.clone();
-                            let address_editing = web_overlay.address_editing;
-                            let suggestions = web_overlay.address_suggestions.clone();
-                            let suggestion_index = web_overlay.address_suggestion_index;
-                            // Dropdown rows: 0 = the synthesized go/search row
-                            // (what plain Enter does), 1.. = history matches.
-                            let dropdown_rows = if address_editing
-                                && !address_text.trim().is_empty()
-                            {
-                                1 + suggestions.len()
-                            } else {
-                                0
-                            };
-                            let nav_button_style = |enabled: bool| {
-                                format!(
-                                    "border:none; background:transparent; color:{}; font-size:14px; line-height:1; padding:4px 7px; border-radius:6px; cursor:{}; opacity:{};",
-                                    theme.foreground,
-                                    if enabled { "pointer" } else { "default" },
-                                    if enabled { "0.85" } else { "0.3" },
-                                )
-                            };
-                            let back_style = nav_button_style(back_target.is_some());
-                            let forward_style = nav_button_style(forward_target.is_some());
-                            let reload_style = nav_button_style(true);
-                            rsx! {
-                                div {
-                                    // The address/nav bar stays in BOTH modes. Only
-                                    // the tabs move to the rail; back/forward/reload
-                                    // and the omnibox (with its history completion
-                                    // and suggestion dropdown) are page controls, and
-                                    // a 300px rail is no place for them.
-                                    style: format!(
-                                        "display:flex; align-items:center; gap:4px; padding:6px 10px; background:{}; user-select:none; \
-                                         overflow:hidden; max-height:60px;",
-                                        theme.background,
-                                    ),
-                                    button {
-                                        style: "{back_style}",
-                                        title: "Back",
-                                        disabled: back_target.is_none(),
-                                        onclick: {
-                                            let nav_path = nav_path.clone();
-                                            let nav_ssh = nav_ssh.clone();
-                                            let back_target = back_target.clone();
-                                            move |_| {
-                                                if let Some((index, url)) = back_target.clone() {
-                                                    navigate_web_surface_tab(
-                                                        state,
-                                                        nav_path.clone(),
-                                                        active_tab_id,
-                                                        url,
-                                                        nav_ssh.clone(),
-                                                        Some(index),
-                                                    );
-                                                }
-                                            }
-                                        },
-                                        "←"
-                                    }
-                                    button {
-                                        style: "{forward_style}",
-                                        title: "Forward",
-                                        disabled: forward_target.is_none(),
-                                        onclick: {
-                                            let nav_path = nav_path.clone();
-                                            let nav_ssh = nav_ssh.clone();
-                                            let forward_target = forward_target.clone();
-                                            move |_| {
-                                                if let Some((index, url)) = forward_target.clone() {
-                                                    navigate_web_surface_tab(
-                                                        state,
-                                                        nav_path.clone(),
-                                                        active_tab_id,
-                                                        url,
-                                                        nav_ssh.clone(),
-                                                        Some(index),
-                                                    );
-                                                }
-                                            }
-                                        },
-                                        "→"
-                                    }
-                                    button {
-                                        style: "{reload_style}",
-                                        title: "Reload",
-                                        onclick: {
-                                            let nav_path = nav_path.clone();
-                                            move |_| {
-                                                state.with_mut(|shell| {
-                                                    shell.web_surface_reload_active_tab(&nav_path);
-                                                });
-                                            }
-                                        },
-                                        "⟳"
-                                    }
-                                    input {
-                                        id: "{web_surface_host_id}-ws-address",
-                                        // Pill omnibox: deliberate DESIGN.md exception —
-                                        // the surface mimics Chrome's vocabulary.
-                                        style: format!(
-                                            "flex:1 1 auto; min-width:0; padding:5px 14px; border-radius:14px; border:1px solid rgba(127,127,127,0.35); \
-                                             background:rgba(127,127,127,0.12); color:{}; font-size:12.5px; outline:none;",
-                                            theme.foreground,
-                                        ),
-                                        value: "{address_text}",
-                                        spellcheck: "false",
-                                        autocomplete: "off",
-                                        placeholder: "Search or enter address",
-                                        onfocus: {
-                                            // Chrome-like: focusing the omnibox selects the
-                                            // whole URL so the user types over it immediately.
-                                            // A one-shot mouseup guard stops the click that
-                                            // focused the field from collapsing the selection
-                                            // to a caret; later clicks position the caret
-                                            // normally (no new focus event fires).
-                                            let address_input_id =
-                                                format!("{web_surface_host_id}-ws-address");
-                                            move |_| {
-                                                let _ = document::eval(&format!(
-                                                    r#"(function(){{
-                                                        var el = document.getElementById('{id}');
-                                                        if (!el || !el.select) return;
-                                                        el.select();
-                                                        var guard = function(e){{
-                                                            e.preventDefault();
-                                                            el.removeEventListener('mouseup', guard);
-                                                        }};
-                                                        el.addEventListener('mouseup', guard);
-                                                    }})();"#,
-                                                    id = address_input_id,
-                                                ));
-                                            }
-                                        },
-                                        oninput: {
-                                            let nav_path = nav_path.clone();
-                                            let address_input_id =
-                                                format!("{web_surface_host_id}-ws-address");
-                                            move |evt: FormEvent| {
-                                                let completion = state.with_mut(|shell| {
-                                                    shell.web_surface_type_address(
-                                                        &nav_path,
-                                                        evt.value(),
-                                                    )
-                                                });
-                                                // Inline completion applied: show the
-                                                // completed text with the auto-completed tail
-                                                // selected, so it is typed-over or accepted
-                                                // with Enter/→. Deferred to the next frame AND
-                                                // it sets the value itself — the controlled
-                                                // re-render may not have landed yet, and
-                                                // selecting a range past the still-short value
-                                                // would clamp to a caret (the completion draft
-                                                // equals this value, so the reconcile is a
-                                                // no-op and the selection sticks).
-                                                if let Some((completed, typed_len, completed_len)) =
-                                                    completion
-                                                {
-                                                    let completed_js = serde_json::to_string(&completed)
-                                                        .unwrap_or_else(|_| "\"\"".to_string());
-                                                    let _ = document::eval(&format!(
-                                                        r#"requestAnimationFrame(function(){{
-                                                            var el = document.getElementById('{id}');
-                                                            if (!el) return;
-                                                            if (el.value !== {completed}) el.value = {completed};
-                                                            if (el.setSelectionRange) el.setSelectionRange({start}, {end});
-                                                        }});"#,
-                                                        id = address_input_id,
-                                                        completed = completed_js,
-                                                        start = typed_len,
-                                                        end = completed_len,
-                                                    ));
-                                                }
-                                            }
-                                        },
-                                        onkeydown: {
-                                            let nav_path = nav_path.clone();
-                                            let nav_ssh = nav_ssh.clone();
-                                            let suggestions = suggestions.clone();
-                                            move |evt: KeyboardEvent| {
-                                                if evt.key() == Key::ArrowDown
-                                                    || evt.key() == Key::ArrowUp
-                                                {
-                                                    if dropdown_rows > 0 {
-                                                        evt.prevent_default();
-                                                        let delta = if evt.key()
-                                                            == Key::ArrowDown
-                                                        {
-                                                            1
-                                                        } else {
-                                                            -1
-                                                        };
-                                                        state.with_mut(|shell| {
-                                                            shell
-                                                                .web_surface_move_address_suggestion(
-                                                                    &nav_path,
-                                                                    delta,
-                                                                    dropdown_rows,
-                                                                );
-                                                        });
-                                                    }
-                                                } else if evt.key() == Key::Enter {
-                                                    evt.prevent_default();
-                                                    // A selected history row navigates
-                                                    // to that URL directly; row 0 (or no
-                                                    // selection) commits the draft.
-                                                    let selected = state.with(|shell| {
-                                                        shell
-                                                            .web_surfaces
-                                                            .get(&nav_path)
-                                                            .and_then(|surface| {
-                                                                surface.address_suggestion_index
-                                                            })
-                                                    });
-                                                    if let Some(index) = selected
-                                                        && index >= 1
-                                                        && let Some((url, _)) =
-                                                            suggestions.get(index - 1)
-                                                    {
-                                                        let tab_id = state.with(|shell| {
-                                                            shell
-                                                                .web_surfaces
-                                                                .get(&nav_path)
-                                                                .map(|surface| surface.active_tab)
-                                                        });
-                                                        if let Some(tab_id) = tab_id {
-                                                            navigate_web_surface_tab(
-                                                                state,
-                                                                nav_path.clone(),
-                                                                tab_id,
-                                                                url.clone(),
-                                                                nav_ssh.clone(),
-                                                                None,
-                                                            );
-                                                        }
-                                                        return;
-                                                    }
-                                                    // Read draft + active tab at commit
-                                                    // time (the render snapshot may lag).
-                                                    let target = state.with(|shell| {
-                                                        let surface =
-                                                            shell.web_surfaces.get(&nav_path)?;
-                                                        let text = surface
-                                                            .address_draft
-                                                            .clone()
-                                                            .or_else(|| {
-                                                                surface
-                                                                    .tabs
-                                                                    .iter()
-                                                                    .find(|tab| {
-                                                                        tab.id == surface.active_tab
-                                                                    })
-                                                                    .map(|tab| tab.url.clone())
-                                                            })?;
-                                                        Some((surface.active_tab, text))
-                                                    });
-                                                    if let Some((tab_id, text)) = target
-                                                        && let Some(url) =
-                                                            web_surface_address_to_url(&text)
-                                                    {
-                                                        navigate_web_surface_tab(
-                                                            state,
-                                                            nav_path.clone(),
-                                                            tab_id,
-                                                            url,
-                                                            nav_ssh.clone(),
-                                                            None,
-                                                        );
-                                                    }
-                                                } else if evt.key() == Key::Escape {
-                                                    state.with_mut(|shell| {
-                                                        shell.web_surface_set_address_draft(
-                                                            &nav_path, None,
-                                                        );
-                                                    });
-                                                }
-                                            }
-                                        },
-                                    }
-                                    // Beside the omnibox: open the internal history
-                                    // viewer (a "chrome://history"-style page) in
-                                    // this tab's webview. Same nav path as any URL —
-                                    // it rides the tab as a `data:` page the omnibox
-                                    // relabels "History".
-                                    button {
-                                        style: "{reload_style}",
-                                        title: "History",
-                                        onclick: {
-                                            let nav_path = nav_path.clone();
-                                            let nav_ssh = nav_ssh.clone();
-                                            let nav_profile = nav_profile.clone();
-                                            move |_| {
-                                                navigate_web_surface_tab(
-                                                    state,
-                                                    nav_path.clone(),
-                                                    active_tab_id,
-                                                    web_history_data_url(&nav_profile),
-                                                    nav_ssh.clone(),
-                                                    None,
-                                                );
-                                            }
-                                        },
-                                        "🕘"
-                                    }
-                                }
-                                // Omnibox dropdown: in NORMAL FLOW below the nav
-                                // bar (not position:absolute) — the page area is
-                                // a NATIVE child webview layered over the main
-                                // DOM, so an overlay dropdown would be occluded.
-                                // Flow-push shrinks the [data-ws-page] rect and
-                                // the native surface follows within a reconcile
-                                // tick.
-                                if dropdown_rows > 0 {
-                                    div {
-                                        style: format!(
-                                            "display:flex; flex-direction:column; padding:2px 10px 8px; background:{}; \
-                                             border-bottom:1px solid rgba(127,127,127,0.25); user-select:none;",
-                                            theme.background,
-                                        ),
-                                        {
-                                            let draft = address_text.trim().to_string();
-                                            let go_label = match web_surface_address_to_url(&draft) {
-                                                Some(url) if !url.contains("{q}")
-                                                    && (url == draft
-                                                        || url == format!("https://{draft}")
-                                                        || url == format!("http://{draft}")) => {
-                                                    format!("Go to {url}")
-                                                }
-                                                _ => format!("Search for \"{draft}\""),
-                                            };
-                                            let row_style = |selected: bool| {
-                                                format!(
-                                                    "display:flex; align-items:center; gap:8px; padding:5px 12px; border-radius:8px; \
-                                                     cursor:pointer; font-size:12.5px; color:{}; background:{};",
-                                                    theme.foreground,
-                                                    if selected {
-                                                        "rgba(127,127,127,0.22)".to_string()
-                                                    } else {
-                                                        "transparent".to_string()
-                                                    },
-                                                )
-                                            };
-                                            let go_row_style = row_style(suggestion_index == Some(0));
-                                            let commit_path = nav_path.clone();
-                                            let commit_ssh = nav_ssh.clone();
-                                            rsx! {
-                                                div {
-                                                    style: "{go_row_style}",
-                                                    onclick: {
-                                                        let draft = draft.clone();
-                                                        move |_| {
-                                                            let tab_id = state.with(|shell| {
-                                                                shell
-                                                                    .web_surfaces
-                                                                    .get(&commit_path)
-                                                                    .map(|surface| surface.active_tab)
-                                                            });
-                                                            if let Some(tab_id) = tab_id
-                                                                && let Some(url) =
-                                                                    web_surface_address_to_url(&draft)
-                                                            {
-                                                                navigate_web_surface_tab(
-                                                                    state,
-                                                                    commit_path.clone(),
-                                                                    tab_id,
-                                                                    url,
-                                                                    commit_ssh.clone(),
-                                                                    None,
-                                                                );
-                                                            }
-                                                        }
-                                                    },
-                                                    span { style: "opacity:0.6; flex:0 0 auto;", "→" }
-                                                    span {
-                                                        style: "white-space:nowrap; overflow:hidden; text-overflow:ellipsis;",
-                                                        "{go_label}"
-                                                    }
-                                                }
-                                                for (row, (sug_url, sug_title)) in suggestions.iter().enumerate() {
-                                                    div {
-                                                        key: "ws-sug-{row}",
-                                                        style: row_style(suggestion_index == Some(row + 1)),
-                                                        onclick: {
-                                                            let nav_path = nav_path.clone();
-                                                            let nav_ssh = nav_ssh.clone();
-                                                            let sug_url = sug_url.clone();
-                                                            move |_| {
-                                                                let tab_id = state.with(|shell| {
-                                                                    shell
-                                                                        .web_surfaces
-                                                                        .get(&nav_path)
-                                                                        .map(|surface| surface.active_tab)
-                                                                });
-                                                                if let Some(tab_id) = tab_id {
-                                                                    navigate_web_surface_tab(
-                                                                        state,
-                                                                        nav_path.clone(),
-                                                                        tab_id,
-                                                                        sug_url.clone(),
-                                                                        nav_ssh.clone(),
-                                                                        None,
-                                                                    );
-                                                                }
-                                                            }
-                                                        },
-                                                        span { style: "opacity:0.6; flex:0 0 auto;", "🕘" }
-                                                        if !sug_title.is_empty() {
-                                                            span {
-                                                                style: "white-space:nowrap; overflow:hidden; text-overflow:ellipsis; flex:0 1 auto;",
-                                                                "{sug_title}"
-                                                            }
-                                                        }
-                                                        span {
-                                                            style: "white-space:nowrap; overflow:hidden; text-overflow:ellipsis; opacity:0.55; flex:0 1 auto;",
-                                                            "{sug_url}"
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
+                        // Nav bar (back / forward / reload + the omnibox). In
+                        // classic mode it lives here over the page; in vertical
+                        // mode the tabs AND this bar move to the tab-tree rail
+                        // (the Zen-style omnibox at the rail top), leaving the
+                        // viewport chrome-free below the collapsed strip. One
+                        // implementation, two homes — see `WebOmniboxBar`.
+                        if !web_overlay.vertical_tabs {
+                            WebOmniboxBar {
+                                state,
+                                session_path: web_surface_session_path.clone(),
+                                input_id: format!("{web_surface_host_id}-ws-address"),
+                                ssh_target: web_surface_nav_ssh_target.clone(),
+                                overlay: web_overlay.clone(),
+                                foreground: theme.foreground.clone(),
+                                background: theme.background.clone(),
+                                compact: false,
                             }
-                        }}
+                        }
                         // Page area placeholder: the actual page is a NATIVE
                         // child webview (own WebContext + optional SOCKS proxy —
                         // the egress rule) layered over this rect by the
@@ -81984,6 +81661,331 @@ fn RightRail(
         }
     }
 }
+/// The browser omnibox with its navigation controls: back / forward / reload,
+/// the address input (Chrome-style inline history completion + a keyboard-driven
+/// suggestion dropdown), and the history-viewer button. ONE implementation for
+/// two homes — the viewport nav bar in classic (horizontal-tabs) mode, and the
+/// top of the tab-tree rail in vertical-tabs mode (the Zen-style omnibox). The
+/// address bar never lives in both at once: the viewport bar draws only when
+/// vertical tabs are OFF, and the rail exists only when they are ON.
+///
+/// `compact` selects the rail styling — the buttons and input wrap so the input
+/// drops to its own line under the nav cluster in a ~300px rail. `input_id` must
+/// be a stable, unique DOM id so the focus/selection scripts address the right
+/// field.
+#[component]
+fn WebOmniboxBar(
+    state: Signal<ShellState>,
+    session_path: String,
+    input_id: String,
+    ssh_target: Option<String>,
+    overlay: WebSurfaceOverlayView,
+    foreground: String,
+    background: String,
+    compact: bool,
+) -> Element {
+    let nav_path = session_path.clone();
+    let nav_ssh = ssh_target.clone();
+    let active_tab_id = overlay.active_tab_id;
+    let nav_profile = overlay.profile.clone();
+    let back_target = overlay.back_target.clone();
+    let forward_target = overlay.forward_target.clone();
+    let address_text = overlay.address_text.clone();
+    let address_editing = overlay.address_editing;
+    let suggestions = overlay.address_suggestions.clone();
+    let suggestion_index = overlay.address_suggestion_index;
+    // Dropdown rows: 0 = the synthesized go/search row (what plain Enter does),
+    // 1.. = history matches.
+    let dropdown_rows = if address_editing && !address_text.trim().is_empty() {
+        1 + suggestions.len()
+    } else {
+        0
+    };
+    let nav_button_style = |enabled: bool| {
+        format!(
+            "border:none; background:transparent; color:{}; font-size:14px; line-height:1; padding:4px 7px; border-radius:6px; cursor:{}; opacity:{};",
+            foreground,
+            if enabled { "pointer" } else { "default" },
+            if enabled { "0.85" } else { "0.3" },
+        )
+    };
+    let back_style = nav_button_style(back_target.is_some());
+    let forward_style = nav_button_style(forward_target.is_some());
+    let reload_style = nav_button_style(true);
+    // In the rail (compact) the cluster wraps and the input drops onto its own
+    // line below the buttons (a 300px rail is too narrow for one row); over the
+    // page it is the classic single-row nav bar.
+    let bar_style = if compact {
+        "display:flex; flex-wrap:wrap; align-items:center; gap:3px; padding:0 0 2px; user-select:none;".to_string()
+    } else {
+        format!(
+            "display:flex; align-items:center; gap:4px; padding:6px 10px; background:{background}; user-select:none; \
+             overflow:hidden; max-height:60px;",
+        )
+    };
+    let input_style = if compact {
+        format!(
+            "flex:1 1 100%; order:9; min-width:0; margin-top:4px; padding:6px 12px; border-radius:12px; \
+             border:1px solid rgba(127,127,127,0.35); background:rgba(127,127,127,0.12); color:{foreground}; \
+             font-size:12px; outline:none;",
+        )
+    } else {
+        format!(
+            "flex:1 1 auto; min-width:0; padding:5px 14px; border-radius:14px; border:1px solid rgba(127,127,127,0.35); \
+             background:rgba(127,127,127,0.12); color:{foreground}; font-size:12.5px; outline:none;",
+        )
+    };
+    rsx! {
+        div {
+            style: "{bar_style}",
+            button {
+                style: "{back_style}",
+                title: "Back",
+                disabled: back_target.is_none(),
+                onclick: {
+                    let nav_path = nav_path.clone();
+                    let nav_ssh = nav_ssh.clone();
+                    let back_target = back_target.clone();
+                    move |_| {
+                        if let Some((index, url)) = back_target.clone() {
+                            navigate_web_surface_tab(state, nav_path.clone(), active_tab_id, url, nav_ssh.clone(), Some(index));
+                        }
+                    }
+                },
+                "←"
+            }
+            button {
+                style: "{forward_style}",
+                title: "Forward",
+                disabled: forward_target.is_none(),
+                onclick: {
+                    let nav_path = nav_path.clone();
+                    let nav_ssh = nav_ssh.clone();
+                    let forward_target = forward_target.clone();
+                    move |_| {
+                        if let Some((index, url)) = forward_target.clone() {
+                            navigate_web_surface_tab(state, nav_path.clone(), active_tab_id, url, nav_ssh.clone(), Some(index));
+                        }
+                    }
+                },
+                "→"
+            }
+            button {
+                style: "{reload_style}",
+                title: "Reload",
+                onclick: {
+                    let nav_path = nav_path.clone();
+                    move |_| {
+                        state.with_mut(|shell| shell.web_surface_reload_active_tab(&nav_path));
+                    }
+                },
+                "⟳"
+            }
+            input {
+                id: "{input_id}",
+                style: "{input_style}",
+                value: "{address_text}",
+                spellcheck: "false",
+                autocomplete: "off",
+                placeholder: "Search or enter address",
+                onfocus: {
+                    let address_input_id = input_id.clone();
+                    move |_| {
+                        let _ = document::eval(&format!(
+                            r#"(function(){{
+                                var el = document.getElementById('{id}');
+                                if (!el || !el.select) return;
+                                el.select();
+                                var guard = function(e){{
+                                    e.preventDefault();
+                                    el.removeEventListener('mouseup', guard);
+                                }};
+                                el.addEventListener('mouseup', guard);
+                            }})();"#,
+                            id = address_input_id,
+                        ));
+                    }
+                },
+                oninput: {
+                    let nav_path = nav_path.clone();
+                    let address_input_id = input_id.clone();
+                    move |evt: FormEvent| {
+                        let completion = state.with_mut(|shell| {
+                            shell.web_surface_type_address(&nav_path, evt.value())
+                        });
+                        if let Some((completed, typed_len, completed_len)) = completion {
+                            let completed_js = serde_json::to_string(&completed)
+                                .unwrap_or_else(|_| "\"\"".to_string());
+                            let _ = document::eval(&format!(
+                                r#"requestAnimationFrame(function(){{
+                                    var el = document.getElementById('{id}');
+                                    if (!el) return;
+                                    if (el.value !== {completed}) el.value = {completed};
+                                    if (el.setSelectionRange) el.setSelectionRange({start}, {end});
+                                }});"#,
+                                id = address_input_id,
+                                completed = completed_js,
+                                start = typed_len,
+                                end = completed_len,
+                            ));
+                        }
+                    }
+                },
+                onkeydown: {
+                    let nav_path = nav_path.clone();
+                    let nav_ssh = nav_ssh.clone();
+                    let suggestions = suggestions.clone();
+                    move |evt: KeyboardEvent| {
+                        if evt.key() == Key::ArrowDown || evt.key() == Key::ArrowUp {
+                            if dropdown_rows > 0 {
+                                evt.prevent_default();
+                                let delta = if evt.key() == Key::ArrowDown { 1 } else { -1 };
+                                state.with_mut(|shell| {
+                                    shell.web_surface_move_address_suggestion(&nav_path, delta, dropdown_rows);
+                                });
+                            }
+                        } else if evt.key() == Key::Enter {
+                            evt.prevent_default();
+                            // A selected history row navigates to that URL directly;
+                            // row 0 (or no selection) commits the draft.
+                            let selected = state.with(|shell| {
+                                shell.web_surfaces.get(&nav_path).and_then(|surface| surface.address_suggestion_index)
+                            });
+                            if let Some(index) = selected
+                                && index >= 1
+                                && let Some((url, _)) = suggestions.get(index - 1)
+                            {
+                                let tab_id = state.with(|shell| {
+                                    shell.web_surfaces.get(&nav_path).map(|surface| surface.active_tab)
+                                });
+                                if let Some(tab_id) = tab_id {
+                                    navigate_web_surface_tab(state, nav_path.clone(), tab_id, url.clone(), nav_ssh.clone(), None);
+                                }
+                                return;
+                            }
+                            let target = state.with(|shell| {
+                                let surface = shell.web_surfaces.get(&nav_path)?;
+                                let text = surface.address_draft.clone().or_else(|| {
+                                    surface.tabs.iter().find(|tab| tab.id == surface.active_tab).map(|tab| tab.url.clone())
+                                })?;
+                                Some((surface.active_tab, text))
+                            });
+                            if let Some((tab_id, text)) = target
+                                && let Some(url) = web_surface_address_to_url(&text)
+                            {
+                                navigate_web_surface_tab(state, nav_path.clone(), tab_id, url, nav_ssh.clone(), None);
+                            }
+                        } else if evt.key() == Key::Escape {
+                            state.with_mut(|shell| {
+                                shell.web_surface_set_address_draft(&nav_path, None);
+                            });
+                        }
+                    }
+                },
+            }
+            button {
+                style: "{reload_style}",
+                title: "History",
+                onclick: {
+                    let nav_path = nav_path.clone();
+                    let nav_ssh = nav_ssh.clone();
+                    let nav_profile = nav_profile.clone();
+                    move |_| {
+                        navigate_web_surface_tab(state, nav_path.clone(), active_tab_id, web_history_data_url(&nav_profile), nav_ssh.clone(), None);
+                    }
+                },
+                "🕘"
+            }
+        }
+        // Omnibox dropdown: normal flow below the bar. Over the page this
+        // flow-push shrinks the [data-ws-page] rect (the native surface follows);
+        // in the rail it is just the top rows.
+        if dropdown_rows > 0 {
+            div {
+                style: format!(
+                    "display:flex; flex-direction:column; padding:2px 10px 8px; background:{background}; \
+                     border-bottom:1px solid rgba(127,127,127,0.25); user-select:none;",
+                ),
+                {
+                    let draft = address_text.trim().to_string();
+                    let go_label = match web_surface_address_to_url(&draft) {
+                        Some(url) if !url.contains("{q}")
+                            && (url == draft
+                                || url == format!("https://{draft}")
+                                || url == format!("http://{draft}")) => {
+                            format!("Go to {url}")
+                        }
+                        _ => format!("Search for \"{draft}\""),
+                    };
+                    let row_style = |selected: bool| {
+                        format!(
+                            "display:flex; align-items:center; gap:8px; padding:5px 12px; border-radius:8px; \
+                             cursor:pointer; font-size:12.5px; color:{}; background:{};",
+                            foreground,
+                            if selected { "rgba(127,127,127,0.22)".to_string() } else { "transparent".to_string() },
+                        )
+                    };
+                    let go_row_style = row_style(suggestion_index == Some(0));
+                    let commit_path = nav_path.clone();
+                    let commit_ssh = nav_ssh.clone();
+                    rsx! {
+                        div {
+                            style: "{go_row_style}",
+                            onclick: {
+                                let draft = draft.clone();
+                                move |_| {
+                                    let tab_id = state.with(|shell| {
+                                        shell.web_surfaces.get(&commit_path).map(|surface| surface.active_tab)
+                                    });
+                                    if let Some(tab_id) = tab_id
+                                        && let Some(url) = web_surface_address_to_url(&draft)
+                                    {
+                                        navigate_web_surface_tab(state, commit_path.clone(), tab_id, url, commit_ssh.clone(), None);
+                                    }
+                                }
+                            },
+                            span { style: "opacity:0.6; flex:0 0 auto;", "→" }
+                            span {
+                                style: "white-space:nowrap; overflow:hidden; text-overflow:ellipsis;",
+                                "{go_label}"
+                            }
+                        }
+                        for (row, (sug_url, sug_title)) in suggestions.iter().enumerate() {
+                            div {
+                                key: "ws-sug-{row}",
+                                style: row_style(suggestion_index == Some(row + 1)),
+                                onclick: {
+                                    let nav_path = nav_path.clone();
+                                    let nav_ssh = nav_ssh.clone();
+                                    let sug_url = sug_url.clone();
+                                    move |_| {
+                                        let tab_id = state.with(|shell| {
+                                            shell.web_surfaces.get(&nav_path).map(|surface| surface.active_tab)
+                                        });
+                                        if let Some(tab_id) = tab_id {
+                                            navigate_web_surface_tab(state, nav_path.clone(), tab_id, sug_url.clone(), nav_ssh.clone(), None);
+                                        }
+                                    }
+                                },
+                                span { style: "opacity:0.6; flex:0 0 auto;", "🕘" }
+                                if !sug_title.is_empty() {
+                                    span {
+                                        style: "white-space:nowrap; overflow:hidden; text-overflow:ellipsis; flex:0 1 auto;",
+                                        "{sug_title}"
+                                    }
+                                }
+                                span {
+                                    style: "white-space:nowrap; overflow:hidden; text-overflow:ellipsis; opacity:0.55; flex:0 1 auto;",
+                                    "{sug_url}"
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
 /// The TAB TREE: the active web surface's tabs and the user's virtual folders.
 /// yggterm's own chrome (it owns the tabs), rendered with the cwd tree's
 /// grammar — disclosure triangles, an inline rename, drag a row into a folder,
@@ -82005,6 +82007,14 @@ fn WebTabsRailBody(snapshot: SharedSnapshot, state: Signal<ShellState>) -> Eleme
         };
     };
     let session_path = snapshot.active_session_path.clone().unwrap_or_default();
+    // The omnibox at the rail top (vertical-tabs mode) drives the SAME active
+    // surface as the tab rows below it, so it needs the surface's egress target
+    // exactly as the viewport nav bar does.
+    let omni_ssh = state.with(|shell| shell.web_surface_session_ssh_target(&session_path));
+    let omni_overlay = overlay.clone();
+    let omni_session_path = session_path.clone();
+    let omni_panel_bg = palette.panel.to_string();
+    let omni_text = palette.text.to_string();
     let rename = snapshot.web_tab_folder_rename.clone();
     let dragging = snapshot.web_tab_drag;
     let drop_target = snapshot.web_tab_drop_target.clone();
@@ -82103,6 +82113,19 @@ fn WebTabsRailBody(snapshot: SharedSnapshot, state: Signal<ShellState>) -> Eleme
             onmouseup: move |_| {
                 state.with_mut(|shell| shell.web_tab_end_drag());
             },
+            // Zen-style omnibox: in vertical-tabs mode the address bar leaves the
+            // viewport and lives here, at the top of the tab tree. Same component
+            // and same active surface as the classic viewport nav bar.
+            WebOmniboxBar {
+                state,
+                session_path: omni_session_path.clone(),
+                input_id: "ws-rail-address".to_string(),
+                ssh_target: omni_ssh.clone(),
+                overlay: omni_overlay.clone(),
+                foreground: omni_text.clone(),
+                background: omni_panel_bg.clone(),
+                compact: true,
+            }
             RailHeader { title: "Tabs".to_string(), color: palette.text.to_string() }
             div {
                 style: "display:flex; gap:6px;",
@@ -82115,6 +82138,11 @@ fn WebTabsRailBody(snapshot: SharedSnapshot, state: Signal<ShellState>) -> Eleme
                     ),
                     onclick: move |_| {
                         state.with_mut(|shell| shell.web_surface_new_tab(&new_tab_path));
+                        // Chrome opens new tabs typing-ready: focus the rail omnibox
+                        // once the re-render commits.
+                        let _ = document::eval(
+                            "setTimeout(() => { const el = document.getElementById('ws-rail-address'); if (el) { el.focus(); if (el.select) { el.select(); } } }, 60);",
+                        );
                     },
                     "+ New tab"
                 }
@@ -88626,6 +88654,133 @@ mod tests {
             shell.effective_right_panel_mode(false),
             RightPanelMode::Hidden,
             "a terminal session must not show an empty tab tree"
+        );
+    }
+
+    // The titlebar Tabs button must bring the rail BACK when another pane borrowed
+    // its slot while vertical mode is still on. Deciding from the vertical pref
+    // alone no-ops (it is already on), which is why the button "did nothing".
+    #[test]
+    fn the_tabs_button_reclaims_the_rail_from_a_borrowing_pane() {
+        let bootstrap = test_shell_bootstrap_with_active_session("local://ws");
+        let mut shell = ShellState::new(bootstrap);
+        shell.settings.web_surface_vertical_tabs = true;
+        shell.upsert_web_surface(
+            "local://ws",
+            "https://example.com/".to_string(),
+            None,
+            "https://example.com/".to_string(),
+            None,
+            None,
+            WEB_SURFACE_TEMP_PROFILE.to_string(),
+            1_000,
+        );
+        assert_eq!(shell.right_panel_mode, RightPanelMode::WebTabs);
+
+        // A pane borrows the slot; the vertical pref stays on.
+        shell.set_right_panel_mode(RightPanelMode::Settings);
+        assert_eq!(shell.right_panel_mode, RightPanelMode::Settings);
+        assert!(shell.settings.web_surface_vertical_tabs);
+
+        // The Tabs button reclaims the rail instead of no-oping.
+        shell.toggle_web_tabs_panel();
+        assert_eq!(
+            shell.right_panel_mode,
+            RightPanelMode::WebTabs,
+            "the Tabs button did nothing when a pane had borrowed the rail"
+        );
+
+        // Clicking it again hides the rail (turns vertical mode off).
+        shell.toggle_web_tabs_panel();
+        assert_eq!(shell.right_panel_mode, RightPanelMode::Hidden);
+        assert!(!shell.settings.web_surface_vertical_tabs);
+    }
+
+    // The ychrome tab rail is a tenant of the web surface: on a session with NO
+    // surface it falls back to the user's own remembered non-web view (here,
+    // Metadata), never leaking the tab tree into an unrelated session and never
+    // blanking a panel the user had open.
+    #[test]
+    fn the_tab_rail_falls_back_to_the_remembered_non_web_view() {
+        let bootstrap = test_shell_bootstrap_with_active_session("local://ws");
+        let mut shell = ShellState::new(bootstrap);
+        // The user had session metadata open before browsing.
+        shell.set_right_panel_mode(RightPanelMode::Metadata);
+        // A web surface opens under vertical tabs and claims the rail.
+        shell.settings.web_surface_vertical_tabs = true;
+        shell.upsert_web_surface(
+            "local://ws",
+            "https://example.com/".to_string(),
+            None,
+            "https://example.com/".to_string(),
+            None,
+            None,
+            WEB_SURFACE_TEMP_PROFILE.to_string(),
+            1_000,
+        );
+        assert_eq!(shell.right_panel_mode, RightPanelMode::WebTabs);
+        assert_eq!(
+            shell.right_panel_mode_before_web_tabs,
+            Some(RightPanelMode::Metadata),
+            "the user's own view must be remembered when the rail takes over"
+        );
+
+        // The surface goes away (the user closed ychrome / was dropped onto a
+        // terminal). The panel restores Metadata — not the tab tree, not Hidden.
+        shell.close_web_surface("local://ws");
+        assert_eq!(
+            shell.effective_right_panel_mode(false),
+            RightPanelMode::Metadata,
+            "the tab tree bled into a non-web session instead of restoring the user's view"
+        );
+    }
+
+    // LIVE-CAUGHT: reclaiming the rail from a BORROWING PANE must not remember the
+    // pane as "the user's own view". It did, which normalized to Hidden and threw
+    // the real remembered view (Metadata) away — so leaving the surface later
+    // blanked the panel instead of restoring it. The user's view is resolved
+    // THROUGH tenants (`user_right_panel_view`), never captured raw.
+    #[test]
+    fn reclaiming_the_rail_from_a_pane_keeps_the_users_view_remembered() {
+        let bootstrap = test_shell_bootstrap_with_active_session("local://ws");
+        let mut shell = ShellState::new(bootstrap);
+        shell.set_right_panel_mode(RightPanelMode::Metadata);
+        shell.settings.web_surface_vertical_tabs = true;
+        shell.upsert_web_surface(
+            "local://ws",
+            "https://example.com/".to_string(),
+            None,
+            "https://example.com/".to_string(),
+            None,
+            None,
+            WEB_SURFACE_TEMP_PROFILE.to_string(),
+            1_000,
+        );
+        assert_eq!(shell.right_panel_mode, RightPanelMode::WebTabs);
+
+        // The app's settings pane borrows the rail...
+        declare_pane(&mut shell, "local://ws", "settings", current_millis());
+        shell.open_app_pane("settings");
+        assert_eq!(
+            shell.right_panel_mode,
+            RightPanelMode::AppPane("settings".into())
+        );
+
+        // ...and the ⊟ button takes it back for the tabs.
+        shell.toggle_web_tabs_panel();
+        assert_eq!(shell.right_panel_mode, RightPanelMode::WebTabs);
+        assert_eq!(
+            shell.right_panel_mode_before_web_tabs,
+            Some(RightPanelMode::Metadata),
+            "the pane was remembered as the user's view, discarding the real one"
+        );
+
+        // Leaving the surface restores what the user actually had open.
+        shell.close_web_surface("local://ws");
+        assert_eq!(
+            shell.effective_right_panel_mode(false),
+            RightPanelMode::Metadata,
+            "the panel blanked instead of restoring the user's own view"
         );
     }
 
