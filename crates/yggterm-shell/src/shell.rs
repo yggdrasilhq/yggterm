@@ -4007,6 +4007,9 @@ struct RenderSnapshot {
     /// SSOT the mouse menu draws and the `rowmenu` KeyTip scope declares.
     row_menu_items: Vec<RowMenuItem>,
     row_menu_title: String,
+    /// The "here" row (`ALT,E`'s target): the selected sidebar row, else the active
+    /// session. The row-menu KeyTip badge paints on THIS row.
+    here_row_path: Option<String>,
     context_menu_row: Option<BrowserRow>,
     context_menu_context_row: Option<BrowserRow>,
     context_menu_position: Option<(f64, f64)>,
@@ -5852,6 +5855,18 @@ impl ShellState {
             }
             None => (Vec::new(), String::new()),
         };
+        // The "here" row's path — what `ALT,E` acts on, so the row menu's KeyTip
+        // badge can be painted ON that row instead of on some proxy in the chrome.
+        // Mirrors [`here_row`] exactly (selected row, else the active session), but
+        // reads the locals: calling `here_row` would re-enter `snapshot()`.
+        let here_row_path = selected_row
+            .as_ref()
+            .map(|row| row.full_path.clone())
+            .or_else(|| {
+                active_session_path
+                    .as_deref()
+                    .map(normalize_live_session_path)
+            });
         let keytip_tree =
             build_keytip_tree(&self.keytip_config, self.server.apps(), &row_menu_items);
         RenderSnapshot {
@@ -5948,6 +5963,7 @@ impl ShellState {
             selected_tree_paths,
             row_menu_items,
             row_menu_title,
+            here_row_path,
             context_menu_row: self.context_menu_row.clone(),
             context_menu_context_row: self.context_menu_context_row.clone(),
             context_menu_position: self.context_menu_position,
@@ -25696,16 +25712,17 @@ const ALT_TAP_LISTENER_JS_TEMPLATE: &str = r#"(function(){
       var host = marker.parentElement || marker;
       var r = host.getBoundingClientRect();
       if (r.width < 1 || r.height < 1){ return; }
+      // A host scrolled out of its container (a sidebar row above the fold) still
+      // has a box — an off-screen one. Without this its badge would be clamped
+      // back into view and float over unrelated chrome, pointing at nothing.
+      if (r.bottom < 0 || r.top > window.innerHeight || r.right < 0 || r.left > window.innerWidth){ return; }
       var node = marker.getAttribute('data-keytip-node') || tip;
       var id = 'ktb__' + node;
       var b = document.getElementById(id);
       if (!b){ b = document.createElement('div'); b.id = id; c.appendChild(b); }
       b.textContent = tip;
-      // Lower-leading corner, overlapping the host; nudged inward at edges. A
-      // slot lets two commands share one host (the active-session chip carries
-      // both "row actions" and "jump to session") without stacking their badges.
-      var slot = Number(marker.getAttribute('data-keytip-slot') || 0);
-      var bx = Math.max(2, Math.min(r.left - 5 + slot * 22, window.innerWidth - 24));
+      // Lower-leading corner, overlapping the host; nudged inward at edges.
+      var bx = Math.max(2, Math.min(r.left - 5, window.innerWidth - 24));
       var by = Math.max(2, Math.min(r.bottom - 11, window.innerHeight - 20));
       b.style.cssText = KT_BADGE_CSS + 'left:' + Math.round(bx) + 'px; top:' + Math.round(by) + 'px;';
       live[id] = true;
@@ -49195,9 +49212,12 @@ fn app() -> Element {
             if snapshot.alt_overlay_active {
                 div {
                     "data-yggterm-keytip-breadcrumb": "1",
+                    // Sits INSIDE the titlebar's search field, vertically centred in
+                    // it — at top:8px the pill hung off the titlebar's bottom border.
+                    // The field's box is 3..29 and the pill is 22 tall, so 5 centres it.
                     style: format!(
-                        "position:absolute; top:8px; left:50%; transform:translateX(-50%); z-index:400; \
-                         display:flex; align-items:center; gap:8px; padding:5px 13px; border-radius:999px; \
+                        "position:absolute; top:5px; left:50%; transform:translateX(-50%); z-index:400; \
+                         display:flex; align-items:center; gap:8px; height:22px; padding:0 13px; border-radius:999px; \
                          background:rgba(95,168,255,0.16); box-shadow: inset 0 0 0 1px rgba(95,168,255,0.42); \
                          color:{}; font-size:11px; font-weight:800; letter-spacing:0.3px; pointer-events:none; \
                          white-space:nowrap;",
@@ -50783,25 +50803,20 @@ fn Titlebar(
                                 evt.stop_propagation();
                             },
                             ondoubleclick: |evt| evt.stop_propagation(),
-                            // The active-session chip is the chrome that stands for
-                            // "the current row", so it hosts the two row-oriented
-                            // commands' badges: E = its right-click menu, J = jump
-                            // to another live session. Separate slots so the two
-                            // badges sit side by side instead of on top of each
-                            // other. The markers are hidden spans (no layout, no
-                            // interactable) — the chip's own click still opens the
-                            // session details, which is why it stays exempt below.
-                            span {
-                                "data-keytip-node": keytip_node_id("session.menu"),
-                                "data-keytip-tip": keytip_tip_attr(&snapshot, "session.menu"),
-                                "data-keytip-slot": "0",
-                                style: "display:none;",
-                            }
-                            span {
-                                "data-keytip-node": keytip_node_id("session.jump"),
-                                "data-keytip-tip": keytip_tip_attr(&snapshot, "session.jump"),
-                                "data-keytip-slot": "1",
-                                style: "display:none;",
+                            // A KeyTip belongs ON the thing it acts on. With the
+                            // sidebar OPEN, `ALT,E`'s badge is painted on the "here"
+                            // row itself and `ALT,J`'s on the Live Sessions row (see
+                            // `SidebarRow`). With the sidebar CLOSED there is no row
+                            // on screen, and this chip IS the active session — so it
+                            // hosts E, and only then. The marker is a hidden span (no
+                            // layout, not an interactable); the chip's own click still
+                            // opens the session details, which is why it stays exempt.
+                            if !snapshot.sidebar_open {
+                                span {
+                                    "data-keytip-node": keytip_node_id("session.menu"),
+                                    "data-keytip-tip": keytip_tip_attr(&snapshot, "session.menu"),
+                                    style: "display:none;",
+                                }
                             }
                             button {
                                 "data-titlebar-session-button": "1",
@@ -51937,6 +51952,19 @@ fn Sidebar(
                                 rename_value: snapshot.tree_rename_value.clone(),
                                 show_live_close: live_group_member && row.kind == BrowserRowKind::Session,
                                 palette: snapshot.palette,
+                                // One badge each, on the row it means something on:
+                                // E on the "here" row (what ALT,E opens), J on the
+                                // Live Sessions row (the list ALT,J walks).
+                                row_menu_tip: if snapshot.here_row_path.as_deref() == Some(row.full_path.as_str()) {
+                                    keytip_tip_attr(&snapshot, "session.menu")
+                                } else {
+                                    String::new()
+                                },
+                                jump_tip: if row.full_path == "__live_sessions__" {
+                                    keytip_tip_attr(&snapshot, "session.jump")
+                                } else {
+                                    String::new()
+                                },
                                 on_select: move |mode: TreeSelectionMode| {
                                     on_select_row.call(((*select_row).clone(), mode));
                                 },
@@ -52770,6 +52798,13 @@ fn SidebarRow(
     rename_value: String,
     show_live_close: bool,
     palette: Palette,
+    /// `ALT,E`'s letter when THIS row is the "here" row the row menu would open on,
+    /// else empty. A KeyTip is painted on the thing it acts on, and what `ALT,E`
+    /// acts on is a row (spec §8: the layer's actions apply to the focused item).
+    row_menu_tip: String,
+    /// `ALT,J`'s letter on the Live Sessions row — the list jump mode walks — else
+    /// empty.
+    jump_tip: String,
     on_select: EventHandler<TreeSelectionMode>,
     // Fired on mouse-DOWN to paint the selection highlight immediately (instant
     // feedback) without opening/switching the session — the open still happens
@@ -53135,6 +53170,26 @@ fn SidebarRow(
                     }
                 }
             },
+                // KeyTip markers for the two ROW-oriented commands. They are painted
+                // on the row they act on, not on a proxy in the chrome: E on the row
+                // the menu would open on, J on the Live Sessions row whose list jump
+                // mode walks. Hidden spans — the badge painter measures their parent
+                // (this row) and floats the letter there, so the row does not reflow
+                // and the audit still sees the row as an exempt list-item.
+                if !row_menu_tip.is_empty() {
+                    span {
+                        "data-keytip-node": keytip_node_id("session.menu"),
+                        "data-keytip-tip": "{row_menu_tip}",
+                        style: "display:none;",
+                    }
+                }
+                if !jump_tip.is_empty() {
+                    span {
+                        "data-keytip-node": keytip_node_id("session.jump"),
+                        "data-keytip-tip": "{jump_tip}",
+                        style: "display:none;",
+                    }
+                }
                 div {
                     style: "display:flex; align-items:center; justify-content:space-between; gap:6px;",
                     div {
@@ -113222,6 +113277,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             keytip_tree: KeyTipTree::default(),
             row_menu_items: Vec::new(),
             row_menu_title: String::new(),
+            here_row_path: None,
             session_jump_status: None,
             keytip_config: KeymapConfig::default(),
             keymap_editor_open: false,
@@ -113855,6 +113911,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             keytip_tree: KeyTipTree::default(),
             row_menu_items: Vec::new(),
             row_menu_title: String::new(),
+            here_row_path: None,
             session_jump_status: None,
             keytip_config: KeymapConfig::default(),
             keymap_editor_open: false,
@@ -114023,6 +114080,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             keytip_tree: KeyTipTree::default(),
             row_menu_items: Vec::new(),
             row_menu_title: String::new(),
+            here_row_path: None,
             session_jump_status: None,
             keytip_config: KeymapConfig::default(),
             keymap_editor_open: false,
@@ -114191,6 +114249,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             keytip_tree: KeyTipTree::default(),
             row_menu_items: Vec::new(),
             row_menu_title: String::new(),
+            here_row_path: None,
             session_jump_status: None,
             keytip_config: KeymapConfig::default(),
             keymap_editor_open: false,
@@ -114362,6 +114421,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             keytip_tree: KeyTipTree::default(),
             row_menu_items: Vec::new(),
             row_menu_title: String::new(),
+            here_row_path: None,
             session_jump_status: None,
             keytip_config: KeymapConfig::default(),
             keymap_editor_open: false,
@@ -114537,6 +114597,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             keytip_tree: KeyTipTree::default(),
             row_menu_items: Vec::new(),
             row_menu_title: String::new(),
+            here_row_path: None,
             session_jump_status: None,
             keytip_config: KeymapConfig::default(),
             keymap_editor_open: false,
@@ -114704,6 +114765,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             keytip_tree: KeyTipTree::default(),
             row_menu_items: Vec::new(),
             row_menu_title: String::new(),
+            here_row_path: None,
             session_jump_status: None,
             keytip_config: KeymapConfig::default(),
             keymap_editor_open: false,
@@ -114871,6 +114933,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             keytip_tree: KeyTipTree::default(),
             row_menu_items: Vec::new(),
             row_menu_title: String::new(),
+            here_row_path: None,
             session_jump_status: None,
             keytip_config: KeymapConfig::default(),
             keymap_editor_open: false,
@@ -115072,6 +115135,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             keytip_tree: KeyTipTree::default(),
             row_menu_items: Vec::new(),
             row_menu_title: String::new(),
+            here_row_path: None,
             session_jump_status: None,
             keytip_config: KeymapConfig::default(),
             keymap_editor_open: false,
@@ -115242,6 +115306,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             keytip_tree: KeyTipTree::default(),
             row_menu_items: Vec::new(),
             row_menu_title: String::new(),
+            here_row_path: None,
             session_jump_status: None,
             keytip_config: KeymapConfig::default(),
             keymap_editor_open: false,
@@ -115444,6 +115509,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             keytip_tree: KeyTipTree::default(),
             row_menu_items: Vec::new(),
             row_menu_title: String::new(),
+            here_row_path: None,
             session_jump_status: None,
             keytip_config: KeymapConfig::default(),
             keymap_editor_open: false,
@@ -115823,6 +115889,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             keytip_tree: KeyTipTree::default(),
             row_menu_items: Vec::new(),
             row_menu_title: String::new(),
+            here_row_path: None,
             session_jump_status: None,
             keytip_config: KeymapConfig::default(),
             keymap_editor_open: false,
