@@ -1266,20 +1266,103 @@ struct SidebarContributionState {
     /// Failed `<control>/zoom` fetches for the current stamp. Capped so a broken
     /// endpoint is not polled forever; the surfaces just keep the global zoom.
     zoom_attempts: u32,
+    /// The app's stamp over its chrome-appearance choice (the general default +
+    /// per-site overrides). Empty ⇒ the app ships no appearance (an old ychrome,
+    /// or a non-browser app) and the chrome falls back to Light. Refetched only
+    /// when it moves, exactly like `zoom_version`.
+    appearance_version: String,
+    /// The app's general default appearance. `Light` until `/appearance` answers,
+    /// so the chrome is light before the fetch lands (the ship default).
+    appearance_default: WebChromeAppearance,
+    /// Per-site appearance overrides the app serves, host -> appearance. The
+    /// render applies the entry for the live page's host (longest-suffix match)
+    /// and falls back to `appearance_default`. Like zoom, this never gates a
+    /// surface — appearance is cosmetic — so the OLD map stays applied while a new
+    /// one is in flight (no flicker).
+    appearance_overrides: HashMap<String, WebChromeAppearance>,
+    /// Whether `appearance_default`/`appearance_overrides` correspond to the
+    /// current `appearance_version`. False after a stamp change until the refetch
+    /// lands.
+    appearance_loaded: bool,
+    /// Failed `<control>/appearance` fetches for the current stamp. Capped like
+    /// the zoom attempts; on exhaustion the chrome just stays at the last map.
+    appearance_attempts: u32,
     last_seen_ms: u64,
 }
 
-/// What a re-declare tells the reconciler to refetch. Two independent stamps
-/// (policy, zoom) so a zoom edit does not drag the ruleset over the wire.
+/// What a re-declare tells the reconciler to refetch. Independent stamps
+/// (policy, zoom, appearance) so one edit does not drag the others over the wire.
 #[derive(Debug, Clone, Copy, Default)]
 struct SidebarRefetch {
     policy: bool,
     zoom: bool,
+    appearance: bool,
 }
 
 /// Attempts at `<control>/zoom` for one stamp before the reconciler stops asking
 /// and leaves the surfaces on the global zoom.
 const MAX_ZOOM_FETCH_ATTEMPTS: u32 = 3;
+
+/// Attempts at `<control>/appearance` for one stamp before the reconciler stops
+/// asking and leaves the chrome at whatever appearance it last had.
+const MAX_APPEARANCE_FETCH_ATTEMPTS: u32 = 3;
+
+/// The chrome appearance yggterm paints a web surface's tab strip, address bar
+/// and page frame in. `Light` is the default everywhere it is not overridden — a
+/// browser is light out of the box, and it keeps a dark terminal theme from
+/// framing every light page in a near-black border. ychrome owns the choice (the
+/// general default + per-site overrides); yggterm only paints it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum WebChromeAppearance {
+    #[default]
+    Light,
+    Dark,
+}
+
+impl WebChromeAppearance {
+    /// Parse the wire token from `<control>/appearance`. Anything unrecognised is
+    /// `None` (the caller keeps the default) — a garbled value never means dark.
+    fn parse(text: &str) -> Option<Self> {
+        match text.trim().to_ascii_lowercase().as_str() {
+            "light" => Some(WebChromeAppearance::Light),
+            "dark" => Some(WebChromeAppearance::Dark),
+            _ => None,
+        }
+    }
+}
+
+/// The colours a web surface's chrome + frame paint in for a given appearance.
+/// `Dark` reuses the terminal theme (the pre-appearance behaviour); `Light` is a
+/// fixed light surface whose frame is near-invisible against a light page, which
+/// is what removes the "black border" a dark terminal theme drew around every
+/// site.
+struct WebChromeColors {
+    /// The viewport frame around the page (shell + host + overlay backgrounds) —
+    /// the seam the user saw as a border.
+    frame_bg: String,
+    /// The tab strip and address bar fill.
+    chrome_bg: String,
+    /// Text and icons on the chrome.
+    chrome_fg: String,
+}
+
+fn web_chrome_colors(appearance: WebChromeAppearance, theme: &TerminalTheme) -> WebChromeColors {
+    match appearance {
+        WebChromeAppearance::Dark => WebChromeColors {
+            frame_bg: theme.background.clone(),
+            chrome_bg: theme.background.clone(),
+            chrome_fg: theme.foreground.clone(),
+        },
+        WebChromeAppearance::Light => WebChromeColors {
+            // A hair off pure white so the page (which the `[data-ws-page]`
+            // placeholder paints `#ffffff`) reads as sitting IN a light frame
+            // rather than bleeding into it, without the near-black seam.
+            frame_bg: "#f4f4f2".to_string(),
+            chrome_bg: "#f4f4f2".to_string(),
+            chrome_fg: "#20242b".to_string(),
+        },
+    }
+}
 
 /// The web-content policy an app ships for its own surfaces.
 ///
@@ -1538,6 +1621,11 @@ struct AppPaneActionReply {
     /// declare to move `zoom_version`. The reconciler applies the fresh map.
     #[serde(default)]
     refetch_zoom: bool,
+    /// Re-read `<control>/appearance` now: the app changed the chrome's light/dark
+    /// choice from its pane and wants the live chrome repainted at once, not at
+    /// the next ~4s declare. Same immediate-refetch shape as `refetch_zoom`.
+    #[serde(default)]
+    refetch_appearance: bool,
     /// Set one of yggterm's own web-surface preferences from the app's pane.
     ///
     /// These are NOT app config: yggterm owns the tabs, the tab tree and the
@@ -1605,6 +1693,65 @@ fn parse_web_surface_zoom(value: &serde_json::Value) -> HashMap<String, f32> {
     out
 }
 
+/// `<control>/appearance` — the app's chrome-appearance choice, `{ "default":
+/// "light"|"dark", "sites": { host: "light"|"dark" } }`. No query param, like
+/// `/zoom`: the whole thing is tiny and the GUI does the per-host matching.
+fn app_appearance_url(control_url: &str) -> String {
+    format!("{}/appearance", control_url.trim_end_matches('/'))
+}
+
+/// Parse `<control>/appearance` into `(default, host -> appearance)`. A missing
+/// or unrecognised `default` is Light (the ship default); a site whose value is
+/// not `light`/`dark`, or whose host is empty, is dropped.
+fn parse_web_surface_appearance(
+    value: &serde_json::Value,
+) -> (WebChromeAppearance, HashMap<String, WebChromeAppearance>) {
+    let default = value
+        .get("default")
+        .and_then(|value| value.as_str())
+        .and_then(WebChromeAppearance::parse)
+        .unwrap_or_default();
+    let mut sites = HashMap::new();
+    if let Some(map) = value.get("sites").and_then(|sites| sites.as_object()) {
+        for (host, appearance) in map {
+            let host = host.split(':').next().unwrap_or(host).trim().to_lowercase();
+            if host.is_empty() {
+                continue;
+            }
+            if let Some(appearance) = appearance.as_str().and_then(WebChromeAppearance::parse) {
+                sites.insert(host, appearance);
+            }
+        }
+    }
+    (default, sites)
+}
+
+/// The effective chrome appearance for a page's host: the per-site override
+/// (longest-suffix, so a `youtube.com` entry covers `music.youtube.com`) if one
+/// exists, else the general default. Stops before a bare TLD, so an override on
+/// `com` cannot repaint the whole web. The GUI twin of ychrome's
+/// `webappearance::site_override_for_host` — keep them in step.
+fn web_chrome_appearance_for_host(
+    default: WebChromeAppearance,
+    overrides: &HashMap<String, WebChromeAppearance>,
+    host: &str,
+) -> WebChromeAppearance {
+    let host = host.split(':').next().unwrap_or(host).trim().to_lowercase();
+    if host.is_empty() {
+        return default;
+    }
+    let mut candidate = host.as_str();
+    loop {
+        if let Some(appearance) = overrides.get(candidate) {
+            return *appearance;
+        }
+        match candidate.split_once('.') {
+            Some((_, rest)) if rest.contains('.') => candidate = rest,
+            _ => return default,
+        }
+    }
+}
+
 /// Spill an app-supplied adblock ruleset to a file on the GUI host, because
 /// WebKit's `UserContentFilterStore` compiles from a path, not from memory.
 ///
@@ -1658,6 +1805,11 @@ struct WebSurfaceOverlayView {
     /// The user's virtual folders, in display order. Drawn by the rail in
     /// vertical mode and by the classic strip's overflow menu otherwise.
     folders: Vec<WebTabFolder>,
+    /// The effective chrome appearance for the ACTIVE tab's host (the app's
+    /// per-site override, else its default, else Light). The render paints the
+    /// tab strip, address bar and page frame in it — this is what stops a dark
+    /// terminal theme from framing a light page in a near-black border.
+    chrome_appearance: WebChromeAppearance,
 }
 #[derive(Debug, Clone, PartialEq)]
 struct WebSurfaceOverlayTabView {
@@ -2679,6 +2831,19 @@ async fn web_surface_native_reconcile_loop(
                     let _ = desktop.stash_web_surface(entry.native_id);
                     entry.stashed_at_ms = Some(now_ms);
                     entry.visible = false;
+                    // A stashed surface stops being polled for page state, so a
+                    // load that finishes in the background would leave the tab's
+                    // loading light stuck ON — and the session row blinking —
+                    // for as long as the session stays backgrounded. Snuff it at
+                    // stash time; the engine's truth resumes on unstash (a page
+                    // genuinely still loading re-lights within one poll tick).
+                    if entry.loading {
+                        entry.loading = false;
+                        let mut writable = state;
+                        writable.with_mut(|shell| {
+                            shell.set_web_tab_loading(&key.0, key.1, false);
+                        });
+                    }
                     append_trace_event(
                         &trace_home,
                         "ui",
@@ -2703,13 +2868,24 @@ async fn web_surface_native_reconcile_loop(
         // surface page area currently laid out (CSS px == wry logical px).
         let mut eval = document::eval(
             r#"(function(){
+                // The auto-hiding titlebar is a floating DOM overlay, and a
+                // native webview paints above ALL DOM — so the webview must be
+                // CLAMPED below the titlebar's live bottom edge. Collapsed,
+                // that keeps the 6px hover sensor at the window's top edge
+                // real (hoverable DOM, not native surface); revealed, it makes
+                // the titlebar visible over the page by dipping the page —
+                // without re-laying-out anything else, which is the point.
+                const tb = document.querySelector('[data-titlebar-auto-hide-enabled="true"]');
+                const clampTop = tb ? Math.max(0, Math.round(tb.getBoundingClientRect().bottom)) : 0;
                 const out = {};
                 for (const el of document.querySelectorAll('[data-ws-page]')) {
                     const r = el.getBoundingClientRect();
-                    if (r.width > 1 && r.height > 1) {
+                    const top = Math.max(Math.round(r.top), clampTop);
+                    const height = Math.round(r.bottom) - top;
+                    if (r.width > 1 && height > 1) {
                         out[el.getAttribute('data-ws-page') || ''] = [
-                            Math.round(r.left), Math.round(r.top),
-                            Math.round(r.width), Math.round(r.height),
+                            Math.round(r.left), top,
+                            Math.round(r.width), height,
                         ];
                     }
                 }
@@ -4203,6 +4379,11 @@ struct RenderSnapshot {
     /// The active app's declared display name, for the zoom control's label
     /// ("Ychrome Global Zoom"). The app names itself over `sidebar ; declare`.
     active_web_surface_app_name: Option<String>,
+    /// Every session with a LIVE web surface → whether its ACTIVE tab is
+    /// loading. The sidebar row's working light reads this: a browsing session
+    /// is not "working" because a browser process sits foreground (that is true
+    /// the whole time it is open) — its light is the PAGE's loading state.
+    web_surface_loading: HashMap<String, bool>,
     /// Panes the ACTIVE session's libyggterm app has declared. Empty unless an
     /// app is live and declaring — which is what keeps app chrome out of the
     /// rail. yggterm never invents one of these.
@@ -6170,7 +6351,7 @@ impl ShellState {
                     }
                     _ => true,
                 };
-                self.effective_right_panel_mode(offers_pane)
+                self.effective_right_panel_mode(offers_pane, current_millis())
             },
             rows,
             selected_path,
@@ -6185,6 +6366,26 @@ impl ShellState {
             active_web_surface_app_name: active_session_path
                 .as_deref()
                 .and_then(|path| self.web_surface_app_name(path)),
+            web_surface_loading: {
+                // NO staleness filter: a backgrounded-but-live surface's
+                // last_seen goes stale while its reads are paused, and falling
+                // back to the shell heuristic there is exactly the phantom
+                // blink (ychrome is a perpetually-running foreground process).
+                // A defunct entry answers idle — its loading light was snuffed
+                // at stash time — which is also the right answer.
+                self.web_surfaces
+                    .iter()
+                    .filter(|(_, surface)| surface.picker.is_none())
+                    .map(|(path, surface)| {
+                        let loading = surface
+                            .tabs
+                            .iter()
+                            .find(|tab| tab.id == surface.active_tab)
+                            .is_some_and(|tab| tab.loading);
+                        (path.clone(), loading)
+                    })
+                    .collect()
+            },
             active_web_surface_overlay: active_session_path
                 .as_deref()
                 .and_then(|path| self.web_surface_overlay_for_session(path, current_millis())),
@@ -6697,6 +6898,7 @@ impl ShellState {
         policy_version: Option<String>,
         app_name: Option<String>,
         zoom_version: Option<String>,
+        appearance_version: Option<String>,
         now_ms: u64,
         resolved: Option<(
             String,
@@ -6705,6 +6907,7 @@ impl ShellState {
     ) -> SidebarRefetch {
         let policy_version = policy_version.unwrap_or_default();
         let zoom_version = zoom_version.unwrap_or_default();
+        let appearance_version = appearance_version.unwrap_or_default();
         if let Some(existing) = self.sidebar_contributions.get_mut(session_path) {
             existing.last_seen_ms = now_ms;
             // Panes may change between declares (an app can add one); the
@@ -6731,6 +6934,13 @@ impl ShellState {
                 existing.zoom_loaded = false;
                 existing.zoom_attempts = 0;
             }
+            // Appearance is non-gating like zoom: keep the OLD map applied on a
+            // stamp change and just mark it stale until the refetch lands.
+            if existing.appearance_version != appearance_version {
+                existing.appearance_version = appearance_version.clone();
+                existing.appearance_loaded = false;
+                existing.appearance_attempts = 0;
+            }
             // Retry a failed fetch on the next heartbeat, but only until the
             // attempts run out — a permanently broken endpoint must not mean one
             // fetch every 4s for the life of the session.
@@ -6741,6 +6951,9 @@ impl ShellState {
                 zoom: !zoom_version.is_empty()
                     && !existing.zoom_loaded
                     && existing.zoom_attempts < MAX_ZOOM_FETCH_ATTEMPTS,
+                appearance: !appearance_version.is_empty()
+                    && !existing.appearance_loaded
+                    && existing.appearance_attempts < MAX_APPEARANCE_FETCH_ATTEMPTS,
             };
         }
         let Some((control_url, forward_child)) = resolved else {
@@ -6760,12 +6973,18 @@ impl ShellState {
                 zoom_overrides: HashMap::new(),
                 zoom_loaded: false,
                 zoom_attempts: 0,
+                appearance_version: appearance_version.clone(),
+                appearance_default: WebChromeAppearance::default(),
+                appearance_overrides: HashMap::new(),
+                appearance_loaded: false,
+                appearance_attempts: 0,
                 last_seen_ms: now_ms,
             },
         );
         SidebarRefetch {
             policy: !policy_version.is_empty(),
             zoom: !zoom_version.is_empty(),
+            appearance: !appearance_version.is_empty(),
         }
     }
     /// Store the policy the app served for `policy_version`. A reply for a stale
@@ -6856,6 +7075,57 @@ impl ShellState {
     fn web_surface_zoom_override(&self, session_path: &str, host: &str) -> Option<f32> {
         let overrides = &self.sidebar_contributions.get(session_path)?.zoom_overrides;
         zoom_override_for_host(overrides, host)
+    }
+    /// The stamp an appearance fetch for this session should be filed under.
+    /// `None` when the app ships no appearance (an old ychrome, a non-browser).
+    fn sidebar_appearance_version(&self, session_path: &str) -> Option<String> {
+        self.sidebar_contributions
+            .get(session_path)
+            .map(|contribution| contribution.appearance_version.clone())
+            .filter(|version| !version.is_empty())
+    }
+    /// Store the appearance the app served for `appearance_version`. A reply for a
+    /// stale stamp is dropped: a newer fetch is already in flight.
+    fn apply_sidebar_appearance(
+        &mut self,
+        session_path: &str,
+        appearance_version: &str,
+        default: WebChromeAppearance,
+        overrides: HashMap<String, WebChromeAppearance>,
+    ) {
+        if let Some(contribution) = self.sidebar_contributions.get_mut(session_path)
+            && contribution.appearance_version == appearance_version
+        {
+            contribution.appearance_default = default;
+            contribution.appearance_overrides = overrides;
+            contribution.appearance_loaded = true;
+            contribution.appearance_attempts = 0;
+        }
+    }
+    /// Count a failed `<control>/appearance` fetch. Returns true once the
+    /// reconciler should stop asking and leave the chrome at its last appearance.
+    fn fail_sidebar_appearance(&mut self, session_path: &str, appearance_version: &str) -> bool {
+        let Some(contribution) = self.sidebar_contributions.get_mut(session_path) else {
+            return false;
+        };
+        if contribution.appearance_version != appearance_version {
+            return false;
+        }
+        contribution.appearance_attempts += 1;
+        contribution.appearance_attempts >= MAX_APPEARANCE_FETCH_ATTEMPTS
+    }
+    /// The effective chrome appearance for `host` on this session: the per-site
+    /// override, else the app's general default, else Light (no contribution yet).
+    /// One owner for the match rule; mirrors ychrome's `site_override_for_host`.
+    fn web_surface_chrome_appearance(&self, session_path: &str, host: &str) -> WebChromeAppearance {
+        let Some(contribution) = self.sidebar_contributions.get(session_path) else {
+            return WebChromeAppearance::default();
+        };
+        web_chrome_appearance_for_host(
+            contribution.appearance_default,
+            &contribution.appearance_overrides,
+            host,
+        )
     }
     /// The app's declared display name for the zoom control ("Ychrome"), if any.
     fn web_surface_app_name(&self, session_path: &str) -> Option<String> {
@@ -7480,6 +7750,13 @@ impl ShellState {
             profile: active.profile.clone(),
             vertical_tabs: self.settings.web_surface_vertical_tabs,
             folders: surface.folders.clone(),
+            // Follows the ACTIVE tab's host, so navigating between a light and a
+            // dark-overridden site repaints the chrome. Same host the pane's
+            // per-site row and the zoom map key on.
+            chrome_appearance: self.web_surface_chrome_appearance(
+                session_path,
+                &web_surface_tab_host_label(&active.url),
+            ),
         })
     }
     /// Write the ENGINE's loading truth onto a tab. The ONE writer of
@@ -7562,6 +7839,20 @@ impl ShellState {
     fn active_web_surface(&self) -> Option<&WebSurfaceUiState> {
         let session = self.server.active_session_path()?;
         self.web_surfaces.get(session)
+    }
+    /// Whether the active session's surface is LIVE — present AND heartbeat-fresh.
+    /// The map alone is not liveness: the stale sweep only runs on incoming OSC
+    /// events, so a DEFUNCT app (exited, killed) leaves its entry behind forever
+    /// on a backgrounded session. Everything that decides what the USER SEES from
+    /// a surface (the tab rail's tenancy, the Hidden→WebTabs bounce) must use
+    /// this, or a dead ychrome pins its empty tab tree onto unrelated sessions —
+    /// the "defunct Ychrome's tab view instead of my sidebar" report. Same
+    /// freshness rule as `web_surface_overlay_for_session`, so the rail and the
+    /// overlay can never disagree about whether a surface exists.
+    fn active_web_surface_is_live(&self, now_ms: u64) -> bool {
+        self.active_web_surface().is_some_and(|surface| {
+            now_ms.saturating_sub(surface.last_seen_ms) <= WEB_SURFACE_STALE_AFTER_MS
+        })
     }
     fn active_web_surface_has_folders(&self) -> bool {
         self.active_web_surface()
@@ -7954,20 +8245,17 @@ impl ShellState {
         self.set_right_panel_mode(next_mode);
     }
     fn set_right_panel_mode(&mut self, mode: RightPanelMode) {
-        // While vertical tabs are on, the rail's RESTING state is the tab tree —
-        // that is where the tabs live, and the strip is collapsed. Another pane
-        // (the app's settings, the vault) BORROWS the slot; when it leaves, the
-        // tabs come back. Without this, closing the settings pane left the tabs
-        // with no home at all: strip collapsed AND rail hidden. To hide the rail
-        // outright, turn vertical tabs off — the ⊟ button does exactly that.
-        let mode = if mode == RightPanelMode::Hidden
-            && self.settings.web_surface_vertical_tabs
-            && self.active_web_surface().is_some()
-        {
-            RightPanelMode::WebTabs
-        } else {
-            mode
-        };
+        // Hidden means HIDDEN — even in vertical-tabs mode. This used to bounce
+        // Hidden back to the tab rail ("the tabs must have somewhere to live"),
+        // which made a closed-sidebar browsing view impossible: every gesture
+        // that closed the right panel sprang the rail back open. Closing a
+        // sidebar is a VIEW gesture, not a mode change (user report 2026-07-13):
+        // the vertical pref stays on, the strip stays collapsed, the page gets
+        // the whole viewport, and the tabs come back through the ⊟ button or by
+        // reopening any panel path that restores the rail. A pane that BORROWS
+        // the slot still hands it back through `close_app_pane`, which restores
+        // the remembered mode (the rail) explicitly rather than relying on a
+        // Hidden bounce.
         // Entering the web tab rail: remember the user's own view so that a session
         // with no web surface restores it, rather than blanking the rail or leaking
         // one surface's tabs into an unrelated session. Resolved THROUGH whatever
@@ -8030,15 +8318,17 @@ impl ShellState {
             settled => settled,
         }
     }
-    /// The tab-tree rail's titlebar button. Vertical mode is what the rail is
-    /// FOR, so opening it turns the mode on and closing it turns the mode off —
-    /// one fact, one control, no way to have vertical tabs with nowhere to put
-    /// them (or a rail nobody asked for).
+    /// The tab-tree rail's titlebar button. Opening it turns vertical mode on
+    /// (tabs need the rail to live in); closing it only HIDES the rail — the
+    /// vertical pref stays on and the strip stays collapsed, because closing a
+    /// sidebar is a view gesture, not a request to bring the tab strip back
+    /// (user report 2026-07-13). Leaving vertical mode is the settings pane's
+    /// "Vertical tabs" toggle, which is where a MODE change belongs.
     fn toggle_web_tabs_panel(&mut self) {
         if self.right_panel_mode == RightPanelMode::WebTabs {
-            // The rail is what's showing → hide it, which is what turning vertical
-            // mode off does.
-            self.request_web_surface_vertical_tabs(false);
+            // The rail is what's showing → hide it. Chromeless browsing: no
+            // rail, no strip, the page gets the whole viewport.
+            self.set_right_panel_mode(RightPanelMode::Hidden);
         } else if self.settings.web_surface_vertical_tabs {
             // Vertical mode is already ON, but another pane (settings, a
             // contributed pane) borrowed the rail's slot. Requesting vertical=on
@@ -8101,20 +8391,27 @@ impl ShellState {
     /// remembered view instead of blanking. This is a pure derivation, not a
     /// mutation, so switching BACK to the app's session re-reveals the pane for
     /// free — the user who works with the sidebar open never sees it vanish.
-    fn effective_right_panel_mode(&self, active_session_offers_pane: bool) -> RightPanelMode {
+    fn effective_right_panel_mode(
+        &self,
+        active_session_offers_pane: bool,
+        now_ms: u64,
+    ) -> RightPanelMode {
         match &self.right_panel_mode {
             RightPanelMode::AppPane(_) if !active_session_offers_pane => self
                 .right_panel_mode_before_app_pane
                 .clone()
                 .unwrap_or(RightPanelMode::Hidden),
             // The tab rail is a tenant of the surface, exactly like a contributed
-            // pane is a tenant of its app: a session with no web surface has no
-            // tabs, so the rail stands down. It does NOT collapse to Hidden — it
-            // falls back to the user's own remembered non-web view, so the ychrome
-            // tab tree never bleeds into an unrelated session and the panel the
-            // user had open before browsing comes back (Hidden only if that is
-            // what they had). Symmetric with the `AppPane` fallback above.
-            RightPanelMode::WebTabs if self.active_web_surface().is_none() => self
+            // pane is a tenant of its app: a session with no LIVE web surface has
+            // no tabs, so the rail stands down. Liveness, not map presence — a
+            // defunct app's swept-less entry must not pin an empty tab tree onto
+            // the session (see `active_web_surface_is_live`). It does NOT collapse
+            // to Hidden — it falls back to the user's own remembered non-web view,
+            // so the ychrome tab tree never bleeds into an unrelated session and
+            // the panel the user had open before browsing comes back (Hidden only
+            // if that is what they had). Symmetric with the `AppPane` fallback
+            // above.
+            RightPanelMode::WebTabs if !self.active_web_surface_is_live(now_ms) => self
                 .right_panel_mode_before_web_tabs
                 .clone()
                 .unwrap_or(RightPanelMode::Hidden),
@@ -24701,6 +24998,15 @@ fn titlebar_wrapper_style(
     native_compositor_blur_active: bool,
     material_blur_px: f32,
 ) -> String {
+    // Auto-hide is the SAME floating overlay everywhere, web surface included:
+    // the titlebar reveals ON TOP of the UI (position:absolute, z-index 180)
+    // without changing anyone's layout. A native web surface cannot show DOM
+    // painted over it, so the reveal is made visible there by the surface
+    // reconciler CLAMPING the native webview below the titlebar's live rect
+    // (see the titlebar clamp in `web_surface_native_reconcile_loop`) — the
+    // page dips, the rest of the UI never moves. An earlier cut put the
+    // titlebar IN FLOW over web surfaces, which made every reveal re-lay-out
+    // the whole window (user report 2026-07-13).
     let collapsed = auto_hide_enabled && !revealed;
     let height_px = if collapsed {
         TITLEBAR_AUTOHIDE_SENSOR_HEIGHT_PX
@@ -24720,6 +25026,7 @@ fn titlebar_wrapper_style(
     let background_color = if auto_hide_enabled && revealed {
         titlebar_autohide_chrome_background_color(palette, native_compositor_blur_active)
     } else if auto_hide_enabled {
+        // Collapsed sensor strip: an invisible hover zone.
         "transparent".to_string()
     } else {
         palette.titlebar.to_string()
@@ -40603,6 +40910,61 @@ async fn app_zoom_fetch(
     }
 }
 
+/// Fetch `<control>/appearance` and store the chrome-appearance choice under
+/// `appearance_version`. Mirrors [`app_zoom_fetch`]: non-gating (a slow fetch
+/// just leaves the chrome at its last appearance), stamp-guarded (a reply for a
+/// retired stamp is dropped), attempt-capped.
+async fn app_appearance_fetch(
+    mut state: Signal<ShellState>,
+    session_path: String,
+    appearance_version: String,
+    trace_home: std::path::PathBuf,
+) {
+    let Some(control_url) = state.peek().sidebar_control_url(&session_path) else {
+        return;
+    };
+    let url = app_appearance_url(&control_url);
+    let fetched = task::spawn_blocking(move || control_request(&url, None))
+        .await
+        .unwrap_or_else(|error| Err(format!("appearance fetch panicked: {error}")));
+    match fetched {
+        Ok(value) => {
+            let (default, overrides) = parse_web_surface_appearance(&value);
+            append_trace_event(
+                &trace_home,
+                "ui",
+                "sidebar_contribution",
+                "appearance",
+                json!({
+                    "session_path": session_path,
+                    "appearance_version": appearance_version,
+                    "default": format!("{default:?}"),
+                    "sites": overrides.len(),
+                }),
+            );
+            state.with_mut(|shell| {
+                shell.apply_sidebar_appearance(&session_path, &appearance_version, default, overrides)
+            });
+        }
+        Err(error) => {
+            let exhausted = state
+                .with_mut(|shell| shell.fail_sidebar_appearance(&session_path, &appearance_version));
+            append_trace_event(
+                &trace_home,
+                "ui",
+                "sidebar_contribution",
+                "appearance_failed",
+                json!({
+                    "session_path": session_path,
+                    "appearance_version": appearance_version,
+                    "error": error,
+                    "exhausted": exhausted,
+                }),
+            );
+        }
+    }
+}
+
 /// Answer a passkey presence dialog: POST the grant (or deny) to the app's
 /// control endpoint, over the SAME `ssh -L` forward its `sidebar` declaration
 /// opened, then clear the dialog. The app is parked on `/fido2/get` waiting for
@@ -40818,6 +41180,26 @@ async fn app_pane_run_action(
             if let Some(version) = version {
                 let trace_home = resolve_yggterm_home().unwrap_or_else(|_| PathBuf::from("."));
                 spawn(app_zoom_fetch(state, session, version, trace_home));
+            }
+        }
+    }
+    if reply.refetch_appearance {
+        // An appearance action wants the live chrome repainted NOW. Re-read
+        // `/appearance` under the current stamp; the render picks up the new
+        // colours as soon as the map lands (the stamp has not moved yet — the
+        // ~4s declare will catch up — so clear `appearance_loaded` to force it).
+        let session = state.peek().server.active_session_path().map(str::to_string);
+        if let Some(session) = session {
+            let version = state.with_mut(|shell| {
+                if let Some(contribution) = shell.sidebar_contributions.get_mut(&session) {
+                    contribution.appearance_loaded = false;
+                    contribution.appearance_attempts = 0;
+                }
+                shell.sidebar_appearance_version(&session)
+            });
+            if let Some(version) = version {
+                let trace_home = resolve_yggterm_home().unwrap_or_else(|_| PathBuf::from("."));
+                spawn(app_appearance_fetch(state, session, version, trace_home));
             }
         }
     }
@@ -49298,14 +49680,19 @@ fn app() -> Element {
     let main_snapshot = snapshot.clone();
     let metadata_snapshot = snapshot.clone();
     // A native child webview paints above ALL DOM. An auto-hidden titlebar is
-    // `position:absolute` OVER the content, so a web surface swallows it whole:
-    // the titlebar (with its app menu, the ychrome/incognito identity, the
-    // window buttons) vanishes, and it cannot even be hovered back — the reveal
-    // sensor is under the webview too. So while a native surface is on screen
-    // the titlebar takes its space in FLOW, which is also what pushes the
-    // surface's rect down below it. A browser keeps its chrome.
-    let titlebar_auto_hide_enabled =
-        snapshot.settings.auto_hide_titlebar && !snapshot.native_web_surface_visible;
+    // `position:absolute` OVER the content — and a web surface would swallow
+    // that whole: the titlebar (app menu, the ychrome/incognito identity, the
+    // window buttons) vanishes, and it cannot even be hovered back, because the
+    // reveal sensor is under the webview too.
+    //
+    // The answer is NOT to give up auto-hide over a web surface, and not to
+    // move the titlebar into flow either (that made every reveal re-lay-out the
+    // whole window — user report 2026-07-13). The titlebar stays the SAME
+    // floating overlay everywhere; what moves is the NATIVE WEBVIEW: the
+    // surface reconciler clamps its rect below the titlebar's live bottom edge,
+    // so the collapsed sensor strip is real hoverable DOM and a revealed
+    // titlebar sits on top of everything with only the page dipping under it.
+    let titlebar_auto_hide_enabled = snapshot.settings.auto_hide_titlebar;
     let titlebar_reveal_pinned = titlebar_autohide_pinned(&snapshot);
     let titlebar_revealed = titlebar_autohide_revealed(
         titlebar_auto_hide_enabled,
@@ -52919,6 +53306,20 @@ fn sidebar_row_busy_state(snapshot: &RenderSnapshot, row: &BrowserRow) -> Sideba
     };
     if session.kind == SessionKind::Document {
         return SidebarBusyState::idle();
+    }
+    // A session whose viewport is a WEB SURFACE: the foreground-process signal
+    // is useless there — the browser app is "running" the whole time it is
+    // open, which kept the row blinking from launch to quit. The row's light is
+    // the PAGE's: blink while the active tab loads, steady once it is loaded.
+    if let Some(loading) = snapshot
+        .web_surface_loading
+        .get(session.session_path.as_str())
+    {
+        return if *loading {
+            SidebarBusyState::busy("web_surface_loading")
+        } else {
+            SidebarBusyState::idle()
+        };
     }
     if sidebar_row_has_optimistic_busy_hint(snapshot, row) {
         return SidebarBusyState::busy("optimistic_terminal_input");
@@ -57197,15 +57598,17 @@ fn TerminalCanvas(
     let terminal_frame = terminal_frame_style(snapshot.fullscreen);
     let terminal_shell_padding = terminal_frame.padding.to_string();
     let terminal_shell_radius = terminal_frame.shell_radius.to_string();
-    // The web overlay is a TENANT of this viewport, not a lid on top of it: it
-    // takes the same inset and radius the terminal host takes, so the viewport's
-    // frame is drawn around the page exactly as it is around a terminal. This is
-    // load-bearing, not cosmetic — the native child webview is placed at the
-    // `[data-ws-page]` rect INSIDE this overlay, and a rect that ran to the
-    // viewport's edge put a native rectangle over the frame (and, with the
-    // titlebar auto-hidden, over the titlebar) with nothing to clip it.
-    let terminal_web_overlay_inset = terminal_frame.padding.to_string();
-    let terminal_web_overlay_radius = terminal_frame.host_radius.to_string();
+    // The web overlay is a TENANT of this viewport (it lives inside the shell
+    // root and follows a resize or a split), but unlike a terminal it takes NO
+    // inset and NO radius: a browser page runs flush to the viewport's edges.
+    // The terminal's 4px frame padding, painted in the chrome color, is exactly
+    // the "border around every page" the user kept reporting — near-black on a
+    // dark chrome, a light band on a light one (2026-07-13). A native webview
+    // cannot be corner-clipped anyway, so the radius was already a fiction at
+    // the page's corners. The titlebar overlap this used to guard is handled by
+    // the reconciler's titlebar clamp, not by insetting the page.
+    let terminal_web_overlay_inset = "0px".to_string();
+    let terminal_web_overlay_radius = "0px".to_string();
     let terminal_host_chrome = format!(
         "border-radius:{}; box-shadow:none !important; outline:none !important; background:{};",
         terminal_frame.host_radius, theme.background,
@@ -60349,6 +60752,7 @@ fn TerminalCanvas(
                                 policy_version,
                                 app_name,
                                 zoom_version,
+                                appearance_version,
                             }) => {
                                 let now_ms = current_millis();
                                 let contribution_session_path = session_path.clone();
@@ -60371,6 +60775,7 @@ fn TerminalCanvas(
                                                     policy_version.clone(),
                                                     app_name.clone(),
                                                     zoom_version.clone(),
+                                                    appearance_version.clone(),
                                                     now_ms,
                                                     None,
                                                 )
@@ -60407,6 +60812,7 @@ fn TerminalCanvas(
                                                     policy_version.clone(),
                                                     app_name.clone(),
                                                     zoom_version.clone(),
+                                                    appearance_version.clone(),
                                                     now_ms,
                                                     Some((effective_control.clone(), forward_child)),
                                                 )
@@ -60448,6 +60854,16 @@ fn TerminalCanvas(
                                             let trace_home = trace_home.clone();
                                             let session = contribution_session_path.clone();
                                             spawn(app_zoom_fetch(state, session, version, trace_home));
+                                        }
+                                        // Chrome appearance moved (or first declare).
+                                        // Non-gating like zoom: fetched off the render
+                                        // path, applied when it lands.
+                                        if refetch.appearance
+                                            && let Some(version) = appearance_version.clone()
+                                        {
+                                            let trace_home = trace_home.clone();
+                                            let session = contribution_session_path.clone();
+                                            spawn(app_appearance_fetch(state, session, version, trace_home));
                                         }
                                     }
                                     "close" => {
@@ -65574,6 +65990,41 @@ fn TerminalCanvas(
     let web_surface_overlay = state.with(|shell| {
         shell.web_surface_overlay_for_session(&session.session_path, current_millis())
     });
+    // Chrome + frame colours for a web surface follow the app's appearance (Light
+    // by default); a terminal keeps the terminal theme. `web_frame_bg` repaints
+    // the viewport frame that used to draw the dark "border" around a light page;
+    // `web_chrome_bg`/`web_chrome_fg` the tab strip and address bar.
+    let web_chrome = web_surface_overlay
+        .as_ref()
+        .map(|overlay| web_chrome_colors(overlay.chrome_appearance, &theme));
+    let web_frame_bg = web_chrome
+        .as_ref()
+        .map(|colors| colors.frame_bg.clone())
+        .unwrap_or_else(|| theme.background.clone());
+    let web_chrome_bg = web_chrome
+        .as_ref()
+        .map(|colors| colors.chrome_bg.clone())
+        .unwrap_or_else(|| theme.background.clone());
+    let web_chrome_fg = web_chrome
+        .as_ref()
+        .map(|colors| colors.chrome_fg.clone())
+        .unwrap_or_else(|| theme.foreground.clone());
+    // The viewport frame (shell fill + host chrome) follows the surface too, so a
+    // web page is not framed in the dark terminal theme. A terminal is unchanged
+    // (`web_chrome` is None → these keep `theme.background`).
+    let terminal_shell_background = if web_chrome.is_some() {
+        web_frame_bg.clone()
+    } else {
+        terminal_shell_background
+    };
+    let terminal_host_chrome = if web_chrome.is_some() {
+        format!(
+            "border-radius:{}; box-shadow:none !important; outline:none !important; background:{};",
+            terminal_frame.host_radius, web_frame_bg,
+        )
+    } else {
+        terminal_host_chrome
+    };
     let web_surface_close_session_path = session.session_path.clone();
     let web_surface_session_path = session.session_path.clone();
     // The classic strip's folder-overflow menu. GUI-only state, read here so the
@@ -65651,7 +66102,7 @@ fn TerminalCanvas(
                          --yggterm-term-dim-foreground:{}; --yggterm-term-cursor:{}; --yggterm-term-cursor-muted:{}; --yggterm-term-cursor-text:{}; \
                          --yggterm-term-font-smoothing:{}; --yggterm-term-moz-font-smoothing:{};",
                         terminal_shell_padding,
-                        theme.background,
+                        web_frame_bg,
                         terminal_host_visibility,
                         terminal_host_chrome,
                         TERMINAL_FONT_FAMILY,
@@ -65696,19 +66147,19 @@ fn TerminalCanvas(
                             "data-yggterm-web-picker": "1",
                             style: format!(
                                 "position:absolute; inset:{}; z-index:40; display:flex; flex-direction:column; background:{}; border-radius:{}; overflow:hidden;",
-                                terminal_web_overlay_inset, theme.background, terminal_web_overlay_radius,
+                                terminal_web_overlay_inset, web_frame_bg, terminal_web_overlay_radius,
                             ),
                             WebSurfacePickerView {
                                 control_url: picker_control_url,
-                                foreground: theme.foreground.clone(),
-                                background: theme.background.clone(),
+                                foreground: web_chrome_fg.clone(),
+                                background: web_frame_bg.clone(),
                             }
                         }
                     } else {
                     div {
                         style: format!(
                             "position:absolute; inset:{}; z-index:40; display:flex; flex-direction:column; background:{}; border-radius:{}; overflow:hidden;",
-                            terminal_web_overlay_inset, theme.background, terminal_web_overlay_radius,
+                            terminal_web_overlay_inset, web_frame_bg, terminal_web_overlay_radius,
                         ),
                         // The tab loading dot's blink, declared where it is drawn.
                         style { "{STATUS_DOT_BLINK_CSS}" }
@@ -65745,7 +66196,7 @@ fn TerminalCanvas(
                                 let select_path = web_surface_session_path.clone();
                                 let close_tab_path = web_surface_session_path.clone();
                                 let (tab_background, tab_opacity) = if tab_active {
-                                    (theme.background.clone(), "1")
+                                    (web_chrome_bg.clone(), "1")
                                 } else {
                                     ("transparent".to_string(), "0.65")
                                 };
@@ -65755,7 +66206,7 @@ fn TerminalCanvas(
                                         style: format!(
                                             "display:flex; align-items:center; gap:6px; flex:1 1 0; max-width:200px; min-width:0; padding:0 10px; \
                                              border-radius:8px 8px 0 0; background:{}; color:{}; opacity:{}; cursor:pointer; font-size:12px;",
-                                            tab_background, theme.foreground, tab_opacity,
+                                            tab_background, web_chrome_fg, tab_opacity,
                                         ),
                                         onclick: move |_| {
                                             select_web_surface_tab(state, select_path.clone(), tab_id);
@@ -66002,8 +66453,8 @@ fn TerminalCanvas(
                                 input_id: format!("{web_surface_host_id}-ws-address"),
                                 ssh_target: web_surface_nav_ssh_target.clone(),
                                 overlay: web_overlay.clone(),
-                                foreground: theme.foreground.clone(),
-                                background: theme.background.clone(),
+                                foreground: web_chrome_fg.clone(),
+                                background: web_chrome_bg.clone(),
                                 compact: false,
                             }
                         }
@@ -70944,6 +71395,9 @@ fn terminal_eval_script_with_canvas_renderer(
                                     : null,
                                 zoom_version: typeof payload.zoom_version === 'string'
                                     ? payload.zoom_version
+                                    : null,
+                                appearance_version: typeof payload.appearance_version === 'string'
+                                    ? payload.appearance_version
                                     : null,
                                 panes: panes
                                     .filter((pane) => pane && typeof pane.id === 'string' && pane.id)
@@ -88688,8 +89142,12 @@ fn inline_toggle_track_style(palette: Palette, enabled: bool) -> String {
     } else {
         emphasized_exit_transition(&["background-color", "box-shadow"])
     };
+    // flex:0 0 auto — the track sits in a flex row beside the label, and a
+    // long label (SponsorBlock, the cookie extension) otherwise SHRINKS it:
+    // a 36px track squeezed to ~20px with the thumb translated 16px paints
+    // the knob hanging outside the pill (the "UI corruption" report).
     format!(
-        "position:relative; width:36px; height:20px; border-radius:999px; background:{}; box-shadow:inset 0 0 0 1px {}; transition:{};",
+        "position:relative; flex:0 0 auto; width:36px; height:20px; border-radius:999px; background:{}; box-shadow:inset 0 0 0 1px {}; transition:{};",
         if enabled {
             palette.accent
         } else if palette_is_dark(palette) {
@@ -89204,18 +89662,97 @@ mod tests {
         );
         assert_eq!(shell.right_panel_mode, RightPanelMode::WebTabs);
 
-        shell.set_right_panel_mode(RightPanelMode::AppPane("settings".to_string()));
+        shell.open_app_pane("settings");
         assert_eq!(
             shell.right_panel_mode,
             RightPanelMode::AppPane("settings".to_string()),
             "a pane may borrow the slot"
         );
 
-        shell.set_right_panel_mode(RightPanelMode::Hidden);
+        shell.close_app_pane();
         assert_eq!(
             shell.right_panel_mode,
             RightPanelMode::WebTabs,
-            "and hiding it hands the rail back to the tabs, not to nothing"
+            "and closing it hands the rail back to the tabs, not to nothing"
+        );
+    }
+
+    // Closing the right panel in vertical-tabs mode is a VIEW gesture: the rail
+    // hides, the vertical pref stays on, and the strip stays collapsed — a
+    // chromeless page, not "the chrome comes back" (user report 2026-07-13).
+    // The old Hidden→WebTabs bounce made this state impossible.
+    #[test]
+    fn hiding_the_rail_keeps_vertical_mode_and_does_not_bounce_back() {
+        let bootstrap = test_shell_bootstrap_with_active_session("local://ws");
+        let mut shell = ShellState::new(bootstrap);
+        shell.settings.web_surface_vertical_tabs = true;
+        shell.upsert_web_surface(
+            "local://ws",
+            "https://example.com/".to_string(),
+            None,
+            "https://example.com/".to_string(),
+            None,
+            None,
+            WEB_SURFACE_TEMP_PROFILE.to_string(),
+            false,
+            1_000,
+        );
+        assert_eq!(shell.right_panel_mode, RightPanelMode::WebTabs);
+
+        // The ⊟ button hides the rail without leaving vertical mode.
+        shell.toggle_web_tabs_panel();
+        assert_eq!(shell.right_panel_mode, RightPanelMode::Hidden);
+        assert!(
+            shell.settings.web_surface_vertical_tabs,
+            "hiding the rail must not flip the tab MODE (that is what brought the strip back)"
+        );
+
+        // Any panel close path lands on Hidden and STAYS hidden.
+        shell.set_right_panel_mode(RightPanelMode::Metadata);
+        shell.toggle_metadata_panel();
+        assert_eq!(shell.right_panel_mode, RightPanelMode::Hidden);
+        assert!(shell.settings.web_surface_vertical_tabs);
+
+        // And the ⊟ button brings the rail back without touching the pref.
+        shell.toggle_web_tabs_panel();
+        assert_eq!(shell.right_panel_mode, RightPanelMode::WebTabs);
+        assert!(shell.settings.web_surface_vertical_tabs);
+    }
+
+    // A DEFUNCT surface (app exited; the event-driven sweep never ran again) must
+    // not pin its empty tab tree onto the session: liveness, not map presence,
+    // decides the rail's tenancy — the "defunct Ychrome's tab view instead of my
+    // sidebar" report (2026-07-13).
+    #[test]
+    fn a_defunct_surface_does_not_pin_the_tab_rail() {
+        let bootstrap = test_shell_bootstrap_with_active_session("local://ws");
+        let mut shell = ShellState::new(bootstrap);
+        shell.set_right_panel_mode(RightPanelMode::Metadata);
+        shell.settings.web_surface_vertical_tabs = true;
+        shell.upsert_web_surface(
+            "local://ws",
+            "https://example.com/".to_string(),
+            None,
+            "https://example.com/".to_string(),
+            None,
+            None,
+            WEB_SURFACE_TEMP_PROFILE.to_string(),
+            false,
+            1_000,
+        );
+        assert_eq!(shell.right_panel_mode, RightPanelMode::WebTabs);
+
+        // Heartbeats fresh → the rail holds.
+        assert_eq!(
+            shell.effective_right_panel_mode(true, 1_000),
+            RightPanelMode::WebTabs
+        );
+        // Heartbeats stopped (the app is gone, the entry was never swept) → the
+        // user's own remembered view, not an empty tab tree.
+        assert_eq!(
+            shell.effective_right_panel_mode(true, 1_000 + WEB_SURFACE_STALE_AFTER_MS + 1),
+            RightPanelMode::Metadata,
+            "a dead app's surface entry pinned the tab rail"
         );
     }
 
@@ -89227,7 +89764,7 @@ mod tests {
         let mut shell = ShellState::new(bootstrap);
         shell.right_panel_mode = RightPanelMode::WebTabs;
         assert_eq!(
-            shell.effective_right_panel_mode(false),
+            shell.effective_right_panel_mode(false, current_millis()),
             RightPanelMode::Hidden,
             "a terminal session must not show an empty tab tree"
         );
@@ -89267,10 +89804,11 @@ mod tests {
             "the Tabs button did nothing when a pane had borrowed the rail"
         );
 
-        // Clicking it again hides the rail (turns vertical mode off).
+        // Clicking it again hides the rail — the vertical MODE stays on, so the
+        // strip does not come back (closing a sidebar is a view gesture).
         shell.toggle_web_tabs_panel();
         assert_eq!(shell.right_panel_mode, RightPanelMode::Hidden);
-        assert!(!shell.settings.web_surface_vertical_tabs);
+        assert!(shell.settings.web_surface_vertical_tabs);
     }
 
     // The ychrome tab rail is a tenant of the web surface: on a session with NO
@@ -89307,7 +89845,7 @@ mod tests {
         // terminal). The panel restores Metadata — not the tab tree, not Hidden.
         shell.close_web_surface("local://ws");
         assert_eq!(
-            shell.effective_right_panel_mode(false),
+            shell.effective_right_panel_mode(false, current_millis()),
             RightPanelMode::Metadata,
             "the tab tree bled into a non-web session instead of restoring the user's view"
         );
@@ -89357,7 +89895,7 @@ mod tests {
         // Leaving the surface restores what the user actually had open.
         shell.close_web_surface("local://ws");
         assert_eq!(
-            shell.effective_right_panel_mode(false),
+            shell.effective_right_panel_mode(false, current_millis()),
             RightPanelMode::Metadata,
             "the panel blanked instead of restoring the user's own view"
         );
@@ -92695,6 +93233,78 @@ mod tests {
         assert!(always_visible.contains("background-image:none"));
     }
     #[test]
+    fn web_chrome_appearance_matches_host_most_specific_first() {
+        let mut overrides = HashMap::new();
+        overrides.insert("youtube.com".to_string(), WebChromeAppearance::Dark);
+        overrides.insert("music.youtube.com".to_string(), WebChromeAppearance::Light);
+        // Exact beats parent beats default.
+        assert_eq!(
+            web_chrome_appearance_for_host(WebChromeAppearance::Light, &overrides, "music.youtube.com"),
+            WebChromeAppearance::Light
+        );
+        assert_eq!(
+            web_chrome_appearance_for_host(WebChromeAppearance::Light, &overrides, "www.youtube.com"),
+            WebChromeAppearance::Dark
+        );
+        // No entry falls through to the default (either default).
+        assert_eq!(
+            web_chrome_appearance_for_host(WebChromeAppearance::Light, &overrides, "example.com"),
+            WebChromeAppearance::Light
+        );
+        assert_eq!(
+            web_chrome_appearance_for_host(WebChromeAppearance::Dark, &overrides, "example.com"),
+            WebChromeAppearance::Dark
+        );
+        // A bare-TLD override never repaints the whole web.
+        let mut tld = HashMap::new();
+        tld.insert("com".to_string(), WebChromeAppearance::Dark);
+        assert_eq!(
+            web_chrome_appearance_for_host(WebChromeAppearance::Light, &tld, "example.com"),
+            WebChromeAppearance::Light
+        );
+    }
+
+    #[test]
+    fn web_chrome_appearance_parse_and_default() {
+        assert_eq!(WebChromeAppearance::parse("light"), Some(WebChromeAppearance::Light));
+        assert_eq!(WebChromeAppearance::parse("DARK"), Some(WebChromeAppearance::Dark));
+        assert_eq!(WebChromeAppearance::parse("bogus"), None);
+        assert_eq!(WebChromeAppearance::default(), WebChromeAppearance::Light);
+    }
+
+    #[test]
+    fn parse_web_surface_appearance_reads_default_and_sites() {
+        let value = serde_json::json!({
+            "default": "dark",
+            "sites": { "a.com": "light", "b.com": "nope", "": "dark" }
+        });
+        let (default, sites) = parse_web_surface_appearance(&value);
+        assert_eq!(default, WebChromeAppearance::Dark);
+        assert_eq!(sites.get("a.com"), Some(&WebChromeAppearance::Light));
+        assert_eq!(sites.get("b.com"), None); // garbage dropped
+        assert!(!sites.contains_key("")); // empty host dropped
+        // A missing default is Light (the ship default).
+        let (default, _) = parse_web_surface_appearance(&serde_json::json!({}));
+        assert_eq!(default, WebChromeAppearance::Light);
+    }
+
+    #[test]
+    fn web_chrome_colors_light_frame_is_not_the_dark_terminal_bg() {
+        let dark_theme = terminal_theme(
+            UiTheme::ZedDark,
+            palette(UiTheme::ZedDark),
+            14.0,
+            &terminal_theme_value_for_settings("", UiTheme::ZedDark),
+        );
+        let light = web_chrome_colors(WebChromeAppearance::Light, &dark_theme);
+        let dark = web_chrome_colors(WebChromeAppearance::Dark, &dark_theme);
+        // Light frame is a fixed light surface, NOT the terminal background.
+        assert_ne!(light.frame_bg, dark_theme.background);
+        // Dark keeps the terminal theme (the pre-appearance behaviour).
+        assert_eq!(dark.frame_bg, dark_theme.background);
+        assert_eq!(dark.chrome_fg, dark_theme.foreground);
+    }
+    #[test]
     fn theme_editor_stable_path_removes_experimental_dials() {
         let source = include_str!("shell.rs");
         assert!(source.contains("\"data-theme-editor-brightness-input\": \"1\""));
@@ -95064,6 +95674,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             now_ms,
             Some(("http://127.0.0.1:1".to_string(), None)),
         );
@@ -95084,6 +95695,7 @@ mod tests {
                     title: "Settings".to_string(),
                 }],
                 policy_version.map(str::to_string),
+                None,
                 None,
                 None,
                 now_ms,
@@ -95327,12 +95939,12 @@ mod tests {
 
         // Active session offers the pane → it shows.
         assert_eq!(
-            shell.effective_right_panel_mode(true),
+            shell.effective_right_panel_mode(true, current_millis()),
             RightPanelMode::AppPane("vault".into())
         );
         // Active session does NOT offer it (switched to a non-app session, or the
         // app died) → the user's remembered view, not a blank rail.
-        assert_eq!(shell.effective_right_panel_mode(false), RightPanelMode::Metadata);
+        assert_eq!(shell.effective_right_panel_mode(false, current_millis()), RightPanelMode::Metadata);
         // The underlying mode is untouched — switching back re-reveals the pane.
         assert_eq!(shell.right_panel_mode, RightPanelMode::AppPane("vault".into()));
     }
@@ -95344,7 +95956,7 @@ mod tests {
         let mut shell = ShellState::new(test_shell_bootstrap_with_active_session("local://pane"));
         shell.set_right_panel_mode(RightPanelMode::Hidden);
         shell.open_app_pane("vault");
-        assert_eq!(shell.effective_right_panel_mode(false), RightPanelMode::Hidden);
+        assert_eq!(shell.effective_right_panel_mode(false, current_millis()), RightPanelMode::Hidden);
     }
 
     // The end-to-end path the renderer reads: the snapshot shows the vault pane
@@ -113891,6 +114503,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             active_split_group: None,
             terminal_mount_epochs: HashMap::new(),
             active_web_surface_profile: None,
+            web_surface_loading: HashMap::new(),
             active_web_surface_overlay: None,
             pending_classic_tabs_switch: false,
             web_tab_folder_rename: None,
@@ -114526,6 +115139,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             active_split_group: None,
             terminal_mount_epochs: HashMap::new(),
             active_web_surface_profile: None,
+            web_surface_loading: HashMap::new(),
             active_web_surface_overlay: None,
             pending_classic_tabs_switch: false,
             web_tab_folder_rename: None,
@@ -114696,6 +115310,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             active_split_group: None,
             terminal_mount_epochs: HashMap::new(),
             active_web_surface_profile: None,
+            web_surface_loading: HashMap::new(),
             active_web_surface_overlay: None,
             pending_classic_tabs_switch: false,
             web_tab_folder_rename: None,
@@ -114866,6 +115481,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             active_split_group: None,
             terminal_mount_epochs: HashMap::new(),
             active_web_surface_profile: None,
+            web_surface_loading: HashMap::new(),
             active_web_surface_overlay: None,
             pending_classic_tabs_switch: false,
             web_tab_folder_rename: None,
@@ -115039,6 +115655,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             active_split_group: None,
             terminal_mount_epochs: HashMap::new(),
             active_web_surface_profile: None,
+            web_surface_loading: HashMap::new(),
             active_web_surface_overlay: None,
             pending_classic_tabs_switch: false,
             web_tab_folder_rename: None,
@@ -115216,6 +115833,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             active_split_group: None,
             terminal_mount_epochs: HashMap::new(),
             active_web_surface_profile: None,
+            web_surface_loading: HashMap::new(),
             active_web_surface_overlay: None,
             pending_classic_tabs_switch: false,
             web_tab_folder_rename: None,
@@ -115385,6 +116003,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             active_split_group: None,
             terminal_mount_epochs: HashMap::new(),
             active_web_surface_profile: None,
+            web_surface_loading: HashMap::new(),
             active_web_surface_overlay: None,
             pending_classic_tabs_switch: false,
             web_tab_folder_rename: None,
@@ -115554,6 +116173,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             active_split_group: None,
             terminal_mount_epochs: HashMap::new(),
             active_web_surface_profile: None,
+            web_surface_loading: HashMap::new(),
             active_web_surface_overlay: None,
             pending_classic_tabs_switch: false,
             web_tab_folder_rename: None,
@@ -115757,6 +116377,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             active_split_group: None,
             terminal_mount_epochs: HashMap::new(),
             active_web_surface_profile: None,
+            web_surface_loading: HashMap::new(),
             active_web_surface_overlay: None,
             pending_classic_tabs_switch: false,
             web_tab_folder_rename: None,
@@ -115929,6 +116550,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             active_split_group: None,
             terminal_mount_epochs: HashMap::new(),
             active_web_surface_profile: None,
+            web_surface_loading: HashMap::new(),
             active_web_surface_overlay: None,
             pending_classic_tabs_switch: false,
             web_tab_folder_rename: None,
@@ -116133,6 +116755,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             active_split_group: None,
             terminal_mount_epochs: HashMap::new(),
             active_web_surface_profile: None,
+            web_surface_loading: HashMap::new(),
             active_web_surface_overlay: None,
             pending_classic_tabs_switch: false,
             web_tab_folder_rename: None,
@@ -116514,6 +117137,7 @@ Use these for deliberate starts, important calls, planning, repair, or auspiciou
             active_split_group: None,
             terminal_mount_epochs: HashMap::new(),
             active_web_surface_profile: None,
+            web_surface_loading: HashMap::new(),
             active_web_surface_overlay: None,
             pending_classic_tabs_switch: false,
             web_tab_folder_rename: None,
