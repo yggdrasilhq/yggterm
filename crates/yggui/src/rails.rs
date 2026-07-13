@@ -79,17 +79,32 @@ pub fn SideRailShell(visible: bool, width_px: usize, zoom_percent: f32, body: El
     }
 }
 
+/// A rail's section heading, with an optional trailing action cluster.
+///
+/// `actions` is where a rail hangs the verbs that ACT ON the section it heads
+/// (the tab rail's new-tab and new-folder buttons). They belong on the heading
+/// rather than in a band below it: a heading row is one line the eye already
+/// reads, and a verb parked next to its noun needs no label to explain itself.
 #[component]
-pub fn RailHeader(title: String, color: String) -> Element {
+pub fn RailHeader(title: String, color: String, actions: Option<Element>) -> Element {
     rsx! {
         div {
             "data-yggui-rail-header": "1",
-            style: format!(
-                "padding:16px 16px 10px 16px; font-size:12px; font-weight:700; letter-spacing:0.01em; color:{}; \
-                 text-rendering:optimizeLegibility; -webkit-font-smoothing:antialiased; -moz-osx-font-smoothing:grayscale;",
-                color
-            ),
-            "{title}"
+            style: "display:flex; align-items:center; gap:8px; padding:16px 16px 10px 16px;",
+            span {
+                style: format!(
+                    "flex:1 1 auto; min-width:0; font-size:12px; font-weight:700; letter-spacing:0.01em; color:{}; \
+                     text-rendering:optimizeLegibility; -webkit-font-smoothing:antialiased; -moz-osx-font-smoothing:grayscale;",
+                    color
+                ),
+                "{title}"
+            }
+            if let Some(actions) = actions {
+                div {
+                    style: "flex:0 0 auto; display:flex; align-items:center; gap:6px;",
+                    {actions}
+                }
+            }
         }
     }
 }
