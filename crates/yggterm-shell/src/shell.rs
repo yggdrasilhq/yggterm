@@ -120695,7 +120695,7 @@ Shared connection to 192.0.2.14 closed.
 ─ Worked for 2m 02s ─────────────────────────────────────────────────────────────
 
 › Error: terminal session not found: local://019d0000-0000-7000-8000-000000000001
-                                                                                 Shared connection to 192.168.
+                                                                                 Shared connection to 192.0.2.
 ed.pt-5.5 xhigh · ~/git/samplenotes";
 
         let cleaned = sanitize_terminal_replay_payload(raw);
