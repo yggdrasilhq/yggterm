@@ -26,6 +26,13 @@ mod query;
 mod shortcut;
 mod waker;
 mod web_surface;
+#[cfg(not(any(
+    target_os = "windows",
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "android"
+)))]
+pub use web_surface::{SurfaceCloseRequest, SurfacePopup};
 mod webview;
 
 // mobile shortcut is only supported on mobile platforms
